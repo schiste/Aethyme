@@ -75,6 +75,9 @@ pub enum BrokerError {
     #[error("operation history --limit must be between 1 and {maximum}, got {limit}")]
     InvalidOperationHistoryLimit { limit: u32, maximum: u32 },
 
+    #[error("merge queue history --limit must be between 1 and {maximum}, got {limit}")]
+    InvalidMergeQueueHistoryLimit { limit: u32, maximum: u32 },
+
     #[error("a session already exists for worktree {0}")]
     WorktreeAlreadyRegistered(String),
 

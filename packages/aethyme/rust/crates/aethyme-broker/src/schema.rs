@@ -16,7 +16,7 @@ use rusqlite::Connection;
 use crate::error::BrokerError;
 
 /// Current database schema version (== `MIGRATIONS.len()`).
-pub const SCHEMA_VERSION: i64 = 20;
+pub const SCHEMA_VERSION: i64 = 22;
 
 /// Version stamped on every event row written by this binary.
 pub const EVENTS_SCHEMA_VERSION: i64 = 1;
@@ -501,6 +501,34 @@ CREATE INDEX sessions_by_cleanup_age
     ON sessions (cleanup_state, closed_at, id);
 ";
 
+const MIGRATION_V21: &str = "
+-- Default status reads only the latest row for each live session; terminal
+-- history is served separately through a newest-first id cursor.
+CREATE INDEX merge_queue_by_session_id
+    ON merge_queue (session_id, id DESC);
+";
+
+const MIGRATION_V22: &str = "
+-- Bounded, content-free shown-to-action correlation. One row per advisory
+-- and delivery surface is updated in place rather than appending on every
+-- command. Foreign-key cleanup follows the authoritative advisory row.
+CREATE TABLE advisory_delivery_metrics (
+    advisory_id     INTEGER NOT NULL REFERENCES advisories(id) ON DELETE CASCADE,
+    session_id      INTEGER REFERENCES sessions(id),
+    surface         TEXT NOT NULL CHECK (surface IN (
+                        'status', 'command', 'post_commit', 'pre_gate', 'inventory'
+                    )),
+    first_shown_at  INTEGER NOT NULL,
+    last_shown_at   INTEGER NOT NULL,
+    show_count      INTEGER NOT NULL DEFAULT 1,
+    acted_at        INTEGER,
+    action          TEXT CHECK (action IN ('acknowledged', 'publication_resolved')),
+    PRIMARY KEY (advisory_id, surface)
+);
+CREATE INDEX advisory_delivery_by_action
+    ON advisory_delivery_metrics (acted_at, advisory_id);
+";
+
 const MIGRATIONS: &[&str] = &[
     MIGRATION_V1,
     MIGRATION_V2,
@@ -522,6 +550,8 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_V18,
     MIGRATION_V19,
     MIGRATION_V20,
+    MIGRATION_V21,
+    MIGRATION_V22,
 ];
 
 pub(crate) fn current_version(conn: &Connection) -> Result<i64, BrokerError> {
@@ -973,5 +1003,57 @@ mod tests {
                 .unwrap();
             assert!(indexes.iter().any(|index| index == expected), "{table}");
         }
+    }
+
+    #[test]
+    fn v21_indexes_latest_queue_entry_by_session() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let indexes = conn
+            .prepare("PRAGMA index_list('merge_queue')")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            indexes
+                .iter()
+                .any(|index| index == "merge_queue_by_session_id")
+        );
+    }
+
+    #[test]
+    fn v22_adds_bounded_advisory_delivery_metrics() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'advisory_delivery_metrics'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(sql.contains("PRIMARY KEY (advisory_id, surface)"));
+        let columns = conn
+            .prepare("PRAGMA table_info(advisory_delivery_metrics)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            columns,
+            [
+                "advisory_id",
+                "session_id",
+                "surface",
+                "first_shown_at",
+                "last_shown_at",
+                "show_count",
+                "acted_at",
+                "action",
+            ]
+        );
     }
 }

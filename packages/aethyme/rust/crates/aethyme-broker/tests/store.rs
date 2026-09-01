@@ -3,9 +3,10 @@
 //! issue #5: migrations from empty and from v1).
 
 use aethyme_broker::{
-    AdvisoryEvidence, AdvisoryResolutionState, AdvisorySeverity, BrokerError, BrokerStore,
-    EntryExposureState, GateDef, GateFailureClass, GateStatus, LeaseKind, MergeStatus, NewAdvisory,
-    NewGateResult, NewPrWatchState, NewSession, RepositoryContract, SessionOrigin, SessionStatus,
+    AdvisoryAction, AdvisoryDeliverySurface, AdvisoryEvidence, AdvisoryResolutionState,
+    AdvisorySeverity, BrokerError, BrokerStore, EntryExposureState, GateDef, GateFailureClass,
+    GateStatus, LeaseKind, MergeStatus, NewAdvisory, NewGateResult, NewPrWatchState, NewSession,
+    RepositoryContract, SessionOrigin, SessionStatus,
 };
 
 fn open_temp() -> (tempfile::TempDir, BrokerStore) {
@@ -157,6 +158,46 @@ fn advisory_round_trip_is_idempotent_and_acknowledgement_preserves_history() {
     assert_eq!(store.record_advisory(&advisory).unwrap().id, created.id);
     assert_eq!(store.advisories(false).unwrap(), vec![created.clone()]);
 
+    store
+        .record_advisories_shown(
+            std::slice::from_ref(&created),
+            AdvisoryDeliverySurface::Command,
+        )
+        .unwrap();
+    store
+        .record_advisories_shown(
+            std::slice::from_ref(&created),
+            AdvisoryDeliverySurface::Command,
+        )
+        .unwrap();
+    store
+        .record_advisories_shown(
+            std::slice::from_ref(&created),
+            AdvisoryDeliverySurface::Status,
+        )
+        .unwrap();
+    let summary = store.advisory_delivery_summary().unwrap();
+    assert_eq!(summary.shown_advisories, 1);
+    assert_eq!(summary.surface_rows, 2);
+    assert_eq!(summary.total_shows, 3);
+    assert_eq!(summary.actioned_advisories, 0);
+    let metrics = store.advisory_delivery_metrics().unwrap();
+    assert_eq!(metrics.len(), 2);
+    assert_eq!(metrics[0].show_count + metrics[1].show_count, 3);
+    let encoded = serde_json::to_string(&metrics).unwrap();
+    for forbidden in [
+        "Fix auth bug",
+        "src/lib.rs",
+        "src/main.rs",
+        "integration advanced after review",
+        "task",
+        "paths",
+        "evidence",
+        "command_args",
+    ] {
+        assert!(!encoded.contains(forbidden), "leaked {forbidden:?}");
+    }
+
     let mut conflicting = advisory.clone();
     conflicting.severity = AdvisorySeverity::Critical;
     assert!(matches!(
@@ -173,6 +214,17 @@ fn advisory_round_trip_is_idempotent_and_acknowledgement_preserves_history() {
     assert!(acknowledged.acknowledged_at.is_some());
     assert!(store.advisories(false).unwrap().is_empty());
     assert_eq!(store.advisories(true).unwrap(), vec![acknowledged.clone()]);
+    let metrics = store.advisory_delivery_metrics().unwrap();
+    assert!(metrics.iter().all(|metric| {
+        metric.acted_at.is_some() && metric.action == Some(AdvisoryAction::Acknowledged)
+    }));
+    assert_eq!(
+        store
+            .advisory_delivery_summary()
+            .unwrap()
+            .actioned_advisories,
+        1
+    );
     assert_eq!(
         store.acknowledge_advisory(created.id).unwrap(),
         acknowledged,
@@ -686,6 +738,59 @@ fn generic_nonaccepted_outcomes_do_not_advance_the_contribution_checkpoint() {
         assert_eq!(unchanged.accepted_queue_entry_id, None);
         assert_eq!(unchanged.accepted_at, None);
     }
+}
+
+#[test]
+fn merge_queue_history_is_bounded_newest_first_and_cursor_stable() {
+    let (_tmp, mut store) = open_temp();
+    let session = sample_session(&mut store);
+    let mut terminal_ids = Vec::new();
+    for (index, status) in [
+        MergeStatus::Rejected,
+        MergeStatus::Superseded,
+        MergeStatus::Rejected,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let entry = store
+            .submit(session.id, &format!("terminal-{index}"), "base")
+            .unwrap();
+        store
+            .set_merge_status(entry.id, status, None, None)
+            .unwrap();
+        terminal_ids.push(entry.id);
+    }
+    let current = store.submit(session.id, "current", "base").unwrap();
+
+    assert_eq!(store.current_merge_queue().unwrap()[0].id, current.id);
+    let first = store.merge_queue_history_page(2, None).unwrap();
+    assert_eq!(
+        first
+            .entries
+            .iter()
+            .map(|entry| entry.id)
+            .collect::<Vec<_>>(),
+        vec![terminal_ids[2], terminal_ids[1]]
+    );
+    assert_eq!(first.next_before_id, Some(terminal_ids[1]));
+    assert_eq!(
+        first
+            .terminal_counts
+            .iter()
+            .map(|item| (item.status, item.count))
+            .collect::<Vec<_>>(),
+        vec![(MergeStatus::Rejected, 2), (MergeStatus::Superseded, 1)]
+    );
+
+    let second = store
+        .merge_queue_history_page(2, first.next_before_id)
+        .unwrap();
+    assert_eq!(second.entries.len(), 1);
+    assert_eq!(second.entries[0].id, terminal_ids[0]);
+    assert_eq!(second.next_before_id, None);
+    assert!(store.merge_queue_history_page(0, None).is_err());
+    assert!(store.merge_queue_history_page(201, None).is_err());
 }
 
 #[test]

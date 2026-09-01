@@ -703,9 +703,23 @@ pub struct CleanupSweepReport {
     pub failures: Vec<CleanupSweepFailure>,
 }
 
-#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct CleanupRetention {
     pub broker_owned_worktree_count: usize,
+    pub retained_session_branch_count: usize,
+    pub eligible_worktree_count: usize,
+    pub estimated_retained_bytes: u64,
+    pub estimated_reclaimable_bytes: u64,
+    pub oldest_closed_age_days: u64,
+    pub closed_worktrees_policy_days: u32,
+    pub severity: StatusAdviceSeverity,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct StatusQueueHistory {
+    pub schema_version: u32,
+    pub terminal_counts: Vec<crate::MergeQueueStatusCount>,
+    pub command: String,
 }
 
 /// Everything `broker status` renders, in one serializable shape.
@@ -715,13 +729,17 @@ pub struct StatusView {
     pub advice: Vec<StatusAdvice>,
     /// Durable, non-blocking advisories that remain outstanding.
     pub outstanding_advisories: Vec<crate::Advisory>,
+    /// Content-free shown-to-action correlation summary.
+    pub advisory_delivery: crate::AdvisoryDeliverySummary,
     /// Promoted entry paths whose publication has not yet been proven.
     pub outstanding_entry_exposures: Vec<crate::EntryPathExposure>,
     pub agents: Vec<AgentView>,
     pub leases: Vec<crate::Lease>,
     pub overlaps: Vec<crate::leases::Overlap>,
     pub promoted_conflicts: Vec<PromotedConflict>,
+    /// Live/pending/conflicted rows only. Terminal history is paginated.
     pub queue: Vec<crate::types::MergeQueueEntry>,
+    pub queue_history: StatusQueueHistory,
     pub integration_branch: String,
     pub integration_head: String,
     pub main_head: String,
@@ -1677,6 +1695,26 @@ impl Broker {
         self.store
             .advisory(id)?
             .ok_or_else(|| BrokerError::AdvisoryNotFound(id).into())
+    }
+
+    pub fn record_advisories_shown(
+        &mut self,
+        advisories: &[Advisory],
+        surface: crate::AdvisoryDeliverySurface,
+    ) -> Result<(), BrokerOpError> {
+        Ok(self.store.record_advisories_shown(advisories, surface)?)
+    }
+
+    pub fn advisory_delivery_metrics(
+        &self,
+    ) -> Result<Vec<crate::AdvisoryDeliveryMetric>, BrokerOpError> {
+        Ok(self.store.advisory_delivery_metrics()?)
+    }
+
+    pub fn advisory_delivery_summary(
+        &self,
+    ) -> Result<crate::AdvisoryDeliverySummary, BrokerOpError> {
+        Ok(self.store.advisory_delivery_summary()?)
     }
 
     pub fn acknowledge_advisory(&mut self, id: i64) -> Result<Advisory, BrokerOpError> {
@@ -3948,7 +3986,13 @@ impl Broker {
         let overlaps = self.refresh_leases()?;
         let agents = self.agents(now_ms)?;
         let integration = self.integration_head()?;
-        self.build_status(agents, overlaps, integration)
+        let mut view = self.build_status(agents, overlaps, integration, now_ms)?;
+        self.store.record_advisories_shown(
+            &view.outstanding_advisories,
+            crate::AdvisoryDeliverySurface::Status,
+        )?;
+        view.advisory_delivery = self.store.advisory_delivery_summary()?;
+        Ok(view)
     }
 
     /// Render the same status contract from persisted state and derived
@@ -3958,7 +4002,7 @@ impl Broker {
         let overlaps = self.lease_overlaps_snapshot()?;
         let agents = self.agents_snapshot(now_ms)?;
         let integration = self.integration_head_snapshot()?;
-        self.build_status(agents, overlaps, integration)
+        self.build_status(agents, overlaps, integration, now_ms)
     }
 
     fn build_status(
@@ -3966,9 +4010,20 @@ impl Broker {
         agents: Vec<AgentView>,
         overlaps: Vec<crate::Overlap>,
         (integration_branch, integration_head): (String, String),
+        now_ms: i64,
     ) -> Result<StatusView, BrokerOpError> {
         let promoted_conflicts = self.promoted_conflicts()?;
-        let queue = self.store.merge_queue()?;
+        let queue = self.store.current_merge_queue()?;
+        let terminal_counts = self.store.terminal_merge_queue_counts()?;
+        let mut latest_live_queue = Vec::new();
+        for agent in &agents {
+            if let Some(entry) = self
+                .store
+                .latest_merge_queue_for_session(agent.session.id)?
+            {
+                latest_live_queue.push(entry);
+            }
+        }
         let main_head = self.repo.head_commit()?;
         let (upstream_ref, upstream_head) = self
             .repo
@@ -4009,7 +4064,7 @@ impl Broker {
         let mut advice = self.status_advice(
             &agents,
             &promoted_conflicts,
-            &queue,
+            &latest_live_queue,
             &integration_branch,
             &integration_head,
         );
@@ -4055,12 +4110,12 @@ impl Broker {
                 },
                 );
         }
-        let cleanup_retention = self.cleanup_retention()?;
+        let cleanup_retention = self.cleanup_retention(now_ms)?;
         if cleanup_retention.broker_owned_worktree_count > 0 {
             let count = cleanup_retention.broker_owned_worktree_count;
             advice.push(StatusAdvice {
                 id: "cleanup.retained-worktrees",
-                severity: StatusAdviceSeverity::Warning,
+                severity: cleanup_retention.severity,
                 reason: "closed broker-owned worktrees are retained until explicit cleanup",
                 summary: format!(
                     "{count} closed broker-owned {} remain on disk; review reclaimable bytes and remove only eligible worktrees",
@@ -4068,7 +4123,23 @@ impl Broker {
                 ),
                 session_id: None,
                 queue_entry_id: None,
-                evidence: vec![format!("retained broker-owned worktrees: {count}")],
+                evidence: vec![
+                    format!("retained broker-owned worktrees: {count}"),
+                    format!(
+                        "retained session branches: {}",
+                        cleanup_retention.retained_session_branch_count
+                    ),
+                    format!(
+                        "retained/reclaimable bytes: {}/{}",
+                        cleanup_retention.estimated_retained_bytes,
+                        cleanup_retention.estimated_reclaimable_bytes
+                    ),
+                    format!(
+                        "oldest closed age/policy: {}/{} days",
+                        cleanup_retention.oldest_closed_age_days,
+                        cleanup_retention.closed_worktrees_policy_days
+                    ),
+                ],
                 commands: vec![
                     "aethyme broker cleanup --all-cleaned".into(),
                     "aethyme broker cleanup --all-cleaned --apply".into(),
@@ -4079,12 +4150,18 @@ impl Broker {
             summary,
             advice,
             outstanding_advisories: self.store.advisories(false)?,
+            advisory_delivery: self.store.advisory_delivery_summary()?,
             outstanding_entry_exposures: self.store.outstanding_entry_path_exposures()?,
             agents,
             leases: self.store.active_leases()?,
             overlaps,
             promoted_conflicts,
             queue,
+            queue_history: StatusQueueHistory {
+                schema_version: crate::MERGE_QUEUE_HISTORY_SCHEMA_VERSION,
+                terminal_counts,
+                command: "aethyme broker queue history".into(),
+            },
             integration_branch,
             integration_head,
             main_head,
@@ -5478,8 +5555,10 @@ impl Broker {
         })
     }
 
-    fn cleanup_retention(&self) -> Result<CleanupRetention, BrokerOpError> {
-        let count = self
+    fn cleanup_retention(&self, now_ms: i64) -> Result<CleanupRetention, BrokerOpError> {
+        let plan = self.cleanup_plan()?;
+        let policy = crate::load_retention_policy(&self.main_root)?;
+        let oldest_closed_at = self
             .store
             .cleaned_sessions()?
             .into_iter()
@@ -5487,9 +5566,26 @@ impl Broker {
                 let path = Path::new(&session.worktree_path);
                 path.exists() && self.is_broker_owned_worktree(session, path)
             })
-            .count();
+            .filter_map(|session| session.closed_at)
+            .min();
+        let oldest_closed_age_days = oldest_closed_at
+            .map(|closed_at| now_ms.saturating_sub(closed_at).max(0) as u64 / 86_400_000)
+            .unwrap_or(0);
+        let severity = cleanup_retention_severity(
+            plan.retained_worktree_count,
+            plan.estimated_retained_bytes,
+            oldest_closed_age_days,
+            policy.closed_worktrees_days,
+        );
         Ok(CleanupRetention {
-            broker_owned_worktree_count: count,
+            broker_owned_worktree_count: plan.retained_worktree_count,
+            retained_session_branch_count: plan.retained_branch_count,
+            eligible_worktree_count: plan.eligible_worktree_count,
+            estimated_retained_bytes: plan.estimated_retained_bytes,
+            estimated_reclaimable_bytes: plan.estimated_reclaimable_bytes,
+            oldest_closed_age_days,
+            closed_worktrees_policy_days: policy.closed_worktrees_days,
+            severity,
         })
     }
 
@@ -5732,6 +5828,22 @@ fn dirty_session_count(agents: &[AgentView]) -> usize {
                 .unwrap_or(false)
         })
         .count()
+}
+
+fn cleanup_retention_severity(
+    retained_worktrees: usize,
+    retained_bytes: u64,
+    oldest_age_days: u64,
+    policy_days: u32,
+) -> StatusAdviceSeverity {
+    if retained_worktrees >= 5
+        || retained_bytes >= 1_073_741_824
+        || oldest_age_days >= u64::from(policy_days)
+    {
+        StatusAdviceSeverity::Warning
+    } else {
+        StatusAdviceSeverity::Notice
+    }
 }
 
 fn status_summary(
@@ -6657,6 +6769,26 @@ mod tests {
             "no live sessions; no overlaps; aethyme/integration current with main; no active submitters"
         );
         assert!(summary.commands.is_empty());
+    }
+
+    #[test]
+    fn cleanup_retention_severity_scales_by_count_bytes_and_policy_age() {
+        assert_eq!(
+            super::cleanup_retention_severity(1, 1024, 1, 7),
+            super::StatusAdviceSeverity::Notice
+        );
+        assert_eq!(
+            super::cleanup_retention_severity(5, 1024, 1, 7),
+            super::StatusAdviceSeverity::Warning
+        );
+        assert_eq!(
+            super::cleanup_retention_severity(1, 1_073_741_824, 1, 7),
+            super::StatusAdviceSeverity::Warning
+        );
+        assert_eq!(
+            super::cleanup_retention_severity(1, 1024, 7, 7),
+            super::StatusAdviceSeverity::Warning
+        );
     }
 
     fn doctor_report(

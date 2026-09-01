@@ -182,23 +182,27 @@ fn v0_three_agents_end_to_end() {
     // ── status renders the whole picture without error ────────────────
     let status = broker.status(0).unwrap();
     assert_eq!(status.agents.len(), 3);
-    // Four entries: alice, carol, bob's superseded conflict, bob's retry.
-    assert_eq!(status.queue.len(), 4);
+    // Every entry is terminal, so default status keeps the current queue
+    // empty and reports deterministic terminal counts instead of history.
+    assert!(status.queue.is_empty());
     assert_eq!(
         status
-            .queue
+            .queue_history
+            .terminal_counts
             .iter()
-            .filter(|e| e.status == MergeStatus::Superseded)
-            .count(),
-        1
+            .find(|item| item.status == MergeStatus::Superseded)
+            .map(|item| item.count),
+        Some(1)
     );
-    assert!(
+    assert_eq!(
         status
-            .queue
+            .queue_history
+            .terminal_counts
             .iter()
-            .filter(|e| e.status == MergeStatus::Promoted)
-            .count()
-            == 3
+            .find(|item| item.status == MergeStatus::Promoted)
+            .map(|item| item.count),
+        Some(3)
     );
+    assert_eq!(status.queue_history.command, "aethyme broker queue history");
     assert_eq!(status.integration_branch, "aethyme/integration");
 }

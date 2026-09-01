@@ -67,6 +67,7 @@ product surface.
 - `aethyme broker gh`
 - `aethyme broker operations`
 - `aethyme broker advisories`
+- `aethyme broker queue history`
 - `aethyme broker submit`
 - `aethyme broker repair`
 - `aethyme broker finish`
@@ -220,15 +221,33 @@ lease planning, and durable finish handoffs, see the
 - `aethyme broker advisories list [--all] [--json]`
 - `aethyme broker advisories show <id> [--json]`
 - `aethyme broker advisories ack <id> [--json]`
+- `aethyme broker advisories metrics [--json]`
+- `aethyme broker queue history [--limit <n>] [--before <id>] [--json]`
+- `aethyme broker queue [--json]` (compatibility full-inventory view)
 - `aethyme broker exposures plan [--json]`
 - `aethyme broker exposures apply --session <id> --confirm <sha256> [--json]`
 - `aethyme broker note send --session <sender> --to-session <recipient> --message <text> [--json]`
 - `aethyme broker note list --session <recipient> [--json]`
 - `aethyme broker note ack --session <recipient> --id <note-id> [--json]`
 
-Text status renders current merge-queue entries individually and collapses
-terminal history into counts; use `aethyme broker queue` for the complete
-history. JSON status retains the complete structured queue for compatibility.
+Status is a bounded present-state view. Text and JSON expose live, pending, and
+conflicted merge-queue entries individually, while `queue_history` contains a
+versioned terminal-count summary and the exact history command. Use
+`aethyme broker queue history` for a stable newest-first page; `--before`
+advances without duplicating the boundary row, and `next_before_id: null`
+proves the end. The bare `broker queue` command remains a documented
+compatibility full-inventory view, but status no longer loads terminal rows.
+
+Text status orders remediation by urgency: summary and warnings, outstanding
+advisories and publication exposures with exact inspection commands, live
+sessions and current queue entries, then terminal-history counts. Advisory and
+exposure detail is capped at ten rows in text; their authoritative inventories
+remain available through the printed commands. Cleanup retention fields report
+retained worktree and session-branch counts, eligible count, retained and
+reclaimable bytes, oldest closed-session age, the configured age policy, and a
+typed severity. Severity becomes `warning` when retained count reaches five,
+estimated retained bytes reaches 1 GiB, or the oldest closed worktree reaches
+the configured retention age; otherwise it is `notice`.
 
 Exposure reconciliation is explicit because normal status is non-mutating.
 The plan queries the remote default branch without updating local refs and
@@ -322,6 +341,15 @@ structured evidence, creation time, and a typed `outstanding`, `acknowledged`,
 or publication-`resolved` state. `list` returns outstanding rows newest-first;
 `list --all` includes terminal history, and `show <id>` returns one exact row.
 `ack <id>` is idempotent and preserves the row and evidence.
+
+`advisories metrics` exposes bounded shown-to-action correlation as text or a
+versioned JSON object. One row is retained per advisory and delivery surface;
+repeated delivery increments its count rather than appending history. The
+allowlist is limited to advisory and session IDs, surface, first/last display
+times, count, action time, and acknowledged/publication-resolved action. It
+does not store task text, command arguments, paths, evidence, diffs, or secrets.
+The metrics are operational feedback only and never change advisory severity
+or broker behavior.
 
 After each advisory creation or acknowledgement, the broker takes a
 cross-process projection lock, re-reads outstanding rows from SQLite, and

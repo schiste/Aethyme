@@ -1126,6 +1126,8 @@ fn run_selections(
             if let Some(session_id) = session_id
                 && let Ok(advisories) = store.outstanding_advisories_for_session(session_id)
             {
+                let _ = store
+                    .record_advisories_shown(&advisories, crate::AdvisoryDeliverySurface::PreGate);
                 for line in crate::advisories::session_notice_lines(&advisories) {
                     progress.report(&line);
                 }

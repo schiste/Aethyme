@@ -193,14 +193,16 @@ pub use ship::{
 };
 pub use store::BrokerStore;
 pub use types::{
-    Advisory, AdvisoryEvidence, AdvisoryList, AdvisoryResolutionState, AdvisorySeverity,
-    CoordinatedOperation, DEFAULT_OPERATION_HISTORY_LIMIT, EntryExposureResolutionKind,
-    EntryExposureState, EntryPathExposure, Event, GateDef, GateFailureClass, GateResult,
-    GateStatus, Lease, LeaseKind, MAX_OPERATION_HISTORY_LIMIT, MergeQueueEntry, MergeStatus,
-    NewAdvisory, NewCoordinatedOperation, NewGateResult, NewPrWatchState, NewSession,
-    OperationEffect, OperationHistoryPage, OperationHistoryQuery, OperationIdentityProvenance,
-    OperationProvider, OperationStatus, PrWatchState, Session, SessionCleanupState, SessionNote,
-    SessionNoteList, SessionOrigin, SessionStatus,
+    Advisory, AdvisoryAction, AdvisoryDeliveryMetric, AdvisoryDeliverySummary,
+    AdvisoryDeliverySurface, AdvisoryEvidence, AdvisoryList, AdvisoryResolutionState,
+    AdvisorySeverity, CoordinatedOperation, DEFAULT_OPERATION_HISTORY_LIMIT,
+    EntryExposureResolutionKind, EntryExposureState, EntryPathExposure, Event, GateDef,
+    GateFailureClass, GateResult, GateStatus, Lease, LeaseKind, MAX_OPERATION_HISTORY_LIMIT,
+    MERGE_QUEUE_HISTORY_SCHEMA_VERSION, MergeQueueEntry, MergeQueueHistoryPage,
+    MergeQueueStatusCount, MergeStatus, NewAdvisory, NewCoordinatedOperation, NewGateResult,
+    NewPrWatchState, NewSession, OperationEffect, OperationHistoryPage, OperationHistoryQuery,
+    OperationIdentityProvenance, OperationProvider, OperationStatus, PrWatchState, Session,
+    SessionCleanupState, SessionNote, SessionNoteList, SessionOrigin, SessionStatus,
 };
 pub use update::{
     INSTALL_RECEIPT_FILENAME, INSTALL_RECEIPT_SCHEMA_VERSION, InstallReceipt, InstallationMethod,

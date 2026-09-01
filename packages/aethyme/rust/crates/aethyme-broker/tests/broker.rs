@@ -401,6 +401,13 @@ fn cleanup_plan_and_apply_reclaim_only_safe_closed_broker_worktrees() {
 
     let status = broker.status(now_ms()).unwrap();
     assert_eq!(status.cleanup_retention.broker_owned_worktree_count, 2);
+    assert_eq!(status.cleanup_retention.retained_session_branch_count, 2);
+    assert_eq!(status.cleanup_retention.eligible_worktree_count, 1);
+    assert!(status.cleanup_retention.estimated_retained_bytes >= 4096);
+    assert_eq!(
+        status.cleanup_retention.severity,
+        aethyme_broker::StatusAdviceSeverity::Notice
+    );
     assert!(
         status
             .advice

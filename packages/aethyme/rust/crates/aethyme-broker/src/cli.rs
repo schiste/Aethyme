@@ -175,6 +175,9 @@ Usage:
       Promotion/lease advisories repeat on session commands, after
       post-commit, and before uncached gates whose cost exceeds 1; they
       remain informational and never alter command or promotion outcomes.
+  aethyme broker advisories metrics [--json]
+      Inspect bounded, content-free shown-to-action correlation. Metrics
+      never retain task text, command arguments, paths, evidence, or secrets.
   aethyme broker exposures plan [--json]
       Read-only reconciliation plan against the remote default branch's
       freshly advertised exact SHA. Normal status never performs this check.
@@ -275,6 +278,9 @@ Usage:
       first, then atomically re-anchor the broker checkpoint. Never rewrites the
       session worktree or hides uncommitted work.
   aethyme broker queue [--json]
+  aethyme broker queue history [--limit <n>] [--before <id>] [--json]
+      The bare command remains the compatibility inventory. `history` is a
+      bounded newest-first terminal page with a stable next_before_id cursor.
       Show the merge queue.
   aethyme broker promote --entry <id> [--json]
       Manual-mode only: advance the local integration branch to a verified
@@ -1924,22 +1930,34 @@ fn queue_status_is_current(status: crate::MergeStatus) -> bool {
     )
 }
 
-fn terminal_queue_counts(entries: &[crate::MergeQueueEntry]) -> Vec<(crate::MergeStatus, usize)> {
-    [
-        crate::MergeStatus::Promoted,
-        crate::MergeStatus::ExternallyLanded,
-        crate::MergeStatus::Rejected,
-        crate::MergeStatus::Superseded,
-    ]
-    .into_iter()
-    .filter_map(|status| {
-        let count = entries
-            .iter()
-            .filter(|entry| entry.status == status)
-            .count();
-        (count > 0).then_some((status, count))
-    })
-    .collect()
+fn render_queue_history(page: &crate::MergeQueueHistoryPage) {
+    if page.entries.is_empty() {
+        println!("No terminal merge-queue entries in this page.");
+    } else {
+        println!("{:<4} {:<4} {:<17} HEAD", "ID", "SID", "STATUS");
+        for entry in &page.entries {
+            println!(
+                "{:<4} {:<4} {:<17} {}",
+                entry.id,
+                entry.session_id,
+                entry.status.as_str(),
+                short_commit(&entry.head_commit)
+            );
+        }
+    }
+    let summary = page
+        .terminal_counts
+        .iter()
+        .map(|item| format!("{} {}", item.status.as_str(), item.count))
+        .collect::<Vec<_>>()
+        .join(", ");
+    println!(
+        "Terminal totals: {}",
+        if summary.is_empty() { "none" } else { &summary }
+    );
+    if let Some(before) = page.next_before_id {
+        println!("Next: aethyme broker queue history --before {before}");
+    }
 }
 
 fn render_repair_report(report: &crate::RepairReport) {
@@ -4332,6 +4350,12 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                         ));
                     }
                     let report = broker.advisory_list(parsed.all)?;
+                    if !parsed.read_only_snapshot {
+                        broker.record_advisories_shown(
+                            &report.advisories,
+                            crate::AdvisoryDeliverySurface::Inventory,
+                        )?;
+                    }
                     if parsed.json {
                         println!("{}", serde_json::to_string_pretty(&report)?);
                     } else if report.advisories.is_empty() {
@@ -4356,6 +4380,12 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     }
                     let id = parse_advisory_id(parsed.positional.get(1), ADVISORIES_SHOW_USAGE)?;
                     let advisory = broker.advisory(id)?;
+                    if !parsed.read_only_snapshot {
+                        broker.record_advisories_shown(
+                            std::slice::from_ref(&advisory),
+                            crate::AdvisoryDeliverySurface::Inventory,
+                        )?;
+                    }
                     if parsed.json {
                         println!("{}", serde_json::to_string_pretty(&advisory)?);
                     } else {
@@ -4379,14 +4409,54 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                         println!("Projection refreshed: {}", crate::BROKER_ADVISORY_RELPATH);
                     }
                 }
+                Some("metrics") => {
+                    if parsed.positional.len() != 1 {
+                        return Err(UsageError::Message(
+                            "usage: aethyme broker advisories metrics [--json]".into(),
+                        ));
+                    }
+                    let summary = broker.advisory_delivery_summary()?;
+                    let metrics = broker.advisory_delivery_metrics()?;
+                    if parsed.json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "schema_version": 1,
+                                "summary": summary,
+                                "metrics": metrics,
+                            }))?
+                        );
+                    } else {
+                        println!(
+                            "Advisory delivery: {} shown, {} actioned, {} displays across {} surfaces.",
+                            summary.shown_advisories,
+                            summary.actioned_advisories,
+                            summary.total_shows,
+                            summary.surface_rows,
+                        );
+                        for metric in metrics {
+                            println!(
+                                "  advisory {} / {}: {} display{}{}",
+                                metric.advisory_id,
+                                metric.surface.as_str(),
+                                metric.show_count,
+                                if metric.show_count == 1 { "" } else { "s" },
+                                metric
+                                    .action
+                                    .map(|action| format!("; {}", action.as_str()))
+                                    .unwrap_or_default(),
+                            );
+                        }
+                    }
+                }
                 Some(other) => {
                     return Err(UsageError::Message(format!(
-                        "unknown advisories action {other:?} — expected list, show, or ack"
+                        "unknown advisories action {other:?} — expected list, show, ack, or metrics"
                     )));
                 }
                 None => {
                     return Err(UsageError::Message(
-                        "advisories requires an action: list, show, or ack".into(),
+                        "advisories requires an action: list, show, ack, or metrics".into(),
                     ));
                 }
             }
@@ -5295,6 +5365,28 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
         }
         "queue" => {
             let mut broker = open_broker(parsed.read_only_snapshot)?;
+            if parsed.positional.first().map(String::as_str) == Some("history") {
+                if parsed.positional.len() != 1 {
+                    return Err(UsageError::Message(
+                        "queue history accepts no positional arguments".into(),
+                    ));
+                }
+                let page = broker
+                    .store()
+                    .merge_queue_history_page(parsed.limit.unwrap_or(50), parsed.before)?;
+                if parsed.json {
+                    println!("{}", serde_json::to_string_pretty(&page)?);
+                } else {
+                    render_queue_history(&page);
+                }
+                return Ok(());
+            }
+            if !parsed.positional.is_empty() || parsed.limit.is_some() || parsed.before.is_some() {
+                return Err(UsageError::Message(
+                    "queue accepts no selectors; use `queue history [--limit <n>] [--before <id>]`"
+                        .into(),
+                ));
+            }
             let entries = broker.store().merge_queue()?;
             if parsed.json {
                 println!("{}", serde_json::to_string_pretty(&entries)?);
@@ -5472,6 +5564,59 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                 println!("Summary: {}", status.summary.message);
                 println!();
                 render_status_advice(&status.advice);
+                if !status.outstanding_advisories.is_empty() {
+                    println!();
+                    println!(
+                        "Outstanding advisories: {}",
+                        status.outstanding_advisories.len()
+                    );
+                    for advisory in status.outstanding_advisories.iter().take(10) {
+                        println!(
+                            "  {} [{}]: {}",
+                            advisory.id,
+                            advisory.severity.as_str(),
+                            advisory_text(&advisory.identity),
+                        );
+                        println!(
+                            "    inspect: aethyme broker advisories show {}",
+                            advisory.id
+                        );
+                        println!(
+                            "    acknowledge: aethyme broker advisories ack {}",
+                            advisory.id
+                        );
+                    }
+                    if status.outstanding_advisories.len() > 10 {
+                        println!(
+                            "  and {} more; inspect: aethyme broker advisories list",
+                            status.outstanding_advisories.len() - 10
+                        );
+                    }
+                }
+                if !status.outstanding_entry_exposures.is_empty() {
+                    println!();
+                    println!(
+                        "Publication exposures: {} promoted {} not yet verified on remote main",
+                        status.outstanding_entry_exposures.len(),
+                        plural(status.outstanding_entry_exposures.len(), "entry", "entries")
+                    );
+                    for exposure in status.outstanding_entry_exposures.iter().take(10) {
+                        println!(
+                            "  qid {} @ {}: {} {}",
+                            exposure.queue_entry_id,
+                            short_commit(&exposure.promotion_sha),
+                            exposure.paths.len(),
+                            plural(exposure.paths.len(), "path", "paths")
+                        );
+                    }
+                    if status.outstanding_entry_exposures.len() > 10 {
+                        println!(
+                            "  and {} more",
+                            status.outstanding_entry_exposures.len() - 10
+                        );
+                    }
+                    println!("  inspect: aethyme broker exposures plan");
+                }
                 println!();
                 if status.agents.is_empty() {
                     println!("No live sessions.");
@@ -5522,15 +5667,12 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                         );
                     }
                 }
-                let terminal_counts = terminal_queue_counts(&status.queue);
+                let terminal_counts = &status.queue_history.terminal_counts;
                 if !terminal_counts.is_empty() {
-                    let total = terminal_counts
-                        .iter()
-                        .map(|(_, count)| count)
-                        .sum::<usize>();
+                    let total = terminal_counts.iter().map(|item| item.count).sum::<usize>();
                     let summary = terminal_counts
                         .iter()
-                        .map(|(status, count)| format!("{} {count}", status.as_str()))
+                        .map(|item| format!("{} {}", item.status.as_str(), item.count))
                         .collect::<Vec<_>>()
                         .join(", ");
                     println!();
@@ -5538,24 +5680,17 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                         "Queue history: {total} terminal {} ({summary}).",
                         plural(total, "entry", "entries")
                     );
-                    println!("  inspect: aethyme broker queue");
+                    println!("  inspect: {}", status.queue_history.command);
                 }
-                if !status.outstanding_entry_exposures.is_empty() {
+                if status.advisory_delivery.shown_advisories > 0 {
                     println!();
                     println!(
-                        "Publication exposures: {} promoted {} not yet verified on remote main",
-                        status.outstanding_entry_exposures.len(),
-                        plural(status.outstanding_entry_exposures.len(), "entry", "entries")
+                        "Advisory delivery: {} shown, {} actioned, {} displays.",
+                        status.advisory_delivery.shown_advisories,
+                        status.advisory_delivery.actioned_advisories,
+                        status.advisory_delivery.total_shows,
                     );
-                    for exposure in status.outstanding_entry_exposures.iter().take(10) {
-                        println!(
-                            "  qid {} @ {}: {} {}",
-                            exposure.queue_entry_id,
-                            short_commit(&exposure.promotion_sha),
-                            exposure.paths.len(),
-                            plural(exposure.paths.len(), "path", "paths")
-                        );
-                    }
+                    println!("  inspect: aethyme broker advisories metrics");
                 }
                 print_overlap_warnings(&status.overlaps);
                 print_promoted_conflict_warnings(&status.promoted_conflicts);
@@ -6132,7 +6267,8 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
 /// Every broker invocation associated with a live session surfaces its
 /// outstanding durable advisories and unread local notes on stderr. Stdout
 /// remains untouched so all existing `--json` contracts stay parseable. This
-/// is best effort and read-only: notification failure never changes behavior.
+/// is best effort: notification failure never changes command behavior, and
+/// the delivery metric path never creates broker state for an offline read.
 fn surface_command_advisories(subcommand: &str, parsed: &Parsed) {
     // Internal hooks are not interactive broker commands. Pre-commit remains
     // quiet on success, while post-commit surfaces through run_post_commit
@@ -6149,7 +6285,15 @@ fn surface_command_advisories(subcommand: &str, parsed: &Parsed) {
     let Ok(main_root) = checkout.main_root() else {
         return;
     };
-    let Ok(store) = crate::BrokerStore::open_snapshot_in_repo(&main_root) else {
+    if !main_root.join(crate::BROKER_DB_RELPATH).is_file() {
+        return;
+    }
+    let store = if parsed.read_only_snapshot {
+        crate::BrokerStore::open_snapshot_in_repo(&main_root)
+    } else {
+        crate::BrokerStore::open_in_repo(&main_root)
+    };
+    let Ok(mut store) = store else {
         return;
     };
     let session_id = parsed.session.or_else(|| {
@@ -6165,6 +6309,9 @@ fn surface_command_advisories(subcommand: &str, parsed: &Parsed) {
     let Ok(advisories) = store.outstanding_advisories_for_session(session_id) else {
         return;
     };
+    if !parsed.read_only_snapshot {
+        let _ = store.record_advisories_shown(&advisories, crate::AdvisoryDeliverySurface::Command);
+    }
     for line in crate::advisories::session_notice_lines(&advisories) {
         eprintln!("{line}");
     }

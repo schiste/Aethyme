@@ -1145,6 +1145,99 @@ impl BrokerStore {
         Ok(entries)
     }
 
+    pub fn current_merge_queue(&self) -> Result<Vec<MergeQueueEntry>, BrokerError> {
+        let mut stmt = self.conn.prepare(&format!(
+            "{MERGE_SELECT}
+             WHERE status IN ('submitted', 'simulating', 'conflict', 'verified')
+             ORDER BY id"
+        ))?;
+        let rows = stmt.query_map([], merge_from_row)?;
+        rows.map(|row| row?).collect()
+    }
+
+    pub fn latest_merge_queue_for_session(
+        &self,
+        session_id: i64,
+    ) -> Result<Option<MergeQueueEntry>, BrokerError> {
+        self.conn
+            .query_row(
+                &format!("{MERGE_SELECT} WHERE session_id = ?1 ORDER BY id DESC LIMIT 1"),
+                [session_id],
+                merge_from_row,
+            )
+            .optional()?
+            .transpose()
+    }
+
+    pub fn terminal_merge_queue_counts(
+        &self,
+    ) -> Result<Vec<crate::MergeQueueStatusCount>, BrokerError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT status, COUNT(*) FROM merge_queue
+             WHERE status IN ('promoted', 'externally_landed', 'rejected', 'superseded')
+             GROUP BY status",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let value: String = row.get(0)?;
+            let status = MergeStatus::parse(&value).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?;
+            Ok(crate::MergeQueueStatusCount {
+                status,
+                count: row.get::<_, i64>(1)?.max(0) as usize,
+            })
+        })?;
+        let mut counts = rows.collect::<Result<Vec<_>, _>>()?;
+        counts.sort_by_key(|item| match item.status {
+            MergeStatus::Promoted => 0,
+            MergeStatus::ExternallyLanded => 1,
+            MergeStatus::Rejected => 2,
+            MergeStatus::Superseded => 3,
+            _ => 4,
+        });
+        Ok(counts)
+    }
+
+    pub fn merge_queue_history_page(
+        &self,
+        limit: u32,
+        before_id: Option<i64>,
+    ) -> Result<crate::MergeQueueHistoryPage, BrokerError> {
+        const MAX_LIMIT: u32 = 200;
+        if !(1..=MAX_LIMIT).contains(&limit) {
+            return Err(BrokerError::InvalidMergeQueueHistoryLimit {
+                limit,
+                maximum: MAX_LIMIT,
+            });
+        }
+        let mut stmt = self.conn.prepare(&format!(
+            "{MERGE_SELECT}
+             WHERE status IN ('promoted', 'externally_landed', 'rejected', 'superseded')
+               AND (?1 IS NULL OR id < ?1)
+             ORDER BY id DESC LIMIT ?2"
+        ))?;
+        let rows = stmt.query_map(
+            rusqlite::params![before_id, i64::from(limit) + 1],
+            merge_from_row,
+        )?;
+        let mut entries = rows.map(|row| row?).collect::<Result<Vec<_>, _>>()?;
+        let has_more = entries.len() > limit as usize;
+        entries.truncate(limit as usize);
+        let next_before_id = has_more
+            .then(|| entries.last().map(|entry| entry.id))
+            .flatten();
+        Ok(crate::MergeQueueHistoryPage {
+            schema_version: crate::MERGE_QUEUE_HISTORY_SCHEMA_VERSION,
+            entries,
+            terminal_counts: self.terminal_merge_queue_counts()?,
+            next_before_id,
+        })
+    }
+
     /// Move a reviewed session ownership checkpoint and journal the exact
     /// transition in one SQLite transaction. Git preservation happens before
     /// this call, so a database failure can only leave an extra safe ref.
@@ -1438,6 +1531,15 @@ impl BrokerStore {
                              resolution_evidence = ?3
                          WHERE queue_entry_id = ?1 AND resolution_state = 'outstanding'",
                         params![update.queue_entry_id, now, resolution_evidence],
+                    )?;
+                    tx.execute(
+                        "UPDATE advisory_delivery_metrics
+                         SET acted_at = COALESCE(acted_at, ?2),
+                             action = 'publication_resolved'
+                         WHERE advisory_id IN (
+                             SELECT id FROM advisories WHERE queue_entry_id = ?1
+                         )",
+                        params![update.queue_entry_id, now],
                     )?;
                 }
             } else if update.status == MergeStatus::Promoted
@@ -1891,6 +1993,69 @@ impl BrokerStore {
         rows.map(|row| row?).collect()
     }
 
+    /// Record content-free delivery correlation. Repeated displays update one
+    /// row per advisory/surface, so ordinary command use cannot create an
+    /// unbounded event stream. No task, arguments, paths, or evidence enter
+    /// this table.
+    pub fn record_advisories_shown(
+        &mut self,
+        advisories: &[Advisory],
+        surface: crate::AdvisoryDeliverySurface,
+    ) -> Result<(), BrokerError> {
+        if advisories.is_empty() {
+            return Ok(());
+        }
+        let now = now_ms();
+        let tx = self.conn.transaction()?;
+        for advisory in advisories {
+            tx.execute(
+                "INSERT INTO advisory_delivery_metrics (
+                     advisory_id, session_id, surface, first_shown_at,
+                     last_shown_at, show_count
+                 ) VALUES (?1, ?2, ?3, ?4, ?4, 1)
+                 ON CONFLICT(advisory_id, surface) DO UPDATE SET
+                     last_shown_at = excluded.last_shown_at,
+                     show_count = advisory_delivery_metrics.show_count + 1",
+                params![advisory.id, advisory.session_id, surface.as_str(), now],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn advisory_delivery_metrics(
+        &self,
+    ) -> Result<Vec<crate::AdvisoryDeliveryMetric>, BrokerError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT advisory_id, session_id, surface, first_shown_at,
+                    last_shown_at, show_count, acted_at, action
+             FROM advisory_delivery_metrics
+             ORDER BY advisory_id DESC, surface",
+        )?;
+        let rows = stmt.query_map([], advisory_delivery_metric_from_row)?;
+        rows.map(|row| row?).collect()
+    }
+
+    pub fn advisory_delivery_summary(&self) -> Result<crate::AdvisoryDeliverySummary, BrokerError> {
+        self.conn
+            .query_row(
+                "SELECT COUNT(DISTINCT advisory_id), COUNT(*),
+                        COALESCE(SUM(show_count), 0),
+                        COUNT(DISTINCT CASE WHEN acted_at IS NOT NULL THEN advisory_id END)
+                 FROM advisory_delivery_metrics",
+                [],
+                |row| {
+                    Ok(crate::AdvisoryDeliverySummary {
+                        shown_advisories: row.get::<_, i64>(0)?.max(0) as usize,
+                        surface_rows: row.get::<_, i64>(1)?.max(0) as usize,
+                        total_shows: row.get::<_, i64>(2)?.max(0) as u64,
+                        actioned_advisories: row.get::<_, i64>(3)?.max(0) as usize,
+                    })
+                },
+            )
+            .map_err(Into::into)
+    }
+
     /// Outstanding advisories for one session, oldest first so repeated
     /// command-boundary notices stay deterministic and preserve chronology.
     pub fn outstanding_advisories_for_session(
@@ -1924,6 +2089,12 @@ impl BrokerStore {
             params![id, now],
         )?;
         let _ = updated;
+        tx.execute(
+            "UPDATE advisory_delivery_metrics
+             SET acted_at = COALESCE(acted_at, ?2), action = 'acknowledged'
+             WHERE advisory_id = ?1",
+            params![id, now],
+        )?;
         tx.commit()?;
         self.advisory(id)?.ok_or(BrokerError::AdvisoryNotFound(id))
     }
@@ -2163,6 +2334,12 @@ impl BrokerStore {
                      resolution_evidence = ?3
                  WHERE id = ?1 AND resolution_state IN ('outstanding', 'acknowledged')",
                 params![advisory_id, now, evidence],
+            )?;
+            tx.execute(
+                "UPDATE advisory_delivery_metrics
+                 SET acted_at = COALESCE(acted_at, ?2), action = 'publication_resolved'
+                 WHERE advisory_id = ?1",
+                params![advisory_id, now],
             )?;
         }
         tx.commit()?;
@@ -2923,6 +3100,28 @@ fn advisory_from_row(row: &rusqlite::Row<'_>) -> RowResult<Advisory> {
             acknowledged_at: row.get(10)?,
             resolved_at: row.get(11)?,
             resolution_evidence: row.get(12)?,
+        })
+    })())
+}
+
+fn advisory_delivery_metric_from_row(
+    row: &rusqlite::Row<'_>,
+) -> RowResult<crate::AdvisoryDeliveryMetric> {
+    let surface: String = row.get(2)?;
+    let action: Option<String> = row.get(7)?;
+    Ok((|| {
+        Ok(crate::AdvisoryDeliveryMetric {
+            advisory_id: row.get(0)?,
+            session_id: row.get(1)?,
+            surface: crate::AdvisoryDeliverySurface::parse(&surface)?,
+            first_shown_at: row.get(3)?,
+            last_shown_at: row.get(4)?,
+            show_count: row.get::<_, i64>(5)?.max(0) as u64,
+            acted_at: row.get(6)?,
+            action: action
+                .as_deref()
+                .map(crate::AdvisoryAction::parse)
+                .transpose()?,
         })
     })())
 }

@@ -106,6 +106,19 @@ text_enum!(MergeStatus, "merge_queue.status", {
     Superseded => "superseded",
 });
 
+text_enum!(AdvisoryDeliverySurface, "advisory_delivery_metrics.surface", {
+    Status => "status",
+    Command => "command",
+    PostCommit => "post_commit",
+    PreGate => "pre_gate",
+    Inventory => "inventory",
+});
+
+text_enum!(AdvisoryAction, "advisory_delivery_metrics.action", {
+    Acknowledged => "acknowledged",
+    PublicationResolved => "publication_resolved",
+});
+
 text_enum!(OperationProvider, "coordinated_operations.provider", {
     Git => "git",
     Github => "github",
@@ -217,6 +230,26 @@ pub struct AdvisoryList {
     pub advisories: Vec<Advisory>,
     pub outstanding_count: usize,
     pub includes_acknowledged: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct AdvisoryDeliveryMetric {
+    pub advisory_id: i64,
+    pub session_id: Option<i64>,
+    pub surface: AdvisoryDeliverySurface,
+    pub first_shown_at: i64,
+    pub last_shown_at: i64,
+    pub show_count: u64,
+    pub acted_at: Option<i64>,
+    pub action: Option<AdvisoryAction>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct AdvisoryDeliverySummary {
+    pub shown_advisories: usize,
+    pub surface_rows: usize,
+    pub total_shows: u64,
+    pub actioned_advisories: usize,
 }
 
 /// One bounded local message between two broker sessions in this repository.
@@ -453,6 +486,22 @@ pub struct MergeQueueEntry {
     pub details_json: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct MergeQueueStatusCount {
+    pub status: MergeStatus,
+    pub count: usize,
+}
+
+pub const MERGE_QUEUE_HISTORY_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MergeQueueHistoryPage {
+    pub schema_version: u32,
+    pub entries: Vec<MergeQueueEntry>,
+    pub terminal_counts: Vec<MergeQueueStatusCount>,
+    pub next_before_id: Option<i64>,
 }
 
 /// One append-only event. `schema_version` is per-row so readers can

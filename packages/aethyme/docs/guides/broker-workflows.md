@@ -369,6 +369,33 @@ worktrees, dirty paths, symlinked paths, or commits not represented by main,
 integration, or the configured upstream. `broker status` warns when eligible
 cleaned worktrees remain. Use `--json` for the stable plan or sweep report.
 
+Treat `broker status` as the bounded present-state dashboard, not as an audit
+log. Resolve its warnings, inspect outstanding advisories and exposures with
+the exact printed commands, then consider live sessions and current queue
+entries. Fetch terminal queue history separately and page it when needed:
+
+```bash
+aethyme broker queue history --limit 50 --json
+aethyme broker queue history --limit 50 --before <next-before-id> --json
+```
+
+Status also grades retained cleanup cost using worktree and branch counts,
+estimated bytes, and oldest closed-session age against the declared retention
+policy. A warning means at least one threshold has been crossed; review the
+dry-run cleanup or GC plan before authorizing reclamation.
+
+To assess whether agent-facing advisory delivery is effective without
+retaining repository content, inspect the bounded allowlisted metrics:
+
+```bash
+aethyme broker advisories metrics
+aethyme broker advisories metrics --json
+```
+
+These rows correlate display surfaces with acknowledgement or verified
+publication resolution. They deliberately exclude task text, arguments,
+repository paths, evidence, diffs, and secrets.
+
 The cleanup sweep above is limited to represented session worktrees. For the
 complete bounded retention lifecycle—including terminal database history,
 gate logs, command metrics, and the same represented worktrees—review and

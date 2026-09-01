@@ -630,7 +630,8 @@ pub fn run_post_commit(cwd: &Path) {
     }
 }
 
-/// Read-only advisory notices for the live session owning this worktree.
+/// Advisory notices for the live session owning this worktree. Delivery is
+/// counted without storing task text, arguments, paths, evidence, or output.
 /// Called after the conflict radar so post-commit output reflects the new
 /// commit first and durable integration drift second.
 pub fn session_advisory_notices(cwd: &Path) -> Result<Vec<String>, HooksError> {
@@ -639,12 +640,13 @@ pub fn session_advisory_notices(cwd: &Path) -> Result<Vec<String>, HooksError> {
     if !main_root.join(crate::BROKER_DB_RELPATH).exists() {
         return Ok(Vec::new());
     }
-    let store = BrokerStore::open_snapshot_in_repo(&main_root)?;
+    let mut store = BrokerStore::open_in_repo(&main_root)?;
     let Some(session) = store.session_for_worktree(checkout.root().to_string_lossy().as_ref())?
     else {
         return Ok(Vec::new());
     };
     let advisories = store.outstanding_advisories_for_session(session.id)?;
+    store.record_advisories_shown(&advisories, crate::AdvisoryDeliverySurface::PostCommit)?;
     Ok(crate::advisories::session_notice_lines(&advisories))
 }
 

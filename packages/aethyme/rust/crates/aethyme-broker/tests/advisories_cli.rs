@@ -113,8 +113,26 @@ fn list_show_and_ack_keep_database_authoritative_and_projection_current() {
     assert_eq!(
         broker.store().events_after(0, i64::MAX).unwrap().len(),
         event_count_before_reads,
-        "list and show must remain read-only"
+        "content-free delivery correlation must not expand event history"
     );
+
+    let metrics = run(tmp.path(), &["advisories", "metrics", "--json"]);
+    assert!(metrics.status.success());
+    let metrics_text = String::from_utf8(metrics.stdout).unwrap();
+    let metrics_json: serde_json::Value = serde_json::from_str(&metrics_text).unwrap();
+    assert_eq!(metrics_json["schema_version"], 1);
+    assert_eq!(metrics_json["summary"]["shown_advisories"], 1);
+    assert!(metrics_json["summary"]["total_shows"].as_u64().unwrap() >= 2);
+    for forbidden in [
+        "advisory fixture",
+        "src/z.rs",
+        "the reviewed integration tip moved",
+        "task",
+        "paths",
+        "evidence",
+    ] {
+        assert!(!metrics_text.contains(forbidden), "leaked {forbidden:?}");
+    }
 
     let acknowledged = run(tmp.path(), &["advisories", "ack", &id, "--json"]);
     assert!(
