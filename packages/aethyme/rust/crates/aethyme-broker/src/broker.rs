@@ -197,6 +197,27 @@ pub enum BrokerOpError {
     },
     #[error("ship queue entry {entry} was not found")]
     ShipEntryNotFound { entry: i64 },
+    #[error("exposure reconciliation plan is unavailable: {reason}")]
+    ExposurePlanUnavailable { reason: String },
+    #[error("exposure reconciliation confirmation must be a full SHA-256 digest")]
+    ExposureConfirmationNotSha256,
+    #[error(
+        "exposure reconciliation confirmation mismatch: expected {expected}, received {actual}"
+    )]
+    ExposureConfirmationMismatch { expected: String, actual: String },
+    #[error("exposure reconciliation is unsafe: {reasons}")]
+    ExposurePlanUnsafe { reasons: String },
+    #[error(
+        "exposure remote verification operation {operation_id} ended {status}; no lifecycle state changed"
+    )]
+    ExposureVerificationFailed {
+        operation_id: i64,
+        status: &'static str,
+    },
+    #[error(
+        "remote default branch moved during exposure reconciliation: expected {expected}, observed {actual}; review a new plan"
+    )]
+    ExposureRemoteMoved { expected: String, actual: String },
     #[error("ship requires a promoted queue entry; entry {entry} is {status}")]
     ShipEntryNotPromoted { entry: i64, status: &'static str },
     #[error(

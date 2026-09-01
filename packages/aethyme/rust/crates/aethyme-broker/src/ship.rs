@@ -110,6 +110,7 @@ pub struct ShipExecutionReport {
     pub published_sha: String,
     pub verified_remote_sha: String,
     pub resolved_exposures: Vec<EntryPathExposure>,
+    pub resolved_advisories: Vec<crate::Advisory>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sync_operation: Option<CoordinatedOperation>,
     pub local_main_sync: ShipLocalMainSync,
@@ -535,6 +536,12 @@ impl Broker {
             &verified_remote_sha,
             &resolution_evidence,
         )?;
+        let resolved_advisories = self
+            .store()
+            .resolve_entry_advisories_without_active_leases(
+                &contained_entry_ids,
+                &resolution_evidence,
+            )?;
         let _ = self.refresh_advisory_projection();
 
         let before_sha = plan.local_default_branch_sha.clone();
@@ -620,6 +627,7 @@ impl Broker {
             published_sha: confirm.into(),
             verified_remote_sha,
             resolved_exposures,
+            resolved_advisories,
             sync_operation,
             local_main_sync,
         })

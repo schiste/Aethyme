@@ -175,6 +175,12 @@ Usage:
       Promotion/lease advisories repeat on session commands, after
       post-commit, and before uncached gates whose cost exceeds 1; they
       remain informational and never alter command or promotion outcomes.
+  aethyme broker exposures plan [--json]
+      Read-only reconciliation plan against the remote default branch's
+      freshly advertised exact SHA. Normal status never performs this check.
+  aethyme broker exposures apply --session <id> --confirm <sha256> [--json]
+      Rebuild the plan, journal a second exact remote observation, and resolve
+      only contained exposures and advisories without live lease overlap.
   aethyme broker note send --session <sender> --to-session <recipient> --message <text> [--json]
   aethyme broker note list --session <recipient> [--json]
   aethyme broker note ack --session <recipient> --id <note-id> [--json]
@@ -423,6 +429,7 @@ const KNOWN_COMMAND_WORDS: &[&str] = &[
     "gh",
     "operations",
     "advisories",
+    "exposures",
     "note",
     "send",
     "list",
@@ -587,6 +594,7 @@ fn command_records_metric(args: &[String]) -> bool {
     match args.first().map(String::as_str) {
         Some("certify" | "queue" | "metrics" | "handoff") => false,
         Some("advisories") => args.get(1).map(String::as_str) == Some("ack"),
+        Some("exposures") => args.get(1).map(String::as_str) == Some("apply"),
         Some("report") => args.get(1).map(String::as_str) == Some("file"),
         Some("ship") => args.get(1).map(String::as_str) != Some("plan"),
         Some("checkpoint") => args.get(1).map(String::as_str) == Some("apply"),
@@ -4232,6 +4240,97 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     return Err(UsageError::Message(
                         "advisories requires an action: list, show, or ack".into(),
                     ));
+                }
+            }
+        }
+        "exposures" => {
+            let action = parsed
+                .positional
+                .first()
+                .map(String::as_str)
+                .ok_or_else(|| {
+                    UsageError::Message("exposures requires an action: plan or apply".into())
+                })?;
+            let mut broker = open_broker(parsed.read_only_snapshot)?;
+            match action {
+                "plan" => {
+                    let plan = broker.exposure_reconciliation_plan()?;
+                    if parsed.json {
+                        println!("{}", serde_json::to_string_pretty(&plan)?);
+                    } else {
+                        println!(
+                            "Remote: {} @ {}",
+                            plan.remote_default_branch_ref,
+                            short_commit(&plan.remote_default_branch_sha)
+                        );
+                        println!(
+                            "Tracking: {} @ {} ({})",
+                            plan.tracking_ref,
+                            plan.tracking_sha
+                                .as_deref()
+                                .map(short_commit)
+                                .unwrap_or("missing"),
+                            if plan.tracking_matches_remote {
+                                "current"
+                            } else {
+                                "stale or missing"
+                            }
+                        );
+                        println!(
+                            "Exposures: {} contained, {} remaining",
+                            plan.contained_exposures.len(),
+                            plan.remaining_exposures.len()
+                        );
+                        let eligible = plan
+                            .advisories
+                            .iter()
+                            .filter(|advisory| advisory.eligible)
+                            .count();
+                        println!(
+                            "Advisories: {} eligible, {} blocked by live leases",
+                            eligible,
+                            plan.advisories.len().saturating_sub(eligible)
+                        );
+                        for refusal in &plan.refusals {
+                            println!("Refusal: {refusal}");
+                        }
+                        println!("Plan digest: {}", plan.digest);
+                        if plan.safe {
+                            println!(
+                                "Apply with: aethyme broker exposures apply --session <id> --confirm {}",
+                                plan.digest
+                            );
+                        }
+                    }
+                }
+                "apply" => {
+                    let session = parsed.session.ok_or_else(|| {
+                        UsageError::Message("exposures apply requires --session <id>".into())
+                    })?;
+                    let confirm = parsed.confirm.as_deref().ok_or_else(|| {
+                        UsageError::Message("exposures apply requires --confirm <sha256>".into())
+                    })?;
+                    let report = broker.apply_exposure_reconciliation(session, confirm)?;
+                    if parsed.json {
+                        println!("{}", serde_json::to_string_pretty(&report)?);
+                    } else {
+                        println!(
+                            "Verified {} at {} via operation {}.",
+                            report.plan.remote_default_branch_ref,
+                            report.plan.remote_default_branch_sha,
+                            report.verification_operation.id
+                        );
+                        println!(
+                            "Resolved {} exposure(s) and {} advisory record(s).",
+                            report.resolved_exposures.len(),
+                            report.resolved_advisories.len()
+                        );
+                    }
+                }
+                other => {
+                    return Err(UsageError::Message(format!(
+                        "unknown exposures action {other:?} — expected plan or apply"
+                    )));
                 }
             }
         }

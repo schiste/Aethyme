@@ -26,6 +26,7 @@ pub mod cli;
 pub mod contract_check;
 mod error;
 pub mod events;
+mod exposures;
 mod gates;
 mod git;
 mod github_target;
@@ -75,6 +76,10 @@ pub use broker::{
     StatusIntegrationRelation, StatusSummary, StatusView, VersionRepairReport, VersionRepairStep,
 };
 pub use error::BrokerError;
+pub use exposures::{
+    AdvisoryReconciliationItem, EXPOSURE_RECONCILIATION_SCHEMA_VERSION,
+    ExposureReconciliationApplyReport, ExposureReconciliationPlan, ExposureRemainingItem,
+};
 pub use gates::{
     CachePolicy, GATES_CONFIG_RELPATH, Gate, GateConfigError, GateProgressSink,
     GateResourceProvenance, GateRunOutcome, PrePushPlan, PrePushReport, PrePushUpdate,

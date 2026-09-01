@@ -220,6 +220,8 @@ lease planning, and durable finish handoffs, see the
 - `aethyme broker advisories list [--all] [--json]`
 - `aethyme broker advisories show <id> [--json]`
 - `aethyme broker advisories ack <id> [--json]`
+- `aethyme broker exposures plan [--json]`
+- `aethyme broker exposures apply --session <id> --confirm <sha256> [--json]`
 - `aethyme broker note send --session <sender> --to-session <recipient> --message <text> [--json]`
 - `aethyme broker note list --session <recipient> [--json]`
 - `aethyme broker note ack --session <recipient> --id <note-id> [--json]`
@@ -227,6 +229,14 @@ lease planning, and durable finish handoffs, see the
 Text status renders current merge-queue entries individually and collapses
 terminal history into counts; use `aethyme broker queue` for the complete
 history. JSON status retains the complete structured queue for compatibility.
+
+Exposure reconciliation is explicit because normal status is non-mutating.
+The plan queries the remote default branch without updating local refs and
+binds its exact SHA, candidates, and live-lease blockers into a digest. Apply
+rebuilds that plan and records a second coordinated remote observation before
+resolving local lifecycle rows. Stale tracking refs are reported but are not
+used as publication authority; a missing remote commit object blocks the plan
+until an explicit fetch makes ancestry verification possible.
 - `aethyme broker resources plan <request.json> [--json]`
 - `aethyme broker resources acquire <request.json> [--wait <duration>] [--grant-out <path>] [--json]`
 - `aethyme broker resources run <request.json> [--wait <duration>] [--cleanup-command <shell>] [--json] -- <command> ...`

@@ -10,6 +10,8 @@ use aethyme_broker::{
     OperationIdentityProvenance, OperationStatus, ShipFreshnessResult,
 };
 
+const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
+
 fn git_output(cwd: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
         .args(args)
@@ -252,6 +254,7 @@ fn ship_execute_publishes_and_verifies_the_exact_confirmed_sha() {
     assert_eq!(report.push_operation.status, OperationStatus::Succeeded);
     assert_eq!(report.verify_operation.status, OperationStatus::Succeeded);
     assert_eq!(report.resolved_exposures.len(), 1);
+    assert_eq!(report.resolved_advisories.len(), 1);
     assert_eq!(report.resolved_exposures[0].queue_entry_id, entry_id);
     assert_eq!(
         report.resolved_exposures[0].state,
@@ -304,6 +307,121 @@ fn ship_execute_publishes_and_verifies_the_exact_confirmed_sha() {
     assert_eq!(
         report.local_main_sync.follow_up_command.as_deref(),
         Some(follow_up.as_str())
+    );
+}
+
+#[test]
+fn ship_retains_advisory_while_its_overlapping_lease_is_live() {
+    let fixture = Fixture::new();
+    let (entry_id, session_id, integration) = fixture.promoted_entry();
+    let mut broker = fixture.broker();
+    broker
+        .store()
+        .claim_lease(session_id, "feature.txt", None)
+        .unwrap();
+    let advisory = broker
+        .persist_advisory(NewAdvisory {
+            identity: format!("live-promotion-exposure:{entry_id}"),
+            session_id: Some(session_id),
+            severity: AdvisorySeverity::Warning,
+            queue_entry_id: Some(entry_id),
+            integration_sha: Some(integration.clone()),
+            paths: vec!["feature.txt".into()],
+            evidence: vec![AdvisoryEvidence {
+                kind: "lease_overlap".into(),
+                summary: "live overlap".into(),
+            }],
+        })
+        .unwrap();
+
+    let report = broker.ship_execute(entry_id, &integration).unwrap();
+    assert_eq!(report.resolved_exposures.len(), 1);
+    assert!(report.resolved_advisories.is_empty());
+    let retained = broker.advisory(advisory.id).unwrap();
+    assert_eq!(
+        retained.resolution_state,
+        AdvisoryResolutionState::Outstanding
+    );
+
+    let blocked_plan = broker.exposure_reconciliation_plan().unwrap();
+    assert!(blocked_plan.safe);
+    assert!(blocked_plan.contained_exposures.is_empty());
+    assert_eq!(blocked_plan.advisories.len(), 1);
+    assert!(!blocked_plan.advisories[0].eligible);
+    assert_eq!(blocked_plan.advisories[0].blocking_leases, ["feature.txt"]);
+    let _ = broker.status(0).unwrap();
+    assert_eq!(
+        broker.advisory(advisory.id).unwrap().resolution_state,
+        AdvisoryResolutionState::Outstanding,
+        "normal status must not silently reconcile publication lifecycle state"
+    );
+
+    broker.acknowledge_advisory(advisory.id).unwrap();
+    broker.close(session_id).unwrap();
+    let operator = broker.start_worktree("reconcile exposures").unwrap();
+    let plan = broker.exposure_reconciliation_plan().unwrap();
+    assert!(plan.safe);
+    assert_eq!(plan.advisories.len(), 1);
+    assert!(plan.advisories[0].eligible);
+    let report = broker
+        .apply_exposure_reconciliation(operator.id, &plan.digest)
+        .unwrap();
+    assert!(report.resolved_exposures.is_empty());
+    assert_eq!(report.resolved_advisories.len(), 1);
+    assert_eq!(
+        broker.advisory(advisory.id).unwrap().resolution_state,
+        AdvisoryResolutionState::Resolved
+    );
+}
+
+#[test]
+fn exposure_plan_refuses_when_the_fresh_remote_commit_is_missing_locally() {
+    let fixture = Fixture::new();
+    fixture.promoted_entry();
+    let remote_head = fixture.advance_remote();
+    let mut broker = fixture.broker();
+
+    let plan = broker.exposure_reconciliation_plan().unwrap();
+    assert_eq!(plan.remote_default_branch_sha, remote_head);
+    assert!(!plan.safe);
+    assert!(
+        plan.refusals
+            .iter()
+            .any(|reason| reason.contains("not available locally")),
+        "{:?}",
+        plan.refusals
+    );
+}
+
+#[test]
+fn exposure_plan_cli_is_stable_and_does_not_mutate_lifecycle_state() {
+    let fixture = Fixture::new();
+    let (entry_id, _, _) = fixture.promoted_entry();
+    let output = Command::new(CLI)
+        .args(["exposures", "plan", "--json"])
+        .current_dir(&fixture.repo)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let plan: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(plan["schema_version"], 1);
+    assert_eq!(plan["safe"], true);
+    assert_eq!(plan["contained_exposures"].as_array().unwrap().len(), 0);
+    assert_eq!(plan["remaining_exposures"][0]["queue_entry_id"], entry_id);
+    assert_eq!(plan["digest"].as_str().unwrap().len(), 64);
+    assert_eq!(
+        fixture
+            .broker()
+            .store()
+            .outstanding_entry_path_exposures()
+            .unwrap()
+            .len(),
+        1,
+        "read-only planning must not resolve exposure state"
     );
 }
 

@@ -1993,9 +1993,9 @@ impl BrokerStore {
         rows.map(|row| row?).collect()
     }
 
-    /// Resolve exact entry exposures and their still-outstanding advisories
-    /// in one transaction. Unknown ids are ignored, making crash recovery and
-    /// repeated verified observations idempotent.
+    /// Resolve exact entry exposures. Advisory resolution is deliberately
+    /// separate because a published promotion can still intersect a live
+    /// session lease.
     pub(crate) fn resolve_entry_path_exposures(
         &mut self,
         queue_entry_ids: &[i64],
@@ -2018,19 +2018,63 @@ impl BrokerStore {
                 continue;
             }
             resolved_ids.push(*queue_entry_id);
-            tx.execute(
-                "UPDATE advisories
-                 SET resolution_state = 'resolved', resolved_at = ?2,
-                     resolution_evidence = ?3
-                 WHERE queue_entry_id = ?1 AND resolution_state = 'outstanding'",
-                params![queue_entry_id, now, evidence],
-            )?;
         }
         tx.commit()?;
 
         resolved_ids
             .into_iter()
             .filter_map(|queue_entry_id| self.entry_path_exposure(queue_entry_id).transpose())
+            .collect()
+    }
+
+    /// Resolve publication advisories only after their affected session no
+    /// longer has a live lease overlapping the advisory paths. Acknowledged
+    /// advisories still complete their lifecycle once the condition clears.
+    pub(crate) fn resolve_entry_advisories_without_active_leases(
+        &mut self,
+        queue_entry_ids: &[i64],
+        evidence: &str,
+    ) -> Result<Vec<Advisory>, BrokerError> {
+        let queue_entry_ids = queue_entry_ids
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        let active_leases = self.active_leases()?;
+        let advisory_ids = self
+            .advisories(true)?
+            .into_iter()
+            .filter(|advisory| advisory.resolution_state != AdvisoryResolutionState::Resolved)
+            .filter(|advisory| {
+                advisory
+                    .queue_entry_id
+                    .is_some_and(|entry_id| queue_entry_ids.contains(&entry_id))
+            })
+            .filter(|advisory| {
+                !active_leases.iter().any(|lease| {
+                    Some(lease.session_id) == advisory.session_id
+                        && advisory
+                            .paths
+                            .iter()
+                            .any(|path| crate::leases::paths_overlap(path, &lease.path))
+                })
+            })
+            .map(|advisory| advisory.id)
+            .collect::<Vec<_>>();
+        let now = now_ms();
+        let tx = self.conn.transaction()?;
+        for advisory_id in &advisory_ids {
+            tx.execute(
+                "UPDATE advisories
+                 SET resolution_state = 'resolved', resolved_at = ?2,
+                     resolution_evidence = ?3
+                 WHERE id = ?1 AND resolution_state IN ('outstanding', 'acknowledged')",
+                params![advisory_id, now, evidence],
+            )?;
+        }
+        tx.commit()?;
+        advisory_ids
+            .into_iter()
+            .filter_map(|id| self.advisory(id).transpose())
             .collect()
     }
 
