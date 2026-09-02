@@ -4,6 +4,39 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.7.2] - 2026-09-02
+
+### Added
+
+- Durable pull-request watches observe metadata-only comments, reviews, and
+  checks through a provider-neutral polling contract.
+- New activity is normalized into deterministic, acknowledgeable batches with
+  stable deduplication across repeated polls.
+- A provider-neutral delivery outbox supports explicit notify, resume, and
+  same-PR review-and-push policies with fenced claims and durable retries.
+
+### Changed
+
+- Delivery prompts contain allowlisted metadata and explicit safety guidance;
+  comment and review bodies remain at the provider and are treated as
+  untrusted when retrieved by an agent.
+- Live delivery clients such as Chau7 are separate adapters. Aethyme owns
+  observation, authorization, deduplication, and durable state without
+  depending on any one transport.
+
+### Fixed
+
+- Existing provider activity seeds a new watch baseline instead of appearing
+  as fresh feedback.
+- Retry claims use worker and generation fencing, preventing a stale adapter
+  from completing work reclaimed by another process.
+
+### Upgrade notes
+
+Read [Upgrading to v0.7.2](packages/aethyme/docs/guides/upgrading-to-v0.7.2.md)
+before updating. Broker storage migrates from schema 25 to 28; repository
+deployment and engine protocol remain unchanged.
+
 ## [0.7.1] - 2026-09-01
 
 ### Added
