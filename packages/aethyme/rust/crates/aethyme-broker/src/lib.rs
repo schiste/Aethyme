@@ -24,6 +24,7 @@ mod advisories;
 mod broker;
 pub mod cli;
 pub mod contract_check;
+mod delivery;
 mod error;
 pub mod events;
 mod exposures;
@@ -84,6 +85,11 @@ pub use broker::{
     StartReport, StatusAdvice, StatusAdviceSeverity, StatusIntegrationRelation, StatusSummary,
     StatusView, VersionRepairReport, VersionRepairStep, WORKTREE_ROOT_SCHEMA_VERSION,
     WorktreePlacement, WorktreeRootPlan, WorktreeRootSource,
+};
+pub use delivery::{
+    DEFAULT_DELIVERY_CLAIM_SECONDS, DELIVERY_OUTBOX_SCHEMA_VERSION, DeliveryClaimReport,
+    DeliveryCompletion, DeliveryEnvelope, DeliveryError, DeliveryOutboxItem, DeliveryPolicy,
+    DeliveryStatus, DeliverySubscription,
 };
 pub use error::BrokerError;
 pub use exposures::{

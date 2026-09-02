@@ -50,6 +50,8 @@ pub enum BrokerOpError {
     #[error(transparent)]
     PullRequestWatch(#[from] crate::PullRequestWatchError),
     #[error(transparent)]
+    Delivery(#[from] crate::DeliveryError),
+    #[error(transparent)]
     RemoteTarget(#[from] crate::RemoteTargetError),
     #[error(transparent)]
     HostOperation(#[from] crate::HostOperationError),

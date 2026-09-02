@@ -279,6 +279,13 @@ Usage:
       Aethyme records provider ids, authors, states, URLs and timestamps, but
       never comment/review bodies. Scheduling and live-agent delivery are
       separate adapter responsibilities.
+  aethyme broker deliveries subscribe --watch <id> --adapter <name> --target <opaque-id> [--policy <notify|resume|review-and-push>] [--json]
+  aethyme broker deliveries list [--adapter <name>] [--all] [--json]
+  aethyme broker deliveries claim --adapter <name> --worker <id> [--seconds <15..900>] [--json]
+  aethyme broker deliveries complete --id <delivery-id> --worker <id> --generation <n> --outcome <delivered|retry|failed> [--error-code <code>] [--json]
+      Provider-neutral durable outbox. Claiming fences concurrent adapters;
+      completion requires the exact worker and generation. Prompts contain
+      allowlisted PR metadata, never comment or review bodies.
       Inspect the open PR for the current branch targeting <branch>
       (default: production). A thumbs-up marker in the PR body means all
       good and skips activity checks. A looking-eyes marker or no marker
@@ -553,6 +560,9 @@ const KNOWN_COMMAND_WORDS: &[&str] = &[
     "handoff",
     "report",
     "external-events",
+    "deliveries",
+    "subscribe",
+    "complete",
     "review",
     "register",
     "request",
@@ -1293,6 +1303,33 @@ mod tests {
     }
 
     #[test]
+    fn parse_accepts_provider_neutral_delivery_claim_fence() {
+        let args = vec![
+            "complete".to_string(),
+            "--id".to_string(),
+            "12".to_string(),
+            "--worker".to_string(),
+            "chau7-main".to_string(),
+            "--generation".to_string(),
+            "3".to_string(),
+            "--outcome".to_string(),
+            "retry".to_string(),
+            "--error-code".to_string(),
+            "tab_busy".to_string(),
+        ];
+        let parsed = match super::parse(&args) {
+            Ok(parsed) => parsed,
+            Err(_) => panic!("delivery completion fence should parse"),
+        };
+        assert_eq!(parsed.positional, vec!["complete"]);
+        assert_eq!(parsed.note_id, Some(12));
+        assert_eq!(parsed.worker.as_deref(), Some("chau7-main"));
+        assert_eq!(parsed.generation, Some(3));
+        assert_eq!(parsed.outcome.as_deref(), Some("retry"));
+        assert_eq!(parsed.error_code.as_deref(), Some("tab_busy"));
+    }
+
+    #[test]
     fn upstream_relation_names_both_sides_of_divergence() {
         assert_eq!(
             super::upstream_relation(35, 213),
@@ -1350,6 +1387,12 @@ struct Parsed {
     limit: Option<u32>,
     status: Option<String>,
     provider: Option<String>,
+    adapter: Option<String>,
+    worker: Option<String>,
+    policy: Option<String>,
+    error_code: Option<String>,
+    watch_id: Option<i64>,
+    generation: Option<i64>,
     events: Option<String>,
     ttl_seconds: Option<i64>,
     wait: Option<String>,
@@ -1420,6 +1463,12 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         limit: None,
         status: None,
         provider: None,
+        adapter: None,
+        worker: None,
+        policy: None,
+        error_code: None,
+        watch_id: None,
+        generation: None,
         events: None,
         ttl_seconds: None,
         wait: None,
@@ -1702,6 +1751,51 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
                         .ok_or(UsageError::Message("--provider requires a value".into()))?
                         .clone(),
                 )
+            }
+            "--adapter" => {
+                parsed.adapter = Some(
+                    iter.next()
+                        .ok_or(UsageError::Message("--adapter requires a value".into()))?
+                        .clone(),
+                )
+            }
+            "--worker" => {
+                parsed.worker = Some(
+                    iter.next()
+                        .ok_or(UsageError::Message("--worker requires a value".into()))?
+                        .clone(),
+                )
+            }
+            "--policy" => {
+                parsed.policy = Some(
+                    iter.next()
+                        .ok_or(UsageError::Message("--policy requires a value".into()))?
+                        .clone(),
+                )
+            }
+            "--error-code" => {
+                parsed.error_code = Some(
+                    iter.next()
+                        .ok_or(UsageError::Message("--error-code requires a value".into()))?
+                        .clone(),
+                )
+            }
+            "--watch" => {
+                let value = iter
+                    .next()
+                    .ok_or(UsageError::Message("--watch requires a value".into()))?;
+                parsed.watch_id = Some(value.parse().map_err(|_| {
+                    UsageError::Message("--watch must be an integer watch id".into())
+                })?);
+            }
+            "--generation" => {
+                let value = iter
+                    .next()
+                    .ok_or(UsageError::Message("--generation requires a value".into()))?;
+                parsed.generation =
+                    Some(value.parse().map_err(|_| {
+                        UsageError::Message("--generation must be an integer".into())
+                    })?);
             }
             "--events" => {
                 parsed.events = Some(
@@ -3567,6 +3661,147 @@ fn run_pull_request_watch(parsed: Parsed) -> Result<(), UsageError> {
     Ok(())
 }
 
+fn run_deliveries(parsed: Parsed) -> Result<(), UsageError> {
+    let action = parsed
+        .positional
+        .first()
+        .map(String::as_str)
+        .ok_or_else(|| {
+            UsageError::Message("deliveries requires subscribe, list, claim, or complete".into())
+        })?;
+    let mut broker = open_broker(parsed.read_only_snapshot)?;
+    match action {
+        "subscribe" => {
+            let watch_id = parsed.watch_id.ok_or_else(|| {
+                UsageError::Message("deliveries subscribe requires --watch <id>".into())
+            })?;
+            let adapter = parsed.adapter.as_deref().ok_or_else(|| {
+                UsageError::Message("deliveries subscribe requires --adapter <name>".into())
+            })?;
+            let target = parsed.target.as_deref().ok_or_else(|| {
+                UsageError::Message("deliveries subscribe requires --target <opaque-id>".into())
+            })?;
+            let policy = parse_delivery_policy(parsed.policy.as_deref())?;
+            let subscription = broker.subscribe_pull_request_delivery(
+                watch_id,
+                adapter,
+                target,
+                policy,
+                now_ms(),
+            )?;
+            if parsed.json {
+                println!("{}", serde_json::to_string_pretty(&subscription)?);
+            } else {
+                println!(
+                    "Delivery subscription {}: watch {}, adapter {}, target {}, policy {}.",
+                    subscription.id,
+                    subscription.watch_id,
+                    subscription.adapter,
+                    subscription.target,
+                    subscription.policy.as_str(),
+                );
+            }
+        }
+        "list" => {
+            let items = broker.delivery_outbox(parsed.adapter.as_deref(), parsed.all)?;
+            if parsed.json {
+                println!("{}", serde_json::to_string_pretty(&items)?);
+            } else if items.is_empty() {
+                println!("No delivery outbox items.");
+            } else {
+                for item in items {
+                    println!(
+                        "Delivery {}: batch {}, subscription {}, {}, generation {}, attempts {}",
+                        item.id,
+                        item.batch_id,
+                        item.subscription_id,
+                        item.status.as_str(),
+                        item.generation,
+                        item.attempt_count,
+                    );
+                }
+            }
+        }
+        "claim" => {
+            let adapter = parsed.adapter.as_deref().ok_or_else(|| {
+                UsageError::Message("deliveries claim requires --adapter <name>".into())
+            })?;
+            let worker = parsed.worker.as_deref().ok_or_else(|| {
+                UsageError::Message("deliveries claim requires --worker <id>".into())
+            })?;
+            let report = broker.claim_next_delivery(
+                adapter,
+                worker,
+                parsed
+                    .seconds
+                    .unwrap_or(crate::DEFAULT_DELIVERY_CLAIM_SECONDS),
+                now_ms(),
+            )?;
+            if parsed.json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else if let Some(delivery) = report.delivery {
+                println!(
+                    "Claimed delivery {} generation {} for {}. Use --json to read its structured envelope and prompt.",
+                    delivery.item.id, delivery.item.generation, delivery.subscription.target,
+                );
+            } else {
+                println!("No pending delivery for adapter {adapter}.");
+            }
+        }
+        "complete" => {
+            let id = parsed.note_id.ok_or_else(|| {
+                UsageError::Message("deliveries complete requires --id <delivery-id>".into())
+            })?;
+            let worker = parsed.worker.as_deref().ok_or_else(|| {
+                UsageError::Message("deliveries complete requires --worker <id>".into())
+            })?;
+            let generation = parsed.generation.ok_or_else(|| {
+                UsageError::Message("deliveries complete requires --generation <n>".into())
+            })?;
+            let completion = match parsed.outcome.as_deref() {
+                Some("delivered") => crate::DeliveryCompletion::Delivered,
+                Some("retry") => crate::DeliveryCompletion::Retry,
+                Some("failed") => crate::DeliveryCompletion::Failed,
+                _ => {
+                    return Err(UsageError::Message(
+                        "deliveries complete requires --outcome delivered|retry|failed".into(),
+                    ));
+                }
+            };
+            let item = broker.complete_delivery(
+                id,
+                worker,
+                generation,
+                completion,
+                parsed.error_code.as_deref(),
+                now_ms(),
+            )?;
+            if parsed.json {
+                println!("{}", serde_json::to_string_pretty(&item)?);
+            } else {
+                println!("Delivery {} is {}.", item.id, item.status.as_str());
+            }
+        }
+        other => {
+            return Err(UsageError::Message(format!(
+                "unknown deliveries action {other:?} — expected subscribe, list, claim, or complete"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn parse_delivery_policy(value: Option<&str>) -> Result<crate::DeliveryPolicy, UsageError> {
+    match value.unwrap_or("notify") {
+        "notify" => Ok(crate::DeliveryPolicy::Notify),
+        "resume" => Ok(crate::DeliveryPolicy::Resume),
+        "review-and-push" | "review_and_push" => Ok(crate::DeliveryPolicy::ReviewAndPush),
+        value => Err(UsageError::Message(format!(
+            "unknown delivery policy {value:?}; expected notify, resume, or review-and-push"
+        ))),
+    }
+}
+
 fn parse_pull_request_event_kinds(
     value: Option<&str>,
 ) -> Result<Vec<crate::PullRequestActivityKind>, UsageError> {
@@ -5022,6 +5257,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
         }
         "report" => run_report(parsed)?,
         "external-events" => run_external_events(parsed)?,
+        "deliveries" => run_deliveries(parsed)?,
         "review" => run_review(parsed)?,
         "resources" => run_resources(parsed)?,
         "agents" => {

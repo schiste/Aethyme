@@ -61,6 +61,18 @@ pub enum BrokerError {
     #[error("pull request activity batch {0} was already acknowledged differently")]
     PullRequestActivityBatchAckConflict(i64),
 
+    #[error("delivery outbox item {0} was not found")]
+    DeliveryOutboxNotFound(i64),
+
+    #[error(
+        "delivery outbox claim changed for item {id}; expected worker {worker:?} generation {generation}"
+    )]
+    DeliveryClaimChanged {
+        id: i64,
+        worker: String,
+        generation: i64,
+    },
+
     #[error("advisory identity {0:?} already exists with different immutable data")]
     AdvisoryIdentityConflict(String),
 

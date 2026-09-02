@@ -4,9 +4,10 @@ use std::process::Command;
 use std::sync::Mutex;
 
 use aethyme_broker::{
-    Broker, BrokerOpError, NewSession, PullRequestActivityKind, PullRequestActivityMetadata,
-    PullRequestBatchAckOutcome, PullRequestBatchStatus, PullRequestSnapshot, PullRequestWatchError,
-    PullRequestWatchProvider, PullRequestWatchRequest, PullRequestWatchStatus, SessionOrigin,
+    Broker, BrokerOpError, DeliveryCompletion, DeliveryPolicy, DeliveryStatus, NewSession,
+    PullRequestActivityKind, PullRequestActivityMetadata, PullRequestBatchAckOutcome,
+    PullRequestBatchStatus, PullRequestSnapshot, PullRequestWatchError, PullRequestWatchProvider,
+    PullRequestWatchRequest, PullRequestWatchStatus, SessionOrigin,
 };
 
 fn git(root: &Path, args: &[&str]) {
@@ -114,6 +115,15 @@ fn durable_watch_tracks_metadata_changes_and_completes_with_the_pr() {
     assert_eq!(watch.canonical_repository, "github.com/owner/repo");
     assert_eq!(watch.status, PullRequestWatchStatus::Active);
     assert!(watch.is_draft);
+    let subscription = broker
+        .subscribe_pull_request_delivery(
+            watch.id,
+            "test-adapter",
+            "recipient-1",
+            DeliveryPolicy::Notify,
+            2_000,
+        )
+        .unwrap();
 
     let changed = broker
         .poll_pull_request_watch(watch.id, &provider, 61_000)
@@ -124,6 +134,56 @@ fn durable_watch_tracks_metadata_changes_and_completes_with_the_pr() {
     assert_eq!(changed.watch.head_sha, "b".repeat(40));
     let batch = changed.batch.expect("new C2 is batched");
     assert_eq!(batch.activities[0].metadata.provider_id, "C2");
+    let claimed = broker
+        .claim_next_delivery("test-adapter", "worker-1", 120, 61_100)
+        .unwrap()
+        .delivery
+        .expect("new batch is enqueued for active subscription");
+    assert_eq!(claimed.subscription, subscription);
+    assert_eq!(claimed.batch, batch);
+    assert!(claimed.prompt.contains("does not authorize a push"));
+    assert!(!claimed.prompt.contains("untrusted secret"));
+    let retried = broker
+        .complete_delivery(
+            claimed.item.id,
+            "worker-1",
+            claimed.item.generation,
+            DeliveryCompletion::Retry,
+            Some("recipient_busy"),
+            61_200,
+        )
+        .unwrap();
+    assert_eq!(retried.status, DeliveryStatus::Pending);
+    let claimed_again = broker
+        .claim_next_delivery("test-adapter", "worker-2", 120, 61_300)
+        .unwrap()
+        .delivery
+        .unwrap();
+    assert_eq!(claimed_again.item.generation, claimed.item.generation + 1);
+    assert!(matches!(
+        broker
+            .complete_delivery(
+                claimed.item.id,
+                "worker-1",
+                claimed.item.generation,
+                DeliveryCompletion::Delivered,
+                None,
+                61_400,
+            )
+            .unwrap_err(),
+        BrokerOpError::Store(aethyme_broker::BrokerError::DeliveryClaimChanged { .. })
+    ));
+    let delivered = broker
+        .complete_delivery(
+            claimed_again.item.id,
+            "worker-2",
+            claimed_again.item.generation,
+            DeliveryCompletion::Delivered,
+            None,
+            61_500,
+        )
+        .unwrap();
+    assert_eq!(delivered.status, DeliveryStatus::Delivered);
     assert_eq!(
         broker
             .pull_request_activity_batches(watch.id, false)

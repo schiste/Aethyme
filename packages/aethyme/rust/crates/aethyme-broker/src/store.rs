@@ -15,6 +15,10 @@ use rusqlite::{
 };
 use sha2::{Digest, Sha256};
 
+use crate::delivery::{
+    DELIVERY_OUTBOX_SCHEMA_VERSION, DeliveryCompletion, DeliveryOutboxItem, DeliveryPolicy,
+    DeliveryStatus, DeliverySubscription,
+};
 use crate::error::BrokerError;
 use crate::external_events::{
     ExternalEventRecord, ExternalEventStatus, NewExternalEventRecord,
@@ -3114,6 +3118,15 @@ impl BrokerStore {
                     params![batch_id, activity_id],
                 )?;
             }
+            tx.execute(
+                "INSERT OR IGNORE INTO delivery_outbox (
+                     subscription_id, batch_id, status, created_at, updated_at
+                 )
+                 SELECT id, ?1, 'pending', ?2, ?2
+                 FROM delivery_subscriptions
+                 WHERE watch_id = ?3 AND active = 1",
+                params![batch_id, now, id],
+            )?;
             Some(batch_id)
         };
         tx.execute(
@@ -3296,6 +3309,261 @@ impl BrokerStore {
         tx.commit()?;
         self.pull_request_activity_batch(batch_id)?
             .ok_or(BrokerError::PullRequestActivityBatchNotFound(batch_id))
+    }
+
+    // ── provider-neutral delivery outbox ─────────────────────────────
+
+    pub fn subscribe_pull_request_delivery(
+        &mut self,
+        watch_id: i64,
+        adapter: &str,
+        target: &str,
+        policy: DeliveryPolicy,
+        now: i64,
+    ) -> Result<DeliverySubscription, BrokerError> {
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "INSERT INTO delivery_subscriptions (
+                 watch_id, adapter, target, policy, active, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, 1, ?5, ?5)
+             ON CONFLICT(watch_id, adapter, target) DO UPDATE SET
+                 policy = excluded.policy, active = 1, updated_at = excluded.updated_at",
+            params![watch_id, adapter, target, policy.as_str(), now],
+        )?;
+        let subscription_id = tx.query_row(
+            "SELECT id FROM delivery_subscriptions
+             WHERE watch_id = ?1 AND adapter = ?2 AND target = ?3",
+            params![watch_id, adapter, target],
+            |row| row.get::<_, i64>(0),
+        )?;
+        tx.execute(
+            "INSERT OR IGNORE INTO delivery_outbox (
+                 subscription_id, batch_id, status, created_at, updated_at
+             )
+             SELECT ?1, id, 'pending', ?2, ?2
+             FROM pull_request_activity_batches
+             WHERE watch_id = ?3 AND status = 'pending'",
+            params![subscription_id, now, watch_id],
+        )?;
+        let payload = serde_json::json!({
+            "subscription_id": subscription_id,
+            "watch_id": watch_id,
+            "adapter": adapter,
+            "policy": policy,
+        })
+        .to_string();
+        let session_id = tx.query_row(
+            "SELECT session_id FROM pull_request_watches WHERE id = ?1",
+            [watch_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        insert_event(
+            &tx,
+            now,
+            "delivery.subscribed",
+            Some(session_id),
+            Some(&payload),
+        )?;
+        tx.commit()?;
+        self.delivery_subscription(subscription_id)?
+            .ok_or(BrokerError::InvalidEnumValue {
+                field: "delivery_subscription.id",
+                value: subscription_id.to_string(),
+            })
+    }
+
+    pub fn delivery_subscription(
+        &self,
+        id: i64,
+    ) -> Result<Option<DeliverySubscription>, BrokerError> {
+        self.conn
+            .query_row(
+                &(DELIVERY_SUBSCRIPTION_SELECT.to_owned() + " WHERE id = ?1"),
+                [id],
+                delivery_subscription_from_row,
+            )
+            .optional()?
+            .transpose()
+    }
+
+    pub fn delivery_outbox(
+        &self,
+        adapter: Option<&str>,
+        include_terminal: bool,
+    ) -> Result<Vec<DeliveryOutboxItem>, BrokerError> {
+        let mut sql = DELIVERY_OUTBOX_SELECT.to_owned()
+            + " JOIN delivery_subscriptions s ON s.id = o.subscription_id WHERE 1 = 1";
+        if adapter.is_some() {
+            sql.push_str(" AND s.adapter = ?1");
+        }
+        if !include_terminal {
+            sql.push_str(" AND o.status IN ('pending', 'claimed')");
+        }
+        sql.push_str(" ORDER BY o.id");
+        let mut statement = self.conn.prepare(&sql)?;
+        let rows = if let Some(adapter) = adapter {
+            statement.query_map([adapter], delivery_outbox_from_row)?
+        } else {
+            statement.query_map([], delivery_outbox_from_row)?
+        };
+        rows.map(|row| row?).collect()
+    }
+
+    pub fn claim_next_delivery(
+        &mut self,
+        adapter: &str,
+        worker: &str,
+        claim_seconds: u64,
+        now: i64,
+    ) -> Result<
+        Option<(
+            DeliveryOutboxItem,
+            DeliverySubscription,
+            PullRequestWatch,
+            PullRequestActivityBatch,
+        )>,
+        BrokerError,
+    > {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let id = tx
+            .query_row(
+                "SELECT o.id
+                 FROM delivery_outbox o
+                 JOIN delivery_subscriptions s ON s.id = o.subscription_id
+                 WHERE s.adapter = ?1 AND s.active = 1
+                   AND (o.status = 'pending'
+                        OR (o.status = 'claimed' AND o.claim_expires_at <= ?2))
+                 ORDER BY o.id LIMIT 1",
+                params![adapter, now],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        let Some(id) = id else {
+            tx.commit()?;
+            return Ok(None);
+        };
+        tx.execute(
+            "UPDATE delivery_outbox
+             SET status = 'claimed', generation = generation + 1,
+                 claimed_by = ?2, claim_expires_at = ?3,
+                 attempt_count = attempt_count + 1,
+                 last_error_code = NULL, updated_at = ?4
+             WHERE id = ?1",
+            params![id, worker, now + claim_seconds as i64 * 1_000, now],
+        )?;
+        tx.commit()?;
+        self.delivery_context(id).map(Some)
+    }
+
+    pub fn complete_delivery(
+        &mut self,
+        id: i64,
+        worker: &str,
+        generation: i64,
+        completion: DeliveryCompletion,
+        error_code: Option<&str>,
+        now: i64,
+    ) -> Result<DeliveryOutboxItem, BrokerError> {
+        let (current, subscription, watch, _) = self.delivery_context(id)?;
+        if current.status != DeliveryStatus::Claimed
+            || current.claimed_by.as_deref() != Some(worker)
+            || current.generation != generation
+            || current.claim_expires_at.is_none_or(|expiry| expiry <= now)
+        {
+            return Err(BrokerError::DeliveryClaimChanged {
+                id,
+                worker: worker.into(),
+                generation,
+            });
+        }
+        let (status, delivered_at) = match completion {
+            DeliveryCompletion::Delivered => (DeliveryStatus::Delivered, Some(now)),
+            DeliveryCompletion::Retry => (DeliveryStatus::Pending, None),
+            DeliveryCompletion::Failed => (DeliveryStatus::Failed, None),
+        };
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let updated = tx.execute(
+            "UPDATE delivery_outbox
+             SET status = ?2, claimed_by = NULL, claim_expires_at = NULL,
+                 last_error_code = ?3, delivered_at = ?4, updated_at = ?5
+             WHERE id = ?1 AND status = 'claimed' AND generation = ?6 AND claimed_by = ?7",
+            params![
+                id,
+                status.as_str(),
+                error_code,
+                delivered_at,
+                now,
+                generation,
+                worker,
+            ],
+        )?;
+        if updated != 1 {
+            return Err(BrokerError::DeliveryClaimChanged {
+                id,
+                worker: worker.into(),
+                generation,
+            });
+        }
+        let payload = serde_json::json!({
+            "delivery_id": id,
+            "subscription_id": subscription.id,
+            "adapter": subscription.adapter,
+            "status": status,
+            "generation": generation,
+        })
+        .to_string();
+        insert_event(
+            &tx,
+            now,
+            &format!("delivery.{}", status.as_str()),
+            Some(watch.session_id),
+            Some(&payload),
+        )?;
+        tx.commit()?;
+        self.delivery_outbox_item(id)?
+            .ok_or(BrokerError::DeliveryOutboxNotFound(id))
+    }
+
+    pub fn delivery_outbox_item(&self, id: i64) -> Result<Option<DeliveryOutboxItem>, BrokerError> {
+        self.conn
+            .query_row(
+                &(DELIVERY_OUTBOX_SELECT.to_owned() + " WHERE o.id = ?1"),
+                [id],
+                delivery_outbox_from_row,
+            )
+            .optional()?
+            .transpose()
+    }
+
+    fn delivery_context(
+        &self,
+        id: i64,
+    ) -> Result<
+        (
+            DeliveryOutboxItem,
+            DeliverySubscription,
+            PullRequestWatch,
+            PullRequestActivityBatch,
+        ),
+        BrokerError,
+    > {
+        let item = self
+            .delivery_outbox_item(id)?
+            .ok_or(BrokerError::DeliveryOutboxNotFound(id))?;
+        let subscription = self
+            .delivery_subscription(item.subscription_id)?
+            .ok_or(BrokerError::DeliveryOutboxNotFound(id))?;
+        let watch = self
+            .pull_request_watch(subscription.watch_id)?
+            .ok_or(BrokerError::DeliveryOutboxNotFound(id))?;
+        let batch = self
+            .pull_request_activity_batch(item.batch_id)?
+            .ok_or(BrokerError::DeliveryOutboxNotFound(id))?;
+        Ok((item, subscription, watch, batch))
     }
 
     // ── events ────────────────────────────────────────────────────────
@@ -3889,6 +4157,13 @@ const PULL_REQUEST_WATCH_SELECT: &str = "SELECT id, session_id, provider, canoni
      poll_interval_seconds, cursor_digest, last_polled_at, next_poll_at, last_error_code, \
      created_at, updated_at FROM pull_request_watches";
 
+const DELIVERY_SUBSCRIPTION_SELECT: &str = "SELECT id, watch_id, adapter, target, policy, active, \
+     created_at, updated_at FROM delivery_subscriptions";
+
+const DELIVERY_OUTBOX_SELECT: &str = "SELECT o.id, o.subscription_id, o.batch_id, o.status, \
+     o.generation, o.claimed_by, o.claim_expires_at, o.attempt_count, o.last_error_code, \
+     o.delivered_at, o.created_at, o.updated_at FROM delivery_outbox o";
+
 const ADVISORY_SELECT: &str = "SELECT id, identity, session_id, severity, queue_entry_id, \
      integration_sha, paths_json, evidence_json, created_at, resolution_state, acknowledged_at, \
      resolved_at, resolution_evidence \
@@ -4097,6 +4372,43 @@ fn pull_request_activity_from_row(row: &rusqlite::Row<'_>) -> RowResult<PullRequ
             },
             first_seen_at: row.get(8)?,
             last_seen_at: row.get(9)?,
+        })
+    })())
+}
+
+fn delivery_subscription_from_row(row: &rusqlite::Row<'_>) -> RowResult<DeliverySubscription> {
+    let policy: String = row.get(4)?;
+    Ok((|| {
+        Ok(DeliverySubscription {
+            id: row.get(0)?,
+            watch_id: row.get(1)?,
+            adapter: row.get(2)?,
+            target: row.get(3)?,
+            policy: DeliveryPolicy::parse(&policy)?,
+            active: row.get(5)?,
+            created_at: row.get(6)?,
+            updated_at: row.get(7)?,
+        })
+    })())
+}
+
+fn delivery_outbox_from_row(row: &rusqlite::Row<'_>) -> RowResult<DeliveryOutboxItem> {
+    let status: String = row.get(3)?;
+    Ok((|| {
+        Ok(DeliveryOutboxItem {
+            schema_version: DELIVERY_OUTBOX_SCHEMA_VERSION,
+            id: row.get(0)?,
+            subscription_id: row.get(1)?,
+            batch_id: row.get(2)?,
+            status: DeliveryStatus::parse(&status)?,
+            generation: row.get(4)?,
+            claimed_by: row.get(5)?,
+            claim_expires_at: row.get(6)?,
+            attempt_count: row.get(7)?,
+            last_error_code: row.get(8)?,
+            delivered_at: row.get(9)?,
+            created_at: row.get(10)?,
+            updated_at: row.get(11)?,
         })
     })())
 }

@@ -16,7 +16,7 @@ use rusqlite::Connection;
 use crate::error::BrokerError;
 
 /// Current database schema version (== `MIGRATIONS.len()`).
-pub const SCHEMA_VERSION: i64 = 27;
+pub const SCHEMA_VERSION: i64 = 28;
 
 /// Version stamped on every event row written by this binary.
 pub const EVENTS_SCHEMA_VERSION: i64 = 1;
@@ -764,6 +764,41 @@ CREATE INDEX pull_request_activity_batches_pending
     ON pull_request_activity_batches (status, id);
 ";
 
+const MIGRATION_V28: &str = "
+CREATE TABLE delivery_subscriptions (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    watch_id   INTEGER NOT NULL REFERENCES pull_request_watches(id),
+    adapter    TEXT NOT NULL,
+    target     TEXT NOT NULL,
+    policy     TEXT NOT NULL CHECK (policy IN ('notify', 'resume', 'review_and_push')),
+    active     INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    UNIQUE (watch_id, adapter, target)
+);
+
+CREATE TABLE delivery_outbox (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    subscription_id    INTEGER NOT NULL REFERENCES delivery_subscriptions(id),
+    batch_id           INTEGER NOT NULL REFERENCES pull_request_activity_batches(id),
+    status             TEXT NOT NULL CHECK (status IN ('pending', 'claimed', 'delivered', 'failed')),
+    generation         INTEGER NOT NULL DEFAULT 0,
+    claimed_by         TEXT,
+    claim_expires_at   INTEGER,
+    attempt_count      INTEGER NOT NULL DEFAULT 0,
+    last_error_code    TEXT,
+    delivered_at       INTEGER,
+    created_at         INTEGER NOT NULL,
+    updated_at         INTEGER NOT NULL,
+    UNIQUE (subscription_id, batch_id)
+);
+
+CREATE INDEX delivery_outbox_due
+    ON delivery_outbox (status, claim_expires_at, id);
+CREATE INDEX delivery_outbox_by_adapter
+    ON delivery_outbox (subscription_id, status, id);
+";
+
 const MIGRATIONS: &[&str] = &[
     MIGRATION_V1,
     MIGRATION_V2,
@@ -792,6 +827,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_V25,
     MIGRATION_V26,
     MIGRATION_V27,
+    MIGRATION_V28,
 ];
 
 pub(crate) fn current_version(conn: &Connection) -> Result<i64, BrokerError> {
