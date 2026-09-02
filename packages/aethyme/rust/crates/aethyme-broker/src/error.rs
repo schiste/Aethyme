@@ -52,6 +52,9 @@ pub enum BrokerError {
     #[error("no session note with id {0}")]
     SessionNoteNotFound(i64),
 
+    #[error("pull request watch identity is already active for {repository} PR #{pr_number}")]
+    PullRequestWatchIdentityConflict { repository: String, pr_number: i64 },
+
     #[error("advisory identity {0:?} already exists with different immutable data")]
     AdvisoryIdentityConflict(String),
 

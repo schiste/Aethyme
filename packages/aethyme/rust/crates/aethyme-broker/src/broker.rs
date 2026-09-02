@@ -48,6 +48,8 @@ pub enum BrokerOpError {
     #[error(transparent)]
     Pr(#[from] crate::pr::PrError),
     #[error(transparent)]
+    PullRequestWatch(#[from] crate::PullRequestWatchError),
+    #[error(transparent)]
     RemoteTarget(#[from] crate::RemoteTargetError),
     #[error(transparent)]
     HostOperation(#[from] crate::HostOperationError),
@@ -1782,6 +1784,10 @@ impl Broker {
 
     pub fn store(&mut self) -> &mut BrokerStore {
         &mut self.store
+    }
+
+    pub(crate) fn store_ref(&self) -> &BrokerStore {
+        &self.store
     }
 
     /// Build a bounded, allowlist-only lease routing snapshot without

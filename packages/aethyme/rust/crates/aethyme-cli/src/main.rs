@@ -108,6 +108,19 @@ fn broker_command_capability(args: &[String]) -> repository_upgrade::CommandCapa
         (Some("external-events"), Some("ingest" | "reconcile")) => {
             CommandCapability::SharedMutation
         }
+        (Some("watch"), Some("pr"))
+            if matches!(
+                args.get(2).map(String::as_str),
+                Some("start" | "poll" | "pause" | "resume" | "stop")
+            ) =>
+        {
+            CommandCapability::SessionContinuation
+        }
+        (Some("watch"), Some("pr"))
+            if matches!(args.get(2).map(String::as_str), Some("list" | "show")) =>
+        {
+            CommandCapability::DiagnosticRead
+        }
         (Some("review"), Some("register" | "request" | "unlock")) => {
             CommandCapability::SharedMutation
         }
@@ -846,6 +859,14 @@ mod compatibility_command_tests {
             (
                 &["broker", "advisories", "ack", "7"][..],
                 CommandCapability::RecoveryWrite,
+            ),
+            (
+                &["broker", "watch", "pr", "list"][..],
+                CommandCapability::DiagnosticRead,
+            ),
+            (
+                &["broker", "watch", "pr", "poll", "--id", "7"][..],
+                CommandCapability::SessionContinuation,
             ),
         ];
         for (args, expected) in cases {

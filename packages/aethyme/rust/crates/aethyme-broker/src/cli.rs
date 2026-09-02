@@ -270,6 +270,13 @@ Usage:
       (hooks pre-commit / hooks post-commit / hooks pre-push are internal entry
       points the installed shims call — not for direct use.)
   aethyme broker pr check [--target <branch>] [--pr <number>] [--agent <name>] [--dispatch] [--cmd <command>] [--json]
+  aethyme broker watch pr start --session <id> --repo <owner/name> --pr <number> [--events <comments,reviews,checks>] [--seconds <15..3600>] [--json]
+  aethyme broker watch pr list [--all] [--json]
+  aethyme broker watch pr show|poll|pause|resume|stop --id <watch-id> [--json]
+      Persist a metadata-only PR watch and inspect it with one-shot polling.
+      Aethyme records provider ids, authors, states, URLs and timestamps, but
+      never comment/review bodies. Scheduling and live-agent delivery are
+      separate adapter responsibilities.
       Inspect the open PR for the current branch targeting <branch>
       (default: production). A thumbs-up marker in the PR body means all
       good and skips activity checks. A looking-eyes marker or no marker
@@ -1256,6 +1263,34 @@ mod tests {
     }
 
     #[test]
+    fn parse_accepts_metadata_only_pull_request_watch_flags() {
+        let args = vec![
+            "pr".to_string(),
+            "start".to_string(),
+            "--session".to_string(),
+            "17".to_string(),
+            "--repo".to_string(),
+            "Owner/Repo".to_string(),
+            "--pr".to_string(),
+            "42".to_string(),
+            "--events".to_string(),
+            "comments,reviews".to_string(),
+            "--seconds".to_string(),
+            "90".to_string(),
+        ];
+        let parsed = match super::parse(&args) {
+            Ok(parsed) => parsed,
+            Err(_) => panic!("watch flags should parse"),
+        };
+        assert_eq!(parsed.positional, vec!["pr", "start"]);
+        assert_eq!(parsed.session, Some(17));
+        assert_eq!(parsed.repository.as_deref(), Some("Owner/Repo"));
+        assert_eq!(parsed.pr_number, Some(42));
+        assert_eq!(parsed.events.as_deref(), Some("comments,reviews"));
+        assert_eq!(parsed.seconds, Some(90));
+    }
+
+    #[test]
     fn upstream_relation_names_both_sides_of_divergence() {
         assert_eq!(
             super::upstream_relation(35, 213),
@@ -1313,6 +1348,7 @@ struct Parsed {
     limit: Option<u32>,
     status: Option<String>,
     provider: Option<String>,
+    events: Option<String>,
     ttl_seconds: Option<i64>,
     wait: Option<String>,
     since: Option<i64>,
@@ -1382,6 +1418,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         limit: None,
         status: None,
         provider: None,
+        events: None,
         ttl_seconds: None,
         wait: None,
         since: None,
@@ -1661,6 +1698,13 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
                 parsed.provider = Some(
                     iter.next()
                         .ok_or(UsageError::Message("--provider requires a value".into()))?
+                        .clone(),
+                )
+            }
+            "--events" => {
+                parsed.events = Some(
+                    iter.next()
+                        .ok_or(UsageError::Message("--events requires a value".into()))?
                         .clone(),
                 )
             }
@@ -3350,6 +3394,168 @@ fn parse_advisory_id(value: Option<&String>, usage: &str) -> Result<i64, UsageEr
         )));
     }
     Ok(id)
+}
+
+fn run_pull_request_watch(parsed: Parsed) -> Result<(), UsageError> {
+    if parsed.positional.first().map(String::as_str) != Some("pr") {
+        return Err(UsageError::Message(
+            "watch requires `pr` followed by start, list, show, poll, pause, resume, or stop"
+                .into(),
+        ));
+    }
+    let action = parsed
+        .positional
+        .get(1)
+        .map(String::as_str)
+        .ok_or_else(|| {
+            UsageError::Message(
+                "watch pr requires start, list, show, poll, pause, resume, or stop".into(),
+            )
+        })?;
+    let mut broker = open_broker(parsed.read_only_snapshot)?;
+    match action {
+        "start" => {
+            let session = parsed.session.ok_or_else(|| {
+                UsageError::Message("watch pr start requires --session <id>".into())
+            })?;
+            let repository = parsed.repository.as_deref().ok_or_else(|| {
+                UsageError::Message("watch pr start requires --repo <owner/name>".into())
+            })?;
+            let pr_number = parsed.pr_number.ok_or_else(|| {
+                UsageError::Message("watch pr start requires --pr <number>".into())
+            })?;
+            let event_kinds = parse_pull_request_event_kinds(parsed.events.as_deref())?;
+            let watch = broker.start_pull_request_watch(
+                session,
+                repository,
+                pr_number,
+                event_kinds,
+                parsed
+                    .seconds
+                    .unwrap_or(crate::DEFAULT_PR_WATCH_INTERVAL_SECONDS),
+                &crate::GithubCliPullRequestWatchProvider,
+                now_ms(),
+            )?;
+            render_pull_request_watch(&watch, parsed.json)?;
+        }
+        "list" => {
+            let watches = broker.pull_request_watches(parsed.all)?;
+            if parsed.json {
+                println!("{}", serde_json::to_string_pretty(&watches)?);
+            } else if watches.is_empty() {
+                println!("No pull request watches.");
+            } else {
+                for watch in watches {
+                    render_pull_request_watch(&watch, false)?;
+                }
+            }
+        }
+        "show" => {
+            let id = parsed.note_id.ok_or_else(|| {
+                UsageError::Message("watch pr show requires --id <watch-id>".into())
+            })?;
+            render_pull_request_watch(&broker.pull_request_watch(id)?, parsed.json)?;
+        }
+        "poll" => {
+            let id = parsed.note_id.ok_or_else(|| {
+                UsageError::Message("watch pr poll requires --id <watch-id>".into())
+            })?;
+            let report = broker.poll_pull_request_watch(
+                id,
+                &crate::GithubCliPullRequestWatchProvider,
+                now_ms(),
+            )?;
+            if parsed.json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!(
+                    "Watch {} polled {}#{} at {}: {} metadata item(s), {}.",
+                    report.watch.id,
+                    report.watch.display_repository,
+                    report.watch.pr_number,
+                    short_commit(&report.watch.head_sha),
+                    report.activity_count,
+                    if report.changed {
+                        "activity changed"
+                    } else {
+                        "no change"
+                    },
+                );
+            }
+        }
+        "pause" | "resume" | "stop" => {
+            let id = parsed.note_id.ok_or_else(|| {
+                UsageError::Message(format!("watch pr {action} requires --id <watch-id>"))
+            })?;
+            let status = match action {
+                "pause" => crate::PullRequestWatchStatus::Paused,
+                "resume" => crate::PullRequestWatchStatus::Active,
+                "stop" => crate::PullRequestWatchStatus::Stopped,
+                _ => unreachable!(),
+            };
+            let watch = broker.set_pull_request_watch_status(id, status, now_ms())?;
+            render_pull_request_watch(&watch, parsed.json)?;
+        }
+        other => {
+            return Err(UsageError::Message(format!(
+                "unknown watch pr action {other:?} — expected start, list, show, poll, pause, resume, or stop"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn parse_pull_request_event_kinds(
+    value: Option<&str>,
+) -> Result<Vec<crate::PullRequestActivityKind>, UsageError> {
+    let value = value.unwrap_or("comments,reviews,checks");
+    let mut kinds = Vec::new();
+    for item in value
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+    {
+        let kind = match item {
+            "comment" | "comments" => crate::PullRequestActivityKind::Comment,
+            "review" | "reviews" => crate::PullRequestActivityKind::Review,
+            "check" | "checks" => crate::PullRequestActivityKind::Check,
+            _ => {
+                return Err(UsageError::Message(format!(
+                    "unknown pull request event kind {item:?}; expected comments, reviews, or checks"
+                )));
+            }
+        };
+        kinds.push(kind);
+    }
+    if kinds.is_empty() {
+        return Err(UsageError::Message(
+            "--events must select comments, reviews, or checks".into(),
+        ));
+    }
+    kinds.sort();
+    kinds.dedup();
+    Ok(kinds)
+}
+
+fn render_pull_request_watch(
+    watch: &crate::PullRequestWatch,
+    json: bool,
+) -> Result<(), UsageError> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(watch)?);
+    } else {
+        println!(
+            "Watch {}: {}#{} {} at {} (session {}, every {}s)",
+            watch.id,
+            watch.display_repository,
+            watch.pr_number,
+            watch.status.as_str(),
+            short_commit(&watch.head_sha),
+            watch.session_id,
+            watch.poll_interval_seconds,
+        );
+    }
+    Ok(())
 }
 
 fn render_operation_show(report: &crate::OperationShowReport) {
@@ -5761,6 +5967,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                 }
             }
         }
+        "watch" => run_pull_request_watch(parsed)?,
         "pr" => {
             let action = parsed
                 .positional

@@ -16,7 +16,7 @@ use rusqlite::Connection;
 use crate::error::BrokerError;
 
 /// Current database schema version (== `MIGRATIONS.len()`).
-pub const SCHEMA_VERSION: i64 = 25;
+pub const SCHEMA_VERSION: i64 = 26;
 
 /// Version stamped on every event row written by this binary.
 pub const EVENTS_SCHEMA_VERSION: i64 = 1;
@@ -690,6 +690,37 @@ CREATE INDEX review_transitions_by_lifecycle
     ON review_lifecycle_transitions (lifecycle_id, id);
 ";
 
+const MIGRATION_V26: &str = "
+CREATE TABLE pull_request_watches (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id           INTEGER NOT NULL REFERENCES sessions(id),
+    provider             TEXT NOT NULL CHECK (provider IN ('github')),
+    canonical_repository TEXT NOT NULL,
+    display_repository   TEXT NOT NULL,
+    pr_number            INTEGER NOT NULL CHECK (pr_number > 0),
+    target_branch        TEXT NOT NULL,
+    head_sha             TEXT NOT NULL,
+    is_draft             INTEGER NOT NULL CHECK (is_draft IN (0, 1)),
+    status               TEXT NOT NULL CHECK (status IN ('active', 'paused', 'completed', 'stopped')),
+    event_kinds_json     TEXT NOT NULL,
+    poll_interval_seconds INTEGER NOT NULL CHECK (poll_interval_seconds BETWEEN 15 AND 3600),
+    cursor_digest        TEXT NOT NULL,
+    last_polled_at       INTEGER,
+    next_poll_at         INTEGER,
+    last_error_code      TEXT,
+    created_at           INTEGER NOT NULL,
+    updated_at           INTEGER NOT NULL
+);
+
+CREATE UNIQUE INDEX pull_request_watches_live_pr
+    ON pull_request_watches (canonical_repository, pr_number)
+    WHERE status IN ('active', 'paused');
+CREATE INDEX pull_request_watches_by_session
+    ON pull_request_watches (session_id, id);
+CREATE INDEX pull_request_watches_due
+    ON pull_request_watches (status, next_poll_at, id);
+";
+
 const MIGRATIONS: &[&str] = &[
     MIGRATION_V1,
     MIGRATION_V2,
@@ -716,6 +747,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_V23,
     MIGRATION_V24,
     MIGRATION_V25,
+    MIGRATION_V26,
 ];
 
 pub(crate) fn current_version(conn: &Connection) -> Result<i64, BrokerError> {

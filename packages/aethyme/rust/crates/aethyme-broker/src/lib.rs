@@ -44,6 +44,7 @@ mod leases;
 mod merge;
 mod operations;
 mod pr;
+mod pr_watch;
 mod quick_test;
 mod reconciliation;
 mod release_compatibility;
@@ -145,6 +146,12 @@ pub use operations::{
 pub use pr::{
     PrActivityItem, PrCheckOptions, PrCheckReport, PrCheckRun, PrDecision, PrDecisionStatus,
     PrDispatchReport, PrDispatchStatus, PrError, PrMarker, PrSummary,
+};
+pub use pr_watch::{
+    DEFAULT_PR_WATCH_INTERVAL_SECONDS, GithubCliPullRequestWatchProvider, NewPullRequestWatch,
+    PULL_REQUEST_WATCH_SCHEMA_VERSION, PullRequestActivityKind, PullRequestActivityMetadata,
+    PullRequestSnapshot, PullRequestWatch, PullRequestWatchError, PullRequestWatchPollReport,
+    PullRequestWatchProvider, PullRequestWatchRequest, PullRequestWatchStatus,
 };
 pub use quick_test::{
     Chau7Probe, QuickTestError, QuickTestGateOutcome, QuickTestGateReport, QuickTestMode,

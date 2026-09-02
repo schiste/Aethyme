@@ -19,6 +19,10 @@ use crate::external_events::{
     ExternalEventRecord, ExternalEventStatus, NewExternalEventRecord,
     aggregate_ownership_candidates,
 };
+use crate::pr_watch::{
+    NewPullRequestWatch, PULL_REQUEST_WATCH_SCHEMA_VERSION, PullRequestSnapshot, PullRequestWatch,
+    PullRequestWatchStatus,
+};
 use crate::review::{NewReviewLifecycle, ReviewLifecycle, ReviewLifecycleState};
 use crate::schema::{self, EVENTS_SCHEMA_VERSION};
 use crate::types::{
@@ -2914,6 +2918,194 @@ impl BrokerStore {
             .collect()
     }
 
+    // ── pull request watches ────────────────────────────────────────
+
+    pub fn insert_pull_request_watch(
+        &mut self,
+        watch: &NewPullRequestWatch,
+    ) -> Result<PullRequestWatch, BrokerError> {
+        let event_kinds_json = serde_json::to_string(&watch.event_kinds)
+            .expect("serializing pull request event kinds cannot fail");
+        let tx = self.conn.transaction()?;
+        match tx.execute(
+            "INSERT INTO pull_request_watches (
+                 session_id, provider, canonical_repository, display_repository,
+                 pr_number, target_branch, head_sha, is_draft, status,
+                 event_kinds_json, poll_interval_seconds, cursor_digest,
+                 next_poll_at, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'active', ?9, ?10, ?11, ?12, ?13, ?13)",
+            params![
+                watch.session_id,
+                watch.provider,
+                watch.canonical_repository,
+                watch.display_repository,
+                watch.pr_number,
+                watch.target_branch,
+                watch.head_sha,
+                watch.is_draft,
+                event_kinds_json,
+                watch.poll_interval_seconds as i64,
+                watch.cursor_digest,
+                watch.now_ms + watch.poll_interval_seconds as i64 * 1_000,
+                watch.now_ms,
+            ],
+        ) {
+            Ok(_) => {}
+            Err(error)
+                if error.sqlite_error_code() == Some(rusqlite::ErrorCode::ConstraintViolation) =>
+            {
+                return Err(BrokerError::PullRequestWatchIdentityConflict {
+                    repository: watch.canonical_repository.clone(),
+                    pr_number: watch.pr_number,
+                });
+            }
+            Err(error) => return Err(error.into()),
+        }
+        let id = tx.last_insert_rowid();
+        let payload = serde_json::json!({
+            "watch_id": id,
+            "repository": watch.canonical_repository,
+            "pr_number": watch.pr_number,
+            "provider": watch.provider,
+        })
+        .to_string();
+        insert_event(
+            &tx,
+            watch.now_ms,
+            "pr_watch.started",
+            Some(watch.session_id),
+            Some(&payload),
+        )?;
+        tx.commit()?;
+        self.pull_request_watch(id)?
+            .ok_or(BrokerError::InvalidEnumValue {
+                field: "pull_request_watch.id",
+                value: id.to_string(),
+            })
+    }
+
+    pub fn pull_request_watch(&self, id: i64) -> Result<Option<PullRequestWatch>, BrokerError> {
+        self.conn
+            .query_row(
+                &(PULL_REQUEST_WATCH_SELECT.to_owned() + " WHERE id = ?1"),
+                [id],
+                pull_request_watch_from_row,
+            )
+            .optional()?
+            .transpose()
+    }
+
+    pub fn pull_request_watches(
+        &self,
+        include_terminal: bool,
+    ) -> Result<Vec<PullRequestWatch>, BrokerError> {
+        let sql = if include_terminal {
+            PULL_REQUEST_WATCH_SELECT.to_owned() + " ORDER BY id DESC"
+        } else {
+            PULL_REQUEST_WATCH_SELECT.to_owned()
+                + " WHERE status IN ('active', 'paused') ORDER BY id DESC"
+        };
+        let mut statement = self.conn.prepare(&sql)?;
+        statement
+            .query_map([], pull_request_watch_from_row)?
+            .map(|row| row?)
+            .collect()
+    }
+
+    pub fn update_pull_request_watch_status(
+        &mut self,
+        id: i64,
+        status: PullRequestWatchStatus,
+        now: i64,
+        last_error_code: Option<&str>,
+    ) -> Result<PullRequestWatch, BrokerError> {
+        let current = self
+            .pull_request_watch(id)?
+            .ok_or(BrokerError::InvalidEnumValue {
+                field: "pull_request_watch.id",
+                value: id.to_string(),
+            })?;
+        let next_poll_at = (status == PullRequestWatchStatus::Active)
+            .then_some(now + current.poll_interval_seconds as i64 * 1_000);
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "UPDATE pull_request_watches
+             SET status = ?2, next_poll_at = ?3, last_error_code = ?4, updated_at = ?5
+             WHERE id = ?1",
+            params![id, status.as_str(), next_poll_at, last_error_code, now],
+        )?;
+        let payload = serde_json::json!({ "watch_id": id, "status": status }).to_string();
+        insert_event(
+            &tx,
+            now,
+            "pr_watch.status_changed",
+            Some(current.session_id),
+            Some(&payload),
+        )?;
+        tx.commit()?;
+        self.pull_request_watch(id)?
+            .ok_or(BrokerError::InvalidEnumValue {
+                field: "pull_request_watch.id",
+                value: id.to_string(),
+            })
+    }
+
+    pub fn record_pull_request_watch_poll(
+        &mut self,
+        id: i64,
+        snapshot: &PullRequestSnapshot,
+        cursor_digest: &str,
+        status: PullRequestWatchStatus,
+        now: i64,
+    ) -> Result<PullRequestWatch, BrokerError> {
+        let current = self
+            .pull_request_watch(id)?
+            .ok_or(BrokerError::InvalidEnumValue {
+                field: "pull_request_watch.id",
+                value: id.to_string(),
+            })?;
+        let next_poll_at = (status == PullRequestWatchStatus::Active)
+            .then_some(now + current.poll_interval_seconds as i64 * 1_000);
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "UPDATE pull_request_watches
+             SET target_branch = ?2, head_sha = ?3, is_draft = ?4,
+                 status = ?5, cursor_digest = ?6, last_polled_at = ?7,
+                 next_poll_at = ?8, last_error_code = NULL, updated_at = ?7
+             WHERE id = ?1",
+            params![
+                id,
+                snapshot.target_branch,
+                snapshot.head_sha,
+                snapshot.is_draft,
+                status.as_str(),
+                cursor_digest,
+                now,
+                next_poll_at,
+            ],
+        )?;
+        let payload = serde_json::json!({
+            "watch_id": id,
+            "head_sha": snapshot.head_sha,
+            "status": status,
+            "activity_count": snapshot.activities.len(),
+        })
+        .to_string();
+        insert_event(
+            &tx,
+            now,
+            "pr_watch.polled",
+            Some(current.session_id),
+            Some(&payload),
+        )?;
+        tx.commit()?;
+        self.pull_request_watch(id)?
+            .ok_or(BrokerError::InvalidEnumValue {
+                field: "pull_request_watch.id",
+                value: id.to_string(),
+            })
+    }
+
     // ── events ────────────────────────────────────────────────────────
 
     /// Append one event. Most mutations already emit their own event in
@@ -3453,6 +3645,11 @@ const MERGE_SELECT: &str = "SELECT id, session_id, head_commit, base_commit, sta
 const PR_WATCH_SELECT: &str = "SELECT id, target_branch, pr_number, activity_fingerprint, \
      marker, last_dispatch_at, last_agent_session_id, updated_at FROM pr_watch_state";
 
+const PULL_REQUEST_WATCH_SELECT: &str = "SELECT id, session_id, provider, canonical_repository, \
+     display_repository, pr_number, target_branch, head_sha, is_draft, status, event_kinds_json, \
+     poll_interval_seconds, cursor_digest, last_polled_at, next_poll_at, last_error_code, \
+     created_at, updated_at FROM pull_request_watches";
+
 const ADVISORY_SELECT: &str = "SELECT id, identity, session_id, severity, queue_entry_id, \
      integration_sha, paths_json, evidence_json, created_at, resolution_state, acknowledged_at, \
      resolved_at, resolution_evidence \
@@ -3607,6 +3804,41 @@ fn pr_watch_from_row(row: &rusqlite::Row<'_>) -> RowResult<PrWatchState> {
         last_dispatch_at: row.get(5)?,
         last_agent_session_id: row.get(6)?,
         updated_at: row.get(7)?,
+    }))
+}
+
+fn pull_request_watch_from_row(row: &rusqlite::Row<'_>) -> RowResult<PullRequestWatch> {
+    let status = PullRequestWatchStatus::parse(row.get(9)?)?;
+    let event_kinds_json: String = row.get(10)?;
+    let event_kinds = match serde_json::from_str(&event_kinds_json) {
+        Ok(value) => value,
+        Err(source) => {
+            return Ok(Err(BrokerError::InvalidEnumValue {
+                field: "pull_request_watches.event_kinds_json",
+                value: source.to_string(),
+            }));
+        }
+    };
+    Ok(Ok(PullRequestWatch {
+        schema_version: PULL_REQUEST_WATCH_SCHEMA_VERSION,
+        id: row.get(0)?,
+        session_id: row.get(1)?,
+        provider: row.get(2)?,
+        canonical_repository: row.get(3)?,
+        display_repository: row.get(4)?,
+        pr_number: row.get(5)?,
+        target_branch: row.get(6)?,
+        head_sha: row.get(7)?,
+        is_draft: row.get(8)?,
+        status,
+        event_kinds,
+        poll_interval_seconds: row.get::<_, i64>(11)? as u64,
+        cursor_digest: row.get(12)?,
+        last_polled_at: row.get(13)?,
+        next_poll_at: row.get(14)?,
+        last_error_code: row.get(15)?,
+        created_at: row.get(16)?,
+        updated_at: row.get(17)?,
     }))
 }
 
