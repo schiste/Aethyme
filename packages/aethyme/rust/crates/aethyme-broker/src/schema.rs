@@ -16,7 +16,7 @@ use rusqlite::Connection;
 use crate::error::BrokerError;
 
 /// Current database schema version (== `MIGRATIONS.len()`).
-pub const SCHEMA_VERSION: i64 = 26;
+pub const SCHEMA_VERSION: i64 = 27;
 
 /// Version stamped on every event row written by this binary.
 pub const EVENTS_SCHEMA_VERSION: i64 = 1;
@@ -721,6 +721,49 @@ CREATE INDEX pull_request_watches_due
     ON pull_request_watches (status, next_poll_at, id);
 ";
 
+const MIGRATION_V27: &str = "
+CREATE TABLE pull_request_activities (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    watch_id            INTEGER NOT NULL REFERENCES pull_request_watches(id),
+    kind                TEXT NOT NULL CHECK (kind IN ('comment', 'review', 'check')),
+    provider_id         TEXT NOT NULL,
+    author              TEXT,
+    state               TEXT,
+    url                 TEXT,
+    provider_updated_at TEXT,
+    first_seen_at       INTEGER NOT NULL,
+    last_seen_at        INTEGER NOT NULL,
+    UNIQUE (watch_id, kind, provider_id)
+);
+
+CREATE INDEX pull_request_activities_by_watch
+    ON pull_request_activities (watch_id, id);
+
+CREATE TABLE pull_request_activity_batches (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    watch_id          INTEGER NOT NULL REFERENCES pull_request_watches(id),
+    head_sha          TEXT NOT NULL,
+    digest            TEXT NOT NULL,
+    activity_count    INTEGER NOT NULL CHECK (activity_count > 0),
+    status            TEXT NOT NULL CHECK (status IN ('pending', 'acknowledged')),
+    ack_outcome       TEXT CHECK (ack_outcome IS NULL OR ack_outcome IN (
+                          'addressed', 'stale', 'non_actionable', 'superseded')),
+    ack_reason_digest TEXT,
+    created_at        INTEGER NOT NULL,
+    acknowledged_at  INTEGER,
+    UNIQUE (watch_id, digest)
+);
+
+CREATE TABLE pull_request_activity_batch_items (
+    batch_id   INTEGER NOT NULL REFERENCES pull_request_activity_batches(id),
+    activity_id INTEGER NOT NULL REFERENCES pull_request_activities(id),
+    PRIMARY KEY (batch_id, activity_id)
+);
+
+CREATE INDEX pull_request_activity_batches_pending
+    ON pull_request_activity_batches (status, id);
+";
+
 const MIGRATIONS: &[&str] = &[
     MIGRATION_V1,
     MIGRATION_V2,
@@ -748,6 +791,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_V24,
     MIGRATION_V25,
     MIGRATION_V26,
+    MIGRATION_V27,
 ];
 
 pub(crate) fn current_version(conn: &Connection) -> Result<i64, BrokerError> {

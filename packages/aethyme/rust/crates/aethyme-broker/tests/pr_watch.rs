@@ -5,8 +5,8 @@ use std::sync::Mutex;
 
 use aethyme_broker::{
     Broker, BrokerOpError, NewSession, PullRequestActivityKind, PullRequestActivityMetadata,
-    PullRequestSnapshot, PullRequestWatchError, PullRequestWatchProvider, PullRequestWatchRequest,
-    PullRequestWatchStatus, SessionOrigin,
+    PullRequestBatchAckOutcome, PullRequestBatchStatus, PullRequestSnapshot, PullRequestWatchError,
+    PullRequestWatchProvider, PullRequestWatchRequest, PullRequestWatchStatus, SessionOrigin,
 };
 
 fn git(root: &Path, args: &[&str]) {
@@ -120,12 +120,62 @@ fn durable_watch_tracks_metadata_changes_and_completes_with_the_pr() {
         .unwrap();
     assert!(changed.changed);
     assert_eq!(changed.activity_count, 2);
+    assert_eq!(changed.new_activity_count, 1);
     assert_eq!(changed.watch.head_sha, "b".repeat(40));
+    let batch = changed.batch.expect("new C2 is batched");
+    assert_eq!(batch.activities[0].metadata.provider_id, "C2");
+    assert_eq!(
+        broker
+            .pull_request_activity_batches(watch.id, false)
+            .unwrap(),
+        vec![batch.clone()]
+    );
+
+    let acknowledged = broker
+        .acknowledge_pull_request_activity_batch(
+            batch.id,
+            PullRequestBatchAckOutcome::Addressed,
+            "fixed in the current PR head",
+            62_000,
+        )
+        .unwrap();
+    assert_eq!(acknowledged.status, PullRequestBatchStatus::Acknowledged);
+    assert_eq!(acknowledged.ack_reason_digest.as_deref().unwrap().len(), 64);
+    assert_eq!(
+        broker
+            .acknowledge_pull_request_activity_batch(
+                batch.id,
+                PullRequestBatchAckOutcome::Addressed,
+                "fixed in the current PR head",
+                63_000,
+            )
+            .unwrap(),
+        acknowledged
+    );
+    assert!(matches!(
+        broker
+            .acknowledge_pull_request_activity_batch(
+                batch.id,
+                PullRequestBatchAckOutcome::Stale,
+                "different classification",
+                64_000,
+            )
+            .unwrap_err(),
+        BrokerOpError::Store(aethyme_broker::BrokerError::PullRequestActivityBatchAckConflict(_))
+    ));
+    assert_eq!(
+        broker
+            .pull_request_activity_batches(watch.id, false)
+            .unwrap(),
+        Vec::new()
+    );
 
     let completed = broker
         .poll_pull_request_watch(watch.id, &provider, 121_000)
         .unwrap();
     assert_eq!(completed.watch.status, PullRequestWatchStatus::Completed);
+    assert_eq!(completed.new_activity_count, 0);
+    assert!(completed.batch.is_none());
     assert_eq!(broker.pull_request_watches(false).unwrap().len(), 0);
     assert_eq!(broker.pull_request_watches(true).unwrap().len(), 1);
 }

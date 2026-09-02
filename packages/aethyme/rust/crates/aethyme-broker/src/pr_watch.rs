@@ -29,6 +29,18 @@ impl PullRequestActivityKind {
             Self::Check => "check",
         }
     }
+
+    pub(crate) fn parse(value: &str) -> Result<Self, crate::BrokerError> {
+        match value {
+            "comment" => Ok(Self::Comment),
+            "review" => Ok(Self::Review),
+            "check" => Ok(Self::Check),
+            _ => Err(crate::BrokerError::InvalidEnumValue {
+                field: "pull_request_activities.kind",
+                value: value.into(),
+            }),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,6 +85,90 @@ pub struct PullRequestActivityMetadata {
     pub state: Option<String>,
     pub url: Option<String>,
     pub updated_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PullRequestActivity {
+    pub id: i64,
+    pub watch_id: i64,
+    #[serde(flatten)]
+    pub metadata: PullRequestActivityMetadata,
+    pub first_seen_at: i64,
+    pub last_seen_at: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PullRequestBatchStatus {
+    Pending,
+    Acknowledged,
+}
+
+impl PullRequestBatchStatus {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Acknowledged => "acknowledged",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Result<Self, crate::BrokerError> {
+        match value {
+            "pending" => Ok(Self::Pending),
+            "acknowledged" => Ok(Self::Acknowledged),
+            _ => Err(crate::BrokerError::InvalidEnumValue {
+                field: "pull_request_activity_batches.status",
+                value: value.into(),
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PullRequestBatchAckOutcome {
+    Addressed,
+    Stale,
+    NonActionable,
+    Superseded,
+}
+
+impl PullRequestBatchAckOutcome {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Addressed => "addressed",
+            Self::Stale => "stale",
+            Self::NonActionable => "non_actionable",
+            Self::Superseded => "superseded",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Result<Self, crate::BrokerError> {
+        match value {
+            "addressed" => Ok(Self::Addressed),
+            "stale" => Ok(Self::Stale),
+            "non_actionable" => Ok(Self::NonActionable),
+            "superseded" => Ok(Self::Superseded),
+            _ => Err(crate::BrokerError::InvalidEnumValue {
+                field: "pull_request_activity_batches.ack_outcome",
+                value: value.into(),
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PullRequestActivityBatch {
+    pub id: i64,
+    pub watch_id: i64,
+    pub head_sha: String,
+    pub digest: String,
+    pub activities: Vec<PullRequestActivity>,
+    pub status: PullRequestBatchStatus,
+    pub ack_outcome: Option<PullRequestBatchAckOutcome>,
+    pub ack_reason_digest: Option<String>,
+    pub created_at: i64,
+    pub acknowledged_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -132,6 +228,7 @@ pub struct NewPullRequestWatch {
     pub event_kinds: Vec<PullRequestActivityKind>,
     pub poll_interval_seconds: u64,
     pub cursor_digest: String,
+    pub baseline_activities: Vec<PullRequestActivityMetadata>,
     pub now_ms: i64,
 }
 
@@ -163,9 +260,16 @@ pub struct PullRequestWatchPollReport {
     pub watch: PullRequestWatch,
     pub changed: bool,
     pub activity_count: usize,
+    pub new_activity_count: usize,
+    pub batch: Option<PullRequestActivityBatch>,
     pub previous_cursor_digest: String,
     pub observed_cursor_digest: String,
     pub pr_url: String,
+}
+
+pub(crate) struct PullRequestWatchPollStorageResult {
+    pub watch: PullRequestWatch,
+    pub batch: Option<PullRequestActivityBatch>,
 }
 
 impl PullRequestWatchProvider for GithubCliPullRequestWatchProvider {
@@ -372,6 +476,7 @@ impl Broker {
                 event_kinds: request.event_kinds,
                 poll_interval_seconds,
                 cursor_digest,
+                baseline_activities: snapshot.activities,
                 now_ms,
             })?;
         Ok(watch)
@@ -429,17 +534,56 @@ impl Broker {
         } else {
             PullRequestWatchStatus::Completed
         };
-        let watch = self
+        let result = self
             .store()
             .record_pull_request_watch_poll(id, &snapshot, &digest, status, now_ms)?;
         Ok(PullRequestWatchPollReport {
             changed: digest != current.cursor_digest,
             activity_count: snapshot.activities.len(),
+            new_activity_count: result
+                .batch
+                .as_ref()
+                .map_or(0, |batch| batch.activities.len()),
+            batch: result.batch,
             previous_cursor_digest: current.cursor_digest,
             observed_cursor_digest: digest,
             pr_url: snapshot.url,
-            watch,
+            watch: result.watch,
         })
+    }
+
+    pub fn pull_request_activity_batches(
+        &self,
+        watch_id: i64,
+        include_acknowledged: bool,
+    ) -> Result<Vec<PullRequestActivityBatch>, BrokerOpError> {
+        self.pull_request_watch(watch_id)?;
+        Ok(self
+            .store_ref()
+            .pull_request_activity_batches(watch_id, include_acknowledged)?)
+    }
+
+    pub fn acknowledge_pull_request_activity_batch(
+        &mut self,
+        batch_id: i64,
+        outcome: PullRequestBatchAckOutcome,
+        reason: &str,
+        now_ms: i64,
+    ) -> Result<PullRequestActivityBatch, BrokerOpError> {
+        let reason = reason.trim();
+        if reason.is_empty() {
+            return Err(PullRequestWatchError::Invalid(
+                "batch acknowledgment requires a non-empty classification reason".into(),
+            )
+            .into());
+        }
+        let reason_digest = format!("{:x}", Sha256::digest(reason.as_bytes()));
+        Ok(self.store().acknowledge_pull_request_activity_batch(
+            batch_id,
+            outcome,
+            &reason_digest,
+            now_ms,
+        )?)
     }
 
     pub fn set_pull_request_watch_status(

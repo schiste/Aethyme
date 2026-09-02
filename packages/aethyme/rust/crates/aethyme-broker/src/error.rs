@@ -55,6 +55,12 @@ pub enum BrokerError {
     #[error("pull request watch identity is already active for {repository} PR #{pr_number}")]
     PullRequestWatchIdentityConflict { repository: String, pr_number: i64 },
 
+    #[error("pull request activity batch {0} was not found")]
+    PullRequestActivityBatchNotFound(i64),
+
+    #[error("pull request activity batch {0} was already acknowledged differently")]
+    PullRequestActivityBatchAckConflict(i64),
+
     #[error("advisory identity {0:?} already exists with different immutable data")]
     AdvisoryIdentityConflict(String),
 

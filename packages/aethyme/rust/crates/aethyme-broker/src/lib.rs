@@ -149,9 +149,11 @@ pub use pr::{
 };
 pub use pr_watch::{
     DEFAULT_PR_WATCH_INTERVAL_SECONDS, GithubCliPullRequestWatchProvider, NewPullRequestWatch,
-    PULL_REQUEST_WATCH_SCHEMA_VERSION, PullRequestActivityKind, PullRequestActivityMetadata,
-    PullRequestSnapshot, PullRequestWatch, PullRequestWatchError, PullRequestWatchPollReport,
-    PullRequestWatchProvider, PullRequestWatchRequest, PullRequestWatchStatus,
+    PULL_REQUEST_WATCH_SCHEMA_VERSION, PullRequestActivity, PullRequestActivityBatch,
+    PullRequestActivityKind, PullRequestActivityMetadata, PullRequestBatchAckOutcome,
+    PullRequestBatchStatus, PullRequestSnapshot, PullRequestWatch, PullRequestWatchError,
+    PullRequestWatchPollReport, PullRequestWatchProvider, PullRequestWatchRequest,
+    PullRequestWatchStatus,
 };
 pub use quick_test::{
     Chau7Probe, QuickTestError, QuickTestGateOutcome, QuickTestGateReport, QuickTestMode,

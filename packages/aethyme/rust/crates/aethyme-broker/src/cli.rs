@@ -273,6 +273,8 @@ Usage:
   aethyme broker watch pr start --session <id> --repo <owner/name> --pr <number> [--events <comments,reviews,checks>] [--seconds <15..3600>] [--json]
   aethyme broker watch pr list [--all] [--json]
   aethyme broker watch pr show|poll|pause|resume|stop --id <watch-id> [--json]
+  aethyme broker watch pr batches --id <watch-id> [--all] [--json]
+  aethyme broker watch pr ack --id <batch-id> --outcome <addressed|stale|non-actionable|superseded> --reason <text> [--json]
       Persist a metadata-only PR watch and inspect it with one-shot polling.
       Aethyme records provider ids, authors, states, URLs and timestamps, but
       never comment/review bodies. Scheduling and live-agent delivery are
@@ -3399,7 +3401,7 @@ fn parse_advisory_id(value: Option<&String>, usage: &str) -> Result<i64, UsageEr
 fn run_pull_request_watch(parsed: Parsed) -> Result<(), UsageError> {
     if parsed.positional.first().map(String::as_str) != Some("pr") {
         return Err(UsageError::Message(
-            "watch requires `pr` followed by start, list, show, poll, pause, resume, or stop"
+            "watch requires `pr` followed by start, list, show, poll, batches, ack, pause, resume, or stop"
                 .into(),
         ));
     }
@@ -3409,7 +3411,8 @@ fn run_pull_request_watch(parsed: Parsed) -> Result<(), UsageError> {
         .map(String::as_str)
         .ok_or_else(|| {
             UsageError::Message(
-                "watch pr requires start, list, show, poll, pause, resume, or stop".into(),
+                "watch pr requires start, list, show, poll, batches, ack, pause, resume, or stop"
+                    .into(),
             )
         })?;
     let mut broker = open_broker(parsed.read_only_snapshot)?;
@@ -3476,11 +3479,70 @@ fn run_pull_request_watch(parsed: Parsed) -> Result<(), UsageError> {
                     short_commit(&report.watch.head_sha),
                     report.activity_count,
                     if report.changed {
-                        "activity changed"
+                        if report.new_activity_count > 0 {
+                            "new activity batched"
+                        } else {
+                            "metadata changed"
+                        }
                     } else {
                         "no change"
                     },
                 );
+            }
+        }
+        "batches" => {
+            let watch_id = parsed.note_id.ok_or_else(|| {
+                UsageError::Message("watch pr batches requires --id <watch-id>".into())
+            })?;
+            let batches = broker.pull_request_activity_batches(watch_id, parsed.all)?;
+            if parsed.json {
+                println!("{}", serde_json::to_string_pretty(&batches)?);
+            } else if batches.is_empty() {
+                println!("No pull request activity batches.");
+            } else {
+                for batch in batches {
+                    println!(
+                        "Batch {}: watch {}, {} metadata item(s), {} at {}",
+                        batch.id,
+                        batch.watch_id,
+                        batch.activities.len(),
+                        batch.status.as_str(),
+                        short_commit(&batch.head_sha),
+                    );
+                }
+            }
+        }
+        "ack" => {
+            let batch_id = parsed.note_id.ok_or_else(|| {
+                UsageError::Message("watch pr ack requires --id <batch-id>".into())
+            })?;
+            let outcome = match parsed.outcome.as_deref() {
+                Some("addressed") => crate::PullRequestBatchAckOutcome::Addressed,
+                Some("stale") => crate::PullRequestBatchAckOutcome::Stale,
+                Some("non-actionable" | "non_actionable") => {
+                    crate::PullRequestBatchAckOutcome::NonActionable
+                }
+                Some("superseded") => crate::PullRequestBatchAckOutcome::Superseded,
+                _ => {
+                    return Err(UsageError::Message(
+                        "watch pr ack requires --outcome addressed|stale|non-actionable|superseded"
+                            .into(),
+                    ));
+                }
+            };
+            let reason = parsed.reason.as_deref().ok_or_else(|| {
+                UsageError::Message("watch pr ack requires --reason <text>".into())
+            })?;
+            let batch = broker.acknowledge_pull_request_activity_batch(
+                batch_id,
+                outcome,
+                reason,
+                now_ms(),
+            )?;
+            if parsed.json {
+                println!("{}", serde_json::to_string_pretty(&batch)?);
+            } else {
+                println!("Batch {} acknowledged as {}.", batch.id, outcome.as_str());
             }
         }
         "pause" | "resume" | "stop" => {
@@ -3498,7 +3560,7 @@ fn run_pull_request_watch(parsed: Parsed) -> Result<(), UsageError> {
         }
         other => {
             return Err(UsageError::Message(format!(
-                "unknown watch pr action {other:?} — expected start, list, show, poll, pause, resume, or stop"
+                "unknown watch pr action {other:?} — expected start, list, show, poll, batches, ack, pause, resume, or stop"
             )));
         }
     }

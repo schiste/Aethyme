@@ -111,13 +111,16 @@ fn broker_command_capability(args: &[String]) -> repository_upgrade::CommandCapa
         (Some("watch"), Some("pr"))
             if matches!(
                 args.get(2).map(String::as_str),
-                Some("start" | "poll" | "pause" | "resume" | "stop")
+                Some("start" | "poll" | "ack" | "pause" | "resume" | "stop")
             ) =>
         {
             CommandCapability::SessionContinuation
         }
         (Some("watch"), Some("pr"))
-            if matches!(args.get(2).map(String::as_str), Some("list" | "show")) =>
+            if matches!(
+                args.get(2).map(String::as_str),
+                Some("list" | "show" | "batches")
+            ) =>
         {
             CommandCapability::DiagnosticRead
         }

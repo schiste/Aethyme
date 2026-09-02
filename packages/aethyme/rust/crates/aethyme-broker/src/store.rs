@@ -13,6 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rusqlite::{
     Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
 };
+use sha2::{Digest, Sha256};
 
 use crate::error::BrokerError;
 use crate::external_events::{
@@ -20,8 +21,10 @@ use crate::external_events::{
     aggregate_ownership_candidates,
 };
 use crate::pr_watch::{
-    NewPullRequestWatch, PULL_REQUEST_WATCH_SCHEMA_VERSION, PullRequestSnapshot, PullRequestWatch,
-    PullRequestWatchStatus,
+    NewPullRequestWatch, PULL_REQUEST_WATCH_SCHEMA_VERSION, PullRequestActivity,
+    PullRequestActivityBatch, PullRequestActivityKind, PullRequestActivityMetadata,
+    PullRequestBatchAckOutcome, PullRequestBatchStatus, PullRequestSnapshot, PullRequestWatch,
+    PullRequestWatchPollStorageResult, PullRequestWatchStatus,
 };
 use crate::review::{NewReviewLifecycle, ReviewLifecycle, ReviewLifecycleState};
 use crate::schema::{self, EVENTS_SCHEMA_VERSION};
@@ -2962,6 +2965,9 @@ impl BrokerStore {
             Err(error) => return Err(error.into()),
         }
         let id = tx.last_insert_rowid();
+        for activity in &watch.baseline_activities {
+            upsert_pull_request_activity(&tx, id, activity, watch.now_ms)?;
+        }
         let payload = serde_json::json!({
             "watch_id": id,
             "repository": watch.canonical_repository,
@@ -3050,14 +3056,14 @@ impl BrokerStore {
             })
     }
 
-    pub fn record_pull_request_watch_poll(
+    pub(crate) fn record_pull_request_watch_poll(
         &mut self,
         id: i64,
         snapshot: &PullRequestSnapshot,
         cursor_digest: &str,
         status: PullRequestWatchStatus,
         now: i64,
-    ) -> Result<PullRequestWatch, BrokerError> {
+    ) -> Result<PullRequestWatchPollStorageResult, BrokerError> {
         let current = self
             .pull_request_watch(id)?
             .ok_or(BrokerError::InvalidEnumValue {
@@ -3067,6 +3073,49 @@ impl BrokerStore {
         let next_poll_at = (status == PullRequestWatchStatus::Active)
             .then_some(now + current.poll_interval_seconds as i64 * 1_000);
         let tx = self.conn.transaction()?;
+        let mut new_activity_ids = Vec::new();
+        let mut new_activity_identities = Vec::new();
+        for activity in &snapshot.activities {
+            let (activity_id, inserted) = upsert_pull_request_activity(&tx, id, activity, now)?;
+            if inserted {
+                new_activity_ids.push(activity_id);
+                new_activity_identities.push(format!(
+                    "{}:{}",
+                    activity.kind.as_str(),
+                    activity.provider_id
+                ));
+            }
+        }
+        new_activity_identities.sort();
+        let batch_id = if new_activity_ids.is_empty() {
+            None
+        } else {
+            let digest_input =
+                serde_json::to_vec(&(id, snapshot.head_sha.as_str(), &new_activity_identities))
+                    .expect("serializing batch identity cannot fail");
+            let batch_digest = format!("{:x}", Sha256::digest(digest_input));
+            tx.execute(
+                "INSERT INTO pull_request_activity_batches (
+                     watch_id, head_sha, digest, activity_count, status, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, 'pending', ?5)",
+                params![
+                    id,
+                    snapshot.head_sha,
+                    batch_digest,
+                    new_activity_ids.len() as i64,
+                    now,
+                ],
+            )?;
+            let batch_id = tx.last_insert_rowid();
+            for activity_id in &new_activity_ids {
+                tx.execute(
+                    "INSERT INTO pull_request_activity_batch_items (batch_id, activity_id)
+                     VALUES (?1, ?2)",
+                    params![batch_id, activity_id],
+                )?;
+            }
+            Some(batch_id)
+        };
         tx.execute(
             "UPDATE pull_request_watches
              SET target_branch = ?2, head_sha = ?3, is_draft = ?4,
@@ -3089,6 +3138,8 @@ impl BrokerStore {
             "head_sha": snapshot.head_sha,
             "status": status,
             "activity_count": snapshot.activities.len(),
+            "new_activity_count": new_activity_ids.len(),
+            "batch_id": batch_id,
         })
         .to_string();
         insert_event(
@@ -3099,11 +3150,152 @@ impl BrokerStore {
             Some(&payload),
         )?;
         tx.commit()?;
-        self.pull_request_watch(id)?
+        let watch = self
+            .pull_request_watch(id)?
             .ok_or(BrokerError::InvalidEnumValue {
                 field: "pull_request_watch.id",
                 value: id.to_string(),
+            })?;
+        let batch = batch_id
+            .map(|batch_id| self.pull_request_activity_batch(batch_id))
+            .transpose()?
+            .flatten();
+        Ok(PullRequestWatchPollStorageResult { watch, batch })
+    }
+
+    pub fn pull_request_activity_batches(
+        &self,
+        watch_id: i64,
+        include_acknowledged: bool,
+    ) -> Result<Vec<PullRequestActivityBatch>, BrokerError> {
+        let sql = if include_acknowledged {
+            "SELECT id FROM pull_request_activity_batches WHERE watch_id = ?1 ORDER BY id"
+        } else {
+            "SELECT id FROM pull_request_activity_batches WHERE watch_id = ?1 AND status = 'pending' ORDER BY id"
+        };
+        let mut statement = self.conn.prepare(sql)?;
+        let ids = statement
+            .query_map([watch_id], |row| row.get::<_, i64>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        ids.into_iter()
+            .map(|id| {
+                self.pull_request_activity_batch(id)?
+                    .ok_or(BrokerError::PullRequestActivityBatchNotFound(id))
             })
+            .collect()
+    }
+
+    pub fn pull_request_activity_batch(
+        &self,
+        batch_id: i64,
+    ) -> Result<Option<PullRequestActivityBatch>, BrokerError> {
+        let header = self
+            .conn
+            .query_row(
+                "SELECT watch_id, head_sha, digest, status, ack_outcome,
+                        ack_reason_digest, created_at, acknowledged_at
+                 FROM pull_request_activity_batches WHERE id = ?1",
+                [batch_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, Option<i64>>(7)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((
+            watch_id,
+            head_sha,
+            digest,
+            status,
+            ack_outcome,
+            ack_reason_digest,
+            created_at,
+            acknowledged_at,
+        )) = header
+        else {
+            return Ok(None);
+        };
+        let mut statement = self.conn.prepare(
+            "SELECT a.id, a.watch_id, a.kind, a.provider_id, a.author, a.state,
+                    a.url, a.provider_updated_at, a.first_seen_at, a.last_seen_at
+             FROM pull_request_activities a
+             JOIN pull_request_activity_batch_items i ON i.activity_id = a.id
+             WHERE i.batch_id = ?1 ORDER BY a.kind, a.provider_id",
+        )?;
+        let activities = statement
+            .query_map([batch_id], pull_request_activity_from_row)?
+            .map(|row| row?)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Some(PullRequestActivityBatch {
+            id: batch_id,
+            watch_id,
+            head_sha,
+            digest,
+            activities,
+            status: PullRequestBatchStatus::parse(&status)?,
+            ack_outcome: ack_outcome
+                .as_deref()
+                .map(PullRequestBatchAckOutcome::parse)
+                .transpose()?,
+            ack_reason_digest,
+            created_at,
+            acknowledged_at,
+        }))
+    }
+
+    pub fn acknowledge_pull_request_activity_batch(
+        &mut self,
+        batch_id: i64,
+        outcome: PullRequestBatchAckOutcome,
+        reason_digest: &str,
+        now: i64,
+    ) -> Result<PullRequestActivityBatch, BrokerError> {
+        let current = self
+            .pull_request_activity_batch(batch_id)?
+            .ok_or(BrokerError::PullRequestActivityBatchNotFound(batch_id))?;
+        if current.status == PullRequestBatchStatus::Acknowledged {
+            if current.ack_outcome == Some(outcome)
+                && current.ack_reason_digest.as_deref() == Some(reason_digest)
+            {
+                return Ok(current);
+            }
+            return Err(BrokerError::PullRequestActivityBatchAckConflict(batch_id));
+        }
+        let session_id = self
+            .pull_request_watch(current.watch_id)?
+            .map(|watch| watch.session_id);
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "UPDATE pull_request_activity_batches
+             SET status = 'acknowledged', ack_outcome = ?2,
+                 ack_reason_digest = ?3, acknowledged_at = ?4
+             WHERE id = ?1 AND status = 'pending'",
+            params![batch_id, outcome.as_str(), reason_digest, now],
+        )?;
+        let payload = serde_json::json!({
+            "batch_id": batch_id,
+            "watch_id": current.watch_id,
+            "outcome": outcome,
+        })
+        .to_string();
+        insert_event(
+            &tx,
+            now,
+            "pr_watch.batch_acknowledged",
+            session_id,
+            Some(&payload),
+        )?;
+        tx.commit()?;
+        self.pull_request_activity_batch(batch_id)?
+            .ok_or(BrokerError::PullRequestActivityBatchNotFound(batch_id))
     }
 
     // ── events ────────────────────────────────────────────────────────
@@ -3623,6 +3815,53 @@ fn insert_planned_explicit_leases(
     Ok(())
 }
 
+fn upsert_pull_request_activity(
+    tx: &Transaction<'_>,
+    watch_id: i64,
+    activity: &PullRequestActivityMetadata,
+    now: i64,
+) -> Result<(i64, bool), BrokerError> {
+    let inserted = tx.execute(
+        "INSERT OR IGNORE INTO pull_request_activities (
+             watch_id, kind, provider_id, author, state, url,
+             provider_updated_at, first_seen_at, last_seen_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
+        params![
+            watch_id,
+            activity.kind.as_str(),
+            activity.provider_id,
+            activity.author,
+            activity.state,
+            activity.url,
+            activity.updated_at,
+            now,
+        ],
+    )? == 1;
+    tx.execute(
+        "UPDATE pull_request_activities
+         SET author = ?4, state = ?5, url = ?6,
+             provider_updated_at = ?7, last_seen_at = ?8
+         WHERE watch_id = ?1 AND kind = ?2 AND provider_id = ?3",
+        params![
+            watch_id,
+            activity.kind.as_str(),
+            activity.provider_id,
+            activity.author,
+            activity.state,
+            activity.url,
+            activity.updated_at,
+            now,
+        ],
+    )?;
+    let id = tx.query_row(
+        "SELECT id FROM pull_request_activities
+         WHERE watch_id = ?1 AND kind = ?2 AND provider_id = ?3",
+        params![watch_id, activity.kind.as_str(), activity.provider_id],
+        |row| row.get(0),
+    )?;
+    Ok((id, inserted))
+}
+
 const SESSION_SELECT: &str = "SELECT id, worktree_path, branch, origin, status, task, \
      diff_base, adoption_base, adopted_head, accepted_session_head, \
      accepted_integration_commit, accepted_integration_tree, accepted_queue_entry_id, \
@@ -3840,6 +4079,26 @@ fn pull_request_watch_from_row(row: &rusqlite::Row<'_>) -> RowResult<PullRequest
         created_at: row.get(16)?,
         updated_at: row.get(17)?,
     }))
+}
+
+fn pull_request_activity_from_row(row: &rusqlite::Row<'_>) -> RowResult<PullRequestActivity> {
+    let kind: String = row.get(2)?;
+    Ok((|| {
+        Ok(PullRequestActivity {
+            id: row.get(0)?,
+            watch_id: row.get(1)?,
+            metadata: PullRequestActivityMetadata {
+                kind: PullRequestActivityKind::parse(&kind)?,
+                provider_id: row.get(3)?,
+                author: row.get(4)?,
+                state: row.get(5)?,
+                url: row.get(6)?,
+                updated_at: row.get(7)?,
+            },
+            first_seen_at: row.get(8)?,
+            last_seen_at: row.get(9)?,
+        })
+    })())
 }
 
 const REVIEW_LIFECYCLE_SELECT: &str =
