@@ -3176,6 +3176,53 @@ impl BrokerStore {
         Ok(PullRequestWatchPollStorageResult { watch, batch })
     }
 
+    pub(crate) fn record_pull_request_watch_failure(
+        &mut self,
+        id: i64,
+        error_code: &str,
+        retry_at: i64,
+        now: i64,
+        attempted: bool,
+    ) -> Result<PullRequestWatch, BrokerError> {
+        let current = self
+            .pull_request_watch(id)?
+            .ok_or(BrokerError::InvalidEnumValue {
+                field: "pull_request_watch.id",
+                value: id.to_string(),
+            })?;
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "UPDATE pull_request_watches
+             SET last_polled_at = CASE WHEN ?5 THEN ?2 ELSE last_polled_at END,
+                 next_poll_at = ?3, last_error_code = ?4, updated_at = ?2
+             WHERE id = ?1 AND status = 'active'",
+            params![id, now, retry_at, error_code, attempted],
+        )?;
+        let payload = serde_json::json!({
+            "watch_id": id,
+            "error_code": error_code,
+            "retry_at": retry_at,
+        })
+        .to_string();
+        insert_event(
+            &tx,
+            now,
+            if attempted {
+                "pr_watch.poll_failed"
+            } else {
+                "pr_watch.poll_deferred"
+            },
+            Some(current.session_id),
+            Some(&payload),
+        )?;
+        tx.commit()?;
+        self.pull_request_watch(id)?
+            .ok_or(BrokerError::InvalidEnumValue {
+                field: "pull_request_watch.id",
+                value: id.to_string(),
+            })
+    }
+
     pub fn pull_request_activity_batches(
         &self,
         watch_id: i64,

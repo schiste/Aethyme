@@ -284,12 +284,13 @@ Usage:
   aethyme broker watch pr start --session <id> --repo <owner/name> --pr <number> [--events <comments,reviews,checks>] [--seconds <15..3600>] [--json]
   aethyme broker watch pr list [--all] [--json]
   aethyme broker watch pr show|poll|pause|resume|stop --id <watch-id> [--json]
+  aethyme broker watch pr tick [--limit <1..100>] [--json]
   aethyme broker watch pr batches --id <watch-id> [--all] [--json]
   aethyme broker watch pr ack --id <batch-id> --outcome <addressed|stale|non-actionable|superseded> --reason <text> [--json]
       Persist a metadata-only PR watch and inspect it with one-shot polling.
       Aethyme records provider ids, authors, states, URLs and timestamps, but
-      never comment/review bodies. Scheduling and live-agent delivery are
-      separate adapter responsibilities.
+      never comment/review bodies. `tick` performs one bounded foreground
+      scheduling pass; the broker never starts a background poller.
   aethyme broker deliveries subscribe --watch <id> --adapter <name> --target <opaque-id> [--policy <notify|resume|review-and-push>] [--json]
   aethyme broker deliveries list [--adapter <name>] [--all] [--json]
   aethyme broker deliveries claim --adapter <name> --worker <id> [--seconds <15..900>] [--json]
@@ -1312,6 +1313,24 @@ mod tests {
         assert_eq!(parsed.pr_number, Some(42));
         assert_eq!(parsed.events.as_deref(), Some("comments,reviews"));
         assert_eq!(parsed.seconds, Some(90));
+    }
+
+    #[test]
+    fn parse_accepts_foreground_pr_scheduler_limit() {
+        let args = vec![
+            "pr".to_string(),
+            "tick".to_string(),
+            "--limit".to_string(),
+            "17".to_string(),
+            "--json".to_string(),
+        ];
+        let parsed = match super::parse(&args) {
+            Ok(parsed) => parsed,
+            Err(_) => panic!("scheduler tick flags should parse"),
+        };
+        assert_eq!(parsed.positional, vec!["pr", "tick"]);
+        assert_eq!(parsed.limit, Some(17));
+        assert!(parsed.json);
     }
 
     #[test]
@@ -3604,7 +3623,7 @@ fn parse_advisory_id(value: Option<&String>, usage: &str) -> Result<i64, UsageEr
 fn run_pull_request_watch(parsed: Parsed) -> Result<(), UsageError> {
     if parsed.positional.first().map(String::as_str) != Some("pr") {
         return Err(UsageError::Message(
-            "watch requires `pr` followed by start, list, show, poll, batches, ack, pause, resume, or stop"
+            "watch requires `pr` followed by start, list, show, poll, tick, batches, ack, pause, resume, or stop"
                 .into(),
         ));
     }
@@ -3614,7 +3633,7 @@ fn run_pull_request_watch(parsed: Parsed) -> Result<(), UsageError> {
         .map(String::as_str)
         .ok_or_else(|| {
             UsageError::Message(
-                "watch pr requires start, list, show, poll, batches, ack, pause, resume, or stop"
+                "watch pr requires start, list, show, poll, tick, batches, ack, pause, resume, or stop"
                     .into(),
             )
         })?;
@@ -3693,6 +3712,35 @@ fn run_pull_request_watch(parsed: Parsed) -> Result<(), UsageError> {
                 );
             }
         }
+        "tick" => {
+            let limit = parsed
+                .limit
+                .map(|limit| limit as usize)
+                .unwrap_or(crate::DEFAULT_PR_SCHEDULER_LIMIT);
+            let report = broker.tick_pull_request_watches(
+                &crate::GithubCliPullRequestWatchProvider,
+                now_ms(),
+                limit,
+            )?;
+            if parsed.json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!(
+                    "PR scheduler tick: {} due, {} polled, {} failed, {} deferred.",
+                    report.due_watch_count,
+                    report.successful_watch_count,
+                    report.failed_watch_count,
+                    report.deferred_watch_count,
+                );
+                if let Some(retry_at) = report.rate_limit_until {
+                    println!("Provider rate limit: retry no earlier than {retry_at}.");
+                }
+                match report.next_tick_at {
+                    Some(next) => println!("Next due tick: {next}."),
+                    None => println!("Next due tick: none."),
+                }
+            }
+        }
         "batches" => {
             let watch_id = parsed.note_id.ok_or_else(|| {
                 UsageError::Message("watch pr batches requires --id <watch-id>".into())
@@ -3763,7 +3811,7 @@ fn run_pull_request_watch(parsed: Parsed) -> Result<(), UsageError> {
         }
         other => {
             return Err(UsageError::Message(format!(
-                "unknown watch pr action {other:?} — expected start, list, show, poll, batches, ack, pause, resume, or stop"
+                "unknown watch pr action {other:?} — expected start, list, show, poll, tick, batches, ack, pause, resume, or stop"
             )));
         }
     }

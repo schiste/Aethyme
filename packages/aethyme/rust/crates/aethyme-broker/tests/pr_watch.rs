@@ -68,6 +68,21 @@ impl PullRequestWatchProvider for FakeProvider {
     }
 }
 
+struct ResultProvider(Mutex<VecDeque<Result<PullRequestSnapshot, PullRequestWatchError>>>);
+
+impl PullRequestWatchProvider for ResultProvider {
+    fn inspect(
+        &self,
+        _request: &PullRequestWatchRequest,
+    ) -> Result<PullRequestSnapshot, PullRequestWatchError> {
+        self.0
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or_else(|| Err(PullRequestWatchError::Provider("fixture exhausted".into())))
+    }
+}
+
 fn snapshot(state: &str, sha: char, activity: &[&str]) -> PullRequestSnapshot {
     PullRequestSnapshot {
         number: 7,
@@ -273,4 +288,115 @@ fn duplicate_live_watch_is_refused_for_case_equivalent_repository() {
         error,
         BrokerOpError::Store(aethyme_broker::BrokerError::PullRequestWatchIdentityConflict { .. })
     ));
+}
+
+#[test]
+fn scheduler_tick_shares_rate_limit_backoff_without_busy_polling() {
+    let (_root, mut broker, session_id) = broker_fixture();
+    let provider = ResultProvider(Mutex::new(VecDeque::from([
+        Ok(snapshot("open", 'a', &[])),
+        Ok(snapshot("open", 'b', &[])),
+        Ok(snapshot("open", 'c', &[])),
+        Err(PullRequestWatchError::Provider(
+            "API rate limit exceeded for this account".into(),
+        )),
+        Ok(snapshot("open", 'd', &["must-not-be-polled"])),
+    ])));
+    for repository in ["Owner/Alpha", "Owner/Beta", "Owner/Gamma"] {
+        broker
+            .start_pull_request_watch(
+                session_id,
+                repository,
+                7,
+                vec![PullRequestActivityKind::Comment],
+                15,
+                &provider,
+                1_000,
+            )
+            .unwrap();
+    }
+
+    let report = broker
+        .tick_pull_request_watches(&provider, 16_000, 10)
+        .unwrap();
+    assert_eq!(report.schema_version, 1);
+    assert_eq!(report.due_watch_count, 3);
+    assert_eq!(report.attempted_watch_count, 1);
+    assert_eq!(report.failed_watch_count, 1);
+    assert_eq!(report.deferred_watch_count, 2);
+    assert_eq!(report.rate_limit_until, Some(916_000));
+    assert_eq!(report.next_tick_at, Some(916_000));
+    assert_eq!(
+        report.results[0].error_code.as_deref(),
+        Some("rate_limited")
+    );
+    assert_eq!(
+        report.results[1].error_code.as_deref(),
+        Some("rate_limited_shared")
+    );
+    assert!(!report.results[1].attempted);
+    assert_eq!(
+        broker
+            .tick_pull_request_watches(&provider, 16_001, 10)
+            .unwrap()
+            .due_watch_count,
+        0
+    );
+    let deferred = broker
+        .pull_request_watch(report.results[1].watch_id)
+        .unwrap();
+    assert_eq!(deferred.last_polled_at, None);
+
+    // Only the first tick provider call was consumed; deferred watches did
+    // not contact GitHub after shared rate-limit evidence was observed.
+    assert_eq!(provider.0.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn scheduler_tick_is_bounded_deterministic_and_persists_safe_error_codes() {
+    let (_root, mut broker, session_id) = broker_fixture();
+    let provider = ResultProvider(Mutex::new(VecDeque::from([
+        Ok(snapshot("open", 'a', &[])),
+        Ok(snapshot("open", 'b', &[])),
+        Err(PullRequestWatchError::Provider(
+            "authentication token is invalid: secret detail".into(),
+        )),
+    ])));
+    for repository in ["Owner/Zulu", "Owner/Alpha"] {
+        broker
+            .start_pull_request_watch(
+                session_id,
+                repository,
+                7,
+                vec![PullRequestActivityKind::Review],
+                15,
+                &provider,
+                1_000,
+            )
+            .unwrap();
+    }
+
+    let report = broker
+        .tick_pull_request_watches(&provider, 16_000, 1)
+        .unwrap();
+    assert_eq!(report.due_watch_count, 2);
+    assert_eq!(report.results.len(), 1);
+    assert_eq!(
+        report.results[0].canonical_repository,
+        "github.com/owner/alpha"
+    );
+    assert_eq!(
+        report.results[0].error_code.as_deref(),
+        Some("authentication_failed")
+    );
+    assert_eq!(report.results[0].retry_at, Some(316_000));
+    assert_eq!(report.next_tick_at, Some(16_000));
+
+    let encoded = serde_json::to_string(&report).unwrap();
+    assert!(!encoded.contains("secret detail"));
+    assert!(
+        broker
+            .tick_pull_request_watches(&provider, 16_000, 0)
+            .is_err()
+    );
 }

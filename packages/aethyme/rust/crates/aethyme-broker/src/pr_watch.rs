@@ -11,7 +11,10 @@ use sha2::{Digest, Sha256};
 use crate::{Broker, BrokerOpError, resolve_github_target};
 
 pub const PULL_REQUEST_WATCH_SCHEMA_VERSION: u32 = 1;
+pub const PULL_REQUEST_SCHEDULER_SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_PR_WATCH_INTERVAL_SECONDS: u64 = 60;
+pub const DEFAULT_PR_SCHEDULER_LIMIT: usize = 32;
+pub const MAX_PR_SCHEDULER_LIMIT: usize = 100;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
@@ -255,7 +258,7 @@ pub struct PullRequestWatch {
     pub updated_at: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PullRequestWatchPollReport {
     pub watch: PullRequestWatch,
     pub changed: bool,
@@ -265,6 +268,47 @@ pub struct PullRequestWatchPollReport {
     pub previous_cursor_digest: String,
     pub observed_cursor_digest: String,
     pub pr_url: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PullRequestSchedulerDisposition {
+    Polled,
+    Failed,
+    DeferredByRateLimit,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PullRequestSchedulerWatchResult {
+    pub watch_id: i64,
+    pub canonical_repository: String,
+    pub pr_number: i64,
+    pub due_at: i64,
+    pub attempted: bool,
+    pub disposition: PullRequestSchedulerDisposition,
+    pub error_code: Option<String>,
+    pub retry_at: Option<i64>,
+    pub poll: Option<PullRequestWatchPollReport>,
+}
+
+/// Stable, adapter-neutral result of one explicit foreground scheduling tick.
+///
+/// A host scheduler decides when to invoke a tick. The broker performs no
+/// background network activity and returns enough state for launchd, systemd,
+/// Chau7, or another supervisor to schedule the next invocation safely.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PullRequestSchedulerTickReport {
+    pub schema_version: u32,
+    pub tick_at: i64,
+    pub limit: usize,
+    pub due_watch_count: usize,
+    pub attempted_watch_count: usize,
+    pub successful_watch_count: usize,
+    pub failed_watch_count: usize,
+    pub deferred_watch_count: usize,
+    pub rate_limit_until: Option<i64>,
+    pub next_tick_at: Option<i64>,
+    pub results: Vec<PullRequestSchedulerWatchResult>,
 }
 
 pub(crate) struct PullRequestWatchPollStorageResult {
@@ -552,6 +596,150 @@ impl Broker {
         })
     }
 
+    /// Polls a bounded, deterministic prefix of watches which are due now.
+    ///
+    /// Provider failures are converted into persisted, bounded retry state so
+    /// an external scheduler never needs to parse stderr or invent backoff.
+    /// A rate-limit response defers the remainder of this tick without making
+    /// additional provider calls.
+    pub fn tick_pull_request_watches(
+        &mut self,
+        provider: &dyn PullRequestWatchProvider,
+        now_ms: i64,
+        limit: usize,
+    ) -> Result<PullRequestSchedulerTickReport, BrokerOpError> {
+        if !(1..=MAX_PR_SCHEDULER_LIMIT).contains(&limit) {
+            return Err(PullRequestWatchError::Invalid(format!(
+                "scheduler limit must be between 1 and {MAX_PR_SCHEDULER_LIMIT}"
+            ))
+            .into());
+        }
+
+        let mut due = self
+            .pull_request_watches(false)?
+            .into_iter()
+            .filter(|watch| {
+                watch.status == PullRequestWatchStatus::Active
+                    && watch.next_poll_at.is_some_and(|due_at| due_at <= now_ms)
+            })
+            .collect::<Vec<_>>();
+        due.sort_by(|left, right| {
+            (
+                left.next_poll_at,
+                &left.canonical_repository,
+                left.pr_number,
+                left.id,
+            )
+                .cmp(&(
+                    right.next_poll_at,
+                    &right.canonical_repository,
+                    right.pr_number,
+                    right.id,
+                ))
+        });
+        let due_watch_count = due.len();
+        let mut results = Vec::new();
+        let mut rate_limit_until = None;
+
+        for watch in due.into_iter().take(limit) {
+            let due_at = watch.next_poll_at.unwrap_or(now_ms);
+            if let Some(retry_at) = rate_limit_until {
+                let updated = self.store().record_pull_request_watch_failure(
+                    watch.id,
+                    "rate_limited_shared",
+                    retry_at,
+                    now_ms,
+                    false,
+                )?;
+                results.push(PullRequestSchedulerWatchResult {
+                    watch_id: watch.id,
+                    canonical_repository: watch.canonical_repository,
+                    pr_number: watch.pr_number,
+                    due_at,
+                    attempted: false,
+                    disposition: PullRequestSchedulerDisposition::DeferredByRateLimit,
+                    error_code: updated.last_error_code,
+                    retry_at: updated.next_poll_at,
+                    poll: None,
+                });
+                continue;
+            }
+
+            match self.poll_pull_request_watch(watch.id, provider, now_ms) {
+                Ok(poll) => results.push(PullRequestSchedulerWatchResult {
+                    watch_id: watch.id,
+                    canonical_repository: watch.canonical_repository,
+                    pr_number: watch.pr_number,
+                    due_at,
+                    attempted: true,
+                    disposition: PullRequestSchedulerDisposition::Polled,
+                    error_code: None,
+                    retry_at: poll.watch.next_poll_at,
+                    poll: Some(poll),
+                }),
+                Err(BrokerOpError::PullRequestWatch(error)) => {
+                    let (error_code, is_rate_limit, retry_at) =
+                        scheduler_failure(&error, &watch, now_ms);
+                    let current = self.pull_request_watch(watch.id)?;
+                    let retry_at = if current.status == PullRequestWatchStatus::Active {
+                        let updated = self.store().record_pull_request_watch_failure(
+                            watch.id, error_code, retry_at, now_ms, true,
+                        )?;
+                        updated.next_poll_at
+                    } else {
+                        current.next_poll_at
+                    };
+                    if is_rate_limit {
+                        rate_limit_until = retry_at;
+                    }
+                    results.push(PullRequestSchedulerWatchResult {
+                        watch_id: watch.id,
+                        canonical_repository: watch.canonical_repository,
+                        pr_number: watch.pr_number,
+                        due_at,
+                        attempted: true,
+                        disposition: PullRequestSchedulerDisposition::Failed,
+                        error_code: Some(error_code.into()),
+                        retry_at,
+                        poll: None,
+                    });
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        let next_tick_at = self
+            .pull_request_watches(false)?
+            .into_iter()
+            .filter(|watch| watch.status == PullRequestWatchStatus::Active)
+            .filter_map(|watch| watch.next_poll_at)
+            .min();
+        Ok(PullRequestSchedulerTickReport {
+            schema_version: PULL_REQUEST_SCHEDULER_SCHEMA_VERSION,
+            tick_at: now_ms,
+            limit,
+            due_watch_count,
+            attempted_watch_count: results.iter().filter(|item| item.attempted).count(),
+            successful_watch_count: results
+                .iter()
+                .filter(|item| item.disposition == PullRequestSchedulerDisposition::Polled)
+                .count(),
+            failed_watch_count: results
+                .iter()
+                .filter(|item| item.disposition == PullRequestSchedulerDisposition::Failed)
+                .count(),
+            deferred_watch_count: results
+                .iter()
+                .filter(|item| {
+                    item.disposition == PullRequestSchedulerDisposition::DeferredByRateLimit
+                })
+                .count(),
+            rate_limit_until,
+            next_tick_at,
+            results,
+        })
+    }
+
     pub fn pull_request_activity_batches(
         &self,
         watch_id: i64,
@@ -606,6 +794,41 @@ impl Broker {
             .store()
             .update_pull_request_watch_status(id, status, now_ms, None)?)
     }
+}
+
+fn scheduler_failure(
+    error: &PullRequestWatchError,
+    watch: &PullRequestWatch,
+    now_ms: i64,
+) -> (&'static str, bool, i64) {
+    let base_seconds = watch.poll_interval_seconds.max(15);
+    let (code, rate_limited, retry_seconds) = match error {
+        PullRequestWatchError::Spawn(_) => ("provider_unavailable", false, base_seconds * 2),
+        PullRequestWatchError::Json(_) => ("invalid_provider_payload", false, 300),
+        PullRequestWatchError::Invalid(_) | PullRequestWatchError::NotFound(_) => {
+            ("watch_invalid", false, 300)
+        }
+        PullRequestWatchError::Provider(detail) => {
+            let detail = detail.to_ascii_lowercase();
+            if detail.contains("rate limit") || detail.contains("secondary rate") {
+                ("rate_limited", true, 900)
+            } else if detail.contains("auth")
+                || detail.contains("login")
+                || detail.contains("credential")
+                || detail.contains("http 401")
+                || detail.contains("http 403")
+            {
+                ("authentication_failed", false, 300)
+            } else {
+                ("provider_error", false, base_seconds * 2)
+            }
+        }
+    };
+    (
+        code,
+        rate_limited,
+        now_ms + retry_seconds.clamp(30, 900) as i64 * 1_000,
+    )
 }
 
 fn validate_watch_input(

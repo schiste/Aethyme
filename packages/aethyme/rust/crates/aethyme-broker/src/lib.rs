@@ -91,9 +91,9 @@ pub use broker::{
     WorktreeRootPlan, WorktreeRootSource,
 };
 pub use delivery::{
-    DEFAULT_DELIVERY_CLAIM_SECONDS, DELIVERY_OUTBOX_SCHEMA_VERSION, DeliveryClaimReport,
-    DeliveryCompletion, DeliveryEnvelope, DeliveryError, DeliveryOutboxItem, DeliveryPolicy,
-    DeliveryStatus, DeliverySubscription,
+    DEFAULT_DELIVERY_CLAIM_SECONDS, DELIVERY_ADAPTER_PROTOCOL_VERSION,
+    DELIVERY_OUTBOX_SCHEMA_VERSION, DeliveryClaimReport, DeliveryCompletion, DeliveryEnvelope,
+    DeliveryError, DeliveryOutboxItem, DeliveryPolicy, DeliveryStatus, DeliverySubscription,
 };
 pub use error::BrokerError;
 pub use exposures::{
@@ -164,12 +164,14 @@ pub use pr::{
     PrDispatchReport, PrDispatchStatus, PrError, PrMarker, PrSummary,
 };
 pub use pr_watch::{
-    DEFAULT_PR_WATCH_INTERVAL_SECONDS, GithubCliPullRequestWatchProvider, NewPullRequestWatch,
-    PULL_REQUEST_WATCH_SCHEMA_VERSION, PullRequestActivity, PullRequestActivityBatch,
-    PullRequestActivityKind, PullRequestActivityMetadata, PullRequestBatchAckOutcome,
-    PullRequestBatchStatus, PullRequestSnapshot, PullRequestWatch, PullRequestWatchError,
-    PullRequestWatchPollReport, PullRequestWatchProvider, PullRequestWatchRequest,
-    PullRequestWatchStatus,
+    DEFAULT_PR_SCHEDULER_LIMIT, DEFAULT_PR_WATCH_INTERVAL_SECONDS,
+    GithubCliPullRequestWatchProvider, MAX_PR_SCHEDULER_LIMIT, NewPullRequestWatch,
+    PULL_REQUEST_SCHEDULER_SCHEMA_VERSION, PULL_REQUEST_WATCH_SCHEMA_VERSION, PullRequestActivity,
+    PullRequestActivityBatch, PullRequestActivityKind, PullRequestActivityMetadata,
+    PullRequestBatchAckOutcome, PullRequestBatchStatus, PullRequestSchedulerDisposition,
+    PullRequestSchedulerTickReport, PullRequestSchedulerWatchResult, PullRequestSnapshot,
+    PullRequestWatch, PullRequestWatchError, PullRequestWatchPollReport, PullRequestWatchProvider,
+    PullRequestWatchRequest, PullRequestWatchStatus,
 };
 pub use preparation::{
     PREPARATION_CONFIG_RELPATH, PREPARATION_SCHEMA_VERSION, PreparationCachePolicy,

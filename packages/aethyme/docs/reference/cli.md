@@ -1230,6 +1230,50 @@ Session repair is bounded by the baseline recorded at `start` or `adopt`.
 Repair refuses when integration does not contain that baseline; reconcile the
 upstream first instead of replaying upstream commits as session work.
 
+### Durable PR Watches and Delivery Adapters
+
+For continuing review after an agent has opened an open or draft PR, create a
+metadata-only watch and subscribe a delivery adapter:
+
+```bash
+aethyme broker watch pr start --session 111 --repo owner/name --pr 42 \
+  --events comments,reviews,checks --seconds 60 --json
+aethyme broker deliveries subscribe --watch 7 \
+  --adapter my-adapter --target opaque-target --policy notify --json
+```
+
+Run one bounded foreground scheduling pass with:
+
+```bash
+aethyme broker watch pr tick --limit 32 --json
+```
+
+`tick` contacts only due active watches and exits. The schema-versioned report
+contains deterministic per-watch outcomes, retry times, shared rate-limit
+evidence, and the next due time. Authentication failures, invalid responses,
+ordinary provider errors, and rate limits receive bounded persisted backoff;
+after rate-limit evidence, the remainder of the tick is deferred without more
+provider calls. A host scheduler may add jitter, but must not run a watch before
+its reported retry time. Aethyme never starts a background poller.
+
+Adapters consume the provider-neutral, schema-versioned outbox with:
+
+```bash
+aethyme broker deliveries claim --adapter my-adapter \
+  --worker host-worker-1 --seconds 120 --json
+aethyme broker deliveries complete --id 19 \
+  --worker host-worker-1 --generation 3 --outcome delivered
+aethyme broker watch pr ack --id 12 --outcome addressed \
+  --reason "classified and durably delivered"
+```
+
+The exact worker and generation fence completion. Expired claims can be
+reclaimed with a new generation; stale workers are refused. Targets are opaque,
+prompts contain allowlisted metadata rather than comment bodies, and retrieved
+provider text is untrusted. `review-and-push` never grants publication authority
+by itself. See [PR Review Scheduling and Delivery](../guides/pr-review-delivery.md)
+for scheduler setup, adapter duties, failure recovery, and removal.
+
 ### PR Follow-Up
 
 `aethyme broker pr check` is the first production-PR routing surface. It is
