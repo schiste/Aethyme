@@ -2,7 +2,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use aethyme_broker::{
-    Broker, EntryExposureResolutionKind, EntryExposureState, IntegrationReconcileClassification,
+    AutomaticIntegrationCleanupState, Broker, EntryExposureResolutionKind, EntryExposureState,
+    IntegrationDriftEntryState, IntegrationReconcileClassification,
     IntegrationReconcileCommitOrigin, IntegrationReconcileEquivalence, IntegrationReconcileOptions,
     MergeStatus,
 };
@@ -220,6 +221,24 @@ fn patch_equivalent_promotion_is_landed_when_local_main_already_equals_upstream(
     git(&repo, &["merge", "--ff-only", "origin/main"]);
     assert_eq!(git(&repo, &["rev-parse", "HEAD"]), upstream_head);
 
+    let assessment = broker
+        .assess_integration_drift("origin/main", &upstream_head, &promoted_commit)
+        .unwrap();
+    assert!(assessment.stale_only, "{assessment:#?}");
+    assert!(assessment.automatic_cleanup_safe, "{assessment:#?}");
+    assert_eq!(assessment.landed_entry_count, 1);
+    assert_eq!(assessment.ambiguous_entry_count, 0);
+    assert_eq!(assessment.unresolved_entry_count, 0);
+    assert!(assessment.unrecorded_commits.is_empty());
+    assert_eq!(
+        assessment.entries[0].state,
+        IntegrationDriftEntryState::AlreadyLanded
+    );
+    assert_eq!(
+        assessment.entries[0].upstream_landing.as_deref(),
+        Some(equivalent_upstream.as_str())
+    );
+
     let dry_run = broker
         .reconcile_integration(IntegrationReconcileOptions {
             upstream: "origin/main".into(),
@@ -246,14 +265,10 @@ fn patch_equivalent_promotion_is_landed_when_local_main_already_equals_upstream(
     assert_eq!(dry_run.new_integration, upstream_head);
 
     let applied = broker
-        .reconcile_integration(IntegrationReconcileOptions {
-            upstream: "origin/main".into(),
-            apply: true,
-            resolution_file: None,
-            confirm: dry_run.plan_digest,
-        })
+        .auto_cleanup_landed_integration("origin/main")
         .unwrap();
-    assert!(applied.applied);
+    assert_eq!(applied.state, AutomaticIntegrationCleanupState::Cleaned);
+    assert_eq!(applied.cleaned_queue_entry_ids, vec![promoted.entry.id]);
     assert_eq!(
         git(&repo, &["rev-parse", "aethyme/integration"]),
         upstream_head
@@ -276,6 +291,29 @@ fn patch_equivalent_promotion_is_landed_when_local_main_already_equals_upstream(
 fn reconciliation_plan_classifies_every_relevant_commit_with_full_provenance() {
     let fixture = DeployDivergenceFixture::new();
     let mut broker = Broker::open(&fixture.repo).unwrap();
+    let assessment = broker
+        .assess_integration_drift(
+            "origin/main",
+            &fixture.upstream_head,
+            &fixture.old_integration,
+        )
+        .unwrap();
+    assert!(!assessment.stale_only);
+    assert!(!assessment.automatic_cleanup_safe);
+    assert_eq!(
+        assessment.unrecorded_commits,
+        vec![fixture.unrecorded_commit.clone()]
+    );
+    assert_eq!(assessment.landed_entry_count, 1);
+
+    let cleanup = broker
+        .auto_cleanup_landed_integration("origin/main")
+        .unwrap();
+    assert_eq!(cleanup.state, AutomaticIntegrationCleanupState::Deferred);
+    assert_eq!(cleanup.old_integration, fixture.old_integration);
+    assert_eq!(cleanup.new_integration, fixture.old_integration);
+    assert!(cleanup.next_action.unwrap().contains("--dry-run"));
+
     let report = broker
         .reconcile_integration(IntegrationReconcileOptions {
             upstream: "origin/main".into(),

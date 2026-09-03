@@ -174,7 +174,9 @@ Usage:
   aethyme broker gh --session <id> --repo <owner/name> [--scope <scope>] [--effect <read|write|destructive>] [--reason <text>] [--destructive] [--json] -- <gh-args>
       Run GitHub CLI through the same repository coordinator. The broker sets
       GH_REPO from the exact target and never persists command output or
-      secret-bearing argument values.
+      secret-bearing argument values. After a successful `gh pr merge`, it
+      refreshes the tracked target and removes a fully landed integration
+      layer; mixed or uncertain work remains unchanged with recovery guidance.
   aethyme broker operations list [--limit <n>] [--before <id>] [--session <id>] [--status <status>] [--repo <canonical-id>] [--provider <git|github>] [--json]
       List a filtered newest-first page of the durable operation journal.
       `operations` without `list` is a compatibility alias during deprecation.
@@ -3007,6 +3009,17 @@ fn render_integration_status(
         }
     }
 
+    if let Some(reconciliation) = &report.reconciliation {
+        println!(
+            "Reconciliation evidence: {} landed, {} ambiguous, {} unresolved, {} unrecorded",
+            reconciliation.landed_entry_count,
+            reconciliation.ambiguous_entry_count,
+            reconciliation.unresolved_entry_count,
+            reconciliation.unrecorded_commits.len()
+        );
+        println!("  {}", reconciliation.explanation);
+    }
+
     println!("Delivery state: {}", report.next_action.state.as_str());
     println!("Next action: {}", report.next_action.summary);
     for command in &report.next_action.commands {
@@ -3921,6 +3934,19 @@ fn render_coordinated_operation(
             report.operation.repository,
             report.classification,
         );
+        if let Some(cleanup) = &report.post_merge_cleanup {
+            println!(
+                "post-merge integration cleanup: {} — {}",
+                cleanup.state.as_str(),
+                cleanup.explanation
+            );
+            if let Some(operation_id) = cleanup.fetch_operation_id {
+                println!("  upstream refresh operation: {operation_id}");
+            }
+            if let Some(command) = &cleanup.next_action {
+                println!("  next: {command}");
+            }
+        }
     }
     Ok(())
 }

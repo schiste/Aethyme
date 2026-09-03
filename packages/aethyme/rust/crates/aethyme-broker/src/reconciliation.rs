@@ -271,12 +271,82 @@ pub struct IntegrationReconcileReport {
     pub next_action: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IntegrationDriftEntryState {
+    AlreadyLanded,
+    SupersededUpstream,
+    Ambiguous,
+    Unresolved,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct IntegrationDriftEntry {
+    pub queue_entry_id: i64,
+    pub session_id: i64,
+    pub promotion_commit: String,
+    pub state: IntegrationDriftEntryState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream_landing: Option<String>,
+    pub evidence: String,
+}
+
+/// Read-only explanation of a fetched-upstream/integration divergence.
+///
+/// This intentionally stops before replay simulation. It can prove that a
+/// complete recorded layer is stale, but it never guesses that unmatched
+/// work is safe to discard or labels it conflict-free.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct IntegrationDriftAssessment {
+    pub upstream_ref: String,
+    pub upstream_head: String,
+    pub integration_head: String,
+    pub entries: Vec<IntegrationDriftEntry>,
+    pub unrecorded_commits: Vec<String>,
+    pub chain_complete: bool,
+    pub landed_entry_count: usize,
+    pub ambiguous_entry_count: usize,
+    pub unresolved_entry_count: usize,
+    pub stale_only: bool,
+    pub automatic_cleanup_safe: bool,
+    pub explanation: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutomaticIntegrationCleanupState {
+    NotNeeded,
+    Cleaned,
+    Deferred,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct AutomaticIntegrationCleanupReport {
+    pub state: AutomaticIntegrationCleanupState,
+    pub upstream_ref: String,
+    pub upstream_head: String,
+    pub old_integration: String,
+    pub new_integration: String,
+    pub cleaned_queue_entry_ids: Vec<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assessment: Option<IntegrationDriftAssessment>,
+    pub explanation: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_action: Option<String>,
+}
+
 #[derive(Clone)]
 struct Candidate {
     entry: MergeQueueEntry,
     merge_commit: String,
     old_parent: String,
     files: Vec<String>,
+}
+
+struct CandidateLayer {
+    candidates: Vec<Candidate>,
+    integration_layer: Vec<String>,
+    described_chain_is_complete: bool,
 }
 
 struct LoadedOperatorResolutions {
@@ -311,6 +381,254 @@ impl Broker {
             actual,
             old: prepared.old_integration,
             new: prepared.new_integration,
+        })
+    }
+
+    /// Classify only conclusive landing evidence without changing refs,
+    /// queue rows, worktrees, or remote state.
+    pub fn assess_integration_drift(
+        &self,
+        upstream_ref: &str,
+        upstream_head: &str,
+        integration_head: &str,
+    ) -> Result<IntegrationDriftAssessment, BrokerOpError> {
+        let queue = self.store_ref().merge_queue()?;
+        let plan =
+            build_reconciliation_plan(self.repo_handle(), &queue, upstream_head, integration_head)?;
+        let CandidateLayer {
+            candidates,
+            described_chain_is_complete,
+            ..
+        } = build_candidate_layer(self.repo_handle(), &queue, &plan, integration_head)?;
+        let classified =
+            classify_automatic_entries(self.repo_handle(), &plan, &candidates, upstream_head)?;
+
+        let entries: Vec<IntegrationDriftEntry> = candidates
+            .iter()
+            .zip(classified)
+            .map(|(candidate, classification)| {
+                let (state, upstream_landing, evidence) = match classification {
+                    Some(entry) => {
+                        let state = match entry.classification {
+                            IntegrationReconcileClassification::AlreadyLanded => {
+                                IntegrationDriftEntryState::AlreadyLanded
+                            }
+                            IntegrationReconcileClassification::SupersededUpstream => {
+                                IntegrationDriftEntryState::SupersededUpstream
+                            }
+                            IntegrationReconcileClassification::Ambiguous => {
+                                IntegrationDriftEntryState::Ambiguous
+                            }
+                            IntegrationReconcileClassification::StillPending
+                            | IntegrationReconcileClassification::GenuinelyConflicting => {
+                                IntegrationDriftEntryState::Unresolved
+                            }
+                        };
+                        (state, entry.upstream_landing, entry.evidence)
+                    }
+                    None => (
+                        IntegrationDriftEntryState::Unresolved,
+                        None,
+                        "no conclusive upstream landing evidence; reviewed reconciliation is required"
+                            .into(),
+                    ),
+                };
+                IntegrationDriftEntry {
+                    queue_entry_id: candidate.entry.id,
+                    session_id: candidate.entry.session_id,
+                    promotion_commit: candidate.merge_commit.clone(),
+                    state,
+                    upstream_landing,
+                    evidence,
+                }
+            })
+            .collect();
+        let unrecorded_commits: Vec<String> = plan
+            .commits
+            .iter()
+            .filter(|commit| {
+                commit.origin == IntegrationReconcileCommitOrigin::UnrecordedIntegrationCommit
+            })
+            .map(|commit| commit.commit.clone())
+            .collect();
+        let landed_entry_count = entries
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry.state,
+                    IntegrationDriftEntryState::AlreadyLanded
+                        | IntegrationDriftEntryState::SupersededUpstream
+                )
+            })
+            .count();
+        let ambiguous_entry_count = entries
+            .iter()
+            .filter(|entry| entry.state == IntegrationDriftEntryState::Ambiguous)
+            .count();
+        let unresolved_entry_count = entries
+            .iter()
+            .filter(|entry| entry.state == IntegrationDriftEntryState::Unresolved)
+            .count();
+        let stale_only = described_chain_is_complete
+            && !entries.is_empty()
+            && unrecorded_commits.is_empty()
+            && landed_entry_count == entries.len();
+        let local_main = self.repo_handle().head_commit()?;
+        let automatic_cleanup_safe =
+            stale_only && self.repo_handle().is_ancestor(&local_main, upstream_head);
+        let explanation = if stale_only {
+            if automatic_cleanup_safe {
+                format!(
+                    "all {landed_entry_count} promoted entries have conclusive upstream landing evidence; the recorded integration layer is stale and can be cleaned automatically"
+                )
+            } else {
+                "all promoted entries appear landed, but local main is not an ancestor of upstream; automatic cleanup is refused"
+                    .into()
+            }
+        } else if !described_chain_is_complete || !unrecorded_commits.is_empty() {
+            "integration contains work outside the complete recorded promoted layer; explicit reviewed reconciliation is required"
+                .into()
+        } else {
+            "some promoted entries lack conclusive upstream landing evidence; explicit reviewed reconciliation is required"
+                .into()
+        };
+
+        Ok(IntegrationDriftAssessment {
+            upstream_ref: upstream_ref.to_string(),
+            upstream_head: upstream_head.to_string(),
+            integration_head: integration_head.to_string(),
+            entries,
+            unrecorded_commits,
+            chain_complete: described_chain_is_complete,
+            landed_entry_count,
+            ambiguous_entry_count,
+            unresolved_entry_count,
+            stale_only,
+            automatic_cleanup_safe,
+            explanation,
+        })
+    }
+
+    /// Clean only a complete integration layer whose every recorded
+    /// promotion is already proven upstream by automatic evidence.
+    ///
+    /// Mixed, ambiguous, unrecorded, or locally divergent histories remain
+    /// on the normal digest-confirmed reconciliation path.
+    pub fn auto_cleanup_landed_integration(
+        &mut self,
+        upstream_ref: &str,
+    ) -> Result<AutomaticIntegrationCleanupReport, BrokerOpError> {
+        self.recover_prepared_reconciliation()?;
+        let upstream_head = self
+            .repo_handle()
+            .resolve_ref(upstream_ref)
+            .ok_or_else(|| BrokerOpError::UpstreamRefNotFound {
+                upstream: upstream_ref.to_string(),
+            })?;
+        let (_, old_integration) = self.integration_head()?;
+        if self
+            .repo_handle()
+            .is_ancestor(&upstream_head, &old_integration)
+        {
+            return Ok(AutomaticIntegrationCleanupReport {
+                state: AutomaticIntegrationCleanupState::NotNeeded,
+                upstream_ref: upstream_ref.to_string(),
+                upstream_head,
+                old_integration: old_integration.clone(),
+                new_integration: old_integration,
+                cleaned_queue_entry_ids: Vec::new(),
+                assessment: None,
+                explanation: "integration already contains the fetched upstream".into(),
+                next_action: None,
+            });
+        }
+
+        let assessment =
+            self.assess_integration_drift(upstream_ref, &upstream_head, &old_integration)?;
+        let manual_command =
+            format!("aethyme broker integration reconcile --upstream {upstream_ref} --dry-run");
+        if !assessment.automatic_cleanup_safe {
+            return Ok(AutomaticIntegrationCleanupReport {
+                state: AutomaticIntegrationCleanupState::Deferred,
+                upstream_ref: upstream_ref.to_string(),
+                upstream_head,
+                old_integration: old_integration.clone(),
+                new_integration: old_integration,
+                cleaned_queue_entry_ids: Vec::new(),
+                explanation: assessment.explanation.clone(),
+                assessment: Some(assessment),
+                next_action: Some(manual_command),
+            });
+        }
+
+        let dry_run = self.reconcile_integration(IntegrationReconcileOptions {
+            upstream: upstream_ref.to_string(),
+            apply: false,
+            resolution_file: None,
+            confirm: None,
+        })?;
+        let conclusively_landed = dry_run.safe
+            && dry_run.new_integration == upstream_head
+            && !dry_run.entries.is_empty()
+            && dry_run.entries.iter().all(|entry| {
+                matches!(
+                    entry.classification,
+                    IntegrationReconcileClassification::AlreadyLanded
+                        | IntegrationReconcileClassification::SupersededUpstream
+                )
+            });
+        if !conclusively_landed {
+            return Ok(AutomaticIntegrationCleanupReport {
+                state: AutomaticIntegrationCleanupState::Deferred,
+                upstream_ref: upstream_ref.to_string(),
+                upstream_head,
+                old_integration: old_integration.clone(),
+                new_integration: old_integration,
+                cleaned_queue_entry_ids: Vec::new(),
+                assessment: Some(assessment),
+                explanation: "the full reconciliation plan found work that is not a conclusive upstream landing; automatic cleanup was refused"
+                    .into(),
+                next_action: Some(manual_command),
+            });
+        }
+
+        let cleaned_queue_entry_ids = dry_run
+            .entries
+            .iter()
+            .map(|entry| entry.queue_entry_id)
+            .collect();
+        let applied = self.reconcile_integration(IntegrationReconcileOptions {
+            upstream: upstream_ref.to_string(),
+            apply: true,
+            resolution_file: None,
+            confirm: dry_run.plan_digest,
+        })?;
+        if !applied.applied {
+            return Ok(AutomaticIntegrationCleanupReport {
+                state: AutomaticIntegrationCleanupState::Deferred,
+                upstream_ref: upstream_ref.to_string(),
+                upstream_head,
+                old_integration,
+                new_integration: applied.new_integration,
+                cleaned_queue_entry_ids: Vec::new(),
+                assessment: Some(assessment),
+                explanation:
+                    "reconciliation state changed before the confirmed cleanup could apply".into(),
+                next_action: Some(manual_command),
+            });
+        }
+
+        Ok(AutomaticIntegrationCleanupReport {
+            state: AutomaticIntegrationCleanupState::Cleaned,
+            upstream_ref: upstream_ref.to_string(),
+            upstream_head,
+            old_integration,
+            new_integration: applied.new_integration,
+            cleaned_queue_entry_ids,
+            assessment: Some(assessment),
+            explanation: "all recorded integration promotions were proven upstream and cleaned transactionally"
+                .into(),
+            next_action: None,
         })
     }
 
@@ -397,33 +715,6 @@ impl Broker {
             ));
         }
 
-        let mut candidates = Vec::new();
-        for entry in queue
-            .iter()
-            .cloned()
-            .filter(|entry| entry.status == MergeStatus::Promoted)
-        {
-            let Some(merge_commit) = promoted_commit(&entry) else {
-                continue;
-            };
-            if !self
-                .repo_handle()
-                .is_ancestor(&merge_commit, &old_integration)
-            {
-                continue;
-            }
-            let old_parent = self.repo_handle().first_parent(&merge_commit)?;
-            let files = self
-                .repo_handle()
-                .changed_between(&old_parent, &merge_commit)?;
-            candidates.push(Candidate {
-                entry,
-                merge_commit,
-                old_parent,
-                files,
-            });
-        }
-
         // Every commit in the local pending layer must be explained by the
         // promoted queue. Otherwise rebuilding from only known entries could
         // silently discard an operator-created or partially recorded commit.
@@ -432,36 +723,11 @@ impl Broker {
         // a fetch, and upstream commits below this boundary are not pending
         // integration work. Sort by first-parent position because queue IDs
         // can be re-promoted out of order after older conflicts are retried.
-        let integration_layer = self
-            .repo_handle()
-            .first_parent_commits_between_oldest(&report.plan.common_base, &old_integration)?;
-        let positions: BTreeMap<String, usize> = integration_layer
-            .iter()
-            .enumerate()
-            .map(|(index, commit)| (commit.clone(), index))
-            .collect();
-        let recorded: BTreeSet<&str> = candidates
-            .iter()
-            .map(|candidate| candidate.merge_commit.as_str())
-            .collect();
-        let described_unrecorded: BTreeSet<&str> = report
-            .plan
-            .commits
-            .iter()
-            .filter(|commit| {
-                commit.origin == IntegrationReconcileCommitOrigin::UnrecordedIntegrationCommit
-            })
-            .map(|commit| commit.commit.as_str())
-            .collect();
-        let described_chain_is_complete = integration_layer.iter().all(|commit| {
-            recorded.contains(commit.as_str()) || described_unrecorded.contains(commit.as_str())
-        });
-        candidates.sort_by_key(|candidate| {
-            positions
-                .get(&candidate.merge_commit)
-                .copied()
-                .unwrap_or(usize::MAX)
-        });
+        let CandidateLayer {
+            candidates,
+            integration_layer,
+            described_chain_is_complete,
+        } = build_candidate_layer(self.repo_handle(), &queue, &report.plan, &old_integration)?;
         if !described_chain_is_complete {
             report.safe = false;
             report.warnings.push(
@@ -478,132 +744,12 @@ impl Broker {
             validate_resolution_candidates(loaded, &candidates)?;
         }
 
-        let mut upstream_by_patch: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        for commit in report.plan.commits.iter().filter(|commit| {
-            commit.origin == IntegrationReconcileCommitOrigin::UpstreamOnlyExternalWork
-        }) {
-            if let Some(patch_id) = commit.patch_id.as_ref() {
-                upstream_by_patch
-                    .entry(patch_id.clone())
-                    .or_default()
-                    .push(commit.commit.clone());
-            }
-        }
-
-        let mut classified: Vec<Option<IntegrationReconcileEntry>> = vec![None; candidates.len()];
-
-        // Exact graph ancestry is conclusive and takes precedence over
-        // content matching.
-        for (index, candidate) in candidates.iter().enumerate() {
-            if self
-                .repo_handle()
-                .is_ancestor(&candidate.merge_commit, &upstream_head)
-            {
-                classified[index] = Some(entry_report(
-                    candidate,
-                    IntegrationReconcileClassification::AlreadyLanded,
-                    Some(candidate.merge_commit.clone()),
-                    None,
-                    Vec::new(),
-                    "promoted merge commit is reachable from upstream".into(),
-                ));
-            } else if self
-                .repo_handle()
-                .is_ancestor(&candidate.entry.head_commit, &upstream_head)
-            {
-                classified[index] = Some(entry_report(
-                    candidate,
-                    IntegrationReconcileClassification::AlreadyLanded,
-                    Some(candidate.entry.head_commit.clone()),
-                    None,
-                    Vec::new(),
-                    "submitted session head is reachable from upstream".into(),
-                ));
-            }
-        }
-
-        // Match largest contiguous groups first. This recognizes one
-        // upstream squash commit that contains several promoted entries.
-        for group_len in (1..=candidates.len()).rev() {
-            for start in 0..=candidates.len().saturating_sub(group_len) {
-                let end = start + group_len;
-                if classified[start..end].iter().any(Option::is_some) {
-                    continue;
-                }
-                if candidates[start..end]
-                    .windows(2)
-                    .any(|pair| pair[1].old_parent != pair[0].merge_commit)
-                {
-                    continue;
-                }
-                let Some(patch_id) = self.repo_handle().patch_id_between(
-                    &candidates[start].old_parent,
-                    &candidates[end - 1].merge_commit,
-                )?
-                else {
-                    continue;
-                };
-                let Some(matches) = upstream_by_patch.get(&patch_id) else {
-                    continue;
-                };
-                if matches.len() > 1 {
-                    for index in start..end {
-                        classified[index] = Some(entry_report(
-                            &candidates[index],
-                            IntegrationReconcileClassification::Ambiguous,
-                            None,
-                            None,
-                            Vec::new(),
-                            format!(
-                                "stable patch id matches multiple upstream commits: {}",
-                                matches.join(", ")
-                            ),
-                        ));
-                    }
-                    continue;
-                }
-                let landing = matches[0].clone();
-                for index in start..end {
-                    classified[index] = Some(entry_report(
-                        &candidates[index],
-                        IntegrationReconcileClassification::AlreadyLanded,
-                        Some(landing.clone()),
-                        None,
-                        Vec::new(),
-                        if group_len == 1 {
-                            "stable patch id matches upstream commit".into()
-                        } else {
-                            format!(
-                                "stable cumulative patch id matches one upstream squash for {group_len} promoted entries"
-                            )
-                        },
-                    ));
-                }
-            }
-        }
-
-        // Identical final content on every path touched by an unmatched
-        // promotion is sufficient to call it superseded, but empty deltas
-        // are ambiguous because they provide no content evidence.
-        for (index, candidate) in candidates.iter().enumerate() {
-            if classified[index].is_some() || candidate.files.is_empty() {
-                continue;
-            }
-            if self.repo_handle().paths_equal(
-                &candidate.merge_commit,
-                &upstream_head,
-                &candidate.files,
-            )? {
-                classified[index] = Some(entry_report(
-                    candidate,
-                    IntegrationReconcileClassification::SupersededUpstream,
-                    Some(upstream_head.clone()),
-                    None,
-                    Vec::new(),
-                    "upstream has identical content on every path changed by the promotion".into(),
-                ));
-            }
-        }
+        let mut classified = classify_automatic_entries(
+            self.repo_handle(),
+            &report.plan,
+            &candidates,
+            &upstream_head,
+        )?;
 
         // Explicit operator attestations are evaluated only after every
         // conclusive automatic matcher. They cannot replace machine-derived
@@ -923,6 +1069,196 @@ impl Broker {
             "integration and broker queue reconciled; submit new session work normally".into();
         Ok(report)
     }
+}
+
+fn build_candidate_layer(
+    repo: &crate::git::GitRepo,
+    queue: &[MergeQueueEntry],
+    plan: &IntegrationReconcilePlan,
+    old_integration: &str,
+) -> Result<CandidateLayer, BrokerOpError> {
+    let mut candidates = Vec::new();
+    for entry in queue
+        .iter()
+        .cloned()
+        .filter(|entry| entry.status == MergeStatus::Promoted)
+    {
+        let Some(merge_commit) = promoted_commit(&entry) else {
+            continue;
+        };
+        if !repo.is_ancestor(&merge_commit, old_integration) {
+            continue;
+        }
+        let old_parent = repo.first_parent(&merge_commit)?;
+        let files = repo.changed_between(&old_parent, &merge_commit)?;
+        candidates.push(Candidate {
+            entry,
+            merge_commit,
+            old_parent,
+            files,
+        });
+    }
+
+    let integration_layer =
+        repo.first_parent_commits_between_oldest(&plan.common_base, old_integration)?;
+    let positions: BTreeMap<String, usize> = integration_layer
+        .iter()
+        .enumerate()
+        .map(|(index, commit)| (commit.clone(), index))
+        .collect();
+    let recorded: BTreeSet<&str> = candidates
+        .iter()
+        .map(|candidate| candidate.merge_commit.as_str())
+        .collect();
+    let described_unrecorded: BTreeSet<&str> = plan
+        .commits
+        .iter()
+        .filter(|commit| {
+            commit.origin == IntegrationReconcileCommitOrigin::UnrecordedIntegrationCommit
+        })
+        .map(|commit| commit.commit.as_str())
+        .collect();
+    let described_chain_is_complete = integration_layer.iter().all(|commit| {
+        recorded.contains(commit.as_str()) || described_unrecorded.contains(commit.as_str())
+    });
+    candidates.sort_by_key(|candidate| {
+        positions
+            .get(&candidate.merge_commit)
+            .copied()
+            .unwrap_or(usize::MAX)
+    });
+
+    Ok(CandidateLayer {
+        candidates,
+        integration_layer,
+        described_chain_is_complete,
+    })
+}
+
+fn classify_automatic_entries(
+    repo: &crate::git::GitRepo,
+    plan: &IntegrationReconcilePlan,
+    candidates: &[Candidate],
+    upstream_head: &str,
+) -> Result<Vec<Option<IntegrationReconcileEntry>>, BrokerOpError> {
+    let mut upstream_by_patch: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for commit in plan.commits.iter().filter(|commit| {
+        commit.origin == IntegrationReconcileCommitOrigin::UpstreamOnlyExternalWork
+    }) {
+        if let Some(patch_id) = commit.patch_id.as_ref() {
+            upstream_by_patch
+                .entry(patch_id.clone())
+                .or_default()
+                .push(commit.commit.clone());
+        }
+    }
+
+    let mut classified: Vec<Option<IntegrationReconcileEntry>> = vec![None; candidates.len()];
+
+    // Exact graph ancestry is conclusive and takes precedence over
+    // content matching.
+    for (index, candidate) in candidates.iter().enumerate() {
+        if repo.is_ancestor(&candidate.merge_commit, upstream_head) {
+            classified[index] = Some(entry_report(
+                candidate,
+                IntegrationReconcileClassification::AlreadyLanded,
+                Some(candidate.merge_commit.clone()),
+                None,
+                Vec::new(),
+                "promoted merge commit is reachable from upstream".into(),
+            ));
+        } else if repo.is_ancestor(&candidate.entry.head_commit, upstream_head) {
+            classified[index] = Some(entry_report(
+                candidate,
+                IntegrationReconcileClassification::AlreadyLanded,
+                Some(candidate.entry.head_commit.clone()),
+                None,
+                Vec::new(),
+                "submitted session head is reachable from upstream".into(),
+            ));
+        }
+    }
+
+    // Match largest contiguous groups first. This recognizes one upstream
+    // squash commit that contains several promoted entries.
+    for group_len in (1..=candidates.len()).rev() {
+        for start in 0..=candidates.len().saturating_sub(group_len) {
+            let end = start + group_len;
+            if classified[start..end].iter().any(Option::is_some) {
+                continue;
+            }
+            if candidates[start..end]
+                .windows(2)
+                .any(|pair| pair[1].old_parent != pair[0].merge_commit)
+            {
+                continue;
+            }
+            let Some(patch_id) = repo.patch_id_between(
+                &candidates[start].old_parent,
+                &candidates[end - 1].merge_commit,
+            )?
+            else {
+                continue;
+            };
+            let Some(matches) = upstream_by_patch.get(&patch_id) else {
+                continue;
+            };
+            if matches.len() > 1 {
+                for index in start..end {
+                    classified[index] = Some(entry_report(
+                        &candidates[index],
+                        IntegrationReconcileClassification::Ambiguous,
+                        None,
+                        None,
+                        Vec::new(),
+                        format!(
+                            "stable patch id matches multiple upstream commits: {}",
+                            matches.join(", ")
+                        ),
+                    ));
+                }
+                continue;
+            }
+            let landing = matches[0].clone();
+            for index in start..end {
+                classified[index] = Some(entry_report(
+                    &candidates[index],
+                    IntegrationReconcileClassification::AlreadyLanded,
+                    Some(landing.clone()),
+                    None,
+                    Vec::new(),
+                    if group_len == 1 {
+                        "stable patch id matches upstream commit".into()
+                    } else {
+                        format!(
+                            "stable cumulative patch id matches one upstream squash for {group_len} promoted entries"
+                        )
+                    },
+                ));
+            }
+        }
+    }
+
+    // Identical final content on every path touched by an unmatched
+    // promotion is sufficient to call it superseded, but empty deltas are
+    // ambiguous because they provide no content evidence.
+    for (index, candidate) in candidates.iter().enumerate() {
+        if classified[index].is_some() || candidate.files.is_empty() {
+            continue;
+        }
+        if repo.paths_equal(&candidate.merge_commit, upstream_head, &candidate.files)? {
+            classified[index] = Some(entry_report(
+                candidate,
+                IntegrationReconcileClassification::SupersededUpstream,
+                Some(upstream_head.to_string()),
+                None,
+                Vec::new(),
+                "upstream has identical content on every path changed by the promotion".into(),
+            ));
+        }
+    }
+
+    Ok(classified)
 }
 
 fn build_reconciliation_plan(

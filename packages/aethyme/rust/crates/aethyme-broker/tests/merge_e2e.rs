@@ -3146,6 +3146,66 @@ fn status_warns_on_the_first_external_main_movement() {
 }
 
 #[test]
+fn status_distinguishes_stale_landed_promotions_from_unresolved_drift() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let worktree = agent_worktree(tmp.path(), "landed-promotion");
+    let session = broker.adopt(&worktree, Some("land through pr")).unwrap();
+    commit_edit(&worktree, "src/a.py", "a = 2\n");
+    let submitted = broker.submit(session.id).unwrap();
+    assert!(submitted.promoted);
+    let promotion = promoted_merge_commit(&submitted.entry);
+
+    sh(tmp.path(), &["switch", "-qc", "upstream-landing", "main"]);
+    std::fs::write(tmp.path().join("src/a.py"), "a = 2\n").unwrap();
+    sh(tmp.path(), &["add", "src/a.py"]);
+    sh(tmp.path(), &["commit", "-qm", "merge pull request"]);
+    let upstream = resolve(tmp.path(), "HEAD");
+    sh(
+        tmp.path(),
+        &["update-ref", "refs/remotes/origin/main", &upstream],
+    );
+    sh(tmp.path(), &["switch", "main"]);
+    sh(tmp.path(), &["config", "remote.origin.url", "."]);
+    sh(
+        tmp.path(),
+        &[
+            "config",
+            "remote.origin.fetch",
+            "+refs/heads/*:refs/remotes/origin/*",
+        ],
+    );
+    sh(tmp.path(), &["config", "branch.main.remote", "origin"]);
+    sh(
+        tmp.path(),
+        &["config", "branch.main.merge", "refs/heads/main"],
+    );
+
+    let status = broker.status(0).unwrap();
+    let assessment = status.integration_reconciliation.as_ref().unwrap();
+    assert_eq!(assessment.integration_head, promotion);
+    assert!(assessment.stale_only, "{assessment:#?}");
+    assert!(assessment.automatic_cleanup_safe, "{assessment:#?}");
+    assert!(status.advice.iter().any(|advice| {
+        advice.id == "integration.stale-promotions"
+            && advice.severity == StatusAdviceSeverity::Notice
+            && advice.summary.contains("can be cleaned automatically")
+    }));
+    assert!(!status.advice.iter().any(|advice| {
+        advice.id == "integration.upstream-main-ahead"
+            && advice.severity == StatusAdviceSeverity::Blocked
+    }));
+
+    let integration = broker.integration_status(0).unwrap();
+    assert_eq!(
+        integration.next_action.state,
+        IntegrationDeliveryState::ReconciliationReady
+    );
+    assert!(integration.reconciliation.unwrap().stale_only);
+}
+
+#[test]
 fn status_reports_both_local_and_upstream_only_counts_after_divergence() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());

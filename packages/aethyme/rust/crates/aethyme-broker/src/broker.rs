@@ -831,6 +831,10 @@ pub struct StatusView {
     pub main_ahead_upstream_commits: u64,
     /// Commits reachable from the fetched upstream but not local main.
     pub main_behind_upstream_commits: u64,
+    /// Conclusive, read-only classification when integration does not
+    /// contain the currently fetched upstream.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub integration_reconciliation: Option<crate::IntegrationDriftAssessment>,
     pub cleanup_retention: CleanupRetention,
 }
 
@@ -1151,6 +1155,8 @@ pub struct IntegrationStatusView {
     pub changed_files: Vec<String>,
     pub promoted_entries: Vec<PromotedIntegrationEntry>,
     pub conflicts: Vec<PromotedConflict>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reconciliation: Option<crate::IntegrationDriftAssessment>,
     pub next_action: IntegrationNextAction,
 }
 
@@ -1184,6 +1190,7 @@ pub enum IntegrationDeliveryState {
     Published,
     LocallySynchronized,
     Blocked,
+    ReconciliationReady,
     Untracked,
 }
 
@@ -1194,6 +1201,7 @@ impl IntegrationDeliveryState {
             Self::Published => "published",
             Self::LocallySynchronized => "locally_synchronized",
             Self::Blocked => "blocked",
+            Self::ReconciliationReady => "reconciliation_ready",
             Self::Untracked => "untracked",
         }
     }
@@ -4418,16 +4426,35 @@ impl Broker {
         let integration_contains_upstream = upstream_head
             .as_deref()
             .is_some_and(|upstream| self.repo.is_ancestor(upstream, &head));
+        let reconciliation = match (upstream_ref.as_deref(), upstream_head.as_deref()) {
+            (Some(upstream_ref), Some(upstream_head)) if !integration_contains_upstream => self
+                .assess_integration_drift(upstream_ref, upstream_head, &head)
+                .ok(),
+            _ => None,
+        };
         if upstream_head.is_some() && !integration_contains_upstream {
             let upstream = upstream_ref.as_deref().unwrap_or("@{upstream}");
-            next_action = IntegrationNextAction {
-                state: IntegrationDeliveryState::Blocked,
-                summary: format!(
-                    "external main movement detected: integration does not contain {upstream}; plan reconciliation before repair or submit"
-                ),
-                commands: vec![format!(
-                    "aethyme broker integration reconcile --upstream {upstream} --dry-run"
-                )],
+            next_action = if let Some(assessment) = reconciliation
+                .as_ref()
+                .filter(|assessment| assessment.stale_only)
+            {
+                IntegrationNextAction {
+                    state: IntegrationDeliveryState::ReconciliationReady,
+                    summary: assessment.explanation.clone(),
+                    commands: vec![format!(
+                        "aethyme broker integration reconcile --upstream {upstream} --dry-run"
+                    )],
+                }
+            } else {
+                IntegrationNextAction {
+                    state: IntegrationDeliveryState::Blocked,
+                    summary: format!(
+                        "external main movement detected: integration does not contain {upstream}; unresolved or unrecorded work requires reviewed reconciliation"
+                    ),
+                    commands: vec![format!(
+                        "aethyme broker integration reconcile --upstream {upstream} --dry-run"
+                    )],
+                }
             };
         }
 
@@ -4444,6 +4471,7 @@ impl Broker {
             changed_files,
             promoted_entries,
             conflicts,
+            reconciliation,
             next_action,
         })
     }
@@ -4605,27 +4633,48 @@ impl Broker {
         let integration_contains_upstream = upstream_head
             .as_deref()
             .is_some_and(|upstream| self.repo.is_ancestor(upstream, &integration_head));
+        let integration_reconciliation = match (upstream_ref.as_deref(), upstream_head.as_deref()) {
+            (Some(upstream_ref), Some(upstream_head)) if !integration_contains_upstream => self
+                .assess_integration_drift(upstream_ref, upstream_head, &integration_head)
+                .ok(),
+            _ => None,
+        };
         if upstream_head.is_some()
             && (main_behind_upstream_commits > 0 || !integration_contains_upstream)
         {
             let upstream = upstream_ref.as_deref().unwrap_or("@{upstream}");
+            let stale_only = integration_reconciliation
+                .as_ref()
+                .filter(|assessment| assessment.stale_only);
             advice.insert(
                 0,
                 StatusAdvice {
-                    id: "integration.upstream-main-ahead",
+                    id: if stale_only.is_some() {
+                        "integration.stale-promotions"
+                    } else {
+                        "integration.upstream-main-ahead"
+                    },
                     severity: if integration_contains_upstream {
+                        StatusAdviceSeverity::Notice
+                    } else if stale_only.is_some() {
                         StatusAdviceSeverity::Notice
                     } else {
                         StatusAdviceSeverity::Blocked
                     },
-                    reason: "configured upstream moved outside broker-managed integration",
+                    reason: if stale_only.is_some() {
+                        "all recorded integration promotions have conclusive upstream landing evidence"
+                    } else {
+                        "configured upstream moved outside broker-managed integration"
+                    },
                     summary: if integration_contains_upstream {
                         format!(
                             "local main is {main_behind_upstream_commits} commits behind {upstream}; integration already contains upstream, so broker operations remain safe"
                         )
+                    } else if let Some(assessment) = stale_only {
+                        assessment.explanation.clone()
                     } else {
                         format!(
-                            "external main movement detected: integration does not contain {upstream}; repair and submit are unsafe until reconciliation is planned"
+                            "external main movement detected: integration does not contain {upstream}; unresolved or unrecorded work requires reviewed reconciliation"
                         )
                     },
                     session_id: None,
@@ -4703,6 +4752,7 @@ impl Broker {
             upstream_head,
             main_ahead_upstream_commits,
             main_behind_upstream_commits,
+            integration_reconciliation,
             cleanup_retention,
         })
     }

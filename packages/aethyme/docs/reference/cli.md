@@ -979,6 +979,18 @@ unplannable shape remain conservatively unknown. Output text never participates
 in this classification. V1 deliberately serializes all writes for one
 repository.
 
+After a successful coordinated `gh pr merge`, the broker performs a second,
+journaled fetch of the primary branch's configured remote-tracking target. It
+then removes stale integration history automatically only when the complete
+recorded promotion layer is conclusively present upstream by ancestry, stable
+patch identity (including a cumulative squash), or identical path content.
+The cleanup uses the same crash-recoverable ref/database reconciliation as the
+manual command. A queued auto-merge, failed fetch, local-main divergence,
+unrecorded commit, unmatched promotion, or ambiguous result leaves integration
+unchanged and reports the exact inspection or dry-run command. A successful PR
+merge is never reported as failed merely because this follow-up cleanup was
+deferred.
+
 `integration reconcile` is the recovery path when main moves outside the
 broker, including deploy-authored release commits and squash merges. It never
 fetches: first update the remote-tracking ref through an authorized coordinated
@@ -1003,6 +1015,13 @@ it did not, and refuses to guess if the ref has a third value.
 Entries proven landed or superseded resolve their path exposures in that same
 database transaction. Entries replayed onto the new integration tip retain the
 same exposure with its promoted SHA retargeted to the replayed commit.
+
+`broker status` and `broker integration status` run the conclusive portion of
+this classifier without changing refs, queue rows, worktrees, or remote state.
+JSON includes full promotion and upstream landing SHAs. A complete layer whose
+entries are all landed is `reconciliation_ready` with notice severity; any
+unresolved, ambiguous, incomplete, or unrecorded layer remains blocked and
+uses the reviewed reconciliation workflow below.
 
 When automatic evidence correctly fails closed because landed work was later
 modified upstream, an operator can attest only the affected queue entries with

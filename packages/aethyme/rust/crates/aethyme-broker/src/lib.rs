@@ -147,7 +147,8 @@ pub use merge::{
 pub use operations::{
     CoordinatedCommand, CoordinatedOperationReport, OperationReconcileReport,
     OperationReconciliation, OperationReconciliationRecovery, OperationReconciliationState,
-    OperationShowReport, UnknownOutcomeRecovery, classify_gh, classify_git,
+    OperationShowReport, PostMergeCleanupReport, PostMergeCleanupState, UnknownOutcomeRecovery,
+    classify_gh, classify_git,
 };
 pub use pr::{
     PrActivityItem, PrCheckOptions, PrCheckReport, PrCheckRun, PrDecision, PrDecisionStatus,
@@ -167,6 +168,8 @@ pub use quick_test::{
     run_broker_quick_test_with_options,
 };
 pub use reconciliation::{
+    AutomaticIntegrationCleanupReport, AutomaticIntegrationCleanupState,
+    IntegrationDriftAssessment, IntegrationDriftEntry, IntegrationDriftEntryState,
     IntegrationReconcileClassification, IntegrationReconcileCommit,
     IntegrationReconcileCommitOrigin, IntegrationReconcileEntry, IntegrationReconcileEquivalence,
     IntegrationReconcileOptions, IntegrationReconcilePlan,

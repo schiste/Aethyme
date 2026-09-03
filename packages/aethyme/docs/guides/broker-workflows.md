@@ -42,6 +42,15 @@ release or deploy workflow writes changelogs directly to main. Do not merge or
 reset refs by hand: update the remote-tracking ref through the coordinated Git
 lane, then inspect a reconciliation plan:
 
+When the movement follows a successful
+`aethyme broker gh ... -- pr merge ...`, the broker performs that target refresh
+itself. If every promotion in the complete integration layer is conclusively
+landed, it cleans the stale layer and resolves its publication exposures
+transactionally. This includes one upstream squash representing several
+contiguous promotions. Mixed or uncertain layers are never rewritten
+automatically; the merge succeeds, cleanup is reported as deferred, and the
+commands below remain the recovery path.
+
 ```bash
 aethyme broker git --session 111 --reason "inspect upstream for recovery" -- \
   fetch origin main
@@ -53,6 +62,13 @@ and patch-equivalent landings, unrecorded integration commits, pending queue
 entries, and ambiguous equivalence. Full SHAs in JSON let an operator trace
 each decision. Cold evidence never becomes a guess: ambiguous matches and
 replay conflicts return a successful read-only report marked unsafe.
+
+The ordinary status surfaces use the same automatic evidence without replaying
+or mutating anything. `reconciliation_ready` means all recorded promotions are
+already landed and only stale broker history remains. `blocked` means at least
+one promotion is unresolved or ambiguous, the layer is incomplete, or an
+unrecorded commit needs an explicit disposition. Inspect the structured JSON
+before acting; the states are intentionally not interchangeable.
 
 Every unrecorded integration commit must be reviewed individually in a schema-2
 resolution file:

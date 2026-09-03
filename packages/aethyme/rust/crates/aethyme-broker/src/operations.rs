@@ -50,6 +50,8 @@ pub struct CoordinatedOperationReport {
     pub command_success: bool,
     pub stdout: String,
     pub stderr: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub post_merge_cleanup: Option<PostMergeCleanupReport>,
 }
 
 impl CoordinatedOperationReport {
@@ -61,6 +63,38 @@ impl CoordinatedOperationReport {
         (self.operation.status == OperationStatus::OutcomeUnknown)
             .then(|| UnknownOutcomeRecovery::from_operation(&self.operation))
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PostMergeCleanupState {
+    Cleaned,
+    NotNeeded,
+    Deferred,
+}
+
+impl PostMergeCleanupState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Cleaned => "cleaned",
+            Self::NotNeeded => "not_needed",
+            Self::Deferred => "deferred",
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PostMergeCleanupReport {
+    pub state: PostMergeCleanupState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream_ref: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fetch_operation_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cleanup: Option<crate::AutomaticIntegrationCleanupReport>,
+    pub explanation: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_action: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -864,6 +898,35 @@ fn redacted_command(provider: OperationProvider, args: &[String]) -> Result<Stri
     Ok(serde_json::to_string(&redacted)?)
 }
 
+fn is_github_pull_request_merge(args: &[String]) -> bool {
+    args.first().map(String::as_str) == Some("pr")
+        && args.get(1).map(String::as_str) == Some("merge")
+}
+
+fn tracking_upstream_parts(upstream: &str) -> Option<(&str, &str)> {
+    upstream
+        .strip_prefix("refs/remotes/")
+        .unwrap_or(upstream)
+        .split_once('/')
+        .filter(|(remote, branch)| !remote.is_empty() && !branch.is_empty())
+}
+
+fn deferred_post_merge_cleanup(
+    upstream_ref: Option<String>,
+    fetch_operation_id: Option<i64>,
+    explanation: &str,
+    next_action: Option<String>,
+) -> PostMergeCleanupReport {
+    PostMergeCleanupReport {
+        state: PostMergeCleanupState::Deferred,
+        upstream_ref,
+        fetch_operation_id,
+        cleanup: None,
+        explanation: explanation.into(),
+        next_action,
+    }
+}
+
 impl Broker {
     pub fn show_coordinated_operation(
         &mut self,
@@ -885,7 +948,130 @@ impl Broker {
                 session_id: session.id,
             });
         }
-        self.run_coordinated_operation_at(request, Path::new(&session.worktree_path))
+        let should_cleanup_after_merge = request.provider == OperationProvider::Github
+            && is_github_pull_request_merge(&request.args);
+        let session_id = request.session_id;
+        let repository = request.repository.clone();
+        let mut report =
+            self.run_coordinated_operation_at(request, Path::new(&session.worktree_path))?;
+        if report.ok() && should_cleanup_after_merge {
+            report.post_merge_cleanup = Some(
+                self.cleanup_after_github_pull_request_merge(session_id, repository.as_deref()),
+            );
+        }
+        Ok(report)
+    }
+
+    fn cleanup_after_github_pull_request_merge(
+        &mut self,
+        session_id: i64,
+        repository: Option<&str>,
+    ) -> PostMergeCleanupReport {
+        let Some(repository) = repository else {
+            return deferred_post_merge_cleanup(
+                None,
+                None,
+                "the successful GitHub merge had no canonical repository assertion",
+                None,
+            );
+        };
+        let Some((upstream_ref, _)) = self.repo_handle().tracking_upstream() else {
+            return deferred_post_merge_cleanup(
+                None,
+                None,
+                "the primary branch has no configured fetched upstream",
+                None,
+            );
+        };
+        let Some((remote, branch)) = tracking_upstream_parts(&upstream_ref) else {
+            return deferred_post_merge_cleanup(
+                Some(upstream_ref.clone()),
+                None,
+                "the configured upstream is not a remote-tracking branch",
+                Some(format!(
+                    "aethyme broker integration reconcile --upstream {upstream_ref} --dry-run"
+                )),
+            );
+        };
+        let destination = format!("refs/remotes/{remote}/{branch}");
+        let source = format!("refs/heads/{branch}");
+        let fetch = self.run_coordinated_operation(CoordinatedCommand {
+            session_id,
+            provider: OperationProvider::Git,
+            repository: Some(repository.to_string()),
+            resolved_target: None,
+            scope: Some(format!("ref:{destination}")),
+            declared_effect: None,
+            destructive_confirmed: false,
+            authorization_reason: Some(
+                "refresh the tracked target after an authorized pull-request merge".into(),
+            ),
+            args: vec![
+                "fetch".into(),
+                remote.to_string(),
+                format!("{source}:{destination}"),
+            ],
+        });
+        let fetch = match fetch {
+            Ok(fetch) if fetch.ok() => fetch,
+            Ok(fetch) => {
+                return deferred_post_merge_cleanup(
+                    Some(upstream_ref),
+                    Some(fetch.operation.id),
+                    "the pull request merged, but refreshing its target branch did not complete successfully",
+                    Some(format!(
+                        "aethyme broker operations show {}",
+                        fetch.operation.id
+                    )),
+                );
+            }
+            Err(error) => {
+                return deferred_post_merge_cleanup(
+                    Some(upstream_ref.clone()),
+                    None,
+                    &format!(
+                        "the pull request merged, but the tracked target could not be refreshed: {error}"
+                    ),
+                    Some(format!(
+                        "aethyme broker integration reconcile --upstream {upstream_ref} --dry-run"
+                    )),
+                );
+            }
+        };
+
+        match self.auto_cleanup_landed_integration(&upstream_ref) {
+            Ok(cleanup) => {
+                let state = match cleanup.state {
+                    crate::AutomaticIntegrationCleanupState::Cleaned => {
+                        PostMergeCleanupState::Cleaned
+                    }
+                    crate::AutomaticIntegrationCleanupState::NotNeeded => {
+                        PostMergeCleanupState::NotNeeded
+                    }
+                    crate::AutomaticIntegrationCleanupState::Deferred => {
+                        PostMergeCleanupState::Deferred
+                    }
+                };
+                PostMergeCleanupReport {
+                    state,
+                    upstream_ref: Some(upstream_ref),
+                    fetch_operation_id: Some(fetch.operation.id),
+                    explanation: cleanup.explanation.clone(),
+                    next_action: cleanup.next_action.clone(),
+                    cleanup: Some(cleanup),
+                }
+            }
+            Err(error) => deferred_post_merge_cleanup(
+                Some(upstream_ref.clone()),
+                Some(fetch.operation.id),
+                &format!(
+                    "the pull request merged and upstream refreshed, but automatic cleanup was refused: {error}"
+                ),
+                Some(format!(
+                    "aethyme broker integration reconcile --upstream {upstream_ref} --dry-run"
+                )),
+            ),
+        }
     }
 
     pub(crate) fn run_coordinated_operation_at(
@@ -1280,6 +1466,7 @@ impl Broker {
             command_success: output.status.success(),
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            post_merge_cleanup: None,
         })
     }
 
