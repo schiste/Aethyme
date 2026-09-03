@@ -57,6 +57,9 @@ pub fn deploy_skills(target_repo: &Path, force: bool) -> Result<Vec<String>, Str
                     .map_err(|e| format!("{}: {e}", dest.display()))?;
             }
         }
+        let broker_reference = dest_dir.join("references/broker.md");
+        std::fs::write(&broker_reference, crate::agents::render_broker_reference())
+            .map_err(|e| format!("{}: {e}", broker_reference.display()))?;
         deployed.push(skill_name.to_string());
     }
     Ok(deployed)
@@ -109,6 +112,9 @@ mod tests {
         assert!(!skill_md.contains("{{AETHYME_ROOT}}"));
         assert!(repo
             .join(".codex/skills/aethyme/references/explore.md")
+            .exists());
+        assert!(repo
+            .join(".codex/skills/aethyme/references/broker.md")
             .exists());
         use std::os::unix::fs::PermissionsExt;
         let mode = std::fs::metadata(repo.join(".codex/skills/aethyme/aethyme-explore"))

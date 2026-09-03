@@ -1868,6 +1868,58 @@ fn first_command_of_kind(commands: &Value, kind: &str) -> Result<Option<Value>, 
 
 // ── overrides ───────────────────────────────────────────────────────────────
 
+const ONBOARDING_OVERRIDE_KEYS: &[&str] = &[
+    "repo",
+    "summon",
+    "commands",
+    "areas",
+    "entrypoints",
+    "caution_zones",
+    "navigation_recipes",
+    "notes",
+];
+const ONBOARDING_REPO_OVERRIDE_KEYS: &[&str] = &[
+    "name",
+    "root",
+    "kind",
+    "languages",
+    "package_manager",
+    "manifests",
+];
+const ONBOARDING_SUMMON_OVERRIDE_KEYS: &[&str] = &["description", "recommended_when", "skip_when"];
+
+fn unknown_override_errors(payload: &Value) -> Vec<String> {
+    let mut errors = Vec::new();
+    let Some(entries) = payload.as_object() else {
+        return errors;
+    };
+    for (key, value) in entries {
+        if !ONBOARDING_OVERRIDE_KEYS.contains(&key.as_str()) {
+            errors.push(format!(
+                "unknown field $.{key}; allowed keys: {}",
+                ONBOARDING_OVERRIDE_KEYS.join(", ")
+            ));
+            continue;
+        }
+        let nested_allowed = match key.as_str() {
+            "repo" => Some(ONBOARDING_REPO_OVERRIDE_KEYS),
+            "summon" => Some(ONBOARDING_SUMMON_OVERRIDE_KEYS),
+            _ => None,
+        };
+        if let (Some(allowed), Some(nested)) = (nested_allowed, value.as_object()) {
+            for (nested_key, _) in nested {
+                if !allowed.contains(&nested_key.as_str()) {
+                    errors.push(format!(
+                        "unknown field $.{key}.{nested_key}; allowed keys: {}",
+                        allowed.join(", ")
+                    ));
+                }
+            }
+        }
+    }
+    errors
+}
+
 /// `_load_overrides`: onboarding override payload with the exact Python
 /// tolerances — missing → `{}`, unreadable/invalid/non-object →
 /// `{_invalid_override: true, _source: …}`, else payload + `_source`.
@@ -1889,6 +1941,9 @@ pub fn load_overrides(repo_path: &Path) -> Value {
         return invalid();
     };
     if !payload.is_object() {
+        return invalid();
+    }
+    if !unknown_override_errors(&payload).is_empty() {
         return invalid();
     }
     payload.set("_source", Value::str(ONBOARDING_OVERRIDE_PATH));
@@ -2028,6 +2083,11 @@ pub fn validate_overrides(repo_path: &Path) -> Value {
         ]);
     }
     let mut errors: Vec<Value> = Vec::new();
+    errors.extend(
+        unknown_override_errors(&payload)
+            .into_iter()
+            .map(Value::str),
+    );
     if let Some(notes) = payload.get("notes") {
         let valid = match notes {
             Value::Null => true,
@@ -2957,11 +3017,28 @@ mod tests {
         assert_eq!(
             errors,
             vec![
+                "unknown field $.extra; allowed keys: repo, summon, commands, areas, entrypoints, caution_zones, navigation_recipes, notes",
                 "notes must be a list of strings",
                 "commands must be a list",
                 "summon must be an object",
             ]
         );
+
+        write(
+            &repo.join(ONBOARDING_OVERRIDE_PATH),
+            r#"{"repo": {"kind": "service", "mystery": true}, "summon": {"other": []}}"#,
+        );
+        let result = validate_overrides(&repo);
+        let errors: Vec<_> = result
+            .get("errors")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(errors[0].starts_with("unknown field $.repo.mystery;"));
+        assert!(errors[1].starts_with("unknown field $.summon.other;"));
 
         write(
             &repo.join(ONBOARDING_OVERRIDE_PATH),

@@ -87,41 +87,33 @@ fn agents_document_includes_broker_protocol_only_when_configured() {
         "broker status --json",
         "broker start --task",
         "broker start --task \"<your task>\" --path <planned-path>",
-        "Repeat `--path` for every file",
-        "explicit leases atomically",
-        "atomic `start/adopt --path` declaration",
         "broker adopt",
         "broker leases claim",
-        "broker exec --session",
         "broker submit",
-        "broker ship plan --entry <promoted-entry-id>",
-        "broker ship execute --entry <promoted-entry-id> --confirm <full-publication-sha>",
-        "Prefer this reviewed broker ship workflow over a raw push",
-        "Without publication authority, stop after submit",
-        "AETHYME_TEST_DB_SUFFIX",
         ".aethyme/broker-action-required.md",
-        "aethyme/integration",
-        "Git operations remain available to agents",
-        "clone, fetch, pull, switch, branch, add, commit",
-        "stash, merge, cherry-pick, rebase, revert, reset, tag, push",
-        "force-push when explicitly authorized",
-        "deletion of an exact ref",
-        "Operations that require coordination **must go through the broker**",
-        "Direct Git is limited to read-only inspection",
-        "must not run outside the broker",
-        "broker git --session <your-session-id>",
-        "broker gh --session <your-session-id>",
-        "Every GitHub repository or account mutation",
-        "broker operations reconcile",
-        "--effect read|write|destructive --scope <resource>",
-        "Do not infer permission to publish",
+        "Editing or submitting never implies publication authority",
+        ".codex/skills/aethyme/references/broker.md",
     ] {
         assert!(agents.contains(needle), "AGENTS.md missing {needle:?}");
     }
+    assert!(agents.len() <= aethyme_enhance::agents::COMPACT_POLICY_MAX_BYTES);
+    let broker_reference = read(repo.join(".codex/skills/aethyme/references/broker.md"));
+    for moved in [
+        "AETHYME_TEST_DB_SUFFIX",
+        "aethyme broker cleanup --all-cleaned --apply",
+        "aethyme broker operations reconcile",
+        "aethyme broker ship execute",
+        "--effect read|write|destructive --scope <resource>",
+    ] {
+        assert!(
+            broker_reference.contains(moved),
+            "broker reference missing {moved:?}"
+        );
+    }
     assert!(!agents.contains("**Never** push"));
     assert!(!agents.contains("Direct Git commands are also permitted when appropriate"));
-    // CLAUDE.md renders from the same generated document.
-    assert!(read(repo.join("CLAUDE.md")).contains("## Broker Coordination"));
+    // CLAUDE.md renders from the same typed policy source.
+    assert_eq!(read(repo.join("CLAUDE.md")), agents);
 }
 
 #[test]

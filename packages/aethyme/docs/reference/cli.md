@@ -1495,7 +1495,9 @@ regenerating onboarding, not by editing generated skill files directly.
 
 `repo init-onboarding-overrides` writes a starter override file.
 `repo validate-onboarding-overrides` checks that the override file is valid JSON
-and that key fields use the expected shapes.
+and that key fields use the expected shapes. Unknown top-level keys and unknown
+keys inside `repo` or `summon` fail with the exact JSON path and the allowed
+keys; misspellings are never silently ignored.
 
 `repo init-agents-overrides` writes a starter `.aethyme/overrides/agents.json`
 file. Use it for repo-specific root instruction customization such as:
@@ -1507,7 +1509,23 @@ file. Use it for repo-specific root instruction customization such as:
 - migrated maintainer markdown
 
 `repo validate-agents-overrides` checks that the agents override file is valid
-JSON and that those fields use the expected shapes.
+JSON and that those fields use the expected shapes. Its schema is closed:
+unknown fields fail with an exact `$.field` diagnostic and the allowed keys.
+
+Broker-enrolled repositories use progressive disclosure by default. Generated
+`AGENTS.md` and `CLAUDE.md` remain byte-identical and retain mandatory Explore,
+session lifecycle, refusal, advisory, and publication-authorization rules, but
+are contract-tested to stay at or below 12,000 bytes. Detailed lease, gate,
+resource, cleanup, operation, ship, and recovery procedures are generated at
+both `.codex/skills/aethyme/references/broker.md` and
+`.claude/skills/aethyme/references/broker.md`. Agents load that local reference
+when those workflows apply; no network lookup is required. Generated policy is
+deterministic and contains no wall-clock timestamp.
+
+Direct root-policy edits remain protected by the repository upgrade planner.
+Content that differs from the recorded generated receipt is classified as
+customized and requires an explicit preserve, merge, or replace resolution;
+neither deploy nor upgrade silently treats it as a known generated version.
 
 `repo deploy-skills` is now a compatibility path that deploys only the static
 runtime navigation skill. For real repositories, prefer

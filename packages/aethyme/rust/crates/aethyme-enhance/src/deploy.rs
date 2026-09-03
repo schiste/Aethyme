@@ -7,6 +7,7 @@ use std::path::Path;
 use crate::agents::{
     extract_legacy_agents_content, generated_policy_receipt, load_agents_overrides,
     looks_like_generated_agents_document, policy_sha256, render_agents_document,
+    render_broker_reference,
 };
 use crate::onboarding::{
     expected_onboarding_files, override_freshness, recommendation_summary, ACT_STARTER_JSON_PATH,
@@ -31,6 +32,8 @@ pub const TARGETS: &[(&str, &str)] = &[
     ("CLAUDE.md", templates::AGENTS_MD),
     (".claude/skills/aethyme/SKILL.md", templates::SKILL_MD),
     (".codex/skills/aethyme/SKILL.md", templates::SKILL_MD),
+    (".claude/skills/aethyme/references/broker.md", ""),
+    (".codex/skills/aethyme/references/broker.md", ""),
     (
         ".codex/skills/aethyme/aethyme-explore",
         templates::AETHYME_EXPLORE,
@@ -64,6 +67,15 @@ pub const TARGETS: &[(&str, &str)] = &[
         templates::LOAD_CONTEXT_SH,
     ),
 ];
+
+fn render_target(repo: &Path, relative_path: &str, template: &str) -> Result<String, String> {
+    match relative_path {
+        "CLAUDE.md" => render_agents_document(Some(repo)),
+        ".claude/skills/aethyme/references/broker.md"
+        | ".codex/skills/aethyme/references/broker.md" => Ok(render_broker_reference()),
+        _ => Ok(template.to_string()),
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct DeployAction {
@@ -140,6 +152,20 @@ fn deploy_inner(
 ) -> Result<Vec<DeployAction>, String> {
     let mut actions: Vec<DeployAction> = Vec::new();
     if manage_root_policy {
+        for relative in ["AGENTS.md", "CLAUDE.md"] {
+            let path = repo.join(relative);
+            if !path.exists() {
+                continue;
+            }
+            let existing = read_text(&path)?;
+            if generated_policy_receipt(&existing)
+                .is_some_and(|receipt| receipt.policy_sha256 != policy_sha256(&receipt.policy_body))
+            {
+                return Err(format!(
+                    "customized generated policy {relative} requires reviewed resolution; run `aethyme upgrade plan --repo . --diff`, choose preserve, merge, or replace, then apply the confirmed plan"
+                ));
+            }
+        }
         if let Some(action) = drop_stale_generated_agents_override(repo)? {
             actions.push(action);
         }
@@ -176,11 +202,7 @@ fn deploy_inner(
             continue;
         }
         let dest = repo.join(relative_path);
-        let content = if *relative_path == "CLAUDE.md" {
-            render_agents_document(Some(repo))?
-        } else {
-            template.to_string()
-        };
+        let content = render_target(repo, relative_path, template)?;
         if dest.exists() && !force && read_text(&dest)? == content {
             // Still ensure the executable bit is right on shell scripts.
             if is_executable(relative_path) {
@@ -492,11 +514,7 @@ pub fn verify(repo: &Path) -> Result<Vec<VerifyResult>, String> {
             continue;
         }
         let actual = read_text(&dest)?;
-        let canonical = if *relative_path == "CLAUDE.md" {
-            render_agents_document(Some(repo))?
-        } else {
-            template.to_string()
-        };
+        let canonical = render_target(repo, relative_path, template)?;
         let (matches_canonical, policy_provenance) = if *relative_path == "CLAUDE.md" {
             let (matches, provenance) = verify_policy_content(&actual, &canonical);
             (matches, Some(provenance))
@@ -742,8 +760,8 @@ mod tests {
         assert_eq!(actions.first().unwrap().relative_path, "AGENTS.md");
         assert_eq!(actions.last().unwrap().relative_path, SETTINGS_FILE);
         assert!(actions.iter().all(|a| a.action == "created"));
-        // 1 AGENTS + 6 onboarding + 11 targets + settings = 19.
-        assert_eq!(actions.len(), 19);
+        // 1 AGENTS + 6 onboarding + 13 targets + settings = 21.
+        assert_eq!(actions.len(), 21);
 
         let settings = std::fs::read_to_string(repo.join(SETTINGS_FILE)).unwrap();
         assert_eq!(
@@ -794,16 +812,26 @@ mod tests {
         let claude = std::fs::read_to_string(repo.join("CLAUDE.md")).unwrap();
         assert_eq!(agents, claude);
         for required in [
-            "Treat broker advisories as delivered work context, not as blockers",
+            "delivered\nadvisories as work context",
             "aethyme broker status --json",
+        ] {
+            assert!(
+                agents.contains(required),
+                "missing protocol clause: {required}"
+            );
+        }
+        let reference =
+            std::fs::read_to_string(repo.join(".codex/skills/aethyme/references/broker.md"))
+                .unwrap();
+        for required in [
             "gitignored persistence projection",
             "Acknowledging a notice stops repeat delivery",
             "selected integration prefix clears only entries contained",
             "Advisories never expand gate selection or block submit",
         ] {
             assert!(
-                agents.contains(required),
-                "missing protocol clause: {required}"
+                reference.contains(required),
+                "missing reference clause: {required}"
             );
         }
 
@@ -934,5 +962,24 @@ mod tests {
                 generator_version: "0.3.0".into()
             }
         );
+    }
+
+    #[test]
+    fn deploy_refuses_modified_generated_policy_before_writing() {
+        let repo = fixture_repo("customized-policy");
+        deploy(&repo, true).unwrap();
+        let before_skill = std::fs::read(repo.join(".codex/skills/aethyme/SKILL.md")).unwrap();
+        let mut agents = std::fs::read_to_string(repo.join("AGENTS.md")).unwrap();
+        agents.push_str("\nmaintainer direct edit\n");
+        std::fs::write(repo.join("AGENTS.md"), agents).unwrap();
+
+        let error = deploy(&repo, true).unwrap_err();
+        assert!(error.contains("customized generated policy AGENTS.md"));
+        assert!(error.contains("upgrade plan --repo . --diff"));
+        assert_eq!(
+            std::fs::read(repo.join(".codex/skills/aethyme/SKILL.md")).unwrap(),
+            before_skill
+        );
+        std::fs::remove_dir_all(&repo).unwrap();
     }
 }

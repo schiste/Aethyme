@@ -12,6 +12,15 @@ use crate::{AGENTS_OVERRIDE_PATH, BLOCK_BEGIN, BLOCK_END};
 
 pub const GENERATED_POLICY_PREFIX: &str = "<!-- AETHYME-GENERATED:";
 const GENERATED_POLICY_SUFFIX: &str = " -->";
+pub const COMPACT_POLICY_MAX_BYTES: usize = 12_000;
+const AGENT_OVERRIDE_KEYS: &[&str] = &[
+    "repo_summary",
+    "hard_constraints",
+    "validation_rules",
+    "commit_hygiene_notes",
+    "summon_policy_notes",
+    "maintainer_markdown",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GeneratedPolicyReceipt {
@@ -108,6 +117,13 @@ pub fn load_agents_overrides(repo: &Path) -> Value {
     if !payload.is_object() {
         return invalid();
     }
+    if payload.as_object().is_some_and(|entries| {
+        entries
+            .iter()
+            .any(|(key, _)| !AGENT_OVERRIDE_KEYS.contains(&key.as_str()))
+    }) {
+        return invalid();
+    }
     payload.set("_source", Value::str(AGENTS_OVERRIDE_PATH));
     payload
 }
@@ -194,6 +210,14 @@ pub fn validate_agents_overrides(repo: &Path) -> Value {
         ]);
     }
     let mut errors: Vec<Value> = Vec::new();
+    for (key, _) in payload.as_object().expect("validated object") {
+        if !AGENT_OVERRIDE_KEYS.contains(&key.as_str()) {
+            errors.push(Value::str(format!(
+                "unknown field $.{key}; allowed keys: {}",
+                AGENT_OVERRIDE_KEYS.join(", ")
+            )));
+        }
+    }
     // Python: `"repo_summary" in payload and not isinstance(..., str)` —
     // key presence (even null) with a non-string value is an error.
     if let Some(value) = payload.get("repo_summary") {
@@ -240,7 +264,7 @@ pub fn render_agents_document(repo: Option<&Path>) -> Result<String, String> {
         if !routing.is_empty() {
             content = format!("{}\n\n{routing}", content.trim_end());
         }
-        let broker = render_broker_protocol(repo);
+        let broker = render_broker_protocol_compact(repo);
         if !broker.is_empty() {
             content = format!("{}\n\n{broker}", content.trim_end());
         }
@@ -254,10 +278,47 @@ pub fn render_agents_document(repo: Option<&Path>) -> Result<String, String> {
 
 /// Agent-facing broker coordination protocol, rendered only when the repo
 /// is broker-configured.
-fn render_broker_protocol(repo: &Path) -> String {
+fn render_broker_protocol_compact(repo: &Path) -> String {
     if !(repo.join(".aethyme/gates.toml").exists() || repo.join(".aethyme/config.toml").exists()) {
         return String::new();
     }
+    r#"## Broker Coordination (multi-agent repository)
+
+Aethyme coordination is local-only: contributors without local broker state
+are not blocked. Other agents may be editing sibling worktrees, so inspect
+activity and create an isolated session before changing files:
+
+```bash
+aethyme broker status --json
+aethyme broker start --task "<your task>" --path <planned-path>
+```
+
+Work only in the reported worktree. If scope expands, claim it before editing:
+`aethyme broker leases claim <path> --session <id>`. Commit small changes, then
+run `aethyme broker submit --session <id>`. Finish with
+`aethyme broker finish --session <id>` or reuse the worktree with
+`aethyme broker adopt --reuse --task "<follow-up>"`.
+
+Never edit another session's worktree or bypass a broker refusal. Read
+`.aethyme/broker-action-required.md` immediately when present. Treat delivered
+advisories as work context: inspect `aethyme broker status --json`; advisories
+inform but never expand gates or authorize publication.
+
+Remote/shared mutations require broker coordination. Use `broker submit` for
+integration, `broker git` for other shared Git operations, and `broker gh` for
+GitHub writes. Editing or submitting never implies publication authority.
+Only an explicitly authorized operator may use the reviewed full-SHA
+`broker ship plan` / `broker ship execute` lane. Never blindly retry an unknown
+remote outcome.
+
+Load the full local reference when the task involves gates, leases, resources,
+cleanup, operations, publication, conflicts, or recovery:
+`.codex/skills/aethyme/references/broker.md` or
+`.claude/skills/aethyme/references/broker.md`."#
+        .to_string()
+}
+
+pub(crate) fn render_broker_reference() -> String {
     r#"## Broker Coordination (multi-agent repository)
 
 This repository coordinates concurrent agent sessions through the Aethyme
@@ -720,35 +781,24 @@ mod tests {
         std::fs::write(repo.join(".aethyme/gates.toml"), "[[gate]]\n").unwrap();
         let doc = render_agents_document(Some(&repo)).unwrap();
         assert!(doc.contains("## Broker Coordination (multi-agent repository)"));
-        assert!(doc.contains("Git enforces the session boundary on\nprotected branches"));
-        assert!(doc.contains("This enforcement is local-only"));
+        assert!(doc.contains("coordination is local-only"));
         assert!(doc.contains("aethyme broker submit --session"));
-        assert!(doc.contains("single-parent patch\n   series"));
-        assert!(doc.contains("preserve the current HEAD on the named recovery branch"));
-        assert!(doc.contains("Never reset first"));
         assert!(doc.contains("broker start --task \"<your task>\" --path <planned-path>"));
-        assert!(doc.contains("Repeat `--path` for every file"));
-        assert!(doc.contains("explicit leases atomically"));
-        assert!(doc.contains("Prefer the\n   atomic `start/adopt --path` declaration"));
-        assert!(doc.contains("aethyme broker ship plan --entry <promoted-entry-id>"));
-        assert!(doc.contains(
-            "aethyme broker ship execute --entry <promoted-entry-id> --confirm <full-publication-sha>"
-        ));
-        assert!(doc.contains("Prefer this reviewed broker ship workflow over a raw push"));
-        assert!(doc.contains("Without publication authority, stop after submit"));
+        assert!(doc.contains("broker-action-required.md"));
+        assert!(doc.contains("broker ship plan` / `broker ship execute"));
+        assert!(doc.contains("Editing or submitting never implies publication authority"));
         assert!(doc.contains("aethyme broker finish --session <id>"));
-        assert!(doc.contains("aethyme broker cleanup --all-cleaned --apply"));
-        assert!(doc.contains("Treat broker advisories as delivered work context, not as blockers"));
-        assert!(doc.contains("after rebasing or reusing a worktree"));
-        assert!(doc.contains("gitignored persistence projection"));
-        assert!(doc.contains("Acknowledging a notice stops repeat delivery"));
-        assert!(doc.contains("selected integration prefix clears only entries contained"));
-        assert!(doc.contains("Advisories never expand gate selection or block submit"));
+        assert!(doc.contains(".codex/skills/aethyme/references/broker.md"));
+        assert!(doc.len() <= COMPACT_POLICY_MAX_BYTES, "{} bytes", doc.len());
+        let reference = render_broker_reference();
+        assert!(reference.contains("aethyme broker cleanup --all-cleaned --apply"));
+        assert!(reference.contains("aethyme broker operations reconcile"));
+        assert!(reference.contains("aethyme broker ship execute"));
         std::fs::remove_dir_all(&repo).unwrap();
     }
 
     #[test]
-    fn override_sections_render_known_keys_and_ignore_unknown() {
+    fn override_sections_reject_unknown_keys() {
         let repo = fixture_repo("overrides");
         std::fs::create_dir_all(repo.join(".aethyme/overrides")).unwrap();
         std::fs::write(
@@ -757,10 +807,12 @@ mod tests {
         )
         .unwrap();
         let doc = render_agents_document(Some(&repo)).unwrap();
-        assert!(doc.contains("## Repo Summary\n\nSummary here."));
-        assert!(doc.contains("## Hard Constraints\n\n- Never break tenancy"));
-        assert!(!doc.contains("ignored"));
-        assert!(!doc.contains("42"));
+        assert!(doc.contains("## Aethyme Override Status"));
+        let validation = validate_agents_overrides(&repo);
+        let errors = validation.get("errors").unwrap().as_array().unwrap();
+        assert!(errors.iter().any(|error| error
+            .as_str()
+            .is_some_and(|error| error.contains("unknown field $.unknown_key"))));
         std::fs::remove_dir_all(&repo).unwrap();
     }
 
