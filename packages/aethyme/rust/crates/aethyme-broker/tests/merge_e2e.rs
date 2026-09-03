@@ -7,10 +7,13 @@ use std::process::Command;
 
 use aethyme_broker::{
     AdoptMode, Broker, CheckpointRefusalCode, EntryExposureState, FinishStatus,
-    IntegrationDeliveryState, IntegrationReconcileClassification, IntegrationReconcileOptions,
-    MergeStatus, NewSession, RepairAction, RepairSource, SessionOrigin, StatusAdviceSeverity,
-    SubmissionCommitOwnership, SubmissionGateVerificationStatus, SubmissionIntegrationState,
+    GraphIntegrityStatus, IntegrationDeliveryState, IntegrationReconcileClassification,
+    IntegrationReconcileOptions, MergeStatus, NewSession, RepairAction, RepairSource,
+    SessionOrigin, StatusAdviceSeverity, SubmissionCommitOwnership,
+    SubmissionGateVerificationStatus, SubmissionIntegrationState,
 };
+use aethyme_graph_indexer::{IndexerContext, WalkOptions, index_repo_to_disk, link_repo};
+use aethyme_graph_storage::bootstrap_repo;
 
 fn sh(cwd: &Path, args: &[&str]) {
     let status = Command::new("git")
@@ -90,6 +93,55 @@ fn commit_edit(worktree: &Path, file: &str, content: &str) {
     std::fs::write(worktree.join(file), content).unwrap();
     sh(worktree, &["add", "-A"]);
     sh(worktree, &["commit", "-qm", "edit"]);
+}
+
+fn refresh_graph(root: &Path, repository: &str) {
+    bootstrap_repo(root, env!("CARGO_PKG_VERSION")).unwrap();
+    let context =
+        IndexerContext::new(repository, root.to_path_buf(), env!("CARGO_PKG_VERSION")).unwrap();
+    index_repo_to_disk(&context, &WalkOptions::default()).unwrap();
+    link_repo(&context).unwrap();
+}
+
+#[test]
+fn submit_rejects_stale_authoritative_graph_before_promotion() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    std::fs::write(
+        tmp.path().join(".aethyme/config.toml"),
+        "[graph]\nauthority = 'committed_fragments'\nrepository = 'fixture'\n",
+    )
+    .unwrap();
+    refresh_graph(tmp.path(), "fixture");
+    sh(tmp.path(), &["add", ".aethyme"]);
+    sh(
+        tmp.path(),
+        &["commit", "-qm", "declare authoritative graph"],
+    );
+
+    let integration_before = resolve(tmp.path(), "main");
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let worktree = agent_worktree(tmp.path(), "stale-graph");
+    let session = broker.adopt(&worktree, Some("change source")).unwrap();
+    commit_edit(&worktree, "src/a.py", "a = 2\n");
+
+    let outcome = broker.submit(session.id).unwrap();
+    assert_eq!(outcome.entry.status, MergeStatus::Rejected);
+    assert!(!outcome.promoted);
+    assert!(outcome.gate_outcomes.is_empty());
+    let graph = outcome.graph_integrity.expect("graph integrity outcome");
+    assert_eq!(graph.status, GraphIntegrityStatus::Stale);
+    assert!(
+        graph
+            .changed_paths
+            .iter()
+            .any(|path| path == ".aethyme/graph/src/a.py.bin")
+    );
+    assert_eq!(
+        resolve(tmp.path(), "aethyme/integration"),
+        integration_before,
+        "stale graph must not move integration"
+    );
 }
 
 fn resolve(root: &Path, rev: &str) -> String {

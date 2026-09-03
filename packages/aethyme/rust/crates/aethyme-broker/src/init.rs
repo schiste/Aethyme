@@ -424,6 +424,7 @@ pub const CONFIG_SCHEMA_VERSION: i64 = 1;
 const CONFIG_KNOWN_KEYS: &[(&str, &[&str])] = &[
     ("promote", &["mode", "branch"]),
     ("leases", &["ignore", "routing"]),
+    ("graph", &["authority", "repository"]),
 ];
 
 fn check_enrollment_visibility(repo: &crate::GitRepo, checkout_root: &Path) -> Vec<Check> {

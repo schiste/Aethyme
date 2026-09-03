@@ -23,6 +23,8 @@ version = "0.7.3"
 dependencies = [
  "aethyme-engine",
  "aethyme-enhance",
+ "aethyme-graph-indexer",
+ "aethyme-graph-storage",
  "globset",
  "libc",
  "noyalib",

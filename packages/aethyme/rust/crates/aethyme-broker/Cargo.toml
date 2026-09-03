@@ -24,6 +24,8 @@ path = "src/bin/broker-cli-shim.rs"
 [dependencies]
 aethyme-engine = { path = "../aethyme-engine" }
 aethyme-enhance = { path = "../aethyme-enhance" }
+aethyme-graph-indexer = { path = "../aethyme-graph-indexer" }
+aethyme-graph-storage = { path = "../aethyme-graph-storage" }
 # Bundled SQLite so the broker has zero system dependencies and one
 # known SQLite version across platforms (macOS/Linux are the v0 targets).
 rusqlite = { version = "0.32", features = ["bundled"] }

@@ -216,6 +216,8 @@ pub enum BrokerOpError {
     #[error(transparent)]
     GateConfig(#[from] crate::gates::GateConfigError),
     #[error(transparent)]
+    GraphIntegrityPolicy(#[from] crate::GraphIntegrityPolicyError),
+    #[error(transparent)]
     RetentionConfig(#[from] crate::RetentionConfigError),
     #[error(transparent)]
     PrePush(#[from] crate::gates::PrePushValidationError),

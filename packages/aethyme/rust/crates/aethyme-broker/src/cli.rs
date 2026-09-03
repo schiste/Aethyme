@@ -6454,6 +6454,19 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                 );
                 return Err(UsageError::Message("submission conflicted".into()));
             } else {
+                if let Some(graph) = &outcome.graph_integrity
+                    && graph.enforced
+                {
+                    println!(
+                        "graph integrity: {:?} (tree {}) — {}",
+                        graph.status,
+                        short_commit(&graph.tree_hash),
+                        graph.reason
+                    );
+                    if !graph.changed_paths.is_empty() {
+                        println!("  stale graph paths: {}", graph.changed_paths.join(", "));
+                    }
+                }
                 let gate_wall_ms: i64 = outcome
                     .gate_outcomes
                     .iter()

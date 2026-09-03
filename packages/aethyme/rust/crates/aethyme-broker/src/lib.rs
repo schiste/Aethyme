@@ -34,6 +34,7 @@ mod gc;
 mod git;
 mod github_target;
 mod graph_impact;
+mod graph_integrity;
 mod homebrew;
 pub mod hooks;
 mod host_operations;
@@ -120,6 +121,10 @@ pub use graph_impact::{
     GRAPH_IMPACT_MAX_DEPTH, GRAPH_IMPACT_MAX_NODES, GRAPH_IMPACT_RESULT_LIMIT, GraphImpactChain,
     GraphImpactLookup, GraphImpactProvider, GraphImpactQuery, GraphImpactStatus,
     GraphStoreImpactProvider,
+};
+pub use graph_integrity::{
+    GRAPH_CONFIG_RELPATH, GraphAuthority, GraphIntegrityOutcome, GraphIntegrityPolicy,
+    GraphIntegrityPolicyError, GraphIntegrityStatus,
 };
 pub use homebrew::render_homebrew_formula;
 pub use hooks::{HookReport, HookState, HooksError};

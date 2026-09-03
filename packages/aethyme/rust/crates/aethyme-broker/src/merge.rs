@@ -173,6 +173,9 @@ pub struct SubmitOutcome {
     pub conflicts: Vec<String>,
     pub conflict_details: Vec<SubmissionConflict>,
     pub gate_outcomes: Vec<GateRunOutcome>,
+    /// Native deployment-integrity verification for repositories that
+    /// explicitly declare committed graph fragments authoritative.
+    pub graph_integrity: Option<crate::GraphIntegrityOutcome>,
     /// Queue status describes promotion eligibility; this field describes
     /// whether gates actually supplied verification evidence.
     pub gate_verification: SubmissionGateVerification,
@@ -540,6 +543,7 @@ impl Broker {
                 conflicts: simulation.conflicts,
                 conflict_details: simulation.conflict_details,
                 gate_outcomes: Vec::new(),
+                graph_integrity: None,
                 gate_verification: SubmissionGateVerification::not_run(),
                 no_changes: false,
                 promoted: false,
@@ -574,6 +578,7 @@ impl Broker {
                 conflicts: Vec::new(),
                 conflict_details: Vec::new(),
                 gate_outcomes: Vec::new(),
+                graph_integrity: None,
                 gate_verification: SubmissionGateVerification::not_run(),
                 no_changes: true,
                 promoted: false,
@@ -608,6 +613,9 @@ impl Broker {
             .gate_scope_changed_between(verify_base, &merge_commit)?;
         let mut verification_slot = MergeVerificationSlot::acquire(&self.main_root_path())?;
         let sim_worktree = verification_slot.materialize(self.repo_handle(), &merge_commit)?;
+        let graph_policy = crate::GraphIntegrityPolicy::load(sim_worktree.root())?;
+        let graph_integrity =
+            crate::graph_integrity::verify_disposable_checkout(&sim_worktree, &graph_policy);
         // Conflict-only brokering is valid: a repo with no gates.toml gets
         // textual merge simulation and promotion on clean merges, with zero
         // verification — recorded explicitly so nobody mistakes it for a
@@ -623,21 +631,26 @@ impl Broker {
             };
         let configured_gates = gates.len();
         let main_root = self.main_root_path();
-        let gate_outcomes = crate::gates::run_affected(
-            self.store(),
-            &main_root,
-            &sim_worktree,
-            &gates,
-            &changed,
-            Some(entry.session_id),
-            cache_policy,
-        );
+        let gate_outcomes = if graph_integrity.allows_promotion() {
+            crate::gates::run_affected(
+                self.store(),
+                &main_root,
+                &sim_worktree,
+                &gates,
+                &changed,
+                Some(entry.session_id),
+                cache_policy,
+            )
+        } else {
+            Ok(Vec::new())
+        };
         verification_slot.cleanup();
         let gate_outcomes = gate_outcomes?;
 
-        let all_pass = gate_outcomes
-            .iter()
-            .all(|o| o.status == crate::types::GateStatus::Pass);
+        let all_pass = graph_integrity.allows_promotion()
+            && gate_outcomes
+                .iter()
+                .all(|o| o.status == crate::types::GateStatus::Pass);
         let gate_verification = SubmissionGateVerification {
             status: if !gate_configuration_present {
                 SubmissionGateVerificationStatus::NoConfiguration
@@ -703,6 +716,7 @@ impl Broker {
             conflicts: Vec::new(),
             conflict_details: Vec::new(),
             gate_outcomes,
+            graph_integrity: Some(graph_integrity),
             gate_verification,
             no_changes: false,
             promoted,
