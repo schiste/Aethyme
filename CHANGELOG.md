@@ -4,6 +4,31 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.7.3] - 2026-09-03
+
+### Changed
+
+- `broker status` and `broker integration status` now distinguish a stale
+  local promotion layer that is conclusively present upstream from unresolved
+  or unrecorded integration divergence.
+
+### Fixed
+
+- A successful coordinated `gh pr merge` now refreshes the configured target
+  branch through a separately journaled Git operation and automatically
+  reconciles the complete recorded promotion layer when exact commits, stable
+  patch identities, cumulative squash evidence, or path content prove it has
+  landed upstream.
+- Automatic post-merge cleanup refuses ambiguous, partially landed, pending,
+  or unrecorded work and reports the exact reviewed reconciliation command
+  instead of moving integration optimistically.
+
+### Upgrade notes
+
+Read [Upgrading to v0.7.3](packages/aethyme/docs/guides/upgrading-to-v0.7.3.md)
+before updating. Broker storage, repository deployment, and engine protocol
+remain unchanged from v0.7.2.
+
 ## [0.7.2] - 2026-09-02
 
 ### Added
