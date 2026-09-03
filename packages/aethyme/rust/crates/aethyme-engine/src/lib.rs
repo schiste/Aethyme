@@ -8,6 +8,7 @@ pub mod explore_cli;
 pub mod facts_cli;
 pub mod graph;
 pub mod graph_cli;
+pub mod index_store;
 pub mod json;
 pub mod map;
 pub mod model;

@@ -1,0 +1,73 @@
+# Version-safe graph refresh
+
+Last Updated: 2026-09-03
+
+Aethyme repositories may make committed graph fragments authoritative through
+the `[graph]` policy in `.aethyme/config.toml`. Refresh those fragments only
+with the installed `aethyme` release whose version exactly matches
+`.aethyme/engine-version`. The router links the compatible indexer and engine
+libraries into the same signed release unit; no separately installed indexer
+or network download is involved.
+
+## Review and apply
+
+Start with the read-only status and plan:
+
+```bash
+aethyme graph status --repo . --json
+aethyme graph refresh plan --repo . --diff
+aethyme graph refresh plan --repo . --json
+```
+
+The proposal is built from exact committed `HEAD` in a disposable checkout.
+Its digest binds the source commit and tree, graph policy and pin, installed
+component versions, every proposed path/hash/mode, derived-store action, dirty
+overlap, live sessions, and relevant leases. The plan contains hashes and
+repository-relative paths, never source contents or absolute paths.
+
+After reviewing the plan, authorize only its full digest:
+
+```bash
+aethyme graph refresh execute --repo . --confirm <plan-sha256>
+```
+
+Execution revalidates the complete plan under an exclusive lock. It writes
+committed fragments transactionally, verifies their hashes, then atomically
+publishes the local `.aethyme/graph_store.redb`. Review and commit changed
+fragment paths. Because that commit creates a new authoritative HEAD, rerun
+`graph status`; if it reports only a stale derived store, review and execute
+the new plan to stamp the local store against that committed graph revision.
+
+## Safety and recovery
+
+- A mismatched engine pin requires the signed compatible Aethyme release or a
+  reviewed repository upgrade. Refresh never rewrites the pin.
+- Dirty paths that overlap the exact graph write set block. Disjoint dirty
+  work is preserved and is explicitly excluded from plan inputs.
+- Live broker sessions block shared fragment changes. Finish them before
+  applying the plan; relevant leases remain visible in JSON.
+- Symlinked output paths are refused.
+- A crash leaves a private digest-bound recovery journal. Do not rerun execute.
+  Complete only the reviewed transaction with:
+
+  ```bash
+  aethyme graph refresh recover --repo . --plan <plan-sha256>
+  ```
+
+Canonical and local-only Aethyme deployments use the same graph contract. The
+deployment mode controls which policy files are tracked; it does not weaken
+the exact-HEAD, version-pin, confirmation, or transactional safety rules.
+
+The lower-level `aethyme-engine-cli index` command remains supported for
+engine diagnostics and compatibility. It is not a substitute for the reviewed
+refresh lifecycle when committed fragments are repository authority: it does
+not propose their exact write set or bind repository preconditions to a digest.
+
+## Upgrading an old pin
+
+Install the release named by `.aethyme/engine-version` when it is still
+supported. When a repository migration intentionally advances that pin, use
+the repository upgrade planner and its digest-confirmed apply flow first.
+Then use the graph refresh plan above. Never edit the pin merely to make a
+locally installed binary pass: doing so would change repository policy without
+reviewing the corresponding generated graph.

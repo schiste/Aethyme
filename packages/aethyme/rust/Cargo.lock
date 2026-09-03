@@ -45,6 +45,8 @@ dependencies = [
  "aethyme-broker",
  "aethyme-engine",
  "aethyme-enhance",
+ "aethyme-graph-indexer",
+ "aethyme-graph-storage",
  "aethyme-quality",
  "aethyme-testkit",
  "libc",

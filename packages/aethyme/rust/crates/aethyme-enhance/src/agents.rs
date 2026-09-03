@@ -331,8 +331,12 @@ blocked.
    check, not a semantic gate suggestion. Session gates, full-tree CI,
    repository pre-push, and submit verify the exact tree in a disposable
    checkout and refuse stale or wrong-version fragments without rewriting your
-   worktree. Review `aethyme graph refresh plan --repo .` for remediation;
-   never rebuild committed fragments with an unpinned binary.
+   worktree. Run `aethyme graph status --repo .`, review
+   `aethyme graph refresh plan --repo . --diff`, and authorize only its full
+   digest with `aethyme graph refresh execute --repo . --confirm <plan-sha256>`.
+   Never rebuild committed fragments with an unpinned binary. If execution was
+   interrupted, use the exact `graph refresh recover --plan <plan-sha256>`
+   handoff; do not retry blindly.
 
 6. **When your task is complete**, use verified broker integration by
    default instead of manually combining concurrent session branches:

@@ -72,6 +72,19 @@ jobs:
           "$smoke_root/aethyme" --version
           "$smoke_root/aethyme-engine-cli" --version
           "$smoke_root/aethyme" broker quick-test
+          graph_repo="$smoke_root/graph-refresh"
+          git init --quiet --initial-branch=main "$graph_repo"
+          mkdir -p "$graph_repo/.aethyme"
+          printf '[graph]\nauthority="committed_fragments"\nrepository="release-smoke"\n' > "$graph_repo/.aethyme/config.toml"
+          printf '%s\n' "${REF_NAME#v}" > "$graph_repo/.aethyme/engine-version"
+          printf 'def release_smoke():\n    return True\n' > "$graph_repo/app.py"
+          git -C "$graph_repo" -c user.name='Aethyme Release' -c user.email='release@example.invalid' add -A
+          git -C "$graph_repo" -c user.name='Aethyme Release' -c user.email='release@example.invalid' commit --quiet -m fixture
+          "$smoke_root/aethyme" graph status --repo "$graph_repo" --json
+          plan_sha="$("$smoke_root/aethyme" graph refresh plan --repo "$graph_repo" --json | sed -n 's/.*"plan_sha256": "\([0-9a-f]*\)".*/\1/p')"
+          test "${#plan_sha}" = 64
+          "$smoke_root/aethyme" graph refresh execute --repo "$graph_repo" --confirm "$plan_sha"
+          test -f "$graph_repo/.aethyme/graph_store.redb"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7

@@ -81,6 +81,10 @@ fn release_workflow_smokes_the_installed_archive_contract() {
         "\"$smoke_root/aethyme\" --version",
         "\"$smoke_root/aethyme-engine-cli\" --version",
         "\"$smoke_root/aethyme\" broker quick-test",
+        "\"$smoke_root/aethyme\" graph status",
+        "\"$smoke_root/aethyme\" graph refresh plan",
+        "\"$smoke_root/aethyme\" graph refresh execute",
+        ".aethyme/graph_store.redb",
     ] {
         assert!(smoke.contains(command), "smoke step is missing {command}");
     }

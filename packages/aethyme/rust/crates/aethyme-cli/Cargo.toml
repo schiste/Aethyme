@@ -12,6 +12,8 @@ path = "src/main.rs"
 aethyme-engine = { path = "../aethyme-engine" }
 aethyme-broker = { path = "../aethyme-broker" }
 aethyme-enhance = { path = "../aethyme-enhance" }
+aethyme-graph-indexer = { path = "../aethyme-graph-indexer" }
+aethyme-graph-storage = { path = "../aethyme-graph-storage" }
 aethyme-quality = { path = "../aethyme-quality" }
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }

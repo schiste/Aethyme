@@ -14,6 +14,7 @@ use crate::{
 };
 
 pub const RELEASE_MANIFEST_SCHEMA_VERSION: u32 = 1;
+pub const GRAPH_REFRESH_PLAN_SCHEMA_VERSION: u32 = 1;
 pub const RELEASE_TARGETS: &[&str] = &[
     "aarch64-apple-darwin",
     "x86_64-apple-darwin",
@@ -45,6 +46,10 @@ pub struct ReleaseCompatibility {
     /// advertised. New manifests are always generated with the current value.
     #[serde(default)]
     pub repository_schema: u32,
+    /// Zero identifies a legacy manifest published before the installed
+    /// release unit advertised an embedded graph-refresh capability.
+    #[serde(default)]
+    pub graph_refresh_plan_schema: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -85,6 +90,7 @@ impl ReleaseManifest {
                 engine_protocol: ENGINE_PROTOCOL_VERSION,
                 minimum_git_version: MINIMUM_GIT_VERSION.to_string(),
                 repository_schema: REPOSITORY_SCHEMA_VERSION,
+                graph_refresh_plan_schema: GRAPH_REFRESH_PLAN_SCHEMA_VERSION,
             },
             installer,
             release_channel: release_channel.into(),
@@ -242,6 +248,10 @@ mod tests {
         assert_eq!(
             manifest.compatibility.repository_schema,
             REPOSITORY_SCHEMA_VERSION
+        );
+        assert_eq!(
+            manifest.compatibility.graph_refresh_plan_schema,
+            GRAPH_REFRESH_PLAN_SCHEMA_VERSION
         );
         assert_eq!(manifest.validate(), Ok(()));
     }

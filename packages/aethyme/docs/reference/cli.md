@@ -1597,6 +1597,47 @@ actually invoked:
 
 It does not yet claim actual agent adoption or downstream answer quality.
 
+### Authoritative Graph Lifecycle
+
+The installed `aethyme` router owns the complete version-safe lifecycle; a
+separate graph-indexer executable is not required:
+
+```bash
+aethyme graph status --repo . [--json]
+aethyme graph refresh plan --repo . [--json | --diff]
+aethyme graph refresh execute --repo . --confirm <plan-sha256>
+aethyme graph refresh recover --repo . --plan <plan-sha256>
+```
+
+`status` and `plan` regenerate from exact committed `HEAD` in a disposable
+clone. They do not read incidental source or graph bytes from the active
+worktree. The stable JSON plan reports the canonical repository, source commit
+and tree, graph policy and pin, linked component versions, hash-only fragment
+write set, derived-store action, dirty overlap, live sessions, relevant leases,
+compatibility, blockers, and a SHA-256 binding all of those preconditions.
+Neither JSON nor the hash-only `--diff` surface contains source contents or
+absolute repository paths.
+
+`execute` revalidates the complete plan under an exclusive repository lock,
+requires the full digest, writes a private rollback/recovery journal, applies
+fragment files through sibling temporary files, verifies every resulting hash,
+and only then builds and atomically publishes `.aethyme/graph_store.redb` from
+the reviewed committed inputs. A crash never authorizes an implicit retry;
+`recover` completes only the exact digest-confirmed journal. Exact generated
+outputs already present but not committed are recognized and routed to review
+and commit. Disjoint dirty files are preserved and explicitly reported as not
+being plan inputs; overlapping graph changes and live broker sessions block.
+
+The repository engine-version pin is never rewritten by refresh. If the pin
+does not match the installed release unit, install the signed compatible
+release or migrate the repository contract through the reviewed upgrade flow.
+Ordinary Explore performs no background download or transparent refresh.
+The complete operational workflow, including post-commit restamping and old
+pin handling, is in [Version-safe graph refresh](../guides/graph-refresh.md).
+The lower-level `aethyme-engine-cli index` surface remains available for
+engine diagnostics, but it does not provide the plan, confirmation, dirty-path,
+session, lease, or recovery contract required for authoritative fragments.
+
 ### High-Level Intent Surface
 
 > **Note (2026-08-01):** every command is served by the native Rust binary. The Python CLI that once carried a targeted recovery error for `explore` is itself deleted; `python -m src.cli` now fails with `No module named src`.
@@ -1678,8 +1719,9 @@ The current `usage_boundary_query` implementation uses the scope-first
 `analyze-usage-boundary` engine path for PHP public methods/functions. That path
 opens `.aethyme/graph_store.redb` read-only to discover public symbols and
 candidate files, then scans source/docs/config text for evidence. It does not
-build `RepositoryMap` or mutate the store; run `aethyme-engine-cli index --repo
-<repo>` first if the redb artifact is missing. For non-PHP scopes, or when
+build `RepositoryMap` or mutate the store; use `aethyme graph status --repo
+<repo>` and the reviewed `graph refresh plan`/`execute` flow if the redb
+artifact is missing. For non-PHP scopes, or when
 `degraded_reasons` includes language/support gaps, use the graph-backed
 `analyze dead-code` / `facts function-usage` commands as the fallback.
 

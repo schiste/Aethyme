@@ -27,6 +27,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
+mod graph_refresh;
 mod repository_deploy;
 mod repository_enrollment;
 mod repository_upgrade;
@@ -274,6 +275,9 @@ fn main() -> ExitCode {
         // Native since python-retirement Phase 1 (the Python `query`
         // group is deleted). Errors keep Click's `Error: {msg}` shape
         // and exit 1 so scripted consumers see the same surface.
+        "graph" if graph_refresh::handles(&args[1..]) => {
+            ExitCode::from(graph_refresh::run(&args[1..]))
+        }
         "graph" => match aethyme_engine::graph_cli::run(&args[1..]) {
             Ok(()) => ExitCode::SUCCESS,
             Err(message) => {
@@ -426,6 +430,7 @@ fn print_top_level_help() {
     eprintln!("  broker adopt|start-agent|agents|cleanup   (see `broker --help`)");
     eprintln!("  update check|plan|execute  explicit paired-binary updates; never background");
     eprintln!("  upgrade plan|apply|recover review, apply, or recover repository migrations");
+    eprintln!("  graph status|refresh       inspect or refresh authoritative graph artifacts");
     eprintln!();
     eprintln!("Setup:");
     eprintln!("  deploy [verify|bridge] [--repo <path>]  enroll repository policy");
@@ -536,7 +541,8 @@ fn start_engine_daemon_and_wait(repo: &Path) -> Result<(), String> {
         ReadyOutcome::Ready => Ok(()),
         ReadyOutcome::ProcessExited => Err(format!(
             "engine daemon exited during startup (is the repo indexed? \
-             run `aethyme-graph-index` + `aethyme-engine-cli index`). Log tail:\n{}",
+             run `aethyme graph status --repo .`, then review and execute \
+             `aethyme graph refresh plan --repo .`). Log tail:\n{}",
             daemon::log_tail(repo, 5)
         )),
         ReadyOutcome::TimedOut => Err(format!(

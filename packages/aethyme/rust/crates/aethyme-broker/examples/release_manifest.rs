@@ -218,6 +218,7 @@ mod tests {
             manifest.compatibility.engine_protocol,
             aethyme_broker::ENGINE_PROTOCOL_VERSION
         );
+        assert_eq!(manifest.compatibility.graph_refresh_plan_schema, 1);
         assert_eq!(
             manifest.compatibility.broker_storage.current_schema,
             aethyme_broker::BROKER_STORAGE_CURRENT_SCHEMA
