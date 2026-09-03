@@ -21,6 +21,8 @@ pub struct RetentionPolicy {
     pub terminal_merge_queue_days: u32,
     pub command_metrics_days: u32,
     pub closed_worktrees_days: u32,
+    /// Soft repository storage budget. `0` disables budget warnings.
+    pub retained_bytes_budget: u64,
     pub artifact_reclaim_days: u32,
     pub orphan_worktree_roots_days: u32,
     /// Wall-clock budget for the autonomous artifact sweep. `0` disables it.
@@ -39,9 +41,10 @@ impl Default for RetentionPolicy {
             terminal_merge_queue_days: 180,
             command_metrics_days: 30,
             closed_worktrees_days: 7,
+            retained_bytes_budget: 1_073_741_824,
             artifact_reclaim_days: 3,
             orphan_worktree_roots_days: 1,
-            artifact_sweep_budget_ms: 1_500,
+            artifact_sweep_budget_ms: 0,
             artifact_sweep_interval_hours: 24,
             startup_budget_ms: 25,
         }
@@ -71,11 +74,21 @@ impl RetentionPolicy {
                 });
             }
         }
+        if self.retained_bytes_budget > 1_125_899_906_842_624 {
+            return Err(RetentionConfigError::InvalidValue {
+                field: "retained_bytes_budget",
+                value: self.retained_bytes_budget.to_string(),
+                constraint: "must be between 0 (warnings disabled) and 1 PiB",
+            });
+        }
         // These two accept 0, meaning no grace period. Neither removes
         // committed work, so waiting is a convenience rather than a safeguard.
         for (field, value) in [
             ("artifact_reclaim_days", self.artifact_reclaim_days),
-            ("orphan_worktree_roots_days", self.orphan_worktree_roots_days),
+            (
+                "orphan_worktree_roots_days",
+                self.orphan_worktree_roots_days,
+            ),
         ] {
             if value > 36_500 {
                 return Err(RetentionConfigError::InvalidValue {
@@ -288,6 +301,7 @@ pub struct GcHealth {
     pub estimated_reclaimable_bytes: u64,
     pub estimated_retained_bytes: u64,
     pub estimated_blocked_bytes: u64,
+    pub over_retained_bytes_budget: bool,
     pub blockers: usize,
 }
 
@@ -331,6 +345,8 @@ mod tests {
         assert!(policy.terminal_events_days >= policy.gate_results_days);
         assert!(policy.terminal_merge_queue_days >= policy.gate_results_days);
         assert!(policy.startup_budget_ms <= 25);
+        assert_eq!(policy.artifact_sweep_budget_ms, 0);
+        assert_eq!(policy.retained_bytes_budget, 1_073_741_824);
     }
 
     #[test]
@@ -362,6 +378,7 @@ mod tests {
             "[retention]\nschema_version = 2\n",
             "[retention]\nterminal_events_days = 0\n",
             "[retention]\nstartup_budget_ms = 5001\n",
+            "[retention]\nretained_bytes_budget = 1125899906842625\n",
         ];
         for text in cases {
             let repo = tempfile::tempdir().unwrap();

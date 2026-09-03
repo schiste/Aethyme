@@ -7,7 +7,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
-use crate::broker::{WORKTREE_ROOT_MARKER, WorktreeRootMarker, directory_size_without_following_links};
+use crate::broker::{
+    WORKTREE_ROOT_MARKER, WorktreeRootMarker, directory_size_without_following_links,
+};
 use crate::{
     Broker, BrokerOpError, GcApplyReport, GcArtifactCandidate, GcBlocker, GcFileAction,
     GcFileCandidate, GcHealth, GcOrphanCandidate, GcPlan, GcRowCandidate, GcWorktreeCandidate,
@@ -768,6 +770,8 @@ impl Broker {
     pub fn gc_health(&mut self) -> Result<GcHealth, BrokerOpError> {
         let plan = self.gc_plan()?;
         let journal = load_journal(&self.main_root().join(".aethyme/gc-journal.json"))?;
+        let over_retained_bytes_budget = plan.policy.retained_bytes_budget > 0
+            && plan.estimated_retained_bytes >= plan.policy.retained_bytes_budget;
         Ok(GcHealth {
             policy: plan.policy,
             pending_recovery_digest: journal.map(|journal| journal.digest),
@@ -779,6 +783,7 @@ impl Broker {
             estimated_reclaimable_bytes: plan.estimated_reclaimable_bytes,
             estimated_retained_bytes: plan.estimated_retained_bytes,
             estimated_blocked_bytes: plan.estimated_blocked_bytes,
+            over_retained_bytes_budget,
             blockers: plan.blockers.len(),
         })
     }
@@ -794,9 +799,9 @@ impl Broker {
         let policy = load_retention_policy(self.main_root())?;
         let journal_path = self.main_root().join(".aethyme/gc-journal.json");
         let resumed = match load_journal(&journal_path)? {
-            Some(journal) => Some(
-                self.gc_apply_bounded(&journal.digest, Some(policy.startup_budget_ms))?,
-            ),
+            Some(journal) => {
+                Some(self.gc_apply_bounded(&journal.digest, Some(policy.startup_budget_ms))?)
+            }
             None => None,
         };
         let _ = self.sweep_artifacts_autonomously(&policy);

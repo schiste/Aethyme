@@ -2596,7 +2596,10 @@ fn render_gc_plan(plan: &crate::GcPlan) {
             human_bytes(orphan.estimated_bytes),
             orphan.reason,
         );
-        println!("    owning repository: {} (missing)", orphan.repository_root);
+        println!(
+            "    owning repository: {} (missing)",
+            orphan.repository_root
+        );
     }
     for blocker in &plan.blockers {
         println!(
@@ -7361,13 +7364,20 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     }
                 }
                 println!(
-                    "retention: {} rows, {} files, {} worktrees, {} reclaimable; {} protected findings",
+                    "retention: {} rows, {} files, {} worktrees, {} retained, {} reclaimable; {} protected findings",
                     report.retention.candidate_rows,
                     report.retention.candidate_files,
                     report.retention.candidate_worktrees,
+                    human_bytes(report.retention.estimated_retained_bytes),
                     human_bytes(report.retention.estimated_reclaimable_bytes),
                     report.retention.blockers,
                 );
+                if report.retention.over_retained_bytes_budget {
+                    println!(
+                        "  warning: retained storage exceeds the configured {} budget; review `aethyme broker gc plan`",
+                        human_bytes(report.retention.policy.retained_bytes_budget)
+                    );
+                }
                 if let Some(digest) = &report.retention.pending_recovery_digest {
                     println!("  recovery pending: aethyme broker gc apply --confirm {digest}");
                 }

@@ -732,17 +732,20 @@ gate_results_days = 30
 terminal_merge_queue_days = 180
 command_metrics_days = 30
 closed_worktrees_days = 7
+retained_bytes_budget = 1073741824
 artifact_reclaim_days = 3
 orphan_worktree_roots_days = 1
-artifact_sweep_budget_ms = 1500
+artifact_sweep_budget_ms = 0
 artifact_sweep_interval_hours = 24
 startup_budget_ms = 25
 ```
 
-`artifact_reclaim_days` and `orphan_worktree_roots_days` accept `0`, meaning no
+`retained_bytes_budget` is a soft, non-blocking budget used by status, doctor,
+and finish warnings; `0` disables only those warnings. It never authorizes
+deletion. `artifact_reclaim_days` and `orphan_worktree_roots_days` accept `0`, meaning no
 grace period; neither removes committed work, so waiting is a convenience rather
-than a safeguard. Setting `artifact_sweep_budget_ms = 0` disables the autonomous
-sweep described below.
+than a safeguard. The autonomous sweep is disabled by default. Set
+`artifact_sweep_budget_ms` to a positive, bounded duration to opt in.
 
 Run `aethyme broker gc plan` first. Its text and stable JSON enumerate every
 eligible database row, runtime file, represented worktree and exact branch ref,
@@ -768,8 +771,9 @@ recognised (`target`, `node_modules`) *and* a witness confirms it is a real cach
 source directory that merely shares the name is never removed. The scan is
 depth-bounded, skips git metadata, and never follows symlinks.
 
-Once a closed session has been idle for `artifact_reclaim_days`, its build caches
-are reclaimed automatically on broker startup, without operator confirmation.
+When the maintainer explicitly enables `artifact_sweep_budget_ms`, build caches
+from sessions idle for `artifact_reclaim_days` are reclaimed automatically on
+broker startup, without per-run confirmation.
 This is the one exemption from the rule that startup never authorizes fresh work,
 and it is narrow: the sweep removes only build caches, never commits, refs, or
 worktrees, and it skips live sessions. It runs at most once per
@@ -778,8 +782,8 @@ stays off the hot path of every broker command; its cadence stamp lives in the
 broker database rather than under `.aethyme/`, where a durable runtime file would
 register as a dirty path to the checkout-cleanliness gates. Because the stamp is
 set on the first run, a newly upgraded repository may wait up to one interval
-before the first automatic sweep — use `gc plan` and `gc apply` to clear an
-existing backlog immediately.
+before the first automatic sweep. With the default disabled policy, or to clear
+an existing backlog immediately, use `gc plan` and digest-confirmed `gc apply`.
 
 Worktree storage is host-scoped while the records that own it are
 repository-local, so a deleted repository leaves a worktree tree that no database

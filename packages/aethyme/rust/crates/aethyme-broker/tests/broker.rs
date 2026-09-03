@@ -416,6 +416,18 @@ fn cleanup_plan_and_apply_reclaim_only_safe_closed_broker_worktrees() {
     assert_eq!(status.cleanup_retention.eligible_worktree_count, 1);
     assert!(status.cleanup_retention.estimated_retained_bytes >= 4096);
     assert_eq!(
+        status.cleanup_retention.estimated_blocked_bytes,
+        status
+            .cleanup_retention
+            .estimated_retained_bytes
+            .saturating_sub(status.cleanup_retention.estimated_reclaimable_bytes)
+    );
+    assert_eq!(
+        status.cleanup_retention.retained_bytes_budget,
+        1_073_741_824
+    );
+    assert!(!status.cleanup_retention.over_retained_bytes_budget);
+    assert_eq!(
         status.cleanup_retention.severity,
         aethyme_broker::StatusAdviceSeverity::Notice
     );

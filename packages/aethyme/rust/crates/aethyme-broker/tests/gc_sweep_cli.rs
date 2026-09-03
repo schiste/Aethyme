@@ -77,9 +77,8 @@ fn stamp_root(container: &Path, key: &str, repository_root: &Path) -> PathBuf {
 
 #[test]
 fn orphaned_roots_are_swept_while_owned_and_unmarked_roots_are_protected() {
-    let (repo, container) = fixture(
-        "[retention]\norphan_worktree_roots_days = 0\nartifact_sweep_budget_ms = 0\n",
-    );
+    let (repo, container) =
+        fixture("[retention]\norphan_worktree_roots_days = 0\nartifact_sweep_budget_ms = 0\n");
     let missing = container.path().join("deleted-repository");
     let orphan = stamp_root(container.path(), "repo-orphaned", &missing);
     let owned = stamp_root(container.path(), "repo-owned", repo.path());
@@ -123,9 +122,8 @@ fn orphaned_roots_are_swept_while_owned_and_unmarked_roots_are_protected() {
 
 #[test]
 fn a_reappearing_repository_revokes_an_authorized_orphan_removal() {
-    let (repo, container) = fixture(
-        "[retention]\norphan_worktree_roots_days = 0\nartifact_sweep_budget_ms = 0\n",
-    );
+    let (repo, container) =
+        fixture("[retention]\norphan_worktree_roots_days = 0\nartifact_sweep_budget_ms = 0\n");
     let missing = container.path().join("deleted-repository");
     let orphan = stamp_root(container.path(), "repo-orphaned", &missing);
 
@@ -204,6 +202,24 @@ fn enable_sweep(repo: &Path) {
 }
 
 #[test]
+fn default_policy_never_reclaims_build_caches_without_confirmation() {
+    let (repo, container) = fixture("");
+    let (_id, worktree) = blocked_session_with_build_cache(repo.path(), container.path());
+    let target = worktree.join("rust/target");
+
+    let output = run(repo.path(), container.path(), &["status", "--json"]);
+    assert!(
+        output.status.success(),
+        "status: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        target.exists(),
+        "default broker startup must not delete a cache without explicit opt-in or confirmed GC"
+    );
+}
+
+#[test]
 fn build_caches_are_reclaimable_even_when_the_worktree_itself_is_blocked() {
     // The autonomous sweep is off so the plan is what is under test.
     let (repo, container) =
@@ -212,7 +228,11 @@ fn build_caches_are_reclaimable_even_when_the_worktree_itself_is_blocked() {
 
     let plan = plan_json(repo.path(), container.path());
     let artifacts = plan["artifacts"].as_array().unwrap();
-    assert_eq!(artifacts.len(), 1, "expected one build cache, got {artifacts:?}");
+    assert_eq!(
+        artifacts.len(),
+        1,
+        "expected one build cache, got {artifacts:?}"
+    );
     assert_eq!(artifacts[0]["relative_dir"], "rust/target");
     assert!(artifacts[0]["estimated_bytes"].as_u64().unwrap() >= 4096);
 
@@ -238,7 +258,10 @@ fn build_caches_are_reclaimable_even_when_the_worktree_itself_is_blocked() {
         "gc apply: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(!worktree.join("rust/target").exists(), "build cache should be gone");
+    assert!(
+        !worktree.join("rust/target").exists(),
+        "build cache should be gone"
+    );
     assert!(
         worktree.join("work.txt").exists(),
         "committed work must be untouched"
@@ -275,7 +298,11 @@ fn the_autonomous_sweep_reclaims_build_caches_without_confirmation() {
 fn a_live_session_keeps_its_build_cache() {
     let (repo, container) =
         fixture("[retention]\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 0\n");
-    let output = run(repo.path(), container.path(), &["start", "--task", "live", "--json"]);
+    let output = run(
+        repo.path(),
+        container.path(),
+        &["start", "--task", "live", "--json"],
+    );
     let session: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     let worktree = PathBuf::from(session["worktree_path"].as_str().unwrap());
     let target = worktree.join("rust/target");

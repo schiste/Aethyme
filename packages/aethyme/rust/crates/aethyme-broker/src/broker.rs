@@ -799,6 +799,9 @@ pub struct CleanupRetention {
     pub eligible_worktree_count: usize,
     pub estimated_retained_bytes: u64,
     pub estimated_reclaimable_bytes: u64,
+    pub estimated_blocked_bytes: u64,
+    pub retained_bytes_budget: u64,
+    pub over_retained_bytes_budget: bool,
     pub oldest_closed_age_days: u64,
     pub closed_worktrees_policy_days: u32,
     pub severity: StatusAdviceSeverity,
@@ -2550,39 +2553,38 @@ impl Broker {
 
     pub fn worktree_root_plan(&self) -> Result<WorktreeRootPlan, BrokerOpError> {
         let repository_key = self.repository_worktree_key()?;
-        let (preferred_root, preferred_source, root_container) = if let Some(root) =
-            &self.worktree_root_override
-        {
-            (
-                Some(self.absolute_worktree_root(root)),
-                Some(WorktreeRootSource::LibraryOverride),
-                None,
-            )
-        } else if let Some(base) =
-            std::env::var_os("AETHYME_WORKTREE_ROOT").filter(|value| !value.is_empty())
-        {
-            let container = self.absolute_worktree_root(&PathBuf::from(base));
-            (
-                Some(container.join(&repository_key)),
-                Some(WorktreeRootSource::EnvironmentOverride),
-                Some(container),
-            )
-        } else if let Some(base) = crate::host_state::default_host_state_dir().filter(|_| {
-            // Only the implicit platform default is withheld from ephemeral
-            // repositories; an explicitly named host state directory is a
-            // deliberate choice and is always honoured.
-            crate::host_state::host_state_dir_is_explicit()
-                || !crate::host_state::path_is_ephemeral(&self.main_root)
-        }) {
-            let container = base.join("worktrees");
-            (
-                Some(container.join(&repository_key)),
-                Some(WorktreeRootSource::HostState),
-                Some(container),
-            )
-        } else {
-            (None, None, None)
-        };
+        let (preferred_root, preferred_source, root_container) =
+            if let Some(root) = &self.worktree_root_override {
+                (
+                    Some(self.absolute_worktree_root(root)),
+                    Some(WorktreeRootSource::LibraryOverride),
+                    None,
+                )
+            } else if let Some(base) =
+                std::env::var_os("AETHYME_WORKTREE_ROOT").filter(|value| !value.is_empty())
+            {
+                let container = self.absolute_worktree_root(&PathBuf::from(base));
+                (
+                    Some(container.join(&repository_key)),
+                    Some(WorktreeRootSource::EnvironmentOverride),
+                    Some(container),
+                )
+            } else if let Some(base) = crate::host_state::default_host_state_dir().filter(|_| {
+                // Only the implicit platform default is withheld from ephemeral
+                // repositories; an explicitly named host state directory is a
+                // deliberate choice and is always honoured.
+                crate::host_state::host_state_dir_is_explicit()
+                    || !crate::host_state::path_is_ephemeral(&self.main_root)
+            }) {
+                let container = base.join("worktrees");
+                (
+                    Some(container.join(&repository_key)),
+                    Some(WorktreeRootSource::HostState),
+                    Some(container),
+                )
+            } else {
+                (None, None, None)
+            };
         let preferred_outside_repository = preferred_root
             .as_deref()
             .is_some_and(|root| !self.path_is_inside_repository(root));
@@ -4782,6 +4784,16 @@ impl Broker {
                         cleanup_retention.estimated_reclaimable_bytes
                     ),
                     format!(
+                        "blocked/budget bytes: {}/{}{}",
+                        cleanup_retention.estimated_blocked_bytes,
+                        cleanup_retention.retained_bytes_budget,
+                        if cleanup_retention.over_retained_bytes_budget {
+                            " (budget exceeded)"
+                        } else {
+                            ""
+                        }
+                    ),
+                    format!(
                         "oldest closed age/policy: {}/{} days",
                         cleanup_retention.oldest_closed_age_days,
                         cleanup_retention.closed_worktrees_policy_days
@@ -5568,6 +5580,8 @@ impl Broker {
             .iter()
             .rev()
             .find(|entry| entry.session_id == session_id);
+        let retention = self.cleanup_retention(at_ms)?;
+        let retention_warning = cleanup_retention_warning(&retention);
         let mut report = FinishReport {
             session_id,
             worktree_path: session.worktree_path.clone(),
@@ -5586,7 +5600,7 @@ impl Broker {
             cleanup: FinishCleanupReport::default(),
             recommended_next_action: None,
             summary: format!("session {session_id} is not finished yet"),
-            warnings: Vec::new(),
+            warnings: retention_warning.into_iter().collect(),
             next_commands: Vec::new(),
         };
 
@@ -6312,13 +6326,22 @@ impl Broker {
             plan.estimated_retained_bytes,
             oldest_closed_age_days,
             policy.closed_worktrees_days,
+            policy.retained_bytes_budget,
         );
+        let estimated_blocked_bytes = plan
+            .estimated_retained_bytes
+            .saturating_sub(plan.estimated_reclaimable_bytes);
+        let over_retained_bytes_budget = policy.retained_bytes_budget > 0
+            && plan.estimated_retained_bytes >= policy.retained_bytes_budget;
         Ok(CleanupRetention {
             broker_owned_worktree_count: plan.retained_worktree_count,
             retained_session_branch_count: plan.retained_branch_count,
             eligible_worktree_count: plan.eligible_worktree_count,
             estimated_retained_bytes: plan.estimated_retained_bytes,
             estimated_reclaimable_bytes: plan.estimated_reclaimable_bytes,
+            estimated_blocked_bytes,
+            retained_bytes_budget: policy.retained_bytes_budget,
+            over_retained_bytes_budget,
             oldest_closed_age_days,
             closed_worktrees_policy_days: policy.closed_worktrees_days,
             severity,
@@ -6571,15 +6594,25 @@ fn cleanup_retention_severity(
     retained_bytes: u64,
     oldest_age_days: u64,
     policy_days: u32,
+    retained_bytes_budget: u64,
 ) -> StatusAdviceSeverity {
     if retained_worktrees >= 5
-        || retained_bytes >= 1_073_741_824
+        || (retained_bytes_budget > 0 && retained_bytes >= retained_bytes_budget)
         || oldest_age_days >= u64::from(policy_days)
     {
         StatusAdviceSeverity::Warning
     } else {
         StatusAdviceSeverity::Notice
     }
+}
+
+fn cleanup_retention_warning(retention: &CleanupRetention) -> Option<String> {
+    retention.over_retained_bytes_budget.then(|| {
+        format!(
+            "retained broker storage is {} bytes, exceeding the configured {} byte budget; review `aethyme broker gc plan`",
+            retention.estimated_retained_bytes, retention.retained_bytes_budget
+        )
+    })
 }
 
 fn status_summary(
@@ -7510,20 +7543,42 @@ mod tests {
     #[test]
     fn cleanup_retention_severity_scales_by_count_bytes_and_policy_age() {
         assert_eq!(
-            super::cleanup_retention_severity(1, 1024, 1, 7),
+            super::cleanup_retention_severity(1, 1024, 1, 7, 1_073_741_824),
             super::StatusAdviceSeverity::Notice
         );
         assert_eq!(
-            super::cleanup_retention_severity(5, 1024, 1, 7),
+            super::cleanup_retention_severity(5, 1024, 1, 7, 1_073_741_824),
             super::StatusAdviceSeverity::Warning
         );
         assert_eq!(
-            super::cleanup_retention_severity(1, 1_073_741_824, 1, 7),
+            super::cleanup_retention_severity(1, 1024, 1, 7, 1024),
             super::StatusAdviceSeverity::Warning
         );
         assert_eq!(
-            super::cleanup_retention_severity(1, 1024, 7, 7),
+            super::cleanup_retention_severity(1, 1024, 7, 7, 0),
             super::StatusAdviceSeverity::Warning
+        );
+        assert_eq!(
+            super::cleanup_retention_severity(1, u64::MAX, 1, 7, 0),
+            super::StatusAdviceSeverity::Notice
+        );
+        let retention = super::CleanupRetention {
+            broker_owned_worktree_count: 1,
+            retained_session_branch_count: 1,
+            eligible_worktree_count: 0,
+            estimated_retained_bytes: 2048,
+            estimated_reclaimable_bytes: 0,
+            estimated_blocked_bytes: 2048,
+            retained_bytes_budget: 1024,
+            over_retained_bytes_budget: true,
+            oldest_closed_age_days: 1,
+            closed_worktrees_policy_days: 7,
+            severity: super::StatusAdviceSeverity::Warning,
+        };
+        assert!(
+            super::cleanup_retention_warning(&retention)
+                .unwrap()
+                .contains("aethyme broker gc plan")
         );
     }
 
@@ -7563,6 +7618,7 @@ mod tests {
                 estimated_reclaimable_bytes: 0,
                 estimated_retained_bytes: 0,
                 estimated_blocked_bytes: 0,
+                over_retained_bytes_budget: false,
                 blockers: 0,
             },
             integration_movement: None,
