@@ -7,13 +7,92 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
+use crate::broker::{WORKTREE_ROOT_MARKER, WorktreeRootMarker, directory_size_without_following_links};
 use crate::{
-    Broker, BrokerOpError, GcApplyReport, GcBlocker, GcFileAction, GcFileCandidate, GcHealth,
-    GcPlan, GcRowCandidate, GcWorktreeCandidate, OperationStatus, RetentionPolicy,
-    load_retention_policy,
+    Broker, BrokerOpError, GcApplyReport, GcArtifactCandidate, GcBlocker, GcFileAction,
+    GcFileCandidate, GcHealth, GcOrphanCandidate, GcPlan, GcRowCandidate, GcWorktreeCandidate,
+    OperationStatus, RetentionPolicy, load_retention_policy,
 };
 
-pub const GC_PLAN_SCHEMA_VERSION: u32 = 1;
+pub const GC_PLAN_SCHEMA_VERSION: u32 = 2;
+
+/// Git-ignored build directories that may be reclaimed independently of a
+/// worktree's cleanup disposition. Each name is paired with a witness that
+/// must be present before the directory is treated as a build cache, so an
+/// unrelated source directory that merely shares the name is never removed.
+const ARTIFACT_DIRECTORIES: &[(&str, ArtifactWitness)] = &[
+    ("target", ArtifactWitness::File("CACHEDIR.TAG")),
+    ("node_modules", ArtifactWitness::NonEmptyDirectory),
+];
+
+/// How deep below a worktree root a build directory is looked for. Deep enough
+/// for nested workspaces and package directories, shallow enough to keep the
+/// scan bounded on large trees.
+const ARTIFACT_SCAN_DEPTH: usize = 6;
+
+/// `meta` key holding the last autonomous artifact sweep time.
+const ARTIFACT_SWEEP_STAMP_KEY: &str = "gc.artifact_sweep.last_run_ms";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArtifactWitness {
+    File(&'static str),
+    NonEmptyDirectory,
+}
+
+impl ArtifactWitness {
+    fn confirms(self, path: &Path) -> bool {
+        match self {
+            Self::File(name) => path.join(name).is_file(),
+            Self::NonEmptyDirectory => std::fs::read_dir(path)
+                .map(|mut entries| entries.next().is_some())
+                .unwrap_or(false),
+        }
+    }
+}
+
+fn is_real_directory(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir())
+}
+
+fn days_between(now: i64, earlier: i64) -> u32 {
+    u32::try_from(now.saturating_sub(earlier) / 86_400_000).unwrap_or(u32::MAX)
+}
+
+/// Classify a build directory found beneath `root`, if it is one.
+fn artifact_witness_for(path: &Path) -> Option<ArtifactWitness> {
+    let name = path.file_name()?.to_str()?;
+    ARTIFACT_DIRECTORIES
+        .iter()
+        .find(|(candidate, _)| *candidate == name)
+        .map(|(_, witness)| *witness)
+        .filter(|witness| witness.confirms(path))
+}
+
+/// Collect build directories beneath `root`, never descending into one that
+/// already matched and never following symlinks.
+fn collect_artifact_dirs(root: &Path, current: &Path, depth: usize, found: &mut Vec<PathBuf>) {
+    if depth > ARTIFACT_SCAN_DEPTH {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(current) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !is_real_directory(&path) {
+            continue;
+        }
+        // The worktree's own git metadata is never a build artifact.
+        if path.file_name().is_some_and(|name| name == ".git") {
+            continue;
+        }
+        if artifact_witness_for(&path).is_some() {
+            found.push(path);
+            continue;
+        }
+        collect_artifact_dirs(root, &path, depth + 1, found);
+    }
+}
 
 fn now_ms() -> i64 {
     SystemTime::now()
@@ -118,9 +197,17 @@ struct GcJournal {
     remaining_rows: Vec<GcRowCandidate>,
     remaining_files: Vec<GcFileCandidate>,
     remaining_worktrees: Vec<GcWorktreeCandidate>,
+    #[serde(default)]
+    remaining_artifacts: Vec<GcArtifactCandidate>,
+    #[serde(default)]
+    remaining_orphans: Vec<GcOrphanCandidate>,
     rows_removed: usize,
     files_completed: Vec<String>,
     sessions_cleaned: Vec<i64>,
+    #[serde(default)]
+    artifacts_reclaimed: Vec<String>,
+    #[serde(default)]
+    orphans_removed: Vec<String>,
     reclaimed_bytes: u64,
 }
 
@@ -134,9 +221,13 @@ impl From<GcPlan> for GcJournal {
             remaining_rows: plan.rows,
             remaining_files: plan.files,
             remaining_worktrees: plan.worktrees,
+            remaining_artifacts: plan.artifacts,
+            remaining_orphans: plan.orphans,
             rows_removed: 0,
             files_completed: Vec::new(),
             sessions_cleaned: Vec::new(),
+            artifacts_reclaimed: Vec::new(),
+            orphans_removed: Vec::new(),
             reclaimed_bytes: 0,
         }
     }
@@ -288,6 +379,144 @@ fn check_deadline(deadline: Option<Instant>) -> bool {
 }
 
 impl Broker {
+    /// Build directories inside retained worktrees, for sessions idle at least
+    /// `artifact_reclaim_days`.
+    ///
+    /// This deliberately ignores the worktree's cleanup disposition. Blocked
+    /// dispositions protect *commits*; build caches hold none, so a worktree
+    /// whose provenance is unproven still has reclaimable bytes. Sessions
+    /// already scheduled for whole-worktree removal are skipped so the two
+    /// candidate sets never double-count the same bytes.
+    fn artifact_candidates(
+        &self,
+        evaluated_at: i64,
+        policy: &RetentionPolicy,
+        cleanup: &[crate::CleanupWorktreePlan],
+        sessions: &BTreeMap<i64, crate::Session>,
+        already_removed: &[i64],
+    ) -> Vec<GcArtifactCandidate> {
+        let mut candidates = Vec::new();
+        for item in cleanup {
+            if !item.worktree_present || already_removed.contains(&item.session_id) {
+                continue;
+            }
+            // Only closed sessions appear here; a live worktree is still in use.
+            let Some(session) = sessions.get(&item.session_id) else {
+                continue;
+            };
+            let closed_at = session.closed_at.unwrap_or(session.updated_at);
+            let idle_days = days_between(evaluated_at, closed_at);
+            if idle_days < policy.artifact_reclaim_days {
+                continue;
+            }
+            let root = PathBuf::from(&item.worktree_path);
+            if !is_real_directory(&root) {
+                continue;
+            }
+            let mut found = Vec::new();
+            collect_artifact_dirs(&root, &root, 0, &mut found);
+            for dir in found {
+                let Some(relative) = repo_relative(&root, &dir) else {
+                    continue;
+                };
+                let bytes = directory_size_without_following_links(&dir).unwrap_or(0);
+                if bytes == 0 {
+                    continue;
+                }
+                candidates.push(GcArtifactCandidate {
+                    session_id: item.session_id,
+                    worktree_path: item.worktree_path.clone(),
+                    relative_dir: relative,
+                    estimated_bytes: bytes,
+                    idle_days,
+                });
+            }
+        }
+        candidates.sort_by(|left, right| {
+            (left.session_id, &left.relative_dir).cmp(&(right.session_id, &right.relative_dir))
+        });
+        candidates
+    }
+
+    /// Host worktree roots whose owning repository is gone.
+    ///
+    /// Each root carries a `.aethyme-worktree-root.json` breadcrumb naming the
+    /// repository that created it. When that repository no longer exists, no
+    /// broker database can ever account for the tree again, so nothing but a
+    /// host-level sweep will reclaim it.
+    fn orphan_candidates(
+        &self,
+        evaluated_at: i64,
+        policy: &RetentionPolicy,
+        blockers: &mut Vec<GcBlocker>,
+    ) -> Result<Vec<GcOrphanCandidate>, BrokerOpError> {
+        let plan = self.worktree_root_plan()?;
+        let Some(container) = plan.root_container.clone() else {
+            return Ok(Vec::new());
+        };
+        let Ok(entries) = std::fs::read_dir(&container) else {
+            return Ok(Vec::new());
+        };
+        let mut candidates = Vec::new();
+        for entry in entries.flatten() {
+            let root = entry.path();
+            if !is_real_directory(&root) {
+                continue;
+            }
+            let key = root.file_name().unwrap_or_default().to_string_lossy();
+            if key == plan.repository_key {
+                continue;
+            }
+            let marker_path = root.join(WORKTREE_ROOT_MARKER);
+            let Ok(bytes) = std::fs::read(&marker_path) else {
+                // No breadcrumb means no provable owner; never remove blind.
+                blockers.push(GcBlocker {
+                    kind: "unmarked_worktree_root".into(),
+                    id: None,
+                    reason: format!("{key} has no {WORKTREE_ROOT_MARKER} and is never swept"),
+                });
+                continue;
+            };
+            let Ok(marker) = serde_json::from_slice::<WorktreeRootMarker>(&bytes) else {
+                blockers.push(GcBlocker {
+                    kind: "unmarked_worktree_root".into(),
+                    id: None,
+                    reason: format!("{key} has an unreadable {WORKTREE_ROOT_MARKER}"),
+                });
+                continue;
+            };
+            if marker.repository_root.exists() {
+                continue;
+            }
+            let age_days = std::fs::metadata(&root)
+                .and_then(|metadata| metadata.modified())
+                .ok()
+                .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+                .map(|since| days_between(evaluated_at, since.as_millis() as i64))
+                .unwrap_or(0);
+            if age_days < policy.orphan_worktree_roots_days {
+                blockers.push(GcBlocker {
+                    kind: "orphan_grace".into(),
+                    id: None,
+                    reason: format!(
+                        "orphaned root {key} is younger than the {} day grace period",
+                        policy.orphan_worktree_roots_days
+                    ),
+                });
+                continue;
+            }
+            candidates.push(GcOrphanCandidate {
+                repository_key: marker.repository_key,
+                worktree_root: root.to_string_lossy().into_owned(),
+                repository_root: marker.repository_root.to_string_lossy().into_owned(),
+                estimated_bytes: directory_size_without_following_links(&root).unwrap_or(0),
+                reason: "owning repository no longer exists".into(),
+            });
+        }
+        candidates.sort_by(|left, right| left.worktree_root.cmp(&right.worktree_root));
+        Ok(candidates)
+    }
+
     pub fn gc_plan(&mut self) -> Result<GcPlan, BrokerOpError> {
         let evaluated_at = now_ms();
         let main_root = self.main_root().to_path_buf();
@@ -427,7 +656,7 @@ impl Broker {
 
         let worktree_cutoff = cutoff(evaluated_at, policy.closed_worktrees_days);
         let mut worktrees = Vec::new();
-        for item in cleanup.worktrees {
+        for item in cleanup.worktrees.iter().cloned() {
             let Some(session) = sessions.get(&item.session_id) else {
                 continue;
             };
@@ -462,6 +691,19 @@ impl Broker {
             });
         }
 
+        let removed_sessions = worktrees
+            .iter()
+            .map(|worktree| worktree.session_id)
+            .collect::<Vec<_>>();
+        let artifacts = self.artifact_candidates(
+            evaluated_at,
+            &policy,
+            &cleanup.worktrees,
+            &sessions,
+            &removed_sessions,
+        );
+        let orphans = self.orphan_candidates(evaluated_at, &policy, &mut blockers)?;
+
         rows.sort_by_key(|row| (row.kind, row.id));
         let mut files = files.into_values().collect::<Vec<_>>();
         files.sort_by(|left, right| left.path.cmp(&right.path));
@@ -479,7 +721,27 @@ impl Broker {
                     .map(|file| file.bytes_before.saturating_sub(file.bytes_after)),
             )
             .chain(worktrees.iter().map(|worktree| worktree.estimated_bytes))
+            .chain(artifacts.iter().map(|artifact| artifact.estimated_bytes))
+            .chain(orphans.iter().map(|orphan| orphan.estimated_bytes))
             .fold(0_u64, u64::saturating_add);
+        // Retained bytes describe disk pressure, not authorized work: every
+        // byte held by a retained worktree plus every orphaned host root.
+        let estimated_retained_bytes = orphans
+            .iter()
+            .map(|orphan| orphan.estimated_bytes)
+            .fold(cleanup.estimated_retained_bytes, u64::saturating_add);
+        // Blocked bytes compare like with like: only worktree-scoped totals.
+        // Row and file candidates live in the repository runtime directory and
+        // were never counted as retained, so subtracting them would understate
+        // what policy is actually holding back.
+        let worktree_scoped_reclaimable = worktrees
+            .iter()
+            .map(|worktree| worktree.estimated_bytes)
+            .chain(artifacts.iter().map(|artifact| artifact.estimated_bytes))
+            .chain(orphans.iter().map(|orphan| orphan.estimated_bytes))
+            .fold(0_u64, u64::saturating_add);
+        let estimated_blocked_bytes =
+            estimated_retained_bytes.saturating_sub(worktree_scoped_reclaimable);
         let mut plan = GcPlan {
             schema_version: GC_PLAN_SCHEMA_VERSION,
             digest: String::new(),
@@ -488,8 +750,12 @@ impl Broker {
             rows,
             files,
             worktrees,
+            artifacts,
+            orphans,
             blockers,
             estimated_reclaimable_bytes,
+            estimated_retained_bytes,
+            estimated_blocked_bytes,
         };
         plan.finish_digest()?;
         Ok(plan)
@@ -508,22 +774,116 @@ impl Broker {
             candidate_rows: plan.rows.len(),
             candidate_files: plan.files.len(),
             candidate_worktrees: plan.worktrees.len(),
+            candidate_artifacts: plan.artifacts.len(),
+            candidate_orphans: plan.orphans.len(),
             estimated_reclaimable_bytes: plan.estimated_reclaimable_bytes,
+            estimated_retained_bytes: plan.estimated_retained_bytes,
+            estimated_blocked_bytes: plan.estimated_blocked_bytes,
             blockers: plan.blockers.len(),
         })
     }
 
-    /// Continue only a GC plan that an operator already authorized. Startup
-    /// never invents or confirms a new plan; it merely spends the configured
-    /// monotonic budget advancing an existing recovery journal.
+    /// Continue only a GC plan that an operator already authorized, then run
+    /// the autonomous artifact sweep.
+    ///
+    /// Startup never invents or confirms a plan that removes committed work.
+    /// The artifact sweep is exempt from that rule because it only removes
+    /// git-ignored build caches, which hold no contribution and are recovered
+    /// by rebuilding.
     pub(crate) fn resume_gc_maintenance(&mut self) -> Result<Option<GcApplyReport>, BrokerOpError> {
-        let journal_path = self.main_root().join(".aethyme/gc-journal.json");
-        let Some(journal) = load_journal(&journal_path)? else {
-            return Ok(None);
-        };
         let policy = load_retention_policy(self.main_root())?;
-        self.gc_apply_bounded(&journal.digest, Some(policy.startup_budget_ms))
-            .map(Some)
+        let journal_path = self.main_root().join(".aethyme/gc-journal.json");
+        let resumed = match load_journal(&journal_path)? {
+            Some(journal) => Some(
+                self.gc_apply_bounded(&journal.digest, Some(policy.startup_budget_ms))?,
+            ),
+            None => None,
+        };
+        let _ = self.sweep_artifacts_autonomously(&policy);
+        Ok(resumed)
+    }
+
+    /// Reclaim build caches from long-idle closed worktrees without operator
+    /// confirmation.
+    ///
+    /// Deliberately avoids [`Broker::cleanup_plan`]: sizing every retained
+    /// worktree is a full stat walk over tens of gigabytes, far too expensive
+    /// for a path that runs on every broker open. Discovery here is a bounded
+    /// `read_dir` scan and sizes are never computed; the operator-invoked
+    /// `gc plan` remains the surface that reports bytes.
+    fn sweep_artifacts_autonomously(
+        &mut self,
+        policy: &RetentionPolicy,
+    ) -> Result<usize, BrokerOpError> {
+        if policy.artifact_sweep_budget_ms == 0 {
+            return Ok(0);
+        }
+        let main_root = self.main_root().to_path_buf();
+        let now = now_ms();
+        let interval_ms = i64::from(policy.artifact_sweep_interval_hours) * 3_600_000;
+        if let Some(last) = self
+            .store()
+            .meta_get(ARTIFACT_SWEEP_STAMP_KEY)?
+            .and_then(|value| value.parse::<i64>().ok())
+            && now.saturating_sub(last) < interval_ms
+        {
+            return Ok(0);
+        }
+        // A concurrent GC owns the artifact namespace; skip rather than race.
+        let Ok(_lock) = GcLock::acquire(&main_root) else {
+            return Ok(0);
+        };
+        // Stamp before acting so a failure mid-sweep cannot spin on every open.
+        self.store()
+            .meta_set(ARTIFACT_SWEEP_STAMP_KEY, &now.to_string())?;
+
+        let live = self
+            .store()
+            .live_sessions()?
+            .into_iter()
+            .map(|session| session.id)
+            .collect::<Vec<_>>();
+        let deadline = Instant::now() + Duration::from_millis(policy.artifact_sweep_budget_ms);
+        let mut removed = Vec::new();
+        for session in self.store().cleaned_sessions()? {
+            if check_deadline(Some(deadline)) {
+                break;
+            }
+            if live.contains(&session.id) {
+                continue;
+            }
+            let closed_at = session.closed_at.unwrap_or(session.updated_at);
+            if days_between(now, closed_at) < policy.artifact_reclaim_days {
+                continue;
+            }
+            let root = PathBuf::from(&session.worktree_path);
+            if !is_real_directory(&root) || !self.is_broker_owned_worktree(&session, &root) {
+                continue;
+            }
+            let mut found = Vec::new();
+            collect_artifact_dirs(&root, &root, 0, &mut found);
+            for dir in found {
+                if check_deadline(Some(deadline)) {
+                    break;
+                }
+                if std::fs::remove_dir_all(&dir).is_ok() {
+                    removed.push(dir.to_string_lossy().into_owned());
+                }
+            }
+        }
+        if !removed.is_empty() {
+            let payload = serde_json::json!({
+                "directories": removed.len(),
+                "idle_days": policy.artifact_reclaim_days,
+            })
+            .to_string();
+            self.store().append_event(
+                crate::events::BROKER_GC_ARTIFACTS_SWEPT,
+                None,
+                Some(&payload),
+            )?;
+        }
+        Ok(removed.len())
     }
 
     /// Apply or resume an authorized plan. A budget is used by amortized
@@ -710,13 +1070,83 @@ impl Broker {
             write_journal(&journal_path, &journal)?;
         }
 
+        let live = self
+            .store()
+            .live_sessions()?
+            .into_iter()
+            .map(|session| session.id)
+            .collect::<Vec<_>>();
+        while !journal.remaining_artifacts.is_empty() && !check_deadline(deadline) {
+            let candidate = journal.remaining_artifacts[0].clone();
+            let root = PathBuf::from(&candidate.worktree_path);
+            let dir = root.join(&candidate.relative_dir);
+            // Re-prove every precondition: a session may have been reused and
+            // rebuilt since the plan was authorized.
+            let safe = !live.contains(&candidate.session_id)
+                && Path::new(&candidate.relative_dir)
+                    .components()
+                    .all(|component| matches!(component, Component::Normal(_)))
+                && dir.starts_with(&root)
+                && is_real_directory(&dir)
+                && artifact_witness_for(&dir).is_some();
+            if !safe {
+                failures.push(format!(
+                    "{}: no longer a reclaimable build directory; review a new GC plan",
+                    candidate.relative_dir
+                ));
+                break;
+            }
+            if let Err(error) = std::fs::remove_dir_all(&dir) {
+                failures.push(format!("{}: {error}", candidate.relative_dir));
+                break;
+            }
+            journal.reclaimed_bytes = journal
+                .reclaimed_bytes
+                .saturating_add(candidate.estimated_bytes);
+            journal
+                .artifacts_reclaimed
+                .push(dir.to_string_lossy().into_owned());
+            journal.remaining_artifacts.remove(0);
+            write_journal(&journal_path, &journal)?;
+        }
+
+        while !journal.remaining_orphans.is_empty() && !check_deadline(deadline) {
+            let candidate = journal.remaining_orphans[0].clone();
+            let root = PathBuf::from(&candidate.worktree_root);
+            // The owning repository reappearing revokes the whole premise.
+            let safe = is_real_directory(&root)
+                && root.join(WORKTREE_ROOT_MARKER).is_file()
+                && !Path::new(&candidate.repository_root).exists();
+            if !safe {
+                failures.push(format!(
+                    "{}: orphan evidence changed; review a new GC plan",
+                    candidate.worktree_root
+                ));
+                break;
+            }
+            if let Err(error) = std::fs::remove_dir_all(&root) {
+                failures.push(format!("{}: {error}", candidate.worktree_root));
+                break;
+            }
+            journal.reclaimed_bytes = journal
+                .reclaimed_bytes
+                .saturating_add(candidate.estimated_bytes);
+            journal.orphans_removed.push(candidate.worktree_root);
+            journal.remaining_orphans.remove(0);
+            write_journal(&journal_path, &journal)?;
+        }
+
         let deadline_reached = check_deadline(deadline)
             && (!journal.remaining_rows.is_empty()
                 || !journal.remaining_files.is_empty()
-                || !journal.remaining_worktrees.is_empty());
+                || !journal.remaining_worktrees.is_empty()
+                || !journal.remaining_artifacts.is_empty()
+                || !journal.remaining_orphans.is_empty());
         let complete = journal.remaining_rows.is_empty()
             && journal.remaining_files.is_empty()
-            && journal.remaining_worktrees.is_empty();
+            && journal.remaining_worktrees.is_empty()
+            && journal.remaining_artifacts.is_empty()
+            && journal.remaining_orphans.is_empty();
         let recovery_action =
             (!complete).then(|| format!("aethyme broker gc apply --confirm {}", journal.digest));
         let report = GcApplyReport {
@@ -726,6 +1156,8 @@ impl Broker {
             rows_removed: journal.rows_removed,
             files_completed: journal.files_completed.clone(),
             sessions_cleaned: journal.sessions_cleaned.clone(),
+            artifacts_reclaimed: journal.artifacts_reclaimed.clone(),
+            orphans_removed: journal.orphans_removed.clone(),
             reclaimed_bytes: journal.reclaimed_bytes,
             failures,
             recovery_action,
@@ -736,6 +1168,8 @@ impl Broker {
                 "rows_removed": report.rows_removed,
                 "files_completed": report.files_completed.len(),
                 "sessions_cleaned": report.sessions_cleaned.len(),
+                "artifacts_reclaimed": report.artifacts_reclaimed.len(),
+                "orphans_removed": report.orphans_removed.len(),
                 "reclaimed_bytes": report.reclaimed_bytes,
             })
             .to_string();
@@ -747,5 +1181,103 @@ impl Broker {
             })?;
         }
         Ok(report)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dir(root: &Path, relative: &str) -> PathBuf {
+        let path = root.join(relative);
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn build_directories_need_a_witness_before_they_are_reclaimable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        // A cargo target directory is only recognised once cargo has stamped it.
+        let target = dir(root, "rust/target");
+        assert!(artifact_witness_for(&target).is_none());
+        std::fs::write(target.join("CACHEDIR.TAG"), "Signature\n").unwrap();
+        assert!(artifact_witness_for(&target).is_some());
+
+        // An empty node_modules holds nothing worth reclaiming.
+        let modules = dir(root, "web/node_modules");
+        assert!(artifact_witness_for(&modules).is_none());
+        dir(root, "web/node_modules/left-pad");
+        assert!(artifact_witness_for(&modules).is_some());
+
+        // A source directory that merely shares the name is never a candidate.
+        let source = dir(root, "src/target");
+        std::fs::write(source.join("main.rs"), "fn main() {}\n").unwrap();
+        assert!(artifact_witness_for(&source).is_none());
+    }
+
+    #[test]
+    fn collection_skips_git_metadata_and_never_descends_into_a_match() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        let target = dir(root, "rust/target");
+        std::fs::write(target.join("CACHEDIR.TAG"), "Signature\n").unwrap();
+        // A nested match inside an outer match must not be reported twice.
+        let nested = dir(root, "rust/target/debug/node_modules");
+        dir(root, "rust/target/debug/node_modules/pkg");
+        assert!(artifact_witness_for(&nested).is_some());
+
+        // Git metadata is never treated as a build cache.
+        let git_target = dir(root, ".git/target");
+        std::fs::write(git_target.join("CACHEDIR.TAG"), "Signature\n").unwrap();
+
+        let mut found = Vec::new();
+        collect_artifact_dirs(root, root, 0, &mut found);
+        assert_eq!(found, vec![target]);
+    }
+
+    #[test]
+    fn collection_is_depth_bounded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let deep = "a/b/c/d/e/f/g/h/target";
+        let target = dir(root, deep);
+        std::fs::write(target.join("CACHEDIR.TAG"), "Signature\n").unwrap();
+
+        let mut found = Vec::new();
+        collect_artifact_dirs(root, root, 0, &mut found);
+        assert!(
+            found.is_empty(),
+            "a directory below the scan depth must stay untouched: {found:?}"
+        );
+    }
+
+    #[test]
+    fn symlinked_build_directories_are_never_followed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let real = dir(root, "elsewhere/target");
+        std::fs::write(real.join("CACHEDIR.TAG"), "Signature\n").unwrap();
+
+        let worktree = dir(root, "worktree");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(root.join("elsewhere"), worktree.join("linked")).unwrap();
+
+        // A symlinked entry inside the tree is never descended into, so the
+        // build directory it points at stays untouched.
+        let mut found = Vec::new();
+        collect_artifact_dirs(&worktree, &worktree, 0, &mut found);
+        assert!(found.is_empty(), "symlinked entries must not be scanned");
+
+        // A symlinked worktree root is rejected one layer up, by the guard
+        // every caller applies before scanning.
+        #[cfg(unix)]
+        {
+            let linked_root = root.join("linked-root");
+            std::os::unix::fs::symlink(root.join("elsewhere"), &linked_root).unwrap();
+            assert!(!is_real_directory(&linked_root));
+        }
     }
 }

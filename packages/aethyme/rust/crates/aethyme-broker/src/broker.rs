@@ -35,7 +35,7 @@ const IDLE_AFTER_MS: i64 = 10 * 60 * 1000;
 const STALE_AFTER_MS: i64 = 2 * 60 * 60 * 1000;
 pub const SESSION_NOTE_MAX_BYTES: usize = 1_000;
 pub const WORKTREE_ROOT_SCHEMA_VERSION: u32 = 1;
-const WORKTREE_ROOT_MARKER: &str = ".aethyme-worktree-root.json";
+pub(crate) const WORKTREE_ROOT_MARKER: &str = ".aethyme-worktree-root.json";
 
 #[derive(Debug, thiserror::Error)]
 pub enum BrokerOpError {
@@ -517,6 +517,11 @@ pub struct WorktreeRootPlan {
     pub repository_key: String,
     pub preferred_root: Option<PathBuf>,
     pub preferred_source: Option<WorktreeRootSource>,
+    /// Directory holding one subdirectory per repository key, when the layout
+    /// is keyed. `None` for layouts that place worktrees directly under the
+    /// configured root, where sibling directories are sessions rather than
+    /// repositories and must never be swept as orphans.
+    pub root_container: Option<PathBuf>,
     pub legacy_fallback_root: PathBuf,
     pub preferred_outside_repository: bool,
 }
@@ -531,10 +536,10 @@ pub struct WorktreePlacement {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-struct WorktreeRootMarker {
-    schema_version: u32,
-    repository_key: String,
-    repository_root: PathBuf,
+pub(crate) struct WorktreeRootMarker {
+    pub(crate) schema_version: u32,
+    pub(crate) repository_key: String,
+    pub(crate) repository_root: PathBuf,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -2545,28 +2550,38 @@ impl Broker {
 
     pub fn worktree_root_plan(&self) -> Result<WorktreeRootPlan, BrokerOpError> {
         let repository_key = self.repository_worktree_key()?;
-        let (preferred_root, preferred_source) = if let Some(root) = &self.worktree_root_override {
+        let (preferred_root, preferred_source, root_container) = if let Some(root) =
+            &self.worktree_root_override
+        {
             (
                 Some(self.absolute_worktree_root(root)),
                 Some(WorktreeRootSource::LibraryOverride),
+                None,
             )
         } else if let Some(base) =
             std::env::var_os("AETHYME_WORKTREE_ROOT").filter(|value| !value.is_empty())
         {
+            let container = self.absolute_worktree_root(&PathBuf::from(base));
             (
-                Some(
-                    self.absolute_worktree_root(&PathBuf::from(base))
-                        .join(&repository_key),
-                ),
+                Some(container.join(&repository_key)),
                 Some(WorktreeRootSource::EnvironmentOverride),
+                Some(container),
             )
-        } else if let Some(base) = crate::host_state::default_host_state_dir() {
+        } else if let Some(base) = crate::host_state::default_host_state_dir().filter(|_| {
+            // Only the implicit platform default is withheld from ephemeral
+            // repositories; an explicitly named host state directory is a
+            // deliberate choice and is always honoured.
+            crate::host_state::host_state_dir_is_explicit()
+                || !crate::host_state::path_is_ephemeral(&self.main_root)
+        }) {
+            let container = base.join("worktrees");
             (
-                Some(base.join("worktrees").join(&repository_key)),
+                Some(container.join(&repository_key)),
                 Some(WorktreeRootSource::HostState),
+                Some(container),
             )
         } else {
-            (None, None)
+            (None, None, None)
         };
         let preferred_outside_repository = preferred_root
             .as_deref()
@@ -2577,6 +2592,7 @@ impl Broker {
             repository_key,
             preferred_root,
             preferred_source,
+            root_container,
             legacy_fallback_root: self.legacy_broker_worktree_root(),
             preferred_outside_repository,
         })
@@ -5835,7 +5851,7 @@ impl Broker {
         self.main_root.join(".aethyme/worktrees")
     }
 
-    fn is_broker_owned_worktree(&self, session: &Session, path: &Path) -> bool {
+    pub(crate) fn is_broker_owned_worktree(&self, session: &Session, path: &Path) -> bool {
         if session.origin != SessionOrigin::Spawned || path == self.main_root.as_path() {
             return false;
         }
@@ -6370,7 +6386,7 @@ impl Broker {
     }
 }
 
-fn directory_size_without_following_links(path: &Path) -> std::io::Result<u64> {
+pub(crate) fn directory_size_without_following_links(path: &Path) -> std::io::Result<u64> {
     let metadata = std::fs::symlink_metadata(path)?;
     if metadata.file_type().is_symlink() {
         return Ok(0);
@@ -7542,7 +7558,11 @@ mod tests {
                 candidate_rows: 0,
                 candidate_files: 0,
                 candidate_worktrees: 0,
+                candidate_artifacts: 0,
+                candidate_orphans: 0,
                 estimated_reclaimable_bytes: 0,
+                estimated_retained_bytes: 0,
+                estimated_blocked_bytes: 0,
                 blockers: 0,
             },
             integration_movement: None,

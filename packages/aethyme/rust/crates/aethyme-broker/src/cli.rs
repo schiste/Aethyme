@@ -2542,12 +2542,19 @@ fn render_cleanup_sweep_report(report: &crate::CleanupSweepReport) {
 
 fn render_gc_plan(plan: &crate::GcPlan) {
     println!(
-        "GC plan {}: {} rows, {} files, {} represented worktrees, {} reclaimable",
+        "GC plan {}: {} rows, {} files, {} represented worktrees, {} build caches, {} orphaned roots, {} reclaimable",
         plan.digest,
         plan.rows.len(),
         plan.files.len(),
         plan.worktrees.len(),
+        plan.artifacts.len(),
+        plan.orphans.len(),
         human_bytes(plan.estimated_reclaimable_bytes),
+    );
+    println!(
+        "  retained: {}; blocked by policy or provenance: {}",
+        human_bytes(plan.estimated_retained_bytes),
+        human_bytes(plan.estimated_blocked_bytes),
     );
     for row in &plan.rows {
         println!(
@@ -2572,6 +2579,25 @@ fn render_gc_plan(plan: &crate::GcPlan) {
             worktree.branch_tip.as_deref().unwrap_or("missing")
         );
     }
+    for artifact in &plan.artifacts {
+        println!(
+            "  build cache: session {} {}/{} ({}, idle {} days)",
+            artifact.session_id,
+            artifact.worktree_path,
+            artifact.relative_dir,
+            human_bytes(artifact.estimated_bytes),
+            artifact.idle_days,
+        );
+    }
+    for orphan in &plan.orphans {
+        println!(
+            "  orphaned root: {} ({}) — {}",
+            orphan.worktree_root,
+            human_bytes(orphan.estimated_bytes),
+            orphan.reason,
+        );
+        println!("    owning repository: {} (missing)", orphan.repository_root);
+    }
     for blocker in &plan.blockers {
         println!(
             "  protected: {}{} — {}",
@@ -2580,7 +2606,12 @@ fn render_gc_plan(plan: &crate::GcPlan) {
             blocker.reason
         );
     }
-    if plan.rows.is_empty() && plan.files.is_empty() && plan.worktrees.is_empty() {
+    if plan.rows.is_empty()
+        && plan.files.is_empty()
+        && plan.worktrees.is_empty()
+        && plan.artifacts.is_empty()
+        && plan.orphans.is_empty()
+    {
         println!("  apply: nothing eligible");
     } else {
         println!("  apply: aethyme broker gc apply --confirm {}", plan.digest);
@@ -2589,7 +2620,7 @@ fn render_gc_plan(plan: &crate::GcPlan) {
 
 fn render_gc_apply(report: &crate::GcApplyReport) {
     println!(
-        "GC apply {}: {} rows, {} files, {} worktrees, {} reclaimed",
+        "GC apply {}: {} rows, {} files, {} worktrees, {} build caches, {} orphaned roots, {} reclaimed",
         if report.complete {
             "complete"
         } else {
@@ -2598,6 +2629,8 @@ fn render_gc_apply(report: &crate::GcApplyReport) {
         report.rows_removed,
         report.files_completed.len(),
         report.sessions_cleaned.len(),
+        report.artifacts_reclaimed.len(),
+        report.orphans_removed.len(),
         human_bytes(report.reclaimed_bytes),
     );
     for failure in &report.failures {

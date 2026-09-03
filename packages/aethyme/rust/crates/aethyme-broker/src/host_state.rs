@@ -21,6 +21,31 @@ pub(crate) fn default_host_state_dir() -> Option<PathBuf> {
     })
 }
 
+/// True when the host state directory was named explicitly rather than derived
+/// from the platform default.
+///
+/// An explicit declaration is a deliberate choice about where durable state
+/// lives, so it outranks the ephemeral-repository guard below.
+pub(crate) fn host_state_dir_is_explicit() -> bool {
+    ["AETHYME_HOST_STATE_DIR", "XDG_STATE_HOME"]
+        .into_iter()
+        .any(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()))
+}
+
+/// True when `path` resolves inside the system temporary directory.
+///
+/// Repositories under the system temp directory are ephemeral - test fixtures
+/// and scratch clones - and must never anchor worktrees in durable host state.
+/// Worktree storage is host-scoped while the records that own it are
+/// repository-local, so when such a repository is deleted its worktree tree is
+/// left with no database that could ever account for it again.
+pub(crate) fn path_is_ephemeral(path: &Path) -> bool {
+    let temp = std::env::temp_dir();
+    let temp = std::fs::canonicalize(&temp).unwrap_or(temp);
+    let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    path.starts_with(&temp)
+}
+
 pub(crate) fn default_host_cache_dir() -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("AETHYME_HOST_CACHE_DIR").filter(|path| !path.is_empty()) {
         return Some(PathBuf::from(path));

@@ -339,3 +339,15 @@ fn locked_runtime_file_is_retained_and_resumable() {
             .contains("\"old\"")
     );
 }
+
+#[test]
+fn ephemeral_repositories_never_anchor_worktrees_in_durable_host_state() {
+    let (tmp, _broker, _id, worktree) = fixture();
+    let repo = tmp.path().canonicalize().unwrap();
+    let worktree = worktree.canonicalize().unwrap();
+    assert!(
+        worktree.starts_with(&repo),
+        "a temp-dir repository must keep its worktrees repo-local so they die with it, got {}",
+        worktree.display()
+    );
+}

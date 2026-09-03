@@ -720,7 +720,8 @@ with `--all-cleaned`; there is no blanket discard authorization.
 
 `broker gc` applies one declared retention policy across terminal events,
 gate results and their broker-owned logs, terminal merge-queue history,
-command metrics, and closed represented worktrees. The optional
+command metrics, closed represented worktrees, build caches inside retained
+worktrees, and orphaned host worktree roots. The optional
 `.aethyme/broker.toml` file overrides conservative defaults:
 
 ```toml
@@ -731,15 +732,65 @@ gate_results_days = 30
 terminal_merge_queue_days = 180
 command_metrics_days = 30
 closed_worktrees_days = 7
+artifact_reclaim_days = 3
+orphan_worktree_roots_days = 1
+artifact_sweep_budget_ms = 1500
+artifact_sweep_interval_hours = 24
 startup_budget_ms = 25
 ```
 
+`artifact_reclaim_days` and `orphan_worktree_roots_days` accept `0`, meaning no
+grace period; neither removes committed work, so waiting is a convenience rather
+than a safeguard. Setting `artifact_sweep_budget_ms = 0` disables the autonomous
+sweep described below.
+
 Run `aethyme broker gc plan` first. Its text and stable JSON enumerate every
 eligible database row, runtime file, represented worktree and exact branch ref,
-estimated bytes, protected finding, and the SHA-256 authorization digest. GC
-never ages out live sessions, outstanding or acknowledged advisories,
-unpublished exposures, unresolved coordinated operations, accepted
-checkpoints, or unproven contributions.
+build cache, orphaned root, estimated bytes, protected finding, and the SHA-256
+authorization digest. GC never ages out live sessions, outstanding or
+acknowledged advisories, unpublished exposures, unresolved coordinated
+operations, accepted checkpoints, or unproven contributions.
+
+The plan also reports `estimated_retained_bytes` and `estimated_blocked_bytes`
+alongside `estimated_reclaimable_bytes`, so it states total disk pressure rather
+than only the bytes this plan will act on. The two reporting totals are excluded
+from the authorization digest: a measured size change must never invalidate a
+plan an operator already confirmed.
+
+### Build caches and orphaned roots
+
+A blocked cleanup disposition protects committed work. A git-ignored build cache
+holds none and is recovered by rebuilding, so build caches are reclaimed
+independently of the worktree's disposition: a worktree whose provenance is
+unproven still has reclaimable bytes. A directory qualifies only when its name is
+recognised (`target`, `node_modules`) *and* a witness confirms it is a real cache
+— `CACHEDIR.TAG` for `target`, a non-empty directory for `node_modules` — so a
+source directory that merely shares the name is never removed. The scan is
+depth-bounded, skips git metadata, and never follows symlinks.
+
+Once a closed session has been idle for `artifact_reclaim_days`, its build caches
+are reclaimed automatically on broker startup, without operator confirmation.
+This is the one exemption from the rule that startup never authorizes fresh work,
+and it is narrow: the sweep removes only build caches, never commits, refs, or
+worktrees, and it skips live sessions. It runs at most once per
+`artifact_sweep_interval_hours` within `artifact_sweep_budget_ms`, so discovery
+stays off the hot path of every broker command; its cadence stamp lives in the
+broker database rather than under `.aethyme/`, where a durable runtime file would
+register as a dirty path to the checkout-cleanliness gates. Because the stamp is
+set on the first run, a newly upgraded repository may wait up to one interval
+before the first automatic sweep — use `gc plan` and `gc apply` to clear an
+existing backlog immediately.
+
+Worktree storage is host-scoped while the records that own it are
+repository-local, so a deleted repository leaves a worktree tree that no database
+can account for again. Each host worktree root carries a
+`.aethyme-worktree-root.json` breadcrumb naming its owning repository; when that
+repository no longer exists the root becomes reclaimable. A root with no readable
+breadcrumb is reported as a blocker and never removed blind, and an authorization
+stops binding the moment the owning repository reappears. Repositories under the
+system temporary directory are never anchored in the implicit platform host-state
+directory for this reason, though an explicitly configured
+`AETHYME_HOST_STATE_DIR` or `AETHYME_WORKTREE_ROOT` is always honoured.
 
 Apply only the reviewed plan:
 

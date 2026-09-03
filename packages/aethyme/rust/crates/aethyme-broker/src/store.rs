@@ -3571,6 +3571,30 @@ impl BrokerStore {
     /// Append one event. Most mutations already emit their own event in
     /// the same transaction; this is for kinds with no store mutation
     /// (e.g. `lease.overlap`, `worktree.stale`).
+    /// Read a broker-scoped key from the `meta` table.
+    ///
+    /// Durable maintenance bookkeeping belongs here rather than in a runtime
+    /// file: anything written under `.aethyme/` shows up as a dirty path to the
+    /// checkout-cleanliness gates.
+    pub fn meta_get(&self, key: &str) -> Result<Option<String>, BrokerError> {
+        let value = self
+            .conn
+            .query_row("SELECT value FROM meta WHERE key = ?1", [key], |row| {
+                row.get::<_, String>(0)
+            })
+            .optional()?;
+        Ok(value)
+    }
+
+    pub fn meta_set(&self, key: &str, value: &str) -> Result<(), BrokerError> {
+        self.conn.execute(
+            "INSERT INTO meta (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [key, value],
+        )?;
+        Ok(())
+    }
+
     pub fn append_event(
         &mut self,
         kind: &str,

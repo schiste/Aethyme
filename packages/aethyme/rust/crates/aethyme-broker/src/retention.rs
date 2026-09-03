@@ -21,6 +21,12 @@ pub struct RetentionPolicy {
     pub terminal_merge_queue_days: u32,
     pub command_metrics_days: u32,
     pub closed_worktrees_days: u32,
+    pub artifact_reclaim_days: u32,
+    pub orphan_worktree_roots_days: u32,
+    /// Wall-clock budget for the autonomous artifact sweep. `0` disables it.
+    pub artifact_sweep_budget_ms: u64,
+    /// Minimum spacing between autonomous artifact sweeps.
+    pub artifact_sweep_interval_hours: u32,
     pub startup_budget_ms: u64,
 }
 
@@ -33,6 +39,10 @@ impl Default for RetentionPolicy {
             terminal_merge_queue_days: 180,
             command_metrics_days: 30,
             closed_worktrees_days: 7,
+            artifact_reclaim_days: 3,
+            orphan_worktree_roots_days: 1,
+            artifact_sweep_budget_ms: 1_500,
+            artifact_sweep_interval_hours: 24,
             startup_budget_ms: 25,
         }
     }
@@ -60,6 +70,34 @@ impl RetentionPolicy {
                     constraint: "must be between 1 and 36500 days",
                 });
             }
+        }
+        // These two accept 0, meaning no grace period. Neither removes
+        // committed work, so waiting is a convenience rather than a safeguard.
+        for (field, value) in [
+            ("artifact_reclaim_days", self.artifact_reclaim_days),
+            ("orphan_worktree_roots_days", self.orphan_worktree_roots_days),
+        ] {
+            if value > 36_500 {
+                return Err(RetentionConfigError::InvalidValue {
+                    field,
+                    value: value.to_string(),
+                    constraint: "must be between 0 (no grace period) and 36500 days",
+                });
+            }
+        }
+        if self.artifact_sweep_budget_ms > 60_000 {
+            return Err(RetentionConfigError::InvalidValue {
+                field: "artifact_sweep_budget_ms",
+                value: self.artifact_sweep_budget_ms.to_string(),
+                constraint: "must be between 0 (disabled) and 60000 milliseconds",
+            });
+        }
+        if !(1..=8_760).contains(&self.artifact_sweep_interval_hours) {
+            return Err(RetentionConfigError::InvalidValue {
+                field: "artifact_sweep_interval_hours",
+                value: self.artifact_sweep_interval_hours.to_string(),
+                constraint: "must be between 1 and 8760 hours",
+            });
         }
         if !(1..=5_000).contains(&self.startup_budget_ms) {
             return Err(RetentionConfigError::InvalidValue {
@@ -164,6 +202,36 @@ pub struct GcWorktreeCandidate {
     pub closed_at: i64,
 }
 
+/// A git-ignored build directory inside a retained worktree.
+///
+/// Reclaiming these is provenance-neutral: they hold no committed work, so
+/// they are recoverable by rebuilding and are considered independently of the
+/// worktree's own cleanup disposition.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct GcArtifactCandidate {
+    pub session_id: i64,
+    pub worktree_path: String,
+    /// Path of the build directory relative to the worktree root.
+    pub relative_dir: String,
+    pub estimated_bytes: u64,
+    pub idle_days: u32,
+}
+
+/// A host worktree root whose owning repository no longer exists.
+///
+/// Worktree storage is host-scoped but ownership records are repository-local,
+/// so a deleted repository leaves its worktree tree with no database that can
+/// ever account for it. The `.aethyme-worktree-root.json` breadcrumb is the
+/// reverse pointer that makes these recoverable.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct GcOrphanCandidate {
+    pub repository_key: String,
+    pub worktree_root: String,
+    pub repository_root: String,
+    pub estimated_bytes: u64,
+    pub reason: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct GcBlocker {
     pub kind: String,
@@ -180,8 +248,17 @@ pub struct GcPlan {
     pub rows: Vec<GcRowCandidate>,
     pub files: Vec<GcFileCandidate>,
     pub worktrees: Vec<GcWorktreeCandidate>,
+    pub artifacts: Vec<GcArtifactCandidate>,
+    pub orphans: Vec<GcOrphanCandidate>,
     pub blockers: Vec<GcBlocker>,
     pub estimated_reclaimable_bytes: u64,
+    /// Every byte held by retained worktrees, whether or not this plan acts on
+    /// it. Reporting only: excluded from the digest so measured sizes never
+    /// invalidate an authorization.
+    pub estimated_retained_bytes: u64,
+    /// Bytes this plan deliberately leaves in place because a retention or
+    /// provenance gate blocked them.
+    pub estimated_blocked_bytes: u64,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
@@ -192,6 +269,8 @@ pub struct GcApplyReport {
     pub rows_removed: usize,
     pub files_completed: Vec<String>,
     pub sessions_cleaned: Vec<i64>,
+    pub artifacts_reclaimed: Vec<String>,
+    pub orphans_removed: Vec<String>,
     pub reclaimed_bytes: u64,
     pub failures: Vec<String>,
     pub recovery_action: Option<String>,
@@ -204,7 +283,11 @@ pub struct GcHealth {
     pub candidate_rows: usize,
     pub candidate_files: usize,
     pub candidate_worktrees: usize,
+    pub candidate_artifacts: usize,
+    pub candidate_orphans: usize,
     pub estimated_reclaimable_bytes: u64,
+    pub estimated_retained_bytes: u64,
+    pub estimated_blocked_bytes: u64,
     pub blockers: usize,
 }
 
@@ -217,6 +300,8 @@ impl GcPlan {
             rows: &'a [GcRowCandidate],
             files: &'a [GcFileCandidate],
             worktrees: &'a [GcWorktreeCandidate],
+            artifacts: &'a [GcArtifactCandidate],
+            orphans: &'a [GcOrphanCandidate],
             blockers: &'a [GcBlocker],
         }
         let bytes = serde_json::to_vec(&Authorization {
@@ -225,6 +310,8 @@ impl GcPlan {
             rows: &self.rows,
             files: &self.files,
             worktrees: &self.worktrees,
+            artifacts: &self.artifacts,
+            orphans: &self.orphans,
             blockers: &self.blockers,
         })?;
         self.digest = format!("{:x}", Sha256::digest(bytes));
