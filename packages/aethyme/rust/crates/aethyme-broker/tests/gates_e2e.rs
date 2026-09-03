@@ -10,9 +10,11 @@ use std::sync::Mutex;
 use aethyme_broker::{
     AdvisoryEvidence, AdvisorySeverity, Broker, CachePolicy, GRAPH_IMPACT_MAX_DEPTH,
     GRAPH_IMPACT_MAX_NODES, GRAPH_IMPACT_RESULT_LIMIT, GateFailureClass, GateProgressSink,
-    GateStatus, GraphImpactLookup, GraphImpactProvider, GraphImpactQuery, GraphImpactStatus,
-    NewAdvisory,
+    GateStatus, GitRepo, GraphImpactLookup, GraphImpactProvider, GraphImpactQuery,
+    GraphImpactStatus, NewAdvisory,
 };
+use aethyme_graph_indexer::{IndexerContext, WalkOptions, index_repo_to_disk, link_repo};
+use aethyme_graph_storage::bootstrap_repo;
 
 #[derive(Clone)]
 struct FixedGraphImpactProvider {
@@ -139,6 +141,69 @@ fn add_worktree(root: &Path, name: &str) -> std::path::PathBuf {
         ],
     );
     path
+}
+
+fn refresh_committed_graph(root: &Path) {
+    bootstrap_repo(root, env!("CARGO_PKG_VERSION")).unwrap();
+    let context =
+        IndexerContext::new("fixture", root.to_path_buf(), env!("CARGO_PKG_VERSION")).unwrap();
+    index_repo_to_disk(&context, &WalkOptions::default()).unwrap();
+    link_repo(&context).unwrap();
+}
+
+#[test]
+fn session_and_full_tree_gates_enforce_committed_graph_authority() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    write_gates(
+        tmp.path(),
+        "[[gate]]\nname='source-check'\ncommand='echo ran >> gate-markers.txt'\ntriggers=['src/**']\n",
+    );
+    std::fs::write(
+        tmp.path().join(".aethyme/config.toml"),
+        "[graph]\nauthority='committed_fragments'\nrepository='fixture'\n",
+    )
+    .unwrap();
+    refresh_committed_graph(tmp.path());
+    commit_all(tmp.path(), "configure authoritative graph");
+
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let full_tree = broker.run_all_gates(tmp.path()).unwrap();
+    assert_eq!(full_tree.len(), 1, "fresh CI-equivalent tree passes");
+    std::fs::remove_file(tmp.path().join("gate-markers.txt")).unwrap();
+
+    let worktree = add_worktree(tmp.path(), "stale-graph-gates");
+    let session = broker.adopt(&worktree, None).unwrap();
+    std::fs::write(worktree.join("src/app.py"), "x = 2\n").unwrap();
+    let status_before = GitRepo::discover(&worktree).unwrap().dirty_paths().unwrap();
+
+    let error = broker.run_gates(session.id).unwrap_err();
+    let aethyme_broker::BrokerOpError::GraphIntegrityRejected(rejection) = error else {
+        panic!("unexpected gate error: {error}");
+    };
+    assert_eq!(
+        rejection.status,
+        aethyme_broker::GraphIntegrityStatus::Stale
+    );
+    assert_eq!(rejection.tree_hash.len(), 40);
+    assert_eq!(rejection.policy_digest.len(), 64);
+    assert!(
+        rejection
+            .changed_paths
+            .iter()
+            .any(|path| path == ".aethyme/graph/src/app.py.bin")
+    );
+    assert!(!worktree.join("gate-markers.txt").exists());
+    assert_eq!(
+        GitRepo::discover(&worktree).unwrap().dirty_paths().unwrap(),
+        status_before,
+        "refusal must not rewrite the caller worktree or index"
+    );
+
+    refresh_committed_graph(&worktree);
+    let refreshed = broker.run_gates(session.id).unwrap();
+    assert_eq!(refreshed.len(), 1);
+    assert_eq!(refreshed[0].status, GateStatus::Pass);
 }
 
 #[test]

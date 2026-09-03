@@ -6458,9 +6458,10 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     && graph.enforced
                 {
                     println!(
-                        "graph integrity: {:?} (tree {}) — {}",
+                        "graph integrity: {:?} (tree {}, policy {}) — {}",
                         graph.status,
                         short_commit(&graph.tree_hash),
+                        short_commit(&graph.policy_digest),
                         graph.reason
                     );
                     if !graph.changed_paths.is_empty() {

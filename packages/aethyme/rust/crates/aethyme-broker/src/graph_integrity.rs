@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 
 use aethyme_graph_indexer::{IndexerContext, WalkOptions, index_repo_to_disk, link_repo};
 use aethyme_graph_storage::{bootstrap_repo, read_engine_version};
+use sha2::{Digest, Sha256};
 
 pub const GRAPH_CONFIG_RELPATH: &str = ".aethyme/config.toml";
 
@@ -115,6 +116,25 @@ impl GraphIntegrityPolicy {
     pub fn enforces_committed_fragments(&self) -> bool {
         self.authority == GraphAuthority::CommittedFragments
     }
+
+    /// Stable cache/provenance identity for policy plus checker implementation.
+    pub fn digest(&self) -> String {
+        let authority = match self.authority {
+            GraphAuthority::Disabled => "disabled",
+            GraphAuthority::CommittedFragments => "committed_fragments",
+        };
+        let repository = self.repository.as_deref().unwrap_or("");
+        format!(
+            "{:x}",
+            Sha256::digest(
+                format!(
+                    "graph-integrity-v1\nauthority={authority}\nrepository={repository}\nengine={}\n",
+                    env!("CARGO_PKG_VERSION")
+                )
+                .as_bytes()
+            )
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -132,6 +152,7 @@ pub struct GraphIntegrityOutcome {
     pub status: GraphIntegrityStatus,
     pub enforced: bool,
     pub tree_hash: String,
+    pub policy_digest: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub engine_version: Option<String>,
     pub changed_paths: Vec<String>,
@@ -157,6 +178,7 @@ pub(crate) fn verify_disposable_checkout(
     checkout: &crate::GitRepo,
     policy: &GraphIntegrityPolicy,
 ) -> GraphIntegrityOutcome {
+    let policy_digest = policy.digest();
     let tree_hash = match checkout.working_tree_hash() {
         Ok(tree) => tree,
         Err(error) => {
@@ -164,6 +186,7 @@ pub(crate) fn verify_disposable_checkout(
                 status: GraphIntegrityStatus::Error,
                 enforced: policy.enforces_committed_fragments(),
                 tree_hash: String::new(),
+                policy_digest,
                 engine_version: None,
                 changed_paths: Vec::new(),
                 reason: format!("cannot hash the exact verification tree: {error}"),
@@ -175,6 +198,7 @@ pub(crate) fn verify_disposable_checkout(
             status: GraphIntegrityStatus::Disabled,
             enforced: false,
             tree_hash,
+            policy_digest,
             engine_version: None,
             changed_paths: Vec::new(),
             reason: "repository does not declare committed graph fragments authoritative".into(),
@@ -188,6 +212,7 @@ pub(crate) fn verify_disposable_checkout(
                 status: GraphIntegrityStatus::Incompatible,
                 enforced: true,
                 tree_hash,
+                policy_digest,
                 engine_version: None,
                 changed_paths: Vec::new(),
                 reason: format!(
@@ -202,6 +227,7 @@ pub(crate) fn verify_disposable_checkout(
             status: GraphIntegrityStatus::Incompatible,
             enforced: true,
             tree_hash,
+            policy_digest,
             engine_version: Some(pinned_version.clone()),
             changed_paths: Vec::new(),
             reason: format!(
@@ -216,6 +242,7 @@ pub(crate) fn verify_disposable_checkout(
     {
         return graph_error(
             tree_hash,
+            policy_digest,
             Some(pinned_version),
             format!("cannot reset disposable graph directory: {error}"),
         );
@@ -223,6 +250,7 @@ pub(crate) fn verify_disposable_checkout(
     if let Err(error) = bootstrap_repo(checkout.root(), running_version) {
         return graph_error(
             tree_hash,
+            policy_digest,
             Some(pinned_version),
             format!("cannot bootstrap disposable graph output: {error}"),
         );
@@ -237,6 +265,7 @@ pub(crate) fn verify_disposable_checkout(
             Err(error) => {
                 return graph_error(
                     tree_hash,
+                    policy_digest,
                     Some(pinned_version),
                     format!("cannot initialize graph verifier: {error}"),
                 );
@@ -245,6 +274,7 @@ pub(crate) fn verify_disposable_checkout(
     if let Err(error) = index_repo_to_disk(&context, &WalkOptions::default()) {
         return graph_error(
             tree_hash,
+            policy_digest,
             Some(pinned_version),
             format!("cannot regenerate graph fragments: {error}"),
         );
@@ -252,6 +282,7 @@ pub(crate) fn verify_disposable_checkout(
     if let Err(error) = link_repo(&context) {
         return graph_error(
             tree_hash,
+            policy_digest,
             Some(pinned_version),
             format!("cannot link regenerated graph fragments: {error}"),
         );
@@ -262,6 +293,7 @@ pub(crate) fn verify_disposable_checkout(
         Err(error) => {
             return graph_error(
                 tree_hash,
+                policy_digest,
                 Some(pinned_version),
                 format!("cannot hash regenerated graph fragments: {error}"),
             );
@@ -278,6 +310,7 @@ pub(crate) fn verify_disposable_checkout(
             status: GraphIntegrityStatus::Passed,
             enforced: true,
             tree_hash,
+            policy_digest,
             engine_version: Some(pinned_version),
             changed_paths,
             reason: "committed graph fragments match the exact verification tree".into(),
@@ -287,6 +320,7 @@ pub(crate) fn verify_disposable_checkout(
             status: GraphIntegrityStatus::Stale,
             enforced: true,
             tree_hash,
+            policy_digest,
             engine_version: Some(pinned_version),
             changed_paths,
             reason: "committed graph fragments are stale; run `aethyme graph refresh plan --repo .` and review the generated diff".into(),
@@ -296,6 +330,7 @@ pub(crate) fn verify_disposable_checkout(
 
 fn graph_error(
     tree_hash: String,
+    policy_digest: String,
     engine_version: Option<String>,
     reason: String,
 ) -> GraphIntegrityOutcome {
@@ -303,9 +338,60 @@ fn graph_error(
         status: GraphIntegrityStatus::Error,
         enforced: true,
         tree_hash,
+        policy_digest,
         engine_version,
         changed_paths: Vec::new(),
         reason,
+    }
+}
+
+/// Verify the caller's exact working state without mutating its worktree or
+/// index. A synthetic commit materializes staged, unstaged, and untracked
+/// content captured by [`crate::GitRepo::working_tree_hash`].
+pub(crate) fn verify_checkout_without_mutation(
+    main_root: &Path,
+    checkout: &crate::GitRepo,
+    policy: &GraphIntegrityPolicy,
+) -> Result<GraphIntegrityOutcome, crate::BrokerOpError> {
+    if !policy.enforces_committed_fragments() {
+        return Ok(verify_disposable_checkout(checkout, policy));
+    }
+    let tree = checkout.working_tree_hash()?;
+    let head = checkout.head_commit()?;
+    let commit = checkout.commit_tree(
+        &tree,
+        &[&head],
+        "broker: materialize exact graph-integrity verification tree",
+    )?;
+    let mut slot =
+        crate::verification::ExactTreeVerificationSlot::acquire(main_root, "graph-integrity")?;
+    let disposable = slot.materialize(checkout, &commit)?;
+    let outcome = verify_disposable_checkout(&disposable, policy);
+    slot.cleanup();
+    Ok(outcome)
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "graph integrity {status:?} for tree {tree_hash} under policy {policy_digest}: {reason}; changed paths: {changed_paths:?}"
+)]
+pub struct GraphIntegrityRejection {
+    pub status: GraphIntegrityStatus,
+    pub tree_hash: String,
+    pub policy_digest: String,
+    pub changed_paths: Vec<String>,
+    pub reason: String,
+}
+
+impl From<GraphIntegrityOutcome> for GraphIntegrityRejection {
+    fn from(outcome: GraphIntegrityOutcome) -> Self {
+        Self {
+            status: outcome.status,
+            tree_hash: outcome.tree_hash,
+            policy_digest: outcome.policy_digest,
+            changed_paths: outcome.changed_paths,
+            reason: outcome.reason,
+        }
     }
 }
 

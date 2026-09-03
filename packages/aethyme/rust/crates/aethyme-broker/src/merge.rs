@@ -19,9 +19,7 @@
 //! bottleneck). `mode = "manual"` restores explicit `broker promote`.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{File, OpenOptions};
-use std::os::fd::AsRawFd;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::broker::{Broker, BrokerOpError};
 use crate::gates::GateRunOutcome;
@@ -30,77 +28,6 @@ use crate::types::{AdvisoryEvidence, AdvisorySeverity, MergeQueueEntry, MergeSta
 
 pub const DEFAULT_INTEGRATION_BRANCH: &str = "aethyme/integration";
 pub const ACTION_REQUIRED_RELPATH: &str = ".aethyme/broker-action-required.md";
-
-/// One stable, repository-local checkout used for merged-tree verification.
-///
-/// Cargo fingerprints path dependencies by source root. Giving every queue
-/// entry a new checkout path made a shared target directory grow without
-/// bound, so submissions deliberately serialize around one reusable path.
-/// The file lock covers checkout materialization, gate execution, and cleanup.
-struct MergeVerificationSlot {
-    repository_root: PathBuf,
-    path: PathBuf,
-    _lock: File,
-}
-
-impl MergeVerificationSlot {
-    fn acquire(main_root: &Path) -> Result<Self, BrokerOpError> {
-        let directory = main_root.join(".aethyme/run/merge-sim");
-        std::fs::create_dir_all(&directory).map_err(|source| crate::BrokerError::Io {
-            path: directory.clone(),
-            source,
-        })?;
-        let lock_path = directory.join("slot.lock");
-        let lock = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(&lock_path)
-            .map_err(|source| crate::BrokerError::Io {
-                path: lock_path.clone(),
-                source,
-            })?;
-        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
-            return Err(crate::BrokerError::Io {
-                path: lock_path,
-                source: std::io::Error::last_os_error(),
-            }
-            .into());
-        }
-        Ok(Self {
-            repository_root: main_root.to_path_buf(),
-            path: directory.join("slot"),
-            _lock: lock,
-        })
-    }
-
-    fn materialize(
-        &mut self,
-        repository: &GitRepo,
-        commit: &str,
-    ) -> Result<GitRepo, BrokerOpError> {
-        self.cleanup();
-        let checkout = repository.worktree_add_detached(&self.path, commit)?;
-        Ok(checkout)
-    }
-
-    fn cleanup(&mut self) {
-        // Always try the Git-level removal: after a crash the next process did
-        // not create this guard, but the common Git directory can still hold a
-        // registration for the stable path.
-        if let Ok(repository) = GitRepo::discover(&self.repository_root) {
-            let _ = repository.worktree_remove(&self.path, true);
-        }
-        let _ = std::fs::remove_dir_all(&self.path);
-    }
-}
-
-impl Drop for MergeVerificationSlot {
-    fn drop(&mut self) {
-        self.cleanup();
-    }
-}
 
 /// `[promote]` section of `.aethyme/config.toml`.
 #[derive(Debug, Clone)]
@@ -611,7 +538,10 @@ impl Broker {
         let changed = self
             .repo_handle()
             .gate_scope_changed_between(verify_base, &merge_commit)?;
-        let mut verification_slot = MergeVerificationSlot::acquire(&self.main_root_path())?;
+        let mut verification_slot = crate::verification::ExactTreeVerificationSlot::acquire(
+            &self.main_root_path(),
+            "merge-sim",
+        )?;
         let sim_worktree = verification_slot.materialize(self.repo_handle(), &merge_commit)?;
         let graph_policy = crate::GraphIntegrityPolicy::load(sim_worktree.root())?;
         let graph_integrity =
@@ -1531,25 +1461,4 @@ fn write_action_required(
         let _ = std::fs::create_dir_all(parent);
     }
     let _ = std::fs::write(path, body);
-}
-
-#[cfg(test)]
-mod verification_slot_tests {
-    use super::*;
-
-    #[test]
-    fn verification_slot_reuses_one_path_and_removes_stale_contents() {
-        let root = tempfile::tempdir().unwrap();
-        let expected = root.path().join(".aethyme/run/merge-sim/slot");
-        {
-            let mut first = MergeVerificationSlot::acquire(root.path()).unwrap();
-            assert_eq!(first.path, expected);
-            std::fs::create_dir_all(&first.path).unwrap();
-            std::fs::write(first.path.join("stale"), "old run").unwrap();
-            first.cleanup();
-            assert!(!expected.exists());
-        }
-        let second = MergeVerificationSlot::acquire(root.path()).unwrap();
-        assert_eq!(second.path, expected);
-    }
 }

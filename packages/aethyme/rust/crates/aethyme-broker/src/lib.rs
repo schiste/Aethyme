@@ -63,6 +63,7 @@ mod ship;
 mod store;
 mod types;
 mod update;
+mod verification;
 mod verify_loop;
 mod version;
 
@@ -124,7 +125,7 @@ pub use graph_impact::{
 };
 pub use graph_integrity::{
     GRAPH_CONFIG_RELPATH, GraphAuthority, GraphIntegrityOutcome, GraphIntegrityPolicy,
-    GraphIntegrityPolicyError, GraphIntegrityStatus,
+    GraphIntegrityPolicyError, GraphIntegrityRejection, GraphIntegrityStatus,
 };
 pub use homebrew::render_homebrew_formula;
 pub use hooks::{HookReport, HookState, HooksError};

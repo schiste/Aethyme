@@ -218,6 +218,8 @@ pub enum BrokerOpError {
     #[error(transparent)]
     GraphIntegrityPolicy(#[from] crate::GraphIntegrityPolicyError),
     #[error(transparent)]
+    GraphIntegrityRejected(#[from] crate::GraphIntegrityRejection),
+    #[error(transparent)]
     RetentionConfig(#[from] crate::RetentionConfigError),
     #[error(transparent)]
     PrePush(#[from] crate::gates::PrePushValidationError),
@@ -4180,6 +4182,7 @@ impl Broker {
         cache_policy: crate::gates::CachePolicy,
     ) -> Result<Vec<crate::gates::GateRunOutcome>, BrokerOpError> {
         let checkout = GitRepo::discover(dir)?;
+        self.enforce_graph_integrity(&checkout)?;
         let config_root = checkout.root().to_path_buf();
         let gates = self.load_and_sync_gates_from(&config_root)?;
         crate::gates::run_all(
@@ -4200,6 +4203,7 @@ impl Broker {
         cache_policy: crate::gates::CachePolicy,
     ) -> Result<Vec<crate::gates::GateRunOutcome>, BrokerOpError> {
         let checkout = GitRepo::discover(dir)?;
+        self.enforce_graph_integrity(&checkout)?;
         let config_root = checkout.root().to_path_buf();
         let gates = self.load_and_sync_gates_from(&config_root)?;
         crate::gates::run_named(
@@ -4255,6 +4259,7 @@ impl Broker {
         progress: &dyn crate::gates::GateProgressSink,
     ) -> Result<Vec<crate::gates::GateRunOutcome>, BrokerOpError> {
         let checkout = GitRepo::discover(dir)?;
+        self.enforce_graph_integrity(&checkout)?;
         let config_root = checkout.root().to_path_buf();
         let gates = self.load_and_sync_gates_from(&config_root)?;
         crate::gates::run_all_with_progress(
@@ -4274,6 +4279,7 @@ impl Broker {
     ) -> Result<(GitRepo, Vec<crate::gates::Gate>, Vec<String>), BrokerOpError> {
         let session = self.store.session(session_id)?;
         let checkout = GitRepo::discover(Path::new(&session.worktree_path))?;
+        self.enforce_graph_integrity(&checkout)?;
         let config_root = checkout.root().to_path_buf();
         let gates = self.load_and_sync_gates_from(&config_root)?;
         let base = self
@@ -4282,6 +4288,23 @@ impl Broker {
             .unwrap_or_else(|| "HEAD".to_string());
         let changed = checkout.changed_files(&base)?;
         Ok((checkout, gates, changed))
+    }
+
+    fn enforce_graph_integrity(
+        &self,
+        checkout: &GitRepo,
+    ) -> Result<crate::GraphIntegrityOutcome, BrokerOpError> {
+        let policy = crate::GraphIntegrityPolicy::load(checkout.root())?;
+        let outcome = crate::graph_integrity::verify_checkout_without_mutation(
+            &self.main_root,
+            checkout,
+            &policy,
+        )?;
+        if outcome.allows_promotion() {
+            Ok(outcome)
+        } else {
+            Err(crate::GraphIntegrityRejection::from(outcome).into())
+        }
     }
 
     /// Load gates.toml and sync the definition snapshot so recorded
