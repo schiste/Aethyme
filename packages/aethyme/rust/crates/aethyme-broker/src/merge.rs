@@ -584,6 +584,11 @@ impl Broker {
             Ok(Vec::new())
         };
         verification_slot.cleanup();
+        // Promotion may re-simulate another in-flight entry, and a stale
+        // verification may recursively re-simulate this entry. Both paths
+        // acquire the same stable slot. Release the non-reentrant flock
+        // before either path is reachable or one process deadlocks itself.
+        drop(verification_slot);
         let gate_outcomes = gate_outcomes?;
 
         let all_pass = graph_integrity.allows_promotion()

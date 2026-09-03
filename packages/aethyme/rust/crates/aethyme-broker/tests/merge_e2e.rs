@@ -4,6 +4,7 @@
 
 use std::path::Path;
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 use aethyme_broker::{
     AdoptMode, Broker, CheckpointRefusalCode, EntryExposureState, FinishStatus,
@@ -334,6 +335,80 @@ fn two_clean_sessions_promote_with_requeue_on_base_move_manual_mode() {
     ] {
         assert!(kinds.iter().any(|k| k == expected), "missing {expected}");
     }
+}
+
+#[test]
+fn auto_promotion_releases_the_verification_slot_before_requeue() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    std::fs::write(
+        tmp.path().join(".aethyme/config.toml"),
+        "[promote]\nmode = \"manual\"\n",
+    )
+    .unwrap();
+    let mut broker = Broker::open(tmp.path()).unwrap();
+
+    let wt_a = agent_worktree(tmp.path(), "auto-a");
+    let wt_b = agent_worktree(tmp.path(), "auto-b");
+    let a = broker.adopt(&wt_a, Some("edit a")).unwrap();
+    let b = broker.adopt(&wt_b, Some("edit b")).unwrap();
+    commit_edit(&wt_a, "src/a.py", "a = 2\n");
+    commit_edit(&wt_b, "src/b.py", "b = 2\n");
+
+    let waiting = broker.submit(b.id).unwrap();
+    assert_eq!(waiting.entry.status, MergeStatus::Verified);
+    std::fs::write(
+        tmp.path().join(".aethyme/config.toml"),
+        "[promote]\nmode = \"auto\"\n",
+    )
+    .unwrap();
+    drop(broker);
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_broker-cli-shim"))
+        .args(["submit", "--session", &a.id.to_string()])
+        .current_dir(tmp.path())
+        .spawn()
+        .unwrap();
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if started.elapsed() >= Duration::from_secs(10) {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("concurrent auto-promotion deadlocked on the verification slot");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(status.success(), "broker submit failed with {status}");
+
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let queue = broker.store().merge_queue().unwrap();
+    assert_eq!(
+        queue
+            .iter()
+            .find(|entry| entry.session_id == a.id)
+            .unwrap()
+            .status,
+        MergeStatus::Promoted
+    );
+    assert_eq!(
+        queue
+            .iter()
+            .find(|entry| entry.session_id == b.id)
+            .unwrap()
+            .status,
+        MergeStatus::Promoted
+    );
+    assert_eq!(
+        file_at(tmp.path(), "aethyme/integration", "src/a.py"),
+        "a = 2\n"
+    );
+    assert_eq!(
+        file_at(tmp.path(), "aethyme/integration", "src/b.py"),
+        "b = 2\n"
+    );
 }
 
 #[test]
