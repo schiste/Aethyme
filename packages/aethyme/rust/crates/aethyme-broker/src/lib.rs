@@ -47,6 +47,7 @@ mod merge;
 mod operations;
 mod pr;
 mod pr_watch;
+mod preparation;
 mod quick_test;
 mod reconciliation;
 mod release_compatibility;
@@ -169,6 +170,11 @@ pub use pr_watch::{
     PullRequestBatchStatus, PullRequestSnapshot, PullRequestWatch, PullRequestWatchError,
     PullRequestWatchPollReport, PullRequestWatchProvider, PullRequestWatchRequest,
     PullRequestWatchStatus,
+};
+pub use preparation::{
+    PREPARATION_CONFIG_RELPATH, PREPARATION_SCHEMA_VERSION, PreparationCachePolicy,
+    PreparationConfig, PreparationError, PreparationReport, PreparationState, PreparationStatus,
+    PreparationStep, PreparationStepResult, RuntimeProbe,
 };
 pub use quick_test::{
     Chau7Probe, QuickTestError, QuickTestGateOutcome, QuickTestGateReport, QuickTestMode,

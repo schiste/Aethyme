@@ -3,7 +3,7 @@
 Last Updated: 2026-09-01
 
 This guide covers broker workflows that matter after the basic
-start-edit-submit loop: reusing a session worktree, choosing fresh or cached
+start-edit-submit loop: preparing declared worktree dependencies, reusing a session worktree, choosing fresh or cached
 gate evidence, understanding normalized submission planning, inspecting
 advisory semantic gate suggestions, planning leases before claiming them, and
 exporting redacted routing metadata, and leaving or retrieving a durable finish handoff. For the complete flag
@@ -19,6 +19,7 @@ Each workflow separates observation from mutation:
 
 | Need | Inspect first | Explicit mutation | Refusal boundary |
 | --- | --- | --- | --- |
+| Prepare worktree dependencies | `prepare status --session <id>` | `prepare --session <id>`, optionally `--offline` | no implicit execution; symlink outputs, undeclared offline commands, lease loss, and writes outside session leases fail closed |
 | Continue in an existing worktree | `broker integration status` | `adopt --reuse`, optionally with `--sync-integration` | synchronization requires a clean, fast-forwardable worktree |
 | Prove the current tree | default gate run and its tree provenance | rerun with `--no-cache` | a bypass never substitutes an older cached result |
 | Share gate scope with CI | `gates manifest` and `gates scope` | none | unsupported schema, digest drift, missing refs, or invalid committed policy fail closed |
@@ -33,6 +34,36 @@ Each workflow separates observation from mutation:
 These commands coordinate local repository state. Submission promotes only to
 the local `aethyme/integration` branch. Use the separate
 `broker ship plan`/`broker ship execute` lane when publication is authorized.
+
+## Prepare Each Worktree Explicitly
+
+If a repository commits `.aethyme/prepare.toml`, every new or adopted session
+reports whether its local dependencies are current and prints the exact next
+action. Creation remains cheap and deterministic: it never installs packages
+or runs a version command automatically.
+
+```bash
+aethyme broker prepare status --session 111 --json
+aethyme broker prepare --session 111 --wait 10m
+# only when every step declares an offline alternative:
+aethyme broker prepare --session 111 --offline
+```
+
+The repository defines argv commands, lockfile/config inputs, local output
+paths, cache scope, and whether hooks need the result. The broker provides the
+session boundary, path audit, content-addressed state, runtime fingerprint,
+and host-wide serialization for shared caches. It never creates cross-worktree
+dependency symlinks and never substitutes ecosystem heuristics. This same
+contract supports npm, pnpm, Yarn, Cargo, Python, or mixed repositories.
+
+Use `worktree_local` for disposable outputs wholly owned by one checkout. Use
+`repository_shared` only when the tool can safely consume the exported
+`AETHYME_PREPARE_CACHE_DIR`; the broker heartbeats that lease and records an
+interrupted state if completion was not proven. A failed or stale preparation
+does not delete existing dependencies. Fix the declared command or input and
+run the printed retry command. Hooks that require preparation refuse before
+gates run and leave staged changes untouched. See the
+[CLI reference](../reference/cli.md) for the schema and state model.
 
 ## Recover External Main Movement
 

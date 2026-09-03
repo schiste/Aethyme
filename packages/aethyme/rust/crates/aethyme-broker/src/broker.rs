@@ -52,6 +52,8 @@ pub enum BrokerOpError {
     #[error(transparent)]
     Delivery(#[from] crate::DeliveryError),
     #[error(transparent)]
+    Preparation(#[from] crate::PreparationError),
+    #[error(transparent)]
     RemoteTarget(#[from] crate::RemoteTargetError),
     #[error(transparent)]
     HostOperation(#[from] crate::HostOperationError),
@@ -468,6 +470,7 @@ pub struct AdoptReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub integration_sync: Option<AdoptIntegrationSync>,
     pub planned_explicit_leases: Vec<crate::Lease>,
+    pub preparation: crate::PreparationStatus,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -477,6 +480,7 @@ pub struct StartReport {
     pub start_base: SessionStartBase,
     pub worktree_placement: WorktreePlacement,
     pub planned_explicit_leases: Vec<crate::Lease>,
+    pub preparation: crate::PreparationStatus,
 }
 
 /// Result of starting a detached agent process, including where its checkout
@@ -2196,12 +2200,14 @@ impl Broker {
                         Some(self.adopt_integration_drift(&checkout, session.id)?);
                     let planned_explicit_leases =
                         self.planned_explicit_leases(session.id, &planned_paths)?;
+                    let preparation = self.preparation_status(session.id)?;
                     return Ok(AdoptReport {
                         session,
                         outcome: AdoptOutcome::Reused,
                         integration_drift,
                         integration_sync,
                         planned_explicit_leases,
+                        preparation,
                     });
                 }
                 AdoptMode::ReplaceStale => {
@@ -2253,12 +2259,14 @@ impl Broker {
             None
         };
         let planned_explicit_leases = self.planned_explicit_leases(session.id, &planned_paths)?;
+        let preparation = self.preparation_status(session.id)?;
         Ok(AdoptReport {
             session,
             outcome,
             integration_drift,
             integration_sync,
             planned_explicit_leases,
+            preparation,
         })
     }
 
@@ -2460,11 +2468,13 @@ impl Broker {
         };
         self.store.set_session_foreign_files(session.id, &[])?;
         let planned_explicit_leases = self.planned_explicit_leases(session.id, &planned_paths)?;
+        let preparation = self.preparation_status(session.id)?;
         Ok(StartReport {
             session,
             start_base,
             worktree_placement,
             planned_explicit_leases,
+            preparation,
         })
     }
 
@@ -3356,6 +3366,28 @@ impl Broker {
         session_id: i64,
         command: &[String],
     ) -> Result<GuardedExecReport, BrokerOpError> {
+        self.guarded_exec_with_env(session_id, command, &[])
+    }
+
+    pub(crate) fn guarded_exec_with_env(
+        &mut self,
+        session_id: i64,
+        command: &[String],
+        environment: &[(String, String)],
+    ) -> Result<GuardedExecReport, BrokerOpError> {
+        self.guarded_exec_with_env_and_heartbeat(session_id, command, environment, || Ok(()))
+    }
+
+    pub(crate) fn guarded_exec_with_env_and_heartbeat<F>(
+        &mut self,
+        session_id: i64,
+        command: &[String],
+        environment: &[(String, String)],
+        mut heartbeat: F,
+    ) -> Result<GuardedExecReport, BrokerOpError>
+    where
+        F: FnMut() -> Result<(), BrokerOpError>,
+    {
         if command.is_empty() {
             return Err(BrokerOpError::MissingExecCommand);
         }
@@ -3367,17 +3399,34 @@ impl Broker {
         before_dirty.dedup();
         let before_identities = snapshot_path_identities(checkout.root(), &before_dirty)?;
 
-        let status = Command::new(&command[0])
+        let mut child = Command::new(&command[0]);
+        child
             .args(&command[1..])
             .current_dir(&session.worktree_path)
             .env("AETHYME_BROKER_SESSION_ID", session_id.to_string())
             .env("AETHYME_GATE_WORKER_ID", format!("s{session_id}-exec"))
-            .env("AETHYME_TEST_DB_SUFFIX", format!("s{session_id}-exec"))
-            .status()
-            .map_err(|source| BrokerOpError::Spawn {
+            .env("AETHYME_TEST_DB_SUFFIX", format!("s{session_id}-exec"));
+        for (name, value) in environment {
+            child.env(name, value);
+        }
+        let mut child = child.spawn().map_err(|source| BrokerOpError::Spawn {
+            command: command.join(" "),
+            source,
+        })?;
+        let status = loop {
+            if let Some(status) = child.try_wait().map_err(|source| BrokerOpError::Spawn {
                 command: command.join(" "),
                 source,
-            })?;
+            })? {
+                break status;
+            }
+            if let Err(error) = heartbeat() {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        };
 
         let mut after_dirty = checkout.dirty_paths()?;
         after_dirty.sort();

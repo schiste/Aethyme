@@ -120,6 +120,15 @@ Usage:
   aethyme broker start-agent --task <text> --cmd <command> [--json]
       Create a worktree + branch and spawn <command> in it (sh -c),
       logging to .aethyme/logs/.
+  aethyme broker prepare status --session <id> [--json]
+      Inspect repository-declared dependency preparation for one worktree.
+      This is read-only and reports the exact remediation when preparation is
+      absent, stale, interrupted, failed, or invalid.
+  aethyme broker prepare --session <id> [--offline] [--wait <duration>] [--json]
+      Explicitly run the repository's .aethyme/prepare.toml commands in the
+      session worktree. Shared caches are serialized host-wide; no command is
+      ever run automatically by start or adopt. --offline refuses any step
+      without a declared offline_command.
   aethyme broker worktree-root [--json]
       Resolve the scanner-safe external root used by future broker starts.
       Read-only: reports the preferred per-user location, repository key,
@@ -519,6 +528,7 @@ const KNOWN_COMMAND_WORDS: &[&str] = &[
     "leases",
     "export",
     "resources",
+    "prepare",
     "claim",
     "release",
     "gates",
@@ -1436,6 +1446,7 @@ struct Parsed {
     only: Option<String>,
     stdout: bool,
     include_task: bool,
+    offline: bool,
     planned_paths: Vec<String>,
     exec_command: Vec<String>,
 }
@@ -1512,6 +1523,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         only: None,
         stdout: false,
         include_task: false,
+        offline: false,
         planned_paths: Vec::new(),
         exec_command: Vec::new(),
     };
@@ -1596,6 +1608,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
                 )
             }
             "--include-task" => parsed.include_task = true,
+            "--offline" => parsed.offline = true,
             "--replace-stale" => parsed.replace_stale = true,
             "--path" => parsed.planned_paths.push(
                 iter.next()
@@ -2056,6 +2069,33 @@ fn render_worktree_placement(placement: &crate::WorktreePlacement) {
     if let Some(reason) = &placement.fallback_reason {
         println!("Warning: external worktree placement was unavailable: {reason}");
     }
+}
+
+fn render_preparation_status(
+    status: &crate::PreparationStatus,
+    json: bool,
+) -> Result<(), UsageError> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(status)?);
+        return Ok(());
+    }
+    println!(
+        "Preparation {:?} for session {}: {}",
+        status.state, status.session_id, status.reason
+    );
+    if let Some(digest) = &status.expected_digest {
+        println!("Expected digest: {}", short_sha(digest));
+    }
+    if !status.missing_outputs.is_empty() {
+        println!("Missing outputs:");
+        for path in &status.missing_outputs {
+            println!("  {path}");
+        }
+    }
+    if let Some(next_action) = &status.next_action {
+        println!("Next: {next_action}");
+    }
+    Ok(())
 }
 
 fn render_pr_check_report(report: &crate::PrCheckReport, json: bool) -> Result<(), UsageError> {
@@ -5286,6 +5326,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     println!("Safe next action: {}", drift.safe_next_action);
                 }
                 render_planned_explicit_leases(&report.planned_explicit_leases);
+                render_preparation_status(&report.preparation, false)?;
             }
         }
         "start" => {
@@ -5310,7 +5351,8 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                 );
                 render_worktree_placement(&report.worktree_placement);
                 render_planned_explicit_leases(&report.planned_explicit_leases);
-                println!("Next: cd {}", session.worktree_path);
+                render_preparation_status(&report.preparation, false)?;
+                println!("Worktree: cd {}", session.worktree_path);
             }
         }
         "start-agent" => {
@@ -5341,6 +5383,65 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
         "external-events" => run_external_events(parsed)?,
         "deliveries" => run_deliveries(parsed)?,
         "review" => run_review(parsed)?,
+        "prepare" => {
+            let session_id = parsed
+                .session
+                .ok_or_else(|| UsageError::Message("prepare requires --session <id>".into()))?;
+            match parsed.positional.first().map(String::as_str) {
+                Some("status") => {
+                    if parsed.positional.len() != 1 {
+                        return Err(UsageError::Message(
+                            "prepare status accepts no additional arguments".into(),
+                        ));
+                    }
+                    if parsed.offline || parsed.wait.is_some() {
+                        return Err(UsageError::Message(
+                            "--offline and --wait apply only to preparation execution".into(),
+                        ));
+                    }
+                    let broker = open_broker(true)?;
+                    let status = broker.preparation_status(session_id)?;
+                    render_preparation_status(&status, parsed.json)?;
+                }
+                None => {
+                    let wait = parsed
+                        .wait
+                        .as_deref()
+                        .map(parse_resource_duration)
+                        .transpose()?
+                        .unwrap_or_default();
+                    let mut broker = open_broker(parsed.read_only_snapshot)?;
+                    let report = broker.prepare_session(session_id, parsed.offline, wait)?;
+                    if parsed.json {
+                        println!("{}", serde_json::to_string_pretty(&report)?);
+                    } else {
+                        println!(
+                            "Preparation {:?} for session {} (digest {})",
+                            report.state,
+                            report.session_id,
+                            short_sha(&report.digest)
+                        );
+                        for step in &report.steps {
+                            println!(
+                                "  {}: {} (exit {:?})",
+                                step.name,
+                                if step.succeeded { "passed" } else { "failed" },
+                                step.exit_code
+                            );
+                        }
+                        if report.shared_cache_coordinated {
+                            println!("Shared cache: coordinated host-wide");
+                        }
+                        println!("Next: {}", report.next_action);
+                    }
+                }
+                Some(other) => {
+                    return Err(UsageError::Message(format!(
+                        "unknown prepare action {other:?}; expected status or no action"
+                    )));
+                }
+            }
+        }
         "resources" => run_resources(parsed)?,
         "agents" => {
             let mut broker = open_broker(parsed.read_only_snapshot)?;

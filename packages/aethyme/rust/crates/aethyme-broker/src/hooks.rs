@@ -99,6 +99,19 @@ pub enum HooksError {
         behind: u64,
         session_id: i64,
     },
+    #[error("cannot inspect declared worktree preparation safely: {reason}")]
+    PreparationInspection { reason: String },
+    #[error(
+        "git commit refused by Aethyme pre-commit:\n\
+         session {session_id} requires declared worktree preparation ({state}): {reason}\n\
+         Your staged changes remain unchanged.\n\
+         Prepare this exact worktree: aethyme broker prepare --session {session_id}"
+    )]
+    PreparationRequired {
+        session_id: i64,
+        state: String,
+        reason: String,
+    },
     #[error(
         "git push refused by Aethyme pre-push:\n\
          enrolled repository is publishing protected ref(s): {refs}.\n\
@@ -420,7 +433,26 @@ pub fn status(repo: &GitRepo) -> Result<Vec<HookReport>, HooksError> {
 pub fn run_pre_commit(cwd: &Path) -> Result<(), HooksError> {
     let checkout = GitRepo::discover(cwd)?;
     let main_root = checkout.main_root()?;
-    enforce_protected_branch_session(&checkout, &main_root)?;
+    let session_id = enforce_protected_branch_session(&checkout, &main_root)?;
+    if let Some(session_id) = session_id {
+        let broker = crate::Broker::open_snapshot(cwd).map_err(|error| {
+            HooksError::PreparationInspection {
+                reason: error.to_string(),
+            }
+        })?;
+        let status = broker.preparation_status(session_id).map_err(|error| {
+            HooksError::PreparationInspection {
+                reason: error.to_string(),
+            }
+        })?;
+        if status.hook_required && status.state != crate::PreparationState::Current {
+            return Err(HooksError::PreparationRequired {
+                session_id,
+                state: status.state.as_str().into(),
+                reason: status.reason,
+            });
+        }
+    }
     let gates = match load_gates(&main_root) {
         // No config = no commit-time policy. A *broken* config still
         // blocks: silently skipping validation would be worse.
@@ -517,30 +549,29 @@ pub fn run_pre_push(cwd: &Path, updates: &str) -> Result<(), HooksError> {
 fn enforce_protected_branch_session(
     checkout: &GitRepo,
     main_root: &Path,
-) -> Result<(), HooksError> {
+) -> Result<Option<i64>, HooksError> {
     let shared_activation = checkout
         .git_common_dir()?
         .join(crate::init::ACTIVATION_MARKER_RELPATH)
         .is_file();
     if !shared_activation && !main_root.join(crate::BROKER_DB_RELPATH).exists() {
-        return Ok(());
+        return Ok(None);
     }
 
     let branch = checkout.current_branch()?;
-    if !protected_branches(checkout).contains(&branch) {
-        return Ok(());
-    }
-
     let store = BrokerStore::open_snapshot_in_repo(main_root)?;
     let worktree = checkout.root().to_string_lossy().into_owned();
     let session = store
         .session_for_worktree(&worktree)?
-        .filter(|session| session.branch == branch)
-        .ok_or_else(|| HooksError::SessionRequired {
-            branch: branch.clone(),
-            worktree: worktree.clone(),
-            adopt_command: adopt_command(&worktree, &checkout.staged_files().unwrap_or_default()),
-        })?;
+        .filter(|session| session.branch == branch && !session.status.is_closed());
+    if !protected_branches(checkout).contains(&branch) {
+        return Ok(session.map(|session| session.id));
+    }
+    let session = session.ok_or_else(|| HooksError::SessionRequired {
+        branch: branch.clone(),
+        worktree: worktree.clone(),
+        adopt_command: adopt_command(&worktree, &checkout.staged_files().unwrap_or_default()),
+    })?;
 
     if let Some((upstream, upstream_head)) = checkout.tracking_upstream() {
         let head = checkout.head_commit()?;
@@ -556,7 +587,7 @@ fn enforce_protected_branch_session(
             });
         }
     }
-    Ok(())
+    Ok(Some(session.id))
 }
 
 fn protected_branches(checkout: &GitRepo) -> BTreeSet<String> {

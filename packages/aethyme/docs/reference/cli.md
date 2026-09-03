@@ -230,6 +230,8 @@ falling back. Existing legacy sessions remain cleanup-compatible.
 - `aethyme broker worktree-root [--json]`
 - `aethyme broker start --task "..." [--path <repo-path>]... [--json]`
 - `aethyme broker adopt [<path>] --task "..." [--path <repo-path>]... [--reuse [--sync-integration]] [--json]`
+- `aethyme broker prepare status --session <id> [--json]`
+- `aethyme broker prepare --session <id> [--offline] [--wait <duration>] [--json]`
 - `aethyme broker exec --session <id> -- <command> [--json]`
 - `aethyme broker git --session <id> [--repo <owner/name>] [--scope <scope>] [--effect <read|write|destructive>] [--reason <text>] [--destructive] -- <git-args>`
 - `aethyme broker gh --session <id> --repo <owner/name> [--scope <scope>] [--effect <read|write|destructive>] [--reason <text>] [--destructive] -- <gh-args>`
@@ -258,6 +260,55 @@ falling back. Existing legacy sessions remain cleanup-compatible.
 - `aethyme broker note send --session <sender> --to-session <recipient> --message <text> [--json]`
 - `aethyme broker note list --session <recipient> [--json]`
 - `aethyme broker note ack --session <recipient> --id <note-id> [--json]`
+
+Repository-owned dependency preparation is optional and declarative. When
+`.aethyme/prepare.toml` exists, `start` and `adopt` return a structured
+`preparation` status but never execute it. `prepare status` is also strictly
+read-only: it hashes the declaration, exact input bytes, OS, architecture, and
+metadata for each declared runtime executable without launching repository
+commands or making network requests. The explicit `prepare` command is the
+only execution boundary.
+
+```toml
+schema_version = 1
+
+[[runtimes]]
+name = "node"
+command = ["node", "--version"]
+
+[[steps]]
+name = "javascript-dependencies"
+command = ["pnpm", "install", "--frozen-lockfile"]
+offline_command = ["pnpm", "install", "--offline", "--frozen-lockfile"]
+inputs = ["package.json", "pnpm-lock.yaml"]
+outputs = ["node_modules/"]
+cache = "repository_shared"
+required_for_hooks = true
+```
+
+Commands are argv arrays, not shell strings; Aethyme does not infer npm,
+pnpm, Yarn, Cargo, Python, or any other ecosystem. Every input and output is a
+validated repository-relative path. Outputs remain inside the worktree and a
+symlink at an output path is refused. Repositories should ignore local outputs
+in Git. `worktree_local` steps receive no shared cache. A
+`repository_shared` step receives `AETHYME_PREPARE_CACHE_DIR`; access is
+serialized in per-user host state by canonical remote identity, renewed while
+the command runs, and released afterward. The cache path and ownership token
+are absent from JSON and broker journals.
+
+The digest changes with command definitions, input bytes, platform,
+architecture, or declared runtime executable identity. State is one of
+`not_configured`, `required`, `current`, `stale`, `in_progress`, `failed`, or
+`invalid`. Failed and interrupted state includes bounded evidence and the
+exact retry command. `--offline` uses only explicit `offline_command` values
+and refuses the entire run before execution when any step lacks one.
+
+Preparation commands run through the broker's worktree guard. Dirty work that
+already exists is preserved; newly changed tracked paths still require the
+session's explicit leases. Hooks block only when a step sets
+`required_for_hooks = true`, keep staged changes intact, and print the exact
+`broker prepare --session <id>` remediation. Contributors without local
+broker activation retain the existing no-op behavior.
 
 Status is a bounded present-state view. Text and JSON expose live, pending, and
 conflicted merge-queue entries individually, while `queue_history` contains a
