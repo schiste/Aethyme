@@ -84,6 +84,11 @@ fn fixture() -> tempfile::TempDir {
         "[[gate]]\nname = \"provenance\"\ncommand = \"echo gate-output; echo run >> gate-runs.txt\"\n",
     )
     .unwrap();
+    std::fs::write(
+        tmp.path().join(".aethyme/config.toml"),
+        "[graph]\nauthority='disabled'\n",
+    )
+    .unwrap();
     git(tmp.path(), &["add", "-A"]);
     git(tmp.path(), &["commit", "-qm", "fixture"]);
     tmp
@@ -116,6 +121,11 @@ name = "always"
 command = "true"
 cost = 0
 "#,
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join(".aethyme/config.toml"),
+        "[graph]\nauthority='committed_fragments'\nrepository='fixture'\n",
     )
     .unwrap();
     git(tmp.path(), &["add", "-A"]);
@@ -155,8 +165,20 @@ cost = 0
     );
     let manifest: serde_json::Value = serde_json::from_str(&manifest).unwrap();
     assert_eq!(manifest["policy_head_sha"], head);
-    assert_eq!(manifest["manifest"]["schema_version"], 1);
+    assert_eq!(manifest["manifest"]["schema_version"], 2);
     assert_eq!(manifest["manifest"]["semantic_advice"]["enforced"], false);
+    assert_eq!(manifest["manifest"]["graph_integrity"]["enforced"], true);
+    assert_eq!(
+        manifest["manifest"]["graph_integrity"]["repository"],
+        "fixture"
+    );
+    assert_eq!(
+        manifest["manifest"]["graph_integrity"]["policy_sha256"]
+            .as_str()
+            .unwrap()
+            .len(),
+        64
+    );
     assert_eq!(
         manifest["manifest"]["gates"]
             .as_array()
@@ -178,6 +200,7 @@ cost = 0
     let scope: serde_json::Value = serde_json::from_str(&scope).unwrap();
     assert_eq!(scope["base_sha"], base);
     assert_eq!(scope["head_sha"], head);
+    assert_eq!(scope["graph_integrity"]["enforced"], true);
     assert_eq!(
         scope["changed_paths"],
         serde_json::json!(["assets/blob.bin", "backend/old.rs", "frontend/moved.rs"])

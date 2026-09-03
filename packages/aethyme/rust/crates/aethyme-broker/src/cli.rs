@@ -2393,6 +2393,16 @@ fn render_finish_report(report: &crate::FinishReport) {
         ),
         None => println!("  last gate: none recorded"),
     }
+    match &report.last_graph_integrity {
+        Some(graph) => println!(
+            "  last graph integrity: {} on tree {} under policy {} at {}",
+            graph.status.as_str(),
+            short_commit(&graph.tree_hash),
+            short_commit(&graph.policy_digest),
+            graph.recorded_at,
+        ),
+        None => println!("  last graph integrity: none recorded"),
+    }
     println!(
         "  cleanup safe: {}",
         if report.cleanup_safe { "yes" } else { "no" }
@@ -2682,6 +2692,16 @@ fn render_handoff_report(report: &crate::SessionHandoffReport) {
             }
         ),
         None => println!("  last gate: none recorded"),
+    }
+    match &handoff.last_graph_integrity {
+        Some(graph) => println!(
+            "  last graph integrity: {} on tree {} under policy {} at {}",
+            graph.status.as_str(),
+            short_commit(&graph.tree_hash),
+            short_commit(&graph.policy_digest),
+            graph.recorded_at,
+        ),
+        None => println!("  last graph integrity: none recorded"),
     }
     println!(
         "  cleanup safe: {}",
@@ -6019,7 +6039,9 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     let checkout = crate::GitRepo::discover(&cwd)?;
                     let head = parsed.head.as_deref().unwrap_or("HEAD");
                     let (head_sha, gates) = crate::load_gates_at_commit(&checkout, head)?;
-                    let manifest = crate::gate_scope_manifest(&gates);
+                    let graph_policy =
+                        crate::GraphIntegrityPolicy::load_at_commit(&checkout, &head_sha)?;
+                    let manifest = crate::gate_scope_manifest_with_graph(&gates, &graph_policy);
                     if parsed.json {
                         println!(
                             "{}",
@@ -6037,6 +6059,15 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                         println!("  schema: {}", manifest.schema_version);
                         println!("  gates: {}", manifest.gates.len());
                         println!("  semantic suggestions enforced: false");
+                        println!(
+                            "  graph integrity: {} (policy {})",
+                            if manifest.graph_integrity.enforced {
+                                "enforced"
+                            } else {
+                                "disabled"
+                            },
+                            short_commit(&manifest.graph_integrity.policy_sha256)
+                        );
                         for gate in manifest.gates {
                             println!(
                                 "  [{}] {} (triggers: {}; cache: {}; resources: {})",
@@ -6063,8 +6094,16 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     let cwd = std::env::current_dir()
                         .map_err(|err| UsageError::Message(format!("cannot resolve cwd: {err}")))?;
                     let checkout = crate::GitRepo::discover(&cwd)?;
-                    let (_, gates) = crate::load_gates_at_commit(&checkout, head)?;
-                    let report = crate::evaluate_gate_scope(&checkout, &gates, base, head)?;
+                    let (head_sha, gates) = crate::load_gates_at_commit(&checkout, head)?;
+                    let graph_policy =
+                        crate::GraphIntegrityPolicy::load_at_commit(&checkout, &head_sha)?;
+                    let report = crate::evaluate_gate_scope_with_graph(
+                        &checkout,
+                        &gates,
+                        &graph_policy,
+                        base,
+                        head,
+                    )?;
                     if parsed.json {
                         println!("{}", serde_json::to_string_pretty(&report)?);
                     } else {
@@ -6075,6 +6114,15 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                             &report.manifest_sha256[..12]
                         );
                         println!("  changed paths: {}", report.changed_paths.len());
+                        println!(
+                            "  graph integrity: {} (policy {})",
+                            if report.graph_integrity.enforced {
+                                "enforced"
+                            } else {
+                                "disabled"
+                            },
+                            short_commit(&report.graph_integrity.policy_sha256)
+                        );
                         if report.selected_gates.is_empty() {
                             println!("  selected gates: none");
                         } else {

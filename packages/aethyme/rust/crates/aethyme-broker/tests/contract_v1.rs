@@ -13,9 +13,10 @@ use std::process::Command;
 
 use aethyme_broker::{
     Broker, EVENTS_SCHEMA_VERSION, Event, FinishCleanupReport, FinishDelivery,
-    FinishGateCacheSource, FinishGateRun, FinishHandoff, FinishLease, FinishLeaseState,
-    FinishPendingWork, FinishReport, FinishStatus, GateStatus, LeaseKind, MergeStatus,
-    OperationEffect, OperationProvider, OperationStatus, Overlap, SessionStatus, events,
+    FinishGateCacheSource, FinishGateRun, FinishGraphIntegrity, FinishHandoff, FinishLease,
+    FinishLeaseState, FinishPendingWork, FinishReport, FinishStatus, GateStatus, LeaseKind,
+    MergeStatus, OperationEffect, OperationProvider, OperationStatus, Overlap, SessionStatus,
+    events,
 };
 
 /// The complete v1 kind catalog. Additions append here (additive change);
@@ -26,6 +27,7 @@ const V1_KINDS: &[&str] = &[
     "gate.error",
     "gate.fail",
     "gate.pass",
+    "graph.integrity_checked",
     "lease.claimed",
     "lease.overlap",
     "lease.released",
@@ -119,6 +121,7 @@ fn v1_kind_catalog_is_frozen() {
         events::LEASE_RELEASED.into(),
         events::LEASE_OVERLAP.into(),
         events::GATE_CACHED.into(),
+        events::GRAPH_INTEGRITY_CHECKED.into(),
         events::MERGE_INTEGRATION_BRANCH_CREATED.into(),
         events::MERGE_INTEGRATION_REFRESHED.into(),
     ];
@@ -189,6 +192,26 @@ fn v1_constructor_payload_field_names_are_frozen() {
         &["exit_code"],
         "session.exited",
     );
+    assert_keys(
+        &events::graph_integrity_checked_payload(&aethyme_broker::GraphIntegrityOutcome {
+            status: aethyme_broker::GraphIntegrityStatus::Passed,
+            enforced: true,
+            tree_hash: "tree".into(),
+            policy_digest: "policy".into(),
+            engine_version: Some("version".into()),
+            changed_paths: vec![".aethyme/graph/src/lib.rs.bin".into()],
+            reason: "redacted from durable payload".into(),
+        }),
+        &[
+            "changed_paths",
+            "enforced",
+            "engine_version",
+            "policy",
+            "status",
+            "tree",
+        ],
+        "graph.integrity_checked",
+    );
     let finish = FinishReport {
         session_id: 7,
         worktree_path: "/secret/worktree".into(),
@@ -219,6 +242,14 @@ fn v1_constructor_payload_field_names_are_frozen() {
             recorded_at: 1,
             cache_source: FinishGateCacheSource::Executed,
         }),
+        last_graph_integrity: Some(FinishGraphIntegrity {
+            status: aethyme_broker::GraphIntegrityStatus::Passed,
+            tree_hash: "graph-tree".into(),
+            policy_digest: "graph-policy".into(),
+            engine_version: Some("version".into()),
+            changed_paths: Vec::new(),
+            recorded_at: 2,
+        }),
         cleanup_safe: false,
         cleanup: FinishCleanupReport::default(),
         recommended_next_action: Some("next".into()),
@@ -234,6 +265,7 @@ fn v1_constructor_payload_field_names_are_frozen() {
             "cleanup_safe",
             "delivery",
             "last_gate",
+            "last_graph_integrity",
             "latest_queue_entry_id",
             "latest_queue_status",
             "leases_held",
@@ -269,6 +301,18 @@ fn v1_constructor_payload_field_names_are_frozen() {
         &finished["last_gate"].to_string(),
         &["cache_source", "gate", "recorded_at", "status", "tree_hash"],
         "session.finished last_gate",
+    );
+    assert_keys(
+        &finished["last_graph_integrity"].to_string(),
+        &[
+            "changed_paths",
+            "engine_version",
+            "policy_digest",
+            "recorded_at",
+            "status",
+            "tree_hash",
+        ],
+        "session.finished last_graph_integrity",
     );
     assert_keys(
         &finished["cleanup"].to_string(),

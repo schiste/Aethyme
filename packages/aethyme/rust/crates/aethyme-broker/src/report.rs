@@ -461,6 +461,17 @@ fn validate_report_document(
             "snapshot contains a non-repository-relative trigger path".into(),
         ));
     }
+    if report
+        .snapshot
+        .graph_integrity
+        .iter()
+        .flat_map(|observation| observation.changed_paths.iter())
+        .any(|path| !is_safe_repo_relative(path))
+    {
+        return Err(invalid(
+            "snapshot contains a non-repository-relative graph path".into(),
+        ));
+    }
     if !report.snapshot.includes_task
         && (report
             .snapshot
@@ -931,6 +942,20 @@ impl<'a> ReportSnapshotBuilder<'a> {
         let last_known_failure =
             last_known_failure(self.session, self.events, self.operations, self.gates);
 
+        let mut graph_integrity = self
+            .events
+            .iter()
+            .filter_map(report_graph_integrity_from_event)
+            .collect::<Vec<_>>();
+        graph_integrity.sort_by(|left, right| {
+            right
+                .recorded_at
+                .cmp(&left.recorded_at)
+                .then_with(|| left.tree_hash.cmp(&right.tree_hash))
+                .then_with(|| left.policy_digest.cmp(&right.policy_digest))
+        });
+        graph_integrity.truncate(REPORT_RECENT_GATE_LIMIT);
+
         ReportSnapshot {
             schema_version: REPORT_SNAPSHOT_SCHEMA_VERSION,
             includes_task: self.include_task,
@@ -946,6 +971,7 @@ impl<'a> ReportSnapshotBuilder<'a> {
             recent_event_types,
             operations,
             gates,
+            graph_integrity,
             last_known_failure,
         }
     }
@@ -961,7 +987,55 @@ pub struct ReportSnapshot {
     pub recent_event_types: Vec<ReportEventType>,
     pub operations: Vec<ReportOperation>,
     pub gates: Vec<ReportGateProvenance>,
+    #[serde(default)]
+    pub graph_integrity: Vec<ReportGraphIntegrity>,
     pub last_known_failure: Option<ReportLastFailure>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ReportGraphIntegrity {
+    pub session_id: Option<i64>,
+    pub status: crate::GraphIntegrityStatus,
+    pub tree_hash: String,
+    pub policy_digest: String,
+    pub engine_version: Option<String>,
+    pub changed_paths: Vec<String>,
+    pub recorded_at: i64,
+}
+
+fn report_graph_integrity_from_event(event: &Event) -> Option<ReportGraphIntegrity> {
+    if event.kind != crate::events::GRAPH_INTEGRITY_CHECKED {
+        return None;
+    }
+    let payload: serde_json::Value = serde_json::from_str(event.payload_json.as_deref()?).ok()?;
+    let status = payload
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .and_then(crate::GraphIntegrityStatus::parse)?;
+    let tree_hash = payload.get("tree")?.as_str()?.to_string();
+    let policy_digest = payload.get("policy")?.as_str()?.to_string();
+    let mut changed_paths = payload
+        .get("changed_paths")?
+        .as_array()?
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .filter(|path| is_safe_repo_relative(path))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    changed_paths.sort();
+    changed_paths.dedup();
+    Some(ReportGraphIntegrity {
+        session_id: event.session_id,
+        status,
+        tree_hash,
+        policy_digest,
+        engine_version: payload
+            .get("engine_version")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        changed_paths,
+        recorded_at: event.ts,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1388,11 +1462,18 @@ mod tests {
     fn default_snapshot_is_an_explicit_forbidden_field_boundary() {
         let build = build();
         let session = session();
-        let events = vec![event(
-            8,
-            "gate.failed",
-            r#"{"content":"FILE-CONTENT-SECRET","diff":"DIFF-SECRET","hunk":"HUNK-SECRET"}"#,
-        )];
+        let events = vec![
+            event(
+                8,
+                "gate.failed",
+                r#"{"content":"FILE-CONTENT-SECRET","diff":"DIFF-SECRET","hunk":"HUNK-SECRET"}"#,
+            ),
+            event(
+                9,
+                crate::events::GRAPH_INTEGRITY_CHECKED,
+                r#"{"status":"stale","enforced":true,"tree":"graph-tree","policy":"graph-policy","engine_version":"0.7.3","changed_paths":[".aethyme/graph/src/lib.rs.bin","/private/repo/ABSOLUTE-GRAPH-PATH-SECRET"],"reason":"GRAPH-REASON-SECRET"}"#,
+            ),
+        ];
         let operations = vec![operation()];
         let gate = gate();
         let gates = vec![ReportGateObservation {
@@ -1424,6 +1505,8 @@ mod tests {
             "HUNK-SECRET",
             "GATE-LOG-SECRET",
             "ABSOLUTE-TRIGGER-PATH-SECRET",
+            "ABSOLUTE-GRAPH-PATH-SECRET",
+            "GRAPH-REASON-SECRET",
         ] {
             assert!(
                 !json.contains(forbidden),
@@ -1434,6 +1517,12 @@ mod tests {
         assert_eq!(snapshot.session.as_ref().unwrap().task, None);
         assert_eq!(snapshot.operations[0].authorization_reason, None);
         assert_eq!(snapshot.gates[0].triggered_by, None);
+        assert_eq!(snapshot.graph_integrity.len(), 1);
+        assert_eq!(snapshot.graph_integrity[0].tree_hash, "graph-tree");
+        assert_eq!(
+            snapshot.graph_integrity[0].changed_paths,
+            vec![".aethyme/graph/src/lib.rs.bin"]
+        );
 
         let root_keys = value
             .as_object()
@@ -1446,6 +1535,7 @@ mod tests {
             BTreeSet::from([
                 "build",
                 "gates",
+                "graph_integrity",
                 "includes_task",
                 "last_known_failure",
                 "operations",

@@ -326,6 +326,14 @@ blocked.
    external state should suffix it with that value instead of sharing one
    fixed name.
 
+   If this repository declares committed graph fragments authoritative in
+   `.aethyme/config.toml`, graph freshness is an enforced deployment-integrity
+   check, not a semantic gate suggestion. Session gates, full-tree CI,
+   repository pre-push, and submit verify the exact tree in a disposable
+   checkout and refuse stale or wrong-version fragments without rewriting your
+   worktree. Review `aethyme graph refresh plan --repo .` for remediation;
+   never rebuild committed fragments with an unpinned binary.
+
 6. **When your task is complete**, use verified broker integration by
    default instead of manually combining concurrent session branches:
 

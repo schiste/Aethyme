@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 
 pub const GRAPH_CONFIG_RELPATH: &str = ".aethyme/config.toml";
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GraphAuthority {
     #[default]
@@ -43,6 +43,26 @@ impl GraphIntegrityPolicy {
                 });
             }
         };
+        Self::parse_at(&text, path)
+    }
+
+    /// Parse policy bytes obtained from an exact Git tree without consulting
+    /// the invoking worktree.
+    pub fn parse(text: &str) -> Result<Self, GraphIntegrityPolicyError> {
+        Self::parse_at(text, PathBuf::from(GRAPH_CONFIG_RELPATH))
+    }
+
+    pub(crate) fn load_at_commit(
+        repository: &crate::GitRepo,
+        commit: &str,
+    ) -> Result<Self, crate::BrokerOpError> {
+        match repository.file_at_commit(commit, GRAPH_CONFIG_RELPATH)? {
+            Some(text) => Ok(Self::parse(&text)?),
+            None => Ok(Self::default()),
+        }
+    }
+
+    fn parse_at(text: &str, path: PathBuf) -> Result<Self, GraphIntegrityPolicyError> {
         let value =
             text.parse::<toml::Value>()
                 .map_err(|error| GraphIntegrityPolicyError::Parse {
@@ -137,7 +157,7 @@ impl GraphIntegrityPolicy {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GraphIntegrityStatus {
     Disabled,
@@ -145,6 +165,29 @@ pub enum GraphIntegrityStatus {
     Stale,
     Incompatible,
     Error,
+}
+
+impl GraphIntegrityStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Passed => "passed",
+            Self::Stale => "stale",
+            Self::Incompatible => "incompatible",
+            Self::Error => "error",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "disabled" => Some(Self::Disabled),
+            "passed" => Some(Self::Passed),
+            "stale" => Some(Self::Stale),
+            "incompatible" => Some(Self::Incompatible),
+            "error" => Some(Self::Error),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -299,12 +342,13 @@ pub(crate) fn verify_disposable_checkout(
             );
         }
     };
-    let changed_paths = checkout
+    let mut changed_paths = checkout
         .dirty_paths()
         .unwrap_or_default()
         .into_iter()
         .filter(|path| path == ".aethyme/engine-version" || path.starts_with(".aethyme/graph/"))
         .collect::<Vec<_>>();
+    changed_paths.sort();
     if regenerated_tree == tree_hash {
         GraphIntegrityOutcome {
             status: GraphIntegrityStatus::Passed,
@@ -563,6 +607,86 @@ mod tests {
                 .iter()
                 .any(|path| path == ".aethyme/graph/src/lib.rs.bin")
         );
+    }
+
+    #[test]
+    fn corrupted_and_deleted_fragments_are_stale_and_deterministic() {
+        let repo = graph_repo();
+        let fragment = repo.path().join(".aethyme/graph/src/lib.rs.bin");
+        std::fs::write(&fragment, b"corrupted graph bytes").unwrap();
+        git(repo.path(), &["add", ".aethyme/graph"]);
+        git(repo.path(), &["commit", "-m", "corrupt graph fragment"]);
+        let checkout = crate::GitRepo::discover(repo.path()).unwrap();
+        let policy = GraphIntegrityPolicy::load(repo.path()).unwrap();
+        let corrupted = verify_disposable_checkout(&checkout, &policy);
+        assert_eq!(corrupted.status, GraphIntegrityStatus::Stale);
+        assert_eq!(
+            corrupted.changed_paths,
+            vec![".aethyme/graph/src/lib.rs.bin"]
+        );
+
+        git(repo.path(), &["checkout", "HEAD^", "--", ".aethyme/graph"]);
+        std::fs::remove_file(&fragment).unwrap();
+        git(repo.path(), &["add", ".aethyme/graph"]);
+        git(repo.path(), &["commit", "-m", "delete graph fragment"]);
+        let deleted = verify_disposable_checkout(&checkout, &policy);
+        assert_eq!(deleted.status, GraphIntegrityStatus::Stale);
+        assert_eq!(deleted.changed_paths, corrupted.changed_paths);
+        assert_eq!(deleted.policy_digest, corrupted.policy_digest);
+    }
+
+    #[test]
+    fn source_rename_is_stale_until_fragments_are_refreshed() {
+        let repo = graph_repo();
+        git(repo.path(), &["mv", "src/lib.rs", "src/renamed.rs"]);
+        git(
+            repo.path(),
+            &["commit", "-m", "rename source without graph"],
+        );
+        let checkout = crate::GitRepo::discover(repo.path()).unwrap();
+        let policy = GraphIntegrityPolicy::load(repo.path()).unwrap();
+        let stale = verify_disposable_checkout(&checkout, &policy);
+        assert_eq!(stale.status, GraphIntegrityStatus::Stale);
+        assert_eq!(
+            stale.changed_paths,
+            vec![
+                ".aethyme/graph/_index/src.lib.ndjson",
+                ".aethyme/graph/_index/src.renamed.ndjson",
+                ".aethyme/graph/src/lib.rs.bin",
+                ".aethyme/graph/src/renamed.rs.bin"
+            ]
+        );
+
+        let context = IndexerContext::new(
+            "fixture",
+            repo.path().to_path_buf(),
+            env!("CARGO_PKG_VERSION"),
+        )
+        .unwrap();
+        std::fs::remove_dir_all(repo.path().join(".aethyme/graph")).unwrap();
+        bootstrap_repo(repo.path(), env!("CARGO_PKG_VERSION")).unwrap();
+        index_repo_to_disk(&context, &WalkOptions::default()).unwrap();
+        link_repo(&context).unwrap();
+        assert_eq!(
+            verify_disposable_checkout(&checkout, &policy).status,
+            GraphIntegrityStatus::Passed
+        );
+    }
+
+    #[test]
+    fn binary_only_and_empty_changes_leave_fresh_fragments_valid() {
+        let repo = graph_repo();
+        let checkout = crate::GitRepo::discover(repo.path()).unwrap();
+        let policy = GraphIntegrityPolicy::load(repo.path()).unwrap();
+        let unchanged = verify_disposable_checkout(&checkout, &policy);
+        assert_eq!(unchanged.status, GraphIntegrityStatus::Passed);
+
+        std::fs::write(repo.path().join("asset.bin"), [0_u8, 159, 146, 150]).unwrap();
+        let binary_only = verify_disposable_checkout(&checkout, &policy);
+        assert_eq!(binary_only.status, GraphIntegrityStatus::Passed);
+        assert!(binary_only.changed_paths.is_empty());
+        assert_ne!(binary_only.tree_hash, unchanged.tree_hash);
+        assert_eq!(binary_only.policy_digest, unchanged.policy_digest);
     }
 
     #[test]

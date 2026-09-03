@@ -300,6 +300,24 @@ until an explicit fetch makes ancestry verification possible.
 - `aethyme broker gates run --session <id> [--only <gate>] [--no-cache] [--json]`
 - `aethyme broker gates run --all [--only <gate>] [--no-cache] [--json]`
 
+Repositories that commit `.aethyme/graph/**` as authoritative generated state
+must opt in explicitly:
+
+```toml
+[graph]
+authority = "committed_fragments"
+repository = "owner/repository"
+```
+
+For that mode, session gates, named reruns, `gates run --all`, the
+repository-owned pre-push adapter, and submit-time merged-tree verification all
+regenerate fragments in a locked disposable checkout before running configured
+gates. A stale, deleted, corrupted, or wrong-version fragment set refuses with
+the full exact-tree and policy digests plus repository-relative changed paths.
+The caller worktree and index are never rewritten. `.aethyme/graph_store.redb`
+is derived local state and is deliberately not part of this authority check.
+Repositories without this declaration retain normal gate behavior.
+
 `--only <gate>` runs exactly one configured gate, regardless of its path
 triggers, for focused diagnosis after a failure. Text-mode failures replay the
 last 20 captured output lines (bounded to 16 KiB); JSON remains structured and
@@ -538,7 +556,9 @@ merge-queue consumers. It reads `.aethyme/gates.toml` from the exact committed
 `--head` (default `HEAD`), not from dirty or ignored checkout content. JSON
 contains the normalized triggers, cost, cache policy, resource requirements,
 managed-cache policy, opaque execution-definition hash, semantic-advice bounds,
-schema version, and manifest SHA-256. It never contains gate commands,
+and graph-integrity authority, policy digest, and checker version. Schema 2
+introduced graph-integrity provenance; the manifest SHA-256 binds every field.
+It never contains gate commands,
 environment values, credentials, diffs, or absolute paths. Consumers must
 reject unsupported schema versions, unknown fields, and digest drift.
 

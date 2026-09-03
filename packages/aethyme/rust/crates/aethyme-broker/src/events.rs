@@ -32,6 +32,7 @@ pub const LEASE_RELEASED: &str = "lease.released";
 pub const LEASE_OVERLAP: &str = "lease.overlap";
 // gate.<status> kinds derive from GateStatus::as_str (pass/fail/cancelled/error).
 pub const GATE_CACHED: &str = "gate.cached";
+pub const GRAPH_INTEGRITY_CHECKED: &str = "graph.integrity_checked";
 // merge.<status> kinds derive from MergeStatus::as_str.
 pub const MERGE_INTEGRATION_BRANCH_CREATED: &str = "merge.integration_branch_created";
 pub const MERGE_INTEGRATION_REFRESHED: &str = "merge.integration_refreshed";
@@ -114,6 +115,18 @@ pub fn review_lifecycle_abandoned_payload(
 
 pub fn session_exit_payload(exit_code: i64) -> String {
     json!({ "exit_code": exit_code }).to_string()
+}
+
+pub fn graph_integrity_checked_payload(outcome: &crate::GraphIntegrityOutcome) -> String {
+    json!({
+        "status": outcome.status.as_str(),
+        "enforced": outcome.enforced,
+        "tree": outcome.tree_hash,
+        "policy": outcome.policy_digest,
+        "engine_version": outcome.engine_version,
+        "changed_paths": outcome.changed_paths,
+    })
+    .to_string()
 }
 
 pub fn broker_command_outcome_payload(

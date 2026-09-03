@@ -36,7 +36,7 @@ use crate::store::BrokerStore;
 use crate::types::{GateFailureClass, GateStatus, NewGateResult};
 
 pub const GATES_CONFIG_RELPATH: &str = ".aethyme/gates.toml";
-pub const GATE_SCOPE_MANIFEST_SCHEMA_VERSION: u32 = 1;
+pub const GATE_SCOPE_MANIFEST_SCHEMA_VERSION: u32 = 2;
 
 /// Whether a gate run may reuse a conclusive result for the same tree.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -109,11 +109,22 @@ pub struct SemanticGateScopeContract {
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+pub struct GraphIntegrityScopeContract {
+    pub authority: crate::GraphAuthority,
+    pub enforced: bool,
+    pub repository: Option<String>,
+    pub policy_sha256: String,
+    pub checker_version: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct GateScopeManifest {
     pub schema_version: u32,
     pub manifest_sha256: String,
     pub gates: Vec<GateScopeDefinition>,
     pub semantic_advice: SemanticGateScopeContract,
+    pub graph_integrity: GraphIntegrityScopeContract,
 }
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
@@ -133,6 +144,7 @@ pub struct GateScopeEvaluation {
     pub head_sha: String,
     pub changed_paths: Vec<String>,
     pub selected_gates: Vec<GateScopeSelection>,
+    pub graph_integrity: GraphIntegrityScopeContract,
     pub semantic_suggestions_enforced: bool,
     pub semantic_suggestions_included: bool,
 }
@@ -354,6 +366,13 @@ pub fn load_gates_at_commit(
 
 /// Build the content-free portable manifest consumed by external validators.
 pub fn gate_scope_manifest(gates: &[Gate]) -> GateScopeManifest {
+    gate_scope_manifest_with_graph(gates, &crate::GraphIntegrityPolicy::default())
+}
+
+pub fn gate_scope_manifest_with_graph(
+    gates: &[Gate],
+    graph_policy: &crate::GraphIntegrityPolicy,
+) -> GateScopeManifest {
     let definitions = gates
         .iter()
         .map(|gate| GateScopeDefinition {
@@ -375,23 +394,34 @@ pub fn gate_scope_manifest(gates: &[Gate]) -> GateScopeManifest {
         frontier_max_nodes: crate::GRAPH_IMPACT_MAX_NODES,
         result_limit: crate::GRAPH_IMPACT_RESULT_LIMIT,
     };
-    let manifest_sha256 = gate_scope_manifest_digest(&definitions, &semantic_advice);
+    let graph_integrity = GraphIntegrityScopeContract {
+        authority: graph_policy.authority,
+        enforced: graph_policy.enforces_committed_fragments(),
+        repository: graph_policy.repository.clone(),
+        policy_sha256: graph_policy.digest(),
+        checker_version: env!("CARGO_PKG_VERSION").into(),
+    };
+    let manifest_sha256 =
+        gate_scope_manifest_digest(&definitions, &semantic_advice, &graph_integrity);
     GateScopeManifest {
         schema_version: GATE_SCOPE_MANIFEST_SCHEMA_VERSION,
         manifest_sha256,
         gates: definitions,
         semantic_advice,
+        graph_integrity,
     }
 }
 
 fn gate_scope_manifest_digest(
     definitions: &[GateScopeDefinition],
     semantic_advice: &SemanticGateScopeContract,
+    graph_integrity: &GraphIntegrityScopeContract,
 ) -> String {
     let digest_payload = serde_json::json!({
         "schema_version": GATE_SCOPE_MANIFEST_SCHEMA_VERSION,
         "gates": definitions,
         "semantic_advice": semantic_advice,
+        "graph_integrity": graph_integrity,
     });
     format!(
         "{:x}",
@@ -410,7 +440,11 @@ pub fn verify_gate_scope_manifest(manifest: &GateScopeManifest) -> Result<(), Ga
             supported: GATE_SCOPE_MANIFEST_SCHEMA_VERSION,
         });
     }
-    let expected = gate_scope_manifest_digest(&manifest.gates, &manifest.semantic_advice);
+    let expected = gate_scope_manifest_digest(
+        &manifest.gates,
+        &manifest.semantic_advice,
+        &manifest.graph_integrity,
+    );
     if manifest.manifest_sha256 != expected {
         return Err(GateScopeError::ManifestDigestMismatch);
     }
@@ -422,6 +456,22 @@ pub fn verify_gate_scope_manifest(manifest: &GateScopeManifest) -> Result<(), Ga
 pub fn evaluate_gate_scope(
     repo: &GitRepo,
     gates: &[Gate],
+    base: &str,
+    head: &str,
+) -> Result<GateScopeEvaluation, GateScopeError> {
+    evaluate_gate_scope_with_graph(
+        repo,
+        gates,
+        &crate::GraphIntegrityPolicy::default(),
+        base,
+        head,
+    )
+}
+
+pub fn evaluate_gate_scope_with_graph(
+    repo: &GitRepo,
+    gates: &[Gate],
+    graph_policy: &crate::GraphIntegrityPolicy,
     base: &str,
     head: &str,
 ) -> Result<GateScopeEvaluation, GateScopeError> {
@@ -452,7 +502,7 @@ pub fn evaluate_gate_scope(
             triggered_by: selection.triggered_by,
         })
         .collect();
-    let manifest = gate_scope_manifest(gates);
+    let manifest = gate_scope_manifest_with_graph(gates, graph_policy);
     Ok(GateScopeEvaluation {
         schema_version: GATE_SCOPE_MANIFEST_SCHEMA_VERSION,
         manifest_sha256: manifest.manifest_sha256,
@@ -460,6 +510,7 @@ pub fn evaluate_gate_scope(
         head_sha,
         changed_paths,
         selected_gates,
+        graph_integrity: manifest.graph_integrity,
         semantic_suggestions_enforced: false,
         semantic_suggestions_included: false,
     })

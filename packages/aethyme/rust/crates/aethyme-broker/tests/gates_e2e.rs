@@ -204,6 +204,13 @@ fn session_and_full_tree_gates_enforce_committed_graph_authority() {
     let refreshed = broker.run_gates(session.id).unwrap();
     assert_eq!(refreshed.len(), 1);
     assert_eq!(refreshed[0].status, GateStatus::Pass);
+    assert!(!refreshed[0].cached);
+    let cached = broker.run_gates(session.id).unwrap();
+    assert_eq!(cached.len(), 1);
+    assert!(
+        cached[0].cached,
+        "identical verified tree reuses gate proof"
+    );
 }
 
 #[test]

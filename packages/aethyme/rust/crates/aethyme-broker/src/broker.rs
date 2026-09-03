@@ -1413,6 +1413,7 @@ pub struct FinishReport {
     pub pending_work: FinishPendingWork,
     pub leases_held: Vec<FinishLease>,
     pub last_gate: Option<FinishGateRun>,
+    pub last_graph_integrity: Option<FinishGraphIntegrity>,
     pub cleanup_safe: bool,
     pub cleanup: FinishCleanupReport,
     pub recommended_next_action: Option<String>,
@@ -1473,6 +1474,17 @@ pub struct FinishGateRun {
     pub cache_source: FinishGateCacheSource,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct FinishGraphIntegrity {
+    pub status: crate::GraphIntegrityStatus,
+    pub tree_hash: String,
+    pub policy_digest: String,
+    pub engine_version: Option<String>,
+    pub changed_paths: Vec<String>,
+    /// Unix epoch milliseconds from the event ledger.
+    pub recorded_at: i64,
+}
+
 /// Redacted durable projection written to a `session.finished` event.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct FinishHandoff {
@@ -1484,6 +1496,8 @@ pub struct FinishHandoff {
     pub pending_work: FinishPendingWork,
     pub leases_held: Vec<FinishLease>,
     pub last_gate: Option<FinishGateRun>,
+    #[serde(default)]
+    pub last_graph_integrity: Option<FinishGraphIntegrity>,
     pub cleanup_safe: bool,
     #[serde(default)]
     pub cleanup: FinishCleanupHandoff,
@@ -1513,6 +1527,7 @@ impl From<&FinishReport> for FinishHandoff {
             pending_work: report.pending_work.clone(),
             leases_held: report.leases_held.clone(),
             last_gate: report.last_gate.clone(),
+            last_graph_integrity: report.last_graph_integrity.clone(),
             cleanup_safe: report.cleanup_safe,
             cleanup: FinishCleanupHandoff {
                 requested: report.cleanup.requested,
@@ -4182,7 +4197,7 @@ impl Broker {
         cache_policy: crate::gates::CachePolicy,
     ) -> Result<Vec<crate::gates::GateRunOutcome>, BrokerOpError> {
         let checkout = GitRepo::discover(dir)?;
-        self.enforce_graph_integrity(&checkout)?;
+        self.enforce_graph_integrity(&checkout, None)?;
         let config_root = checkout.root().to_path_buf();
         let gates = self.load_and_sync_gates_from(&config_root)?;
         crate::gates::run_all(
@@ -4203,7 +4218,7 @@ impl Broker {
         cache_policy: crate::gates::CachePolicy,
     ) -> Result<Vec<crate::gates::GateRunOutcome>, BrokerOpError> {
         let checkout = GitRepo::discover(dir)?;
-        self.enforce_graph_integrity(&checkout)?;
+        self.enforce_graph_integrity(&checkout, None)?;
         let config_root = checkout.root().to_path_buf();
         let gates = self.load_and_sync_gates_from(&config_root)?;
         crate::gates::run_named(
@@ -4259,7 +4274,7 @@ impl Broker {
         progress: &dyn crate::gates::GateProgressSink,
     ) -> Result<Vec<crate::gates::GateRunOutcome>, BrokerOpError> {
         let checkout = GitRepo::discover(dir)?;
-        self.enforce_graph_integrity(&checkout)?;
+        self.enforce_graph_integrity(&checkout, None)?;
         let config_root = checkout.root().to_path_buf();
         let gates = self.load_and_sync_gates_from(&config_root)?;
         crate::gates::run_all_with_progress(
@@ -4279,7 +4294,7 @@ impl Broker {
     ) -> Result<(GitRepo, Vec<crate::gates::Gate>, Vec<String>), BrokerOpError> {
         let session = self.store.session(session_id)?;
         let checkout = GitRepo::discover(Path::new(&session.worktree_path))?;
-        self.enforce_graph_integrity(&checkout)?;
+        self.enforce_graph_integrity(&checkout, Some(session_id))?;
         let config_root = checkout.root().to_path_buf();
         let gates = self.load_and_sync_gates_from(&config_root)?;
         let base = self
@@ -4291,8 +4306,9 @@ impl Broker {
     }
 
     fn enforce_graph_integrity(
-        &self,
+        &mut self,
         checkout: &GitRepo,
+        session_id: Option<i64>,
     ) -> Result<crate::GraphIntegrityOutcome, BrokerOpError> {
         let policy = crate::GraphIntegrityPolicy::load(checkout.root())?;
         let outcome = crate::graph_integrity::verify_checkout_without_mutation(
@@ -4300,6 +4316,13 @@ impl Broker {
             checkout,
             &policy,
         )?;
+        if outcome.enforced {
+            self.store.append_event(
+                crate::events::GRAPH_INTEGRITY_CHECKED,
+                session_id,
+                Some(&crate::events::graph_integrity_checked_payload(&outcome)),
+            )?;
+        }
         if outcome.allows_promotion() {
             Ok(outcome)
         } else {
@@ -5328,6 +5351,60 @@ impl Broker {
         }))
     }
 
+    fn finish_last_graph_integrity(
+        &self,
+        session_id: i64,
+    ) -> Result<Option<FinishGraphIntegrity>, BrokerOpError> {
+        let Some(event) = self
+            .store
+            .latest_session_graph_integrity_event(session_id)?
+        else {
+            return Ok(None);
+        };
+        let Some(payload) = event
+            .payload_json
+            .as_deref()
+            .and_then(|payload| serde_json::from_str::<serde_json::Value>(payload).ok())
+        else {
+            return Ok(None);
+        };
+        let Some(status) = payload
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .and_then(crate::GraphIntegrityStatus::parse)
+        else {
+            return Ok(None);
+        };
+        let Some(tree_hash) = payload.get("tree").and_then(serde_json::Value::as_str) else {
+            return Ok(None);
+        };
+        let Some(policy_digest) = payload.get("policy").and_then(serde_json::Value::as_str) else {
+            return Ok(None);
+        };
+        let changed_paths = payload
+            .get("changed_paths")
+            .and_then(serde_json::Value::as_array)
+            .map(|paths| {
+                paths
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(Some(FinishGraphIntegrity {
+            status,
+            tree_hash: tree_hash.to_string(),
+            policy_digest: policy_digest.to_string(),
+            engine_version: payload
+                .get("engine_version")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            changed_paths,
+            recorded_at: event.ts,
+        }))
+    }
+
     fn finalize_finish_report(&self, report: &mut FinishReport) {
         report.pending_work = FinishPendingWork {
             present: !report.dirty_paths.is_empty() || report.unsubmitted_commits > 0,
@@ -5488,6 +5565,7 @@ impl Broker {
             pending_work: FinishPendingWork::default(),
             leases_held: self.finish_leases(session_id, at_ms)?,
             last_gate: self.finish_last_gate(session_id)?,
+            last_graph_integrity: self.finish_last_graph_integrity(session_id)?,
             cleanup_safe: false,
             cleanup: FinishCleanupReport::default(),
             recommended_next_action: None,

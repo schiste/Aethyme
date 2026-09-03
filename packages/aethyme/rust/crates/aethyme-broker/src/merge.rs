@@ -546,6 +546,15 @@ impl Broker {
         let graph_policy = crate::GraphIntegrityPolicy::load(sim_worktree.root())?;
         let graph_integrity =
             crate::graph_integrity::verify_disposable_checkout(&sim_worktree, &graph_policy);
+        if graph_integrity.enforced {
+            self.store().append_event(
+                crate::events::GRAPH_INTEGRITY_CHECKED,
+                Some(entry.session_id),
+                Some(&crate::events::graph_integrity_checked_payload(
+                    &graph_integrity,
+                )),
+            )?;
+        }
         // Conflict-only brokering is valid: a repo with no gates.toml gets
         // textual merge simulation and promotion on clean merges, with zero
         // verification — recorded explicitly so nobody mistakes it for a

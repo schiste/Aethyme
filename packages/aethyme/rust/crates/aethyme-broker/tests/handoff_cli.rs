@@ -132,6 +132,7 @@ fn handoff_json_by_session_has_a_stable_read_only_contract() {
             "delivery",
             "event_id",
             "last_gate",
+            "last_graph_integrity",
             "latest_queue_entry_id",
             "latest_queue_status",
             "leases_held",
@@ -147,6 +148,7 @@ fn handoff_json_by_session_has_a_stable_read_only_contract() {
     assert_eq!(report["delivery"]["promoted"], true);
     assert_eq!(report["delivery"]["published"], false);
     assert_eq!(report["last_gate"]["gate"], "handoff-cli-gate");
+    assert!(report["last_graph_integrity"].is_null());
     assert!(
         report["leases_held"]
             .as_array()

@@ -347,6 +347,23 @@ later default-policy run for the same tree. Submit threads the same policy into
 its merged-tree gates, so use the flag there when the landing decision requires
 fresh evidence.
 
+### Authoritative committed graph fragments
+
+`[graph].authority = "committed_fragments"` makes graph freshness a repository
+deployment-integrity requirement rather than a semantic suggestion. The
+repository must also declare its stable graph namespace in `[graph].repository`.
+The broker checks the exact candidate tree before configured gates across
+session runs, full-tree CI, pre-push, and submission. It reports full tree and
+policy hashes in structured outcomes and refuses before promotion when
+fragments are stale, missing, corrupted, or pinned to another Aethyme version.
+
+Verification never repairs the patch. It regenerates only inside a disposable
+checkout and leaves staged, unstaged, and untracked work recoverable. Review
+the version-safe `aethyme graph refresh plan --repo .`, then execute its
+digest-confirmed refresh workflow; do not copy fragments from another checkout
+or rebuild with a different binary version. A missing local
+`.aethyme/graph_store.redb` does not make committed fragments stale.
+
 Managed pre-commit hooks follow the same diagnostic principle. Successful
 cheap gates stay quiet. A failure replays complete standard output and error,
 prints the broker diagnosis, and preserves the failing exit code.
