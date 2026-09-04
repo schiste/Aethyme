@@ -4,6 +4,58 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.7.4] - 2026-09-04
+
+### Added
+
+- `broker gc` reclaims git-ignored build caches inside retained worktrees.
+  Build caches hold no committed work, so they are considered independently of
+  a worktree's cleanup disposition: a worktree whose provenance is unproven
+  still has reclaimable bytes. A directory qualifies only when its name is
+  recognized and a witness confirms it is a real cache.
+- `broker gc` sweeps orphaned host worktree roots whose owning repository no
+  longer exists, using the `.aethyme-worktree-root.json` breadcrumb. A root
+  with no readable breadcrumb is reported, never removed.
+- `broker gc plan` reports `estimated_retained_bytes` and
+  `estimated_blocked_bytes` alongside `estimated_reclaimable_bytes`, so the
+  plan states total disk pressure rather than only the bytes it will act on.
+  Both totals are excluded from the authorization digest.
+- `retention.retained_bytes_budget` declares a soft repository storage budget
+  surfaced as non-blocking warnings in status, doctor, and finish. It never
+  authorizes deletion.
+- Declarative per-worktree dependency preparation.
+- Scheduler adapter boundary.
+
+### Changed
+
+- Repositories under the system temporary directory no longer anchor worktrees
+  in the implicit platform host-state directory. Worktree storage is
+  host-scoped while the records owning it are repository-local, so an
+  ephemeral repository previously left a tree no database could account for.
+  An explicitly configured host state or worktree root is still honored.
+- The autonomous build-cache sweep is disabled by default
+  (`artifact_sweep_budget_ms = 0`); set a positive bounded duration to opt in.
+  `artifact_reclaim_days` defaults to 14, deliberately longer than
+  `closed_worktrees_days`.
+- Generated agent policy output is more compact.
+- Graph refresh follows a version-safe lifecycle.
+
+### Fixed
+
+- A recursive submit verification slot no longer deadlocks: the non-reentrant
+  lock is released before promotion or a stale verification can re-simulate
+  the same entry.
+- Graph authority parity for standalone gates and pre-push.
+- Graph freshness correctness.
+
+### Upgrade notes
+
+Read [Upgrading to v0.7.4](packages/aethyme/docs/guides/upgrading-to-v0.7.4.md)
+before updating. Broker storage, repository deployment, and engine protocol
+remain unchanged from v0.7.3. The GC plan schema moves from 1 to 2, so an
+outstanding `.aethyme/gc-journal.json` written by an earlier version is
+refused; complete or remove it before upgrading.
+
 ## [0.7.3] - 2026-09-03
 
 ### Changed
