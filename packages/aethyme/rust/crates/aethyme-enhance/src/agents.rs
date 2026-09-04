@@ -293,6 +293,12 @@ aethyme broker status --json
 aethyme broker start --task "<your task>" --path <planned-path>
 ```
 
+Graph support is repository opt-in and Explore never generates graph state.
+When Explore reports `graph_store_missing`, follow its bounded manual
+verification or run `aethyme graph materialize --repo .` for an already
+enrolled repository. Do not enable graph authority merely to silence a
+degraded response.
+
 Work only in the reported worktree. If scope expands, claim it before editing:
 `aethyme broker leases claim <path> --session <id>`. Commit small changes, then
 run `aethyme broker submit --session <id>`. Finish with
@@ -398,6 +404,12 @@ blocked.
    Never rebuild committed fragments with an unpinned binary. If execution was
    interrupted, use the exact `graph refresh recover --plan <plan-sha256>`
    handoff; do not retry blindly.
+
+   Graph support is repository opt-in. Explore never generates graph state.
+   If Explore reports `graph_store_missing`, continue with its bounded manual
+   verification steps, or materialize the verified committed fragments for
+   this worktree with `aethyme graph materialize --repo .`. Do not enable graph
+   authority merely to silence a degraded response.
 
 6. **When your task is complete**, use verified broker integration by
    default instead of manually combining concurrent session branches:
@@ -789,6 +801,9 @@ mod tests {
         assert!(doc.contains("Editing or submitting never implies publication authority"));
         assert!(doc.contains("aethyme broker finish --session <id>"));
         assert!(doc.contains(".codex/skills/aethyme/references/broker.md"));
+        assert!(doc.contains("Graph support is repository opt-in"));
+        assert!(doc.contains("aethyme graph materialize --repo ."));
+        assert!(doc.contains("Do not enable graph authority merely to silence"));
         assert!(doc.len() <= COMPACT_POLICY_MAX_BYTES, "{} bytes", doc.len());
         let reference = render_broker_reference();
         assert!(reference.contains("aethyme broker cleanup --all-cleaned --apply"));

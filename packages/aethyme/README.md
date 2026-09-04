@@ -84,6 +84,7 @@ Aethyme runs against local repositories without a SaaS layer.
 Primary commands:
 
 - `aethyme deploy --repo /path/to/repo`
+- `aethyme deploy --repo /path/to/repo --with-graph` (optional canonical graph enrollment; generation remains deferred until commit)
 - `aethyme deploy verify --repo /path/to/repo`
 - `aethyme deploy bridge --repo /path/to/repo`
 - `aethyme deploy --local-only --repo /path/to/repo`
@@ -94,6 +95,7 @@ Primary commands:
 - `aethyme explore --repo /path/to/repo --request "<task>" --format answer-json`
   (native Rust entrypoint; the paired `aethyme-engine-cli` binary serves the
   daemon protocol and is installed from the same release archive)
+- `aethyme graph materialize --repo /path/to/repo` (explicitly build the ignored local query store for an opted-in repository)
 - `aethyme repo compile-skills /path/to/repo`
 - `aethyme repo init-onboarding-overrides /path/to/repo`
 - `aethyme repo validate-onboarding-overrides /path/to/repo`
@@ -154,6 +156,7 @@ Runtime notes:
 - Git repositories use commit plus dirty-state metadata for cache keys instead of a full recursive fingerprint on every call
 - `aethyme deploy plan --repo <path> --diff` plus digest-confirmed `deploy execute` is the atomic public first-enrollment path; it plans from the exact remote default tree, preserves pre-enrollment refs, uses isolated broker submission and ship, verifies publication, and synchronizes local main only by a clean fast-forward
 - `aethyme deploy --repo <path>` remains the offline/manual repository-enrollment preparation path; it composes broker scaffold, gate drafting, agent-policy deployment, verification, and certification without publishing
+- graph support is opt-in through canonical `deploy --with-graph`; ordinary and local-only deployment generate no graph artifacts, and every clone materializes its ignored query store explicitly
 - `aethyme deploy verify --repo <path>` is its read-only local and CI contract; `aethyme enhance deploy/verify` remain lower-level discoverability operations
 - binary installation and repository migration are separate: after updating the paired binaries, `aethyme upgrade plan` reviews embedded repository-policy migrations one repository at a time, `upgrade apply` requires the plan digest and uses a rollback journal, and an interrupted transaction is restored explicitly with `upgrade recover --plan <digest>`
 - canonical deployments track `.aethyme/repository.json`; local-only deployments keep the equivalent marker ignored, and enrolled repositories fail closed on broker use when their policy schema is stale or newer than the installed binary
@@ -171,6 +174,7 @@ Runtime notes:
 - generated operator status artifacts are machine-local and ignored at `.aethyme/generated/experience-status.json` and `.aethyme/generated/experience-status.md`
 - `aethyme repo commit-message-template` and `aethyme repo lint-commit-message` define and validate the typed commit contract Aethyme will later use for repo-memory extraction; substantive commit types (`fix`, `feat`, `refactor`, `perf`) require `Problem`, `Decision`, `Rationale`, and `Validation` sections, while non-substantive types (`test`, `docs`, `build`, `chore`, `revert`) may be subject-only; structured section content can begin on the header line (`Problem: text`) or the following line
 - `explore --request ...` defaults to `task_localization_query`, a bounded general-purpose answer path that returns ranked candidate files/symbols/areas, compact evidence, verification steps, confidence, next actions, compact agent observability, `output_chars_estimate`, and `truncated`; on large repos it returns degraded `needs_verification` output instead of blocking or claiming answer safety
+- when the optional graph store is unavailable, Explore returns schema-valid degraded JSON with empty evidence and false safety flags instead of failing or generating state behind the caller's back
 - `explore --intent usage_boundary_query` now uses a scope-first PHP analyzer path that returns answer/excluded/confidence/observability without building the full repository graph
 - reports include an Aethyme Usage section so availability is not confused with actual `aethyme` invocation
 

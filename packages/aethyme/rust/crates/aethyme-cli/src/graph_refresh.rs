@@ -22,7 +22,10 @@ use sha2::{Digest, Sha256};
 const PLAN_SCHEMA_VERSION: u32 = 1;
 
 pub(crate) fn handles(args: &[String]) -> bool {
-    matches!(args.first().map(String::as_str), Some("status" | "refresh"))
+    matches!(
+        args.first().map(String::as_str),
+        Some("status" | "materialize" | "refresh")
+    )
 }
 
 pub(crate) fn run(args: &[String]) -> u8 {
@@ -42,6 +45,26 @@ fn run_inner(args: &[String]) -> Result<(), String> {
             let json = has_flag(args, "--json");
             let built = build_plan(&repo)?;
             render_status(&built.plan, json)
+        }
+        Some("materialize") => {
+            let repo = option_path(args, "--repo")?;
+            let report = materialize(&repo)?;
+            if has_flag(args, "--json") {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report).map_err(|error| error.to_string())?
+                );
+            } else {
+                println!(
+                    "Graph store {:?} for {} at {} ({} files, {} ms)",
+                    report.action,
+                    report.canonical_repository,
+                    short(&report.source_head),
+                    report.file_count,
+                    report.elapsed_ms
+                );
+            }
+            Ok(())
         }
         Some("refresh") => match args.get(1).map(String::as_str) {
             Some("plan") => {
@@ -90,8 +113,19 @@ fn run_inner(args: &[String]) -> Result<(), String> {
                     .into(),
             ),
         },
-        _ => Err("usage: aethyme graph <status|refresh> --repo <path>".into()),
+        _ => Err("usage: aethyme graph <status|materialize|refresh> --repo <path>".into()),
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct GraphMaterializationReport {
+    schema_version: u32,
+    canonical_repository: String,
+    source_head: String,
+    fragment_status: GraphIntegrityStatus,
+    action: DerivedStoreAction,
+    file_count: usize,
+    elapsed_ms: u128,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -215,7 +249,7 @@ struct BuiltPlan {
     plan: GraphRefreshPlan,
     existing_files: BTreeMap<String, GraphFileBytes>,
     proposed_files: BTreeMap<String, GraphFileBytes>,
-    _proposal: ProposedRepository,
+    proposal: ProposedRepository,
 }
 
 struct ProposedRepository {
@@ -426,7 +460,62 @@ fn build_plan(repo_hint: &Path) -> Result<BuiltPlan, String> {
         plan,
         existing_files: existing,
         proposed_files: proposed,
-        _proposal: proposal,
+        proposal,
+    })
+}
+
+fn materialize(repo_hint: &Path) -> Result<GraphMaterializationReport, String> {
+    let started = std::time::Instant::now();
+    let built = build_plan(repo_hint)?;
+    if built.plan.compatibility != GraphRefreshCompatibility::Compatible {
+        return Err(format!(
+            "graph materialization requires compatible committed graph authority; status is {:?}: {}",
+            built.plan.compatibility, built.plan.next_action
+        ));
+    }
+    if built.plan.fragments.status != GraphIntegrityStatus::Passed {
+        return Err(
+            "committed graph fragments do not match committed HEAD; run `aethyme graph refresh plan --repo . --diff`"
+                .into(),
+        );
+    }
+    let repository = GitRepo::discover(repo_hint).map_err(|error| error.to_string())?;
+    let current_head = repository
+        .head_commit()
+        .map_err(|error| error.to_string())?;
+    if current_head != built.plan.source.head_sha {
+        return Err("repository HEAD moved during graph validation; retry materialization".into());
+    }
+    let mut file_count = 0;
+    let action = built.plan.derived_store.action;
+    if action != DerivedStoreAction::None {
+        let (mut map, _) =
+            aethyme_engine::map::RepositoryMap::build_from_fragments(&built.proposal.root)?;
+        file_count = map.files.len();
+        map.snapshot.root = repository
+            .root()
+            .canonicalize()
+            .map_err(|error| format!("resolve graph store target: {error}"))?
+            .to_string_lossy()
+            .into_owned();
+        aethyme_engine::index_store::materialize_graph_store(
+            repository.root(),
+            &map,
+            &built.plan.source.head_sha,
+        )?;
+    } else if let Ok(store) = GraphStore::open_read_only(repository.root())
+        && let Ok(Some(metadata)) = store.repo_metadata()
+    {
+        file_count = metadata.file_count as usize;
+    }
+    Ok(GraphMaterializationReport {
+        schema_version: PLAN_SCHEMA_VERSION,
+        canonical_repository: built.plan.canonical_repository,
+        source_head: built.plan.source.head_sha,
+        fragment_status: built.plan.fragments.status,
+        action,
+        file_count,
+        elapsed_ms: started.elapsed().as_millis(),
     })
 }
 

@@ -38,8 +38,8 @@ use crate::model::task::TaskInput;
 #[cfg(test)]
 use crate::store::redb::graph_store::SymbolMatchSignals;
 use crate::store::redb::graph_store::{
-    GraphStore, NodeDisplay, ReadOnlyGraphStore, StoredNodeKind, SubsystemCandidate,
-    SurfaceFlowCandidate, SurfacePathCandidate,
+    GraphStore, GraphStoreError, NodeDisplay, ReadOnlyGraphStore, StoredNodeKind,
+    SubsystemCandidate, SurfaceFlowCandidate, SurfacePathCandidate,
 };
 
 const SURFACE_FLOW_COVERAGE_SCHEMA_VERSION: u8 = 1;
@@ -889,6 +889,13 @@ pub enum ExploreError {
     /// Engine analyzer failure — used by redb/source-text paths that do
     /// not have a more specific user-error variant.
     EngineAnalyzer(String),
+    /// The optional local graph query artifact is unavailable. The CLI
+    /// converts this into a successful but unsafe answer-json envelope so
+    /// agents can follow explicit enrollment/materialization remediation.
+    GraphUnavailable {
+        status: &'static str,
+        reason: String,
+    },
     /// Caller passed insufficient or malformed parameters for the
     /// requested intent. Distinguishes user error from system error so
     /// CLIs can return exit code 2 instead of 1.
@@ -902,9 +909,133 @@ impl std::fmt::Display for ExploreError {
             Self::DaemonRpc(msg) => write!(f, "engine daemon rpc: {msg}"),
             Self::InvalidResponse(msg) => write!(f, "invalid daemon response: {msg}"),
             Self::EngineAnalyzer(msg) => write!(f, "engine analyzer: {msg}"),
+            Self::GraphUnavailable { status, reason } => {
+                write!(f, "graph {status}: {reason}")
+            }
             Self::BadParams(msg) => write!(f, "bad params: {msg}"),
         }
     }
+}
+
+pub(super) fn graph_store_explore_error(error: GraphStoreError) -> ExploreError {
+    let (status, reason) = match error {
+        GraphStoreError::MissingGraphStore { .. } => (
+            "missing",
+            "the local derived graph store has not been materialized".into(),
+        ),
+        GraphStoreError::SchemaMismatch { found, expected } => (
+            "incompatible",
+            format!("graph store schema {found} does not match required schema {expected}"),
+        ),
+        GraphStoreError::IncompatibleRedbFileFormat { found, .. } => (
+            "incompatible",
+            format!("graph store file format {found} is incompatible with this runtime"),
+        ),
+        GraphStoreError::Io(_) => (
+            "unavailable",
+            "the local graph store could not be read".into(),
+        ),
+        GraphStoreError::Db(_) => (
+            "unavailable",
+            "the local graph database could not be opened".into(),
+        ),
+        GraphStoreError::Encode(_) => (
+            "unavailable",
+            "the local graph store contains undecodable data".into(),
+        ),
+    };
+    ExploreError::GraphUnavailable { status, reason }
+}
+
+/// Build the stable answer-json contract for a repository whose optional
+/// local graph store cannot currently answer. No source scan is attempted:
+/// callers receive an explicit unsafe result and deterministic recovery.
+pub fn graph_unavailable_response(
+    repo: &Path,
+    request: &str,
+    intent: &'static str,
+    intent_source: &'static str,
+    status: &'static str,
+    reason: String,
+) -> ExploreResponse {
+    let enrolled = std::fs::read_to_string(repo.join(".aethyme/config.toml"))
+        .ok()
+        .is_some_and(|text| {
+            text.contains("authority = \"committed_fragments\"")
+                || text.contains("authority='committed_fragments'")
+                || text.contains("authority = 'committed_fragments'")
+        });
+    let next_action = if enrolled {
+        "Run `aethyme graph materialize --repo .`; if committed fragments are stale, review `aethyme graph refresh plan --repo . --diff`."
+    } else {
+        "Graph support is optional. Continue with bounded source inspection, or explicitly enroll with `aethyme deploy --repo . --with-graph`."
+    };
+    response_with_output_estimate(ExploreResponse {
+        schema_version: "aethyme-explore-v1",
+        mode: "explore",
+        intent,
+        intent_source,
+        status: "degraded",
+        request: ExploreRequest {
+            raw: request.to_string(),
+            parameters: serde_json::json!({}),
+        },
+        answer: Vec::new(),
+        navigation_hints: Vec::new(),
+        excluded: Vec::new(),
+        ambiguous: Vec::new(),
+        subsystems: Vec::new(),
+        evidence: Evidence {
+            answer_count: 0,
+            navigation_hint_count: 0,
+            excluded_count: 0,
+        },
+        confidence: Confidence {
+            overall: None,
+            answer_summary: ConfidenceSummary::default(),
+            excluded_summary: ConfidenceSummary::default(),
+            analyzed_summary: serde_json::json!({"graph_available": false}),
+        },
+        safe_to_use_as_answer: false,
+        safe_to_use_as_navigation: false,
+        trust_policy: TrustPolicy {
+            safe_to_use_as_answer: false,
+            safe_to_use_as_navigation: false,
+            evidence_level: "none".into(),
+            authoritative_answer_count: 0,
+            navigation_hint_count: 0,
+            degraded: true,
+            trust_policy: "verify_before_use",
+            reason: "The optional graph query artifact is unavailable; no repository location was inferred."
+                .into(),
+        },
+        degraded_reasons: vec![format!("graph_store_{status}")],
+        verification_steps: vec![serde_json::json!({
+            "kind": "manual_source_inspection",
+            "reason": "Explore returned no graph-backed targets"
+        })],
+        next_actions: vec![next_action.into()],
+        available_specialized_intents: vec![
+            "behavior_localization_query",
+            "usage_boundary_query",
+        ],
+        output_chars_estimate: 0,
+        truncated: false,
+        output_adapters: None,
+        resolved_parameters: None,
+        observability: Some(serde_json::json!({
+            "readiness": {
+                "status": "degraded",
+                "reason": "optional_graph_unavailable"
+            },
+            "graph_store": {
+                "status": status,
+                "source_of_truth": "graph_fragments",
+                "derived_query_artifact": "redb_graph_store",
+                "reason": reason
+            }
+        })),
+    })
 }
 
 impl std::error::Error for ExploreError {}
@@ -965,8 +1096,7 @@ pub fn explore_with_intent(
     let canonical_repo = repo
         .canonicalize()
         .map_err(|e| ExploreError::EngineAnalyzer(format!("canonicalize repo: {e}")))?;
-    let store = GraphStore::open_read_only(&canonical_repo)
-        .map_err(|e| ExploreError::EngineAnalyzer(e.to_string()))?;
+    let store = GraphStore::open_read_only(&canonical_repo).map_err(graph_store_explore_error)?;
     let observability = graph_store_observability(&canonical_repo);
 
     // 1. Graph-derived view (anchors + scope + next).
@@ -4879,8 +5009,8 @@ fn merge_symbol_search_evidence(existing: &mut AnswerItem, symbol_item: &AnswerI
 ///   1. If token/auth ambiguity exists → verify the top 2 subsystems
 ///   2. If text evidence with line_refs → read the cited line(s)
 ///   3. If symbol evidence → grep callers/dispatch sites of the symbol
-///   4. If failed/no answers → suggest broadening the request or running
-///      Python explore for richer evidence
+///   4. If failed/no answers → suggest broadening the request or increasing
+///      native detail for richer evidence
 ///   5. Generic "open top answer and confirm" as a final fallback
 fn build_verification_steps(
     answers: &[AnswerItem],
@@ -5003,12 +5133,12 @@ fn build_verification_steps(
         } else if trust_policy.trust_policy == "needs_verification" {
             steps.push(serde_json::json!({
                 "step": "If the task requires high confidence, rerun with \
-                         `--detail standard` or via the Python explore for \
-                         additional source-callsite expansion and evidence \
-                         aggregation.",
-                "rationale": "Native session-3 path covers the common cases; \
-                              richer evidence sources are deferred to the \
-                              Python orchestrator.",
+                         `--detail standard`; use `--detail full \
+                         --show-observability` only when the wider native \
+                         evidence still needs diagnosis.",
+                "rationale": "The compact native path prioritizes bounded \
+                              output; higher native detail levels expose \
+                              wider evidence and diagnostics.",
             }));
         }
     }
@@ -5606,6 +5736,10 @@ mod tests {
         // The survivor is the text-match (added first, stronger
         // evidence), not the symbol anchor.
         assert_eq!(matches[0].kind, "source_text_file");
+        let verification = serde_json::to_string(&response.verification_steps).unwrap();
+        assert!(verification.contains("--detail standard"));
+        assert!(verification.contains("--detail full"));
+        assert!(!verification.contains("Python"));
     }
 
     #[test]

@@ -3,7 +3,18 @@
 Last Updated: 2026-09-03
 
 Aethyme repositories may make committed graph fragments authoritative through
-the `[graph]` policy in `.aethyme/config.toml`. Refresh those fragments only
+an explicit canonical deployment opt-in:
+
+```bash
+aethyme deploy --repo . --with-graph
+# When no canonical origin is configured:
+aethyme deploy --repo . --with-graph --graph-repository owner/name
+```
+
+Default and local-only deployment remain graph-free. The opt-in writes the
+`[graph]` policy in `.aethyme/config.toml` and `.aethyme/engine-version`, but
+does not generate anything. Review and commit enrollment first so generation
+has an exact committed source. Refresh those fragments only
 with the installed `aethyme` release whose version exactly matches
 `.aethyme/engine-version`. The router links the compatible indexer and engine
 libraries into the same signed release unit; no separately installed indexer
@@ -38,6 +49,19 @@ fragment paths. Because that commit creates a new authoritative HEAD, rerun
 `graph status`; if it reports only a stale derived store, review and execute
 the new plan to stamp the local store against that committed graph revision.
 
+Every other clone or broker worktree can then build only its ignored local
+query artifact from the verified committed fragments:
+
+```bash
+aethyme graph materialize --repo .
+aethyme graph materialize --repo . --json
+```
+
+Materialization refuses disabled authority, stale fragments, a version
+mismatch, or a HEAD that moves during validation. It changes no tracked file
+and reports the full source SHA, action, file count, and elapsed milliseconds.
+An already-current store is a no-op.
+
 ## Safety and recovery
 
 - A mismatched engine pin requires the signed compatible Aethyme release or a
@@ -54,9 +78,16 @@ the new plan to stamp the local store against that committed graph revision.
   aethyme graph refresh recover --repo . --plan <plan-sha256>
   ```
 
-Canonical and local-only Aethyme deployments use the same graph contract. The
-deployment mode controls which policy files are tracked; it does not weaken
-the exact-HEAD, version-pin, confirmation, or transactional safety rules.
+Local-only Aethyme activation cannot enable authoritative fragments because
+its policy is intentionally untracked. Use canonical deployment when a team
+wants a shared graph contract.
+
+Explore remains read-only in every mode. Without a usable local store it
+returns successful, schema-valid degraded answer JSON: `answer` is empty,
+answer/navigation safety are false, observability names the graph state, and
+the next action either offers explicit materialization or notes that graph
+support is optional. Agents may continue with bounded source verification;
+they must not enable graphing simply to silence degradation.
 
 The lower-level `aethyme-engine-cli index` command remains supported for
 engine diagnostics and compatibility. It is not a substitute for the reviewed

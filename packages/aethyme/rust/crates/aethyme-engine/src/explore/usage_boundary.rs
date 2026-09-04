@@ -17,7 +17,8 @@ use crate::store::redb::graph_store::GraphStore;
 
 use super::{
     AnswerItem, Confidence, ConfidenceSummary, Evidence, ExploreError, ExploreRequest,
-    ExploreResponse, TrustPolicy, bucket_confidence, graph_store_observability,
+    ExploreResponse, TrustPolicy, bucket_confidence, graph_store_explore_error,
+    graph_store_observability,
 };
 
 /// Parameters for `usage_boundary_query` intent.
@@ -65,7 +66,7 @@ impl Default for UsageBoundaryParams {
             max_evidence_per_symbol: 5,
             // Mirrors task_localization compact default. 25 is enough
             // for the agent to triage; full lists are available via
-            // narrower --scope or the Python orchestrator.
+            // narrower --scope calls.
             max_answer_items: 25,
         }
     }
@@ -93,8 +94,7 @@ pub fn explore_usage_boundary(
     let canonical_repo = repo
         .canonicalize()
         .map_err(|error| ExploreError::EngineAnalyzer(format!("resolve repo: {error}")))?;
-    let store = GraphStore::open_read_only(&canonical_repo)
-        .map_err(|error| ExploreError::EngineAnalyzer(error.to_string()))?;
+    let store = GraphStore::open_read_only(&canonical_repo).map_err(graph_store_explore_error)?;
     let answer = analyze_usage_boundary_scope_first_redb_with_request(
         &canonical_repo,
         &store,

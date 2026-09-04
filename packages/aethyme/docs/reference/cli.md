@@ -1776,6 +1776,7 @@ separate graph-indexer executable is not required:
 
 ```bash
 aethyme graph status --repo . [--json]
+aethyme graph materialize --repo . [--json]
 aethyme graph refresh plan --repo . [--json | --diff]
 aethyme graph refresh execute --repo . --confirm <plan-sha256>
 aethyme graph refresh recover --repo . --plan <plan-sha256>
@@ -1789,6 +1790,19 @@ write set, derived-store action, dirty overlap, live sessions, relevant leases,
 compatibility, blockers, and a SHA-256 binding all of those preconditions.
 Neither JSON nor the hash-only `--diff` surface contains source contents or
 absolute repository paths.
+
+Graph support is disabled by default. Canonical setup opts in with
+`aethyme deploy --repo . --with-graph`; use
+`--graph-repository owner/name` only when no canonical `origin` can be
+resolved. Enrollment writes policy plus the exact engine pin but defers all
+generation until those files are reviewed and committed. `--with-graph` is
+refused for `--local-only` because untracked policy cannot authorize shared
+committed fragments.
+
+`materialize` validates committed policy, pin, and fragments against exact
+`HEAD`, then atomically builds only the ignored worktree-local redb store. It
+does not change fragments, accepts no hidden network input, reports elapsed
+milliseconds in stable JSON, and is a no-op when the store is current.
 
 `execute` revalidates the complete plan under an exclusive repository lock,
 requires the full digest, writes a private rollback/recovery journal, applies
@@ -1804,6 +1818,10 @@ The repository engine-version pin is never rewritten by refresh. If the pin
 does not match the installed release unit, install the signed compatible
 release or migrate the repository contract through the reviewed upgrade flow.
 Ordinary Explore performs no background download or transparent refresh.
+When its optional local store is unavailable, Explore exits successfully with
+schema-valid degraded answer JSON, empty evidence, false answer/navigation
+safety, path-redacted observability, and an explicit manual or materialization
+next action.
 The complete operational workflow, including post-commit restamping and old
 pin handling, is in [Version-safe graph refresh](../guides/graph-refresh.md).
 The lower-level `aethyme-engine-cli index` surface remains available for

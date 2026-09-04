@@ -136,6 +136,14 @@ pub fn run(args: &[String]) -> ExploreCliOutcome {
         Err(explore::ExploreError::DaemonNotRunning) => {
             ExploreCliOutcome::DaemonNotRunning { repo }
         }
+        Err(explore::ExploreError::GraphUnavailable { status, reason }) => print_graph_unavailable(
+            &repo,
+            &request,
+            intent.as_str(),
+            intent_source.as_str(),
+            status,
+            reason,
+        ),
         Err(other) => ExploreCliOutcome::Failed(format!("explore: {other}")),
     }
 }
@@ -191,7 +199,34 @@ fn run_usage_boundary(args: &[String], repo_str: &str, request: &str) -> Explore
         Err(explore::ExploreError::BadParams(msg)) => {
             ExploreCliOutcome::BadUsage(format!("explore (usage_boundary_query): {msg}"))
         }
+        Err(explore::ExploreError::GraphUnavailable { status, reason }) => print_graph_unavailable(
+            &repo,
+            request,
+            "usage_boundary_query",
+            "explicit",
+            status,
+            reason,
+        ),
         Err(err) => ExploreCliOutcome::Failed(format!("explore (usage_boundary_query): {err}")),
+    }
+}
+
+fn print_graph_unavailable(
+    repo: &std::path::Path,
+    request: &str,
+    intent: &'static str,
+    intent_source: &'static str,
+    status: &'static str,
+    reason: String,
+) -> ExploreCliOutcome {
+    let response =
+        explore::graph_unavailable_response(repo, request, intent, intent_source, status, reason);
+    match serde_json::to_string_pretty(&response) {
+        Ok(json) => {
+            println!("{json}");
+            ExploreCliOutcome::Done
+        }
+        Err(error) => ExploreCliOutcome::Failed(format!("serialize response: {error}")),
     }
 }
 

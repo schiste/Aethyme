@@ -3481,17 +3481,6 @@ fn query_commands_fail_cleanly_and_do_not_create_store_when_missing() {
             "Update load_token flow",
         ],
         vec![
-            "explore",
-            "--repo",
-            tmp.path().to_str().unwrap(),
-            "--request",
-            "Update load_token flow",
-            "--format",
-            "answer-json",
-            "--intent",
-            "task_localization_query",
-        ],
-        vec![
             "task-expand",
             "--repo",
             tmp.path().to_str().unwrap(),
@@ -3581,6 +3570,27 @@ fn query_commands_fail_cleanly_and_do_not_create_store_when_missing() {
             "stderr={stderr}"
         );
     }
+
+    let explore = run_engine([
+        "explore",
+        "--repo",
+        tmp.path().to_str().unwrap(),
+        "--request",
+        "Update load_token flow",
+        "--format",
+        "answer-json",
+        "--intent",
+        "task_localization_query",
+    ]);
+    assert_success(&explore);
+    assert!(explore.stderr.is_empty());
+    let degraded: serde_json::Value = serde_json::from_slice(&explore.stdout).unwrap();
+    assert_eq!(degraded["status"], "degraded");
+    assert_eq!(degraded["safe_to_use_as_answer"], false);
+    assert_eq!(
+        degraded["degraded_reasons"],
+        serde_json::json!(["graph_store_missing"])
+    );
 
     assert!(
         !store_path.exists(),

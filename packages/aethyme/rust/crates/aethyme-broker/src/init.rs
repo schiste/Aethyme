@@ -138,19 +138,7 @@ pub fn certify(repo_hint: &Path) -> Result<InitReport, BrokerOpError> {
         status: protocol_status(&checkout_root),
         detail: protocol_detail(&checkout_root),
     });
-    checks.push(Check {
-        id: "certify.graph",
-        status: if checkout_root.join(".aethyme/graph").is_dir() {
-            CheckStatus::Pass
-        } else {
-            CheckStatus::Skipped
-        },
-        detail: if checkout_root.join(".aethyme/graph").is_dir() {
-            "graph fragments present".into()
-        } else {
-            "no graph fragments — optional; run aethyme-graph-index to build the charts".into()
-        },
-    });
+    checks.push(check_graph_enrollment(&checkout_root));
 
     // Broker state: verified only when it exists (certification creates
     // nothing — the db appears on first adopt/scaffold use).
@@ -212,6 +200,41 @@ pub fn certify(repo_hint: &Path) -> Result<InitReport, BrokerOpError> {
         check_mode: true,
         checks,
     })
+}
+
+fn check_graph_enrollment(checkout_root: &Path) -> Check {
+    let fragments_present = checkout_root.join(".aethyme/graph").is_dir();
+    match crate::GraphIntegrityPolicy::load(checkout_root) {
+        Ok(policy) if policy.enforces_committed_fragments() && fragments_present => Check {
+            id: "certify.graph",
+            status: CheckStatus::Pass,
+            detail: "authoritative graph fragments are present; use `aethyme graph status --repo .` for exact-tree freshness"
+                .into(),
+        },
+        Ok(policy) if policy.enforces_committed_fragments() => Check {
+            id: "certify.graph",
+            status: CheckStatus::Warn,
+            detail: "graph authority is enabled but fragments are not committed; commit enrollment, then review `aethyme graph refresh plan --repo . --diff`"
+                .into(),
+        },
+        Ok(_) if fragments_present => Check {
+            id: "certify.graph",
+            status: CheckStatus::Warn,
+            detail: "graph fragments exist while graph authority is disabled; review repository policy before relying on them"
+                .into(),
+        },
+        Ok(_) => Check {
+            id: "certify.graph",
+            status: CheckStatus::Skipped,
+            detail: "graph authority disabled (optional); default deployment performs no graph generation"
+                .into(),
+        },
+        Err(error) => Check {
+            id: "certify.graph",
+            status: CheckStatus::Fail,
+            detail: format!("invalid graph policy: {error}"),
+        },
+    }
 }
 
 fn check_retention_policy(main_root: &Path) -> Check {

@@ -101,6 +101,11 @@ fn deploy_enrolls_and_verifies_a_repository_without_a_source_checkout() {
     ] {
         assert!(repo.join(relative).is_file(), "missing {relative}");
     }
+    let config = fs::read_to_string(repo.join(".aethyme/config.toml")).unwrap();
+    assert!(!config.contains("[graph]"));
+    assert!(!repo.join(".aethyme/engine-version").exists());
+    assert!(!repo.join(".aethyme/graph").exists());
+    assert!(!repo.join(".aethyme/graph_store.redb").exists());
     let agents = fs::read_to_string(repo.join("AGENTS.md")).unwrap();
     assert!(agents.contains("## Broker Coordination"));
     assert!(!agents.contains("AETHYME_ROOT"));
@@ -140,6 +145,7 @@ fn deploy_enrolls_and_verifies_a_repository_without_a_source_checkout() {
     assert!(stdout.contains(".aethyme/generated/onboarding.json"));
     assert!(stdout.contains("Optional local Claude integration:"));
     assert!(stdout.contains("settings.local.json (machine-local; never commit)"));
+    assert!(stdout.contains("graph authority disabled (optional)"));
 
     let verified = command(&repo)
         .args(["deploy", "verify", "--repo"])
@@ -283,6 +289,68 @@ fn top_level_help_exposes_the_canonical_deployment_surface() {
     assert!(deploy_help.contains("--confirm <plan-sha256>"));
     assert!(deploy_help.contains("aethyme deploy verify"));
     assert!(deploy_help.contains("--local-only"));
+    assert!(deploy_help.contains("--with-graph"));
+    assert!(deploy_help.contains("--graph-repository <owner/name>"));
+}
+
+#[test]
+fn graph_generation_is_opt_in_deferred_and_canonical_only() {
+    let temp = tmp_dir();
+    let repo = repository(temp.path());
+    let deployed = command(&repo)
+        .args([
+            "deploy",
+            "--repo",
+            repo.to_str().unwrap(),
+            "--with-graph",
+            "--graph-repository",
+            "example/project",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        deployed.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&deployed.stdout),
+        String::from_utf8_lossy(&deployed.stderr)
+    );
+    let config = fs::read_to_string(repo.join(".aethyme/config.toml")).unwrap();
+    assert!(config.contains("[graph]"));
+    assert!(config.contains("authority = \"committed_fragments\""));
+    assert!(config.contains("repository = \"example/project\""));
+    assert_eq!(
+        fs::read_to_string(repo.join(".aethyme/engine-version")).unwrap(),
+        format!("{}\n", env!("CARGO_PKG_VERSION"))
+    );
+    assert!(!repo.join(".aethyme/graph").exists());
+    assert!(!repo.join(".aethyme/graph_store.redb").exists());
+    let stdout = String::from_utf8_lossy(&deployed.stdout);
+    assert!(stdout.contains("deferred  graph generation"));
+    assert!(stdout.contains("commit the deployment"));
+    assert!(stdout.contains("aethyme graph refresh plan --repo . --diff"));
+    assert!(stdout.contains("graph authority is enabled but fragments are not committed"));
+    assert!(!stdout.contains("aethyme-graph-index"));
+
+    let local_temp = tmp_dir();
+    let local_repo = repository(local_temp.path());
+    let rejected = command(&local_repo)
+        .args([
+            "deploy",
+            "--local-only",
+            "--with-graph",
+            "--graph-repository",
+            "example/project",
+            "--repo",
+            local_repo.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr)
+            .contains("local-only activation remains graph-free")
+    );
+    assert!(!local_repo.join(".aethyme").exists());
 }
 
 #[test]

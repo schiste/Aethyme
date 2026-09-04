@@ -430,7 +430,9 @@ fn print_top_level_help() {
     eprintln!("  broker adopt|start-agent|agents|cleanup   (see `broker --help`)");
     eprintln!("  update check|plan|execute  explicit paired-binary updates; never background");
     eprintln!("  upgrade plan|apply|recover review, apply, or recover repository migrations");
-    eprintln!("  graph status|refresh       inspect or refresh authoritative graph artifacts");
+    eprintln!(
+        "  graph status|materialize|refresh  inspect, materialize, or refresh graph artifacts"
+    );
     eprintln!();
     eprintln!("Setup:");
     eprintln!("  deploy [verify|bridge] [--repo <path>]  enroll repository policy");

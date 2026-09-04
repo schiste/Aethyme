@@ -14,6 +14,8 @@ struct Options {
     repo: PathBuf,
     force: bool,
     local_only: bool,
+    with_graph: bool,
+    graph_repository: Option<String>,
 }
 
 pub fn run(args: &[String]) -> u8 {
@@ -57,6 +59,12 @@ pub fn run(args: &[String]) -> u8 {
     if options.action == Action::Bridge {
         return install_bridge(&repo);
     }
+    if options.local_only && options.with_graph {
+        eprintln!(
+            "aethyme deploy: --with-graph requires canonical deployment because authoritative graph fragments and the engine pin must be committed; local-only activation remains graph-free"
+        );
+        return 2;
+    }
     if options.local_only {
         return if options.action == Action::Verify {
             verify_local_repository(&repo)
@@ -73,6 +81,19 @@ pub fn run(args: &[String]) -> u8 {
     });
     if scaffold != 0 {
         return scaffold;
+    }
+    if options.with_graph {
+        let repository = match graph_repository(&repo, options.graph_repository.as_deref()) {
+            Ok(repository) => repository,
+            Err(error) => {
+                eprintln!("aethyme deploy: {error}");
+                return 1;
+            }
+        };
+        if let Err(error) = enroll_graph(&repo, &repository) {
+            eprintln!("aethyme deploy: {error}");
+            return 1;
+        }
     }
     let gates = in_repo(&repo, || {
         aethyme_broker::cli::run(&["gates".to_string(), "draft".to_string()])
@@ -132,6 +153,8 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
     let mut repo = PathBuf::from(".");
     let mut force = false;
     let mut local_only = false;
+    let mut with_graph = false;
+    let mut graph_repository = None;
     let mut index = 0;
     match args.first().map(String::as_str) {
         Some("verify") => {
@@ -159,17 +182,33 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
                 local_only = true;
                 index += 1;
             }
+            "--with-graph" if action == Action::Deploy => {
+                with_graph = true;
+                index += 1;
+            }
+            "--graph-repository" if action == Action::Deploy => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or("--graph-repository requires owner/name")?;
+                graph_repository = Some(value.clone());
+                index += 2;
+            }
             option if option.starts_with('-') => {
                 return Err(format!("unknown option {option}"));
             }
             value => return Err(format!("unexpected argument {value}")),
         }
     }
+    if graph_repository.is_some() && !with_graph {
+        return Err("--graph-repository requires --with-graph".into());
+    }
     Ok(Options {
         action,
         repo,
         force,
         local_only,
+        with_graph,
+        graph_repository,
     })
 }
 
@@ -200,7 +239,9 @@ fn print_usage() {
     println!("Usage:");
     println!("  aethyme deploy plan [--repo <path>] [--diff|--json]");
     println!("  aethyme deploy execute [--repo <path>] --confirm <plan-sha256> [--json]");
-    println!("  aethyme deploy [--repo <path>] [--force]");
+    println!(
+        "  aethyme deploy [--repo <path>] [--force] [--with-graph [--graph-repository <owner/name>]]"
+    );
     println!("  aethyme deploy bridge [--repo <path>]");
     println!("  aethyme deploy --local-only [--repo <path>] [--force]");
     println!("  aethyme deploy verify [--repo <path>] [--local-only]");
@@ -349,4 +390,63 @@ fn print_artifact_ownership() {
     println!(
         "Next: review the generated policy, commit it, and retain `aethyme deploy verify --repo .` in CI."
     );
+}
+
+fn graph_repository(repo: &Path, explicit: Option<&str>) -> Result<String, String> {
+    if let Some(repository) = explicit {
+        return validate_graph_repository(repository);
+    }
+    let git = aethyme_broker::GitRepo::discover(repo).map_err(|error| error.to_string())?;
+    let target = git.resolve_remote_target("origin", None).map_err(|error| {
+        format!(
+            "cannot derive graph repository identity from origin: {error}; pass --graph-repository <owner/name>"
+        )
+    })?;
+    validate_graph_repository(&target.display_slug)
+}
+
+fn validate_graph_repository(value: &str) -> Result<String, String> {
+    let value = value.trim().trim_end_matches(".git");
+    let valid = value.split('/').count() >= 2
+        && !value.starts_with('/')
+        && !value.ends_with('/')
+        && !value.contains(':')
+        && !value.chars().any(char::is_whitespace);
+    if !valid {
+        return Err(format!(
+            "invalid graph repository {value:?}; expected a credential-free owner/name slug"
+        ));
+    }
+    Ok(value.to_string())
+}
+
+fn enroll_graph(repo: &Path, repository: &str) -> Result<(), String> {
+    use toml_edit::{DocumentMut, Item, Table, value};
+
+    let config_path = repo.join(".aethyme/config.toml");
+    let text = std::fs::read_to_string(&config_path)
+        .map_err(|error| format!("read {}: {error}", config_path.display()))?;
+    let mut document = text
+        .parse::<DocumentMut>()
+        .map_err(|error| format!("parse {}: {error}", config_path.display()))?;
+    if document.get("graph").is_none() {
+        document["graph"] = Item::Table(Table::new());
+    }
+    let graph = document["graph"]
+        .as_table_mut()
+        .ok_or("[graph] in .aethyme/config.toml must be a TOML table")?;
+    graph["authority"] = value("committed_fragments");
+    graph["repository"] = value(repository);
+    std::fs::write(&config_path, document.to_string())
+        .map_err(|error| format!("write {}: {error}", config_path.display()))?;
+
+    let version_path = repo.join(".aethyme/engine-version");
+    std::fs::write(&version_path, format!("{}\n", env!("CARGO_PKG_VERSION")))
+        .map_err(|error| format!("write {}: {error}", version_path.display()))?;
+    println!("enabled   graph authority for {repository}");
+    println!("deferred  graph generation until enrollment is reviewed and committed");
+    println!(
+        "Next graph step: commit the deployment, then run `aethyme graph refresh plan --repo . --diff`."
+    );
+    Ok(())
 }

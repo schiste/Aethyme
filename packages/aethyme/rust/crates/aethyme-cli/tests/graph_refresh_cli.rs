@@ -152,6 +152,158 @@ fn confirmed_execute_refreshes_fragments_then_materializes_the_local_store() {
 }
 
 #[test]
+fn materialize_rebuilds_only_the_local_store_from_verified_committed_fragments() {
+    let (_temporary, repo) = fixture();
+    let planned = plan(&repo);
+    let digest = planned["plan_sha256"].as_str().unwrap();
+    success(run(
+        &repo,
+        &[
+            "graph",
+            "refresh",
+            "execute",
+            "--repo",
+            ".",
+            "--confirm",
+            digest,
+        ],
+    ));
+    commit_all(&repo, "commit graph");
+    fs::remove_file(repo.join(".aethyme/graph_store.redb")).unwrap();
+    let before = git(&repo, &["status", "--porcelain"]);
+
+    let report: Value = serde_json::from_str(&success(run(
+        &repo,
+        &["graph", "materialize", "--repo", ".", "--json"],
+    )))
+    .unwrap();
+    assert_eq!(report["schema_version"], 1);
+    assert_eq!(report["canonical_repository"], "fixture");
+    assert_eq!(report["fragment_status"], "passed");
+    assert_eq!(report["action"], "materialize_after_fragment_verification");
+    assert_eq!(report["source_head"], git(&repo, &["rev-parse", "HEAD"]));
+    assert!(report["file_count"].as_u64().unwrap() >= 1);
+    assert!(repo.join(".aethyme/graph_store.redb").is_file());
+    assert_eq!(git(&repo, &["status", "--porcelain"]), before);
+
+    let current: Value = serde_json::from_str(&success(run(
+        &repo,
+        &["graph", "materialize", "--repo", ".", "--json"],
+    )))
+    .unwrap();
+    assert_eq!(current["action"], "none");
+}
+
+#[test]
+fn materialize_refuses_disabled_or_stale_committed_graph_authority() {
+    let (_temporary, repo) = fixture();
+    fs::write(
+        repo.join(".aethyme/config.toml"),
+        "[graph]\nauthority='disabled'\n",
+    )
+    .unwrap();
+    commit_all(&repo, "disable graph");
+    let disabled = run(&repo, &["graph", "materialize", "--repo", "."]);
+    assert!(!disabled.status.success());
+    assert!(
+        String::from_utf8_lossy(&disabled.stderr)
+            .contains("requires compatible committed graph authority")
+    );
+
+    fs::write(
+        repo.join(".aethyme/config.toml"),
+        "[graph]\nauthority='committed_fragments'\nrepository='fixture'\n",
+    )
+    .unwrap();
+    commit_all(&repo, "restore graph authority");
+    let stale = run(&repo, &["graph", "materialize", "--repo", "."]);
+    assert!(!stale.status.success());
+    assert!(
+        String::from_utf8_lossy(&stale.stderr)
+            .contains("committed graph fragments do not match committed HEAD")
+    );
+}
+
+#[test]
+fn explore_returns_structured_degradation_when_the_opt_in_store_is_missing() {
+    let (_temporary, repo) = fixture();
+    let response: Value = serde_json::from_str(&success(run(
+        &repo,
+        &[
+            "explore",
+            "--repo",
+            ".",
+            "--request",
+            "locate the answer function",
+            "--format",
+            "answer-json",
+            "--show-observability",
+        ],
+    )))
+    .unwrap();
+    assert_eq!(response["status"], "degraded");
+    assert_eq!(response["safe_to_use_as_answer"], false);
+    assert_eq!(response["safe_to_use_as_navigation"], false);
+    assert_eq!(response["answer"], serde_json::json!([]));
+    assert_eq!(
+        response["degraded_reasons"],
+        serde_json::json!(["graph_store_missing"])
+    );
+    assert_eq!(
+        response["observability"]["graph_store"]["status"],
+        "missing"
+    );
+    assert!(
+        !serde_json::to_string(&response)
+            .unwrap()
+            .contains(repo.to_string_lossy().as_ref())
+    );
+    assert!(
+        response["next_actions"][0]
+            .as_str()
+            .unwrap()
+            .contains("aethyme graph materialize --repo .")
+    );
+}
+
+#[test]
+fn explore_degradation_keeps_graph_enrollment_optional() {
+    let temporary = tempfile::tempdir().unwrap();
+    let repo = temporary.path().join("repo");
+    fs::create_dir(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    fs::write(repo.join("README.md"), "fixture\n").unwrap();
+    commit_all(&repo, "fixture");
+
+    let response: Value = serde_json::from_str(&success(run(
+        &repo,
+        &[
+            "explore",
+            "--repo",
+            ".",
+            "--request",
+            "orient me",
+            "--format",
+            "answer-json",
+        ],
+    )))
+    .unwrap();
+    assert_eq!(response["status"], "degraded");
+    assert!(
+        response["next_actions"][0]
+            .as_str()
+            .unwrap()
+            .contains("Graph support is optional")
+    );
+    assert!(
+        response["next_actions"][0]
+            .as_str()
+            .unwrap()
+            .contains("--with-graph")
+    );
+}
+
+#[test]
 fn wrong_pin_and_dirty_overlap_are_explicit_blockers() {
     let (_temporary, repo) = fixture();
     fs::write(repo.join(".aethyme/engine-version"), "0.0.0\n").unwrap();
