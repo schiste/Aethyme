@@ -91,9 +91,9 @@
     ]
   },
   "freshness": {
-    "source_digest": "e43a92d16e1cd3c2fb90bc253acb0960d0735bd8f63ceef18ef04ac78c404a2b",
+    "source_digest": "41b1acb826e74ea39c545c7919c3230daa15b19f1c90cac182fc90e43dfcc640",
     "source_commit": null,
-    "source_file_count": 523,
+    "source_file_count": 534,
     "generator": "deterministic"
   },
   "telemetry": {

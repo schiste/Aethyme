@@ -2619,7 +2619,10 @@ fn render_promotion_record_plan(plan: &crate::PromotionRecordPlan) {
         plan.candidates.len(),
         recoverable
     );
-    println!("  integration: {} @ {}", plan.integration_ref, plan.integration_tip);
+    println!(
+        "  integration: {} @ {}",
+        plan.integration_ref, plan.integration_tip
+    );
     for candidate in &plan.candidates {
         match (&candidate.entry_id, &candidate.blocker) {
             (Some(entry), None) => {
@@ -5397,9 +5400,9 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                 // so it will fail the first push for reasons the session cannot
                 // see. Saying so at adopt time is cheaper than discovering it
                 // one rejected push at a time.
-                if let Ok(repo) = crate::GitRepo::discover(std::path::Path::new(
-                    &session.worktree_path,
-                )) && let Ok(dirty) = repo.dirty_paths()
+                if let Ok(repo) =
+                    crate::GitRepo::discover(std::path::Path::new(&session.worktree_path))
+                    && let Ok(dirty) = repo.dirty_paths()
                     && !dirty.is_empty()
                 {
                     let shown = dirty.iter().take(5).cloned().collect::<Vec<_>>();
@@ -6910,9 +6913,14 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
             }
         }
         "promotion-record" => {
-            let action = parsed.positional.first().map(String::as_str).ok_or(
-                UsageError::Message("promotion-record requires plan or apply".into()),
-            )?;
+            let action =
+                parsed
+                    .positional
+                    .first()
+                    .map(String::as_str)
+                    .ok_or(UsageError::Message(
+                        "promotion-record requires plan or apply".into(),
+                    ))?;
             let mut broker = open_broker(parsed.read_only_snapshot)?;
             match action {
                 "plan" => {

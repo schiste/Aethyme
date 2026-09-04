@@ -178,7 +178,6 @@ struct PreparationRecord {
 }
 
 impl Broker {
-
     /// Git-ignored top-level directories that exist in the primary checkout but
     /// not in this worktree.
     ///

@@ -48,6 +48,7 @@ mod operations;
 mod pr;
 mod pr_watch;
 mod preparation;
+mod promotion_record;
 mod quick_test;
 mod reconciliation;
 mod release_compatibility;
@@ -57,7 +58,6 @@ mod report;
 mod report_filing;
 mod repository_contract;
 mod resources;
-mod promotion_record;
 mod retention;
 mod review;
 mod schema;
@@ -179,6 +179,10 @@ pub use preparation::{
     PreparationConfig, PreparationError, PreparationReport, PreparationState, PreparationStatus,
     PreparationStep, PreparationStepResult, RuntimeProbe,
 };
+pub use promotion_record::{
+    PROMOTION_RECORD_PLAN_SCHEMA_VERSION, PromotionRecordApplyReport, PromotionRecordPlan,
+    UnrecordedPromotion,
+};
 pub use quick_test::{
     Chau7Probe, QuickTestError, QuickTestGateOutcome, QuickTestGateReport, QuickTestMode,
     QuickTestOptions, QuickTestReport, QuickTestStep, run_broker_quick_test,
@@ -237,10 +241,6 @@ pub use resources::{
     HostResourceGrant, HostResourceKind, HostResourceLease, HostResourcePlan, HostResourceRequest,
     HostResourceRequirement, HostResourceRunError, HostResourceRunReport,
     default_host_resource_db_path, resource_environment_key, validate_host_resource_requirements,
-};
-pub use promotion_record::{
-    PROMOTION_RECORD_PLAN_SCHEMA_VERSION, PromotionRecordApplyReport, PromotionRecordPlan,
-    UnrecordedPromotion,
 };
 pub use retention::{
     BROKER_CONFIG_RELPATH, GcApplyReport, GcArtifactCandidate, GcBlocker, GcFileAction,

@@ -4,6 +4,44 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.7.6] - 2026-09-04
+
+### Added
+
+- Graph lifecycle reports expose phase timing, observable bytes,
+  node/edge/file counts, and peak memory without putting runtime measurements
+  into refresh authorization digests.
+- Missing worktree graph stores can reuse a verified immutable host-cache
+  artifact keyed by source tree, fragment manifest, engine/protocol version,
+  and storage schema. Each worktree still receives a private redb copy.
+- `broker promotion-record plan/apply` provides digest-confirmed recovery when
+  integration contains a proven promotion whose queue record was interrupted.
+
+### Changed
+
+- Disabled graph status is a healthy, cheap no-op. Materialization validates
+  and reads committed fragments directly; it never clones or indexes source.
+- Committed graph objects are read through one binary-safe Git batch. On the
+  9,363-fragment Playground, cold materialization fell from 393 seconds to
+  20.3 seconds, and a verified cross-worktree cache install took 3.53 seconds.
+- Broker preparation reports warn when gates exist but dependency setup is not
+  configured. Main-checkout adoption names out-of-scope dirty paths, and status
+  JSON includes a `sessions` alias for `agents`.
+
+### Fixed
+
+- Large committed graph batches no longer deadlock when both Git pipes exceed
+  capacity.
+- Failed coordinated pushes using implicit refspecs such as `HEAD`, a branch,
+  or a tag are planned from exact refs, so unchanged remote evidence records a
+  retryable failure instead of unnecessarily write-blocking the repository.
+
+### Upgrade notes
+
+Read [Upgrading to v0.7.6](packages/aethyme/docs/guides/upgrading-to-v0.7.6.md)
+before updating. Broker storage, repository deployment, and engine protocol are
+unchanged from v0.7.5. Graph support remains opt-in.
+
 ## [0.7.5] - 2026-09-04
 
 ### Added

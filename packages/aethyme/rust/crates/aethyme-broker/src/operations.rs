@@ -1587,7 +1587,11 @@ mod tests {
         (tmp, target)
     }
 
-    fn planned_destinations(tmp: &tempfile::TempDir, target: &crate::ResolvedRemoteTarget, argv: &[&str]) -> Vec<String> {
+    fn planned_destinations(
+        tmp: &tempfile::TempDir,
+        target: &crate::ResolvedRemoteTarget,
+        argv: &[&str],
+    ) -> Vec<String> {
         match plan_exact_push(tmp.path(), &args(argv), Some(target)) {
             PushPlanning::Planned(plan) => plan
                 .destinations

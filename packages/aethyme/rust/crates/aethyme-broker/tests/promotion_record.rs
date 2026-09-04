@@ -44,7 +44,12 @@ fn fixture() -> (tempfile::TempDir, Broker, i64, String) {
     let entry_id = outcome.entry.id;
     let promotion = git(tmp.path(), &["rev-parse", "refs/heads/aethyme/integration"]);
     broker
-        .finish_with_options(session.id, FinishOptions { keep_worktree: false })
+        .finish_with_options(
+            session.id,
+            FinishOptions {
+                keep_worktree: false,
+            },
+        )
         .unwrap();
     (tmp, broker, entry_id, promotion)
 }
@@ -79,10 +84,7 @@ fn a_lost_promotion_record_is_recovered_from_its_merge_tree() {
     assert_eq!(candidate.entry_id, Some(entry_id));
     assert_eq!(candidate.current_status.as_deref(), Some("superseded"));
     assert!(
-        candidate
-            .evidence
-            .iter()
-            .any(|e| e.contains("merged_tree")),
+        candidate.evidence.iter().any(|e| e.contains("merged_tree")),
         "the merge tree is the load-bearing evidence: {:?}",
         candidate.evidence
     );
@@ -149,8 +151,11 @@ fn an_unmatched_commit_is_reported_but_never_repaired() {
     erase_record(tmp.path(), entry_id);
     // Destroy the one piece of load-bearing evidence.
     let conn = rusqlite::Connection::open(tmp.path().join(".aethyme/broker.db")).unwrap();
-    conn.execute("UPDATE merge_queue SET merged_tree=NULL WHERE id=?1", [entry_id])
-        .unwrap();
+    conn.execute(
+        "UPDATE merge_queue SET merged_tree=NULL WHERE id=?1",
+        [entry_id],
+    )
+    .unwrap();
     drop(conn);
 
     let mut broker = Broker::open(tmp.path()).unwrap();

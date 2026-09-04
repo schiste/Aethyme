@@ -281,7 +281,15 @@ fn gates_without_preparation_fixture() -> tempfile::TempDir {
     git(temp.path(), &["add", "-A"]);
     git(
         temp.path(),
-        &["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init"],
+        &[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-qm",
+            "init",
+        ],
     );
     // A dependency directory the primary checkout has and a fresh worktree will not.
     std::fs::create_dir_all(temp.path().join("node_modules/pkg")).unwrap();
@@ -351,6 +359,9 @@ fn unconfigured_preparation_stays_quiet_without_gates() {
         &["prepare", "status", "--session", &session, "--json"],
     ));
     assert_eq!(status["state"], "not_configured");
-    assert_eq!(status["reason"], "repository declares no dependency preparation");
+    assert_eq!(
+        status["reason"],
+        "repository declares no dependency preparation"
+    );
     assert!(status["next_action"].is_null());
 }

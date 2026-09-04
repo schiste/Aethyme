@@ -78,6 +78,12 @@ blocked.
    interrupted, use the exact `graph refresh recover --plan <plan-sha256>`
    handoff; do not retry blindly.
 
+   Graph support is repository opt-in. Explore never generates graph state.
+   If Explore reports `graph_store_missing`, continue with its bounded manual
+   verification steps, or materialize the verified committed fragments for
+   this worktree with `aethyme graph materialize --repo .`. Do not enable graph
+   authority merely to silence a degraded response.
+
 6. **When your task is complete**, use verified broker integration by
    default instead of manually combining concurrent session branches:
 

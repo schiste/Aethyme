@@ -360,7 +360,13 @@ impl GitRepo {
     pub fn full_ref_name(&self, revision: &str) -> Option<String> {
         let name = run_git(
             &self.root,
-            &["rev-parse", "--symbolic-full-name", "--verify", "--quiet", revision],
+            &[
+                "rev-parse",
+                "--symbolic-full-name",
+                "--verify",
+                "--quiet",
+                revision,
+            ],
         )
         .ok()?;
         let name = name.trim();
