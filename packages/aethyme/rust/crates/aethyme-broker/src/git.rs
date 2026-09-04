@@ -349,6 +349,26 @@ impl GitRepo {
         )
     }
 
+    /// Fully-qualified ref name a revision denotes, e.g. `main` or `HEAD` ->
+    /// `refs/heads/main`. Returns `None` when the revision is not a ref (a raw
+    /// SHA), is ambiguous, or does not resolve.
+    ///
+    /// Used to make a push refspec written without an explicit destination
+    /// planable. Git pushes such a refspec to the ref of the same name on the
+    /// remote, so the destination is derivable locally and does not need to be
+    /// guessed from the command line.
+    pub fn full_ref_name(&self, revision: &str) -> Option<String> {
+        let name = run_git(
+            &self.root,
+            &["rev-parse", "--symbolic-full-name", "--verify", "--quiet", revision],
+        )
+        .ok()?;
+        let name = name.trim();
+        // A raw SHA resolves to itself rather than a ref name; only a real ref
+        // yields a destination we may push to.
+        (!name.is_empty() && name.starts_with("refs/")).then(|| name.to_string())
+    }
+
     /// Validate one fully-qualified destination ref with Git's own grammar.
     pub fn validate_push_destination(&self, destination: &str) -> Result<(), GitError> {
         run_git(&self.root, &["check-ref-format", destination]).map(|_| ())

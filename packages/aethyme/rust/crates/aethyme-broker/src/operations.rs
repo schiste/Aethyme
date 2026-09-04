@@ -719,10 +719,24 @@ fn plan_exact_push(
     let mut destinations = Vec::with_capacity(refspecs.len());
     for refspec in refspecs {
         let refspec = refspec.strip_prefix('+').unwrap_or(refspec);
-        let Some((source, destination)) = refspec.split_once(':') else {
-            return PushPlanning::Unsupported {
-                reason: "push_refspec_is_not_explicit_source_and_destination",
-            };
+        // A refspec without a colon pushes the named ref to the ref of the
+        // same name on the remote, so its destination is derivable locally.
+        // Resolving it here is what lets a failed `push origin <branch>`,
+        // `push -u origin HEAD`, or `push origin refs/tags/<tag>` be
+        // classified from remote evidence instead of being reported as an
+        // unknown outcome that write-blocks the repository.
+        let resolved_destination;
+        let (source, destination) = match refspec.split_once(':') {
+            Some(pair) => pair,
+            None => {
+                let Some(full) = repo.full_ref_name(refspec) else {
+                    return PushPlanning::Unsupported {
+                        reason: "push_refspec_does_not_resolve_to_one_local_ref",
+                    };
+                };
+                resolved_destination = full;
+                (refspec, resolved_destination.as_str())
+            }
         };
         if source.is_empty()
             || destination.is_empty()
@@ -1536,6 +1550,125 @@ mod tests {
 
     fn args(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|part| (*part).into()).collect()
+    }
+
+    /// A repository with one commit on `main`, a tag, and a GitHub remote.
+    fn push_fixture() -> (tempfile::TempDir, crate::ResolvedRemoteTarget) {
+        let tmp = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(tmp.path())
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}");
+        };
+        run(&["init", "-q", "-b", "main"]);
+        std::fs::write(tmp.path().join("a.txt"), "a\n").unwrap();
+        run(&["add", "-A"]);
+        run(&["commit", "-qm", "init"]);
+        run(&["tag", "v1.0.0"]);
+        // A real local remote: planning queries pre-push SHAs, so the remote
+        // must be reachable for the plan to resolve.
+        let bare = tmp.path().join("remote.git");
+        let init = std::process::Command::new("git")
+            .args(["init", "-q", "--bare"])
+            .arg(&bare)
+            .output()
+            .unwrap();
+        assert!(init.status.success());
+        run(&["remote", "add", "origin", bare.to_str().unwrap()]);
+        let repo = crate::GitRepo::discover(tmp.path()).unwrap();
+        let target = repo.resolve_remote_target("origin", None).unwrap();
+        (tmp, target)
+    }
+
+    fn planned_destinations(tmp: &tempfile::TempDir, target: &crate::ResolvedRemoteTarget, argv: &[&str]) -> Vec<String> {
+        match plan_exact_push(tmp.path(), &args(argv), Some(target)) {
+            PushPlanning::Planned(plan) => plan
+                .destinations
+                .iter()
+                .map(|d| d.destination_ref.clone())
+                .collect(),
+            other => panic!("expected a plan for {argv:?}, got {other:?}"),
+        }
+    }
+
+    /// A push written without an explicit `src:dst` must still be planable:
+    /// an unplanned push cannot be classified from remote evidence, so any
+    /// failure of it write-blocks the repository (issue #131).
+    #[test]
+    fn implicit_push_refspecs_resolve_to_their_destination_ref() {
+        let (tmp, target) = push_fixture();
+        assert_eq!(
+            planned_destinations(&tmp, &target, &["push", "-u", "origin", "HEAD"]),
+            vec!["refs/heads/main"],
+            "`push -u origin HEAD` pushes the current branch"
+        );
+        assert_eq!(
+            planned_destinations(&tmp, &target, &["push", "origin", "main"]),
+            vec!["refs/heads/main"],
+            "a bare branch name pushes to the same branch"
+        );
+        assert_eq!(
+            planned_destinations(&tmp, &target, &["push", "origin", "refs/tags/v1.0.0"]),
+            vec!["refs/tags/v1.0.0"],
+            "a fully qualified tag ref pushes to itself"
+        );
+        // An explicit refspec keeps working unchanged.
+        assert_eq!(
+            planned_destinations(&tmp, &target, &["push", "origin", "HEAD:refs/heads/main"]),
+            vec!["refs/heads/main"]
+        );
+    }
+
+    /// The case from issue #131: a local pre-push hook rejects the push, so no
+    /// ref moved. With the refspec planable, remote evidence proves the write
+    /// failed, which must classify as `failed` — not as an unknown outcome that
+    /// write-blocks the repository.
+    #[test]
+    fn a_push_that_moved_no_ref_classifies_as_failed() {
+        let (tmp, target) = push_fixture();
+        for argv in [
+            vec!["push", "-u", "origin", "HEAD"],
+            vec!["push", "origin", "main"],
+            vec!["push", "origin", "refs/tags/v1.0.0"],
+        ] {
+            let planning = plan_exact_push(tmp.path(), &args(&argv), Some(&target));
+            let (status, value) =
+                reconcile_failed_push(tmp.path(), &planning).expect("a planned push reconciles");
+            assert_eq!(
+                status,
+                OperationStatus::Failed,
+                "{argv:?} moved no ref and must classify as failed, got {value}"
+            );
+            assert_eq!(value["evidence"]["classification"], "failed", "{argv:?}");
+        }
+    }
+
+    /// Resolution must stay conservative: anything that is not exactly one
+    /// local ref still refuses to plan rather than inventing a destination.
+    #[test]
+    fn unresolvable_push_refspecs_still_refuse_to_plan() {
+        let (tmp, target) = push_fixture();
+        let repo = crate::GitRepo::discover(tmp.path()).unwrap();
+        let sha = repo.resolve_push_source("HEAD").unwrap();
+        for argv in [
+            vec!["push", "origin", "no-such-branch"],
+            vec!["push", "origin", sha.as_str()],
+        ] {
+            match plan_exact_push(tmp.path(), &args(&argv), Some(&target)) {
+                PushPlanning::Unsupported { reason } => assert_eq!(
+                    reason, "push_refspec_does_not_resolve_to_one_local_ref",
+                    "{argv:?}"
+                ),
+                other => panic!("expected refusal for {argv:?}, got {other:?}"),
+            }
+        }
     }
 
     #[test]
