@@ -7,7 +7,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use aethyme_broker::{
-    AdoptMode, Broker, CheckpointRefusalCode, EntryExposureState, FinishStatus,
+    AdoptMode, Broker, CheckpointRefusalCode, EntryExposureState, FinishStatus, GitRepo,
     GraphIntegrityStatus, IntegrationDeliveryState, IntegrationReconcileClassification,
     IntegrationReconcileOptions, MergeStatus, NewSession, RepairAction, RepairSource,
     SessionOrigin, StatusAdviceSeverity, SubmissionCommitOwnership,
@@ -15,6 +15,7 @@ use aethyme_broker::{
 };
 use aethyme_graph_indexer::{IndexerContext, WalkOptions, index_repo_to_disk, link_repo};
 use aethyme_graph_storage::bootstrap_repo;
+use aethyme_graph_storage::write_graph_authority_manifest;
 
 fn sh(cwd: &Path, args: &[&str]) {
     let status = Command::new("git")
@@ -102,6 +103,13 @@ fn refresh_graph(root: &Path, repository: &str) {
         IndexerContext::new(repository, root.to_path_buf(), env!("CARGO_PKG_VERSION")).unwrap();
     index_repo_to_disk(&context, &WalkOptions::default()).unwrap();
     link_repo(&context).unwrap();
+    let git_repository = GitRepo::discover(root).unwrap();
+    let tree = git_repository.working_tree_hash().unwrap();
+    let head = git_repository.head_commit().unwrap();
+    let source = git_repository
+        .commit_tree(&tree, &[&head], "test: bind graph source snapshot")
+        .unwrap();
+    write_graph_authority_manifest(root, &source, repository, env!("CARGO_PKG_VERSION")).unwrap();
 }
 
 #[test]
@@ -113,6 +121,9 @@ fn submit_rejects_stale_authoritative_graph_before_promotion() {
         "[graph]\nauthority = 'committed_fragments'\nrepository = 'fixture'\n",
     )
     .unwrap();
+    bootstrap_repo(tmp.path(), env!("CARGO_PKG_VERSION")).unwrap();
+    sh(tmp.path(), &["add", "-A"]);
+    sh(tmp.path(), &["commit", "-qm", "enroll authoritative graph"]);
     refresh_graph(tmp.path(), "fixture");
     sh(tmp.path(), &["add", ".aethyme"]);
     sh(

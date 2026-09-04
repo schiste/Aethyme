@@ -56,7 +56,9 @@ pub mod disk;
 pub mod fragment;
 pub mod index_shard;
 pub mod layout;
+pub mod manifest;
 pub mod overlay;
+pub mod policy;
 pub mod store;
 
 pub use binary::{
@@ -81,8 +83,16 @@ pub use layout::{
     INDEX_SUBDIR, InvalidPath, OVERLAYS_SUBDIR, cache_dir, engine_version_path, fragment_path,
     index_shard_path, overlay_path, validate_module_name, validate_source_path,
 };
+pub use manifest::{
+    GRAPH_MANIFEST_RELPATH, GRAPH_MANIFEST_SCHEMA_VERSION, GraphAuthorityManifest,
+    GraphManifestError, committed_source_tree_digest, graph_fragment_set_digest,
+    write_graph_authority_manifest,
+};
 pub use overlay::{
     OverlayBuildError, OverlayDecodeError, OverlayEncodeError, OverlayFragment, read_overlay_bytes,
     write_overlay_bytes,
+};
+pub use policy::{
+    GRAPH_CONFIG_RELPATH, GraphAuthority, GraphIntegrityPolicy, GraphIntegrityPolicyError,
 };
 pub use store::{FragmentStore, StoreLookupError, StoreOpenError};

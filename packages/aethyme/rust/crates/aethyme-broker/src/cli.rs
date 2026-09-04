@@ -6225,7 +6225,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     let head = parsed.head.as_deref().unwrap_or("HEAD");
                     let (head_sha, gates) = crate::load_gates_at_commit(&checkout, head)?;
                     let graph_policy =
-                        crate::GraphIntegrityPolicy::load_at_commit(&checkout, &head_sha)?;
+                        crate::graph_integrity::load_graph_policy_at_commit(&checkout, &head_sha)?;
                     let manifest = crate::gate_scope_manifest_with_graph(&gates, &graph_policy);
                     if parsed.json {
                         println!(
@@ -6281,7 +6281,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     let checkout = crate::GitRepo::discover(&cwd)?;
                     let (head_sha, gates) = crate::load_gates_at_commit(&checkout, head)?;
                     let graph_policy =
-                        crate::GraphIntegrityPolicy::load_at_commit(&checkout, &head_sha)?;
+                        crate::graph_integrity::load_graph_policy_at_commit(&checkout, &head_sha)?;
                     let report = crate::evaluate_gate_scope_with_graph(
                         &checkout,
                         &gates,

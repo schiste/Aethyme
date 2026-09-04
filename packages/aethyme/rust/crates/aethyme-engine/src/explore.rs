@@ -958,17 +958,17 @@ pub fn graph_unavailable_response(
     status: &'static str,
     reason: String,
 ) -> ExploreResponse {
-    let enrolled = std::fs::read_to_string(repo.join(".aethyme/config.toml"))
-        .ok()
-        .is_some_and(|text| {
-            text.contains("authority = \"committed_fragments\"")
-                || text.contains("authority='committed_fragments'")
-                || text.contains("authority = 'committed_fragments'")
-        });
-    let next_action = if enrolled {
-        "Run `aethyme graph materialize --repo .`; if committed fragments are stale, review `aethyme graph refresh plan --repo . --diff`."
-    } else {
-        "Graph support is optional. Continue with bounded source inspection, or explicitly enroll with `aethyme deploy --repo . --with-graph`."
+    let policy = aethyme_graph_storage::GraphIntegrityPolicy::load(repo);
+    let next_action = match policy {
+        Ok(policy) if policy.enforces_committed_fragments() => {
+            "Run `aethyme graph materialize --repo .`; if committed fragments are stale, review `aethyme graph refresh plan --repo . --diff`."
+        }
+        Ok(_) => {
+            "Graph support is optional. Continue with bounded source inspection, or explicitly enroll with `aethyme deploy --repo . --with-graph`."
+        }
+        Err(_) => {
+            "The repository graph policy is invalid. Run `aethyme graph status --repo .` for the exact diagnosis; bounded source inspection remains available."
+        }
     };
     response_with_output_estimate(ExploreResponse {
         schema_version: "aethyme-explore-v1",

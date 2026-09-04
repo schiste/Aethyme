@@ -1782,9 +1782,11 @@ aethyme graph refresh execute --repo . --confirm <plan-sha256>
 aethyme graph refresh recover --repo . --plan <plan-sha256>
 ```
 
-`status` and `plan` regenerate from exact committed `HEAD` in a disposable
-clone. They do not read incidental source or graph bytes from the active
-worktree. The stable JSON plan reports the canonical repository, source commit
+`status` inspects typed policy plus the committed graph manifest without
+cloning or indexing; deliberate disabled authority is healthy and requires no
+action. `plan` alone regenerates from exact committed `HEAD` in a disposable
+clone. Neither reads incidental source bytes from the active worktree. The
+stable JSON plan reports the canonical repository, source commit
 and tree, graph policy and pin, linked component versions, hash-only fragment
 write set, derived-store action, dirty overlap, live sessions, relevant leases,
 compatibility, blockers, and a SHA-256 binding all of those preconditions.
@@ -1799,10 +1801,12 @@ generation until those files are reviewed and committed. `--with-graph` is
 refused for `--local-only` because untracked policy cannot authorize shared
 committed fragments.
 
-`materialize` validates committed policy, pin, and fragments against exact
-`HEAD`, then atomically builds only the ignored worktree-local redb store. It
-does not change fragments, accepts no hidden network input, reports elapsed
-milliseconds in stable JSON, and is a no-op when the store is current.
+`materialize` validates committed policy, pin, manifest, and fragment bytes
+against exact `HEAD`, then atomically builds only the ignored worktree-local
+redb store. It never clones, parses source, or regenerates fragments. It does
+not change tracked files, accepts no hidden network input, reports elapsed
+milliseconds plus clone/index operation counts in stable JSON, and is a no-op
+when the store is current.
 
 `execute` revalidates the complete plan under an exclusive repository lock,
 requires the full digest, writes a private rollback/recovery journal, applies

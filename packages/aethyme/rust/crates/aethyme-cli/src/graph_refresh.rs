@@ -12,10 +12,14 @@ use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use aethyme_broker::{Broker, GitRepo, GraphIntegrityPolicy, GraphIntegrityStatus, SessionStatus};
+use aethyme_broker::{Broker, GitRepo, GraphIntegrityStatus, SessionStatus};
 use aethyme_engine::store::redb::graph_store::GraphStore;
 use aethyme_graph_indexer::{IndexerContext, WalkOptions, index_repo_to_disk, link_repo};
-use aethyme_graph_storage::read_engine_version;
+use aethyme_graph_storage::{
+    GRAPH_CONFIG_RELPATH, GRAPH_MANIFEST_RELPATH, GraphAuthorityManifest, GraphIntegrityPolicy,
+    committed_source_tree_digest, graph_fragment_set_digest, read_engine_version,
+    write_graph_authority_manifest,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -43,8 +47,8 @@ fn run_inner(args: &[String]) -> Result<(), String> {
         Some("status") => {
             let repo = option_path(args, "--repo")?;
             let json = has_flag(args, "--json");
-            let built = build_plan(&repo)?;
-            render_status(&built.plan, json)
+            let status = GraphStatusInspector::inspect(&repo)?;
+            render_status(&status, json)
         }
         Some("materialize") => {
             let repo = option_path(args, "--repo")?;
@@ -126,6 +130,44 @@ struct GraphMaterializationReport {
     action: DerivedStoreAction,
     file_count: usize,
     elapsed_ms: u128,
+    work: GraphLifecycleWork,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+struct GraphLifecycleWork {
+    disposable_clones: u32,
+    source_index_runs: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct GraphStatusReport {
+    schema_version: u32,
+    canonical_repository: String,
+    source: GraphSourceState,
+    policy: GraphPolicyState,
+    installed: InstalledGraphRuntime,
+    fragments: FragmentState,
+    derived_store: DerivedStoreState,
+    compatibility: GraphRefreshCompatibility,
+    healthy: bool,
+    action_required: bool,
+    safe_to_refresh: bool,
+    refresh_plan_required: bool,
+    blockers: Vec<String>,
+    diagnosis: Option<String>,
+    next_action: String,
+    work: GraphLifecycleWork,
+}
+
+struct GraphStatusInspector;
+
+struct GraphMaterializationPlan {
+    canonical_repository: String,
+    source_head: String,
+    fragment_status: GraphIntegrityStatus,
+    action: DerivedStoreAction,
+    committed_files: BTreeMap<String, GraphFileBytes>,
+    work: GraphLifecycleWork,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -149,6 +191,7 @@ struct GraphRefreshPlan {
     safe_to_execute: bool,
     blockers: Vec<String>,
     next_action: String,
+    work: GraphLifecycleWork,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -191,6 +234,7 @@ struct DerivedStoreState {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum DerivedStoreStatus {
+    Disabled,
     Missing,
     Current,
     Stale,
@@ -249,7 +293,6 @@ struct BuiltPlan {
     plan: GraphRefreshPlan,
     existing_files: BTreeMap<String, GraphFileBytes>,
     proposed_files: BTreeMap<String, GraphFileBytes>,
-    proposal: ProposedRepository,
 }
 
 struct ProposedRepository {
@@ -258,7 +301,12 @@ struct ProposedRepository {
 }
 
 impl ProposedRepository {
-    fn from_committed_head(repo: &Path, head: &str) -> Result<Self, String> {
+    fn from_committed_head(
+        repo: &Path,
+        head: &str,
+        work: &mut GraphLifecycleWork,
+    ) -> Result<Self, String> {
+        work.disposable_clones += 1;
         let temporary = tempfile::Builder::new()
             .prefix("aethyme-graph-refresh-plan-")
             .tempdir()
@@ -295,14 +343,217 @@ impl ProposedRepository {
     }
 }
 
+impl GraphStatusInspector {
+    fn inspect(repo_hint: &Path) -> Result<GraphStatusReport, String> {
+        let repository = GitRepo::discover(repo_hint).map_err(|error| error.to_string())?;
+        let root = repository.root();
+        let head_sha = repository
+            .head_commit()
+            .map_err(|error| error.to_string())?;
+        let tree_sha = git(root, &["rev-parse", &format!("{head_sha}^{{tree}}")])?;
+        let policy = graph_policy_at_commit(&repository, &head_sha)?;
+        let canonical_repository = policy
+            .repository
+            .clone()
+            .unwrap_or_else(|| "unconfigured".into());
+        let pinned_engine_version = engine_version_at_commit(&repository, &head_sha)?;
+        let running_version = env!("CARGO_PKG_VERSION").to_string();
+        let compatibility = graph_compatibility(&policy, pinned_engine_version.as_deref());
+        let source = GraphSourceState { head_sha, tree_sha };
+        let policy_state = GraphPolicyState {
+            authority: policy.authority,
+            repository: policy.repository.clone(),
+            policy_sha256: policy.digest(),
+            pinned_engine_version: pinned_engine_version.clone(),
+        };
+        let installed = InstalledGraphRuntime {
+            router_version: running_version.clone(),
+            linked_engine_version: running_version.clone(),
+            graph_indexer_version: running_version.clone(),
+        };
+        let work = GraphLifecycleWork::default();
+
+        if compatibility == GraphRefreshCompatibility::AuthorityDisabled {
+            return Ok(GraphStatusReport {
+                schema_version: PLAN_SCHEMA_VERSION,
+                canonical_repository,
+                source,
+                policy: policy_state,
+                installed,
+                fragments: FragmentState {
+                    status: GraphIntegrityStatus::Disabled,
+                    existing_file_count: 0,
+                    proposed_file_count: 0,
+                    changed_file_count: 0,
+                    working_tree_matches_proposal: true,
+                },
+                derived_store: DerivedStoreState {
+                    status: DerivedStoreStatus::Disabled,
+                    indexed_commit: None,
+                    action: DerivedStoreAction::None,
+                },
+                compatibility,
+                healthy: true,
+                action_required: false,
+                safe_to_refresh: false,
+                refresh_plan_required: false,
+                blockers: Vec::new(),
+                diagnosis: None,
+                next_action: "graph authority is disabled; no action is required. Enroll explicitly with `aethyme deploy --repo . --with-graph`"
+                    .into(),
+                work,
+            });
+        }
+
+        let mut blockers = compatibility_blockers(compatibility, pinned_engine_version.as_deref());
+        let committed_files = committed_graph_files(root)?;
+        let committed_validation = validate_fragment_authority(
+            root,
+            &source.head_sha,
+            &policy,
+            pinned_engine_version.as_deref(),
+            &committed_files,
+        );
+        let active_files = filesystem_graph_files(root)?;
+        let active_validation = validate_fragment_authority(
+            root,
+            &source.head_sha,
+            &policy,
+            pinned_engine_version.as_deref(),
+            &active_files,
+        );
+        let active_changes = compare_graph_files(&committed_files, &active_files);
+        let working_tree_matches_proposal = active_validation.is_ok();
+        let fragment_status = if compatibility != GraphRefreshCompatibility::Compatible {
+            GraphIntegrityStatus::Incompatible
+        } else if committed_validation.is_ok() {
+            GraphIntegrityStatus::Passed
+        } else {
+            GraphIntegrityStatus::Stale
+        };
+        let diagnosis = committed_validation.err();
+        blockers.sort();
+        blockers.dedup();
+        let derived_store = derived_store_state(root, &source.head_sha);
+        let healthy = compatibility == GraphRefreshCompatibility::Compatible
+            && fragment_status == GraphIntegrityStatus::Passed;
+        let action_required = !healthy || derived_store.action != DerivedStoreAction::None;
+        let next_action = if compatibility != GraphRefreshCompatibility::Compatible {
+            "resolve the compatibility blocker before using graph artifacts".into()
+        } else if working_tree_matches_proposal && !active_changes.is_empty() {
+            "review and commit the generated graph paths, then rerun graph status; committed HEAD remains the authority"
+                .into()
+        } else if fragment_status != GraphIntegrityStatus::Passed {
+            "review `aethyme graph refresh plan --repo . --diff` before regenerating authoritative fragments"
+                .into()
+        } else if derived_store.action != DerivedStoreAction::None {
+            "run `aethyme graph materialize --repo .` to build the verified local query store"
+                .into()
+        } else {
+            "graph fragments and derived store are current; no action is required".into()
+        };
+        Ok(GraphStatusReport {
+            schema_version: PLAN_SCHEMA_VERSION,
+            canonical_repository,
+            source,
+            policy: policy_state,
+            installed,
+            fragments: FragmentState {
+                status: fragment_status,
+                existing_file_count: committed_files.len(),
+                proposed_file_count: if working_tree_matches_proposal {
+                    active_files.len()
+                } else {
+                    committed_files.len()
+                },
+                changed_file_count: if working_tree_matches_proposal {
+                    active_changes.len()
+                } else {
+                    0
+                },
+                working_tree_matches_proposal,
+            },
+            derived_store,
+            compatibility,
+            healthy,
+            action_required,
+            // Status is observational; only a digest-bound refresh plan checks
+            // dirty overlap, sessions, leases, and exact writes.
+            safe_to_refresh: false,
+            refresh_plan_required: fragment_status != GraphIntegrityStatus::Passed
+                || working_tree_matches_proposal && !active_changes.is_empty(),
+            blockers,
+            diagnosis,
+            next_action,
+            work,
+        })
+    }
+}
+
+fn graph_policy_at_commit(
+    repository: &GitRepo,
+    commit: &str,
+) -> Result<GraphIntegrityPolicy, String> {
+    match repository
+        .file_at_commit(commit, GRAPH_CONFIG_RELPATH)
+        .map_err(|error| error.to_string())?
+    {
+        Some(text) => GraphIntegrityPolicy::parse(&text).map_err(|error| error.to_string()),
+        None => Ok(GraphIntegrityPolicy::default()),
+    }
+}
+
+fn engine_version_at_commit(repository: &GitRepo, commit: &str) -> Result<Option<String>, String> {
+    Ok(repository
+        .file_at_commit(commit, ".aethyme/engine-version")
+        .map_err(|error| error.to_string())?
+        .map(|version| version.trim().to_string())
+        .filter(|version| !version.is_empty()))
+}
+
+fn graph_compatibility(
+    policy: &GraphIntegrityPolicy,
+    pinned_engine_version: Option<&str>,
+) -> GraphRefreshCompatibility {
+    if !policy.enforces_committed_fragments() {
+        GraphRefreshCompatibility::AuthorityDisabled
+    } else if pinned_engine_version.is_none() {
+        GraphRefreshCompatibility::MissingEnginePin
+    } else if pinned_engine_version != Some(env!("CARGO_PKG_VERSION")) {
+        GraphRefreshCompatibility::VersionMismatch
+    } else {
+        GraphRefreshCompatibility::Compatible
+    }
+}
+
+fn compatibility_blockers(
+    compatibility: GraphRefreshCompatibility,
+    pinned_engine_version: Option<&str>,
+) -> Vec<String> {
+    match compatibility {
+        GraphRefreshCompatibility::AuthorityDisabled => Vec::new(),
+        GraphRefreshCompatibility::MissingEnginePin => vec![
+            "committed .aethyme/engine-version is missing or unreadable; never invent or rewrite the pin during refresh"
+                .into(),
+        ],
+        GraphRefreshCompatibility::VersionMismatch => vec![format!(
+            "repository graph pin {} does not match installed Aethyme {}; install the signed compatible release or migrate the repository policy explicitly",
+            pinned_engine_version.unwrap_or("<missing>"),
+            env!("CARGO_PKG_VERSION")
+        )],
+        GraphRefreshCompatibility::Compatible => Vec::new(),
+    }
+}
+
 fn build_plan(repo_hint: &Path) -> Result<BuiltPlan, String> {
+    let mut work = GraphLifecycleWork::default();
     let repository = GitRepo::discover(repo_hint).map_err(|error| error.to_string())?;
     let root = repository.root();
     let head_sha = repository
         .head_commit()
         .map_err(|error| error.to_string())?;
     let tree_sha = git(root, &["rev-parse", &format!("{head_sha}^{{tree}}")])?;
-    let proposal = ProposedRepository::from_committed_head(root, &head_sha)?;
+    let proposal = ProposedRepository::from_committed_head(root, &head_sha, &mut work)?;
     let policy = GraphIntegrityPolicy::load(&proposal.root).map_err(|error| error.to_string())?;
     let canonical_repository = policy
         .repository
@@ -311,20 +562,17 @@ fn build_plan(repo_hint: &Path) -> Result<BuiltPlan, String> {
     let pinned_engine_version = read_engine_version(&proposal.root).ok();
     let running_version = env!("CARGO_PKG_VERSION").to_string();
 
-    let compatibility = if !policy.enforces_committed_fragments() {
-        GraphRefreshCompatibility::AuthorityDisabled
-    } else if pinned_engine_version.is_none() {
-        GraphRefreshCompatibility::MissingEnginePin
-    } else if pinned_engine_version.as_deref() != Some(running_version.as_str()) {
-        GraphRefreshCompatibility::VersionMismatch
-    } else {
-        GraphRefreshCompatibility::Compatible
-    };
+    let compatibility = graph_compatibility(&policy, pinned_engine_version.as_deref());
 
     let existing = committed_graph_files(&proposal.root)?;
     let mut blockers = Vec::new();
     let proposed = if compatibility == GraphRefreshCompatibility::Compatible {
-        regenerate_fragments(&proposal.root, &canonical_repository, &running_version)?;
+        regenerate_fragments(
+            &proposal.root,
+            &canonical_repository,
+            &running_version,
+            &mut work,
+        )?;
         filesystem_graph_files(&proposal.root)?
     } else {
         match compatibility {
@@ -454,43 +702,101 @@ fn build_plan(repo_hint: &Path) -> Result<BuiltPlan, String> {
         safe_to_execute,
         blockers,
         next_action,
+        work,
     };
     plan.plan_sha256 = plan_digest(&plan)?;
     Ok(BuiltPlan {
         plan,
         existing_files: existing,
         proposed_files: proposed,
-        proposal,
     })
+}
+
+impl GraphMaterializationPlan {
+    fn build(repo_hint: &Path) -> Result<Self, String> {
+        let status = GraphStatusInspector::inspect(repo_hint)?;
+        if status.compatibility != GraphRefreshCompatibility::Compatible {
+            return Err(format!(
+                "graph materialization requires compatible committed graph authority; status is {:?}: {}",
+                status.compatibility, status.next_action
+            ));
+        }
+        if status.fragments.status != GraphIntegrityStatus::Passed {
+            return Err(format!(
+                "committed graph fragments do not match committed HEAD: {}; run `aethyme graph refresh plan --repo . --diff`",
+                status
+                    .diagnosis
+                    .as_deref()
+                    .unwrap_or("fragment authority is stale")
+            ));
+        }
+        let repository = GitRepo::discover(repo_hint).map_err(|error| error.to_string())?;
+        let committed_files = committed_graph_files(repository.root())?;
+        Ok(Self {
+            canonical_repository: status.canonical_repository,
+            source_head: status.source.head_sha,
+            fragment_status: status.fragments.status,
+            action: status.derived_store.action,
+            committed_files,
+            work: status.work,
+        })
+    }
+}
+
+struct ExactFragmentRepository {
+    _temporary: tempfile::TempDir,
+    root: PathBuf,
+}
+
+impl ExactFragmentRepository {
+    fn from_committed_files(files: &BTreeMap<String, GraphFileBytes>) -> Result<Self, String> {
+        let temporary = tempfile::Builder::new()
+            .prefix("aethyme-graph-materialize-")
+            .tempdir()
+            .map_err(|error| format!("create exact fragment directory: {error}"))?;
+        let root = temporary.path().join("repository");
+        for (relative, file) in files {
+            if !relative.starts_with(".aethyme/graph/")
+                || Path::new(relative)
+                    .components()
+                    .any(|component| matches!(component, std::path::Component::ParentDir))
+            {
+                return Err(format!("invalid committed graph path {relative}"));
+            }
+            let target = root.join(relative);
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|error| format!("create exact fragment parent: {error}"))?;
+            }
+            std::fs::write(&target, &file.bytes)
+                .map_err(|error| format!("write exact committed fragment {relative}: {error}"))?;
+            set_mode(&target, &file.mode)?;
+        }
+        Ok(Self {
+            _temporary: temporary,
+            root,
+        })
+    }
 }
 
 fn materialize(repo_hint: &Path) -> Result<GraphMaterializationReport, String> {
     let started = std::time::Instant::now();
-    let built = build_plan(repo_hint)?;
-    if built.plan.compatibility != GraphRefreshCompatibility::Compatible {
-        return Err(format!(
-            "graph materialization requires compatible committed graph authority; status is {:?}: {}",
-            built.plan.compatibility, built.plan.next_action
-        ));
-    }
-    if built.plan.fragments.status != GraphIntegrityStatus::Passed {
-        return Err(
-            "committed graph fragments do not match committed HEAD; run `aethyme graph refresh plan --repo . --diff`"
-                .into(),
-        );
+    let plan = GraphMaterializationPlan::build(repo_hint)?;
+    if plan.fragment_status != GraphIntegrityStatus::Passed {
+        return Err("committed graph fragments do not match committed HEAD; run `aethyme graph refresh plan --repo . --diff`".into());
     }
     let repository = GitRepo::discover(repo_hint).map_err(|error| error.to_string())?;
     let current_head = repository
         .head_commit()
         .map_err(|error| error.to_string())?;
-    if current_head != built.plan.source.head_sha {
+    if current_head != plan.source_head {
         return Err("repository HEAD moved during graph validation; retry materialization".into());
     }
     let mut file_count = 0;
-    let action = built.plan.derived_store.action;
+    let action = plan.action;
     if action != DerivedStoreAction::None {
-        let (mut map, _) =
-            aethyme_engine::map::RepositoryMap::build_from_fragments(&built.proposal.root)?;
+        let exact = ExactFragmentRepository::from_committed_files(&plan.committed_files)?;
+        let (mut map, _) = aethyme_engine::map::RepositoryMap::build_from_fragments(&exact.root)?;
         file_count = map.files.len();
         map.snapshot.root = repository
             .root()
@@ -498,10 +804,18 @@ fn materialize(repo_hint: &Path) -> Result<GraphMaterializationReport, String> {
             .map_err(|error| format!("resolve graph store target: {error}"))?
             .to_string_lossy()
             .into_owned();
+        let current_head = repository
+            .head_commit()
+            .map_err(|error| error.to_string())?;
+        if current_head != plan.source_head {
+            return Err(
+                "repository HEAD moved during graph validation; retry materialization".into(),
+            );
+        }
         aethyme_engine::index_store::materialize_graph_store(
             repository.root(),
             &map,
-            &built.plan.source.head_sha,
+            &plan.source_head,
         )?;
     } else if let Ok(store) = GraphStore::open_read_only(repository.root())
         && let Ok(Some(metadata)) = store.repo_metadata()
@@ -510,12 +824,13 @@ fn materialize(repo_hint: &Path) -> Result<GraphMaterializationReport, String> {
     }
     Ok(GraphMaterializationReport {
         schema_version: PLAN_SCHEMA_VERSION,
-        canonical_repository: built.plan.canonical_repository,
-        source_head: built.plan.source.head_sha,
-        fragment_status: built.plan.fragments.status,
+        canonical_repository: plan.canonical_repository,
+        source_head: plan.source_head,
+        fragment_status: plan.fragment_status,
         action,
         file_count,
         elapsed_ms: started.elapsed().as_millis(),
+        work: plan.work,
     })
 }
 
@@ -551,7 +866,58 @@ fn committed_graph_files(repo: &Path) -> Result<BTreeMap<String, GraphFileBytes>
     Ok(files)
 }
 
-fn regenerate_fragments(repo: &Path, repository: &str, version: &str) -> Result<(), String> {
+fn validate_fragment_authority(
+    repo: &Path,
+    head: &str,
+    policy: &GraphIntegrityPolicy,
+    pinned_engine_version: Option<&str>,
+    files: &BTreeMap<String, GraphFileBytes>,
+) -> Result<(), String> {
+    let manifest_bytes = files
+        .get(GRAPH_MANIFEST_RELPATH)
+        .ok_or_else(|| "committed graph authority manifest is missing".to_string())?;
+    let manifest =
+        GraphAuthorityManifest::decode(&manifest_bytes.bytes).map_err(|error| error.to_string())?;
+    let repository = policy
+        .repository
+        .as_deref()
+        .ok_or_else(|| "graph.repository is missing".to_string())?;
+    if manifest.repository != repository {
+        return Err(format!(
+            "graph manifest repository {:?} does not match policy {:?}",
+            manifest.repository, repository
+        ));
+    }
+    let pinned_engine_version = pinned_engine_version
+        .ok_or_else(|| "committed .aethyme/engine-version is missing".to_string())?;
+    if manifest.engine_version != pinned_engine_version {
+        return Err(format!(
+            "graph manifest engine {} does not match pin {}",
+            manifest.engine_version, pinned_engine_version
+        ));
+    }
+    let source_tree_sha256 =
+        committed_source_tree_digest(repo, head).map_err(|error| error.to_string())?;
+    if manifest.source_tree_sha256 != source_tree_sha256 {
+        return Err("committed graph manifest does not match exact source tree".into());
+    }
+    let fragment_set_sha256 = graph_fragment_set_digest(
+        files
+            .iter()
+            .map(|(path, file)| (path.as_str(), file.mode.as_str(), file.bytes.as_slice())),
+    );
+    if manifest.fragment_set_sha256 != fragment_set_sha256 {
+        return Err("committed graph manifest does not match fragment bytes".into());
+    }
+    Ok(())
+}
+
+fn regenerate_fragments(
+    repo: &Path,
+    repository: &str,
+    version: &str,
+    work: &mut GraphLifecycleWork,
+) -> Result<(), String> {
     let graph = repo.join(".aethyme/graph");
     if let Err(error) = std::fs::remove_dir_all(&graph)
         && error.kind() != std::io::ErrorKind::NotFound
@@ -560,8 +926,11 @@ fn regenerate_fragments(repo: &Path, repository: &str, version: &str) -> Result<
     }
     let context = IndexerContext::new(repository, repo.to_path_buf(), version)
         .map_err(|error| error.to_string())?;
+    work.source_index_runs += 1;
     index_repo_to_disk(&context, &WalkOptions::default()).map_err(|error| error.to_string())?;
     link_repo(&context).map_err(|error| error.to_string())?;
+    write_graph_authority_manifest(repo, "HEAD", repository, version)
+        .map_err(|error| error.to_string())?;
     Ok(())
 }
 
@@ -814,12 +1183,7 @@ fn execute(repo_hint: &Path, confirmation: &str) -> Result<GraphRefreshPlan, Str
     write_journal(&path, &journal)?;
     let result = (|| {
         apply_journal_forward(&root, &journal)?;
-        materialize_exact_store(
-            &root,
-            &journal.source_head,
-            &journal.canonical_repository,
-            &journal.engine_version,
-        )?;
+        materialize_exact_store(&root, &journal.source_head)?;
         verify_journal_after(&root, &journal)
     })();
     if let Err(error) = result {
@@ -867,12 +1231,7 @@ fn recover(repo_hint: &Path, digest: &str) -> Result<(), String> {
         ));
     }
     apply_journal_forward(&root, &journal)?;
-    materialize_exact_store(
-        &root,
-        &journal.source_head,
-        &journal.canonical_repository,
-        &journal.engine_version,
-    )?;
+    materialize_exact_store(&root, &journal.source_head)?;
     verify_journal_after(&root, &journal)?;
     std::fs::remove_file(&path)
         .map_err(|error| format!("remove completed graph refresh journal: {error}"))?;
@@ -1007,15 +1366,10 @@ fn verify_journal_after(repo: &Path, journal: &GraphRefreshJournal) -> Result<()
     Ok(())
 }
 
-fn materialize_exact_store(
-    repo: &Path,
-    head: &str,
-    canonical_repository: &str,
-    engine_version: &str,
-) -> Result<(), String> {
-    let proposal = ProposedRepository::from_committed_head(repo, head)?;
-    regenerate_fragments(&proposal.root, canonical_repository, engine_version)?;
-    let (mut map, _) = aethyme_engine::map::RepositoryMap::build_from_fragments(&proposal.root)?;
+fn materialize_exact_store(repo: &Path, head: &str) -> Result<(), String> {
+    let files = filesystem_graph_files(repo)?;
+    let exact = ExactFragmentRepository::from_committed_files(&files)?;
+    let (mut map, _) = aethyme_engine::map::RepositoryMap::build_from_fragments(&exact.root)?;
     map.snapshot.root = repo
         .canonicalize()
         .map_err(|error| format!("resolve graph store target: {error}"))?
@@ -1218,32 +1572,21 @@ fn validate_digest(value: &str, flag: &str) -> Result<(), String> {
     }
 }
 
-fn render_status(plan: &GraphRefreshPlan, json: bool) -> Result<(), String> {
+fn render_status(status: &GraphStatusReport, json: bool) -> Result<(), String> {
     if json {
-        let value = serde_json::json!({
-            "schema_version": plan.schema_version,
-            "canonical_repository": plan.canonical_repository,
-            "source": plan.source,
-            "policy": plan.policy,
-            "installed": plan.installed,
-            "fragments": plan.fragments,
-            "derived_store": plan.derived_store,
-            "compatibility": plan.compatibility,
-            "safe_to_refresh": plan.safe_to_execute,
-            "blockers": plan.blockers,
-            "next_action": plan.next_action,
-        });
         println!(
             "{}",
-            serde_json::to_string_pretty(&value).map_err(|error| error.to_string())?
+            serde_json::to_string_pretty(status).map_err(|error| error.to_string())?
         );
     } else {
-        println!("Graph status for {}", plan.canonical_repository);
-        println!("  source HEAD: {}", short(&plan.source.head_sha));
-        println!("  fragments: {:?}", plan.fragments.status);
-        println!("  derived store: {:?}", plan.derived_store.status);
-        println!("  compatibility: {:?}", plan.compatibility);
-        println!("  next: {}", plan.next_action);
+        println!("Graph status for {}", status.canonical_repository);
+        println!("  source HEAD: {}", short(&status.source.head_sha));
+        println!("  fragments: {:?}", status.fragments.status);
+        println!("  derived store: {:?}", status.derived_store.status);
+        println!("  compatibility: {:?}", status.compatibility);
+        println!("  healthy: {}", status.healthy);
+        println!("  action required: {}", status.action_required);
+        println!("  next: {}", status.next_action);
     }
     Ok(())
 }

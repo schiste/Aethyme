@@ -15,6 +15,7 @@ use aethyme_broker::{
 };
 use aethyme_graph_indexer::{IndexerContext, WalkOptions, index_repo_to_disk, link_repo};
 use aethyme_graph_storage::bootstrap_repo;
+use aethyme_graph_storage::write_graph_authority_manifest;
 
 #[derive(Clone)]
 struct FixedGraphImpactProvider {
@@ -149,6 +150,13 @@ fn refresh_committed_graph(root: &Path) {
         IndexerContext::new("fixture", root.to_path_buf(), env!("CARGO_PKG_VERSION")).unwrap();
     index_repo_to_disk(&context, &WalkOptions::default()).unwrap();
     link_repo(&context).unwrap();
+    let repository = GitRepo::discover(root).unwrap();
+    let tree = repository.working_tree_hash().unwrap();
+    let head = repository.head_commit().unwrap();
+    let source = repository
+        .commit_tree(&tree, &[&head], "test: bind graph source snapshot")
+        .unwrap();
+    write_graph_authority_manifest(root, &source, "fixture", env!("CARGO_PKG_VERSION")).unwrap();
 }
 
 #[test]
@@ -164,8 +172,10 @@ fn session_and_full_tree_gates_enforce_committed_graph_authority() {
         "[graph]\nauthority='committed_fragments'\nrepository='fixture'\n",
     )
     .unwrap();
+    bootstrap_repo(tmp.path(), env!("CARGO_PKG_VERSION")).unwrap();
+    commit_all(tmp.path(), "enroll authoritative graph");
     refresh_committed_graph(tmp.path());
-    commit_all(tmp.path(), "configure authoritative graph");
+    commit_all(tmp.path(), "commit authoritative graph");
 
     let mut broker = Broker::open(tmp.path()).unwrap();
     let full_tree = broker.run_all_gates(tmp.path()).unwrap();

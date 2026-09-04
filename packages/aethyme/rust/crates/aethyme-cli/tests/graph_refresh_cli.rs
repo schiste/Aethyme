@@ -92,6 +92,8 @@ fn plan_is_read_only_deterministic_and_contains_no_absolute_paths_or_source() {
     assert_eq!(first["canonical_repository"], "fixture");
     assert_eq!(first["compatibility"], "compatible");
     assert_eq!(first["safe_to_execute"], true);
+    assert_eq!(first["work"]["disposable_clones"], 1);
+    assert_eq!(first["work"]["source_index_runs"], 1);
     assert!(first["changes"].as_array().unwrap().len() >= 2);
     assert_eq!(first["derived_store"]["status"], "missing");
     assert_eq!(git(&repo, &["status", "--porcelain"]), before);
@@ -181,6 +183,8 @@ fn materialize_rebuilds_only_the_local_store_from_verified_committed_fragments()
     assert_eq!(report["canonical_repository"], "fixture");
     assert_eq!(report["fragment_status"], "passed");
     assert_eq!(report["action"], "materialize_after_fragment_verification");
+    assert_eq!(report["work"]["disposable_clones"], 0);
+    assert_eq!(report["work"]["source_index_runs"], 0);
     assert_eq!(report["source_head"], git(&repo, &["rev-parse", "HEAD"]));
     assert!(report["file_count"].as_u64().unwrap() >= 1);
     assert!(repo.join(".aethyme/graph_store.redb").is_file());
@@ -192,6 +196,39 @@ fn materialize_rebuilds_only_the_local_store_from_verified_committed_fragments()
     )))
     .unwrap();
     assert_eq!(current["action"], "none");
+}
+
+#[test]
+fn disabled_status_is_a_cheap_healthy_no_op() {
+    let (_temporary, repo) = fixture();
+    fs::write(
+        repo.join(".aethyme/config.toml"),
+        "[graph]\nauthority='disabled'\n",
+    )
+    .unwrap();
+    commit_all(&repo, "disable graph");
+
+    let status: Value = serde_json::from_str(&success(run(
+        &repo,
+        &["graph", "status", "--repo", ".", "--json"],
+    )))
+    .unwrap();
+    assert_eq!(status["compatibility"], "authority_disabled");
+    assert_eq!(status["healthy"], true);
+    assert_eq!(status["action_required"], false);
+    assert_eq!(status["refresh_plan_required"], false);
+    assert_eq!(status["blockers"], serde_json::json!([]));
+    assert_eq!(status["fragments"]["status"], "disabled");
+    assert_eq!(status["derived_store"]["status"], "disabled");
+    assert_eq!(status["derived_store"]["action"], "none");
+    assert_eq!(status["work"]["disposable_clones"], 0);
+    assert_eq!(status["work"]["source_index_runs"], 0);
+    assert!(
+        status["next_action"]
+            .as_str()
+            .unwrap()
+            .contains("no action is required")
+    );
 }
 
 #[test]
@@ -220,6 +257,50 @@ fn materialize_refuses_disabled_or_stale_committed_graph_authority() {
     assert!(!stale.status.success());
     assert!(
         String::from_utf8_lossy(&stale.stderr)
+            .contains("committed graph fragments do not match committed HEAD")
+    );
+}
+
+#[test]
+fn materialize_refuses_exact_head_drift_without_cloning_or_indexing() {
+    let (_temporary, repo) = fixture();
+    let planned = plan(&repo);
+    success(run(
+        &repo,
+        &[
+            "graph",
+            "refresh",
+            "execute",
+            "--repo",
+            ".",
+            "--confirm",
+            planned["plan_sha256"].as_str().unwrap(),
+        ],
+    ));
+    commit_all(&repo, "commit graph");
+    fs::write(repo.join("app.py"), "def answer():\n    return 2\n").unwrap();
+    commit_all(&repo, "change source without graph");
+
+    let status: Value = serde_json::from_str(&success(run(
+        &repo,
+        &["graph", "status", "--repo", ".", "--json"],
+    )))
+    .unwrap();
+    assert_eq!(status["fragments"]["status"], "stale");
+    assert_eq!(status["refresh_plan_required"], true);
+    assert_eq!(status["work"]["disposable_clones"], 0);
+    assert_eq!(status["work"]["source_index_runs"], 0);
+    assert!(
+        status["diagnosis"]
+            .as_str()
+            .unwrap()
+            .contains("exact source tree")
+    );
+
+    let materialize = run(&repo, &["graph", "materialize", "--repo", "."]);
+    assert!(!materialize.status.success());
+    assert!(
+        String::from_utf8_lossy(&materialize.stderr)
             .contains("committed graph fragments do not match committed HEAD")
     );
 }
@@ -263,6 +344,38 @@ fn explore_returns_structured_degradation_when_the_opt_in_store_is_missing() {
             .as_str()
             .unwrap()
             .contains("aethyme graph materialize --repo .")
+    );
+}
+
+#[test]
+fn explore_degradation_uses_the_typed_graph_policy() {
+    let (_temporary, repo) = fixture();
+    fs::write(
+        repo.join(".aethyme/config.toml"),
+        "[graph]\nauthority  =  \"committed_fragments\"\nrepository = \"fixture\"\n",
+    )
+    .unwrap();
+    commit_all(&repo, "format graph policy differently");
+
+    let response: Value = serde_json::from_str(&success(run(
+        &repo,
+        &[
+            "explore",
+            "--repo",
+            ".",
+            "--request",
+            "locate the answer function",
+            "--format",
+            "answer-json",
+            "--show-observability",
+        ],
+    )))
+    .unwrap();
+    assert!(
+        response["next_actions"][0]
+            .as_str()
+            .unwrap()
+            .contains("aethyme graph materialize")
     );
 }
 

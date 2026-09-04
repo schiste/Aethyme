@@ -68,6 +68,9 @@ mod verification;
 mod verify_loop;
 mod version;
 
+pub use aethyme_graph_storage::{
+    GRAPH_CONFIG_RELPATH, GraphAuthority, GraphIntegrityPolicy, GraphIntegrityPolicyError,
+};
 pub use broker::{
     AdoptIntegrationDrift, AdoptIntegrationRelation, AdoptIntegrationSync,
     AdoptIntegrationSyncOutcome, AdoptMode, AdoptOptions, AdoptOutcome, AdoptReport, AgentView,
@@ -126,10 +129,7 @@ pub use graph_impact::{
     GraphImpactLookup, GraphImpactProvider, GraphImpactQuery, GraphImpactStatus,
     GraphStoreImpactProvider,
 };
-pub use graph_integrity::{
-    GRAPH_CONFIG_RELPATH, GraphAuthority, GraphIntegrityOutcome, GraphIntegrityPolicy,
-    GraphIntegrityPolicyError, GraphIntegrityRejection, GraphIntegrityStatus,
-};
+pub use graph_integrity::{GraphIntegrityOutcome, GraphIntegrityRejection, GraphIntegrityStatus};
 pub use homebrew::render_homebrew_formula;
 pub use hooks::{HookReport, HookState, HooksError};
 pub use host_operations::{

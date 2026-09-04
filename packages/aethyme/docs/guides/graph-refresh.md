@@ -30,7 +30,9 @@ aethyme graph refresh plan --repo . --diff
 aethyme graph refresh plan --repo . --json
 ```
 
-The proposal is built from exact committed `HEAD` in a disposable checkout.
+Status reads typed policy and committed graph provenance directly; a disabled
+repository is a healthy no-op and does not clone or index. The refresh proposal
+is built from exact committed `HEAD` in a disposable checkout.
 Its digest binds the source commit and tree, graph policy and pin, installed
 component versions, every proposed path/hash/mode, derived-store action, dirty
 overlap, live sessions, and relevant leases. The plan contains hashes and
@@ -57,10 +59,14 @@ aethyme graph materialize --repo .
 aethyme graph materialize --repo . --json
 ```
 
-Materialization refuses disabled authority, stale fragments, a version
-mismatch, or a HEAD that moves during validation. It changes no tracked file
-and reports the full source SHA, action, file count, and elapsed milliseconds.
-An already-current store is a no-op.
+Refresh writes a deterministic `.aethyme/graph/manifest.json` that binds the
+non-graph Git tree, repository identity, engine version, and complete fragment
+set. Materialization validates that manifest and decodes only exact committed
+fragment bytes: it never clones the repository, parses source, or regenerates
+fragments. It refuses disabled authority, stale or corrupt fragments, a
+version mismatch, or a HEAD that moves during validation. It changes no
+tracked file and reports the full source SHA, action, file count, elapsed
+milliseconds, and zero clone/index work. An already-current store is a no-op.
 
 ## Safety and recovery
 
