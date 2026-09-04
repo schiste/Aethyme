@@ -57,6 +57,7 @@ mod report;
 mod report_filing;
 mod repository_contract;
 mod resources;
+mod promotion_record;
 mod retention;
 mod review;
 mod schema;
@@ -236,6 +237,10 @@ pub use resources::{
     HostResourceGrant, HostResourceKind, HostResourceLease, HostResourcePlan, HostResourceRequest,
     HostResourceRequirement, HostResourceRunError, HostResourceRunReport,
     default_host_resource_db_path, resource_environment_key, validate_host_resource_requirements,
+};
+pub use promotion_record::{
+    PROMOTION_RECORD_PLAN_SCHEMA_VERSION, PromotionRecordApplyReport, PromotionRecordPlan,
+    UnrecordedPromotion,
 };
 pub use retention::{
     BROKER_CONFIG_RELPATH, GcApplyReport, GcArtifactCandidate, GcBlocker, GcFileAction,

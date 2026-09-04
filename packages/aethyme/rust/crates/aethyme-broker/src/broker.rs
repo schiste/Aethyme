@@ -71,6 +71,8 @@ pub enum BrokerOpError {
     GcConfirmationNotSha256,
     #[error("GC confirmation mismatch: expected {expected}, received {actual}")]
     GcConfirmationMismatch { expected: String, actual: String },
+    #[error("promotion record confirmation mismatch: expected {expected}, received {actual}")]
+    PromotionRecordConfirmationMismatch { expected: String, actual: String },
     #[error("GC is already running under process {pid}; wait or inspect .aethyme/gc.lock")]
     GcLocked { pid: String },
     #[error("GC recovery journal is invalid: {reason}")]

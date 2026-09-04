@@ -24,6 +24,7 @@ pub const REVIEW_LIFECYCLE_REASSIGNED: &str = "review.lifecycle_reassigned";
 pub const REVIEW_LIFECYCLE_ABANDONED: &str = "review.lifecycle_abandoned";
 pub const BROKER_COMMAND_FAILED: &str = "broker.command.failed";
 pub const BROKER_GC_APPLIED: &str = "broker.gc.applied";
+pub const BROKER_PROMOTION_RECORD_RESTORED: &str = "broker.promotion-record.restored";
 pub const BROKER_GC_ARTIFACTS_SWEPT: &str = "broker.gc.artifacts-swept";
 pub const BROKER_COMMAND_SUCCEEDED: &str = "broker.command.succeeded";
 // session.<status> transition kinds are derived from SessionStatus::as_str

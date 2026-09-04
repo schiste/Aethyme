@@ -429,6 +429,15 @@ Usage:
       by default; --apply revalidates and removes only clean worktrees whose
       session work is represented on main, integration, or configured upstream.
       Adopted worktrees are never included in the bulk sweep.
+  aethyme broker promotion-record plan [--json]
+      Read-only plan for integration commits that no promoted queue entry
+      claims. A commit is recoverable when exactly one non-promoted entry
+      recorded a merge tree equal to the commit's tree; ambiguous or
+      unmatched commits are reported, never repaired.
+  aethyme broker promotion-record apply --confirm <sha256> [--json]
+      Restore the promoted record for every recoverable candidate in the
+      reviewed plan. Re-proves each precondition, writes only status and
+      commit details, and rebuilds the missing path exposures.
   aethyme broker gc plan [--json]
       Report exact retention-eligible rows, runtime files, represented
       worktrees/refs, estimated bytes, blockers, and a stable plan digest.
@@ -551,6 +560,7 @@ const KNOWN_COMMAND_WORDS: &[&str] = &[
     "submit",
     "repair",
     "checkpoint",
+    "promotion-record",
     "apply",
     "queue",
     "promote",
@@ -2595,6 +2605,47 @@ fn render_cleanup_sweep_report(report: &crate::CleanupSweepReport) {
         println!(
             "  apply: aethyme broker cleanup --all-cleaned --apply --confirm {}",
             report.plan.digest
+        );
+    }
+}
+
+fn render_promotion_record_plan(plan: &crate::PromotionRecordPlan) {
+    let recoverable = plan.recoverable().count();
+    println!(
+        "Promotion record plan {}: {} unrecorded commit(s), {} recoverable",
+        plan.digest,
+        plan.candidates.len(),
+        recoverable
+    );
+    println!("  integration: {} @ {}", plan.integration_ref, plan.integration_tip);
+    for candidate in &plan.candidates {
+        match (&candidate.entry_id, &candidate.blocker) {
+            (Some(entry), None) => {
+                println!(
+                    "  {} -> entry {} (session {}), currently {}",
+                    candidate.commit,
+                    entry,
+                    candidate.session_id.unwrap_or_default(),
+                    candidate.current_status.as_deref().unwrap_or("unknown")
+                );
+                for line in &candidate.evidence {
+                    println!("      evidence: {line}");
+                }
+            }
+            _ => {
+                println!("  {} -> not recoverable", candidate.commit);
+                if let Some(blocker) = &candidate.blocker {
+                    println!("      blocked: {blocker}");
+                }
+            }
+        }
+    }
+    if recoverable == 0 {
+        println!("  apply: nothing recoverable");
+    } else {
+        println!(
+            "  apply: aethyme broker promotion-record apply --confirm {}",
+            plan.digest
         );
     }
 }
@@ -6826,6 +6877,47 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
                 render_repair_report(&report);
+            }
+        }
+        "promotion-record" => {
+            let action = parsed.positional.first().map(String::as_str).ok_or(
+                UsageError::Message("promotion-record requires plan or apply".into()),
+            )?;
+            let mut broker = open_broker(parsed.read_only_snapshot)?;
+            match action {
+                "plan" => {
+                    let plan = broker.promotion_record_plan()?;
+                    if parsed.json {
+                        println!("{}", serde_json::to_string_pretty(&plan)?);
+                    } else {
+                        render_promotion_record_plan(&plan);
+                    }
+                }
+                "apply" => {
+                    let confirm = parsed.confirm.as_deref().ok_or(UsageError::Message(
+                        "promotion-record apply requires --confirm <sha256>".into(),
+                    ))?;
+                    let report = broker.promotion_record_apply(confirm)?;
+                    if parsed.json {
+                        println!("{}", serde_json::to_string_pretty(&report)?);
+                    } else {
+                        println!(
+                            "Promotion record recovery: {} restored",
+                            report.restored.len()
+                        );
+                        for id in &report.restored {
+                            println!("  entry {id} recorded as promoted");
+                        }
+                        for skip in &report.skipped {
+                            println!("  skipped: {skip}");
+                        }
+                    }
+                }
+                other => {
+                    return Err(UsageError::Message(format!(
+                        "unknown promotion-record action {other:?}; expected plan or apply"
+                    )));
+                }
             }
         }
         "checkpoint" => {

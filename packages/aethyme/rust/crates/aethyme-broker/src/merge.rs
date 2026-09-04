@@ -1326,7 +1326,7 @@ impl Broker {
         }
     }
 
-    fn queue_entry(&mut self, entry_id: i64) -> Result<MergeQueueEntry, BrokerOpError> {
+    pub(crate) fn queue_entry(&mut self, entry_id: i64) -> Result<MergeQueueEntry, BrokerOpError> {
         self.store()
             .merge_queue()?
             .into_iter()
