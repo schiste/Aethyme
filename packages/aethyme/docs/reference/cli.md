@@ -784,7 +784,7 @@ terminal_merge_queue_days = 180
 command_metrics_days = 30
 closed_worktrees_days = 7
 retained_bytes_budget = 1073741824
-artifact_reclaim_days = 3
+artifact_reclaim_days = 14
 orphan_worktree_roots_days = 1
 artifact_sweep_budget_ms = 0
 artifact_sweep_interval_hours = 24
@@ -793,10 +793,14 @@ startup_budget_ms = 25
 
 `retained_bytes_budget` is a soft, non-blocking budget used by status, doctor,
 and finish warnings; `0` disables only those warnings. It never authorizes
-deletion. `artifact_reclaim_days` and `orphan_worktree_roots_days` accept `0`, meaning no
-grace period; neither removes committed work, so waiting is a convenience rather
-than a safeguard. The autonomous sweep is disabled by default. Set
-`artifact_sweep_budget_ms` to a positive, bounded duration to opt in.
+deletion. `artifact_reclaim_days` is deliberately longer than
+`closed_worktrees_days`: a represented worktree is removed whole at the shorter
+age, so this value governs the worktrees cleanup refuses to touch, where a
+resumed session would otherwise pay for a full cold rebuild. It and
+`orphan_worktree_roots_days` accept `0`, meaning no grace period; neither removes
+committed work, so waiting is a convenience rather than a safeguard. The
+autonomous sweep is disabled by default. Set `artifact_sweep_budget_ms` to a
+positive, bounded duration to opt in.
 
 Run `aethyme broker gc plan` first. Its text and stable JSON enumerate every
 eligible database row, runtime file, represented worktree and exact branch ref,

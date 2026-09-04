@@ -23,6 +23,11 @@ pub struct RetentionPolicy {
     pub closed_worktrees_days: u32,
     /// Soft repository storage budget. `0` disables budget warnings.
     pub retained_bytes_budget: u64,
+    /// Idle days before a closed session's build caches are reclaimed without
+    /// confirmation. Deliberately longer than `closed_worktrees_days`: a
+    /// represented worktree is removed whole at that shorter age, so this
+    /// governs the worktrees cleanup refuses to touch, where a resumed session
+    /// would otherwise pay for a full cold rebuild.
     pub artifact_reclaim_days: u32,
     pub orphan_worktree_roots_days: u32,
     /// Wall-clock budget for the autonomous artifact sweep. `0` disables it.
@@ -42,7 +47,7 @@ impl Default for RetentionPolicy {
             command_metrics_days: 30,
             closed_worktrees_days: 7,
             retained_bytes_budget: 1_073_741_824,
-            artifact_reclaim_days: 3,
+            artifact_reclaim_days: 14,
             orphan_worktree_roots_days: 1,
             artifact_sweep_budget_ms: 0,
             artifact_sweep_interval_hours: 24,
