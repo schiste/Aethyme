@@ -62,13 +62,15 @@ aethyme --version
 aethyme-engine-cli --version
 aethyme deploy --repo .
 git check-ignore -v .aethyme/graph_store.redb
+git status --short --untracked-files=all .aethyme
 aethyme enhance verify --repo .
 aethyme graph status --repo . --json
 ```
 
 Both version commands must report `0.7.7`. Graph-disabled repositories remain
 healthy no-ops. Enrolled repositories keep committed fragments visible while
-the derived redb files are ignored.
+the derived redb files are ignored. The status check may list committed graph
+fragments that have not been added yet, but it must not list either redb file.
 
 ## Rollback
 
