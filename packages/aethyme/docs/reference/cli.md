@@ -1778,7 +1778,7 @@ separate graph-indexer executable is not required:
 aethyme graph status --repo . [--json]
 aethyme graph materialize --repo . [--json]
 aethyme graph refresh plan --repo . [--json | --diff]
-aethyme graph refresh execute --repo . --confirm <plan-sha256>
+aethyme graph refresh execute --repo . --confirm <plan-sha256> [--json]
 aethyme graph refresh recover --repo . --plan <plan-sha256>
 ```
 
@@ -1800,6 +1800,12 @@ resolved. Enrollment writes policy plus the exact engine pin but defers all
 generation until those files are reviewed and committed. `--with-graph` is
 refused for `--local-only` because untracked policy cannot authorize shared
 committed fragments.
+
+All lifecycle JSON reports include content-free phase timings, observable byte
+counts, graph entity counts when available, and process peak RSS. Confirmed
+refresh supports `--json` so benchmark and diagnostic tooling can capture the
+actual revalidated execution rather than only its preliminary plan. Timing and
+memory evidence are excluded from the deterministic plan digest.
 
 `materialize` validates committed policy, pin, manifest, and fragment bytes
 against exact `HEAD`, then atomically builds only the ignored worktree-local
@@ -1828,6 +1834,8 @@ safety, path-redacted observability, and an explicit manual or materialization
 next action.
 The complete operational workflow, including post-commit restamping and old
 pin handling, is in [Version-safe graph refresh](../guides/graph-refresh.md).
+Reproducible release-mode measurement and interpretation are documented in
+[Graph performance evidence](../guides/graph-performance.md).
 The lower-level `aethyme-engine-cli index` surface remains available for
 engine diagnostics, but it does not provide the plan, confirmation, dirty-path,
 session, lease, or recovery contract required for authoritative fragments.

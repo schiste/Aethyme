@@ -382,6 +382,14 @@ fn has_behavior_test_warning(response: &serde_json::Value) -> bool {
         })
 }
 
+fn without_runtime_performance(mut response: serde_json::Value) -> serde_json::Value {
+    response["observability"]
+        .as_object_mut()
+        .expect("observability object")
+        .remove("performance");
+    response
+}
+
 #[test]
 fn auth_surface_positive_contract_is_ranked_bounded_and_deterministic() {
     let tmp = build_auth_fixture(AuthFixtureOptions::positive());
@@ -398,7 +406,8 @@ fn auth_surface_positive_contract_is_ranked_bounded_and_deterministic() {
     eprintln!("positive second metrics: {second_metrics:?}");
 
     assert_eq!(
-        first, second,
+        without_runtime_performance(first.clone()),
+        without_runtime_performance(second),
         "repeated explore output should be deterministic"
     );
     assert_eq!(first["schema_version"], "aethyme-explore-v1");

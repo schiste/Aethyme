@@ -163,6 +163,29 @@ fn index_repo_counts_by_kind() {
 }
 
 #[test]
+fn index_repo_reports_content_free_phase_evidence() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = b"def hello():\n    return 'hi'\n";
+    write(tmp.path(), "src/cli.py", source);
+
+    let summary = index_repo_to_disk(&ctx(tmp.path()), &WalkOptions::default()).unwrap();
+    assert_eq!(summary.total_files, 1);
+    assert_eq!(summary.observability.source_bytes_read, source.len() as u64);
+    assert!(summary.observability.fragment_bytes_written > 0);
+    assert_eq!(
+        summary.total_nodes,
+        summary.counts_by_kind.values().sum::<usize>()
+    );
+    assert!(summary.total_nodes >= 2);
+    assert!(summary.total_edges >= 1);
+    // Timings are deliberately not threshold assertions: their presence in
+    // the typed report is the contract, not host scheduling behavior.
+    let _ = summary.observability.source_discovery_elapsed_us;
+    let _ = summary.observability.source_indexing_elapsed_us;
+    let _ = summary.observability.fragment_serialization_elapsed_us;
+}
+
+#[test]
 fn index_repo_handles_empty_tree() {
     let tmp = tempfile::tempdir().unwrap();
     let summary = index_repo_to_disk(&ctx(tmp.path()), &WalkOptions::default()).unwrap();

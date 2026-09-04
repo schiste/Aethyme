@@ -108,3 +108,7 @@ the repository upgrade planner and its digest-confirmed apply flow first.
 Then use the graph refresh plan above. Never edit the pin merely to make a
 locally installed binary pass: doing so would change repository policy without
 reviewing the corresponding generated graph.
+
+For phase-level timing, byte, count, memory, and disk-footprint measurement,
+use the reproducible [graph performance evidence](graph-performance.md)
+workflow against disposable Playground repositories.

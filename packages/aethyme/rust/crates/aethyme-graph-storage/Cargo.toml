@@ -21,6 +21,7 @@ aethyme-graph-schema = { path = "../aethyme-graph-schema" }
 # works for every type the schema crate exposes (after the
 # externally-tagged Edge fix in Phase 2.1).
 bincode = "1"
+libc = "0.2"
 
 # serde + serde_json power the NDJSON index shards (Phase 2.4 commit).
 # Carrying them here rather than as dev-dependencies because index-

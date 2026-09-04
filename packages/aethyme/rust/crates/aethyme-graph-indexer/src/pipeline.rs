@@ -12,6 +12,7 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::time::Instant;
 
 use rayon::prelude::*;
 
@@ -161,101 +162,105 @@ pub fn index_repo_to_disk(
 
 /// Same as [`index_repo_to_disk`] but accepts an explicit registry.
 ///
-/// The per-file phase (read + parse + build + write) is parallelized
-/// across rayon's thread pool. Each file's output goes to a distinct
-/// path so writes don't contend. Output paths are collected into a
-/// Vec preserving the walk's canonical (sorted) order; per-kind
-/// counts are merged with a parallel fold/reduce.
+/// Source discovery, in-memory indexing, and fragment serialization are
+/// separate measured phases. The per-file indexing and serialization phases
+/// remain parallelized across rayon's thread pool.
 pub fn index_repo_to_disk_with(
     ctx: &IndexerContext,
     options: &WalkOptions,
     registry: &LanguageRegistry,
 ) -> Result<IndexRepoSummary, IndexRepoError> {
+    let discovery_started = Instant::now();
     let walk = walk_source_tree(ctx, options).map_err(IndexRepoError::Walk)?;
+    let source_discovery_elapsed_us = discovery_started.elapsed().as_micros();
     let total_files = walk.files.len();
     let total_skipped = walk.skipped.len();
 
-    // Parallel per-file phase. Each closure returns
-    // (path_written, counts_for_this_file, BuiltFragment). The
-    // built fragment is captured so the post-loop step can emit
-    // SymbolRecords from each fragment's full node list (not just
-    // the IndexedFile's top-level node).
-    let per_file: Vec<(PathBuf, BTreeMap<NodeKind, usize>, BuiltFragment)> = walk
+    let indexing_started = Instant::now();
+    // Build every fragment in memory first so parsing/indexing and serialization
+    // have distinct wall-clock boundaries instead of an ambiguous combined time.
+    let per_file: Vec<(BTreeMap<NodeKind, usize>, BuiltFragment, u64)> = walk
         .files
         .par_iter()
-        .map(|indexed| -> Result<(PathBuf, BTreeMap<NodeKind, usize>, BuiltFragment), IndexRepoError> {
-            let language_indexer = registry.get(&indexed.language);
-            let needs_content = language_indexer.is_some() || surface_flow::should_scan(indexed);
-            let content = if needs_content {
-                let abs = ctx.repo_root().join(&*indexed.source_path);
-                Some(std::fs::read_to_string(&abs).map_err(|e| {
-                        IndexRepoError::ReadSource {
+        .map(
+            |indexed| -> Result<(BTreeMap<NodeKind, usize>, BuiltFragment, u64), IndexRepoError> {
+                let language_indexer = registry.get(&indexed.language);
+                let needs_content =
+                    language_indexer.is_some() || surface_flow::should_scan(indexed);
+                let content = if needs_content {
+                    let abs = ctx.repo_root().join(&*indexed.source_path);
+                    Some(
+                        std::fs::read_to_string(&abs).map_err(|e| IndexRepoError::ReadSource {
                             source_path: indexed.source_path.clone(),
                             message: e.to_string(),
-                        }
-                })?)
-            } else {
-                None
-            };
+                        })?,
+                    )
+                } else {
+                    None
+                };
 
-            let mut combined = LanguageIndexResult::default();
-            if let Some(indexer) = language_indexer {
-                let content = content
-                    .as_deref()
-                    .expect("language-indexed files are read above");
-                let output = indexer
-                    .index_file(ctx, indexed, content)
-                    .map_err(IndexRepoError::Language)?;
-                combined.additional_nodes.extend(output.additional_nodes);
-                combined.additional_edges.extend(output.additional_edges);
-            }
-            if surface_flow::should_scan(indexed) {
-                let content = content
-                    .as_deref()
-                    .expect("surface-flow-scanned files are read above");
-                let output =
-                    surface_flow::index_file(ctx, indexed, content).map_err(IndexRepoError::Language)?;
-                combined.additional_nodes.extend(output.additional_nodes);
-                combined.additional_edges.extend(output.additional_edges);
-            };
-            let lang_output =
-                if combined.additional_nodes.is_empty() && combined.additional_edges.is_empty() {
+                let mut combined = LanguageIndexResult::default();
+                if let Some(indexer) = language_indexer {
+                    let content = content
+                        .as_deref()
+                        .expect("language-indexed files are read above");
+                    let output = indexer
+                        .index_file(ctx, indexed, content)
+                        .map_err(IndexRepoError::Language)?;
+                    combined.additional_nodes.extend(output.additional_nodes);
+                    combined.additional_edges.extend(output.additional_edges);
+                }
+                if surface_flow::should_scan(indexed) {
+                    let content = content
+                        .as_deref()
+                        .expect("surface-flow-scanned files are read above");
+                    let output = surface_flow::index_file(ctx, indexed, content)
+                        .map_err(IndexRepoError::Language)?;
+                    combined.additional_nodes.extend(output.additional_nodes);
+                    combined.additional_edges.extend(output.additional_edges);
+                };
+                let lang_output = if combined.additional_nodes.is_empty()
+                    && combined.additional_edges.is_empty()
+                {
                     None
                 } else {
                     Some(combined)
                 };
 
-            let built = build_fragment(indexed, lang_output)
-                .map_err(IndexRepoError::Build)?;
+                let built = build_fragment(indexed, lang_output).map_err(IndexRepoError::Build)?;
 
-            let mut counts: BTreeMap<NodeKind, usize> = BTreeMap::new();
-            for node in built.fragment.nodes() {
-                *counts.entry(node.kind()).or_default() += 1;
-            }
-
-            let path = write_fragment(
-                ctx.repo_root(),
-                &built.source_path,
-                &built.fragment,
-            )
-            .map_err(IndexRepoError::FragmentWrite)?;
-
-            Ok((path, counts, built))
-        })
+                let mut counts: BTreeMap<NodeKind, usize> = BTreeMap::new();
+                for node in built.fragment.nodes() {
+                    *counts.entry(node.kind()).or_default() += 1;
+                }
+                let source_bytes = content.as_ref().map_or(0, |content| content.len() as u64);
+                Ok((counts, built, source_bytes))
+            },
+        )
         .collect::<Result<Vec<_>, _>>()?;
+    let source_indexing_elapsed_us = indexing_started.elapsed().as_micros();
 
-    // Aggregate across threads. The Vec already preserves the
-    // canonical walk order; split it into (paths, counts, built).
-    let mut fragments_written = Vec::with_capacity(per_file.len());
     let mut counts_by_kind: BTreeMap<NodeKind, usize> = BTreeMap::new();
     let mut built_fragments: Vec<BuiltFragment> = Vec::with_capacity(per_file.len());
-    for (path, counts, built) in per_file {
-        fragments_written.push(path);
+    let mut source_bytes_read = 0_u64;
+    let mut total_edges = 0_usize;
+    for (counts, built, source_bytes) in per_file {
         for (kind, count) in counts {
             *counts_by_kind.entry(kind).or_default() += count;
         }
+        source_bytes_read += source_bytes;
+        total_edges += built.fragment.edge_count();
         built_fragments.push(built);
     }
+
+    let serialization_started = Instant::now();
+    let fragments_written: Vec<PathBuf> = built_fragments
+        .par_iter()
+        .map(|built| {
+            write_fragment(ctx.repo_root(), &built.source_path, &built.fragment)
+                .map_err(IndexRepoError::FragmentWrite)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
 
     // Index shards: emit SymbolRecords from each built fragment's
     // FULL node list, not just the file-level walk. This is what
@@ -272,6 +277,13 @@ pub fn index_repo_to_disk_with(
         .collect::<Result<Vec<_>, _>>()?;
     // Canonical sort by path for deterministic summary output.
     shards_written.sort();
+    let fragment_serialization_elapsed_us = serialization_started.elapsed().as_micros();
+    let fragment_bytes_written = fragments_written
+        .iter()
+        .chain(shards_written.iter())
+        .filter_map(|path| std::fs::metadata(path).ok().map(|metadata| metadata.len()))
+        .sum();
+    let total_nodes = counts_by_kind.values().sum();
 
     Ok(IndexRepoSummary {
         total_files,
@@ -279,7 +291,25 @@ pub fn index_repo_to_disk_with(
         fragments_written,
         shards_written,
         counts_by_kind,
+        total_nodes,
+        total_edges,
+        observability: IndexRepoObservability {
+            source_discovery_elapsed_us,
+            source_indexing_elapsed_us,
+            fragment_serialization_elapsed_us,
+            source_bytes_read,
+            fragment_bytes_written,
+        },
     })
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IndexRepoObservability {
+    pub source_discovery_elapsed_us: u128,
+    pub source_indexing_elapsed_us: u128,
+    pub fragment_serialization_elapsed_us: u128,
+    pub source_bytes_read: u64,
+    pub fragment_bytes_written: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -289,6 +319,9 @@ pub struct IndexRepoSummary {
     pub fragments_written: Vec<PathBuf>,
     pub shards_written: Vec<PathBuf>,
     pub counts_by_kind: BTreeMap<NodeKind, usize>,
+    pub total_nodes: usize,
+    pub total_edges: usize,
+    pub observability: IndexRepoObservability,
 }
 
 #[derive(Debug)]

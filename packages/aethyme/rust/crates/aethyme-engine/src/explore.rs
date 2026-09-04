@@ -1081,6 +1081,7 @@ pub fn explore_with_intent(
     intent_source: IntentSource,
     params: &ExploreParams,
 ) -> Result<ExploreResponse, ExploreError> {
+    let started = std::time::Instant::now();
     let mut effective_params = params.clone();
     // Order: detail widening first (compact → standard/full caps),
     // then intent overrides (behavior_localization wider than
@@ -1093,11 +1094,16 @@ pub fn explore_with_intent(
     intent.apply_param_defaults(&mut effective_params);
     let params = &effective_params;
 
+    let discovery_started = std::time::Instant::now();
     let canonical_repo = repo
         .canonicalize()
         .map_err(|e| ExploreError::EngineAnalyzer(format!("canonicalize repo: {e}")))?;
+    let repository_discovery_elapsed_us = discovery_started.elapsed().as_micros();
+    let store_started = std::time::Instant::now();
     let store = GraphStore::open_read_only(&canonical_repo).map_err(graph_store_explore_error)?;
+    let graph_store_open_elapsed_us = store_started.elapsed().as_micros();
     let observability = graph_store_observability(&canonical_repo);
+    let query_started = std::time::Instant::now();
 
     // 1. Graph-derived view (anchors + scope + next).
     let view = task_localize_redb(&store, request)?;
@@ -1159,7 +1165,8 @@ pub fn explore_with_intent(
     )
     .unwrap_or_default();
 
-    Ok(build_response_with_surface_flow(
+    let query_execution_elapsed_us = query_started.elapsed().as_micros();
+    let mut response = build_response_with_surface_flow(
         request,
         intent,
         intent_source,
@@ -1171,7 +1178,23 @@ pub fn explore_with_intent(
         &surface_flow,
         params,
         observability,
-    ))
+    );
+    if let Some(serde_json::Value::Object(observability)) = response.observability.as_mut() {
+        observability.insert(
+            "performance".into(),
+            serde_json::json!({
+                "repository_discovery_elapsed_us": repository_discovery_elapsed_us,
+                "graph_store_open_elapsed_us": graph_store_open_elapsed_us,
+                "query_execution_elapsed_us": query_execution_elapsed_us,
+                "total_elapsed_us": started.elapsed().as_micros(),
+                "store_bytes": std::fs::metadata(GraphStore::final_path(&canonical_repo))
+                    .ok()
+                    .map(|metadata| metadata.len()),
+                "peak_memory_bytes": aethyme_graph_storage::peak_memory_bytes(),
+            }),
+        );
+    }
+    Ok(response)
 }
 
 mod callsite;

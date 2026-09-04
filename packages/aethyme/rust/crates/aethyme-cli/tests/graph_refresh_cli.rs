@@ -87,13 +87,36 @@ fn plan_is_read_only_deterministic_and_contains_no_absolute_paths_or_source() {
     let before = git(&repo, &["status", "--porcelain"]);
     let first = plan(&repo);
     let second = plan(&repo);
-    assert_eq!(first, second);
+    let mut first_authority = first.clone();
+    let mut second_authority = second.clone();
+    first_authority
+        .as_object_mut()
+        .unwrap()
+        .remove("performance");
+    second_authority
+        .as_object_mut()
+        .unwrap()
+        .remove("performance");
+    assert_eq!(first_authority, second_authority);
     assert_eq!(first["schema_version"], 1);
     assert_eq!(first["canonical_repository"], "fixture");
     assert_eq!(first["compatibility"], "compatible");
     assert_eq!(first["safe_to_execute"], true);
     assert_eq!(first["work"]["disposable_clones"], 1);
     assert_eq!(first["work"]["source_index_runs"], 1);
+    assert!(
+        first["performance"]["source_indexing"]["bytes_read"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    assert!(
+        first["performance"]["fragment_serialization"]["bytes_written"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    assert!(first["performance"]["counts"]["files"].as_u64().unwrap() >= 1);
     assert!(first["changes"].as_array().unwrap().len() >= 2);
     assert_eq!(first["derived_store"]["status"], "missing");
     assert_eq!(git(&repo, &["status", "--porcelain"]), before);
@@ -187,6 +210,20 @@ fn materialize_rebuilds_only_the_local_store_from_verified_committed_fragments()
     assert_eq!(report["work"]["source_index_runs"], 0);
     assert_eq!(report["source_head"], git(&repo, &["rev-parse", "HEAD"]));
     assert!(report["file_count"].as_u64().unwrap() >= 1);
+    assert!(
+        report["performance"]["redb_materialization"]["bytes_read"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    assert!(
+        report["performance"]["redb_materialization"]["bytes_written"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    assert!(report["performance"]["counts"]["nodes"].as_u64().unwrap() >= 1);
+    assert!(report["performance"]["counts"]["edges"].is_number());
     assert!(repo.join(".aethyme/graph_store.redb").is_file());
     assert_eq!(git(&repo, &["status", "--porcelain"]), before);
 
@@ -196,6 +233,31 @@ fn materialize_rebuilds_only_the_local_store_from_verified_committed_fragments()
     )))
     .unwrap();
     assert_eq!(current["action"], "none");
+    assert_eq!(
+        current["performance"]["redb_materialization"]["bytes_written"],
+        0
+    );
+
+    let explored: Value = serde_json::from_str(&success(run(
+        &repo,
+        &[
+            "explore",
+            "--repo",
+            ".",
+            "--request",
+            "locate the answer function",
+            "--format",
+            "answer-json",
+            "--show-observability",
+        ],
+    )))
+    .unwrap();
+    let performance = &explored["observability"]["performance"];
+    assert!(performance["repository_discovery_elapsed_us"].is_number());
+    assert!(performance["graph_store_open_elapsed_us"].is_number());
+    assert!(performance["query_execution_elapsed_us"].is_number());
+    assert!(performance["total_elapsed_us"].is_number());
+    assert!(performance["store_bytes"].as_u64().unwrap() > 0);
 }
 
 #[test]
@@ -223,6 +285,11 @@ fn disabled_status_is_a_cheap_healthy_no_op() {
     assert_eq!(status["derived_store"]["action"], "none");
     assert_eq!(status["work"]["disposable_clones"], 0);
     assert_eq!(status["work"]["source_index_runs"], 0);
+    assert_eq!(
+        status["performance"]["fragment_validation"]["bytes_read"],
+        0
+    );
+    assert_eq!(status["performance"]["source_indexing"]["bytes_read"], 0);
     assert!(
         status["next_action"]
             .as_str()

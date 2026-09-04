@@ -58,6 +58,7 @@ pub mod index_shard;
 pub mod layout;
 pub mod manifest;
 pub mod overlay;
+pub mod performance;
 pub mod policy;
 pub mod store;
 
@@ -91,6 +92,9 @@ pub use manifest::{
 pub use overlay::{
     OverlayBuildError, OverlayDecodeError, OverlayEncodeError, OverlayFragment, read_overlay_bytes,
     write_overlay_bytes,
+};
+pub use performance::{
+    GraphEntityCounts, GraphLifecycleObservability, GraphPhaseObservation, peak_memory_bytes,
 };
 pub use policy::{
     GRAPH_CONFIG_RELPATH, GraphAuthority, GraphIntegrityPolicy, GraphIntegrityPolicyError,

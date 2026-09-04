@@ -168,6 +168,13 @@ fn emit_text_summary(summary: &IndexRepoSummary, elapsed: &std::time::Duration) 
         summary.fragments_written.len(),
         summary.shards_written.len(),
     );
+    println!(
+        "  graph: {} nodes, {} edges; source read: {} bytes; fragments written: {} bytes",
+        summary.total_nodes,
+        summary.total_edges,
+        summary.observability.source_bytes_read,
+        summary.observability.fragment_bytes_written,
+    );
     if !summary.counts_by_kind.is_empty() {
         println!("  nodes by kind:");
         // BTreeMap iteration is sorted by kind; canonical-order
@@ -196,6 +203,30 @@ fn emit_json_summary(
     print!("\"shards_written\":{},", summary.shards_written.len());
     print!("\"elapsed_ms\":{},", elapsed_ms);
     print!("\"index_elapsed_ms\":{},", index_elapsed_ms);
+    print!("\"total_nodes\":{},", summary.total_nodes);
+    print!("\"total_edges\":{},", summary.total_edges);
+    print!("\"observability\":{{");
+    print!(
+        "\"source_discovery_elapsed_us\":{},",
+        summary.observability.source_discovery_elapsed_us
+    );
+    print!(
+        "\"source_indexing_elapsed_us\":{},",
+        summary.observability.source_indexing_elapsed_us
+    );
+    print!(
+        "\"fragment_serialization_elapsed_us\":{},",
+        summary.observability.fragment_serialization_elapsed_us
+    );
+    print!(
+        "\"source_bytes_read\":{},",
+        summary.observability.source_bytes_read
+    );
+    print!(
+        "\"fragment_bytes_written\":{}",
+        summary.observability.fragment_bytes_written
+    );
+    print!("}},");
     print!("\"counts_by_kind\":{{");
     for (i, (kind, count)) in summary.counts_by_kind.iter().enumerate() {
         if i > 0 {

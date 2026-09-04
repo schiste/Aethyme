@@ -16,9 +16,9 @@ use aethyme_broker::{Broker, GitRepo, GraphIntegrityStatus, SessionStatus};
 use aethyme_engine::store::redb::graph_store::GraphStore;
 use aethyme_graph_indexer::{IndexerContext, WalkOptions, index_repo_to_disk, link_repo};
 use aethyme_graph_storage::{
-    GRAPH_CONFIG_RELPATH, GRAPH_MANIFEST_RELPATH, GraphAuthorityManifest, GraphIntegrityPolicy,
-    committed_source_tree_digest, graph_fragment_set_digest, read_engine_version,
-    write_graph_authority_manifest,
+    GRAPH_CONFIG_RELPATH, GRAPH_MANIFEST_RELPATH, GraphAuthorityManifest, GraphEntityCounts,
+    GraphIntegrityPolicy, GraphLifecycleObservability, committed_source_tree_digest,
+    graph_fragment_set_digest, read_engine_version, write_graph_authority_manifest,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -67,6 +67,7 @@ fn run_inner(args: &[String]) -> Result<(), String> {
                     report.file_count,
                     report.elapsed_ms
                 );
+                render_performance_text(&report.performance);
             }
             Ok(())
         }
@@ -96,13 +97,21 @@ fn run_inner(args: &[String]) -> Result<(), String> {
                 let repo = option_path(args, "--repo")?;
                 let confirmation = required_option(args, "--confirm")?;
                 let plan = execute(&repo, confirmation)?;
-                println!(
-                    "Graph refresh complete for {} at {} ({} fragment change(s)); derived store {:?}",
-                    plan.canonical_repository,
-                    short(&plan.source.head_sha),
-                    plan.changes.len(),
-                    plan.derived_store.action
-                );
+                if has_flag(args, "--json") {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&plan).map_err(|error| error.to_string())?
+                    );
+                } else {
+                    println!(
+                        "Graph refresh complete for {} at {} ({} fragment change(s)); derived store {:?}",
+                        plan.canonical_repository,
+                        short(&plan.source.head_sha),
+                        plan.changes.len(),
+                        plan.derived_store.action
+                    );
+                    render_performance_text(&plan.performance);
+                }
                 Ok(())
             }
             Some("recover") => {
@@ -131,6 +140,7 @@ struct GraphMaterializationReport {
     file_count: usize,
     elapsed_ms: u128,
     work: GraphLifecycleWork,
+    performance: GraphLifecycleObservability,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -157,6 +167,7 @@ struct GraphStatusReport {
     diagnosis: Option<String>,
     next_action: String,
     work: GraphLifecycleWork,
+    performance: GraphLifecycleObservability,
 }
 
 struct GraphStatusInspector;
@@ -168,6 +179,7 @@ struct GraphMaterializationPlan {
     action: DerivedStoreAction,
     committed_files: BTreeMap<String, GraphFileBytes>,
     work: GraphLifecycleWork,
+    performance: GraphLifecycleObservability,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -192,6 +204,7 @@ struct GraphRefreshPlan {
     blockers: Vec<String>,
     next_action: String,
     work: GraphLifecycleWork,
+    performance: GraphLifecycleObservability,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -305,7 +318,9 @@ impl ProposedRepository {
         repo: &Path,
         head: &str,
         work: &mut GraphLifecycleWork,
+        performance: &mut GraphLifecycleObservability,
     ) -> Result<Self, String> {
+        let started = std::time::Instant::now();
         work.disposable_clones += 1;
         let temporary = tempfile::Builder::new()
             .prefix("aethyme-graph-refresh-plan-")
@@ -336,6 +351,7 @@ impl ProposedRepository {
                 head,
             ],
         )?;
+        performance.source_snapshot.elapsed_us += started.elapsed().as_micros();
         Ok(Self {
             _temporary: temporary,
             root,
@@ -345,18 +361,26 @@ impl ProposedRepository {
 
 impl GraphStatusInspector {
     fn inspect(repo_hint: &Path) -> Result<GraphStatusReport, String> {
+        let started = std::time::Instant::now();
+        let mut performance = GraphLifecycleObservability::default();
+        let discovery_started = std::time::Instant::now();
         let repository = GitRepo::discover(repo_hint).map_err(|error| error.to_string())?;
         let root = repository.root();
         let head_sha = repository
             .head_commit()
             .map_err(|error| error.to_string())?;
         let tree_sha = git(root, &["rev-parse", &format!("{head_sha}^{{tree}}")])?;
-        let policy = graph_policy_at_commit(&repository, &head_sha)?;
+        performance.repository_discovery.elapsed_us = discovery_started.elapsed().as_micros();
+        let policy_started = std::time::Instant::now();
+        let (policy, policy_bytes) = graph_policy_at_commit(&repository, &head_sha)?;
         let canonical_repository = policy
             .repository
             .clone()
             .unwrap_or_else(|| "unconfigured".into());
-        let pinned_engine_version = engine_version_at_commit(&repository, &head_sha)?;
+        let (pinned_engine_version, version_bytes) =
+            engine_version_at_commit(&repository, &head_sha)?;
+        performance.policy_loading.elapsed_us = policy_started.elapsed().as_micros();
+        performance.policy_loading.bytes_read = policy_bytes + version_bytes;
         let running_version = env!("CARGO_PKG_VERSION").to_string();
         let compatibility = graph_compatibility(&policy, pinned_engine_version.as_deref());
         let source = GraphSourceState { head_sha, tree_sha };
@@ -374,6 +398,7 @@ impl GraphStatusInspector {
         let work = GraphLifecycleWork::default();
 
         if compatibility == GraphRefreshCompatibility::AuthorityDisabled {
+            performance.finish(started.elapsed().as_micros());
             return Ok(GraphStatusReport {
                 schema_version: PLAN_SCHEMA_VERSION,
                 canonical_repository,
@@ -402,10 +427,12 @@ impl GraphStatusInspector {
                 next_action: "graph authority is disabled; no action is required. Enroll explicitly with `aethyme deploy --repo . --with-graph`"
                     .into(),
                 work,
+                performance,
             });
         }
 
         let mut blockers = compatibility_blockers(compatibility, pinned_engine_version.as_deref());
+        let validation_started = std::time::Instant::now();
         let committed_files = committed_graph_files(root)?;
         let committed_validation = validate_fragment_authority(
             root,
@@ -423,6 +450,9 @@ impl GraphStatusInspector {
             &active_files,
         );
         let active_changes = compare_graph_files(&committed_files, &active_files);
+        performance.fragment_validation.elapsed_us = validation_started.elapsed().as_micros();
+        performance.fragment_validation.bytes_read =
+            graph_files_bytes(&committed_files) + graph_files_bytes(&active_files);
         let working_tree_matches_proposal = active_validation.is_ok();
         let fragment_status = if compatibility != GraphRefreshCompatibility::Compatible {
             GraphIntegrityStatus::Incompatible
@@ -452,6 +482,7 @@ impl GraphStatusInspector {
         } else {
             "graph fragments and derived store are current; no action is required".into()
         };
+        performance.finish(started.elapsed().as_micros());
         Ok(GraphStatusReport {
             schema_version: PLAN_SCHEMA_VERSION,
             canonical_repository,
@@ -486,6 +517,7 @@ impl GraphStatusInspector {
             diagnosis,
             next_action,
             work,
+            performance,
         })
     }
 }
@@ -493,22 +525,35 @@ impl GraphStatusInspector {
 fn graph_policy_at_commit(
     repository: &GitRepo,
     commit: &str,
-) -> Result<GraphIntegrityPolicy, String> {
+) -> Result<(GraphIntegrityPolicy, u64), String> {
     match repository
         .file_at_commit(commit, GRAPH_CONFIG_RELPATH)
         .map_err(|error| error.to_string())?
     {
-        Some(text) => GraphIntegrityPolicy::parse(&text).map_err(|error| error.to_string()),
-        None => Ok(GraphIntegrityPolicy::default()),
+        Some(text) => {
+            let bytes = text.len() as u64;
+            GraphIntegrityPolicy::parse(&text)
+                .map(|policy| (policy, bytes))
+                .map_err(|error| error.to_string())
+        }
+        None => Ok((GraphIntegrityPolicy::default(), 0)),
     }
 }
 
-fn engine_version_at_commit(repository: &GitRepo, commit: &str) -> Result<Option<String>, String> {
-    Ok(repository
+fn engine_version_at_commit(
+    repository: &GitRepo,
+    commit: &str,
+) -> Result<(Option<String>, u64), String> {
+    let value = repository
         .file_at_commit(commit, ".aethyme/engine-version")
-        .map_err(|error| error.to_string())?
-        .map(|version| version.trim().to_string())
-        .filter(|version| !version.is_empty()))
+        .map_err(|error| error.to_string())?;
+    let bytes = value.as_ref().map_or(0, |version| version.len() as u64);
+    Ok((
+        value
+            .map(|version| version.trim().to_string())
+            .filter(|version| !version.is_empty()),
+        bytes,
+    ))
 }
 
 fn graph_compatibility(
@@ -546,25 +591,37 @@ fn compatibility_blockers(
 }
 
 fn build_plan(repo_hint: &Path) -> Result<BuiltPlan, String> {
+    let started = std::time::Instant::now();
     let mut work = GraphLifecycleWork::default();
+    let mut performance = GraphLifecycleObservability::default();
+    let discovery_started = std::time::Instant::now();
     let repository = GitRepo::discover(repo_hint).map_err(|error| error.to_string())?;
     let root = repository.root();
     let head_sha = repository
         .head_commit()
         .map_err(|error| error.to_string())?;
     let tree_sha = git(root, &["rev-parse", &format!("{head_sha}^{{tree}}")])?;
-    let proposal = ProposedRepository::from_committed_head(root, &head_sha, &mut work)?;
+    performance.repository_discovery.elapsed_us = discovery_started.elapsed().as_micros();
+    let proposal =
+        ProposedRepository::from_committed_head(root, &head_sha, &mut work, &mut performance)?;
+    let policy_started = std::time::Instant::now();
     let policy = GraphIntegrityPolicy::load(&proposal.root).map_err(|error| error.to_string())?;
     let canonical_repository = policy
         .repository
         .clone()
         .unwrap_or_else(|| "unconfigured".into());
     let pinned_engine_version = read_engine_version(&proposal.root).ok();
+    performance.policy_loading.elapsed_us = policy_started.elapsed().as_micros();
+    performance.policy_loading.bytes_read = file_len(&proposal.root.join(GRAPH_CONFIG_RELPATH))
+        + file_len(&proposal.root.join(".aethyme/engine-version"));
     let running_version = env!("CARGO_PKG_VERSION").to_string();
 
     let compatibility = graph_compatibility(&policy, pinned_engine_version.as_deref());
 
+    let validation_started = std::time::Instant::now();
     let existing = committed_graph_files(&proposal.root)?;
+    performance.fragment_validation.elapsed_us += validation_started.elapsed().as_micros();
+    performance.fragment_validation.bytes_read += graph_files_bytes(&existing);
     let mut blockers = Vec::new();
     let proposed = if compatibility == GraphRefreshCompatibility::Compatible {
         regenerate_fragments(
@@ -572,8 +629,13 @@ fn build_plan(repo_hint: &Path) -> Result<BuiltPlan, String> {
             &canonical_repository,
             &running_version,
             &mut work,
+            &mut performance,
         )?;
-        filesystem_graph_files(&proposal.root)?
+        let validation_started = std::time::Instant::now();
+        let files = filesystem_graph_files(&proposal.root)?;
+        performance.fragment_validation.elapsed_us += validation_started.elapsed().as_micros();
+        performance.fragment_validation.bytes_read += graph_files_bytes(&files);
+        files
     } else {
         match compatibility {
             GraphRefreshCompatibility::AuthorityDisabled => blockers.push(
@@ -667,6 +729,7 @@ fn build_plan(repo_hint: &Path) -> Result<BuiltPlan, String> {
     };
 
     let policy_sha256 = policy.digest();
+    performance.finish(started.elapsed().as_micros());
     let mut plan = GraphRefreshPlan {
         schema_version: PLAN_SCHEMA_VERSION,
         plan_sha256: String::new(),
@@ -703,6 +766,7 @@ fn build_plan(repo_hint: &Path) -> Result<BuiltPlan, String> {
         blockers,
         next_action,
         work,
+        performance,
     };
     plan.plan_sha256 = plan_digest(&plan)?;
     Ok(BuiltPlan {
@@ -731,7 +795,11 @@ impl GraphMaterializationPlan {
             ));
         }
         let repository = GitRepo::discover(repo_hint).map_err(|error| error.to_string())?;
+        let validation_started = std::time::Instant::now();
         let committed_files = committed_graph_files(repository.root())?;
+        let mut performance = status.performance;
+        performance.fragment_validation.elapsed_us += validation_started.elapsed().as_micros();
+        performance.fragment_validation.bytes_read += graph_files_bytes(&committed_files);
         Ok(Self {
             canonical_repository: status.canonical_repository,
             source_head: status.source.head_sha,
@@ -739,6 +807,7 @@ impl GraphMaterializationPlan {
             action: status.derived_store.action,
             committed_files,
             work: status.work,
+            performance,
         })
     }
 }
@@ -781,7 +850,7 @@ impl ExactFragmentRepository {
 
 fn materialize(repo_hint: &Path) -> Result<GraphMaterializationReport, String> {
     let started = std::time::Instant::now();
-    let plan = GraphMaterializationPlan::build(repo_hint)?;
+    let mut plan = GraphMaterializationPlan::build(repo_hint)?;
     if plan.fragment_status != GraphIntegrityStatus::Passed {
         return Err("committed graph fragments do not match committed HEAD; run `aethyme graph refresh plan --repo . --diff`".into());
     }
@@ -795,9 +864,12 @@ fn materialize(repo_hint: &Path) -> Result<GraphMaterializationReport, String> {
     let mut file_count = 0;
     let action = plan.action;
     if action != DerivedStoreAction::None {
+        let materialization_started = std::time::Instant::now();
         let exact = ExactFragmentRepository::from_committed_files(&plan.committed_files)?;
         let (mut map, _) = aethyme_engine::map::RepositoryMap::build_from_fragments(&exact.root)?;
         file_count = map.files.len();
+        plan.performance.counts = graph_counts(&map);
+        plan.performance.redb_materialization.bytes_read = graph_files_bytes(&plan.committed_files);
         map.snapshot.root = repository
             .root()
             .canonicalize()
@@ -817,11 +889,17 @@ fn materialize(repo_hint: &Path) -> Result<GraphMaterializationReport, String> {
             &map,
             &plan.source_head,
         )?;
+        plan.performance.redb_materialization.elapsed_us =
+            materialization_started.elapsed().as_micros();
+        plan.performance.redb_materialization.bytes_written =
+            file_len(&GraphStore::final_path(repository.root()));
     } else if let Ok(store) = GraphStore::open_read_only(repository.root())
         && let Ok(Some(metadata)) = store.repo_metadata()
     {
         file_count = metadata.file_count as usize;
+        plan.performance.counts.files = Some(file_count);
     }
+    plan.performance.finish(started.elapsed().as_micros());
     Ok(GraphMaterializationReport {
         schema_version: PLAN_SCHEMA_VERSION,
         canonical_repository: plan.canonical_repository,
@@ -831,7 +909,27 @@ fn materialize(repo_hint: &Path) -> Result<GraphMaterializationReport, String> {
         file_count,
         elapsed_ms: started.elapsed().as_millis(),
         work: plan.work,
+        performance: plan.performance,
     })
+}
+
+fn graph_counts(map: &aethyme_engine::map::RepositoryMap) -> GraphEntityCounts {
+    GraphEntityCounts {
+        files: Some(map.files.len()),
+        nodes: Some(
+            1 + map.areas.len()
+                + map.directories.len()
+                + map.files.len()
+                + map.classes.len()
+                + map.functions.len()
+                + map.surfaces.len()
+                + map.docs.len()
+                + map.configs.len()
+                + map.unresolved.len()
+                + map.risk_flags.len(),
+        ),
+        edges: Some(map.edges.len()),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -917,6 +1015,7 @@ fn regenerate_fragments(
     repository: &str,
     version: &str,
     work: &mut GraphLifecycleWork,
+    performance: &mut GraphLifecycleObservability,
 ) -> Result<(), String> {
     let graph = repo.join(".aethyme/graph");
     if let Err(error) = std::fs::remove_dir_all(&graph)
@@ -927,10 +1026,26 @@ fn regenerate_fragments(
     let context = IndexerContext::new(repository, repo.to_path_buf(), version)
         .map_err(|error| error.to_string())?;
     work.source_index_runs += 1;
-    index_repo_to_disk(&context, &WalkOptions::default()).map_err(|error| error.to_string())?;
+    let summary =
+        index_repo_to_disk(&context, &WalkOptions::default()).map_err(|error| error.to_string())?;
+    performance.source_indexing.elapsed_us += summary.observability.source_discovery_elapsed_us
+        + summary.observability.source_indexing_elapsed_us;
+    performance.source_indexing.bytes_read += summary.observability.source_bytes_read;
+    performance.fragment_serialization.elapsed_us +=
+        summary.observability.fragment_serialization_elapsed_us;
+    let linking_started = std::time::Instant::now();
     link_repo(&context).map_err(|error| error.to_string())?;
+    performance.graph_linking.elapsed_us += linking_started.elapsed().as_micros();
+    let serialization_started = std::time::Instant::now();
     write_graph_authority_manifest(repo, "HEAD", repository, version)
         .map_err(|error| error.to_string())?;
+    performance.fragment_serialization.elapsed_us += serialization_started.elapsed().as_micros();
+    performance.counts = GraphEntityCounts {
+        files: Some(summary.total_files),
+        nodes: Some(summary.total_nodes),
+        edges: Some(summary.total_edges),
+    };
+    performance.fragment_serialization.bytes_written = directory_regular_file_bytes(&graph)?;
     Ok(())
 }
 
@@ -958,6 +1073,22 @@ fn filesystem_graph_files(repo: &Path) -> Result<BTreeMap<String, GraphFileBytes
         );
     }
     Ok(files)
+}
+
+fn graph_files_bytes(files: &BTreeMap<String, GraphFileBytes>) -> u64 {
+    files.values().map(|file| file.bytes.len() as u64).sum()
+}
+
+fn file_len(path: &Path) -> u64 {
+    std::fs::metadata(path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0)
+}
+
+fn directory_regular_file_bytes(root: &Path) -> Result<u64, String> {
+    let mut paths = Vec::new();
+    collect_regular_files(root, &mut paths)?;
+    Ok(paths.iter().map(|path| file_len(path)).sum())
 }
 
 fn collect_regular_files(root: &Path, output: &mut Vec<PathBuf>) -> Result<(), String> {
@@ -1122,6 +1253,9 @@ fn path_crosses_symlink(repo: &Path, relative: &str) -> Result<bool, String> {
 fn plan_digest(plan: &GraphRefreshPlan) -> Result<String, String> {
     let mut normalized = plan.clone();
     normalized.plan_sha256.clear();
+    // Timing and process memory are evidence from this invocation, never part
+    // of the authorization digest for the deterministic proposed tree.
+    normalized.performance = GraphLifecycleObservability::default();
     let bytes = serde_json::to_vec(&normalized).map_err(|error| error.to_string())?;
     Ok(sha256(&bytes))
 }
@@ -1155,11 +1289,12 @@ impl Drop for GraphRefreshLock {
 }
 
 fn execute(repo_hint: &Path, confirmation: &str) -> Result<GraphRefreshPlan, String> {
+    let started = std::time::Instant::now();
     validate_digest(confirmation, "--confirm")?;
     let repository = GitRepo::discover(repo_hint).map_err(|error| error.to_string())?;
     let root = repository.root().to_path_buf();
     let _lock = acquire_refresh_lock(&repository)?;
-    let built = build_plan(&root)?;
+    let mut built = build_plan(&root)?;
     if built.plan.plan_sha256 != confirmation {
         return Err(format!(
             "graph refresh state changed after review; planned {}, received {confirmation}; regenerate the plan",
@@ -1182,12 +1317,23 @@ fn execute(repo_hint: &Path, confirmation: &str) -> Result<GraphRefreshPlan, Str
     let path = journal_path(&repository, confirmation)?;
     write_journal(&path, &journal)?;
     let result = (|| {
+        let application_started = std::time::Instant::now();
         apply_journal_forward(&root, &journal)?;
-        materialize_exact_store(&root, &journal.source_head)?;
-        verify_journal_after(&root, &journal)
+        built.plan.performance.fragment_application.elapsed_us =
+            application_started.elapsed().as_micros();
+        built.plan.performance.fragment_application.bytes_written = journal
+            .entries
+            .iter()
+            .filter_map(|entry| entry.after.as_ref())
+            .map(|file| file.bytes.len() as u64)
+            .sum();
+        let observation = materialize_exact_store(&root, &journal.source_head)?;
+        verify_journal_after(&root, &journal)?;
+        Ok::<_, String>(observation)
     })();
-    if let Err(error) = result {
-        match rollback_journal(&root, &journal) {
+    let observation = match result {
+        Ok(observation) => observation,
+        Err(error) => match rollback_journal(&root, &journal) {
             Ok(()) => {
                 let _ = std::fs::remove_file(&path);
                 return Err(format!(
@@ -1199,11 +1345,14 @@ fn execute(repo_hint: &Path, confirmation: &str) -> Result<GraphRefreshPlan, Str
                     "graph refresh failed: {error}; rollback also failed: {rollback_error}; run `aethyme graph refresh recover --repo . --plan {confirmation}`"
                 ));
             }
-        }
-    }
+        },
+    };
     std::fs::remove_file(&path)
         .map_err(|error| format!("remove completed graph refresh journal: {error}"))?;
     sync_parent(&path)?;
+    built.plan.performance.redb_materialization = observation.phase;
+    built.plan.performance.counts = observation.counts;
+    built.plan.performance.finish(started.elapsed().as_micros());
     Ok(built.plan)
 }
 
@@ -1231,7 +1380,7 @@ fn recover(repo_hint: &Path, digest: &str) -> Result<(), String> {
         ));
     }
     apply_journal_forward(&root, &journal)?;
-    materialize_exact_store(&root, &journal.source_head)?;
+    let _ = materialize_exact_store(&root, &journal.source_head)?;
     verify_journal_after(&root, &journal)?;
     std::fs::remove_file(&path)
         .map_err(|error| format!("remove completed graph refresh journal: {error}"))?;
@@ -1366,16 +1515,32 @@ fn verify_journal_after(repo: &Path, journal: &GraphRefreshJournal) -> Result<()
     Ok(())
 }
 
-fn materialize_exact_store(repo: &Path, head: &str) -> Result<(), String> {
+struct GraphStoreMaterialization {
+    phase: aethyme_graph_storage::GraphPhaseObservation,
+    counts: GraphEntityCounts,
+}
+
+fn materialize_exact_store(repo: &Path, head: &str) -> Result<GraphStoreMaterialization, String> {
+    let started = std::time::Instant::now();
     let files = filesystem_graph_files(repo)?;
+    let bytes_read = graph_files_bytes(&files);
     let exact = ExactFragmentRepository::from_committed_files(&files)?;
     let (mut map, _) = aethyme_engine::map::RepositoryMap::build_from_fragments(&exact.root)?;
+    let counts = graph_counts(&map);
     map.snapshot.root = repo
         .canonicalize()
         .map_err(|error| format!("resolve graph store target: {error}"))?
         .to_string_lossy()
         .into_owned();
-    aethyme_engine::index_store::materialize_graph_store(repo, &map, head)
+    aethyme_engine::index_store::materialize_graph_store(repo, &map, head)?;
+    Ok(GraphStoreMaterialization {
+        phase: aethyme_graph_storage::GraphPhaseObservation {
+            elapsed_us: started.elapsed().as_micros(),
+            bytes_read,
+            bytes_written: file_len(&GraphStore::final_path(repo)),
+        },
+        counts,
+    })
 }
 
 fn acquire_refresh_lock(repository: &GitRepo) -> Result<GraphRefreshLock, String> {
@@ -1586,6 +1751,7 @@ fn render_status(status: &GraphStatusReport, json: bool) -> Result<(), String> {
         println!("  compatibility: {:?}", status.compatibility);
         println!("  healthy: {}", status.healthy);
         println!("  action required: {}", status.action_required);
+        render_performance_text(&status.performance);
         println!("  next: {}", status.next_action);
     }
     Ok(())
@@ -1599,11 +1765,25 @@ fn render_plan_text(plan: &GraphRefreshPlan) {
     println!("  fragment writes: {}", plan.changes.len());
     println!("  derived store: {:?}", plan.derived_store.action);
     println!("  safe: {}", plan.safe_to_execute);
+    render_performance_text(&plan.performance);
     for blocker in &plan.blockers {
         println!("  blocker: {blocker}");
     }
     println!("  plan SHA-256: {}", plan.plan_sha256);
     println!("  next: {}", plan.next_action);
+}
+
+fn render_performance_text(performance: &GraphLifecycleObservability) {
+    println!(
+        "  performance: {:.3} ms total; {} bytes read; {} bytes written; peak RSS {}",
+        performance.totals.elapsed_us as f64 / 1_000.0,
+        performance.totals.bytes_read,
+        performance.totals.bytes_written,
+        performance
+            .peak_memory_bytes
+            .map(|bytes| format!("{bytes} bytes"))
+            .unwrap_or_else(|| "unavailable".into())
+    );
 }
 
 fn render_change_summary(plan: &GraphRefreshPlan) -> String {
