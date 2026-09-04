@@ -369,6 +369,11 @@ impl GitRepo {
         (!name.is_empty() && name.starts_with("refs/")).then(|| name.to_string())
     }
 
+    /// Whether Git ignores `path`, relative to the repository root.
+    pub fn path_is_ignored(&self, path: &str) -> bool {
+        run_git(&self.root, &["check-ignore", "--quiet", "--", path]).is_ok()
+    }
+
     /// Validate one fully-qualified destination ref with Git's own grammar.
     pub fn validate_push_destination(&self, destination: &str) -> Result<(), GitError> {
         run_git(&self.root, &["check-ref-format", destination]).map(|_| ())

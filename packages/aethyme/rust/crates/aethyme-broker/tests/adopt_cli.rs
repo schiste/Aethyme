@@ -321,3 +321,38 @@ fn adopt_cli_requires_reuse_for_integration_sync() {
         String::from_utf8_lossy(&output.stderr).contains("--sync-integration requires --reuse")
     );
 }
+
+/// Uncommitted work already in the checkout is not this session's, but a
+/// repository pre-push gate validates the whole snapshot, so it fails the
+/// session's first push for reasons the session cannot see (#131 finding 3).
+#[test]
+fn adopt_warns_about_uncommitted_paths_it_did_not_create() {
+    let repo = tempfile::tempdir().unwrap();
+    git(repo.path(), &["init", "-q", "-b", "main"]);
+    std::fs::write(repo.path().join(".gitignore"), "/.aethyme/\n").unwrap();
+    std::fs::write(repo.path().join("a.txt"), "a\n").unwrap();
+    git(repo.path(), &["add", "-A"]);
+    git(repo.path(), &["commit", "-qm", "init"]);
+
+    // Clean checkout: nothing to warn about.
+    let clean = run(repo.path(), &["adopt", "--task", "clean checkout"]);
+    let clean_out = String::from_utf8_lossy(&clean.stdout);
+    assert!(
+        !clean_out.contains("warning:"),
+        "a clean checkout must not warn: {clean_out}"
+    );
+    run(repo.path(), &["close", "--session", "1"]);
+
+    // Pre-existing unrelated work: the session must be told.
+    std::fs::write(repo.path().join("unrelated.txt"), "not mine\n").unwrap();
+    let dirty = run(repo.path(), &["adopt", "--task", "dirty checkout"]);
+    let dirty_out = String::from_utf8_lossy(&dirty.stdout);
+    assert!(
+        dirty_out.contains("warning:") && dirty_out.contains("unrelated.txt"),
+        "adopt must name the pre-existing uncommitted paths: {dirty_out}"
+    );
+    assert!(
+        dirty_out.contains("pre-push"),
+        "the warning must say why it matters: {dirty_out}"
+    );
+}

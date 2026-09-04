@@ -178,11 +178,89 @@ struct PreparationRecord {
 }
 
 impl Broker {
+
+    /// Git-ignored top-level directories that exist in the primary checkout but
+    /// not in this worktree.
+    ///
+    /// These are *observations*, not requirements: without a declared
+    /// preparation config the broker cannot know what a gate needs. Naming what
+    /// visibly differs is enough to turn "nothing to do here" into a concrete
+    /// starting point, without inventing a contract the repository never stated.
+    fn dependency_paths_absent_from_worktree(&self, worktree: &Path) -> Vec<String> {
+        let main = self.main_root();
+        if main == worktree {
+            return Vec::new();
+        }
+        let Ok(entries) = fs::read_dir(main) else {
+            return Vec::new();
+        };
+        let mut absent = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if name.starts_with('.') || worktree.join(name).exists() {
+                continue;
+            }
+            // Only ignored directories: a tracked directory missing here would
+            // be a checkout problem, not a preparation gap.
+            if crate::GitRepo::discover(main)
+                .ok()
+                .is_some_and(|repo| repo.path_is_ignored(name))
+            {
+                absent.push(name.to_string());
+            }
+            if absent.len() >= 5 {
+                break;
+            }
+        }
+        absent.sort();
+        absent
+    }
+
     pub fn preparation_status(&self, session_id: i64) -> Result<PreparationStatus, BrokerOpError> {
         let session = self.store_ref().session(session_id)?;
         let root = Path::new(&session.worktree_path);
         let config = match load_config(root) {
             Ok(None) => {
+                // "Not configured" is only benign when nothing depends on the
+                // worktree being prepared. When the repository declares gate
+                // commands, a fresh worktree may not be able to run them, and
+                // reporting a bare `next_action: null` reads as "nothing to do
+                // here" right up until the gate fails at push time.
+                let gate_count = crate::gates::load_gates(self.main_root())
+                    .map(|gates| gates.len())
+                    .unwrap_or(0);
+                let absent = self.dependency_paths_absent_from_worktree(root);
+                let (reason, next_action) = if gate_count == 0 {
+                    (
+                        "repository declares no dependency preparation".to_string(),
+                        None,
+                    )
+                } else {
+                    let mut reason = format!(
+                        "repository declares no dependency preparation but declares {gate_count} \
+                         gate command(s); this worktree is not guaranteed to satisfy them"
+                    );
+                    if !absent.is_empty() {
+                        reason.push_str(&format!(
+                            "; ignored path(s) present in the primary checkout and absent here: {}",
+                            absent.join(", ")
+                        ));
+                    }
+                    (
+                        reason,
+                        Some(
+                            "declare preparation in .aethyme/preparation.toml, or run the \
+                             repository's own setup in this worktree before gating"
+                                .to_string(),
+                        ),
+                    )
+                };
                 return Ok(PreparationStatus {
                     schema_version: PREPARATION_SCHEMA_VERSION,
                     session_id,
@@ -191,10 +269,10 @@ impl Broker {
                     recorded_digest: None,
                     source_digest: None,
                     recorded_source_digest: None,
-                    missing_outputs: Vec::new(),
+                    missing_outputs: absent,
                     hook_required: false,
-                    reason: "repository declares no dependency preparation".into(),
-                    next_action: None,
+                    reason,
+                    next_action,
                 });
             }
             Ok(Some(config)) => config,

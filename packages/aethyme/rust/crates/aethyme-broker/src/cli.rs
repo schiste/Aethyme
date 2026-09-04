@@ -391,7 +391,9 @@ Usage:
       exact identifiers and deliberately invalid null operator judgments.
   aethyme broker status [--json]
       The whole picture: agents, overlaps, promoted conflicts, merge
-      queue, integration head.
+      queue, integration head. Session records are reported under the
+      `agents` key; the id every `--session <id>` flag expects is
+      `agents[].id`. There is no `sessions` key.
   aethyme broker events [--since <id>] [--kind <prefix>] [--follow] [--json]
       Show the append-only event log (see docs/events-contract.md).
       --kind filters by prefix (e.g. merge. or lease.overlap); --follow
@@ -5388,6 +5390,34 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                         "note: main-checkout session — verification is advisory here \
                          (commits land on main before gates run); use a worktree \
                          session for enforced verification."
+                    );
+                }
+                // Pre-existing uncommitted work is not this session's, but the
+                // repository's own pre-push gate validates the whole snapshot,
+                // so it will fail the first push for reasons the session cannot
+                // see. Saying so at adopt time is cheaper than discovering it
+                // one rejected push at a time.
+                if let Ok(repo) = crate::GitRepo::discover(std::path::Path::new(
+                    &session.worktree_path,
+                )) && let Ok(dirty) = repo.dirty_paths()
+                    && !dirty.is_empty()
+                {
+                    let shown = dirty.iter().take(5).cloned().collect::<Vec<_>>();
+                    println!(
+                        "warning: {} uncommitted path(s) already present in this checkout \
+                         before the session began: {}{}",
+                        dirty.len(),
+                        shown.join(", "),
+                        if dirty.len() > shown.len() {
+                            format!(", and {} more", dirty.len() - shown.len())
+                        } else {
+                            String::new()
+                        }
+                    );
+                    println!(
+                        "         they are not owned by this session, and a repository \
+                         pre-push gate validates the whole snapshot — commit or set them \
+                         aside, or adopt an isolated worktree instead."
                     );
                 }
                 if let Some(sync) = &report.integration_sync {

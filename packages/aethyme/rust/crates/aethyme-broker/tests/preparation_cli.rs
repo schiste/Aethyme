@@ -261,3 +261,96 @@ required_for_hooks = true
     assert!(reason.contains("lease-evidence"), "{reason}");
     assert!(reason.contains("generation 3"), "{reason}");
 }
+
+/// A repository that declares gates but no preparation config (#131 finding 2).
+fn gates_without_preparation_fixture() -> tempfile::TempDir {
+    let temp = tempfile::tempdir().unwrap();
+    git(temp.path(), &["init", "-q", "-b", "main"]);
+    std::fs::create_dir_all(temp.path().join(".aethyme")).unwrap();
+    std::fs::write(
+        temp.path().join(".gitignore"),
+        "/.aethyme/broker.db*\n/.aethyme/run/\n/node_modules/\n",
+    )
+    .unwrap();
+    std::fs::write(
+        temp.path().join(".aethyme/gates.toml"),
+        "[[gate]]\nname = \"quality\"\ncommand = \"true\"\ncost = 1\n",
+    )
+    .unwrap();
+    std::fs::write(temp.path().join("work.txt"), "initial\n").unwrap();
+    git(temp.path(), &["add", "-A"]);
+    git(
+        temp.path(),
+        &["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init"],
+    );
+    // A dependency directory the primary checkout has and a fresh worktree will not.
+    std::fs::create_dir_all(temp.path().join("node_modules/pkg")).unwrap();
+    temp
+}
+
+/// `not_configured` must not read as "nothing to do" when the repository
+/// declares gate commands a fresh worktree cannot satisfy.
+#[test]
+fn unconfigured_preparation_names_the_consequence_when_gates_exist() {
+    let repo = gates_without_preparation_fixture();
+    let state = tempfile::tempdir().unwrap();
+    let started = success_json(run(
+        repo.path(),
+        state.path(),
+        &["start", "--task", "gates without preparation", "--json"],
+    ));
+    let session = started["id"].as_i64().unwrap().to_string();
+
+    let status = success_json(run(
+        repo.path(),
+        state.path(),
+        &["prepare", "status", "--session", &session, "--json"],
+    ));
+    assert_eq!(status["state"], "not_configured");
+    let reason = status["reason"].as_str().unwrap();
+    assert!(
+        reason.contains("gate command"),
+        "the reason must state that gates exist: {reason}"
+    );
+    assert!(
+        reason.contains("node_modules"),
+        "the reason must name the ignored path the worktree lacks: {reason}"
+    );
+    assert!(
+        status["next_action"].is_string(),
+        "a null next_action reads as 'nothing to do here'"
+    );
+    assert_eq!(
+        status["missing_outputs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["node_modules"]
+    );
+}
+
+/// With no gates declared there is nothing to warn about, so the report stays
+/// quiet rather than inventing an obligation.
+#[test]
+fn unconfigured_preparation_stays_quiet_without_gates() {
+    let repo = gates_without_preparation_fixture();
+    std::fs::remove_file(repo.path().join(".aethyme/gates.toml")).unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let started = success_json(run(
+        repo.path(),
+        state.path(),
+        &["start", "--task", "no gates", "--json"],
+    ));
+    let session = started["id"].as_i64().unwrap().to_string();
+
+    let status = success_json(run(
+        repo.path(),
+        state.path(),
+        &["prepare", "status", "--session", &session, "--json"],
+    ));
+    assert_eq!(status["state"], "not_configured");
+    assert_eq!(status["reason"], "repository declares no dependency preparation");
+    assert!(status["next_action"].is_null());
+}
