@@ -381,6 +381,8 @@ fn print_artifact_ownership() {
         ".aethyme/run/",
         ".aethyme/worktrees/",
         ".aethyme/broker-action-required.md",
+        ".aethyme/graph_store.redb",
+        ".aethyme/graph_store.redb.indexing",
         ".aethyme/generated/experience-telemetry.jsonl",
         ".aethyme/generated/experience-status.json",
         ".aethyme/generated/experience-status.md",

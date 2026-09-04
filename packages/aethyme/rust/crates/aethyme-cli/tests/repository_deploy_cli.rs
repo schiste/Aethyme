@@ -114,6 +114,8 @@ fn deploy_enrolls_and_verifies_a_repository_without_a_source_checkout() {
     assert!(!onboarding.contains(repo.to_string_lossy().as_ref()));
     let gitignore = fs::read_to_string(repo.join(".gitignore")).unwrap();
     for runtime_path in [
+        ".aethyme/graph_store.redb",
+        ".aethyme/graph_store.redb.indexing",
         ".aethyme/generated/experience-telemetry.jsonl",
         ".aethyme/generated/experience-status.json",
         ".aethyme/generated/experience-status.md",
@@ -129,6 +131,15 @@ fn deploy_enrolls_and_verifies_a_repository_without_a_source_checkout() {
             "runtime path is not ignored: {runtime_path}"
         );
     }
+    let committed_fragment = Command::new("git")
+        .args(["check-ignore", "--quiet", ".aethyme/graph/example.rs.bin"])
+        .current_dir(&repo)
+        .status()
+        .unwrap();
+    assert!(
+        !committed_fragment.success(),
+        "committed graph fragments must remain visible to Git"
+    );
     let canonical_is_ignored = Command::new("git")
         .args([
             "check-ignore",

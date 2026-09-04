@@ -914,6 +914,8 @@ const GITIGNORE_BLOCK: &str = "\
 .aethyme/worktrees/
 .aethyme/broker-action-required.md
 .aethyme/broker-advisory.md
+.aethyme/graph_store.redb
+.aethyme/graph_store.redb.indexing
 .aethyme/generated/experience-status.json
 .aethyme/generated/experience-status.md
 .aethyme/generated/experience-telemetry.jsonl

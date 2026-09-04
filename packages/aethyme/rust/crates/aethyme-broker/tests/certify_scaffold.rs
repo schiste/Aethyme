@@ -784,6 +784,8 @@ fn existing_files_are_never_touched_and_gitignore_appends_preserving_content() {
     assert!(gitignore.contains(".aethyme/reports/"));
     assert!(gitignore.contains(".aethyme/worktrees/"));
     assert!(gitignore.contains(".aethyme/broker-advisory.md"));
+    assert!(gitignore.contains(".aethyme/graph_store.redb"));
+    assert!(gitignore.contains(".aethyme/graph_store.redb.indexing"));
     assert!(gitignore.contains(".aethyme/generated/experience-telemetry.jsonl"));
     assert!(gitignore.contains(".aethyme/generated/experience-status.json"));
     assert!(gitignore.contains(".aethyme/generated/experience-status.md"));
@@ -815,6 +817,8 @@ custom-after/\n";
     assert!(gitignore.contains("custom-before/"));
     assert!(gitignore.contains("custom-after/"));
     assert!(gitignore.contains(".aethyme/reports/"));
+    assert!(gitignore.contains(".aethyme/graph_store.redb"));
+    assert!(gitignore.contains(".aethyme/graph_store.redb.indexing"));
     assert!(gitignore.contains(".aethyme/generated/experience-telemetry.jsonl"));
     assert_eq!(gitignore.matches("aethyme-broker:begin").count(), 1);
     assert_eq!(
