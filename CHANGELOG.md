@@ -4,6 +4,21 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.7.7] - 2026-09-04
+
+### Fixed
+
+- Graph enrollment now adds the final redb query store and its interrupted-
+  index staging file to the Aethyme-managed `.gitignore` block. Existing
+  managed blocks are upgraded in place, while committed fragments under
+  `.aethyme/graph/` remain visible to Git.
+
+### Upgrade notes
+
+Read [Upgrading to v0.7.7](packages/aethyme/docs/guides/upgrading-to-v0.7.7.md)
+before updating. Broker storage, repository deployment, engine protocol, and
+graph cache schemas are unchanged from v0.7.6.
+
 ## [0.7.6] - 2026-09-04
 
 ### Added
