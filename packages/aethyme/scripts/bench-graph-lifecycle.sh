@@ -41,6 +41,7 @@ WORKSPACE_ROOT="$(cd "$PRODUCT_ROOT/../.." && pwd -P)"
 PRODUCT_GIT_COMMON="$(git -C "$WORKSPACE_ROOT" rev-parse --path-format=absolute --git-common-dir)"
 RUN_ROOT="$(mktemp -d -t aethyme-graph-benchmark.XXXXXX)"
 RESULTS="$RUN_ROOT/results.jsonl"
+CACHE_ROOT="$RUN_ROOT/host-cache"
 : > "$RESULTS"
 
 cleanup() {
@@ -108,9 +109,14 @@ for specification in "${SOURCES[@]}"; do
     git -C "$repo" commit -qm "chore(benchmark): commit graph snapshot"
 
     command rm -f -- "$repo/.aethyme/graph_store.redb" "$repo/.aethyme/graph_store.redb.indexing"
-    print -u2 "benchmark[$label]: cold and no-op materialization"
+    print -u2 "benchmark[$label]: cold, cache-hit, and no-op materialization"
     cold_materialization="$RUN_ROOT/$label-cold-materialization.json"
-    "$AETHYME_BIN" graph materialize --repo "$repo" --json > "$cold_materialization"
+    AETHYME_HOST_CACHE_DIR="$CACHE_ROOT" \
+        "$AETHYME_BIN" graph materialize --repo "$repo" --json > "$cold_materialization"
+    command rm -f -- "$repo/.aethyme/graph_store.redb" "$repo/.aethyme/graph_store.redb.indexing"
+    cached_materialization="$RUN_ROOT/$label-cached-materialization.json"
+    AETHYME_HOST_CACHE_DIR="$CACHE_ROOT" \
+        "$AETHYME_BIN" graph materialize --repo "$repo" --json > "$cached_materialization"
     noop_materialization="$RUN_ROOT/$label-noop-materialization.json"
     "$AETHYME_BIN" graph materialize --repo "$repo" --json > "$noop_materialization"
 
@@ -142,6 +148,9 @@ for specification in "${SOURCES[@]}"; do
         --argjson cold_refresh "$(jq '.performance' "$cold_refresh")" \
         --argjson one_file_refresh "$(jq '.performance' "$one_file_refresh")" \
         --argjson cold_materialization "$(jq '.performance' "$cold_materialization")" \
+        --argjson cold_materialization_cache "$(jq '.cache' "$cold_materialization")" \
+        --argjson cached_materialization "$(jq '.performance' "$cached_materialization")" \
+        --argjson cached_materialization_cache "$(jq '.cache' "$cached_materialization")" \
         --argjson noop_materialization "$(jq '.performance' "$noop_materialization")" \
         --argjson cold_explore "$(jq '.observability.performance' "$cold_explore")" \
         --argjson warm_explore "$(jq '.observability.performance' "$warm_explore")" \
@@ -151,6 +160,9 @@ for specification in "${SOURCES[@]}"; do
           cold_refresh_plan: $cold_plan, cold_refresh: $cold_refresh,
           one_file_refresh: $one_file_refresh,
           cold_materialization: $cold_materialization,
+          cold_materialization_cache: $cold_materialization_cache,
+          cached_materialization: $cached_materialization,
+          cached_materialization_cache: $cached_materialization_cache,
           noop_materialization: $noop_materialization,
           cold_explore: $cold_explore, warm_explore: $warm_explore,
           disk: {committed_graph_bytes: $graph_bytes, redb_bytes: $redb_bytes}}' >> "$RESULTS"
@@ -160,10 +172,11 @@ report="$RUN_ROOT/report.json"
 jq -s \
     --arg aethyme_version "$("$AETHYME_BIN" --version | head -1)" \
     --arg platform "$(uname -sm)" \
-    '{schema_version: 1, methodology: {
+    '{schema_version: 2, methodology: {
         isolation: "disposable Playground clone per source",
         cold_explore: "first Explore process after cold materialization; OS caches are not forcibly purged",
         warm_explore: "immediate identical second Explore process",
+        cached_materialization: "remove the private redb after a cache-seeding cold materialization, then materialize the identical verified key",
         one_file_refresh: "one committed Markdown probe added after the cold snapshot",
         aethyme_version: $aethyme_version, platform: $platform
       }, repositories: .}' "$RESULTS" > "$report"

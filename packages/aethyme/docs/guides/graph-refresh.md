@@ -68,6 +68,22 @@ version mismatch, or a HEAD that moves during validation. It changes no
 tracked file and reports the full source SHA, action, file count, elapsed
 milliseconds, and zero clone/index work. An already-current store is a no-op.
 
+When the local store is missing, Aethyme may reuse an immutable host-cache
+artifact produced for the same source tree, fragment-manifest digest, engine
+and protocol version, and storage schema. Cache bytes and metadata are hashed
+and validated under a per-entry host lock. A cache hit is copied into private
+staging, opened to validate its redb schema, rebound to the receiving
+worktree, and atomically published. Aethyme never opens a cached redb for
+writes and never shares one writable database between worktrees. Invalid or
+corrupt entries are misses and fall back to a fresh verified build.
+
+JSON reports `cache.status` as `not_needed`, `unavailable`, `hit`,
+`miss_stored`, or `miss_unstored`, plus the content-key digest and artifact
+size. Cache paths are not exposed. Disposable repositories under the system
+temporary directory do not populate the durable cache unless
+`AETHYME_HOST_CACHE_DIR` is explicitly set. The cache is derived and may be
+removed when disk space is needed; committed fragments remain authoritative.
+
 ## Safety and recovery
 
 - A mismatched engine pin requires the signed compatible Aethyme release or a

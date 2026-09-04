@@ -52,6 +52,7 @@
 
 pub mod binary;
 pub mod bootstrap;
+pub mod cache;
 pub mod disk;
 pub mod fragment;
 pub mod index_shard;
@@ -68,6 +69,10 @@ pub use binary::{
 pub use bootstrap::{
     BootstrapError, BootstrapPaths, EngineVersionReadError, GITATTRIBUTES_CONTENT, bootstrap_repo,
     read_engine_version,
+};
+pub use cache::{
+    CachedGraphStoreArtifact, GRAPH_STORE_CACHE_SCHEMA_VERSION, GraphStoreArtifactCache,
+    GraphStoreCacheEntry, GraphStoreCacheKey,
 };
 pub use disk::{
     FragmentReadError, FragmentWriteError, IndexShardReadError, IndexShardWriteError,

@@ -54,11 +54,14 @@ packages/aethyme/scripts/bench-graph-lifecycle.sh \
 For each source the harness records:
 
 1. cold refresh plan and confirmed execution;
-2. cold materialization after removing only the disposable local redb;
-3. an already-current no-op materialization;
-4. the first and immediate second identical Explore process;
-5. refresh after one committed Markdown probe is added; and
-6. committed fragment and redb disk footprints.
+2. cold materialization after removing only the disposable local redb, using
+   an isolated empty host cache;
+3. materialization after removing the local redb again, now using the verified
+   cache entry created by step 2;
+4. an already-current no-op materialization;
+5. the first and immediate second identical Explore process;
+6. refresh after one committed Markdown probe is added; and
+7. committed fragment and redb disk footprints.
 
 The first Explore is “cold” only at the application-process level. The harness
 does not purge operating-system caches, which would require privileged,
@@ -77,6 +80,10 @@ identity, platform, and methodology object from every report.
   not as evidence that the parser itself is slow.
 - Treat no-op materialization time and bytes as hot-path overhead: it should
   perform enough validation to stay safe, but should not rebuild redb.
+- Compare cache installation with both cold construction and the ordinary
+  no-op. A cache is justified only for a missing local store shared by many
+  identical worktrees; it must not make an already-current store do more work.
 
 The initial measured baseline and resulting priorities are recorded in
-[Phase 2 graph performance baseline](../reports/graph-performance-phase2.md).
+[Phase 2 graph performance baseline](../reports/graph-performance-phase2.md),
+including the measured Phase 3 cache decision.

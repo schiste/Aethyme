@@ -1814,6 +1814,17 @@ not change tracked files, accepts no hidden network input, reports elapsed
 milliseconds plus clone/index operation counts in stable JSON, and is a no-op
 when the store is current.
 
+If the local store is missing, materialization can install a verified immutable
+host-cache artifact keyed by source tree, fragment-manifest digest, engine and
+protocol version, and storage schema. JSON `cache.status` is `not_needed`,
+`unavailable`, `hit`, `miss_stored`, or `miss_unstored`; it also reports the
+key digest and artifact bytes without exposing a host path. A hit is copied to
+private staging, schema-validated, rebound to the receiving worktree, and
+atomically published. Cached redb files are never opened writable or shared
+between worktrees. Set `AETHYME_HOST_CACHE_DIR` only to relocate the derived
+cache or isolate a benchmark; deleting it is safe because committed fragments
+remain authoritative.
+
 `execute` revalidates the complete plan under an exclusive repository lock,
 requires the full digest, writes a private rollback/recovery journal, applies
 fragment files through sibling temporary files, verifies every resulting hash,

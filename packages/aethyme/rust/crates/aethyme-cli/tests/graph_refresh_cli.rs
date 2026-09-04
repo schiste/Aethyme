@@ -63,6 +63,17 @@ fn run(repo: &Path, args: &[&str]) -> Output {
         .unwrap()
 }
 
+fn run_with_cache(repo: &Path, cache: &Path, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_aethyme"))
+        .args(args)
+        .current_dir(repo)
+        .env_remove("AETHYME_ROOT")
+        .env("XDG_CONFIG_HOME", repo.join("empty-config"))
+        .env("AETHYME_HOST_CACHE_DIR", cache)
+        .output()
+        .unwrap()
+}
+
 fn success(output: Output) -> String {
     assert!(
         output.status.success(),
@@ -258,6 +269,78 @@ fn materialize_rebuilds_only_the_local_store_from_verified_committed_fragments()
     assert!(performance["query_execution_elapsed_us"].is_number());
     assert!(performance["total_elapsed_us"].is_number());
     assert!(performance["store_bytes"].as_u64().unwrap() > 0);
+}
+
+#[test]
+fn identical_clones_install_private_stores_from_one_verified_host_cache_entry() {
+    let (temporary, repo) = fixture();
+    let cache = temporary.path().join("host-cache");
+    let planned = plan(&repo);
+    let digest = planned["plan_sha256"].as_str().unwrap();
+    let refreshed: Value = serde_json::from_str(&success(run_with_cache(
+        &repo,
+        &cache,
+        &[
+            "graph",
+            "refresh",
+            "execute",
+            "--repo",
+            ".",
+            "--confirm",
+            digest,
+            "--json",
+        ],
+    )))
+    .unwrap();
+    assert_eq!(refreshed["cache"]["status"], "miss_stored");
+    let cache_key = refreshed["cache"]["key_sha256"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    commit_all(&repo, "commit graph");
+
+    let clone = temporary.path().join("clone");
+    let output = Command::new("git")
+        .args(["clone", "-q"])
+        .arg(&repo)
+        .arg(&clone)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git clone: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let materialized: Value = serde_json::from_str(&success(run_with_cache(
+        &clone,
+        &cache,
+        &["graph", "materialize", "--repo", ".", "--json"],
+    )))
+    .unwrap();
+    assert_eq!(materialized["cache"]["status"], "hit");
+    assert_eq!(materialized["cache"]["key_sha256"], cache_key);
+    assert_eq!(
+        materialized["source_head"],
+        git(&clone, &["rev-parse", "HEAD"])
+    );
+
+    let original_store = repo.join(".aethyme/graph_store.redb");
+    let cloned_store = clone.join(".aethyme/graph_store.redb");
+    assert!(original_store.is_file() && cloned_store.is_file());
+    let overview = success(run(&clone, &["graph", "overview", ".", "--json-output"]));
+    assert!(
+        !overview.contains(&repo.display().to_string()),
+        "cached data must not retain the producer worktree path: {overview}"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        assert_ne!(
+            fs::metadata(original_store).unwrap().ino(),
+            fs::metadata(cloned_store).unwrap().ino(),
+            "worktrees must never share one writable redb inode"
+        );
+    }
 }
 
 #[test]

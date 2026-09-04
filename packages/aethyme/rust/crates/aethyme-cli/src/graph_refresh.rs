@@ -10,15 +10,16 @@ use std::io::Write;
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use aethyme_broker::{Broker, GitRepo, GraphIntegrityStatus, SessionStatus};
 use aethyme_engine::store::redb::graph_store::GraphStore;
 use aethyme_graph_indexer::{IndexerContext, WalkOptions, index_repo_to_disk, link_repo};
 use aethyme_graph_storage::{
     GRAPH_CONFIG_RELPATH, GRAPH_MANIFEST_RELPATH, GraphAuthorityManifest, GraphEntityCounts,
-    GraphIntegrityPolicy, GraphLifecycleObservability, committed_source_tree_digest,
-    graph_fragment_set_digest, read_engine_version, write_graph_authority_manifest,
+    GraphIntegrityPolicy, GraphLifecycleObservability, GraphStoreArtifactCache, GraphStoreCacheKey,
+    committed_source_tree_digest, graph_fragment_set_digest, read_engine_version,
+    write_graph_authority_manifest,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -68,6 +69,7 @@ fn run_inner(args: &[String]) -> Result<(), String> {
                     report.elapsed_ms
                 );
                 render_performance_text(&report.performance);
+                render_cache_text(&report.cache);
             }
             Ok(())
         }
@@ -111,6 +113,7 @@ fn run_inner(args: &[String]) -> Result<(), String> {
                         plan.derived_store.action
                     );
                     render_performance_text(&plan.performance);
+                    render_cache_text(&plan.cache);
                 }
                 Ok(())
             }
@@ -141,6 +144,34 @@ struct GraphMaterializationReport {
     elapsed_ms: u128,
     work: GraphLifecycleWork,
     performance: GraphLifecycleObservability,
+    cache: GraphMaterializationCache,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct GraphMaterializationCache {
+    status: GraphMaterializationCacheStatus,
+    key_sha256: Option<String>,
+    artifact_bytes: u64,
+}
+
+impl Default for GraphMaterializationCache {
+    fn default() -> Self {
+        Self {
+            status: GraphMaterializationCacheStatus::NotNeeded,
+            key_sha256: None,
+            artifact_bytes: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum GraphMaterializationCacheStatus {
+    NotNeeded,
+    Unavailable,
+    Hit,
+    MissStored,
+    MissUnstored,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -205,6 +236,7 @@ struct GraphRefreshPlan {
     next_action: String,
     work: GraphLifecycleWork,
     performance: GraphLifecycleObservability,
+    cache: GraphMaterializationCache,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -767,6 +799,7 @@ fn build_plan(repo_hint: &Path) -> Result<BuiltPlan, String> {
         next_action,
         work,
         performance,
+        cache: GraphMaterializationCache::default(),
     };
     plan.plan_sha256 = plan_digest(&plan)?;
     Ok(BuiltPlan {
@@ -855,6 +888,9 @@ fn materialize(repo_hint: &Path) -> Result<GraphMaterializationReport, String> {
         return Err("committed graph fragments do not match committed HEAD; run `aethyme graph refresh plan --repo . --diff`".into());
     }
     let repository = GitRepo::discover(repo_hint).map_err(|error| error.to_string())?;
+    let _lock = (plan.action != DerivedStoreAction::None)
+        .then(|| acquire_refresh_lock(&repository))
+        .transpose()?;
     let current_head = repository
         .head_commit()
         .map_err(|error| error.to_string())?;
@@ -863,19 +899,8 @@ fn materialize(repo_hint: &Path) -> Result<GraphMaterializationReport, String> {
     }
     let mut file_count = 0;
     let action = plan.action;
+    let mut cache = GraphMaterializationCache::default();
     if action != DerivedStoreAction::None {
-        let materialization_started = std::time::Instant::now();
-        let exact = ExactFragmentRepository::from_committed_files(&plan.committed_files)?;
-        let (mut map, _) = aethyme_engine::map::RepositoryMap::build_from_fragments(&exact.root)?;
-        file_count = map.files.len();
-        plan.performance.counts = graph_counts(&map);
-        plan.performance.redb_materialization.bytes_read = graph_files_bytes(&plan.committed_files);
-        map.snapshot.root = repository
-            .root()
-            .canonicalize()
-            .map_err(|error| format!("resolve graph store target: {error}"))?
-            .to_string_lossy()
-            .into_owned();
         let current_head = repository
             .head_commit()
             .map_err(|error| error.to_string())?;
@@ -884,15 +909,15 @@ fn materialize(repo_hint: &Path) -> Result<GraphMaterializationReport, String> {
                 "repository HEAD moved during graph validation; retry materialization".into(),
             );
         }
-        aethyme_engine::index_store::materialize_graph_store(
+        let observation = materialize_verified_store(
             repository.root(),
-            &map,
             &plan.source_head,
+            &plan.committed_files,
         )?;
-        plan.performance.redb_materialization.elapsed_us =
-            materialization_started.elapsed().as_micros();
-        plan.performance.redb_materialization.bytes_written =
-            file_len(&GraphStore::final_path(repository.root()));
+        file_count = observation.counts.files.unwrap_or(0);
+        plan.performance.counts = observation.counts;
+        plan.performance.redb_materialization = observation.phase;
+        cache = observation.cache;
     } else if let Ok(store) = GraphStore::open_read_only(repository.root())
         && let Ok(Some(metadata)) = store.repo_metadata()
     {
@@ -910,6 +935,7 @@ fn materialize(repo_hint: &Path) -> Result<GraphMaterializationReport, String> {
         elapsed_ms: started.elapsed().as_millis(),
         work: plan.work,
         performance: plan.performance,
+        cache,
     })
 }
 
@@ -943,7 +969,7 @@ fn committed_graph_files(repo: &Path) -> Result<BTreeMap<String, GraphFileBytes>
         repo,
         &["ls-tree", "-r", "-z", "HEAD", "--", ".aethyme/graph"],
     )?;
-    let mut files = BTreeMap::new();
+    let mut entries = Vec::new();
     for row in output
         .split(|byte| *byte == 0)
         .filter(|row| !row.is_empty())
@@ -953,15 +979,116 @@ fn committed_graph_files(repo: &Path) -> Result<BTreeMap<String, GraphFileBytes>
         let (metadata, path) = row
             .split_once('\t')
             .ok_or_else(|| "invalid git ls-tree graph record".to_string())?;
+        let mut metadata = metadata.split_whitespace();
         let mode = metadata
-            .split_whitespace()
             .next()
             .ok_or_else(|| "missing graph file mode".to_string())?
             .to_string();
-        let bytes = git_bytes(repo, &["show", &format!("HEAD:{path}")])?;
-        files.insert(path.to_string(), GraphFileBytes { bytes, mode });
+        let kind = metadata
+            .next()
+            .ok_or_else(|| "missing graph object kind".to_string())?;
+        let oid = metadata
+            .next()
+            .ok_or_else(|| "missing graph object id".to_string())?
+            .to_string();
+        if kind != "blob" || oid.len() < 40 || !oid.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(format!("invalid committed graph object for {path}"));
+        }
+        entries.push((path.to_string(), mode, oid));
+    }
+
+    let blobs = git_blob_batch(repo, entries.iter().map(|(_, _, oid)| oid.as_str()))?;
+    let mut files = BTreeMap::new();
+    for ((path, mode, _), bytes) in entries.into_iter().zip(blobs) {
+        files.insert(path, GraphFileBytes { bytes, mode });
     }
     Ok(files)
+}
+
+fn git_blob_batch<'a>(
+    repo: &Path,
+    object_ids: impl IntoIterator<Item = &'a str>,
+) -> Result<Vec<Vec<u8>>, String> {
+    let object_ids = object_ids
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if object_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut child = Command::new("git")
+        .args(["cat-file", "--batch"])
+        .current_dir(repo)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("git cat-file --batch: {error}"))?;
+    let mut input = child
+        .stdin
+        .take()
+        .ok_or_else(|| "git cat-file --batch stdin is unavailable".to_string())?;
+    let requested_object_ids = object_ids.clone();
+    let writer = std::thread::spawn(move || {
+        for object_id in requested_object_ids {
+            input
+                .write_all(object_id.as_bytes())
+                .and_then(|_| input.write_all(b"\n"))
+                .map_err(|error| format!("write git cat-file batch request: {error}"))?;
+        }
+        Ok::<(), String>(())
+    });
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("wait for git cat-file --batch: {error}"))?;
+    writer
+        .join()
+        .map_err(|_| "git cat-file batch request writer panicked".to_string())??;
+    if !output.status.success() {
+        return Err(format!(
+            "git cat-file --batch: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    let mut offset = 0usize;
+    let mut blobs = Vec::with_capacity(object_ids.len());
+    for expected_oid in object_ids {
+        let header_end = output.stdout[offset..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map(|position| offset + position)
+            .ok_or_else(|| "git cat-file batch response has no header terminator".to_string())?;
+        let header = std::str::from_utf8(&output.stdout[offset..header_end])
+            .map_err(|_| "git cat-file batch response header is not UTF-8".to_string())?;
+        let mut fields = header.split_whitespace();
+        let actual_oid = fields.next().unwrap_or_default();
+        let kind = fields.next().unwrap_or_default();
+        let size = fields
+            .next()
+            .ok_or_else(|| format!("git cat-file omitted size for {expected_oid}"))?
+            .parse::<usize>()
+            .map_err(|_| format!("git cat-file returned invalid size for {expected_oid}"))?;
+        if actual_oid != expected_oid || kind != "blob" || fields.next().is_some() {
+            return Err(format!(
+                "git cat-file returned invalid object for {expected_oid}"
+            ));
+        }
+        let content_start = header_end + 1;
+        let content_end = content_start
+            .checked_add(size)
+            .filter(|end| *end < output.stdout.len())
+            .ok_or_else(|| format!("git cat-file truncated object {expected_oid}"))?;
+        if output.stdout[content_end] != b'\n' {
+            return Err(format!("git cat-file omitted delimiter for {expected_oid}"));
+        }
+        blobs.push(output.stdout[content_start..content_end].to_vec());
+        offset = content_end + 1;
+    }
+    if offset != output.stdout.len() {
+        return Err("git cat-file returned unexpected trailing bytes".into());
+    }
+    Ok(blobs)
 }
 
 fn validate_fragment_authority(
@@ -1256,6 +1383,7 @@ fn plan_digest(plan: &GraphRefreshPlan) -> Result<String, String> {
     // Timing and process memory are evidence from this invocation, never part
     // of the authorization digest for the deterministic proposed tree.
     normalized.performance = GraphLifecycleObservability::default();
+    normalized.cache = GraphMaterializationCache::default();
     let bytes = serde_json::to_vec(&normalized).map_err(|error| error.to_string())?;
     Ok(sha256(&bytes))
 }
@@ -1352,6 +1480,7 @@ fn execute(repo_hint: &Path, confirmation: &str) -> Result<GraphRefreshPlan, Str
     sync_parent(&path)?;
     built.plan.performance.redb_materialization = observation.phase;
     built.plan.performance.counts = observation.counts;
+    built.plan.cache = observation.cache;
     built.plan.performance.finish(started.elapsed().as_micros());
     Ok(built.plan)
 }
@@ -1518,12 +1647,60 @@ fn verify_journal_after(repo: &Path, journal: &GraphRefreshJournal) -> Result<()
 struct GraphStoreMaterialization {
     phase: aethyme_graph_storage::GraphPhaseObservation,
     counts: GraphEntityCounts,
+    cache: GraphMaterializationCache,
 }
 
 fn materialize_exact_store(repo: &Path, head: &str) -> Result<GraphStoreMaterialization, String> {
-    let started = std::time::Instant::now();
     let files = filesystem_graph_files(repo)?;
+    materialize_verified_store(repo, head, &files)
+}
+
+fn materialize_verified_store(
+    repo: &Path,
+    head: &str,
+    files: &BTreeMap<String, GraphFileBytes>,
+) -> Result<GraphStoreMaterialization, String> {
+    let started = std::time::Instant::now();
     let bytes_read = graph_files_bytes(&files);
+    let manifest_bytes = files
+        .get(GRAPH_MANIFEST_RELPATH)
+        .ok_or_else(|| "graph authority manifest is missing during materialization".to_string())?;
+    let manifest = GraphAuthorityManifest::decode(&manifest_bytes.bytes)
+        .map_err(|error| format!("decode graph authority manifest for caching: {error}"))?;
+    let key = GraphStoreCacheKey {
+        source_tree_sha256: manifest.source_tree_sha256,
+        fragment_manifest_sha256: sha256(&manifest_bytes.bytes),
+        engine_version: manifest.engine_version,
+        engine_protocol_version: aethyme_engine::daemon::ENGINE_PROTOCOL_VERSION,
+        storage_schema_version:
+            aethyme_engine::store::redb::graph_store::GRAPH_STORE_SCHEMA_VERSION,
+    };
+    let key_sha256 = key.digest()?;
+    let cache = GraphStoreArtifactCache::for_environment(repo);
+    let entry = cache.as_ref().and_then(|cache| cache.acquire(key).ok());
+    if let Some(entry) = &entry
+        && let Ok(Some(artifact)) = entry.lookup()
+        && let Ok(metadata) = GraphStore::install_cached_artifact(repo, &artifact.path, head)
+    {
+        return Ok(GraphStoreMaterialization {
+            phase: aethyme_graph_storage::GraphPhaseObservation {
+                elapsed_us: started.elapsed().as_micros(),
+                bytes_read: artifact.bytes,
+                bytes_written: file_len(&GraphStore::final_path(repo)),
+            },
+            counts: GraphEntityCounts {
+                files: Some(metadata.file_count as usize),
+                nodes: None,
+                edges: None,
+            },
+            cache: GraphMaterializationCache {
+                status: GraphMaterializationCacheStatus::Hit,
+                key_sha256: Some(key_sha256),
+                artifact_bytes: artifact.bytes,
+            },
+        });
+    }
+
     let exact = ExactFragmentRepository::from_committed_files(&files)?;
     let (mut map, _) = aethyme_engine::map::RepositoryMap::build_from_fragments(&exact.root)?;
     let counts = graph_counts(&map);
@@ -1533,13 +1710,28 @@ fn materialize_exact_store(repo: &Path, head: &str) -> Result<GraphStoreMaterial
         .to_string_lossy()
         .into_owned();
     aethyme_engine::index_store::materialize_graph_store(repo, &map, head)?;
+    let store_path = GraphStore::final_path(repo);
+    let artifact_bytes = file_len(&store_path);
+    let cache_status = match &entry {
+        Some(entry) if entry.store(&store_path).is_ok() => {
+            GraphMaterializationCacheStatus::MissStored
+        }
+        Some(_) => GraphMaterializationCacheStatus::MissUnstored,
+        None if cache.is_some() => GraphMaterializationCacheStatus::MissUnstored,
+        None => GraphMaterializationCacheStatus::Unavailable,
+    };
     Ok(GraphStoreMaterialization {
         phase: aethyme_graph_storage::GraphPhaseObservation {
             elapsed_us: started.elapsed().as_micros(),
             bytes_read,
-            bytes_written: file_len(&GraphStore::final_path(repo)),
+            bytes_written: artifact_bytes,
         },
         counts,
+        cache: GraphMaterializationCache {
+            status: cache_status,
+            key_sha256: Some(key_sha256),
+            artifact_bytes,
+        },
     })
 }
 
@@ -1786,6 +1978,21 @@ fn render_performance_text(performance: &GraphLifecycleObservability) {
     );
 }
 
+fn render_cache_text(cache: &GraphMaterializationCache) {
+    if cache.status != GraphMaterializationCacheStatus::NotNeeded {
+        println!(
+            "  host cache: {:?}{} ({} bytes)",
+            cache.status,
+            cache
+                .key_sha256
+                .as_deref()
+                .map(|key| format!(" {}", short(key)))
+                .unwrap_or_default(),
+            cache.artifact_bytes
+        );
+    }
+}
+
 fn render_change_summary(plan: &GraphRefreshPlan) -> String {
     let mut output = String::from("Graph fragment changes (hash-only; no source content):\n");
     if plan.changes.is_empty() {
@@ -1872,4 +2079,38 @@ fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn batched_blob_reads_do_not_deadlock_when_both_pipes_exceed_capacity() {
+        let temporary = tempfile::tempdir().unwrap();
+        git(temporary.path(), &["init", "-q"]).unwrap();
+
+        let mut child = Command::new("git")
+            .args(["hash-object", "-w", "--stdin"])
+            .current_dir(temporary.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(&vec![b'x'; 2_048])
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success());
+        let oid = String::from_utf8(output.stdout).unwrap().trim().to_string();
+
+        // The request stream and response stream both exceed ordinary pipe
+        // capacities. A write-all-then-read implementation blocks forever.
+        let blobs = git_blob_batch(temporary.path(), vec![oid.as_str(); 4_096]).unwrap();
+        assert_eq!(blobs.len(), 4_096);
+        assert!(blobs.iter().all(|blob| blob.len() == 2_048));
+    }
 }

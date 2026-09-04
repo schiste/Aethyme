@@ -95,3 +95,33 @@ No finding justifies modifying evaluation logic, scorer-facing output, or the
 graph’s correctness contract. Graph generation should remain opt-in while the
 large-repository validation, incremental refresh, footprint, and Explore
 latency issues are addressed.
+
+## Phase 3 cache decision
+
+Phase 3 first replaced one-Git-process-per-artifact validation with one
+binary-safe `git cat-file --batch` stream. The large Playground exposed and
+then gained regression coverage for bidirectional pipe pressure: requests are
+now written while output is consumed, so repositories with thousands of
+fragments cannot deadlock.
+
+The cache comparison used the same `Mockup` source SHA and a fresh isolated
+cache. After batching, cold materialization fell from the Phase 2 observation
+of 393.459 seconds to 20.307 seconds. Installing the same verified store in a
+second clone took 3.533 seconds, while the ordinary already-current no-op took
+2.596 seconds. The cache hit is about 5.7 times faster than rebuilding the
+missing 514 MiB redb and does not affect the cheaper no-op path. A small Python
+sample measured 0.255 seconds cold, 0.136 seconds cached, and 0.103 seconds
+no-op.
+
+That evidence justifies a narrow content-addressed host cache for identical
+committed graph inputs across worktrees. It does not justify shared writable
+redb state: every receiver gets a separately copied, schema-validated,
+worktree-rebound database. The cache key binds source tree, fragment manifest,
+engine version, protocol version, and storage schema. Artifact size and SHA-256
+are verified before use.
+
+The remaining costs preserve the opt-in decision. On the large sample, cold
+refresh took 217.443 seconds and a one-file refresh took 114.048 seconds;
+committed fragments remained 155.6 MiB and the local/cache artifact 514 MiB.
+Incremental fragment generation, compression/packing, cache retention, and
+large-graph Explore latency remain follow-up work before default enrollment.

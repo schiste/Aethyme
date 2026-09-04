@@ -49,6 +49,9 @@ use crate::model::unresolved::UnresolvedNode;
 /// rather than try to migrate.
 const SCHEMA_VERSION: u32 = 8;
 
+/// Public compatibility identity used by the immutable materialization cache.
+pub const GRAPH_STORE_SCHEMA_VERSION: u32 = SCHEMA_VERSION;
+
 /// Single-row metadata table: schema version, build timestamps, repo root, ...
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 
@@ -429,6 +432,78 @@ impl GraphStore {
             }
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// Copy an immutable cached artifact into private staging, validate its
+    /// schema, bind its repository metadata to this worktree, and publish it.
+    /// The shared cache file is never opened writable or hard-linked.
+    pub fn install_cached_artifact(
+        repo_root: &Path,
+        cached_artifact: &Path,
+        source_commit: &str,
+    ) -> Result<RepoMetadata, GraphStoreError> {
+        let cached_metadata = std::fs::symlink_metadata(cached_artifact)?;
+        if !cached_metadata.file_type().is_file() {
+            return Err(invalid_cached_artifact("artifact is not a regular file"));
+        }
+        let canonical = repo_root.canonicalize()?;
+        let staging_path = Self::staging_path(&canonical);
+        if let Some(parent) = staging_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        match std::fs::symlink_metadata(&staging_path) {
+            Ok(metadata) if metadata.file_type().is_file() => {
+                std::fs::remove_file(&staging_path)?;
+            }
+            Ok(_) => {
+                return Err(invalid_cached_artifact(
+                    "staging destination is not a regular file",
+                ));
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        std::fs::copy(cached_artifact, &staging_path)?;
+
+        let store = Self::open_path(staging_path)?;
+        let mut metadata = store
+            .repo_metadata()?
+            .ok_or_else(|| invalid_cached_artifact("repository metadata is missing"))?;
+        let root_path = canonical.to_string_lossy().into_owned();
+        let txn = store.db.begin_write()?;
+        {
+            let mut table = txn.open_table(REPOSITORIES)?;
+            let mut repositories = Vec::new();
+            for row in table.iter()? {
+                let (key, value) = row?;
+                repositories.push((
+                    key.value().to_string(),
+                    bincode::deserialize::<RepositoryNode>(value.value())?,
+                ));
+            }
+            if repositories.len() != 1 {
+                return Err(invalid_cached_artifact(format!(
+                    "expected one repository row, found {}",
+                    repositories.len()
+                )));
+            }
+            for (key, mut repository) in repositories {
+                repository.root_path.clone_from(&root_path);
+                let bytes = bincode::serialize(&repository)?;
+                table.insert(key.as_str(), bytes.as_slice())?;
+            }
+        }
+        txn.commit()?;
+        metadata.root_path = root_path;
+        metadata.commit_hash = Some(source_commit.to_string());
+        metadata.indexed_at_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs() as i64)
+            .unwrap_or(0);
+        store.set_repo_metadata(&metadata)?;
+        drop(store);
+        Self::publish_staging(&canonical)?;
+        Ok(metadata)
     }
 
     fn open_path(db_path: PathBuf) -> Result<Self, GraphStoreError> {
@@ -4860,6 +4935,13 @@ fn open_or_create_database(db_path: &Path) -> Result<Database, GraphStoreError> 
         }
         Err(e) => Err(e.into()),
     }
+}
+
+fn invalid_cached_artifact(reason: impl Into<String>) -> GraphStoreError {
+    GraphStoreError::Io(std::io::Error::new(
+        ErrorKind::InvalidData,
+        format!("invalid cached graph store: {}", reason.into()),
+    ))
 }
 
 fn open_read_only_database(db_path: &Path) -> Result<ReadOnlyDatabase, GraphStoreError> {
