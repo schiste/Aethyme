@@ -4,6 +4,32 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.7.5] - 2026-09-04
+
+### Added
+
+- `aethyme graph materialize --repo .` validates committed graph policy, the
+  engine pin, and fragments against the exact `HEAD`, then atomically builds
+  only the ignored worktree-local redb store. It never changes fragments,
+  accepts no hidden network input, reports elapsed milliseconds in stable
+  JSON, and is a no-op when the store is already current.
+- Opt-in graph enrollment through `aethyme deploy --repo . --with-graph`, with
+  `--graph-repository owner/name` for repositories where no canonical `origin`
+  resolves. Enrollment writes policy plus the exact engine pin and defers all
+  generation until those files have been reviewed and committed.
+
+### Changed
+
+- Graph support is disabled by default; a repository opts in explicitly.
+- `--with-graph` is refused together with `--local-only`, because untracked
+  policy cannot authorize shared committed fragments.
+
+### Upgrade notes
+
+Read [Upgrading to v0.7.5](packages/aethyme/docs/guides/upgrading-to-v0.7.5.md)
+before updating. Broker storage, repository deployment, and engine protocol are
+unchanged from v0.7.4, and graph support stays off unless a repository enrolls.
+
 ## [0.7.4] - 2026-09-04
 
 ### Added
