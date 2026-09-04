@@ -44,8 +44,11 @@ packages/aethyme/rust/target/
 packages/aethyme/.profiling/
 packages/aethyme/dhat-heap.json
 
-# Claude Code per-project runtime files (settings.local.json, scheduled_tasks.lock, etc.)
-.claude/
+# Claude Code per-project runtime files (settings.local.json, hooks, etc.).
+# The generated skills surface is tracked, mirroring .codex/skills/, so the
+# Claude-facing agent policy is reviewable rather than invisible.
+.claude/*
+!.claude/skills/
 
 # aethyme-broker:begin (managed block — do not edit inside)
 .aethyme/broker.db*
