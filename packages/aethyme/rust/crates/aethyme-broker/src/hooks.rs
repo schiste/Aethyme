@@ -469,10 +469,7 @@ fn unprepared_worktree_note(main_root: &Path, worktree: &Path) -> String {
         if name.starts_with('.') || worktree.join(name).exists() {
             continue;
         }
-        if repo
-            .as_ref()
-            .is_some_and(|repo| repo.path_is_ignored(name))
-        {
+        if repo.as_ref().is_some_and(|repo| repo.path_is_ignored(name)) {
             absent.push(name.to_string());
         }
         if absent.len() >= 4 {
@@ -485,7 +482,7 @@ fn unprepared_worktree_note(main_root: &Path, worktree: &Path) -> String {
     absent.sort();
     format!(
         "\nThis worktree lacks ignored path(s) the primary checkout has: {}. \
-         If the gate needs them, declare preparation in .aethyme/preparation.toml \
+         If the gate needs them, declare preparation in .aethyme/prepare.toml \
          or run the repository's setup here; `aethyme broker prepare status \
          --session <id>` reports what is known.",
         absent.join(", ")

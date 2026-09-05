@@ -7,8 +7,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
 
-use aethyme_broker::Gate;
 use aethyme_broker::init::{self, CheckStatus};
+use aethyme_broker::{Gate, ReadinessDimensionId, ReadinessState, RepositoryOperatingMode};
 
 fn sh(cwd: &Path, args: &[&str]) {
     let status = Command::new("git")
@@ -553,6 +553,31 @@ fn guided_init_sets_up_a_fresh_repo_and_second_run_is_a_no_op() {
     let report = init::guided_init(tmp.path()).unwrap();
     assert!(report.certified());
     assert!(report.changed, "first run creates the missing artifacts");
+    assert_eq!(
+        report.readiness.operating_mode,
+        RepositoryOperatingMode::ConflictOnly
+    );
+    for (id, expected) in [
+        (ReadinessDimensionId::Coordination, ReadinessState::Ready),
+        (ReadinessDimensionId::AgentContext, ReadinessState::NotReady),
+        (ReadinessDimensionId::Validation, ReadinessState::Limited),
+        (
+            ReadinessDimensionId::ParallelExecution,
+            ReadinessState::NotReady,
+        ),
+    ] {
+        assert_eq!(
+            report
+                .readiness
+                .dimensions
+                .iter()
+                .find(|dimension| dimension.id == id)
+                .unwrap()
+                .state,
+            expected,
+            "{id:?}"
+        );
+    }
     let scaffold = report.scaffold.as_ref().expect("certification passed");
     for id in [
         "scaffold.config-toml",

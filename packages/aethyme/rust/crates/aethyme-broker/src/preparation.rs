@@ -254,7 +254,7 @@ impl Broker {
                     (
                         reason,
                         Some(
-                            "declare preparation in .aethyme/preparation.toml, or run the \
+                            "declare preparation in .aethyme/prepare.toml, or run the \
                              repository's own setup in this worktree before gating"
                                 .to_string(),
                         ),
@@ -552,7 +552,7 @@ impl Broker {
     }
 }
 
-fn load_config(root: &Path) -> Result<Option<PreparationConfig>, PreparationError> {
+pub(crate) fn load_config(root: &Path) -> Result<Option<PreparationConfig>, PreparationError> {
     let path = root.join(PREPARATION_CONFIG_RELPATH);
     let text = match fs::read_to_string(&path) {
         Ok(text) => text,

@@ -254,6 +254,22 @@ freshness uses the exact source HEAD, committed fragment manifest, content
 digests, pinned engine version, and read-only store metadata rather than file
 timestamps.
 
+`aethyme init` embeds exactly one post-run readiness snapshot in its existing
+JSON document and renders the same concise summary in text. A successful first
+init normally reports `conflict_only`: broker coordination exists, while the
+agent protocol and reviewed validation policy still need deployment. The
+standalone `certify` JSON and exit contract are unchanged.
+
+Successful canonical and local-only `aethyme deploy` runs inspect readiness
+once after verification. Deployment success does not imply
+`parallel_ready`: missing agent context, a missing cheap gate, invalid gates,
+or an absent/invalid `.aethyme/prepare.toml` keeps the truthful lower operating
+mode. A valid preparation contract proves that fresh isolated worktrees have a
+reproducible dependency path. Host-resource storage may remain absent until
+the first resource-aware gate; readiness reports that lazy capability without
+creating it. `aethyme deploy verify` retains its certification-only output and
+exit behavior.
+
 By default, the command exits zero whenever it can produce a report—even for
 an undeployed or invalid repository—so diagnostics remain available. CI must
 choose its policy explicitly:

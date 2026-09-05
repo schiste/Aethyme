@@ -193,7 +193,8 @@ pub use quick_test::{
 pub use readiness::{
     READINESS_SCHEMA_VERSION, ReadinessAction, ReadinessDimension, ReadinessDimensionId,
     ReadinessEvidence, ReadinessFinding, ReadinessReport, ReadinessState, RepositoryOperatingMode,
-    RepositoryReadinessMode, inspect_repository_readiness,
+    RepositoryReadinessMode, inspect_repository_readiness, render_readiness_json,
+    render_readiness_text,
 };
 pub use reconciliation::{
     AutomaticIntegrationCleanupReport, AutomaticIntegrationCleanupState,

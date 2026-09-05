@@ -1,6 +1,6 @@
 # Repository deployment contract
 
-Last Updated: 2026-09-01
+Last Updated: 2026-09-05
 
 Aethyme has two distinct installation scopes:
 
@@ -44,6 +44,40 @@ For an intentionally offline/manual enrollment, `aethyme deploy --repo .`
 continues to scaffold, draft, deploy, verify, and certify the working tree
 without publishing it. The operator is then responsible for reviewing,
 committing, and publishing that tree.
+
+## Read the setup outcome
+
+Setup commands distinguish files written from actual operating readiness.
+`aethyme init` ends with one post-run snapshot. A normal first initialization
+is `conflict_only`: broker storage is ready, but generated agent context and a
+reviewed validation contract are not yet complete. Its `--json` output remains
+one document, with the typed readiness report under `readiness`; it never
+prints an additional JSON value or parses certification prose.
+
+Both canonical and local-only deployment print the same typed summary after a
+successful verification. A successful deploy may still report
+`conflict_only` or `agent_ready`. It reports `parallel_ready` only when agent
+context is current, a cheap valid gate exists, broker state is healthy, and a
+valid `.aethyme/prepare.toml` declares reproducible preparation for isolated
+worktrees. Missing host-resource storage is safe: the first resource-aware
+gate initializes it, while readiness remains read-only.
+
+Disabled graphing appears as:
+
+```text
+Graph: disabled by repository policy; no action required.
+```
+
+This does not lower the operating mode. Use the standalone CI gate when a
+specific level is mandatory:
+
+```bash
+aethyme broker readiness --require parallel-ready --json
+```
+
+`aethyme certify` and `aethyme deploy verify` retain their existing output and
+exit contracts. They verify deterministic facts; they do not silently become
+readiness policy gates.
 
 ## Review the policy
 

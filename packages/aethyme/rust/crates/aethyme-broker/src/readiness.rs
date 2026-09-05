@@ -39,6 +39,16 @@ impl ReadinessState {
             Self::NotApplicable => "not_applicable",
         }
     }
+
+    fn human_label(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::Limited => "limited",
+            Self::NotReady => "not ready",
+            Self::Unknown => "unknown",
+            Self::NotApplicable => "not applicable",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -126,6 +136,18 @@ impl ReadinessDimensionId {
             Self::UpgradeCompatibility => "upgrade-compatibility",
         }
     }
+
+    fn human_label(self) -> &'static str {
+        match self {
+            Self::RepositoryDeployment => "Repository deployment",
+            Self::Coordination => "Coordination",
+            Self::AgentContext => "Agent context",
+            Self::Validation => "Validation",
+            Self::ParallelExecution => "Parallel execution",
+            Self::GraphAvailability => "Graph",
+            Self::UpgradeCompatibility => "Upgrade compatibility",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -211,6 +233,96 @@ impl ReadinessReport {
     }
 }
 
+/// Render the stable, agent-facing readiness summary shared by the standalone
+/// inspector and setup commands. Detailed evidence remains available in JSON.
+pub fn render_readiness_text(report: &ReadinessReport) -> String {
+    let mut lines = vec![format!(
+        "Operating mode: {}",
+        report.operating_mode.as_str()
+    )];
+    for id in [
+        ReadinessDimensionId::Coordination,
+        ReadinessDimensionId::AgentContext,
+        ReadinessDimensionId::Validation,
+        ReadinessDimensionId::ParallelExecution,
+    ] {
+        if let Some(dimension) = report
+            .dimensions
+            .iter()
+            .find(|dimension| dimension.id == id)
+        {
+            lines.push(format!(
+                "{}: {}",
+                id.human_label(),
+                dimension.state.human_label()
+            ));
+        }
+    }
+
+    if let Some(graph) = report
+        .dimensions
+        .iter()
+        .find(|dimension| dimension.id == ReadinessDimensionId::GraphAvailability)
+    {
+        if graph.state == ReadinessState::NotApplicable {
+            lines.push("Graph: disabled by repository policy; no action required.".into());
+        } else {
+            lines.push(format!(
+                "Graph: {} — {}",
+                graph.state.human_label(),
+                graph.summary
+            ));
+        }
+    }
+
+    let mandatory = [
+        ReadinessDimensionId::Coordination,
+        ReadinessDimensionId::AgentContext,
+        ReadinessDimensionId::Validation,
+        ReadinessDimensionId::ParallelExecution,
+    ];
+    if mandatory.iter().all(|id| {
+        report
+            .dimensions
+            .iter()
+            .find(|dimension| dimension.id == *id)
+            .is_some_and(|dimension| dimension.state == ReadinessState::Ready)
+    }) {
+        lines.push(String::new());
+        lines.push("All mandatory agent-readiness dimensions are ready.".into());
+    }
+
+    let mut actions = Vec::<String>::new();
+    for dimension in &report.dimensions {
+        if matches!(
+            dimension.state,
+            ReadinessState::Ready | ReadinessState::NotApplicable
+        ) {
+            continue;
+        }
+        for remediation in &dimension.remediation {
+            let rendered = match &remediation.command {
+                Some(command) => format!("{}: `{command}`", remediation.summary),
+                None => remediation.summary.clone(),
+            };
+            if !actions.contains(&rendered) {
+                actions.push(rendered);
+            }
+        }
+    }
+    if !actions.is_empty() {
+        lines.push(String::new());
+        lines.push("Next actions:".into());
+        lines.extend(actions.into_iter().map(|action| format!("- {action}")));
+    }
+    lines.push(String::new());
+    lines.join("\n")
+}
+
+pub fn render_readiness_json(report: &ReadinessReport) -> Result<String, serde_json::Error> {
+    serde_json::to_string_pretty(report)
+}
+
 /// Inspect repository and coordination readiness without creating or
 /// refreshing repository, broker, lease, graph, or host state.
 pub fn inspect_repository_readiness(repo_hint: &Path) -> ReadinessReport {
@@ -247,6 +359,7 @@ pub fn inspect_repository_readiness(repo_hint: &Path) -> ReadinessReport {
         .map(|contract| contract.deployment_state_digest.clone());
     let broker = inspect_broker_state(repository.main_root());
     let gates = inspect_gates(root);
+    let preparation = inspect_preparation(root);
     let dimensions = vec![
         deployment_dimension(
             &facts,
@@ -258,7 +371,7 @@ pub fn inspect_repository_readiness(repo_hint: &Path) -> ReadinessReport {
         coordination_dimension(&broker),
         agent_context_dimension(&facts, root),
         validation_dimension(&gates),
-        parallel_dimension(&broker, &gates),
+        parallel_dimension(&broker, &gates, &preparation),
         graph_dimension(root, source_head.as_deref()),
         upgrade_dimension(repository_mode, &contract),
     ];
@@ -277,6 +390,13 @@ enum BrokerStateInspection {
 enum GateInspection {
     Missing,
     Ready { total: usize, cheap: usize },
+    Invalid(String),
+}
+
+#[derive(Debug)]
+enum PreparationInspection {
+    Missing,
+    Ready { steps: usize, hook_steps: usize },
     Invalid(String),
 }
 
@@ -324,6 +444,21 @@ fn inspect_gates(root: &Path) -> GateInspection {
     }
 }
 
+fn inspect_preparation(root: &Path) -> PreparationInspection {
+    match crate::preparation::load_config(root) {
+        Ok(None) => PreparationInspection::Missing,
+        Ok(Some(config)) => PreparationInspection::Ready {
+            steps: config.steps.len(),
+            hook_steps: config
+                .steps
+                .iter()
+                .filter(|step| step.required_for_hooks)
+                .count(),
+        },
+        Err(error) => PreparationInspection::Invalid(error.to_string()),
+    }
+}
+
 fn deployment_dimension(
     facts: &CertificationFacts,
     repository_mode: RepositoryReadinessMode,
@@ -353,8 +488,8 @@ fn deployment_dimension(
             "Aethyme is not deployed in this repository",
             Vec::new(),
             vec![action(
-                "Review a repository deployment",
-                Some("aethyme deploy --repo . --plan"),
+                "Deploy the generated agent protocol",
+                Some("aethyme deploy --repo ."),
             )],
         );
     }
@@ -553,6 +688,7 @@ fn validation_dimension(gates: &GateInspection) -> ReadinessDimension {
 fn parallel_dimension(
     broker: &BrokerStateInspection,
     gates: &GateInspection,
+    preparation: &PreparationInspection,
 ) -> ReadinessDimension {
     if !matches!(broker, BrokerStateInspection::Ready { .. }) {
         return dimension_with(
@@ -572,15 +708,38 @@ fn parallel_dimension(
     if !matches!(gates, GateInspection::Ready { .. }) {
         return dimension_with(
             ReadinessDimensionId::ParallelExecution,
-            if matches!(gates, GateInspection::Invalid(_)) {
-                ReadinessState::NotReady
-            } else {
-                ReadinessState::Limited
-            },
+            ReadinessState::NotReady,
             "parallel validation requires valid gate definitions",
             Vec::new(),
             Vec::new(),
         );
+    }
+    match preparation {
+        PreparationInspection::Missing => {
+            return dimension_with(
+                ReadinessDimensionId::ParallelExecution,
+                ReadinessState::NotReady,
+                "fresh worktrees are not proven ready to execute repository gates",
+                vec![evidence(
+                    "dependency-preparation",
+                    "validation gates exist but .aethyme/prepare.toml is not declared",
+                )],
+                vec![action(
+                    "Declare reproducible dependency preparation for isolated worktrees",
+                    Some("aethyme broker prepare status --session <id>"),
+                )],
+            );
+        }
+        PreparationInspection::Invalid(reason) => {
+            return dimension_with(
+                ReadinessDimensionId::ParallelExecution,
+                ReadinessState::NotReady,
+                "dependency preparation policy is invalid",
+                vec![evidence("dependency-preparation", reason.clone())],
+                vec![action("Repair .aethyme/prepare.toml", None)],
+            );
+        }
+        PreparationInspection::Ready { .. } => {}
     }
     let host_path = match default_host_resource_db_path() {
         Ok(path) => path,
@@ -595,16 +754,27 @@ fn parallel_dimension(
         }
     };
     match std::fs::symlink_metadata(&host_path) {
-        Err(error) if error.kind() == ErrorKind::NotFound => dimension_with(
-            ReadinessDimensionId::ParallelExecution,
-            ReadinessState::Limited,
-            "host resource state is absent and was not created",
-            vec![evidence(
-                "host-state",
-                "the first resource-aware gate run will initialize host coordination",
-            )],
-            Vec::new(),
-        ),
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            let PreparationInspection::Ready { steps, hook_steps } = preparation else {
+                unreachable!()
+            };
+            dimension_with(
+                ReadinessDimensionId::ParallelExecution,
+                ReadinessState::Ready,
+                "isolated worktree preparation and lazy host coordination are available",
+                vec![
+                    evidence(
+                        "dependency-preparation",
+                        format!("{steps} declared step(s); {hook_steps} required by hooks"),
+                    ),
+                    evidence(
+                        "host-state",
+                        "the first resource-aware gate run will initialize host coordination",
+                    ),
+                ],
+                Vec::new(),
+            )
+        }
         Err(error) => dimension_with(
             ReadinessDimensionId::ParallelExecution,
             ReadinessState::Unknown,
@@ -620,13 +790,21 @@ fn parallel_dimension(
             Vec::new(),
         ),
         Ok(_) => match HostResourceCoordinator::open_read_only(&host_path) {
-            Ok(_) => dimension_with(
-                ReadinessDimensionId::ParallelExecution,
-                ReadinessState::Ready,
-                "host resource coordination is available without mutation",
-                Vec::new(),
-                Vec::new(),
-            ),
+            Ok(_) => {
+                let PreparationInspection::Ready { steps, hook_steps } = preparation else {
+                    unreachable!()
+                };
+                dimension_with(
+                    ReadinessDimensionId::ParallelExecution,
+                    ReadinessState::Ready,
+                    "isolated worktree preparation and host resource coordination are available",
+                    vec![evidence(
+                        "dependency-preparation",
+                        format!("{steps} declared step(s); {hook_steps} required by hooks"),
+                    )],
+                    Vec::new(),
+                )
+            }
             Err(error) => dimension_with(
                 ReadinessDimensionId::ParallelExecution,
                 ReadinessState::Unknown,
@@ -872,9 +1050,6 @@ fn classify_operating_mode(
     repository_mode: RepositoryReadinessMode,
     dimensions: &[ReadinessDimension],
 ) -> RepositoryOperatingMode {
-    if repository_mode == RepositoryReadinessMode::Absent {
-        return RepositoryOperatingMode::Undeployed;
-    }
     let state = |id| {
         dimensions
             .iter()
@@ -882,6 +1057,13 @@ fn classify_operating_mode(
             .map(|dimension| dimension.state)
             .unwrap_or(ReadinessState::Unknown)
     };
+    if repository_mode == RepositoryReadinessMode::Absent {
+        return if state(ReadinessDimensionId::Coordination) == ReadinessState::Ready {
+            RepositoryOperatingMode::ConflictOnly
+        } else {
+            RepositoryOperatingMode::Undeployed
+        };
+    }
     if matches!(
         state(ReadinessDimensionId::RepositoryDeployment),
         ReadinessState::NotReady
@@ -978,6 +1160,23 @@ mod tests {
         );
         assert_eq!(absent.operating_mode, RepositoryOperatingMode::Undeployed);
 
+        let mut initialized = dimensions(ReadinessState::Unknown);
+        initialized
+            .iter_mut()
+            .find(|item| item.id == ReadinessDimensionId::Coordination)
+            .unwrap()
+            .state = ReadinessState::Ready;
+        let initialized = ReadinessReport::from_dimensions(
+            RepositoryReadinessMode::Absent,
+            None,
+            None,
+            initialized,
+        );
+        assert_eq!(
+            initialized.operating_mode,
+            RepositoryOperatingMode::ConflictOnly
+        );
+
         let mut agent = dimensions(ReadinessState::Limited);
         for id in [
             ReadinessDimensionId::RepositoryDeployment,
@@ -1002,6 +1201,59 @@ mod tests {
         assert_eq!(
             parallel.operating_mode,
             RepositoryOperatingMode::ParallelReady
+        );
+    }
+
+    #[test]
+    fn shared_text_renderer_is_compact_and_excludes_optional_graph_actions() {
+        let report = ReadinessReport::from_dimensions(
+            RepositoryReadinessMode::Canonical,
+            None,
+            None,
+            vec![
+                dimension(
+                    ReadinessDimensionId::RepositoryDeployment,
+                    ReadinessState::Ready,
+                ),
+                dimension(ReadinessDimensionId::Coordination, ReadinessState::Ready),
+                ReadinessDimension {
+                    id: ReadinessDimensionId::AgentContext,
+                    state: ReadinessState::NotReady,
+                    summary: "agent context missing".into(),
+                    evidence: Vec::new(),
+                    remediation: vec![action(
+                        "Deploy the generated agent protocol",
+                        Some("aethyme deploy --repo ."),
+                    )],
+                },
+                dimension(ReadinessDimensionId::Validation, ReadinessState::Limited),
+                dimension(
+                    ReadinessDimensionId::ParallelExecution,
+                    ReadinessState::NotReady,
+                ),
+                ReadinessDimension {
+                    id: ReadinessDimensionId::GraphAvailability,
+                    state: ReadinessState::NotApplicable,
+                    summary: "disabled".into(),
+                    evidence: Vec::new(),
+                    remediation: vec![action("Optional graph action", None)],
+                },
+                dimension(
+                    ReadinessDimensionId::UpgradeCompatibility,
+                    ReadinessState::Ready,
+                ),
+            ],
+        );
+        let text = render_readiness_text(&report);
+        assert!(text.starts_with("Operating mode: conflict_only\n"));
+        assert!(text.contains("Agent context: not ready\n"));
+        assert!(text.contains("Graph: disabled by repository policy; no action required.\n"));
+        assert!(text.contains("- Deploy the generated agent protocol: `aethyme deploy --repo .`"));
+        assert!(!text.contains("Optional graph action"));
+        assert_eq!(
+            serde_json::from_str::<ReadinessReport>(&render_readiness_json(&report).unwrap())
+                .unwrap(),
+            report
         );
     }
 

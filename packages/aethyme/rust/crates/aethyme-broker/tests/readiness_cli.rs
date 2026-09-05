@@ -63,6 +63,15 @@ fn readiness_json(root: &Path, host_state: &Path) -> (Output, ReadinessReport) {
     (output, report)
 }
 
+fn run_broker(root: &Path, host_state: &Path, args: &[&str]) -> Output {
+    Command::new(CLI)
+        .args(args)
+        .current_dir(root)
+        .env("AETHYME_HOST_STATE_DIR", host_state)
+        .output()
+        .expect("run broker CLI")
+}
+
 fn dimension(
     report: &ReadinessReport,
     id: ReadinessDimensionId,
@@ -92,6 +101,14 @@ fn write_valid_gates(root: &Path) {
     .unwrap();
 }
 
+fn write_valid_preparation(root: &Path) {
+    std::fs::write(
+        root.join(".aethyme/prepare.toml"),
+        "schema_version = 1\n\n[[steps]]\nname = \"dependencies\"\ncommand = [\"true\"]\noutputs = [\".prepared\"]\nrequired_for_hooks = true\n",
+    )
+    .unwrap();
+}
+
 fn initialize_host_state(state: &Path) {
     let path = state.join("host-resources.db");
     drop(HostResourceCoordinator::open(&path).expect("initialize host resource state"));
@@ -100,6 +117,7 @@ fn initialize_host_state(state: &Path) {
 fn canonical_ready_fixture(root: &Path, state: &Path) {
     write_canonical_contract(root, aethyme_broker::REPOSITORY_SCHEMA_VERSION);
     write_valid_gates(root);
+    write_valid_preparation(root);
     aethyme_broker::init::scaffold(root).unwrap();
     aethyme_enhance::deploy::deploy(root, true).unwrap();
     initialize_host_state(state);
@@ -132,6 +150,7 @@ fn conflict_only_and_full_parallel_readiness_are_distinct() {
     );
 
     write_valid_gates(repo.path());
+    write_valid_preparation(repo.path());
     aethyme_broker::init::scaffold(repo.path()).unwrap();
     aethyme_enhance::deploy::deploy(repo.path(), true).unwrap();
     initialize_host_state(&state);
@@ -165,6 +184,49 @@ fn conflict_only_and_full_parallel_readiness_are_distinct() {
 }
 
 #[test]
+fn guided_init_reports_one_post_run_readiness_snapshot() {
+    let text_repo = init_repo();
+    let text_state = host_state_path(text_repo.path());
+    let text = run_broker(text_repo.path(), &text_state, &["init"]);
+    assert!(
+        text.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&text.stdout),
+        String::from_utf8_lossy(&text.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&text.stdout);
+    assert!(stdout.contains("Repository initialized."));
+    assert_eq!(stdout.matches("Operating mode:").count(), 1);
+    assert!(stdout.contains("Operating mode: conflict_only"));
+    assert!(stdout.contains("Coordination: ready"));
+    assert!(stdout.contains("Agent context: not ready"));
+    assert!(stdout.contains("Validation: limited"));
+    assert!(stdout.contains("Parallel execution: not ready"));
+    assert!(stdout.contains("Next actions:"));
+
+    let json_repo = init_repo();
+    let json_state = host_state_path(json_repo.path());
+    let json = run_broker(json_repo.path(), &json_state, &["init", "--json"]);
+    assert!(json.status.success());
+    let document: serde_json::Value = serde_json::from_slice(&json.stdout)
+        .expect("--json emits exactly one JSON document with no prose");
+    assert_eq!(document["readiness"]["operating_mode"], "conflict_only");
+    let json_text = String::from_utf8(json.stdout).unwrap();
+    let positions = ["certify", "scaffold", "gates", "changed", "readiness"]
+        .map(|field| json_text.find(&format!("\n  \"{field}\":")).unwrap());
+    assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+
+    let certify_repo = init_repo();
+    let certify = run_broker(
+        certify_repo.path(),
+        &host_state_path(certify_repo.path()),
+        &["certify", "--json"],
+    );
+    let certify_document: serde_json::Value = serde_json::from_slice(&certify.stdout).unwrap();
+    assert!(certify_document.get("readiness").is_none());
+}
+
+#[test]
 fn local_only_deployment_is_reported_without_canonicalizing_it() {
     let repo = init_repo();
     let state = host_state_path(repo.path());
@@ -180,6 +242,7 @@ fn local_only_deployment_is_reported_without_canonicalizing_it() {
     .unwrap();
     std::fs::write(repo.path().join(".aethyme/config.toml"), "schema = 1\n").unwrap();
     write_valid_gates(repo.path());
+    write_valid_preparation(repo.path());
     aethyme_broker::init::scaffold_local(repo.path()).unwrap();
     initialize_host_state(&state);
 
@@ -233,7 +296,7 @@ fn missing_and_inaccessible_host_state_remain_observational() {
     let (_, missing) = readiness_json(repo.path(), &missing_state);
     assert_eq!(
         dimension(&missing, ReadinessDimensionId::ParallelExecution).state,
-        ReadinessState::Limited
+        ReadinessState::Ready
     );
     assert!(!missing_state.join("host-resources.db").exists());
 
@@ -243,6 +306,39 @@ fn missing_and_inaccessible_host_state_remain_observational() {
     assert_eq!(
         dimension(&inaccessible, ReadinessDimensionId::ParallelExecution).state,
         ReadinessState::Unknown
+    );
+}
+
+#[test]
+fn missing_or_invalid_preparation_prevents_false_parallel_readiness() {
+    let repo = init_repo();
+    let state = host_state_path(repo.path());
+    write_canonical_contract(repo.path(), aethyme_broker::REPOSITORY_SCHEMA_VERSION);
+    write_valid_gates(repo.path());
+    aethyme_broker::init::scaffold(repo.path()).unwrap();
+    aethyme_enhance::deploy::deploy(repo.path(), true).unwrap();
+    initialize_host_state(&state);
+
+    let (_, missing) = readiness_json(repo.path(), &state);
+    let parallel = dimension(&missing, ReadinessDimensionId::ParallelExecution);
+    assert_eq!(parallel.state, ReadinessState::NotReady);
+    assert!(parallel.summary.contains("not proven"));
+    assert!(
+        parallel
+            .evidence
+            .iter()
+            .any(|evidence| evidence.summary.contains(".aethyme/prepare.toml"))
+    );
+
+    std::fs::write(
+        repo.path().join(".aethyme/prepare.toml"),
+        "schema_version = 99\nsteps = []\n",
+    )
+    .unwrap();
+    let (_, invalid) = readiness_json(repo.path(), &state);
+    assert_eq!(
+        dimension(&invalid, ReadinessDimensionId::ParallelExecution).state,
+        ReadinessState::NotReady
     );
 }
 

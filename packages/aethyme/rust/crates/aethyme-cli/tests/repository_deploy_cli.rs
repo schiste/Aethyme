@@ -157,6 +157,9 @@ fn deploy_enrolls_and_verifies_a_repository_without_a_source_checkout() {
     assert!(stdout.contains("Optional local Claude integration:"));
     assert!(stdout.contains("settings.local.json (machine-local; never commit)"));
     assert!(stdout.contains("graph authority disabled (optional)"));
+    assert!(stdout.contains("Operating mode: conflict_only"));
+    assert!(stdout.contains("Validation: limited"));
+    assert!(stdout.contains("Graph: disabled by repository policy; no action required."));
 
     let verified = command(&repo)
         .args(["deploy", "verify", "--repo"])
@@ -167,6 +170,49 @@ fn deploy_enrolls_and_verifies_a_repository_without_a_source_checkout() {
         verified.status.success(),
         "{}",
         String::from_utf8_lossy(&verified.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&verified.stdout).contains("Operating mode:"),
+        "deploy verify keeps its existing certification-only output contract"
+    );
+}
+
+#[test]
+fn complete_deployment_reports_parallel_ready_without_materializing_host_state() {
+    let temp = tmp_dir();
+    let repo = repository(temp.path());
+    fs::create_dir_all(repo.join(".aethyme")).unwrap();
+    fs::write(
+        repo.join(".aethyme/gates.toml"),
+        "[[gate]]\nname = \"fast\"\ncommand = \"true\"\ncost = 0\n",
+    )
+    .unwrap();
+    fs::write(
+        repo.join(".aethyme/prepare.toml"),
+        "schema_version = 1\n\n[[steps]]\nname = \"dependencies\"\ncommand = [\"true\"]\noutputs = [\".prepared\"]\nrequired_for_hooks = true\n",
+    )
+    .unwrap();
+    let host_state = repo.join("host-state");
+
+    let deployed = command(&repo)
+        .env("AETHYME_HOST_STATE_DIR", &host_state)
+        .args(["deploy", "--repo"])
+        .arg(&repo)
+        .output()
+        .unwrap();
+    assert!(
+        deployed.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&deployed.stdout),
+        String::from_utf8_lossy(&deployed.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&deployed.stdout);
+    assert!(stdout.contains("Operating mode: parallel_ready"));
+    assert!(stdout.contains("All mandatory agent-readiness dimensions are ready."));
+    assert!(stdout.contains("Graph: disabled by repository policy; no action required."));
+    assert!(
+        !host_state.exists(),
+        "readiness must not materialize lazy host coordination state"
     );
 }
 
@@ -397,6 +443,9 @@ fn local_only_activation_is_clean_and_does_not_follow_a_clone() {
         String::from_utf8_lossy(&activated.stdout),
         String::from_utf8_lossy(&activated.stderr)
     );
+    let activated_stdout = String::from_utf8_lossy(&activated.stdout);
+    assert!(activated_stdout.contains("Operating mode: conflict_only"));
+    assert!(activated_stdout.contains("Graph: disabled by repository policy; no action required."));
     assert!(repo.join(".aethyme/local/enabled").is_file());
     let policy = fs::read_to_string(repo.join(".aethyme/local/AGENTS.md")).unwrap();
     assert!(policy.contains("## Broker Coordination"));

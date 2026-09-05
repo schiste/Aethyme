@@ -453,6 +453,10 @@ pub struct GuidedInitReport {
     /// True when this run wrote anything at all; a second invocation on
     /// the same repository must report `false`.
     pub changed: bool,
+    /// One post-run, read-only readiness snapshot. This is captured after
+    /// every phase that was allowed to run and is the authority for both
+    /// text and JSON setup outcomes.
+    pub readiness: crate::ReadinessReport,
 }
 
 impl GuidedInitReport {
@@ -476,6 +480,7 @@ pub fn guided_init(repo_hint: &Path) -> Result<GuidedInitReport, BrokerOpError> 
             scaffold: None,
             gates: None,
             changed: false,
+            readiness: crate::inspect_repository_readiness(repo_hint),
         });
     }
     let repo = crate::GitRepo::discover(repo_hint).map_err(BrokerOpError::Git)?;
@@ -497,6 +502,7 @@ pub fn guided_init(repo_hint: &Path) -> Result<GuidedInitReport, BrokerOpError> 
         scaffold: Some(scaffold),
         gates,
         changed,
+        readiness: crate::inspect_repository_readiness(repo_hint),
     })
 }
 

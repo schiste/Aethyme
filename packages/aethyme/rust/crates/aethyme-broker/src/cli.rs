@@ -1154,20 +1154,6 @@ mod tests {
     }
 
     #[test]
-    fn init_next_steps_names_deploy_before_quick_test_start_and_submit() {
-        let message = super::init_next_steps_message();
-        let deploy = message.find("aethyme deploy --repo .").unwrap();
-        let quick_test = message.find("aethyme broker quick-test").unwrap();
-        let start = message.find("aethyme broker start").unwrap();
-        let submit = message
-            .find("aethyme broker submit --session <id>")
-            .unwrap();
-        assert!(deploy < quick_test);
-        assert!(quick_test < start);
-        assert!(start < submit);
-    }
-
-    #[test]
     fn parse_accepts_explicit_doctor_version_fix() {
         let args = vec!["doctor".to_string(), "--fix-version".to_string()];
         let parsed = match super::parse(&args) {
@@ -2015,43 +2001,9 @@ fn aethyme_gates_load(main_root: &std::path::Path) -> Result<Vec<crate::Gate>, U
 
 fn render_readiness_report(report: &crate::ReadinessReport, json: bool) -> Result<(), UsageError> {
     if json {
-        out!("{}", serde_json::to_string_pretty(report)?);
-        return Ok(());
-    }
-    out!(
-        "Repository readiness: {} ({})",
-        report.operating_mode.as_str(),
-        report.repository_mode.as_str()
-    );
-    if let Some(head) = report.source_head.as_deref() {
-        out!("Source HEAD: {}", short_sha(head));
-    }
-    for dimension in &report.dimensions {
-        out!(
-            "{:<14} {:<22} {}",
-            dimension.state.as_str(),
-            dimension.id.as_str(),
-            dimension.summary
-        );
-        for evidence in &dimension.evidence {
-            out!("  evidence {}: {}", evidence.id, evidence.summary);
-        }
-        for remediation in &dimension.remediation {
-            out!("  next: {}", remediation.summary);
-            if let Some(command) = &remediation.command {
-                out!("        {command}");
-            }
-        }
-    }
-    if report.blockers.is_empty() {
-        out!("Blockers: none");
+        out!("{}", crate::render_readiness_json(report)?);
     } else {
-        out!("Blockers: {}", report.blockers.len());
-    }
-    if report.warnings.is_empty() {
-        out!("Warnings: none");
-    } else {
-        out!("Warnings: {}", report.warnings.len());
+        out!("{}", crate::render_readiness_text(report).trim_end());
     }
     Ok(())
 }
@@ -2357,13 +2309,6 @@ fn render_quick_test_report(report: &crate::QuickTestReport, json: bool) -> Resu
         out!("integration head: {}", &head[..12.min(head.len())]);
     }
     Ok(())
-}
-
-fn init_next_steps_message() -> &'static str {
-    "First-time flow: install -> `aethyme deploy --repo .` -> `aethyme broker hooks install` -> `aethyme broker quick-test` -> \
-     `aethyme broker start --task \"...\"` -> `aethyme broker submit --session <id>`.\n\
-     This low-level init configured broker state only. Run `aethyme deploy --repo .` \
-     now to install mandatory agent policy and certify the complete deployment."
 }
 
 fn print_overlap_warnings(overlaps: &[crate::Overlap]) {
@@ -8102,7 +8047,13 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                          (init is idempotent)."
                     );
                 }
-                out!("{}", init_next_steps_message());
+                out!();
+                out!("Repository initialized.");
+                out!();
+                out!(
+                    "{}",
+                    crate::render_readiness_text(&report.readiness).trim_end()
+                );
             }
             if !report.certified() {
                 return Err(UsageError::Message("initialization failed".into()));

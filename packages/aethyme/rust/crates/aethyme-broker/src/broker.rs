@@ -2879,10 +2879,7 @@ impl Broker {
         let Some((upstream_ref, upstream_head)) = self.repo.tracking_upstream() else {
             return (None, None);
         };
-        let behind = self
-            .repo
-            .commit_count_between(commit, &upstream_head)
-            .ok();
+        let behind = self.repo.commit_count_between(commit, &upstream_head).ok();
         (behind, Some(upstream_ref))
     }
 
