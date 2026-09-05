@@ -1,6 +1,6 @@
 # CLI Reference
 
-Last Updated: 2026-08-24
+Last Updated: 2026-09-05
 
 ## Install
 
@@ -59,6 +59,7 @@ product surface.
 - `aethyme deploy --local-only`
 - `aethyme init`
 - `aethyme certify`
+- `aethyme broker readiness`
 - `aethyme broker status`
 - `aethyme broker start`
 - `aethyme broker adopt`
@@ -224,8 +225,53 @@ legacy `.aethyme/worktrees/` location and reports the exact fallback reason in
 text and JSON. Explicit environment overrides fail closed instead of silently
 falling back. Existing legacy sessions remain cleanup-compatible.
 
+### Repository readiness
+
+`aethyme broker readiness` interprets deterministic repository and broker
+facts into an agent-readiness outcome. It complements `aethyme certify`:
+certification retains its stable pass/warn/fail fact contract, while readiness
+groups those facts into seven typed dimensions:
+
+- repository deployment;
+- coordination;
+- agent context;
+- validation;
+- parallel execution;
+- graph availability;
+- upgrade compatibility.
+
+The resulting operating mode is one of `undeployed`, `conflict_only`,
+`agent_ready`, `parallel_ready`, or `invalid`. Canonical, local-only, and absent
+repository deployments remain distinct in JSON. Disabled graphing is
+`not_applicable`, not a warning or blocker; opt in voluntarily with
+`aethyme deploy --repo . --with-graph`.
+
+Readiness is an offline, read-only inspection. It does not create missing
+broker or host databases, migrate storage, refresh sessions or leases, write
+telemetry, materialize graphs, or contact a remote. Inaccessible host state is
+reported as `unknown` while repository-local dimensions continue. Graph
+freshness uses the exact source HEAD, committed fragment manifest, content
+digests, pinned engine version, and read-only store metadata rather than file
+timestamps.
+
+By default, the command exits zero whenever it can produce a report—even for
+an undeployed or invalid repository—so diagnostics remain available. CI must
+choose its policy explicitly:
+
+```bash
+aethyme broker readiness --require conflict-only
+aethyme broker readiness --require agent-ready
+aethyme broker readiness --require parallel-ready --json
+```
+
+An unmet `--require` level exits 1 after printing the complete report. Bad
+invocation, including an unknown level, follows the normal CLI usage-error
+contract. The JSON schema begins at version 1 and keeps report fields,
+dimensions, blockers, and warnings in deterministic order.
+
 - `aethyme init`
 - `aethyme certify`
+- `aethyme broker readiness [--require <conflict-only|agent-ready|parallel-ready>] [--json]`
 - `aethyme broker status [--json]`
 - `aethyme broker worktree-root [--json]`
 - `aethyme broker start --task "..." [--path <repo-path>]... [--json]`

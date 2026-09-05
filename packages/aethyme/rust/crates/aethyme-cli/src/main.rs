@@ -149,7 +149,8 @@ fn broker_command_capability(args: &[String]) -> repository_upgrade::CommandCapa
         | (Some("review"), Some("show"))
         | (
             Some(
-                "handoff" | "queue" | "status" | "agents" | "metrics" | "certify" | "worktree-root",
+                "handoff" | "queue" | "status" | "agents" | "metrics" | "certify" | "readiness"
+                | "worktree-root",
             ),
             _,
         )
@@ -745,6 +746,10 @@ mod compatibility_command_tests {
     fn parsed_commands_cover_every_compatibility_capability() {
         let cases = [
             (&["broker", "status"][..], CommandCapability::DiagnosticRead),
+            (
+                &["broker", "readiness", "--require", "agent-ready"][..],
+                CommandCapability::DiagnosticRead,
+            ),
             (
                 &["broker", "integration", "reconcile", "--apply"][..],
                 CommandCapability::RecoveryWrite,

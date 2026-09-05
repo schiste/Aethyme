@@ -25,7 +25,7 @@
 //! timestamps and no absolute paths; report ordering is fixed.
 
 use std::fmt::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::broker::{Broker, BrokerOpError};
 
@@ -71,13 +71,50 @@ impl InitReport {
     }
 }
 
-/// The certification method: read-only, deterministic checks only.
-pub fn certify(repo_hint: &Path) -> Result<InitReport, BrokerOpError> {
+/// Repository identity discovered while collecting certification facts.
+///
+/// Paths remain process-local inputs and are intentionally not serialized in
+/// the stable certification or readiness contracts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CertificationRepository {
+    checkout_root: PathBuf,
+    main_root: PathBuf,
+    source_head: Option<String>,
+}
+
+impl CertificationRepository {
+    pub fn checkout_root(&self) -> &Path {
+        &self.checkout_root
+    }
+
+    pub fn main_root(&self) -> &Path {
+        &self.main_root
+    }
+
+    pub fn source_head(&self) -> Option<&str> {
+        self.source_head.as_deref()
+    }
+}
+
+/// Typed, deterministic inputs shared by certification and readiness.
+///
+/// Collection performs repository-local reads only. Broker storage is kept
+/// out of this layer because opening legacy storage can migrate it; callers
+/// that need operational facts must use an explicitly non-mutating snapshot.
+#[derive(Debug, Clone)]
+pub struct CertificationFacts {
+    pub checks: Vec<Check>,
+    pub repository: Option<CertificationRepository>,
+}
+
+/// Collect the repository-local facts used by [`certify`] without opening or
+/// creating broker storage.
+pub fn certification_facts(repo_hint: &Path) -> Result<CertificationFacts, BrokerOpError> {
     let mut checks = Vec::new();
 
     checks.push(check_git_version());
     checks.push(check_git_output());
-    let (repo, checkout_root, main_root) = match crate::GitRepo::discover(repo_hint) {
+    let (repo, checkout_root, main_root, source_head) = match crate::GitRepo::discover(repo_hint) {
         Ok(repo) => {
             let checkout_root = repo.root().to_path_buf();
             let main_root = repo.main_root()?;
@@ -86,21 +123,27 @@ pub fn certify(repo_hint: &Path) -> Result<InitReport, BrokerOpError> {
                 status: CheckStatus::Pass,
                 detail: "inside a git repository".into(),
             });
-            match repo.head_commit() {
-                Ok(_) => checks.push(Check {
-                    id: "certify.head-commit",
-                    status: CheckStatus::Pass,
-                    detail: "repository has at least one commit".into(),
-                }),
-                Err(_) => checks.push(Check {
-                    id: "certify.head-commit",
-                    status: CheckStatus::Fail,
-                    detail: "no commits yet — the broker needs a HEAD to diff against; \
-                             make an initial commit"
-                        .into(),
-                }),
-            }
-            (repo, checkout_root, main_root)
+            let source_head = match repo.head_commit() {
+                Ok(head) => {
+                    checks.push(Check {
+                        id: "certify.head-commit",
+                        status: CheckStatus::Pass,
+                        detail: "repository has at least one commit".into(),
+                    });
+                    Some(head)
+                }
+                Err(_) => {
+                    checks.push(Check {
+                        id: "certify.head-commit",
+                        status: CheckStatus::Fail,
+                        detail: "no commits yet — the broker needs a HEAD to diff against; \
+                                 make an initial commit"
+                            .into(),
+                    });
+                    None
+                }
+            };
+            (repo, checkout_root, main_root, source_head)
         }
         Err(_) => {
             checks.push(Check {
@@ -108,16 +151,15 @@ pub fn certify(repo_hint: &Path) -> Result<InitReport, BrokerOpError> {
                 status: CheckStatus::Fail,
                 detail: "not a git repository — run `git init` and make one commit".into(),
             });
-            return Ok(InitReport {
-                check_mode: true,
+            return Ok(CertificationFacts {
                 checks,
+                repository: None,
             });
         }
     };
     checks.push(check_binary_shadowing());
     checks.push(check_binary_version(&main_root));
 
-    // Document requirements: presence + validity, never generation.
     checks.push(if checkout_root.join(".aethyme/gates.toml").exists() {
         validate_gates(&checkout_root)
     } else {
@@ -140,11 +182,32 @@ pub fn certify(repo_hint: &Path) -> Result<InitReport, BrokerOpError> {
     });
     checks.push(check_graph_enrollment(&checkout_root));
 
+    Ok(CertificationFacts {
+        checks,
+        repository: Some(CertificationRepository {
+            checkout_root,
+            main_root,
+            source_head,
+        }),
+    })
+}
+
+/// The certification method: read-only, deterministic checks only.
+pub fn certify(repo_hint: &Path) -> Result<InitReport, BrokerOpError> {
+    let facts = certification_facts(repo_hint)?;
+    let mut checks = facts.checks;
+    let Some(repository) = facts.repository else {
+        return Ok(InitReport {
+            check_mode: true,
+            checks,
+        });
+    };
+
     // Broker state: verified only when it exists (certification creates
     // nothing — the db appears on first adopt/scaffold use).
-    let db_path = main_root.join(crate::BROKER_DB_RELPATH);
+    let db_path = repository.main_root.join(crate::BROKER_DB_RELPATH);
     if db_path.exists() {
-        let mut broker = Broker::open(&main_root)?;
+        let mut broker = Broker::open(&repository.main_root)?;
         let report = broker.doctor()?;
         checks.push(Check {
             id: "certify.broker-db",

@@ -132,7 +132,7 @@ mod tests {
     #[test]
     fn denied_host_state_access_names_the_cause_and_the_override() {
         for source in [
-            std::io::Error::from_raw_os_error(1),  // EPERM, what macOS reports
+            std::io::Error::from_raw_os_error(1), // EPERM, what macOS reports
             std::io::Error::from_raw_os_error(13), // EACCES
             std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied"),
         ] {
@@ -165,7 +165,10 @@ mod tests {
         );
         let text = describe_host_state_sqlite(&denied);
         assert!(text.contains("AETHYME_HOST_STATE_DIR"), "{text}");
-        assert!(text.contains("not a missing or outdated installation"), "{text}");
+        assert!(
+            text.contains("not a missing or outdated installation"),
+            "{text}"
+        );
 
         let unrelated = rusqlite::Error::QueryReturnedNoRows;
         assert_eq!(

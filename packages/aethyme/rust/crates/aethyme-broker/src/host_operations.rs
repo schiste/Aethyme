@@ -38,7 +38,10 @@ CREATE INDEX IF NOT EXISTS host_operations_unresolved
 
 #[derive(Debug, thiserror::Error)]
 pub enum HostOperationError {
-    #[error("host operation state at {}", crate::host_state::describe_host_state_io(path, source))]
+    #[error(
+        "host operation state at {}",
+        crate::host_state::describe_host_state_io(path, source)
+    )]
     Io {
         path: PathBuf,
         source: std::io::Error,

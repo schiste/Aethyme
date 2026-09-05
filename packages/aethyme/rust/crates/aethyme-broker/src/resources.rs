@@ -54,7 +54,10 @@ CREATE INDEX IF NOT EXISTS resource_allocations_by_value
 
 #[derive(Debug, thiserror::Error)]
 pub enum HostResourceError {
-    #[error("host resource state at {}", crate::host_state::describe_host_state_io(path, source))]
+    #[error(
+        "host resource state at {}",
+        crate::host_state::describe_host_state_io(path, source)
+    )]
     Io {
         path: PathBuf,
         source: std::io::Error,

@@ -51,6 +51,7 @@ mod pr_watch;
 mod preparation;
 mod promotion_record;
 mod quick_test;
+mod readiness;
 mod reconciliation;
 mod release_compatibility;
 pub mod release_manifest;
@@ -188,6 +189,11 @@ pub use quick_test::{
     Chau7Probe, QuickTestError, QuickTestGateOutcome, QuickTestGateReport, QuickTestMode,
     QuickTestOptions, QuickTestReport, QuickTestStep, run_broker_quick_test,
     run_broker_quick_test_with_options,
+};
+pub use readiness::{
+    READINESS_SCHEMA_VERSION, ReadinessAction, ReadinessDimension, ReadinessDimensionId,
+    ReadinessEvidence, ReadinessFinding, ReadinessReport, ReadinessState, RepositoryOperatingMode,
+    RepositoryReadinessMode, inspect_repository_readiness,
 };
 pub use reconciliation::{
     AutomaticIntegrationCleanupReport, AutomaticIntegrationCleanupState,

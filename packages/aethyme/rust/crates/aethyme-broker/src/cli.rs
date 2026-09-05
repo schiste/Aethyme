@@ -38,6 +38,11 @@ Usage:
       (git version, repo, configs valid, gitignore contract, protocol,
       db integrity). Exits non-zero on failures — CI/cron-able as the
       recurring inspection. Never writes anything.
+  aethyme broker readiness [--require <conflict-only|agent-ready|parallel-ready>] [--json]
+      Interpret deterministic repository, broker, agent-context, validation,
+      parallel-execution, graph, and upgrade facts into a typed readiness
+      report. Inspection is offline and strictly read-only. By default every
+      complete report exits zero; --require makes unmet readiness a CI failure.
   aethyme broker scaffold [--json]
       Deterministic setup: ONLY what the broker needs, with content that
       is identical for every repo (config.toml skeleton, .gitignore
@@ -603,6 +608,7 @@ const KNOWN_COMMAND_WORDS: &[&str] = &[
     "cleanup",
     "gc",
     "certify",
+    "readiness",
     "scaffold",
     "init",
 ];
@@ -739,7 +745,7 @@ fn output_measurement_opted_in() -> bool {
 
 fn command_records_metric(args: &[String]) -> bool {
     match args.first().map(String::as_str) {
-        Some("certify" | "queue" | "metrics" | "handoff" | "worktree-root") => false,
+        Some("certify" | "readiness" | "queue" | "metrics" | "handoff" | "worktree-root") => false,
         Some("advisories") => args.get(1).map(String::as_str) == Some("ack"),
         Some("exposures") => args.get(1).map(String::as_str) == Some("apply"),
         Some("report") => args.get(1).map(String::as_str) == Some("file"),
@@ -808,6 +814,7 @@ mod tests {
     fn telemetry_classification_tracks_semantic_mutability() {
         for command in [
             args(&["certify"]),
+            args(&["readiness", "--require", "agent-ready"]),
             args(&["hooks", "status"]),
             args(&["leases", "plan", "src/lib.rs"]),
             args(&["queue"]),
@@ -912,6 +919,17 @@ mod tests {
                 "stateful command should record telemetry: {command:?}"
             );
         }
+    }
+
+    #[test]
+    fn parse_accepts_readiness_requirement() {
+        let args = ["--require".into(), "parallel-ready".into(), "--json".into()];
+        let parsed = match super::parse(&args) {
+            Ok(parsed) => parsed,
+            Err(_) => panic!("readiness flags should parse"),
+        };
+        assert_eq!(parsed.required_mode.as_deref(), Some("parallel-ready"));
+        assert!(parsed.json);
     }
 
     #[test]
@@ -1509,6 +1527,7 @@ struct Parsed {
     stdout: bool,
     include_task: bool,
     offline: bool,
+    required_mode: Option<String>,
     planned_paths: Vec<String>,
     exec_command: Vec<String>,
 }
@@ -1588,6 +1607,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         stdout: false,
         include_task: false,
         offline: false,
+        required_mode: None,
         planned_paths: Vec::new(),
         exec_command: Vec::new(),
     };
@@ -1675,6 +1695,15 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
             }
             "--include-task" => parsed.include_task = true,
             "--offline" => parsed.offline = true,
+            "--require" => {
+                parsed.required_mode = Some(
+                    iter.next()
+                        .ok_or(UsageError::Message(
+                            "--require requires a readiness level".into(),
+                        ))?
+                        .clone(),
+                )
+            }
             "--replace-stale" => parsed.replace_stale = true,
             "--path" => parsed.planned_paths.push(
                 iter.next()
@@ -1984,6 +2013,49 @@ fn aethyme_gates_load(main_root: &std::path::Path) -> Result<Vec<crate::Gate>, U
     Ok(crate::load_gates(main_root)?)
 }
 
+fn render_readiness_report(report: &crate::ReadinessReport, json: bool) -> Result<(), UsageError> {
+    if json {
+        out!("{}", serde_json::to_string_pretty(report)?);
+        return Ok(());
+    }
+    out!(
+        "Repository readiness: {} ({})",
+        report.operating_mode.as_str(),
+        report.repository_mode.as_str()
+    );
+    if let Some(head) = report.source_head.as_deref() {
+        out!("Source HEAD: {}", short_sha(head));
+    }
+    for dimension in &report.dimensions {
+        out!(
+            "{:<14} {:<22} {}",
+            dimension.state.as_str(),
+            dimension.id.as_str(),
+            dimension.summary
+        );
+        for evidence in &dimension.evidence {
+            out!("  evidence {}: {}", evidence.id, evidence.summary);
+        }
+        for remediation in &dimension.remediation {
+            out!("  next: {}", remediation.summary);
+            if let Some(command) = &remediation.command {
+                out!("        {command}");
+            }
+        }
+    }
+    if report.blockers.is_empty() {
+        out!("Blockers: none");
+    } else {
+        out!("Blockers: {}", report.blockers.len());
+    }
+    if report.warnings.is_empty() {
+        out!("Warnings: none");
+    } else {
+        out!("Warnings: {}", report.warnings.len());
+    }
+    Ok(())
+}
+
 fn print_checks(checks: &[crate::init::Check]) {
     for check in checks {
         let tag = match check.status {
@@ -2147,7 +2219,9 @@ fn render_preparation_status(
     }
     out!(
         "Preparation {:?} for session {}: {}",
-        status.state, status.session_id, status.reason
+        status.state,
+        status.session_id,
+        status.reason
     );
     if let Some(digest) = &status.expected_digest {
         out!("Expected digest: {}", short_sha(digest));
@@ -2174,7 +2248,9 @@ fn render_pr_check_report(report: &crate::PrCheckReport, json: bool) -> Result<(
         Some(pr) => {
             out!(
                 "PR #{} -> {}: {}",
-                pr.number, report.target_branch, pr.title
+                pr.number,
+                report.target_branch,
+                pr.title
             );
             if let Some(url) = &pr.url {
                 out!("URL: {url}");
@@ -2635,7 +2711,8 @@ fn render_cleanup_sweep_report(report: &crate::CleanupSweepReport, detail: bool)
         for failure in &report.failures {
             out!(
                 "  retained session {} after revalidation: {}",
-                failure.session_id, failure.reason
+                failure.session_id,
+                failure.reason
             );
         }
     } else if report.plan.eligible_worktree_count > 0 || report.plan.eligible_branch_count > 0 {
@@ -2656,7 +2733,8 @@ fn render_promotion_record_plan(plan: &crate::PromotionRecordPlan) {
     );
     out!(
         "  integration: {} @ {}",
-        plan.integration_ref, plan.integration_tip
+        plan.integration_ref,
+        plan.integration_tip
     );
     for candidate in &plan.candidates {
         match (&candidate.entry_id, &candidate.blocker) {
@@ -2704,7 +2782,11 @@ const SHIP_ENTRY_CAP: usize = 6;
 /// counts and the digest are what a reader acts on; the enumeration is what
 /// they page past. `--detail` restores it when someone genuinely wants to audit.
 fn render_capped<T>(items: &[T], cap: usize, detail: bool, mut render: impl FnMut(&T)) {
-    let shown = if detail { items.len() } else { cap.min(items.len()) };
+    let shown = if detail {
+        items.len()
+    } else {
+        cap.min(items.len())
+    };
     for item in &items[..shown] {
         render(item);
     }
@@ -2735,19 +2817,28 @@ fn render_gc_plan(plan: &crate::GcPlan, detail: bool) {
     render_capped(&plan.rows, GC_LIST_CAP, detail, |row| {
         out!(
             "  row: {:?} {} at {} ({} bytes)",
-            row.kind, row.id, row.recorded_at, row.estimated_bytes
+            row.kind,
+            row.id,
+            row.recorded_at,
+            row.estimated_bytes
         );
     });
     render_capped(&plan.files, GC_LIST_CAP, detail, |file| {
         out!(
             "  file: {:?} {} ({} -> {} bytes; before {})",
-            file.action, file.path, file.bytes_before, file.bytes_after, file.before_sha256
+            file.action,
+            file.path,
+            file.bytes_before,
+            file.bytes_after,
+            file.before_sha256
         );
     });
     render_capped(&plan.worktrees, GC_LIST_CAP, detail, |worktree| {
         out!(
             "  worktree: session {} {} ({} bytes)",
-            worktree.session_id, worktree.worktree_path, worktree.estimated_bytes
+            worktree.session_id,
+            worktree.worktree_path,
+            worktree.estimated_bytes
         );
         out!(
             "    ref: {} at {}",
@@ -3071,7 +3162,10 @@ fn render_semantic_gate_advice(report: &crate::SemanticGateAdvice) {
             match &gate.chain {
                 Some(chain) => out!(
                     "    - {} ({} -> {} -> {})",
-                    gate.gate, chain.changed_file, chain.caller_file, chain.suggested_gate
+                    gate.gate,
+                    chain.changed_file,
+                    chain.caller_file,
+                    chain.suggested_gate
                 ),
                 None => match &gate.triggered_by {
                     Some(path) => out!("    - {} (via {})", gate.gate, path),
@@ -3229,7 +3323,10 @@ fn render_integration_status(
         for conflict in report.conflicts.iter().take(12) {
             out!(
                 "  session {}: {} (session {}, integration {})",
-                conflict.session_id, conflict.path, conflict.session_path, conflict.promoted_path
+                conflict.session_id,
+                conflict.path,
+                conflict.session_path,
+                conflict.promoted_path
             );
         }
         if report.conflicts.len() > 12 {
@@ -3267,11 +3364,13 @@ fn render_ship_plan(report: &crate::ShipPlan, json: bool, detail: bool) -> Resul
     }
     out!(
         "Ship plan q{} (session {})",
-        report.queue_entry.id, report.originating_session.id
+        report.queue_entry.id,
+        report.originating_session.id
     );
     out!(
         "Integration: {} @ {}",
-        report.integration_ref, report.integration_sha
+        report.integration_ref,
+        report.integration_sha
     );
     out!("Publication prefix: {}", report.publication_sha);
     // One line per promoted entry ever included is unbounded and grows with
@@ -3308,7 +3407,8 @@ fn render_ship_plan(report: &crate::ShipPlan, json: bool, detail: bool) -> Resul
     }
     out!(
         "Local default:  {} @ {}",
-        report.local_default_branch_ref, report.local_default_branch_sha
+        report.local_default_branch_ref,
+        report.local_default_branch_sha
     );
     out!(
         "Remote default: {}/{} @ {}",
@@ -3318,7 +3418,8 @@ fn render_ship_plan(report: &crate::ShipPlan, json: bool, detail: bool) -> Resul
     );
     out!(
         "Target: {} ({})",
-        report.target.display_slug, report.target.normalized_host
+        report.target.display_slug,
+        report.target.normalized_host
     );
     out!("Freshness: {:?}", report.freshness.result);
     out!("Proposed push: {}", report.proposed_push.command.join(" "));
@@ -3375,7 +3476,8 @@ fn render_ship_plan(report: &crate::ShipPlan, json: bool, detail: bool) -> Resul
     }
     out!(
         "Confirm with: aethyme broker ship execute --entry {} --confirm {}",
-        report.queue_entry.id, report.publication_sha
+        report.queue_entry.id,
+        report.publication_sha
     );
     Ok(())
 }
@@ -3390,7 +3492,9 @@ fn render_ship_execution(
     }
     out!(
         "Published {} to {}/{}.",
-        report.published_sha, report.plan.target.remote_name, report.plan.remote_default_branch_ref
+        report.published_sha,
+        report.plan.target.remote_name,
+        report.plan.remote_default_branch_ref
     );
     out!("Verified remote SHA: {}", report.verified_remote_sha);
     out!(
@@ -3402,12 +3506,15 @@ fn render_ship_execution(
     }
     out!(
         "Operations: fetch {}, push {}, verify {}",
-        report.fetch_operation.id, report.push_operation.id, report.verify_operation.id
+        report.fetch_operation.id,
+        report.push_operation.id,
+        report.verify_operation.id
     );
     if report.local_main_sync.synchronized {
         out!(
             "Local main synchronized: {} -> {}",
-            report.local_main_sync.before_sha, report.local_main_sync.after_sha
+            report.local_main_sync.before_sha,
+            report.local_main_sync.after_sha
         );
     } else if let Some(command) = &report.local_main_sync.follow_up_command {
         out!("Local main unchanged. To synchronize it explicitly:");
@@ -3433,7 +3540,8 @@ fn render_integration_stability(
     );
     out!(
         "Window:      {}s (observed {}ms)",
-        report.requested_seconds, report.observed_ms
+        report.requested_seconds,
+        report.observed_ms
     );
     out!(
         "Result:      {}",
@@ -3536,7 +3644,9 @@ fn render_integration_reconcile(
         for rule in &template.field_contract.unrecorded_dispositions {
             out!(
                 "  {}: upstream_commit {}; {}",
-                rule.value, rule.upstream_commit, rule.condition
+                rule.value,
+                rule.upstream_commit,
+                rule.condition
             );
         }
         out!("  operator: {}", template.field_contract.operator);
@@ -4028,7 +4138,9 @@ fn run_deliveries(parsed: Parsed) -> Result<(), UsageError> {
             } else if let Some(delivery) = report.delivery {
                 out!(
                     "Claimed delivery {} generation {} for {}. Use --json to read its structured envelope and prompt.",
-                    delivery.item.id, delivery.item.generation, delivery.subscription.target,
+                    delivery.item.id,
+                    delivery.item.generation,
+                    delivery.subscription.target,
                 );
             } else {
                 out!("No pending delivery for adapter {adapter}.");
@@ -4345,7 +4457,8 @@ fn run_review(parsed: Parsed) -> Result<(), UsageError> {
             } else {
                 out!(
                     "Review lifecycle {} abandoned; {}",
-                    report.lifecycle.id, report.next_action
+                    report.lifecycle.id,
+                    report.next_action
                 );
             }
         }
@@ -4382,7 +4495,8 @@ fn render_review_report(
         );
         out!(
             "  repository/PR: {} / #{}",
-            report.lifecycle.repository, report.lifecycle.pr_number
+            report.lifecycle.repository,
+            report.lifecycle.pr_number
         );
         out!("  commit: {}", report.lifecycle.commit_sha);
         if let Some(operation_id) = report.operation_id {
@@ -4996,7 +5110,9 @@ fn render_host_lease(lease: &crate::HostResourceLease) {
     for allocation in &lease.allocations {
         out!(
             "  {:<20} {:<14} {}",
-            allocation.key, allocation.kind, allocation.value
+            allocation.key,
+            allocation.kind,
+            allocation.value
         );
     }
 }
@@ -5122,13 +5238,16 @@ fn run_resources(parsed: Parsed) -> Result<(), UsageError> {
                     for allocation in &plan.proposed {
                         out!(
                             "  proposed {:<20} {:<14} {}",
-                            allocation.key, allocation.kind, allocation.value
+                            allocation.key,
+                            allocation.kind,
+                            allocation.value
                         );
                     }
                     for conflict in &plan.conflicts {
                         out!(
                             "  conflict {:<20} {}",
-                            conflict.resource_key, conflict.reason
+                            conflict.resource_key,
+                            conflict.reason
                         );
                     }
                 }
@@ -5375,9 +5494,44 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
             "--path is valid only with broker start or broker adopt".into(),
         ));
     }
+    if parsed.required_mode.is_some() && subcommand != "readiness" {
+        return Err(UsageError::Message(
+            "--require is valid only with broker readiness".into(),
+        ));
+    }
     surface_command_advisories(subcommand, &parsed);
 
     match subcommand.as_str() {
+        "readiness" => {
+            if !parsed.positional.is_empty() {
+                return Err(UsageError::Message(
+                    "readiness does not accept positional arguments".into(),
+                ));
+            }
+            let cwd = std::env::current_dir()
+                .map_err(|error| UsageError::Message(format!("cannot resolve cwd: {error}")))?;
+            let report = crate::inspect_repository_readiness(&cwd);
+            render_readiness_report(&report, parsed.json)?;
+            if let Some(required) = parsed.required_mode.as_deref() {
+                let required = crate::RepositoryOperatingMode::parse_requirement(required)
+                    .ok_or_else(|| {
+                        UsageError::Message(
+                            "--require must be conflict-only, agent-ready, or parallel-ready"
+                                .into(),
+                        )
+                    })?;
+                if !report.meets(required) {
+                    return Err(UsageError::Exit {
+                        message: format!(
+                            "repository mode {} does not meet required {}",
+                            report.operating_mode.as_str(),
+                            required.as_str()
+                        ),
+                        code: 1,
+                    });
+                }
+            }
+        }
         "worktree-root" => {
             if !parsed.positional.is_empty() {
                 return Err(UsageError::Message(
@@ -5450,15 +5604,21 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                 match report.outcome {
                     crate::AdoptOutcome::Created => out!(
                         "Created session {} on the existing worktree — {} on branch {}",
-                        session.id, session.worktree_path, session.branch
+                        session.id,
+                        session.worktree_path,
+                        session.branch
                     ),
                     crate::AdoptOutcome::Reused => out!(
                         "Reusing session {} — worktree {} on branch {}",
-                        session.id, session.worktree_path, session.branch
+                        session.id,
+                        session.worktree_path,
+                        session.branch
                     ),
                     crate::AdoptOutcome::Replaced => out!(
                         "Replaced the prior session with session {} on the existing worktree — {} on branch {}",
-                        session.id, session.worktree_path, session.branch
+                        session.id,
+                        session.worktree_path,
+                        session.branch
                     ),
                 }
                 if std::path::Path::new(&session.worktree_path) == broker.main_root() {
@@ -5546,7 +5706,9 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
             } else {
                 out!(
                     "Started session {} — worktree {} on branch {}",
-                    session.id, session.worktree_path, session.branch
+                    session.id,
+                    session.worktree_path,
+                    session.branch
                 );
                 out!(
                     "Start base: {} at {} ({})",
@@ -5671,7 +5833,10 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
             } else {
                 out!(
                     "{:<4} {:<8} {:<8} {:<24} TASK",
-                    "ID", "STATUS", "ORIGIN", "BRANCH"
+                    "ID",
+                    "STATUS",
+                    "ORIGIN",
+                    "BRANCH"
                 );
                 for view in views {
                     out!(
@@ -5887,27 +6052,29 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                 let guard_refused = !report.outside_lease_paths.is_empty()
                     || !report.foreign_paths.is_empty()
                     || !report.modified_preexisting_dirty_paths.is_empty();
-                return Err(UsageError::Message(match (report.command_success, guard_refused) {
-                    (true, _) => "guarded exec refused: the command changed paths outside \
+                return Err(UsageError::Message(
+                    match (report.command_success, guard_refused) {
+                        (true, _) => "guarded exec refused: the command changed paths outside \
                                   this session's ownership (listed above)"
-                        .to_string(),
-                    (false, false) => format!(
-                        "guarded exec: the command exited {} — the guard found no ownership \
+                            .to_string(),
+                        (false, false) => format!(
+                            "guarded exec: the command exited {} — the guard found no ownership \
                          violation, so this is the command's own failure",
-                        report
-                            .exit_code
-                            .map(|code| code.to_string())
-                            .unwrap_or_else(|| "by signal".into())
-                    ),
-                    (false, true) => format!(
-                        "guarded exec: the command exited {}, and it changed paths outside \
+                            report
+                                .exit_code
+                                .map(|code| code.to_string())
+                                .unwrap_or_else(|| "by signal".into())
+                        ),
+                        (false, true) => format!(
+                            "guarded exec: the command exited {}, and it changed paths outside \
                          this session's ownership (listed above)",
-                        report
-                            .exit_code
-                            .map(|code| code.to_string())
-                            .unwrap_or_else(|| "by signal".into())
-                    ),
-                }));
+                            report
+                                .exit_code
+                                .map(|code| code.to_string())
+                                .unwrap_or_else(|| "by signal".into())
+                        ),
+                    },
+                ));
             }
         }
         "git" | "gh" => {
@@ -6177,7 +6344,9 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     } else {
                         out!(
                             "Sent broker note {} from session {} to session {}.",
-                            note.id, note.sender_session_id, note.recipient_session_id
+                            note.id,
+                            note.sender_session_id,
+                            note.recipient_session_id
                         );
                     }
                 }
@@ -6252,7 +6421,10 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     } else {
                         out!(
                             "{:<5} {:<8} {:<21} {:<22} SCOPE",
-                            "ID", "TOOL", "STATUS", "REPOSITORY"
+                            "ID",
+                            "TOOL",
+                            "STATUS",
+                            "REPOSITORY"
                         );
                         for operation in page.operations {
                             out!(
@@ -6916,7 +7088,8 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     ),
                     crate::SubmissionGateVerificationStatus::NoGatesTriggered => out!(
                         "verification: no gate matched this diff ({} configured, 0 selected); review triggers with `aethyme broker gates affected --session {}`",
-                        outcome.gate_verification.configured_gates, outcome.entry.session_id
+                        outcome.gate_verification.configured_gates,
+                        outcome.entry.session_id
                     ),
                     crate::SubmissionGateVerificationStatus::Passed => out!(
                         "verification: {} selected gate(s) passed ({} executed, {} cached)",
@@ -6993,7 +7166,8 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     out!(
                         "What now: entry {} is verified but not promoted (manual mode). \
                          Promote with `aethyme broker promote --entry {}`.",
-                        outcome.entry.id, outcome.entry.id,
+                        outcome.entry.id,
+                        outcome.entry.id,
                     );
                 }
             }
@@ -7114,7 +7288,8 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                         if report.safe {
                             out!(
                                 "Apply with: aethyme broker checkpoint apply --session {} --confirm {}",
-                                session, report.digest
+                                session,
+                                report.digest
                             );
                         }
                     }
@@ -7129,7 +7304,9 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     } else {
                         out!(
                             "Re-anchored session {} at {} after preserving {}.",
-                            session, report.accepted_session_head, report.preservation_ref
+                            session,
+                            report.accepted_session_head,
+                            report.preservation_ref
                         );
                         out!("Next: aethyme broker submit --session {session}");
                     }
@@ -7430,7 +7607,10 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                 } else {
                     out!(
                         "{:<4} {:<8} {:<8} {:<24} TASK",
-                        "ID", "STATUS", "ORIGIN", "BRANCH"
+                        "ID",
+                        "STATUS",
+                        "ORIGIN",
+                        "BRANCH"
                     );
                     for view in &status.agents {
                         out!(
@@ -7869,7 +8049,8 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     Some(gates) => print_checks(&gates.checks),
                     None => out!(
                         "{:<8} {:<28} .aethyme/gates.toml already present — drafting skipped",
-                        "skip", "gates.draft"
+                        "skip",
+                        "gates.draft"
                     ),
                 }
                 out!();
@@ -7923,9 +8104,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     if subcommand == "certify" {
                         out!("Certified (read-only — nothing written).");
                     } else {
-                        out!(
-                            "Scaffolding done — review the drafts, then run `aethyme certify`."
-                        );
+                        out!("Scaffolding done — review the drafts, then run `aethyme certify`.");
                     }
                 } else {
                     return Err(UsageError::Message("FAIL items above must be fixed".into()));
@@ -8114,7 +8293,7 @@ fn surface_command_advisories(subcommand: &str, parsed: &Parsed) {
     // Internal hooks are not interactive broker commands. Pre-commit remains
     // quiet on success, while post-commit surfaces through run_post_commit
     // after its conflict radar and therefore does not print twice.
-    if subcommand == "hooks" {
+    if matches!(subcommand, "hooks" | "readiness") {
         return;
     }
     let Ok(cwd) = std::env::current_dir() else {

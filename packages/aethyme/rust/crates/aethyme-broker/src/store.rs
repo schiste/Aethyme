@@ -177,6 +177,33 @@ impl BrokerStore {
         })
     }
 
+    /// Open the repository database only when its persisted schema is already
+    /// current. Unlike [`Self::open_snapshot_in_repo`], this path never creates
+    /// an in-memory database or a migrated temporary copy. Readiness uses it to
+    /// keep the absence and age of broker state observable facts.
+    pub(crate) fn open_current_read_only_in_repo(repo_root: &Path) -> Result<Self, BrokerError> {
+        let path = repo_root.join(crate::BROKER_DB_RELPATH);
+        let conn = Connection::open_with_flags(
+            &path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        conn.busy_timeout(std::time::Duration::from_millis(BUSY_TIMEOUT_MS))?;
+        let found = schema::current_version(&conn)?;
+        if found != crate::SCHEMA_VERSION {
+            return Err(BrokerError::SnapshotSchemaMismatch {
+                found,
+                minimum: crate::SCHEMA_VERSION,
+                maximum: crate::SCHEMA_VERSION,
+            });
+        }
+        conn.pragma_update(None, "query_only", true)?;
+        Ok(Self {
+            conn,
+            path,
+            _snapshot_dir: None,
+        })
+    }
+
     /// Open (creating and migrating if needed) a broker database at an
     /// explicit path. Parent directories are created.
     ///

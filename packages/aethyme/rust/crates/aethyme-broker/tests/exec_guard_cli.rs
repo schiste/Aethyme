@@ -44,9 +44,20 @@ fn fixture() -> (tempfile::TempDir, tempfile::TempDir, String) {
     let started = run(
         repo.path(),
         state.path(),
-        &["start", "--task", "exec guard", "--path", "owned.txt", "--json"],
+        &[
+            "start",
+            "--task",
+            "exec guard",
+            "--path",
+            "owned.txt",
+            "--json",
+        ],
     );
-    assert!(started.status.success(), "start: {}", String::from_utf8_lossy(&started.stderr));
+    assert!(
+        started.status.success(),
+        "start: {}",
+        String::from_utf8_lossy(&started.stderr)
+    );
     let session: serde_json::Value = serde_json::from_slice(&started.stdout).unwrap();
     let id = session["id"].as_i64().unwrap().to_string();
     let worktree = session["worktree_path"].as_str().unwrap().to_string();
@@ -75,7 +86,10 @@ fn a_command_that_fails_on_its_own_is_not_reported_as_an_ownership_failure() {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(!out.status.success(), "the command failed, so exec must fail: {text}");
+    assert!(
+        !out.status.success(),
+        "the command failed, so exec must fail: {text}"
+    );
     assert!(
         text.contains("exited 3"),
         "the wrapped command's exit code is the useful fact: {text}"
@@ -99,7 +113,12 @@ fn a_write_outside_ownership_is_reported_as_a_refusal() {
     let (id, worktree) = split(&packed);
     let out = Command::new(CLI)
         .args([
-            "exec", "--session", id, "--", "sh", "-c",
+            "exec",
+            "--session",
+            id,
+            "--",
+            "sh",
+            "-c",
             "printf changed >> other.txt",
         ])
         .current_dir(worktree)
@@ -111,7 +130,10 @@ fn a_write_outside_ownership_is_reported_as_a_refusal() {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(!out.status.success(), "an out-of-ownership write must fail: {text}");
+    assert!(
+        !out.status.success(),
+        "an out-of-ownership write must fail: {text}"
+    );
     assert!(
         text.contains("outside") && text.contains("ownership"),
         "a real refusal must name ownership: {text}"

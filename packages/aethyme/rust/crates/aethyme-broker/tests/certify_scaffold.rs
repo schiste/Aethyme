@@ -171,6 +171,30 @@ fn certify_is_always_read_only_and_scaffold_rerun_is_byte_identical() {
 }
 
 #[test]
+fn certification_facts_expose_repository_inputs_without_opening_storage() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+
+    let facts = init::certification_facts(tmp.path()).unwrap();
+    let repository = facts.repository.expect("git repository facts");
+    let canonical = tmp.path().canonicalize().unwrap();
+    assert_eq!(repository.checkout_root(), canonical);
+    assert_eq!(repository.main_root(), canonical);
+    assert_eq!(repository.source_head().map(str::len), Some(40));
+    assert!(facts.checks.iter().any(|check| check.id == "certify.graph"));
+    assert!(
+        facts
+            .checks
+            .iter()
+            .all(|check| check.id != "certify.broker-db")
+    );
+    assert!(
+        !tmp.path().join(".aethyme/broker.db").exists(),
+        "typed fact collection must not create broker storage"
+    );
+}
+
+#[test]
 fn shared_activation_reaches_pre_enrollment_worktrees_and_certifies_upstream_visibility() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());

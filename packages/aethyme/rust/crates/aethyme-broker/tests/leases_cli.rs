@@ -459,9 +459,20 @@ fn a_lease_refusal_names_the_holder_and_its_status() {
     let repo = fixture();
     let first = run(
         repo.path(),
-        &["start", "--task", "holder", "--path", "shared.txt", "--json"],
+        &[
+            "start",
+            "--task",
+            "holder",
+            "--path",
+            "shared.txt",
+            "--json",
+        ],
     );
-    assert!(first.status.success(), "start: {}", String::from_utf8_lossy(&first.stderr));
+    assert!(
+        first.status.success(),
+        "start: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
     let holder: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
     let holder_id = holder["id"].as_i64().unwrap();
 
@@ -480,10 +491,7 @@ fn a_lease_refusal_names_the_holder_and_its_status() {
         text.contains(&format!("session {holder_id}")),
         "the refusal must name the holding session: {text}"
     );
-    assert!(
-        text.contains("shared.txt"),
-        "and the path it holds: {text}"
-    );
+    assert!(text.contains("shared.txt"), "and the path it holds: {text}");
     assert!(
         text.contains("(active)") || text.contains("(idle)") || text.contains("(stale)"),
         "and the holder's status, which is what makes it actionable: {text}"
