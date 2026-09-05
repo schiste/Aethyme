@@ -27,7 +27,6 @@
 use std::path::{Path, PathBuf};
 
 use crate::pyjson::{self, py_bool, Value};
-use crate::util::resolve_path;
 use crate::{agents, hygiene, onboarding, skills, telemetry, AGENTS_OVERRIDE_PATH};
 
 /// Result of dispatching a repo subcommand.

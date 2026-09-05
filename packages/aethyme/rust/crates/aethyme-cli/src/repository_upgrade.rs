@@ -2937,6 +2937,7 @@ pub(crate) fn apply_readiness_remediation(
     Ok(report)
 }
 
+#[allow(dead_code)]
 pub fn plan(
     repo_hint: &Path,
     requested_mode: Option<RepositoryMode>,
@@ -2968,6 +2969,7 @@ pub fn initial_enrollment_plan(
     .map(|built| built.report)
 }
 
+#[allow(dead_code)]
 pub fn apply(
     repo_hint: &Path,
     requested_mode: Option<RepositoryMode>,

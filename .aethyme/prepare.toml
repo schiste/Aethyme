@@ -1,0 +1,13 @@
+schema_version = 1
+
+[[runtimes]]
+name = "python"
+command = ["python3", "--version"]
+
+[[steps]]
+name = "aethyme-eval"
+command = ["sh", "-c", "python3 -m venv packages/aethyme-eval/.venv && packages/aethyme-eval/.venv/bin/python -m pip install --quiet --disable-pip-version-check pytest"]
+inputs = ["packages/aethyme-eval/pyproject.toml"]
+outputs = ["packages/aethyme-eval/.venv/"]
+cache = "worktree_local"
+required_for_hooks = false

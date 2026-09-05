@@ -55,12 +55,14 @@
 name = "pytest-aethyme-eval"
 command = 'export CHAU7_CTO_OPTIM_ACTIVE=1 && cd packages/aethyme-eval && { [ -x .venv/bin/python ] || { python3 -m venv .venv && .venv/bin/python -m pip install --quiet --disable-pip-version-check pytest; }; } && PYTHONPATH=src .venv/bin/python -m pytest -q tests'
 cost = 1
+timeout_seconds = 300
 triggers = ["packages/aethyme-eval/**"]
 
 [[gate]]
 name = "cargo-test"
 command = 'export CHAU7_CTO_OPTIM_ACTIVE=1 CARGO_INCREMENTAL=0 CARGO_PROFILE_TEST_DEBUG=1 CARGO_TARGET_DIR="$AETHYME_GATE_CACHE_DIR" && cargo test --workspace --quiet --manifest-path packages/aethyme/rust/Cargo.toml'
 cost = 3
+timeout_seconds = 1200
 resource_wait_seconds = 900
 triggers = [
     "**/*.rs",
@@ -117,6 +119,7 @@ name = "cross-process-contract"
 command = 'export CHAU7_CTO_OPTIM_ACTIVE=1 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=1 CARGO_TARGET_DIR="$AETHYME_GATE_CACHE_DIR" && BASE="$(git merge-base HEAD aethyme/integration 2>/dev/null || git rev-parse HEAD~1)" && BODY="$(mktemp)" && git log --format=%B "$BASE"..HEAD > "$BODY" && cargo run --quiet --manifest-path packages/aethyme/rust/Cargo.toml -p aethyme-cli --bin aethyme -- broker check-contract --base "$BASE" --pr-body "$BODY"'
 cost = 1
 cache = false
+timeout_seconds = 300
 resource_wait_seconds = 900
 
 [gate.managed_cache]

@@ -4,7 +4,7 @@
 //! verified by the `scripts/migration/enhance-golden.sh` stdout
 //! comparison. The router dispatches here unconditionally.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use crate::deploy::{deploy, is_ok, refresh_status, summarize, verify, PolicyProvenance};
 use crate::pyjson::{py_bool, Value};
