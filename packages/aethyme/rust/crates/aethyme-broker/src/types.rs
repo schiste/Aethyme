@@ -152,9 +152,28 @@ text_enum!(AdvisorySeverity, "advisories.severity", {
     Critical => "critical",
 });
 
+// Delivery audience is part of the durable advisory contract. Session
+// notices may use hook/command delivery; maintainer recommendations are
+// restricted to explicit repository-quality inspection surfaces.
+text_enum!(AdvisoryAudience, "advisories.audience", {
+    Session => "session",
+    Maintainer => "maintainer",
+});
+
+// Typed origin prevents renderers from inferring behavior from free-form
+// identity prefixes.
+text_enum!(AdvisoryProducer, "advisories.producer", {
+    Coordination => "coordination",
+    ConflictHistory => "conflict_history",
+    GateReliabilityHistory => "gate_reliability_history",
+    IsolationHistory => "isolation_history",
+    ResourceHistory => "resource_history",
+});
+
 text_enum!(AdvisoryResolutionState, "advisories.resolution_state", {
     Outstanding => "outstanding",
     Acknowledged => "acknowledged",
+    Suppressed => "suppressed",
     Resolved => "resolved",
 });
 
@@ -180,6 +199,8 @@ pub struct AdvisoryEvidence {
 pub struct NewAdvisory {
     /// Stable idempotency key chosen by the advisory producer.
     pub identity: String,
+    pub audience: AdvisoryAudience,
+    pub producer: AdvisoryProducer,
     pub session_id: Option<i64>,
     pub severity: AdvisorySeverity,
     pub queue_entry_id: Option<i64>,
@@ -193,6 +214,8 @@ pub struct NewAdvisory {
 pub struct Advisory {
     pub id: i64,
     pub identity: String,
+    pub audience: AdvisoryAudience,
+    pub producer: AdvisoryProducer,
     pub session_id: Option<i64>,
     pub severity: AdvisorySeverity,
     pub queue_entry_id: Option<i64>,
@@ -202,6 +225,7 @@ pub struct Advisory {
     pub created_at: i64,
     pub resolution_state: AdvisoryResolutionState,
     pub acknowledged_at: Option<i64>,
+    pub suppressed_at: Option<i64>,
     pub resolved_at: Option<i64>,
     pub resolution_evidence: Option<String>,
 }

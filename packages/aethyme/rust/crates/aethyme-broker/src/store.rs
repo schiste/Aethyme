@@ -7,6 +7,7 @@
 //! (CLI invocations are short-lived). Cross-process safety comes from
 //! SQLite WAL + a 5s busy timeout; nothing here assumes in-process locks.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1298,6 +1299,45 @@ impl BrokerStore {
         })
     }
 
+    /// Newest-first bounded input for repository-quality recommendation
+    /// producers. Unlike the operator history page, this includes conflict
+    /// rows and reads no task or command data.
+    pub(crate) fn recent_merge_history(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<MergeQueueEntry>, BrokerError> {
+        let limit = limit.clamp(1, crate::RECOMMENDATION_HISTORY_LIMIT);
+        let mut stmt = self
+            .conn
+            .prepare(&format!("{MERGE_SELECT} ORDER BY id DESC LIMIT ?1"))?;
+        let rows = stmt.query_map([limit as i64], merge_from_row)?;
+        rows.map(|row| row?).collect()
+    }
+
+    pub(crate) fn recent_gate_results_for_recommendations(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<GateResult>, BrokerError> {
+        let limit = limit.clamp(1, crate::RECOMMENDATION_GATE_HISTORY_LIMIT);
+        let mut stmt = self
+            .conn
+            .prepare(&format!("{GATE_RESULT_SELECT} ORDER BY id DESC LIMIT ?1"))?;
+        let rows = stmt.query_map([limit as i64], gate_result_from_row)?;
+        rows.map(|row| row?).collect()
+    }
+
+    pub(crate) fn recent_leases_for_recommendations(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<Lease>, BrokerError> {
+        let limit = limit.clamp(1, crate::RECOMMENDATION_HISTORY_LIMIT);
+        let mut stmt = self
+            .conn
+            .prepare(&format!("{LEASE_SELECT} ORDER BY id DESC LIMIT ?1"))?;
+        let rows = stmt.query_map([limit as i64], lease_from_row)?;
+        rows.map(|row| row?).collect()
+    }
+
     /// Move a reviewed session ownership checkpoint and journal the exact
     /// transition in one SQLite transaction. Git preservation happens before
     /// this call, so a database failure can only leave an extra safe ref.
@@ -2309,11 +2349,14 @@ impl BrokerStore {
         let tx = self.conn.transaction()?;
         let inserted = tx.execute(
             "INSERT OR IGNORE INTO advisories (
-                 identity, session_id, severity, queue_entry_id, integration_sha,
-                 paths_json, evidence_json, created_at, resolution_state
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'outstanding')",
+                 identity, audience, producer, session_id, severity,
+                 queue_entry_id, integration_sha, paths_json, evidence_json,
+                 created_at, resolution_state
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'outstanding')",
             params![
                 advisory.identity,
+                advisory.audience.as_str(),
+                advisory.producer.as_str(),
                 advisory.session_id,
                 advisory.severity.as_str(),
                 advisory.queue_entry_id,
@@ -2329,7 +2372,9 @@ impl BrokerStore {
         let stored = self
             .advisory_by_identity(&advisory.identity)?
             .expect("insert or existing advisory identity must resolve");
-        if stored.session_id != advisory.session_id
+        if stored.audience != advisory.audience
+            || stored.producer != advisory.producer
+            || stored.session_id != advisory.session_id
             || stored.severity != advisory.severity
             || stored.queue_entry_id != advisory.queue_entry_id
             || stored.integration_sha != advisory.integration_sha
@@ -2341,6 +2386,165 @@ impl BrokerStore {
             ));
         }
         Ok(stored)
+    }
+
+    /// Persist the current bounded maintainer snapshot and advance only its
+    /// explicit lifecycle states. Session-facing coordination advisories are
+    /// never selected by this operation.
+    pub(crate) fn sync_maintainer_recommendations(
+        &mut self,
+        snapshot: &crate::recommendations::RecommendationSnapshot,
+    ) -> Result<(), BrokerError> {
+        let now = now_ms();
+        let current_identities = snapshot
+            .recommendations
+            .iter()
+            .map(|recommendation| recommendation.identity.as_str())
+            .collect::<BTreeSet<_>>();
+        let saturated_kinds = snapshot
+            .saturated_kinds
+            .iter()
+            .map(|kind| kind.as_str())
+            .collect::<BTreeSet<_>>();
+        let tx = self.conn.transaction()?;
+
+        for recommendation in &snapshot.recommendations {
+            let advisory = recommendation.to_new_advisory();
+            let paths_json = serde_json::to_string(&advisory.paths)
+                .expect("serializing maintainer recommendation paths cannot fail");
+            let evidence_json = serde_json::to_string(&advisory.evidence)
+                .expect("serializing maintainer recommendation evidence cannot fail");
+            let existing = tx
+                .query_row(
+                    "SELECT audience, producer, resolution_state, evidence_json, suppressed_at
+                     FROM advisories WHERE identity = ?1",
+                    [&advisory.identity],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, Option<i64>>(4)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            match existing {
+                None => {
+                    tx.execute(
+                        "INSERT INTO advisories (
+                             identity, audience, producer, session_id, severity,
+                             queue_entry_id, integration_sha, paths_json, evidence_json,
+                             created_at, resolution_state
+                         ) VALUES (?1, 'maintainer', ?2, NULL, ?3, NULL, NULL,
+                                   ?4, ?5, ?6, 'outstanding')",
+                        params![
+                            advisory.identity,
+                            advisory.producer.as_str(),
+                            advisory.severity.as_str(),
+                            paths_json,
+                            evidence_json,
+                            now,
+                        ],
+                    )?;
+                }
+                Some((audience, producer, resolution_state, previous_evidence, suppressed_at)) => {
+                    if audience != crate::AdvisoryAudience::Maintainer.as_str()
+                        || producer != advisory.producer.as_str()
+                    {
+                        return Err(BrokerError::AdvisoryIdentityConflict(
+                            advisory.identity.clone(),
+                        ));
+                    }
+                    let previous = if suppressed_at.is_some() {
+                        AdvisoryResolutionState::Suppressed
+                    } else {
+                        AdvisoryResolutionState::parse(&resolution_state)?
+                    };
+                    let next = match previous {
+                        AdvisoryResolutionState::Suppressed => AdvisoryResolutionState::Suppressed,
+                        AdvisoryResolutionState::Acknowledged
+                            if previous_evidence == evidence_json =>
+                        {
+                            AdvisoryResolutionState::Acknowledged
+                        }
+                        _ => AdvisoryResolutionState::Outstanding,
+                    };
+                    tx.execute(
+                        "UPDATE advisories
+                         SET severity = ?2, paths_json = ?3, evidence_json = ?4,
+                             resolution_state = ?5,
+                             acknowledged_at = CASE
+                                 WHEN ?5 = 'acknowledged' THEN acknowledged_at ELSE NULL END,
+                             suppressed_at = CASE
+                                 WHEN ?6 = 1 THEN suppressed_at ELSE NULL END,
+                             resolved_at = NULL, resolution_evidence = NULL
+                         WHERE identity = ?1",
+                        params![
+                            advisory.identity,
+                            advisory.severity.as_str(),
+                            paths_json,
+                            evidence_json,
+                            if next == AdvisoryResolutionState::Suppressed {
+                                AdvisoryResolutionState::Acknowledged.as_str()
+                            } else {
+                                next.as_str()
+                            },
+                            i64::from(next == AdvisoryResolutionState::Suppressed),
+                        ],
+                    )?;
+                }
+            }
+        }
+
+        let candidates = {
+            let mut statement = tx.prepare(
+                "SELECT id, identity, evidence_json
+                 FROM advisories
+                 WHERE audience = 'maintainer'
+                   AND resolution_state IN ('outstanding', 'acknowledged')
+                   AND suppressed_at IS NULL
+                 ORDER BY id",
+            )?;
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        for (id, identity, evidence_json) in candidates {
+            if current_identities.contains(identity.as_str()) {
+                continue;
+            }
+            let evidence = serde_json::from_str::<Vec<crate::AdvisoryEvidence>>(&evidence_json)
+                .map_err(|source| BrokerError::InvalidAdvisoryJson {
+                    id,
+                    field: "evidence_json",
+                    source,
+                })?;
+            let kind = evidence
+                .iter()
+                .find(|item| item.kind == "recommendation_kind")
+                .map(|item| item.summary.as_str());
+            if !kind.is_some_and(|kind| saturated_kinds.contains(kind)) {
+                continue;
+            }
+            tx.execute(
+                "UPDATE advisories
+                 SET resolution_state = 'resolved', resolved_at = ?2,
+                     resolution_evidence = 'bounded_clean_window'
+                 WHERE id = ?1
+                   AND resolution_state IN ('outstanding', 'acknowledged')",
+                params![id, now],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// Exact durable advisory lookup.
@@ -2696,6 +2900,32 @@ impl BrokerStore {
             "UPDATE advisory_delivery_metrics
              SET acted_at = COALESCE(acted_at, ?2), action = 'acknowledged'
              WHERE advisory_id = ?1",
+            params![id, now],
+        )?;
+        tx.commit()?;
+        self.advisory(id)?.ok_or(BrokerError::AdvisoryNotFound(id))
+    }
+
+    /// Suppress a maintainer recommendation without affecting session
+    /// coordination delivery. Suppression remains in force across new samples.
+    pub fn suppress_maintainer_advisory(&mut self, id: i64) -> Result<Advisory, BrokerError> {
+        let existing = self
+            .advisory(id)?
+            .ok_or(BrokerError::AdvisoryNotFound(id))?;
+        if existing.audience != crate::AdvisoryAudience::Maintainer {
+            return Err(BrokerError::AdvisorySuppressionNotAllowed(id));
+        }
+        if existing.resolution_state == AdvisoryResolutionState::Suppressed {
+            return Ok(existing);
+        }
+        let now = now_ms();
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "UPDATE advisories
+             SET resolution_state = 'acknowledged', suppressed_at = ?2,
+                 acknowledged_at = NULL, resolved_at = NULL,
+                 resolution_evidence = NULL
+             WHERE id = ?1",
             params![id, now],
         )?;
         tx.commit()?;
@@ -4281,7 +4511,7 @@ const DELIVERY_OUTBOX_SELECT: &str = "SELECT o.id, o.subscription_id, o.batch_id
 
 const ADVISORY_SELECT: &str = "SELECT id, identity, session_id, severity, queue_entry_id, \
      integration_sha, paths_json, evidence_json, created_at, resolution_state, acknowledged_at, \
-     resolved_at, resolution_evidence \
+     suppressed_at, resolved_at, resolution_evidence, audience, producer \
      FROM advisories";
 
 const SESSION_NOTE_SELECT: &str = "SELECT id, sender_session_id, recipient_session_id, message, \
@@ -4593,10 +4823,15 @@ fn advisory_from_row(row: &rusqlite::Row<'_>) -> RowResult<Advisory> {
     let paths_json: String = row.get(6)?;
     let evidence_json: String = row.get(7)?;
     let resolution_state: String = row.get(9)?;
+    let suppressed_at: Option<i64> = row.get(11)?;
+    let audience: String = row.get(14)?;
+    let producer: String = row.get(15)?;
     Ok((|| {
         Ok(Advisory {
             id,
             identity: row.get(1)?,
+            audience: crate::AdvisoryAudience::parse(&audience)?,
+            producer: crate::AdvisoryProducer::parse(&producer)?,
             session_id: row.get(2)?,
             severity: AdvisorySeverity::parse(&severity)?,
             queue_entry_id: row.get(4)?,
@@ -4616,10 +4851,15 @@ fn advisory_from_row(row: &rusqlite::Row<'_>) -> RowResult<Advisory> {
                 }
             })?,
             created_at: row.get(8)?,
-            resolution_state: AdvisoryResolutionState::parse(&resolution_state)?,
+            resolution_state: if suppressed_at.is_some() {
+                AdvisoryResolutionState::Suppressed
+            } else {
+                AdvisoryResolutionState::parse(&resolution_state)?
+            },
             acknowledged_at: row.get(10)?,
-            resolved_at: row.get(11)?,
-            resolution_evidence: row.get(12)?,
+            suppressed_at,
+            resolved_at: row.get(12)?,
+            resolution_evidence: row.get(13)?,
         })
     })())
 }

@@ -51,6 +51,9 @@ pub struct GateDoctorReport {
     pub source_file_count: usize,
     pub gates: Vec<GateDoctorGate>,
     pub findings: Vec<GateDiagnostic>,
+    pub maintainer_history_state: String,
+    pub maintainer_history_reason: Option<String>,
+    pub maintainer_advisories: Vec<crate::MaintainerRecommendation>,
     pub probe: Option<GateProbeReport>,
 }
 
@@ -400,14 +403,25 @@ pub fn inspect_gate_quality(repo: &crate::GitRepo) -> Result<GateDoctorReport, G
     }
 
     sort_findings(&mut findings);
+    let history = repo
+        .main_root()
+        .map(|root| crate::recommendations::inspect_history_recommendations(&root))
+        .unwrap_or_else(|error| crate::recommendations::RecommendationInspection {
+            state: "inaccessible",
+            reason: Some(error.to_string()),
+            recommendations: Vec::new(),
+        });
     Ok(GateDoctorReport {
-        schema_version: 1,
+        schema_version: 2,
         advisory_only: true,
         source_head: head,
         tracked_file_count: tracked.len(),
         source_file_count: sources.len(),
         gates: summaries,
         findings,
+        maintainer_history_state: history.state.into(),
+        maintainer_history_reason: history.reason,
+        maintainer_advisories: history.recommendations,
         probe: None,
     })
 }

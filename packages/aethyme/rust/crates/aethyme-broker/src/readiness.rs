@@ -17,7 +17,7 @@ use crate::{
     RepositoryContract, default_host_resource_db_path, load_gates,
 };
 
-pub const READINESS_SCHEMA_VERSION: u32 = 1;
+pub const READINESS_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -190,6 +190,9 @@ pub struct ReadinessReport {
     pub dimensions: Vec<ReadinessDimension>,
     pub blockers: Vec<ReadinessFinding>,
     pub warnings: Vec<ReadinessFinding>,
+    pub maintainer_history_state: String,
+    pub maintainer_history_reason: Option<String>,
+    pub maintainer_advisories: Vec<crate::MaintainerRecommendation>,
 }
 
 impl ReadinessReport {
@@ -225,6 +228,9 @@ impl ReadinessReport {
             dimensions,
             blockers,
             warnings,
+            maintainer_history_state: "missing".into(),
+            maintainer_history_reason: Some("broker history was not inspected".into()),
+            maintainer_advisories: Vec::new(),
         }
     }
 
@@ -315,6 +321,19 @@ pub fn render_readiness_text(report: &ReadinessReport) -> String {
         lines.push("Next actions:".into());
         lines.extend(actions.into_iter().map(|action| format!("- {action}")));
     }
+    if !report.maintainer_advisories.is_empty() {
+        lines.push(String::new());
+        lines.push(format!(
+            "Maintainer recommendations: {} (advisory only)",
+            report.maintainer_advisories.len()
+        ));
+        for recommendation in &report.maintainer_advisories {
+            lines.push(format!(
+                "- {:?}: {}",
+                recommendation.kind, recommendation.remediation
+            ));
+        }
+    }
     lines.push(String::new());
     lines.join("\n")
 }
@@ -375,13 +394,35 @@ pub fn inspect_repository_readiness(repo_hint: &Path) -> ReadinessReport {
         graph_dimension(root, source_head.as_deref()),
         upgrade_dimension(repository_mode, &contract),
     ];
-    ReadinessReport::from_dimensions(repository_mode, source_head, deployment_digest, dimensions)
+    let mut report = ReadinessReport::from_dimensions(
+        repository_mode,
+        source_head,
+        deployment_digest,
+        dimensions,
+    );
+    if let BrokerStateInspection::Ready {
+        maintainer_history_state,
+        maintainer_history_reason,
+        maintainer_advisories,
+        ..
+    } = broker
+    {
+        report.maintainer_history_state = maintainer_history_state.into();
+        report.maintainer_history_reason = maintainer_history_reason;
+        report.maintainer_advisories = maintainer_advisories;
+    }
+    report
 }
 
 #[derive(Debug)]
 enum BrokerStateInspection {
     Missing,
-    Ready { live_sessions: usize },
+    Ready {
+        live_sessions: usize,
+        maintainer_history_state: &'static str,
+        maintainer_history_reason: Option<String>,
+        maintainer_advisories: Vec<crate::MaintainerRecommendation>,
+    },
     Invalid(String),
     Inaccessible(String),
 }
@@ -412,9 +453,23 @@ fn inspect_broker_state(main_root: &Path) -> BrokerStateInspection {
         Ok(_) => match BrokerStore::open_current_read_only_in_repo(main_root) {
             Ok(store) => match store.integrity_check() {
                 Ok(integrity) if integrity == "ok" => match store.live_sessions() {
-                    Ok(sessions) => BrokerStateInspection::Ready {
-                        live_sessions: sessions.len(),
-                    },
+                    Ok(sessions) => {
+                        let history = crate::recommendations::recommendations_from_store(&store);
+                        match history {
+                            Ok(maintainer_advisories) => BrokerStateInspection::Ready {
+                                live_sessions: sessions.len(),
+                                maintainer_history_state: "ready",
+                                maintainer_history_reason: None,
+                                maintainer_advisories,
+                            },
+                            Err(error) => BrokerStateInspection::Ready {
+                                live_sessions: sessions.len(),
+                                maintainer_history_state: "inaccessible",
+                                maintainer_history_reason: Some(error.to_string()),
+                                maintainer_advisories: Vec::new(),
+                            },
+                        }
+                    }
                     Err(error) => BrokerStateInspection::Invalid(error.to_string()),
                 },
                 Ok(integrity) => BrokerStateInspection::Invalid(format!(
@@ -555,7 +610,7 @@ fn coordination_dimension(state: &BrokerStateInspection) -> ReadinessDimension {
                 Some("aethyme broker start --task \"<task>\""),
             )],
         ),
-        BrokerStateInspection::Ready { live_sessions } => dimension_with(
+        BrokerStateInspection::Ready { live_sessions, .. } => dimension_with(
             ReadinessDimensionId::Coordination,
             ReadinessState::Ready,
             "broker storage is readable and healthy",
@@ -1306,7 +1361,7 @@ mod tests {
                 ),
             ],
         );
-        assert_eq!(report.schema_version, 1);
+        assert_eq!(report.schema_version, 2);
         assert_eq!(report.blockers.len(), 1);
         assert_eq!(report.warnings.len(), 1);
         assert_eq!(
@@ -1323,7 +1378,7 @@ mod tests {
         );
         let json = serde_json::to_string(&report).unwrap();
         assert!(json.starts_with(
-            "{\"schema_version\":1,\"repository_mode\":\"local_only\",\"operating_mode\":\"invalid\""
+            "{\"schema_version\":2,\"repository_mode\":\"local_only\",\"operating_mode\":\"invalid\""
         ));
     }
 

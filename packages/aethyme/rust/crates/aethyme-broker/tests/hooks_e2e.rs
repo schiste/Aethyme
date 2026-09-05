@@ -511,6 +511,8 @@ fn post_commit_radar_warns_on_overlap_and_never_blocks() {
     let advisory = broker
         .persist_advisory(NewAdvisory {
             identity: "post-commit-session-advisory".into(),
+            audience: aethyme_broker::AdvisoryAudience::Session,
+            producer: aethyme_broker::AdvisoryProducer::Coordination,
             session_id: Some(b.id),
             severity: AdvisorySeverity::Warning,
             queue_entry_id: None,

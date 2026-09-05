@@ -19,6 +19,7 @@ const OPERATIONS_RECONCILE_USAGE: &str = "usage: aethyme broker operations recon
 const OPERATIONS_SHOW_USAGE: &str = "usage: aethyme broker operations show <id> [--json]";
 const ADVISORIES_SHOW_USAGE: &str = "usage: aethyme broker advisories show <id> [--json]";
 const ADVISORIES_ACK_USAGE: &str = "usage: aethyme broker advisories ack <id> [--json]";
+const ADVISORIES_SUPPRESS_USAGE: &str = "usage: aethyme broker advisories suppress <id> [--json]";
 const INTEGRATION_RECONCILE_USAGE: &str = "usage: aethyme broker integration reconcile \
      --upstream <ref> [--resolution-file <path>] [--write-resolution-template <path>] \
      [--dry-run | --apply --confirm <sha256>] [--json]";
@@ -214,7 +215,8 @@ Usage:
       remote state. Overlapping writes remain blocked until reconciliation.
   aethyme broker advisories list [--all] [--json]
       List outstanding non-blocking advisories newest-first. --all includes
-      acknowledged and publication-resolved history. The broker database is authoritative.
+      acknowledged, suppressed, and resolved history. Deliberate inventory
+      refreshes bounded maintainer recommendations; the broker database is authoritative.
   aethyme broker advisories show <id> [--json]
       Show one exact advisory with paths, evidence, integration provenance,
       creation time, and resolution state.
@@ -224,6 +226,9 @@ Usage:
       Promotion/lease advisories repeat on session commands, after
       post-commit, and before uncached gates whose cost exceeds 1; they
       remain informational and never alter command or promotion outcomes.
+  aethyme broker advisories suppress <id> [--json]
+      Suppress a maintainer recommendation across later evidence samples.
+      Session-facing coordination advisories cannot be suppressed.
   aethyme broker advisories metrics [--json]
       Inspect bounded, content-free shown-to-action correlation. Metrics
       never retain task text, command arguments, paths, evidence, or secrets.
@@ -757,7 +762,7 @@ fn output_measurement_opted_in() -> bool {
 fn command_records_metric(args: &[String]) -> bool {
     match args.first().map(String::as_str) {
         Some("certify" | "readiness" | "queue" | "metrics" | "handoff" | "worktree-root") => false,
-        Some("advisories") => args.get(1).map(String::as_str) == Some("ack"),
+        Some("advisories") => matches!(args.get(1).map(String::as_str), Some("ack" | "suppress")),
         Some("exposures") => args.get(1).map(String::as_str) == Some("apply"),
         Some("report") => args.get(1).map(String::as_str) == Some("file"),
         Some("external-events") => matches!(
@@ -893,6 +898,7 @@ mod tests {
             args(&["integration", "status"]),
             args(&["operations", "reconcile", "--operation", "1"]),
             args(&["advisories", "ack", "1"]),
+            args(&["advisories", "suppress", "1"]),
             args(&["external-events", "ingest", "event.json"]),
             args(&[
                 "external-events",
@@ -3889,6 +3895,13 @@ fn render_advisory(advisory: &crate::Advisory) {
             .unwrap_or_else(|| "no".into())
     );
     out!(
+        "Suppressed: {}",
+        advisory
+            .suppressed_at
+            .map(|time| time.to_string())
+            .unwrap_or_else(|| "no".into())
+    );
+    out!(
         "Resolved: {}",
         advisory
             .resolved_at
@@ -3916,6 +3929,12 @@ fn render_advisory(advisory: &crate::Advisory) {
     }
     if advisory.resolution_state == crate::AdvisoryResolutionState::Outstanding {
         out!("Acknowledge: aethyme broker advisories ack {}", advisory.id);
+        if advisory.audience == crate::AdvisoryAudience::Maintainer {
+            out!(
+                "Suppress: aethyme broker advisories suppress {}",
+                advisory.id
+            );
+        }
     }
 }
 
@@ -6238,6 +6257,9 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                             "usage: aethyme broker advisories list [--all] [--json]".into(),
                         ));
                     }
+                    if !parsed.read_only_snapshot {
+                        broker.refresh_maintainer_recommendations()?;
+                    }
                     let report = broker.advisory_list(parsed.all)?;
                     if !parsed.read_only_snapshot {
                         broker.record_advisories_shown(
@@ -6250,11 +6272,18 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     } else if report.advisories.is_empty() {
                         out!("No outstanding advisories.");
                     } else {
-                        out!("{:<5} {:<9} {:<14} IDENTITY", "ID", "SEVERITY", "STATE");
+                        out!(
+                            "{:<5} {:<11} {:<9} {:<14} IDENTITY",
+                            "ID",
+                            "AUDIENCE",
+                            "SEVERITY",
+                            "STATE"
+                        );
                         for advisory in &report.advisories {
                             out!(
-                                "{:<5} {:<9} {:<14} {}",
+                                "{:<5} {:<11} {:<9} {:<14} {}",
                                 advisory.id,
+                                advisory.audience.as_str(),
                                 advisory.severity.as_str(),
                                 advisory.resolution_state.as_str(),
                                 advisory_text(&advisory.identity),
@@ -6296,6 +6325,23 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                             advisory_text(&advisory.identity)
                         );
                         out!("Projection refreshed: {}", crate::BROKER_ADVISORY_RELPATH);
+                    }
+                }
+                Some("suppress") => {
+                    if parsed.positional.len() != 2 {
+                        return Err(UsageError::Message(ADVISORIES_SUPPRESS_USAGE.into()));
+                    }
+                    let id =
+                        parse_advisory_id(parsed.positional.get(1), ADVISORIES_SUPPRESS_USAGE)?;
+                    let advisory = broker.suppress_maintainer_advisory(id)?;
+                    if parsed.json {
+                        out!("{}", serde_json::to_string_pretty(&advisory)?);
+                    } else {
+                        out!(
+                            "Suppressed maintainer advisory {}: {}",
+                            advisory.id,
+                            advisory_text(&advisory.identity)
+                        );
                     }
                 }
                 Some("metrics") => {
@@ -6340,12 +6386,13 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                 }
                 Some(other) => {
                     return Err(UsageError::Message(format!(
-                        "unknown advisories action {other:?} — expected list, show, ack, or metrics"
+                        "unknown advisories action {other:?} — expected list, show, ack, suppress, or metrics"
                     )));
                 }
                 None => {
                     return Err(UsageError::Message(
-                        "advisories requires an action: list, show, ack, or metrics".into(),
+                        "advisories requires an action: list, show, ack, suppress, or metrics"
+                            .into(),
                     ));
                 }
             }

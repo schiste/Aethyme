@@ -119,7 +119,7 @@ fn a_write_outside_ownership_is_reported_as_a_refusal() {
             "--",
             "sh",
             "-c",
-            "printf changed >> other.txt",
+            "printf changed >> other.txt; touch runtime.sock",
         ])
         .current_dir(worktree)
         .env("AETHYME_HOST_STATE_DIR", state.path())
@@ -141,6 +141,28 @@ fn a_write_outside_ownership_is_reported_as_a_refusal() {
     assert!(
         !text.contains("no ownership violation"),
         "this one really is an ownership violation: {text}"
+    );
+    let mut broker = aethyme_broker::Broker::open(repo.path()).unwrap();
+    let events = broker.store().events_after(0, i64::MAX).unwrap();
+    let out_of_lease = events
+        .iter()
+        .find(|event| event.kind == "guard.out_of_lease_write")
+        .expect("out-of-lease evidence is durable");
+    assert!(
+        out_of_lease
+            .payload_json
+            .as_deref()
+            .is_some_and(|payload| payload.contains("other.txt") && !payload.contains("printf"))
+    );
+    let untracked = events
+        .iter()
+        .find(|event| event.kind == "guard.untracked_artifact")
+        .expect("new untracked artifact evidence is durable");
+    assert!(
+        untracked
+            .payload_json
+            .as_deref()
+            .is_some_and(|payload| payload.contains("runtime.sock") && !payload.contains(worktree))
     );
     drop(repo);
 }

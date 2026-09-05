@@ -32,8 +32,11 @@ pub const BROKER_COMMAND_SUCCEEDED: &str = "broker.command.succeeded";
 pub const LEASE_CLAIMED: &str = "lease.claimed";
 pub const LEASE_RELEASED: &str = "lease.released";
 pub const LEASE_OVERLAP: &str = "lease.overlap";
+pub const GUARD_OUT_OF_LEASE_WRITE: &str = "guard.out_of_lease_write";
+pub const GUARD_UNTRACKED_ARTIFACT: &str = "guard.untracked_artifact";
 // gate.<status> kinds derive from GateStatus::as_str (pass/fail/cancelled/error).
 pub const GATE_CACHED: &str = "gate.cached";
+pub const GATE_CACHE_BYPASSED: &str = "gate.cache_bypassed";
 pub const GRAPH_INTEGRITY_CHECKED: &str = "graph.integrity_checked";
 // merge.<status> kinds derive from MergeStatus::as_str.
 pub const MERGE_INTEGRATION_BRANCH_CREATED: &str = "merge.integration_branch_created";
@@ -159,6 +162,10 @@ pub fn lease_path_payload(path: &str) -> String {
     json!({ "path": path }).to_string()
 }
 
+pub fn guard_paths_payload(paths: &[String]) -> String {
+    json!({ "paths": paths }).to_string()
+}
+
 pub fn gate_result_payload(
     gate: &str,
     tree: &str,
@@ -189,6 +196,10 @@ pub fn gate_cached_payload(
         "failure_class": failure_class.map(|class| class.as_str()),
     })
     .to_string()
+}
+
+pub fn gate_cache_bypassed_payload(gate: &str, tree: &str) -> String {
+    json!({ "gate": gate, "tree": tree }).to_string()
 }
 
 pub fn merge_submitted_payload(head: &str) -> String {

@@ -2,8 +2,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use aethyme_broker::{
-    HostResourceCoordinator, ReadinessDimensionId, ReadinessReport, ReadinessState,
-    RepositoryOperatingMode, RepositoryReadinessMode,
+    AdvisoryAudience, AdvisoryProducer, Broker, HostResourceCoordinator, MergeStatus,
+    ReadinessDimensionId, ReadinessReport, ReadinessState, RepositoryOperatingMode,
+    RepositoryReadinessMode,
 };
 use aethyme_engine::index_store::materialize_graph_store;
 use aethyme_engine::map::RepositoryMap;
@@ -130,7 +131,7 @@ fn virgin_repository_is_undeployed_and_inspection_creates_nothing() {
 
     let (_, report) = readiness_json(repo.path(), &state);
 
-    assert_eq!(report.schema_version, 1);
+    assert_eq!(report.schema_version, 2);
     assert_eq!(report.repository_mode, RepositoryReadinessMode::Absent);
     assert_eq!(report.operating_mode, RepositoryOperatingMode::Undeployed);
     assert!(!repo.path().join(".aethyme").exists());
@@ -181,6 +182,46 @@ fn conflict_only_and_full_parallel_readiness_are_distinct() {
             .exists(),
         "readiness must not create command telemetry"
     );
+}
+
+#[test]
+fn readiness_includes_read_only_maintainer_history_recommendations() {
+    let repo = init_repo();
+    let state = host_state_path(repo.path());
+    canonical_ready_fixture(repo.path(), &state);
+
+    let mut broker = Broker::open(repo.path()).unwrap();
+    let session = broker
+        .adopt(repo.path(), Some("must never enter readiness output"))
+        .unwrap();
+    for index in 1..=3 {
+        let head = format!("{index:040x}");
+        let entry = broker.store().submit(session.id, &head, &head).unwrap();
+        broker
+            .store()
+            .set_merge_status(
+                entry.id,
+                MergeStatus::Conflict,
+                None,
+                Some(r#"{"conflicts":["src/shared.rs"]}"#),
+            )
+            .unwrap();
+    }
+    drop(broker);
+
+    let database_path = repo.path().join(".aethyme/broker.db");
+    let before = std::fs::read(&database_path).unwrap();
+    let (_, report) = readiness_json(repo.path(), &state);
+
+    assert_eq!(report.maintainer_history_state, "ready");
+    assert_eq!(report.maintainer_advisories.len(), 1);
+    let recommendation = &report.maintainer_advisories[0];
+    assert_eq!(recommendation.audience, AdvisoryAudience::Maintainer);
+    assert_eq!(recommendation.producer, AdvisoryProducer::ConflictHistory);
+    assert_eq!(recommendation.paths, ["src/shared.rs"]);
+    assert_eq!(std::fs::read(database_path).unwrap(), before);
+    let json = serde_json::to_string(&report).unwrap();
+    assert!(!json.contains("must never enter readiness output"));
 }
 
 #[test]

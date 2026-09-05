@@ -432,6 +432,48 @@ Docker names or the invoking checkout. A failing or mutating probe still
 returns diagnostic evidence for review; it does not rewrite the policy or
 change enforced gates.
 
+## Turn Broker History Into Maintainer Recommendations
+
+Readiness and gate doctor also inspect a bounded window of typed broker
+history. They report a maintainer recommendation only after enough consistent
+evidence exists for one of these patterns: repeated conflicts on one path,
+session-tree passes followed by merged-tree failures, infrastructure failures,
+slow gates with sufficient duration samples, repeated cache bypasses,
+out-of-lease writes, untracked runtime artifacts, resource contention, or
+lease expiration. These recommendations are advisory: they never select a
+gate, alter cache policy, block submission, or rewrite repository policy.
+
+Use the explicit advisory inventory to persist the current recommendation
+snapshot and manage its lifecycle:
+
+```bash
+aethyme broker advisories list --json
+aethyme broker advisories show <id> --json
+aethyme broker advisories ack <id>
+aethyme broker advisories suppress <id>
+```
+
+Acknowledgement hides the current evidence but allows the same deterministic
+identity to reopen when its bounded evidence changes. Suppression is a
+deliberate maintainer choice and remains suppressed across later samples.
+When a producer's complete bounded window contains sufficient newer clean
+evidence and the pattern is absent, the broker resolves the stored
+recommendation automatically. Use `--all` to audit acknowledged, suppressed,
+and resolved history.
+
+Recommendation producers consume allowlisted structured fields only. Their
+records contain repository-relative paths, typed counts, gate labels, and
+durations. They exclude task text, command output, diffs, file contents,
+absolute paths, environment values, and secrets. Unsafe path or gate labels
+are dropped or redacted before identity generation. Maintainer recommendations
+appear only in readiness, gate doctor, and explicit advisory commands; they
+are never delivered after commit or before gate execution.
+
+Dynamic recommendation state remains in `.aethyme/broker.db`. It is not added
+to tracked onboarding or generated agent-context artifacts, so regenerating
+repository guidance remains byte-deterministic and does not expose local
+broker history.
+
 ### Authoritative committed graph fragments
 
 `[graph].authority = "committed_fragments"` makes graph freshness a repository

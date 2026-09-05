@@ -206,6 +206,8 @@ mod tests {
         Advisory {
             id: 7,
             identity: identity.into(),
+            audience: crate::AdvisoryAudience::Session,
+            producer: crate::AdvisoryProducer::Coordination,
             session_id: Some(3),
             severity: AdvisorySeverity::Warning,
             queue_entry_id: Some(9),
@@ -218,6 +220,7 @@ mod tests {
             created_at: 42,
             resolution_state: AdvisoryResolutionState::Outstanding,
             acknowledged_at: None,
+            suppressed_at: None,
             resolved_at: None,
             resolution_evidence: None,
         }

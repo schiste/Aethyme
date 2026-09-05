@@ -1109,6 +1109,7 @@ pub struct GuardedExecReport {
     pub before_dirty_paths: Vec<String>,
     pub after_dirty_paths: Vec<String>,
     pub newly_dirty_paths: Vec<String>,
+    pub new_untracked_paths: Vec<String>,
     pub modified_preexisting_dirty_paths: Vec<String>,
     pub touched_paths: Vec<String>,
     pub outside_lease_paths: Vec<String>,
@@ -1966,6 +1967,24 @@ impl Broker {
         Ok(self.store.advisories(include_all)?)
     }
 
+    /// Derive current maintainer recommendations from a bounded, redacted
+    /// history window without mutating advisory or repository state.
+    pub fn maintainer_recommendations(
+        &self,
+    ) -> Result<Vec<crate::MaintainerRecommendation>, BrokerOpError> {
+        Ok(crate::recommendations::recommendations_from_store(
+            &self.store,
+        )?)
+    }
+
+    /// Synchronize the explicit maintainer advisory inventory from bounded
+    /// history. This is used only by deliberate advisory commands; readiness
+    /// and gate doctor keep using the read-only projection above.
+    pub fn refresh_maintainer_recommendations(&mut self) -> Result<(), BrokerOpError> {
+        let snapshot = crate::recommendations::recommendation_snapshot_from_store(&self.store)?;
+        Ok(self.store.sync_maintainer_recommendations(&snapshot)?)
+    }
+
     pub fn advisory_list(&self, include_acknowledged: bool) -> Result<AdvisoryList, BrokerOpError> {
         let advisories = self.store.advisories(include_acknowledged)?;
         let outstanding_count = advisories
@@ -2011,6 +2030,10 @@ impl Broker {
         let advisory = self.store.acknowledge_advisory(id)?;
         self.refresh_advisory_projection()?;
         Ok(advisory)
+    }
+
+    pub fn suppress_maintainer_advisory(&mut self, id: i64) -> Result<Advisory, BrokerOpError> {
+        Ok(self.store.suppress_maintainer_advisory(id)?)
     }
 
     pub fn send_session_note(
@@ -2102,7 +2125,14 @@ impl Broker {
 
     pub fn refresh_advisory_projection(&mut self) -> Result<PathBuf, BrokerOpError> {
         let main_root = self.main_root.clone();
-        crate::advisories::project(&main_root, || self.store.advisories(false))
+        crate::advisories::project(&main_root, || {
+            Ok(self
+                .store
+                .advisories(false)?
+                .into_iter()
+                .filter(|advisory| advisory.audience == crate::AdvisoryAudience::Session)
+                .collect())
+        })
     }
 
     pub(crate) fn main_root_path(&self) -> PathBuf {
@@ -3465,6 +3495,10 @@ impl Broker {
         let mut before_dirty = checkout.dirty_paths()?;
         before_dirty.sort();
         before_dirty.dedup();
+        let before_untracked = checkout
+            .untracked_paths()?
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
         let before_identities = snapshot_path_identities(checkout.root(), &before_dirty)?;
 
         let mut child = Command::new(&command[0]);
@@ -3505,6 +3539,13 @@ impl Broker {
             .filter(|path| !before_set.contains(*path))
             .cloned()
             .collect();
+        let mut new_untracked_paths = checkout
+            .untracked_paths()?
+            .into_iter()
+            .filter(|path| !before_untracked.contains(path))
+            .collect::<Vec<_>>();
+        new_untracked_paths.sort();
+        new_untracked_paths.dedup();
         let modified_preexisting_dirty_paths: Vec<String> = before_dirty
             .iter()
             .filter_map(|path| {
@@ -3529,7 +3570,7 @@ impl Broker {
         )?;
         let command_success = status.success();
         let ok = command_success && audit.ok;
-        Ok(GuardedExecReport {
+        let report = GuardedExecReport {
             session_id,
             command: command.to_vec(),
             exit_code: status.code(),
@@ -3537,12 +3578,32 @@ impl Broker {
             before_dirty_paths: before_dirty,
             after_dirty_paths: after_dirty,
             newly_dirty_paths,
+            new_untracked_paths,
             modified_preexisting_dirty_paths,
             touched_paths: touched,
             outside_lease_paths: audit.missing_lease_paths,
             foreign_paths: audit.foreign_paths,
             ok,
-        })
+        };
+        if !report.outside_lease_paths.is_empty() {
+            self.store.append_event(
+                crate::events::GUARD_OUT_OF_LEASE_WRITE,
+                Some(session_id),
+                Some(&crate::events::guard_paths_payload(
+                    &report.outside_lease_paths,
+                )),
+            )?;
+        }
+        if !report.new_untracked_paths.is_empty() {
+            self.store.append_event(
+                crate::events::GUARD_UNTRACKED_ARTIFACT,
+                Some(session_id),
+                Some(&crate::events::guard_paths_payload(
+                    &report.new_untracked_paths,
+                )),
+            )?;
+        }
+        Ok(report)
     }
 
     /// Detect live-session leases that overlap already-promoted work on

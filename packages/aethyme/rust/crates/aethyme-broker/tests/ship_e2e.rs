@@ -230,6 +230,8 @@ fn ship_execute_publishes_and_verifies_the_exact_confirmed_sha() {
     let advisory = broker
         .persist_advisory(NewAdvisory {
             identity: format!("test-promotion-exposure:{entry_id}"),
+            audience: aethyme_broker::AdvisoryAudience::Session,
+            producer: aethyme_broker::AdvisoryProducer::Coordination,
             session_id: None,
             severity: AdvisorySeverity::Warning,
             queue_entry_id: Some(entry_id),
@@ -322,6 +324,8 @@ fn ship_retains_advisory_while_its_overlapping_lease_is_live() {
     let advisory = broker
         .persist_advisory(NewAdvisory {
             identity: format!("live-promotion-exposure:{entry_id}"),
+            audience: aethyme_broker::AdvisoryAudience::Session,
+            producer: aethyme_broker::AdvisoryProducer::Coordination,
             session_id: Some(session_id),
             severity: AdvisorySeverity::Warning,
             queue_entry_id: Some(entry_id),

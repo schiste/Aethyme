@@ -1373,6 +1373,15 @@ fn run_selections(
     for selection in selections {
         let gate = selection.gate;
         let worker_id = gate_worker_id(session_id, &gate.name);
+        if cache_policy == CachePolicy::Bypass {
+            let _ = store.append_event(
+                crate::events::GATE_CACHE_BYPASSED,
+                session_id,
+                Some(&crate::events::gate_cache_bypassed_payload(
+                    &gate.name, &tree,
+                )),
+            );
+        }
         // Cache: conclusive result for this exact tree, any session. The
         // hit is recorded as an event so saved execution time is
         // measurable (kill-criterion accounting). Gates that inspect

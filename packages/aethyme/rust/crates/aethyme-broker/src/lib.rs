@@ -53,6 +53,7 @@ mod preparation;
 mod promotion_record;
 mod quick_test;
 mod readiness;
+mod recommendations;
 mod reconciliation;
 mod release_compatibility;
 pub mod release_manifest;
@@ -203,6 +204,13 @@ pub use readiness::{
     RepositoryReadinessMode, inspect_repository_readiness, render_readiness_json,
     render_readiness_text,
 };
+pub use recommendations::{
+    MaintainerRecommendation, RECOMMENDATION_DURATION_MIN_SAMPLES,
+    RECOMMENDATION_GATE_HISTORY_LIMIT, RECOMMENDATION_HISTORY_LIMIT, RECOMMENDATION_MIN_SAMPLES,
+    RECOMMENDATION_SCHEMA_VERSION, RECOMMENDATION_SLOW_MEDIAN_MS, RECOMMENDATION_SLOW_P95_MS,
+    RecommendationConfidence, RecommendationKind, derive_conflict_recommendations,
+    derive_gate_recommendations, derive_isolation_resource_recommendations,
+};
 pub use reconciliation::{
     AutomaticIntegrationCleanupReport, AutomaticIntegrationCleanupState,
     IntegrationDriftAssessment, IntegrationDriftEntry, IntegrationDriftEntryState,
@@ -278,16 +286,17 @@ pub use ship::{
 };
 pub use store::BrokerStore;
 pub use types::{
-    Advisory, AdvisoryAction, AdvisoryDeliveryMetric, AdvisoryDeliverySummary,
-    AdvisoryDeliverySurface, AdvisoryEvidence, AdvisoryList, AdvisoryResolutionState,
-    AdvisorySeverity, CoordinatedOperation, DEFAULT_OPERATION_HISTORY_LIMIT,
-    EntryExposureResolutionKind, EntryExposureState, EntryPathExposure, Event, GateDef,
-    GateFailureClass, GateResult, GateStatus, Lease, LeaseKind, MAX_OPERATION_HISTORY_LIMIT,
-    MERGE_QUEUE_HISTORY_SCHEMA_VERSION, MergeQueueEntry, MergeQueueHistoryPage,
-    MergeQueueStatusCount, MergeStatus, NewAdvisory, NewCoordinatedOperation, NewGateResult,
-    NewPrWatchState, NewSession, OperationEffect, OperationHistoryPage, OperationHistoryQuery,
-    OperationIdentityProvenance, OperationProvider, OperationStatus, PrWatchState, Session,
-    SessionCleanupState, SessionNote, SessionNoteList, SessionOrigin, SessionStatus,
+    Advisory, AdvisoryAction, AdvisoryAudience, AdvisoryDeliveryMetric, AdvisoryDeliverySummary,
+    AdvisoryDeliverySurface, AdvisoryEvidence, AdvisoryList, AdvisoryProducer,
+    AdvisoryResolutionState, AdvisorySeverity, CoordinatedOperation,
+    DEFAULT_OPERATION_HISTORY_LIMIT, EntryExposureResolutionKind, EntryExposureState,
+    EntryPathExposure, Event, GateDef, GateFailureClass, GateResult, GateStatus, Lease, LeaseKind,
+    MAX_OPERATION_HISTORY_LIMIT, MERGE_QUEUE_HISTORY_SCHEMA_VERSION, MergeQueueEntry,
+    MergeQueueHistoryPage, MergeQueueStatusCount, MergeStatus, NewAdvisory,
+    NewCoordinatedOperation, NewGateResult, NewPrWatchState, NewSession, OperationEffect,
+    OperationHistoryPage, OperationHistoryQuery, OperationIdentityProvenance, OperationProvider,
+    OperationStatus, PrWatchState, Session, SessionCleanupState, SessionNote, SessionNoteList,
+    SessionOrigin, SessionStatus,
 };
 pub use update::{
     INSTALL_RECEIPT_FILENAME, INSTALL_RECEIPT_SCHEMA_VERSION, InstallReceipt, InstallationMethod,

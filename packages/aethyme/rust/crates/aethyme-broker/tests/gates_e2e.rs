@@ -1055,6 +1055,8 @@ triggers = ["**/*.py"]
     let advisory = broker
         .persist_advisory(NewAdvisory {
             identity: "gate-boundary-advisory".into(),
+            audience: aethyme_broker::AdvisoryAudience::Session,
+            producer: aethyme_broker::AdvisoryProducer::Coordination,
             session_id: Some(session.id),
             severity: AdvisorySeverity::Warning,
             queue_entry_id: None,
@@ -1268,6 +1270,20 @@ triggers = ["**/*.nomatch"]
         cached_after.id > cached_before.id,
         "bypassed execution stores a fresh cache row"
     );
+    let bypass_events = broker
+        .store()
+        .events_after(0, i64::MAX)
+        .unwrap()
+        .into_iter()
+        .filter(|event| event.kind == "gate.cache_bypassed")
+        .collect::<Vec<_>>();
+    assert_eq!(bypass_events.len(), 3);
+    assert!(bypass_events.iter().all(|event| {
+        event
+            .payload_json
+            .as_deref()
+            .is_some_and(|payload| payload.contains(&tree_hash) && !payload.contains("command"))
+    }));
 
     let reused_fresh = broker.run_all_gates(tmp.path()).unwrap();
     assert!(reused_fresh.iter().all(|outcome| outcome.cached));

@@ -1316,6 +1316,8 @@ impl Broker {
             });
             let _ = self.persist_advisory(NewAdvisory {
                 identity: format!("promotion_lease_intersection:{integration_sha}:{session_id}"),
+                audience: crate::AdvisoryAudience::Session,
+                producer: crate::AdvisoryProducer::Coordination,
                 session_id: Some(session_id),
                 severity: AdvisorySeverity::Warning,
                 queue_entry_id: Some(entry.id),

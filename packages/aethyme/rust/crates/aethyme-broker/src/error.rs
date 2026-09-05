@@ -49,6 +49,9 @@ pub enum BrokerError {
     #[error("no advisory with id {0}")]
     AdvisoryNotFound(i64),
 
+    #[error("advisory {0} is session-facing and cannot be suppressed")]
+    AdvisorySuppressionNotAllowed(i64),
+
     #[error("no session note with id {0}")]
     SessionNoteNotFound(i64),
 

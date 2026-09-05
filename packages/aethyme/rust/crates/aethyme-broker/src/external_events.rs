@@ -525,6 +525,8 @@ impl Broker {
         }
         let advisory = self.persist_advisory(NewAdvisory {
             identity: format!("external:{}:{}", event.provider.as_str(), event_id_hash),
+            audience: crate::AdvisoryAudience::Session,
+            producer: crate::AdvisoryProducer::Coordination,
             session_id: Some(session_id),
             severity: kind.severity(),
             queue_entry_id: event.queue_entry_id,

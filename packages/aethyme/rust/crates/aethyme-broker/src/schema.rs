@@ -16,7 +16,7 @@ use rusqlite::Connection;
 use crate::error::BrokerError;
 
 /// Current database schema version (== `MIGRATIONS.len()`).
-pub const SCHEMA_VERSION: i64 = 28;
+pub const SCHEMA_VERSION: i64 = 30;
 
 /// Version stamped on every event row written by this binary.
 pub const EVENTS_SCHEMA_VERSION: i64 = 1;
@@ -799,6 +799,28 @@ CREATE INDEX delivery_outbox_by_adapter
     ON delivery_outbox (subscription_id, status, id);
 ";
 
+const MIGRATION_V29: &str = "
+-- Advisory delivery and provenance are typed independently from free-form
+-- identities. Existing rows are session coordination notices by contract.
+ALTER TABLE advisories ADD COLUMN audience TEXT NOT NULL DEFAULT 'session'
+    CHECK (audience IN ('session', 'maintainer'));
+ALTER TABLE advisories ADD COLUMN producer TEXT NOT NULL DEFAULT 'coordination'
+    CHECK (producer IN (
+        'coordination', 'conflict_history', 'gate_reliability_history',
+        'isolation_history', 'resource_history'
+    ));
+CREATE INDEX advisories_by_audience_resolution
+    ON advisories (audience, resolution_state, id DESC);
+CREATE INDEX advisories_by_producer_identity
+    ON advisories (producer, identity);
+";
+
+const MIGRATION_V30: &str = "
+-- Suppression is a maintainer-only control layered over the established
+-- acknowledged state, so widening the durable state constraint is unnecessary.
+ALTER TABLE advisories ADD COLUMN suppressed_at INTEGER;
+";
+
 const MIGRATIONS: &[&str] = &[
     MIGRATION_V1,
     MIGRATION_V2,
@@ -828,6 +850,8 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_V26,
     MIGRATION_V27,
     MIGRATION_V28,
+    MIGRATION_V29,
+    MIGRATION_V30,
 ];
 
 pub(crate) fn current_version(conn: &Connection) -> Result<i64, BrokerError> {
@@ -895,6 +919,103 @@ pub fn migrate(conn: &Connection) -> Result<(), BrokerError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn v30_preserves_advisories_and_accepts_explicit_suppression() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON").unwrap();
+        conn.execute_batch("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            .unwrap();
+        for (index, sql) in MIGRATIONS.iter().take(29).enumerate() {
+            conn.execute_batch(sql).unwrap();
+            conn.execute(
+                "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)
+                 ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                [(index + 1).to_string()],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO advisories (
+                 identity, audience, producer, session_id, severity,
+                 queue_entry_id, integration_sha, paths_json, evidence_json,
+                 created_at, resolution_state
+             ) VALUES (
+                 'history:test', 'maintainer', 'conflict_history', NULL,
+                 'warning', NULL, NULL, '[]', '[]', 1, 'acknowledged'
+             )",
+            [],
+        )
+        .unwrap();
+        let advisory_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO advisory_delivery_metrics (
+                 advisory_id, surface, first_shown_at, last_shown_at,
+                 show_count, acted_at, action
+             ) VALUES (?1, 'inventory', 1, 1, 1, 1, 'acknowledged')",
+            [advisory_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO external_coordination_events (
+                 provider, provider_event_id, event_type, repository,
+                 target_branch, pr_number, commit_sha, occurred_at,
+                 verification_method, verified_at, normalized_digest,
+                 status, advisory_id, received_at
+             ) VALUES (
+                 'github', 'event-1', 'review', 'owner/repo', 'main', 1,
+                 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 1,
+                 'authenticated_poll', 1, 'digest', 'advisory_created', ?1, 1
+             )",
+            [advisory_id],
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT audience || ':' || producer || ':' || resolution_state
+                 FROM advisories WHERE identity = 'history:test'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "maintainer:conflict_history:acknowledged"
+        );
+        conn.execute(
+            "UPDATE advisories SET suppressed_at = 2
+             WHERE identity = 'history:test'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT resolution_state || ':' || suppressed_at
+                 FROM advisories WHERE identity = 'history:test'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "acknowledged:2"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM external_coordination_events
+                 WHERE advisory_id = ?1",
+                [advisory_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            0
+        );
+        assert_eq!(current_version(&conn).unwrap(), SCHEMA_VERSION);
+    }
 
     #[test]
     fn v15_adds_newest_first_operation_history_indexes() {
@@ -1520,6 +1641,43 @@ mod tests {
             indexes
                 .iter()
                 .any(|name| name == "review_lifecycles_active_pr")
+        );
+        assert_eq!(current_version(&conn).unwrap(), SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn v29_types_legacy_advisories_as_session_coordination() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            .unwrap();
+        for (index, sql) in MIGRATIONS[..28].iter().enumerate() {
+            conn.execute_batch(sql).unwrap();
+            conn.execute(
+                "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)
+                 ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                [(index + 1).to_string()],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO advisories (
+                 identity, severity, paths_json, evidence_json, created_at,
+                 resolution_state
+             ) VALUES ('legacy', 'warning', '[]', '[]', 1, 'outstanding')",
+            [],
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        assert_eq!(
+            conn.query_row(
+                "SELECT audience, producer FROM advisories WHERE identity = 'legacy'",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .unwrap(),
+            ("session".into(), "coordination".into())
         );
         assert_eq!(current_version(&conn).unwrap(), SCHEMA_VERSION);
     }

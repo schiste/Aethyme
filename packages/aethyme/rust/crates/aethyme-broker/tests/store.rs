@@ -139,6 +139,8 @@ fn advisory_round_trip_is_idempotent_and_acknowledgement_preserves_history() {
     let session = sample_session(&mut store);
     let advisory = NewAdvisory {
         identity: "integration-drift:session-1".into(),
+        audience: aethyme_broker::AdvisoryAudience::Session,
+        producer: aethyme_broker::AdvisoryProducer::Coordination,
         session_id: Some(session.id),
         severity: AdvisorySeverity::Warning,
         queue_entry_id: None,
@@ -151,6 +153,11 @@ fn advisory_round_trip_is_idempotent_and_acknowledgement_preserves_history() {
     };
 
     let created = store.record_advisory(&advisory).unwrap();
+    assert_eq!(created.audience, aethyme_broker::AdvisoryAudience::Session);
+    assert_eq!(
+        created.producer,
+        aethyme_broker::AdvisoryProducer::Coordination
+    );
     assert_eq!(
         created.resolution_state,
         AdvisoryResolutionState::Outstanding
