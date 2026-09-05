@@ -682,7 +682,7 @@ pub(crate) fn repository_relative(path: &str) -> bool {
 
 pub(crate) fn stable_identity(kind: RecommendationKind, scope: &str) -> String {
     let digest = format!("{:x}", Sha256::digest(scope.as_bytes()));
-    format!("history:{kind:?}:{}", &digest[..24]).to_ascii_lowercase()
+    format!("history:{}:{}", kind.as_str(), &digest[..24])
 }
 
 #[cfg(test)]
@@ -782,6 +782,11 @@ mod tests {
         assert_eq!(first[0].producer, AdvisoryProducer::ConflictHistory);
         assert_eq!(first[0].sample_count, 3);
         assert_eq!(first[0].paths, ["src/a.rs"]);
+        assert!(
+            first[0]
+                .identity
+                .starts_with("history:repeated_merge_conflict:")
+        );
         let json = serde_json::to_string(&first).unwrap();
         for forbidden in ["SECRET", "/tmp/secret", "../escape", "diff", "task"] {
             assert!(!json.contains(forbidden), "leaked {forbidden:?}");
