@@ -28,6 +28,7 @@ const MIGRATION_ID: &str = "repository-deployment-v1";
 const MIGRATION_IN_PROGRESS: &str = "repository-deployment-v1:in-progress";
 const TRANSACTION_SCHEMA_VERSION: u32 = 1;
 const JOURNAL_MAX_BYTES: usize = 64 * 1024 * 1024;
+#[cfg(debug_assertions)]
 const CRASH_EXIT_CODE: i32 = 86;
 const READINESS_REMEDIATION_SCHEMA_VERSION: u32 = 1;
 
