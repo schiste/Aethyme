@@ -255,19 +255,31 @@ mod tests {
             "export const vendored = true;\n",
         )
         .unwrap();
+        fs::write(root.join(".gitignore"), "ignored.tsx\n").unwrap();
+        fs::write(root.join("ignored.tsx"), "<button>ignored</button>\n").unwrap();
         fs::write(root.join("scratch.tsx"), "<button>untracked</button>\n").unwrap();
         git(
             &root,
-            &["add", "src/lib.rs", "generated.ts", "vendor/pkg/code.ts"],
+            &[
+                "add",
+                ".gitignore",
+                "src/lib.rs",
+                "generated.ts",
+                "vendor/pkg/code.ts",
+            ],
         );
 
         let snapshot = TrackedSnapshot::materialize(&root).unwrap();
-        assert_eq!(snapshot.tracked_file_count, 3);
-        assert_eq!(snapshot.relevant_file_count, 1);
+        assert_eq!(snapshot.tracked_file_count, 4);
+        assert_eq!(snapshot.relevant_file_count, 2);
         assert_eq!(snapshot.excluded_generated_count, 1);
         assert_eq!(snapshot.excluded_vendored_count, 1);
-        assert_eq!(snapshot.relative_paths(), &[PathBuf::from("src/lib.rs")]);
+        assert_eq!(
+            snapshot.relative_paths(),
+            &[PathBuf::from(".gitignore"), PathBuf::from("src/lib.rs")]
+        );
         assert!(snapshot.root().join("src/lib.rs").is_file());
+        assert!(!snapshot.root().join("ignored.tsx").exists());
         assert!(!snapshot.root().join("scratch.tsx").exists());
 
         drop(snapshot);

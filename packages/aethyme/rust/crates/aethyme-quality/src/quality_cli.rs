@@ -447,5 +447,12 @@ mod tests {
         assert!(json.contains("\"rendered\": 3"));
         assert!(json.contains("\"omitted\": 9"));
         assert!(json.contains("\"operational_blockers\": []"));
+
+        let full = rendered_findings(&report, 3, true);
+        assert_eq!(full.len(), 12);
+        let json = format_json(&report, &full, true);
+        assert!(json.contains("\"rendered\": 12"));
+        assert!(json.contains("\"omitted\": 0"));
+        assert!(json.contains("\"full_output\": true"));
     }
 }
