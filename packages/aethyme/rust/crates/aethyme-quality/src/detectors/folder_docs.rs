@@ -35,6 +35,14 @@ impl super::Detector for FolderDocsDetector {
         "Checks for missing FOLDER.md documentation in directories"
     }
 
+    fn applicability(&self, repo_path: &Path) -> super::DetectorApplicability {
+        super::applies_to_extensions(
+            repo_path,
+            &[".py", ".ts", ".tsx", ".js", ".rs", ".go", ".java"],
+            "source files",
+        )
+    }
+
     fn detect(&self, repo_path: &Path) -> Vec<Finding> {
         let mut findings = Vec::new();
 

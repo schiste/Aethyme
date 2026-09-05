@@ -38,6 +38,10 @@ impl super::Detector for RelativeLinksDetector {
         "Checks for absolute file paths that should use relative links"
     }
 
+    fn applicability(&self, repo_path: &Path) -> super::DetectorApplicability {
+        super::applies_to_extensions(repo_path, &EXTENSIONS, "portable text or source files")
+    }
+
     fn detect(&self, repo_path: &Path) -> Vec<Finding> {
         let mut findings = Vec::new();
 

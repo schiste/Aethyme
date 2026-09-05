@@ -1,4 +1,4 @@
-//! Native `aethyme ai-ready` front end (retirement Phase 4 flip).
+//! Native legacy `aethyme ai-ready` compatibility front end.
 //!
 //! Stdout is byte-compatible with the deleted Click command
 //! (`ai_ready` in `src/cli.py` before the flip), verified by the
@@ -22,7 +22,11 @@ use crate::model::ScorecardReport;
 
 const HELP: &str = "Usage: aethyme ai-ready [OPTIONS]
 
-  Run AI-readiness scorecard on a repository.
+  Run the legacy repository-quality scorecard.
+
+  This score does not determine broker or agent readiness. Use
+  `aethyme readiness` for operational readiness and `aethyme quality inspect`
+  for bounded repository-quality analysis.
 
 Options:
   --repo PATH                  Repository path (defaults to current directory)
@@ -58,6 +62,10 @@ pub fn run(args: &[String]) -> u8 {
             return 2;
         }
     };
+
+    eprintln!(
+        "Notice: `aethyme ai-ready` is a legacy repository-quality scorecard; its score does not determine operational readiness. Use `aethyme readiness`, or `aethyme quality inspect` for bounded quality suggestions."
+    );
 
     // Determine repository path (Python: Path(repo).resolve() / cwd).
     let repo_path: PathBuf = match &parsed.repo {

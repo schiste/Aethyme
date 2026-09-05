@@ -4,7 +4,10 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::detectors::{Detector, all_detectors};
-use crate::model::{DetectorResult, ScorecardReport};
+use crate::model::{
+    DetectorResult, InspectionDetectorResult, QualityInspection, ScorecardReport, Severity,
+};
+use crate::snapshot::TrackedSnapshot;
 use crate::util::{now_timestamps, uuid4};
 use crate::walk::{count_files_skip, py_suffix, rglob_all};
 
@@ -93,6 +96,74 @@ impl ScorecardEngine {
         report
     }
 
+    /// Inspect only tracked, relevant repository files. Unlike the legacy
+    /// scorecard, this surface records detector applicability and does not
+    /// interpret quality findings as operational readiness blockers.
+    pub fn inspect_tracked(
+        &self,
+        detectors: Option<&[String]>,
+    ) -> Result<QualityInspection, String> {
+        let start = Instant::now();
+        let snapshot = TrackedSnapshot::materialize(&self.repo_path)?;
+        let to_run: Vec<Box<dyn Detector>> = match detectors {
+            None => all_detectors(),
+            Some(names) => all_detectors()
+                .into_iter()
+                .filter(|detector| names.iter().any(|name| name == detector.name()))
+                .collect(),
+        };
+
+        let mut findings = Vec::new();
+        let mut detector_results = Vec::new();
+        for detector in to_run {
+            let applicability = detector.applicability(snapshot.root());
+            let det_start = Instant::now();
+            let detector_findings = if applicability.is_applicable() {
+                detector.detect(snapshot.root())
+            } else {
+                Vec::new()
+            };
+            findings.extend(detector_findings.iter().cloned());
+            detector_results.push(InspectionDetectorResult {
+                detector_name: detector.name().to_string(),
+                description: detector.description().to_string(),
+                applicability,
+                findings: detector_findings,
+                execution_time_ms: det_start.elapsed().as_secs_f64() * 1000.0,
+                error: None,
+            });
+        }
+
+        let high_count = findings
+            .iter()
+            .filter(|finding| finding.severity == Severity::Blocker)
+            .count();
+        let medium_count = findings
+            .iter()
+            .filter(|finding| finding.severity == Severity::Warning)
+            .count();
+        let low_count = findings
+            .iter()
+            .filter(|finding| finding.severity == Severity::Info)
+            .count();
+
+        Ok(QualityInspection {
+            repository_path: snapshot.source_root().display().to_string(),
+            tracked_file_count: snapshot.tracked_file_count,
+            relevant_file_count: snapshot.relevant_file_count,
+            excluded_vendored_count: snapshot.excluded_vendored_count,
+            excluded_generated_count: snapshot.excluded_generated_count,
+            excluded_non_regular_count: snapshot.excluded_non_regular_count,
+            total_findings: findings.len(),
+            high_count,
+            medium_count,
+            low_count,
+            findings,
+            detector_results,
+            total_scan_time_ms: start.elapsed().as_secs_f64() * 1000.0,
+        })
+    }
+
     /// Port of `_count_files`: every file under the repo whose Python
     /// `suffix` is in the counted set and whose path shares no
     /// component with the skip-dir list (note: NO hidden-component
@@ -156,6 +227,85 @@ mod tests {
         assert!(report.detector_results.is_empty());
         assert_eq!(report.repository_id.as_deref(), Some("rid"));
         assert_eq!(report.tenant_id.as_deref(), Some("tid"));
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn tracked_inspection_ignores_untracked_irrelevant_ui_files() {
+        use std::process::Command;
+
+        let tmp =
+            std::env::temp_dir().join(format!("aq-tracked-inspection-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(tmp.join("src")).unwrap();
+        assert!(
+            Command::new("git")
+                .arg("init")
+                .arg("-q")
+                .arg(&tmp)
+                .status()
+                .unwrap()
+                .success()
+        );
+        fs::write(tmp.join("src/lib.rs"), "pub fn answer() -> u8 { 42 }\n").unwrap();
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(&tmp)
+                .args(["add", "src/lib.rs"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        fs::write(
+            tmp.join("scratch.tsx"),
+            "export const X = () => <button>go</button>;\n",
+        )
+        .unwrap();
+
+        let engine = ScorecardEngine::new(&tmp, None, None).unwrap();
+        let report = engine
+            .inspect_tracked(Some(&["data-ui-coverage".to_string()]))
+            .unwrap();
+        assert_eq!(report.total_findings, 0);
+        assert_eq!(report.tracked_file_count, 1);
+        assert_eq!(report.relevant_file_count, 1);
+        assert!(matches!(
+            report.detector_results[0].applicability,
+            crate::detectors::DetectorApplicability::NotApplicable { .. }
+        ));
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn legacy_scan_keeps_irrelevant_monorepo_findings_for_compatibility() {
+        let tmp = std::env::temp_dir().join(format!(
+            "aq-legacy-irrelevant-monorepo-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(tmp.join("src")).unwrap();
+        fs::write(
+            tmp.join("Cargo.toml"),
+            "[package]\nname = \"rust-only\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(tmp.join("src/lib.rs"), "pub fn answer() -> u8 { 42 }\n").unwrap();
+
+        // The legacy scorecard walks arbitrary repository files, including an
+        // incidental untracked UI scratch file in an otherwise Rust project.
+        fs::write(
+            tmp.join("scratch.tsx"),
+            "export const X = () => <button>go</button>;\n",
+        )
+        .unwrap();
+
+        let engine = ScorecardEngine::new(&tmp, None, None).unwrap();
+        let report = engine.scan(Some(&["data-ui-coverage".to_string()]));
+        assert_eq!(report.warning_count, 1);
+        assert_eq!(report.warnings[0].file_path, "scratch.tsx");
+
         let _ = fs::remove_dir_all(&tmp);
     }
 }

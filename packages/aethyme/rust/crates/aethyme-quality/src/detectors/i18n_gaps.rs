@@ -48,6 +48,10 @@ impl super::Detector for I18nGapsDetector {
         "Checks for hardcoded user-facing strings that should be internationalized"
     }
 
+    fn applicability(&self, repo_path: &Path) -> super::DetectorApplicability {
+        super::applies_to_extensions(repo_path, &EXTENSIONS, "localizable UI files")
+    }
+
     fn detect(&self, repo_path: &Path) -> Vec<Finding> {
         let patterns = patterns();
         let mut findings = Vec::new();

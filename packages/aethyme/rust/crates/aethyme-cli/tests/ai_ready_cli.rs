@@ -147,6 +147,34 @@ fn help_names_the_options() {
     for flag in ["--repo", "--repo-id", "--format", "--output", "--detectors"] {
         result.assert_contains(flag);
     }
+    result.assert_contains("legacy repository-quality scorecard");
+    result.assert_contains("aethyme readiness");
+}
+
+#[test]
+fn legacy_alias_explains_positioning_and_keeps_report_contract() {
+    let tmp = tmp_dir();
+    let repo = build_problematic_scorecard_repo(tmp.path());
+    let output_file = tmp.path().join("legacy-scorecard.json");
+    let result = invoke_aethyme([
+        "ai-ready",
+        "--repo",
+        &repo.display().to_string(),
+        "--format",
+        "json",
+        "--output",
+        &output_file.display().to_string(),
+    ]);
+    result.expect_code(2);
+    result.assert_contains("legacy repository-quality scorecard");
+    result.assert_contains("does not determine operational readiness");
+    result.assert_contains("aethyme quality inspect");
+
+    let report: Value = serde_json::from_str(&read(&output_file)).unwrap();
+    assert_eq!(report["score"], 24);
+    assert_eq!(report["summary"]["total_findings"], 13);
+    assert!(report.get("scan_id").is_some());
+    assert!(report.get("detectors").is_some());
 }
 
 /// The parts of the report contract the Phase 4 corpus goldens froze.

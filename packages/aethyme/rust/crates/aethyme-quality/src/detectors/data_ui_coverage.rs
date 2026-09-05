@@ -45,6 +45,10 @@ impl super::Detector for DataUiCoverageDetector {
         "Checks for missing data-ui attributes in UI components"
     }
 
+    fn applicability(&self, repo_path: &Path) -> super::DetectorApplicability {
+        super::applies_to_extensions(repo_path, &EXTENSIONS, "UI component files")
+    }
+
     fn detect(&self, repo_path: &Path) -> Vec<Finding> {
         let patterns = patterns();
         let mut findings = Vec::new();

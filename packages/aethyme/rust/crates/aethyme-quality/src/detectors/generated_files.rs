@@ -58,6 +58,13 @@ impl super::Detector for GeneratedFilesDetector {
         "Checks for manual edits to auto-generated files"
     }
 
+    fn applicability(&self, repo_path: &Path) -> super::DetectorApplicability {
+        let _ = repo_path;
+        super::DetectorApplicability::NotApplicable {
+            reason: "generated content is excluded from tracked quality inspection".to_string(),
+        }
+    }
+
     fn detect(&self, repo_path: &Path) -> Vec<Finding> {
         let patterns = patterns();
         let mut findings = Vec::new();

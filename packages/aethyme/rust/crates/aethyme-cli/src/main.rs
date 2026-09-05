@@ -369,6 +369,7 @@ fn main() -> ExitCode {
         // new repo runs.
         "init" => ExitCode::from(aethyme_broker::cli::run(&args)),
         "deploy" => ExitCode::from(repository_deploy::run(&args[1..])),
+        "readiness" => ExitCode::from(aethyme_broker::cli::run(&args)),
         // Native since python-retirement Phase 2 (the Python `enhance`
         // group is deleted). deploy/verify answer natively; unknown
         // subcommands (and `--help`) get a native error like the other
@@ -381,6 +382,7 @@ fn main() -> ExitCode {
         // keep Click's `Error: {message}` line without the usage block
         // (Phase 2 precedent).
         "ai-ready" => ExitCode::from(aethyme_quality::ai_ready_cli::run(&args[1..])),
+        "quality" => ExitCode::from(aethyme_quality::quality_cli::run(&args[1..])),
         // Native since python-retirement Phase 5 (the Python `autofix`
         // command and src/autofixers/ are deleted). The safety/risk
         // engine, patch generation, the 5 fixers, and the git/PR helper
@@ -446,7 +448,9 @@ fn print_top_level_help() {
     eprintln!("  root show|set <path>        developer checkout pointer (legacy compatibility)");
     eprintln!();
     eprintln!("Quality:");
-    eprintln!("  ai-ready [--repo <path>]    AI-readiness scorecard");
+    eprintln!("  readiness [--require <level>] authoritative operational readiness");
+    eprintln!("  quality inspect [--repo <path>] bounded optional repository-quality analysis");
+    eprintln!("  ai-ready [--repo <path>]    legacy quality scorecard alias (deprecated)");
     eprintln!("  autofix <path> [--dry-run|--apply|--pr]");
     eprintln!("                              safe automated fixes (see `autofix --help`)");
     eprintln!();

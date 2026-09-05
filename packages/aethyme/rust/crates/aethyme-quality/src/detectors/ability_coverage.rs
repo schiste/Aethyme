@@ -52,6 +52,10 @@ impl super::Detector for AbilityCoverageDetector {
         "Checks for missing authorization and permission definitions"
     }
 
+    fn applicability(&self, repo_path: &Path) -> super::DetectorApplicability {
+        super::applies_to_extensions(repo_path, &[".py"], "Python authorization source files")
+    }
+
     fn detect(&self, repo_path: &Path) -> Vec<Finding> {
         let routes = self.find_protected_routes(repo_path);
         let mut findings = self.check_permission_definitions(repo_path, &routes);

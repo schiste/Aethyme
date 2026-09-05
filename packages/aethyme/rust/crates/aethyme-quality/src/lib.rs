@@ -1,6 +1,11 @@
-//! AI-readiness scorecard, detect side (retirement plan Phase 4).
+//! Optional repository-quality analysis and the legacy AI-readiness scorecard.
 //!
-//! Port of `src/scorecard/` — the `Finding` model, the eight detectors,
+//! `quality inspect` is the maintained, bounded surface. It scans a tracked,
+//! relevant snapshot and records detector applicability. Its suggestions are
+//! advisory and never feed operational readiness. `ai-ready` preserves the
+//! old scorecard contract as a deprecated compatibility alias.
+//!
+//! The legacy implementation is a port of `src/scorecard/` — the `Finding` model, the eight detectors,
 //! the integer 100-point scoring engine, and the json/md report
 //! renderers. The contract is byte parity with the Python
 //! implementation (decision #2): identical finding sets per detector
@@ -33,6 +38,8 @@ pub mod engine;
 pub mod fix;
 pub mod format;
 pub mod model;
+pub mod quality_cli;
+pub mod snapshot;
 pub mod util;
 pub mod walk;
 

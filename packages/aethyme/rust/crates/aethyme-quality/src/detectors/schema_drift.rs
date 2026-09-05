@@ -60,6 +60,14 @@ impl super::Detector for SchemaDriftDetector {
         "Checks for schema and type definition mismatches"
     }
 
+    fn applicability(&self, repo_path: &Path) -> super::DetectorApplicability {
+        super::applies_to_extensions(
+            repo_path,
+            &[".py", ".ts", ".tsx"],
+            "Python or TypeScript schema files",
+        )
+    }
+
     fn detect(&self, repo_path: &Path) -> Vec<Finding> {
         let mut findings = Vec::new();
         findings.extend(self.check_pydantic_models(repo_path));

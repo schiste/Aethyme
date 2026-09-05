@@ -61,6 +61,26 @@ pub mod schema_drift;
 use std::path::Path;
 
 use crate::model::Finding;
+use crate::walk::{py_suffix, rglob_all, should_skip_file};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DetectorApplicability {
+    Applicable { evidence: String },
+    NotApplicable { reason: String },
+}
+
+impl DetectorApplicability {
+    pub fn is_applicable(&self) -> bool {
+        matches!(self, Self::Applicable { .. })
+    }
+
+    pub fn reason(&self) -> &str {
+        match self {
+            Self::Applicable { evidence } => evidence,
+            Self::NotApplicable { reason } => reason,
+        }
+    }
+}
 
 /// A scorecard detector (port of `BaseDetector`). Detectors are pure
 /// functions of the repository tree; shared walk/skip/read helpers live
@@ -70,9 +90,34 @@ pub trait Detector {
     fn name(&self) -> &'static str;
     /// Human-readable description (parity: carried but not rendered).
     fn description(&self) -> &'static str;
+    /// Declare whether this detector has meaningful inputs in the
+    /// repository snapshot. Quality inspection records skipped detectors
+    /// instead of interpreting their empty output as a successful check.
+    fn applicability(&self, repo_path: &Path) -> DetectorApplicability;
     /// Run detection over `repo_path` and return findings in the
     /// Python-identical order.
     fn detect(&self, repo_path: &Path) -> Vec<Finding>;
+}
+
+pub(super) fn applies_to_extensions(
+    repo_path: &Path,
+    extensions: &[&str],
+    description: &str,
+) -> DetectorApplicability {
+    let found = rglob_all(repo_path).into_iter().any(|entry| {
+        entry.is_file
+            && !should_skip_file(&entry.path)
+            && extensions.contains(&py_suffix(&entry.path).as_str())
+    });
+    if found {
+        DetectorApplicability::Applicable {
+            evidence: format!("tracked snapshot contains {description}"),
+        }
+    } else {
+        DetectorApplicability::NotApplicable {
+            reason: format!("tracked snapshot contains no {description}"),
+        }
+    }
 }
 
 /// Registry of all detectors, in the exact `ALL_DETECTORS` order from
@@ -90,4 +135,50 @@ pub fn all_detectors() -> Vec<Box<dyn Detector>> {
         Box::new(route_coverage::RouteCoverageDetector),
         Box::new(ability_coverage::AbilityCoverageDetector),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn every_detector_declares_applicability() {
+        let root = std::env::temp_dir().join(format!(
+            "aethyme-quality-applicability-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn answer() -> u8 { 42 }\n").unwrap();
+
+        let outcomes: Vec<_> = all_detectors()
+            .into_iter()
+            .map(|detector| (detector.name(), detector.applicability(&root)))
+            .collect();
+        assert_eq!(outcomes.len(), 8);
+        assert!(
+            outcomes
+                .iter()
+                .all(|(_, outcome)| !outcome.reason().is_empty())
+        );
+        assert!(
+            outcomes
+                .iter()
+                .find(|(name, _)| *name == "folder-docs")
+                .unwrap()
+                .1
+                .is_applicable()
+        );
+        assert!(
+            !outcomes
+                .iter()
+                .find(|(name, _)| *name == "data-ui-coverage")
+                .unwrap()
+                .1
+                .is_applicable()
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
 }

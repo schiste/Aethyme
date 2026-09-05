@@ -48,6 +48,33 @@ pub struct DetectorResult {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct InspectionDetectorResult {
+    pub detector_name: String,
+    pub description: String,
+    pub applicability: crate::detectors::DetectorApplicability,
+    pub findings: Vec<Finding>,
+    pub execution_time_ms: f64,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct QualityInspection {
+    pub repository_path: String,
+    pub tracked_file_count: usize,
+    pub relevant_file_count: usize,
+    pub excluded_vendored_count: usize,
+    pub excluded_generated_count: usize,
+    pub excluded_non_regular_count: usize,
+    pub total_findings: usize,
+    pub high_count: usize,
+    pub medium_count: usize,
+    pub low_count: usize,
+    pub findings: Vec<Finding>,
+    pub detector_results: Vec<InspectionDetectorResult>,
+    pub total_scan_time_ms: f64,
+}
+
 /// Complete scorecard report (port of `ScorecardReport`).
 #[derive(Debug, Clone)]
 pub struct ScorecardReport {

@@ -44,6 +44,10 @@ impl super::Detector for RouteCoverageDetector {
         "Checks for undocumented API routes and endpoints"
     }
 
+    fn applicability(&self, repo_path: &Path) -> super::DetectorApplicability {
+        super::applies_to_extensions(repo_path, &[".py", ".js", ".ts"], "HTTP route source files")
+    }
+
     fn detect(&self, repo_path: &Path) -> Vec<Finding> {
         let routes = self.find_routes(repo_path);
         self.check_route_documentation(repo_path, &routes)
