@@ -36,11 +36,7 @@ impl super::Detector for FolderDocsDetector {
     }
 
     fn applicability(&self, repo_path: &Path) -> super::DetectorApplicability {
-        super::applies_to_named_file(
-            repo_path,
-            "FOLDER.md",
-            "established FOLDER.md convention",
-        )
+        super::applies_to_named_file(repo_path, "FOLDER.md", "established FOLDER.md convention")
     }
 
     fn detect(&self, repo_path: &Path) -> Vec<Finding> {
