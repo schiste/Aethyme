@@ -369,7 +369,7 @@ impl HostResourceCoordinator {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        quarantine_expired(&tx, now)?;
+        quarantine_reclaimable(&tx, now)?;
         if let Some((existing_digest, state, token)) = tx.query_row(
             "SELECT request_digest,state,ownership_token FROM resource_leases WHERE request_id=?1",
             [&request.request_id],
@@ -483,7 +483,7 @@ impl HostResourceCoordinator {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        quarantine_expired(&tx, now)?;
+        quarantine_reclaimable(&tx, now)?;
         verify_ownership(&tx, lease_id, generation, token, true)?;
         let expires = now.saturating_add((ttl_seconds as i64).saturating_mul(1_000));
         tx.execute(
@@ -506,7 +506,7 @@ impl HostResourceCoordinator {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        quarantine_expired(&tx, now)?;
+        quarantine_reclaimable(&tx, now)?;
         verify_ownership(&tx, lease_id, generation, token, false)?;
         tx.execute("UPDATE resource_leases SET state='released',released_at=?2,updated_at=?2 WHERE lease_id=?1 AND state!='released'", params![lease_id,now])?;
         let lease = load_lease(&tx, "lease_id", lease_id)?
@@ -681,7 +681,7 @@ impl HostResourceCoordinator {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        quarantine_expired(&tx, now)?;
+        quarantine_reclaimable(&tx, now)?;
         let (actual, state): (i64, String) = tx
             .query_row(
                 "SELECT generation,state FROM resource_leases WHERE lease_id=?1",
@@ -1068,21 +1068,52 @@ struct Occupied {
     value: String,
     units: Option<u32>,
     limit: Option<u32>,
+    /// A named resource stays reserved after its holder dies, so the waiter needs
+    /// to be told that waiting cannot resolve it.
+    holder_gone: bool,
 }
 
+/// Quarantined leases keep occupying their resources, because reusing a name
+/// whose cleanup was never confirmed is exactly what quarantine exists to
+/// prevent. Capacity is the one exception, and only for a provably dead holder.
+///
+/// The two kinds reserve different things. A namespace or exclusive key names a
+/// real artifact -- a database, a directory -- that may still hold residue, so it
+/// stays reserved until reconciliation proves cleanup. A capacity unit is a pure
+/// counter reserving machine throughput, with no artifact to leave dirty, so once
+/// the process consuming that throughput is gone the unit reserves nothing at all.
+/// Holding it merely stalls the pool (issue #139).
+///
+/// Liveness rather than state is the test on purpose: a quarantined holder that is
+/// still running keeps its units, because it is still consuming the CPU and memory
+/// the pool exists to bound.
 fn load_occupied(conn: &Connection) -> Result<Vec<Occupied>, HostResourceError> {
-    let mut stmt=conn.prepare("SELECT a.lease_id,a.kind,a.value,a.units,a.capacity_limit FROM resource_allocations a JOIN resource_leases l ON l.lease_id=a.lease_id WHERE l.state IN ('active','quarantined') ORDER BY l.generation,a.resource_key")?;
-    Ok(stmt
+    let mut stmt=conn.prepare("SELECT a.lease_id,a.kind,a.value,a.units,a.capacity_limit,l.holder_pid FROM resource_allocations a JOIN resource_leases l ON l.lease_id=a.lease_id WHERE l.state IN ('active','quarantined') ORDER BY l.generation,a.resource_key")?;
+    let rows = stmt
         .query_map([], |row| {
-            Ok(Occupied {
-                lease_id: row.get(0)?,
-                kind: row.get(1)?,
-                value: row.get(2)?,
-                units: row.get::<_, Option<i64>>(3)?.map(|v| v as u32),
-                limit: row.get::<_, Option<i64>>(4)?.map(|v| v as u32),
-            })
+            Ok((
+                Occupied {
+                    lease_id: row.get(0)?,
+                    kind: row.get(1)?,
+                    value: row.get(2)?,
+                    units: row.get::<_, Option<i64>>(3)?.map(|v| v as u32),
+                    limit: row.get::<_, Option<i64>>(4)?.map(|v| v as u32),
+                    holder_gone: row
+                        .get::<_, Option<i64>>(5)?
+                        .is_some_and(holder_process_is_gone),
+                },
+                row.get::<_, Option<i64>>(5)?,
+            ))
         })?
-        .collect::<Result<Vec<_>, _>>()?)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows
+        .into_iter()
+        .filter(|(occupied, holder_pid)| {
+            occupied.kind != "capacity"
+                || !holder_pid.is_some_and(|pid| holder_process_is_gone(pid))
+        })
+        .map(|(occupied, _)| occupied)
+        .collect())
 }
 
 fn plan_allocations(
@@ -1150,7 +1181,10 @@ fn plan_allocations(
                         &requirement.key,
                         "capacity",
                         format!("{pool}:{units}/{limit}"),
-                        &format!("pool has {used}/{limit} units allocated"),
+                        &format!(
+                            "pool has {used}/{limit} units allocated by {} live lease(s)",
+                            matching.len()
+                        ),
                         matching.first().map(|o| o.lease_id.clone()),
                     ));
                 } else {
@@ -1168,12 +1202,21 @@ fn plan_allocations(
                     .iter()
                     .find(|o| o.kind == "exclusive_key" && o.value == *name)
                 {
+                    let reason = if owner.holder_gone {
+                        format!(
+                            "exclusive key is held by lease {} whose holder process is gone; \
+                             waiting cannot release it, reconcile that lease to confirm cleanup",
+                            owner.lease_id
+                        )
+                    } else {
+                        format!("exclusive key is held by lease {}", owner.lease_id)
+                    };
                     conflicts.push(conflict(
                         "resource_contention",
                         &requirement.key,
                         "exclusive_key",
                         name.clone(),
-                        "exclusive key is already allocated",
+                        &reason,
                         Some(owner.lease_id.clone()),
                     ));
                 } else {
@@ -1251,6 +1294,65 @@ fn sanitize(value: &str) -> String {
 fn quarantine_expired(conn: &Connection, now: i64) -> Result<(), HostResourceError> {
     conn.execute("UPDATE resource_leases SET state='quarantined',updated_at=?1 WHERE state='active' AND expires_at<=?1",[now])?;
     Ok(())
+}
+
+/// Probe with signal 0: it reports whether a process can be signalled without
+/// disturbing a live holder.
+///
+/// Deliberately conservative about PID reuse. A recycled PID reports *alive*,
+/// which forgoes an early reclaim; the opposite bias would revoke a lease from a
+/// running holder. Only a provably absent process (`ESRCH`) counts as gone, so a
+/// PID this process may not signal (`EPERM`) is treated as alive.
+fn holder_process_is_gone(pid: i64) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    if pid <= 0 {
+        return false;
+    }
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return false;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+}
+
+/// A holder that no longer exists can never renew or release its lease, so its
+/// allocations pin the pool until the TTL elapses. On a pool whose limit a single
+/// run consumes entirely, that stalls every gate on the machine -- across every
+/// worktree and every session, not only the one that leaked (issue #139).
+///
+/// Reclaiming early is safe precisely because renewal comes from the holder
+/// process: once it is gone nothing will renew, so quarantining only anticipates
+/// an expiry that is already certain. Quarantine rather than release keeps the
+/// existing reconciliation gate, so cleanup authority is still confirmed.
+fn quarantine_dead_holders(conn: &Connection, now: i64) -> Result<(), HostResourceError> {
+    let candidates = {
+        let mut stmt = conn.prepare(
+            "SELECT lease_id,holder_pid FROM resource_leases \
+             WHERE state='active' AND holder_pid IS NOT NULL",
+        )?;
+        stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    for (lease_id, holder_pid) in candidates {
+        if !holder_process_is_gone(holder_pid) {
+            continue;
+        }
+        conn.execute(
+            "UPDATE resource_leases SET state='quarantined',updated_at=?2 \
+             WHERE lease_id=?1 AND state='active'",
+            params![lease_id, now],
+        )?;
+    }
+    Ok(())
+}
+
+/// Every write path reclaims both kinds of unusable lease before reading
+/// occupancy, so a stalled pool frees itself at the next attempt rather than
+/// requiring an operator to notice.
+fn quarantine_reclaimable(conn: &Connection, now: i64) -> Result<(), HostResourceError> {
+    quarantine_expired(conn, now)?;
+    quarantine_dead_holders(conn, now)
 }
 
 fn verify_ownership(
@@ -1478,6 +1580,84 @@ mod tests {
             Err(HostResourceError::Conflict { .. })
         ));
     }
+    /// Reaped, so the PID is provably absent rather than merely idle.
+    fn reaped_pid() -> u32 {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        pid
+    }
+
+    fn whole_pool(id: &str) -> HostResourceRequest {
+        req(
+            id,
+            vec![HostResourceRequirement {
+                key: "host-work".into(),
+                resource: HostResourceKind::Capacity {
+                    pool: "host-work".into(),
+                    units: 4,
+                    limit: 4,
+                },
+            }],
+        )
+    }
+
+    /// Issue #139: a holder that died without releasing pinned a whole-pool lease
+    /// until its TTL, stalling every gate on the machine.
+    #[test]
+    fn dead_holder_does_not_pin_the_pool_until_expiry() {
+        let t = tempfile::tempdir().unwrap();
+        let mut c = HostResourceCoordinator::open(&t.path().join("h.db")).unwrap();
+        let mut leaked = whole_pool("leaked");
+        // An hour of TTL left, so expiry cannot be what frees the pool.
+        leaked.ttl_seconds = 3_600;
+        leaked.holder_pid = Some(reaped_pid());
+        c.acquire(&leaked).unwrap();
+
+        c.acquire(&whole_pool("next"))
+            .expect("a dead holder must not pin the pool for the rest of its TTL");
+    }
+
+    /// The capacity exception must not leak into named resources: a dead holder
+    /// may have left a database or directory dirty, so its exclusive key stays
+    /// reserved until reconciliation proves cleanup.
+    #[test]
+    fn dead_holder_still_reserves_its_named_resources() {
+        let t = tempfile::tempdir().unwrap();
+        let mut c = HostResourceCoordinator::open(&t.path().join("h.db")).unwrap();
+        let mut leaked = req("leaked", vec![exclusive("shared")]);
+        leaked.ttl_seconds = 3_600;
+        leaked.holder_pid = Some(reaped_pid());
+        c.acquire(&leaked).unwrap();
+
+        let Err(HostResourceError::Conflict { message, .. }) =
+            c.acquire(&req("next", vec![exclusive("shared")]))
+        else {
+            panic!("a dead holder's exclusive key must stay reserved");
+        };
+        // Waiting is futile here, so the message has to say so and name the remedy.
+        assert!(
+            message.contains("holder process is gone") && message.contains("reconcile"),
+            "conflict must explain that waiting cannot resolve it: {message}"
+        );
+    }
+
+    /// The reclaim must not be so eager that it revokes a lease from a running
+    /// holder; only a provably absent process is reclaimed.
+    #[test]
+    fn live_holder_keeps_its_capacity() {
+        let t = tempfile::tempdir().unwrap();
+        let mut c = HostResourceCoordinator::open(&t.path().join("h.db")).unwrap();
+        let mut held = whole_pool("held");
+        held.holder_pid = Some(std::process::id());
+        c.acquire(&held).unwrap();
+
+        assert!(matches!(
+            c.acquire(&whole_pool("next")),
+            Err(HostResourceError::Conflict { .. })
+        ));
+    }
+
     #[test]
     fn invalid_request_never_writes() {
         let t = tempfile::tempdir().unwrap();

@@ -326,7 +326,11 @@ struct RepositoryWriteLock {
 }
 
 impl RepositoryWriteLock {
-    fn acquire(main_root: &Path, repository: &str) -> Result<Self, BrokerOpError> {
+    fn acquire(
+        main_root: &Path,
+        repository: &str,
+        describe_holder: impl FnOnce() -> String,
+    ) -> Result<Self, BrokerOpError> {
         let dir = main_root.join(".aethyme/locks/operations");
         std::fs::create_dir_all(&dir).map_err(|source| BrokerOpError::OperationIo {
             path: dir.clone(),
@@ -343,6 +347,27 @@ impl RepositoryWriteLock {
                 path: path.clone(),
                 source,
             })?;
+        // Try without blocking first, so the uncontended path stays a single
+        // syscall and the holder lookup only runs when it can actually help.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc == 0 {
+            return Ok(Self { file });
+        }
+        let would_block = std::io::Error::last_os_error().raw_os_error() == Some(libc::EWOULDBLOCK);
+        if !would_block {
+            return Err(BrokerOpError::OperationIo {
+                path,
+                source: std::io::Error::last_os_error(),
+            });
+        }
+        // A coordinated operation that simply pauses is indistinguishable from one
+        // that died. Saying what holds the lock, and for how long, is what makes
+        // the difference visible to the caller (issue #138).
+        eprintln!(
+            "[coordination] waiting for the {repository} write lock: {}",
+            describe_holder()
+        );
+        let waited = std::time::Instant::now();
         let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
         if rc != 0 {
             return Err(BrokerOpError::OperationIo {
@@ -350,7 +375,49 @@ impl RepositoryWriteLock {
                 source: std::io::Error::last_os_error(),
             });
         }
+        eprintln!(
+            "[coordination] acquired the {repository} write lock after {}",
+            humanize_duration(waited.elapsed().as_secs())
+        );
         Ok(Self { file })
+    }
+}
+
+fn humanize_duration(seconds: u64) -> String {
+    match seconds {
+        0..=59 => format!("{seconds}s"),
+        _ => format!("{}m {}s", seconds / 60, seconds % 60),
+    }
+}
+
+/// The holder is whichever operation on this repository is recorded as running.
+/// An operation that has not registered yet is reported as such rather than as
+/// "no holder", because the lock is demonstrably held by someone.
+fn describe_lock_holder(store: &mut crate::BrokerStore, repository: &str) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let running = store
+        .unresolved_coordinated_operations(repository)
+        .ok()
+        .and_then(|operations| {
+            operations
+                .into_iter()
+                .find(|operation| operation.status == OperationStatus::Running)
+        });
+    match running {
+        Some(operation) => format!(
+            "operation {} (session {}, {} {}) has held it for {}",
+            operation.id,
+            operation.session_id,
+            operation.provider.as_str(),
+            operation.scope,
+            humanize_duration(
+                now.saturating_sub(operation.created_at).max(0) as u64 / 1_000
+            )
+        ),
+        None => "held by an operation that has not recorded itself yet".into(),
     }
 }
 
@@ -1245,7 +1312,10 @@ impl Broker {
         let _lock = if effect == OperationEffect::Read {
             None
         } else {
-            Some(RepositoryWriteLock::acquire(self.main_root(), &repository)?)
+            let main_root = self.main_root().to_path_buf();
+            Some(RepositoryWriteLock::acquire(&main_root, &repository, || {
+                describe_lock_holder(self.store(), &repository)
+            })?)
         };
         if effect != OperationEffect::Read {
             let unresolved = self
@@ -1547,6 +1617,65 @@ impl Broker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wait_durations_read_naturally() {
+        assert_eq!(humanize_duration(9), "9s");
+        assert_eq!(humanize_duration(59), "59s");
+        assert_eq!(humanize_duration(1_688), "28m 8s");
+    }
+
+    /// Issue #138: a blocked caller saw nothing at all, so a long hold was
+    /// indistinguishable from a dead command and got re-issued.
+    #[test]
+    fn a_contended_lock_names_the_operation_holding_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("broker.db");
+        // Open once so the schema exists, then seed the owning session directly.
+        drop(crate::BrokerStore::open(&db).unwrap());
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "INSERT INTO sessions (
+                 id, worktree_path, branch, origin, status,
+                 created_at, updated_at, last_activity_at
+             ) VALUES (37, '/repo/one', 'agent/one', 'adopted', 'active', 1, 1, 1);",
+        )
+        .unwrap();
+        drop(conn);
+        let mut store = crate::BrokerStore::open(&db).unwrap();
+        let created = store
+            .create_coordinated_operation(&crate::NewCoordinatedOperation {
+                session_id: 37,
+                provider: OperationProvider::Git,
+                repository: "owner/repo".into(),
+                scope: "refs/heads/feature".into(),
+                effect: OperationEffect::Write,
+                authorization_reason: Some("test".into()),
+                command_json: "[\"push\"]".into(),
+                pid: std::process::id() as i64,
+                host_operation_id: None,
+                identity_provenance: crate::OperationIdentityProvenance::VerifiedCanonical,
+            })
+            .unwrap();
+        store
+            .transition_coordinated_operation(created.id, OperationStatus::Running, None, None)
+            .unwrap();
+
+        let described = describe_lock_holder(&mut store, "owner/repo");
+        assert!(
+            described.contains(&format!("operation {}", created.id))
+                && described.contains("session 37")
+                && described.contains("refs/heads/feature"),
+            "the notice must identify the holder: {described}"
+        );
+
+        // A repository with nothing running must not claim a phantom holder.
+        let other = describe_lock_holder(&mut store, "owner/elsewhere");
+        assert!(
+            other.contains("has not recorded itself"),
+            "an unregistered holder must be reported as such: {other}"
+        );
+    }
 
     fn args(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|part| (*part).into()).collect()
