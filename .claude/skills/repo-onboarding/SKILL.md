@@ -15,19 +15,48 @@ description: Use when starting work in an unfamiliar repository, when the task a
 ## Repo Identity
 
 - Kind: `monorepo`
-- Languages: `unknown`
-- Package manager: `unknown`
+- Languages: `rust, python`
+- Package manager: `cargo`
+- Key manifests: `packages/aethyme-eval/pyproject.toml, packages/aethyme/Makefile, packages/aethyme/package.json, packages/aethyme/rust/Cargo.toml, packages/aethyme/rust/crates/aethyme-broker/Cargo.toml, packages/aethyme/rust/crates/aethyme-cli/Cargo.toml, packages/aethyme/rust/crates/aethyme-engine/Cargo.toml, packages/aethyme/rust/crates/aethyme-enhance/Cargo.toml, packages/aethyme/rust/crates/aethyme-graph-indexer/Cargo.toml, packages/aethyme/rust/crates/aethyme-graph-schema/Cargo.toml, packages/aethyme/rust/crates/aethyme-graph-storage/Cargo.toml, packages/aethyme/rust/crates/aethyme-producers/Cargo.toml, packages/aethyme/rust/crates/aethyme-quality/Cargo.toml, packages/aethyme/rust/crates/aethyme-testkit/Cargo.toml`
+
+## Workspaces
+
+- `packages/aethyme/rust` (primary; cargo; manifest `packages/aethyme/rust/Cargo.toml`; high confidence)
+- `packages/aethyme` (supporting; npm; manifest `packages/aethyme/package.json`; high confidence)
+- `packages/aethyme-eval` (supporting; python; manifest `packages/aethyme-eval/pyproject.toml`; high confidence)
 
 ## Start Here
 
-- `fast_test`: `cargo test`
-- `build`: `cargo build`
+- `fast_test`: `cargo test --manifest-path packages/aethyme/rust/Cargo.toml --workspace`
+- `build`: `cargo build --manifest-path packages/aethyme/rust/Cargo.toml --workspace`
 
 ## Supporting Commands
 
-- `cargo test` (fast_test; medium confidence from `github-actions`)
-- `pytest` (fast_test; medium confidence from `github-actions`)
-- `cargo build` (build; medium confidence from `github-actions`)
+- `python -m pip install -e packages/aethyme-eval` (install; medium confidence from `packages/aethyme-eval/pyproject.toml`)
+  Workspace: `packages/aethyme-eval`
+- `cargo test --manifest-path packages/aethyme/rust/Cargo.toml --workspace` (fast_test; high confidence from `packages/aethyme/rust/Cargo.toml`)
+  Workspace: `packages/aethyme/rust`
+- `python -m pytest packages/aethyme-eval` (fast_test; medium confidence from `packages/aethyme-eval/pyproject.toml`)
+  Workspace: `packages/aethyme-eval`
+- `cargo build --manifest-path packages/aethyme/rust/Cargo.toml --workspace` (build; high confidence from `packages/aethyme/rust/Cargo.toml`)
+  Workspace: `packages/aethyme/rust`
+
+## Entrypoints
+
+- `cli`: `packages/aethyme/rust/crates/aethyme-cli/src/main.rs` (tracked Rust binary entrypoint in `packages/aethyme/rust`; high confidence)
+
+## Additional Entrypoints
+
+- `packages/aethyme/rust/crates/aethyme-cli/src/main.rs` (file; role=cli; tracked Rust binary entrypoint in `packages/aethyme/rust`; high confidence)
+  Executable: `aethyme`
+- `packages/aethyme/rust/crates/aethyme-engine/src/bin/aethyme-engine-cli.rs` (file; role=cli; tracked Rust binary entrypoint in `packages/aethyme/rust`; high confidence)
+  Executable: `aethyme-engine-cli`
+- `packages/aethyme/rust/crates/aethyme-graph-indexer/src/bin/aethyme-graph-index.rs` (file; role=cli; tracked Rust binary entrypoint in `packages/aethyme/rust`; high confidence)
+  Executable: `aethyme-graph-index`
+- `packages/aethyme/rust/crates/aethyme-graph-indexer/src/bin/aethyme-graph-link.rs` (file; role=cli; tracked Rust binary entrypoint in `packages/aethyme/rust`; high confidence)
+  Executable: `aethyme-graph-link`
+- `packages/aethyme/rust/crates/aethyme-graph-indexer/src/bin/aethyme-graph-query.rs` (file; role=cli; tracked Rust binary entrypoint in `packages/aethyme/rust`; high confidence)
+  Executable: `aethyme-graph-query`
 
 ## Repo Map
 
@@ -44,9 +73,15 @@ description: Use when starting work in an unfamiliar repository, when the task a
 - `aethyme graph callers "$PWD" "<symbol-or-file>" --json-output`
   Purpose: Trace likely impact before editing
 
+## Generated and Dangerous Paths
+
+- Generated/vendor `.aethyme/generated`: tracked generated or vendored surface; verify ownership before editing
+- Sensitive `.aethyme/gates.toml`: repository validation policy; changes affect every broker submission
+- Sensitive `.github/workflows`: repository automation; changes can affect publication or shared CI
+
 ## Freshness
 
-- Source digest: `0b17b99b74f28871b69c64a3956c96ac191fa6856a5e2913a706c32143c43145`
-- Tracked source files: `534`
+- Source digest: `4a8e740640ae8599b14705fbc658e0a506b5739819fccc4e145017e6265798a9`
+- Tracked source files: `536`
 - Overrides applied: `False`
-- Sections generated: `repo, commands, areas, entrypoints, caution_zones, navigation_recipes, summon, freshness`
+- Sections generated: `repo, workspaces, primary_workspace, commands, areas, entrypoints, caution_zones, generated_paths, dangerous_paths, navigation_recipes, summon, freshness`

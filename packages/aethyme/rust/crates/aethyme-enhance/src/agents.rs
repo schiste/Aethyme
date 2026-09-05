@@ -541,6 +541,7 @@ fn render_repo_routing(repo: &Path) -> Result<String, String> {
         .map_err(|e| format!("{}: {e}", onboarding_path.display()))?;
     let onboarding = pyjson::loads(&onboarding_text)
         .map_err(|e| format!("{}: {e}", onboarding_path.display()))?;
+    crate::onboarding::validate_onboarding_schema(&onboarding)?;
     let act = if act_path.exists() {
         let act_text = std::fs::read_to_string(&act_path)
             .map_err(|e| format!("{}: {e}", act_path.display()))?;

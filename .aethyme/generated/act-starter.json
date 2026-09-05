@@ -21,19 +21,65 @@
     ]
   },
   "commands": {
-    "fast_test": "cargo test",
+    "fast_test": "cargo test --manifest-path packages/aethyme/rust/Cargo.toml --workspace",
     "full_test": null,
     "lint": null,
-    "build": "cargo build",
+    "build": "cargo build --manifest-path packages/aethyme/rust/Cargo.toml --workspace",
     "dev": null
   },
-  "entrypoints": [],
-  "primary_entrypoints": {},
+  "entrypoints": [
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-cli/src/main.rs",
+      "kind": "file",
+      "role": "cli",
+      "reason": "tracked Rust binary entrypoint in `packages/aethyme/rust`",
+      "confidence": "high",
+      "workspace_root": "packages/aethyme/rust",
+      "provenance": "derived from tracked workspace source",
+      "executable_name": "aethyme",
+      "relevance": "primary"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-engine/src/bin/aethyme-engine-cli.rs",
+      "kind": "file",
+      "role": "cli",
+      "reason": "tracked Rust binary entrypoint in `packages/aethyme/rust`",
+      "confidence": "high",
+      "workspace_root": "packages/aethyme/rust",
+      "provenance": "derived from tracked workspace source",
+      "executable_name": "aethyme-engine-cli",
+      "relevance": "product"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-graph-indexer/src/bin/aethyme-graph-index.rs",
+      "kind": "file",
+      "role": "cli",
+      "reason": "tracked Rust binary entrypoint in `packages/aethyme/rust`",
+      "confidence": "high",
+      "workspace_root": "packages/aethyme/rust",
+      "provenance": "derived from tracked workspace source",
+      "executable_name": "aethyme-graph-index",
+      "relevance": "product"
+    }
+  ],
+  "primary_entrypoints": {
+    "cli": {
+      "path": "packages/aethyme/rust/crates/aethyme-cli/src/main.rs",
+      "kind": "file",
+      "role": "cli",
+      "reason": "tracked Rust binary entrypoint in `packages/aethyme/rust`",
+      "confidence": "high",
+      "workspace_root": "packages/aethyme/rust",
+      "provenance": "derived from tracked workspace source",
+      "executable_name": "aethyme",
+      "relevance": "primary"
+    }
+  },
   "caution_zones": [],
   "telemetry": {
     "derived_from": ".aethyme/generated/onboarding.json",
-    "entrypoint_count": 0,
-    "primary_entrypoint_count": 0,
+    "entrypoint_count": 7,
+    "primary_entrypoint_count": 1,
     "caution_zone_count": 0
   }
 }

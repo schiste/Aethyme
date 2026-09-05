@@ -143,6 +143,22 @@ fn enhance_deploy_writes_generated_onboarding() {
         serde_json::from_str(&read(repo.join(".aethyme/generated/onboarding.json"))).unwrap();
     let act: Value =
         serde_json::from_str(&read(repo.join(".aethyme/generated/act-starter.json"))).unwrap();
+    assert_eq!(artifact["schema_version"], "aethyme-onboarding-v2");
+    assert_eq!(artifact["primary_workspace"]["root"], ".");
+    assert_eq!(artifact["primary_workspace"]["package_manager"], "pnpm");
+    assert_eq!(artifact["repo"]["primary_language"], "typescript");
+    assert!(artifact["workspaces"].as_array().is_some_and(|workspaces| {
+        workspaces.iter().any(|workspace| {
+            workspace["manifest"]["path"] == "package.json" && workspace["primary"] == true
+        })
+    }));
+    assert!(artifact["commands"].as_array().is_some_and(|commands| {
+        commands.iter().any(|command| {
+            command["command"] == "pnpm test"
+                && command["workspace_root"] == "."
+                && command["provenance"] == "derived from tracked workspace manifest"
+        })
+    }));
     assert!(
         artifact["telemetry"]["counts"]["commands"]
             .as_i64()

@@ -6,7 +6,7 @@
 //! All JSON is built as ordered [`Value`]s so `json.dumps(..., indent=2)`
 //! byte shapes survive the port, including override-injected content.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -22,6 +22,8 @@ pub const ONBOARDING_CODEX_PATH: &str = ".codex/skills/repo-onboarding/SKILL.md"
 pub const ACT_CLAUDE_PATH: &str = ".claude/skills/repo-act/SKILL.md";
 pub const ACT_CODEX_PATH: &str = ".codex/skills/repo-act/SKILL.md";
 pub const ONBOARDING_OVERRIDE_PATH: &str = ".aethyme/overrides/onboarding.json";
+pub const ONBOARDING_SCHEMA_V1: &str = "aethyme-onboarding-v1";
+pub const ONBOARDING_SCHEMA_V2: &str = "aethyme-onboarding-v2";
 
 const GENERATED_DEPLOY_PATHS: [&str; 4] = [
     "AGENTS.md",
@@ -43,6 +45,16 @@ const GENERATED_DEPLOY_PREFIXES: [&str; 7] = [
 /// missing keys; the port surfaces the same condition as a command error.
 fn req<'a>(value: &'a Value, key: &str) -> Result<&'a Value, String> {
     value.get(key).ok_or_else(|| format!("KeyError: '{key}'"))
+}
+
+pub fn validate_onboarding_schema(artifact: &Value) -> Result<(), String> {
+    match artifact.get("schema_version").and_then(Value::as_str) {
+        Some(ONBOARDING_SCHEMA_V1 | ONBOARDING_SCHEMA_V2) => Ok(()),
+        Some(schema) => Err(format!(
+            "unsupported onboarding schema {schema:?}; expected {ONBOARDING_SCHEMA_V1:?} or {ONBOARDING_SCHEMA_V2:?}"
+        )),
+        None => Err("onboarding artifact missing string field 'schema_version'".into()),
+    }
 }
 
 fn obj(pairs: Vec<(&str, Value)>) -> Value {
@@ -97,21 +109,35 @@ pub fn build_onboarding_artifact(repo_path: &Path) -> Result<Value, String> {
     let repo_path = resolve_path(repo_path);
     let snapshot = snapshot_metadata(&repo_path)?;
     let surface_files = OnboardingFileSnapshot::discover(&repo_path)?;
+    let inventory = WorkspaceInventory::discover(&repo_path, &surface_files)?;
 
-    let manifests = detect_manifests(&repo_path);
-    let package_manager = primary_package_manager(&repo_path, &manifests);
-    let commands = collect_commands(&repo_path, &manifests, package_manager)?;
-    let primary_commands = primary_commands_map(&commands);
+    let manifests = inventory.manifests.clone();
+    let primary_workspace = inventory.primary();
+    let package_manager = primary_workspace
+        .map(|workspace| workspace.package_manager.as_str())
+        .unwrap_or("unknown");
+    let commands = collect_commands(&repo_path, &manifests, package_manager, &inventory)?;
+    let primary_commands = primary_commands_map(
+        &commands,
+        primary_workspace.map(|workspace| workspace.root.as_str()),
+    );
     let areas = collect_areas(&surface_files);
-    let entrypoints = collect_entrypoints(&repo_path, &manifests, &surface_files)?;
+    let entrypoints = collect_entrypoints(
+        &repo_path,
+        &manifests,
+        &surface_files,
+        &inventory,
+        &snapshot.repo_name,
+    )?;
     let primary_entrypoints = primary_entrypoints_map(&entrypoints);
     let caution_zones = collect_caution_zones(&surface_files);
+    let (generated_paths, dangerous_paths) = collect_path_controls(&surface_files);
     let repo_kind = infer_repo_kind(&repo_path, &manifests, &areas);
-    let languages = infer_languages(&repo_path, &manifests);
+    let languages = inventory.languages_primary_first();
     let overrides = load_overrides(&repo_path);
 
     let mut artifact = obj(vec![
-        ("schema_version", Value::str("aethyme-onboarding-v1")),
+        ("schema_version", Value::str(ONBOARDING_SCHEMA_V2)),
         (
             "repo",
             obj(vec![
@@ -123,7 +149,11 @@ pub fn build_onboarding_artifact(repo_path: &Path) -> Result<Value, String> {
                 ("kind", Value::str(repo_kind)),
                 (
                     "languages",
-                    Value::Array(languages.iter().map(|l| Value::str(*l)).collect()),
+                    Value::Array(languages.iter().map(Value::str).collect()),
+                ),
+                (
+                    "primary_language",
+                    languages.first().map(Value::str).unwrap_or(Value::Null),
                 ),
                 ("package_manager", Value::str(package_manager)),
                 (
@@ -132,12 +162,32 @@ pub fn build_onboarding_artifact(repo_path: &Path) -> Result<Value, String> {
                 ),
             ]),
         ),
+        (
+            "workspaces",
+            Value::Array(
+                inventory
+                    .ranked()
+                    .into_iter()
+                    .map(|workspace| {
+                        workspace_value(workspace, primary_workspace == Some(workspace))
+                    })
+                    .collect(),
+            ),
+        ),
+        (
+            "primary_workspace",
+            primary_workspace
+                .map(|workspace| workspace_value(workspace, true))
+                .unwrap_or(Value::Null),
+        ),
         ("commands", Value::Array(commands.clone())),
         ("primary_commands", primary_commands),
         ("areas", Value::Array(areas)),
         ("entrypoints", Value::Array(entrypoints)),
         ("primary_entrypoints", primary_entrypoints),
         ("caution_zones", Value::Array(caution_zones)),
+        ("generated_paths", Value::Array(generated_paths)),
+        ("dangerous_paths", Value::Array(dangerous_paths)),
         ("navigation_recipes", navigation_recipes()),
         ("summon", summon_policy()),
         (
@@ -164,6 +214,7 @@ pub fn build_onboarding_artifact(repo_path: &Path) -> Result<Value, String> {
 
 /// Build a deterministic Act starter artifact from onboarding facts.
 pub fn build_act_starter_artifact(onboarding_artifact: &Value) -> Result<Value, String> {
+    validate_onboarding_schema(onboarding_artifact)?;
     let repo = req(onboarding_artifact, "repo")?;
     let empty = Value::Array(vec![]);
     let empty_obj = Value::object();
@@ -281,6 +332,7 @@ pub fn build_act_starter_artifact(onboarding_artifact: &Value) -> Result<Value, 
 
 /// Render the onboarding artifact into an agent-facing skill.
 pub fn render_onboarding_skill(artifact: &Value) -> Result<String, String> {
+    validate_onboarding_schema(artifact)?;
     let repo = req(artifact, "repo")?;
     let commands = req(artifact, "commands")?;
     let empty_obj = Value::object();
@@ -304,6 +356,12 @@ pub fn render_onboarding_skill(artifact: &Value) -> Result<String, String> {
     let summon = req(artifact, "summon")?;
     let freshness = req(artifact, "freshness")?;
     let telemetry = req(artifact, "telemetry")?;
+    let empty_workspaces = Value::Array(vec![]);
+    let workspaces = artifact.get("workspaces").unwrap_or(&empty_workspaces);
+    let empty_generated = Value::Array(vec![]);
+    let generated_paths = artifact.get("generated_paths").unwrap_or(&empty_generated);
+    let empty_dangerous = Value::Array(vec![]);
+    let dangerous_paths = artifact.get("dangerous_paths").unwrap_or(&empty_dangerous);
 
     let mut lines: Vec<String> = vec![
         "---".to_string(),
@@ -351,6 +409,29 @@ pub fn render_onboarding_skill(artifact: &Value) -> Result<String, String> {
         ));
     }
 
+    if workspaces.truthy() {
+        lines.push(String::new());
+        lines.push("## Workspaces".to_string());
+        lines.push(String::new());
+        if let Some(items) = workspaces.as_array() {
+            for workspace in items.iter().take(8) {
+                let marker = if workspace.get("primary").map(Value::truthy).unwrap_or(false) {
+                    "primary"
+                } else {
+                    "supporting"
+                };
+                let manifest = req(workspace, "manifest")?;
+                lines.push(format!(
+                    "- `{}` ({marker}; {}; manifest `{}`; {} confidence)",
+                    req(workspace, "root")?.py_str(),
+                    req(workspace, "package_manager")?.py_str(),
+                    req(manifest, "path")?.py_str(),
+                    req(workspace, "confidence")?.py_str(),
+                ));
+            }
+        }
+    }
+
     lines.push(String::new());
     lines.push("## Start Here".to_string());
     lines.push(String::new());
@@ -375,6 +456,9 @@ pub fn render_onboarding_skill(artifact: &Value) -> Result<String, String> {
                 req(command, "confidence")?.py_str(),
                 req(command, "source")?.py_str(),
             ));
+            if let Some(root) = command.get("workspace_root") {
+                lines.push(format!("  Workspace: `{}`", root.py_str()));
+            }
         }
     }
 
@@ -418,6 +502,9 @@ pub fn render_onboarding_skill(artifact: &Value) -> Result<String, String> {
                         .unwrap_or(&Value::str("medium"))
                         .py_str(),
                 ));
+                if let Some(name) = entrypoint.get("executable_name") {
+                    lines.push(format!("  Executable: `{}`", name.py_str()));
+                }
             }
         }
     }
@@ -461,6 +548,30 @@ pub fn render_onboarding_skill(artifact: &Value) -> Result<String, String> {
                     "- `{}` ({})",
                     req(zone, "path")?.py_str(),
                     req(zone, "reason")?.py_str(),
+                ));
+            }
+        }
+    }
+
+    if generated_paths.truthy() || dangerous_paths.truthy() {
+        lines.push(String::new());
+        lines.push("## Generated and Dangerous Paths".to_string());
+        lines.push(String::new());
+        if let Some(items) = generated_paths.as_array() {
+            for path in items.iter().take(8) {
+                lines.push(format!(
+                    "- Generated/vendor `{}`: {}",
+                    req(path, "path")?.py_str(),
+                    req(path, "reason")?.py_str(),
+                ));
+            }
+        }
+        if let Some(items) = dangerous_paths.as_array() {
+            for path in items.iter().take(8) {
+                lines.push(format!(
+                    "- Sensitive `{}`: {}",
+                    req(path, "path")?.py_str(),
+                    req(path, "reason")?.py_str(),
                 ));
             }
         }
@@ -625,47 +736,779 @@ const MANIFEST_NAMES: [&str; 14] = [
     "compose.yaml",
 ];
 
-fn detect_manifests(repo_path: &Path) -> Vec<String> {
-    MANIFEST_NAMES
+const LOCKFILE_NAMES: [&str; 9] = [
+    "Cargo.lock",
+    "package-lock.json",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+    "uv.lock",
+    "poetry.lock",
+    "Pipfile.lock",
+    "composer.lock",
+    "go.sum",
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum WorkspaceManifestKind {
+    Cargo,
+    Python,
+    Node,
+    Pnpm,
+    Go,
+    Composer,
+}
+
+impl WorkspaceManifestKind {
+    fn from_path(path: &str) -> Option<Self> {
+        match file_name(path) {
+            "Cargo.toml" => Some(Self::Cargo),
+            "pyproject.toml" => Some(Self::Python),
+            "package.json" => Some(Self::Node),
+            "pnpm-workspace.yaml" => Some(Self::Pnpm),
+            "go.mod" => Some(Self::Go),
+            "composer.json" => Some(Self::Composer),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Cargo => "cargo",
+            Self::Python => "python",
+            Self::Node => "node",
+            Self::Pnpm => "pnpm",
+            Self::Go => "go",
+            Self::Composer => "composer",
+        }
+    }
+
+    fn package_manager(self, root: &str, paths: &HashSet<String>) -> &'static str {
+        match self {
+            Self::Cargo => "cargo",
+            Self::Python => {
+                if path_in_root(root, "uv.lock", paths) {
+                    "uv"
+                } else if path_in_root(root, "poetry.lock", paths) {
+                    "poetry"
+                } else {
+                    "python"
+                }
+            }
+            Self::Node | Self::Pnpm => {
+                if path_in_root(root, "pnpm-lock.yaml", paths) {
+                    "pnpm"
+                } else if path_in_root(root, "yarn.lock", paths) {
+                    "yarn"
+                } else {
+                    "npm"
+                }
+            }
+            Self::Go => "go",
+            Self::Composer => "composer",
+        }
+    }
+
+    fn languages(self, root: &str, paths: &HashSet<String>) -> Vec<String> {
+        match self {
+            Self::Cargo => vec!["rust".into()],
+            Self::Python => vec!["python".into()],
+            Self::Node | Self::Pnpm => {
+                let typescript = paths.iter().any(|path| {
+                    is_within_root(path, root) && matches!(path_extension(path), Some("ts" | "tsx"))
+                });
+                let javascript = paths.iter().any(|path| {
+                    is_within_root(path, root)
+                        && matches!(path_extension(path), Some("js" | "jsx" | "mjs" | "cjs"))
+                });
+                if typescript {
+                    vec!["typescript".into()]
+                } else if javascript {
+                    vec!["javascript".into()]
+                } else {
+                    Vec::new()
+                }
+            }
+            Self::Go => vec!["go".into()],
+            Self::Composer => vec!["php".into()],
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorkspaceCommand {
+    kind: String,
+    command: String,
+    source: String,
+    confidence: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorkspaceEvidence {
+    kind: String,
+    detail: String,
+    confidence: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorkspaceDescriptor {
+    root: String,
+    manifest_path: String,
+    manifest_kind: WorkspaceManifestKind,
+    package_manager: String,
+    languages: Vec<String>,
+    members: Vec<String>,
+    lockfiles: Vec<String>,
+    candidate_commands: Vec<WorkspaceCommand>,
+    evidence: Vec<WorkspaceEvidence>,
+    confidence: String,
+    source_file_count: usize,
+    executable_entrypoint_count: usize,
+    ci_mention_count: usize,
+    declares_workspace: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorkspaceInventory {
+    manifests: Vec<String>,
+    workspaces: Vec<WorkspaceDescriptor>,
+}
+
+#[derive(Debug)]
+struct ManifestCandidate {
+    path: String,
+    root: String,
+    kind: WorkspaceManifestKind,
+    declares_workspace: bool,
+    declared_members: Vec<String>,
+    parsed: bool,
+}
+
+impl WorkspaceInventory {
+    fn discover(repo_path: &Path, surface_files: &OnboardingFileSnapshot) -> Result<Self, String> {
+        let mut manifests = surface_files
+            .sorted_paths()
+            .into_iter()
+            .filter(|path| MANIFEST_NAMES.contains(&file_name(path)))
+            .collect::<Vec<_>>();
+        manifests.sort();
+
+        let mut candidates = manifests
+            .iter()
+            .filter_map(|path| {
+                WorkspaceManifestKind::from_path(path)
+                    .map(|kind| manifest_candidate(repo_path, path, kind))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        candidates.sort_by(|left, right| {
+            path_depth(&left.root)
+                .cmp(&path_depth(&right.root))
+                .then(left.root.cmp(&right.root))
+                .then(left.kind.cmp(&right.kind))
+        });
+
+        let cargo_roots = candidates
+            .iter()
+            .filter(|candidate| {
+                candidate.kind == WorkspaceManifestKind::Cargo && candidate.declares_workspace
+            })
+            .map(|candidate| candidate.root.clone())
+            .collect::<Vec<_>>();
+        let pnpm_roots = candidates
+            .iter()
+            .filter(|candidate| candidate.kind == WorkspaceManifestKind::Pnpm)
+            .map(|candidate| candidate.root.clone())
+            .collect::<Vec<_>>();
+
+        let workflow_text = tracked_workflow_text(repo_path, surface_files);
+        let mut workspaces = Vec::new();
+        for candidate in candidates {
+            if candidate.kind == WorkspaceManifestKind::Cargo
+                && !candidate.declares_workspace
+                && nearest_ancestor_root(&candidate.root, &cargo_roots).is_some()
+            {
+                continue;
+            }
+            if candidate.kind == WorkspaceManifestKind::Node
+                && pnpm_roots.iter().any(|root| {
+                    *root == candidate.root || is_descendant_root(&candidate.root, root)
+                })
+            {
+                continue;
+            }
+
+            let mut members = candidate.declared_members;
+            if candidate.kind == WorkspaceManifestKind::Cargo && candidate.declares_workspace {
+                for path in &manifests {
+                    if file_name(path) != "Cargo.toml" || *path == candidate.path {
+                        continue;
+                    }
+                    let root = parent_path(path);
+                    if is_descendant_root(&root, &candidate.root) {
+                        members.push(root);
+                    }
+                }
+            } else if candidate.kind == WorkspaceManifestKind::Pnpm {
+                for path in &manifests {
+                    if file_name(path) != "package.json" {
+                        continue;
+                    }
+                    let root = parent_path(path);
+                    if is_descendant_root(&root, &candidate.root) {
+                        members.push(root);
+                    }
+                }
+            }
+            members.sort();
+            members.dedup();
+
+            let mut lockfiles = surface_files
+                .sorted_paths()
+                .into_iter()
+                .filter(|path| {
+                    LOCKFILE_NAMES.contains(&file_name(path))
+                        && is_within_root(path, &candidate.root)
+                        && lockfile_matches(candidate.kind, file_name(path))
+                })
+                .collect::<Vec<_>>();
+            lockfiles.sort();
+
+            let package_manager = candidate
+                .kind
+                .package_manager(&candidate.root, &surface_files.paths)
+                .to_string();
+            let languages = candidate
+                .kind
+                .languages(&candidate.root, &surface_files.paths);
+            let source_file_count = surface_files
+                .paths
+                .iter()
+                .filter(|path| is_within_root(path, &candidate.root) && is_source_path(path))
+                .count();
+            let executable_entrypoint_count = surface_files
+                .paths
+                .iter()
+                .filter(|path| {
+                    is_within_root(path, &candidate.root) && is_executable_entrypoint(path)
+                })
+                .count();
+            let ci_mention_count = if candidate.root == "." {
+                0
+            } else {
+                workflow_text.matches(&candidate.root).count()
+            };
+            let confidence = if candidate.parsed { "high" } else { "medium" };
+            let mut evidence = vec![WorkspaceEvidence {
+                kind: "tracked_manifest".into(),
+                detail: candidate.path.clone(),
+                confidence: "high".into(),
+            }];
+            if candidate.root == "." {
+                evidence.push(WorkspaceEvidence {
+                    kind: "root_manifest".into(),
+                    detail: "manifest is at repository root".into(),
+                    confidence: "high".into(),
+                });
+            }
+            if !members.is_empty() {
+                evidence.push(WorkspaceEvidence {
+                    kind: "workspace_members".into(),
+                    detail: format!("{} tracked member roots", members.len()),
+                    confidence: "high".into(),
+                });
+            }
+            if ci_mention_count > 0 {
+                evidence.push(WorkspaceEvidence {
+                    kind: "ci_usage".into(),
+                    detail: format!("workspace root mentioned {ci_mention_count} time(s) in CI"),
+                    confidence: "medium".into(),
+                });
+            }
+
+            let candidate_commands = workspace_commands(
+                repo_path,
+                surface_files,
+                &candidate.root,
+                &candidate.path,
+                candidate.kind,
+                candidate.declares_workspace,
+                &package_manager,
+            )?;
+            workspaces.push(WorkspaceDescriptor {
+                root: candidate.root,
+                manifest_path: candidate.path,
+                manifest_kind: candidate.kind,
+                package_manager,
+                languages,
+                members,
+                lockfiles,
+                candidate_commands,
+                evidence,
+                confidence: confidence.into(),
+                source_file_count,
+                executable_entrypoint_count,
+                ci_mention_count,
+                declares_workspace: candidate.declares_workspace,
+            });
+        }
+        workspaces.sort_by(|left, right| {
+            left.root
+                .cmp(&right.root)
+                .then(left.manifest_kind.cmp(&right.manifest_kind))
+        });
+        Ok(Self {
+            manifests,
+            workspaces,
+        })
+    }
+
+    fn ranked(&self) -> Vec<&WorkspaceDescriptor> {
+        let mut ranked = self.workspaces.iter().collect::<Vec<_>>();
+        ranked.sort_by(|left, right| {
+            let left_root = left.root == ".";
+            let right_root = right.root == ".";
+            right_root
+                .cmp(&left_root)
+                .then(right.declares_workspace.cmp(&left.declares_workspace))
+                .then(right.members.len().cmp(&left.members.len()))
+                .then(right.ci_mention_count.cmp(&left.ci_mention_count))
+                .then(
+                    right
+                        .executable_entrypoint_count
+                        .cmp(&left.executable_entrypoint_count),
+                )
+                .then(right.source_file_count.cmp(&left.source_file_count))
+                .then(left.root.cmp(&right.root))
+                .then(left.manifest_kind.cmp(&right.manifest_kind))
+        });
+        ranked
+    }
+
+    fn primary(&self) -> Option<&WorkspaceDescriptor> {
+        self.ranked().into_iter().next()
+    }
+
+    fn languages_primary_first(&self) -> Vec<String> {
+        let mut languages = Vec::new();
+        let mut seen = BTreeSet::new();
+        for workspace in self.ranked() {
+            for language in &workspace.languages {
+                if seen.insert(language.clone()) {
+                    languages.push(language.clone());
+                }
+            }
+        }
+        languages
+    }
+}
+
+fn workspace_value(workspace: &WorkspaceDescriptor, primary: bool) -> Value {
+    obj(vec![
+        ("root", Value::str(workspace.root.clone())),
+        (
+            "manifest",
+            obj(vec![
+                ("path", Value::str(workspace.manifest_path.clone())),
+                ("kind", Value::str(workspace.manifest_kind.as_str())),
+            ]),
+        ),
+        (
+            "package_manager",
+            Value::str(workspace.package_manager.clone()),
+        ),
+        (
+            "languages",
+            Value::Array(
+                workspace
+                    .languages
+                    .iter()
+                    .map(|language| Value::str(language.clone()))
+                    .collect(),
+            ),
+        ),
+        (
+            "members",
+            Value::Array(
+                workspace
+                    .members
+                    .iter()
+                    .map(|member| Value::str(member.clone()))
+                    .collect(),
+            ),
+        ),
+        (
+            "lockfiles",
+            Value::Array(
+                workspace
+                    .lockfiles
+                    .iter()
+                    .map(|lockfile| Value::str(lockfile.clone()))
+                    .collect(),
+            ),
+        ),
+        (
+            "candidate_commands",
+            Value::Array(
+                workspace
+                    .candidate_commands
+                    .iter()
+                    .map(|command| {
+                        obj(vec![
+                            ("kind", Value::str(command.kind.clone())),
+                            ("command", Value::str(command.command.clone())),
+                            ("source", Value::str(command.source.clone())),
+                            ("confidence", Value::str(command.confidence.clone())),
+                        ])
+                    })
+                    .collect(),
+            ),
+        ),
+        (
+            "evidence",
+            Value::Array(
+                workspace
+                    .evidence
+                    .iter()
+                    .map(|evidence| {
+                        obj(vec![
+                            ("kind", Value::str(evidence.kind.clone())),
+                            ("detail", Value::str(evidence.detail.clone())),
+                            ("confidence", Value::str(evidence.confidence.clone())),
+                        ])
+                    })
+                    .collect(),
+            ),
+        ),
+        ("confidence", Value::str(workspace.confidence.clone())),
+        ("primary", Value::Bool(primary)),
+        (
+            "ranking",
+            obj(vec![
+                ("root_manifest", Value::Bool(workspace.root == ".")),
+                (
+                    "declares_workspace",
+                    Value::Bool(workspace.declares_workspace),
+                ),
+                ("member_count", Value::Int(workspace.members.len() as i128)),
+                (
+                    "ci_mentions",
+                    Value::Int(workspace.ci_mention_count as i128),
+                ),
+                (
+                    "executable_entrypoints",
+                    Value::Int(workspace.executable_entrypoint_count as i128),
+                ),
+                (
+                    "source_files",
+                    Value::Int(workspace.source_file_count as i128),
+                ),
+            ]),
+        ),
+    ])
+}
+
+fn manifest_candidate(
+    repo_path: &Path,
+    path: &str,
+    kind: WorkspaceManifestKind,
+) -> Result<ManifestCandidate, String> {
+    let root = parent_path(path);
+    let mut declares_workspace = kind == WorkspaceManifestKind::Pnpm;
+    let mut declared_members = Vec::new();
+    let mut parsed = true;
+    if matches!(
+        kind,
+        WorkspaceManifestKind::Cargo | WorkspaceManifestKind::Python
+    ) {
+        match read_text(&repo_path.join(path)).and_then(|text| {
+            text.parse::<toml::Value>()
+                .map_err(|error| error.to_string())
+        }) {
+            Ok(document) if kind == WorkspaceManifestKind::Cargo => {
+                if let Some(workspace) = document.get("workspace") {
+                    declares_workspace = true;
+                    declared_members = workspace
+                        .get("members")
+                        .and_then(toml::Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(toml::Value::as_str)
+                        .map(|member| join_repo_path(&root, member))
+                        .collect();
+                }
+            }
+            Ok(_) => {}
+            Err(_) => parsed = false,
+        }
+    }
+    Ok(ManifestCandidate {
+        path: path.into(),
+        root,
+        kind,
+        declares_workspace,
+        declared_members,
+        parsed,
+    })
+}
+
+fn workspace_commands(
+    repo_path: &Path,
+    surface_files: &OnboardingFileSnapshot,
+    root: &str,
+    manifest_path: &str,
+    kind: WorkspaceManifestKind,
+    declares_workspace: bool,
+    package_manager: &str,
+) -> Result<Vec<WorkspaceCommand>, String> {
+    let source = manifest_path.to_string();
+    let mut commands = Vec::new();
+    let scoped = |root_command: &str, nested_command: String| {
+        if root == "." {
+            root_command.to_string()
+        } else {
+            nested_command
+        }
+    };
+    let mut add = |kind: &str, command: String, confidence: &str| {
+        commands.push(WorkspaceCommand {
+            kind: kind.into(),
+            command,
+            source: source.clone(),
+            confidence: confidence.into(),
+        });
+    };
+    match kind {
+        WorkspaceManifestKind::Cargo => {
+            let workspace = if declares_workspace {
+                " --workspace"
+            } else {
+                ""
+            };
+            add(
+                "fast_test",
+                scoped(
+                    &format!("cargo test{workspace}"),
+                    format!("cargo test --manifest-path {manifest_path}{workspace}"),
+                ),
+                "high",
+            );
+            add(
+                "build",
+                scoped(
+                    &format!("cargo build{workspace}"),
+                    format!("cargo build --manifest-path {manifest_path}{workspace}"),
+                ),
+                "high",
+            );
+        }
+        WorkspaceManifestKind::Python => {
+            add(
+                "fast_test",
+                scoped("python -m pytest", format!("python -m pytest {root}")),
+                "medium",
+            );
+            add(
+                "install",
+                scoped(
+                    "python -m pip install -e .",
+                    format!("python -m pip install -e {root}"),
+                ),
+                "medium",
+            );
+        }
+        WorkspaceManifestKind::Node | WorkspaceManifestKind::Pnpm => {
+            let package_json = if kind == WorkspaceManifestKind::Pnpm {
+                repo_path.join(join_repo_path(root, "package.json"))
+            } else {
+                repo_path.join(manifest_path)
+            };
+            let scripts = if package_json.is_file() {
+                load_json_file(&package_json)
+                    .ok()
+                    .and_then(|value| value.get("scripts").cloned())
+            } else {
+                None
+            };
+            if let Some(scripts) = scripts {
+                for (script, command_kind) in [
+                    ("test", "fast_test"),
+                    ("lint", "lint"),
+                    ("build", "build"),
+                    ("dev", "dev"),
+                ] {
+                    if let Some(script_body) = scripts.get(script).and_then(Value::as_str) {
+                        if script_references_missing_tracked_path(
+                            script_body,
+                            root,
+                            &surface_files.paths,
+                        ) {
+                            continue;
+                        }
+                        let command = match (package_manager, root) {
+                            ("pnpm", ".") => format!("pnpm {script}"),
+                            ("pnpm", _) => format!("pnpm --dir {root} {script}"),
+                            ("yarn", ".") => format!("yarn {script}"),
+                            ("yarn", _) => format!("yarn --cwd {root} {script}"),
+                            (_, ".") => format!("npm run {script}"),
+                            _ => format!("npm --prefix {root} run {script}"),
+                        };
+                        add(command_kind, command, "high");
+                    }
+                }
+            }
+        }
+        WorkspaceManifestKind::Go => {
+            add(
+                "fast_test",
+                scoped("go test ./...", format!("go test ./{root}/...")),
+                "high",
+            );
+            add(
+                "build",
+                scoped("go build ./...", format!("go build ./{root}/...")),
+                "high",
+            );
+        }
+        WorkspaceManifestKind::Composer => {
+            add(
+                "install",
+                scoped(
+                    "composer install",
+                    format!("composer --working-dir {root} install"),
+                ),
+                "high",
+            );
+        }
+    }
+    Ok(commands)
+}
+
+fn script_references_missing_tracked_path(
+    script: &str,
+    root: &str,
+    tracked_paths: &HashSet<String>,
+) -> bool {
+    const CONVENTIONAL_PATHS: [&str; 10] = [
+        "app", "apps", "src", "test", "tests", "spec", "specs", "scripts", "packages", "crates",
+    ];
+
+    script.split_whitespace().any(|raw_token| {
+        if raw_token.contains("://") || raw_token.starts_with('-') || raw_token.contains('$') {
+            return false;
+        }
+        let token = raw_token
+            .trim_matches(['\"', '\'', ',', ';', '(', ')'])
+            .trim_start_matches("./")
+            .trim_end_matches(['/', ',']);
+        if token.is_empty() || token.contains('=') {
+            return false;
+        }
+        let looks_like_path =
+            raw_token.ends_with('/') || token.contains('/') || CONVENTIONAL_PATHS.contains(&token);
+        if !looks_like_path {
+            return false;
+        }
+        let candidate = join_repo_path(root, token);
+        !tracked_paths.contains(&candidate)
+            && !tracked_paths
+                .iter()
+                .any(|tracked| tracked.starts_with(&format!("{candidate}/")))
+    })
+}
+
+fn file_name(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+fn parent_path(path: &str) -> String {
+    path.rsplit_once('/')
+        .map(|(parent, _)| parent.to_string())
+        .unwrap_or_else(|| ".".into())
+}
+
+fn join_repo_path(root: &str, child: &str) -> String {
+    if root == "." {
+        child.trim_start_matches("./").to_string()
+    } else {
+        format!("{root}/{}", child.trim_start_matches("./"))
+    }
+}
+
+fn path_depth(path: &str) -> usize {
+    if path == "." {
+        0
+    } else {
+        path.split('/').count()
+    }
+}
+
+fn is_descendant_root(candidate: &str, root: &str) -> bool {
+    root == "." || candidate.starts_with(&format!("{root}/"))
+}
+
+fn is_within_root(path: &str, root: &str) -> bool {
+    root == "." || path == root || path.starts_with(&format!("{root}/"))
+}
+
+fn nearest_ancestor_root(root: &str, roots: &[String]) -> Option<String> {
+    roots
         .iter()
-        .filter(|name| repo_path.join(name).exists())
-        .map(|name| name.to_string())
-        .collect()
+        .filter(|candidate| **candidate != root && is_descendant_root(root, candidate))
+        .max_by_key(|candidate| path_depth(candidate))
+        .cloned()
+}
+
+fn path_in_root(root: &str, name: &str, paths: &HashSet<String>) -> bool {
+    paths.contains(&join_repo_path(root, name))
+}
+
+fn path_extension(path: &str) -> Option<&str> {
+    file_name(path)
+        .rsplit_once('.')
+        .map(|(_, extension)| extension)
+}
+
+fn is_source_path(path: &str) -> bool {
+    matches!(
+        path_extension(path),
+        Some("rs" | "py" | "js" | "jsx" | "ts" | "tsx" | "go" | "php")
+    )
+}
+
+fn is_executable_entrypoint(path: &str) -> bool {
+    matches!(
+        file_name(path),
+        "main.rs" | "main.py" | "app.py" | "manage.py" | "main.go" | "index.ts" | "index.js"
+    )
+}
+
+fn lockfile_matches(kind: WorkspaceManifestKind, name: &str) -> bool {
+    match kind {
+        WorkspaceManifestKind::Cargo => name == "Cargo.lock",
+        WorkspaceManifestKind::Python => matches!(name, "uv.lock" | "poetry.lock" | "Pipfile.lock"),
+        WorkspaceManifestKind::Node | WorkspaceManifestKind::Pnpm => {
+            matches!(name, "package-lock.json" | "pnpm-lock.yaml" | "yarn.lock")
+        }
+        WorkspaceManifestKind::Go => name == "go.sum",
+        WorkspaceManifestKind::Composer => name == "composer.lock",
+    }
+}
+
+fn tracked_workflow_text(repo_path: &Path, surface_files: &OnboardingFileSnapshot) -> String {
+    let mut text = String::new();
+    for path in surface_files.sorted_paths().into_iter().filter(|path| {
+        path.starts_with(".github/workflows/")
+            && matches!(path_extension(path), Some("yml" | "yaml"))
+    }) {
+        if let Ok(workflow) = read_text(&repo_path.join(path)) {
+            text.push_str(&workflow);
+            text.push('\n');
+        }
+    }
+    text
 }
 
 fn has_manifest(manifests: &[String], name: &str) -> bool {
     manifests.iter().any(|m| m == name)
-}
-
-fn primary_package_manager(repo_path: &Path, manifests: &[String]) -> &'static str {
-    if has_manifest(manifests, "pnpm-workspace.yaml") || repo_path.join("pnpm-lock.yaml").exists() {
-        return "pnpm";
-    }
-    if repo_path.join("package-lock.json").exists() {
-        return "npm";
-    }
-    if repo_path.join("yarn.lock").exists() {
-        return "yarn";
-    }
-    if has_manifest(manifests, "Cargo.toml") {
-        return "cargo";
-    }
-    if has_manifest(manifests, "composer.json") {
-        return "composer";
-    }
-    if has_manifest(manifests, "go.mod") {
-        return "go";
-    }
-    if has_manifest(manifests, "pyproject.toml") {
-        return "python";
-    }
-    if has_manifest(manifests, "Makefile") {
-        return "make";
-    }
-    if has_manifest(manifests, "justfile") || has_manifest(manifests, "Justfile") {
-        return "just";
-    }
-    "unknown"
 }
 
 struct CommandAdder {
@@ -693,6 +1536,24 @@ impl CommandAdder {
             ("confidence", Value::str(confidence)),
         ]));
     }
+
+    fn add_workspace(&mut self, command: &WorkspaceCommand, workspace: &WorkspaceDescriptor) {
+        if self.seen.contains(&command.command) {
+            return;
+        }
+        self.seen.insert(command.command.clone());
+        self.commands.push(obj(vec![
+            ("kind", Value::str(command.kind.clone())),
+            ("command", Value::str(command.command.clone())),
+            ("source", Value::str(command.source.clone())),
+            ("confidence", Value::str(command.confidence.clone())),
+            ("workspace_root", Value::str(workspace.root.clone())),
+            (
+                "provenance",
+                Value::str("derived from tracked workspace manifest"),
+            ),
+        ]));
+    }
 }
 
 fn read_text(path: &Path) -> Result<String, String> {
@@ -707,8 +1568,15 @@ fn collect_commands(
     repo_path: &Path,
     manifests: &[String],
     package_manager: &str,
+    inventory: &WorkspaceInventory,
 ) -> Result<Vec<Value>, String> {
     let mut adder = CommandAdder::new();
+
+    for workspace in inventory.ranked() {
+        for command in &workspace.candidate_commands {
+            adder.add_workspace(command, workspace);
+        }
+    }
 
     if matches!(package_manager, "pnpm" | "npm" | "yarn") && repo_path.join("package.json").exists()
     {
@@ -906,8 +1774,10 @@ fn collect_commands(
     for inferred in commands_from_compose(repo_path)? {
         adder.add(&inferred.0, &inferred.1, &inferred.2, &inferred.3);
     }
-    for inferred in commands_from_github_actions(repo_path) {
-        adder.add(&inferred.0, &inferred.1, &inferred.2, &inferred.3);
+    if inventory.workspaces.is_empty() {
+        for inferred in commands_from_github_actions(repo_path) {
+            adder.add(&inferred.0, &inferred.1, &inferred.2, &inferred.3);
+        }
     }
 
     let mut ranked = adder.commands;
@@ -1045,6 +1915,12 @@ impl OnboardingFileSnapshot {
         self.paths.contains(path)
     }
 
+    fn sorted_paths(&self) -> Vec<String> {
+        let mut paths = self.paths.iter().cloned().collect::<Vec<_>>();
+        paths.sort();
+        paths
+    }
+
     fn contains_directory(&self, path: &str) -> bool {
         let prefix = format!("{path}/");
         self.paths
@@ -1125,12 +2001,45 @@ impl EntrypointAdder {
             ("confidence", Value::str(confidence)),
         ]));
     }
+
+    fn add_workspace(
+        &mut self,
+        path: &str,
+        role: &str,
+        reason: &str,
+        workspace_root: &str,
+        executable_name: Option<String>,
+    ) {
+        let key = (path.to_string(), role.to_string());
+        if self.seen.contains(&key) {
+            return;
+        }
+        self.seen.insert(key);
+        let mut value = obj(vec![
+            ("path", Value::str(path)),
+            ("kind", Value::str("file")),
+            ("role", Value::str(role)),
+            ("reason", Value::str(reason)),
+            ("confidence", Value::str("high")),
+            ("workspace_root", Value::str(workspace_root)),
+            (
+                "provenance",
+                Value::str("derived from tracked workspace source"),
+            ),
+        ]);
+        if let Some(name) = executable_name {
+            value.set("executable_name", Value::str(name));
+        }
+        self.candidates.push(value);
+    }
 }
 
 fn collect_entrypoints(
     repo_path: &Path,
     manifests: &[String],
     surface_files: &OnboardingFileSnapshot,
+    inventory: &WorkspaceInventory,
+    repo_name: &str,
 ) -> Result<Vec<Value>, String> {
     let mut adder = EntrypointAdder::new();
 
@@ -1278,11 +2187,57 @@ fn collect_entrypoints(
         );
     }
 
+    for path in surface_files.sorted_paths() {
+        let Some(workspace) = inventory.workspace_for_path(&path) else {
+            continue;
+        };
+        let (role, reason, executable_name) = match workspace.manifest_kind {
+            WorkspaceManifestKind::Cargo if is_rust_binary_entrypoint(&path) => (
+                "cli",
+                format!("tracked Rust binary entrypoint in `{}`", workspace.root),
+                rust_executable_name(repo_path, surface_files, &path),
+            ),
+            WorkspaceManifestKind::Python
+                if matches!(file_name(&path), "main.py" | "app.py" | "manage.py") =>
+            {
+                let role = if file_name(&path) == "manage.py" {
+                    "cli"
+                } else {
+                    "app"
+                };
+                (
+                    role,
+                    format!("tracked Python entrypoint in `{}`", workspace.root),
+                    path.strip_suffix(".py")
+                        .and_then(|stem| stem.rsplit('/').next())
+                        .map(str::to_string),
+                )
+            }
+            WorkspaceManifestKind::Go if file_name(&path) == "main.go" => (
+                "app",
+                format!("tracked Go entrypoint in `{}`", workspace.root),
+                path.rsplit_once('/')
+                    .map(|(parent, _)| file_name(parent).to_string()),
+            ),
+            _ => continue,
+        };
+        adder.add_workspace(&path, role, &reason, &workspace.root, executable_name);
+    }
+
     let mut candidates = adder.candidates;
+    for candidate in &mut candidates {
+        candidate.set(
+            "relevance",
+            Value::str(entrypoint_relevance(candidate, repo_name)),
+        );
+    }
     candidates.sort_by(|a, b| {
         let key = |c: &Value| {
             (
                 entrypoint_role_priority(&c.get("role").map(Value::py_str).unwrap_or_default()),
+                entrypoint_relevance_priority(
+                    &c.get("relevance").map(Value::py_str).unwrap_or_default(),
+                ),
                 -confidence_rank(&c.get("confidence").map(Value::py_str).unwrap_or_default()),
                 c.get("path").map(Value::py_str).unwrap_or_default(),
             )
@@ -1291,6 +2246,101 @@ fn collect_entrypoints(
     });
     candidates.truncate(8);
     Ok(candidates)
+}
+
+fn normalized_identity(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn entrypoint_relevance(entrypoint: &Value, repo_name: &str) -> &'static str {
+    let Some(executable_name) = entrypoint.get("executable_name").and_then(Value::as_str) else {
+        return "supporting";
+    };
+    let executable = normalized_identity(executable_name);
+    let repository = normalized_identity(repo_name);
+    if !repository.is_empty() && executable == repository {
+        "primary"
+    } else if !repository.is_empty() && executable.starts_with(&repository) {
+        "product"
+    } else {
+        "supporting"
+    }
+}
+
+fn entrypoint_relevance_priority(relevance: &str) -> i32 {
+    match relevance {
+        "primary" => 0,
+        "product" => 1,
+        "supporting" => 2,
+        _ => 3,
+    }
+}
+
+impl WorkspaceInventory {
+    fn workspace_for_path(&self, path: &str) -> Option<&WorkspaceDescriptor> {
+        self.workspaces
+            .iter()
+            .filter(|workspace| is_within_root(path, &workspace.root))
+            .max_by(|left, right| {
+                path_depth(&left.root)
+                    .cmp(&path_depth(&right.root))
+                    .then_with(|| right.root.cmp(&left.root))
+            })
+    }
+}
+
+fn is_rust_binary_entrypoint(path: &str) -> bool {
+    path.ends_with("/src/main.rs")
+        || path
+            .split_once("/src/bin/")
+            .is_some_and(|(_, tail)| tail.ends_with(".rs") && !tail.contains('/'))
+}
+
+fn rust_executable_name(
+    repo_path: &Path,
+    surface_files: &OnboardingFileSnapshot,
+    source_path: &str,
+) -> Option<String> {
+    let crate_root = source_path
+        .split_once("/src/")
+        .map(|(root, _)| root)
+        .or_else(|| source_path.strip_suffix("/src/main.rs"))?;
+    let manifest_path = join_repo_path(crate_root, "Cargo.toml");
+    if !surface_files.contains_file(&manifest_path) {
+        return source_path
+            .split_once("/src/bin/")
+            .and_then(|(_, tail)| tail.strip_suffix(".rs"))
+            .map(str::to_string);
+    }
+    let document = read_text(&repo_path.join(&manifest_path))
+        .ok()?
+        .parse::<toml::Value>()
+        .ok()?;
+    let relative_source = source_path.strip_prefix(&format!("{crate_root}/"))?;
+    if let Some(bins) = document.get("bin").and_then(toml::Value::as_array) {
+        for bin in bins {
+            let name = bin.get("name").and_then(toml::Value::as_str);
+            let declared_path = bin
+                .get("path")
+                .and_then(toml::Value::as_str)
+                .unwrap_or("src/main.rs");
+            if declared_path == relative_source {
+                return name.map(str::to_string);
+            }
+        }
+    }
+    if let Some((_, tail)) = relative_source.split_once("src/bin/") {
+        return tail.strip_suffix(".rs").map(str::to_string);
+    }
+    document
+        .get("package")
+        .and_then(|package| package.get("name"))
+        .and_then(toml::Value::as_str)
+        .map(str::to_string)
 }
 
 fn add_tracked_entrypoint_candidates(
@@ -1342,6 +2392,81 @@ fn collect_caution_zones(surface_files: &OnboardingFileSnapshot) -> Vec<Value> {
     caution
 }
 
+fn collect_path_controls(surface_files: &OnboardingFileSnapshot) -> (Vec<Value>, Vec<Value>) {
+    let generated_names = [
+        "generated",
+        "vendor",
+        "third_party",
+        "dist",
+        "build",
+        "coverage",
+        "target",
+        "node_modules",
+    ];
+    let dangerous_names = [
+        "migrations",
+        "terraform",
+        "deploy",
+        "deployments",
+        "k8s",
+        "helm",
+    ];
+    // This output root is part of Aethyme's declared contract rather than an
+    // observed input. Keeping it unconditional prevents generation from
+    // changing its own next result after the artifacts are committed.
+    let mut generated = BTreeSet::from([".aethyme/generated".to_string()]);
+    let mut dangerous = BTreeSet::new();
+    for path in surface_files.sorted_paths() {
+        let components = path.split('/').collect::<Vec<_>>();
+        for (index, component) in components.iter().enumerate() {
+            if generated_names.contains(component) {
+                generated.insert(components[..=index].join("/"));
+            }
+            if dangerous_names.contains(component) {
+                dangerous.insert(components[..=index].join("/"));
+            }
+        }
+    }
+    if surface_files.contains_directory(".github/workflows") {
+        dangerous.insert(".github/workflows".into());
+    }
+    if surface_files.contains_file(".aethyme/gates.toml") {
+        dangerous.insert(".aethyme/gates.toml".into());
+    }
+    (
+        generated
+            .into_iter()
+            .map(|path| {
+                obj(vec![
+                    ("path", Value::str(path)),
+                    (
+                        "reason",
+                        Value::str("tracked generated or vendored surface; verify ownership before editing"),
+                    ),
+                    ("provenance", Value::str("tracked path classification")),
+                ])
+            })
+            .collect(),
+        dangerous
+            .into_iter()
+            .map(|path| {
+                let reason = if path == ".aethyme/gates.toml" {
+                    "repository validation policy; changes affect every broker submission"
+                } else if path == ".github/workflows" {
+                    "repository automation; changes can affect publication or shared CI"
+                } else {
+                    "deployment, infrastructure, or migration surface; review repository policy before editing"
+                };
+                obj(vec![
+                    ("path", Value::str(path)),
+                    ("reason", Value::str(reason)),
+                    ("provenance", Value::str("tracked path classification")),
+                ])
+            })
+            .collect(),
+    )
+}
+
 fn infer_repo_kind(repo_path: &Path, manifests: &[String], areas: &[Value]) -> &'static str {
     let area_paths: HashSet<String> = areas
         .iter()
@@ -1369,33 +2494,6 @@ fn infer_repo_kind(repo_path: &Path, manifests: &[String], areas: &[Value]) -> &
         return "library_or_service";
     }
     "repository"
-}
-
-fn infer_languages(repo_path: &Path, manifests: &[String]) -> Vec<&'static str> {
-    let mut languages = Vec::new();
-    if has_manifest(manifests, "pyproject.toml") {
-        languages.push("python");
-    }
-    if has_manifest(manifests, "package.json") {
-        if ["tsconfig.json", "src/index.ts", "src/main.ts"]
-            .iter()
-            .any(|rel| repo_path.join(rel).exists())
-        {
-            languages.push("typescript");
-        } else {
-            languages.push("javascript");
-        }
-    }
-    if has_manifest(manifests, "Cargo.toml") {
-        languages.push("rust");
-    }
-    if has_manifest(manifests, "composer.json") {
-        languages.push("php");
-    }
-    if has_manifest(manifests, "go.mod") {
-        languages.push("go");
-    }
-    languages
 }
 
 fn navigation_recipes() -> Value {
@@ -1751,18 +2849,28 @@ fn confidence_rank(confidence: &str) -> i32 {
     }
 }
 
-fn primary_commands_map(commands: &[Value]) -> Value {
+fn primary_commands_map(commands: &[Value], primary_workspace_root: Option<&str>) -> Value {
     let mut primary = Value::object();
     for kind in ["install", "dev", "fast_test", "full_test", "lint", "build"] {
         let mut ranked: Vec<&Value> = commands
             .iter()
             .filter(|c| c.get("kind").map(Value::py_str).as_deref() == Some(kind))
+            .filter(|c| {
+                primary_workspace_root.is_none()
+                    || c.get("workspace_root").is_none()
+                    || c.get("workspace_root").and_then(Value::as_str) == primary_workspace_root
+            })
             .collect();
         ranked.sort_by(|a, b| {
             let key = |c: &Value| {
                 (
-                    -confidence_rank(&c.get("confidence").unwrap_or(&Value::Null).py_str()),
                     source_priority(kind, &c.get("source").unwrap_or(&Value::Null).py_str()),
+                    if c.get("workspace_root").is_some() {
+                        0
+                    } else {
+                        1
+                    },
+                    -confidence_rank(&c.get("confidence").unwrap_or(&Value::Null).py_str()),
                     c.get("command").unwrap_or(&Value::Null).py_str(),
                 )
             };
@@ -1788,6 +2896,9 @@ fn primary_entrypoints_map(entrypoints: &[Value]) -> Value {
         ranked.sort_by(|a, b| {
             let key = |e: &Value| {
                 (
+                    entrypoint_relevance_priority(
+                        &e.get("relevance").unwrap_or(&Value::Null).py_str(),
+                    ),
                     -confidence_rank(&e.get("confidence").unwrap_or(&Value::Null).py_str()),
                     entrypoint_kind_priority(&e.get("kind").unwrap_or(&Value::Null).py_str()),
                     e.get("path").unwrap_or(&Value::Null).py_str(),
@@ -1871,10 +2982,14 @@ fn first_command_of_kind(commands: &Value, kind: &str) -> Result<Option<Value>, 
 const ONBOARDING_OVERRIDE_KEYS: &[&str] = &[
     "repo",
     "summon",
+    "workspaces",
+    "primary_workspace",
     "commands",
     "areas",
     "entrypoints",
     "caution_zones",
+    "generated_paths",
+    "dangerous_paths",
     "navigation_recipes",
     "notes",
 ];
@@ -1883,6 +2998,7 @@ const ONBOARDING_REPO_OVERRIDE_KEYS: &[&str] = &[
     "root",
     "kind",
     "languages",
+    "primary_language",
     "package_manager",
     "manifests",
 ];
@@ -1979,18 +3095,29 @@ fn apply_overrides(artifact: &mut Value, overrides: &Value) -> Result<(), String
     }
 
     for key in [
+        "workspaces",
         "commands",
         "areas",
         "entrypoints",
         "caution_zones",
+        "generated_paths",
+        "dangerous_paths",
         "navigation_recipes",
     ] {
         if let Some(value @ Value::Array(_)) = overrides.get(key) {
             artifact.set(key, value.clone());
         }
     }
+    if let Some(value @ Value::Object(_)) = overrides.get("primary_workspace") {
+        artifact.set("primary_workspace", value.clone());
+    }
     if let Some(Value::Array(entrypoints)) = artifact.get("entrypoints") {
         artifact.set("primary_entrypoints", primary_entrypoints_map(entrypoints));
+    }
+    if overrides.get("commands").is_some() {
+        if let Some(Value::Array(commands)) = artifact.get("commands") {
+            artifact.set("primary_commands", primary_commands_map(commands, None));
+        }
     }
 
     if let Some(notes @ Value::Array(_)) = overrides.get("notes") {
@@ -2170,10 +3297,14 @@ fn generation_telemetry(artifact: &Value, overrides: &Value) -> Value {
             "sections",
             str_list(&[
                 "repo",
+                "workspaces",
+                "primary_workspace",
                 "commands",
                 "areas",
                 "entrypoints",
                 "caution_zones",
+                "generated_paths",
+                "dangerous_paths",
                 "navigation_recipes",
                 "summon",
                 "freshness",
@@ -2182,10 +3313,13 @@ fn generation_telemetry(artifact: &Value, overrides: &Value) -> Value {
         (
             "counts",
             obj(vec![
+                ("workspaces", Value::Int(count("workspaces"))),
                 ("commands", Value::Int(count("commands"))),
                 ("areas", Value::Int(count("areas"))),
                 ("entrypoints", Value::Int(count("entrypoints"))),
                 ("caution_zones", Value::Int(count("caution_zones"))),
+                ("generated_paths", Value::Int(count("generated_paths"))),
+                ("dangerous_paths", Value::Int(count("dangerous_paths"))),
                 (
                     "navigation_recipes",
                     Value::Int(count("navigation_recipes")),
@@ -2605,6 +3739,29 @@ mod tests {
         worktree
     }
 
+    fn linked_worktree_at(repo: &Path, worktree: &Path) {
+        let _ = std::fs::remove_dir_all(worktree);
+        let worktree_arg = worktree.to_string_lossy().into_owned();
+        git(
+            repo,
+            &["worktree", "add", "--detach", &worktree_arg, "HEAD"],
+        );
+    }
+
+    fn commit_all(repo: &Path, message: &str) {
+        git(repo, &["add", "--all"]);
+        git(repo, &["commit", "-m", message]);
+    }
+
+    fn value_strings(value: &Value) -> Vec<String> {
+        value
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(Value::py_str)
+            .collect()
+    }
+
     fn artifact_paths(artifact: &Value, key: &str) -> Vec<String> {
         artifact
             .get(key)
@@ -2777,6 +3934,401 @@ mod tests {
     }
 
     #[test]
+    fn onboarding_is_identical_across_same_named_linked_worktrees() {
+        let repo = committed_git_repo("same-name-source");
+        let parent = repo.with_file_name(format!(
+            "aethyme-enhance-same-name-parent-{}",
+            std::process::id()
+        ));
+        let first = parent.join("first").join("workspace");
+        let second = parent.join("second").join("workspace");
+        linked_worktree_at(&repo, &first);
+        linked_worktree_at(&repo, &second);
+
+        assert_eq!(
+            expected_onboarding_files(&first).unwrap(),
+            expected_onboarding_files(&second).unwrap()
+        );
+
+        std::fs::remove_dir_all(&first).unwrap();
+        std::fs::remove_dir_all(&second).unwrap();
+        std::fs::remove_dir_all(&repo).unwrap();
+        std::fs::remove_dir_all(&parent).unwrap();
+    }
+
+    #[test]
+    fn nested_cargo_workspace_is_discovered_without_a_root_manifest() {
+        let repo = committed_git_repo("nested-cargo-workspace");
+        write(
+            &repo.join("products/tool/Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/router\", \"crates/engine\"]\nresolver = \"2\"\n",
+        );
+        for (name, source) in [("router", "fn main() {}\n"), ("engine", "fn main() {}\n")] {
+            write(
+                &repo.join(format!("products/tool/crates/{name}/Cargo.toml")),
+                &format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+            );
+            write(
+                &repo.join(format!("products/tool/crates/{name}/src/main.rs")),
+                source,
+            );
+        }
+        commit_all(&repo, "test: add nested cargo workspace");
+
+        let artifact = build_onboarding_artifact(&repo).unwrap();
+        let repo_facts = artifact.get("repo").unwrap();
+        assert_eq!(
+            repo_facts.get("package_manager").unwrap().as_str(),
+            Some("cargo")
+        );
+        assert!(value_strings(repo_facts.get("languages").unwrap()).contains(&"rust".into()));
+        assert!(value_strings(repo_facts.get("manifests").unwrap())
+            .contains(&"products/tool/Cargo.toml".into()));
+        assert_eq!(
+            artifact
+                .get("primary_workspace")
+                .unwrap()
+                .get("root")
+                .unwrap()
+                .as_str(),
+            Some("products/tool")
+        );
+
+        std::fs::remove_dir_all(&repo).unwrap();
+    }
+
+    #[test]
+    fn mixed_monorepo_keeps_specialized_python_commands_out_of_primary_test() {
+        let repo = committed_git_repo("mixed-workspaces");
+        write(
+            &repo.join("packages/product/Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/router\", \"crates/engine\"]\nresolver = \"2\"\n",
+        );
+        for name in ["router", "engine"] {
+            write(
+                &repo.join(format!("packages/product/crates/{name}/Cargo.toml")),
+                &format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+            );
+            write(
+                &repo.join(format!("packages/product/crates/{name}/src/main.rs")),
+                "fn main() {}\n",
+            );
+        }
+        write(
+            &repo.join("packages/evaluation/pyproject.toml"),
+            "[project]\nname = \"evaluation\"\nversion = \"0.1.0\"\n",
+        );
+        write(
+            &repo.join("packages/evaluation/tests/test_eval.py"),
+            "def test_ok(): assert True\n",
+        );
+        write(
+            &repo.join("packages/product/Cargo.lock"),
+            "# fixture lock\n",
+        );
+        write(
+            &repo.join("packages/evaluation/uv.lock"),
+            "# fixture lock\n",
+        );
+        write(
+            &repo.join(".github/workflows/test.yml"),
+            "jobs:\n  test:\n    steps:\n      - run: cargo test --manifest-path packages/product/Cargo.toml --workspace\n      - run: pytest packages/evaluation\n",
+        );
+        commit_all(&repo, "test: add mixed workspace fixture");
+
+        let artifact = build_onboarding_artifact(&repo).unwrap();
+        assert_eq!(
+            artifact
+                .get("repo")
+                .unwrap()
+                .get("package_manager")
+                .unwrap()
+                .as_str(),
+            Some("cargo")
+        );
+        assert_eq!(
+            artifact
+                .get("primary_commands")
+                .unwrap()
+                .get("fast_test")
+                .unwrap()
+                .as_str(),
+            Some("cargo test --manifest-path packages/product/Cargo.toml --workspace")
+        );
+        let commands = artifact.get("commands").unwrap().as_array().unwrap();
+        assert!(commands.iter().any(|command| {
+            command.get("command").unwrap().as_str() == Some("python -m pytest packages/evaluation")
+                && command.get("workspace_root").unwrap().as_str() == Some("packages/evaluation")
+        }));
+        assert_ne!(
+            artifact
+                .get("primary_commands")
+                .unwrap()
+                .get("fast_test")
+                .unwrap()
+                .as_str(),
+            Some("pytest")
+        );
+        let workspaces = artifact.get("workspaces").unwrap().as_array().unwrap();
+        assert!(workspaces.iter().any(|workspace| {
+            workspace.get("root").unwrap().as_str() == Some("packages/product")
+                && value_strings(workspace.get("lockfiles").unwrap())
+                    .contains(&"packages/product/Cargo.lock".into())
+        }));
+        assert!(workspaces.iter().any(|workspace| {
+            workspace.get("root").unwrap().as_str() == Some("packages/evaluation")
+                && value_strings(workspace.get("lockfiles").unwrap())
+                    .contains(&"packages/evaluation/uv.lock".into())
+        }));
+
+        std::fs::remove_dir_all(&repo).unwrap();
+    }
+
+    #[test]
+    fn stale_supporting_manifest_cannot_invent_product_facts() {
+        let repo = committed_git_repo("stale-supporting-manifest");
+        git(
+            &repo,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "git@github.com:example/Aethyme.git",
+            ],
+        );
+        write(
+            &repo.join("packages/aethyme/package.json"),
+            r#"{"scripts":{"test":"python3 -m pytest tests/ -v","lint":"ruff check src/"}}"#,
+        );
+        write(
+            &repo.join("packages/aethyme/rust/Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/router\", \"crates/helper\"]\nresolver = \"2\"\n",
+        );
+        for (member, package) in [("router", "aethyme"), ("helper", "broker-cli-shim")] {
+            write(
+                &repo.join(format!("packages/aethyme/rust/crates/{member}/Cargo.toml")),
+                &format!(
+                    "[package]\nname = \"{package}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"
+                ),
+            );
+            write(
+                &repo.join(format!("packages/aethyme/rust/crates/{member}/src/main.rs")),
+                "fn main() {}\n",
+            );
+        }
+        commit_all(&repo, "test: add product and stale supporting manifest");
+
+        let artifact = build_onboarding_artifact(&repo).unwrap();
+        let repo_facts = artifact.get("repo").unwrap();
+        assert_eq!(
+            value_strings(repo_facts.get("languages").unwrap()),
+            vec!["rust"]
+        );
+        assert_eq!(
+            repo_facts.get("package_manager").unwrap().as_str(),
+            Some("cargo")
+        );
+        let commands = artifact.get("commands").unwrap().as_array().unwrap();
+        assert!(!commands.iter().any(|command| command
+            .get("command")
+            .unwrap()
+            .py_str()
+            .contains("pytest")));
+        assert!(artifact
+            .get("primary_commands")
+            .unwrap()
+            .get("lint")
+            .is_none());
+        assert_eq!(
+            artifact
+                .get("primary_entrypoints")
+                .unwrap()
+                .get("cli")
+                .unwrap()
+                .get("executable_name")
+                .unwrap()
+                .as_str(),
+            Some("aethyme")
+        );
+
+        std::fs::remove_dir_all(&repo).unwrap();
+    }
+
+    #[test]
+    fn ignored_and_untracked_manifests_never_enter_workspace_inventory() {
+        let repo = committed_git_repo("tracked-workspace-inventory");
+        write(
+            &repo.join(".gitignore"),
+            "node_modules/\ntarget/\n.venv/\nlocal/\n",
+        );
+        write(
+            &repo.join("packages/kept/Cargo.toml"),
+            "[package]\nname = \"kept\"\nversion = \"0.1.0\"\n",
+        );
+        write(&repo.join("packages/kept/src/lib.rs"), "pub fn kept() {}\n");
+        commit_all(&repo, "test: add tracked workspace");
+        write(&repo.join("package.json"), "{}\n");
+        write(&repo.join("node_modules/pkg/package.json"), "{}\n");
+        write(&repo.join("target/Cargo.toml"), "[workspace]\n");
+        write(
+            &repo.join(".venv/pyproject.toml"),
+            "[project]\nname='ignored'\n",
+        );
+        write(&repo.join("local/go.mod"), "module untracked\n");
+
+        let snapshot = OnboardingFileSnapshot::discover(&repo).unwrap();
+        let inventory = WorkspaceInventory::discover(&repo, &snapshot).unwrap();
+        let roots = inventory
+            .workspaces
+            .iter()
+            .map(|workspace| workspace.root.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(roots, vec!["packages/kept"]);
+        assert_eq!(inventory.manifests, vec!["packages/kept/Cargo.toml"]);
+
+        std::fs::remove_dir_all(&repo).unwrap();
+    }
+
+    #[test]
+    fn workspace_inventory_types_nested_members_locks_commands_and_evidence() {
+        let repo = committed_git_repo("typed-workspace-inventory");
+        write(
+            &repo.join("products/tool/Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/router\"]\nresolver = \"2\"\n",
+        );
+        write(
+            &repo.join("products/tool/crates/router/Cargo.toml"),
+            "[package]\nname = \"router\"\nversion = \"0.1.0\"\n",
+        );
+        write(
+            &repo.join("products/tool/crates/router/src/main.rs"),
+            "fn main() {}\n",
+        );
+        write(&repo.join("products/tool/Cargo.lock"), "# fixture lock\n");
+        write(
+            &repo.join(".github/workflows/test.yml"),
+            "steps:\n  - run: cargo test --manifest-path products/tool/Cargo.toml --workspace\n",
+        );
+        commit_all(&repo, "test: add typed workspace fixture");
+
+        let snapshot = OnboardingFileSnapshot::discover(&repo).unwrap();
+        let inventory = WorkspaceInventory::discover(&repo, &snapshot).unwrap();
+        assert_eq!(inventory.workspaces.len(), 1);
+        let workspace = &inventory.workspaces[0];
+        assert_eq!(workspace.root, "products/tool");
+        assert_eq!(workspace.manifest_path, "products/tool/Cargo.toml");
+        assert_eq!(workspace.manifest_kind, WorkspaceManifestKind::Cargo);
+        assert_eq!(workspace.package_manager, "cargo");
+        assert_eq!(workspace.languages, vec!["rust"]);
+        assert_eq!(workspace.members, vec!["products/tool/crates/router"]);
+        assert_eq!(workspace.lockfiles, vec!["products/tool/Cargo.lock"]);
+        assert!(workspace.declares_workspace);
+        assert_eq!(workspace.source_file_count, 1);
+        assert_eq!(workspace.executable_entrypoint_count, 1);
+        assert_eq!(workspace.ci_mention_count, 1);
+        assert!(workspace.candidate_commands.iter().any(|command| {
+            command.kind == "fast_test"
+                && command.command
+                    == "cargo test --manifest-path products/tool/Cargo.toml --workspace"
+                && command.source == "products/tool/Cargo.toml"
+                && command.confidence == "high"
+        }));
+        assert!(workspace.evidence.iter().any(|evidence| {
+            evidence.kind == "tracked_manifest"
+                && evidence.detail == "products/tool/Cargo.toml"
+                && evidence.confidence == "high"
+        }));
+        assert_eq!(workspace.confidence, "high");
+
+        std::fs::remove_dir_all(&repo).unwrap();
+    }
+
+    #[test]
+    fn primary_workspace_ranking_uses_structure_ci_entrypoints_and_source_footprint() {
+        let repo = committed_git_repo("rank-workspaces");
+        write(
+            &repo.join("packages/product/Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/router\", \"crates/engine\"]\nresolver = \"2\"\n",
+        );
+        for name in ["router", "engine"] {
+            write(
+                &repo.join(format!("packages/product/crates/{name}/Cargo.toml")),
+                &format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\n"),
+            );
+            write(
+                &repo.join(format!("packages/product/crates/{name}/src/main.rs")),
+                "fn main() {}\n",
+            );
+        }
+        write(
+            &repo.join("packages/evaluation/pyproject.toml"),
+            "[project]\nname = \"evaluation\"\nversion = \"0.1.0\"\n",
+        );
+        write(
+            &repo.join("packages/evaluation/test_eval.py"),
+            "def test_ok(): assert True\n",
+        );
+        write(
+            &repo.join(".github/workflows/test.yml"),
+            "steps:\n  - run: cargo test --manifest-path packages/product/Cargo.toml --workspace\n",
+        );
+        commit_all(&repo, "test: add ranked workspaces");
+
+        let snapshot = OnboardingFileSnapshot::discover(&repo).unwrap();
+        let inventory = WorkspaceInventory::discover(&repo, &snapshot).unwrap();
+        assert_eq!(inventory.primary().unwrap().root, "packages/product");
+        assert_eq!(inventory.languages_primary_first(), vec!["rust", "python"]);
+        let artifact = build_onboarding_artifact(&repo).unwrap();
+        let repo_facts = artifact.get("repo").unwrap();
+        assert_eq!(
+            repo_facts.get("package_manager").unwrap().as_str(),
+            Some("cargo")
+        );
+        assert_eq!(
+            value_strings(repo_facts.get("languages").unwrap()),
+            vec!["rust", "python"]
+        );
+        assert_eq!(
+            value_strings(repo_facts.get("manifests").unwrap()),
+            vec![
+                "packages/evaluation/pyproject.toml".to_string(),
+                "packages/product/Cargo.toml".to_string(),
+                "packages/product/crates/engine/Cargo.toml".to_string(),
+                "packages/product/crates/router/Cargo.toml".to_string(),
+            ]
+        );
+
+        std::fs::remove_dir_all(&repo).unwrap();
+    }
+
+    #[test]
+    fn repository_root_manifest_outranks_nested_workspace() {
+        let repo = committed_git_repo("rank-root-manifest");
+        write(
+            &repo.join("pyproject.toml"),
+            "[project]\nname = \"root-product\"\nversion = \"0.1.0\"\n",
+        );
+        write(&repo.join("src/main.py"), "print('root')\n");
+        write(
+            &repo.join("tools/helper/Cargo.toml"),
+            "[workspace]\nmembers = [\"cli\"]\n",
+        );
+        write(
+            &repo.join("tools/helper/cli/Cargo.toml"),
+            "[package]\nname = \"helper\"\nversion = \"0.1.0\"\n",
+        );
+        write(&repo.join("tools/helper/cli/src/main.rs"), "fn main() {}\n");
+        commit_all(&repo, "test: add root and nested workspaces");
+
+        let snapshot = OnboardingFileSnapshot::discover(&repo).unwrap();
+        let inventory = WorkspaceInventory::discover(&repo, &snapshot).unwrap();
+        assert_eq!(inventory.primary().unwrap().root, ".");
+        assert_eq!(inventory.primary().unwrap().package_manager, "python");
+
+        std::fs::remove_dir_all(&repo).unwrap();
+    }
+
+    #[test]
     fn source_digest_tracks_bytes_not_only_dirty_path_names() {
         let repo = committed_git_repo("content-digest");
         write(&repo.join("README.md"), "first dirty contents\n");
@@ -2901,7 +4453,7 @@ mod tests {
 
         let artifact = build_onboarding_artifact(&repo).unwrap();
         let json = pyjson::dumps_indent2(&artifact);
-        assert!(json.contains("\"schema_version\": \"aethyme-onboarding-v1\""));
+        assert!(json.contains("\"schema_version\": \"aethyme-onboarding-v2\""));
         assert!(json.contains("\"kind\": \"repository\""));
         assert!(json.contains("\"package_manager\": \"unknown\""));
         // Entrypoint detection: src/main.py as app entrypoint.
@@ -2967,6 +4519,100 @@ mod tests {
     }
 
     #[test]
+    fn v1_artifacts_remain_readable_during_v2_migration() {
+        let repo = committed_git_repo("v1-readable");
+        let mut artifact = build_onboarding_artifact(&repo).unwrap();
+        artifact.set("schema_version", Value::str(ONBOARDING_SCHEMA_V1));
+        artifact.remove("workspaces");
+        artifact.remove("primary_workspace");
+        artifact.remove("generated_paths");
+        artifact.remove("dangerous_paths");
+        if let Some(repo_facts) = artifact.get("repo").cloned() {
+            let mut repo_facts = repo_facts;
+            repo_facts.remove("primary_language");
+            artifact.set("repo", repo_facts);
+        }
+
+        validate_onboarding_schema(&artifact).unwrap();
+        build_act_starter_artifact(&artifact).unwrap();
+        let rendered = render_onboarding_skill(&artifact).unwrap();
+        assert!(!rendered.contains("## Workspaces"));
+        assert!(!rendered.contains("## Generated and Dangerous Paths"));
+
+        artifact.set("schema_version", Value::str("aethyme-onboarding-v99"));
+        assert!(validate_onboarding_schema(&artifact).is_err());
+
+        std::fs::remove_dir_all(&repo).unwrap();
+    }
+
+    #[test]
+    fn workspace_entrypoints_publish_executable_names() {
+        let repo = committed_git_repo("workspace-entrypoints");
+        write(
+            &repo.join("product/Cargo.toml"),
+            "[workspace]\nmembers = [\"router\", \"engine\"]\n",
+        );
+        write(
+            &repo.join("product/router/Cargo.toml"),
+            "[package]\nname = \"router-package\"\nversion = \"0.1.0\"\n\n[[bin]]\nname = \"aethyme\"\npath = \"src/main.rs\"\n",
+        );
+        write(&repo.join("product/router/src/main.rs"), "fn main() {}\n");
+        write(
+            &repo.join("product/engine/Cargo.toml"),
+            "[package]\nname = \"engine-package\"\nversion = \"0.1.0\"\n\n[[bin]]\nname = \"aethyme-engine-cli\"\npath = \"src/bin/aethyme-engine-cli.rs\"\n",
+        );
+        write(
+            &repo.join("product/engine/src/bin/aethyme-engine-cli.rs"),
+            "fn main() {}\n",
+        );
+        commit_all(&repo, "test: add workspace binaries");
+
+        let artifact = build_onboarding_artifact(&repo).unwrap();
+        let entrypoints = artifact.get("entrypoints").unwrap().as_array().unwrap();
+        let names = entrypoints
+            .iter()
+            .filter_map(|entrypoint| entrypoint.get("executable_name"))
+            .map(Value::py_str)
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"aethyme".into()));
+        assert!(names.contains(&"aethyme-engine-cli".into()));
+
+        std::fs::remove_dir_all(&repo).unwrap();
+    }
+
+    #[test]
+    fn v2_artifact_exposes_tracked_generated_and_dangerous_paths() {
+        let repo = committed_git_repo("path-controls");
+        write(&repo.join(".aethyme/generated/context.json"), "{}\n");
+        write(
+            &repo.join(".aethyme/gates.toml"),
+            "[[gate]]\nname='test'\ncommand='true'\n",
+        );
+        write(&repo.join(".github/workflows/test.yml"), "jobs: {}\n");
+        write(&repo.join("services/api/migrations/001.sql"), "select 1;\n");
+        write(
+            &repo.join("packages/lib/generated/client.rs"),
+            "// generated\n",
+        );
+        commit_all(&repo, "test: add controlled paths");
+
+        let artifact = build_onboarding_artifact(&repo).unwrap();
+        assert_eq!(
+            artifact.get("schema_version").unwrap().as_str(),
+            Some(ONBOARDING_SCHEMA_V2)
+        );
+        let generated = artifact_paths(&artifact, "generated_paths");
+        assert!(generated.contains(&".aethyme/generated".into()));
+        assert!(generated.contains(&"packages/lib/generated".into()));
+        let dangerous = artifact_paths(&artifact, "dangerous_paths");
+        assert!(dangerous.contains(&".aethyme/gates.toml".into()));
+        assert!(dangerous.contains(&".github/workflows".into()));
+        assert!(dangerous.contains(&"services/api/migrations".into()));
+
+        std::fs::remove_dir_all(&repo).unwrap();
+    }
+
+    #[test]
     fn override_template_matches_python_dumps_shape() {
         let json = pyjson::dumps_indent2(&override_template());
         assert!(json.starts_with("{\n  \"repo\": {\n    \"kind\": \"service\"\n  },"));
@@ -3017,7 +4663,7 @@ mod tests {
         assert_eq!(
             errors,
             vec![
-                "unknown field $.extra; allowed keys: repo, summon, commands, areas, entrypoints, caution_zones, navigation_recipes, notes",
+                "unknown field $.extra; allowed keys: repo, summon, workspaces, primary_workspace, commands, areas, entrypoints, caution_zones, generated_paths, dangerous_paths, navigation_recipes, notes",
                 "notes must be a list of strings",
                 "commands must be a list",
                 "summon must be an object",

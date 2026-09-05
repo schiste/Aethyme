@@ -1521,6 +1521,29 @@ artifact. Maintainers can override selected sections with
 It also generates a deterministic `repo-act` starter artifact and skill for
 debugging and validation planning.
 
+Workspace inference is tracked-snapshot-only. Aethyme reads the NUL-delimited
+output of `git ls-files -z`, inventories root and nested Cargo, Python, Node,
+Go, and Composer manifests, and relates workspace manifests to their tracked
+members, lockfiles, source footprint, CI usage, and executable entrypoints.
+Ignored or untracked manifests and dependency trees are not evidence. The
+primary workspace is ranked deterministically from those generic signals;
+supporting workspaces remain visible without supplying missing primary
+commands.
+
+Every inferred command is runnable from the repository root and records its
+manifest and workspace provenance. For example, a nested Cargo workspace is
+rendered as:
+
+```bash
+cargo test --manifest-path packages/product/rust/Cargo.toml --workspace
+```
+
+The v2 onboarding artifact exposes `workspaces`, `primary_workspace`, scoped
+commands, executable names, command provenance, and tracked generated and
+dangerous paths. Readers accept v1 artifacts during migration. Generation is
+content-deterministic: checkout directory names and wall-clock time do not
+enter canonical output.
+
 Example override:
 
 ```json
@@ -1549,6 +1572,13 @@ regenerating onboarding, not by editing generated skill files directly.
 and that key fields use the expected shapes. Unknown top-level keys and unknown
 keys inside `repo` or `summon` fail with the exact JSON path and the allowed
 keys; misspellings are never silently ignored.
+
+Overrides take precedence over inference. Maintainers may replace inferred
+`commands`, `areas`, `entrypoints`, `caution_zones`, `workspaces`,
+`primary_workspace`, `generated_paths`, or `dangerous_paths`, and may refine
+the supported `repo` and `summon` fields. Use an override only when repository
+policy or an intentional generated/local area cannot be established from the
+tracked snapshot.
 
 `repo init-agents-overrides` writes a starter `.aethyme/overrides/agents.json`
 file. Use it for repo-specific root instruction customization such as:
@@ -1701,10 +1731,15 @@ generated artifact.
 
 `onboarding.json` is the canonical artifact. It includes:
 - repo identity
-- inferred commands, areas, entrypoints, caution zones
+- a ranked tracked-workspace inventory and primary workspace
+- root-runnable scoped commands with manifest provenance
+- inferred areas, executable entrypoints, caution zones, and path controls
 - summon rules for when the onboarding skill should be loaded
 - freshness metadata
 - generation telemetry and override status
+
+Schema `aethyme-onboarding-v2` is the current write format. Runtime readers
+continue to accept `aethyme-onboarding-v1` while repositories regenerate.
 
 `act-starter.json` is the deterministic execution companion artifact. It includes:
 - debugging and validation starter checklists

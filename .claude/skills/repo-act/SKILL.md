@@ -27,5 +27,15 @@ description: Use after repo-onboarding or Explore when moving from orientation i
 
 ## Useful Commands
 
-- `fast_test`: `cargo test`
-- `build`: `cargo build`
+- `fast_test`: `cargo test --manifest-path packages/aethyme/rust/Cargo.toml --workspace`
+- `build`: `cargo build --manifest-path packages/aethyme/rust/Cargo.toml --workspace`
+
+## Primary Entrypoints
+
+- `cli`: `packages/aethyme/rust/crates/aethyme-cli/src/main.rs` (tracked Rust binary entrypoint in `packages/aethyme/rust`)
+
+## Likely Entrypoints
+
+- `packages/aethyme/rust/crates/aethyme-cli/src/main.rs` (tracked Rust binary entrypoint in `packages/aethyme/rust`)
+- `packages/aethyme/rust/crates/aethyme-engine/src/bin/aethyme-engine-cli.rs` (tracked Rust binary entrypoint in `packages/aethyme/rust`)
+- `packages/aethyme/rust/crates/aethyme-graph-indexer/src/bin/aethyme-graph-index.rs` (tracked Rust binary entrypoint in `packages/aethyme/rust`)

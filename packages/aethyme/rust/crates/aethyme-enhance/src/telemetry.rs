@@ -28,7 +28,9 @@
 
 use std::path::Path;
 
-use crate::onboarding::{override_freshness, ACT_STARTER_JSON_PATH, ONBOARDING_JSON_PATH};
+use crate::onboarding::{
+    override_freshness, validate_onboarding_schema, ACT_STARTER_JSON_PATH, ONBOARDING_JSON_PATH,
+};
 use crate::pyjson::{self, Value};
 use crate::timeutil::now_iso_utc;
 use crate::util::{py_splitlines, resolve_path};
@@ -265,6 +267,7 @@ fn req<'a>(value: &'a Value, key: &str) -> Result<&'a Value, String> {
 
 /// The onboarding summary block shared by deploy events and `summarize`.
 pub fn onboarding_summary_payload(onboarding: &Value) -> Result<Value, String> {
+    validate_onboarding_schema(onboarding)?;
     let telemetry = req(onboarding, "telemetry")?;
     let counts = req(telemetry, "counts")?;
     Ok(obj(vec![

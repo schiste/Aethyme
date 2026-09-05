@@ -1,36 +1,288 @@
 {
-  "schema_version": "aethyme-onboarding-v1",
+  "schema_version": "aethyme-onboarding-v2",
   "repo": {
     "name": "Aethyme",
     "root": ".",
     "kind": "monorepo",
-    "languages": [],
-    "package_manager": "unknown",
-    "manifests": []
+    "languages": [
+      "rust",
+      "python"
+    ],
+    "primary_language": "rust",
+    "package_manager": "cargo",
+    "manifests": [
+      "packages/aethyme-eval/pyproject.toml",
+      "packages/aethyme/Makefile",
+      "packages/aethyme/package.json",
+      "packages/aethyme/rust/Cargo.toml",
+      "packages/aethyme/rust/crates/aethyme-broker/Cargo.toml",
+      "packages/aethyme/rust/crates/aethyme-cli/Cargo.toml",
+      "packages/aethyme/rust/crates/aethyme-engine/Cargo.toml",
+      "packages/aethyme/rust/crates/aethyme-enhance/Cargo.toml",
+      "packages/aethyme/rust/crates/aethyme-graph-indexer/Cargo.toml",
+      "packages/aethyme/rust/crates/aethyme-graph-schema/Cargo.toml",
+      "packages/aethyme/rust/crates/aethyme-graph-storage/Cargo.toml",
+      "packages/aethyme/rust/crates/aethyme-producers/Cargo.toml",
+      "packages/aethyme/rust/crates/aethyme-quality/Cargo.toml",
+      "packages/aethyme/rust/crates/aethyme-testkit/Cargo.toml"
+    ]
+  },
+  "workspaces": [
+    {
+      "root": "packages/aethyme/rust",
+      "manifest": {
+        "path": "packages/aethyme/rust/Cargo.toml",
+        "kind": "cargo"
+      },
+      "package_manager": "cargo",
+      "languages": [
+        "rust"
+      ],
+      "members": [
+        "packages/aethyme/rust/crates/aethyme-broker",
+        "packages/aethyme/rust/crates/aethyme-cli",
+        "packages/aethyme/rust/crates/aethyme-engine",
+        "packages/aethyme/rust/crates/aethyme-enhance",
+        "packages/aethyme/rust/crates/aethyme-graph-indexer",
+        "packages/aethyme/rust/crates/aethyme-graph-schema",
+        "packages/aethyme/rust/crates/aethyme-graph-storage",
+        "packages/aethyme/rust/crates/aethyme-producers",
+        "packages/aethyme/rust/crates/aethyme-quality",
+        "packages/aethyme/rust/crates/aethyme-testkit"
+      ],
+      "lockfiles": [
+        "packages/aethyme/rust/Cargo.lock"
+      ],
+      "candidate_commands": [
+        {
+          "kind": "fast_test",
+          "command": "cargo test --manifest-path packages/aethyme/rust/Cargo.toml --workspace",
+          "source": "packages/aethyme/rust/Cargo.toml",
+          "confidence": "high"
+        },
+        {
+          "kind": "build",
+          "command": "cargo build --manifest-path packages/aethyme/rust/Cargo.toml --workspace",
+          "source": "packages/aethyme/rust/Cargo.toml",
+          "confidence": "high"
+        }
+      ],
+      "evidence": [
+        {
+          "kind": "tracked_manifest",
+          "detail": "packages/aethyme/rust/Cargo.toml",
+          "confidence": "high"
+        },
+        {
+          "kind": "workspace_members",
+          "detail": "10 tracked member roots",
+          "confidence": "high"
+        },
+        {
+          "kind": "ci_usage",
+          "detail": "workspace root mentioned 12 time(s) in CI",
+          "confidence": "medium"
+        }
+      ],
+      "confidence": "high",
+      "primary": true,
+      "ranking": {
+        "root_manifest": false,
+        "declares_workspace": true,
+        "member_count": 10,
+        "ci_mentions": 12,
+        "executable_entrypoints": 1,
+        "source_files": 329
+      }
+    },
+    {
+      "root": "packages/aethyme",
+      "manifest": {
+        "path": "packages/aethyme/package.json",
+        "kind": "node"
+      },
+      "package_manager": "npm",
+      "languages": [],
+      "members": [],
+      "lockfiles": [],
+      "candidate_commands": [],
+      "evidence": [
+        {
+          "kind": "tracked_manifest",
+          "detail": "packages/aethyme/package.json",
+          "confidence": "high"
+        },
+        {
+          "kind": "ci_usage",
+          "detail": "workspace root mentioned 21 time(s) in CI",
+          "confidence": "medium"
+        }
+      ],
+      "confidence": "high",
+      "primary": false,
+      "ranking": {
+        "root_manifest": false,
+        "declares_workspace": false,
+        "member_count": 0,
+        "ci_mentions": 21,
+        "executable_entrypoints": 1,
+        "source_files": 329
+      }
+    },
+    {
+      "root": "packages/aethyme-eval",
+      "manifest": {
+        "path": "packages/aethyme-eval/pyproject.toml",
+        "kind": "python"
+      },
+      "package_manager": "python",
+      "languages": [
+        "python"
+      ],
+      "members": [],
+      "lockfiles": [],
+      "candidate_commands": [
+        {
+          "kind": "fast_test",
+          "command": "python -m pytest packages/aethyme-eval",
+          "source": "packages/aethyme-eval/pyproject.toml",
+          "confidence": "medium"
+        },
+        {
+          "kind": "install",
+          "command": "python -m pip install -e packages/aethyme-eval",
+          "source": "packages/aethyme-eval/pyproject.toml",
+          "confidence": "medium"
+        }
+      ],
+      "evidence": [
+        {
+          "kind": "tracked_manifest",
+          "detail": "packages/aethyme-eval/pyproject.toml",
+          "confidence": "high"
+        },
+        {
+          "kind": "ci_usage",
+          "detail": "workspace root mentioned 1 time(s) in CI",
+          "confidence": "medium"
+        }
+      ],
+      "confidence": "high",
+      "primary": false,
+      "ranking": {
+        "root_manifest": false,
+        "declares_workspace": false,
+        "member_count": 0,
+        "ci_mentions": 1,
+        "executable_entrypoints": 0,
+        "source_files": 16
+      }
+    }
+  ],
+  "primary_workspace": {
+    "root": "packages/aethyme/rust",
+    "manifest": {
+      "path": "packages/aethyme/rust/Cargo.toml",
+      "kind": "cargo"
+    },
+    "package_manager": "cargo",
+    "languages": [
+      "rust"
+    ],
+    "members": [
+      "packages/aethyme/rust/crates/aethyme-broker",
+      "packages/aethyme/rust/crates/aethyme-cli",
+      "packages/aethyme/rust/crates/aethyme-engine",
+      "packages/aethyme/rust/crates/aethyme-enhance",
+      "packages/aethyme/rust/crates/aethyme-graph-indexer",
+      "packages/aethyme/rust/crates/aethyme-graph-schema",
+      "packages/aethyme/rust/crates/aethyme-graph-storage",
+      "packages/aethyme/rust/crates/aethyme-producers",
+      "packages/aethyme/rust/crates/aethyme-quality",
+      "packages/aethyme/rust/crates/aethyme-testkit"
+    ],
+    "lockfiles": [
+      "packages/aethyme/rust/Cargo.lock"
+    ],
+    "candidate_commands": [
+      {
+        "kind": "fast_test",
+        "command": "cargo test --manifest-path packages/aethyme/rust/Cargo.toml --workspace",
+        "source": "packages/aethyme/rust/Cargo.toml",
+        "confidence": "high"
+      },
+      {
+        "kind": "build",
+        "command": "cargo build --manifest-path packages/aethyme/rust/Cargo.toml --workspace",
+        "source": "packages/aethyme/rust/Cargo.toml",
+        "confidence": "high"
+      }
+    ],
+    "evidence": [
+      {
+        "kind": "tracked_manifest",
+        "detail": "packages/aethyme/rust/Cargo.toml",
+        "confidence": "high"
+      },
+      {
+        "kind": "workspace_members",
+        "detail": "10 tracked member roots",
+        "confidence": "high"
+      },
+      {
+        "kind": "ci_usage",
+        "detail": "workspace root mentioned 12 time(s) in CI",
+        "confidence": "medium"
+      }
+    ],
+    "confidence": "high",
+    "primary": true,
+    "ranking": {
+      "root_manifest": false,
+      "declares_workspace": true,
+      "member_count": 10,
+      "ci_mentions": 12,
+      "executable_entrypoints": 1,
+      "source_files": 329
+    }
   },
   "commands": [
     {
-      "kind": "fast_test",
-      "command": "cargo test",
-      "source": "github-actions",
-      "confidence": "medium"
+      "kind": "install",
+      "command": "python -m pip install -e packages/aethyme-eval",
+      "source": "packages/aethyme-eval/pyproject.toml",
+      "confidence": "medium",
+      "workspace_root": "packages/aethyme-eval",
+      "provenance": "derived from tracked workspace manifest"
     },
     {
       "kind": "fast_test",
-      "command": "pytest",
-      "source": "github-actions",
-      "confidence": "medium"
+      "command": "cargo test --manifest-path packages/aethyme/rust/Cargo.toml --workspace",
+      "source": "packages/aethyme/rust/Cargo.toml",
+      "confidence": "high",
+      "workspace_root": "packages/aethyme/rust",
+      "provenance": "derived from tracked workspace manifest"
+    },
+    {
+      "kind": "fast_test",
+      "command": "python -m pytest packages/aethyme-eval",
+      "source": "packages/aethyme-eval/pyproject.toml",
+      "confidence": "medium",
+      "workspace_root": "packages/aethyme-eval",
+      "provenance": "derived from tracked workspace manifest"
     },
     {
       "kind": "build",
-      "command": "cargo build",
-      "source": "github-actions",
-      "confidence": "medium"
+      "command": "cargo build --manifest-path packages/aethyme/rust/Cargo.toml --workspace",
+      "source": "packages/aethyme/rust/Cargo.toml",
+      "confidence": "high",
+      "workspace_root": "packages/aethyme/rust",
+      "provenance": "derived from tracked workspace manifest"
     }
   ],
   "primary_commands": {
-    "fast_test": "cargo test",
-    "build": "cargo build"
+    "fast_test": "cargo test --manifest-path packages/aethyme/rust/Cargo.toml --workspace",
+    "build": "cargo build --manifest-path packages/aethyme/rust/Cargo.toml --workspace"
   },
   "areas": [
     {
@@ -52,9 +304,118 @@
       "confidence": "high"
     }
   ],
-  "entrypoints": [],
-  "primary_entrypoints": {},
+  "entrypoints": [
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-cli/src/main.rs",
+      "kind": "file",
+      "role": "cli",
+      "reason": "tracked Rust binary entrypoint in `packages/aethyme/rust`",
+      "confidence": "high",
+      "workspace_root": "packages/aethyme/rust",
+      "provenance": "derived from tracked workspace source",
+      "executable_name": "aethyme",
+      "relevance": "primary"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-engine/src/bin/aethyme-engine-cli.rs",
+      "kind": "file",
+      "role": "cli",
+      "reason": "tracked Rust binary entrypoint in `packages/aethyme/rust`",
+      "confidence": "high",
+      "workspace_root": "packages/aethyme/rust",
+      "provenance": "derived from tracked workspace source",
+      "executable_name": "aethyme-engine-cli",
+      "relevance": "product"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-graph-indexer/src/bin/aethyme-graph-index.rs",
+      "kind": "file",
+      "role": "cli",
+      "reason": "tracked Rust binary entrypoint in `packages/aethyme/rust`",
+      "confidence": "high",
+      "workspace_root": "packages/aethyme/rust",
+      "provenance": "derived from tracked workspace source",
+      "executable_name": "aethyme-graph-index",
+      "relevance": "product"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-graph-indexer/src/bin/aethyme-graph-link.rs",
+      "kind": "file",
+      "role": "cli",
+      "reason": "tracked Rust binary entrypoint in `packages/aethyme/rust`",
+      "confidence": "high",
+      "workspace_root": "packages/aethyme/rust",
+      "provenance": "derived from tracked workspace source",
+      "executable_name": "aethyme-graph-link",
+      "relevance": "product"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-graph-indexer/src/bin/aethyme-graph-query.rs",
+      "kind": "file",
+      "role": "cli",
+      "reason": "tracked Rust binary entrypoint in `packages/aethyme/rust`",
+      "confidence": "high",
+      "workspace_root": "packages/aethyme/rust",
+      "provenance": "derived from tracked workspace source",
+      "executable_name": "aethyme-graph-query",
+      "relevance": "product"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-broker/src/bin/broker-cli-shim.rs",
+      "kind": "file",
+      "role": "cli",
+      "reason": "tracked Rust binary entrypoint in `packages/aethyme/rust`",
+      "confidence": "high",
+      "workspace_root": "packages/aethyme/rust",
+      "provenance": "derived from tracked workspace source",
+      "executable_name": "broker-cli-shim",
+      "relevance": "supporting"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-broker/src/bin/broker-stress-worker.rs",
+      "kind": "file",
+      "role": "cli",
+      "reason": "tracked Rust binary entrypoint in `packages/aethyme/rust`",
+      "confidence": "high",
+      "workspace_root": "packages/aethyme/rust",
+      "provenance": "derived from tracked workspace source",
+      "executable_name": "broker-stress-worker",
+      "relevance": "supporting"
+    }
+  ],
+  "primary_entrypoints": {
+    "cli": {
+      "path": "packages/aethyme/rust/crates/aethyme-cli/src/main.rs",
+      "kind": "file",
+      "role": "cli",
+      "reason": "tracked Rust binary entrypoint in `packages/aethyme/rust`",
+      "confidence": "high",
+      "workspace_root": "packages/aethyme/rust",
+      "provenance": "derived from tracked workspace source",
+      "executable_name": "aethyme",
+      "relevance": "primary"
+    }
+  },
   "caution_zones": [],
+  "generated_paths": [
+    {
+      "path": ".aethyme/generated",
+      "reason": "tracked generated or vendored surface; verify ownership before editing",
+      "provenance": "tracked path classification"
+    }
+  ],
+  "dangerous_paths": [
+    {
+      "path": ".aethyme/gates.toml",
+      "reason": "repository validation policy; changes affect every broker submission",
+      "provenance": "tracked path classification"
+    },
+    {
+      "path": ".github/workflows",
+      "reason": "repository automation; changes can affect publication or shared CI",
+      "provenance": "tracked path classification"
+    }
+  ],
   "navigation_recipes": [
     {
       "purpose": "Broad repository orientation for a user request",
@@ -91,27 +452,34 @@
     ]
   },
   "freshness": {
-    "source_digest": "0b17b99b74f28871b69c64a3956c96ac191fa6856a5e2913a706c32143c43145",
+    "source_digest": "4a8e740640ae8599b14705fbc658e0a506b5739819fccc4e145017e6265798a9",
     "source_commit": null,
-    "source_file_count": 534,
+    "source_file_count": 536,
     "generator": "deterministic"
   },
   "telemetry": {
     "sections": [
       "repo",
+      "workspaces",
+      "primary_workspace",
       "commands",
       "areas",
       "entrypoints",
       "caution_zones",
+      "generated_paths",
+      "dangerous_paths",
       "navigation_recipes",
       "summon",
       "freshness"
     ],
     "counts": {
-      "commands": 3,
+      "workspaces": 3,
+      "commands": 4,
       "areas": 3,
-      "entrypoints": 0,
+      "entrypoints": 7,
       "caution_zones": 0,
+      "generated_paths": 1,
+      "dangerous_paths": 2,
       "navigation_recipes": 3,
       "notes": 0
     },

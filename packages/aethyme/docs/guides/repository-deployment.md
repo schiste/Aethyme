@@ -72,6 +72,23 @@ The two JSON artifacts under `.aethyme/generated/` are portable canonical
 inputs, not caches. They use repository-relative identity and allow another
 clone to reproduce and verify the rendered agent guidance.
 
+The onboarding artifact is generated from tracked repository inputs only.
+Nested workspace manifests, members, lockfiles, source files, CI references,
+and executable entrypoints provide auditable evidence for the selected primary
+workspace. Commands are scoped so they run from the repository root; a nested
+Cargo product therefore uses `cargo ... --manifest-path <path> --workspace`
+instead of relying on an implicit working directory. Supporting tools and
+evaluation packages remain visible but do not replace missing commands in the
+primary product contract.
+
+Ignored dependencies, virtual environments, build output, and untracked local
+manifests never influence canonical onboarding. If maintainers intentionally
+need a local/generated surface or want to replace an inferred workspace,
+command, entrypoint, or path classification, record that decision in
+`.aethyme/overrides/onboarding.json` and regenerate. Overrides win over
+inference and are validated with a closed schema; generated files should not be
+edited directly.
+
 ## Ignore runtime state
 
 The managed `.gitignore` block excludes machine-local broker state:
