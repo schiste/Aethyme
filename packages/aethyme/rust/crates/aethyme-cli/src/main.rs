@@ -28,6 +28,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 mod graph_refresh;
+mod readiness_remediation;
 mod repository_deploy;
 mod repository_enrollment;
 mod repository_upgrade;
@@ -90,6 +91,8 @@ fn broker_command_capability(args: &[String]) -> repository_upgrade::CommandCapa
     let subcommand = args.first().map(String::as_str);
     let nested = args.get(1).map(String::as_str);
     match (subcommand, nested) {
+        (Some("readiness"), Some("apply")) => CommandCapability::Upgrade,
+        (Some("readiness"), Some("recover")) => CommandCapability::RecoveryWrite,
         (Some("start" | "start-agent"), _) => CommandCapability::NewSession,
         (Some("adopt"), _) => CommandCapability::NewSession,
         (Some("submit" | "exec" | "repair"), _) => CommandCapability::SessionContinuation,
@@ -348,6 +351,9 @@ fn main() -> ExitCode {
         },
         "root" => run_root_subcommand(&args[1..]),
         // Broker commands have been native Rust from birth (issue #31).
+        "broker" if readiness_remediation::is_command(command.args) => {
+            ExitCode::from(readiness_remediation::run(&command.args[1..]))
+        }
         "broker" => ExitCode::from(aethyme_broker::cli::run_with_mode(
             command.args,
             broker_compatibility_mode,

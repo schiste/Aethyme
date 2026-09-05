@@ -246,7 +246,7 @@ repository deployments remain distinct in JSON. Disabled graphing is
 `not_applicable`, not a warning or blocker; opt in voluntarily with
 `aethyme deploy --repo . --with-graph`.
 
-Readiness is an offline, read-only inspection. It does not create missing
+The bare readiness command is an offline, read-only inspection. It does not create missing
 broker or host databases, migrate storage, refresh sessions or leases, write
 telemetry, materialize graphs, or contact a remote. Inaccessible host state is
 reported as `unknown` while repository-local dimensions continue. Graph
@@ -285,9 +285,52 @@ invocation, including an unknown level, follows the normal CLI usage-error
 contract. The JSON schema begins at version 1 and keeps report fields,
 dimensions, blockers, and warnings in deterministic order.
 
+Readiness remediation is a separate reviewed workflow; there is deliberately
+no immediate `--fix`:
+
+```bash
+aethyme broker readiness plan --repo . --json
+aethyme broker readiness plan --repo . --diff
+aethyme broker readiness apply --repo . --confirm <plan-sha256>
+aethyme broker readiness recover --repo . --plan <plan-sha256>
+```
+
+`plan` builds the proposed repository tree from committed `HEAD` without
+writing the worktree. Its digest binds the source commit, deployment mode and
+schema, managed-state digest, exact examined and write paths, before/after
+content hashes and modes, ownership, resolutions, compatibility constraints,
+dirty-path classification, and relevant live sessions and leases. `--diff`
+renders the exact local patch for review; it cannot be combined with `--json`.
+Use `--local-only` consistently for a clone-local deployment, and pass the
+same resolution file to `plan` and `apply` when a typed migration requires an
+explicit choice.
+
+The safe action set is intentionally mechanical: restore fixed broker config
+and runtime ignore blocks, generate missing onboarding or agent-protocol
+artifacts, update known marked Aethyme blocks, refresh ignored experience
+status, and create a gates draft only when none exists. A new draft contains
+`reviewed = false`, so readiness continues to classify validation as limited
+until a maintainer reviews the commands and explicitly marks it reviewed.
+Customized policy, existing gate semantics, CI, symlinks, and files covered by
+live leases are blockers rather than automatic edits.
+
+`apply` takes the exclusive repository-upgrade lock, rebuilds and compares the
+whole plan, rejects confirmation or state drift, writes recoverable before
+bytes to a rollback journal, stages sibling temporary files, atomically
+renames only the reviewed paths, verifies every resulting hash, and writes a
+repository marker last when the migration includes one. Disjoint dirty work
+is preserved and reported because it was not an input; overlapping dirty work
+blocks. An ambiguous interruption preserves the journal and prints the exact
+digest-scoped `recover` command. Recovery rolls back that journal; it never
+guesses that an in-progress marker means retry, and remediation never advises
+stashing multi-worktree changes.
+
 - `aethyme init`
 - `aethyme certify`
 - `aethyme broker readiness [--require <conflict-only|agent-ready|parallel-ready>] [--json]`
+- `aethyme broker readiness plan [--repo <path>] [--local-only] [--resolution-file <path>] [--diff|--json]`
+- `aethyme broker readiness apply [--repo <path>] [--local-only] [--resolution-file <path>] --confirm <plan-sha256> [--json]`
+- `aethyme broker readiness recover [--repo <path>] --plan <plan-sha256> [--json]`
 - `aethyme broker status [--json]`
 - `aethyme broker worktree-root [--json]`
 - `aethyme broker start --task "..." [--path <repo-path>]... [--json]`

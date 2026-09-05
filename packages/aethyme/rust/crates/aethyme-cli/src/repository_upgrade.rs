@@ -29,6 +29,7 @@ const MIGRATION_IN_PROGRESS: &str = "repository-deployment-v1:in-progress";
 const TRANSACTION_SCHEMA_VERSION: u32 = 1;
 const JOURNAL_MAX_BYTES: usize = 64 * 1024 * 1024;
 const CRASH_EXIT_CODE: i32 = 86;
+const READINESS_REMEDIATION_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Copy)]
 struct EmbeddedMigration {
@@ -193,6 +194,66 @@ pub struct RepositoryTreeChange {
     pub file_mode: Option<String>,
     pub ownership: RepositoryPathOwnership,
     pub requires_resolution: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadinessRemediationActionKind {
+    BrokerConfiguration,
+    RuntimeIgnoreBlock,
+    AgentContext,
+    GatesDraft,
+    ManagedBlockUpdate,
+    GeneratedVersionMigration,
+    ExperienceStatusProjection,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReadinessRemediationAction {
+    pub id: String,
+    pub kind: ReadinessRemediationActionKind,
+    pub summary: String,
+    pub paths: Vec<String>,
+    pub review_required: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ReadinessRemediationTreeChange {
+    pub path: String,
+    pub action: RepositoryTreeAction,
+    pub before_sha256: Option<String>,
+    pub after_sha256: Option<String>,
+    pub before_mode: Option<String>,
+    pub after_mode: Option<String>,
+    pub ownership: RepositoryPathOwnership,
+    pub requires_resolution: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ReadinessRemediationPlan {
+    pub schema_version: u32,
+    pub source_head: String,
+    pub repository_mode: RepositoryMode,
+    pub repository_schema: u32,
+    pub target_schema: u32,
+    pub managed_state_digest: String,
+    pub examined_paths: Vec<String>,
+    pub planned_write_set: Vec<String>,
+    pub changes: Vec<ReadinessRemediationTreeChange>,
+    pub customizations: Vec<RepositoryCustomization>,
+    pub required_resolutions: Vec<RepositoryResolution>,
+    pub dirty_overlapping_paths: Vec<String>,
+    pub dirty_disjoint_paths: Vec<String>,
+    pub live_sessions: Vec<UpgradeActiveSessionPrecondition>,
+    pub relevant_leases: Vec<UpgradeRelevantLease>,
+    pub actions: Vec<ReadinessRemediationAction>,
+    pub warnings: Vec<String>,
+    pub blockers: Vec<String>,
+    pub diff_sha256: String,
+    pub safe: bool,
+    pub applied: bool,
+    pub plan_sha256: String,
+    pub next_action: String,
 }
 
 #[derive(Serialize)]
@@ -628,18 +689,42 @@ struct ProposedRepository {
     root: PathBuf,
 }
 
-struct BuiltUpgradePlan {
-    report: RepositoryUpgradePlan,
-    migration_diff: String,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RepositoryPlanIntent {
+    SchemaUpgrade,
+    ReadinessRemediation,
+}
+
+pub(crate) struct BuiltUpgradePlan {
+    pub(crate) report: RepositoryUpgradePlan,
+    pub(crate) migration_diff: String,
+    pub(crate) proposed_outputs: Vec<ProposedOutput>,
+}
+
+pub(crate) struct BuiltReadinessRemediationPlan {
+    pub(crate) report: ReadinessRemediationPlan,
+    pub(crate) remediation_diff: String,
+    transaction_plan: RepositoryUpgradePlan,
     proposed_outputs: Vec<ProposedOutput>,
 }
 
 #[derive(Clone)]
-struct ProposedOutput {
-    path: String,
-    action: RepositoryTreeAction,
-    bytes: Option<Vec<u8>>,
-    file_mode: Option<String>,
+pub(crate) struct ProposedOutput {
+    pub(crate) path: String,
+    pub(crate) action: RepositoryTreeAction,
+    pub(crate) bytes: Option<Vec<u8>>,
+    pub(crate) file_mode: Option<String>,
+}
+
+pub(crate) struct RepositoryTransactionPlan<'a> {
+    pub(crate) plan_digest: &'a str,
+    pub(crate) repository_head: &'a str,
+    pub(crate) existing_managed_state_digest: &'a str,
+    pub(crate) mode: RepositoryMode,
+    pub(crate) marker_path: Option<&'a str>,
+    pub(crate) recovery_command: &'a str,
+    pub(crate) require_reviewed_before_state: bool,
+    pub(crate) changes: &'a [RepositoryTreeChange],
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -649,8 +734,15 @@ struct UpgradeRollbackJournal {
     repository_head: String,
     existing_managed_state_digest: String,
     mode: RepositoryMode,
-    marker_path: String,
+    #[serde(default)]
+    marker_path: Option<String>,
+    #[serde(default = "default_recovery_command")]
+    recovery_command: String,
     entries: Vec<UpgradeRollbackEntry>,
+}
+
+fn default_recovery_command() -> String {
+    "aethyme upgrade recover".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1490,7 +1582,7 @@ fn backup_path(path: &Path) -> Result<Option<UpgradeBackup>, String> {
 
 fn build_rollback_journal(
     repo: &Path,
-    plan: &RepositoryUpgradePlan,
+    plan: &RepositoryTransactionPlan<'_>,
     outputs: &[ProposedOutput],
 ) -> Result<UpgradeRollbackJournal, String> {
     let entries = outputs
@@ -1503,6 +1595,15 @@ fn build_rollback_journal(
                 .iter()
                 .find(|change| change.path == output.path)
                 .ok_or_else(|| format!("missing reviewed change {}", output.path))?;
+            let before_sha256 = before.as_ref().map(|entry| entry.sha256.as_str());
+            if plan.require_reviewed_before_state
+                && before_sha256 != planned_change.before_sha256.as_deref()
+            {
+                return Err(format!(
+                    "repository path {} changed after the plan was reviewed; no repository files were replaced",
+                    output.path
+                ));
+            }
             let after_sha256 = output.bytes.as_deref().map(sha256);
             if after_sha256 != planned_change.after_sha256
                 || output.action != planned_change.action
@@ -1549,11 +1650,12 @@ fn build_rollback_journal(
         .collect::<Result<Vec<_>, String>>()?;
     Ok(UpgradeRollbackJournal {
         schema_version: TRANSACTION_SCHEMA_VERSION,
-        plan_digest: plan.plan_digest.clone(),
-        repository_head: plan.repository_head.clone(),
-        existing_managed_state_digest: plan.existing_managed_state_digest.clone(),
+        plan_digest: plan.plan_digest.into(),
+        repository_head: plan.repository_head.into(),
+        existing_managed_state_digest: plan.existing_managed_state_digest.into(),
         mode: plan.mode,
-        marker_path: plan.mode.marker_path().into(),
+        marker_path: plan.marker_path.map(str::to_string),
+        recovery_command: plan.recovery_command.into(),
         entries,
     })
 }
@@ -1562,8 +1664,8 @@ fn write_rollback_journal(path: &Path, journal: &UpgradeRollbackJournal) -> Resu
     match std::fs::symlink_metadata(path) {
         Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
             return Err(format!(
-                "rollback journal already exists for plan {}; run `aethyme upgrade recover --plan {}`",
-                journal.plan_digest, journal.plan_digest
+                "rollback journal already exists for plan {}; run `{} --plan {}`",
+                journal.plan_digest, journal.recovery_command, journal.plan_digest
             ));
         }
         Ok(_) => {
@@ -1703,13 +1805,21 @@ fn crash_if_requested(point: &str) {
 #[cfg(not(debug_assertions))]
 fn crash_if_requested(_point: &str) {}
 
-fn execute_upgrade_transaction(
+pub(crate) fn execute_repository_transaction(
     repo: &Path,
-    plan: &RepositoryUpgradePlan,
+    plan: &RepositoryTransactionPlan<'_>,
     outputs: &[ProposedOutput],
-    customizations: &[RepositoryCustomization],
+    verify_result: impl FnOnce() -> Result<(), String>,
 ) -> Result<(), String> {
     let active_managed_state_digest = repository_state_digest(repo, plan.mode)?;
+    if plan.require_reviewed_before_state
+        && active_managed_state_digest != plan.existing_managed_state_digest
+    {
+        return Err(
+            "managed repository state changed after the plan was reviewed; no repository files were replaced"
+                .into(),
+        );
+    }
     let journal = build_rollback_journal(repo, plan, outputs)?;
     if repository_state_digest(repo, plan.mode)? != active_managed_state_digest {
         return Err(
@@ -1727,7 +1837,7 @@ fn execute_upgrade_transaction(
         for entry in journal
             .entries
             .iter()
-            .filter(|entry| entry.path != journal.marker_path)
+            .filter(|entry| journal.marker_path.as_deref() != Some(entry.path.as_str()))
         {
             verify_before_entry(repo, entry)?;
             apply_transaction_entry(repo, entry)?;
@@ -1740,42 +1850,44 @@ fn execute_upgrade_transaction(
         for entry in journal
             .entries
             .iter()
-            .filter(|entry| entry.path != journal.marker_path)
+            .filter(|entry| journal.marker_path.as_deref() != Some(entry.path.as_str()))
         {
             verify_after_entry(repo, entry)?;
         }
-        let marker = journal
-            .entries
-            .iter()
-            .find(|entry| entry.path == journal.marker_path)
-            .ok_or_else(|| {
-                "reviewed migration does not contain the repository marker".to_string()
-            })?;
-        verify_before_entry(repo, marker)?;
-        apply_transaction_entry(repo, marker)?;
-        crash_if_requested("after_marker");
+        if let Some(marker_path) = journal.marker_path.as_deref() {
+            let marker = journal
+                .entries
+                .iter()
+                .find(|entry| entry.path == marker_path)
+                .ok_or_else(|| {
+                    "reviewed migration does not contain the repository marker".to_string()
+                })?;
+            verify_before_entry(repo, marker)?;
+            apply_transaction_entry(repo, marker)?;
+            crash_if_requested("after_marker");
+        }
         for entry in &journal.entries {
             verify_after_entry(repo, entry)?;
         }
-        verify_deployment(repo, plan.mode, customizations)?;
+        verify_result()?;
         Ok(())
     })();
     if let Err(error) = result {
         return Err(format!(
-            "{error}; rollback journal retained — run `aethyme upgrade recover --plan {}`",
-            plan.plan_digest
+            "{error}; rollback journal retained — run `{} --plan {}`",
+            plan.recovery_command, plan.plan_digest
         ));
     }
     cleanup_transaction_artifacts(repo, &journal).map_err(|error| {
         format!(
-            "{error}; rollback journal retained — run `aethyme upgrade recover --plan {}`",
-            plan.plan_digest
+            "{error}; rollback journal retained — run `{} --plan {}`",
+            plan.recovery_command, plan.plan_digest
         )
     })?;
     remove_file_durable(&journal_path).map_err(|error| {
         format!(
-            "{error}; verified migration completed but journal cleanup must be reconciled with `aethyme upgrade recover --plan {}`",
-            plan.plan_digest
+            "{error}; verified migration completed but journal cleanup must be reconciled with `{} --plan {}`",
+            plan.recovery_command, plan.plan_digest
         )
     })?;
     Ok(())
@@ -1822,8 +1934,17 @@ fn validate_rollback_journal(
         &journal.existing_managed_state_digest,
         "journaled managed state",
     )?;
-    if journal.marker_path != journal.mode.marker_path() {
+    if journal
+        .marker_path
+        .as_deref()
+        .is_some_and(|path| path != journal.mode.marker_path())
+    {
         return Err("rollback journal marker path does not match its repository mode".into());
+    }
+    if journal.recovery_command != "aethyme upgrade recover"
+        && journal.recovery_command != "aethyme broker readiness recover"
+    {
+        return Err("rollback journal contains an unsupported recovery command".into());
     }
     let mut paths = BTreeSet::new();
     if journal.entries.is_empty() {
@@ -1884,16 +2005,18 @@ fn validate_rollback_journal(
             }
         }
     }
-    let marker = journal
-        .entries
-        .iter()
-        .find(|entry| entry.path == journal.marker_path)
-        .ok_or("rollback journal does not contain the repository marker")?;
-    if !matches!(
-        marker.action,
-        RepositoryTreeAction::Create | RepositoryTreeAction::Update
-    ) {
-        return Err("rollback journal does not install the repository marker last".into());
+    if let Some(marker_path) = journal.marker_path.as_deref() {
+        let marker = journal
+            .entries
+            .iter()
+            .find(|entry| entry.path == marker_path)
+            .ok_or("rollback journal does not contain the repository marker")?;
+        if !matches!(
+            marker.action,
+            RepositoryTreeAction::Create | RepositoryTreeAction::Update
+        ) {
+            return Err("rollback journal does not install the repository marker last".into());
+        }
     }
     Ok(())
 }
@@ -2022,11 +2145,35 @@ fn verify_before_entry(repo: &Path, entry: &UpgradeRollbackEntry) -> Result<(), 
     }
 }
 
-fn recover(repo_hint: &Path, plan_digest: &str) -> Result<RepositoryUpgradeRecovery, String> {
+pub(crate) fn recover(
+    repo_hint: &Path,
+    plan_digest: &str,
+) -> Result<RepositoryUpgradeRecovery, String> {
+    recover_for_command(repo_hint, plan_digest, "aethyme upgrade recover")
+}
+
+pub(crate) fn recover_readiness_remediation(
+    repo_hint: &Path,
+    plan_digest: &str,
+) -> Result<RepositoryUpgradeRecovery, String> {
+    recover_for_command(repo_hint, plan_digest, "aethyme broker readiness recover")
+}
+
+fn recover_for_command(
+    repo_hint: &Path,
+    plan_digest: &str,
+    expected_recovery_command: &str,
+) -> Result<RepositoryUpgradeRecovery, String> {
     validate_plan_digest(plan_digest)?;
     let repo = git_root(repo_hint)?;
     let _lock = acquire_upgrade_lock(&repo)?;
     let (path, journal) = read_rollback_journal(&repo, plan_digest)?;
+    if journal.recovery_command != expected_recovery_command {
+        return Err(format!(
+            "plan {plan_digest} belongs to `{}`; recover it through that exact command",
+            journal.recovery_command
+        ));
+    }
     let current_head = git(&repo, &["rev-parse", "HEAD"])?;
     if current_head != journal.repository_head {
         return Err(format!(
@@ -2039,14 +2186,14 @@ fn recover(repo_hint: &Path, plan_digest: &str) -> Result<RepositoryUpgradeRecov
         .entries
         .iter()
         .enumerate()
-        .filter(|(_, entry)| entry.path != journal.marker_path)
+        .filter(|(_, entry)| journal.marker_path.as_deref() != Some(entry.path.as_str()))
         .collect::<Vec<_>>();
     ordered.extend(
         journal
             .entries
             .iter()
             .enumerate()
-            .filter(|(_, entry)| entry.path == journal.marker_path),
+            .filter(|(_, entry)| journal.marker_path.as_deref() == Some(entry.path.as_str())),
     );
     let mut restored = 0;
     for (index, entry) in ordered {
@@ -2236,6 +2383,7 @@ fn build_plan(
     requested_mode: Option<RepositoryMode>,
     resolution_file: Option<&Path>,
     excluded_session_id: Option<i64>,
+    intent: RepositoryPlanIntent,
 ) -> Result<BuiltUpgradePlan, String> {
     let repo = git_root(repo_hint)?;
     let requested_resolutions = load_resolution_file(&repo, resolution_file)?;
@@ -2285,7 +2433,15 @@ fn build_plan(
             "repository schema {from_schema} is newer than supported schema {REPOSITORY_SCHEMA_VERSION}"
         ));
     }
-    let managed_paths = managed_paths(mode);
+    let mut managed_paths = managed_paths(mode);
+    if intent == RepositoryPlanIntent::ReadinessRemediation {
+        managed_paths.extend([
+            aethyme_enhance::telemetry::STATUS_JSON_PATH.into(),
+            aethyme_enhance::telemetry::STATUS_MARKDOWN_PATH.into(),
+        ]);
+        managed_paths.sort();
+        managed_paths.dedup();
+    }
     let mut resolution_paths = BTreeSet::new();
     for relative in &managed_paths {
         if let Some(blocker) = managed_path_blocker(proposed_repo, relative)? {
@@ -2309,6 +2465,9 @@ fn build_plan(
         .collect::<Vec<_>>();
     let mut examined_paths = committed_paths(proposed_repo, &repository_head)?;
     examined_paths.extend(managed_paths.iter().cloned());
+    if intent == RepositoryPlanIntent::ReadinessRemediation {
+        examined_paths.push(aethyme_enhance::telemetry::TELEMETRY_LOG_PATH.into());
+    }
     examined_paths.sort();
     examined_paths.dedup();
     let existing_managed_state_digest = repository_state_digest(proposed_repo, mode)?;
@@ -2337,18 +2496,43 @@ fn build_plan(
     })
     .ok_or_else(|| "cannot determine repository upgrade compatibility".to_string())?;
     let active_sessions = active_session_preconditions(&repo, excluded_session_id)?;
-    let before_tree = snapshot_paths(proposed_repo, &examined_paths)?;
-    if blockers.is_empty() && !migrations.is_empty() {
-        write_pending_marker(proposed_repo, mode)?;
+    let mut before_tree = snapshot_paths(proposed_repo, &examined_paths)?;
+    if intent == RepositoryPlanIntent::ReadinessRemediation {
+        before_tree.extend(snapshot_paths(&repo, &managed_paths)?);
+    }
+    if blockers.is_empty()
+        && (!migrations.is_empty() || intent == RepositoryPlanIntent::ReadinessRemediation)
+    {
+        if !migrations.is_empty() {
+            write_pending_marker(proposed_repo, mode)?;
+        }
         match mode {
             RepositoryMode::Canonical => migrate_canonical(proposed_repo, &customizations)?,
             RepositoryMode::LocalOnly => migrate_local(proposed_repo, &customizations)?,
         }
-        write_current_marker(proposed_repo, mode)?;
+        if intent == RepositoryPlanIntent::ReadinessRemediation {
+            render_experience_status(&repo, proposed_repo)?;
+        }
+        if !migrations.is_empty() {
+            write_current_marker(proposed_repo, mode)?;
+        }
         verify_deployment(proposed_repo, mode, &customizations)?;
     }
     let mut change_paths = managed_paths;
     change_paths.extend(proposed_changed_paths(proposed_repo)?);
+    change_paths.retain(|path| path != aethyme_enhance::telemetry::TELEMETRY_LOG_PATH);
+    if intent == RepositoryPlanIntent::ReadinessRemediation && !blockers.is_empty() {
+        change_paths.clear();
+    }
+    if intent == RepositoryPlanIntent::ReadinessRemediation {
+        change_paths.retain(|path| {
+            !matches!(
+                path.as_str(),
+                aethyme_enhance::telemetry::STATUS_JSON_PATH
+                    | aethyme_enhance::telemetry::STATUS_MARKDOWN_PATH
+            ) || proposed_repo.join(path).is_file()
+        });
+    }
     change_paths.sort();
     change_paths.dedup();
     examined_paths.extend(change_paths.iter().cloned());
@@ -2410,6 +2594,16 @@ fn build_plan(
             active_sessions
                 .iter()
                 .map(|session| session.session_id.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if !relevant_leases.is_empty() {
+        blockers.push(format!(
+            "proposed repository writes overlap live session leases: {}; finish or release the exact leases before remediation",
+            relevant_leases
+                .iter()
+                .map(|lease| format!("{} (session {})", lease.path, lease.session_id))
                 .collect::<Vec<_>>()
                 .join(", ")
         ));
@@ -2495,11 +2689,266 @@ fn build_plan(
     })
 }
 
+impl ReadinessRemediationActionKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::BrokerConfiguration => "broker-configuration",
+            Self::RuntimeIgnoreBlock => "runtime-ignore-block",
+            Self::AgentContext => "agent-context",
+            Self::GatesDraft => "gates-draft",
+            Self::ManagedBlockUpdate => "managed-block-update",
+            Self::GeneratedVersionMigration => "generated-version-migration",
+            Self::ExperienceStatusProjection => "experience-status-projection",
+        }
+    }
+}
+
+fn remediation_actions(
+    changes: &[RepositoryTreeChange],
+    customizations: &[RepositoryCustomization],
+) -> Vec<ReadinessRemediationAction> {
+    let mut actions = changes
+        .iter()
+        .filter(|change| change.action != RepositoryTreeAction::Unchanged)
+        .map(|change| {
+            let customization = customizations
+                .iter()
+                .find(|customization| customization.path == change.path);
+            let kind = match change.path.as_str() {
+                ".aethyme/config.toml" => ReadinessRemediationActionKind::BrokerConfiguration,
+                ".gitignore" => ReadinessRemediationActionKind::RuntimeIgnoreBlock,
+                ".aethyme/gates.toml" if change.action == RepositoryTreeAction::Create => {
+                    ReadinessRemediationActionKind::GatesDraft
+                }
+                ".aethyme/gates.toml" => ReadinessRemediationActionKind::GeneratedVersionMigration,
+                aethyme_enhance::telemetry::STATUS_JSON_PATH
+                | aethyme_enhance::telemetry::STATUS_MARKDOWN_PATH => {
+                    ReadinessRemediationActionKind::ExperienceStatusProjection
+                }
+                "AGENTS.md" | "CLAUDE.md"
+                    if customization.is_some_and(|item| {
+                        item.classification == RepositoryCustomizationClassification::KnownGenerated
+                    }) =>
+                {
+                    ReadinessRemediationActionKind::GeneratedVersionMigration
+                }
+                "AGENTS.md" | "CLAUDE.md" if change.before_sha256.is_some() => {
+                    ReadinessRemediationActionKind::ManagedBlockUpdate
+                }
+                _ => ReadinessRemediationActionKind::AgentContext,
+            };
+            let review_required =
+                change.requires_resolution || kind == ReadinessRemediationActionKind::GatesDraft;
+            ReadinessRemediationAction {
+                id: format!("{}:{}", kind.as_str(), change.path),
+                kind,
+                summary: match kind {
+                    ReadinessRemediationActionKind::BrokerConfiguration => {
+                        "install missing fixed broker configuration"
+                    }
+                    ReadinessRemediationActionKind::RuntimeIgnoreBlock => {
+                        "update the marked Aethyme runtime ignore block"
+                    }
+                    ReadinessRemediationActionKind::AgentContext => {
+                        "generate missing agent-facing repository context"
+                    }
+                    ReadinessRemediationActionKind::GatesDraft => {
+                        "create an explicitly unreviewed validation-gate draft"
+                    }
+                    ReadinessRemediationActionKind::ManagedBlockUpdate => {
+                        "update only the marked Aethyme-managed policy block"
+                    }
+                    ReadinessRemediationActionKind::GeneratedVersionMigration => {
+                        "migrate a recognized prior generated artifact"
+                    }
+                    ReadinessRemediationActionKind::ExperienceStatusProjection => {
+                        "refresh an ignored experience-status projection"
+                    }
+                }
+                .into(),
+                paths: vec![change.path.clone()],
+                review_required,
+            }
+        })
+        .collect::<Vec<_>>();
+    actions.sort_by(|left, right| {
+        left.kind
+            .cmp(&right.kind)
+            .then_with(|| left.paths.cmp(&right.paths))
+    });
+    actions
+}
+
+fn readiness_plan_digest(plan: &ReadinessRemediationPlan) -> Result<String, String> {
+    let mut authorization = plan.clone();
+    authorization.applied = false;
+    authorization.plan_sha256.clear();
+    authorization.next_action.clear();
+    Ok(sha256(
+        &serde_json::to_vec(&authorization).map_err(|error| error.to_string())?,
+    ))
+}
+
+pub(crate) fn build_readiness_remediation_plan(
+    repo_hint: &Path,
+    requested_mode: Option<RepositoryMode>,
+    resolution_file: Option<&Path>,
+) -> Result<BuiltReadinessRemediationPlan, String> {
+    let repo = git_root(repo_hint)?;
+    let mut built = build_plan(
+        &repo,
+        requested_mode,
+        resolution_file,
+        None,
+        RepositoryPlanIntent::ReadinessRemediation,
+    )?;
+    built.report.existing_managed_state_digest = repository_state_digest(&repo, built.report.mode)?;
+    let before = snapshot_paths(&repo, &built.report.planned_paths)?;
+    let changes = built
+        .report
+        .changes
+        .iter()
+        .filter(|change| change.action != RepositoryTreeAction::Unchanged)
+        .map(|change| ReadinessRemediationTreeChange {
+            path: change.path.clone(),
+            action: change.action,
+            before_sha256: change.before_sha256.clone(),
+            after_sha256: change.after_sha256.clone(),
+            before_mode: before
+                .get(&change.path)
+                .and_then(Option::as_ref)
+                .map(|entry| entry.file_mode.clone()),
+            after_mode: (change.action != RepositoryTreeAction::Delete)
+                .then(|| change.file_mode.clone())
+                .flatten(),
+            ownership: change.ownership,
+            requires_resolution: change.requires_resolution,
+        })
+        .collect::<Vec<_>>();
+    let actions = remediation_actions(&built.report.changes, &built.report.customizations);
+    let mut report = ReadinessRemediationPlan {
+        schema_version: READINESS_REMEDIATION_SCHEMA_VERSION,
+        source_head: built.report.repository_head.clone(),
+        repository_mode: built.report.mode,
+        repository_schema: built.report.from_schema,
+        target_schema: built.report.to_schema,
+        managed_state_digest: built.report.existing_managed_state_digest.clone(),
+        examined_paths: built.report.examined_paths.clone(),
+        planned_write_set: built.report.planned_paths.clone(),
+        changes,
+        customizations: built.report.customizations.clone(),
+        required_resolutions: built.report.resolution_choices.clone(),
+        dirty_overlapping_paths: built.report.overlapping_dirty_paths.clone(),
+        dirty_disjoint_paths: built.report.disjoint_dirty_paths.clone(),
+        live_sessions: built.report.active_sessions.clone(),
+        relevant_leases: built.report.relevant_leases.clone(),
+        actions,
+        warnings: built.report.warnings.clone(),
+        blockers: built.report.blockers.clone(),
+        diff_sha256: built.report.diff_sha256.clone(),
+        safe: built.report.safe,
+        applied: false,
+        plan_sha256: String::new(),
+        next_action: String::new(),
+    };
+    report.plan_sha256 = readiness_plan_digest(&report)?;
+    report.next_action = if !report.safe {
+        "resolve every listed blocker while preserving unrelated work in place, then regenerate `aethyme broker readiness plan --diff`"
+            .into()
+    } else if report.planned_write_set.is_empty() {
+        "repository readiness artifacts already match the reviewed generators".into()
+    } else {
+        format!(
+            "review this plan and diff, then run `aethyme broker readiness apply --confirm {}`",
+            report.plan_sha256
+        )
+    };
+    built.report.plan_digest = report.plan_sha256.clone();
+    Ok(BuiltReadinessRemediationPlan {
+        report,
+        remediation_diff: built.migration_diff,
+        transaction_plan: built.report,
+        proposed_outputs: built.proposed_outputs,
+    })
+}
+
+pub(crate) fn apply_readiness_remediation(
+    repo_hint: &Path,
+    requested_mode: Option<RepositoryMode>,
+    confirmation: &str,
+    resolution_file: Option<&Path>,
+) -> Result<ReadinessRemediationPlan, String> {
+    validate_plan_digest(confirmation)
+        .map_err(|_| "--confirm must be the full 64-character plan SHA-256".to_string())?;
+    let repo = git_root(repo_hint)?;
+    let _lock = acquire_upgrade_lock(&repo)?;
+    refuse_unjournaled_in_progress_marker(&repo, requested_mode)?;
+    let built = build_readiness_remediation_plan(&repo, requested_mode, resolution_file)?;
+    if !built.report.safe {
+        return Err(format!(
+            "readiness remediation is blocked: {}",
+            built.report.blockers.join("; ")
+        ));
+    }
+    if built.report.plan_sha256 != confirmation {
+        return Err(format!(
+            "repository changed after review; expected confirmation {}, received {confirmation}; regenerate the readiness plan",
+            built.report.plan_sha256
+        ));
+    }
+    if built.report.planned_write_set.is_empty() {
+        return Ok(built.report);
+    }
+    ensure_apply_worktree_safe(&repo, &built.transaction_plan, None)?;
+    let marker_path = built
+        .report
+        .planned_write_set
+        .iter()
+        .any(|path| path == built.report.repository_mode.marker_path())
+        .then(|| built.report.repository_mode.marker_path());
+    let transaction = RepositoryTransactionPlan {
+        plan_digest: &built.report.plan_sha256,
+        repository_head: &built.report.source_head,
+        existing_managed_state_digest: &built.report.managed_state_digest,
+        mode: built.report.repository_mode,
+        marker_path,
+        recovery_command: "aethyme broker readiness recover",
+        require_reviewed_before_state: true,
+        changes: &built.transaction_plan.changes,
+    };
+    execute_repository_transaction(&repo, &transaction, &built.proposed_outputs, || {
+        verify_deployment(
+            &repo,
+            built.report.repository_mode,
+            &built.report.customizations,
+        )
+    })?;
+    let mut report = built.report;
+    report.applied = true;
+    report.next_action = match report.repository_mode {
+        RepositoryMode::Canonical => {
+            "review and commit the remediated repository files; generated gates remain unreviewed until reviewed = true"
+                .into()
+        }
+        RepositoryMode::LocalOnly => {
+            "local-only readiness remediation complete; other clones remain unchanged".into()
+        }
+    };
+    Ok(report)
+}
+
 pub fn plan(
     repo_hint: &Path,
     requested_mode: Option<RepositoryMode>,
 ) -> Result<RepositoryUpgradePlan, String> {
-    build_plan(repo_hint, requested_mode, None, None).map(|built| built.report)
+    build_plan(
+        repo_hint,
+        requested_mode,
+        None,
+        None,
+        RepositoryPlanIntent::SchemaUpgrade,
+    )
+    .map(|built| built.report)
 }
 
 /// Build the exact tracked tree for first canonical enrollment. The optional
@@ -2514,6 +2963,7 @@ pub fn initial_enrollment_plan(
         Some(RepositoryMode::Canonical),
         None,
         enrollment_session_id,
+        RepositoryPlanIntent::SchemaUpgrade,
     )
     .map(|built| built.report)
 }
@@ -2591,6 +3041,7 @@ fn apply_with_resolution_file_excluding_session(
         requested_mode,
         resolution_file,
         excluded_session_id,
+        RepositoryPlanIntent::SchemaUpgrade,
     )?;
     let proposed_outputs = built.proposed_outputs;
     let mut before = built.report;
@@ -2611,7 +3062,19 @@ fn apply_with_resolution_file_excluding_session(
     }
 
     ensure_apply_worktree_safe(&repo, &before, excluded_session_id)?;
-    execute_upgrade_transaction(&repo, &before, &proposed_outputs, &before.customizations)?;
+    let transaction = RepositoryTransactionPlan {
+        plan_digest: &before.plan_digest,
+        repository_head: &before.repository_head,
+        existing_managed_state_digest: &before.existing_managed_state_digest,
+        mode: before.mode,
+        marker_path: Some(before.mode.marker_path()),
+        recovery_command: "aethyme upgrade recover",
+        require_reviewed_before_state: false,
+        changes: &before.changes,
+    };
+    execute_repository_transaction(&repo, &transaction, &proposed_outputs, || {
+        verify_deployment(&repo, before.mode, &before.customizations)
+    })?;
     before.applied = true;
     before.next_action = match before.mode {
         RepositoryMode::Canonical => {
@@ -2636,6 +3099,35 @@ fn migrate_canonical(
 fn migrate_local(repo: &Path, customizations: &[RepositoryCustomization]) -> Result<(), String> {
     aethyme_broker::init::scaffold_local(repo).map_err(|error| error.to_string())?;
     apply_customization_migrations(repo, RepositoryMode::LocalOnly, customizations)
+}
+
+fn render_experience_status(source_repo: &Path, proposed_repo: &Path) -> Result<(), String> {
+    let telemetry_relative = aethyme_enhance::telemetry::TELEMETRY_LOG_PATH;
+    let telemetry_source = source_repo.join(telemetry_relative);
+    match std::fs::symlink_metadata(&telemetry_source) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            return Err(format!(
+                "{telemetry_relative} must be a regular non-symlink file when present"
+            ));
+        }
+        Ok(metadata) => {
+            if metadata.len() > JOURNAL_MAX_BYTES as u64 {
+                return Err(format!(
+                    "{telemetry_relative} exceeds the {} MiB remediation input limit",
+                    JOURNAL_MAX_BYTES / 1024 / 1024
+                ));
+            }
+            let bytes = std::fs::read(&telemetry_source)
+                .map_err(|error| format!("read {telemetry_relative}: {error}"))?;
+            atomic_write(&proposed_repo.join(telemetry_relative), &bytes)?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("inspect {telemetry_relative}: {error}")),
+    }
+    for artifact in aethyme_enhance::telemetry::render_status_artifacts(proposed_repo)? {
+        atomic_write(&proposed_repo.join(artifact.path), &artifact.bytes)?;
+    }
+    Ok(())
 }
 
 fn verify_managed_policy(repo: &Path, relative: &str) -> Result<(), String> {
@@ -3032,7 +3524,13 @@ fn run_inner(args: &[String]) -> Result<(), String> {
     let mut migration_diff = None;
     let report = match action {
         "plan" => {
-            let built = build_plan(&repo, mode, resolution_file.as_deref(), None)?;
+            let built = build_plan(
+                &repo,
+                mode,
+                resolution_file.as_deref(),
+                None,
+                RepositoryPlanIntent::SchemaUpgrade,
+            )?;
             if diff {
                 migration_diff = Some(built.migration_diff);
             }

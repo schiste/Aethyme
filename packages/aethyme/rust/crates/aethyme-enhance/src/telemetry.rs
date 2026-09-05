@@ -39,6 +39,12 @@ pub const TELEMETRY_LOG_PATH: &str = ".aethyme/generated/experience-telemetry.js
 pub const STATUS_JSON_PATH: &str = ".aethyme/generated/experience-status.json";
 pub const STATUS_MARKDOWN_PATH: &str = ".aethyme/generated/experience-status.md";
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderedStatusArtifact {
+    pub path: &'static str,
+    pub bytes: Vec<u8>,
+}
+
 fn obj(pairs: Vec<(&str, Value)>) -> Value {
     Value::Object(pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect())
 }
@@ -549,22 +555,35 @@ pub fn render_status_markdown(status: &Value) -> Result<String, String> {
     Ok(format!("{}\n", lines.join("\n")))
 }
 
+/// Render the ignored experience-status projections without writing them.
+/// Review/apply workflows use these exact bytes in their digest-bound plan.
+pub fn render_status_artifacts(repo_path: &Path) -> Result<Vec<RenderedStatusArtifact>, String> {
+    let repo_path = resolve_path(repo_path);
+    let status = build_status_artifact(&repo_path)?;
+    Ok(vec![
+        RenderedStatusArtifact {
+            path: STATUS_JSON_PATH,
+            bytes: format!("{}\n", pyjson::dumps_indent2(&status)).into_bytes(),
+        },
+        RenderedStatusArtifact {
+            path: STATUS_MARKDOWN_PATH,
+            bytes: render_status_markdown(&status)?.into_bytes(),
+        },
+    ])
+}
+
 /// Write repo-local experience status artifacts; return the status payload.
 pub fn write_status_artifacts(repo_path: &Path) -> Result<Value, String> {
     let repo_path = resolve_path(repo_path);
     let status = build_status_artifact(&repo_path)?;
     let status_json_path = repo_path.join(STATUS_JSON_PATH);
-    let status_markdown_path = repo_path.join(STATUS_MARKDOWN_PATH);
     if let Some(parent) = status_json_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
     }
-    std::fs::write(
-        &status_json_path,
-        format!("{}\n", pyjson::dumps_indent2(&status)),
-    )
-    .map_err(|e| format!("{}: {e}", status_json_path.display()))?;
-    std::fs::write(&status_markdown_path, render_status_markdown(&status)?)
-        .map_err(|e| format!("{}: {e}", status_markdown_path.display()))?;
+    for artifact in render_status_artifacts(&repo_path)? {
+        let path = repo_path.join(artifact.path);
+        std::fs::write(&path, artifact.bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+    }
     Ok(status)
 }
 

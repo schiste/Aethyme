@@ -79,6 +79,47 @@ aethyme broker readiness --require parallel-ready --json
 exit contracts. They verify deterministic facts; they do not silently become
 readiness policy gates.
 
+## Remediate a readiness report safely
+
+Readiness findings do not authorize an immediate broad rewrite. Review an
+exact, digest-bound plan first:
+
+```bash
+aethyme broker readiness plan --repo . --json
+aethyme broker readiness plan --repo . --diff
+aethyme broker readiness apply --repo . --confirm <plan-sha256>
+```
+
+Planning is offline and read-only. It records committed `HEAD`, repository
+mode and schema, managed-state digest, examined paths, exact writes, hashes and
+modes, ownership and required resolutions, dirty overlap, and relevant live
+sessions and leases. Applying recomputes that complete plan under the shared
+repository-upgrade lock. A changed digest, changed `HEAD`, modified target,
+overlapping dirty path, active-session policy migration, symlink, or live
+lease refuses without writing.
+
+The workflow repairs mechanical Aethyme-owned state only: fixed broker config,
+runtime ignore blocks, missing onboarding and protocol artifacts, marked
+managed blocks, known generated migrations, and ignored experience status. It
+may draft `.aethyme/gates.toml` only when that file is absent. The draft is
+marked `reviewed = false`; its existence does not make validation ready.
+Existing gate commands, customized policy, CI, generated-file ownership, and
+repository validation semantics remain maintainer decisions.
+
+Disjoint uncommitted paths may remain because planning uses committed `HEAD`
+and apply touches only reviewed outputs; the report warns that those changes
+were not inputs. It never recommends a stash. If an interrupted transaction
+leaves a rollback journal, do not retry or infer intent from the marker. Run
+the exact recovery command printed by the failed apply:
+
+```bash
+aethyme broker readiness recover --repo . --plan <plan-sha256>
+```
+
+Recovery accepts only the matching digest and restores the journaled bytes.
+For clone-local policy, add `--local-only` to both plan and apply; recovery is
+still keyed solely by repository and reviewed plan digest.
+
 ## Review the policy
 
 The plan and its local diff cover the files that execution will commit:

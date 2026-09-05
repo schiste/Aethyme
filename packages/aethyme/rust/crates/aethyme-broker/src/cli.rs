@@ -43,6 +43,13 @@ Usage:
       parallel-execution, graph, and upgrade facts into a typed readiness
       report. Inspection is offline and strictly read-only. By default every
       complete report exits zero; --require makes unmet readiness a CI failure.
+  aethyme broker readiness plan [--repo <path>] [--local-only] [--resolution-file <path>] [--diff|--json]
+  aethyme broker readiness apply [--repo <path>] [--local-only] [--resolution-file <path>] --confirm <plan-sha256> [--json]
+  aethyme broker readiness recover [--repo <path>] --plan <plan-sha256> [--json]
+      Plan exact safe repository repairs from committed HEAD, review their
+      local diff, then apply only the confirmed digest through the shared
+      repository-upgrade transaction. Recovery is explicit after interruption.
+      There is no immediate --fix mode.
   aethyme broker scaffold [--json]
       Deterministic setup: ONLY what the broker needs, with content that
       is identical for every repo (config.toml skeleton, .gitignore
