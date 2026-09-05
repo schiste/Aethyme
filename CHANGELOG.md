@@ -4,6 +4,75 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.7.8] - 2026-09-06
+
+### Added
+
+- `aethyme broker readiness` reports whether a repository is conflict-only,
+  agent-ready, or parallel-ready, with `readiness plan`, `readiness apply
+  --confirm <sha256>`, and `readiness recover --plan <sha256>` for
+  digest-confirmed remediation.
+- `aethyme broker gates doctor` diagnoses gate configuration, optionally
+  probing each gate.
+- `aethyme quality inspect` performs bounded optional repository-quality
+  analysis. The former `ai-ready` spelling remains as a deprecated alias.
+- `aethyme broker git` and `aethyme broker gh` accept `--no-wait` and
+  `--queue-timeout <seconds>` to bound how long a coordinated operation queues
+  for the repository write lock instead of waiting indefinitely.
+- `aethyme broker queue --active` lists only non-terminal entries, and
+  `aethyme broker advisories suppress <id>` silences a delivered advisory.
+
+### Fixed
+
+- Readiness remediation no longer captures every other `plan`, `apply`, or
+  `recover` subcommand. `gc plan`, `ship plan`, `promotion-record plan`, and
+  `checkpoint plan` each reach their own command again. Previously they
+  returned a readiness plan **and its digest**, which the matching
+  `apply --confirm` would have accepted, applying work the caller never
+  reviewed.
+- A host-resource holder that died without releasing no longer pins its pool
+  until the lease TTL elapses. A provably absent holder is quarantined
+  immediately and its capacity units stop counting toward pool occupancy, while
+  namespaces and exclusive keys stay reserved until reconciliation proves
+  cleanup.
+- Resource conflicts name the owning lease, and say when waiting cannot resolve
+  one because the holder process is gone.
+- `aethyme broker resources release <lease-id>` explains that the command takes
+  the grant JSON written at acquire, and names the `reconcile` invocation that
+  reclaims a lease whose grant file is gone.
+- A coordinated operation is recorded before it queues for the repository write
+  lock, so a waiting command is visible in `operations list` for the whole wait
+  rather than only once it acquires the lock. A blocked caller is also told
+  which operation holds the lock and for how long.
+- An identical coordinated command that is still pending for the same session is
+  refused instead of queueing a duplicate mutation behind the first.
+- A report whose filing already succeeded can no longer be filed twice after a
+  later attempt fails. The duplicate guard now bars on any past success rather
+  than on the most recent attempt.
+- A lease-claim refusal names the sessions holding the overlapping leases and
+  their status, `broker start` warns when the chosen base is behind the default
+  branch, and a gate failure reports git-ignored paths the worktree lacks.
+- `aethyme broker exec` distinguishes a wrapped command's own failure from an
+  ownership violation found by the guard.
+- Host-scoped coordination state reports the real cause when it cannot be
+  opened, including under sandboxed execution.
+- Broker worktree retention reclaims build artifacts, proving each retained path
+  is git-ignored before removing it, and accounts for the bytes it reclaims.
+- Agent-facing command output is bounded, and read commands can record their
+  output size on request.
+
+### Changed
+
+- Broker storage writes schema 30. Schemas 1 through 30 are read and migrated.
+
+### Upgrade notes
+
+Read [Upgrading to v0.7.8](packages/aethyme/docs/guides/upgrading-to-v0.7.8.md)
+before updating. Broker storage moves from schema 28 to schema 30, and the
+migration is applied in place the first time a v0.7.8 binary opens the database.
+Earlier releases cannot read a migrated database, so upgrade every Aethyme
+installation that shares a repository together.
+
 ## [0.7.7] - 2026-09-04
 
 ### Fixed
