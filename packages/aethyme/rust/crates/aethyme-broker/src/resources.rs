@@ -1331,8 +1331,10 @@ fn quarantine_dead_holders(conn: &Connection, now: i64) -> Result<(), HostResour
             "SELECT lease_id,holder_pid FROM resource_leases \
              WHERE state='active' AND holder_pid IS NOT NULL",
         )?;
-        stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))?
-            .collect::<Result<Vec<_>, _>>()?
+        stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?
     };
     for (lease_id, holder_pid) in candidates {
         if !holder_process_is_gone(holder_pid) {

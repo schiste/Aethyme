@@ -194,11 +194,14 @@ Usage:
       Run a command in the session worktree, then fail if it creates or
       modifies dirty paths outside explicit leases or in adoption-time
       foreign files. Exports AETHYME_TEST_DB_SUFFIX=s<id>-exec.
-  aethyme broker git --session <id> [--repo <owner/name>] [--scope <scope>] [--effect <read|write|destructive>] [--reason <text>] [--destructive] [--json] -- <git-args>
+  aethyme broker git --session <id> [--repo <owner/name>] [--scope <scope>] [--effect <read|write|destructive>] [--reason <text>] [--destructive] [--no-wait|--queue-timeout <seconds>] [--json] -- <git-args>
       Run Git through the durable operation coordinator. Remote Git commands
       require an exact --repo. Repository writes are serialized, journaled,
       and fail closed after a crash with an unknown remote outcome.
-  aethyme broker gh --session <id> --repo <owner/name> [--scope <scope>] [--effect <read|write|destructive>] [--reason <text>] [--destructive] [--json] -- <gh-args>
+      A write queues for the repository lock and is recorded while it waits, so
+      `operations list` shows it. Use --no-wait to refuse rather than queue, or
+      --queue-timeout <seconds> to give up after a bounded wait.
+  aethyme broker gh --session <id> --repo <owner/name> [--scope <scope>] [--effect <read|write|destructive>] [--reason <text>] [--destructive] [--no-wait|--queue-timeout <seconds>] [--json] -- <gh-args>
       Run GitHub CLI through the same repository coordinator. The broker sets
       GH_REPO from the exact target and never persists command output or
       secret-bearing argument values. After a successful `gh pr merge`, it
@@ -1543,6 +1546,8 @@ struct Parsed {
     apply: bool,
     dry_run: bool,
     destructive: bool,
+    no_wait: bool,
+    queue_timeout_seconds: Option<u64>,
     break_glass: bool,
     sync_main: bool,
     sync_integration: bool,
@@ -1624,6 +1629,9 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         apply: false,
         dry_run: false,
         destructive: false,
+        no_wait: false,
+        queue_timeout_seconds: None,
+
         break_glass: false,
         sync_main: false,
         sync_integration: false,
@@ -1684,6 +1692,17 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
             "--with-gate" => parsed.with_gate = true,
             "--apply" => parsed.apply = true,
             "--dry-run" => parsed.dry_run = true,
+            "--no-wait" => parsed.no_wait = true,
+            "--queue-timeout" => {
+                let value = iter.next().ok_or(UsageError::Message(
+                    "--queue-timeout requires a value in seconds".into(),
+                ))?;
+                parsed.queue_timeout_seconds = Some(value.parse().map_err(|_| {
+                    UsageError::Message(
+                        "--queue-timeout must be an integer number of seconds".into(),
+                    )
+                })?);
+            }
             "--destructive" => parsed.destructive = true,
             "--break-glass" => parsed.break_glass = true,
             "--sync-main" => parsed.sync_main = true,
@@ -6232,8 +6251,18 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                 authorization_reason: parsed.reason,
                 args: parsed.exec_command,
             };
+            let queue_wait = match (parsed.no_wait, parsed.queue_timeout_seconds) {
+                (true, Some(_)) => {
+                    return Err(UsageError::Message(
+                        "--no-wait and --queue-timeout are mutually exclusive".into(),
+                    ));
+                }
+                (true, None) => crate::QueueWait::Refuse,
+                (false, Some(seconds)) => crate::QueueWait::Seconds(seconds),
+                (false, None) => crate::QueueWait::Forever,
+            };
             let mut broker = open_broker(parsed.read_only_snapshot)?;
-            let report = broker.run_coordinated_operation(request)?;
+            let report = broker.run_coordinated_operation_with_wait(request, queue_wait)?;
             render_coordinated_operation(&report, parsed.json)?;
             if !report.ok() {
                 if let Some(recovery) = report.unknown_outcome_recovery() {

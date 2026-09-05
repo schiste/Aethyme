@@ -39,6 +39,24 @@ pub(crate) const WORKTREE_ROOT_MARKER: &str = ".aethyme-worktree-root.json";
 
 #[derive(Debug, thiserror::Error)]
 pub enum BrokerOpError {
+    /// An identical command from the same session is still pending. Queueing a
+    /// second one would fire it against state the first already changed.
+    #[error(
+        "session already has an identical {status} coordinated operation {operation_id} pending; \
+         wait for it to finish or reconcile it rather than queueing a duplicate"
+    )]
+    DuplicatePendingOperation {
+        operation_id: i64,
+        status: &'static str,
+    },
+    /// The caller bounded its patience and the lock did not free in time.
+    #[error("repository {repository} write lock is busy ({waited}): {holder}")]
+    CoordinatedLockBusy {
+        repository: String,
+        holder: String,
+        waited: String,
+    },
+
     #[error(transparent)]
     Git(#[from] GitError),
     #[error(transparent)]

@@ -21,6 +21,21 @@ use crate::types::{
     OperationProvider, OperationStatus,
 };
 
+/// How long an invocation is willing to queue for the repository write lock.
+/// This is a property of the caller's patience, not of the command, so it is
+/// passed per invocation rather than carried on the request (issue #138).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum QueueWait {
+    /// Queue until the lock is free.
+    #[default]
+    Forever,
+    /// Refuse immediately if the lock is held, so the caller can report honestly
+    /// instead of parking.
+    Refuse,
+    /// Queue, but give up after this many seconds.
+    Seconds(u64),
+}
+
 #[derive(Debug, Clone)]
 pub struct CoordinatedCommand {
     pub session_id: i64,
@@ -329,7 +344,8 @@ impl RepositoryWriteLock {
     fn acquire(
         main_root: &Path,
         repository: &str,
-        describe_holder: impl FnOnce() -> String,
+        mut describe_holder: impl FnMut() -> String,
+        queue_wait: QueueWait,
     ) -> Result<Self, BrokerOpError> {
         let dir = main_root.join(".aethyme/locks/operations");
         std::fs::create_dir_all(&dir).map_err(|source| BrokerOpError::OperationIo {
@@ -360,6 +376,13 @@ impl RepositoryWriteLock {
                 source: std::io::Error::last_os_error(),
             });
         }
+        if queue_wait == QueueWait::Refuse {
+            return Err(BrokerOpError::CoordinatedLockBusy {
+                repository: repository.into(),
+                holder: describe_holder(),
+                waited: "not waited for".into(),
+            });
+        }
         // A coordinated operation that simply pauses is indistinguishable from one
         // that died. Saying what holds the lock, and for how long, is what makes
         // the difference visible to the caller (issue #138).
@@ -368,12 +391,43 @@ impl RepositoryWriteLock {
             describe_holder()
         );
         let waited = std::time::Instant::now();
-        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-        if rc != 0 {
-            return Err(BrokerOpError::OperationIo {
-                path,
-                source: std::io::Error::last_os_error(),
-            });
+        match queue_wait {
+            QueueWait::Refuse => unreachable!("refused above"),
+            QueueWait::Forever => {
+                let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+                if rc != 0 {
+                    return Err(BrokerOpError::OperationIo {
+                        path,
+                        source: std::io::Error::last_os_error(),
+                    });
+                }
+            }
+            // No portable timed flock, so poll: the deadline is the caller's, and
+            // giving up honestly beats parking past it.
+            QueueWait::Seconds(seconds) => {
+                let deadline = waited + std::time::Duration::from_secs(seconds);
+                loop {
+                    let rc =
+                        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+                    if rc == 0 {
+                        break;
+                    }
+                    if std::io::Error::last_os_error().raw_os_error() != Some(libc::EWOULDBLOCK) {
+                        return Err(BrokerOpError::OperationIo {
+                            path,
+                            source: std::io::Error::last_os_error(),
+                        });
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        return Err(BrokerOpError::CoordinatedLockBusy {
+                            repository: repository.into(),
+                            holder: describe_holder(),
+                            waited: humanize_duration(waited.elapsed().as_secs()),
+                        });
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            }
         }
         eprintln!(
             "[coordination] acquired the {repository} write lock after {}",
@@ -381,6 +435,23 @@ impl RepositoryWriteLock {
         );
         Ok(Self { file })
     }
+}
+
+/// Probe with signal 0: reports whether a process can be signalled without
+/// disturbing it. Conservative about PID reuse -- a recycled PID reads as alive,
+/// which forgoes a cleanup rather than resolving a live operation out from under
+/// the process still running it.
+fn process_is_gone(pid: i64) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    if pid <= 0 {
+        return false;
+    }
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return false;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
 }
 
 fn humanize_duration(seconds: u64) -> String {
@@ -413,9 +484,7 @@ fn describe_lock_holder(store: &mut crate::BrokerStore, repository: &str) -> Str
             operation.session_id,
             operation.provider.as_str(),
             operation.scope,
-            humanize_duration(
-                now.saturating_sub(operation.created_at).max(0) as u64 / 1_000
-            )
+            humanize_duration(now.saturating_sub(operation.created_at).max(0) as u64 / 1_000)
         ),
         None => "held by an operation that has not recorded itself yet".into(),
     }
@@ -1023,6 +1092,16 @@ impl Broker {
         &mut self,
         request: CoordinatedCommand,
     ) -> Result<CoordinatedOperationReport, BrokerOpError> {
+        self.run_coordinated_operation_with_wait(request, QueueWait::Forever)
+    }
+
+    /// As [`Self::run_coordinated_operation`], but bounding how long the caller
+    /// is willing to queue for the repository write lock.
+    pub fn run_coordinated_operation_with_wait(
+        &mut self,
+        request: CoordinatedCommand,
+        queue_wait: QueueWait,
+    ) -> Result<CoordinatedOperationReport, BrokerOpError> {
         let session = self.store().session(request.session_id)?;
         if session.status.is_closed() {
             return Err(BrokerOpError::ClosedSessionOperation {
@@ -1033,8 +1112,13 @@ impl Broker {
             && is_github_pull_request_merge(&request.args);
         let session_id = request.session_id;
         let repository = request.repository.clone();
-        let mut report =
-            self.run_coordinated_operation_at(request, Path::new(&session.worktree_path))?;
+        let mut report = self.run_coordinated_operation_at_with_hooks(
+            request,
+            Path::new(&session.worktree_path),
+            queue_wait,
+            || Ok(()),
+            |_, _| Ok(None),
+        )?;
         if report.ok() && should_cleanup_after_merge {
             report.post_merge_cleanup = Some(
                 self.cleanup_after_github_pull_request_merge(session_id, repository.as_deref()),
@@ -1155,12 +1239,31 @@ impl Broker {
         }
     }
 
+    /// A record created before queueing must not linger as prepared when the
+    /// operation never started. Best-effort: the caller is already returning the
+    /// real failure, and the liveness-aware sweep is the backstop.
+    fn resolve_unstarted_operation(&mut self, id: i64, reason: &str) {
+        let details = json!({ "reason": reason }).to_string();
+        let _ = self.store().transition_coordinated_operation(
+            id,
+            OperationStatus::Failed,
+            None,
+            Some(&details),
+        );
+    }
+
     pub(crate) fn run_coordinated_operation_at(
         &mut self,
         request: CoordinatedCommand,
         cwd: &Path,
     ) -> Result<CoordinatedOperationReport, BrokerOpError> {
-        self.run_coordinated_operation_at_with_hooks(request, cwd, || Ok(()), |_, _| Ok(None))
+        self.run_coordinated_operation_at_with_hooks(
+            request,
+            cwd,
+            QueueWait::Forever,
+            || Ok(()),
+            |_, _| Ok(None),
+        )
     }
 
     /// Execute through the normal coordinated-operation state machine while
@@ -1170,6 +1273,7 @@ impl Broker {
         &mut self,
         request: CoordinatedCommand,
         cwd: &Path,
+        queue_wait: QueueWait,
         pre_execute: P,
         on_success: F,
     ) -> Result<CoordinatedOperationReport, BrokerOpError>
@@ -1309,13 +1413,78 @@ impl Broker {
 
         let is_remote_write = effect != OperationEffect::Read
             && (resolved_target.is_some() || github_target.is_some());
+
+        // Register before queueing, not after acquiring. An operation that only
+        // existed once it held the lock was invisible for the whole wait, so a
+        // caller could not tell a queued command from one that never started and
+        // re-issued it (issue #138).
+        let command_json = redacted_command(request.provider, &request.args)?;
+
+        // Two identical commands from one session cannot both be intended: the
+        // second would fire against state the first already changed. Now that a
+        // queued operation is recorded, refusing the duplicate is possible before
+        // it is queued rather than after both have run (issue #138).
+        if effect != OperationEffect::Read {
+            if let Some(pending) = self
+                .store()
+                .unresolved_coordinated_operations(&repository)?
+                .into_iter()
+                .find(|pending| {
+                    pending.session_id == request.session_id
+                        && pending.command_json == command_json
+                        && matches!(
+                            pending.status,
+                            OperationStatus::Prepared | OperationStatus::Running
+                        )
+                        && !process_is_gone(pending.pid)
+                })
+            {
+                return Err(BrokerOpError::DuplicatePendingOperation {
+                    operation_id: pending.id,
+                    status: pending.status.as_str(),
+                });
+            }
+        }
+
+        let operation = self
+            .store()
+            .create_coordinated_operation(&NewCoordinatedOperation {
+                session_id: request.session_id,
+                provider: request.provider,
+                repository: repository.clone(),
+                scope,
+                effect,
+                authorization_reason,
+                command_json,
+                pid: i64::from(std::process::id()),
+                // Not known until the lock is held and the host guard begins.
+                host_operation_id: None,
+                identity_provenance: if resolved_target.is_some() || github_target.is_some() {
+                    OperationIdentityProvenance::VerifiedCanonical
+                } else {
+                    OperationIdentityProvenance::LocalRepository
+                },
+            })?;
+
+        let queued_operation_id = operation.id;
+
         let _lock = if effect == OperationEffect::Read {
             None
         } else {
             let main_root = self.main_root().to_path_buf();
-            Some(RepositoryWriteLock::acquire(&main_root, &repository, || {
-                describe_lock_holder(self.store(), &repository)
-            })?)
+            match RepositoryWriteLock::acquire(
+                &main_root,
+                &repository,
+                || describe_lock_holder(self.store(), &repository),
+                queue_wait,
+            ) {
+                Ok(lock) => Some(lock),
+                Err(error) => {
+                    // Nothing ran, so the record must not linger as queued.
+                    self.resolve_unstarted_operation(queued_operation_id, "lock_unavailable");
+                    return Err(error);
+                }
+            }
         };
         if effect != OperationEffect::Read {
             let unresolved = self
@@ -1323,7 +1492,11 @@ impl Broker {
                 .unresolved_coordinated_operations(&repository)?;
             for operation in unresolved {
                 match operation.status {
-                    OperationStatus::Prepared => {
+                    // A prepared record now also covers an operation queued for
+                    // this lock, so only a record whose owner is gone is abandoned.
+                    // Resolving a live one would fail an operation that is merely
+                    // waiting its turn (issue #138).
+                    OperationStatus::Prepared if process_is_gone(operation.pid) => {
                         self.store().transition_coordinated_operation(
                             operation.id,
                             OperationStatus::Failed,
@@ -1331,21 +1504,24 @@ impl Broker {
                             Some(r#"{"reason":"abandoned_before_start"}"#),
                         )?;
                     }
+                    OperationStatus::Prepared => {}
                     OperationStatus::Running => {
-                        let operation = self.store().transition_coordinated_operation(
+                        let blocking = self.store().transition_coordinated_operation(
                             operation.id,
                             OperationStatus::OutcomeUnknown,
                             operation.exit_code,
                             Some(r#"{"reason":"process_ended_without_outcome"}"#),
                         )?;
+                        self.resolve_unstarted_operation(queued_operation_id, "repository_blocked");
                         return Err(BrokerOpError::CoordinatedOperationBlocked {
                             repository,
-                            operation_id: operation.id,
-                            recovery: UnknownOutcomeRecovery::from_operation(&operation),
+                            operation_id: blocking.id,
+                            recovery: UnknownOutcomeRecovery::from_operation(&blocking),
                         });
                     }
                     OperationStatus::OutcomeUnknown => {
                         let recovery = UnknownOutcomeRecovery::from_operation(&operation);
+                        self.resolve_unstarted_operation(queued_operation_id, "repository_blocked");
                         return Err(BrokerOpError::CoordinatedOperationBlocked {
                             repository,
                             operation_id: operation.id,
@@ -1366,34 +1542,23 @@ impl Broker {
         } else {
             None
         };
-        pre_execute().map_err(|reason| BrokerOpError::InvalidCoordinatedOperation { reason })?;
+        if let Err(reason) = pre_execute() {
+            self.resolve_unstarted_operation(queued_operation_id, "revalidation_failed");
+            return Err(BrokerOpError::InvalidCoordinatedOperation { reason });
+        }
         let push_planning = if request.provider == OperationProvider::Git {
             plan_exact_push(cwd, &request.args, resolved_target.as_ref())
         } else {
             PushPlanning::NotApplicable
         };
 
-        let command_json = redacted_command(request.provider, &request.args)?;
-        let operation = self
-            .store()
-            .create_coordinated_operation(&NewCoordinatedOperation {
-                session_id: request.session_id,
-                provider: request.provider,
-                repository: repository.clone(),
-                scope,
-                effect,
-                authorization_reason,
-                command_json,
-                pid: i64::from(std::process::id()),
-                host_operation_id: host_guard
-                    .as_ref()
-                    .map(|guard| guard.operation().operation_id.clone()),
-                identity_provenance: if resolved_target.is_some() || github_target.is_some() {
-                    OperationIdentityProvenance::VerifiedCanonical
-                } else {
-                    OperationIdentityProvenance::LocalRepository
-                },
-            })?;
+        if let Some(host_operation_id) = host_guard
+            .as_ref()
+            .map(|guard| guard.operation().operation_id.clone())
+        {
+            self.store()
+                .attach_host_operation(operation.id, &host_operation_id)?;
+        }
         if let Some(guard) = &mut host_guard {
             guard.mark_running()?;
         }

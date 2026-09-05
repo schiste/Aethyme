@@ -139,14 +139,17 @@ pub fn file_reviewed_report(
         .coordinated_operations()?
         .into_iter()
         .rev()
+        // Any successful filing for this digest bars another, not merely the most
+        // recent operation for it. A later failed or abandoned attempt does not
+        // un-create the issue the successful one already opened, so it must not
+        // mask that success and re-authorize a duplicate.
         .find(|operation| {
-            operation.repository == coordination_key && operation.scope == filing_scope
-        })
-        .filter(|operation| {
-            matches!(
-                operation.status,
-                OperationStatus::Succeeded | OperationStatus::ReconciledSucceeded
-            )
+            operation.repository == coordination_key
+                && operation.scope == filing_scope
+                && matches!(
+                    operation.status,
+                    OperationStatus::Succeeded | OperationStatus::ReconciledSucceeded
+                )
         })
     {
         return Err(ReportFileError::PreviouslyCompleted {
@@ -200,6 +203,7 @@ pub fn file_reviewed_report(
     let operation_report = broker.run_coordinated_operation_at_with_hooks(
         request,
         Path::new(&session.worktree_path),
+        crate::QueueWait::Forever,
         || {
             let index = load_filing_index(&reports_root).map_err(|error| error.to_string())?;
             if index.filings.contains_key(&artifact.report_digest) {

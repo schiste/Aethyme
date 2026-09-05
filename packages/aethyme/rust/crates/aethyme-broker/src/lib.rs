@@ -167,8 +167,8 @@ pub use merge::{
 pub use operations::{
     CoordinatedCommand, CoordinatedOperationReport, OperationReconcileReport,
     OperationReconciliation, OperationReconciliationRecovery, OperationReconciliationState,
-    OperationShowReport, PostMergeCleanupReport, PostMergeCleanupState, UnknownOutcomeRecovery,
-    classify_gh, classify_git,
+    OperationShowReport, PostMergeCleanupReport, PostMergeCleanupState, QueueWait,
+    UnknownOutcomeRecovery, classify_gh, classify_git,
 };
 pub use pr::{
     PrActivityItem, PrCheckOptions, PrCheckReport, PrCheckRun, PrDecision, PrDecisionStatus,

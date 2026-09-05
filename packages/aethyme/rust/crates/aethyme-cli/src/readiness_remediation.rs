@@ -8,10 +8,15 @@ use crate::repository_upgrade::{
 };
 
 pub fn is_command(args: &[String]) -> bool {
-    matches!(
-        args.get(1).map(String::as_str),
-        Some("plan" | "apply" | "recover")
-    )
+    // The subcommand has to match too. Testing only the verb captured every
+    // other `broker <group> plan|apply`, so `gc plan`, `ship plan` and
+    // `promotion-record plan` all returned a readiness plan -- and returned its
+    // digest, which `apply --confirm` would then have accepted.
+    args.first().map(String::as_str) == Some("readiness")
+        && matches!(
+            args.get(1).map(String::as_str),
+            Some("plan" | "apply" | "recover")
+        )
 }
 
 pub fn run(args: &[String]) -> u8 {
@@ -220,4 +225,37 @@ fn print_usage() {
         "  aethyme broker readiness apply [--repo <path>] [--local-only] [--resolution-file <path>] --confirm <plan-sha256> [--json]"
     );
     println!("  aethyme broker readiness recover [--repo <path>] --plan <plan-sha256> [--json]");
+}
+
+#[cfg(test)]
+mod dispatch_tests {
+    use super::is_command;
+
+    fn args(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|part| (*part).into()).collect()
+    }
+
+    #[test]
+    fn only_readiness_plan_apply_and_recover_route_here() {
+        assert!(is_command(&args(&["readiness", "plan"])));
+        assert!(is_command(&args(&["readiness", "apply"])));
+        assert!(is_command(&args(&["readiness", "recover"])));
+    }
+
+    /// Every other digest-bound plan/apply pair must reach its own command. A
+    /// readiness digest returned for `gc plan` would be accepted by `gc apply
+    /// --confirm`, applying something the caller never reviewed.
+    #[test]
+    fn other_plan_and_apply_commands_are_not_captured() {
+        for group in ["gc", "ship", "checkpoint", "promotion-record", "resources"] {
+            assert!(
+                !is_command(&args(&[group, "plan"])),
+                "{group} plan must not route to readiness remediation"
+            );
+            assert!(
+                !is_command(&args(&[group, "apply"])),
+                "{group} apply must not route to readiness remediation"
+            );
+        }
+    }
 }

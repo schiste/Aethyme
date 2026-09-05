@@ -338,8 +338,8 @@ stashing multi-worktree changes.
 - `aethyme broker prepare status --session <id> [--json]`
 - `aethyme broker prepare --session <id> [--offline] [--wait <duration>] [--json]`
 - `aethyme broker exec --session <id> -- <command> [--json]`
-- `aethyme broker git --session <id> [--repo <owner/name>] [--scope <scope>] [--effect <read|write|destructive>] [--reason <text>] [--destructive] -- <git-args>`
-- `aethyme broker gh --session <id> --repo <owner/name> [--scope <scope>] [--effect <read|write|destructive>] [--reason <text>] [--destructive] -- <gh-args>`
+- `aethyme broker git --session <id> [--repo <owner/name>] [--scope <scope>] [--effect <read|write|destructive>] [--reason <text>] [--destructive] [--no-wait|--queue-timeout <seconds>] -- <git-args>`
+- `aethyme broker gh --session <id> --repo <owner/name> [--scope <scope>] [--effect <read|write|destructive>] [--reason <text>] [--destructive] [--no-wait|--queue-timeout <seconds>] -- <gh-args>`
 - `aethyme broker operations list [--limit <n>] [--before <id>] [--session <id>] [--status <status>] [--repo <canonical-id>] [--provider <git|github>] [--json]`
 - `aethyme broker operations [same options]` (compatibility alias during deprecation)
 - `aethyme broker operations show <id> [--json]`

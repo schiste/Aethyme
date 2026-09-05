@@ -2255,6 +2255,21 @@ impl BrokerStore {
         Ok(operations)
     }
 
+    /// The host operation is only known once the lock is held, but the record is
+    /// created before queueing, so the link is attached rather than inserted.
+    pub fn attach_host_operation(
+        &mut self,
+        id: i64,
+        host_operation_id: &str,
+    ) -> Result<(), BrokerError> {
+        self.conn.execute(
+            "UPDATE coordinated_operations SET host_operation_id = ?2, updated_at = ?3
+             WHERE id = ?1",
+            params![id, host_operation_id, now_ms()],
+        )?;
+        Ok(())
+    }
+
     pub fn unresolved_coordinated_operations(
         &self,
         repository: &str,
