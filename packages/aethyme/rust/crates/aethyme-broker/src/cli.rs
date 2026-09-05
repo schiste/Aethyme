@@ -352,7 +352,10 @@ Usage:
       Rebuild and confirm the exact recovery plan, create the preservation ref
       first, then atomically re-anchor the broker checkpoint. Never rewrites the
       session worktree or hides uncommitted work.
-  aethyme broker queue [--json]
+  aethyme broker queue [--active] [--json]
+      `--active` lists only entries that can still change (submitted,
+      simulating, verified, conflict) — the cheap way to watch a submit in
+      flight without paying for the whole inventory on every poll.
   aethyme broker queue history [--limit <n>] [--before <id>] [--json]
       The bare command remains the compatibility inventory. `history` is a
       bounded newest-first terminal page with a stable next_before_id cursor.
@@ -675,14 +678,14 @@ fn record_command_outcome(args: &[String], exit: u8) {
 /// payload an agent pays to read.
 fn record_command_metric(args: &[String], exit: u8, duration_ms: i64) {
     let output_bytes = crate::cli_output::emitted();
-    // Still gated by `command_records_metric`. Widening this to cover read-only
-    // plans would measure the commands that actually dominate agent token cost,
-    // but inspection commands are contractually side-effect free — the CLI
-    // documents "never writes broker state or command telemetry" and
-    // `external_events_cli` asserts the metrics file is byte-identical across
-    // them. Measuring reads therefore needs an explicit opt-in, not a silent
-    // change to that invariant.
-    if !command_records_metric(args) {
+    // Inspection commands are contractually side-effect free: the CLI documents
+    // "never writes broker state or command telemetry" and `external_events_cli`
+    // asserts the metrics file is byte-identical across them. That invariant
+    // also hides the commands that dominate agent token cost, because reads are
+    // the frequent, expensive ones. Measuring them is therefore opt-in: unset,
+    // nothing changes; set, the operator has accepted that inspection now
+    // writes one telemetry line.
+    if !command_records_metric(args) && !output_measurement_opted_in() {
         return;
     }
     let Some(label) = safe_command_surface(args) else {
@@ -720,6 +723,20 @@ fn record_command_metric(args: &[String], exit: u8, duration_ms: i64) {
 /// Whether this invocation should contribute command-latency telemetry.
 /// Report-only commands stay telemetry-free; variants that mutate broker,
 /// repository, or installation state remain observable.
+/// Whether the operator opted into measuring read-only command output.
+///
+/// Off by default so inspection stays side-effect free. `AETHYME_MEASURE_OUTPUT`
+/// is read per invocation rather than cached, so enabling it needs no restart of
+/// anything and a wrapper can scope it to a single command.
+fn output_measurement_opted_in() -> bool {
+    std::env::var_os("AETHYME_MEASURE_OUTPUT")
+        .map(|value| {
+            let value = value.to_string_lossy().to_ascii_lowercase();
+            !matches!(value.as_str(), "" | "0" | "false" | "no" | "off")
+        })
+        .unwrap_or(false)
+}
+
 fn command_records_metric(args: &[String]) -> bool {
     match args.first().map(String::as_str) {
         Some("certify" | "queue" | "metrics" | "handoff" | "worktree-root") => false,
@@ -1441,6 +1458,7 @@ struct Parsed {
     before: Option<i64>,
     limit: Option<u32>,
     detail: bool,
+    active: bool,
     status: Option<String>,
     provider: Option<String>,
     adapter: Option<String>,
@@ -1519,6 +1537,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         before: None,
         limit: None,
         detail: false,
+        active: false,
         status: None,
         provider: None,
         adapter: None,
@@ -1606,6 +1625,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
                 })?);
             }
             "--detail" => parsed.detail = true,
+            "--active" => parsed.active = true,
             "--force" => parsed.force = true,
             "--check" => parsed.check = true,
             "--dispatch" => parsed.dispatch = true,
@@ -7145,11 +7165,34 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                         .into(),
                 ));
             }
-            let entries = broker.store().merge_queue()?;
+            let mut entries = broker.store().merge_queue()?;
+            // Watching a submit in flight is the one polling loop agents run,
+            // and the bare inventory grows without bound — it reached 13 KB
+            // here, paid on every poll. `--active` answers "is it done yet" in
+            // the few entries that can still change. The bare command keeps its
+            // documented compatibility-inventory shape.
+            if parsed.active {
+                entries.retain(|entry| {
+                    matches!(
+                        entry.status,
+                        crate::MergeStatus::Submitted
+                            | crate::MergeStatus::Simulating
+                            | crate::MergeStatus::Verified
+                            | crate::MergeStatus::Conflict
+                    )
+                });
+            }
             if parsed.json {
                 out!("{}", serde_json::to_string_pretty(&entries)?);
             } else if entries.is_empty() {
-                out!("Merge queue is empty.");
+                out!(
+                    "{}",
+                    if parsed.active {
+                        "No queue entry is in flight."
+                    } else {
+                        "Merge queue is empty."
+                    }
+                );
             } else {
                 out!("{:<4} {:<4} {:<11} HEAD", "ID", "SID", "STATUS");
                 for entry in entries {
