@@ -821,7 +821,9 @@ independently of the worktree's disposition: a worktree whose provenance is
 unproven still has reclaimable bytes. A directory qualifies only when its name is
 recognised (`target`, `node_modules`) *and* a witness confirms it is a real cache
 — `CACHEDIR.TAG` for `target`, a non-empty directory for `node_modules` — so a
-source directory that merely shares the name is never removed. The scan is
+source directory that merely shares the name is never removed. Git must also
+confirm the exact repository-relative directory is ignored; tracked content is
+never reclaimed even when its name and witness resemble a cache. The scan is
 depth-bounded, skips git metadata, and never follows symlinks.
 
 By default, build caches from sessions idle for `artifact_reclaim_days` are

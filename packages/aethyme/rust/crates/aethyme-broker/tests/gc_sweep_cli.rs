@@ -30,7 +30,11 @@ fn fixture(retention: &str) -> (tempfile::TempDir, tempfile::TempDir) {
     let container = tempfile::tempdir().unwrap();
     git(repo.path(), &["init", "-q", "-b", "main"]);
     std::fs::write(repo.path().join("README.md"), "fixture\n").unwrap();
-    std::fs::write(repo.path().join(".gitignore"), "/.aethyme/\n").unwrap();
+    std::fs::write(
+        repo.path().join(".gitignore"),
+        "/.aethyme/\n/rust/target/\n",
+    )
+    .unwrap();
     git(repo.path(), &["add", "-A"]);
     git(repo.path(), &["commit", "-qm", "init"]);
     std::fs::create_dir_all(repo.path().join(".aethyme")).unwrap();
@@ -236,6 +240,43 @@ fn explicit_opt_out_preserves_closed_session_build_caches() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(target.exists(), "explicit opt-out must preserve the cache");
+}
+
+#[test]
+fn tracked_directory_with_a_cache_witness_is_never_reclaimed() {
+    let (repo, container) = fixture("");
+    let output = run(
+        repo.path(),
+        container.path(),
+        &["start", "--task", "tracked target", "--json"],
+    );
+    assert!(output.status.success());
+    let session: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let id = session["id"].as_i64().unwrap().to_string();
+    let worktree = PathBuf::from(session["worktree_path"].as_str().unwrap());
+    let target = worktree.join("rust/target");
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::write(target.join("CACHEDIR.TAG"), "Signature: 8a477f597d28d172\n").unwrap();
+    std::fs::write(target.join("tracked.txt"), "repository content\n").unwrap();
+    git(
+        &worktree,
+        &[
+            "add",
+            "-f",
+            "rust/target/CACHEDIR.TAG",
+            "rust/target/tracked.txt",
+        ],
+    );
+    git(&worktree, &["commit", "-qm", "tracked target"]);
+    let output = run(repo.path(), container.path(), &["close", "--session", &id]);
+    assert!(output.status.success());
+
+    let output = run(repo.path(), container.path(), &["status", "--json"]);
+    assert!(output.status.success());
+    assert!(
+        target.join("tracked.txt").exists(),
+        "a tracked directory must survive even when its name and witness resemble a cache"
+    );
 }
 
 #[test]

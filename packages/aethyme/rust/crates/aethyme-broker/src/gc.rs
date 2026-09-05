@@ -13,7 +13,7 @@ use crate::broker::{
 use crate::{
     Broker, BrokerOpError, GcApplyReport, GcArtifactCandidate, GcBlocker, GcFileAction,
     GcFileCandidate, GcHealth, GcOrphanCandidate, GcPlan, GcRowCandidate, GcWorktreeCandidate,
-    OperationStatus, RetentionPolicy, load_retention_policy,
+    GitRepo, OperationStatus, RetentionPolicy, load_retention_policy,
 };
 
 pub const GC_PLAN_SCHEMA_VERSION: u32 = 2;
@@ -415,12 +415,18 @@ impl Broker {
             if !is_real_directory(&root) {
                 continue;
             }
+            let Ok(checkout) = GitRepo::discover(&root) else {
+                continue;
+            };
             let mut found = Vec::new();
             collect_artifact_dirs(&root, &root, 0, &mut found);
             for dir in found {
                 let Some(relative) = repo_relative(&root, &dir) else {
                     continue;
                 };
+                if !checkout.path_is_ignored(&relative) {
+                    continue;
+                }
                 let bytes = directory_size_without_following_links(&dir).unwrap_or(0);
                 if bytes == 0 {
                     continue;
@@ -864,6 +870,9 @@ impl Broker {
             if !is_real_directory(&root) || !self.is_broker_owned_worktree(&session, &root) {
                 continue;
             }
+            let Ok(checkout) = GitRepo::discover(&root) else {
+                continue;
+            };
             eligible_worktree_seen = true;
             let mut found = Vec::new();
             collect_artifact_dirs(&root, &root, 0, &mut found);
@@ -871,6 +880,12 @@ impl Broker {
                 if check_deadline(Some(deadline)) {
                     scan_completed = false;
                     break;
+                }
+                let Some(relative) = repo_relative(&root, &dir) else {
+                    continue;
+                };
+                if !checkout.path_is_ignored(&relative) {
+                    continue;
                 }
                 if std::fs::remove_dir_all(&dir).is_ok() {
                     removed.push(dir.to_string_lossy().into_owned());
