@@ -36,10 +36,10 @@ impl super::Detector for FolderDocsDetector {
     }
 
     fn applicability(&self, repo_path: &Path) -> super::DetectorApplicability {
-        super::applies_to_extensions(
+        super::applies_to_named_file(
             repo_path,
-            &[".py", ".ts", ".tsx", ".js", ".rs", ".go", ".java"],
-            "source files",
+            "FOLDER.md",
+            "established FOLDER.md convention",
         )
     }
 

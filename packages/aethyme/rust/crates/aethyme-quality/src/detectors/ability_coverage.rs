@@ -53,7 +53,19 @@ impl super::Detector for AbilityCoverageDetector {
     }
 
     fn applicability(&self, repo_path: &Path) -> super::DetectorApplicability {
-        super::applies_to_extensions(repo_path, &[".py"], "Python authorization source files")
+        super::applies_to_content(
+            repo_path,
+            &[".py"],
+            &[
+                "Depends(get_current_user)",
+                "@require_auth",
+                "@login_required",
+                "check_permission",
+                "require_permission",
+                "@permission_required",
+            ],
+            "supported authorization declarations",
+        )
     }
 
     fn detect(&self, repo_path: &Path) -> Vec<Finding> {

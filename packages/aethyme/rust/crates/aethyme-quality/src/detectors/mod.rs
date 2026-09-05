@@ -61,7 +61,7 @@ pub mod schema_drift;
 use std::path::Path;
 
 use crate::model::Finding;
-use crate::walk::{py_suffix, rglob_all, should_skip_file};
+use crate::walk::{py_suffix, read_file_safe, rglob_all, should_skip_file};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DetectorApplicability {
@@ -120,6 +120,55 @@ pub(super) fn applies_to_extensions(
     }
 }
 
+pub(super) fn applies_to_content(
+    repo_path: &Path,
+    extensions: &[&str],
+    markers: &[&str],
+    description: &str,
+) -> DetectorApplicability {
+    let found = rglob_all(repo_path).into_iter().any(|entry| {
+        if !entry.is_file
+            || should_skip_file(&entry.path)
+            || !extensions.contains(&py_suffix(&entry.path).as_str())
+        {
+            return false;
+        }
+        read_file_safe(&entry.path)
+            .map(|content| markers.iter().any(|marker| content.contains(marker)))
+            .unwrap_or(false)
+    });
+    if found {
+        DetectorApplicability::Applicable {
+            evidence: format!("tracked snapshot contains {description}"),
+        }
+    } else {
+        DetectorApplicability::NotApplicable {
+            reason: format!("tracked snapshot contains no {description}"),
+        }
+    }
+}
+
+pub(super) fn applies_to_named_file(
+    repo_path: &Path,
+    file_name: &str,
+    description: &str,
+) -> DetectorApplicability {
+    let found = rglob_all(repo_path).into_iter().any(|entry| {
+        entry.is_file
+            && !should_skip_file(&entry.path)
+            && entry.path.file_name().is_some_and(|name| name == file_name)
+    });
+    if found {
+        DetectorApplicability::Applicable {
+            evidence: format!("tracked snapshot contains {description}"),
+        }
+    } else {
+        DetectorApplicability::NotApplicable {
+            reason: format!("tracked snapshot contains no {description}"),
+        }
+    }
+}
+
 /// Registry of all detectors, in the exact `ALL_DETECTORS` order from
 /// `src/scorecard/detectors/__init__.py` — report sections and the
 /// detector-performance table depend on this order. Detectors are added
@@ -151,6 +200,7 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(root.join("src/lib.rs"), "pub fn answer() -> u8 { 42 }\n").unwrap();
+        fs::write(root.join("README.md"), "# Test\n").unwrap();
 
         let outcomes: Vec<_> = all_detectors()
             .into_iter()
@@ -165,7 +215,7 @@ mod tests {
         assert!(
             outcomes
                 .iter()
-                .find(|(name, _)| *name == "folder-docs")
+                .find(|(name, _)| *name == "relative-links")
                 .unwrap()
                 .1
                 .is_applicable()

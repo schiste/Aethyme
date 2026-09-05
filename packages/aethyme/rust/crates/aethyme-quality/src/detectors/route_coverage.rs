@@ -45,7 +45,19 @@ impl super::Detector for RouteCoverageDetector {
     }
 
     fn applicability(&self, repo_path: &Path) -> super::DetectorApplicability {
-        super::applies_to_extensions(repo_path, &[".py", ".js", ".ts"], "HTTP route source files")
+        super::applies_to_content(
+            repo_path,
+            &[".py", ".js", ".ts"],
+            &[
+                "@router.",
+                "@app.route(",
+                "router.get(",
+                "router.post(",
+                "app.get(",
+                "app.post(",
+            ],
+            "supported HTTP route declarations",
+        )
     }
 
     fn detect(&self, repo_path: &Path) -> Vec<Finding> {

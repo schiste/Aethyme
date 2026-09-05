@@ -51,7 +51,7 @@ fn inspect_skips_irrelevant_detectors_with_reasons() {
     result.ok();
     let report: Value = serde_json::from_str(result.output.trim()).unwrap();
     assert_eq!(report["schema_version"], 1);
-    assert_eq!(report["totals"]["findings"], 1); // folder-docs only
+    assert_eq!(report["totals"]["findings"], 0);
     assert_eq!(report["operational_readiness"]["authoritative"], false);
     let data_ui = report["detectors"]
         .as_array()

@@ -61,10 +61,11 @@ impl super::Detector for SchemaDriftDetector {
     }
 
     fn applicability(&self, repo_path: &Path) -> super::DetectorApplicability {
-        super::applies_to_extensions(
+        super::applies_to_content(
             repo_path,
             &[".py", ".ts", ".tsx"],
-            "Python or TypeScript schema files",
+            &["(BaseModel)", "interface "],
+            "Pydantic models or TypeScript interfaces",
         )
     }
 
