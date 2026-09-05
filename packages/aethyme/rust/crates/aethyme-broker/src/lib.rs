@@ -23,6 +23,7 @@
 mod advisories;
 mod broker;
 pub mod cli;
+mod cli_output;
 pub mod contract_check;
 mod delivery;
 mod error;

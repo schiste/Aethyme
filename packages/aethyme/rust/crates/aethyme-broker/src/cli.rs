@@ -10,6 +10,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use crate::broker::Broker;
+use crate::cli_output::out;
 
 const RESOURCES_RECONCILE_USAGE: &str =
     "usage: aethyme broker resources reconcile <lease-id> --confirm <generation> [--json]";
@@ -669,7 +670,18 @@ fn record_command_outcome(args: &[String], exit: u8) {
     let _ = store.append_event(kind, session_id, Some(&payload));
 }
 
+/// Record one command's cost. `output_bytes` counts stdout emitted through
+/// `out!`; stderr is excluded because it carries diagnostics rather than the
+/// payload an agent pays to read.
 fn record_command_metric(args: &[String], exit: u8, duration_ms: i64) {
+    let output_bytes = crate::cli_output::emitted();
+    // Still gated by `command_records_metric`. Widening this to cover read-only
+    // plans would measure the commands that actually dominate agent token cost,
+    // but inspection commands are contractually side-effect free — the CLI
+    // documents "never writes broker state or command telemetry" and
+    // `external_events_cli` asserts the metrics file is byte-identical across
+    // them. Measuring reads therefore needs an explicit opt-in, not a silent
+    // change to that invariant.
     if !command_records_metric(args) {
         return;
     }
@@ -692,7 +704,7 @@ fn record_command_metric(args: &[String], exit: u8, duration_ms: i64) {
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
     let line = format!(
-        "{{\"ts\":{ts},\"command\":\"{}\",\"duration_ms\":{duration_ms},\"exit\":{exit}}}\n",
+        "{{\"ts\":{ts},\"command\":\"{}\",\"duration_ms\":{duration_ms},\"exit\":{exit},\"output_bytes\":{output_bytes}}}\n",
         label
     );
     use std::io::Write;
@@ -1428,6 +1440,7 @@ struct Parsed {
     operation: Option<i64>,
     before: Option<i64>,
     limit: Option<u32>,
+    detail: bool,
     status: Option<String>,
     provider: Option<String>,
     adapter: Option<String>,
@@ -1505,6 +1518,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         operation: None,
         before: None,
         limit: None,
+        detail: false,
         status: None,
         provider: None,
         adapter: None,
@@ -1591,6 +1605,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
                     UsageError::Message("--limit must be a positive integer".into())
                 })?);
             }
+            "--detail" => parsed.detail = true,
             "--force" => parsed.force = true,
             "--check" => parsed.check = true,
             "--dispatch" => parsed.dispatch = true,
@@ -1958,7 +1973,7 @@ fn print_checks(checks: &[crate::init::Check]) {
             crate::init::CheckStatus::Fail => "FAIL",
             crate::init::CheckStatus::Skipped => "skip",
         };
-        println!("{tag:<8} {:<28} {}", check.id, check.detail);
+        out!("{tag:<8} {:<28} {}", check.id, check.detail);
     }
 }
 
@@ -2014,10 +2029,10 @@ fn render_gate_failure_tail(outcome: &crate::gates::GateRunOutcome) {
 
 fn render_hook_reports(reports: &[crate::HookReport], json: bool) -> Result<(), UsageError> {
     if json {
-        println!("{}", serde_json::to_string_pretty(reports)?);
+        out!("{}", serde_json::to_string_pretty(reports)?);
     } else {
         for report in reports {
-            println!(
+            out!(
                 "{:<12} {:<10} {}",
                 report.hook,
                 report.state.as_str(),
@@ -2030,12 +2045,12 @@ fn render_hook_reports(reports: &[crate::HookReport], json: bool) -> Result<(), 
 
 fn render_lease_plan(report: &crate::LeasePlan, json: bool) -> Result<(), UsageError> {
     if json {
-        println!("{}", serde_json::to_string_pretty(report)?);
+        out!("{}", serde_json::to_string_pretty(report)?);
         return Ok(());
     }
 
     for path in &report.paths {
-        println!(
+        out!(
             "{} — {}",
             path.path,
             if path.would_conflict {
@@ -2046,7 +2061,7 @@ fn render_lease_plan(report: &crate::LeasePlan, json: bool) -> Result<(), UsageE
         );
         for (label, overlaps) in [("owned", &path.owned), ("conflict", &path.conflicts)] {
             for overlap in overlaps {
-                println!(
+                out!(
                     "  {label:<8} {:<9} session {:<4} {:<9} {} (expires {}; owner {} at {})",
                     match overlap.relation {
                         crate::LeaseOverlapRelation::Exact => "exact",
@@ -2064,13 +2079,13 @@ fn render_lease_plan(report: &crate::LeasePlan, json: bool) -> Result<(), UsageE
                 );
                 if label == "conflict" {
                     for action in &overlap.safe_next_actions {
-                        println!("    next: {action}");
+                        out!("    next: {action}");
                     }
                 }
             }
         }
         if path.owned.is_empty() && path.conflicts.is_empty() {
-            println!("  no active overlaps");
+            out!("  no active overlaps");
         }
     }
     Ok(())
@@ -2080,9 +2095,9 @@ fn render_planned_explicit_leases(leases: &[crate::Lease]) {
     if leases.is_empty() {
         return;
     }
-    println!("Planned explicit leases:");
+    out!("Planned explicit leases:");
     for lease in leases {
-        println!("  {}", lease.path);
+        out!("  {}", lease.path);
     }
 }
 
@@ -2092,13 +2107,13 @@ fn render_worktree_placement(placement: &crate::WorktreePlacement) {
     } else {
         "inside the repository fallback"
     };
-    println!(
+    out!(
         "Worktree root: {} ({}, {boundary})",
         placement.root.display(),
         placement.source.as_str()
     );
     if let Some(reason) = &placement.fallback_reason {
-        println!("Warning: external worktree placement was unavailable: {reason}");
+        out!("Warning: external worktree placement was unavailable: {reason}");
     }
 }
 
@@ -2107,50 +2122,50 @@ fn render_preparation_status(
     json: bool,
 ) -> Result<(), UsageError> {
     if json {
-        println!("{}", serde_json::to_string_pretty(status)?);
+        out!("{}", serde_json::to_string_pretty(status)?);
         return Ok(());
     }
-    println!(
+    out!(
         "Preparation {:?} for session {}: {}",
         status.state, status.session_id, status.reason
     );
     if let Some(digest) = &status.expected_digest {
-        println!("Expected digest: {}", short_sha(digest));
+        out!("Expected digest: {}", short_sha(digest));
     }
     if !status.missing_outputs.is_empty() {
-        println!("Missing outputs:");
+        out!("Missing outputs:");
         for path in &status.missing_outputs {
-            println!("  {path}");
+            out!("  {path}");
         }
     }
     if let Some(next_action) = &status.next_action {
-        println!("Next: {next_action}");
+        out!("Next: {next_action}");
     }
     Ok(())
 }
 
 fn render_pr_check_report(report: &crate::PrCheckReport, json: bool) -> Result<(), UsageError> {
     if json {
-        println!("{}", serde_json::to_string_pretty(report)?);
+        out!("{}", serde_json::to_string_pretty(report)?);
         return Ok(());
     }
 
     match &report.pr {
         Some(pr) => {
-            println!(
+            out!(
                 "PR #{} -> {}: {}",
                 pr.number, report.target_branch, pr.title
             );
             if let Some(url) = &pr.url {
-                println!("URL: {url}");
+                out!("URL: {url}");
             }
         }
         None => {
-            println!("{}", report.decision.summary);
+            out!("{}", report.decision.summary);
         }
     }
-    println!("Marker: {}", report.marker.as_str());
-    println!(
+    out!("Marker: {}", report.marker.as_str());
+    out!(
         "Activity: {}{}",
         if report.checked_activity {
             "checked"
@@ -2169,8 +2184,8 @@ fn render_pr_check_report(report: &crate::PrCheckReport, json: bool) -> Result<(
             String::new()
         }
     );
-    println!("Decision: {}", report.decision.summary);
-    println!(
+    out!("Decision: {}", report.decision.summary);
+    out!(
         "Dispatch: {}{}",
         report.dispatch.status.as_str(),
         report
@@ -2180,38 +2195,38 @@ fn render_pr_check_report(report: &crate::PrCheckReport, json: bool) -> Result<(
             .unwrap_or_default()
     );
     if let Some(path) = &report.prompt_path {
-        println!("Prompt: {path}");
+        out!("Prompt: {path}");
     }
     for command in &report.next_commands {
-        println!("run: {command}");
+        out!("run: {command}");
     }
     Ok(())
 }
 
 fn render_quick_test_report(report: &crate::QuickTestReport, json: bool) -> Result<(), UsageError> {
     if json {
-        println!("{}", serde_json::to_string_pretty(report)?);
+        out!("{}", serde_json::to_string_pretty(report)?);
         return Ok(());
     }
     if report.skipped {
-        println!("{}", report.message);
+        out!("{}", report.message);
         return Ok(());
     }
-    println!("{}", report.message);
+    out!("{}", report.message);
     if report.chau7.detected {
-        println!(
+        out!(
             "Chau7 runtime markers detected: {}",
             report.chau7.markers.join(", ")
         );
     }
     for step in &report.steps {
-        println!("{:<8} {:<20} {}", step.status, step.name, step.detail);
+        out!("{:<8} {:<20} {}", step.status, step.name, step.detail);
     }
     if let Some(gate) = &report.gate_fixture {
-        println!("gate fixture: {}", gate.gate_name);
-        println!("  passing entry: q{}", gate.passing_entry_id);
+        out!("gate fixture: {}", gate.gate_name);
+        out!("  passing entry: q{}", gate.passing_entry_id);
         for outcome in &gate.passing_outcomes {
-            println!(
+            out!(
                 "    {} {}{} (tree {})",
                 outcome.gate,
                 outcome.status.as_str(),
@@ -2219,13 +2234,13 @@ fn render_quick_test_report(report: &crate::QuickTestReport, json: bool) -> Resu
                 short_commit(&outcome.tree_hash),
             );
         }
-        println!(
+        out!(
             "  failing entry: q{} ({})",
             gate.failing_entry_id,
             gate.failing_entry_status.as_str()
         );
         for outcome in &gate.failing_outcomes {
-            println!(
+            out!(
                 "    {} {}{} (tree {})",
                 outcome.gate,
                 outcome.status.as_str(),
@@ -2234,7 +2249,7 @@ fn render_quick_test_report(report: &crate::QuickTestReport, json: bool) -> Resu
             );
         }
     }
-    println!(
+    out!(
         "temporary repo removed: {}",
         if report.temp_repo_removed {
             "yes"
@@ -2243,7 +2258,7 @@ fn render_quick_test_report(report: &crate::QuickTestReport, json: bool) -> Resu
         }
     );
     if let Some(head) = &report.integration_head {
-        println!("integration head: {}", &head[..12.min(head.len())]);
+        out!("integration head: {}", &head[..12.min(head.len())]);
     }
     Ok(())
 }
@@ -2274,23 +2289,23 @@ fn print_promoted_conflict_warnings(conflicts: &[crate::PromotedConflict]) {
 }
 
 fn render_status_advice(advice: &[crate::StatusAdvice]) {
-    println!("Next actions:");
+    out!("Next actions:");
     if advice.is_empty() {
-        println!("  none");
+        out!("  none");
         return;
     }
     for (index, item) in advice.iter().enumerate() {
-        println!(
+        out!(
             "  {}. {:<7} {}",
             index + 1,
             item.severity.as_str().to_uppercase(),
             item.summary
         );
         if !item.evidence.is_empty() {
-            println!("     evidence: {}", item.evidence.join("; "));
+            out!("     evidence: {}", item.evidence.join("; "));
         }
         for command in &item.commands {
-            println!("     run: {command}");
+            out!("     run: {command}");
         }
     }
 }
@@ -2307,11 +2322,11 @@ fn queue_status_is_current(status: crate::MergeStatus) -> bool {
 
 fn render_queue_history(page: &crate::MergeQueueHistoryPage) {
     if page.entries.is_empty() {
-        println!("No terminal merge-queue entries in this page.");
+        out!("No terminal merge-queue entries in this page.");
     } else {
-        println!("{:<4} {:<4} {:<17} HEAD", "ID", "SID", "STATUS");
+        out!("{:<4} {:<4} {:<17} HEAD", "ID", "SID", "STATUS");
         for entry in &page.entries {
-            println!(
+            out!(
                 "{:<4} {:<4} {:<17} {}",
                 entry.id,
                 entry.session_id,
@@ -2326,67 +2341,67 @@ fn render_queue_history(page: &crate::MergeQueueHistoryPage) {
         .map(|item| format!("{} {}", item.status.as_str(), item.count))
         .collect::<Vec<_>>()
         .join(", ");
-    println!(
+    out!(
         "Terminal totals: {}",
         if summary.is_empty() { "none" } else { &summary }
     );
     if let Some(before) = page.next_before_id {
-        println!("Next: aethyme broker queue history --before {before}");
+        out!("Next: aethyme broker queue history --before {before}");
     }
 }
 
 fn render_repair_report(report: &crate::RepairReport) {
-    println!(
+    out!(
         "Repair session {}: {}",
         report.session_id,
         report.action.as_str()
     );
-    println!("  source: {}", report.source.as_str());
+    out!("  source: {}", report.source.as_str());
     if let Some(base) = &report.base {
-        println!("  base: {}", &base[..12.min(base.len())]);
+        out!("  base: {}", &base[..12.min(base.len())]);
     }
     if report.pending_commits.is_empty() {
-        println!("  pending commits: none");
+        out!("  pending commits: none");
     } else {
-        println!("  pending commits:");
+        out!("  pending commits:");
         for commit in &report.pending_commits {
-            println!("    - {commit}");
+            out!("    - {commit}");
         }
     }
-    println!(
+    out!(
         "  leases refreshed: {}",
         if report.leases_refreshed { "yes" } else { "no" }
     );
     if report.affected_gates.is_empty() {
-        println!("  affected gates: none");
+        out!("  affected gates: none");
     } else {
-        println!("  affected gates:");
+        out!("  affected gates:");
         for gate in &report.affected_gates {
             match &gate.triggered_by {
-                Some(path) => println!("    - {} (triggered by {})", gate.gate, path),
-                None => println!("    - {} (always runs)", gate.gate),
+                Some(path) => out!("    - {} (triggered by {})", gate.gate, path),
+                None => out!("    - {} (always runs)", gate.gate),
             }
         }
     }
-    println!("  next: {}", report.next_command);
+    out!("  next: {}", report.next_command);
 }
 
 fn render_finish_report(report: &crate::FinishReport) {
-    println!(
+    out!(
         "Finish session {}: {}",
         report.session_id,
         report.status.as_str()
     );
-    println!("  {}", report.summary);
-    println!("  worktree: {}", report.worktree_path);
+    out!("  {}", report.summary);
+    out!("  worktree: {}", report.worktree_path);
     if let Some(entry_id) = report.latest_queue_entry_id {
         let status = report
             .latest_queue_status
             .map(|status| status.as_str())
             .unwrap_or("unknown");
-        println!("  latest queue: qid {entry_id} ({status})");
+        out!("  latest queue: qid {entry_id} ({status})");
     }
-    println!(
+    out!(
         "  delivery: submitted={}, promoted={}, published={}",
         if report.delivery.submitted {
             "yes"
@@ -2405,12 +2420,12 @@ fn render_finish_report(report: &crate::FinishReport) {
         },
     );
     if !report.dirty_paths.is_empty() {
-        println!("  dirty paths: {}", capped_join(&report.dirty_paths, 8));
+        out!("  dirty paths: {}", capped_join(&report.dirty_paths, 8));
     }
     if report.unsubmitted_commits > 0 {
-        println!("  unsubmitted commits: {}", report.unsubmitted_commits);
+        out!("  unsubmitted commits: {}", report.unsubmitted_commits);
     }
-    println!(
+    out!(
         "  pending work: {} ({} dirty paths, {} unsubmitted commits{})",
         if report.pending_work.present {
             "yes"
@@ -2426,11 +2441,11 @@ fn render_finish_report(report: &crate::FinishReport) {
         },
     );
     if report.leases_held.is_empty() {
-        println!("  leases held: none recorded");
+        out!("  leases held: none recorded");
     } else {
-        println!("  leases held:");
+        out!("  leases held:");
         for lease in &report.leases_held {
-            println!(
+            out!(
                 "    {} {} {} (expires {}, released {})",
                 lease.kind.as_str(),
                 match lease.state {
@@ -2451,7 +2466,7 @@ fn render_finish_report(report: &crate::FinishReport) {
         }
     }
     match &report.last_gate {
-        Some(gate) => println!(
+        Some(gate) => out!(
             "  last gate: {} {} on tree {} at {} ({})",
             gate.gate,
             gate.status.as_str(),
@@ -2462,23 +2477,23 @@ fn render_finish_report(report: &crate::FinishReport) {
                 crate::FinishGateCacheSource::CacheHit => "cache hit",
             }
         ),
-        None => println!("  last gate: none recorded"),
+        None => out!("  last gate: none recorded"),
     }
     match &report.last_graph_integrity {
-        Some(graph) => println!(
+        Some(graph) => out!(
             "  last graph integrity: {} on tree {} under policy {} at {}",
             graph.status.as_str(),
             short_commit(&graph.tree_hash),
             short_commit(&graph.policy_digest),
             graph.recorded_at,
         ),
-        None => println!("  last graph integrity: none recorded"),
+        None => out!("  last graph integrity: none recorded"),
     }
-    println!(
+    out!(
         "  cleanup safe: {}",
         if report.cleanup_safe { "yes" } else { "no" }
     );
-    println!(
+    out!(
         "  physical cleanup: requested={}, kept={}, attempted={}, completed={}, reclaimed={} bytes",
         report.cleanup.requested,
         report.cleanup.kept,
@@ -2486,7 +2501,7 @@ fn render_finish_report(report: &crate::FinishReport) {
         report.cleanup.completed,
         report.cleanup.reclaimed_bytes,
     );
-    println!(
+    out!(
         "    worktree: {} ({})",
         report.worktree_path,
         if report.cleanup.worktree_removed {
@@ -2496,7 +2511,7 @@ fn render_finish_report(report: &crate::FinishReport) {
         }
     );
     if let Some(branch) = &report.cleanup.branch_ref {
-        println!(
+        out!(
             "    branch: {}{} ({})",
             branch,
             report
@@ -2513,20 +2528,20 @@ fn render_finish_report(report: &crate::FinishReport) {
         );
     }
     if let Some(action) = &report.cleanup.recovery_action {
-        println!("    recovery: {action}");
+        out!("    recovery: {action}");
     }
     for warning in &report.warnings {
-        println!("  warning: {warning}");
+        out!("  warning: {warning}");
     }
     if report.next_commands.is_empty() {
-        println!("  next: none");
+        out!("  next: none");
     } else {
-        println!("  next:");
+        out!("  next:");
         for command in &report.next_commands {
-            println!("    run: {command}");
+            out!("    run: {command}");
         }
     }
-    println!(
+    out!(
         "  recommended next: {}",
         report.recommended_next_action.as_deref().unwrap_or("none")
     );
@@ -2547,23 +2562,23 @@ fn human_bytes(bytes: u64) -> String {
     }
 }
 
-fn render_cleanup_sweep_report(report: &crate::CleanupSweepReport) {
-    println!(
+fn render_cleanup_sweep_report(report: &crate::CleanupSweepReport, detail: bool) {
+    out!(
         "Cleanup {}: {} retained broker-owned worktrees, {} eligible",
         if report.applied { "apply" } else { "plan" },
         report.plan.retained_worktree_count,
         report.plan.eligible_worktree_count,
     );
-    println!(
+    out!(
         "  retained: {}; reclaimable now: {}; branches: {} retained, {} eligible",
         human_bytes(report.plan.estimated_retained_bytes),
         human_bytes(report.plan.estimated_reclaimable_bytes),
         report.plan.retained_branch_count,
         report.plan.eligible_branch_count,
     );
-    println!("  reviewed plan digest: {}", report.plan.digest);
-    for item in &report.plan.worktrees {
-        println!(
+    out!("  reviewed plan digest: {}", report.plan.digest);
+    render_capped(&report.plan.worktrees, GC_LIST_CAP, detail, |item| {
+        out!(
             "  session {}: {} ({}) — {}",
             item.session_id,
             item.disposition.as_str(),
@@ -2572,19 +2587,19 @@ fn render_cleanup_sweep_report(report: &crate::CleanupSweepReport) {
                 .unwrap_or_else(|| "size unavailable".into()),
             item.reason,
         );
-        println!("    {}", item.worktree_path);
+        out!("    {}", item.worktree_path);
         if let Some(branch_tip) = &item.branch_tip {
-            println!("    {} at {}", item.branch_ref, branch_tip);
+            out!("    {} at {}", item.branch_ref, branch_tip);
         }
         for command in &item.inspection_commands {
-            println!("    inspect: {command}");
+            out!("    inspect: {command}");
         }
         if !item.eligible() {
-            println!("    explicit discard: {}", item.force_cleanup_command);
+            out!("    explicit discard: {}", item.force_cleanup_command);
         }
-    }
+    });
     if report.applied {
-        println!(
+        out!(
             "  removed: {}",
             if report.removed_session_ids.is_empty() {
                 "none".into()
@@ -2598,13 +2613,13 @@ fn render_cleanup_sweep_report(report: &crate::CleanupSweepReport) {
             }
         );
         for failure in &report.failures {
-            println!(
+            out!(
                 "  retained session {} after revalidation: {}",
                 failure.session_id, failure.reason
             );
         }
     } else if report.plan.eligible_worktree_count > 0 || report.plan.eligible_branch_count > 0 {
-        println!(
+        out!(
             "  apply: aethyme broker cleanup --all-cleaned --apply --confirm {}",
             report.plan.digest
         );
@@ -2613,20 +2628,20 @@ fn render_cleanup_sweep_report(report: &crate::CleanupSweepReport) {
 
 fn render_promotion_record_plan(plan: &crate::PromotionRecordPlan) {
     let recoverable = plan.recoverable().count();
-    println!(
+    out!(
         "Promotion record plan {}: {} unrecorded commit(s), {} recoverable",
         plan.digest,
         plan.candidates.len(),
         recoverable
     );
-    println!(
+    out!(
         "  integration: {} @ {}",
         plan.integration_ref, plan.integration_tip
     );
     for candidate in &plan.candidates {
         match (&candidate.entry_id, &candidate.blocker) {
             (Some(entry), None) => {
-                println!(
+                out!(
                     "  {} -> entry {} (session {}), currently {}",
                     candidate.commit,
                     entry,
@@ -2634,29 +2649,55 @@ fn render_promotion_record_plan(plan: &crate::PromotionRecordPlan) {
                     candidate.current_status.as_deref().unwrap_or("unknown")
                 );
                 for line in &candidate.evidence {
-                    println!("      evidence: {line}");
+                    out!("      evidence: {line}");
                 }
             }
             _ => {
-                println!("  {} -> not recoverable", candidate.commit);
+                out!("  {} -> not recoverable", candidate.commit);
                 if let Some(blocker) = &candidate.blocker {
-                    println!("      blocked: {blocker}");
+                    out!("      blocked: {blocker}");
                 }
             }
         }
     }
     if recoverable == 0 {
-        println!("  apply: nothing recoverable");
+        out!("  apply: nothing recoverable");
     } else {
-        println!(
+        out!(
             "  apply: aethyme broker promotion-record apply --confirm {}",
             plan.digest
         );
     }
 }
 
-fn render_gc_plan(plan: &crate::GcPlan) {
-    println!(
+/// Default number of items any one plan list prints before summarising.
+const GC_LIST_CAP: usize = 5;
+
+/// Ship plans list every promoted entry in the prefix; show the boundary only.
+const SHIP_ENTRY_CAP: usize = 6;
+
+/// Print at most `cap` items, then say how many were withheld.
+///
+/// Agent-facing output is charged per token. A plan that enumerates every
+/// finding costs the reader far more than the decision it supports: this
+/// repository's `gc plan` reached ~319 KB, of which 93% was one list. The
+/// counts and the digest are what a reader acts on; the enumeration is what
+/// they page past. `--detail` restores it when someone genuinely wants to audit.
+fn render_capped<T>(items: &[T], cap: usize, detail: bool, mut render: impl FnMut(&T)) {
+    let shown = if detail { items.len() } else { cap.min(items.len()) };
+    for item in &items[..shown] {
+        render(item);
+    }
+    if shown < items.len() {
+        out!(
+            "    ... and {} more; rerun with --detail to list them",
+            items.len() - shown
+        );
+    }
+}
+
+fn render_gc_plan(plan: &crate::GcPlan, detail: bool) {
+    out!(
         "GC plan {}: {} rows, {} files, {} represented worktrees, {} build caches, {} orphaned roots, {} reclaimable",
         plan.digest,
         plan.rows.len(),
@@ -2666,36 +2707,36 @@ fn render_gc_plan(plan: &crate::GcPlan) {
         plan.orphans.len(),
         human_bytes(plan.estimated_reclaimable_bytes),
     );
-    println!(
+    out!(
         "  retained: {}; blocked by policy or provenance: {}",
         human_bytes(plan.estimated_retained_bytes),
         human_bytes(plan.estimated_blocked_bytes),
     );
-    for row in &plan.rows {
-        println!(
+    render_capped(&plan.rows, GC_LIST_CAP, detail, |row| {
+        out!(
             "  row: {:?} {} at {} ({} bytes)",
             row.kind, row.id, row.recorded_at, row.estimated_bytes
         );
-    }
-    for file in &plan.files {
-        println!(
+    });
+    render_capped(&plan.files, GC_LIST_CAP, detail, |file| {
+        out!(
             "  file: {:?} {} ({} -> {} bytes; before {})",
             file.action, file.path, file.bytes_before, file.bytes_after, file.before_sha256
         );
-    }
-    for worktree in &plan.worktrees {
-        println!(
+    });
+    render_capped(&plan.worktrees, GC_LIST_CAP, detail, |worktree| {
+        out!(
             "  worktree: session {} {} ({} bytes)",
             worktree.session_id, worktree.worktree_path, worktree.estimated_bytes
         );
-        println!(
+        out!(
             "    ref: {} at {}",
             worktree.branch_ref,
             worktree.branch_tip.as_deref().unwrap_or("missing")
         );
-    }
-    for artifact in &plan.artifacts {
-        println!(
+    });
+    render_capped(&plan.artifacts, GC_LIST_CAP, detail, |artifact| {
+        out!(
             "  build cache: session {} {}/{} ({}, idle {} days)",
             artifact.session_id,
             artifact.worktree_path,
@@ -2703,41 +2744,41 @@ fn render_gc_plan(plan: &crate::GcPlan) {
             human_bytes(artifact.estimated_bytes),
             artifact.idle_days,
         );
-    }
-    for orphan in &plan.orphans {
-        println!(
+    });
+    render_capped(&plan.orphans, GC_LIST_CAP, detail, |orphan| {
+        out!(
             "  orphaned root: {} ({}) — {}",
             orphan.worktree_root,
             human_bytes(orphan.estimated_bytes),
             orphan.reason,
         );
-        println!(
+        out!(
             "    owning repository: {} (missing)",
             orphan.repository_root
         );
-    }
-    for blocker in &plan.blockers {
-        println!(
+    });
+    render_capped(&plan.blockers, GC_LIST_CAP, detail, |blocker| {
+        out!(
             "  protected: {}{} — {}",
             blocker.kind,
             blocker.id.map(|id| format!(" {id}")).unwrap_or_default(),
             blocker.reason
         );
-    }
+    });
     if plan.rows.is_empty()
         && plan.files.is_empty()
         && plan.worktrees.is_empty()
         && plan.artifacts.is_empty()
         && plan.orphans.is_empty()
     {
-        println!("  apply: nothing eligible");
+        out!("  apply: nothing eligible");
     } else {
-        println!("  apply: aethyme broker gc apply --confirm {}", plan.digest);
+        out!("  apply: aethyme broker gc apply --confirm {}", plan.digest);
     }
 }
 
 fn render_gc_apply(report: &crate::GcApplyReport) {
-    println!(
+    out!(
         "GC apply {}: {} rows, {} files, {} worktrees, {} build caches, {} orphaned roots, {} reclaimed",
         if report.complete {
             "complete"
@@ -2752,16 +2793,16 @@ fn render_gc_apply(report: &crate::GcApplyReport) {
         human_bytes(report.reclaimed_bytes),
     );
     for failure in &report.failures {
-        println!("  retained: {failure}");
+        out!("  retained: {failure}");
     }
     if let Some(action) = &report.recovery_action {
-        println!("  recovery: {action}");
+        out!("  recovery: {action}");
     }
 }
 
 fn render_handoff_report(report: &crate::SessionHandoffReport) {
     let handoff = &report.handoff;
-    println!(
+    out!(
         "Session {} handoff: {} (event {} at {})",
         handoff.session_id,
         handoff.status.as_str(),
@@ -2773,9 +2814,9 @@ fn render_handoff_report(report: &crate::SessionHandoffReport) {
             .latest_queue_status
             .map(|status| status.as_str())
             .unwrap_or("unknown");
-        println!("  latest queue: qid {entry_id} ({status})");
+        out!("  latest queue: qid {entry_id} ({status})");
     }
-    println!(
+    out!(
         "  delivery: submitted={}, promoted={}, published={}",
         if handoff.delivery.submitted {
             "yes"
@@ -2793,7 +2834,7 @@ fn render_handoff_report(report: &crate::SessionHandoffReport) {
             "no"
         },
     );
-    println!(
+    out!(
         "  pending work: {} ({} dirty paths, {} unsubmitted commits{})",
         if handoff.pending_work.present {
             "yes"
@@ -2823,7 +2864,7 @@ fn render_handoff_report(report: &crate::SessionHandoffReport) {
         .iter()
         .filter(|lease| lease.state == crate::FinishLeaseState::Expired)
         .count();
-    println!(
+    out!(
         "  leases: {} recorded ({} active, {} released, {} expired)",
         handoff.leases_held.len(),
         active,
@@ -2831,7 +2872,7 @@ fn render_handoff_report(report: &crate::SessionHandoffReport) {
         expired
     );
     match &handoff.last_gate {
-        Some(gate) => println!(
+        Some(gate) => out!(
             "  last gate: {} {} on tree {} at {} ({})",
             gate.gate,
             gate.status.as_str(),
@@ -2842,23 +2883,23 @@ fn render_handoff_report(report: &crate::SessionHandoffReport) {
                 crate::FinishGateCacheSource::CacheHit => "cache hit",
             }
         ),
-        None => println!("  last gate: none recorded"),
+        None => out!("  last gate: none recorded"),
     }
     match &handoff.last_graph_integrity {
-        Some(graph) => println!(
+        Some(graph) => out!(
             "  last graph integrity: {} on tree {} under policy {} at {}",
             graph.status.as_str(),
             short_commit(&graph.tree_hash),
             short_commit(&graph.policy_digest),
             graph.recorded_at,
         ),
-        None => println!("  last graph integrity: none recorded"),
+        None => out!("  last graph integrity: none recorded"),
     }
-    println!(
+    out!(
         "  cleanup safe: {}",
         if handoff.cleanup_safe { "yes" } else { "no" }
     );
-    println!(
+    out!(
         "  next: {}",
         handoff.recommended_next_action.as_deref().unwrap_or("none")
     );
@@ -2893,30 +2934,30 @@ fn resolve_handoff_worktree(path: &std::path::Path) -> Result<PathBuf, UsageErro
 }
 
 fn render_verify_loop_report(report: &crate::VerifyLoopReport) {
-    println!(
+    out!(
         "Broker verify-loop: {}",
         if report.ok { "passed" } else { "failed" }
     );
-    println!(
+    out!(
         "  integration tested: {} @ {}",
         report.integration_branch,
         short_commit(&report.tested_integration_head)
     );
-    println!(
+    out!(
         "  integration current: {} @ {}",
         report.integration_branch,
         short_commit(&report.current_integration_head)
     );
     if report.integration_moved {
-        println!(
+        out!(
             "  warning: integration moved during verification; tested old tip {}, current tip {}; rerun needed",
             short_commit(&report.tested_integration_head),
             short_commit(&report.current_integration_head)
         );
     }
-    println!("Steps:");
+    out!("Steps:");
     for step in &report.steps {
-        println!(
+        out!(
             "  {:<22} {:<5} {} ({}ms)",
             step.name,
             step.status.as_str(),
@@ -2927,17 +2968,17 @@ fn render_verify_loop_report(report: &crate::VerifyLoopReport) {
     if let Some(quick) = &report.quick_test
         && let Some(head) = &quick.integration_head
     {
-        println!("  quick-test temp integration: {}", short_commit(head));
+        out!("  quick-test temp integration: {}", short_commit(head));
     }
     if let Some(doctor) = &report.doctor {
-        println!(
+        out!(
             "  doctor version: {} — {}",
             doctor.version.status.as_str(),
             doctor.version.message
         );
     }
     if report.source_tests.attempted {
-        println!(
+        out!(
             "  source test command: {}",
             report.source_tests.command.join(" ")
         );
@@ -2949,77 +2990,77 @@ fn render_verify_loop_report(report: &crate::VerifyLoopReport) {
                 .chain(report.source_tests.stdout_tail.iter())
                 .take(8)
             {
-                println!("    {line}");
+                out!("    {line}");
             }
         }
     }
     if report.ok {
-        println!("Next: none");
+        out!("Next: none");
     } else if report.integration_moved {
-        println!("Next: rerun `aethyme broker verify-loop` on the current integration tip.");
+        out!("Next: rerun `aethyme broker verify-loop` on the current integration tip.");
     } else {
-        println!("Next: fix the failed step above, then rerun `aethyme broker verify-loop`.");
+        out!("Next: fix the failed step above, then rerun `aethyme broker verify-loop`.");
     }
 }
 
 fn render_semantic_gate_advice(report: &crate::SemanticGateAdvice) {
-    println!("Semantic gate selection: advisory only");
-    println!("  session: {}", report.session_id);
-    println!("  enforced by this command: no");
+    out!("Semantic gate selection: advisory only");
+    out!("  session: {}", report.session_id);
+    out!("  enforced by this command: no");
     if report.changed_files.is_empty() {
-        println!("  changed files: none");
+        out!("  changed files: none");
     } else {
-        println!("  changed files: {}", capped_join(&report.changed_files, 8));
+        out!("  changed files: {}", capped_join(&report.changed_files, 8));
     }
-    println!(
+    out!(
         "  semantic source: {} ({})",
         report.semantic.provider,
         report.semantic.status.as_str()
     );
-    println!("    {}", report.semantic.reason);
+    out!("    {}", report.semantic.reason);
     if !report.semantic.impacted_paths.is_empty() {
-        println!(
+        out!(
             "  semantic impact paths: {}",
             capped_join(&report.semantic.impacted_paths, 8)
         );
     }
     if report.semantic.truncated {
-        println!(
+        out!(
             "  semantic impact result: truncated at {} paths",
             report.semantic.result_limit
         );
     }
 
     if report.path_selected_gates.is_empty() {
-        println!("  path-selected gates: none");
+        out!("  path-selected gates: none");
     } else {
-        println!("  path-selected gates:");
+        out!("  path-selected gates:");
         for gate in &report.path_selected_gates {
             match &gate.triggered_by {
-                Some(path) => println!("    - {} (triggered by {})", gate.gate, path),
-                None => println!("    - {} (always runs)", gate.gate),
+                Some(path) => out!("    - {} (triggered by {})", gate.gate, path),
+                None => out!("    - {} (always runs)", gate.gate),
             }
         }
     }
 
     if report.semantic_suggested_gates.is_empty() {
-        println!("  semantic suggestions: none");
+        out!("  semantic suggestions: none");
     } else {
-        println!("  semantic suggestions:");
+        out!("  semantic suggestions:");
         for gate in &report.semantic_suggested_gates {
             match &gate.chain {
-                Some(chain) => println!(
+                Some(chain) => out!(
                     "    - {} ({} -> {} -> {})",
                     gate.gate, chain.changed_file, chain.caller_file, chain.suggested_gate
                 ),
                 None => match &gate.triggered_by {
-                    Some(path) => println!("    - {} (via {})", gate.gate, path),
-                    None => println!("    - {} ({})", gate.gate, gate.reason),
+                    Some(path) => out!("    - {} (via {})", gate.gate, path),
+                    None => out!("    - {} ({})", gate.gate, gate.reason),
                 },
             }
         }
     }
-    println!("  next: {}", report.next_action);
+    out!("  next: {}", report.next_action);
 }
 
 fn short_commit(commit: &str) -> &str {
@@ -3062,11 +3103,11 @@ fn render_integration_status(
     json: bool,
 ) -> Result<(), UsageError> {
     if json {
-        println!("{}", serde_json::to_string_pretty(report)?);
+        out!("{}", serde_json::to_string_pretty(report)?);
         return Ok(());
     }
 
-    println!(
+    out!(
         "Integration: {} @ {}",
         report.branch,
         short_commit(&report.head)
@@ -3082,7 +3123,7 @@ fn render_integration_status(
     } else {
         "diverged from integration".into()
     };
-    println!(
+    out!(
         "Main:        {} ({main_relation})",
         short_commit(&report.main_head)
     );
@@ -3092,18 +3133,18 @@ fn render_integration_status(
             report.main_ahead_upstream_commits,
             report.main_behind_upstream_commits,
         );
-        println!(
+        out!(
             "Upstream:    {} @ {} ({relation})",
             upstream_ref,
             short_commit(upstream_head)
         );
     }
-    println!();
+    out!();
 
     if report.promoted_entries.is_empty() && report.changed_files.is_empty() {
-        println!("Pending layer: none");
+        out!("Pending layer: none");
     } else {
-        println!(
+        out!(
             "Pending layer: {} promoted {}, {} {} changed, {} {} ahead of main",
             report.promoted_entries.len(),
             plural(report.promoted_entries.len(), "entry", "entries"),
@@ -3115,16 +3156,16 @@ fn render_integration_status(
     }
 
     if report.promoted_entries.is_empty() {
-        println!("Promoted entries: none");
+        out!("Promoted entries: none");
     } else {
-        println!("Promoted entries:");
+        out!("Promoted entries:");
         for entry in report.promoted_entries.iter().take(10) {
             let label = entry
                 .task
                 .as_deref()
                 .or(entry.branch.as_deref())
                 .unwrap_or("-");
-            println!(
+            out!(
                 "  q{} session {} {} -> {}  {}",
                 entry.queue_entry_id,
                 entry.session_id,
@@ -3133,11 +3174,11 @@ fn render_integration_status(
                 label
             );
             if !entry.files.is_empty() {
-                println!("    files: {}", capped_join(&entry.files, 5));
+                out!("    files: {}", capped_join(&entry.files, 5));
             }
         }
         if report.promoted_entries.len() > 10 {
-            println!(
+            out!(
                 "  and {} more promoted {}",
                 report.promoted_entries.len() - 10,
                 plural(report.promoted_entries.len() - 10, "entry", "entries")
@@ -3146,14 +3187,14 @@ fn render_integration_status(
     }
 
     if report.changed_files.is_empty() {
-        println!("Changed files: none");
+        out!("Changed files: none");
     } else {
-        println!("Changed files:");
+        out!("Changed files:");
         for path in report.changed_files.iter().take(12) {
-            println!("  - {path}");
+            out!("  - {path}");
         }
         if report.changed_files.len() > 12 {
-            println!(
+            out!(
                 "  and {} more {}",
                 report.changed_files.len() - 12,
                 plural(report.changed_files.len() - 12, "file", "files")
@@ -3162,17 +3203,17 @@ fn render_integration_status(
     }
 
     if report.conflicts.is_empty() {
-        println!("Conflicts with pending layer: none");
+        out!("Conflicts with pending layer: none");
     } else {
-        println!("Conflicts with pending layer:");
+        out!("Conflicts with pending layer:");
         for conflict in report.conflicts.iter().take(12) {
-            println!(
+            out!(
                 "  session {}: {} (session {}, integration {})",
                 conflict.session_id, conflict.path, conflict.session_path, conflict.promoted_path
             );
         }
         if report.conflicts.len() > 12 {
-            println!(
+            out!(
                 "  and {} more {}",
                 report.conflicts.len() - 12,
                 plural(report.conflicts.len() - 12, "conflict", "conflicts")
@@ -3181,49 +3222,61 @@ fn render_integration_status(
     }
 
     if let Some(reconciliation) = &report.reconciliation {
-        println!(
+        out!(
             "Reconciliation evidence: {} landed, {} ambiguous, {} unresolved, {} unrecorded",
             reconciliation.landed_entry_count,
             reconciliation.ambiguous_entry_count,
             reconciliation.unresolved_entry_count,
             reconciliation.unrecorded_commits.len()
         );
-        println!("  {}", reconciliation.explanation);
+        out!("  {}", reconciliation.explanation);
     }
 
-    println!("Delivery state: {}", report.next_action.state.as_str());
-    println!("Next action: {}", report.next_action.summary);
+    out!("Delivery state: {}", report.next_action.state.as_str());
+    out!("Next action: {}", report.next_action.summary);
     for command in &report.next_action.commands {
-        println!("  run: {command}");
+        out!("  run: {command}");
     }
     Ok(())
 }
 
-fn render_ship_plan(report: &crate::ShipPlan, json: bool) -> Result<(), UsageError> {
+fn render_ship_plan(report: &crate::ShipPlan, json: bool, detail: bool) -> Result<(), UsageError> {
     if json {
-        println!("{}", serde_json::to_string_pretty(report)?);
+        out!("{}", serde_json::to_string_pretty(report)?);
         return Ok(());
     }
-    println!(
+    out!(
         "Ship plan q{} (session {})",
         report.queue_entry.id, report.originating_session.id
     );
-    println!(
+    out!(
         "Integration: {} @ {}",
         report.integration_ref, report.integration_sha
     );
-    println!("Publication prefix: {}", report.publication_sha);
-    println!(
-        "Included entries: {}",
-        report
-            .included_entries
-            .iter()
-            .map(|entry| format!("q{}@{}", entry.queue_entry_id, entry.promotion_sha))
-            .collect::<Vec<_>>()
-            .join(", ")
+    out!("Publication prefix: {}", report.publication_sha);
+    // One line per promoted entry ever included is unbounded and grows with
+    // the repository's history; the count plus the boundary entries is what a
+    // reviewer checks.
+    let included = report
+        .included_entries
+        .iter()
+        .map(|entry| format!("q{}@{}", entry.queue_entry_id, entry.promotion_sha))
+        .collect::<Vec<_>>();
+    out!(
+        "Included entries: {} ({})",
+        included.len(),
+        if detail || included.len() <= SHIP_ENTRY_CAP {
+            included.join(", ")
+        } else {
+            format!(
+                "{}, ... , {} — rerun with --detail for all",
+                included[..2].join(", "),
+                included[included.len() - 1]
+            )
+        }
     );
     if !report.excluded_entries.is_empty() {
-        println!(
+        out!(
             "Excluded later entries: {}",
             report
                 .excluded_entries
@@ -3233,23 +3286,23 @@ fn render_ship_plan(report: &crate::ShipPlan, json: bool) -> Result<(), UsageErr
                 .join(", ")
         );
     }
-    println!(
+    out!(
         "Local default:  {} @ {}",
         report.local_default_branch_ref, report.local_default_branch_sha
     );
-    println!(
+    out!(
         "Remote default: {}/{} @ {}",
         report.target.remote_name,
         report.remote_default_branch_ref,
         report.remote_default_branch_sha
     );
-    println!(
+    out!(
         "Target: {} ({})",
         report.target.display_slug, report.target.normalized_host
     );
-    println!("Freshness: {:?}", report.freshness.result);
-    println!("Proposed push: {}", report.proposed_push.command.join(" "));
-    println!(
+    out!("Freshness: {:?}", report.freshness.result);
+    out!("Proposed push: {}", report.proposed_push.command.join(" "));
+    out!(
         "Publication policy: {:?} (evidence {})",
         report.publication_policy.policy.mode,
         if report.publication_policy.satisfied {
@@ -3259,7 +3312,7 @@ fn render_ship_plan(report: &crate::ShipPlan, json: bool) -> Result<(), UsageErr
         }
     );
     for evidence in &report.publication_policy.evidence {
-        println!(
+        out!(
             "  q{} session {}: {} ({})",
             evidence.queue_entry_id,
             evidence.session_id,
@@ -3272,9 +3325,9 @@ fn render_ship_plan(report: &crate::ShipPlan, json: bool) -> Result<(), UsageErr
         );
     }
     if let Some(remediation) = &report.publication_policy.remediation {
-        println!("Publication remediation: {remediation}");
+        out!("Publication remediation: {remediation}");
     }
-    println!(
+    out!(
         "Local-main synchronization safe now: {}",
         if report.local_main_sync_safe {
             "yes"
@@ -3284,23 +3337,23 @@ fn render_ship_plan(report: &crate::ShipPlan, json: bool) -> Result<(), UsageErr
     );
     let assessment = &report.local_main_sync_assessment;
     if !assessment.tracked_dirty_paths.is_empty() {
-        println!(
+        out!(
             "Blocking tracked paths: {}",
             assessment.tracked_dirty_paths.join(", ")
         );
     }
     if !assessment.conflicting_untracked_paths.is_empty() {
-        println!(
+        out!(
             "Blocking untracked collisions: {}",
             assessment.conflicting_untracked_paths.join(", ")
         );
     } else if !assessment.untracked_paths.is_empty() {
-        println!(
+        out!(
             "Unrelated untracked paths preserved: {}",
             assessment.untracked_paths.join(", ")
         );
     }
-    println!(
+    out!(
         "Confirm with: aethyme broker ship execute --entry {} --confirm {}",
         report.queue_entry.id, report.publication_sha
     );
@@ -3312,33 +3365,33 @@ fn render_ship_execution(
     json: bool,
 ) -> Result<(), UsageError> {
     if json {
-        println!("{}", serde_json::to_string_pretty(report)?);
+        out!("{}", serde_json::to_string_pretty(report)?);
         return Ok(());
     }
-    println!(
+    out!(
         "Published {} to {}/{}.",
         report.published_sha, report.plan.target.remote_name, report.plan.remote_default_branch_ref
     );
-    println!("Verified remote SHA: {}", report.verified_remote_sha);
-    println!(
+    out!("Verified remote SHA: {}", report.verified_remote_sha);
+    out!(
         "Publication authorization: {:?}",
         report.publication_authorization.kind
     );
     if let Some(digest) = &report.publication_authorization.reason_digest {
-        println!("Break-glass reason SHA-256: {digest}");
+        out!("Break-glass reason SHA-256: {digest}");
     }
-    println!(
+    out!(
         "Operations: fetch {}, push {}, verify {}",
         report.fetch_operation.id, report.push_operation.id, report.verify_operation.id
     );
     if report.local_main_sync.synchronized {
-        println!(
+        out!(
             "Local main synchronized: {} -> {}",
             report.local_main_sync.before_sha, report.local_main_sync.after_sha
         );
     } else if let Some(command) = &report.local_main_sync.follow_up_command {
-        println!("Local main unchanged. To synchronize it explicitly:");
-        println!("  {command}");
+        out!("Local main unchanged. To synchronize it explicitly:");
+        out!("  {command}");
     }
     Ok(())
 }
@@ -3348,31 +3401,31 @@ fn render_integration_stability(
     json: bool,
 ) -> Result<(), UsageError> {
     if json {
-        println!("{}", serde_json::to_string_pretty(report)?);
+        out!("{}", serde_json::to_string_pretty(report)?);
         return Ok(());
     }
 
-    println!(
+    out!(
         "Integration: {} {} -> {}",
         report.branch,
         short_commit(&report.start_head),
         short_commit(&report.end_head)
     );
-    println!(
+    out!(
         "Window:      {}s (observed {}ms)",
         report.requested_seconds, report.observed_ms
     );
-    println!(
+    out!(
         "Result:      {}",
         if report.stable { "stable" } else { "moved" }
     );
-    println!("{}", report.message);
+    out!("{}", report.message);
     if report.live_sessions.is_empty() {
-        println!("Live sessions: none");
+        out!("Live sessions: none");
     } else {
-        println!("Live sessions:");
+        out!("Live sessions:");
         for session in report.live_sessions.iter().take(10) {
-            println!(
+            out!(
                 "  session {} {} {} {}",
                 session.id,
                 session.status.as_str(),
@@ -3381,7 +3434,7 @@ fn render_integration_stability(
             );
         }
         if report.live_sessions.len() > 10 {
-            println!(
+            out!(
                 "  and {} more {}",
                 report.live_sessions.len() - 10,
                 plural(report.live_sessions.len() - 10, "session", "sessions")
@@ -3389,7 +3442,7 @@ fn render_integration_stability(
         }
     }
     for command in &report.commands {
-        println!("run: {command}");
+        out!("run: {command}");
     }
     Ok(())
 }
@@ -3399,28 +3452,28 @@ fn render_integration_reconcile(
     json: bool,
 ) -> Result<(), UsageError> {
     if json {
-        println!("{}", serde_json::to_string_pretty(report)?);
+        out!("{}", serde_json::to_string_pretty(report)?);
         return Ok(());
     }
 
-    println!("Local main:  {}", short_commit(&report.local_main));
-    println!(
+    out!("Local main:  {}", short_commit(&report.local_main));
+    out!(
         "Upstream:    {} @ {}",
         report.upstream_ref,
         short_commit(&report.upstream_head)
     );
-    println!(
+    out!(
         "Integration: {} -> {}",
         short_commit(&report.old_integration),
         short_commit(&report.new_integration)
     );
     if let Some(path) = &report.resolution_file {
-        println!("Resolution:  {path}");
+        out!("Resolution:  {path}");
     }
     if let Some(digest) = &report.plan_digest {
-        println!("Plan digest: {digest}");
+        out!("Plan digest: {digest}");
     }
-    println!(
+    out!(
         "Result:      {}",
         if report.applied {
             "applied"
@@ -3431,7 +3484,7 @@ fn render_integration_reconcile(
         }
     );
     for entry in &report.entries {
-        println!(
+        out!(
             "  q{} session {}: {} — {}",
             entry.queue_entry_id,
             entry.session_id,
@@ -3439,11 +3492,11 @@ fn render_integration_reconcile(
             entry.evidence
         );
         if !entry.conflicts.is_empty() {
-            println!("    conflicts: {}", capped_join(&entry.conflicts, 5));
+            out!("    conflicts: {}", capped_join(&entry.conflicts, 5));
         }
     }
     if let Some(template) = &report.resolution_template {
-        println!(
+        out!(
             "Resolution template: {} recorded, {} unrecorded ({})",
             template.document.resolutions.len(),
             template.document.unrecorded_resolutions.len(),
@@ -3453,7 +3506,7 @@ fn render_integration_reconcile(
                 "operator input required"
             }
         );
-        println!(
+        out!(
             "  recorded classification: {}",
             template
                 .field_contract
@@ -3461,18 +3514,18 @@ fn render_integration_reconcile(
                 .join(", ")
         );
         for rule in &template.field_contract.unrecorded_dispositions {
-            println!(
+            out!(
                 "  {}: upstream_commit {}; {}",
                 rule.value, rule.upstream_commit, rule.condition
             );
         }
-        println!("  operator: {}", template.field_contract.operator);
-        println!("  reason: {}", template.field_contract.reason);
+        out!("  operator: {}", template.field_contract.operator);
+        out!("  reason: {}", template.field_contract.reason);
     }
     for warning in &report.warnings {
-        println!("Warning: {warning}");
+        out!("Warning: {warning}");
     }
-    println!("Next action: {}", report.next_action);
+    out!("Next action: {}", report.next_action);
     Ok(())
 }
 
@@ -3597,40 +3650,40 @@ fn advisory_text(value: &str) -> String {
 }
 
 fn render_advisory(advisory: &crate::Advisory) {
-    println!(
+    out!(
         "Advisory {}: {} [{} / {}]",
         advisory.id,
         advisory_text(&advisory.identity),
         advisory.severity.as_str(),
         advisory.resolution_state.as_str(),
     );
-    println!(
+    out!(
         "Session: {}",
         advisory
             .session_id
             .map(|id| id.to_string())
             .unwrap_or_else(|| "none".into())
     );
-    println!(
+    out!(
         "Queue entry: {}",
         advisory
             .queue_entry_id
             .map(|id| id.to_string())
             .unwrap_or_else(|| "none".into())
     );
-    println!(
+    out!(
         "Integration SHA: {}",
         advisory.integration_sha.as_deref().unwrap_or("none")
     );
-    println!("Created: {}", advisory.created_at);
-    println!(
+    out!("Created: {}", advisory.created_at);
+    out!(
         "Acknowledged: {}",
         advisory
             .acknowledged_at
             .map(|time| time.to_string())
             .unwrap_or_else(|| "no".into())
     );
-    println!(
+    out!(
         "Resolved: {}",
         advisory
             .resolved_at
@@ -3638,18 +3691,18 @@ fn render_advisory(advisory: &crate::Advisory) {
             .unwrap_or_else(|| "no".into())
     );
     if let Some(evidence) = advisory.resolution_evidence.as_deref() {
-        println!("Resolution evidence: {}", advisory_text(evidence));
+        out!("Resolution evidence: {}", advisory_text(evidence));
     }
     if !advisory.paths.is_empty() {
-        println!("Paths:");
+        out!("Paths:");
         for path in &advisory.paths {
-            println!("  - {}", advisory_text(path));
+            out!("  - {}", advisory_text(path));
         }
     }
     if !advisory.evidence.is_empty() {
-        println!("Evidence:");
+        out!("Evidence:");
         for evidence in &advisory.evidence {
-            println!(
+            out!(
                 "  - {}: {}",
                 advisory_text(&evidence.kind),
                 advisory_text(&evidence.summary)
@@ -3657,7 +3710,7 @@ fn render_advisory(advisory: &crate::Advisory) {
         }
     }
     if advisory.resolution_state == crate::AdvisoryResolutionState::Outstanding {
-        println!("Acknowledge: aethyme broker advisories ack {}", advisory.id);
+        out!("Acknowledge: aethyme broker advisories ack {}", advisory.id);
     }
 }
 
@@ -3722,9 +3775,9 @@ fn run_pull_request_watch(parsed: Parsed) -> Result<(), UsageError> {
         "list" => {
             let watches = broker.pull_request_watches(parsed.all)?;
             if parsed.json {
-                println!("{}", serde_json::to_string_pretty(&watches)?);
+                out!("{}", serde_json::to_string_pretty(&watches)?);
             } else if watches.is_empty() {
-                println!("No pull request watches.");
+                out!("No pull request watches.");
             } else {
                 for watch in watches {
                     render_pull_request_watch(&watch, false)?;
@@ -3747,9 +3800,9 @@ fn run_pull_request_watch(parsed: Parsed) -> Result<(), UsageError> {
                 now_ms(),
             )?;
             if parsed.json {
-                println!("{}", serde_json::to_string_pretty(&report)?);
+                out!("{}", serde_json::to_string_pretty(&report)?);
             } else {
-                println!(
+                out!(
                     "Watch {} polled {}#{} at {}: {} metadata item(s), {}.",
                     report.watch.id,
                     report.watch.display_repository,
@@ -3779,9 +3832,9 @@ fn run_pull_request_watch(parsed: Parsed) -> Result<(), UsageError> {
                 limit,
             )?;
             if parsed.json {
-                println!("{}", serde_json::to_string_pretty(&report)?);
+                out!("{}", serde_json::to_string_pretty(&report)?);
             } else {
-                println!(
+                out!(
                     "PR scheduler tick: {} due, {} polled, {} failed, {} deferred.",
                     report.due_watch_count,
                     report.successful_watch_count,
@@ -3789,11 +3842,11 @@ fn run_pull_request_watch(parsed: Parsed) -> Result<(), UsageError> {
                     report.deferred_watch_count,
                 );
                 if let Some(retry_at) = report.rate_limit_until {
-                    println!("Provider rate limit: retry no earlier than {retry_at}.");
+                    out!("Provider rate limit: retry no earlier than {retry_at}.");
                 }
                 match report.next_tick_at {
-                    Some(next) => println!("Next due tick: {next}."),
-                    None => println!("Next due tick: none."),
+                    Some(next) => out!("Next due tick: {next}."),
+                    None => out!("Next due tick: none."),
                 }
             }
         }
@@ -3803,12 +3856,12 @@ fn run_pull_request_watch(parsed: Parsed) -> Result<(), UsageError> {
             })?;
             let batches = broker.pull_request_activity_batches(watch_id, parsed.all)?;
             if parsed.json {
-                println!("{}", serde_json::to_string_pretty(&batches)?);
+                out!("{}", serde_json::to_string_pretty(&batches)?);
             } else if batches.is_empty() {
-                println!("No pull request activity batches.");
+                out!("No pull request activity batches.");
             } else {
                 for batch in batches {
-                    println!(
+                    out!(
                         "Batch {}: watch {}, {} metadata item(s), {} at {}",
                         batch.id,
                         batch.watch_id,
@@ -3847,9 +3900,9 @@ fn run_pull_request_watch(parsed: Parsed) -> Result<(), UsageError> {
                 now_ms(),
             )?;
             if parsed.json {
-                println!("{}", serde_json::to_string_pretty(&batch)?);
+                out!("{}", serde_json::to_string_pretty(&batch)?);
             } else {
-                println!("Batch {} acknowledged as {}.", batch.id, outcome.as_str());
+                out!("Batch {} acknowledged as {}.", batch.id, outcome.as_str());
             }
         }
         "pause" | "resume" | "stop" => {
@@ -3903,9 +3956,9 @@ fn run_deliveries(parsed: Parsed) -> Result<(), UsageError> {
                 now_ms(),
             )?;
             if parsed.json {
-                println!("{}", serde_json::to_string_pretty(&subscription)?);
+                out!("{}", serde_json::to_string_pretty(&subscription)?);
             } else {
-                println!(
+                out!(
                     "Delivery subscription {}: watch {}, adapter {}, target {}, policy {}.",
                     subscription.id,
                     subscription.watch_id,
@@ -3918,12 +3971,12 @@ fn run_deliveries(parsed: Parsed) -> Result<(), UsageError> {
         "list" => {
             let items = broker.delivery_outbox(parsed.adapter.as_deref(), parsed.all)?;
             if parsed.json {
-                println!("{}", serde_json::to_string_pretty(&items)?);
+                out!("{}", serde_json::to_string_pretty(&items)?);
             } else if items.is_empty() {
-                println!("No delivery outbox items.");
+                out!("No delivery outbox items.");
             } else {
                 for item in items {
-                    println!(
+                    out!(
                         "Delivery {}: batch {}, subscription {}, {}, generation {}, attempts {}",
                         item.id,
                         item.batch_id,
@@ -3951,14 +4004,14 @@ fn run_deliveries(parsed: Parsed) -> Result<(), UsageError> {
                 now_ms(),
             )?;
             if parsed.json {
-                println!("{}", serde_json::to_string_pretty(&report)?);
+                out!("{}", serde_json::to_string_pretty(&report)?);
             } else if let Some(delivery) = report.delivery {
-                println!(
+                out!(
                     "Claimed delivery {} generation {} for {}. Use --json to read its structured envelope and prompt.",
                     delivery.item.id, delivery.item.generation, delivery.subscription.target,
                 );
             } else {
-                println!("No pending delivery for adapter {adapter}.");
+                out!("No pending delivery for adapter {adapter}.");
             }
         }
         "complete" => {
@@ -3990,9 +4043,9 @@ fn run_deliveries(parsed: Parsed) -> Result<(), UsageError> {
                 now_ms(),
             )?;
             if parsed.json {
-                println!("{}", serde_json::to_string_pretty(&item)?);
+                out!("{}", serde_json::to_string_pretty(&item)?);
             } else {
-                println!("Delivery {} is {}.", item.id, item.status.as_str());
+                out!("Delivery {} is {}.", item.id, item.status.as_str());
             }
         }
         other => {
@@ -4052,9 +4105,9 @@ fn render_pull_request_watch(
     json: bool,
 ) -> Result<(), UsageError> {
     if json {
-        println!("{}", serde_json::to_string_pretty(watch)?);
+        out!("{}", serde_json::to_string_pretty(watch)?);
     } else {
-        println!(
+        out!(
             "Watch {}: {}#{} {} at {} (session {}, every {}s)",
             watch.id,
             watch.display_repository,
@@ -4070,21 +4123,21 @@ fn render_pull_request_watch(
 
 fn render_operation_show(report: &crate::OperationShowReport) {
     let operation = &report.operation;
-    println!("Operation:      {}", operation.id);
-    println!("Session:        {}", operation.session_id);
-    println!("Provider:       {}", operation.provider.as_str());
-    println!("Repository:     {}", operation.repository);
-    println!("Scope:          {}", operation.scope);
-    println!("Effect:         {}", operation.effect.as_str());
-    println!("Status:         {}", operation.status.as_str());
-    println!("Identity:       {}", operation.identity_provenance.as_str());
-    println!("Command:        {}", operation.command_json);
-    println!(
+    out!("Operation:      {}", operation.id);
+    out!("Session:        {}", operation.session_id);
+    out!("Provider:       {}", operation.provider.as_str());
+    out!("Repository:     {}", operation.repository);
+    out!("Scope:          {}", operation.scope);
+    out!("Effect:         {}", operation.effect.as_str());
+    out!("Status:         {}", operation.status.as_str());
+    out!("Identity:       {}", operation.identity_provenance.as_str());
+    out!("Command:        {}", operation.command_json);
+    out!(
         "Host operation: {}",
         operation.host_operation_id.as_deref().unwrap_or("none")
     );
-    println!("Reconciliation: {}", report.reconciliation.state.as_str());
-    println!(
+    out!("Reconciliation: {}", report.reconciliation.state.as_str());
+    out!(
         "Write blocked:  {}",
         if report.reconciliation.write_blocked {
             "yes"
@@ -4092,18 +4145,18 @@ fn render_operation_show(report: &crate::OperationShowReport) {
             "no"
         }
     );
-    println!("Automatic retry: forbidden");
+    out!("Automatic retry: forbidden");
     if let Some(evidence) = &report.reconciliation.evidence {
-        println!("Evidence:       {evidence}");
+        out!("Evidence:       {evidence}");
     }
     if let Some(reason) = &report.reconciliation.operator_reason {
-        println!("Operator reason: {reason}");
+        out!("Operator reason: {reason}");
     }
     if let Some(recovery) = &report.reconciliation.recovery {
-        println!("Inspect:        {}", recovery.inspection);
-        println!("If succeeded:   {}", recovery.succeeded_command);
-        println!("If failed:      {}", recovery.failed_command);
-        println!("Blind retry is forbidden until reconciliation is recorded.");
+        out!("Inspect:        {}", recovery.inspection);
+        out!("If succeeded:   {}", recovery.succeeded_command);
+        out!("If failed:      {}", recovery.failed_command);
+        out!("Blind retry is forbidden until reconciliation is recorded.");
     }
 }
 
@@ -4112,12 +4165,12 @@ fn render_coordinated_operation(
     json: bool,
 ) -> Result<(), UsageError> {
     if json {
-        println!("{}", serde_json::to_string_pretty(report)?);
+        out!("{}", serde_json::to_string_pretty(report)?);
     } else {
         if !report.stdout.is_empty() {
             print!("{}", report.stdout);
             if !report.stdout.ends_with('\n') {
-                println!();
+                out!();
             }
         }
         if !report.stderr.is_empty() {
@@ -4126,7 +4179,7 @@ fn render_coordinated_operation(
                 eprintln!();
             }
         }
-        println!(
+        out!(
             "operation {}: {} {} on {} ({})",
             report.operation.id,
             report.operation.provider.as_str(),
@@ -4135,16 +4188,16 @@ fn render_coordinated_operation(
             report.classification,
         );
         if let Some(cleanup) = &report.post_merge_cleanup {
-            println!(
+            out!(
                 "post-merge integration cleanup: {} — {}",
                 cleanup.state.as_str(),
                 cleanup.explanation
             );
             if let Some(operation_id) = cleanup.fetch_operation_id {
-                println!("  upstream refresh operation: {operation_id}");
+                out!("  upstream refresh operation: {operation_id}");
             }
             if let Some(command) = &cleanup.next_action {
-                println!("  next: {command}");
+                out!("  next: {command}");
             }
         }
     }
@@ -4268,9 +4321,9 @@ fn run_review(parsed: Parsed) -> Result<(), UsageError> {
             let mut broker = open_broker(parsed.read_only_snapshot)?;
             let report = broker.abandon_review_lifecycle(session_id, reason, now_ms())?;
             if parsed.json {
-                println!("{}", serde_json::to_string_pretty(&report)?);
+                out!("{}", serde_json::to_string_pretty(&report)?);
             } else {
-                println!(
+                out!(
                     "Review lifecycle {} abandoned; {}",
                     report.lifecycle.id, report.next_action
                 );
@@ -4290,15 +4343,15 @@ fn render_review_report(
     json: bool,
 ) -> Result<(), UsageError> {
     if json {
-        println!("{}", serde_json::to_string_pretty(report)?);
+        out!("{}", serde_json::to_string_pretty(report)?);
     } else {
-        println!(
+        out!(
             "Review lifecycle {}: {}{}",
             report.lifecycle.id,
             report.lifecycle.state.as_str(),
             if report.changed { " (advanced)" } else { "" }
         );
-        println!(
+        out!(
             "  session/queue: {} / {}",
             report.lifecycle.session_id,
             report
@@ -4307,15 +4360,15 @@ fn render_review_report(
                 .map(|id| id.to_string())
                 .unwrap_or_else(|| "not yet verified".into())
         );
-        println!(
+        out!(
             "  repository/PR: {} / #{}",
             report.lifecycle.repository, report.lifecycle.pr_number
         );
-        println!("  commit: {}", report.lifecycle.commit_sha);
+        out!("  commit: {}", report.lifecycle.commit_sha);
         if let Some(operation_id) = report.operation_id {
-            println!("  coordinated operation: {operation_id}");
+            out!("  coordinated operation: {operation_id}");
         }
-        println!("  next: {}", report.next_action);
+        out!("  next: {}", report.next_action);
     }
     Ok(())
 }
@@ -4391,9 +4444,9 @@ fn run_external_events(parsed: Parsed) -> Result<(), UsageError> {
             let mut broker = open_broker(parsed.read_only_snapshot)?;
             let report = broker.ingest_external_event(envelope, now_ms())?;
             if parsed.json {
-                println!("{}", serde_json::to_string_pretty(&report)?);
+                out!("{}", serde_json::to_string_pretty(&report)?);
             } else {
-                println!(
+                out!(
                     "External event {}: {}{}",
                     report.event.id,
                     report.event.status.as_str(),
@@ -4404,12 +4457,12 @@ fn run_external_events(parsed: Parsed) -> Result<(), UsageError> {
                     }
                 );
                 if let Some(session_id) = report.event.session_id {
-                    println!("  owner session: {session_id}");
+                    out!("  owner session: {session_id}");
                 }
                 if let Some(remediation) = report.remediation {
-                    println!("  reconcile: {remediation}");
+                    out!("  reconcile: {remediation}");
                 }
-                println!("  policy effect: advisory only; no gate or submit state changed");
+                out!("  policy effect: advisory only; no gate or submit state changed");
             }
         }
         "list" => {
@@ -4421,7 +4474,7 @@ fn run_external_events(parsed: Parsed) -> Result<(), UsageError> {
             let mut broker = open_broker(true)?;
             let events = broker.store().external_events(parsed.all)?;
             if parsed.json {
-                println!(
+                out!(
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
                         "schema_version": crate::EXTERNAL_EVENT_SCHEMA_VERSION,
@@ -4431,11 +4484,11 @@ fn run_external_events(parsed: Parsed) -> Result<(), UsageError> {
                     }))?
                 );
             } else if events.is_empty() {
-                println!("No matching external coordination events.");
+                out!("No matching external coordination events.");
             } else {
-                println!("{:<5} {:<24} {:<22} OWNER", "ID", "TYPE", "STATUS");
+                out!("{:<5} {:<24} {:<22} OWNER", "ID", "TYPE", "STATUS");
                 for event in events {
-                    println!(
+                    out!(
                         "{:<5} {:<24} {:<22} {}",
                         event.id,
                         event.event_type,
@@ -4456,24 +4509,24 @@ fn run_external_events(parsed: Parsed) -> Result<(), UsageError> {
                 .external_event(id)?
                 .ok_or(crate::BrokerError::ExternalEventNotFound(id))?;
             if parsed.json {
-                println!("{}", serde_json::to_string_pretty(&event)?);
+                out!("{}", serde_json::to_string_pretty(&event)?);
             } else {
-                println!("External event {}:", event.id);
-                println!(
+                out!("External event {}:", event.id);
+                out!(
                     "  type/status: {} / {}",
                     event.event_type,
                     event.status.as_str()
                 );
-                println!("  repository: {}", event.repository);
-                println!("  PR/commit: #{} / {}", event.pr_number, event.commit_sha);
-                println!(
+                out!("  repository: {}", event.repository);
+                out!("  PR/commit: #{} / {}", event.pr_number, event.commit_sha);
+                out!(
                     "  owner: {}",
                     event
                         .session_id
                         .map(|session| format!("session {session}"))
                         .unwrap_or_else(|| "unresolved".into())
                 );
-                println!("  policy effect: advisory only");
+                out!("  policy effect: advisory only");
             }
         }
         "reconcile" => {
@@ -4515,14 +4568,14 @@ fn run_external_events(parsed: Parsed) -> Result<(), UsageError> {
             let mut broker = open_broker(parsed.read_only_snapshot)?;
             let report = broker.reconcile_external_event(id, resolution, reason, now_ms())?;
             if parsed.json {
-                println!("{}", serde_json::to_string_pretty(&report)?);
+                out!("{}", serde_json::to_string_pretty(&report)?);
             } else {
-                println!(
+                out!(
                     "External event {} reconciled as {} (reason stored as SHA-256 only).",
                     report.event.id,
                     report.event.status.as_str()
                 );
-                println!("Policy effect: advisory only; no gate or submit state changed.");
+                out!("Policy effect: advisory only; no gate or submit state changed.");
             }
         }
         other => {
@@ -4602,15 +4655,15 @@ fn run_report(parsed: Parsed) -> Result<(), UsageError> {
                     &prepared,
                 )?;
                 if parsed.json {
-                    println!("{}", serde_json::to_string_pretty(&result)?);
+                    out!("{}", serde_json::to_string_pretty(&result)?);
                 } else {
-                    println!(
+                    out!(
                         "Captured {} report: {}",
                         kind.as_str(),
                         result.path.as_deref().unwrap_or("-")
                     );
-                    println!("SHA-256: {}", result.sha256);
-                    println!("Review this local report before any later filing step.");
+                    out!("SHA-256: {}", result.sha256);
+                    out!("Review this local report before any later filing step.");
                 }
             }
             Ok(())
@@ -4619,18 +4672,18 @@ fn run_report(parsed: Parsed) -> Result<(), UsageError> {
             let main_root = report_main_root()?;
             let report = crate::list_reports(&main_root)?;
             if parsed.json {
-                println!("{}", serde_json::to_string_pretty(&report)?);
+                out!("{}", serde_json::to_string_pretty(&report)?);
             } else if report.reports.is_empty() && report.invalid.is_empty() {
-                println!("No captured reports.");
+                out!("No captured reports.");
             } else {
                 if report.reports.is_empty() {
-                    println!("No valid captured reports.");
+                    out!("No valid captured reports.");
                 } else {
-                    println!(
+                    out!(
                         "CAPTURED_AT    KIND          STATE     VERSION          DIGEST       PATH"
                     );
                     for item in &report.reports {
-                        println!(
+                        out!(
                             "{:<14} {:<13} {:<9} {:<16} {:<12} {}",
                             item.captured_at,
                             item.kind.as_str(),
@@ -4655,22 +4708,22 @@ fn run_report(parsed: Parsed) -> Result<(), UsageError> {
             let inspection =
                 crate::show_report(&main_root, PathBuf::from(&parsed.positional[1]).as_path())?;
             if parsed.json {
-                println!("{}", serde_json::to_string_pretty(&inspection)?);
+                out!("{}", serde_json::to_string_pretty(&inspection)?);
             } else {
-                println!("Report: {}", inspection.summary.path);
-                println!("  title: {}", inspection.summary.title);
-                println!("  captured at: {}", inspection.summary.captured_at);
-                println!("  kind: {}", inspection.summary.kind.as_str());
-                println!("  version: {}", inspection.summary.version);
-                println!("  digest: {}", inspection.summary.digest);
-                println!(
+                out!("Report: {}", inspection.summary.path);
+                out!("  title: {}", inspection.summary.title);
+                out!("  captured at: {}", inspection.summary.captured_at);
+                out!("  kind: {}", inspection.summary.kind.as_str());
+                out!("  version: {}", inspection.summary.version);
+                out!("  digest: {}", inspection.summary.digest);
+                out!(
                     "  filing state: {}",
                     match inspection.summary.filing_state {
                         crate::ReportFilingState::Unfiled => "unfiled",
                         crate::ReportFilingState::Filed => "filed",
                     }
                 );
-                println!("\n{}", serde_json::to_string_pretty(&inspection.report)?);
+                out!("\n{}", serde_json::to_string_pretty(&inspection.report)?);
             }
             Ok(())
         }
@@ -4687,19 +4740,19 @@ fn run_report(parsed: Parsed) -> Result<(), UsageError> {
             if let Some(output) = parsed.output.as_deref() {
                 let written = crate::write_issue_form_render_atomic(&main_root, output, &rendered)?;
                 if parsed.json {
-                    println!("{}", serde_json::to_string_pretty(&written)?);
+                    out!("{}", serde_json::to_string_pretty(&written)?);
                 } else {
-                    println!("Rendered reviewed report: {}", written.path);
-                    println!("SHA-256: {}", written.sha256);
+                    out!("Rendered reviewed report: {}", written.path);
+                    out!("SHA-256: {}", written.sha256);
                     if !written.valid {
-                        println!(
+                        out!(
                             "Edit the required unfilled sections before filing: {}",
                             written.missing_required.join(", ")
                         );
                     }
                 }
             } else if parsed.json {
-                println!("{}", serde_json::to_string_pretty(&rendered)?);
+                out!("{}", serde_json::to_string_pretty(&rendered)?);
             } else {
                 print!("{}", rendered.markdown);
                 eprintln!("Issue title: {}", rendered.issue_title);
@@ -4743,23 +4796,23 @@ fn run_report(parsed: Parsed) -> Result<(), UsageError> {
                 confirmation,
             )?;
             if parsed.json {
-                println!("{}", serde_json::to_string_pretty(&filed)?);
+                out!("{}", serde_json::to_string_pretty(&filed)?);
             } else {
                 match filed.state {
                     crate::ReportFileState::Filed => {
-                        println!(
+                        out!(
                             "Filed {} as {}#{}",
                             filed.path,
                             filed.repository,
                             filed.issue_number.unwrap_or_default()
                         );
                         if let Some(url) = filed.issue_url.as_deref() {
-                            println!("Issue: {url}");
+                            out!("Issue: {url}");
                         }
-                        println!("Operation: {}", filed.operation_id);
+                        out!("Operation: {}", filed.operation_id);
                     }
                     crate::ReportFileState::ReconciliationRequired => {
-                        println!(
+                        out!(
                             "Report filing outcome is unknown (operation {}).",
                             filed.operation_id
                         );
@@ -4913,7 +4966,7 @@ struct ResourceAcquireFailure<'a> {
 }
 
 fn render_host_lease(lease: &crate::HostResourceLease) {
-    println!(
+    out!(
         "{} generation {} — {} until {}",
         lease.lease_id,
         lease.generation,
@@ -4921,7 +4974,7 @@ fn render_host_lease(lease: &crate::HostResourceLease) {
         lease.expires_at
     );
     for allocation in &lease.allocations {
-        println!(
+        out!(
             "  {:<20} {:<14} {}",
             allocation.key, allocation.kind, allocation.value
         );
@@ -4929,13 +4982,13 @@ fn render_host_lease(lease: &crate::HostResourceLease) {
 }
 
 fn render_submission_plan(plan: &crate::SubmissionPlan, checkout: &crate::GitRepo) {
-    println!(
+    out!(
         "Submitting session {} — HEAD {} onto integration {}",
         plan.session_id,
         short_sha(&plan.session_head),
         short_sha(&plan.integration_head)
     );
-    println!(
+    out!(
         "  recorded baseline: {}",
         plan.recorded_baseline
             .as_deref()
@@ -4966,18 +5019,18 @@ fn render_submission_plan(plan: &crate::SubmissionPlan, checkout: &crate::GitRep
         checkout,
     );
 
-    println!(
+    out!(
         "  merged-tree delta: {} file(s)",
         plan.merged_tree_paths.len()
     );
     for path in plan.merged_tree_paths.iter().take(10) {
-        println!("    {path}");
+        out!("    {path}");
     }
     if plan.merged_tree_paths.len() > 10 {
-        println!("    ... and {} more", plan.merged_tree_paths.len() - 10);
+        out!("    ... and {} more", plan.merged_tree_paths.len() - 10);
     }
     for warning in &plan.warnings {
-        println!("  warning: {warning}");
+        out!("  warning: {warning}");
     }
 }
 
@@ -4987,7 +5040,7 @@ fn render_submission_group<'a>(
     checkout: &crate::GitRepo,
 ) {
     let commits = commits.collect::<Vec<_>>();
-    println!("  {label}: {}", commits.len());
+    out!("  {label}: {}", commits.len());
     for commit in commits.iter().take(10) {
         let subject = checkout
             .commit_message(&commit.commit)
@@ -5004,10 +5057,10 @@ fn render_submission_group<'a>(
             }
             crate::SubmissionIntegrationState::Ambiguous => "ambiguous integration identity",
         };
-        println!("    {} {subject} [{state}]", short_sha(&commit.commit));
+        out!("    {} {subject} [{state}]", short_sha(&commit.commit));
     }
     if commits.len() > 10 {
-        println!("    ... and {} more", commits.len() - 10);
+        out!("    ... and {} more", commits.len() - 10);
     }
 }
 
@@ -5035,9 +5088,9 @@ fn run_resources(parsed: Parsed) -> Result<(), UsageError> {
                 let coordinator = crate::HostResourceCoordinator::open_read_only_default()?;
                 let plan = coordinator.plan(&request)?;
                 if parsed.json {
-                    println!("{}", serde_json::to_string_pretty(&plan)?);
+                    out!("{}", serde_json::to_string_pretty(&plan)?);
                 } else {
-                    println!(
+                    out!(
                         "Request {} — {} (advisory; acquire is authoritative)",
                         plan.request_id,
                         if plan.available {
@@ -5047,13 +5100,13 @@ fn run_resources(parsed: Parsed) -> Result<(), UsageError> {
                         }
                     );
                     for allocation in &plan.proposed {
-                        println!(
+                        out!(
                             "  proposed {:<20} {:<14} {}",
                             allocation.key, allocation.kind, allocation.value
                         );
                     }
                     for conflict in &plan.conflicts {
-                        println!(
+                        out!(
                             "  conflict {:<20} {}",
                             conflict.resource_key, conflict.reason
                         );
@@ -5078,7 +5131,7 @@ fn run_resources(parsed: Parsed) -> Result<(), UsageError> {
                     Err(crate::HostResourceError::Conflict {
                         code, conflicts, ..
                     }) if parsed.json => {
-                        println!(
+                        out!(
                             "{}",
                             serde_json::to_string_pretty(&ResourceAcquireFailure {
                                 retryable: code == "resource_contention",
@@ -5096,7 +5149,7 @@ fn run_resources(parsed: Parsed) -> Result<(), UsageError> {
                     write_private_grant(path, &grant)?;
                 }
                 if parsed.json && parsed.grant_out.is_some() {
-                    println!(
+                    out!(
                         "{}",
                         serde_json::to_string_pretty(&serde_json::json!({
                             "lease": grant.lease,
@@ -5104,14 +5157,14 @@ fn run_resources(parsed: Parsed) -> Result<(), UsageError> {
                         }))?
                     );
                 } else if parsed.json {
-                    println!("{}", serde_json::to_string_pretty(&grant)?);
+                    out!("{}", serde_json::to_string_pretty(&grant)?);
                 } else {
                     render_host_lease(&grant.lease);
                     if let Some(path) = parsed.grant_out {
-                        println!("Private grant: {}", path.display());
+                        out!("Private grant: {}", path.display());
                     } else {
-                        println!("Ownership token: {}", grant.ownership_token);
-                        println!("Store the complete JSON grant privately for renew/release.");
+                        out!("Ownership token: {}", grant.ownership_token);
+                        out!("Store the complete JSON grant privately for renew/release.");
                     }
                 }
             }
@@ -5142,7 +5195,7 @@ fn run_resources(parsed: Parsed) -> Result<(), UsageError> {
                 )?
             };
             if parsed.json {
-                println!("{}", serde_json::to_string_pretty(&grant)?);
+                out!("{}", serde_json::to_string_pretty(&grant)?);
             } else {
                 render_host_lease(&grant.lease);
             }
@@ -5239,9 +5292,9 @@ fn run_resources(parsed: Parsed) -> Result<(), UsageError> {
             let coordinator = crate::HostResourceCoordinator::open_read_only_default()?;
             let leases = coordinator.list(parsed.all)?;
             if parsed.json {
-                println!("{}", serde_json::to_string_pretty(&leases)?);
+                out!("{}", serde_json::to_string_pretty(&leases)?);
             } else if leases.is_empty() {
-                println!("No active or quarantined host resource leases.");
+                out!("No active or quarantined host resource leases.");
             } else {
                 for lease in &leases {
                     render_host_lease(lease);
@@ -5266,7 +5319,7 @@ fn run_resources(parsed: Parsed) -> Result<(), UsageError> {
                 })?;
             let lease = coordinator.reconcile(lease_id, generation)?;
             if parsed.json {
-                println!("{}", serde_json::to_string_pretty(&lease)?);
+                out!("{}", serde_json::to_string_pretty(&lease)?);
             } else {
                 render_host_lease(&lease);
             }
@@ -5314,17 +5367,17 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
             let broker = open_broker(parsed.read_only_snapshot)?;
             let plan = broker.worktree_root_plan()?;
             if parsed.json {
-                println!("{}", serde_json::to_string_pretty(&plan)?);
+                out!("{}", serde_json::to_string_pretty(&plan)?);
             } else {
-                println!("Repository: {}", plan.repository_root.display());
-                println!("Repository key: {}", plan.repository_key);
+                out!("Repository: {}", plan.repository_root.display());
+                out!("Repository key: {}", plan.repository_key);
                 if let (Some(root), Some(source)) = (&plan.preferred_root, plan.preferred_source) {
-                    println!(
+                    out!(
                         "Preferred worktree root: {} ({})",
                         root.display(),
                         source.as_str()
                     );
-                    println!(
+                    out!(
                         "Scanner boundary: {}",
                         if plan.preferred_outside_repository {
                             "outside the repository"
@@ -5333,9 +5386,9 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                         }
                     );
                 } else {
-                    println!("Preferred worktree root: unavailable");
+                    out!("Preferred worktree root: unavailable");
                 }
-                println!(
+                out!(
                     "Legacy fallback: {} (used only when host state is unavailable)",
                     plan.legacy_fallback_root.display()
                 );
@@ -5372,24 +5425,24 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
             )?;
             let session = &report.session;
             if parsed.json {
-                println!("{}", serde_json::to_string_pretty(&report)?);
+                out!("{}", serde_json::to_string_pretty(&report)?);
             } else {
                 match report.outcome {
-                    crate::AdoptOutcome::Created => println!(
+                    crate::AdoptOutcome::Created => out!(
                         "Created session {} on the existing worktree — {} on branch {}",
                         session.id, session.worktree_path, session.branch
                     ),
-                    crate::AdoptOutcome::Reused => println!(
+                    crate::AdoptOutcome::Reused => out!(
                         "Reusing session {} — worktree {} on branch {}",
                         session.id, session.worktree_path, session.branch
                     ),
-                    crate::AdoptOutcome::Replaced => println!(
+                    crate::AdoptOutcome::Replaced => out!(
                         "Replaced the prior session with session {} on the existing worktree — {} on branch {}",
                         session.id, session.worktree_path, session.branch
                     ),
                 }
                 if std::path::Path::new(&session.worktree_path) == broker.main_root() {
-                    println!(
+                    out!(
                         "note: main-checkout session — verification is advisory here \
                          (commits land on main before gates run); use a worktree \
                          session for enforced verification."
@@ -5406,7 +5459,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     && !dirty.is_empty()
                 {
                     let shown = dirty.iter().take(5).cloned().collect::<Vec<_>>();
-                    println!(
+                    out!(
                         "warning: {} uncommitted path(s) already present in this checkout \
                          before the session began: {}{}",
                         dirty.len(),
@@ -5417,7 +5470,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                             String::new()
                         }
                     );
-                    println!(
+                    out!(
                         "         they are not owned by this session, and a repository \
                          pre-push gate validates the whole snapshot — commit or set them \
                          aside, or adopt an isolated worktree instead."
@@ -5428,7 +5481,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                         crate::AdoptIntegrationSyncOutcome::AlreadyCurrent => "already current",
                         crate::AdoptIntegrationSyncOutcome::FastForwarded => "fast-forwarded",
                     };
-                    println!(
+                    out!(
                         "Integration synchronization: {summary} ({} -> {}, {} at {})",
                         short_commit(&sync.before_head),
                         short_commit(&sync.after_head),
@@ -5437,7 +5490,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     );
                 }
                 if let Some(drift) = &report.integration_drift {
-                    println!(
+                    out!(
                         "Integration drift: {} (session HEAD {}, {} HEAD {}; {} ahead, {} behind)",
                         drift.relation.as_str(),
                         short_commit(&drift.session_head),
@@ -5447,15 +5500,15 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                         drift.behind_commits,
                     );
                     if !drift.overlapping_changed_paths.is_empty() {
-                        println!("Overlapping changed paths:");
+                        out!("Overlapping changed paths:");
                         for path in &drift.overlapping_changed_paths {
-                            println!("  {path}");
+                            out!("  {path}");
                         }
                     }
                     if let Some(warning) = &drift.warning {
-                        println!("Warning: {warning}");
+                        out!("Warning: {warning}");
                     }
-                    println!("Safe next action: {}", drift.safe_next_action);
+                    out!("Safe next action: {}", drift.safe_next_action);
                 }
                 render_planned_explicit_leases(&report.planned_explicit_leases);
                 render_preparation_status(&report.preparation, false)?;
@@ -5469,13 +5522,13 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
             let report = broker.start_worktree_with_planned_paths(&task, &parsed.planned_paths)?;
             let session = &report.session;
             if parsed.json {
-                println!("{}", serde_json::to_string_pretty(&report)?);
+                out!("{}", serde_json::to_string_pretty(&report)?);
             } else {
-                println!(
+                out!(
                     "Started session {} — worktree {} on branch {}",
                     session.id, session.worktree_path, session.branch
                 );
-                println!(
+                out!(
                     "Start base: {} at {} ({})",
                     report.start_base.ref_name,
                     short_commit(&report.start_base.commit),
@@ -5484,7 +5537,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                 render_worktree_placement(&report.worktree_placement);
                 render_planned_explicit_leases(&report.planned_explicit_leases);
                 render_preparation_status(&report.preparation, false)?;
-                println!("Worktree: cd {}", session.worktree_path);
+                out!("Worktree: cd {}", session.worktree_path);
             }
         }
         "start-agent" => {
@@ -5498,9 +5551,9 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
             let report = broker.start_agent_report(&task, &cmd)?;
             let session = &report.session;
             if parsed.json {
-                println!("{}", serde_json::to_string_pretty(&report)?);
+                out!("{}", serde_json::to_string_pretty(&report)?);
             } else {
-                println!(
+                out!(
                     "Started session {} (pid {}) — worktree {} on branch {}\nLog: {}",
                     session.id,
                     session.pid.unwrap_or(-1),
@@ -5545,16 +5598,16 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     let mut broker = open_broker(parsed.read_only_snapshot)?;
                     let report = broker.prepare_session(session_id, parsed.offline, wait)?;
                     if parsed.json {
-                        println!("{}", serde_json::to_string_pretty(&report)?);
+                        out!("{}", serde_json::to_string_pretty(&report)?);
                     } else {
-                        println!(
+                        out!(
                             "Preparation {:?} for session {} (digest {})",
                             report.state,
                             report.session_id,
                             short_sha(&report.digest)
                         );
                         for step in &report.steps {
-                            println!(
+                            out!(
                                 "  {}: {} (exit {:?})",
                                 step.name,
                                 if step.succeeded { "passed" } else { "failed" },
@@ -5562,9 +5615,9 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                             );
                         }
                         if report.shared_cache_coordinated {
-                            println!("Shared cache: coordinated host-wide");
+                            out!("Shared cache: coordinated host-wide");
                         }
-                        println!("Next: {}", report.next_action);
+                        out!("Next: {}", report.next_action);
                     }
                 }
                 Some(other) => {
@@ -5586,7 +5639,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                 (broker.refresh_leases()?, broker.agents(now_ms())?)
             };
             if parsed.json {
-                println!(
+                out!(
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
                         "agents": views,
@@ -5594,14 +5647,14 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     }))?
                 );
             } else if views.is_empty() {
-                println!("No live sessions. Start one with `aethyme broker start --task \"...\"`.");
+                out!("No live sessions. Start one with `aethyme broker start --task \"...\"`.");
             } else {
-                println!(
+                out!(
                     "{:<4} {:<8} {:<8} {:<24} TASK",
                     "ID", "STATUS", "ORIGIN", "BRANCH"
                 );
                 for view in views {
-                    println!(
+                    out!(
                         "{:<4} {:<8} {:<8} {:<24} {}",
                         view.session.id,
                         view.derived_status.as_str(),
@@ -5625,7 +5678,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     };
                     let leases = broker.store().active_leases()?;
                     if parsed.json {
-                        println!(
+                        out!(
                             "{}",
                             serde_json::to_string_pretty(&serde_json::json!({
                                 "leases": leases,
@@ -5633,11 +5686,11 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                             }))?
                         );
                     } else if leases.is_empty() {
-                        println!("No active leases.");
+                        out!("No active leases.");
                     } else {
-                        println!("{:<4} {:<9} PATH", "SID", "KIND");
+                        out!("{:<4} {:<9} PATH", "SID", "KIND");
                         for lease in leases {
-                            println!(
+                            out!(
                                 "{:<4} {:<9} {}",
                                 lease.session_id,
                                 lease.kind.as_str(),
@@ -5658,9 +5711,9 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     let report =
                         broker.claim_lease(session, path, parsed.ttl_seconds.map(|s| s * 1000))?;
                     if parsed.json {
-                        println!("{}", serde_json::to_string_pretty(&report)?);
+                        out!("{}", serde_json::to_string_pretty(&report)?);
                     } else {
-                        println!("Session {session} claimed {path}.");
+                        out!("Session {session} claimed {path}.");
                     }
                 }
                 Some("plan") => {
@@ -5687,9 +5740,9 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                         now_ms(),
                     )?;
                     if parsed.json {
-                        println!("{}", serde_json::to_string_pretty(&report)?);
+                        out!("{}", serde_json::to_string_pretty(&report)?);
                     } else {
-                        println!(
+                        out!(
                             "Lease routing for {} (session {}, {} of {} rows):",
                             report.repository.display_slug,
                             report.selector.session_id,
@@ -5702,7 +5755,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                             } else {
                                 lease.routing_categories.join(",")
                             };
-                            println!(
+                            out!(
                                 "  {} [{} / {} / {}] routes={}{}",
                                 lease.path,
                                 lease.path_kind.as_str(),
@@ -5725,7 +5778,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                             );
                         }
                         if report.truncated {
-                            println!(
+                            out!(
                                 "  truncated: increase --limit up to {}",
                                 crate::MAX_LEASE_ROUTING_EXPORT_LIMIT
                             );
@@ -5742,9 +5795,9 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     ))?;
                     broker.store().release_lease(session, path)?;
                     if parsed.json {
-                        println!("{{\"released\":{}}}", serde_json::to_string(path)?);
+                        out!("{{\"released\":{}}}", serde_json::to_string(path)?);
                     } else {
-                        println!("Session {session} released {path}.");
+                        out!("Session {session} released {path}.");
                     }
                 }
                 Some(other) => {
@@ -5761,9 +5814,9 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
             let mut broker = open_broker(parsed.read_only_snapshot)?;
             let report = broker.guarded_exec(session, &parsed.exec_command)?;
             if parsed.json {
-                println!("{}", serde_json::to_string_pretty(&report)?);
+                out!("{}", serde_json::to_string_pretty(&report)?);
             } else {
-                println!(
+                out!(
                     "exec session {}: command {}{}",
                     session,
                     if report.command_success {
@@ -5777,30 +5830,30 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                         .unwrap_or_default()
                 );
                 if report.touched_paths.is_empty() {
-                    println!("  touched paths: none");
+                    out!("  touched paths: none");
                 } else {
-                    println!("  touched paths: {}", capped_join(&report.touched_paths, 8));
+                    out!("  touched paths: {}", capped_join(&report.touched_paths, 8));
                 }
                 if !report.newly_dirty_paths.is_empty() {
-                    println!(
+                    out!(
                         "  newly dirty: {}",
                         capped_join(&report.newly_dirty_paths, 8)
                     );
                 }
                 if !report.modified_preexisting_dirty_paths.is_empty() {
-                    println!(
+                    out!(
                         "  changed while already dirty: {}",
                         capped_join(&report.modified_preexisting_dirty_paths, 8)
                     );
                 }
                 if !report.outside_lease_paths.is_empty() {
-                    println!(
+                    out!(
                         "  outside explicit leases: {}",
                         capped_join(&report.outside_lease_paths, 8)
                     );
                 }
                 if !report.foreign_paths.is_empty() {
-                    println!(
+                    out!(
                         "  adoption-time foreign paths: {}",
                         capped_join(&report.foreign_paths, 8)
                     );
@@ -5890,13 +5943,13 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                         )?;
                     }
                     if parsed.json {
-                        println!("{}", serde_json::to_string_pretty(&report)?);
+                        out!("{}", serde_json::to_string_pretty(&report)?);
                     } else if report.advisories.is_empty() {
-                        println!("No outstanding advisories.");
+                        out!("No outstanding advisories.");
                     } else {
-                        println!("{:<5} {:<9} {:<14} IDENTITY", "ID", "SEVERITY", "STATE");
+                        out!("{:<5} {:<9} {:<14} IDENTITY", "ID", "SEVERITY", "STATE");
                         for advisory in &report.advisories {
-                            println!(
+                            out!(
                                 "{:<5} {:<9} {:<14} {}",
                                 advisory.id,
                                 advisory.severity.as_str(),
@@ -5904,7 +5957,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                                 advisory_text(&advisory.identity),
                             );
                         }
-                        println!("Outstanding: {}", report.outstanding_count);
+                        out!("Outstanding: {}", report.outstanding_count);
                     }
                 }
                 Some("show") => {
@@ -5920,7 +5973,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                         )?;
                     }
                     if parsed.json {
-                        println!("{}", serde_json::to_string_pretty(&advisory)?);
+                        out!("{}", serde_json::to_string_pretty(&advisory)?);
                     } else {
                         render_advisory(&advisory);
                     }
@@ -5932,14 +5985,14 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     let id = parse_advisory_id(parsed.positional.get(1), ADVISORIES_ACK_USAGE)?;
                     let advisory = broker.acknowledge_advisory(id)?;
                     if parsed.json {
-                        println!("{}", serde_json::to_string_pretty(&advisory)?);
+                        out!("{}", serde_json::to_string_pretty(&advisory)?);
                     } else {
-                        println!(
+                        out!(
                             "Acknowledged advisory {}: {}",
                             advisory.id,
                             advisory_text(&advisory.identity)
                         );
-                        println!("Projection refreshed: {}", crate::BROKER_ADVISORY_RELPATH);
+                        out!("Projection refreshed: {}", crate::BROKER_ADVISORY_RELPATH);
                     }
                 }
                 Some("metrics") => {
@@ -5951,7 +6004,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     let summary = broker.advisory_delivery_summary()?;
                     let metrics = broker.advisory_delivery_metrics()?;
                     if parsed.json {
-                        println!(
+                        out!(
                             "{}",
                             serde_json::to_string_pretty(&serde_json::json!({
                                 "schema_version": 1,
@@ -5960,7 +6013,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                             }))?
                         );
                     } else {
-                        println!(
+                        out!(
                             "Advisory delivery: {} shown, {} actioned, {} displays across {} surfaces.",
                             summary.shown_advisories,
                             summary.actioned_advisories,
@@ -5968,7 +6021,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                             summary.surface_rows,
                         );
                         for metric in metrics {
-                            println!(
+                            out!(
                                 "  advisory {} / {}: {} display{}{}",
                                 metric.advisory_id,
                                 metric.surface.as_str(),
@@ -6007,14 +6060,14 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                 "plan" => {
                     let plan = broker.exposure_reconciliation_plan()?;
                     if parsed.json {
-                        println!("{}", serde_json::to_string_pretty(&plan)?);
+                        out!("{}", serde_json::to_string_pretty(&plan)?);
                     } else {
-                        println!(
+                        out!(
                             "Remote: {} @ {}",
                             plan.remote_default_branch_ref,
                             short_commit(&plan.remote_default_branch_sha)
                         );
-                        println!(
+                        out!(
                             "Tracking: {} @ {} ({})",
                             plan.tracking_ref,
                             plan.tracking_sha
@@ -6027,7 +6080,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                                 "stale or missing"
                             }
                         );
-                        println!(
+                        out!(
                             "Exposures: {} contained, {} remaining",
                             plan.contained_exposures.len(),
                             plan.remaining_exposures.len()
@@ -6037,17 +6090,17 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                             .iter()
                             .filter(|advisory| advisory.eligible)
                             .count();
-                        println!(
+                        out!(
                             "Advisories: {} eligible, {} blocked by live leases",
                             eligible,
                             plan.advisories.len().saturating_sub(eligible)
                         );
                         for refusal in &plan.refusals {
-                            println!("Refusal: {refusal}");
+                            out!("Refusal: {refusal}");
                         }
-                        println!("Plan digest: {}", plan.digest);
+                        out!("Plan digest: {}", plan.digest);
                         if plan.safe {
-                            println!(
+                            out!(
                                 "Apply with: aethyme broker exposures apply --session <id> --confirm {}",
                                 plan.digest
                             );
@@ -6063,15 +6116,15 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     })?;
                     let report = broker.apply_exposure_reconciliation(session, confirm)?;
                     if parsed.json {
-                        println!("{}", serde_json::to_string_pretty(&report)?);
+                        out!("{}", serde_json::to_string_pretty(&report)?);
                     } else {
-                        println!(
+                        out!(
                             "Verified {} at {} via operation {}.",
                             report.plan.remote_default_branch_ref,
                             report.plan.remote_default_branch_sha,
                             report.verification_operation.id
                         );
-                        println!(
+                        out!(
                             "Resolved {} exposure(s) and {} advisory record(s).",
                             report.resolved_exposures.len(),
                             report.resolved_advisories.len()
@@ -6100,9 +6153,9 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     })?;
                     let note = broker.send_session_note(sender, recipient, message)?;
                     if parsed.json {
-                        println!("{}", serde_json::to_string_pretty(&note)?);
+                        out!("{}", serde_json::to_string_pretty(&note)?);
                     } else {
-                        println!(
+                        out!(
                             "Sent broker note {} from session {} to session {}.",
                             note.id, note.sender_session_id, note.recipient_session_id
                         );
@@ -6114,13 +6167,13 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     })?;
                     let list = broker.session_note_list(recipient)?;
                     if parsed.json {
-                        println!("{}", serde_json::to_string_pretty(&list)?);
+                        out!("{}", serde_json::to_string_pretty(&list)?);
                     } else if list.notes.is_empty() {
-                        println!("No broker notes for session {recipient}.");
+                        out!("No broker notes for session {recipient}.");
                     } else {
-                        println!("{:<5} {:<8} {:<14} MESSAGE", "ID", "FROM", "STATE");
+                        out!("{:<5} {:<8} {:<14} MESSAGE", "ID", "FROM", "STATE");
                         for note in &list.notes {
-                            println!(
+                            out!(
                                 "{:<5} {:<8} {:<14} {}",
                                 note.id,
                                 note.sender_session_id,
@@ -6132,7 +6185,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                                 note.message
                             );
                         }
-                        println!("Unread: {}", list.unread_count);
+                        out!("Unread: {}", list.unread_count);
                     }
                 }
                 Some("ack") if parsed.positional.len() == 1 => {
@@ -6144,9 +6197,9 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     })?;
                     let note = broker.acknowledge_session_note(recipient, note_id)?;
                     if parsed.json {
-                        println!("{}", serde_json::to_string_pretty(&note)?);
+                        out!("{}", serde_json::to_string_pretty(&note)?);
                     } else {
-                        println!("Acknowledged broker note {}.", note.id);
+                        out!("Acknowledged broker note {}.", note.id);
                     }
                 }
                 Some(other) => {
@@ -6173,16 +6226,16 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     let query = operation_history_query(&parsed)?;
                     let page = broker.store().operation_history(&query)?;
                     if parsed.json {
-                        println!("{}", serde_json::to_string_pretty(&page)?);
+                        out!("{}", serde_json::to_string_pretty(&page)?);
                     } else if page.operations.is_empty() {
-                        println!("No coordinated operations recorded.");
+                        out!("No coordinated operations recorded.");
                     } else {
-                        println!(
+                        out!(
                             "{:<5} {:<8} {:<21} {:<22} SCOPE",
                             "ID", "TOOL", "STATUS", "REPOSITORY"
                         );
                         for operation in page.operations {
-                            println!(
+                            out!(
                                 "{:<5} {:<8} {:<21} {:<22} {}",
                                 operation.id,
                                 operation.provider.as_str(),
@@ -6192,7 +6245,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                             );
                         }
                         if let Some(before_id) = page.next_before_id {
-                            println!("More operations: pass --before {before_id}.");
+                            out!("More operations: pass --before {before_id}.");
                         }
                     }
                 }
@@ -6212,7 +6265,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     }
                     let report = broker.show_coordinated_operation(operation_id)?;
                     if parsed.json {
-                        println!("{}", serde_json::to_string_pretty(&report)?);
+                        out!("{}", serde_json::to_string_pretty(&report)?);
                     } else {
                         render_operation_show(&report);
                     }
@@ -6242,9 +6295,9 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                         .reconcile_coordinated_operation(operation, succeeded, reason)
                         .map_err(operations_reconcile_error)?;
                     if parsed.json {
-                        println!("{}", serde_json::to_string_pretty(&report)?);
+                        out!("{}", serde_json::to_string_pretty(&report)?);
                     } else {
-                        println!(
+                        out!(
                             "operation {} reconciled as {}: {}",
                             report.operation.id,
                             report.operation.status.as_str(),
@@ -6274,10 +6327,10 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                         .map_err(|err| UsageError::Message(format!("cannot resolve cwd: {err}")))?;
                     let report = crate::init::draft_gates(&cwd)?;
                     if parsed.json {
-                        println!("{}", serde_json::to_string_pretty(&report)?);
+                        out!("{}", serde_json::to_string_pretty(&report)?);
                     } else {
                         for check in &report.checks {
-                            println!(
+                            out!(
                                 "{:<8} {}",
                                 format!("{:?}", check.status).to_lowercase(),
                                 check.detail
@@ -6306,11 +6359,11 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                                 })
                             })
                             .collect();
-                        println!("{}", serde_json::to_string_pretty(&summary)?);
+                        out!("{}", serde_json::to_string_pretty(&summary)?);
                     } else {
-                        println!("gates.toml OK — {} gate(s), cheap-first:", gates.len());
+                        out!("gates.toml OK — {} gate(s), cheap-first:", gates.len());
                         for gate in gates {
-                            println!(
+                            out!(
                                 "  [{}] {} — {} (triggers: {}{}; resources: {}; definition: {})",
                                 gate.cost,
                                 gate.name,
@@ -6337,7 +6390,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                         crate::graph_integrity::load_graph_policy_at_commit(&checkout, &head_sha)?;
                     let manifest = crate::gate_scope_manifest_with_graph(&gates, &graph_policy);
                     if parsed.json {
-                        println!(
+                        out!(
                             "{}",
                             serde_json::to_string_pretty(&serde_json::json!({
                                 "policy_head_sha": head_sha,
@@ -6345,15 +6398,15 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                             }))?
                         );
                     } else {
-                        println!(
+                        out!(
                             "Gate scope manifest {} at {}",
                             &manifest.manifest_sha256[..12],
                             &head_sha[..12]
                         );
-                        println!("  schema: {}", manifest.schema_version);
-                        println!("  gates: {}", manifest.gates.len());
-                        println!("  semantic suggestions enforced: false");
-                        println!(
+                        out!("  schema: {}", manifest.schema_version);
+                        out!("  gates: {}", manifest.gates.len());
+                        out!("  semantic suggestions enforced: false");
+                        out!(
                             "  graph integrity: {} (policy {})",
                             if manifest.graph_integrity.enforced {
                                 "enforced"
@@ -6363,7 +6416,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                             short_commit(&manifest.graph_integrity.policy_sha256)
                         );
                         for gate in manifest.gates {
-                            println!(
+                            out!(
                                 "  [{}] {} (triggers: {}; cache: {}; resources: {})",
                                 gate.cost,
                                 gate.name,
@@ -6399,16 +6452,16 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                         head,
                     )?;
                     if parsed.json {
-                        println!("{}", serde_json::to_string_pretty(&report)?);
+                        out!("{}", serde_json::to_string_pretty(&report)?);
                     } else {
-                        println!(
+                        out!(
                             "Gate scope {}..{} (manifest {})",
                             &report.base_sha[..12],
                             &report.head_sha[..12],
                             &report.manifest_sha256[..12]
                         );
-                        println!("  changed paths: {}", report.changed_paths.len());
-                        println!(
+                        out!("  changed paths: {}", report.changed_paths.len());
+                        out!(
                             "  graph integrity: {} (policy {})",
                             if report.graph_integrity.enforced {
                                 "enforced"
@@ -6418,17 +6471,17 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                             short_commit(&report.graph_integrity.policy_sha256)
                         );
                         if report.selected_gates.is_empty() {
-                            println!("  selected gates: none");
+                            out!("  selected gates: none");
                         } else {
-                            println!("  selected gates:");
+                            out!("  selected gates:");
                             for selection in report.selected_gates {
                                 match selection.triggered_by {
-                                    Some(path) => println!("    {} ({path})", selection.gate),
-                                    None => println!("    {} (always)", selection.gate),
+                                    Some(path) => out!("    {} ({path})", selection.gate),
+                                    None => out!("    {} (always)", selection.gate),
                                 }
                             }
                         }
-                        println!("  semantic suggestions: advisory, not included");
+                        out!("  semantic suggestions: advisory, not included");
                     }
                 }
                 "affected" => {
@@ -6444,14 +6497,14 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                                 serde_json::json!({"gate": gate, "triggered_by": why})
                             })
                             .collect();
-                        println!("{}", serde_json::to_string_pretty(&out)?);
+                        out!("{}", serde_json::to_string_pretty(&out)?);
                     } else if selections.is_empty() {
-                        println!("No gates affected by this session's diff.");
+                        out!("No gates affected by this session's diff.");
                     } else {
                         for (gate, why) in selections {
                             match why {
-                                Some(path) => println!("{gate}  (triggered by {path})"),
-                                None => println!("{gate}  (always runs)"),
+                                Some(path) => out!("{gate}  (triggered by {path})"),
+                                None => out!("{gate}  (always runs)"),
                             }
                         }
                     }
@@ -6463,7 +6516,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     let mut broker = open_broker(parsed.read_only_snapshot)?;
                     let report = broker.semantic_gate_advice(session)?;
                     if parsed.json {
-                        println!("{}", serde_json::to_string_pretty(&report)?);
+                        out!("{}", serde_json::to_string_pretty(&report)?);
                     } else {
                         render_semantic_gate_advice(&report);
                     }
@@ -6488,10 +6541,10 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                         broker.run_all_gates_with_policy(&cwd, policy)?
                     };
                     if parsed.json {
-                        println!("{}", serde_json::to_string_pretty(&outcomes)?);
+                        out!("{}", serde_json::to_string_pretty(&outcomes)?);
                     } else {
                         for outcome in &outcomes {
-                            println!(
+                            out!(
                                 "{:<20} {:<10} {}{} (tree {})",
                                 outcome.gate,
                                 gate_status_label(outcome.status, outcome.failure_class),
@@ -6530,13 +6583,13 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                         broker.run_gates_with_policy(session, policy)?
                     };
                     if parsed.json {
-                        println!("{}", serde_json::to_string_pretty(&outcomes)?);
+                        out!("{}", serde_json::to_string_pretty(&outcomes)?);
                     } else if outcomes.is_empty() {
-                        println!("No gates affected — nothing to run.");
+                        out!("No gates affected — nothing to run.");
                     } else {
                         let mut failed = false;
                         for outcome in &outcomes {
-                            println!(
+                            out!(
                                 "{:<20} {:<10} {}{} (tree {})",
                                 outcome.gate,
                                 gate_status_label(outcome.status, outcome.failure_class),
@@ -6592,12 +6645,12 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                         },
                     )?;
                     if parsed.json {
-                        println!("{}", serde_json::to_string_pretty(&report)?);
+                        out!("{}", serde_json::to_string_pretty(&report)?);
                     } else if report.plan.pushed_sha.is_none() {
-                        println!("Pre-push: deletion-only update; no content gates required.");
+                        out!("Pre-push: deletion-only update; no content gates required.");
                     } else {
                         for outcome in &report.gate_outcomes {
-                            println!(
+                            out!(
                                 "{:<20} {:<10} {}{} (tree {})",
                                 outcome.gate,
                                 gate_status_label(outcome.status, outcome.failure_class),
@@ -6609,7 +6662,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                                 short_commit(&outcome.tree_hash),
                             );
                         }
-                        println!(
+                        out!(
                             "Pre-push: verified {} for {} ref update(s) to {}.",
                             short_commit(report.plan.pushed_sha.as_deref().unwrap_or_default()),
                             report.plan.updates.len(),
@@ -6682,7 +6735,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     let reports = crate::hooks::install(&repo, &binary)?;
                     render_hook_reports(&reports, parsed.json)?;
                     if !parsed.json {
-                        println!(
+                        out!(
                             "Hooks are shared by every worktree. Uninstall any time with \
                              `aethyme broker hooks uninstall`."
                         );
@@ -6752,7 +6805,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                 if let Ok(dirty) = checkout.dirty_paths()
                     && !dirty.is_empty()
                 {
-                    println!(
+                    out!(
                         "  ⚠ {} uncommitted change(s) NOT included \
                          (only committed work integrates), e.g. {}",
                         dirty.len(),
@@ -6769,7 +6822,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                 },
             )?;
             if parsed.json {
-                println!("{}", serde_json::to_string_pretty(&outcome)?);
+                out!("{}", serde_json::to_string_pretty(&outcome)?);
             } else if !outcome.conflicts.is_empty() {
                 eprintln!("✗ conflict — rejected before any gate ran. Conflicting files:");
                 for conflict in &outcome.conflict_details {
@@ -6799,7 +6852,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                 if let Some(graph) = &outcome.graph_integrity
                     && graph.enforced
                 {
-                    println!(
+                    out!(
                         "graph integrity: {:?} (tree {}, policy {}) — {}",
                         graph.status,
                         short_commit(&graph.tree_hash),
@@ -6807,7 +6860,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                         graph.reason
                     );
                     if !graph.changed_paths.is_empty() {
-                        println!("  stale graph paths: {}", graph.changed_paths.join(", "));
+                        out!("  stale graph paths: {}", graph.changed_paths.join(", "));
                     }
                 }
                 let gate_wall_ms: i64 = outcome
@@ -6818,7 +6871,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     .sum();
                 for gate in &outcome.gate_outcomes {
                     if gate.cached {
-                        println!(
+                        out!(
                             "gate {:<20} {} (cached, tree {}, saved {})",
                             gate.gate,
                             gate_status_label(gate.status, gate.failure_class),
@@ -6826,7 +6879,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                             duration_label(gate.duration_ms)
                         );
                     } else {
-                        println!(
+                        out!(
                             "gate {:<20} {} in {} (tree {})",
                             gate.gate,
                             gate_status_label(gate.status, gate.failure_class),
@@ -6838,26 +6891,26 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                 }
                 match outcome.gate_verification.status {
                     crate::SubmissionGateVerificationStatus::NotRun => {}
-                    crate::SubmissionGateVerificationStatus::NoConfiguration => println!(
+                    crate::SubmissionGateVerificationStatus::NoConfiguration => out!(
                         "verification: conflict-only — no .aethyme/gates.toml exists in the submitted tree; 0 gates selected"
                     ),
-                    crate::SubmissionGateVerificationStatus::NoGatesTriggered => println!(
+                    crate::SubmissionGateVerificationStatus::NoGatesTriggered => out!(
                         "verification: no gate matched this diff ({} configured, 0 selected); review triggers with `aethyme broker gates affected --session {}`",
                         outcome.gate_verification.configured_gates, outcome.entry.session_id
                     ),
-                    crate::SubmissionGateVerificationStatus::Passed => println!(
+                    crate::SubmissionGateVerificationStatus::Passed => out!(
                         "verification: {} selected gate(s) passed ({} executed, {} cached)",
                         outcome.gate_verification.selected_gates,
                         outcome.gate_verification.executed_gates,
                         outcome.gate_verification.cached_gates
                     ),
-                    crate::SubmissionGateVerificationStatus::Failed => println!(
+                    crate::SubmissionGateVerificationStatus::Failed => out!(
                         "verification: {} selected gate(s) did not all pass",
                         outcome.gate_verification.selected_gates
                     ),
                 }
                 if !outcome.no_changes {
-                    println!("gate wall time: {}ms", gate_wall_ms);
+                    out!("gate wall time: {}ms", gate_wall_ms);
                 }
                 if outcome.entry.status.as_str() == "verified"
                     && matches!(
@@ -6866,12 +6919,12 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                             | crate::SubmissionGateVerificationStatus::NoGatesTriggered
                     )
                 {
-                    println!(
+                    out!(
                         "entry {} → conflict-checked (eligible for manual promotion; no gate verification)",
                         outcome.entry.id
                     );
                 } else {
-                    println!(
+                    out!(
                         "entry {} → {}{}",
                         outcome.entry.id,
                         outcome.entry.status.as_str(),
@@ -6883,7 +6936,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     );
                 }
                 if outcome.no_changes {
-                    println!(
+                    out!(
                         "What now: no pending session-owned content remains to integrate; \
                          aethyme/integration was not moved and no gates ran."
                     );
@@ -6909,7 +6962,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                         .integration_head()
                         .map(|(_, commit)| commit[..12.min(commit.len())].to_string())
                         .unwrap_or_else(|_| "?".into());
-                    println!(
+                    out!(
                         "What now: aethyme/integration is at {integration} and contains this work. \
                          Your checkout and branches are untouched — keep working, or start \
                          a follow-up with `aethyme broker adopt --reuse --task \"...\"`, or \
@@ -6917,7 +6970,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                         outcome.entry.session_id,
                     );
                 } else {
-                    println!(
+                    out!(
                         "What now: entry {} is verified but not promoted (manual mode). \
                          Promote with `aethyme broker promote --entry {}`.",
                         outcome.entry.id, outcome.entry.id,
@@ -6932,7 +6985,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
             let mut broker = open_broker(parsed.read_only_snapshot)?;
             let report = broker.repair(session)?;
             if parsed.json {
-                println!("{}", serde_json::to_string_pretty(&report)?);
+                out!("{}", serde_json::to_string_pretty(&report)?);
             } else {
                 render_repair_report(&report);
             }
@@ -6951,7 +7004,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                 "plan" => {
                     let plan = broker.promotion_record_plan()?;
                     if parsed.json {
-                        println!("{}", serde_json::to_string_pretty(&plan)?);
+                        out!("{}", serde_json::to_string_pretty(&plan)?);
                     } else {
                         render_promotion_record_plan(&plan);
                     }
@@ -6962,17 +7015,17 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     ))?;
                     let report = broker.promotion_record_apply(confirm)?;
                     if parsed.json {
-                        println!("{}", serde_json::to_string_pretty(&report)?);
+                        out!("{}", serde_json::to_string_pretty(&report)?);
                     } else {
-                        println!(
+                        out!(
                             "Promotion record recovery: {} restored",
                             report.restored.len()
                         );
                         for id in &report.restored {
-                            println!("  entry {id} recorded as promoted");
+                            out!("  entry {id} recorded as promoted");
                         }
                         for skip in &report.skipped {
-                            println!("  skipped: {skip}");
+                            out!("  skipped: {skip}");
                         }
                     }
                 }
@@ -7000,22 +7053,22 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                 "plan" => {
                     let report = broker.plan_session_checkpoint_recovery(session)?;
                     if parsed.json {
-                        println!("{}", serde_json::to_string_pretty(&report)?);
+                        out!("{}", serde_json::to_string_pretty(&report)?);
                     } else {
-                        println!(
+                        out!(
                             "Checkpoint recovery for session {}: {}",
                             session,
                             if report.safe { "safe" } else { "refused" }
                         );
-                        println!(
+                        out!(
                             "  old: {}",
                             report.old_checkpoint.as_deref().unwrap_or("missing")
                         );
-                        println!(
+                        out!(
                             "  proposed: {}",
                             report.proposed_checkpoint.as_deref().unwrap_or("missing")
                         );
-                        println!(
+                        out!(
                             "  session HEAD: {} ({}; {} ahead, {} behind)",
                             report.session_head,
                             report
@@ -7025,21 +7078,21 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                             report.ahead_commits,
                             report.behind_commits
                         );
-                        println!("  pending commits: {}", report.pending_commits.len());
-                        println!("  preservation branch: {}", report.preservation_branch);
+                        out!("  pending commits: {}", report.pending_commits.len());
+                        out!("  preservation branch: {}", report.preservation_branch);
                         for refusal in &report.refusals {
-                            println!("  refusal: {refusal}");
+                            out!("  refusal: {refusal}");
                         }
                         if !report.next_actions.is_empty() {
-                            println!("  recovery actions:");
+                            out!("  recovery actions:");
                             for action in &report.next_actions {
-                                println!("    {}: {}", action.kind, action.command);
-                                println!("      {}", action.description);
+                                out!("    {}: {}", action.kind, action.command);
+                                out!("      {}", action.description);
                             }
                         }
-                        println!("Plan digest: {}", report.digest);
+                        out!("Plan digest: {}", report.digest);
                         if report.safe {
-                            println!(
+                            out!(
                                 "Apply with: aethyme broker checkpoint apply --session {} --confirm {}",
                                 session, report.digest
                             );
@@ -7052,13 +7105,13 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     ))?;
                     let report = broker.apply_session_checkpoint_recovery(session, confirm)?;
                     if parsed.json {
-                        println!("{}", serde_json::to_string_pretty(&report)?);
+                        out!("{}", serde_json::to_string_pretty(&report)?);
                     } else {
-                        println!(
+                        out!(
                             "Re-anchored session {} at {} after preserving {}.",
                             session, report.accepted_session_head, report.preservation_ref
                         );
-                        println!("Next: aethyme broker submit --session {session}");
+                        out!("Next: aethyme broker submit --session {session}");
                     }
                 }
                 other => {
@@ -7080,7 +7133,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     .store()
                     .merge_queue_history_page(parsed.limit.unwrap_or(50), parsed.before)?;
                 if parsed.json {
-                    println!("{}", serde_json::to_string_pretty(&page)?);
+                    out!("{}", serde_json::to_string_pretty(&page)?);
                 } else {
                     render_queue_history(&page);
                 }
@@ -7094,13 +7147,13 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
             }
             let entries = broker.store().merge_queue()?;
             if parsed.json {
-                println!("{}", serde_json::to_string_pretty(&entries)?);
+                out!("{}", serde_json::to_string_pretty(&entries)?);
             } else if entries.is_empty() {
-                println!("Merge queue is empty.");
+                out!("Merge queue is empty.");
             } else {
-                println!("{:<4} {:<4} {:<11} HEAD", "ID", "SID", "STATUS");
+                out!("{:<4} {:<4} {:<11} HEAD", "ID", "SID", "STATUS");
                 for entry in entries {
-                    println!(
+                    out!(
                         "{:<4} {:<4} {:<11} {}",
                         entry.id,
                         entry.session_id,
@@ -7117,10 +7170,10 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
             let mut broker = open_broker(parsed.read_only_snapshot)?;
             broker.promote(entry)?;
             if parsed.json {
-                println!("{{\"promoted\":{entry}}}");
+                out!("{{\"promoted\":{entry}}}");
             } else {
-                println!("Promoted entry {entry} to the local integration branch.");
-                println!("Next: aethyme broker ship plan --entry {entry}");
+                out!("Promoted entry {entry} to the local integration branch.");
+                out!("Next: aethyme broker ship plan --entry {entry}");
             }
         }
         "ship" => {
@@ -7136,7 +7189,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     ))?;
                     let mut broker = open_broker(parsed.read_only_snapshot)?;
                     let report = broker.ship_plan(entry)?;
-                    render_ship_plan(&report, parsed.json)?;
+                    render_ship_plan(&report, parsed.json, parsed.detail)?;
                 }
                 "execute" => {
                     let entry = parsed.entry.ok_or(UsageError::Message(
@@ -7251,18 +7304,18 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                 broker.status(now_ms())?
             };
             if parsed.json {
-                println!("{}", serde_json::to_string_pretty(&status)?);
+                out!("{}", serde_json::to_string_pretty(&status)?);
             } else {
-                println!(
+                out!(
                     "Integration: {} @ {}",
                     status.integration_branch,
                     &status.integration_head[..12.min(status.integration_head.len())]
                 );
-                println!("Local main:  {}", short_commit(&status.main_head));
+                out!("Local main:  {}", short_commit(&status.main_head));
                 if let (Some(upstream_ref), Some(upstream_head)) =
                     (&status.upstream_ref, &status.upstream_head)
                 {
-                    println!(
+                    out!(
                         "Upstream:    {} @ {} ({})",
                         upstream_ref,
                         short_commit(upstream_head),
@@ -7272,47 +7325,47 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                         )
                     );
                 }
-                println!("Summary: {}", status.summary.message);
-                println!();
+                out!("Summary: {}", status.summary.message);
+                out!();
                 render_status_advice(&status.advice);
                 if !status.outstanding_advisories.is_empty() {
-                    println!();
-                    println!(
+                    out!();
+                    out!(
                         "Outstanding advisories: {}",
                         status.outstanding_advisories.len()
                     );
                     for advisory in status.outstanding_advisories.iter().take(10) {
-                        println!(
+                        out!(
                             "  {} [{}]: {}",
                             advisory.id,
                             advisory.severity.as_str(),
                             advisory_text(&advisory.identity),
                         );
-                        println!(
+                        out!(
                             "    inspect: aethyme broker advisories show {}",
                             advisory.id
                         );
-                        println!(
+                        out!(
                             "    acknowledge: aethyme broker advisories ack {}",
                             advisory.id
                         );
                     }
                     if status.outstanding_advisories.len() > 10 {
-                        println!(
+                        out!(
                             "  and {} more; inspect: aethyme broker advisories list",
                             status.outstanding_advisories.len() - 10
                         );
                     }
                 }
                 if !status.outstanding_entry_exposures.is_empty() {
-                    println!();
-                    println!(
+                    out!();
+                    out!(
                         "Publication exposures: {} promoted {} not yet verified on remote main",
                         status.outstanding_entry_exposures.len(),
                         plural(status.outstanding_entry_exposures.len(), "entry", "entries")
                     );
                     for exposure in status.outstanding_entry_exposures.iter().take(10) {
-                        println!(
+                        out!(
                             "  qid {} @ {}: {} {}",
                             exposure.queue_entry_id,
                             short_commit(&exposure.promotion_sha),
@@ -7321,23 +7374,23 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                         );
                     }
                     if status.outstanding_entry_exposures.len() > 10 {
-                        println!(
+                        out!(
                             "  and {} more",
                             status.outstanding_entry_exposures.len() - 10
                         );
                     }
-                    println!("  inspect: aethyme broker exposures plan");
+                    out!("  inspect: aethyme broker exposures plan");
                 }
-                println!();
+                out!();
                 if status.agents.is_empty() {
-                    println!("No live sessions.");
+                    out!("No live sessions.");
                 } else {
-                    println!(
+                    out!(
                         "{:<4} {:<8} {:<8} {:<24} TASK",
                         "ID", "STATUS", "ORIGIN", "BRANCH"
                     );
                     for view in &status.agents {
-                        println!(
+                        out!(
                             "{:<4} {:<8} {:<8} {:<24} {}",
                             view.session.id,
                             view.derived_status.as_str(),
@@ -7353,10 +7406,10 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     .filter(|lease| lease.kind == crate::LeaseKind::Explicit)
                     .collect::<Vec<_>>();
                 if !explicit_leases.is_empty() {
-                    println!();
-                    println!("Planned explicit leases:");
+                    out!();
+                    out!("Planned explicit leases:");
                     for lease in explicit_leases {
-                        println!("  session {}: {}", lease.session_id, lease.path);
+                        out!("  session {}: {}", lease.session_id, lease.path);
                     }
                 }
                 let current_queue = status
@@ -7365,11 +7418,11 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     .filter(|entry| queue_status_is_current(entry.status))
                     .collect::<Vec<_>>();
                 if !current_queue.is_empty() {
-                    println!();
-                    println!("Current merge queue:");
-                    println!("{:<4} {:<4} {:<11} HEAD", "QID", "SID", "QSTATUS");
+                    out!();
+                    out!("Current merge queue:");
+                    out!("{:<4} {:<4} {:<11} HEAD", "QID", "SID", "QSTATUS");
                     for entry in current_queue {
-                        println!(
+                        out!(
                             "{:<4} {:<4} {:<11} {}",
                             entry.id,
                             entry.session_id,
@@ -7386,22 +7439,22 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                         .map(|item| format!("{} {}", item.status.as_str(), item.count))
                         .collect::<Vec<_>>()
                         .join(", ");
-                    println!();
-                    println!(
+                    out!();
+                    out!(
                         "Queue history: {total} terminal {} ({summary}).",
                         plural(total, "entry", "entries")
                     );
-                    println!("  inspect: {}", status.queue_history.command);
+                    out!("  inspect: {}", status.queue_history.command);
                 }
                 if status.advisory_delivery.shown_advisories > 0 {
-                    println!();
-                    println!(
+                    out!();
+                    out!(
                         "Advisory delivery: {} shown, {} actioned, {} displays.",
                         status.advisory_delivery.shown_advisories,
                         status.advisory_delivery.actioned_advisories,
                         status.advisory_delivery.total_shows,
                     );
-                    println!("  inspect: aethyme broker advisories metrics");
+                    out!("  inspect: aethyme broker advisories metrics");
                 }
                 print_overlap_warnings(&status.overlaps);
                 print_promoted_conflict_warnings(&status.promoted_conflicts);
@@ -7416,9 +7469,9 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                 let cutoff = now_ms() - keep_days * 24 * 60 * 60 * 1000;
                 let removed = broker.store().prune_events_before(cutoff)?;
                 if parsed.json {
-                    println!("{{\"pruned\":{removed}}}");
+                    out!("{{\"pruned\":{removed}}}");
                 } else {
-                    println!("Pruned {removed} event(s) older than {keep_days} day(s).");
+                    out!("Pruned {removed} event(s) older than {keep_days} day(s).");
                 }
                 return Ok(());
             }
@@ -7448,9 +7501,9 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                 for event in &events {
                     cursor = event.id;
                     if parsed.json {
-                        println!("{}", serde_json::to_string(event)?);
+                        out!("{}", serde_json::to_string(event)?);
                     } else {
-                        println!(
+                        out!(
                             "{:<6} {} {:<28} sid={} {}",
                             event.id,
                             event.ts,
@@ -7492,7 +7545,11 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                 .len();
 
             // Command latency from the safe telemetry file.
-            let mut commands: std::collections::BTreeMap<String, (i64, i64)> =
+            // (calls, total_ms, total_output_bytes, calls_that_recorded_bytes).
+            // The last field matters because lines written before output
+            // accounting existed carry no size; averaging over every call would
+            // silently understate the cost of the ones that do.
+            let mut commands: std::collections::BTreeMap<String, (i64, i64, i64, i64)> =
                 std::collections::BTreeMap::new();
             let metrics_path = broker
                 .main_root()
@@ -7506,9 +7563,14 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                             .unwrap_or("?")
                             .to_string();
                         let ms = v.get("duration_ms").and_then(|d| d.as_i64()).unwrap_or(0);
-                        let entry = commands.entry(name).or_insert((0, 0));
+                        let bytes = v.get("output_bytes").and_then(|b| b.as_i64());
+                        let entry = commands.entry(name).or_insert((0, 0, 0, 0));
                         entry.0 += 1;
                         entry.1 += ms;
+                        if let Some(bytes) = bytes {
+                            entry.2 += bytes;
+                            entry.3 += 1;
+                        }
                     }
                 }
             }
@@ -7522,28 +7584,46 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     "gate_time_saved_ms": saved_ms,
                     "conflicts_caught_pre_gate": conflicts,
                     "overlaps_warned": overlaps,
-                    "commands": commands.iter().map(|(name, (count, ms))| serde_json::json!({
+                    "commands": commands.iter().map(|(name, (count, ms, bytes, sized))| serde_json::json!({
                         "command": name, "count": count, "total_ms": ms,
+                        "total_output_bytes": bytes, "output_sampled_calls": sized,
                     })).collect::<Vec<_>>(),
                 });
-                println!("{}", serde_json::to_string_pretty(&out)?);
+                out!("{}", serde_json::to_string_pretty(&out)?);
             } else {
-                println!("Gate executions:");
+                out!("Gate executions:");
                 for (gate, runs, ms) in &executed {
-                    println!("  {gate:<20} {runs} run(s), {ms}ms total");
+                    out!("  {gate:<20} {runs} run(s), {ms}ms total");
                 }
-                println!(
+                out!(
                     "Cache hits: {} (≈{}s of checks skipped)",
                     cached.len(),
                     saved_ms / 1000
                 );
-                println!("Conflicts caught before any gate ran: {conflicts}");
-                println!("Overlap warnings: {overlaps}");
-                println!("Broker command overhead:");
-                for (name, (count, ms)) in &commands {
-                    println!(
-                        "  {name:<20} {count} call(s), {ms}ms total, {}ms avg",
-                        ms / count.max(&1)
+                out!("Conflicts caught before any gate ran: {conflicts}");
+                out!("Overlap warnings: {overlaps}");
+                out!("Broker command overhead:");
+                for (name, (count, ms, bytes, sized)) in &commands {
+                    let output = if *sized == 0 {
+                        "output not sampled".to_string()
+                    } else {
+                        format!("{} per call", human_bytes((*bytes / sized.max(&1)) as u64))
+                    };
+                    out!(
+                        "  {name:<20} {count} call(s), {ms}ms total, {}ms avg, {output}",
+                        ms / count.max(&1),
+                    );
+                }
+                // Output size is what an agent pays per turn, so name the
+                // worst offender rather than leaving it to be spotted in a table.
+                if let Some((name, (_, _, bytes, sized))) = commands
+                    .iter()
+                    .filter(|(_, (_, _, _, sized))| *sized > 0)
+                    .max_by_key(|(_, (_, _, bytes, sized))| bytes / sized.max(&1))
+                {
+                    out!(
+                        "Largest agent-facing output: {name} at {} per call over {sized} sampled call(s)",
+                        human_bytes((*bytes / sized.max(&1)) as u64)
                     );
                 }
             }
@@ -7556,24 +7636,24 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                 broker.doctor()?
             };
             if parsed.json {
-                println!("{}", serde_json::to_string_pretty(&report)?);
+                out!("{}", serde_json::to_string_pretty(&report)?);
             } else {
-                println!("integrity: {}", report.integrity);
-                println!(
+                out!("integrity: {}", report.integrity);
+                out!(
                     "version: {} — {}",
                     report.version.status.as_str(),
                     report.version.message
                 );
                 if let Some(describe) = &report.version.binary.describe {
-                    println!(
+                    out!(
                         "  binary: aethyme {} ({describe})",
                         report.version.binary.version
                     );
                 } else {
-                    println!("  binary: aethyme {}", report.version.binary.version);
+                    out!("  binary: aethyme {}", report.version.binary.version);
                 }
                 if let Some(path) = &report.version.binary.path {
-                    println!("  path: {path}");
+                    out!("  path: {path}");
                 }
                 if report.version.repo_is_aethyme_source {
                     let integration = report
@@ -7582,20 +7662,20 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                         .as_deref()
                         .or(report.version.integration_head.as_deref())
                         .unwrap_or("unknown");
-                    println!(
+                    out!(
                         "  integration: {} {integration}",
                         report.version.integration_branch
                     );
                 }
                 if let Some(movement) = &report.integration_movement {
-                    println!("integration movement: {}", movement.message);
-                    println!(
+                    out!("integration movement: {}", movement.message);
+                    out!(
                         "  head: {} @ {}",
                         movement.branch,
                         short_commit(&movement.head)
                     );
                     for session in movement.live_sessions.iter().take(5) {
-                        println!(
+                        out!(
                             "  live session {} {} {}",
                             session.id,
                             session.status.as_str(),
@@ -7603,71 +7683,71 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                         );
                     }
                     if movement.live_sessions.len() > 5 {
-                        println!(
+                        out!(
                             "  and {} more live {}",
                             movement.live_sessions.len() - 5,
                             plural(movement.live_sessions.len() - 5, "session", "sessions")
                         );
                     }
                     for command in &movement.commands {
-                        println!("  run: {command}");
+                        out!("  run: {command}");
                     }
                 }
                 if let Some(repair) = &report.version_repair {
-                    println!(
+                    out!(
                         "version repair: {} — {}",
                         repair.status.as_str(),
                         repair.message
                     );
                     if repair.attempted {
-                        println!("  duration: {}ms", repair.duration_ms);
+                        out!("  duration: {}ms", repair.duration_ms);
                         if let Some(code) = repair.exit_code {
-                            println!("  exit: {code}");
+                            out!("  exit: {code}");
                         }
                         for step in &repair.steps {
-                            println!(
+                            out!(
                                 "  {} {}: {}",
                                 step.component,
                                 step.action,
                                 if step.success { "pass" } else { "fail" }
                             );
-                            println!("    command: {}", step.command.join(" "));
+                            out!("    command: {}", step.command.join(" "));
                             if let Some(code) = step.exit_code {
-                                println!("    exit: {code}");
+                                out!("    exit: {code}");
                             }
                         }
                         if repair.steps.is_empty() {
-                            println!("  command: {}", repair.command.join(" "));
+                            out!("  command: {}", repair.command.join(" "));
                         }
                     }
                     if !repair.stdout_tail.is_empty() {
-                        println!("  stdout tail:");
+                        out!("  stdout tail:");
                         for line in &repair.stdout_tail {
-                            println!("    {line}");
+                            out!("    {line}");
                         }
                     }
                     if !repair.stderr_tail.is_empty() {
-                        println!("  stderr tail:");
+                        out!("  stderr tail:");
                         for line in &repair.stderr_tail {
-                            println!("    {line}");
+                            out!("    {line}");
                         }
                     }
                 }
                 if report.missing_worktrees.is_empty() {
-                    println!("worktrees: all live session worktrees exist");
+                    out!("worktrees: all live session worktrees exist");
                 } else {
                     for id in &report.missing_worktrees {
-                        println!("worktrees: session {id} worktree is missing (adopt gone stale?)");
+                        out!("worktrees: session {id} worktree is missing (adopt gone stale?)");
                     }
                 }
                 if report.orphaned_pidfiles.is_empty() {
-                    println!("gate runs: no orphaned pidfiles");
+                    out!("gate runs: no orphaned pidfiles");
                 } else {
                     for name in &report.orphaned_pidfiles {
-                        println!("gate runs: orphaned pidfile removed: {name}");
+                        out!("gate runs: orphaned pidfile removed: {name}");
                     }
                 }
-                println!(
+                out!(
                     "retention: {} rows, {} files, {} worktrees, {} retained, {} reclaimable; {} protected findings",
                     report.retention.candidate_rows,
                     report.retention.candidate_files,
@@ -7677,16 +7757,16 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     report.retention.blockers,
                 );
                 if report.retention.over_retained_bytes_budget {
-                    println!(
+                    out!(
                         "  warning: retained storage exceeds the configured {} budget; review `aethyme broker gc plan`",
                         human_bytes(report.retention.policy.retained_bytes_budget)
                     );
                 }
                 if let Some(digest) = &report.retention.pending_recovery_digest {
-                    println!("  recovery pending: aethyme broker gc apply --confirm {digest}");
+                    out!("  recovery pending: aethyme broker gc apply --confirm {digest}");
                 }
                 if report.healthy() {
-                    println!("doctor: healthy");
+                    out!("doctor: healthy");
                 } else {
                     return Err(UsageError::Message("doctor found problems".into()));
                 }
@@ -7712,7 +7792,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                 .map_err(|err| UsageError::Message(format!("cannot resolve cwd: {err}")))?;
             let report = broker.verify_loop_from(&cwd)?;
             if parsed.json {
-                println!("{}", serde_json::to_string_pretty(&report)?);
+                out!("{}", serde_json::to_string_pretty(&report)?);
             } else {
                 render_verify_loop_report(&report);
                 if !report.ok {
@@ -7725,31 +7805,31 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                 .map_err(|err| UsageError::Message(format!("cannot resolve cwd: {err}")))?;
             let report = crate::init::guided_init(&cwd)?;
             if parsed.json {
-                println!("{}", serde_json::to_string_pretty(&report)?);
+                out!("{}", serde_json::to_string_pretty(&report)?);
             } else {
-                println!("Phase 1/3 — certify (read-only):");
+                out!("Phase 1/3 — certify (read-only):");
                 print_checks(&report.certify.checks);
                 let Some(scaffold) = &report.scaffold else {
-                    println!();
+                    out!();
                     return Err(UsageError::Message(
                         "certification failed — fix the FAIL items above, then re-run \
                          `aethyme init` (nothing was written)"
                             .into(),
                     ));
                 };
-                println!();
-                println!("Phase 2/3 — scaffold (deterministic, only-if-missing):");
+                out!();
+                out!("Phase 2/3 — scaffold (deterministic, only-if-missing):");
                 print_checks(&scaffold.checks);
-                println!();
-                println!("Phase 3/3 — gates draft (adaptive):");
+                out!();
+                out!("Phase 3/3 — gates draft (adaptive):");
                 match &report.gates {
                     Some(gates) => print_checks(&gates.checks),
-                    None => println!(
+                    None => out!(
                         "{:<8} {:<28} .aethyme/gates.toml already present — drafting skipped",
                         "skip", "gates.draft"
                     ),
                 }
-                println!();
+                out!();
                 let write_checks: Vec<&crate::init::Check> = scaffold
                     .checks
                     .iter()
@@ -7761,23 +7841,23 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     .map(|c| c.id)
                     .collect();
                 if !existing.is_empty() {
-                    println!("Already existed (untouched): {}", existing.join(", "));
+                    out!("Already existed (untouched): {}", existing.join(", "));
                 }
                 if report.changed {
-                    println!("Created this run:");
+                    out!("Created this run:");
                     for check in write_checks
                         .iter()
                         .filter(|c| c.status == crate::init::CheckStatus::Created)
                     {
-                        println!("  - {} — {}", check.id, check.detail);
+                        out!("  - {} — {}", check.id, check.detail);
                     }
                 } else {
-                    println!(
+                    out!(
                         "Nothing created — this repository was already set up \
                          (init is idempotent)."
                     );
                 }
-                println!("{}", init_next_steps_message());
+                out!("{}", init_next_steps_message());
             }
             if !report.certified() {
                 return Err(UsageError::Message("initialization failed".into()));
@@ -7792,15 +7872,15 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                 crate::init::scaffold(&cwd)?
             };
             if parsed.json {
-                println!("{}", serde_json::to_string_pretty(&report)?);
+                out!("{}", serde_json::to_string_pretty(&report)?);
             } else {
                 print_checks(&report.checks);
-                println!();
+                out!();
                 if report.certified() {
                     if subcommand == "certify" {
-                        println!("Certified (read-only — nothing written).");
+                        out!("Certified (read-only — nothing written).");
                     } else {
-                        println!(
+                        out!(
                             "Scaffolding done — review the drafts, then run `aethyme certify`."
                         );
                     }
@@ -7832,7 +7912,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                 }
             };
             if parsed.json {
-                println!("{}", serde_json::to_string_pretty(&report)?);
+                out!("{}", serde_json::to_string_pretty(&report)?);
             } else {
                 render_handoff_report(&report);
             }
@@ -7849,7 +7929,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                 },
             )?;
             if parsed.json {
-                println!("{}", serde_json::to_string_pretty(&report)?);
+                out!("{}", serde_json::to_string_pretty(&report)?);
             } else {
                 render_finish_report(&report);
                 if report.status == crate::FinishStatus::Blocked {
@@ -7864,9 +7944,9 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
             let mut broker = open_broker(parsed.read_only_snapshot)?;
             broker.close(session)?;
             if parsed.json {
-                println!("{}", serde_json::json!({ "closed": session }));
+                out!("{}", serde_json::json!({ "closed": session }));
             } else {
-                println!(
+                out!(
                     "Session {session} closed (state only — worktree untouched). \
                      Next task on the same worktree: `aethyme broker adopt --task \"...\"`."
                 );
@@ -7895,9 +7975,9 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     }
                     let plan = broker.gc_plan()?;
                     if parsed.json {
-                        println!("{}", serde_json::to_string_pretty(&plan)?);
+                        out!("{}", serde_json::to_string_pretty(&plan)?);
                     } else {
-                        render_gc_plan(&plan);
+                        render_gc_plan(&plan, parsed.detail);
                     }
                 }
                 "apply" => {
@@ -7906,7 +7986,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     })?;
                     let report = broker.gc_apply(confirm)?;
                     if parsed.json {
-                        println!("{}", serde_json::to_string_pretty(&report)?);
+                        out!("{}", serde_json::to_string_pretty(&report)?);
                     } else {
                         render_gc_apply(&report);
                     }
@@ -7945,9 +8025,9 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                 let report =
                     broker.cleanup_cleaned_worktrees(parsed.apply, parsed.confirm.as_deref())?;
                 if parsed.json {
-                    println!("{}", serde_json::to_string_pretty(&report)?);
+                    out!("{}", serde_json::to_string_pretty(&report)?);
                 } else {
-                    render_cleanup_sweep_report(&report);
+                    render_cleanup_sweep_report(&report, parsed.detail);
                 }
             } else {
                 if parsed.apply {
@@ -7966,9 +8046,9 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     .map_err(|_| UsageError::Message("session id must be an integer".into()))?;
                 broker.cleanup(id, parsed.force)?;
                 if parsed.json {
-                    println!("{{\"cleaned\":{id}}}");
+                    out!("{{\"cleaned\":{id}}}");
                 } else {
-                    println!("Cleaned session {id}.");
+                    out!("Cleaned session {id}.");
                 }
             }
         }
