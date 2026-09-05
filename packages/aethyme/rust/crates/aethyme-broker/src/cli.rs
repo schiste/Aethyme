@@ -5807,9 +5807,34 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                 }
             }
             if !report.ok {
-                return Err(UsageError::Message(
-                    "guarded exec failed ownership or command checks".into(),
-                ));
+                // `ok` is `command_success && audit.ok`, so the two causes are
+                // already separable. Reporting both as an ownership failure
+                // sends the reader to debug leases when the wrapped command
+                // simply exited non-zero for its own reasons.
+                let guard_refused = !report.outside_lease_paths.is_empty()
+                    || !report.foreign_paths.is_empty()
+                    || !report.modified_preexisting_dirty_paths.is_empty();
+                return Err(UsageError::Message(match (report.command_success, guard_refused) {
+                    (true, _) => "guarded exec refused: the command changed paths outside \
+                                  this session's ownership (listed above)"
+                        .to_string(),
+                    (false, false) => format!(
+                        "guarded exec: the command exited {} — the guard found no ownership \
+                         violation, so this is the command's own failure",
+                        report
+                            .exit_code
+                            .map(|code| code.to_string())
+                            .unwrap_or_else(|| "by signal".into())
+                    ),
+                    (false, true) => format!(
+                        "guarded exec: the command exited {}, and it changed paths outside \
+                         this session's ownership (listed above)",
+                        report
+                            .exit_code
+                            .map(|code| code.to_string())
+                            .unwrap_or_else(|| "by signal".into())
+                    ),
+                }));
             }
         }
         "git" | "gh" => {

@@ -38,12 +38,12 @@ CREATE INDEX IF NOT EXISTS host_operations_unresolved
 
 #[derive(Debug, thiserror::Error)]
 pub enum HostOperationError {
-    #[error("host operation state at {path}: {source}")]
+    #[error("host operation state at {}", crate::host_state::describe_host_state_io(path, source))]
     Io {
         path: PathBuf,
         source: std::io::Error,
     },
-    #[error("host operation database: {0}")]
+    #[error("host operation database: {}", crate::host_state::describe_host_state_sqlite(.0))]
     Sqlite(#[from] rusqlite::Error),
     #[error("cannot find per-user state directory; set AETHYME_HOST_STATE_DIR")]
     StateDirectoryUnavailable,

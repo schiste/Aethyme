@@ -54,12 +54,12 @@ CREATE INDEX IF NOT EXISTS resource_allocations_by_value
 
 #[derive(Debug, thiserror::Error)]
 pub enum HostResourceError {
-    #[error("host resource state at {path}: {source}")]
+    #[error("host resource state at {}", crate::host_state::describe_host_state_io(path, source))]
     Io {
         path: PathBuf,
         source: std::io::Error,
     },
-    #[error("host resource database: {0}")]
+    #[error("host resource database: {}", crate::host_state::describe_host_state_sqlite(.0))]
     Sqlite(#[from] rusqlite::Error),
     #[error("invalid host resource request: {0}")]
     InvalidRequest(String),
