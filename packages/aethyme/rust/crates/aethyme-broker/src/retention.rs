@@ -24,10 +24,8 @@ pub struct RetentionPolicy {
     /// Soft repository storage budget. `0` disables budget warnings.
     pub retained_bytes_budget: u64,
     /// Idle days before a closed session's build caches are reclaimed without
-    /// confirmation. Deliberately longer than `closed_worktrees_days`: a
-    /// represented worktree is removed whole at that shorter age, so this
-    /// governs the worktrees cleanup refuses to touch, where a resumed session
-    /// would otherwise pay for a full cold rebuild.
+    /// confirmation. This does not affect committed work or the worktree
+    /// itself; a maintainer may raise it to trade disk space for faster reuse.
     pub artifact_reclaim_days: u32,
     pub orphan_worktree_roots_days: u32,
     /// Wall-clock budget for the autonomous artifact sweep. `0` disables it.
@@ -47,9 +45,9 @@ impl Default for RetentionPolicy {
             command_metrics_days: 30,
             closed_worktrees_days: 7,
             retained_bytes_budget: 1_073_741_824,
-            artifact_reclaim_days: 14,
+            artifact_reclaim_days: 0,
             orphan_worktree_roots_days: 1,
-            artifact_sweep_budget_ms: 0,
+            artifact_sweep_budget_ms: 5_000,
             artifact_sweep_interval_hours: 24,
             startup_budget_ms: 25,
         }
@@ -350,7 +348,8 @@ mod tests {
         assert!(policy.terminal_events_days >= policy.gate_results_days);
         assert!(policy.terminal_merge_queue_days >= policy.gate_results_days);
         assert!(policy.startup_budget_ms <= 25);
-        assert_eq!(policy.artifact_sweep_budget_ms, 0);
+        assert_eq!(policy.artifact_reclaim_days, 0);
+        assert_eq!(policy.artifact_sweep_budget_ms, 5_000);
         assert_eq!(policy.retained_bytes_budget, 1_073_741_824);
     }
 

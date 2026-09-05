@@ -431,11 +431,36 @@ fn cleanup_plan_and_apply_reclaim_only_safe_closed_broker_worktrees() {
         status.cleanup_retention.severity,
         aethyme_broker::StatusAdviceSeverity::Notice
     );
+    let cleanup_advice = status
+        .advice
+        .iter()
+        .find(|advice| advice.id == "cleanup.retained-worktrees")
+        .unwrap();
     assert!(
-        status
-            .advice
+        cleanup_advice
+            .commands
             .iter()
-            .any(|advice| advice.id == "cleanup.retained-worktrees")
+            .any(|command| command.contains("cleanup --all-cleaned"))
+    );
+
+    std::fs::write(
+        tmp.path().join(".aethyme/broker.toml"),
+        "[retention]\nretained_bytes_budget = 1\nartifact_sweep_budget_ms = 0\n",
+    )
+    .unwrap();
+    let pressured = broker.status(now_ms()).unwrap();
+    let pressured_advice = pressured
+        .advice
+        .iter()
+        .find(|advice| advice.id == "cleanup.retained-worktrees")
+        .unwrap();
+    assert!(pressured.cleanup_retention.over_retained_bytes_budget);
+    assert_eq!(
+        pressured_advice.commands,
+        vec![
+            "aethyme broker gc plan",
+            "aethyme broker gc apply --confirm <sha256-from-plan>",
+        ]
     );
 
     let dry_run = broker.cleanup_cleaned_worktrees(false, None).unwrap();

@@ -4850,10 +4850,18 @@ impl Broker {
                         cleanup_retention.closed_worktrees_policy_days
                     ),
                 ],
-                commands: vec![
-                    "aethyme broker cleanup --all-cleaned".into(),
-                    "aethyme broker cleanup --all-cleaned --apply".into(),
-                ],
+                commands: if cleanup_retention.over_retained_bytes_budget {
+                    vec![
+                        "aethyme broker gc plan".into(),
+                        "aethyme broker gc apply --confirm <sha256-from-plan>".into(),
+                    ]
+                } else {
+                    vec![
+                        "aethyme broker cleanup --all-cleaned".into(),
+                        "aethyme broker cleanup --all-cleaned --apply --confirm <sha256-from-plan>"
+                            .into(),
+                    ]
+                },
             });
         }
         Ok(StatusView {

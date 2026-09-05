@@ -838,10 +838,6 @@ impl Broker {
         let Ok(_lock) = GcLock::acquire(&main_root) else {
             return Ok(0);
         };
-        // Stamp before acting so a failure mid-sweep cannot spin on every open.
-        self.store()
-            .meta_set(ARTIFACT_SWEEP_STAMP_KEY, &now.to_string())?;
-
         let live = self
             .store()
             .live_sessions()?
@@ -850,8 +846,11 @@ impl Broker {
             .collect::<Vec<_>>();
         let deadline = Instant::now() + Duration::from_millis(policy.artifact_sweep_budget_ms);
         let mut removed = Vec::new();
+        let mut eligible_worktree_seen = false;
+        let mut scan_completed = true;
         for session in self.store().cleaned_sessions()? {
             if check_deadline(Some(deadline)) {
+                scan_completed = false;
                 break;
             }
             if live.contains(&session.id) {
@@ -865,16 +864,29 @@ impl Broker {
             if !is_real_directory(&root) || !self.is_broker_owned_worktree(&session, &root) {
                 continue;
             }
+            eligible_worktree_seen = true;
             let mut found = Vec::new();
             collect_artifact_dirs(&root, &root, 0, &mut found);
             for dir in found {
                 if check_deadline(Some(deadline)) {
+                    scan_completed = false;
                     break;
                 }
                 if std::fs::remove_dir_all(&dir).is_ok() {
                     removed.push(dir.to_string_lossy().into_owned());
                 }
             }
+            if !scan_completed {
+                break;
+            }
+        }
+        // Do not consume the cadence window before any closed worktree exists,
+        // and do not hide an unfinished backlog for a full interval. Removal
+        // failures do consume the window, preventing a broken path from
+        // slowing every broker command until an operator can inspect it.
+        if eligible_worktree_seen && scan_completed {
+            self.store()
+                .meta_set(ARTIFACT_SWEEP_STAMP_KEY, &now.to_string())?;
         }
         if !removed.is_empty() {
             let payload = serde_json::json!({

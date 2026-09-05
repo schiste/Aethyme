@@ -202,7 +202,7 @@ fn enable_sweep(repo: &Path) {
 }
 
 #[test]
-fn default_policy_never_reclaims_build_caches_without_confirmation() {
+fn default_policy_reclaims_closed_session_build_caches() {
     let (repo, container) = fixture("");
     let (_id, worktree) = blocked_session_with_build_cache(repo.path(), container.path());
     let target = worktree.join("rust/target");
@@ -214,9 +214,28 @@ fn default_policy_never_reclaims_build_caches_without_confirmation() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        target.exists(),
-        "default broker startup must not delete a cache without explicit opt-in or confirmed GC"
+        !target.exists(),
+        "closed-session build cache should be gone"
     );
+    assert!(
+        worktree.join("work.txt").exists(),
+        "default reclamation must preserve committed work"
+    );
+}
+
+#[test]
+fn explicit_opt_out_preserves_closed_session_build_caches() {
+    let (repo, container) = fixture("[retention]\nartifact_sweep_budget_ms = 0\n");
+    let (_id, worktree) = blocked_session_with_build_cache(repo.path(), container.path());
+    let target = worktree.join("rust/target");
+
+    let output = run(repo.path(), container.path(), &["status", "--json"]);
+    assert!(
+        output.status.success(),
+        "status: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(target.exists(), "explicit opt-out must preserve the cache");
 }
 
 #[test]
