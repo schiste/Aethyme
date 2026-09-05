@@ -36,7 +36,7 @@ use crate::store::BrokerStore;
 use crate::types::{GateFailureClass, GateStatus, NewGateResult};
 
 pub const GATES_CONFIG_RELPATH: &str = ".aethyme/gates.toml";
-pub const GATE_SCOPE_MANIFEST_SCHEMA_VERSION: u32 = 2;
+pub const GATE_SCOPE_MANIFEST_SCHEMA_VERSION: u32 = 3;
 
 /// Whether a gate run may reuse a conclusive result for the same tree.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -60,6 +60,8 @@ pub enum GateConfigError {
     },
     #[error("gate {gate:?}: invalid host resource profile: {message}")]
     BadResources { gate: String, message: String },
+    #[error("gate {gate:?}: invalid timeout_seconds: {message}")]
+    BadTimeout { gate: String, message: String },
 }
 
 /// One configured gate, with its compiled trigger set.
@@ -70,6 +72,9 @@ pub struct Gate {
     pub cost: i64,
     pub triggers: Vec<String>,
     pub cache: bool,
+    /// Optional native execution deadline. Absence preserves the historical
+    /// unbounded behavior and is surfaced by the advisory gate doctor.
+    pub timeout_seconds: Option<u64>,
     pub resources: Vec<crate::HostResourceRequirement>,
     pub resource_ttl_seconds: u64,
     /// Maximum time to wait for a contended host resource bundle. Zero
@@ -90,6 +95,8 @@ pub struct GateScopeDefinition {
     pub cost: i64,
     pub triggers: Vec<String>,
     pub cache: bool,
+    #[serde(default)]
+    pub timeout_seconds: Option<u64>,
     pub resources: Vec<crate::HostResourceRequirement>,
     pub resource_ttl_seconds: u64,
     pub resource_wait_seconds: u64,
@@ -225,6 +232,28 @@ pub fn parse_gates(text: &str) -> Result<Vec<Gate>, GateConfigError> {
             .to_string();
         let cost = entry.get("cost").and_then(|v| v.as_integer()).unwrap_or(0);
         let cache = entry.get("cache").and_then(|v| v.as_bool()).unwrap_or(true);
+        let timeout_seconds = match entry.get("timeout_seconds") {
+            None => None,
+            Some(value) => {
+                let value = value
+                    .as_integer()
+                    .ok_or_else(|| GateConfigError::BadTimeout {
+                        gate: name.clone(),
+                        message: "must be a positive integer".into(),
+                    })?;
+                let value = u64::try_from(value).map_err(|_| GateConfigError::BadTimeout {
+                    gate: name.clone(),
+                    message: "must be a positive integer".into(),
+                })?;
+                if value == 0 {
+                    return Err(GateConfigError::BadTimeout {
+                        gate: name.clone(),
+                        message: "must be greater than zero".into(),
+                    });
+                }
+                Some(value)
+            }
+        };
         let triggers: Vec<String> = entry
             .get("triggers")
             .and_then(|v| v.as_array())
@@ -302,6 +331,7 @@ pub fn parse_gates(text: &str) -> Result<Vec<Gate>, GateConfigError> {
             cost,
             &triggers,
             cache,
+            timeout_seconds,
             &resources,
             resource_ttl_seconds,
             resource_wait_seconds,
@@ -331,6 +361,7 @@ pub fn parse_gates(text: &str) -> Result<Vec<Gate>, GateConfigError> {
             cost,
             triggers,
             cache,
+            timeout_seconds,
             resources,
             resource_ttl_seconds,
             resource_wait_seconds,
@@ -380,6 +411,7 @@ pub fn gate_scope_manifest_with_graph(
             cost: gate.cost,
             triggers: gate.triggers.clone(),
             cache: gate.cache,
+            timeout_seconds: gate.timeout_seconds,
             resources: gate.resources.clone(),
             resource_ttl_seconds: gate.resource_ttl_seconds,
             resource_wait_seconds: gate.resource_wait_seconds,
@@ -522,6 +554,7 @@ fn gate_definition_hash(
     cost: i64,
     triggers: &[String],
     cache: bool,
+    timeout_seconds: Option<u64>,
     resources: &[crate::HostResourceRequirement],
     resource_ttl_seconds: u64,
     resource_wait_seconds: u64,
@@ -533,6 +566,7 @@ fn gate_definition_hash(
         "cost": cost,
         "triggers": triggers,
         "cache": cache,
+        "timeout_seconds": timeout_seconds,
         "resources": resources,
         "resource_ttl_seconds": resource_ttl_seconds,
         "resource_wait_seconds": resource_wait_seconds,
@@ -1538,6 +1572,7 @@ fn run_selections(
                 tree: &tree,
                 worker_id: &worker_id,
                 owner_paths: &selection.owner_paths,
+                timeout_seconds: gate.timeout_seconds,
                 started,
                 progress,
                 resources: resource_runtime.as_ref(),
@@ -1565,6 +1600,7 @@ fn run_selections(
             // host bundle may still be owned and must be reconciled as such.
             (Err(_), Some(release_error)) => Ok(GateCommandOutcome {
                 exit_code: None,
+                timed_out: false,
                 resource_error: Some(release_error),
                 first_output_ms: None,
                 output_bytes: 0,
@@ -1636,6 +1672,16 @@ fn classify_gate_result(
     status: Result<GateCommandOutcome, std::io::Error>,
 ) -> (GateStatus, Option<GateFailureClass>, Option<i64>) {
     match status {
+        Ok(GateCommandOutcome {
+            timed_out: true,
+            exit_code,
+            resource_error: None,
+            ..
+        }) => (
+            GateStatus::Error,
+            Some(GateFailureClass::Timeout),
+            exit_code.map(i64::from),
+        ),
         Ok(GateCommandOutcome {
             exit_code,
             resource_error: Some(error),
@@ -1806,6 +1852,7 @@ struct GateCommandContext<'a> {
     tree: &'a str,
     worker_id: &'a str,
     owner_paths: &'a [String],
+    timeout_seconds: Option<u64>,
     started: Instant,
     progress: &'a dyn GateProgressSink,
     resources: Option<&'a GateResourceRuntime>,
@@ -1814,6 +1861,7 @@ struct GateCommandContext<'a> {
 
 struct GateCommandOutcome {
     exit_code: Option<i32>,
+    timed_out: bool,
     resource_error: Option<String>,
     first_output_ms: Option<i64>,
     output_bytes: u64,
@@ -1860,7 +1908,7 @@ fn run_gate_command(
     let fatal_resource_error = std::sync::Arc::new(std::sync::Mutex::new(None));
     let first_output = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(-1));
     let output_monitor_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let status = std::thread::scope(|scope| {
+    let (status, timed_out) = std::thread::scope(|scope| {
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let progress_interval = heartbeat_interval();
         let renewal = context
@@ -1939,10 +1987,46 @@ fn run_gate_command(
                 }
             }
         });
-        let status = child.wait();
+        let deadline = context.timeout_seconds.map(Duration::from_secs);
+        let mut timed_out = false;
+        let status = 'wait: loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break Ok(status),
+                Ok(None)
+                    if deadline.is_some_and(|deadline| context.started.elapsed() >= deadline) =>
+                {
+                    timed_out = true;
+                    let seconds = context.timeout_seconds.unwrap_or_default();
+                    let _ = append_gate_log(
+                        context.log_path,
+                        &format!("aethyme gate timeout exceeded after {seconds}s\n"),
+                    );
+                    unsafe {
+                        libc::killpg(process_group, libc::SIGTERM);
+                    }
+                    let grace_deadline = Instant::now() + Duration::from_secs(1);
+                    let final_status = loop {
+                        match child.try_wait() {
+                            Ok(Some(status)) => break Ok(status),
+                            Ok(None) if Instant::now() >= grace_deadline => {
+                                unsafe {
+                                    libc::killpg(process_group, libc::SIGKILL);
+                                }
+                                break child.wait();
+                            }
+                            Ok(None) => std::thread::sleep(Duration::from_millis(25)),
+                            Err(error) => break Err(error),
+                        }
+                    };
+                    break 'wait final_status;
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(25)),
+                Err(error) => break Err(error),
+            }
+        };
         output_monitor_done.store(true, std::sync::atomic::Ordering::Release);
         let _ = done_tx.send(());
-        status
+        (status, timed_out)
     });
     if let Some(pidfile) = &pidfile {
         let _ = std::fs::remove_file(pidfile);
@@ -1959,6 +2043,7 @@ fn run_gate_command(
     let observed_first_output = first_output.load(std::sync::atomic::Ordering::Acquire);
     Ok(GateCommandOutcome {
         exit_code: status?.code(),
+        timed_out,
         resource_error,
         first_output_ms: match observed_first_output {
             -1 if output_bytes > 0 => Some(context.started.elapsed().as_millis() as i64),
@@ -2004,6 +2089,7 @@ cost = 2
 triggers = ["**/*.py"]
 resource_ttl_seconds = 60
 resource_wait_seconds = 15
+timeout_seconds = 30
 
 [gate.managed_cache]
 key = "python-env"
@@ -2034,6 +2120,7 @@ command = "true"
         let pytest = gates.iter().find(|gate| gate.name == "pytest").unwrap();
         assert_eq!(pytest.resource_ttl_seconds, 60);
         assert_eq!(pytest.resource_wait_seconds, 15);
+        assert_eq!(pytest.timeout_seconds, Some(30));
         assert_eq!(
             pytest.managed_cache,
             Some(ManagedGateCache {
@@ -2069,6 +2156,17 @@ command = "true"
             load_gates(tmp.path()),
             Err(GateConfigError::BadResources { .. })
         ));
+
+        for timeout in ["0", "-1", "'soon'"] {
+            write_config(
+                tmp.path(),
+                &format!("[[gate]]\nname='bad-timeout'\ncommand='x'\ntimeout_seconds={timeout}\n"),
+            );
+            assert!(matches!(
+                load_gates(tmp.path()),
+                Err(GateConfigError::BadTimeout { .. })
+            ));
+        }
     }
 
     #[test]
@@ -2081,6 +2179,7 @@ command = "SECRET_TOKEN=hidden /private/operator/run-tests"
 cost = 3
 triggers = ["backend/**", "Cargo.toml"]
 cache = false
+timeout_seconds = 300
 
 [[gate.resources]]
 key = "database_port"
@@ -2101,6 +2200,7 @@ end = 55999
         assert!(!first_manifest.semantic_advice.enforced);
         assert_eq!(first_manifest.gates[0].name, "backend");
         assert_eq!(first_manifest.gates[0].triggers[0], "backend/**");
+        assert_eq!(first_manifest.gates[0].timeout_seconds, Some(300));
 
         let encoded = serde_json::to_string(&first_manifest).unwrap();
         assert!(!encoded.contains("SECRET_TOKEN"), "{encoded}");
@@ -2115,6 +2215,7 @@ command = "different-command"
 cost = 3
 triggers = ["backend/**", "Cargo.toml"]
 cache = false
+timeout_seconds = 301
 
 [[gate.resources]]
 key = "database_port"

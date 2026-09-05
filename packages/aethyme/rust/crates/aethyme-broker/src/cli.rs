@@ -59,6 +59,10 @@ Usage:
       Adaptive (NOT scaffolding): sniff this repo's manifests and draft
       a gates.toml. Output depends on the repo — review it, then run
       certify.
+  aethyme broker gates doctor [--probe] [--only <gate>] [--json]
+      Inspect exact-HEAD gate quality without changing enforced selection.
+      --probe explicitly runs all or one selected gate in a disposable
+      detached worktree with ephemeral cache evidence and mutation capture.
   aethyme broker adopt [<path>] [--task <text>] [--path <repo-path>]... [--reuse [--sync-integration]|--replace-stale] [--json]
       Register an existing worktree (attach-first). Defaults to the
       current directory. If the worktree already has a session:
@@ -782,10 +786,11 @@ fn command_records_metric(args: &[String]) -> bool {
         Some("leases") => !matches!(args.get(1).map(String::as_str), Some("plan" | "export")),
         Some("resources") => !matches!(args.get(1).map(String::as_str), Some("plan" | "list")),
         Some("events") => args.get(1).map(String::as_str) == Some("prune"),
-        Some("gates") => !matches!(
-            args.get(1).map(String::as_str),
-            Some("validate" | "manifest" | "scope" | "affected" | "semantic")
-        ),
+        Some("gates") => match args.get(1).map(String::as_str) {
+            Some("validate" | "manifest" | "scope" | "affected" | "semantic") => false,
+            Some("doctor") => args.iter().any(|arg| arg == "--probe"),
+            _ => true,
+        },
         Some("doctor") => args.iter().any(|arg| arg == "--fix-version"),
         _ => true,
     }
@@ -838,6 +843,7 @@ mod tests {
             args(&["gates", "validate"]),
             args(&["gates", "affected", "--session", "7"]),
             args(&["gates", "semantic", "--session", "7"]),
+            args(&["gates", "doctor"]),
             args(&["doctor"]),
             args(&["gc", "plan"]),
             args(&["operations"]),
@@ -869,6 +875,7 @@ mod tests {
             args(&["hooks", "install"]),
             args(&["events", "prune", "--keep-days", "7"]),
             args(&["gates", "run", "--session", "7"]),
+            args(&["gates", "doctor", "--probe"]),
             args(&["doctor", "--fix-version"]),
             args(&["gc", "apply", "--confirm", "digest"]),
             args(&["report", "file", "reviewed.issue.md"]),
@@ -963,6 +970,24 @@ mod tests {
         assert!(!super::command_records_metric(&args(&[
             "gates", "manifest", "--head", "feature"
         ])));
+    }
+
+    #[test]
+    fn parse_accepts_explicit_gate_doctor_probe() {
+        let parsed = match super::parse(&args(&[
+            "doctor",
+            "--probe",
+            "--only",
+            "integration",
+            "--json",
+        ])) {
+            Ok(parsed) => parsed,
+            Err(_) => panic!("gate doctor probe flags should parse"),
+        };
+        assert_eq!(parsed.positional, vec!["doctor"]);
+        assert!(parsed.probe);
+        assert_eq!(parsed.only.as_deref(), Some("integration"));
+        assert!(parsed.json);
     }
 
     #[test]
@@ -1516,6 +1541,7 @@ struct Parsed {
     sync_main: bool,
     sync_integration: bool,
     no_cache: bool,
+    probe: bool,
     only: Option<String>,
     stdout: bool,
     include_task: bool,
@@ -1596,6 +1622,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         sync_main: false,
         sync_integration: false,
         no_cache: false,
+        probe: false,
         only: None,
         stdout: false,
         include_task: false,
@@ -1656,6 +1683,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
             "--sync-main" => parsed.sync_main = true,
             "--sync-integration" => parsed.sync_integration = true,
             "--no-cache" => parsed.no_cache = true,
+            "--probe" => parsed.probe = true,
             "--only" => {
                 parsed.only = Some(
                     iter.next()
@@ -3063,6 +3091,101 @@ fn render_verify_loop_report(report: &crate::VerifyLoopReport) {
         out!("Next: rerun `aethyme broker verify-loop` on the current integration tip.");
     } else {
         out!("Next: fix the failed step above, then rerun `aethyme broker verify-loop`.");
+    }
+}
+
+struct CliGateDoctorProgress;
+
+impl crate::GateProgressSink for CliGateDoctorProgress {
+    fn report(&self, line: &str) {
+        eprintln!("{line}");
+    }
+}
+
+fn render_gate_doctor(report: &crate::GateDoctorReport) {
+    out!(
+        "Gate doctor: advisory only at {}",
+        short_commit(&report.source_head)
+    );
+    out!(
+        "  repository: {} tracked file(s), {} source file(s)",
+        report.tracked_file_count,
+        report.source_file_count
+    );
+    out!("  gates:");
+    for gate in &report.gates {
+        out!(
+            "    [{}] {} — timeout {}; coverage {}% ({}/{} source paths)",
+            gate.cost,
+            gate.name,
+            gate.timeout_seconds
+                .map(|seconds| format!("{seconds}s"))
+                .unwrap_or_else(|| "unbounded".into()),
+            gate.repository_coverage_percent,
+            gate.matched_source_paths,
+            report.source_file_count,
+        );
+    }
+    if report.findings.is_empty() {
+        out!("  findings: none");
+    } else {
+        out!("  findings:");
+        for finding in &report.findings {
+            out!(
+                "    {:?}/{:?} {:?}{} — {}",
+                finding.severity,
+                finding.confidence,
+                finding.id,
+                finding
+                    .gate
+                    .as_ref()
+                    .map(|gate| format!(" [{gate}]"))
+                    .unwrap_or_default(),
+                finding.summary,
+            );
+            for evidence in &finding.evidence {
+                out!("      evidence: {evidence}");
+            }
+            out!("      next: {}", finding.remediation);
+        }
+    }
+    if let Some(probe) = &report.probe {
+        out!(
+            "  probe: {}",
+            if probe.passed {
+                "passed"
+            } else {
+                "did not pass"
+            }
+        );
+        out!(
+            "    exact HEAD: {}",
+            short_commit(&probe.worktree.exact_head)
+        );
+        out!("    selected: {}", probe.selected_gates.join(", "));
+        out!("    normal result cache: untouched");
+        for outcome in &probe.outcomes {
+            out!(
+                "    {}: {}{}",
+                outcome.gate,
+                gate_status_label(outcome.status, outcome.failure_class),
+                outcome
+                    .duration_ms
+                    .map(|duration| format!(" in {duration}ms"))
+                    .unwrap_or_default(),
+            );
+        }
+        for (kind, paths) in [
+            ("tracked", &probe.mutations.tracked),
+            ("untracked", &probe.mutations.untracked),
+            ("ignored", &probe.mutations.ignored),
+        ] {
+            if !paths.is_empty() {
+                out!("    {kind} mutations: {}", capped_join(paths, 8));
+            }
+        }
+    } else {
+        out!("  probe: not run (use --probe explicitly)");
     }
 }
 
@@ -6483,9 +6606,14 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                 .first()
                 .map(String::as_str)
                 .ok_or(UsageError::Message(
-                    "gates requires an action: draft, validate, manifest, scope, affected, semantic, run, or pre-push"
+                    "gates requires an action: draft, validate, doctor, manifest, scope, affected, semantic, run, or pre-push"
                         .into(),
                 ))?;
+            if parsed.probe && action != "doctor" {
+                return Err(UsageError::Message(
+                    "--probe is valid only with broker gates doctor".into(),
+                ));
+            }
             match action {
                 "draft" => {
                     let cwd = std::env::current_dir()
@@ -6516,6 +6644,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                                     "name": g.name, "command": g.command,
                                     "cost": g.cost, "triggers": g.triggers,
                                     "cache": g.cache,
+                                    "timeout_seconds": g.timeout_seconds,
                                     "resources": g.resources,
                                     "resource_ttl_seconds": g.resource_ttl_seconds,
                                     "resource_wait_seconds": g.resource_wait_seconds,
@@ -6529,7 +6658,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                         out!("gates.toml OK — {} gate(s), cheap-first:", gates.len());
                         for gate in gates {
                             out!(
-                                "  [{}] {} — {} (triggers: {}{}; resources: {}; definition: {})",
+                                "  [{}] {} — {} (triggers: {}{}; timeout: {}; resources: {}; definition: {})",
                                 gate.cost,
                                 gate.name,
                                 gate.command,
@@ -6539,10 +6668,48 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                                     gate.triggers.join(", ")
                                 },
                                 if gate.cache { "" } else { "; cache: off" },
+                                gate.timeout_seconds
+                                    .map(|seconds| format!("{seconds}s"))
+                                    .unwrap_or_else(|| "unbounded".into()),
                                 gate.resources.len(),
                                 &gate.definition_hash[..12],
                             );
                         }
+                    }
+                }
+                "doctor" => {
+                    if parsed.positional.len() != 1 {
+                        return Err(UsageError::Message(
+                            "gates doctor does not accept positional arguments".into(),
+                        ));
+                    }
+                    if parsed.session.is_some() || parsed.all || parsed.no_cache {
+                        return Err(UsageError::Message(
+                            "gates doctor accepts --probe, --only <gate>, and --json; it does not use session, --all, or --no-cache"
+                                .into(),
+                        ));
+                    }
+                    if parsed.only.is_some() && !parsed.probe {
+                        return Err(UsageError::Message(
+                            "gates doctor --only <gate> requires --probe".into(),
+                        ));
+                    }
+                    let cwd = std::env::current_dir()
+                        .map_err(|err| UsageError::Message(format!("cannot resolve cwd: {err}")))?;
+                    let checkout = crate::GitRepo::discover(&cwd)?;
+                    let report = if parsed.probe {
+                        crate::probe_gate_quality(
+                            &checkout,
+                            parsed.only.as_deref(),
+                            &CliGateDoctorProgress,
+                        )?
+                    } else {
+                        crate::inspect_gate_quality(&checkout)?
+                    };
+                    if parsed.json {
+                        out!("{}", serde_json::to_string_pretty(&report)?);
+                    } else {
+                        render_gate_doctor(&report);
                     }
                 }
                 "manifest" => {
@@ -6582,7 +6749,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                         );
                         for gate in manifest.gates {
                             out!(
-                                "  [{}] {} (triggers: {}; cache: {}; resources: {})",
+                                "  [{}] {} (triggers: {}; cache: {}; timeout: {}; resources: {})",
                                 gate.cost,
                                 gate.name,
                                 if gate.triggers.is_empty() {
@@ -6591,6 +6758,9 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                                     gate.triggers.join(", ")
                                 },
                                 if gate.cache { "use" } else { "disabled" },
+                                gate.timeout_seconds
+                                    .map(|seconds| format!("{seconds}s"))
+                                    .unwrap_or_else(|| "unbounded".into()),
                                 gate.resources.len()
                             );
                         }

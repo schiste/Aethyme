@@ -962,6 +962,36 @@ triggers = ["**/*.py"]
 }
 
 #[test]
+fn native_timeout_terminates_the_gate_process_group_and_is_typed() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    write_gates(
+        tmp.path(),
+        r#"
+[[gate]]
+name = "native-timeout"
+command = "sleep 5; echo completed >> slow-finished.txt"
+timeout_seconds = 1
+triggers = ["**/*.py"]
+"#,
+    );
+    commit_all(tmp.path(), "add native timeout gate");
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let wt = add_worktree(tmp.path(), "native-timeout");
+    let session = broker.adopt(&wt, None).unwrap();
+    std::fs::write(wt.join("src/app.py"), "x = 4\n").unwrap();
+
+    let outcomes = broker.run_gates(session.id).unwrap();
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(outcomes[0].status, GateStatus::Error);
+    assert_eq!(outcomes[0].failure_class, Some(GateFailureClass::Timeout));
+    assert!(!outcomes[0].cached);
+    assert!(!wt.join("slow-finished.txt").exists());
+    let log = std::fs::read_to_string(outcomes[0].log_path.as_ref().unwrap()).unwrap();
+    assert!(log.contains("aethyme gate timeout exceeded after 1s"));
+}
+
+#[test]
 fn slow_gate_emits_heartbeat_progress() {
     let _env = EnvGuard::set("AETHYME_GATE_HEARTBEAT_SECS", "1");
     let tmp = tempfile::tempdir().unwrap();

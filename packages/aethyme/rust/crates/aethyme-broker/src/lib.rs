@@ -30,6 +30,7 @@ mod error;
 pub mod events;
 mod exposures;
 mod external_events;
+mod gate_doctor;
 mod gates;
 mod gc;
 mod git;
@@ -112,6 +113,12 @@ pub use external_events::{
     ExternalEventOwnershipCandidate, ExternalEventProvider, ExternalEventReconcileReport,
     ExternalEventReconciliation, ExternalEventRecord, ExternalEventStatus,
     ExternalVerificationMethod, VerifiedExternalSource, external_event_digest,
+};
+pub use gate_doctor::{
+    GateDiagnostic, GateDiagnosticConfidence, GateDiagnosticId, GateDiagnosticSeverity,
+    GateDoctorError, GateDoctorGate, GateDoctorReport, GateProbeMutations, GateProbeOutcome,
+    GateProbeReport, GateProbeWorktree, inspect_gate_quality, probe_gate_quality,
+    static_gate_diagnostics,
 };
 pub use gates::{
     CachePolicy, GATE_SCOPE_MANIFEST_SCHEMA_VERSION, GATES_CONFIG_RELPATH, Gate, GateConfigError,

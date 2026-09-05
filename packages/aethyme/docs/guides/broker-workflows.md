@@ -378,6 +378,60 @@ later default-policy run for the same tree. Submit threads the same policy into
 its merged-tree gates, so use the flag there when the landing decision requires
 fresh evidence.
 
+## Review Gate Quality Separately From Readiness
+
+Syntax validity is necessary but does not prove that a gate is safe or useful
+for parallel agents. Inspect the committed policy without executing it:
+
+```bash
+aethyme broker gates doctor
+aethyme broker gates doctor --json
+```
+
+Every finding is advisory and includes confidence, bounded evidence, and a
+remediation. The doctor checks explicit positive timeouts, cheap and full
+lanes, trigger coverage over exact tracked paths, broad expensive gates,
+uncovered source areas, service isolation, fixed shared identifiers, writable
+caches, main-checkout coupling, failure-status preservation, and equivalent
+definitions. It does not expand path-selected gates, change submit behavior,
+or run as part of `broker readiness`.
+
+Add a reviewed native deadline to each gate:
+
+```toml
+[[gate]]
+name = "integration"
+command = "./scripts/integration-test"
+cost = 3
+timeout_seconds = 1800
+triggers = ["src/**", "tests/**"]
+```
+
+Omitting `timeout_seconds` keeps the legacy unbounded behavior and produces a
+doctor warning. Zero, negative, or non-integer values are invalid. Changing a
+deadline changes both the execution-definition hash and the portable scope
+manifest, so cached evidence from the old policy cannot authorize the new one.
+On expiry, the broker terminates the complete process group and records a typed
+timeout rather than a test failure.
+
+When static evidence is insufficient, opt into a disposable probe:
+
+```bash
+aethyme broker gates doctor --probe
+aethyme broker gates doctor --probe --only integration --json
+```
+
+The probe checks out exact committed HEAD in a broker-owned detached worktree,
+uses declared host-resource leases, and keeps results and logs in an ephemeral
+store that cannot populate the normal gate cache. It snapshots Git state before
+and after execution and distinguishes tracked, untracked, and ignored writes.
+It does not run repository preparation automatically; that assumption is
+explicit in JSON. Cleanup targets only the registered probe worktree,
+temporary evidence, and ownership-token-protected resource leases—never broad
+Docker names or the invoking checkout. A failing or mutating probe still
+returns diagnostic evidence for review; it does not rewrite the policy or
+change enforced gates.
+
 ### Authoritative committed graph fragments
 
 `[graph].authority = "committed_fragments"` makes graph freshness a repository

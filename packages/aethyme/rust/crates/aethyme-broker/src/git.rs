@@ -917,6 +917,15 @@ impl GitRepo {
         )?))
     }
 
+    /// Tracked paths in an exact committed tree, decoded through the shared
+    /// NUL-safe path parser and returned in deterministic Git tree order.
+    pub fn tracked_files_at(&self, commit: &str) -> Result<Vec<String>, GitError> {
+        Ok(parse_nul_paths(&run_git(
+            &self.root,
+            &["ls-tree", "-r", "--name-only", "-z", commit],
+        )?))
+    }
+
     /// Create a detached worktree at `dest` checked out at `commit`.
     pub fn worktree_add_detached(&self, dest: &Path, commit: &str) -> Result<GitRepo, GitError> {
         if let Some(parent) = dest.parent() {

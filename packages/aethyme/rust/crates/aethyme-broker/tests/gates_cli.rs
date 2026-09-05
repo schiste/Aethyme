@@ -165,7 +165,7 @@ cost = 0
     );
     let manifest: serde_json::Value = serde_json::from_str(&manifest).unwrap();
     assert_eq!(manifest["policy_head_sha"], head);
-    assert_eq!(manifest["manifest"]["schema_version"], 2);
+    assert_eq!(manifest["manifest"]["schema_version"], 3);
     assert_eq!(manifest["manifest"]["semantic_advice"]["enforced"], false);
     assert_eq!(manifest["manifest"]["graph_integrity"]["enforced"], true);
     assert_eq!(
@@ -988,4 +988,191 @@ fn submit_replays_a_bounded_gate_failure_tail() {
     let stderr = String::from_utf8(failed.stderr).unwrap();
     assert!(stderr.contains("gate failure output (last 1 line(s))"));
     assert!(stderr.contains("submit-diagnostic"));
+}
+
+#[test]
+fn syntactically_valid_gates_can_hide_quality_defects() {
+    let repo = fixture();
+    std::fs::create_dir_all(repo.path().join("src/api")).unwrap();
+    std::fs::write(repo.path().join("src/api/server.rs"), "fn serve() {}\n").unwrap();
+    std::fs::create_dir_all(repo.path().join("web")).unwrap();
+    std::fs::write(repo.path().join("web/app.ts"), "export const app = 1;\n").unwrap();
+    std::fs::write(
+        repo.path().join(".aethyme/gates.toml"),
+        r#"
+[[gate]]
+name = "docker-tests"
+command = "POSTGRES_PORT=5432 COMPOSE_PROJECT_NAME=app docker compose up --abort-on-container-exit"
+cost = 3
+triggers = ["src/**", "missing/**"]
+
+[[gate]]
+name = "docker-tests-copy"
+command = "POSTGRES_PORT=5432   COMPOSE_PROJECT_NAME=app docker compose up --abort-on-container-exit"
+cost = 3
+triggers = ["src/**", "missing/**"]
+"#,
+    )
+    .unwrap();
+    git(repo.path(), &["add", "-A"]);
+    git(
+        repo.path(),
+        &[
+            "commit",
+            "-qm",
+            "quality defects remain syntactically valid",
+        ],
+    );
+
+    let validated = run(repo.path(), &["gates", "validate", "--json"]);
+    assert!(
+        validated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&validated.stderr)
+    );
+    let gates: serde_json::Value = serde_json::from_slice(&validated.stdout).unwrap();
+    assert_eq!(gates.as_array().unwrap().len(), 2);
+    assert!(gates.as_array().unwrap().iter().all(|gate| {
+        gate["cost"] == 3
+            && gate["resources"].as_array().unwrap().is_empty()
+            && gate["timeout_seconds"].is_null()
+    }));
+
+    // This tracked source area is intentionally uncovered by both gates.
+    assert_eq!(
+        git_output(repo.path(), &["ls-files", "web/app.ts"]),
+        "web/app.ts"
+    );
+}
+
+#[test]
+fn gate_doctor_is_exact_head_read_only_and_advisory() {
+    let repo = fixture();
+    std::fs::write(
+        repo.path().join(".aethyme/gates.toml"),
+        "[[gate]]\nname='static'\ncommand='touch doctor-must-not-run'\ncost=2\ntriggers=['missing/**']\n",
+    )
+    .unwrap();
+    git(repo.path(), &["add", ".aethyme/gates.toml"]);
+    git(repo.path(), &["commit", "-qm", "add static doctor fixture"]);
+    let head = git_output(repo.path(), &["rev-parse", "HEAD"]);
+    std::fs::write(
+        repo.path().join(".aethyme/gates.toml"),
+        "[[gate]]\nname='dirty'\ncommand='touch dirty-must-not-run'\ntimeout_seconds=60\n",
+    )
+    .unwrap();
+
+    let report = stdout(run(repo.path(), &["gates", "doctor", "--json"]));
+    let report: serde_json::Value = serde_json::from_str(&report).unwrap();
+    assert_eq!(report["source_head"], head);
+    assert_eq!(report["advisory_only"], true);
+    assert!(report["probe"].is_null());
+    assert!(
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| { finding["id"] == "missing_timeout" && finding["gate"] == "static" })
+    );
+    assert!(
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|finding| {
+                !finding["evidence"].as_array().unwrap().is_empty()
+                    && finding["confidence"].is_string()
+            })
+    );
+    assert!(!repo.path().join("doctor-must-not-run").exists());
+    assert!(!repo.path().join("dirty-must-not-run").exists());
+    assert!(!repo.path().join(".aethyme/broker.db").exists());
+}
+
+#[test]
+fn gate_doctor_probe_is_disposable_resource_aware_and_cache_isolated() {
+    let repo = fixture();
+    let host_state = tempfile::tempdir().unwrap();
+    std::fs::write(
+        repo.path().join(".gitignore"),
+        "probe-ignored.txt\n.aethyme/broker.db*\n.aethyme/logs/\n.aethyme/run/\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.path().join(".aethyme/gates.toml"),
+        r#"
+[[gate]]
+name = "mutator"
+command = "printf changed > tracked.txt; touch probe-untracked.txt probe-ignored.txt"
+cost = 1
+timeout_seconds = 30
+resource_ttl_seconds = 30
+
+[[gate.resources]]
+key = "probe_slot"
+kind = "exclusive_key"
+name = "gate-doctor-cli-probe"
+"#,
+    )
+    .unwrap();
+    git(repo.path(), &["add", "-A"]);
+    git(repo.path(), &["commit", "-qm", "add probe fixture"]);
+    let original = std::fs::read_to_string(repo.path().join("tracked.txt")).unwrap();
+
+    let output = Command::new(CLI)
+        .args(["gates", "doctor", "--probe", "--only", "mutator", "--json"])
+        .current_dir(repo.path())
+        .env("AETHYME_HOST_STATE_DIR", host_state.path())
+        .output()
+        .unwrap();
+    let report: serde_json::Value = serde_json::from_str(&stdout(output)).unwrap();
+    assert_eq!(report["probe"]["passed"], true);
+    assert_eq!(
+        report["probe"]["selected_gates"],
+        serde_json::json!(["mutator"])
+    );
+    assert_eq!(
+        report["probe"]["worktree"]["result_cache"],
+        "ephemeral_probe_only"
+    );
+    assert_eq!(
+        report["probe"]["outcomes"][0]["acquired_declared_resources"],
+        true
+    );
+    assert_eq!(
+        report["probe"]["mutations"]["tracked"],
+        serde_json::json!(["tracked.txt"])
+    );
+    assert_eq!(
+        report["probe"]["mutations"]["untracked"],
+        serde_json::json!(["probe-untracked.txt"])
+    );
+    assert_eq!(
+        report["probe"]["mutations"]["ignored"],
+        serde_json::json!(["probe-ignored.txt"])
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.path().join("tracked.txt")).unwrap(),
+        original
+    );
+    assert!(!repo.path().join("probe-untracked.txt").exists());
+    assert!(!repo.path().join("probe-ignored.txt").exists());
+    let tree = GitRepo::discover(repo.path())
+        .unwrap()
+        .working_tree_hash()
+        .unwrap();
+    let store = aethyme_broker::BrokerStore::open_in_repo(repo.path()).unwrap();
+    assert!(
+        store
+            .cached_gate_result("mutator", &tree)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        git_output(repo.path(), &["worktree", "list", "--porcelain"])
+            .lines()
+            .filter(|line| line.starts_with("worktree "))
+            .count(),
+        1
+    );
 }

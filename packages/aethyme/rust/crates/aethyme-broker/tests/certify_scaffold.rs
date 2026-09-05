@@ -519,6 +519,10 @@ fn gates_draft_detects_manifests_deterministically() {
     // The draft parses as a valid gate config.
     let loaded = aethyme_broker::load_gates(tmp.path()).unwrap();
     assert_eq!(loaded.len(), 5);
+    assert!(
+        loaded.iter().all(|gate| gate.timeout_seconds.is_some()),
+        "every generated draft gate must have an explicit reviewed timeout"
+    );
     assert_gate(
         &loaded,
         "js-lint",

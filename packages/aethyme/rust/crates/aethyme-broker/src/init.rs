@@ -1111,14 +1111,14 @@ pub fn draft_gate_config(main_root: &Path) -> Option<String> {
         };
         let _ = write!(
             gates,
-            "\n[[gate]]\nname = \"cargo-test\"\ncommand = \"cargo test --workspace --quiet --manifest-path {manifest}\"\ncost = 3\ntriggers = [\"**/*.rs\", \"**/Cargo.toml\"]\n"
+            "\n[[gate]]\nname = \"cargo-test\"\ncommand = \"cargo test --workspace --quiet --manifest-path {manifest}\"\ncost = 3\ntimeout_seconds = 1800\ntriggers = [\"**/*.rs\", \"**/Cargo.toml\"]\n"
         );
     }
     if manifest_exists(main_root, &["go.mod"]) {
         found = true;
         found_test_gate = true;
         gates.push_str(
-            "\n[[gate]]\nname = \"go-test\"\ncommand = \"go test ./...\"\ncost = 2\ntriggers = [\"**/*.go\", \"go.mod\", \"go.sum\"]\n",
+            "\n[[gate]]\nname = \"go-test\"\ncommand = \"go test ./...\"\ncost = 2\ntimeout_seconds = 900\ntriggers = [\"**/*.go\", \"go.mod\", \"go.sum\"]\n",
         );
     }
     if let Some(scripts) = package_json_scripts(main_root) {
@@ -1127,7 +1127,7 @@ pub fn draft_gate_config(main_root: &Path) -> Option<String> {
             let command = node_script_command(main_root, "lint");
             let _ = write!(
                 gates,
-                "\n[[gate]]\nname = \"js-lint\"\ncommand = \"{command}\"\ncost = 1\ntriggers = [\"**/*.js\", \"**/*.jsx\", \"**/*.ts\", \"**/*.tsx\", \"package.json\"]\n"
+                "\n[[gate]]\nname = \"js-lint\"\ncommand = \"{command}\"\ncost = 1\ntimeout_seconds = 300\ntriggers = [\"**/*.js\", \"**/*.jsx\", \"**/*.ts\", \"**/*.tsx\", \"package.json\"]\n"
             );
         }
         if scripts.iter().any(|script| script == "test") {
@@ -1136,7 +1136,7 @@ pub fn draft_gate_config(main_root: &Path) -> Option<String> {
             let command = node_script_command(main_root, "test");
             let _ = write!(
                 gates,
-                "\n[[gate]]\nname = \"js-test\"\ncommand = \"{command}\"\ncost = 2\ntriggers = [\"**/*.js\", \"**/*.jsx\", \"**/*.ts\", \"**/*.tsx\", \"package.json\"]\n"
+                "\n[[gate]]\nname = \"js-test\"\ncommand = \"{command}\"\ncost = 2\ntimeout_seconds = 900\ntriggers = [\"**/*.js\", \"**/*.jsx\", \"**/*.ts\", \"**/*.tsx\", \"package.json\"]\n"
             );
         }
     }
@@ -1144,7 +1144,7 @@ pub fn draft_gate_config(main_root: &Path) -> Option<String> {
         if pyproject.contains("ruff") {
             found = true;
             gates.push_str(
-                "\n[[gate]]\nname = \"ruff\"\ncommand = \"python3 -m ruff check .\"\ncost = 1\ntriggers = [\"**/*.py\", \"pyproject.toml\"]\n",
+                "\n[[gate]]\nname = \"ruff\"\ncommand = \"python3 -m ruff check .\"\ncost = 1\ntimeout_seconds = 300\ntriggers = [\"**/*.py\", \"pyproject.toml\"]\n",
             );
         }
         if pyproject.contains("pytest") {
@@ -1153,14 +1153,14 @@ pub fn draft_gate_config(main_root: &Path) -> Option<String> {
             let command = toml_basic_string(PYTEST_SAFE_COMMAND);
             let _ = write!(
                 gates,
-                "\n[[gate]]\nname = \"pytest\"\ncommand = \"{command}\"\ncost = 2\ntriggers = [\"**/*.py\", \"pyproject.toml\"]\n",
+                "\n[[gate]]\nname = \"pytest\"\ncommand = \"{command}\"\ncost = 2\ntimeout_seconds = 900\ntriggers = [\"**/*.py\", \"pyproject.toml\"]\n",
             );
         }
     }
     if !found_test_gate && makefile_has_test_target(main_root) {
         found = true;
         gates.push_str(
-            "\n[[gate]]\nname = \"make-test\"\ncommand = \"make test\"\ncost = 2\ntriggers = [\"**\"]\n",
+            "\n[[gate]]\nname = \"make-test\"\ncommand = \"make test\"\ncost = 2\ntimeout_seconds = 900\ntriggers = [\"**\"]\n",
         );
     }
 

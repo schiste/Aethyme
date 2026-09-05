@@ -449,6 +449,7 @@ until an explicit fetch makes ancestry verification possible.
 - `aethyme broker resources list [--all] [--json]`
 - `aethyme broker resources reconcile <lease-id> --confirm <generation> [--json]`
 - `aethyme broker gates validate [--json]`
+- `aethyme broker gates doctor [--probe] [--only <gate>] [--json]`
 - `aethyme broker gates manifest [--head <ref>] [--json]`
 - `aethyme broker gates scope --base <ref> --head <ref> [--json]`
 - `aethyme broker gates affected --session <id> [--why] [--json]`
@@ -717,6 +718,42 @@ introduced graph-integrity provenance; the manifest SHA-256 binds every field.
 It never contains gate commands,
 environment values, credentials, diffs, or absolute paths. Consumers must
 reject unsupported schema versions, unknown fields, and digest drift.
+
+Schema 3 adds the optional `timeout_seconds` field. It is part of both the
+opaque execution-definition hash and the portable scope-manifest digest. A
+positive configured value is enforced natively against the gate's complete
+process group and produces the existing typed `timeout` failure class. An
+absent value preserves historical unbounded execution but is reported by the
+gate doctor. Invalid or zero values are diagnosed by the doctor and refused by
+normal gate parsing. Newly generated drafts contain conservative explicit
+timeouts, while remaining `reviewed = false` until a maintainer approves the
+commands, triggers, costs, and deadlines.
+
+`broker gates doctor` is an advisory exact-HEAD quality inspection. It reports
+confidence and redacted evidence for missing or invalid timeouts, missing
+cheap/full lanes, dead or overly broad triggers, uncovered source areas,
+undeclared Docker/PostgreSQL isolation, fixed database/port/project names,
+unmanaged writable caches, main-checkout assumptions, weak failure evidence,
+and equivalent gates. It reads tracked paths from the committed tree with
+NUL-safe Git output. Dirty, untracked, and ignored files are not inputs, it
+does not open normal broker storage, and it never changes gate selection or
+runs during ordinary readiness inspection.
+
+Probe execution is always explicit:
+
+```bash
+aethyme broker gates doctor --probe
+aethyme broker gates doctor --probe --only integration --json
+```
+
+The probe creates a locked disposable detached worktree at exact committed
+HEAD, loads the committed policy, acquires declared host resources, bypasses
+the normal gate cache, and stores any transient result rows and logs only in a
+temporary probe directory. It records tracked, untracked, and ignored changes
+separately, reports that dependency preparation was not run, then removes only
+the exact probe worktree, temporary evidence, and owned resource leases. The
+invoking checkout is never cleaned or rewritten. Gate failures and mutations
+remain findings in the report rather than silently modifying enforcement.
 
 `broker gates scope` evaluates that same committed policy with the same
 `select_gates` implementation used by broker execution. It resolves both refs
