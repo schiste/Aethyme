@@ -5716,6 +5716,27 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     short_commit(&report.start_base.commit),
                     report.start_base.evidence.as_str()
                 );
+                // Integration is normally ahead of the default branch. Behind
+                // means it stopped following, and every session cut from it
+                // inherits the gap — silently, because the line above looks
+                // identical either way.
+                if let Some(behind) = report.start_base.behind_default_commits
+                    && behind > 0
+                {
+                    out!(
+                        "warning: this base is {behind} commit(s) behind {}; a branch cut \
+                         from it carries that gap into its pull request",
+                        report
+                            .start_base
+                            .default_ref
+                            .as_deref()
+                            .unwrap_or("the default branch")
+                    );
+                    out!(
+                        "         inspect with `aethyme broker integration status`, or start \
+                         from the default branch if integration is not the base you want."
+                    );
+                }
                 render_worktree_placement(&report.worktree_placement);
                 render_planned_explicit_leases(&report.planned_explicit_leases);
                 render_preparation_status(&report.preparation, false)?;

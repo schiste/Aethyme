@@ -574,6 +574,17 @@ pub struct SessionStartBase {
     pub ref_name: String,
     pub commit: String,
     pub evidence: SessionStartBaseEvidence,
+    /// Commits the chosen base is behind the fetched default branch.
+    ///
+    /// Integration is normally *ahead* of the default branch, carrying work not
+    /// yet published. Being behind it means the default branch moved and
+    /// integration did not follow, so every session started here inherits that
+    /// drift — #137 reports a base 160 commits behind, which a branch cut from
+    /// it would have carried into its pull request. `None` when there is no
+    /// fetched default branch to compare against.
+    pub behind_default_commits: Option<u64>,
+    /// The ref the comparison used, so the number can be checked.
+    pub default_ref: Option<String>,
 }
 
 /// A session enriched with liveness derived at read time — what
@@ -2863,14 +2874,29 @@ impl Broker {
         Ok(())
     }
 
+    /// Compare a chosen start base against the fetched default branch.
+    fn start_base_drift(&self, commit: &str) -> (Option<u64>, Option<String>) {
+        let Some((upstream_ref, upstream_head)) = self.repo.tracking_upstream() else {
+            return (None, None);
+        };
+        let behind = self
+            .repo
+            .commit_count_between(commit, &upstream_head)
+            .ok();
+        (behind, Some(upstream_ref))
+    }
+
     fn select_session_start_base(&self) -> Result<SessionStartBase, BrokerOpError> {
         let integration_branch = PromoteConfig::load(&self.main_root).branch;
         let integration_ref = format!("refs/heads/{integration_branch}");
         if let Some(commit) = self.repo.resolve_ref(&integration_ref) {
+            let (behind_default_commits, default_ref) = self.start_base_drift(&commit);
             return Ok(SessionStartBase {
                 ref_name: integration_ref,
                 commit,
                 evidence: SessionStartBaseEvidence::IntegrationTip,
+                behind_default_commits,
+                default_ref,
             });
         }
 
@@ -2882,6 +2908,8 @@ impl Broker {
                         ref_name: local_ref,
                         commit,
                         evidence: SessionStartBaseEvidence::RemoteDefaultBranch,
+                        behind_default_commits: None,
+                        default_ref: None,
                     });
                 }
             }
@@ -2894,11 +2922,15 @@ impl Broker {
                 ref_name: "refs/heads/main".into(),
                 commit,
                 evidence: SessionStartBaseEvidence::ConventionalMain,
+                        behind_default_commits: None,
+                        default_ref: None,
             }),
             (None, Some(commit)) => Ok(SessionStartBase {
                 ref_name: "refs/heads/master".into(),
                 commit,
                 evidence: SessionStartBaseEvidence::ConventionalMaster,
+                        behind_default_commits: None,
+                        default_ref: None,
             }),
             (Some(_), Some(_)) => Err(BrokerOpError::StartBaseUnavailable {
                 reason: "both refs/heads/main and refs/heads/master exist, but origin/HEAD does not select one".into(),

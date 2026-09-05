@@ -70,9 +70,18 @@ pub enum HooksError {
     HooksPathOverride { configured: String },
     #[error(
         "gate {gate} failed (exit {code}) — commit blocked. Fix and retry, or bypass once \
-         with `git commit --no-verify`."
+         with `git commit --no-verify`.{unprepared}"
     )]
-    GateFailed { gate: String, code: i32 },
+    GateFailed {
+        gate: String,
+        code: i32,
+        /// Appended when this worktree visibly lacks dependencies the gate
+        /// needs. `start` already warns that preparation is not declared, but
+        /// that warning arrives before the agent can act on it and is long
+        /// forgotten by the time a gate fails at commit time — so the failure
+        /// has to carry its own explanation.
+        unprepared: String,
+    },
     #[error(
         "git commit refused by Aethyme pre-commit:\n\
          broker coordination is active, but protected branch {branch:?} in {worktree:?} is not owned by a live session.\n\
@@ -430,6 +439,59 @@ pub fn status(repo: &GitRepo) -> Result<Vec<HookReport>, HooksError> {
 /// failing gate blocks the commit and is named in the error. Successful
 /// gate output stays quiet; a failing gate's complete stdout and stderr
 /// are replayed before the actionable error.
+/// Explain a gate failure that a missing dependency directory would cause.
+///
+/// Reported in #137: an agent followed the documented workflow into a broker
+/// worktree, `start` warned that the repository declares gates but no
+/// dependency preparation, and the first commit then failed in `pnpm exec
+/// prettier` with `node_modules missing`. The warning was correct and useless
+/// at that moment, because nothing repeated it where the failure happened.
+///
+/// Names only what is observably absent here and present in the primary
+/// checkout; it never claims to know what a gate requires.
+fn unprepared_worktree_note(main_root: &Path, worktree: &Path) -> String {
+    if main_root == worktree {
+        return String::new();
+    }
+    let Ok(entries) = std::fs::read_dir(main_root) else {
+        return String::new();
+    };
+    let repo = GitRepo::discover(main_root).ok();
+    let mut absent = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if name.starts_with('.') || worktree.join(name).exists() {
+            continue;
+        }
+        if repo
+            .as_ref()
+            .is_some_and(|repo| repo.path_is_ignored(name))
+        {
+            absent.push(name.to_string());
+        }
+        if absent.len() >= 4 {
+            break;
+        }
+    }
+    if absent.is_empty() {
+        return String::new();
+    }
+    absent.sort();
+    format!(
+        "\nThis worktree lacks ignored path(s) the primary checkout has: {}. \
+         If the gate needs them, declare preparation in .aethyme/preparation.toml \
+         or run the repository's setup here; `aethyme broker prepare status \
+         --session <id>` reports what is known.",
+        absent.join(", ")
+    )
+}
+
 pub fn run_pre_commit(cwd: &Path) -> Result<(), HooksError> {
     let checkout = GitRepo::discover(cwd)?;
     let main_root = checkout.main_root()?;
@@ -478,6 +540,7 @@ pub fn run_pre_commit(cwd: &Path) -> Result<(), HooksError> {
             return Err(HooksError::GateFailed {
                 gate: gate.name.clone(),
                 code: output.status.code().unwrap_or(-1),
+                unprepared: unprepared_worktree_note(&main_root, checkout.root()),
             });
         }
     }
