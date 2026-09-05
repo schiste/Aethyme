@@ -153,7 +153,8 @@ pub enum BrokerOpError {
     #[error("cannot capture repository contract at {path}: {reason}")]
     RepositoryContract { path: String, reason: String },
     #[error(
-        "lease claim for {path} by session {session_id} overlaps {blocker_count} active lease(s) held by other sessions"
+        "lease claim for {path} by session {session_id} overlaps {blocker_count} active lease(s): {}",
+        describe_lease_blockers(blockers)
     )]
     LeaseClaimConflict {
         session_id: i64,
@@ -899,11 +900,45 @@ pub struct IntegrationMovementNotice {
     pub commands: Vec<String>,
 }
 
+/// Render lease blockers as "session N (status) holds <path> [kind]".
+///
+/// The blockers were always attached to this error; only the count was printed,
+/// so a reader had to query the JSON to learn whether the holder was even
+/// working. Naming the holder and its status is what makes the refusal
+/// actionable — a lease held by a stale session is a different problem from one
+/// held by a live editor.
+fn describe_lease_blockers(blockers: &[LeaseBlocker]) -> String {
+    if blockers.is_empty() {
+        return "no holder recorded".into();
+    }
+    let mut shown: Vec<String> = blockers
+        .iter()
+        .take(4)
+        .map(|blocker| {
+            format!(
+                "session {} ({}) holds {} [{}]",
+                blocker.session_id,
+                blocker.holder_status.as_deref().unwrap_or("status unknown"),
+                blocker.path,
+                blocker.kind.as_str()
+            )
+        })
+        .collect();
+    if blockers.len() > shown.len() {
+        shown.push(format!("and {} more", blockers.len() - shown.len()));
+    }
+    shown.join("; ")
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct LeaseBlocker {
     pub session_id: i64,
     pub path: String,
     pub kind: LeaseKind,
+    /// Holder's session status. A lease held by a stale or idle session blocks
+    /// exactly as hard as one held by a session actively editing the file, and
+    /// the refusal is only actionable if the reader can tell them apart.
+    pub holder_status: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -3280,6 +3315,7 @@ impl Broker {
                     session_id: blocker.session_id,
                     path: blocker.path.clone(),
                     kind: blocker.kind,
+                    holder_status: self.lease_holder_status(blocker.session_id),
                 });
             }
 
@@ -3342,6 +3378,7 @@ impl Broker {
             .filter(|lease| paths_overlap(&lease.path, path))
             .map(|lease| LeaseBlocker {
                 session_id: lease.session_id,
+                holder_status: self.lease_holder_status(lease.session_id),
                 path: lease.path,
                 kind: lease.kind,
             })
@@ -5922,6 +5959,14 @@ impl Broker {
 
     fn legacy_broker_worktree_root(&self) -> PathBuf {
         self.main_root.join(".aethyme/worktrees")
+    }
+
+    /// Status of the session holding a lease, for a refusal that can be acted on.
+    fn lease_holder_status(&self, session_id: i64) -> Option<String> {
+        self.store_ref()
+            .session(session_id)
+            .ok()
+            .map(|session| session.status.as_str().to_string())
     }
 
     pub(crate) fn is_broker_owned_worktree(&self, session: &Session, path: &Path) -> bool {

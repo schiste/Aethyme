@@ -449,3 +449,43 @@ fn lease_export_requires_a_selector_and_valid_bounds() {
     assert!(!excessive.status.success());
     assert!(String::from_utf8_lossy(&excessive.stderr).contains("between 1 and 1000"));
 }
+
+/// A lease refusal must name who holds the lease and what state they are in
+/// (#137 B4). The blockers were always attached to the error; printing only the
+/// count forced a JSON query to learn whether the holder was even working, and
+/// at eight concurrent sessions that made leases impractical.
+#[test]
+fn a_lease_refusal_names_the_holder_and_its_status() {
+    let repo = fixture();
+    let first = run(
+        repo.path(),
+        &["start", "--task", "holder", "--path", "shared.txt", "--json"],
+    );
+    assert!(first.status.success(), "start: {}", String::from_utf8_lossy(&first.stderr));
+    let holder: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
+    let holder_id = holder["id"].as_i64().unwrap();
+
+    let second = run(repo.path(), &["start", "--task", "claimant", "--json"]);
+    assert!(second.status.success());
+    let claimant: serde_json::Value = serde_json::from_slice(&second.stdout).unwrap();
+    let claimant_id = claimant["id"].as_i64().unwrap().to_string();
+
+    let refused = run(
+        repo.path(),
+        &["leases", "claim", "shared.txt", "--session", &claimant_id],
+    );
+    assert!(!refused.status.success(), "the claim must be refused");
+    let text = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        text.contains(&format!("session {holder_id}")),
+        "the refusal must name the holding session: {text}"
+    );
+    assert!(
+        text.contains("shared.txt"),
+        "and the path it holds: {text}"
+    );
+    assert!(
+        text.contains("(active)") || text.contains("(idle)") || text.contains("(stale)"),
+        "and the holder's status, which is what makes it actionable: {text}"
+    );
+}
