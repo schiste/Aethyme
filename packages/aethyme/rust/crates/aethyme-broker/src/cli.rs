@@ -5385,9 +5385,29 @@ fn run_resources(parsed: Parsed) -> Result<(), UsageError> {
         }
         "renew" | "release" => {
             let mut coordinator = crate::HostResourceCoordinator::open_default()?;
-            let path = parsed.positional.get(1).map(PathBuf::from).ok_or_else(|| {
+            let argument = parsed.positional.get(1).ok_or_else(|| {
                 UsageError::Message(format!("resources {action} requires <grant.json>"))
             })?;
+            let path = PathBuf::from(argument);
+            // A lease id here is a natural mistake, and reporting it as a missing
+            // file sends the operator looking for the wrong thing (issue #139).
+            if !path.exists() {
+                if let Some(lease) = coordinator
+                    .list(false)?
+                    .into_iter()
+                    .find(|lease| &lease.lease_id == argument)
+                {
+                    return Err(UsageError::Message(format!(
+                        "resources {action} takes the grant JSON written at acquire, not a lease \
+                         id; {argument} is a {} lease. The grant carries the ownership token that \
+                         authorizes {action}, and a holder that died leaves none to reuse -- \
+                         reclaim that lease instead: aethyme broker resources reconcile \
+                         {argument} --confirm {}",
+                        lease.state.as_str(),
+                        lease.generation,
+                    )));
+                }
+            }
             let mut grant: crate::HostResourceGrant = read_resource_json(&path)?;
             grant.lease = if action == "renew" {
                 let ttl = parsed.ttl_seconds.ok_or_else(|| {

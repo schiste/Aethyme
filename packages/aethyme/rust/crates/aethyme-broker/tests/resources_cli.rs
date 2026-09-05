@@ -315,3 +315,69 @@ fn host_resource_cli_plans_acquires_lists_and_releases_without_token_leaks() {
         serde_json::json!([])
     );
 }
+
+/// Issue #139: an operator reaching for a lease id got "No such file or
+/// directory", which reads as a broken command rather than a wrong argument.
+#[test]
+fn release_given_a_lease_id_points_at_reconcile() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = temp.path().join("state");
+    let request = temp.path().join("request.json");
+    let grant_path = temp.path().join("grant.json");
+    std::fs::write(
+        &request,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": 1,
+            "request_id": "only",
+            "repository": "owner/repo",
+            "worktree_fingerprint": "only",
+            "run_id": "only",
+            "ttl_seconds": 60,
+            "resources": [{
+                "key": "workers",
+                "kind": "capacity",
+                "pool": "host-work",
+                "units": 1,
+                "limit": 2
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let acquired = run(
+        temp.path(),
+        &state,
+        &[
+            "resources",
+            "acquire",
+            request.to_str().unwrap(),
+            "--grant-out",
+            grant_path.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    assert!(
+        acquired.status.success(),
+        "acquire failed: {}",
+        String::from_utf8_lossy(&acquired.stderr)
+    );
+    let grant: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&grant_path).unwrap()).unwrap();
+    let lease_id = grant["lease"]["lease_id"].as_str().unwrap();
+
+    let released = run(temp.path(), &state, &["resources", "release", lease_id]);
+    assert!(!released.status.success(), "release must reject a lease id");
+    let message = format!(
+        "{}{}",
+        String::from_utf8_lossy(&released.stdout),
+        String::from_utf8_lossy(&released.stderr)
+    );
+    assert!(
+        message.contains("not a lease id") && message.contains("reconcile"),
+        "release must explain the argument and name the reclaim path: {message}"
+    );
+    assert!(
+        !message.contains("No such file or directory"),
+        "the raw file error is what misled the operator: {message}"
+    );
+}
