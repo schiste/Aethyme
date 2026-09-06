@@ -254,14 +254,37 @@ fn digest_confirmed_apply_resumes_a_deadline_and_preserves_monotonic_ids() {
 
     let mut broker = Broker::open(tmp.path()).unwrap();
     let plan = broker.gc_plan().unwrap();
-    let mismatch = broker.gc_apply(&"0".repeat(64)).unwrap_err();
-    assert!(mismatch.to_string().contains("confirmation mismatch"));
+    // No journal yet, so this is ordinary staleness: send the operator back to
+    // `gc plan` rather than offering a digest to paste (issue #140).
+    let mismatch = broker.gc_apply(&"0".repeat(64)).unwrap_err().to_string();
+    assert!(
+        mismatch.contains("no longer matches current state")
+            && mismatch.contains("aethyme broker gc plan"),
+        "stale confirmation must direct to a fresh plan: {mismatch}"
+    );
+    assert!(
+        !mismatch.contains("expected"),
+        "a freshly computed digest must not be offered as a value to confirm: {mismatch}"
+    );
     assert!(gate_log.exists());
 
     let paused = broker.gc_apply_bounded(&plan.digest, Some(0)).unwrap();
     assert!(!paused.complete);
     assert!(paused.deadline_reached);
     assert!(main_root.join(".aethyme/gc-journal.json").exists());
+
+    // With a journal present the expectation comes from the interrupted run, and
+    // no fresh plan can reproduce it -- so the message must say so instead of
+    // sending the operator to `gc plan`, which would loop them (issue #140).
+    let resume = broker.gc_apply(&"1".repeat(64)).unwrap_err().to_string();
+    assert!(
+        resume.contains("interrupted GC run is pending") && resume.contains(&plan.digest),
+        "a pending run must be named with its own digest: {resume}"
+    );
+    assert!(
+        resume.contains("cannot reproduce"),
+        "the message must explain why re-planning will not help: {resume}"
+    );
 
     std::fs::write(&gate_log, "changed after confirmation\n").unwrap();
     let drift = broker.gc_apply(&plan.digest).unwrap_err();

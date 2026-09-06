@@ -87,8 +87,25 @@ pub enum BrokerOpError {
     CleanupConfirmationMismatch { expected: String, actual: String },
     #[error("GC confirmation must be a full SHA-256 digest")]
     GcConfirmationNotSha256,
-    #[error("GC confirmation mismatch: expected {expected}, received {actual}")]
-    GcConfirmationMismatch { expected: String, actual: String },
+    /// The reviewed plan no longer describes current state. The freshly computed
+    /// digest is deliberately not offered as a value to pass: confirming a plan
+    /// nobody reviewed is exactly what this pair exists to prevent (issue #140).
+    #[error(
+        "the reviewed GC plan no longer matches current state, so nothing was applied; \
+         review a new plan with `aethyme broker gc plan` and confirm the digest it prints \
+         (the digest passed, {actual}, is stale)"
+    )]
+    GcConfirmationMismatch { actual: String },
+    /// A partially applied run is recorded in the journal and must be finished
+    /// with its own digest. No fresh plan can reproduce it, so directing the
+    /// operator to re-plan here would loop them (issue #140).
+    #[error(
+        "an interrupted GC run is pending and must be resumed on its own plan: confirm \
+         {expected}, not {actual}. `aethyme broker gc plan` cannot reproduce that digest \
+         because it belongs to the partially applied run recorded in \
+         .aethyme/gc-journal.json; inspect it with `aethyme broker doctor`"
+    )]
+    GcResumeConfirmationMismatch { expected: String, actual: String },
     #[error("promotion record confirmation mismatch: expected {expected}, received {actual}")]
     PromotionRecordConfirmationMismatch { expected: String, actual: String },
     #[error("GC is already running under process {pid}; wait or inspect .aethyme/gc.lock")]

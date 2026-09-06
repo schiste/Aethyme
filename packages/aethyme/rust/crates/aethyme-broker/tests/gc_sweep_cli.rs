@@ -153,7 +153,8 @@ fn a_reappearing_repository_revokes_an_authorized_orphan_removal() {
     // that protects a resumed apply. What must hold either way is that an
     // authorization stops binding the moment its premise changes.
     assert!(
-        rendered.contains("confirmation mismatch") || rendered.contains("orphan evidence changed"),
+        rendered.contains("no longer matches current state")
+            || rendered.contains("orphan evidence changed"),
         "expected the removal to be refused, got {rendered}"
     );
     assert!(orphan.exists(), "the reclaimed tree must survive");

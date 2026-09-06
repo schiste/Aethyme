@@ -943,7 +943,7 @@ impl Broker {
                     });
                 }
                 if !journal.digest.eq_ignore_ascii_case(confirm) {
-                    return Err(BrokerOpError::GcConfirmationMismatch {
+                    return Err(BrokerOpError::GcResumeConfirmationMismatch {
                         expected: journal.digest,
                         actual: confirm.to_owned(),
                     });
@@ -954,7 +954,6 @@ impl Broker {
                 let plan = self.gc_plan()?;
                 if !plan.digest.eq_ignore_ascii_case(confirm) {
                     return Err(BrokerOpError::GcConfirmationMismatch {
-                        expected: plan.digest,
                         actual: confirm.to_owned(),
                     });
                 }
