@@ -2354,7 +2354,7 @@ impl Broker {
                     self.store
                         .set_session_foreign_files(session.id, &foreign_files)?;
                     let integration_drift =
-                        Some(self.adopt_integration_drift(&checkout, session.id)?);
+                        Some(self.adopt_integration_drift(&checkout, session.id, true)?);
                     let planned_explicit_leases =
                         self.planned_explicit_leases(session.id, &planned_paths)?;
                     let preparation = self.preparation_status(session.id)?;
@@ -2411,11 +2411,16 @@ impl Broker {
         };
         self.store
             .set_session_foreign_files(session.id, &foreign_files)?;
-        let integration_drift = if options.mode == AdoptMode::Reuse {
-            Some(self.adopt_integration_drift(&checkout, session.id)?)
-        } else {
-            None
-        };
+        // Computed for every adopt, not only reuse. Adopting a worktree that
+        // already has commits records the current HEAD as the baseline, so those
+        // commits are not session-owned and submit will not replay them. Saying
+        // nothing here is what turns that into a JSON archaeology exercise at
+        // submit time (issue #144).
+        let integration_drift = Some(self.adopt_integration_drift(
+            &checkout,
+            session.id,
+            options.mode == AdoptMode::Reuse,
+        )?);
         let planned_explicit_leases = self.planned_explicit_leases(session.id, &planned_paths)?;
         let preparation = self.preparation_status(session.id)?;
         Ok(AdoptReport {
@@ -2475,13 +2480,21 @@ impl Broker {
         })
     }
 
+    /// `may_create_integration` keeps reuse behaviour unchanged while letting a
+    /// plain adopt report drift without bringing the integration branch into
+    /// existence as a side effect of describing state (issue #144).
     fn adopt_integration_drift(
         &mut self,
         checkout: &GitRepo,
         session_id: i64,
+        may_create_integration: bool,
     ) -> Result<AdoptIntegrationDrift, BrokerOpError> {
         let session_head = checkout.head_commit()?;
-        let (integration_branch, integration_head) = self.integration_head()?;
+        let (integration_branch, integration_head) = if may_create_integration {
+            self.integration_head()?
+        } else {
+            self.integration_head_snapshot()?
+        };
         let ahead_commits = checkout.commit_count_between(&integration_head, &session_head)?;
         let behind_commits = checkout.commit_count_between(&session_head, &integration_head)?;
         let relation = match (ahead_commits, behind_commits) {
@@ -2545,7 +2558,7 @@ impl Broker {
             }
             AdoptIntegrationRelation::Ahead => (
                 Some(format!(
-                    "session HEAD is {ahead_commits} commit(s) ahead of {integration_branch}, but the submission plan has no safe pending session-owned commits; do not submit until ownership is reconciled"
+                    "session HEAD is {ahead_commits} commit(s) ahead of {integration_branch}, but none are session-owned under the recorded baseline, so submit will not replay them; they predate this adoption. To submit them, re-adopt from a base that precedes them"
                 )),
                 "aethyme broker integration status".into(),
             ),

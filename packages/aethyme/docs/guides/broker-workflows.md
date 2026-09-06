@@ -336,6 +336,23 @@ For repositories that explicitly permit an emergency lane, set
 broker persists only the reason digest and still enforces the full confirmed
 SHA, remote freshness, non-force push, and unknown-outcome barriers.
 
+### Synchronizing local main from another worktree
+
+`ship execute --sync-main` is safe to run from any session worktree, which is
+the normal case: the primary checkout almost always has the default branch
+checked out, and sessions run elsewhere. Synchronization runs
+`git merge --ff-only` **in the primary checkout**, so that checkout's index and
+working tree advance with the ref. Before doing so it refuses if the primary
+checkout is on another branch, has tracked changes a fast-forward would
+overwrite, has untracked paths that would collide, or has diverged from the
+confirmed publication.
+
+Do not substitute `git update-ref refs/heads/<default>` for this. It moves the
+ref without touching the primary checkout's index or working tree, which leaves
+every file changed by the published commits looking locally modified when it is
+only stale. `git fetch . origin/<default>:<default>` refuses this case on its
+own; `update-ref` does not.
+
 ## Choose Gate Cache Policy Deliberately
 
 Gate results prove an exact Git tree. Normal gate runs use the cache when the

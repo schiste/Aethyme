@@ -1477,3 +1477,58 @@ fn status_flags_default_branch_commits_that_never_passed_through_submit() {
         advice.commands
     );
 }
+
+/// Issue #144: adopting a worktree that already has commits records the current
+/// HEAD as the baseline, so those commits are not session-owned. That was
+/// silent, and only visible as `no_changes` plus an ownership field in the
+/// submission plan JSON.
+#[test]
+fn adopting_a_worktree_with_pre_existing_commits_says_they_are_not_owned() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    init_repo(&repo);
+
+    // A worktree carrying work committed before any session existed.
+    let recovered = tmp.path().join("recovered");
+    sh(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "recovered",
+            recovered.to_str().unwrap(),
+        ],
+    );
+    std::fs::write(recovered.join("rescued.txt"), "work from a backup branch\n").unwrap();
+    sh(&recovered, &["add", "-A"]);
+    sh(&recovered, &["commit", "-qm", "feat: recovered work"]);
+
+    let mut broker = Broker::open(&repo).unwrap();
+    let report = broker
+        .adopt_with(
+            &recovered,
+            Some("adopt recovered work"),
+            AdoptMode::New,
+            None,
+        )
+        .unwrap();
+
+    let drift = report
+        .integration_drift
+        .expect("a fresh adopt must report drift, not only a reuse");
+    assert_eq!(drift.ahead_commits, 1);
+    let warning = drift
+        .warning
+        .expect("pre-existing commits must not be adopted silently");
+    assert!(
+        warning.contains("none are session-owned") && warning.contains("will not replay them"),
+        "the warning must say the commits are excluded: {warning}"
+    );
+    assert!(
+        warning.contains("re-adopt from a base that precedes them"),
+        "the warning must name a remedy: {warning}"
+    );
+}

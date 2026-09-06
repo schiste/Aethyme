@@ -7527,10 +7527,41 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     );
                 }
                 if outcome.no_changes {
-                    out!(
-                        "What now: no pending session-owned content remains to integrate; \
-                         aethyme/integration was not moved and no gates ran."
-                    );
+                    // "Nothing pending" is the right summary only when nothing was
+                    // set aside. Commits that predate the recorded baseline are not
+                    // session-owned, and saying so here is what saves the reader
+                    // from reading the plan JSON to find out why (issue #144).
+                    let inherited = outcome
+                        .submission_plan
+                        .commits
+                        .iter()
+                        .filter(|commit| {
+                            commit.ownership
+                                == crate::SubmissionCommitOwnership::InheritedFromRecordedBaseline
+                        })
+                        .count();
+                    if inherited > 0 {
+                        out!(
+                            "What now: no pending session-owned content remains to integrate, but \
+                             {inherited} commit(s) on this branch predate the recorded baseline{} \
+                             and are not session-owned, so they were not replayed. To submit them, \
+                             re-adopt the worktree from a base that precedes them.",
+                            outcome
+                                .submission_plan
+                                .recorded_baseline
+                                .as_deref()
+                                .map(|baseline| format!(
+                                    " ({})",
+                                    &baseline[..12.min(baseline.len())]
+                                ))
+                                .unwrap_or_default(),
+                        );
+                    } else {
+                        out!(
+                            "What now: no pending session-owned content remains to integrate; \
+                             aethyme/integration was not moved and no gates ran."
+                        );
+                    }
                     return Ok(());
                 }
                 if outcome.entry.status.as_str() == "rejected" {
