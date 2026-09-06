@@ -1409,3 +1409,71 @@ fn finish_missing_worktree_persists_an_explicitly_incomplete_snapshot() {
         serde_json::from_str(event.payload_json.as_deref().unwrap()).unwrap();
     assert_eq!(handoff["pending_work"]["worktree_missing"], true);
 }
+
+/// Issue #141: local `main` advanced repeatedly while sessions were live, and
+/// `status` could not associate the writes with any session or flag them at all.
+#[test]
+fn status_flags_default_branch_commits_that_never_passed_through_submit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    let remote = tmp.path().join("remote.git");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::create_dir_all(&remote).unwrap();
+    sh(&remote, &["init", "--bare", "-q", "-b", "main"]);
+    init_repo(&repo);
+    sh(
+        &repo,
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+    );
+    sh(&repo, &["push", "-qu", "origin", "main"]);
+    // A clone would set this; `remote add` does not. Without it the check is
+    // skipped rather than guessing a default branch name.
+    sh(&repo, &["remote", "set-head", "origin", "main"]);
+
+    let mut broker = Broker::open(&repo).unwrap();
+    let session = broker.start_worktree("promote something", None).unwrap();
+    let worktree = std::path::PathBuf::from(&session.worktree_path);
+    std::fs::write(worktree.join("owned.txt"), "work\n").unwrap();
+    sh(&worktree, &["add", "-A"]);
+    sh(&worktree, &["commit", "-qm", "session work"]);
+    assert!(broker.submit(session.id).unwrap().promoted);
+
+    // Integration now contains every accounted commit, so nothing is external.
+    let clean = broker.status(now_ms()).unwrap();
+    assert!(
+        !clean
+            .advice
+            .iter()
+            .any(|item| item.id == "main.external-writes"),
+        "a default branch with no unaccounted work must stay quiet: {:?}",
+        clean.advice.iter().map(|item| item.id).collect::<Vec<_>>()
+    );
+
+    // A writer that is not a broker session advances main directly.
+    std::fs::write(repo.join("outside.txt"), "written outside a session\n").unwrap();
+    sh(&repo, &["add", "-A"]);
+    sh(
+        &repo,
+        &["commit", "-qm", "feat: written outside the broker"],
+    );
+
+    let flagged = broker.status(now_ms()).unwrap();
+    let advice = flagged
+        .advice
+        .iter()
+        .find(|item| item.id == "main.external-writes")
+        .expect("an unaccounted default-branch commit must be surfaced");
+    assert!(
+        advice.summary.contains("never passed through submit"),
+        "{}",
+        advice.summary
+    );
+    assert!(
+        advice
+            .commands
+            .iter()
+            .any(|command| command.starts_with("git log --oneline")),
+        "the operator needs a bounded way to list them: {:?}",
+        advice.commands
+    );
+}

@@ -5036,6 +5036,37 @@ impl Broker {
                 },
                 );
         }
+        if let Some((branch, commits)) = self.external_default_branch_writes(&integration_head) {
+            let count = commits.len();
+            advice.push(StatusAdvice {
+                id: "main.external-writes",
+                severity: StatusAdviceSeverity::Warning,
+                reason: "local default branch carries commits integration does not contain",
+                summary: format!(
+                    "{count} {} on {branch} never passed through submit; no session accounts for {}",
+                    plural_word(count, "commit", "commits"),
+                    if count == 1 { "it" } else { "them" }
+                ),
+                session_id: None,
+                queue_entry_id: None,
+                evidence: vec![
+                    format!("integration head {}", &integration_head[..12.min(integration_head.len())]),
+                    format!(
+                        "unaccounted commits: {}",
+                        commits
+                            .iter()
+                            .take(3)
+                            .map(|commit| commit[..12.min(commit.len())].to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                ],
+                commands: vec![
+                    format!("git log --oneline {}..{branch}", integration_head),
+                    "aethyme broker start --task \"replay local default-branch work\"".into(),
+                ],
+            });
+        }
         let cleanup_retention = self.cleanup_retention(now_ms)?;
         if cleanup_retention.broker_owned_worktree_count > 0 {
             let count = cleanup_retention.broker_owned_worktree_count;
@@ -5116,6 +5147,32 @@ impl Broker {
             integration_reconciliation,
             cleanup_retention,
         })
+    }
+
+    /// Commits sitting on the local default branch that integration does not
+    /// contain. They reached the branch without passing through submit, so no
+    /// session accounts for them and `status` would otherwise say nothing
+    /// (issue #141).
+    ///
+    /// Resolution is offline: `origin/HEAD` is written at clone time. When it is
+    /// unset the check is skipped rather than guessing a branch name, because a
+    /// wrong guess would report every repository as having external writes.
+    fn external_default_branch_writes(
+        &self,
+        integration_head: &str,
+    ) -> Option<(String, Vec<String>)> {
+        let repo = self.repo_handle();
+        let head_ref = repo.symbolic_ref("refs/remotes/origin/HEAD")?;
+        let branch = head_ref.rsplit('/').next()?.to_string();
+        let local_ref = format!("refs/heads/{branch}");
+        let local_sha = repo.resolve_ref(&local_ref)?;
+        let commits = repo
+            .commits_between_oldest(integration_head, &local_sha)
+            .ok()?;
+        if commits.is_empty() {
+            return None;
+        }
+        Some((branch, commits))
     }
 
     fn status_advice(
