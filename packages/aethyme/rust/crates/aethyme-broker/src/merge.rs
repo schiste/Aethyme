@@ -391,6 +391,40 @@ impl Broker {
         self.simulate_and_gate_with_policy(entry.id, cache_policy)
     }
 
+    /// Whether `commit` is a promotion this session produced that no promoted
+    /// queue entry claims.
+    ///
+    /// Both halves matter. The message link proves the commit is this session's
+    /// work rather than someone else's landing first, and the unclaimed check
+    /// keeps a normal already-landed submission -- where another entry legitimately
+    /// owns the tip -- reporting content-empty as it should.
+    fn integration_tip_is_unclaimed_promotion_for(
+        &mut self,
+        session_id: i64,
+        commit: &str,
+    ) -> Result<bool, BrokerOpError> {
+        let Ok(message) = self.repo_handle().commit_message(commit) else {
+            return Ok(false);
+        };
+        if !message.contains(&format!("promote session {session_id} ")) {
+            return Ok(false);
+        }
+        let claimed = self.store().merge_queue()?.into_iter().any(|entry| {
+            entry.status == MergeStatus::Promoted
+                && entry
+                    .details_json
+                    .as_deref()
+                    .and_then(|details| serde_json::from_str::<serde_json::Value>(details).ok())
+                    .and_then(|details| {
+                        details
+                            .get("commit")
+                            .and_then(|value| value.as_str().map(str::to_string))
+                    })
+                    .is_some_and(|claimed| claimed == commit)
+        });
+        Ok(!claimed)
+    }
+
     /// Simulate (and, when clean, gate) one queue entry against the
     /// CURRENT integration head. Rebinds the entry's base if the branch
     /// moved since submission.
@@ -492,6 +526,35 @@ impl Broker {
                 "reason": "submission produces no content change",
                 "pending_session_owned_commits": submission_plan.pending_owned_commit_ids(),
             });
+            // Ask why it is empty before recording it as nothing. If this very
+            // session already produced the integration tip and no promoted entry
+            // claims it, a previous attempt promoted and lost its response:
+            // superseding here would strand that commit as unrecorded and refuse
+            // publication (issue #135). Claim it instead, which is idempotent.
+            if self.integration_tip_is_unclaimed_promotion_for(session.id, &base)? {
+                let recovered = serde_json::json!({
+                    "commit": base,
+                    "reason": "retry claimed an unrecorded promotion this session produced",
+                });
+                self.store().record_recovered_promotion(
+                    entry.id,
+                    &base,
+                    &simulation.tree,
+                    &recovered.to_string(),
+                )?;
+                clear_action_required(Path::new(&session.worktree_path));
+                return Ok(SubmitOutcome {
+                    entry: self.queue_entry(entry.id)?,
+                    submission_plan,
+                    conflicts: Vec::new(),
+                    conflict_details: Vec::new(),
+                    gate_outcomes: Vec::new(),
+                    graph_integrity: None,
+                    gate_verification: SubmissionGateVerification::not_run(),
+                    no_changes: true,
+                    promoted: true,
+                });
+            }
             self.store().record_content_empty_supersession(
                 entry.id,
                 &base,

@@ -1137,6 +1137,62 @@ impl BrokerStore {
         Ok(())
     }
 
+    /// Claim an integration commit this session already produced, for an entry
+    /// that is still mid-flight.
+    ///
+    /// A submit whose response was lost can leave the ref advanced while its row
+    /// is `simulating`, and queue revalidation may then supersede that row -- so
+    /// the commit ends up on integration with nothing claiming it (issue #135).
+    /// Unlike [`Self::record_merge_promotion`] this accepts a row that is not
+    /// `verified`, because the verification already happened in the attempt that
+    /// produced the commit.
+    pub fn record_recovered_promotion(
+        &mut self,
+        entry_id: i64,
+        integration_commit: &str,
+        integration_tree: &str,
+        details_json: &str,
+    ) -> Result<(), BrokerError> {
+        let now = now_ms();
+        let tx = self.conn.transaction()?;
+        let entry = tx
+            .query_row(
+                "SELECT session_id, head_commit
+                 FROM merge_queue
+                 WHERE id = ?1 AND status IN ('simulating', 'verified', 'superseded')",
+                [entry_id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        let Some((session_id, session_head)) = entry else {
+            return Err(BrokerError::SessionNotFound(entry_id));
+        };
+        tx.execute(
+            "UPDATE merge_queue
+             SET status = 'promoted', merged_tree = ?2, details_json = ?3, updated_at = ?4
+             WHERE id = ?1",
+            params![entry_id, integration_tree, details_json, now],
+        )?;
+        update_accepted_checkpoint(
+            &tx,
+            session_id,
+            &session_head,
+            integration_commit,
+            integration_tree,
+            entry_id,
+            now,
+        )?;
+        insert_event(
+            &tx,
+            now,
+            "merge.promoted",
+            Some(session_id),
+            Some(details_json),
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Mark one simulated queue entry superseded because normalized replay
     /// proved it content-empty, and advance its session's accepted
     /// contribution checkpoint in the same SQLite transaction.
