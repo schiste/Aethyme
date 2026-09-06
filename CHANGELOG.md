@@ -4,6 +4,29 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.7.9] - 2026-09-06
+
+### Added
+
+- Promote commits now credit everyone in the chain: the human remains the
+  commit author, the broker becomes the committer, and the agent that produced
+  the change is named in a `Co-Authored-By` trailer. Pass
+  `--agent "<Name> <email>"` to `aethyme broker start` or `aethyme broker adopt`,
+  or export `AETHYME_AGENT`. An agent that is not identified is omitted rather
+  than guessed.
+
+### Changed
+
+- Broker storage writes schema 31. Schemas 1 through 31 are read and migrated.
+
+### Upgrade notes
+
+Read [Upgrading to v0.7.9](packages/aethyme/docs/guides/upgrading-to-v0.7.9.md)
+before updating. Broker storage moves from schema 30 to schema 31, and the
+migration is applied in place the first time a v0.7.9 binary opens the database.
+Earlier releases cannot read a migrated database, so upgrade every Aethyme
+installation that shares a repository together.
+
 ## [0.7.8] - 2026-09-06
 
 ### Added
