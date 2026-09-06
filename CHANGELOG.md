@@ -4,6 +4,48 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.7.10] - 2026-09-06
+
+### Fixed
+
+- Readiness remediation no longer captures every other `plan`, `apply`, or
+  `recover` subcommand. `gc plan`, `ship plan`, `promotion-record plan`, and
+  `checkpoint plan` each reach their own command again. Previously they returned
+  a readiness plan **and its digest**, which the matching `apply --confirm`
+  would have accepted, applying work the caller never reviewed.
+- `gc apply` distinguishes a stale confirmation from a pending interrupted run.
+  A stale one directs to a fresh `gc plan`; a pending one names the journal's
+  digest and explains that no fresh plan can reproduce it.
+- Confirmation mismatches for cleanup, checkpoint, promotion record, exposure
+  reconciliation, and integration reconciliation no longer print the expected
+  digest as a value to paste, and name the command that re-reviews instead.
+  `ship` keeps both SHAs, which are inspectable, and warns that confirming the
+  new prefix publishes unreviewed work.
+- `ship plan` states whether the selected prefix represents all local work,
+  naming excluded local-only commits and uncommitted tracked paths. "Ready"
+  describes the prefix, not the repository.
+- A refused `ship execute --sync-main` names a bounded, non-destructive recovery
+  for every cause, including the `git log` range for what a fast-forward would
+  discard and a preservation ref.
+- Ship plans report the entries this push newly publishes rather than the whole
+  included prefix, most of which is already on the remote.
+- A finished session no longer lists its leases as active and unreleased after
+  cleanup released them.
+- `broker status` surfaces commits the local default branch carries that
+  integration does not, so writes that never passed through submit are visible
+  immediately rather than at publication time.
+- `broker adopt` reports integration drift for every adoption, not only reuse,
+  and says when pre-existing commits are not session-owned under the recorded
+  baseline. `broker submit` names those commits instead of reporting that
+  nothing remains to integrate.
+- Repository-quality reporting resolves relative paths more precisely.
+
+### Upgrade notes
+
+Read [Upgrading to v0.7.10](packages/aethyme/docs/guides/upgrading-to-v0.7.10.md)
+before updating. Broker storage, repository deployment, engine protocol, and
+graph cache schemas are unchanged from v0.7.9.
+
 ## [0.7.9] - 2026-09-06
 
 ### Added
