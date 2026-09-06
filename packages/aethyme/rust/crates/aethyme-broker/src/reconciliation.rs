@@ -1026,7 +1026,6 @@ impl Broker {
         }
         if confirm != expected {
             return Err(BrokerOpError::ReconciliationConfirmationMismatch {
-                expected,
                 actual: confirm.to_string(),
             });
         }

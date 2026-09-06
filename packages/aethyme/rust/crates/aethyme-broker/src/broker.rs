@@ -83,8 +83,15 @@ pub enum BrokerOpError {
     DirtyWorktree { id: i64, reason: String },
     #[error("bulk cleanup confirmation must be a full SHA-256 digest")]
     CleanupConfirmationNotSha256,
-    #[error("bulk cleanup confirmation mismatch: expected {expected}, received {actual}")]
-    CleanupConfirmationMismatch { expected: String, actual: String },
+    /// The freshly computed digest is deliberately withheld: it is an opaque
+    /// token whose only use is to be pasted back, and pasting it confirms a plan
+    /// nobody read (issue #142).
+    #[error(
+        "the reviewed cleanup plan no longer matches current state, so nothing was removed; \
+         review a new plan with `aethyme broker cleanup --all-cleaned` and confirm the digest \
+         it prints (the digest passed, {actual}, is stale)"
+    )]
+    CleanupConfirmationMismatch { actual: String },
     #[error("GC confirmation must be a full SHA-256 digest")]
     GcConfirmationNotSha256,
     /// The reviewed plan no longer describes current state. The freshly computed
@@ -106,8 +113,14 @@ pub enum BrokerOpError {
          .aethyme/gc-journal.json; inspect it with `aethyme broker doctor`"
     )]
     GcResumeConfirmationMismatch { expected: String, actual: String },
-    #[error("promotion record confirmation mismatch: expected {expected}, received {actual}")]
-    PromotionRecordConfirmationMismatch { expected: String, actual: String },
+    /// See [`BrokerOpError::CleanupConfirmationMismatch`] for why no digest is
+    /// offered here (issue #142).
+    #[error(
+        "the reviewed promotion record plan no longer matches current state, so nothing was \
+         restored; review a new plan with `aethyme broker promotion-record plan` and confirm \
+         the digest it prints (the digest passed, {actual}, is stale)"
+    )]
+    PromotionRecordConfirmationMismatch { actual: String },
     #[error("GC is already running under process {pid}; wait or inspect .aethyme/gc.lock")]
     GcLocked { pid: String },
     #[error("GC recovery journal is invalid: {reason}")]
@@ -147,10 +160,14 @@ pub enum BrokerOpError {
     UnsafeCheckpointRecovery { reasons: String },
     #[error("session checkpoint recovery confirmation must be a full SHA-256 digest")]
     CheckpointConfirmationNotSha256,
+    /// See [`BrokerOpError::CleanupConfirmationMismatch`] for why no digest is
+    /// offered here (issue #142).
     #[error(
-        "session checkpoint recovery confirmation mismatch: expected {expected}, received {actual}"
+        "the reviewed checkpoint recovery plan no longer matches current state, so nothing was \
+         re-anchored; review a new plan with `aethyme broker checkpoint plan --session <id>` \
+         and confirm the digest it prints (the digest passed, {actual}, is stale)"
     )]
-    CheckpointConfirmationMismatch { expected: String, actual: String },
+    CheckpointConfirmationMismatch { actual: String },
     #[error(
         "session checkpoint recovery ref {reference} already points to {actual}, expected {expected}"
     )]
@@ -284,10 +301,14 @@ pub enum BrokerOpError {
     ExposurePlanUnavailable { reason: String },
     #[error("exposure reconciliation confirmation must be a full SHA-256 digest")]
     ExposureConfirmationNotSha256,
+    /// See [`BrokerOpError::CleanupConfirmationMismatch`] for why no digest is
+    /// offered here (issue #142).
     #[error(
-        "exposure reconciliation confirmation mismatch: expected {expected}, received {actual}"
+        "the reviewed exposure reconciliation plan no longer matches current state, so nothing \
+         was reconciled; review a new plan with `aethyme broker exposures plan` and confirm \
+         the digest it prints (the digest passed, {actual}, is stale)"
     )]
-    ExposureConfirmationMismatch { expected: String, actual: String },
+    ExposureConfirmationMismatch { actual: String },
     #[error("exposure reconciliation is unsafe: {reasons}")]
     ExposurePlanUnsafe { reasons: String },
     #[error(
@@ -318,7 +339,17 @@ pub enum BrokerOpError {
     ShipPublicationPolicy { reason: String, remediation: String },
     #[error("ship confirmation must be the full 40-character integration SHA")]
     ShipConfirmationNotFullSha,
-    #[error("ship confirmation mismatch: expected integration {expected}, received {actual}")]
+    /// Ship keeps both SHAs, unlike its siblings: they are inspectable with
+    /// `git log` and are the artifact under review rather than a token standing
+    /// in for one, so naming them aids diagnosis instead of short-circuiting it.
+    /// The warning is explicit because this is the one lane that publishes
+    /// (issue #142).
+    #[error(
+        "the publication prefix moved since the plan was reviewed: ship now proposes \
+         {expected}, not the confirmed {actual}. Do not confirm {expected} without reading it \
+         -- it publishes work you have not reviewed. Inspect the difference with \
+         `git log --oneline {actual}..{expected}`, then re-run `aethyme broker ship plan`"
+    )]
     ShipConfirmationMismatch { expected: String, actual: String },
     #[error(
         "integration reconciliation apply requires --confirm {expected}; review the dry-run plan first"
@@ -326,10 +357,15 @@ pub enum BrokerOpError {
     ReconciliationConfirmationRequired { expected: String },
     #[error("integration reconciliation confirmation must be a full 64-character SHA-256 digest")]
     ReconciliationConfirmationNotSha256,
+    /// See [`BrokerOpError::CleanupConfirmationMismatch`] for why no digest is
+    /// offered here (issue #142).
     #[error(
-        "integration reconciliation confirmation mismatch: expected {expected}, received {actual}"
+        "the reviewed integration reconciliation plan no longer matches current state, so \
+         nothing was reconciled; review a new plan with \
+         `aethyme broker integration reconcile --upstream <ref> --dry-run` and confirm the \
+         digest it prints (the digest passed, {actual}, is stale)"
     )]
-    ReconciliationConfirmationMismatch { expected: String, actual: String },
+    ReconciliationConfirmationMismatch { actual: String },
     #[error("ship cannot execute without a fetched remote base for {tracking_ref}")]
     ShipRemoteBaseUnavailable { tracking_ref: String },
     #[error(
@@ -3968,7 +4004,6 @@ impl Broker {
         let plan = self.plan_session_checkpoint_recovery(session_id)?;
         if plan.digest != confirm {
             return Err(BrokerOpError::CheckpointConfirmationMismatch {
-                expected: plan.digest,
                 actual: confirm.to_string(),
             });
         }
@@ -6541,7 +6576,6 @@ impl Broker {
             }
             if confirm != plan.digest {
                 return Err(BrokerOpError::CleanupConfirmationMismatch {
-                    expected: plan.digest.clone(),
                     actual: confirm.into(),
                 });
             }

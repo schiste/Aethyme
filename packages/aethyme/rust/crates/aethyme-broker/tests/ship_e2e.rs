@@ -773,10 +773,23 @@ fn ship_execute_rejects_abbreviated_and_mismatched_confirmations_before_operatio
         broker.ship_execute(entry_id, &integration[..12]),
         Err(BrokerOpError::ShipConfirmationNotFullSha)
     ));
+    let mismatch = broker.ship_execute(entry_id, &"0".repeat(40)).unwrap_err();
     assert!(matches!(
-        broker.ship_execute(entry_id, &"0".repeat(40)),
-        Err(BrokerOpError::ShipConfirmationMismatch { .. })
+        mismatch,
+        BrokerOpError::ShipConfirmationMismatch { .. }
     ));
+    // Unlike its siblings, ship keeps both SHAs: they are inspectable and are
+    // the artifact under review. It must warn rather than invite a paste (#142).
+    let rendered = mismatch.to_string();
+    assert!(
+        rendered.contains(&integration) && rendered.contains(&"0".repeat(40)),
+        "both SHAs aid diagnosis and must be named: {rendered}"
+    );
+    assert!(
+        rendered.contains("publishes work you have not reviewed")
+            && rendered.contains("git log --oneline"),
+        "the refusal must warn and show how to inspect the difference: {rendered}"
+    );
     assert!(broker.store().coordinated_operations().unwrap().is_empty());
 }
 

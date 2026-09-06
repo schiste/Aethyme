@@ -784,7 +784,13 @@ fn confirmed_reconciliation_rebuilds_from_upstream_and_journals_the_reviewed_dig
             confirm: Some("0".repeat(64)),
         })
         .unwrap_err();
-    assert!(mismatch.to_string().contains("confirmation mismatch"));
+    let mismatch = mismatch.to_string();
+    assert!(
+        mismatch.contains("no longer matches current state")
+            && mismatch.contains("aethyme broker integration reconcile"),
+        "{mismatch}"
+    );
+    assert!(!mismatch.contains("expected"), "{mismatch}");
     assert_eq!(
         git(&fixture.repo, &["rev-parse", "aethyme/integration"]),
         fixture.old_integration

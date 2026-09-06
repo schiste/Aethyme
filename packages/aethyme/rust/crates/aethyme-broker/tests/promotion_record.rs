@@ -122,9 +122,15 @@ fn a_stale_digest_is_refused() {
     let err = broker
         .promotion_record_apply(&"0".repeat(64))
         .expect_err("a digest that does not match the current plan must be refused");
+    let err = format!("{err}");
     assert!(
-        format!("{err}").contains("confirmation mismatch"),
+        err.contains("no longer matches current state")
+            && err.contains("aethyme broker promotion-record plan"),
         "unexpected error: {err}"
+    );
+    assert!(
+        !err.contains("expected"),
+        "a freshly computed digest must not be offered as a value to confirm: {err}"
     );
     // Refusal must not have written anything.
     let plan = broker.promotion_record_plan().unwrap();

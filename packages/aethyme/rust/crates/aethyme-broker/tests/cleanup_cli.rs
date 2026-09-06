@@ -192,10 +192,15 @@ fn bulk_cleanup_confirmation_binds_the_exact_reviewed_branch_tip() {
         ],
     );
     assert!(!apply.status.success());
+    let refusal = String::from_utf8_lossy(&apply.stderr).into_owned();
     assert!(
-        String::from_utf8_lossy(&apply.stderr).contains("confirmation mismatch"),
-        "{}",
-        String::from_utf8_lossy(&apply.stderr)
+        refusal.contains("no longer matches current state")
+            && refusal.contains("aethyme broker cleanup --all-cleaned"),
+        "{refusal}"
+    );
+    assert!(
+        !refusal.contains("expected"),
+        "a freshly computed digest must not be offered as a value to confirm: {refusal}"
     );
     assert!(worktree.exists());
     assert!(worktree.join("followup.txt").exists());

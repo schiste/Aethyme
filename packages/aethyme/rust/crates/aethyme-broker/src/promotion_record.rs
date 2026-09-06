@@ -260,7 +260,6 @@ impl Broker {
         let plan = self.promotion_record_plan()?;
         if !plan.digest.eq_ignore_ascii_case(confirm) {
             return Err(BrokerOpError::PromotionRecordConfirmationMismatch {
-                expected: plan.digest,
                 actual: confirm.to_owned(),
             });
         }

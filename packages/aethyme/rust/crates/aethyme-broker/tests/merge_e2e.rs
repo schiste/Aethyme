@@ -862,7 +862,13 @@ fn reviewed_checkpoint_recovery_preserves_head_and_reanchors_without_hiding_foll
     let mismatch = broker
         .apply_session_checkpoint_recovery(session.id, &"0".repeat(64))
         .unwrap_err();
-    assert!(mismatch.to_string().contains("confirmation mismatch"));
+    let mismatch = mismatch.to_string();
+    assert!(
+        mismatch.contains("no longer matches current state")
+            && mismatch.contains("aethyme broker checkpoint plan"),
+        "{mismatch}"
+    );
+    assert!(!mismatch.contains("expected"), "{mismatch}");
     assert_eq!(
         broker
             .store()

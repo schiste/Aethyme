@@ -185,7 +185,6 @@ impl Broker {
         let plan = self.exposure_reconciliation_plan()?;
         if plan.digest != confirm {
             return Err(BrokerOpError::ExposureConfirmationMismatch {
-                expected: plan.digest,
                 actual: confirm.into(),
             });
         }
