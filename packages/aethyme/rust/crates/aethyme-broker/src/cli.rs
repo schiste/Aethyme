@@ -817,6 +817,70 @@ fn command_records_metric(args: &[String]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::repository_wide_publication_lines;
+
+    fn assessment(fast_forward: bool, dirty: &[&str]) -> crate::ship::ShipLocalMainSyncAssessment {
+        crate::ship::ShipLocalMainSyncAssessment {
+            safe: fast_forward && dirty.is_empty(),
+            current_branch_matches: true,
+            local_head_unchanged: true,
+            fast_forward,
+            tracked_dirty_paths: dirty.iter().map(|p| (*p).into()).collect(),
+            untracked_paths: Vec::new(),
+            conflicting_untracked_paths: Vec::new(),
+        }
+    }
+
+    /// Issue #141: "Freshness: Ready" describes the prefix, not the repository.
+    /// An operator asking to publish everything must be told what is omitted.
+    #[test]
+    fn ship_plan_states_whether_the_prefix_represents_all_local_work() {
+        let complete = repository_wide_publication_lines(
+            &assessment(true, &[]),
+            "refs/heads/main",
+            "aaaa",
+            "aaaa",
+        );
+        assert_eq!(complete.len(), 1);
+        assert!(complete[0].contains("complete"), "{complete:?}");
+
+        let diverged = repository_wide_publication_lines(
+            &assessment(false, &[]),
+            "refs/heads/main",
+            "aaaa",
+            "bbbb",
+        )
+        .join("\n");
+        assert!(diverged.contains("INCOMPLETE"), "{diverged}");
+        assert!(
+            diverged.contains("git log --oneline aaaa..bbbb"),
+            "the operator must be able to list what is excluded: {diverged}"
+        );
+
+        let dirty = repository_wide_publication_lines(
+            &assessment(true, &["src/a.rs", "src/b.rs"]),
+            "refs/heads/main",
+            "aaaa",
+            "aaaa",
+        )
+        .join("\n");
+        assert!(dirty.contains("INCOMPLETE"), "{dirty}");
+        assert!(
+            dirty.contains("2 uncommitted tracked path(s): src/a.rs, src/b.rs"),
+            "uncommitted tracked work must never be silently omitted: {dirty}"
+        );
+    }
+
+    /// On another branch, local main says nothing about completeness.
+    #[test]
+    fn a_different_checked_out_branch_makes_no_completeness_claim() {
+        let mut other = assessment(true, &[]);
+        other.current_branch_matches = false;
+        assert!(
+            repository_wide_publication_lines(&other, "refs/heads/main", "aaaa", "bbbb").is_empty()
+        );
+    }
+
     fn args(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|part| (*part).to_string()).collect()
     }
@@ -2555,7 +2619,13 @@ fn render_finish_report(report: &crate::FinishReport) {
     if report.leases_held.is_empty() {
         out!("  leases held: none recorded");
     } else {
-        out!("  leases held:");
+        // Past tense once closed: closing released these, and the list is
+        // handoff history rather than a claim of current ownership (#141).
+        if report.cleanup.completed {
+            out!("  leases at close:");
+        } else {
+            out!("  leases held:");
+        }
         for lease in &report.leases_held {
             out!(
                 "    {} {} {} (expires {}, released {})",
@@ -2797,6 +2867,44 @@ const SHIP_ENTRY_CAP: usize = 6;
 /// repository's `gc plan` reached ~319 KB, of which 93% was one list. The
 /// counts and the digest are what a reader acts on; the enumeration is what
 /// they page past. `--detail` restores it when someone genuinely wants to audit.
+/// "Ready" means this exact prefix is safe to push. It does not mean the prefix
+/// represents every piece of work in the repository, and an operator asking to
+/// "publish everything" reasonably reads it that way (issue #141).
+fn repository_wide_publication_lines(
+    assessment: &crate::ship::ShipLocalMainSyncAssessment,
+    local_default_branch_ref: &str,
+    publication_sha: &str,
+    local_default_branch_sha: &str,
+) -> Vec<String> {
+    if !assessment.current_branch_matches {
+        // The primary checkout is on another branch, so local main says nothing
+        // about completeness here.
+        return Vec::new();
+    }
+    let excluded_commits = !assessment.fast_forward;
+    let dirty = assessment.tracked_dirty_paths.len();
+    if !excluded_commits && dirty == 0 {
+        return vec![
+            "Repository-wide publication: complete (this prefix represents local main)".into(),
+        ];
+    }
+    let mut lines = vec!["Repository-wide publication: INCOMPLETE".into()];
+    if excluded_commits {
+        lines.push(format!(
+            "  excluded: local {} carries commits this prefix does not contain; list them with `git log --oneline {}..{}`",
+            local_default_branch_ref, publication_sha, local_default_branch_sha,
+        ));
+    }
+    if dirty > 0 {
+        lines.push(format!(
+            "  excluded: {dirty} uncommitted tracked path(s): {}",
+            assessment.tracked_dirty_paths.join(", ")
+        ));
+    }
+    lines.push("  publishing now is safe, but omits the work listed above".into());
+    lines
+}
+
 fn render_capped<T>(items: &[T], cap: usize, detail: bool, mut render: impl FnMut(&T)) {
     let shown = if detail {
         items.len()
@@ -3559,6 +3667,15 @@ fn render_ship_plan(report: &crate::ShipPlan, json: bool, detail: bool) -> Resul
     if let Some(remediation) = &report.publication_policy.remediation {
         out!("Publication remediation: {remediation}");
     }
+    for line in repository_wide_publication_lines(
+        &report.local_main_sync_assessment,
+        &report.local_default_branch_ref,
+        &report.publication_sha,
+        &report.local_default_branch_sha,
+    ) {
+        out!("{line}");
+    }
+    let assessment = &report.local_main_sync_assessment;
     out!(
         "Local-main synchronization safe now: {}",
         if report.local_main_sync_safe {
@@ -3567,7 +3684,6 @@ fn render_ship_plan(report: &crate::ShipPlan, json: bool, detail: bool) -> Resul
             "no"
         }
     );
-    let assessment = &report.local_main_sync_assessment;
     if !assessment.tracked_dirty_paths.is_empty() {
         out!(
             "Blocking tracked paths: {}",

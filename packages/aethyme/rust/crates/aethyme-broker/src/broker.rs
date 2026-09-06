@@ -5857,6 +5857,34 @@ impl Broker {
         session_id: i64,
         options: FinishOptions,
     ) -> Result<FinishReport, BrokerOpError> {
+        let mut report = self.finish_with_options_inner(session_id, options)?;
+        // The snapshot is taken while the session is still open, because a
+        // blocked finish needs it to explain what is held. Cleanup is what
+        // actually removes the leases, so only a completed cleanup makes the
+        // snapshot history; it must not then read "active ... released never"
+        // (issue #141). Relabelled rather than dropped, because a handoff is
+        // more useful when it records what the session owned.
+        //
+        // Closing alone deliberately does not qualify: `close` only sets the
+        // session status, so a closed session still holds its leases -- and
+        // saying otherwise would hide a real block on other sessions.
+        if report.cleanup.completed {
+            let released_at = now_ms();
+            for lease in &mut report.leases_held {
+                if lease.state == FinishLeaseState::Active {
+                    lease.state = FinishLeaseState::Released;
+                    lease.released_at.get_or_insert(released_at);
+                }
+            }
+        }
+        Ok(report)
+    }
+
+    fn finish_with_options_inner(
+        &mut self,
+        session_id: i64,
+        options: FinishOptions,
+    ) -> Result<FinishReport, BrokerOpError> {
         let session = self.store.session(session_id)?;
         let worktree_path = PathBuf::from(&session.worktree_path);
         let at_ms = now_ms();

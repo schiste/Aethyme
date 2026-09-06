@@ -95,7 +95,13 @@ fn finish_cli_json_is_structured_and_persists_a_redacted_handoff() {
         .iter()
         .find(|lease| lease["path"] == "src/")
         .unwrap();
-    assert_eq!(src_lease["state"], "active");
+    // A closed session no longer holds anything: the snapshot is kept as
+    // handoff history, but it must not claim active, unreleased leases (#141).
+    assert_eq!(src_lease["state"], "released");
+    assert!(
+        src_lease["released_at"].is_i64(),
+        "a released lease must carry its release time: {src_lease}"
+    );
     assert_eq!(report["last_gate"]["gate"], "finish-cli-gate");
     assert_eq!(report["last_gate"]["cache_source"], "executed");
     assert!(report["last_gate"]["recorded_at"].is_i64());
@@ -156,8 +162,15 @@ fn finish_cli_text_summarizes_the_structured_handoff() {
         text.contains("pending work: no (0 dirty paths, 0 unsubmitted commits)"),
         "{text}"
     );
-    assert!(text.contains("leases held:"), "{text}");
-    assert!(text.contains("explicit active src/"), "{text}");
+    assert!(text.contains("leases at close:"), "{text}");
+    assert!(
+        text.contains("explicit released src/"),
+        "a closed session must not list active leases: {text}"
+    );
+    assert!(
+        !text.contains("released never"),
+        "a released lease must carry its release time: {text}"
+    );
     assert!(
         text.contains("last gate: finish-cli-gate pass on tree"),
         "{text}"
