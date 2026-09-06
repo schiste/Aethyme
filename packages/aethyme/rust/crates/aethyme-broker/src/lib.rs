@@ -60,6 +60,7 @@ mod reconciliation;
 mod release_compatibility;
 pub mod release_manifest;
 mod remote_target;
+pub mod renamed_targets;
 mod report;
 mod report_filing;
 mod repository_contract;
@@ -245,6 +246,7 @@ pub use remote_target::{
     RemoteResolutionEvidence, RemoteTargetError, RemoteUrlEvidence, RemoteUrlSource,
     RemoteUrlSyntax, ResolvedRemoteTarget, resolve_remote_command_target, resolve_remote_target,
 };
+pub use renamed_targets::RenamedTarget;
 pub use report::{
     InvalidReportEntry, PreparedReport, REPORT_DOCUMENT_SCHEMA_VERSION, REPORT_FILINGS_FILENAME,
     REPORT_FILINGS_SCHEMA_VERSION, REPORT_INVENTORY_SCHEMA_VERSION, REPORT_MAX_BYTES,

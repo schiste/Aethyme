@@ -558,6 +558,10 @@ pub struct AdoptReport {
     pub integration_sync: Option<AdoptIntegrationSync>,
     pub planned_explicit_leases: Vec<crate::Lease>,
     pub preparation: crate::PreparationStatus,
+    /// Paths this session still targets that a later promotion renamed. Empty
+    /// for the ordinary case (issue #145).
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub renamed_targets: Vec<crate::RenamedTarget>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -2375,6 +2379,7 @@ impl Broker {
                         session,
                         outcome: AdoptOutcome::Reused,
                         integration_drift,
+                        renamed_targets: Vec::new(),
                         integration_sync,
                         planned_explicit_leases,
                         preparation,
@@ -2436,6 +2441,9 @@ impl Broker {
         )?);
         let planned_explicit_leases = self.planned_explicit_leases(session.id, &planned_paths)?;
         let preparation = self.preparation_status(session.id)?;
+        // Reported here because this is before a replay is attempted; failing
+        // later looks like a plain modify/delete conflict (issue #145).
+        let renamed_targets = self.session_renamed_targets(session.id).unwrap_or_default();
         Ok(AdoptReport {
             session,
             outcome,
@@ -2443,6 +2451,7 @@ impl Broker {
             integration_sync,
             planned_explicit_leases,
             preparation,
+            renamed_targets,
         })
     }
 

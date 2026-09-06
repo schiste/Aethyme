@@ -5956,6 +5956,19 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                 },
                 agent_identity.as_deref(),
             )?;
+            for renamed in &report.renamed_targets {
+                out!(
+                    "Renamed target: {} is now {}{}",
+                    renamed.from,
+                    renamed.to,
+                    match (renamed.promoted_entry_id, renamed.promoted_session_id) {
+                        (Some(entry), Some(session)) =>
+                            format!(" (queue entry {entry}, session {session})"),
+                        _ => String::new(),
+                    }
+                );
+                out!("  port this session's changes onto the new path before submitting");
+            }
             let session = &report.session;
             if parsed.json {
                 out!("{}", serde_json::to_string_pretty(&report)?);

@@ -336,6 +336,24 @@ For repositories that explicitly permit an emergency lane, set
 broker persists only the reason digest and still enforces the full confirmed
 SHA, remote freshness, non-force push, and unknown-outcome barriers.
 
+### When a target path moved under a session
+
+A session branched before another session renamed the files it edits will fail
+to replay with `CONFLICT (modify/delete): ... deleted in HEAD`, which reads
+exactly like the file having been deleted. `broker adopt` now reports the rename
+instead:
+
+```
+Renamed target: plugins/old/tool.py is now plugins/new/tool.py (queue entry 118, session 131)
+  port this session's changes onto the new path before submitting
+```
+
+Detection is bounded to the paths the session's own commits touch, and reports
+only paths that are absent from the integration tip *and* have a rename to
+follow. A path that was genuinely deleted stays a deletion: that is a real
+conflict to resolve, and pointing at a path that does not exist would be worse
+than saying nothing.
+
 ### Reconciling a local default branch
 
 `ship` publishes an exact promoted prefix and refuses to discard local work the

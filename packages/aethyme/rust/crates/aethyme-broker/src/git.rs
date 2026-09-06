@@ -684,6 +684,46 @@ impl GitRepo {
             .collect())
     }
 
+    /// Renames git detects between two commits, as `old -> new`.
+    ///
+    /// Computed once over the whole diff rather than per path: rename detection
+    /// needs to see both sides, so a pathspec limited to the old name would hide
+    /// the new one and report a plain deletion.
+    pub fn renames_between(&self, from: &str, to: &str) -> Result<Vec<(String, String)>, GitError> {
+        let out = run_git(
+            &self.root,
+            &[
+                "diff",
+                "-M",
+                "--diff-filter=R",
+                "--name-status",
+                "--no-renames-empty",
+                from,
+                to,
+            ],
+        )
+        .or_else(|_| {
+            // Older git does not know --no-renames-empty.
+            run_git(
+                &self.root,
+                &["diff", "-M", "--diff-filter=R", "--name-status", from, to],
+            )
+        })?;
+        Ok(out
+            .lines()
+            .filter_map(|line| {
+                let mut parts = line.split('\t');
+                let status = parts.next()?;
+                if !status.starts_with('R') {
+                    return None;
+                }
+                let old = parts.next()?.trim().to_string();
+                let new = parts.next()?.trim().to_string();
+                (!old.is_empty() && !new.is_empty()).then_some((old, new))
+            })
+            .collect())
+    }
+
     /// Point `name` at `commit`, creating or moving it. Used for preservation
     /// refs, where the name already encodes the commit it preserves.
     pub fn create_branch_at(&self, name: &str, commit: &str) -> Result<(), GitError> {
