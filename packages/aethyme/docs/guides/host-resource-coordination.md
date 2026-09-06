@@ -48,6 +48,36 @@ grant, signal, cleanup, and final lifecycle records are emitted as JSON lines
 on stderr, so automation can observe coordination without corrupting the
 existing runner's stdout protocol.
 
+## Sandboxed execution
+
+Coordination state is host-scoped, under `~/Library/Application Support/Aethyme`
+by default, because it coordinates across worktrees and repositories on one
+machine. A sandbox that confines writes to a single checkout therefore cannot
+open it, and the failure is a permission denial rather than a missing install.
+
+Sandboxed contexts are supported, and the choice is between two different
+things:
+
+- **Participating.** Grant the process access to the host state path. It then
+  coordinates with every other session on the machine: leases, sessions and host
+  resources are shared, which is what makes contention visible and refusals
+  correct. This is the right answer whenever anything else on the host also runs
+  Aethyme.
+- **Isolating.** Point `AETHYME_HOST_STATE_DIR` at a writable location. This
+  always succeeds, and gives the process a **private coordination domain**. It
+  will not see leases, sessions or host resources held by anything else, and
+  nothing else will see its. Two sandboxes with separate state directories do
+  not coordinate with each other at all.
+
+Isolation is correct for a disposable build, a test harness, or CI where the
+checkout is the whole world. It is wrong wherever concurrent sessions must not
+collide, because each will believe it holds resources the others also believe
+they hold.
+
+There is no third option in which a confined process participates in host-wide
+coordination without access to host-wide state: the shared state *is* the
+coordination.
+
 ## Declare A Gate Bundle
 
 Resources under one gate are acquired atomically: either every value is

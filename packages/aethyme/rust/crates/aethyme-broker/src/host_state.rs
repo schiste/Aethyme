@@ -61,9 +61,12 @@ pub(crate) fn describe_host_state_io(path: &Path, source: &std::io::Error) -> St
     format!(
         "{base} — Aethyme coordination state is host-scoped and lives outside any single \
          worktree, so a sandbox or permission policy that confines writes to the checkout \
-         denies it. This is not a missing or outdated installation. Point \
-         AETHYME_HOST_STATE_DIR at a writable location, or grant this process access to \
-         that path."
+         denies it. This is not a missing or outdated installation. Either grant this \
+         process access to that path, which keeps it coordinating with every other session \
+         on the host, or point AETHYME_HOST_STATE_DIR at a writable location — which \
+         succeeds but gives this process a private coordination domain: it will not see \
+         leases, sessions or host resources held by anything else, so use it only where \
+         isolation is what you want."
     )
 }
 

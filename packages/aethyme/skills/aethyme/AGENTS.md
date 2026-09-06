@@ -63,6 +63,27 @@ short: it tells agents to make one bounded Explore call, inspect trust and
 observability, then verify bounded spans. Detailed workflows live under the skill's
 `references/` directory and should be loaded only when needed.
 
+## Branch And Review Practices
+
+These scale with the number of agents working a repository at once, where a
+habit that costs one agent a minute costs a fleet an hour.
+
+- **Do not merge the default branch into a working branch to keep it current.**
+  Merge or rebase only to resolve an actual conflict, and only in your own
+  worktree. Catch-up merges add conflict surface and history noise for no
+  safety unless the branch is genuinely required to be fresh. If the default
+  branch enforces branch-freshness (GitHub's "Require branches to be up to date
+  before merging"), update immediately before merging rather than reflexively
+  throughout the branch's life.
+- **A check may be required on a pull request only if it is scoped to the diff
+  and finishes in minutes.** Anything heavier belongs once per merge batch or
+  once per release. With one agent an unscoped required check is an annoyance;
+  with several it becomes the dominant cost and serialises the fleet.
+- **Cherry-picking to patch an already-certified release is standard;
+  cherry-picking to assemble a release from trunk is not.** Assembling produces
+  a combination nobody tested, and hides dependencies between the changes being
+  picked. Cut a release from a tested point instead, then patch it.
+
 ## Commit Hygiene
 
 Use typed commit messages.
