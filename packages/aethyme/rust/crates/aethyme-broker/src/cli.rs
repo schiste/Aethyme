@@ -3595,24 +3595,48 @@ fn render_ship_plan(report: &crate::ShipPlan, json: bool, detail: bool) -> Resul
     // One line per promoted entry ever included is unbounded and grows with
     // the repository's history; the count plus the boundary entries is what a
     // reviewer checks.
-    let included = report
+    // Most of an included prefix is already on the remote; enumerating it buries
+    // the handful of entries this push actually publishes (issue #141).
+    let label = |entry: &crate::ship::ShipPromotedEntry| {
+        format!("q{}@{}", entry.queue_entry_id, entry.promotion_sha)
+    };
+    let newly = report
         .included_entries
         .iter()
-        .map(|entry| format!("q{}@{}", entry.queue_entry_id, entry.promotion_sha))
+        .filter(|entry| entry.newly_published)
+        .map(label)
         .collect::<Vec<_>>();
+    let already_published = report.included_entries.len() - newly.len();
     out!(
-        "Included entries: {} ({})",
-        included.len(),
-        if detail || included.len() <= SHIP_ENTRY_CAP {
-            included.join(", ")
-        } else {
-            format!(
-                "{}, ... , {} — rerun with --detail for all",
-                included[..2].join(", "),
-                included[included.len() - 1]
-            )
-        }
+        "Included entries: {} total, {} already on the remote default branch",
+        report.included_entries.len(),
+        already_published
     );
+    if newly.is_empty() {
+        out!("Newly published by this push: none — the remote already contains this prefix");
+    } else {
+        out!(
+            "Newly published by this push: {} ({})",
+            newly.len(),
+            if detail || newly.len() <= SHIP_ENTRY_CAP {
+                newly.join(", ")
+            } else {
+                format!(
+                    "{}, ... , {} — rerun with --detail for all",
+                    newly[..2].join(", "),
+                    newly[newly.len() - 1]
+                )
+            }
+        );
+    }
+    if detail {
+        let included = report
+            .included_entries
+            .iter()
+            .map(label)
+            .collect::<Vec<_>>();
+        out!("Included prefix in full: {}", included.join(", "));
+    }
     if !report.excluded_entries.is_empty() {
         out!(
             "Excluded later entries: {}",

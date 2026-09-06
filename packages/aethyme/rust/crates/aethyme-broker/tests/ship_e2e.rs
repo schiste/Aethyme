@@ -723,10 +723,22 @@ fn ship_execute_sync_main_refuses_a_diverged_primary_checkout_before_publish() {
     let error = broker
         .ship_execute_with_sync(entry_id, &integration, true)
         .unwrap_err();
-    assert!(matches!(
-        error,
-        BrokerOpError::ShipLocalMainUnsafe { reason } if reason.contains("diverged")
-    ));
+    // A refusal must name a bounded, non-destructive way forward (#141).
+    let BrokerOpError::ShipLocalMainUnsafe { reason } = &error else {
+        panic!("expected a local-main refusal, got {error}");
+    };
+    assert!(
+        reason.contains("would discard them") && reason.contains("git log --oneline"),
+        "the refusal must say what is at risk and how to list it: {reason}"
+    );
+    assert!(
+        reason.contains("git branch aethyme/preserve/local-main"),
+        "the refusal must offer a preservation ref: {reason}"
+    );
+    assert!(
+        !reason.contains("reset --hard") && !reason.contains("branch -f"),
+        "a refusal must never recommend destructive ref surgery: {reason}"
+    );
     assert_eq!(fixture.remote_main(), remote_before);
 }
 

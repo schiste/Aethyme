@@ -121,6 +121,10 @@ pub struct ShipPromotedEntry {
     pub queue_entry_id: i64,
     pub session_id: i64,
     pub promotion_sha: String,
+    /// Whether this push is what puts the entry on the remote default branch.
+    /// Most of an included prefix is history that is already published; the
+    /// suffix is what a publication review is actually about (issue #141).
+    pub newly_published: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -270,6 +274,8 @@ impl Broker {
                 queue_entry_id: promoted.id,
                 session_id: promoted.session_id,
                 promotion_sha: promoted_sha.clone(),
+                // Resolved below, once the remote default branch is known.
+                newly_published: true,
             };
             if self
                 .repo_handle()
@@ -389,6 +395,17 @@ impl Broker {
             reason,
         })?;
         let local_main_sync_safe = local_main_sync_assessment.safe;
+
+        // An entry already contained in the remote default branch is history, not
+        // part of what this push publishes. When the remote tip is unknown the
+        // flag stays set, so an uncertain plan shows more rather than less.
+        if !remote_default.sha.is_empty() {
+            for item in &mut included_entries {
+                item.newly_published = !self
+                    .repo_handle()
+                    .is_ancestor(&item.promotion_sha, &remote_default.sha);
+            }
+        }
 
         Ok(ShipPlan {
             queue_entry: entry,
@@ -1044,7 +1061,7 @@ fn validate_local_main_sync(broker: &Broker, plan: &ShipPlan, confirm: &str) -> 
         confirm,
     )?;
     if !assessment.safe {
-        return Err(local_main_sync_refusal(&assessment, default_branch));
+        return Err(local_main_sync_refusal(&assessment, default_branch, plan));
     }
     Ok(())
 }
@@ -1126,28 +1143,58 @@ fn checkout_paths_collide(a: &str, b: &str) -> bool {
             .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
+/// Every refusal names a bounded next step. Refusing without one leaves ref
+/// surgery as the only visible way forward, which is what this lane exists to
+/// make unnecessary (issue #141). Nothing here suggests a destructive command:
+/// the remote publication has already succeeded by this point, and only local
+/// synchronization is being declined.
 fn local_main_sync_refusal(
     assessment: &ShipLocalMainSyncAssessment,
     default_branch: &str,
+    plan: &ShipPlan,
 ) -> String {
     if !assessment.current_branch_matches {
-        return format!("primary checkout is not on expected default branch {default_branch}");
+        return format!(
+            "primary checkout is not on expected default branch {default_branch}; \
+             check it out there and re-run `aethyme broker ship execute --entry {} \
+             --confirm {} --sync-main`",
+            plan.queue_entry.id, plan.publication_sha,
+        );
     }
     if !assessment.local_head_unchanged {
-        return "local main moved since planning".into();
+        return format!(
+            "local {} moved since planning, so the reviewed synchronization no longer \
+             applies; review a new plan with `aethyme broker ship plan --entry {}`",
+            plan.local_default_branch_ref, plan.queue_entry.id,
+        );
     }
     if !assessment.fast_forward {
-        return "local main has diverged from the confirmed publication".into();
+        return format!(
+            "local {} carries commits this publication does not contain, so fast-forwarding \
+             it would discard them. The remote publication already succeeded; only local \
+             synchronization is refused. List what would be lost with \
+             `git log --oneline {}..{}`, preserve it with \
+             `git branch aethyme/preserve/local-main {}`, then replay anything still needed \
+             through a broker session and submit it",
+            plan.local_default_branch_ref,
+            plan.publication_sha,
+            plan.local_default_branch_sha,
+            plan.local_default_branch_sha,
+        );
     }
     if !assessment.tracked_dirty_paths.is_empty() {
         return format!(
-            "primary default-branch checkout has tracked changes: {}",
-            assessment.tracked_dirty_paths.join(", ")
+            "primary default-branch checkout has tracked changes that a fast-forward would \
+             overwrite: {}. Commit them through a broker session, or stash them with \
+             `git stash push -- {}`, then retry --sync-main",
+            assessment.tracked_dirty_paths.join(", "),
+            assessment.tracked_dirty_paths.join(" "),
         );
     }
     if !assessment.conflicting_untracked_paths.is_empty() {
         return format!(
-            "untracked paths would collide with the incoming fast-forward: {}",
+            "untracked paths would collide with the incoming fast-forward: {}. Move or remove \
+             them, then retry --sync-main",
             assessment.conflicting_untracked_paths.join(", ")
         );
     }
