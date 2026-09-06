@@ -1,6 +1,6 @@
 # Repository quality inspection
 
-Last Updated: 2026-09-05
+Last Updated: 2026-09-06
 
 Aethyme separates operational readiness from optional repository-quality
 analysis:
@@ -53,6 +53,18 @@ aethyme quality inspect --repo . \
 Quality severities express suggestion priority (`high`, `medium`, or `low`).
 They are not operational blockers, do not change readiness, and never alter
 gate selection or broker submission behavior.
+
+## Context-aware relative-path findings
+
+The `relative-links` detector reports absolute filesystem paths in source and
+configuration because those values can make a repository environment-specific.
+In Markdown, the detector is narrower: it reports absolute destinations in
+inline links, reference links, autolinks, and HTML `href` or `src` attributes.
+Paths shown as prose, inline examples, indented examples, or fenced code are
+not links and do not produce findings.
+
+This distinction applies to `quality inspect`. The legacy `ai-ready` alias
+retains its historical broad scan and output contract for compatibility.
 
 ## Legacy compatibility
 

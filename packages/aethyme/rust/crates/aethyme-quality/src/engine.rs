@@ -119,7 +119,7 @@ impl ScorecardEngine {
             let applicability = detector.applicability(snapshot.root());
             let det_start = Instant::now();
             let detector_findings = if applicability.is_applicable() {
-                detector.detect(snapshot.root())
+                detector.inspect(snapshot.root())
             } else {
                 Vec::new()
             };

@@ -97,6 +97,13 @@ pub trait Detector {
     /// Run detection over `repo_path` and return findings in the
     /// Python-identical order.
     fn detect(&self, repo_path: &Path) -> Vec<Finding>;
+    /// Run detection for the bounded quality-inspection surface.
+    ///
+    /// Detectors may refine legacy scorecard behavior here when a more
+    /// precise contract is available. The default preserves parity.
+    fn inspect(&self, repo_path: &Path) -> Vec<Finding> {
+        self.detect(repo_path)
+    }
 }
 
 pub(super) fn applies_to_extensions(
