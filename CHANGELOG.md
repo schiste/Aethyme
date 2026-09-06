@@ -4,6 +4,39 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.7.11] - 2026-09-06
+
+### Added
+
+- `aethyme broker main reconcile plan` and `apply --session <id> --confirm
+  <sha256>` reconcile a local default branch that carries commits integration
+  does not. Representation is decided by content rather than ancestry, so work
+  that landed through a squashed promotion is recognised even though its SHA
+  differs. The apply refuses unless every local-only commit is represented and
+  no tracked path is dirty, and preserves the pre-move tip first.
+- `aethyme broker adopt` reports when paths a session still targets were renamed
+  by a later promotion, naming the new path and the promoted entry responsible,
+  instead of leaving a replay to fail as an opaque modify/delete conflict.
+- Repositories may run a push's local hooks before taking the coordination lock
+  with `[coordination] hooks_outside_lock = true`. The hook executes in a dry
+  run against exactly the commits the real push will send, the push is re-planned
+  under the lock and refused if anything moved, and only then pushed. Off by
+  default: it skips every `pre-push` protection on the real push, not only a slow
+  gate.
+
+### Fixed
+
+- A submit whose response was lost no longer strands its promotion. When the
+  integration tip is a promotion this session produced that no promoted entry
+  claims, a retry claims it instead of recording content-empty supersession,
+  which previously left the commit unrecorded and refused publication.
+
+### Upgrade notes
+
+Read [Upgrading to v0.7.11](packages/aethyme/docs/guides/upgrading-to-v0.7.11.md)
+before updating. Broker storage, repository deployment, engine protocol, and
+graph cache schemas are unchanged from v0.7.10.
+
 ## [0.7.10] - 2026-09-06
 
 ### Fixed
