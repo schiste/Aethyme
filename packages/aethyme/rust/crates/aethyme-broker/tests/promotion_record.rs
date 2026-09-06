@@ -34,7 +34,7 @@ fn fixture() -> (tempfile::TempDir, Broker, i64, String) {
     git(tmp.path(), &["commit", "-qm", "init"]);
 
     let mut broker = Broker::open(tmp.path()).unwrap();
-    let session = broker.start_worktree("delivered work").unwrap();
+    let session = broker.start_worktree("delivered work", None).unwrap();
     let worktree = PathBuf::from(&session.worktree_path);
     std::fs::write(worktree.join("work.txt"), "work\n").unwrap();
     git(&worktree, &["add", "work.txt"]);

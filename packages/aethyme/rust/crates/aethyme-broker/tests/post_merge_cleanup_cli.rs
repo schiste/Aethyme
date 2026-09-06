@@ -114,7 +114,9 @@ fn successful_coordinated_pr_merge_cleans_a_fully_landed_integration_layer() {
     git(&repo, &["config", "branch.main.merge", "refs/heads/main"]);
 
     let mut broker = Broker::open(&repo).unwrap();
-    let session = broker.start_worktree("land through pull request").unwrap();
+    let session = broker
+        .start_worktree("land through pull request", None)
+        .unwrap();
     let worktree = PathBuf::from(&session.worktree_path);
     std::fs::write(worktree.join("src/service.txt"), "feature=on\n").unwrap();
     git(&worktree, &["add", "src/service.txt"]);

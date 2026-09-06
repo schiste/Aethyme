@@ -66,7 +66,7 @@ fn planned_start_claims_before_any_diff_and_refuses_a_second_rewrite() {
     let mut broker = Broker::open(tmp.path()).unwrap();
 
     let first = broker
-        .start_worktree_with_planned_paths("first rewrite", &["generated/".into()])
+        .start_worktree_with_planned_paths("first rewrite", &["generated/".into()], None)
         .unwrap();
     assert_eq!(first.planned_explicit_leases.len(), 1);
     assert_eq!(first.planned_explicit_leases[0].path, "generated/");
@@ -74,7 +74,7 @@ fn planned_start_claims_before_any_diff_and_refuses_a_second_rewrite() {
     let worktrees_before = managed_worktree_names(&first.worktree_placement.root);
 
     let error = broker
-        .start_worktree_with_planned_paths("second rewrite", &["generated/policy.md".into()])
+        .start_worktree_with_planned_paths("second rewrite", &["generated/policy.md".into()], None)
         .unwrap_err()
         .to_string();
     assert!(error.contains("planned lease"), "{error}");
@@ -117,6 +117,7 @@ fn planned_reuse_is_all_or_nothing_and_does_not_retask_on_conflict() {
                 sync_integration: false,
                 planned_paths: vec!["docs/new.md".into(), "src/auth.py".into()],
             },
+            None,
         )
         .unwrap_err()
         .to_string();
@@ -160,6 +161,7 @@ fn planned_reuse_is_deduplicated_sorted_and_expired_conflicts_do_not_block() {
                     "zeta.txt".into(),
                 ],
             },
+            None,
         )
         .unwrap();
     assert_eq!(report.session.id, reused.id);
@@ -675,7 +677,9 @@ fn equivalent_tree_publication_starts_from_integration_without_phantom_leases() 
         repository.commit_tree_id(&integration).unwrap()
     );
 
-    let started = broker.start_worktree("disjoint proxy change").unwrap();
+    let started = broker
+        .start_worktree("disjoint proxy change", None)
+        .unwrap();
     assert_eq!(started.diff_base, Some(integration.clone()));
     let started_checkout =
         aethyme_broker::GitRepo::discover(Path::new(&started.worktree_path)).unwrap();

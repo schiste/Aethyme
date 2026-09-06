@@ -21,6 +21,7 @@
 //!   sessions, stress-tested at 20 (see `tests/stress.rs`).
 
 mod advisories;
+pub mod attribution;
 mod broker;
 pub mod cli;
 mod cli_output;
@@ -76,6 +77,7 @@ mod version;
 pub use aethyme_graph_storage::{
     GRAPH_CONFIG_RELPATH, GraphAuthority, GraphIntegrityPolicy, GraphIntegrityPolicyError,
 };
+pub use attribution::{Attribution, Identity};
 pub use broker::{
     AdoptIntegrationDrift, AdoptIntegrationRelation, AdoptIntegrationSync,
     AdoptIntegrationSyncOutcome, AdoptMode, AdoptOptions, AdoptOutcome, AdoptReport, AgentView,

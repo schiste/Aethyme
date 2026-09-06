@@ -372,6 +372,7 @@ fn failed_submit_is_captured_as_a_redacted_structured_command_failure() {
             pid: None,
             command: None,
             log_path: None,
+            agent_identity: None,
         })
         .unwrap();
     std::fs::write(tmp.path().join("README.md"), "pending change\n").unwrap();

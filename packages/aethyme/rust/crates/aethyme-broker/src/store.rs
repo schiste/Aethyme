@@ -330,8 +330,9 @@ impl BrokerStore {
         id: i64,
         task: Option<&str>,
         diff_base: Option<&str>,
+        agent_identity: Option<&str>,
     ) -> Result<Session, BrokerError> {
-        self.reuse_session_with_leases(id, task, diff_base, &[])
+        self.reuse_session_with_leases(id, task, diff_base, agent_identity, &[])
     }
 
     pub fn reuse_session_with_leases(
@@ -339,6 +340,7 @@ impl BrokerStore {
         id: i64,
         task: Option<&str>,
         diff_base: Option<&str>,
+        agent_identity: Option<&str>,
         planned_paths: &[String],
     ) -> Result<Session, BrokerError> {
         let now = now_ms();
@@ -348,9 +350,10 @@ impl BrokerStore {
         validate_planned_lease_conflicts(&tx, Some(id), planned_paths, now)?;
         let changed = tx.execute(
             "UPDATE sessions SET task = COALESCE(?2, task), diff_base = COALESCE(?3, diff_base),
-                                 status = 'active', last_activity_at = ?4, updated_at = ?4
+                                 agent_identity = COALESCE(?4, agent_identity),
+                                 status = 'active', last_activity_at = ?5, updated_at = ?5
              WHERE id = ?1 AND status != 'cleaned'",
-            params![id, task, diff_base, now],
+            params![id, task, diff_base, agent_identity, now],
         )?;
         if changed == 0 {
             return Err(BrokerError::SessionNotFound(id));
@@ -4310,11 +4313,11 @@ fn insert_session(tx: &Transaction<'_>, new: &NewSession, now: i64) -> Result<i6
                                adoption_base, adopted_head, repository_schema,
                                deployment_state_digest, aethyme_version,
                                gate_definition_digest, repository_contract_backfilled,
-                               pid, command, log_path, created_at, updated_at,
-                               last_activity_at)
+                               pid, command, log_path, agent_identity, created_at,
+                               updated_at, last_activity_at)
          VALUES (?1, ?2, ?3, 'active', ?4, ?5, COALESCE(?6, ?5),
                  COALESCE(?7, ?6, ?5), ?8, ?9, ?10, ?11, ?12, ?13,
-                 ?14, ?15, ?16, ?16, ?16)",
+                 ?14, ?15, ?16, ?17, ?17, ?17)",
         params![
             new.worktree_path,
             new.branch,
@@ -4331,6 +4334,7 @@ fn insert_session(tx: &Transaction<'_>, new: &NewSession, now: i64) -> Result<i6
             new.pid,
             new.command,
             new.log_path,
+            new.agent_identity,
             now,
         ],
     );
@@ -4496,7 +4500,7 @@ const SESSION_SELECT: &str = "SELECT id, worktree_path, branch, origin, status, 
      accepted_at, repository_schema, deployment_state_digest, aethyme_version, \
      gate_definition_digest, repository_contract_backfilled, pid, command, log_path, \
      exit_code, created_at, updated_at, last_activity_at, cleanup_state, closed_at, \
-     cleanup_completed_at \
+     cleanup_completed_at, agent_identity \
      FROM sessions";
 
 const LEASE_SELECT: &str =
@@ -4589,6 +4593,7 @@ fn session_from_row(row: &rusqlite::Row<'_>) -> RowResult<Session> {
             cleanup_state,
             closed_at: row.get(27)?,
             cleanup_completed_at: row.get(28)?,
+            agent_identity: row.get(29)?,
             task: row.get(5)?,
             diff_base: row.get(6)?,
             adoption_base: row.get(7)?,

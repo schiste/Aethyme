@@ -64,7 +64,7 @@ Usage:
       Inspect exact-HEAD gate quality without changing enforced selection.
       --probe explicitly runs all or one selected gate in a disposable
       detached worktree with ephemeral cache evidence and mutation capture.
-  aethyme broker adopt [<path>] [--task <text>] [--path <repo-path>]... [--reuse [--sync-integration]|--replace-stale] [--json]
+  aethyme broker adopt [<path>] [--task <text>] [--path <repo-path>]... [--agent <name-and-email>] [--reuse [--sync-integration]|--replace-stale] [--json]
       Register an existing worktree (attach-first). Defaults to the
       current directory. If the worktree already has a session:
       --reuse points it at a follow-up task with a fresh baseline and
@@ -130,12 +130,14 @@ Usage:
       Resolve retained ambiguity explicitly. Assignment requires --session;
       unsupported or repository-mismatched events can only be ignored. The
       reason is stored as a SHA-256 digest, never as text.
-  aethyme broker start --task <text> [--path <repo-path>]... [--json]
+  aethyme broker start --task <text> [--path <repo-path>]... [--agent <name-and-email>] [--json]
       Create a broker-managed worktree + branch and register a session,
       atomically claiming every reviewed --path, but do not spawn a process.
       Prefer this over adopting the main
       checkout for agent work; it isolates the git index and worktree.
-  aethyme broker start-agent --task <text> --cmd <command> [--json]
+      --agent as in adopt (see above).
+  aethyme broker start-agent --task <text> --cmd <command>
+                             [--agent <identity>] [--json]
       Create a worktree + branch and spawn <command> in it (sh -c),
       logging to .aethyme/logs/.
   aethyme broker prepare status --session <id> [--json]
@@ -491,6 +493,15 @@ fn now_ms() -> i64 {
 }
 
 /// Entry point for the router. Returns a process exit code.
+/// `--agent` when given, else `AETHYME_AGENT`. Resolved in the agent's own
+/// process, because promotion can run from a different one (issue rescue: a
+/// later `submit` or queue drain would otherwise credit whoever triggered it).
+fn session_agent_identity(explicit: Option<&str>) -> Option<String> {
+    explicit
+        .map(str::to_string)
+        .or_else(|| crate::attribution::agent_from_env().map(|identity| identity.render()))
+}
+
 pub fn run(args: &[String]) -> u8 {
     run_with_mode(args, CompatibilityMode::Normal)
 }
@@ -5721,6 +5732,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     "--sync-integration requires --reuse".into(),
                 ));
             }
+            let agent_identity = session_agent_identity(parsed.agent.as_deref());
             let report = broker.adopt_with_options(
                 &path,
                 parsed.task.as_deref(),
@@ -5729,6 +5741,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     sync_integration: parsed.sync_integration,
                     planned_paths: parsed.planned_paths,
                 },
+                agent_identity.as_deref(),
             )?;
             let session = &report.session;
             if parsed.json {
@@ -5832,7 +5845,12 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                 .task
                 .ok_or(UsageError::Message("start requires --task".into()))?;
             let mut broker = open_broker(parsed.read_only_snapshot)?;
-            let report = broker.start_worktree_with_planned_paths(&task, &parsed.planned_paths)?;
+            let agent_identity = session_agent_identity(parsed.agent.as_deref());
+            let report = broker.start_worktree_with_planned_paths(
+                &task,
+                &parsed.planned_paths,
+                agent_identity.as_deref(),
+            )?;
             let session = &report.session;
             if parsed.json {
                 out!("{}", serde_json::to_string_pretty(&report)?);
@@ -5884,7 +5902,8 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                 .cmd
                 .ok_or(UsageError::Message("start-agent requires --cmd".into()))?;
             let mut broker = open_broker(parsed.read_only_snapshot)?;
-            let report = broker.start_agent_report(&task, &cmd)?;
+            let agent_identity = session_agent_identity(parsed.agent.as_deref());
+            let report = broker.start_agent_report(&task, &cmd, agent_identity.as_deref())?;
             let session = &report.session;
             if parsed.json {
                 out!("{}", serde_json::to_string_pretty(&report)?);

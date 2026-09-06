@@ -2214,19 +2214,25 @@ impl Broker {
     /// Register an existing worktree the user already launched an agent
     /// in. `worktree` may be any path inside it.
     pub fn adopt(&mut self, worktree: &Path, task: Option<&str>) -> Result<Session, BrokerOpError> {
-        Ok(self.adopt_with(worktree, task, AdoptMode::New)?.session)
+        Ok(self
+            .adopt_with(worktree, task, AdoptMode::New, None)?
+            .session)
     }
 
     /// `adopt` with an explicit policy for the "this worktree already has
     /// a session" case (dogfood feedback 2026-07-14: the bare constraint
     /// error left no obvious follow-up path).
+    ///
+    /// `agent_identity` is the `Name <email>` the session's agent is
+    /// credited under on the promote commit; `None` leaves it unknown.
     pub fn adopt_with(
         &mut self,
         worktree: &Path,
         task: Option<&str>,
         mode: AdoptMode,
+        agent_identity: Option<&str>,
     ) -> Result<AdoptReport, BrokerOpError> {
-        self.adopt_with_options(worktree, task, AdoptOptions::new(mode))
+        self.adopt_with_options(worktree, task, AdoptOptions::new(mode), agent_identity)
     }
 
     pub fn adopt_with_options(
@@ -2234,6 +2240,7 @@ impl Broker {
         worktree: &Path,
         task: Option<&str>,
         options: AdoptOptions,
+        agent_identity: Option<&str>,
     ) -> Result<AdoptReport, BrokerOpError> {
         if options.sync_integration && options.mode != AdoptMode::Reuse {
             return Err(BrokerOpError::ReuseSyncRequiresReuse);
@@ -2288,6 +2295,7 @@ impl Broker {
                         existing.id,
                         task,
                         refreshed_base,
+                        agent_identity,
                         &planned_paths,
                     )?;
                     self.store
@@ -2336,6 +2344,7 @@ impl Broker {
             pid: None,
             command: None,
             log_path: None,
+            agent_identity: agent_identity.map(str::to_string),
         };
         let session = if let Some(replaced_session_id) = replaced_session_id {
             self.store.replace_session_with_leases(
@@ -2522,14 +2531,24 @@ impl Broker {
     /// spawning a process. This is the preferred entrypoint for agents
     /// already running in an existing shell: the caller can `cd` into the
     /// returned path and continue with an isolated index and checkout.
-    pub fn start_worktree(&mut self, task: &str) -> Result<Session, BrokerOpError> {
-        Ok(self.start_worktree_with_planned_paths(task, &[])?.session)
+    /// The caller here IS the agent that will work the worktree -- unlike
+    /// [`Broker::start_agent`], no separate process is involved -- so
+    /// `agent_identity` is its own identity for promote-commit credit.
+    pub fn start_worktree(
+        &mut self,
+        task: &str,
+        agent_identity: Option<&str>,
+    ) -> Result<Session, BrokerOpError> {
+        Ok(self
+            .start_worktree_with_planned_paths(task, &[], agent_identity)?
+            .session)
     }
 
     pub fn start_worktree_with_planned_paths(
         &mut self,
         task: &str,
         paths: &[String],
+        agent_identity: Option<&str>,
     ) -> Result<StartReport, BrokerOpError> {
         let planned_paths = normalize_planned_paths(paths)?;
         self.ensure_planned_paths_available(&planned_paths, None)?;
@@ -2549,6 +2568,7 @@ impl Broker {
             pid: None,
             command: None,
             log_path: None,
+            agent_identity: agent_identity.map(str::to_string),
         };
         let session = match self
             .store
@@ -2578,14 +2598,22 @@ impl Broker {
     /// `sh -c` with stdout/stderr teed to a log file. Returns the session;
     /// the child runs detached (the broker never owns the process beyond
     /// recording its PID).
-    pub fn start_agent(&mut self, task: &str, command: &str) -> Result<Session, BrokerOpError> {
-        Ok(self.start_agent_report(task, command)?.session)
+    pub fn start_agent(
+        &mut self,
+        task: &str,
+        command: &str,
+        agent_identity: Option<&str>,
+    ) -> Result<Session, BrokerOpError> {
+        Ok(self
+            .start_agent_report(task, command, agent_identity)?
+            .session)
     }
 
     pub fn start_agent_report(
         &mut self,
         task: &str,
         command: &str,
+        agent_identity: Option<&str>,
     ) -> Result<StartAgentReport, BrokerOpError> {
         let (slug, branch, start_base, worktree, worktree_placement) =
             self.create_session_worktree(task)?;
@@ -2632,6 +2660,7 @@ impl Broker {
             pid: Some(child.id() as i64),
             command: Some(command.to_string()),
             log_path: Some(log_path.to_string_lossy().into_owned()),
+            agent_identity: agent_identity.map(str::to_string),
         })?;
         self.store.set_session_foreign_files(session.id, &[])?;
         Ok(StartAgentReport {
@@ -7889,6 +7918,7 @@ mod tests {
             command: None,
             log_path: None,
             exit_code: None,
+            agent_identity: None,
             created_at: 0,
             updated_at: 0,
             last_activity_at: 0,

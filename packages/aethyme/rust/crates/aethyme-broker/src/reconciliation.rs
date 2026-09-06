@@ -886,6 +886,7 @@ impl Broker {
                         "broker: reconcile pending queue entry {} (session {})",
                         candidate.entry.id, candidate.entry.session_id
                     ),
+                    &crate::attribution::Attribution::broker_only(),
                 )?;
                 rebuilt = replayed.clone();
                 classified[index] = Some(entry_report(
@@ -944,6 +945,7 @@ impl Broker {
                             "broker: preserve unrecorded integration commit {}",
                             planned.commit
                         ),
+                        &crate::attribution::Attribution::broker_only(),
                     )?;
                     rebuilt = replayed.clone();
                     planned.replayed_commit = Some(replayed);

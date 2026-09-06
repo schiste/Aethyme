@@ -29,6 +29,11 @@ Gates and broker config are committed (`.aethyme/gates.toml`,
 ## The daily loop
 
 ```bash
+# Name the agent once per shell; the promote commit credits it as
+# Co-Authored-By alongside the broker and your own git identity.
+# --agent on start/adopt overrides it for a single session.
+export AETHYME_AGENT="Claude Opus 5 <noreply@anthropic.com>"
+
 # Starting an agent on a task — normal path:
 aethyme broker start --task "short task description"
 cd <reported-worktree>

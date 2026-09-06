@@ -390,6 +390,10 @@ pub struct NewSession {
     pub pid: Option<i64>,
     pub command: Option<String>,
     pub log_path: Option<String>,
+    /// RFC-822-style `Name <email>` for the agent driving this session,
+    /// used as a `Co-Authored-By` trailer on the promote commit. `None`
+    /// when the agent did not identify itself.
+    pub agent_identity: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -422,6 +426,8 @@ pub struct Session {
     pub command: Option<String>,
     pub log_path: Option<String>,
     pub exit_code: Option<i64>,
+    /// See [`NewSession::agent_identity`].
+    pub agent_identity: Option<String>,
     /// Unix epoch milliseconds.
     pub created_at: i64,
     pub updated_at: i64,

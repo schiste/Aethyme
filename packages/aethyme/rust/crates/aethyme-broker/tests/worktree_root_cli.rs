@@ -202,7 +202,9 @@ fn cleanup_accepts_a_worktree_owned_by_the_external_root_marker() {
     fixture_at(&repo);
 
     let mut broker = Broker::open(&repo).unwrap().with_worktree_root(&root);
-    let session = broker.start_worktree("cleanup external checkout").unwrap();
+    let session = broker
+        .start_worktree("cleanup external checkout", None)
+        .unwrap();
     let worktree = PathBuf::from(&session.worktree_path);
     assert!(worktree.exists());
 

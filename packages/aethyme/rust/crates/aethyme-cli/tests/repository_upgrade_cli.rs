@@ -86,6 +86,7 @@ fn adopt_legacy_session(repo: &Path) -> i64 {
                 sync_integration: false,
                 planned_paths: Vec::new(),
             },
+            None,
         )
         .unwrap()
         .session
@@ -115,6 +116,7 @@ fn register_version_pinned_session(repo: &Path, version: &str) -> i64 {
             pid: None,
             command: None,
             log_path: None,
+            agent_identity: None,
         })
         .unwrap()
         .id

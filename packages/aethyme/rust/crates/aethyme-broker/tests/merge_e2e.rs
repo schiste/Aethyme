@@ -107,7 +107,12 @@ fn refresh_graph(root: &Path, repository: &str) {
     let tree = git_repository.working_tree_hash().unwrap();
     let head = git_repository.head_commit().unwrap();
     let source = git_repository
-        .commit_tree(&tree, &[&head], "test: bind graph source snapshot")
+        .commit_tree(
+            &tree,
+            &[&head],
+            "test: bind graph source snapshot",
+            &aethyme_broker::Attribution::broker_only(),
+        )
         .unwrap();
     write_graph_authority_manifest(root, &source, repository, env!("CARGO_PKG_VERSION")).unwrap();
 }
@@ -162,6 +167,16 @@ fn resolve(root: &Path, rev: &str) -> String {
         .current_dir(root)
         .output()
         .unwrap();
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+fn show(root: &Path, format: &str, rev: &str) -> String {
+    let output = Command::new("git")
+        .args(["show", "-s", &format!("--format={format}"), rev])
+        .current_dir(root)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "git show -s {rev} failed");
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
@@ -1308,7 +1323,12 @@ fn repeated_reuse_after_rebase_preserves_owned_work_and_finish_truth() {
 
     // Reusing a closed worktree creates a new identity at its current HEAD.
     let created = broker
-        .adopt_with(&worktree, Some("land the release notes"), AdoptMode::Reuse)
+        .adopt_with(
+            &worktree,
+            Some("land the release notes"),
+            AdoptMode::Reuse,
+            None,
+        )
         .unwrap();
     assert_eq!(
         created.session.diff_base.as_deref(),
@@ -1322,7 +1342,12 @@ fn repeated_reuse_after_rebase_preserves_owned_work_and_finish_truth() {
     let rebased_head = resolve(&worktree, "HEAD");
     assert_ne!(rebased_head, pre_rebase_head);
     let reused = broker
-        .adopt_with(&worktree, Some("land the release notes"), AdoptMode::Reuse)
+        .adopt_with(
+            &worktree,
+            Some("land the release notes"),
+            AdoptMode::Reuse,
+            None,
+        )
         .unwrap();
     assert_eq!(reused.session.id, created.session.id);
     assert_eq!(
@@ -1528,6 +1553,7 @@ fn normalized_replay_refuses_missing_baseline_and_owned_merge_commits() {
             pid: None,
             command: None,
             log_path: None,
+            agent_identity: None,
         })
         .unwrap();
     commit_edit(&missing_worktree, "src/a.py", "a = 9\n");
@@ -1683,6 +1709,90 @@ fn failing_gate_on_merged_tree_rejects_and_auto_mode_promotes() {
     let outcome = broker.submit(session.id).unwrap();
     assert_eq!(outcome.entry.status, MergeStatus::Promoted);
     assert!(outcome.promoted, "auto-promote is the default");
+}
+
+#[test]
+fn promote_commit_credits_the_human_the_agent_and_the_broker() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let wt = agent_worktree(tmp.path(), "credited");
+    let session = broker
+        .adopt_with(
+            &wt,
+            Some("teach the broker to share credit"),
+            aethyme_broker::AdoptMode::New,
+            Some("Claude Opus 5 <noreply@anthropic.com>"),
+        )
+        .unwrap()
+        .session;
+    commit_edit(&wt, "src/a.py", "a = 9\n");
+
+    let outcome = broker.submit(session.id).unwrap();
+    assert_eq!(outcome.entry.status, MergeStatus::Promoted);
+    let merge_commit = promoted_merge_commit(&outcome.entry);
+
+    // The human owns the work: authoring by the repo's configured identity
+    // is what keeps `git log --author` and GitHub account linking working.
+    assert_eq!(
+        show(tmp.path(), "%an <%ae>", &merge_commit),
+        "Aethyme Test <aethyme-test@example.invalid>"
+    );
+    // The broker applied it, and says so where it is literally true.
+    assert_eq!(
+        show(tmp.path(), "%cn <%ce>", &merge_commit),
+        "aethyme-broker <broker@aethyme.local>"
+    );
+    // Agent and broker are visible in the only channel Git gives a third
+    // party — and in log views where the committer never shows up.
+    let body = show(tmp.path(), "%B", &merge_commit);
+    assert!(
+        body.starts_with(&format!(
+            "broker: promote session {} (teach the broker to share credit)",
+            session.id
+        )),
+        "{body}"
+    );
+    assert!(
+        body.contains("Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"),
+        "{body}"
+    );
+    assert!(
+        body.contains("Co-Authored-By: aethyme-broker <broker@aethyme.local>"),
+        "{body}"
+    );
+    assert!(
+        !body.contains("Co-Authored-By: Aethyme Test"),
+        "the author must not also be thanked as a co-author: {body}"
+    );
+}
+
+#[test]
+fn promote_commit_omits_an_agent_that_never_identified_itself() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let wt = agent_worktree(tmp.path(), "anonymous");
+    // Plain `adopt` records no agent — the pre-attribution behaviour every
+    // existing caller still gets.
+    let session = broker.adopt(&wt, Some("anonymous work")).unwrap();
+    commit_edit(&wt, "src/a.py", "a = 10\n");
+
+    let outcome = broker.submit(session.id).unwrap();
+    assert_eq!(outcome.entry.status, MergeStatus::Promoted);
+    let body = show(tmp.path(), "%B", &promoted_merge_commit(&outcome.entry));
+
+    // An unknown agent is left out, never guessed at: a fabricated
+    // Co-Authored-By is a false statement about a real product.
+    assert_eq!(
+        body.matches("Co-Authored-By:").count(),
+        1,
+        "only the broker should be credited: {body}"
+    );
+    assert!(
+        body.contains("Co-Authored-By: aethyme-broker <broker@aethyme.local>"),
+        "{body}"
+    );
 }
 
 #[test]
@@ -2135,7 +2245,12 @@ fn repair_replays_only_submission_plan_pending_commits_after_a_promotion() {
     );
 
     let reused = broker
-        .adopt_with(&worktree, Some("continue repaired work"), AdoptMode::Reuse)
+        .adopt_with(
+            &worktree,
+            Some("continue repaired work"),
+            AdoptMode::Reuse,
+            None,
+        )
         .unwrap();
     assert_eq!(
         reused.integration_drift.unwrap().safe_next_action,

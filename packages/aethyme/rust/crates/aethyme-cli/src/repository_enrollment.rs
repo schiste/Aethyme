@@ -620,7 +620,7 @@ pub fn execute(repo_hint: &Path, confirmation: &str) -> Result<FirstEnrollmentEx
                 .map_err(|error| format!("recover bootstrap session {id}: {error}"))?,
             None => {
                 let session = broker
-                    .start_worktree("Materialize reviewed first-enrollment upstream")
+                    .start_worktree("Materialize reviewed first-enrollment upstream", None)
                     .map_err(|error| format!("start enrollment bootstrap session: {error}"))?;
                 journal.bootstrap_session_id = Some(session.id);
                 write_journal(&journal_path, &journal)?;
@@ -700,6 +700,7 @@ pub fn execute(repo_hint: &Path, confirmation: &str) -> Result<FirstEnrollmentEx
             .start_worktree_with_planned_paths(
                 "Publish reviewed Aethyme repository enrollment",
                 &journal.planned_paths,
+                None,
             )
             .map_err(|error| format!("start isolated enrollment session: {error}"))?;
         journal.enrollment_session_id = Some(started.session.id);

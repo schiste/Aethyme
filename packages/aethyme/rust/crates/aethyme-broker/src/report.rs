@@ -1403,6 +1403,7 @@ mod tests {
             created_at: 100,
             updated_at: 500,
             last_activity_at: 490,
+            agent_identity: None,
         }
     }
 

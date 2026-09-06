@@ -35,6 +35,7 @@ fn sample_session(store: &mut BrokerStore) -> aethyme_broker::Session {
             pid: None,
             command: None,
             log_path: None,
+            agent_identity: None,
         })
         .unwrap()
 }
@@ -100,6 +101,7 @@ fn session_registration_and_planned_leases_rollback_as_one_transaction() {
         pid: None,
         command: None,
         log_path: None,
+        agent_identity: None,
     };
 
     let first = store
@@ -256,6 +258,7 @@ fn duplicate_live_worktree_is_rejected_but_cleaned_frees_the_slot() {
         pid: Some(123),
         command: Some("claude".into()),
         log_path: None,
+        agent_identity: None,
     });
     assert!(matches!(
         duplicate,
@@ -279,6 +282,7 @@ fn duplicate_live_worktree_is_rejected_but_cleaned_frees_the_slot() {
             pid: None,
             command: None,
             log_path: None,
+            agent_identity: None,
         })
         .unwrap();
 }
@@ -410,6 +414,7 @@ fn retention_sweep_drops_leases_of_already_cleaned_sessions() {
             pid: None,
             command: None,
             log_path: None,
+            agent_identity: None,
         })
         .unwrap();
     store

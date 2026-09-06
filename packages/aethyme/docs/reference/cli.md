@@ -333,8 +333,8 @@ stashing multi-worktree changes.
 - `aethyme broker readiness recover [--repo <path>] --plan <plan-sha256> [--json]`
 - `aethyme broker status [--json]`
 - `aethyme broker worktree-root [--json]`
-- `aethyme broker start --task "..." [--path <repo-path>]... [--json]`
-- `aethyme broker adopt [<path>] --task "..." [--path <repo-path>]... [--reuse [--sync-integration]] [--json]`
+- `aethyme broker start --task "..." [--path <repo-path>]... [--agent "<Name> <email>"] [--json]`
+- `aethyme broker adopt [<path>] --task "..." [--path <repo-path>]... [--agent "<Name> <email>"] [--reuse [--sync-integration]] [--json]`
 - `aethyme broker prepare status --session <id> [--json]`
 - `aethyme broker prepare --session <id> [--offline] [--wait <duration>] [--json]`
 - `aethyme broker exec --session <id> -- <command> [--json]`

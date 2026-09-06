@@ -43,6 +43,7 @@ fn main() {
         pid: None,
         command: None,
         log_path: None,
+        agent_identity: None,
     }) {
         Ok(session) => session,
         Err(err) => {

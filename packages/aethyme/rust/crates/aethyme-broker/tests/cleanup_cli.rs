@@ -40,7 +40,7 @@ fn bulk_cleanup_is_dry_run_by_default_and_apply_revalidates() {
     git(tmp.path(), &["commit", "-qm", "init"]);
 
     let mut broker = Broker::open(tmp.path()).unwrap();
-    let session = broker.start_worktree("cleanup CLI fixture").unwrap();
+    let session = broker.start_worktree("cleanup CLI fixture", None).unwrap();
     let worktree = std::path::PathBuf::from(&session.worktree_path);
     std::fs::write(worktree.join("done.txt"), "done\n").unwrap();
     git(&worktree, &["add", "done.txt"]);
@@ -152,7 +152,7 @@ fn bulk_cleanup_confirmation_binds_the_exact_reviewed_branch_tip() {
     git(tmp.path(), &["commit", "-qm", "init"]);
 
     let mut broker = Broker::open(tmp.path()).unwrap();
-    let session = broker.start_worktree("cleanup confirmation").unwrap();
+    let session = broker.start_worktree("cleanup confirmation", None).unwrap();
     let worktree = std::path::PathBuf::from(&session.worktree_path);
     std::fs::write(worktree.join("done.txt"), "done\n").unwrap();
     git(&worktree, &["add", "done.txt"]);

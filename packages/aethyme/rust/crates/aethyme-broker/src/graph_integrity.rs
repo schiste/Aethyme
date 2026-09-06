@@ -284,6 +284,7 @@ pub(crate) fn verify_checkout_without_mutation(
         &tree,
         &[&head],
         "broker: materialize exact graph-integrity verification tree",
+        &crate::attribution::Attribution::broker_only(),
     )?;
     let mut slot =
         crate::verification::ExactTreeVerificationSlot::acquire(main_root, "graph-integrity")?;

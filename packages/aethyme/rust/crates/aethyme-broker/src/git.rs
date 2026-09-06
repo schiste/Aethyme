@@ -853,13 +853,27 @@ impl GitRepo {
         Ok(MergeSimulation { tree, conflicts })
     }
 
+    /// Read `git config --get <key>`, or `None` when unset or empty.
+    /// Missing config is an expected state here, not an error.
+    pub fn config_value(&self, key: &str) -> Option<String> {
+        run_git(&self.root, &["config", "--get", key])
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    }
+
     /// Create a commit object for `tree` with `parents` (no checkout,
     /// no ref update). Used to materialize simulated merges.
+    ///
+    /// `attribution` fills the author and committer slots; the caller is
+    /// responsible for appending any `Co-Authored-By` trailers to
+    /// `message` (see [`crate::attribution::Attribution::trailer_block`]).
     pub fn commit_tree(
         &self,
         tree: &str,
         parents: &[&str],
         message: &str,
+        attribution: &crate::attribution::Attribution,
     ) -> Result<String, GitError> {
         let mut args: Vec<String> = vec!["commit-tree".into(), tree.into()];
         for parent in parents {
@@ -872,10 +886,10 @@ impl GitRepo {
         let output = Command::new("git")
             .args(&arg_refs)
             .current_dir(&self.root)
-            .env("GIT_AUTHOR_NAME", "aethyme-broker")
-            .env("GIT_AUTHOR_EMAIL", "broker@aethyme.local")
-            .env("GIT_COMMITTER_NAME", "aethyme-broker")
-            .env("GIT_COMMITTER_EMAIL", "broker@aethyme.local")
+            .env("GIT_AUTHOR_NAME", &attribution.author.name)
+            .env("GIT_AUTHOR_EMAIL", &attribution.author.email)
+            .env("GIT_COMMITTER_NAME", &attribution.committer.name)
+            .env("GIT_COMMITTER_EMAIL", &attribution.committer.email)
             .output()
             .map_err(|source| GitError::Spawn {
                 args: "commit-tree".into(),

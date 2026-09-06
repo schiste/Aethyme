@@ -516,10 +516,24 @@ impl Broker {
         // stable, locked verification slot. The checkout is still disposable,
         // but its source path remains constant so build tools can reuse safe
         // path-sensitive fingerprints across queue entries.
+        // Credit everyone in the chain: the human authors, the broker commits,
+        // and the agent that did the work is named in a trailer.
+        //
+        // The session row is the ONLY source here. Promotion can run from a
+        // different process than the agent's (another session's submit, or a
+        // queue drain), so AETHYME_AGENT in this process would credit whoever
+        // happened to trigger the merge. `start`/`adopt` resolve the env
+        // fallback once, while it is still the right agent's environment.
+        let agent = session
+            .agent_identity
+            .as_deref()
+            .and_then(crate::attribution::Identity::parse);
+        let attribution = crate::attribution::for_promote(&self.main_root_path(), agent);
         let mut verification_message = format!(
-            "broker: promote session {} ({})",
+            "broker: promote session {} ({}){}",
             session.id,
-            session.task.as_deref().unwrap_or("no task")
+            session.task.as_deref().unwrap_or("no task"),
+            attribution.trailer_block()
         );
         let pending_messages = submission_plan
             .pending_owned_commit_ids()
@@ -531,9 +545,12 @@ impl Broker {
             verification_message.push_str("\n\nContract decision: ");
             verification_message.push_str(decision.label());
         }
-        let merge_commit =
-            self.repo_handle()
-                .commit_tree(&simulation.tree, &[&base], &verification_message)?;
+        let merge_commit = self.repo_handle().commit_tree(
+            &simulation.tree,
+            &[&base],
+            &verification_message,
+            &attribution,
+        )?;
         let verify_base = pre_refresh.as_deref().unwrap_or(&base);
         let changed = self
             .repo_handle()
@@ -773,6 +790,7 @@ impl Broker {
                     &commit.commit[..12],
                     plan.session_id
                 ),
+                &crate::attribution::Attribution::broker_only(),
             )?;
         }
         Ok(SubmissionReplay {

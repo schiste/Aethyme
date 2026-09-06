@@ -77,7 +77,7 @@ impl Fixture {
 
     fn promoted_entry(&self) -> (i64, i64, String) {
         let mut broker = self.broker();
-        let session = broker.start_worktree("ship-plan").unwrap();
+        let session = broker.start_worktree("ship-plan", None).unwrap();
         let worktree = PathBuf::from(&session.worktree_path);
         std::fs::write(worktree.join("feature.txt"), "verified\n").unwrap();
         git(&worktree, &["add", "feature.txt"]);
@@ -203,7 +203,7 @@ fn ship_plan_reports_exact_tip_and_does_not_mutate_refs() {
 fn ship_plan_rejects_an_entry_that_is_not_promoted() {
     let fixture = Fixture::new();
     let mut broker = fixture.broker();
-    let session = broker.start_worktree("unpromoted").unwrap();
+    let session = broker.start_worktree("unpromoted", None).unwrap();
     let entry = broker
         .store()
         .submit(
@@ -362,7 +362,7 @@ fn ship_retains_advisory_while_its_overlapping_lease_is_live() {
 
     broker.acknowledge_advisory(advisory.id).unwrap();
     broker.close(session_id).unwrap();
-    let operator = broker.start_worktree("reconcile exposures").unwrap();
+    let operator = broker.start_worktree("reconcile exposures", None).unwrap();
     let plan = broker.exposure_reconciliation_plan().unwrap();
     assert!(plan.safe);
     assert_eq!(plan.advisories.len(), 1);
@@ -434,7 +434,9 @@ fn selected_prefix_publication_resolves_only_contained_promoted_entries() {
     let fixture = Fixture::new();
     let (first_entry, _, _) = fixture.promoted_entry();
     let mut broker = fixture.broker();
-    let second_session = broker.start_worktree("second promoted entry").unwrap();
+    let second_session = broker
+        .start_worktree("second promoted entry", None)
+        .unwrap();
     let second_worktree = PathBuf::from(&second_session.worktree_path);
     std::fs::write(second_worktree.join("second.txt"), "second\n").unwrap();
     git(&second_worktree, &["add", "second.txt"]);
@@ -443,7 +445,7 @@ fn selected_prefix_publication_resolves_only_contained_promoted_entries() {
     assert!(second.promoted);
     let selected_integration = git_output(&fixture.repo, &["rev-parse", "aethyme/integration"]);
 
-    let third_session = broker.start_worktree("later promoted entry").unwrap();
+    let third_session = broker.start_worktree("later promoted entry", None).unwrap();
     let third_worktree = PathBuf::from(&third_session.worktree_path);
     std::fs::write(third_worktree.join("third.txt"), "third\n").unwrap();
     git(&third_worktree, &["add", "third.txt"]);
@@ -530,7 +532,9 @@ fn ship_plan_refuses_a_selected_prefix_with_unrecorded_integration_commits() {
     );
 
     let mut broker = fixture.broker();
-    let session = broker.start_worktree("after unrecorded commit").unwrap();
+    let session = broker
+        .start_worktree("after unrecorded commit", None)
+        .unwrap();
     let worktree = PathBuf::from(&session.worktree_path);
     std::fs::write(worktree.join("after-unrecorded.txt"), "change\n").unwrap();
     git(&worktree, &["add", "after-unrecorded.txt"]);

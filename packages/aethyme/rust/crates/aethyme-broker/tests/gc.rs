@@ -36,7 +36,7 @@ fn fixture() -> (tempfile::TempDir, Broker, i64, PathBuf) {
     .unwrap();
 
     let mut broker = Broker::open(tmp.path()).unwrap();
-    let delivered = broker.start_worktree("old delivered work").unwrap();
+    let delivered = broker.start_worktree("old delivered work", None).unwrap();
     let worktree = PathBuf::from(&delivered.worktree_path);
     std::fs::write(worktree.join("done.txt"), "done\n").unwrap();
     git(&worktree, &["add", "done.txt"]);
@@ -59,7 +59,7 @@ fn fixture() -> (tempfile::TempDir, Broker, i64, PathBuf) {
 #[test]
 fn plan_is_exact_deterministic_and_protects_live_or_unresolved_state() {
     let (tmp, mut broker, delivered_id, worktree) = fixture();
-    let active = broker.start_worktree("live blocker").unwrap();
+    let active = broker.start_worktree("live blocker", None).unwrap();
     let main_root = broker.main_root().to_path_buf();
     let gate_dir = main_root.join(".aethyme/logs/gates");
     std::fs::create_dir_all(&gate_dir).unwrap();

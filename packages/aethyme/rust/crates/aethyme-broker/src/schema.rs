@@ -16,7 +16,7 @@ use rusqlite::Connection;
 use crate::error::BrokerError;
 
 /// Current database schema version (== `MIGRATIONS.len()`).
-pub const SCHEMA_VERSION: i64 = 30;
+pub const SCHEMA_VERSION: i64 = 31;
 
 /// Version stamped on every event row written by this binary.
 pub const EVENTS_SCHEMA_VERSION: i64 = 1;
@@ -821,6 +821,15 @@ const MIGRATION_V30: &str = "
 ALTER TABLE advisories ADD COLUMN suppressed_at INTEGER;
 ";
 
+// Commit attribution: the promote merge commit must credit the agent that did
+// the work, not just the broker that applied it. Identity is per-session
+// because concurrent sessions may run different agents -- a repo-level setting
+// could not tell them apart. NULL means "unknown", and an unknown agent is
+// omitted from the trailers rather than guessed.
+const MIGRATION_V31: &str = "
+ALTER TABLE sessions ADD COLUMN agent_identity TEXT;
+";
+
 const MIGRATIONS: &[&str] = &[
     MIGRATION_V1,
     MIGRATION_V2,
@@ -852,6 +861,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_V28,
     MIGRATION_V29,
     MIGRATION_V30,
+    MIGRATION_V31,
 ];
 
 pub(crate) fn current_version(conn: &Connection) -> Result<i64, BrokerError> {

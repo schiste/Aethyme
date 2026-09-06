@@ -154,7 +154,12 @@ fn refresh_committed_graph(root: &Path) {
     let tree = repository.working_tree_hash().unwrap();
     let head = repository.head_commit().unwrap();
     let source = repository
-        .commit_tree(&tree, &[&head], "test: bind graph source snapshot")
+        .commit_tree(
+            &tree,
+            &[&head],
+            "test: bind graph source snapshot",
+            &aethyme_broker::Attribution::broker_only(),
+        )
         .unwrap();
     write_graph_authority_manifest(root, &source, "fixture", env!("CARGO_PKG_VERSION")).unwrap();
 }

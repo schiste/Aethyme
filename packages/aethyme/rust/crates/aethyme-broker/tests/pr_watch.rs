@@ -48,6 +48,7 @@ fn broker_fixture() -> (tempfile::TempDir, Broker, i64) {
             pid: None,
             command: None,
             log_path: None,
+            agent_identity: None,
         })
         .unwrap();
     (root, broker, session.id)

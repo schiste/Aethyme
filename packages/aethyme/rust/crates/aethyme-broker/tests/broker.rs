@@ -97,7 +97,7 @@ fn adopted_hand_made_worktree_and_spawned_session_are_indistinguishable() {
 
     // Spawned convenience on the same model.
     let spawned = broker
-        .start_agent("spawned task", "echo out; echo err >&2")
+        .start_agent("spawned task", "echo out; echo err >&2", None)
         .unwrap();
     assert_eq!(spawned.origin, SessionOrigin::Spawned);
     assert!(spawned.pid.is_some());
@@ -134,12 +134,24 @@ fn start_worktree_creates_broker_managed_session_without_process() {
         .unwrap()
         .with_worktree_root(external_root.path());
 
-    let session = broker.start_worktree("isolated edits").unwrap();
+    let session = broker
+        .start_worktree(
+            "isolated edits",
+            Some("Claude Opus 5 <noreply@anthropic.com>"),
+        )
+        .unwrap();
     let wt = std::path::PathBuf::from(&session.worktree_path);
 
     assert_eq!(session.origin, SessionOrigin::Spawned);
     assert!(session.pid.is_none());
     assert_eq!(session.branch, "agent/isolated-edits");
+    // `start` is the primary agent entrypoint and never calls adopt, so it
+    // has to be able to record the identity itself or the promote commit
+    // would never credit an agent on this path.
+    assert_eq!(
+        session.agent_identity.as_deref(),
+        Some("Claude Opus 5 <noreply@anthropic.com>")
+    );
     assert!(wt.exists());
     assert_eq!(
         wt.parent(),
@@ -245,7 +257,7 @@ fn session_creation_pins_repository_contract_and_reuse_does_not_refresh_it() {
     )
     .unwrap();
     let reused = broker
-        .adopt_with(tmp.path(), Some("follow-up"), AdoptMode::Reuse)
+        .adopt_with(tmp.path(), Some("follow-up"), AdoptMode::Reuse, None)
         .unwrap()
         .session;
     assert_eq!(reused.id, created.id);
@@ -274,6 +286,7 @@ fn opening_the_broker_backfills_live_pre_contract_sessions() {
                 pid: None,
                 command: None,
                 log_path: None,
+                agent_identity: None,
             })
             .unwrap()
             .id
@@ -296,7 +309,7 @@ fn dead_spawned_pid_reconciles_to_exited_and_activity_drives_idle() {
     init_repo(tmp.path());
     let mut broker = Broker::open(tmp.path()).unwrap();
 
-    let session = broker.start_agent("quick", "true").unwrap();
+    let session = broker.start_agent("quick", "true", None).unwrap();
     // Let the child exit.
     std::thread::sleep(std::time::Duration::from_millis(400));
 
@@ -340,7 +353,7 @@ fn cleanup_refuses_dirty_and_unmerged_then_force_discards() {
     init_repo(tmp.path());
     let mut broker = Broker::open(tmp.path()).unwrap();
 
-    let session = broker.start_agent("doomed", "true").unwrap();
+    let session = broker.start_agent("doomed", "true", None).unwrap();
     let wt = std::path::PathBuf::from(&session.worktree_path);
 
     // Uncommitted file → refuse.
@@ -372,7 +385,7 @@ fn cleanup_plan_and_apply_reclaim_only_safe_closed_broker_worktrees() {
     sh(tmp.path(), &["commit", "-qm", "ignore build output"]);
     let mut broker = Broker::open(tmp.path()).unwrap();
 
-    let safe = broker.start_worktree("safe cleanup").unwrap();
+    let safe = broker.start_worktree("safe cleanup", None).unwrap();
     let safe_path = std::path::PathBuf::from(&safe.worktree_path);
     std::fs::write(safe_path.join("safe.txt"), "safe\n").unwrap();
     sh(&safe_path, &["add", "safe.txt"]);
@@ -390,7 +403,7 @@ fn cleanup_plan_and_apply_reclaim_only_safe_closed_broker_worktrees() {
     std::fs::create_dir_all(safe_path.join("target/debug")).unwrap();
     std::fs::write(safe_path.join("target/debug/cache.bin"), vec![7_u8; 4096]).unwrap();
 
-    let dirty = broker.start_worktree("dirty cleanup").unwrap();
+    let dirty = broker.start_worktree("dirty cleanup", None).unwrap();
     let dirty_path = std::path::PathBuf::from(&dirty.worktree_path);
     std::fs::write(dirty_path.join("dirty.txt"), "committed\n").unwrap();
     sh(&dirty_path, &["add", "dirty.txt"]);
@@ -528,7 +541,7 @@ fn cleanup_recovers_after_worktree_removal_and_prunes_only_the_exact_branch_tip(
     init_repo(tmp.path());
     let mut broker = Broker::open(tmp.path()).unwrap();
 
-    let session = broker.start_worktree("interrupted cleanup").unwrap();
+    let session = broker.start_worktree("interrupted cleanup", None).unwrap();
     let worktree = std::path::PathBuf::from(&session.worktree_path);
     std::fs::write(worktree.join("renamed.bin"), [0_u8, 7, 255]).unwrap();
     sh(&worktree, &["add", "renamed.bin"]);
@@ -579,14 +592,14 @@ fn cleanup_distinguishes_pending_commits_from_missing_acceptance_provenance() {
     init_repo(tmp.path());
     let mut broker = Broker::open(tmp.path()).unwrap();
 
-    let pending = broker.start_worktree("pending cleanup").unwrap();
+    let pending = broker.start_worktree("pending cleanup", None).unwrap();
     let pending_path = std::path::PathBuf::from(&pending.worktree_path);
     std::fs::write(pending_path.join("pending.bin"), [0_u8, 255, 17]).unwrap();
     sh(&pending_path, &["add", "pending.bin"]);
     sh(&pending_path, &["commit", "-qm", "pending binary"]);
     broker.close(pending.id).unwrap();
 
-    let unproven = broker.start_worktree("unproven cleanup").unwrap();
+    let unproven = broker.start_worktree("unproven cleanup", None).unwrap();
     let unproven_path = std::path::PathBuf::from(&unproven.worktree_path);
     std::fs::write(unproven_path.join("renamed-before.txt"), "accepted\n").unwrap();
     sh(&unproven_path, &["add", "renamed-before.txt"]);
@@ -686,6 +699,7 @@ fn adopt_conflict_close_reuse_and_replace_stale_lifecycle() {
             tmp.path(),
             Some("first task"),
             aethyme_broker::AdoptMode::New,
+            None,
         )
         .unwrap();
     assert_eq!(first.outcome, aethyme_broker::AdoptOutcome::Created);
@@ -717,6 +731,7 @@ fn adopt_conflict_close_reuse_and_replace_stale_lifecycle() {
             tmp.path(),
             Some("follow-up task"),
             aethyme_broker::AdoptMode::Reuse,
+            Some("Claude Opus 5 <noreply@anthropic.com>"),
         )
         .unwrap();
     assert_eq!(reused.outcome, aethyme_broker::AdoptOutcome::Reused);
@@ -748,6 +763,7 @@ fn adopt_conflict_close_reuse_and_replace_stale_lifecycle() {
             tmp.path(),
             Some("third task"),
             aethyme_broker::AdoptMode::Reuse,
+            None,
         )
         .unwrap();
     assert_eq!(second.outcome, aethyme_broker::AdoptOutcome::Created);
@@ -760,6 +776,7 @@ fn adopt_conflict_close_reuse_and_replace_stale_lifecycle() {
             tmp.path(),
             Some("fourth task"),
             aethyme_broker::AdoptMode::ReplaceStale,
+            None,
         )
         .unwrap();
     assert_eq!(replaced.outcome, aethyme_broker::AdoptOutcome::Replaced);
@@ -792,7 +809,7 @@ fn adopt_reuse_reports_behind_drift_and_dirty_path_overlap() {
     std::fs::write(tmp.path().join("shared.txt"), "dirty session edit\n").unwrap();
 
     let report = broker
-        .adopt_with(tmp.path(), Some("follow-up"), AdoptMode::Reuse)
+        .adopt_with(tmp.path(), Some("follow-up"), AdoptMode::Reuse, None)
         .unwrap();
     assert_eq!(report.session.id, session.id);
     let drift = report.integration_drift.expect("reuse drift");
@@ -824,7 +841,7 @@ fn adopt_reuse_reports_diverged_commit_counts_and_overlap() {
     let session_head = rev(tmp.path(), "HEAD");
 
     let report = broker
-        .adopt_with(tmp.path(), Some("follow-up"), AdoptMode::Reuse)
+        .adopt_with(tmp.path(), Some("follow-up"), AdoptMode::Reuse, None)
         .unwrap();
     assert_eq!(report.session.id, session.id);
     let drift = report.integration_drift.expect("reuse drift");
@@ -861,7 +878,7 @@ fn adopt_reuse_reports_ahead_work_and_routes_it_to_submit() {
     sh(&worktree, &["commit", "-qm", "session advances"]);
 
     let report = broker
-        .adopt_with(&worktree, Some("follow-up"), AdoptMode::Reuse)
+        .adopt_with(&worktree, Some("follow-up"), AdoptMode::Reuse, None)
         .unwrap();
     let drift = report.integration_drift.expect("reuse drift");
     assert_eq!(drift.relation, AdoptIntegrationRelation::Ahead);
@@ -898,6 +915,7 @@ fn adopt_reuse_sync_fast_forwards_before_refreshing_the_baseline() {
                 sync_integration: true,
                 planned_paths: Vec::new(),
             },
+            None,
         )
         .unwrap();
 
@@ -939,6 +957,7 @@ fn adopt_reuse_sync_reports_an_already_current_checkout() {
                 sync_integration: true,
                 planned_paths: Vec::new(),
             },
+            None,
         )
         .unwrap();
 
@@ -975,6 +994,7 @@ fn adopt_reuse_sync_refuses_dirty_state_without_changing_head_or_session() {
                 sync_integration: true,
                 planned_paths: Vec::new(),
             },
+            None,
         )
         .unwrap_err();
 
@@ -1012,6 +1032,7 @@ fn adopt_reuse_sync_refuses_divergence_without_changing_head_or_session() {
                 sync_integration: true,
                 planned_paths: Vec::new(),
             },
+            None,
         )
         .unwrap_err();
 

@@ -40,7 +40,7 @@ fn promoted_fixture() -> (tempfile::TempDir, i64, std::path::PathBuf, String) {
     git(tmp.path(), &["commit", "-qm", "init"]);
 
     let mut broker = Broker::open(tmp.path()).unwrap();
-    let session = broker.start_worktree("finish CLI fixture").unwrap();
+    let session = broker.start_worktree("finish CLI fixture", None).unwrap();
     let worktree = std::path::PathBuf::from(&session.worktree_path);
     std::fs::write(worktree.join("done.txt"), "done\n").unwrap();
     git(&worktree, &["add", "-A"]);

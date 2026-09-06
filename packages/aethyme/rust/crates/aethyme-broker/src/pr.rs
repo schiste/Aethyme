@@ -437,7 +437,10 @@ fn dispatch_to_agent(
             shell_word(&prompt_path.to_string_lossy())
         )
     });
-    let session = broker.start_agent(&task, &command)?;
+    // `agent_name` is a dispatch label ("Push2prod"), not a Git identity —
+    // no address to go with it, so there is nothing honest to record here.
+    // The dispatched agent names itself with `adopt --reuse --agent`.
+    let session = broker.start_agent(&task, &command, None)?;
     Ok(PrDispatchReport {
         status: PrDispatchStatus::SpawnedSession,
         session_id: Some(session.id),

@@ -74,7 +74,7 @@ fn v0_three_agents_end_to_end() {
     let bob_wt = root.join(".aethyme/worktrees/bob");
     let alice = broker.adopt(&alice_wt, Some("refactor auth")).unwrap();
     let bob = broker.adopt(&bob_wt, Some("also touches auth")).unwrap();
-    let carol = broker.start_agent("update api", "true").unwrap();
+    let carol = broker.start_agent("update api", "true", None).unwrap();
     let carol_wt = std::path::PathBuf::from(&carol.worktree_path);
 
     // ── work happens ─────────────────────────────────────────────────

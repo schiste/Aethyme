@@ -72,7 +72,7 @@ impl DeployDivergenceFixture {
         git(&repo, &["push", "-qu", "origin", "main"]);
 
         let mut broker = Broker::open(&repo).unwrap();
-        let session = broker.start_worktree("functional promotion").unwrap();
+        let session = broker.start_worktree("functional promotion", None).unwrap();
         let worktree = PathBuf::from(&session.worktree_path);
         commit(
             &worktree,
@@ -130,7 +130,7 @@ impl DeployDivergenceFixture {
             "[promote]\nmode = \"manual\"\n",
         )
         .unwrap();
-        let pending = broker.start_worktree("pending queue work").unwrap();
+        let pending = broker.start_worktree("pending queue work", None).unwrap();
         let pending_worktree = PathBuf::from(&pending.worktree_path);
         let pending_head = commit(
             &pending_worktree,
@@ -178,7 +178,7 @@ fn patch_equivalent_promotion_is_landed_when_local_main_already_equals_upstream(
     git(&repo, &["push", "-qu", "origin", "main"]);
 
     let mut broker = Broker::open(&repo).unwrap();
-    let session = broker.start_worktree("promote feature").unwrap();
+    let session = broker.start_worktree("promote feature", None).unwrap();
     let worktree = PathBuf::from(&session.worktree_path);
     commit(
         &worktree,
@@ -439,7 +439,9 @@ fn first_blocked_report_templates_mixed_recorded_and_unrecorded_resolutions() {
     git(&repo, &["push", "-qu", "origin", "main"]);
 
     let mut broker = Broker::open(&repo).unwrap();
-    let session = broker.start_worktree("recorded local change").unwrap();
+    let session = broker
+        .start_worktree("recorded local change", None)
+        .unwrap();
     let worktree = PathBuf::from(&session.worktree_path);
     commit(
         &worktree,
@@ -857,7 +859,9 @@ fn reviewed_unrecorded_work_is_replayed_in_integration_order() {
     git(repo, &["commit", "-qm", "initial"]);
 
     let mut broker = Broker::open(repo).unwrap();
-    let session = broker.start_worktree("pending functional work").unwrap();
+    let session = broker
+        .start_worktree("pending functional work", None)
+        .unwrap();
     commit(
         Path::new(&session.worktree_path),
         "src/service.txt",

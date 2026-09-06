@@ -359,6 +359,7 @@ fn live_sessions_and_exact_leases_block_the_reviewed_write_set() {
             pid: None,
             command: None,
             log_path: None,
+            agent_identity: None,
         })
         .unwrap();
     store.claim_lease(session.id, "AGENTS.md", None).unwrap();
