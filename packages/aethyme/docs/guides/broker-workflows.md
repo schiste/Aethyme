@@ -354,6 +354,37 @@ follow. A path that was genuinely deleted stays a deletion: that is a real
 conflict to resolve, and pointing at a path that does not exist would be worse
 than saying nothing.
 
+### Running push hooks outside the coordination lock
+
+The repository lock orders remote mutations, but `git push` runs `pre-push`
+inside its own process, so the lock is held across that hook too. Where the hook
+is a legitimately long full suite, every other session's coordinated operation
+on that repository waits for it, and the fleet serialises on whoever is pushing
+the largest change.
+
+A repository can opt out of that coupling:
+
+```toml
+# .aethyme/config.toml
+[coordination]
+hooks_outside_lock = true
+```
+
+With it enabled, a coordinated push first runs `git push --dry-run`, which
+executes `pre-push` against exactly the commits the real push will send, before
+queueing for the lock. A hook that refuses stops the operation there, without
+ever taking the lock. The broker then acquires the lock, re-plans the push, and
+refuses if any destination or proposed commit changed while it waited -- the
+hook's verification would no longer describe what is being sent. Only then does
+it push, with `--no-verify`, because re-running the hook would double the cost
+the setting exists to avoid.
+
+This is off by default and is a deliberate trade. `--no-verify` skips every
+`pre-push` protection, not only the slow gate, so a repository using that hook
+for secret scanning or signing checks is choosing to run those in the dry run
+alone. Enable it when the hook's cost is the constraint and its checks are
+deterministic over the same commits.
+
 ### Reconciling a local default branch
 
 `ship` publishes an exact promoted prefix and refuses to discard local work the

@@ -134,6 +134,28 @@ enum PushPlanning {
 }
 
 impl PushPlanning {
+    /// Whether this plan sends exactly what an earlier plan described.
+    ///
+    /// Compared by destination and proposed commit, which is precisely what the
+    /// pre-push hook inspected during the dry run. Anything the planner cannot
+    /// describe exactly is treated as not covered, so an unplannable push never
+    /// reaches the remote with its hook skipped.
+    fn matches_prechecked(&self, earlier: &PushPlanning) -> bool {
+        match (self, earlier) {
+            (Self::Planned(now), Self::Planned(before)) => {
+                now.remote == before.remote
+                    && now.destinations.len() == before.destinations.len()
+                    && now.destinations.iter().zip(&before.destinations).all(
+                        |(current, earlier)| {
+                            current.destination_ref == earlier.destination_ref
+                                && current.proposed_sha == earlier.proposed_sha
+                        },
+                    )
+            }
+            _ => false,
+        }
+    }
+
     fn journal_value(&self) -> Option<serde_json::Value> {
         match self {
             Self::NotApplicable => None,
@@ -452,6 +474,38 @@ fn process_is_gone(pid: i64) -> bool {
         return false;
     }
     std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+}
+
+/// Opt-in: run a push's local hooks before taking the repository lock.
+///
+/// The lock exists to order remote mutations, but `git push` runs the
+/// repository's `pre-push` hook inside its own process, so holding the lock
+/// across the command holds it across that hook too. On a repository whose
+/// pre-push gate is legitimately long, the fleet then serialises on whoever is
+/// pushing the largest change (issues #138, #146).
+///
+/// Off by default because it changes what the push verifies: the hook runs
+/// against the same commits in a dry run, and the real push is then made with
+/// `--no-verify`. That is sound only because the broker re-plans under the lock
+/// and refuses if any local ref moved in between -- but it does skip any *other*
+/// pre-push protection the repository relies on, which is the repository
+/// owner's decision to make, not ours.
+fn hooks_outside_lock_enabled(main_root: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(main_root.join(".aethyme/config.toml")) else {
+        return false;
+    };
+    let Ok(value) = text.parse::<toml::Value>() else {
+        return false;
+    };
+    value
+        .get("coordination")
+        .and_then(|section| section.get("hooks_outside_lock"))
+        .and_then(toml::Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn is_push(args: &[String]) -> bool {
+    args.iter().any(|arg| arg == "push")
 }
 
 fn humanize_duration(seconds: u64) -> String {
@@ -1468,6 +1522,52 @@ impl Broker {
 
         let queued_operation_id = operation.id;
 
+        // Run the push's local hooks before queueing for the lock, when the
+        // repository opts in. A dry run executes `pre-push` against exactly the
+        // commits the real push will send, so the expensive part happens outside
+        // the lock and the fleet no longer serialises on the slowest gate
+        // (issues #138, #146).
+        let hooks_ran_outside_lock = effect != OperationEffect::Read
+            && request.provider == OperationProvider::Git
+            && is_push(&request.args)
+            && hooks_outside_lock_enabled(&self.main_root().to_path_buf());
+        let prechecked_plan = if hooks_ran_outside_lock {
+            let mut dry_run = Command::new("git");
+            dry_run.arg("push").arg("--dry-run");
+            for arg in request.args.iter().filter(|arg| *arg != "push") {
+                dry_run.arg(arg);
+            }
+            dry_run.current_dir(cwd);
+            match dry_run.output() {
+                Ok(output) if output.status.success() => {}
+                Ok(output) => {
+                    // Failing here is the point: nothing is queued, and no other
+                    // session waited on a gate that was going to refuse anyway.
+                    self.resolve_unstarted_operation(queued_operation_id, "pre_push_refused");
+                    return Err(BrokerOpError::InvalidCoordinatedOperation {
+                        reason: format!(
+                            "the repository's pre-push hook refused this push before the lock was taken: {}",
+                            String::from_utf8_lossy(&output.stderr).trim()
+                        ),
+                    });
+                }
+                Err(source) => {
+                    self.resolve_unstarted_operation(queued_operation_id, "pre_push_unavailable");
+                    return Err(BrokerOpError::OperationIo {
+                        path: cwd.to_path_buf(),
+                        source,
+                    });
+                }
+            }
+            Some(plan_exact_push(
+                cwd,
+                &request.args,
+                resolved_target.as_ref(),
+            ))
+        } else {
+            None
+        };
+
         let _lock = if effect == OperationEffect::Read {
             None
         } else {
@@ -1552,6 +1652,20 @@ impl Broker {
             PushPlanning::NotApplicable
         };
 
+        // The hook verified specific commits. If any local ref moved while this
+        // operation waited for the lock, that verification no longer describes
+        // what would be sent, and the push must not proceed with hooks skipped.
+        if let Some(prechecked) = &prechecked_plan
+            && !push_planning.matches_prechecked(prechecked)
+        {
+            self.resolve_unstarted_operation(queued_operation_id, "refs_moved_after_pre_push");
+            return Err(BrokerOpError::InvalidCoordinatedOperation {
+                reason: "a local ref moved between the pre-push hook and acquiring the lock, so \
+                         the hook no longer describes what would be pushed; re-run the command"
+                    .into(),
+            });
+        }
+
         if let Some(host_operation_id) = host_guard
             .as_ref()
             .map(|guard| guard.operation().operation_id.clone())
@@ -1582,8 +1696,16 @@ impl Broker {
             OperationProvider::Github => "gh",
         };
         let mut command = Command::new(executable);
+        command.args(&request.args);
+        // Appended after the subcommand, where `git push` accepts it. The
+        // repository opted in, the same hook already ran against these exact
+        // commits in the dry run above, and the plan was re-proven unchanged
+        // under the lock. Re-running it here would double the cost the opt-in
+        // exists to avoid (issues #138, #146).
+        if hooks_ran_outside_lock {
+            command.arg("--no-verify");
+        }
         command
-            .args(&request.args)
             .current_dir(cwd)
             .stdin(Stdio::inherit())
             .stdout(Stdio::piped())

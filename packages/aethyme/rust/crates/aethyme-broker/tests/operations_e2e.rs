@@ -870,3 +870,121 @@ fn repository_write_lock_serializes_independent_process_clients() {
         started.elapsed()
     );
 }
+
+/// Issues #138 and #146: the repository lock exists to order remote mutations,
+/// but `git push` runs `pre-push` inside its own process, so holding the lock
+/// across the command holds it across a gate that can legitimately take tens of
+/// minutes. Opting in runs that hook before the lock is taken.
+#[cfg(unix)]
+fn enable_hooks_outside_lock(repo: &Path) {
+    let config = repo.join(".aethyme/config.toml");
+    let existing = std::fs::read_to_string(&config).unwrap_or_default();
+    std::fs::create_dir_all(repo.join(".aethyme")).unwrap();
+    std::fs::write(
+        &config,
+        format!("{existing}\n[coordination]\nhooks_outside_lock = true\n"),
+    )
+    .unwrap();
+}
+
+/// A hook that refuses must stop the push before the lock is taken, so no other
+/// session waits on a gate that was going to refuse anyway.
+#[cfg(unix)]
+#[test]
+fn an_opted_in_pre_push_refusal_stops_before_the_lock() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut fixture = push_fixture(tmp.path(), "hooks-outside");
+    let repo = fixture.broker.main_root().to_path_buf();
+    enable_hooks_outside_lock(&repo);
+    write_executable(
+        &repo.join(".git/hooks/pre-push"),
+        "#!/bin/sh\nprintf 'gate refused\\n' >&2\nexit 1\n",
+    );
+    commit_push_fixture(&fixture, "work\n");
+
+    let error = fixture
+        .broker
+        .run_coordinated_operation(exact_push_request(
+            fixture.session_id,
+            &fixture.worktree,
+            &["HEAD:refs/heads/main"],
+        ))
+        .expect_err("a refusing pre-push hook must refuse the operation");
+    let rendered = error.to_string();
+    assert!(
+        rendered.contains("pre-push hook refused this push before the lock"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("gate refused"),
+        "the hook's own output must survive: {rendered}"
+    );
+}
+
+/// The opted-in path must still push successfully, and must not run the hook a
+/// second time under the lock -- doubling the cost is what the opt-in avoids.
+#[cfg(unix)]
+#[test]
+fn an_opted_in_push_runs_its_hook_once_and_succeeds() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut fixture = push_fixture(tmp.path(), "hooks-once");
+    let repo = fixture.broker.main_root().to_path_buf();
+    enable_hooks_outside_lock(&repo);
+    let counter = tmp.path().join("hook-runs");
+    write_executable(
+        &repo.join(".git/hooks/pre-push"),
+        &format!("#!/bin/sh\nprintf 'x' >> {}\nexit 0\n", counter.display()),
+    );
+    let head = commit_push_fixture(&fixture, "work\n");
+
+    let report = fixture
+        .broker
+        .run_coordinated_operation(exact_push_request(
+            fixture.session_id,
+            &fixture.worktree,
+            &["HEAD:refs/heads/main"],
+        ))
+        .unwrap();
+    assert!(report.ok(), "opted-in push must succeed: {report:?}");
+    assert_eq!(
+        git_output(&fixture.remote, &["rev-parse", "refs/heads/main"]),
+        head,
+        "the remote must have advanced"
+    );
+    let runs = std::fs::read_to_string(&counter).unwrap_or_default();
+    assert_eq!(
+        runs.len(),
+        1,
+        "the hook must run exactly once, in the dry run: {runs:?}"
+    );
+}
+
+/// Default off: without opting in, the hook runs inside the push as before.
+#[cfg(unix)]
+#[test]
+fn without_opting_in_the_hook_still_runs_inside_the_push() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut fixture = push_fixture(tmp.path(), "hooks-default");
+    let repo = fixture.broker.main_root().to_path_buf();
+    let counter = tmp.path().join("hook-runs");
+    write_executable(
+        &repo.join(".git/hooks/pre-push"),
+        &format!("#!/bin/sh\nprintf 'x' >> {}\nexit 0\n", counter.display()),
+    );
+    commit_push_fixture(&fixture, "work\n");
+
+    let report = fixture
+        .broker
+        .run_coordinated_operation(exact_push_request(
+            fixture.session_id,
+            &fixture.worktree,
+            &["HEAD:refs/heads/main"],
+        ))
+        .unwrap();
+    assert!(report.ok());
+    assert_eq!(
+        std::fs::read_to_string(&counter).unwrap_or_default().len(),
+        1,
+        "the default path runs the hook once, inside the push"
+    );
+}
