@@ -658,6 +658,50 @@ impl GitRepo {
     }
 
     /// Tree object referenced by a commit.
+    /// `(status, path)` for every path a commit changed, against its first
+    /// parent. Status is git's name-status letter: `A`, `M`, `D`, and so on.
+    pub fn commit_changed_paths(&self, commit: &str) -> Result<Vec<(String, String)>, GitError> {
+        let out = run_git(
+            &self.root,
+            &[
+                "diff-tree",
+                "--no-commit-id",
+                "--name-status",
+                "-r",
+                "-m",
+                "--first-parent",
+                commit,
+            ],
+        )?;
+        Ok(out
+            .lines()
+            .filter_map(|line| {
+                let mut parts = line.split('\t');
+                let status = parts.next()?.trim().to_string();
+                let path = parts.next()?.trim().to_string();
+                (!status.is_empty() && !path.is_empty()).then_some((status, path))
+            })
+            .collect())
+    }
+
+    /// Point `name` at `commit`, creating or moving it. Used for preservation
+    /// refs, where the name already encodes the commit it preserves.
+    pub fn create_branch_at(&self, name: &str, commit: &str) -> Result<(), GitError> {
+        run_git(&self.root, &["branch", "--force", name, commit]).map(|_| ())
+    }
+
+    /// Blob id of `path` at `rev`, or `None` when the path does not exist there.
+    /// Comparing blob ids is how "this change is already present" is decided
+    /// without replaying the patch.
+    pub fn blob_at(&self, rev: &str, path: &str) -> Option<String> {
+        run_git(
+            &self.root,
+            &["rev-parse", "--verify", "--quiet", &format!("{rev}:{path}")],
+        )
+        .ok()
+        .filter(|value| !value.is_empty())
+    }
+
     pub fn commit_tree_id(&self, commit: &str) -> Result<String, GitError> {
         run_git(&self.root, &["rev-parse", &format!("{commit}^{{tree}}")])
     }

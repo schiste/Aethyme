@@ -39,6 +39,19 @@ pub(crate) const WORKTREE_ROOT_MARKER: &str = ".aethyme-worktree-root.json";
 
 #[derive(Debug, thiserror::Error)]
 pub enum BrokerOpError {
+    #[error("main reconciliation is unavailable: {reason}")]
+    MainReconcileUnavailable { reason: String },
+    #[error("main reconciliation is unsafe: {reason}")]
+    MainReconcileUnsafe { reason: String },
+    /// See [`BrokerOpError::CleanupConfirmationMismatch`] for why no digest is
+    /// offered here (issue #142).
+    #[error(
+        "the reviewed main reconciliation plan no longer matches current state, so nothing was \
+         moved; review a new plan with `aethyme broker main reconcile plan` and confirm the \
+         digest it prints (the digest passed, {actual}, is stale)"
+    )]
+    MainReconcileConfirmationMismatch { actual: String },
+
     /// An identical command from the same session is still pending. Queueing a
     /// second one would fire it against state the first already changed.
     #[error(
@@ -5160,6 +5173,32 @@ impl Broker {
             integration_reconciliation,
             cleanup_retention,
         })
+    }
+
+    /// The local default branch and its tip, resolved offline from
+    /// `origin/HEAD`, which is written at clone time. Guessing a branch name
+    /// would be worse than refusing: it would silently reconcile the wrong ref.
+    pub(crate) fn default_branch_tip(&self) -> Result<(String, String, String), BrokerOpError> {
+        let repo = self.repo_handle();
+        let head_ref = repo.symbolic_ref("refs/remotes/origin/HEAD").ok_or_else(|| {
+            BrokerOpError::MainReconcileUnavailable {
+                reason: "refs/remotes/origin/HEAD is unset, so the default branch is unknown; set it with `git remote set-head origin --auto`".into(),
+            }
+        })?;
+        let branch = head_ref
+            .rsplit('/')
+            .next()
+            .ok_or_else(|| BrokerOpError::MainReconcileUnavailable {
+                reason: format!("cannot read a branch name from {head_ref}"),
+            })?
+            .to_string();
+        let local_ref = format!("refs/heads/{branch}");
+        let local_sha = repo.resolve_ref(&local_ref).ok_or_else(|| {
+            BrokerOpError::MainReconcileUnavailable {
+                reason: format!("{local_ref} does not resolve"),
+            }
+        })?;
+        Ok((branch, local_ref, local_sha))
     }
 
     /// Commits sitting on the local default branch that integration does not

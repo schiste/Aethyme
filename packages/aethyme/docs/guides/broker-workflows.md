@@ -336,6 +336,33 @@ For repositories that explicitly permit an emergency lane, set
 broker persists only the reason digest and still enforces the full confirmed
 SHA, remote freshness, non-force push, and unknown-outcome barriers.
 
+### Reconciling a local default branch
+
+`ship` publishes an exact promoted prefix and refuses to discard local work the
+prefix omits. When the local default branch carries commits integration does
+not, `broker main reconcile` decides whether moving it is safe:
+
+```bash
+aethyme broker main reconcile plan
+aethyme broker main reconcile apply --session <id> --confirm <plan-sha256>
+```
+
+Representation is decided by content, not ancestry. The broker promotes by
+replaying into a squashed commit, so a commit whose work already landed is
+usually not an ancestor of anything on integration, and `git cherry` misses the
+same cases because patch ids do not survive squashing. A commit counts as
+already represented when integration holds its content for every path the
+commit touched; a deletion counts when the path is absent there.
+
+The apply refuses unless every local-only commit is represented and no tracked
+path is dirty. Untracked files are ignored: they survive the move, the same way
+`ship` preserves them. Before moving anything it creates
+`aethyme/preserve/<branch>-<sha>` at the pre-move tip, so the commits left
+behind remain recoverable even though their content is already on integration.
+
+Work that is genuinely unrepresented is never moved over. Replay it through a
+broker session and submit it, then reconcile.
+
 ### Synchronizing local main from another worktree
 
 `ship execute --sync-main` is safe to run from any session worktree, which is

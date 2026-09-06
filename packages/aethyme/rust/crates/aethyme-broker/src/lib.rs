@@ -46,6 +46,7 @@ pub mod init;
 mod issue_form;
 mod lease_export;
 mod leases;
+pub mod main_reconcile;
 mod merge;
 mod operations;
 mod pr;
@@ -161,6 +162,10 @@ pub use lease_export::{
     LeaseRoutingExportOptions, LeaseRoutingItem, MAX_LEASE_ROUTING_EXPORT_LIMIT,
 };
 pub use leases::{LeaseIgnoreRules, Overlap, detect_overlaps};
+pub use main_reconcile::{
+    MAIN_RECONCILE_SCHEMA_VERSION, MainReconcileApplyReport, MainReconcileCommit,
+    MainReconcileDisposition, MainReconcilePlan,
+};
 pub use merge::{
     ACTION_REQUIRED_RELPATH, PromoteConfig, SubmissionCommitOwnership, SubmissionCommitProvenance,
     SubmissionConflict, SubmissionGateVerification, SubmissionGateVerificationStatus,

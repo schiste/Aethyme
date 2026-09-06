@@ -461,6 +461,17 @@ Usage:
       by default; --apply revalidates and removes only clean worktrees whose
       session work is represented on main, integration, or configured upstream.
       Adopted worktrees are never included in the bulk sweep.
+  aethyme broker main reconcile plan [--json]
+      Read-only classification of everything the local default branch carries
+      that the integration branch does not. A commit counts as already
+      represented when integration holds its content for every path it touched,
+      which recognizes work that landed through a squashed promotion and whose
+      SHA therefore differs. Uncommitted tracked changes, or any commit that
+      cannot be proven represented, refuse the apply.
+  aethyme broker main reconcile apply --session <id> --confirm <sha256> [--json]
+      Move the local default branch onto integration after re-proving the
+      reviewed plan. Creates a preservation ref at the pre-move tip first, and
+      never runs when anything would be lost.
   aethyme broker promotion-record plan [--json]
       Read-only plan for integration commits that no promoted queue entry
       claims. A commit is recoverable when exactly one non-promoted entry
@@ -602,6 +613,7 @@ const KNOWN_COMMAND_WORDS: &[&str] = &[
     "repair",
     "checkpoint",
     "promotion-record",
+    "main",
     "apply",
     "queue",
     "promote",
@@ -2903,6 +2915,67 @@ fn repository_wide_publication_lines(
     }
     lines.push("  publishing now is safe, but omits the work listed above".into());
     lines
+}
+
+fn render_main_reconcile_plan(plan: &crate::MainReconcilePlan, detail: bool) {
+    out!(
+        "Main reconcile plan {}: {} local-only commit(s) on {}",
+        plan.digest,
+        plan.commits.len(),
+        plan.default_branch
+    );
+    out!("  local:       {} @ {}", plan.local_ref, plan.local_sha);
+    out!(
+        "  integration: {} @ {}",
+        plan.integration_ref,
+        plan.integration_sha
+    );
+    let unrepresented = plan.unrepresented().count();
+    out!(
+        "  {} already represented, {} unrepresented",
+        plan.commits.len() - unrepresented,
+        unrepresented
+    );
+    if !plan.dirty_tracked_paths.is_empty() {
+        out!(
+            "  uncommitted tracked path(s): {}",
+            plan.dirty_tracked_paths.join(", ")
+        );
+    }
+    // Unrepresented commits are the decision; represented ones are the evidence
+    // that moving the branch is safe, and are summarised unless asked for.
+    for commit in plan.unrepresented() {
+        out!(
+            "  unrepresented {} {} — {}",
+            &commit.commit[..12.min(commit.commit.len())],
+            commit.subject,
+            commit.evidence
+        );
+    }
+    if detail {
+        for commit in plan
+            .commits
+            .iter()
+            .filter(|item| item.disposition == crate::MainReconcileDisposition::AlreadyRepresented)
+        {
+            out!(
+                "  represented   {} {} — {}",
+                &commit.commit[..12.min(commit.commit.len())],
+                commit.subject,
+                commit.evidence
+            );
+        }
+    }
+    match &plan.refusal {
+        Some(refusal) => out!("  refusal: {refusal}"),
+        None => {
+            out!("  preservation ref: {}", plan.preservation_ref);
+            out!(
+                "  apply: aethyme broker main reconcile apply --session <id> --confirm {}",
+                plan.digest
+            );
+        }
+    }
 }
 
 fn render_capped<T>(items: &[T], cap: usize, detail: bool, mut render: impl FnMut(&T)) {
@@ -7611,6 +7684,55 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                 out!("{}", serde_json::to_string_pretty(&report)?);
             } else {
                 render_repair_report(&report);
+            }
+        }
+        "main" => {
+            let action = parsed.positional.first().map(String::as_str);
+            let step = parsed.positional.get(1).map(String::as_str);
+            if action != Some("reconcile") {
+                return Err(UsageError::Message(
+                    "main requires reconcile plan or reconcile apply".into(),
+                ));
+            }
+            let mut broker = open_broker(parsed.read_only_snapshot)?;
+            match step {
+                Some("plan") => {
+                    let plan = broker.main_reconcile_plan()?;
+                    if parsed.json {
+                        out!("{}", serde_json::to_string_pretty(&plan)?);
+                    } else {
+                        render_main_reconcile_plan(&plan, parsed.detail);
+                    }
+                }
+                Some("apply") => {
+                    let session = parsed.session.ok_or(UsageError::Message(
+                        "main reconcile apply requires --session <id>".into(),
+                    ))?;
+                    let confirm = parsed.confirm.as_deref().ok_or(UsageError::Message(
+                        "main reconcile apply requires --confirm <sha256>".into(),
+                    ))?;
+                    let report = broker.main_reconcile_apply(session, confirm)?;
+                    if parsed.json {
+                        out!("{}", serde_json::to_string_pretty(&report)?);
+                    } else {
+                        out!(
+                            "Main reconciled: {} moved {} -> {}",
+                            report.default_branch,
+                            &report.moved_from[..12.min(report.moved_from.len())],
+                            &report.moved_to[..12.min(report.moved_to.len())],
+                        );
+                        out!("  preserved pre-move tip: {}", report.preservation_ref);
+                        out!(
+                            "  {} represented commit(s) left behind, recoverable from that ref",
+                            report.represented_commits
+                        );
+                    }
+                }
+                other => {
+                    return Err(UsageError::Message(format!(
+                        "unknown main reconcile step {other:?}; expected plan or apply"
+                    )));
+                }
             }
         }
         "promotion-record" => {
