@@ -23,6 +23,7 @@
 mod advisories;
 pub mod attribution;
 mod broker;
+mod chau7_tabs;
 pub mod cli;
 mod cli_output;
 pub mod contract_check;
@@ -63,6 +64,9 @@ mod remote_target;
 pub mod renamed_targets;
 mod report;
 mod report_filing;
+pub use chau7_tabs::{
+    Chau7Resolution, Chau7ResolutionRefusal, Chau7Tab, Chau7TabReadiness, resolve_session_tab,
+};
 mod repository_contract;
 mod resources;
 mod retention;

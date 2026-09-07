@@ -321,6 +321,10 @@ Usage:
   aethyme broker deliveries subscribe --watch <id> --adapter <name> --target <opaque-id> [--policy <notify|resume|review-and-push>] [--json]
   aethyme broker deliveries list [--adapter <name>] [--all] [--json]
   aethyme broker deliveries claim --adapter <name> --worker <id> [--seconds <15..900>] [--json]
+  aethyme broker deliveries resolve-tab --session <id> [--tabs-file <path>] [--json]
+      Resolve which Chau7 tab is running a session, from a `tab_list` snapshot
+      on stdin or --tabs-file. The broker never calls Chau7 itself; an adapter
+      supplies the snapshot and performs the transport. Ambiguity refuses.
   aethyme broker deliveries complete --id <delivery-id> --worker <id> --generation <n> --outcome <delivered|retry|failed> [--error-code <code>] [--json]
       Provider-neutral durable outbox. Claiming fences concurrent adapters;
       completion requires the exact worker and generation. Prompts contain
@@ -1610,6 +1614,7 @@ struct Parsed {
     base: Option<String>,
     head: Option<String>,
     resolution_file: Option<PathBuf>,
+    tabs_file: Option<PathBuf>,
     write_resolution_template: Option<PathBuf>,
     worktree: Option<PathBuf>,
     title: Option<String>,
@@ -1693,6 +1698,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         base: None,
         head: None,
         resolution_file: None,
+        tabs_file: None,
         write_resolution_template: None,
         worktree: None,
         title: None,
@@ -1889,6 +1895,13 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
                         .ok_or(UsageError::Message("--head requires a ref".into()))?
                         .clone(),
                 )
+            }
+            "--tabs-file" => {
+                parsed.tabs_file = Some(PathBuf::from(
+                    iter.next()
+                        .ok_or(UsageError::Message("--tabs-file requires a path".into()))?
+                        .clone(),
+                ));
             }
             "--resolution-file" => {
                 parsed.resolution_file = Some(PathBuf::from(
@@ -4422,6 +4435,59 @@ fn run_deliveries(parsed: Parsed) -> Result<(), UsageError> {
         })?;
     let mut broker = open_broker(parsed.read_only_snapshot)?;
     match action {
+        "resolve-tab" => {
+            let session_id = parsed.session.ok_or_else(|| {
+                UsageError::Message("deliveries resolve-tab requires --session <id>".into())
+            })?;
+            let session = broker.store().session(session_id)?;
+            let raw = match parsed.tabs_file.as_deref() {
+                Some(path) => std::fs::read_to_string(path).map_err(|error| {
+                    UsageError::Message(format!("cannot read {}: {error}", path.display()))
+                })?,
+                None => {
+                    use std::io::Read;
+                    let mut buffer = String::new();
+                    std::io::stdin()
+                        .read_to_string(&mut buffer)
+                        .map_err(|error| {
+                            UsageError::Message(format!("cannot read tabs from stdin: {error}"))
+                        })?;
+                    buffer
+                }
+            };
+            let tabs: Vec<crate::Chau7Tab> = serde_json::from_str(&raw).map_err(|error| {
+                UsageError::Message(format!(
+                    "tab snapshot is not a Chau7 tab_list array: {error}"
+                ))
+            })?;
+            let outcome =
+                crate::resolve_session_tab(&tabs, &session.worktree_path, &session.branch);
+            if parsed.json {
+                let body = match &outcome {
+                    Ok(resolution) => serde_json::json!({"resolved": resolution}),
+                    Err(refusal) => serde_json::json!({"refused": refusal}),
+                };
+                out!("{}", serde_json::to_string_pretty(&body)?);
+            } else {
+                match &outcome {
+                    Ok(resolution) => out!(
+                        "session {} -> {} ({:?}{})",
+                        session_id,
+                        resolution.tab_id,
+                        resolution.readiness,
+                        if resolution.mcp_controlled {
+                            ", mcp-controlled"
+                        } else {
+                            ""
+                        }
+                    ),
+                    Err(refusal) => out!("refused: {refusal:?}"),
+                }
+            }
+            if outcome.is_err() {
+                std::process::exit(2);
+            }
+        }
         "subscribe" => {
             let watch_id = parsed.watch_id.ok_or_else(|| {
                 UsageError::Message("deliveries subscribe requires --watch <id>".into())
