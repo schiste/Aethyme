@@ -452,7 +452,7 @@ until an explicit fetch makes ancestry verification possible.
 - `aethyme broker gates doctor [--probe] [--only <gate>] [--json]`
 - `aethyme broker gates manifest [--head <ref>] [--json]`
 - `aethyme broker gates scope --base <ref> --head <ref> [--json]`
-- `aethyme broker gates affected --session <id> [--why] [--json]`
+- `aethyme broker gates affected --session <id> [--json]`
 - `aethyme broker gates semantic --session <id> [--json]`
 - `aethyme broker gates run --session <id> [--only <gate>] [--no-cache] [--json]`
 - `aethyme broker gates run --all [--only <gate>] [--no-cache] [--json]`
@@ -770,7 +770,7 @@ included.
 `broker gates semantic` is a separate, strictly advisory read surface:
 
 ```bash
-aethyme broker gates affected --session 111 --why
+aethyme broker gates affected --session 111
 aethyme broker gates semantic --session 111
 aethyme broker gates semantic --session 111 --json
 ```

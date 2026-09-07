@@ -461,14 +461,14 @@ Usage:
       by default; --apply revalidates and removes only clean worktrees whose
       session work is represented on main, integration, or configured upstream.
       Adopted worktrees are never included in the bulk sweep.
-  aethyme broker main reconcile plan [--json]
+  aethyme broker main reconcile plan [--detail] [--resolution-file <path>] [--write-resolution-template <path>] [--json]
       Read-only classification of everything the local default branch carries
       that the integration branch does not. A commit counts as already
       represented when integration holds its content for every path it touched,
       which recognizes work that landed through a squashed promotion and whose
       SHA therefore differs. Uncommitted tracked changes, or any commit that
       cannot be proven represented, refuse the apply.
-  aethyme broker main reconcile apply --session <id> --confirm <sha256> [--json]
+  aethyme broker main reconcile apply --session <id> --confirm <sha256> [--resolution-file <path>] [--json]
       Move the local default branch onto integration after re-proving the
       reviewed plan. Creates a preservation ref at the pre-move tip first, and
       never runs when anything would be lost.
