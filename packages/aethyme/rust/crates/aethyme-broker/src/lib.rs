@@ -165,7 +165,8 @@ pub use lease_export::{
 pub use leases::{LeaseIgnoreRules, Overlap, detect_overlaps};
 pub use main_reconcile::{
     MAIN_RECONCILE_SCHEMA_VERSION, MainReconcileApplyReport, MainReconcileCommit,
-    MainReconcileDisposition, MainReconcilePlan,
+    MainReconcileDisposition, MainReconcilePlan, MainReconcileResolution,
+    MainReconcileResolutionDocument, MainReconcileResolutionTemplate,
 };
 pub use merge::{
     ACTION_REQUIRED_RELPATH, PromoteConfig, SubmissionCommitOwnership, SubmissionCommitProvenance,

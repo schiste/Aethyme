@@ -409,8 +409,34 @@ path is dirty. Untracked files are ignored: they survive the move, the same way
 `aethyme/preserve/<branch>-<sha>` at the pre-move tip, so the commits left
 behind remain recoverable even though their content is already on integration.
 
-Work that is genuinely unrepresented is never moved over. Replay it through a
-broker session and submit it, then reconcile.
+Work that is genuinely unrepresented is not moved over by default. Replay it
+through a broker session and submit it, then reconcile.
+
+Where that is not the right answer -- work superseded elsewhere, or an
+experiment that should simply leave the branch -- record a reviewed decision
+instead:
+
+```bash
+aethyme broker main reconcile plan --write-resolution-template resolutions.json
+# edit each entry's resolution and reason
+aethyme broker main reconcile plan --resolution-file resolutions.json
+aethyme broker main reconcile apply --session <id> --confirm <digest> \
+    --resolution-file resolutions.json
+```
+
+Three dispositions are available, and only one unblocks the move:
+
+- `replay_through_broker` -- the default; keeps refusing, because the work
+  belongs in integration;
+- `archive_local` -- accept that it leaves the default branch, remaining
+  reachable from the preservation ref;
+- `keep_local_and_block_publication` -- keep it and refuse to move at all.
+
+A commit with no entry stays undecided and keeps refusing: the file records a
+decision rather than waiving the check. `already_represented` cannot be chosen,
+because asserting it would defeat the content check that makes the move safe.
+Each entry requires a reason, and the decisions are bound into the plan digest,
+so an edited file no longer matches a reviewed plan.
 
 ### Synchronizing local main from another worktree
 

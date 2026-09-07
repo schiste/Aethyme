@@ -43,6 +43,68 @@ impl MainReconcileDisposition {
     }
 }
 
+/// What an operator decided about a commit the plan could not prove represented.
+///
+/// Only unrepresented commits need a decision. `AlreadyRepresented` is computed
+/// from content and is never chosen, because letting an operator assert it would
+/// defeat the check that makes moving the branch safe (issue #143).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MainReconcileResolution {
+    /// Replay it through a broker session and submit before reconciling. The
+    /// default, and the only disposition that keeps the work in integration.
+    ReplayThroughBroker,
+    /// Accept that it leaves the default branch. It remains reachable from the
+    /// preservation ref, which is created before anything moves.
+    ArchiveLocal,
+    /// Keep it on the branch and refuse to move at all, so publication stays
+    /// blocked until it is dealt with.
+    KeepLocalAndBlockPublication,
+}
+
+impl MainReconcileResolution {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ReplayThroughBroker => "replay_through_broker",
+            Self::ArchiveLocal => "archive_local",
+            Self::KeepLocalAndBlockPublication => "keep_local_and_block_publication",
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MainReconcileResolutionEntry {
+    pub commit: String,
+    pub resolution: MainReconcileResolution,
+    /// Required: a disposition without a stated reason is not a review.
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MainReconcileResolutionDocument {
+    pub schema_version: u32,
+    #[serde(default)]
+    pub operator: Option<String>,
+    pub resolutions: Vec<MainReconcileResolutionEntry>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MainReconcileResolutionTemplate {
+    pub schema_version: u32,
+    pub operator: Option<String>,
+    pub resolutions: Vec<MainReconcileResolutionTemplateEntry>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MainReconcileResolutionTemplateEntry {
+    pub commit: String,
+    pub subject: String,
+    pub resolution: &'static str,
+    pub reason: String,
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct MainReconcileCommit {
     pub commit: String,
@@ -50,6 +112,10 @@ pub struct MainReconcileCommit {
     pub disposition: MainReconcileDisposition,
     /// Why the disposition holds, in paths a reader can check by hand.
     pub evidence: String,
+    /// Operator decision, present only for unrepresented commits once a
+    /// resolution file has been supplied.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolution: Option<MainReconcileResolution>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -89,7 +155,7 @@ impl MainReconcilePlan {
             local_sha: &'a str,
             integration_sha: &'a str,
             dirty_tracked_paths: &'a [String],
-            commits: Vec<(&'a str, &'static str)>,
+            commits: Vec<(&'a str, &'static str, Option<&'static str>)>,
         }
         let bytes = serde_json::to_vec(&Authorization {
             schema_version: self.schema_version,
@@ -99,7 +165,13 @@ impl MainReconcilePlan {
             commits: self
                 .commits
                 .iter()
-                .map(|commit| (commit.commit.as_str(), commit.disposition.as_str()))
+                .map(|commit| {
+                    (
+                        commit.commit.as_str(),
+                        commit.disposition.as_str(),
+                        commit.resolution.map(MainReconcileResolution::as_str),
+                    )
+                })
                 .collect(),
         })?;
         self.digest = format!("{:x}", Sha256::digest(bytes));
@@ -121,6 +193,14 @@ impl Broker {
     /// Read-only classification of everything the local default branch carries
     /// that integration does not.
     pub fn main_reconcile_plan(&mut self) -> Result<MainReconcilePlan, BrokerOpError> {
+        self.main_reconcile_plan_with(None)
+    }
+
+    /// As [`Self::main_reconcile_plan`], applying an operator resolution file.
+    pub fn main_reconcile_plan_with(
+        &mut self,
+        resolutions: Option<&MainReconcileResolutionDocument>,
+    ) -> Result<MainReconcilePlan, BrokerOpError> {
         let (default_branch, local_ref, local_sha) = self.default_branch_tip()?;
         let integration_ref = crate::merge::PromoteConfig::load(&self.main_root_path()).branch;
         let integration_sha =
@@ -136,7 +216,7 @@ impl Broker {
                 reason: format!("cannot list {default_branch} commits: {source}"),
             })?;
 
-        let mut commits = Vec::new();
+        let mut commits: Vec<MainReconcileCommit> = Vec::new();
         for commit in &local_only {
             commits.push(classify_commit(repo, commit, &integration_sha)?);
         }
@@ -149,10 +229,35 @@ impl Broker {
             }
         })?;
 
-        let unrepresented = commits
+        if let Some(document) = resolutions {
+            for item in commits
+                .iter_mut()
+                .filter(|item| item.disposition == MainReconcileDisposition::Unrepresented)
+            {
+                item.resolution = document
+                    .resolutions
+                    .iter()
+                    .find(|entry| {
+                        entry.commit == item.commit || item.commit.starts_with(&entry.commit)
+                    })
+                    .map(|entry| entry.resolution);
+            }
+        }
+
+        // Only a commit the operator archived stops blocking. An unresolved one,
+        // or one kept deliberately, still refuses -- the point of the file is to
+        // record a decision, not to wave the check through.
+        let blocking = commits
             .iter()
             .filter(|item| item.disposition == MainReconcileDisposition::Unrepresented)
+            .filter(|item| item.resolution != Some(MainReconcileResolution::ArchiveLocal))
             .count();
+        let unresolved = commits
+            .iter()
+            .filter(|item| item.disposition == MainReconcileDisposition::Unrepresented)
+            .filter(|item| item.resolution.is_none())
+            .count();
+        let unrepresented = blocking;
         let refusal = if !dirty_tracked_paths.is_empty() {
             Some(format!(
                 "the primary checkout has {} uncommitted tracked path(s); commit them through a broker session or stash them before reconciling",
@@ -160,7 +265,7 @@ impl Broker {
             ))
         } else if unrepresented > 0 {
             Some(format!(
-                "{unrepresented} commit(s) on {default_branch} are not represented on {integration_ref}; replay them through a broker session and submit before reconciling"
+                "{unrepresented} commit(s) on {default_branch} are not represented on {integration_ref} ({unresolved} with no recorded decision); replay them through a broker session and submit, or record a reviewed disposition with `main reconcile plan --write-resolution-template <path>` and pass it back with --resolution-file"
             ))
         } else if local_only.is_empty() {
             Some(format!(
@@ -191,6 +296,27 @@ impl Broker {
         Ok(plan)
     }
 
+    /// A template naming every commit that needs a decision, pre-filled with the
+    /// safe default so an operator edits rather than composes.
+    pub fn main_reconcile_resolution_template(
+        &mut self,
+    ) -> Result<MainReconcileResolutionTemplate, BrokerOpError> {
+        let plan = self.main_reconcile_plan()?;
+        Ok(MainReconcileResolutionTemplate {
+            schema_version: MAIN_RECONCILE_SCHEMA_VERSION,
+            operator: None,
+            resolutions: plan
+                .unrepresented()
+                .map(|commit| MainReconcileResolutionTemplateEntry {
+                    commit: commit.commit.clone(),
+                    subject: commit.subject.clone(),
+                    resolution: MainReconcileResolution::ReplayThroughBroker.as_str(),
+                    reason: String::new(),
+                })
+                .collect(),
+        })
+    }
+
     /// Move the local default branch onto integration, after re-proving that
     /// every commit it would leave behind is already represented there.
     pub fn main_reconcile_apply(
@@ -198,7 +324,19 @@ impl Broker {
         session_id: i64,
         confirm: &str,
     ) -> Result<MainReconcileApplyReport, BrokerOpError> {
-        let plan = self.main_reconcile_plan()?;
+        self.main_reconcile_apply_with(session_id, confirm, None)
+    }
+
+    /// As [`Self::main_reconcile_apply`], re-proving the same resolution file the
+    /// plan was reviewed with. The digest binds the decisions, so a different
+    /// file simply fails to match.
+    pub fn main_reconcile_apply_with(
+        &mut self,
+        session_id: i64,
+        confirm: &str,
+        resolutions: Option<&MainReconcileResolutionDocument>,
+    ) -> Result<MainReconcileApplyReport, BrokerOpError> {
+        let plan = self.main_reconcile_plan_with(resolutions)?;
         if !plan.digest.eq_ignore_ascii_case(confirm) {
             return Err(BrokerOpError::MainReconcileConfirmationMismatch {
                 actual: confirm.to_owned(),
@@ -289,6 +427,7 @@ fn classify_commit(
             subject,
             disposition: MainReconcileDisposition::AlreadyRepresented,
             evidence: "commit changes no paths".into(),
+            resolution: None,
         });
     }
 
@@ -305,6 +444,7 @@ fn classify_commit(
                 subject,
                 disposition: MainReconcileDisposition::Unrepresented,
                 evidence: format!("{path} differs on the integration tip"),
+                resolution: None,
             });
         }
     }
@@ -314,5 +454,6 @@ fn classify_commit(
         subject,
         disposition: MainReconcileDisposition::AlreadyRepresented,
         evidence: format!("{} path(s) match the integration tip", changed.len()),
+        resolution: None,
     })
 }

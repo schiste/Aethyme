@@ -490,8 +490,8 @@ continues to expose the complete local `log_path` without embedding log data.
 - `aethyme broker finish --session <id> [--json]`
 - `aethyme broker cleanup <session-id> [--force] [--json]`
 - `aethyme broker cleanup --all-cleaned [--apply --confirm <sha256>] [--json]`
-- `aethyme broker main reconcile plan [--detail] [--json]`
-- `aethyme broker main reconcile apply --session <id> --confirm <sha256> [--json]`
+- `aethyme broker main reconcile plan [--detail] [--resolution-file <path>] [--write-resolution-template <path>] [--json]`
+- `aethyme broker main reconcile apply --session <id> --confirm <sha256> [--resolution-file <path>] [--json]`
 - `aethyme broker gc plan [--json]`
 - `aethyme broker gc apply --confirm <sha256> [--json]`
 - `aethyme broker handoff (--session <id> | --worktree <path>) [--json]`

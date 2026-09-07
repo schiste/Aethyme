@@ -2917,6 +2917,20 @@ fn repository_wide_publication_lines(
     lines
 }
 
+fn load_main_reconcile_resolutions(
+    parsed: &Parsed,
+) -> Result<Option<crate::MainReconcileResolutionDocument>, UsageError> {
+    let Some(path) = parsed.resolution_file.as_deref() else {
+        return Ok(None);
+    };
+    let text = std::fs::read_to_string(path).map_err(|source| {
+        UsageError::Message(format!("cannot read {}: {source}", path.display()))
+    })?;
+    let document: crate::MainReconcileResolutionDocument = serde_json::from_str(&text)
+        .map_err(|source| UsageError::Message(format!("invalid {}: {source}", path.display())))?;
+    Ok(Some(document))
+}
+
 fn render_main_reconcile_plan(plan: &crate::MainReconcilePlan, detail: bool) {
     out!(
         "Main reconcile plan {}: {} local-only commit(s) on {}",
@@ -2946,10 +2960,14 @@ fn render_main_reconcile_plan(plan: &crate::MainReconcilePlan, detail: bool) {
     // that moving the branch is safe, and are summarised unless asked for.
     for commit in plan.unrepresented() {
         out!(
-            "  unrepresented {} {} — {}",
+            "  unrepresented {} {} — {}{}",
             &commit.commit[..12.min(commit.commit.len())],
             commit.subject,
-            commit.evidence
+            commit.evidence,
+            match commit.resolution {
+                Some(resolution) => format!(" [{}]", resolution.as_str()),
+                None => " [no decision recorded]".into(),
+            }
         );
     }
     if detail {
@@ -7710,7 +7728,25 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
             let mut broker = open_broker(parsed.read_only_snapshot)?;
             match step {
                 Some("plan") => {
-                    let plan = broker.main_reconcile_plan()?;
+                    if let Some(path) = parsed.write_resolution_template.as_deref() {
+                        let template = broker.main_reconcile_resolution_template()?;
+                        std::fs::write(path, serde_json::to_string_pretty(&template)?).map_err(
+                            |source| {
+                                UsageError::Message(format!(
+                                    "cannot write {}: {source}",
+                                    path.display()
+                                ))
+                            },
+                        )?;
+                        out!(
+                            "Wrote {} resolution(s) needing a decision to {}",
+                            template.resolutions.len(),
+                            path.display()
+                        );
+                        return Ok(());
+                    }
+                    let document = load_main_reconcile_resolutions(&parsed)?;
+                    let plan = broker.main_reconcile_plan_with(document.as_ref())?;
                     if parsed.json {
                         out!("{}", serde_json::to_string_pretty(&plan)?);
                     } else {
@@ -7724,7 +7760,9 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     let confirm = parsed.confirm.as_deref().ok_or(UsageError::Message(
                         "main reconcile apply requires --confirm <sha256>".into(),
                     ))?;
-                    let report = broker.main_reconcile_apply(session, confirm)?;
+                    let document = load_main_reconcile_resolutions(&parsed)?;
+                    let report =
+                        broker.main_reconcile_apply_with(session, confirm, document.as_ref())?;
                     if parsed.json {
                         out!("{}", serde_json::to_string_pretty(&report)?);
                     } else {

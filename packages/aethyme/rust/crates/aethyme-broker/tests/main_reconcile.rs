@@ -169,3 +169,110 @@ fn a_stale_confirmation_is_refused_with_guidance() {
     );
     assert!(!rendered.contains("expected"), "{rendered}");
 }
+
+fn resolutions(json: &str) -> aethyme_broker::MainReconcileResolutionDocument {
+    serde_json::from_str(json).unwrap()
+}
+
+/// Issue #143: unrepresented work can be dispositioned rather than only refused,
+/// but only an explicit decision unblocks it.
+#[test]
+fn archiving_unrepresented_work_unblocks_the_apply() {
+    let (_tmp, repo) = fixture();
+    let mut broker = Broker::open(&repo).unwrap();
+    sh(&repo, &["checkout", "-q", "main"]);
+    std::fs::write(repo.join("only-local.txt"), "never submitted\n").unwrap();
+    sh(&repo, &["add", "-A"]);
+    sh(&repo, &["commit", "-qm", "feat: local only"]);
+
+    let blocked = broker.main_reconcile_plan().unwrap();
+    assert!(!blocked.safe, "an undecided commit must refuse");
+    let commit = blocked.commits[0].commit.clone();
+
+    let document = resolutions(&format!(
+        r#"{{"schema_version":1,"resolutions":[
+             {{"commit":"{commit}","resolution":"archive_local",
+               "reason":"superseded by the generalized plugin"}}]}}"#
+    ));
+    let decided = broker.main_reconcile_plan_with(Some(&document)).unwrap();
+    assert!(
+        decided.safe,
+        "an archived commit must stop blocking: {:?}",
+        decided.refusal
+    );
+
+    // The work still leaves the branch, and the preservation ref keeps it.
+    let before = decided.local_sha.clone();
+    let session = broker.start_worktree("reconcile", None).unwrap();
+    let report = broker
+        .main_reconcile_apply_with(session.id, &decided.digest, Some(&document))
+        .unwrap();
+    assert_eq!(report.moved_from, before);
+    let preserved = Command::new("git")
+        .args(["rev-parse", &report.preservation_ref])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&preserved.stdout).trim(), before);
+}
+
+/// Keeping work deliberately must still refuse, and so must a decision that
+/// names a different commit.
+#[test]
+fn only_an_explicit_archive_decision_unblocks() {
+    let (_tmp, repo) = fixture();
+    let mut broker = Broker::open(&repo).unwrap();
+    sh(&repo, &["checkout", "-q", "main"]);
+    std::fs::write(repo.join("only-local.txt"), "never submitted\n").unwrap();
+    sh(&repo, &["add", "-A"]);
+    sh(&repo, &["commit", "-qm", "feat: local only"]);
+    let commit = broker.main_reconcile_plan().unwrap().commits[0]
+        .commit
+        .clone();
+
+    for resolution in ["replay_through_broker", "keep_local_and_block_publication"] {
+        let document = resolutions(&format!(
+            r#"{{"schema_version":1,"resolutions":[
+                 {{"commit":"{commit}","resolution":"{resolution}","reason":"r"}}]}}"#
+        ));
+        let plan = broker.main_reconcile_plan_with(Some(&document)).unwrap();
+        assert!(
+            !plan.safe,
+            "{resolution} must still refuse: {:?}",
+            plan.refusal
+        );
+    }
+
+    // A decision about some other commit leaves this one undecided.
+    let document = resolutions(
+        r#"{"schema_version":1,"resolutions":[
+             {"commit":"0000000000000000000000000000000000000000",
+              "resolution":"archive_local","reason":"unrelated"}]}"#,
+    );
+    let plan = broker.main_reconcile_plan_with(Some(&document)).unwrap();
+    assert!(!plan.safe, "an unrelated decision must not unblock");
+    assert!(plan.refusal.unwrap().contains("no recorded decision"));
+}
+
+/// The template names what needs deciding, pre-filled with the safe default.
+#[test]
+fn the_template_lists_only_commits_needing_a_decision() {
+    let (_tmp, repo) = fixture();
+    let mut broker = Broker::open(&repo).unwrap();
+    sh(&repo, &["checkout", "-q", "main"]);
+    std::fs::write(repo.join("only-local.txt"), "never submitted\n").unwrap();
+    sh(&repo, &["add", "-A"]);
+    sh(&repo, &["commit", "-qm", "feat: local only"]);
+    std::fs::write(repo.join("seed.txt"), "seed\n").unwrap();
+    sh(&repo, &["add", "-A"]);
+    sh(&repo, &["commit", "-qm", "same content as integration"]);
+
+    let template = broker.main_reconcile_resolution_template().unwrap();
+    assert_eq!(
+        template.resolutions.len(),
+        1,
+        "represented commits need no decision: {template:?}"
+    );
+    assert_eq!(template.resolutions[0].resolution, "replay_through_broker");
+    assert_eq!(template.resolutions[0].subject, "feat: local only");
+}
