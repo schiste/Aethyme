@@ -4,6 +4,25 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.7.14] - 2026-09-07
+
+### Added
+
+- `aethyme broker main reconcile` accepts reviewed dispositions for local-only
+  commits it cannot prove represented. `plan --write-resolution-template <path>`
+  emits the commits needing a decision, and `--resolution-file <path>` applies
+  them to both `plan` and `apply`. `archive_local` accepts that a commit leaves
+  the default branch while staying reachable from the preservation ref;
+  `replay_through_broker` and `keep_local_and_block_publication` continue to
+  refuse. A commit with no entry stays undecided and keeps refusing, and
+  `already_represented` remains computed from content rather than assertable.
+
+### Upgrade notes
+
+Read [Upgrading to v0.7.14](packages/aethyme/docs/guides/upgrading-to-v0.7.14.md)
+before updating. Broker storage, repository deployment, engine protocol, graph
+cache schemas, and the generated agent policy are unchanged from v0.7.13.
+
 ## [0.7.13] - 2026-09-07
 
 ### Changed
