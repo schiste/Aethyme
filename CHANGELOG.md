@@ -4,6 +4,34 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.7.12] - 2026-09-07
+
+### Added
+
+- The generated agent policy carries three practices that only bite at fleet
+  scale, each with its reason: do not merge the default branch into a working
+  branch to keep it current unless freshness is actually required; a check may
+  be required on a pull request only if it is scoped to the diff and finishes in
+  minutes; cherry-picking patches an already-certified release rather than
+  assembling one from trunk.
+
+### Changed
+
+- A host-state permission failure now distinguishes its two remedies. Granting
+  the process access keeps it coordinating with every other session on the host;
+  pointing `AETHYME_HOST_STATE_DIR` elsewhere always succeeds but yields a
+  private coordination domain that sees no other session's leases, sessions or
+  host resources. Sandboxed execution is documented as supported on exactly
+  those terms.
+
+### Upgrade notes
+
+Read [Upgrading to v0.7.12](packages/aethyme/docs/guides/upgrading-to-v0.7.12.md)
+before updating. Broker storage, repository deployment, engine protocol, and
+graph cache schemas are unchanged from v0.7.11. The generated policy changes, so
+`aethyme enhance deploy` will rewrite `AGENTS.md` and `CLAUDE.md` in enrolled
+repositories.
+
 ## [0.7.11] - 2026-09-06
 
 ### Added
