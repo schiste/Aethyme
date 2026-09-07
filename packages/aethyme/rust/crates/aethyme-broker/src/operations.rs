@@ -508,7 +508,7 @@ fn is_push(args: &[String]) -> bool {
     args.iter().any(|arg| arg == "push")
 }
 
-fn humanize_duration(seconds: u64) -> String {
+pub(crate) fn humanize_duration(seconds: u64) -> String {
     match seconds {
         0..=59 => format!("{seconds}s"),
         _ => format!("{}m {}s", seconds / 60, seconds % 60),

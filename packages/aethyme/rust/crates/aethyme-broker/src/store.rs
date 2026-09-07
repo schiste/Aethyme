@@ -2329,6 +2329,34 @@ impl BrokerStore {
         Ok(())
     }
 
+    /// Unresolved write operations across every repository, oldest first.
+    ///
+    /// `unresolved_coordinated_operations` answers "what holds this one
+    /// repository's lock", which is the question the lock itself asks. Status
+    /// needs the other question -- "is anything queued anywhere" -- because a
+    /// blocked caller cannot report on itself: it is parked inside a command
+    /// that never returns, and the one wait notice it printed went to stderr
+    /// before the hang (issue #147).
+    pub fn pending_coordinated_operations(&self) -> Result<Vec<CoordinatedOperation>, BrokerError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, session_id, provider, repository, scope, effect,
+                    status, authorization_reason, command_json, pid,
+                    exit_code, details_json,
+                    created_at, updated_at, finished_at,
+                    host_operation_id, identity_provenance
+             FROM coordinated_operations
+             WHERE effect <> 'read'
+               AND status IN ('prepared', 'running', 'outcome_unknown')
+             ORDER BY id",
+        )?;
+        let rows = stmt.query_map([], coordinated_operation_from_row)?;
+        let mut operations = Vec::new();
+        for row in rows {
+            operations.push(row??);
+        }
+        Ok(operations)
+    }
+
     pub fn unresolved_coordinated_operations(
         &self,
         repository: &str,

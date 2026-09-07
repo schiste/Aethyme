@@ -57,10 +57,32 @@ mod tests {
 
     #[test]
     fn runtime_discovery_finds_the_checkout_from_nested_directories() {
-        let compiled = compiled_repo_root();
+        // Anchored on the runtime checkout, not the compiled one. A binary
+        // reused from a broker merge-sim slot records a `CARGO_MANIFEST_DIR`
+        // that no longer exists, and because that slot sits *inside* the
+        // repository, the ancestor walk escapes it and resolves the enclosing
+        // checkout instead of failing -- so the old assertion compared a live
+        // discovery against a deleted directory and could not hold (#149).
+        let root = repo_root();
         assert_eq!(
-            find_repo_root(&compiled.join("packages/aethyme/rust/crates/aethyme-testkit/src")),
-            Some(compiled)
+            find_repo_root(&root.join("packages/aethyme/rust/crates/aethyme-testkit/src")),
+            Some(root)
+        );
+    }
+
+    /// The escape itself, pinned: discovery started below a directory that is
+    /// not a checkout must not silently answer with an enclosing one.
+    #[test]
+    fn discovery_below_a_missing_checkout_does_not_answer_with_its_parent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nested = tmp
+            .path()
+            .join("packages/aethyme/rust/crates/aethyme-testkit/src");
+        std::fs::create_dir_all(&nested).unwrap();
+        assert_eq!(
+            find_repo_root(&nested),
+            None,
+            "a tree with no workspace manifest must not resolve to any checkout"
         );
     }
 }

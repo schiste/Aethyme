@@ -8203,6 +8203,46 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     }
                     out!("  inspect: aethyme broker exposures plan");
                 }
+                // A caller parked behind a wedged operation is inside a command
+                // that never returns, so it cannot report its own wait. Status
+                // is the out-of-band surface that can (issue #147).
+                if !status.coordinated_operations.is_empty() {
+                    out!();
+                    let holders = status
+                        .coordinated_operations
+                        .iter()
+                        .filter(|operation| operation.holding_lock)
+                        .count();
+                    out!(
+                        "Coordinated operations: {} unresolved, {} holding a write lock",
+                        status.coordinated_operations.len(),
+                        holders
+                    );
+                    for operation in status.coordinated_operations.iter().take(10) {
+                        let role = if operation.holding_lock {
+                            "holding".to_string()
+                        } else {
+                            match operation.blocked_by {
+                                Some(blocker) => format!("blocked by {blocker}"),
+                                None => "queued".to_string(),
+                            }
+                        };
+                        out!(
+                            "  op {:<6} sess {:<4} {:<7} {:<28} {:<9} {:>8}  {}",
+                            operation.id,
+                            operation.session_id,
+                            operation.provider,
+                            operation.repository,
+                            operation.status,
+                            crate::operations::humanize_duration(operation.elapsed_seconds),
+                            role
+                        );
+                    }
+                    if status.coordinated_operations.len() > 10 {
+                        out!("  and {} more", status.coordinated_operations.len() - 10);
+                    }
+                    out!("  inspect: aethyme broker operations list");
+                }
                 out!();
                 if status.agents.is_empty() {
                     out!("No live sessions.");

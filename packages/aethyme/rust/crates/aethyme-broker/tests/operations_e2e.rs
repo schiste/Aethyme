@@ -988,3 +988,79 @@ fn without_opting_in_the_hook_still_runs_inside_the_push() {
         "the default path runs the hook once, inside the push"
     );
 }
+
+/// A caller parked behind a wedged operation is inside a command that never
+/// returns, so it cannot report its own wait. The one notice it printed went to
+/// stderr before it hung. Status is the only surface another agent can reach,
+/// and until #147 it carried no coordinated operations at all -- while offering
+/// a `queue` field meaning the merge queue, which a reporter read as
+/// authoritative and concluded nothing was pending.
+#[test]
+fn status_names_the_holder_and_who_is_parked_behind_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let worktree = add_worktree(tmp.path(), "wedged");
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let session = broker.adopt(&worktree, None).unwrap();
+    let repository = format!("local:{}", broker.main_root().display());
+
+    let new_operation = |scope: &str, command: &str| NewCoordinatedOperation {
+        session_id: session.id,
+        provider: OperationProvider::Git,
+        repository: repository.clone(),
+        scope: scope.into(),
+        effect: OperationEffect::Write,
+        authorization_reason: Some("test".into()),
+        command_json: command.into(),
+        pid: 999_999,
+        host_operation_id: None,
+        identity_provenance: aethyme_broker::OperationIdentityProvenance::LocalRepository,
+    };
+
+    let holder = broker
+        .store()
+        .create_coordinated_operation(&new_operation("repository", r#"["git","push"]"#))
+        .unwrap();
+    broker
+        .store()
+        .transition_coordinated_operation(holder.id, OperationStatus::Running, None, None)
+        .unwrap();
+    let parked = broker
+        .store()
+        .create_coordinated_operation(&new_operation("issues/1/comments", r#"["gh","api"]"#))
+        .unwrap();
+
+    // Elapsed is measured against the stored record, so the clock must be
+    // anchored to it rather than to an arbitrary constant.
+    let now_ms = holder.created_at + 47 * 60 * 1_000;
+    let status = broker.status(now_ms).unwrap();
+
+    // The merge queue is a different question; answering it is what misled the
+    // reporter, so the two must not be conflated.
+    assert!(
+        status.queue.is_empty(),
+        "merge queue must stay empty; this is a coordinated-operation wait"
+    );
+
+    let reported: Vec<_> = status
+        .coordinated_operations
+        .iter()
+        .map(|operation| (operation.id, operation.holding_lock, operation.blocked_by))
+        .collect();
+    assert_eq!(
+        reported,
+        vec![(holder.id, true, None), (parked.id, false, Some(holder.id))],
+        "status must name the holder and attribute the parked operation to it"
+    );
+
+    let held = status
+        .coordinated_operations
+        .iter()
+        .find(|operation| operation.id == holder.id)
+        .unwrap();
+    assert_eq!(
+        held.elapsed_seconds,
+        47 * 60,
+        "the hold duration is the number that makes a wedge judgeable"
+    );
+}

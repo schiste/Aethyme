@@ -920,6 +920,29 @@ pub struct StatusQueueHistory {
     pub command: String,
 }
 
+/// One unresolved coordinated write operation, as status reports it.
+///
+/// Deliberately not named `queue`: `StatusView::queue` is the merge queue, and
+/// a reporter checking status for a stuck operation found that field, read it
+/// as authoritative, and concluded nothing was pending (issue #147).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PendingOperationView {
+    pub id: i64,
+    pub session_id: i64,
+    pub provider: String,
+    pub repository: String,
+    pub scope: String,
+    pub status: String,
+    pub pid: i64,
+    /// Seconds since the record was created.
+    pub elapsed_seconds: u64,
+    /// True for the operation actually holding its repository's write lock.
+    pub holding_lock: bool,
+    /// The operation this one is parked behind, when it is not the holder.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocked_by: Option<i64>,
+}
+
 /// Everything `broker status` renders, in one serializable shape.
 #[derive(Debug, serde::Serialize)]
 pub struct StatusView {
@@ -935,6 +958,9 @@ pub struct StatusView {
     pub leases: Vec<crate::Lease>,
     pub overlaps: Vec<crate::leases::Overlap>,
     pub promoted_conflicts: Vec<PromotedConflict>,
+    /// Unresolved coordinated write operations, across every repository.
+    /// Separate from `queue`, which is the merge queue.
+    pub coordinated_operations: Vec<PendingOperationView>,
     /// Live/pending/conflicted rows only. Terminal history is paginated.
     pub queue: Vec<crate::types::MergeQueueEntry>,
     pub queue_history: StatusQueueHistory,
@@ -5156,6 +5182,42 @@ impl Broker {
                 },
             });
         }
+        // Within a repository the lock is held by the running operation; every
+        // other unresolved row there is parked behind it. Naming that
+        // relationship is the point -- a parked caller cannot say so itself.
+        let pending_rows = self.store.pending_coordinated_operations()?;
+        let mut holder_by_repository: std::collections::HashMap<&str, i64> =
+            std::collections::HashMap::new();
+        for operation in &pending_rows {
+            if operation.status == crate::types::OperationStatus::Running {
+                holder_by_repository
+                    .entry(operation.repository.as_str())
+                    .or_insert(operation.id);
+            }
+        }
+        let coordinated_operations = pending_rows
+            .iter()
+            .map(|operation| {
+                let holder = holder_by_repository
+                    .get(operation.repository.as_str())
+                    .copied();
+                let holding_lock = holder == Some(operation.id);
+                PendingOperationView {
+                    id: operation.id,
+                    session_id: operation.session_id,
+                    provider: operation.provider.as_str().to_string(),
+                    repository: operation.repository.clone(),
+                    scope: operation.scope.clone(),
+                    status: operation.status.as_str().to_string(),
+                    pid: operation.pid,
+                    elapsed_seconds: now_ms.saturating_sub(operation.created_at).max(0) as u64
+                        / 1_000,
+                    holding_lock,
+                    blocked_by: if holding_lock { None } else { holder },
+                }
+            })
+            .collect::<Vec<_>>();
+
         Ok(StatusView {
             summary,
             advice,
@@ -5166,6 +5228,7 @@ impl Broker {
             leases: self.store.active_leases()?,
             overlaps,
             promoted_conflicts,
+            coordinated_operations,
             queue,
             queue_history: StatusQueueHistory {
                 schema_version: crate::MERGE_QUEUE_HISTORY_SCHEMA_VERSION,
