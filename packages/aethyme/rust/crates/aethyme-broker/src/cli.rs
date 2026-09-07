@@ -322,6 +322,11 @@ Usage:
   aethyme broker deliveries list [--adapter <name>] [--all] [--json]
   aethyme broker deliveries claim --adapter <name> --worker <id> [--seconds <15..900>] [--json]
   aethyme broker deliveries resolve-tab --session <id> [--tabs-file <path>] [--json]
+  aethyme broker deliveries dispatch --adapter chau7 --worker <id> [--tabs-file <path>] [--seconds <15..900>] [--json]
+      Claim one delivery and decide what to do with it: send to a resolved tab,
+      defer while that tab is mid-turn or absent, or abandon when it cannot be
+      identified. Deferred and abandoned outcomes are completed for you; a send
+      is left open so the caller completes it after the transport succeeds.
       Resolve which Chau7 tab is running a session, from a `tab_list` snapshot
       on stdin or --tabs-file. The broker never calls Chau7 itself; an adapter
       supplies the snapshot and performs the transport. Ambiguity refuses.
@@ -4435,6 +4440,102 @@ fn run_deliveries(parsed: Parsed) -> Result<(), UsageError> {
         })?;
     let mut broker = open_broker(parsed.read_only_snapshot)?;
     match action {
+        "dispatch" => {
+            let adapter = parsed.adapter.as_deref().unwrap_or("chau7");
+            let worker = parsed.worker.as_deref().ok_or_else(|| {
+                UsageError::Message("deliveries dispatch requires --worker <id>".into())
+            })?;
+            let seconds = parsed.seconds.unwrap_or(120);
+            let claim = broker.claim_next_delivery(adapter, worker, seconds, now_ms())?;
+            let Some(envelope) = claim.delivery else {
+                if parsed.json {
+                    out!("{}", serde_json::json!({"claimed": false}));
+                } else {
+                    out!("no delivery pending for adapter {adapter}");
+                }
+                return Ok(());
+            };
+            let session = broker.store().session(envelope.watch.session_id)?;
+            let raw = match parsed.tabs_file.as_deref() {
+                Some(path) => std::fs::read_to_string(path).map_err(|error| {
+                    UsageError::Message(format!("cannot read {}: {error}", path.display()))
+                })?,
+                None => {
+                    use std::io::Read;
+                    let mut buffer = String::new();
+                    std::io::stdin()
+                        .read_to_string(&mut buffer)
+                        .map_err(|error| {
+                            UsageError::Message(format!("cannot read tabs from stdin: {error}"))
+                        })?;
+                    buffer
+                }
+            };
+            let tabs: Vec<crate::Chau7Tab> = serde_json::from_str(&raw).map_err(|error| {
+                UsageError::Message(format!(
+                    "tab snapshot is not a Chau7 tab_list array: {error}"
+                ))
+            })?;
+            let action = crate::dispatch_action(
+                &tabs,
+                &session.worktree_path,
+                &session.branch,
+                &envelope.prompt,
+            );
+            // Deferral and abandonment are terminal for this claim, so the
+            // broker completes them. A send stays open: only the caller knows
+            // whether the transport actually landed.
+            match &action {
+                crate::Chau7DispatchAction::Defer { why, .. } => {
+                    broker.complete_delivery(
+                        envelope.item.id,
+                        worker,
+                        envelope.item.generation,
+                        crate::DeliveryCompletion::Retry,
+                        Some("tab_not_ready"),
+                        now_ms(),
+                    )?;
+                    if !parsed.json {
+                        out!("deferred delivery {}: {why}", envelope.item.id);
+                    }
+                }
+                crate::Chau7DispatchAction::Abandon { why } => {
+                    broker.complete_delivery(
+                        envelope.item.id,
+                        worker,
+                        envelope.item.generation,
+                        crate::DeliveryCompletion::Failed,
+                        Some("tab_unresolvable"),
+                        now_ms(),
+                    )?;
+                    if !parsed.json {
+                        out!("abandoned delivery {}: {why}", envelope.item.id);
+                    }
+                }
+                crate::Chau7DispatchAction::Send { tab_id, .. } => {
+                    if !parsed.json {
+                        out!("send delivery {} to {tab_id}", envelope.item.id);
+                        out!(
+                            "  complete with: aethyme broker deliveries complete --id {} --worker {worker} --generation {} --outcome delivered",
+                            envelope.item.id,
+                            envelope.item.generation
+                        );
+                    }
+                }
+            }
+            if parsed.json {
+                out!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "claimed": true,
+                        "delivery_id": envelope.item.id,
+                        "generation": envelope.item.generation,
+                        "session_id": envelope.watch.session_id,
+                        "action": action,
+                    }))?
+                );
+            }
+        }
         "resolve-tab" => {
             let session_id = parsed.session.ok_or_else(|| {
                 UsageError::Message("deliveries resolve-tab requires --session <id>".into())
@@ -4740,6 +4841,23 @@ fn render_coordinated_operation(
             report.operation.repository,
             report.classification,
         );
+        // The PR is linkable the moment it exists; starting the watch is left
+        // to the caller because it polls the provider, and this command may
+        // still be inside the repository write lock (#150, and #138 for why).
+        if let Some(number) = report.created_pull_request {
+            let session = report.operation.session_id;
+            let repository = report
+                .github_target
+                .as_ref()
+                .map(|target| target.display_slug.clone())
+                .unwrap_or_else(|| report.operation.repository.clone());
+            out!(
+                "Pull request {number} opened by session {session}. To be told about review activity:"
+            );
+            out!(
+                "  aethyme broker watch pr start --session {session} --repo {repository} --pr {number}"
+            );
+        }
         if let Some(cleanup) = &report.post_merge_cleanup {
             out!(
                 "post-merge integration cleanup: {} — {}",

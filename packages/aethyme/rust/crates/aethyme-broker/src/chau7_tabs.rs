@@ -250,3 +250,132 @@ mod tests {
         assert_eq!(parsed.tab_id, "tab_7");
     }
 }
+
+/// What an adapter should do with a claimed delivery.
+///
+/// The broker decides; the caller performs the transport. Keeping the decision
+/// here means the "is this tab the right one, and can it take a message now"
+/// judgement is tested without Chau7 running, and cannot drift between adapters.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum Chau7DispatchAction {
+    /// Send `prompt` to `tab_id`, then complete the delivery as delivered.
+    Send {
+        tab_id: String,
+        prompt: String,
+        mcp_controlled: bool,
+    },
+    /// The tab is mid-turn. Leave the delivery for a later tick.
+    Defer { tab_id: String, why: String },
+    /// The tab cannot be identified or is gone. The delivery cannot succeed.
+    Abandon { why: String },
+}
+
+/// Decide what to do with one claimed delivery for a Chau7 subscription.
+///
+/// `Defer` and `Abandon` are distinct on purpose: deferring keeps the delivery
+/// for the next tick, whereas abandoning admits it will never land. Collapsing
+/// them would either retry forever against a closed tab or discard a message
+/// because an agent happened to be busy.
+pub fn dispatch_action(
+    tabs: &[Chau7Tab],
+    worktree_path: &str,
+    branch: &str,
+    prompt: &str,
+) -> Chau7DispatchAction {
+    match resolve_session_tab(tabs, worktree_path, branch) {
+        Ok(resolution) => match resolution.readiness {
+            Chau7TabReadiness::Ready => Chau7DispatchAction::Send {
+                tab_id: resolution.tab_id,
+                prompt: prompt.to_string(),
+                mcp_controlled: resolution.mcp_controlled,
+            },
+            Chau7TabReadiness::Busy => Chau7DispatchAction::Defer {
+                tab_id: resolution.tab_id,
+                why: "tab is mid-turn; delivering now would interrupt it".into(),
+            },
+            Chau7TabReadiness::Unavailable => Chau7DispatchAction::Abandon {
+                why: format!("tab {} is not accepting input", resolution.tab_id),
+            },
+        },
+        // A tab that is merely absent may come back -- an agent restarting
+        // between ticks is ordinary -- so this defers rather than abandons.
+        Err(Chau7ResolutionRefusal::NoTabForWorktree { worktree }) => Chau7DispatchAction::Defer {
+            tab_id: String::new(),
+            why: format!("no tab is running {worktree}"),
+        },
+        Err(refusal) => Chau7DispatchAction::Abandon {
+            why: format!("{refusal:?}"),
+        },
+    }
+}
+
+#[cfg(test)]
+mod dispatch_tests {
+    use super::*;
+
+    fn tab(id: &str, cwd: &str, branch: &str, status: &str) -> Chau7Tab {
+        Chau7Tab {
+            tab_id: id.into(),
+            cwd: Some(cwd.into()),
+            repo_root: Some(cwd.into()),
+            git_branch: Some(branch.into()),
+            ai_provider: Some("claude".into()),
+            status: Some(status.into()),
+            is_mcp_controlled: Some(false),
+        }
+    }
+
+    #[test]
+    fn a_ready_tab_receives_the_prompt_unchanged() {
+        let tabs = vec![tab("tab_7", "/w/mine", "agent/mine", "waitingForInput")];
+        let action = dispatch_action(&tabs, "/w/mine", "agent/mine", "review on PR 151");
+        assert_eq!(
+            action,
+            Chau7DispatchAction::Send {
+                tab_id: "tab_7".into(),
+                prompt: "review on PR 151".into(),
+                mcp_controlled: false,
+            }
+        );
+    }
+
+    #[test]
+    fn a_busy_tab_defers_and_keeps_the_delivery() {
+        let tabs = vec![tab("tab_7", "/w/mine", "agent/mine", "running")];
+        assert!(matches!(
+            dispatch_action(&tabs, "/w/mine", "agent/mine", "x"),
+            Chau7DispatchAction::Defer { .. }
+        ));
+    }
+
+    /// An agent restarting between ticks must not lose its review notification.
+    #[test]
+    fn an_absent_tab_defers_rather_than_discarding_the_message() {
+        assert!(matches!(
+            dispatch_action(&[], "/w/mine", "agent/mine", "x"),
+            Chau7DispatchAction::Defer { .. }
+        ));
+    }
+
+    #[test]
+    fn ambiguity_abandons_rather_than_delivering_to_a_guess() {
+        let tabs = vec![
+            tab("tab_1", "/w/mine", "agent/mine", "idle"),
+            tab("tab_2", "/w/mine", "agent/mine", "idle"),
+        ];
+        assert!(matches!(
+            dispatch_action(&tabs, "/w/mine", "agent/mine", "x"),
+            Chau7DispatchAction::Abandon { .. }
+        ));
+    }
+
+    #[test]
+    fn a_finished_tab_abandons_instead_of_retrying_forever() {
+        let tabs = vec![tab("tab_7", "/w/mine", "agent/mine", "done")];
+        assert!(matches!(
+            dispatch_action(&tabs, "/w/mine", "agent/mine", "x"),
+            Chau7DispatchAction::Abandon { .. }
+        ));
+    }
+}

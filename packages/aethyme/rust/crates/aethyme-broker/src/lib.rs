@@ -51,6 +51,7 @@ pub mod main_reconcile;
 mod merge;
 mod operations;
 mod pr;
+mod pr_link;
 mod pr_watch;
 mod preparation;
 mod promotion_record;
@@ -65,8 +66,10 @@ pub mod renamed_targets;
 mod report;
 mod report_filing;
 pub use chau7_tabs::{
-    Chau7Resolution, Chau7ResolutionRefusal, Chau7Tab, Chau7TabReadiness, resolve_session_tab,
+    Chau7DispatchAction, Chau7Resolution, Chau7ResolutionRefusal, Chau7Tab, Chau7TabReadiness,
+    dispatch_action, resolve_session_tab,
 };
+pub use pr_link::{creates_pull_request, pull_request_number_from_output};
 mod repository_contract;
 mod resources;
 mod retention;

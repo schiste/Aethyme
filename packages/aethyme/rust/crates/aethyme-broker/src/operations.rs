@@ -67,6 +67,13 @@ pub struct CoordinatedOperationReport {
     pub stderr: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub post_merge_cleanup: Option<PostMergeCleanupReport>,
+    /// Pull request this operation created, when it created one. Recorded so
+    /// the session that opened it can be told about review activity without a
+    /// human first noticing the number (#150). The watch is *not* started
+    /// here: doing so would poll the provider while this operation still holds
+    /// the repository write lock, which is the head-of-line stall of #138.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_pull_request: Option<i64>,
 }
 
 impl CoordinatedOperationReport {
@@ -1829,6 +1836,11 @@ impl Broker {
         if let Some(guard) = &mut host_guard {
             guard.finish(operation.status)?;
         }
+        let created_pull_request_number = (output.status.success()
+            && request.provider == OperationProvider::Github
+            && crate::creates_pull_request(&request.args))
+        .then(|| crate::pull_request_number_from_output(&String::from_utf8_lossy(&output.stdout)))
+        .flatten();
         Ok(CoordinatedOperationReport {
             operation,
             classification,
@@ -1838,6 +1850,7 @@ impl Broker {
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
             post_merge_cleanup: None,
+            created_pull_request: created_pull_request_number,
         })
     }
 
