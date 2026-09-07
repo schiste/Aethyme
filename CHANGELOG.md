@@ -4,6 +4,22 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.7.13] - 2026-09-07
+
+### Changed
+
+- The release runbook states the enhancement redeploy as an explicit step, with
+  the two orderings it depends on: build at the new version before deploying,
+  because the policy stamp comes from the compiled version, and stage new files
+  before deploying, because the generated freshness digest counts tracked files.
+
+### Upgrade notes
+
+Read [Upgrading to v0.7.13](packages/aethyme/docs/guides/upgrading-to-v0.7.13.md)
+before updating. This release changes maintainer documentation only. Broker
+storage, repository deployment, engine protocol, graph cache schemas, and the
+generated agent policy are unchanged from v0.7.12.
+
 ## [0.7.12] - 2026-09-07
 
 ### Added
