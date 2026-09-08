@@ -6761,11 +6761,18 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     .unwrap_or_else(|| report.operation.repository.clone());
                 let root = broker.main_root().to_path_buf();
                 if crate::pr_monitoring_is_active(&root, session) {
+                    // Comments and reviews, not checks: this exists to route
+                    // human review back to the agent, and check churn on a
+                    // busy PR would bury it. An empty list is rejected as
+                    // meaning nothing, so the default must be explicit.
                     match broker.start_pull_request_watch(
                         session,
                         &repository,
                         number,
-                        Vec::new(),
+                        vec![
+                            crate::PullRequestActivityKind::Comment,
+                            crate::PullRequestActivityKind::Review,
+                        ],
                         300,
                         &crate::GithubCliPullRequestWatchProvider,
                         now_ms(),
