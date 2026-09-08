@@ -123,11 +123,20 @@ pub fn resolve_session_tab(
         }
     };
 
-    if tab.git_branch.as_deref() != Some(branch) {
+    // Only a *known, different* branch is evidence of staleness. Chau7 reports
+    // no branch at all for broker worktrees -- verified live: an ordinary
+    // checkout comes back with `git_branch: "main"`, a worktree under the host
+    // state directory comes back null. Treating absence as divergence would
+    // refuse every delivery to exactly the sessions this feature exists for.
+    // Worktree identity has already picked the session out uniquely; the branch
+    // check narrows an already-unique match, so it must not veto on silence.
+    if let Some(observed) = tab.git_branch.as_deref()
+        && observed != branch
+    {
         return Err(Chau7ResolutionRefusal::BranchDiverged {
             tab_id: tab.tab_id.clone(),
             expected_branch: branch.to_string(),
-            observed_branch: tab.git_branch.clone(),
+            observed_branch: Some(observed.to_string()),
         });
     }
 
@@ -198,6 +207,18 @@ mod tests {
             }
             other => panic!("expected ambiguity, got {other:?}"),
         }
+    }
+
+    /// Chau7 reports no branch for broker worktrees. Refusing on that would
+    /// disable delivery for every broker session -- the intended use case.
+    #[test]
+    fn a_tab_reporting_no_branch_still_resolves_on_worktree_identity() {
+        let tabs = vec![Chau7Tab {
+            git_branch: None,
+            ..tab("tab_23", "/w/mine", "ignored", "idle")
+        }];
+        let resolved = resolve_session_tab(&tabs, "/w/mine", "agent/mine").unwrap();
+        assert_eq!(resolved.tab_id, "tab_23");
     }
 
     #[test]

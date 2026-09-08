@@ -132,8 +132,10 @@ class Chau7Client:
 def dispatch_once(
     broker: str, repo: str | None, worker: str, tabs: list[dict[str, Any]]
 ) -> dict[str, Any]:
+    # No --tabs-file: the broker reads the snapshot from stdin when the flag is
+    # absent. Passing "-" looks conventional but is taken as a literal path.
     command = [broker, "broker", "deliveries", "dispatch", "--adapter", "chau7",
-               "--worker", worker, "--tabs-file", "-", "--json"]
+               "--worker", worker, "--json"]
     result = subprocess.run(
         command,
         input=json.dumps(tabs),
