@@ -139,6 +139,7 @@ fn handoff_json_by_session_has_a_stable_read_only_contract() {
             "pending_work",
             "recommended_next_action",
             "recorded_at",
+            "representing_commit",
             "session_id",
             "status",
         ]
