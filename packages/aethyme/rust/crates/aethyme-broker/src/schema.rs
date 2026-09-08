@@ -16,7 +16,7 @@ use rusqlite::Connection;
 use crate::error::BrokerError;
 
 /// Current database schema version (== `MIGRATIONS.len()`).
-pub const SCHEMA_VERSION: i64 = 31;
+pub const SCHEMA_VERSION: i64 = 32;
 
 /// Version stamped on every event row written by this binary.
 pub const EVENTS_SCHEMA_VERSION: i64 = 1;
@@ -830,6 +830,35 @@ const MIGRATION_V31: &str = "
 ALTER TABLE sessions ADD COLUMN agent_identity TEXT;
 ";
 
+// Representation of work that reached the default branch through a provider-side
+// merge rather than through `broker submit`. Ancestry cannot record this: a
+// squash or rebase merge produces a commit with a new SHA and no relationship to
+// the session's commits. The representing commit is stored rather than
+// recomputed because a verdict against a fixed historical commit stays true,
+// while the same verdict against the branch tip decays the moment an unrelated
+// change touches one of the same files.
+//
+// `representing_commit` is NULL only for a session whose net content the branch
+// already held, where naming a commit would misattribute work that commit did
+// not carry.
+const MIGRATION_V32: &str = "
+CREATE TABLE session_representations (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id          INTEGER NOT NULL REFERENCES sessions(id),
+    session_head        TEXT NOT NULL,
+    representing_commit TEXT,
+    representing_ref    TEXT NOT NULL,
+    discovery           TEXT NOT NULL CHECK (discovery IN ('merge_time', 'history_walk')),
+    pr_number           INTEGER CHECK (pr_number IS NULL OR pr_number > 0),
+    paths_json          TEXT NOT NULL,
+    evidence            TEXT NOT NULL,
+    created_at          INTEGER NOT NULL
+);
+
+CREATE UNIQUE INDEX session_representations_head
+    ON session_representations (session_id, session_head);
+";
+
 const MIGRATIONS: &[&str] = &[
     MIGRATION_V1,
     MIGRATION_V2,
@@ -862,6 +891,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_V29,
     MIGRATION_V30,
     MIGRATION_V31,
+    MIGRATION_V32,
 ];
 
 pub(crate) fn current_version(conn: &Connection) -> Result<i64, BrokerError> {

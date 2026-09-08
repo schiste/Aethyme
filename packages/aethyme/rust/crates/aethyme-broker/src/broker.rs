@@ -24,7 +24,8 @@ use crate::graph_impact::{
 use crate::store::BrokerStore;
 use crate::types::{
     Advisory, AdvisoryList, GateStatus, LeaseKind, MergeQueueEntry, MergeStatus, NewAdvisory,
-    NewSession, Session, SessionNote, SessionNoteList, SessionOrigin, SessionStatus,
+    NewSession, Session, SessionNote, SessionNoteList, SessionOrigin, SessionRepresentation,
+    SessionStatus,
 };
 use crate::version::{VersionDriftReport, VersionDriftStatus};
 
@@ -41,6 +42,11 @@ pub(crate) const WORKTREE_ROOT_MARKER: &str = ".aethyme-worktree-root.json";
 pub enum BrokerOpError {
     #[error("main reconciliation is unavailable: {reason}")]
     MainReconcileUnavailable { reason: String },
+    /// Representation asks a different question from reconciliation -- whether
+    /// a session's work is already on the default branch -- so its refusals
+    /// must not read as a `main reconcile` failure.
+    #[error("representation cannot be decided: {reason}")]
+    RepresentationUnavailable { reason: String },
     #[error("main reconciliation is unsafe: {reason}")]
     MainReconcileUnsafe { reason: String },
     /// See [`BrokerOpError::CleanupConfirmationMismatch`] for why no digest is
@@ -1572,6 +1578,33 @@ pub struct FinishCleanupReport {
     pub recovery_action: Option<String>,
 }
 
+/// What a representation scan found for one session.
+#[derive(Debug, serde::Serialize)]
+pub struct RepresentationScan {
+    pub session_id: i64,
+    pub session_head: String,
+    pub base: String,
+    pub branch: String,
+    pub branch_ref: String,
+    pub branch_tip: String,
+    /// Paths the session changed, in the order the content comparison uses.
+    pub changed_paths: Vec<String>,
+    pub search: crate::LandingSearch,
+    /// A record already stored for this exact head, if any.
+    pub existing: Option<crate::types::SessionRepresentation>,
+    pub digest: String,
+}
+
+impl RepresentationScan {
+    pub fn recorded(&self) -> bool {
+        self.existing.is_some()
+    }
+
+    pub fn paths(&self) -> usize {
+        self.changed_paths.len()
+    }
+}
+
 /// Report from `broker finish --session`: close when safe, otherwise
 /// explain exactly what must happen first.
 #[derive(Debug, serde::Serialize)]
@@ -1585,6 +1618,9 @@ pub struct FinishReport {
     pub latest_queue_entry_id: Option<i64>,
     pub latest_queue_status: Option<MergeStatus>,
     pub delivery: FinishDelivery,
+    /// Set when this HEAD's work reached the default branch through a
+    /// provider-side merge instead of through submit.
+    pub representation: Option<SessionRepresentation>,
     pub pending_work: FinishPendingWork,
     pub leases_held: Vec<FinishLease>,
     pub last_gate: Option<FinishGateRun>,
@@ -1669,6 +1705,8 @@ pub struct FinishHandoff {
     pub latest_queue_status: Option<MergeStatus>,
     pub delivery: FinishDelivery,
     pub pending_work: FinishPendingWork,
+    #[serde(default)]
+    pub representing_commit: Option<String>,
     pub leases_held: Vec<FinishLease>,
     pub last_gate: Option<FinishGateRun>,
     #[serde(default)]
@@ -1700,6 +1738,10 @@ impl From<&FinishReport> for FinishHandoff {
             latest_queue_status: report.latest_queue_status,
             delivery: report.delivery.clone(),
             pending_work: report.pending_work.clone(),
+            representing_commit: report
+                .representation
+                .as_ref()
+                .and_then(|record| record.representing_commit.clone()),
             leases_held: report.leases_held.clone(),
             last_gate: report.last_gate.clone(),
             last_graph_integrity: report.last_graph_integrity.clone(),
@@ -5250,6 +5292,171 @@ impl Broker {
     /// The local default branch and its tip, resolved offline from
     /// `origin/HEAD`, which is written at clone time. Guessing a branch name
     /// would be worse than refusing: it would silently reconcile the wrong ref.
+    /// Look for the default-branch commit that carried a session's work.
+    ///
+    /// Read-only. The answer is computed from content against fixed historical
+    /// commits, so it is stable: re-running after the branch advances gives the
+    /// same verdict, which is what makes it worth recording.
+    pub fn scan_session_representation(
+        &mut self,
+        session_id: i64,
+    ) -> Result<RepresentationScan, BrokerOpError> {
+        let session = self.store().session(session_id)?;
+        let worktree_path = PathBuf::from(&session.worktree_path);
+        let checkout = GitRepo::discover(&worktree_path)?;
+        let head = checkout.head_commit()?;
+        let (branch, branch_ref, branch_tip) = self.default_branch_tip()?;
+
+        let base = session.diff_base.clone().ok_or_else(|| {
+            BrokerOpError::RepresentationUnavailable {
+                reason: format!(
+                    "session {session_id} has no recorded diff base, so the commits it owns cannot be bounded"
+                ),
+            }
+        })?;
+
+        let content = crate::session_content(&checkout, &base, &head)?;
+        let search = crate::find_landing(
+            &checkout,
+            &content,
+            &branch_tip,
+            crate::representation::DEFAULT_SEARCH_CAP,
+        )?;
+        let representing = search.landing().map(|landing| landing.commit.clone());
+        let digest = crate::representation_plan_digest(session_id, &head, representing.as_deref());
+
+        Ok(RepresentationScan {
+            session_id,
+            session_head: head.clone(),
+            base,
+            branch,
+            branch_ref,
+            branch_tip,
+            changed_paths: content.paths.keys().cloned().collect(),
+            search,
+            existing: self.store().session_representation(session_id, &head)?,
+            digest,
+        })
+    }
+
+    /// Persist a scan's verdict, bound to the digest of the plan that was shown.
+    ///
+    /// The digest covers the session, the exact head, and the representing
+    /// commit, so a confirmation cannot be replayed against a session that has
+    /// since committed more work.
+    pub fn record_session_representation(
+        &mut self,
+        session_id: i64,
+        confirm: &str,
+    ) -> Result<RepresentationScan, BrokerOpError> {
+        let scan = self.scan_session_representation(session_id)?;
+        if confirm != scan.digest {
+            return Err(BrokerOpError::RepresentationUnavailable {
+                reason: format!(
+                    "confirmation {confirm} does not match plan digest {}; re-run the scan and confirm the digest it prints",
+                    scan.digest
+                ),
+            });
+        }
+        if !scan.search.represented() {
+            return Err(BrokerOpError::RepresentationUnavailable {
+                reason: format!(
+                    "session {session_id} is not represented on {}; nothing to record",
+                    scan.branch
+                ),
+            });
+        }
+
+        let (representing, evidence) = match &scan.search.outcome {
+            crate::LandingOutcome::Landed(landing) => (
+                Some(landing.commit.clone()),
+                format!(
+                    "{} path(s) match {} — {}",
+                    landing.paths,
+                    &landing.commit[..12.min(landing.commit.len())],
+                    landing.subject
+                ),
+            ),
+            _ => (
+                None,
+                format!("{} already holds the session's net content", scan.branch),
+            ),
+        };
+
+        self.persist_representation(
+            &scan,
+            crate::types::RepresentationDiscovery::HistoryWalk,
+            None,
+            representing,
+            evidence,
+        )?;
+        self.scan_session_representation(session_id)
+    }
+
+    fn persist_representation(
+        &mut self,
+        scan: &RepresentationScan,
+        discovery: crate::types::RepresentationDiscovery,
+        pr_number: Option<i64>,
+        representing_commit: Option<String>,
+        evidence: String,
+    ) -> Result<(), BrokerOpError> {
+        let paths_json = serde_json::to_string(&scan.changed_paths).map_err(|source| {
+            BrokerOpError::RepresentationUnavailable {
+                reason: format!("cannot encode the session's changed paths: {source}"),
+            }
+        })?;
+        self.store()
+            .record_session_representation(&crate::types::NewSessionRepresentation {
+                session_id: scan.session_id,
+                session_head: scan.session_head.clone(),
+                representing_commit,
+                representing_ref: scan.branch_ref.clone(),
+                discovery,
+                pr_number,
+                paths_json,
+                evidence,
+            })?;
+        Ok(())
+    }
+
+    /// Record representation observed at merge time, for the session whose
+    /// branch a just-merged pull request carried.
+    ///
+    /// This is an observation, not a reviewed apply, so it takes no digest --
+    /// but it still re-proves the landing from content. That guard is what
+    /// makes a wrong session link harmless: a session that merges someone
+    /// else's pull request finds none of its own work on the branch and records
+    /// nothing. Any failure is swallowed, because the merge itself succeeded
+    /// and `representation scan` remains the explicit lane.
+    pub(crate) fn note_merge_time_representation(
+        &mut self,
+        session_id: i64,
+        pr_number: Option<i64>,
+    ) -> Option<String> {
+        let scan = self.scan_session_representation(session_id).ok()?;
+        if scan.recorded() {
+            return None;
+        }
+        let landing = scan.search.landing()?;
+        let commit = landing.commit.clone();
+        let evidence = format!(
+            "merged pull request landed {} path(s) as {} — {}",
+            landing.paths,
+            &commit[..12.min(commit.len())],
+            landing.subject
+        );
+        self.persist_representation(
+            &scan,
+            crate::types::RepresentationDiscovery::MergeTime,
+            pr_number,
+            Some(commit.clone()),
+            evidence,
+        )
+        .ok()?;
+        Some(commit)
+    }
+
     pub(crate) fn default_branch_tip(&self) -> Result<(String, String, String), BrokerOpError> {
         let repo = self.repo_handle();
         let head_ref = repo.symbolic_ref("refs/remotes/origin/HEAD").ok_or_else(|| {
@@ -6086,6 +6293,7 @@ impl Broker {
             latest_queue_entry_id: latest_for_session.map(|entry| entry.id),
             latest_queue_status: latest_for_session.map(|entry| entry.status),
             delivery: self.finish_delivery(latest_for_session),
+            representation: None,
             pending_work: FinishPendingWork::default(),
             leases_held: self.finish_leases(session_id, at_ms)?,
             last_gate: self.finish_last_gate(session_id)?,
@@ -6178,7 +6386,13 @@ impl Broker {
             )
         }) || session.accepted_integration_commit.as_deref()
             == Some(head.as_str());
-        report.unsubmitted_commits = if submitted_head_is_delivered {
+        // Work merged through a reviewed pull request is on the default branch
+        // but leaves no promotion row, and ancestry cannot see it because a
+        // squash rewrites the SHA. A recorded representation is the evidence
+        // that it landed (#152); without it the session can never close.
+        report.representation = self.store.session_representation(session_id, &head)?;
+        let head_is_delivered = submitted_head_is_delivered || report.representation.is_some();
+        report.unsubmitted_commits = if head_is_delivered {
             0
         } else {
             let pending_from_plan = self.integration_tip().and_then(|integration_head| {
@@ -6283,6 +6497,9 @@ impl Broker {
             report
                 .next_commands
                 .push(format!("aethyme broker submit --session {session_id}"));
+            report.next_commands.push(format!(
+                "aethyme broker representation scan --session {session_id}"
+            ));
             self.finalize_finish_report(&mut report);
             return Ok(report);
         }

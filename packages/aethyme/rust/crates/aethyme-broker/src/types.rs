@@ -549,6 +549,66 @@ pub struct Event {
     pub payload_json: Option<String>,
 }
 
+/// Why a session's work is considered present on the default branch.
+///
+/// Both values are computed, never asserted. The distinction is recorded
+/// because it says how much the answer cost and how direct the evidence was:
+/// `merge_time` was observed at the moment the provider merged, `history_walk`
+/// was reconstructed afterwards by finding the commit that carried the content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepresentationDiscovery {
+    MergeTime,
+    HistoryWalk,
+}
+
+impl RepresentationDiscovery {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RepresentationDiscovery::MergeTime => "merge_time",
+            RepresentationDiscovery::HistoryWalk => "history_walk",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "merge_time" => Some(RepresentationDiscovery::MergeTime),
+            "history_walk" => Some(RepresentationDiscovery::HistoryWalk),
+            _ => None,
+        }
+    }
+}
+
+/// A durable record that one session head's work reached the default branch.
+///
+/// `representing_commit` is `None` only where the branch already held the
+/// session's net content, so no commit carried the work.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SessionRepresentation {
+    pub id: i64,
+    pub session_id: i64,
+    pub session_head: String,
+    pub representing_commit: Option<String>,
+    pub representing_ref: String,
+    pub discovery: RepresentationDiscovery,
+    pub pr_number: Option<i64>,
+    pub paths_json: String,
+    pub evidence: String,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewSessionRepresentation {
+    pub session_id: i64,
+    pub session_head: String,
+    pub representing_commit: Option<String>,
+    pub representing_ref: String,
+    pub discovery: RepresentationDiscovery,
+    pub pr_number: Option<i64>,
+    pub paths_json: String,
+    pub evidence: String,
+}
+
 /// Durable cursor for PR follow-up routing. The broker stores a compact
 /// fingerprint rather than every comment/review id, so the watch state
 /// stays small and remains independent from GitHub's full API shape.

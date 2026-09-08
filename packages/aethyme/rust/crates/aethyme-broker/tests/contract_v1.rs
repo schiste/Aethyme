@@ -221,6 +221,7 @@ fn v1_constructor_payload_field_names_are_frozen() {
         unsubmitted_commits: 0,
         latest_queue_entry_id: Some(9),
         latest_queue_status: Some(MergeStatus::Promoted),
+        representation: None,
         delivery: FinishDelivery {
             submitted: true,
             promoted: true,
@@ -271,6 +272,7 @@ fn v1_constructor_payload_field_names_are_frozen() {
             "leases_held",
             "pending_work",
             "recommended_next_action",
+            "representing_commit",
             "session_id",
             "status",
         ],
