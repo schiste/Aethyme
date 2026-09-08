@@ -309,6 +309,10 @@ Usage:
       points the installed shims call — not for direct use.)
   aethyme broker pr check [--target <branch>] [--pr <number>] [--agent <name>] [--dispatch] [--cmd <command>] [--json]
   aethyme broker watch pr start --session <id> --repo <owner/name> --pr <number> [--events <comments,reviews,checks>] [--seconds <15..3600>] [--json]
+  aethyme broker watch pr monitoring <activate|deactivate|status> --session <id> [--json]
+      Opt this session in to PR monitoring. Off by default: while active, a
+      pull request opened through `broker gh` starts a watch automatically, and
+      the scheduled poller may deliver its review activity to this session.
   aethyme broker watch pr list [--all] [--json]
   aethyme broker watch pr show|poll|pause|resume|stop --id <watch-id> [--json]
   aethyme broker watch pr tick [--limit <1..100>] [--json]
@@ -4251,6 +4255,52 @@ fn run_pull_request_watch(parsed: Parsed) -> Result<(), UsageError> {
         })?;
     let mut broker = open_broker(parsed.read_only_snapshot)?;
     match action {
+        "monitoring" => {
+            let mode = parsed
+                .positional
+                .get(2)
+                .map(String::as_str)
+                .ok_or_else(|| {
+                    UsageError::Message(
+                        "watch pr monitoring requires activate, deactivate, or status".into(),
+                    )
+                })?;
+            let session_id = parsed.session.ok_or_else(|| {
+                UsageError::Message("watch pr monitoring requires --session <id>".into())
+            })?;
+            // Proves the session exists before recording a flag against it.
+            broker.store().session(session_id)?;
+            let root = broker.main_root().to_path_buf();
+            let io = |result: std::io::Result<()>| -> Result<(), UsageError> {
+                result.map_err(|error| {
+                    UsageError::Message(format!("cannot record PR monitoring state: {error}"))
+                })
+            };
+            match mode {
+                "activate" => io(crate::activate_pr_monitoring(&root, session_id))?,
+                "deactivate" => io(crate::deactivate_pr_monitoring(&root, session_id))?,
+                "status" => {}
+                other => {
+                    return Err(UsageError::Message(format!(
+                        "unknown watch pr monitoring mode {other:?}; expected activate, deactivate, or status"
+                    )));
+                }
+            }
+            let active = crate::pr_monitoring_is_active(&root, session_id);
+            if parsed.json {
+                out!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "session_id": session_id,
+                        "pr_monitoring_active": active,
+                    }))?
+                );
+            } else if active {
+                out!("session {session_id}: PR monitoring active");
+            } else {
+                out!("session {session_id}: PR monitoring off");
+            }
+        }
         "start" => {
             let session = parsed.session.ok_or_else(|| {
                 UsageError::Message("watch pr start requires --session <id>".into())
@@ -4844,20 +4894,6 @@ fn render_coordinated_operation(
         // The PR is linkable the moment it exists; starting the watch is left
         // to the caller because it polls the provider, and this command may
         // still be inside the repository write lock (#150, and #138 for why).
-        if let Some(number) = report.created_pull_request {
-            let session = report.operation.session_id;
-            let repository = report
-                .github_target
-                .as_ref()
-                .map(|target| target.display_slug.clone())
-                .unwrap_or_else(|| report.operation.repository.clone());
-            out!(
-                "Pull request {number} opened by session {session}. To be told about review activity:"
-            );
-            out!(
-                "  aethyme broker watch pr start --session {session} --repo {repository} --pr {number}"
-            );
-        }
         if let Some(cleanup) = &report.post_merge_cleanup {
             out!(
                 "post-merge integration cleanup: {} — {}",
@@ -6711,6 +6747,46 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
             let mut broker = open_broker(parsed.read_only_snapshot)?;
             let report = broker.run_coordinated_operation_with_wait(request, queue_wait)?;
             render_coordinated_operation(&report, parsed.json)?;
+            // After the coordinated operation returned, so the repository
+            // write lock is released. Starting the watch inside it would hold
+            // that lock across a provider call (#138). Opt-in only: a fleet
+            // that watched every PR it opens would deliver interruptions to
+            // agents that never asked for them.
+            if let Some(number) = report.created_pull_request {
+                let session = report.operation.session_id;
+                let repository = report
+                    .github_target
+                    .as_ref()
+                    .map(|target| target.display_slug.clone())
+                    .unwrap_or_else(|| report.operation.repository.clone());
+                let root = broker.main_root().to_path_buf();
+                if crate::pr_monitoring_is_active(&root, session) {
+                    match broker.start_pull_request_watch(
+                        session,
+                        &repository,
+                        number,
+                        Vec::new(),
+                        300,
+                        &crate::GithubCliPullRequestWatchProvider,
+                        now_ms(),
+                    ) {
+                        Ok(watch) => out!(
+                            "Watching pull request {number} for session {session} (watch {})",
+                            watch.id
+                        ),
+                        // Monitoring is an addition to the work, never a reason
+                        // to report the pull request itself as failed.
+                        Err(error) => {
+                            out!("Pull request {number} opened; watch not started: {error}")
+                        }
+                    }
+                } else {
+                    out!(
+                        "Pull request {number} opened. PR monitoring is off for session {session}; enable with:"
+                    );
+                    out!("  aethyme broker watch pr monitoring activate --session {session}");
+                }
+            }
             if !report.ok() {
                 if let Some(recovery) = report.unknown_outcome_recovery() {
                     return Err(UsageError::Exit {

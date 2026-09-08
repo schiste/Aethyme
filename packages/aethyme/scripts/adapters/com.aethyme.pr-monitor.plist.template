@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Scheduled PR monitoring for one repository.
+
+  Install:
+    sed -e "s|@REPO@|$PWD|g" -e "s|@BROKER@|$(command -v aethyme)|g" \
+        packages/aethyme/scripts/adapters/com.aethyme.pr-monitor.plist.template \
+      > ~/Library/LaunchAgents/com.aethyme.pr-monitor.plist
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.aethyme.pr-monitor.plist
+
+  Remove:
+    launchctl bootout gui/$(id -u)/com.aethyme.pr-monitor
+
+  One agent per repository: give each a distinct Label and log paths.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.aethyme.pr-monitor</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>@REPO@/packages/aethyme/scripts/adapters/aethyme-pr-monitor.sh</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>AETHYME_PR_MONITOR_REPO</key>
+        <string>@REPO@</string>
+        <key>AETHYME_BROKER_BIN</key>
+        <string>@BROKER@</string>
+        <key>PATH</key>
+        <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+    </dict>
+    <!-- Review latency is measured in minutes, not seconds, and each pass costs
+         provider calls. Five minutes keeps a fleet responsive without turning
+         monitoring into a rate-limit problem. -->
+    <key>StartInterval</key>
+    <integer>300</integer>
+    <!-- Deliberately not RunAtLoad: loading the agent should not fire a poll
+         during install, before the operator has confirmed the configuration. -->
+    <key>RunAtLoad</key>
+    <false/>
+    <key>StandardOutPath</key>
+    <string>@REPO@/.aethyme/run/pr-monitor.log</string>
+    <key>StandardErrorPath</key>
+    <string>@REPO@/.aethyme/run/pr-monitor.log</string>
+</dict>
+</plist>
