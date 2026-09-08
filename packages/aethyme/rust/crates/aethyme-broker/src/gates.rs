@@ -1882,6 +1882,21 @@ fn run_gate_command(
 ) -> Result<GateCommandOutcome, std::io::Error> {
     use std::os::unix::process::CommandExt;
 
+    // Before anything is spawned. A build that runs out of space reports link
+    // failures and unrelated test failures rather than a disk error, and that
+    // verdict is then cached against the tree -- so the retry that would clear
+    // it is exactly what the cache prevents. Refusing here keeps the condition
+    // and its symptom attached to each other.
+    if let Some(refusal) = crate::disk_headroom_refusal(
+        crate::available_bytes(context.cwd),
+        crate::DEFAULT_GATE_HEADROOM_BYTES,
+    ) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::StorageFull,
+            format!("gate {refusal}"),
+        ));
+    }
+
     let log = std::fs::File::create(context.log_path)?;
     let log_err = log.try_clone()?;
     let mut process = std::process::Command::new("sh");

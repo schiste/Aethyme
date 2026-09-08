@@ -24,6 +24,10 @@ mod advisories;
 pub mod attribution;
 mod broker;
 mod chau7_tabs;
+mod disk_headroom;
+pub use disk_headroom::{
+    DEFAULT_GATE_HEADROOM_BYTES, available_bytes, refusal as disk_headroom_refusal,
+};
 pub mod cli;
 mod cli_output;
 pub mod contract_check;
