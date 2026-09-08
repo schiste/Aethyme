@@ -3839,7 +3839,22 @@ impl BrokerStore {
                  FROM delivery_outbox o
                  JOIN delivery_subscriptions s ON s.id = o.subscription_id
                  WHERE s.adapter = ?1 AND s.active = 1
-                   AND (o.status = 'pending'
+                   AND (
+                        -- Never attempted: claimable at once.
+                        (o.status = 'pending' AND o.attempt_count = 0)
+                        -- Retried: hold it back, or `ORDER BY o.id` re-selects
+                        -- the same row forever and starves every later
+                        -- delivery for this adapter (#154). The target that
+                        -- just declined will not have changed a millisecond
+                        -- later, so an immediate retry cannot succeed anyway.
+                        OR (o.status = 'pending' AND o.attempt_count > 0
+                            AND o.updated_at + MIN(
+                                    
+                                    15000 * (1 << MIN(o.attempt_count - 1, 5)),
+                                    300000
+                                ) <= ?2)
+                        -- An expired claim means the worker died, not that the
+                        -- target refused, so it retries promptly.
                         OR (o.status = 'claimed' AND o.claim_expires_at <= ?2))
                  ORDER BY o.id LIMIT 1",
                 params![adapter, now],

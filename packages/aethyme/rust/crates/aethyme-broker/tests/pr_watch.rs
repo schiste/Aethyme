@@ -170,8 +170,12 @@ fn durable_watch_tracks_metadata_changes_and_completes_with_the_pr() {
         )
         .unwrap();
     assert_eq!(retried.status, DeliveryStatus::Pending);
+    // Past the retry backoff. What this test pins is claim fencing -- the
+    // generation moves and the previous worker's completion is refused -- and
+    // the instant re-claim was only incidental setup. A retried delivery is no
+    // longer claimable in the same breath (#154), so the clock advances.
     let claimed_again = broker
-        .claim_next_delivery("test-adapter", "worker-2", 120, 61_300)
+        .claim_next_delivery("test-adapter", "worker-2", 120, 77_000)
         .unwrap()
         .delivery
         .unwrap();
@@ -184,7 +188,7 @@ fn durable_watch_tracks_metadata_changes_and_completes_with_the_pr() {
                 claimed.item.generation,
                 DeliveryCompletion::Delivered,
                 None,
-                61_400,
+                77_100,
             )
             .unwrap_err(),
         BrokerOpError::Store(aethyme_broker::BrokerError::DeliveryClaimChanged { .. })
@@ -399,5 +403,102 @@ fn scheduler_tick_is_bounded_deterministic_and_persists_safe_error_codes() {
         broker
             .tick_pull_request_watches(&provider, 16_000, 0)
             .is_err()
+    );
+}
+
+/// A deferred delivery must not re-enter the front of the queue.
+///
+/// `claim_next_delivery` orders by id, which is correct -- deliveries should go
+/// out in the order the activity happened. But a delivery completed as `retry`
+/// returned to `pending` with no delay, so the same lowest id was re-selected
+/// immediately and every later delivery for that adapter was starved. Observed
+/// live: one row reached 30 attempts across three scheduled passes while three
+/// others were never claimed once (#154).
+#[test]
+fn a_retried_delivery_yields_to_the_next_one_instead_of_starving_it() {
+    let (_root, mut broker, session_id) = broker_fixture();
+    let provider = FakeProvider(Mutex::new(VecDeque::from([
+        snapshot("open", 'a', &["C1"]),
+        snapshot("open", 'b', &["C1", "C2"]),
+        snapshot("open", 'c', &["C1", "C2", "C3"]),
+    ])));
+
+    let watch = broker
+        .start_pull_request_watch(
+            session_id,
+            "Owner/Repo",
+            7,
+            vec![PullRequestActivityKind::Comment],
+            60,
+            &provider,
+            1_000,
+        )
+        .unwrap();
+    broker
+        .subscribe_pull_request_delivery(
+            watch.id,
+            "test-adapter",
+            "recipient-1",
+            DeliveryPolicy::Notify,
+            2_000,
+        )
+        .unwrap();
+
+    // Two batches, so there is a second delivery to be starved.
+    broker
+        .poll_pull_request_watch(watch.id, &provider, 61_000)
+        .unwrap();
+    broker
+        .poll_pull_request_watch(watch.id, &provider, 121_000)
+        .unwrap();
+
+    let first = broker
+        .claim_next_delivery("test-adapter", "worker-1", 120, 130_000)
+        .unwrap()
+        .delivery
+        .expect("a delivery is pending");
+    let first_id = first.item.id;
+    broker
+        .complete_delivery(
+            first_id,
+            "worker-1",
+            first.item.generation,
+            DeliveryCompletion::Retry,
+            Some("tab_not_ready"),
+            130_100,
+        )
+        .unwrap();
+
+    // Immediately afterwards the retried row must not come back...
+    let next = broker
+        .claim_next_delivery("test-adapter", "worker-1", 120, 130_200)
+        .unwrap()
+        .delivery
+        .expect("the second delivery must be reachable");
+    assert_ne!(
+        next.item.id, first_id,
+        "a just-retried delivery must not be re-claimed ahead of the next one"
+    );
+
+    // ...and once its backoff elapses it becomes claimable again, so deferring
+    // delays a delivery rather than dropping it.
+    broker
+        .complete_delivery(
+            next.item.id,
+            "worker-1",
+            next.item.generation,
+            DeliveryCompletion::Retry,
+            Some("tab_not_ready"),
+            130_300,
+        )
+        .unwrap();
+    let later = broker
+        .claim_next_delivery("test-adapter", "worker-1", 120, 130_300 + 60_000)
+        .unwrap()
+        .delivery
+        .expect("backoff expires rather than dropping the delivery");
+    assert_eq!(
+        later.item.id, first_id,
+        "after its backoff the earlier delivery regains its place in id order"
     );
 }
