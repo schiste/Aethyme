@@ -494,6 +494,12 @@ Usage:
       Restore the promoted record for every recoverable candidate in the
       reviewed plan. Re-proves each precondition, writes only status and
       commit details, and rebuilds the missing path exposures.
+  aethyme broker reclaim plan [--json]
+  aethyme broker reclaim apply --confirm <sha256> [--json]
+      Report regenerable build output (target, node_modules, .venv, build,
+      dist) in session worktrees, and remove only what was reviewed. An active
+      session's artefacts are listed but never removed. Nothing here is
+      recreated for you: a reclaimed worktree pays a cold build next time.
   aethyme broker gc plan [--json]
       Report exact retention-eligible rows, runtime files, represented
       worktrees/refs, estimated bytes, blockers, and a stable plan digest.
@@ -4480,6 +4486,116 @@ fn run_pull_request_watch(parsed: Parsed) -> Result<(), UsageError> {
     Ok(())
 }
 
+fn run_reclaim(parsed: Parsed) -> Result<(), UsageError> {
+    let action = parsed
+        .positional
+        .first()
+        .map(String::as_str)
+        .unwrap_or("plan");
+    let mut broker = open_broker(true)?;
+    // This repository's own worktree directory, not the shared container:
+    // reclaiming another repository's build output from here would be a
+    // surprise, and that repository's broker knows which of its sessions are
+    // live while this one does not.
+    let Some(root) = broker.worktree_root_plan()?.preferred_root else {
+        return Err(UsageError::Message(
+            "this repository has no broker worktree root to reclaim from".into(),
+        ));
+    };
+    // Only sessions actually working are protected. An idle or stale session
+    // may be one that simply cannot be closed, and those are precisely the
+    // worktrees whose build output accumulates.
+    let now = now_ms();
+    let active: Vec<std::path::PathBuf> = broker
+        .agents(now)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|agent| agent.derived_status == crate::SessionStatus::Active)
+        .map(|agent| std::path::PathBuf::from(agent.session.worktree_path.clone()))
+        .collect();
+    let candidates = crate::scan_reclaim(&root, &active);
+    let digest = crate::reclaim::plan_digest(&root, &candidates);
+    let plan = crate::ReclaimPlan {
+        digest: digest.clone(),
+        root: root.clone(),
+        reclaimable_bytes: crate::reclaimable_bytes(&candidates),
+        total_bytes: candidates.iter().map(|c| c.bytes).sum(),
+        candidates,
+    };
+    let gib = |bytes: u64| format!("{:.1} GiB", bytes as f64 / (1024.0 * 1024.0 * 1024.0));
+    match action {
+        "plan" => {
+            if parsed.json {
+                out!("{}", serde_json::to_string_pretty(&plan)?);
+            } else {
+                out!(
+                    "Reclaim plan {}: {} reclaimable of {} found",
+                    plan.digest,
+                    gib(plan.reclaimable_bytes),
+                    gib(plan.total_bytes)
+                );
+                for candidate in plan.candidates.iter().take(20) {
+                    out!(
+                        "  {:>10}  {}{}",
+                        gib(candidate.bytes),
+                        candidate.path.display(),
+                        if candidate.reclaimable {
+                            ""
+                        } else {
+                            "  (active session; kept)"
+                        }
+                    );
+                }
+                if plan.reclaimable_bytes == 0 {
+                    out!("Nothing to reclaim.");
+                } else {
+                    out!(
+                        "Apply with: aethyme broker reclaim apply --confirm {}",
+                        plan.digest
+                    );
+                }
+            }
+        }
+        "apply" => {
+            let confirm = parsed.confirm.as_deref().ok_or_else(|| {
+                UsageError::Message("reclaim apply requires --confirm <sha256>".into())
+            })?;
+            // Re-derived from a fresh scan, so a plan whose candidates moved is
+            // refused rather than applied to a different set than was reviewed.
+            if confirm != plan.digest {
+                return Err(UsageError::Message(format!(
+                    "confirmation does not match the current plan; re-run `aethyme broker reclaim plan` and review it again (current {})",
+                    plan.digest
+                )));
+            }
+            let outcome = crate::apply_reclaim(&plan);
+            if parsed.json {
+                out!("{}", serde_json::to_string_pretty(&outcome)?);
+            } else {
+                out!(
+                    "Reclaimed {} from {} director{}",
+                    gib(outcome.reclaimed_bytes),
+                    outcome.removed.len(),
+                    if outcome.removed.len() == 1 {
+                        "y"
+                    } else {
+                        "ies"
+                    }
+                );
+                for skipped in &outcome.skipped {
+                    out!("  skipped: {skipped}");
+                }
+            }
+        }
+        other => {
+            return Err(UsageError::Message(format!(
+                "unknown reclaim action {other:?}; expected plan or apply"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn run_deliveries(parsed: Parsed) -> Result<(), UsageError> {
     let action = parsed
         .positional
@@ -6385,6 +6501,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
         }
         "report" => run_report(parsed)?,
         "external-events" => run_external_events(parsed)?,
+        "reclaim" => run_reclaim(parsed)?,
         "deliveries" => run_deliveries(parsed)?,
         "review" => run_review(parsed)?,
         "prepare" => {

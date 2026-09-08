@@ -79,6 +79,12 @@ pub use chau7_tabs::{
     dispatch_action, resolve_session_tab,
 };
 pub use pr_link::{creates_pull_request, pull_request_number_from_output};
+mod reclaim;
+pub use reclaim::{
+    ReclaimCandidate, ReclaimOutcome, ReclaimPlan, apply as apply_reclaim,
+    classify as classify_reclaim, directory_bytes, is_artefact_directory,
+    is_within as reclaim_is_within, reclaimable_bytes, scan as scan_reclaim,
+};
 mod repository_contract;
 mod resources;
 mod retention;
