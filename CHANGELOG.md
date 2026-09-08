@@ -4,6 +4,35 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.7.15] - 2026-09-08
+
+### Added
+
+- Pull request review activity is routed back to the session that opened the
+  pull request. `aethyme broker watch pr monitoring activate --session <id>`
+  opts a session in; while active, a pull request opened through `broker gh`
+  starts its watch automatically. Off by default, so no session is interrupted
+  without asking.
+- `aethyme broker deliveries resolve-tab` and `deliveries dispatch` decide
+  which Chau7 tab is running a session and whether it can take a message now.
+  Resolution is by worktree identity, and refuses when it cannot pick exactly
+  one tab.
+- A Chau7 transport adapter and a launchd agent template under
+  `packages/aethyme/scripts/adapters/`, so the loop runs on a schedule. The
+  broker itself still starts no background poller.
+- `broker status` reports unresolved coordinated operations, naming the holder,
+  how long it has held, and what is parked behind it.
+
+### Fixed
+
+- A deferred delivery is no longer re-claimed immediately, which previously
+  starved every delivery behind it for that adapter.
+- Checkout discovery no longer escapes a removed merge-simulation worktree and
+  resolves the enclosing repository.
+- `main reconcile` usage text lists the resolution flags it accepts, and the
+  CLI reference no longer documents a `gates affected --why` flag that was
+  never implemented.
+
 ## [0.7.14] - 2026-09-07
 
 ### Added
