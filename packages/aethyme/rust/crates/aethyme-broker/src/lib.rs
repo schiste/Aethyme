@@ -30,6 +30,7 @@ pub use disk_headroom::{
 };
 pub mod cli;
 mod cli_output;
+mod console;
 pub mod contract_check;
 mod delivery;
 mod error;
@@ -129,6 +130,12 @@ pub use broker::{
     StartReport, StatusAdvice, StatusAdviceSeverity, StatusIntegrationRelation, StatusSummary,
     StatusView, VersionRepairReport, VersionRepairStep, WORKTREE_ROOT_SCHEMA_VERSION,
     WorktreePlacement, WorktreeRootPlan, WorktreeRootSource,
+};
+pub use console::{
+    CONSOLE_EXCLUSIVE_KEY, CONSOLE_NAMESPACE_KEY, CONSOLE_PORT_KEY, CONSOLE_SLOT_KEY,
+    ConsoleConfig, ConsoleIdentity, ConsoleMode, DEFAULT_CONSOLE_POOL_LIMIT, DEFAULT_CONSOLE_PORT,
+    DEFAULT_CONSOLE_PORT_END, DEFAULT_CONSOLE_TTL_SECONDS, console_identity, console_leases,
+    console_port, console_request, worktree_fingerprint,
 };
 pub use delivery::{
     DEFAULT_DELIVERY_CLAIM_SECONDS, DELIVERY_ADAPTER_PROTOCOL_VERSION,

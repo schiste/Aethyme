@@ -449,6 +449,27 @@ until an explicit fetch makes ancestry verification possible.
 - `aethyme broker resources release <grant.json> [--json]`
 - `aethyme broker resources list [--all] [--json]`
 - `aethyme broker resources reconcile <lease-id> --confirm <generation> [--json]`
+- `aethyme broker console [status] [--json]`
+- `aethyme broker console plan [--json]`
+- `aethyme broker console run [--wait <duration>] [--json] -- <command> ...`
+
+A dev server is a host resource, and agent isolation and operator singularity
+want opposite defaults from it. `console` composes the `resources` primitives
+into the two regimes rather than adding a new one, selected by `[console] mode`
+in `.aethyme/config.toml`:
+
+| mode | reserves | for |
+| --- | --- | --- |
+| `singular` (default) | one exclusive key per repository, one pinned port | one operator, one bookmarkable URL, a second launch refused by name |
+| `per_worktree` | a port from a range, a namespace, one slot from a bounded pool | several agent worktrees serving concurrently without exhausting the host |
+| `unmanaged` | nothing | a repository that coordinates its dev server elsewhere |
+
+The default is `singular` because two servers silently answering on two ports
+costs an operator a debugging session, while defaulting wrong for a large
+repository costs one line of configuration. Allocations reach the command as
+`AETHYME_RESOURCE_PORT`, `AETHYME_RESOURCE_NAMESPACE`, and
+`AETHYME_RESOURCE_SLOT`. Other keys: `port`, `port_end`, `pool_limit`,
+`ttl_seconds`.
 - `aethyme broker gates validate [--json]`
 - `aethyme broker gates doctor [--probe] [--only <gate>] [--json]`
 - `aethyme broker gates manifest [--head <ref>] [--json]`

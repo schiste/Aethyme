@@ -192,6 +192,23 @@ Usage:
   aethyme broker resources reconcile <lease-id> --confirm <generation> [--json]
       Release an expired, quarantined allocation after reviewing host cleanup.
       The generation confirmation fences stale cleanup commands.
+  aethyme broker console [status] [--json]
+      Show which consoles are serving this repository right now, this
+      repository's console mode, and whether this checkout is the canonical
+      one. Read-only; reserves nothing.
+  aethyme broker console plan [--json]
+      Show exactly what a console launch would reserve under the current mode
+      without reserving it.
+  aethyme broker console run [--wait <duration>] [--json] -- <command> ...
+      Run a dev server under the repository's console mode. `singular` takes
+      one exclusive key and one pinned port, so a second launch anywhere on
+      this host is refused with the console that already holds it.
+      `per_worktree` takes a distinct port, namespace, and one slot from a
+      bounded pool, so worktrees run side by side without exhausting the host.
+      `unmanaged` reserves nothing and executes directly. Allocations reach
+      the command as AETHYME_RESOURCE_PORT, AETHYME_RESOURCE_NAMESPACE, and
+      AETHYME_RESOURCE_SLOT. Configure with [console] in .aethyme/config.toml:
+      mode, port, port_end, pool_limit, ttl_seconds.
   aethyme broker exec --session <id> -- <command> [--json]
       Run a command in the session worktree, then fail if it creates or
       modifies dirty paths outside explicit leases or in adoption-time
@@ -618,6 +635,7 @@ const KNOWN_COMMAND_WORDS: &[&str] = &[
     "leases",
     "export",
     "resources",
+    "console",
     "prepare",
     "claim",
     "release",
@@ -847,6 +865,7 @@ fn command_records_metric(args: &[String]) -> bool {
         }
         Some("hooks") => args.get(1).map(String::as_str) != Some("status"),
         Some("leases") => !matches!(args.get(1).map(String::as_str), Some("plan" | "export")),
+        Some("console") => args.get(1).map(String::as_str) == Some("run"),
         Some("resources") => !matches!(args.get(1).map(String::as_str), Some("plan" | "list")),
         Some("events") => args.get(1).map(String::as_str) == Some("prune"),
         Some("gates") => match args.get(1).map(String::as_str) {
@@ -6040,6 +6059,291 @@ fn short_sha(value: &str) -> &str {
     &value[..12.min(value.len())]
 }
 
+/// `console` resolves the repository from the current directory rather than
+/// from a session id: an operator starting a dev server is not necessarily in
+/// a broker session, and requiring one would put coordination behind exactly
+/// the step people skip.
+fn console_context() -> Result<(crate::ConsoleConfig, String, PathBuf, PathBuf), UsageError> {
+    let cwd = std::env::current_dir().map_err(|error| UsageError::Message(error.to_string()))?;
+    let repo = crate::GitRepo::discover(&cwd).map_err(|error| {
+        UsageError::Message(format!("console requires a git checkout: {error}"))
+    })?;
+    let worktree_root = repo.root().to_path_buf();
+    let main_root = repo
+        .main_root()
+        .map_err(|error| UsageError::Message(error.to_string()))?;
+    // The same `origin` anchor gates use, so one repository keeps one key
+    // across gate leases and console leases alike. Anchored on the primary
+    // checkout rather than this one: with no `origin` the fingerprint falls
+    // back to a directory name, and taking it from a linked worktree would
+    // give every worktree its own key -- which is exactly the contention
+    // `singular` exists to create.
+    let anchor = crate::GitRepo::discover(&main_root).unwrap_or(repo);
+    let repository = crate::gates::git_origin_fingerprint(&anchor);
+    let config = crate::ConsoleConfig::load(&main_root);
+    Ok((config, repository, main_root, worktree_root))
+}
+
+fn run_console(parsed: Parsed) -> Result<(), UsageError> {
+    let action = parsed
+        .positional
+        .first()
+        .map(String::as_str)
+        .unwrap_or("status");
+    let (config, repository, main_root, worktree_root) = console_context()?;
+    let identity = crate::console_identity(&config, &repository, &main_root, &worktree_root);
+    match action {
+        "status" => {
+            let coordinator = crate::HostResourceCoordinator::open_read_only_default()?;
+            let leases = crate::console_leases(&coordinator.list(false)?, &repository);
+            let canonical_fingerprint = crate::worktree_fingerprint(&main_root);
+            if parsed.json {
+                let running: Vec<_> = leases
+                    .iter()
+                    .map(|lease| {
+                        serde_json::json!({
+                            "lease_id": lease.lease_id,
+                            "port": crate::console_port(lease),
+                            "worktree_fingerprint": lease.worktree_fingerprint,
+                            "canonical": lease.worktree_fingerprint == canonical_fingerprint,
+                            "state": lease.state.as_str(),
+                            "holder_pid": lease.holder_pid,
+                            "expires_at": lease.expires_at,
+                        })
+                    })
+                    .collect();
+                out!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "identity": identity,
+                        "canonical_checkout": main_root,
+                        "this_checkout": worktree_root,
+                        "running": running,
+                    }))?
+                );
+            } else {
+                out!("Console mode: {}", config.mode.as_str());
+                out!("Canonical checkout: {}", main_root.display());
+                out!(
+                    "This checkout: {} ({})",
+                    worktree_root.display(),
+                    if identity.canonical {
+                        "canonical"
+                    } else {
+                        "agent worktree — not canonical"
+                    }
+                );
+                if leases.is_empty() {
+                    out!("Running consoles: none");
+                } else {
+                    out!("Running consoles: {}", leases.len());
+                    for lease in &leases {
+                        out!(
+                            "  {:<10} port {:<6} pid {:<8} {}{}",
+                            lease.state.as_str(),
+                            crate::console_port(lease).unwrap_or("-"),
+                            lease
+                                .holder_pid
+                                .map_or_else(|| "-".into(), |pid| pid.to_string()),
+                            &lease.worktree_fingerprint[..12.min(lease.worktree_fingerprint.len())],
+                            if lease.worktree_fingerprint == canonical_fingerprint {
+                                " (canonical)"
+                            } else {
+                                " (worktree)"
+                            }
+                        );
+                    }
+                }
+            }
+        }
+        "plan" => {
+            let Some(request) =
+                crate::console_request(&config, &repository, &worktree_root, "plan", None)
+            else {
+                return unmanaged_notice(parsed.json, "plan");
+            };
+            let coordinator = crate::HostResourceCoordinator::open_read_only_default()?;
+            let plan = coordinator.plan(&request)?;
+            if parsed.json {
+                out!("{}", serde_json::to_string_pretty(&plan)?);
+            } else {
+                out!(
+                    "Console plan ({}) — {} (advisory; run is authoritative)",
+                    config.mode.as_str(),
+                    if plan.available {
+                        "available"
+                    } else {
+                        "blocked"
+                    }
+                );
+                for allocation in &plan.proposed {
+                    out!(
+                        "  proposed {:<12} {:<14} {}",
+                        allocation.key,
+                        allocation.kind,
+                        allocation.value
+                    );
+                }
+                for conflict in &plan.conflicts {
+                    out!(
+                        "  conflict {:<12} {}",
+                        conflict.resource_key,
+                        conflict.reason
+                    );
+                }
+            }
+        }
+        "run" => {
+            if parsed.exec_command.is_empty() {
+                return Err(UsageError::Message(
+                    "console run requires -- <command> [args...]".into(),
+                ));
+            }
+            let run_id = format!("pid{}", std::process::id());
+            let Some(request) = crate::console_request(
+                &config,
+                &repository,
+                &worktree_root,
+                &run_id,
+                Some(std::process::id()),
+            ) else {
+                // Unmanaged reserves nothing, so there is nothing to supervise.
+                // Running the command anyway keeps one spelling of "start the
+                // console" working in every mode.
+                return run_unmanaged_console(&parsed.exec_command, &worktree_root, parsed.json);
+            };
+            let wait = parsed
+                .wait
+                .as_deref()
+                .map(parse_resource_duration)
+                .transpose()?
+                .unwrap_or_default();
+            let mut coordinator = crate::HostResourceCoordinator::open_default()?;
+            let json = parsed.json;
+            let report = coordinator.run_supervised(
+                &request,
+                wait,
+                &parsed.exec_command,
+                parsed.cleanup_command.as_deref(),
+                &worktree_root,
+                |message| {
+                    if json {
+                        eprintln!(
+                            "{}",
+                            serde_json::json!({
+                                "type": "console_run_event",
+                                "request_id": request.request_id,
+                                "message": message,
+                            })
+                        );
+                    } else {
+                        eprintln!("console: {message}");
+                    }
+                },
+            );
+            let report = match report {
+                Ok(report) => report,
+                // Contention here is the feature, not a fault: in `singular`
+                // it means a console is already serving this repository. Say
+                // which one instead of reporting a bare resource conflict.
+                Err(crate::HostResourceRunError::Resource(
+                    crate::HostResourceError::Conflict { conflicts, .. },
+                )) => {
+                    let coordinator = crate::HostResourceCoordinator::open_read_only_default()?;
+                    let running = crate::console_leases(&coordinator.list(false)?, &repository);
+                    let mut message =
+                        String::from("a console is already running for this repository");
+                    for lease in &running {
+                        message.push_str(&format!(
+                            "\n  port {} pid {} (aethyme broker console status)",
+                            crate::console_port(lease).unwrap_or("-"),
+                            lease
+                                .holder_pid
+                                .map_or_else(|| "-".into(), |pid| pid.to_string()),
+                        ));
+                    }
+                    if running.is_empty() {
+                        for conflict in &conflicts {
+                            message.push_str(&format!(
+                                "\n  {} {}",
+                                conflict.resource_key, conflict.reason
+                            ));
+                        }
+                    }
+                    return Err(UsageError::Message(message));
+                }
+                Err(error) => return Err(error.into()),
+            };
+            if json {
+                eprintln!("{}", serde_json::to_string(&report)?);
+            } else {
+                eprintln!(
+                    "console: child={} final={}",
+                    report.child_exit_code,
+                    report.final_lease_state.as_str()
+                );
+            }
+            let exit = if report.child_exit_code != 0 {
+                report.child_exit_code
+            } else if report.authority_lost
+                || report.final_lease_state != crate::HostLeaseState::Released
+            {
+                70
+            } else {
+                0
+            };
+            if exit != 0 {
+                return Err(UsageError::SilentExit(exit));
+            }
+        }
+        other => {
+            return Err(UsageError::Message(format!(
+                "unknown console action {other:?}; expected status, plan, or run"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn unmanaged_notice(json: bool, action: &str) -> Result<(), UsageError> {
+    if json {
+        out!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "mode": "unmanaged",
+                "action": action,
+                "reserved": serde_json::Value::Null,
+            }))?
+        );
+    } else {
+        out!("Console mode: unmanaged — nothing is reserved and nothing is coordinated.");
+    }
+    Ok(())
+}
+
+/// Unmanaged still runs the command, so a repository can opt out of
+/// coordination without every operator learning a second way to start.
+fn run_unmanaged_console(command: &[String], cwd: &Path, json: bool) -> Result<(), UsageError> {
+    if !json {
+        eprintln!("console: unmanaged mode — no lease, no port reservation");
+    }
+    let status = std::process::Command::new(&command[0])
+        .args(&command[1..])
+        .current_dir(cwd)
+        .status()
+        .map_err(|error| UsageError::Message(error.to_string()))?;
+    // A signal-killed child reports no code; 70 keeps it distinguishable from
+    // a clean exit rather than collapsing to success.
+    let code = status
+        .code()
+        .and_then(|code| u8::try_from(code).ok())
+        .unwrap_or(70);
+    if code != 0 {
+        return Err(UsageError::SilentExit(code));
+    }
+    Ok(())
+}
+
 fn run_resources(parsed: Parsed) -> Result<(), UsageError> {
     let action = parsed
         .positional
@@ -6708,6 +7012,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                 }
             }
         }
+        "console" => run_console(parsed)?,
         "resources" => run_resources(parsed)?,
         "agents" => {
             let mut broker = open_broker(parsed.read_only_snapshot)?;

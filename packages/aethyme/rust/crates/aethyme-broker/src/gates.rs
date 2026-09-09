@@ -1247,7 +1247,7 @@ fn acquire_gate_resources(
     }))
 }
 
-fn git_origin_fingerprint(repo: &GitRepo) -> String {
+pub(crate) fn git_origin_fingerprint(repo: &GitRepo) -> String {
     let material = repo
         .resolve_remote_target("origin", None)
         .map(|target| target.coordination_key)
