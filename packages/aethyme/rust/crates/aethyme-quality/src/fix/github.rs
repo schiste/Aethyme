@@ -931,6 +931,12 @@ mod tests {
             remote_branches.contains("autofix/"),
             "pushed: {remote_branches}"
         );
-        assert!(!gh.is_clean_working_tree() || true);
+        // The patch was applied, committed and pushed, so nothing is left
+        // uncommitted -- the PR call failing afterwards does not put the
+        // checkout back into a dirty state.
+        assert!(
+            gh.is_clean_working_tree(),
+            "the autofix left uncommitted changes behind"
+        );
     }
 }
