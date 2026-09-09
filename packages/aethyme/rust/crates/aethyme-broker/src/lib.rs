@@ -72,6 +72,7 @@ mod reconciliation;
 mod release_compatibility;
 pub mod release_manifest;
 mod remote_target;
+mod removal;
 pub mod renamed_targets;
 mod report;
 mod report_filing;

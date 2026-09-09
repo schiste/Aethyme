@@ -833,7 +833,21 @@ pub struct CleanupProvenance {
     pub accepted_queue_entry_id: Option<i64>,
     pub accepted_queue_status: Option<MergeStatus>,
     pub represented_on: Option<String>,
+    /// The commit that carried this head's work, when a recorded
+    /// representation -- not ancestry -- is what proved it landed.
+    pub represented_by_commit: Option<String>,
     pub pending_commit_count: u64,
+}
+
+/// What a recorded representation says about one session head.
+enum RecordedRepresentationEvidence {
+    /// A named commit on a delivery target carried this head's work.
+    Landed {
+        representing: String,
+        target: String,
+    },
+    /// The branch already held this head's net content, so no commit carried it.
+    AlreadyHeld,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -6612,12 +6626,55 @@ impl Broker {
             return false;
         }
         let Ok(checkout) = GitRepo::discover(&canonical_path) else {
-            return false;
+            // A worktree whose removal was interrupted after deregistration is
+            // no longer discoverable, so this arm used to report it as "outside
+            // the broker-owned worktree directory" -- a claim that is false on
+            // its face, since containment under the owned root was proven
+            // above. That wrong answer is what blocked the documented recovery
+            // and forced a manual `rm -rf` (#165). Fall back to the orphan's
+            // own `.git` pointer, which still names the repository it belonged
+            // to.
+            return self.is_orphaned_worktree_of_this_repository(&canonical_path);
         };
         match (checkout.git_common_dir(), self.repo.git_common_dir()) {
             (Ok(actual), Ok(expected)) => actual == expected,
             _ => false,
         }
+    }
+
+    /// Whether a directory is the remains of a worktree of *this* repository
+    /// whose registration is already gone.
+    ///
+    /// The `.git` file survives the interrupted removal pointing at
+    /// `<common dir>/worktrees/<name>`, and that pointer is the evidence. It is
+    /// checked rather than trusted for containment -- the caller has already
+    /// proven the path sits under the broker-owned root, so this only has to
+    /// establish which repository the remains belong to, not that they are safe
+    /// to touch.
+    fn is_orphaned_worktree_of_this_repository(&self, path: &Path) -> bool {
+        let Ok(expected) = self.repo.git_common_dir() else {
+            return false;
+        };
+        let Ok(pointer) = std::fs::read_to_string(path.join(".git")) else {
+            return false;
+        };
+        let Some(gitdir) = pointer.trim().strip_prefix("gitdir:") else {
+            return false;
+        };
+        let gitdir = PathBuf::from(gitdir.trim());
+        // The gitdir itself is gone -- that is the definition of this state --
+        // so compare the `worktrees/<name>` parent it named, not the leaf.
+        let Some(worktrees_dir) = gitdir.parent() else {
+            return false;
+        };
+        if worktrees_dir.file_name() != Some(std::ffi::OsStr::new("worktrees")) {
+            return false;
+        }
+        let Some(claimed_common_dir) = worktrees_dir.parent() else {
+            return false;
+        };
+        let canonical = |path: &Path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        canonical(claimed_common_dir) == canonical(&expected)
     }
 
     fn worktree_root_marker_matches(&self, root: &Path) -> bool {
@@ -6689,7 +6746,100 @@ impl Broker {
         Ok((disposition, reason, Some(provenance)))
     }
 
+    /// Whether a session's work is represented on a delivery target.
+    ///
+    /// Two kinds of evidence answer this, and both are needed. Ancestry is the
+    /// primary one: it is cheap, always available, and needs no prior record.
+    /// It is also blind to a squash merge, which rewrites the SHA so the
+    /// session's commits appear nowhere in the target's history even though
+    /// its content is there -- and a session that merged that way is left
+    /// uncleanable forever (#164). A recorded representation covers exactly
+    /// that gap, so it is consulted only when ancestry comes up short.
     fn cleanup_provenance(
+        &self,
+        session: &Session,
+        session_head: &str,
+        delivery_targets: &[String],
+    ) -> Result<(CleanupProvenance, String), BrokerOpError> {
+        let (mut provenance, reason) =
+            self.cleanup_provenance_from_ancestry(session, session_head, delivery_targets)?;
+        if matches!(
+            provenance.representation,
+            CleanupRepresentation::Represented
+        ) {
+            return Ok((provenance, reason));
+        }
+        let Some(evidence) =
+            self.recorded_representation_evidence(session, session_head, delivery_targets)?
+        else {
+            return Ok((provenance, reason));
+        };
+        provenance.representation = CleanupRepresentation::Represented;
+        provenance.pending_commit_count = 0;
+        let reason = match evidence {
+            RecordedRepresentationEvidence::Landed {
+                representing,
+                target,
+            } => {
+                let text = format!(
+                    "recorded representation: session head {} landed as {} on delivery target {}",
+                    short_commit(session_head),
+                    short_commit(&representing),
+                    short_commit(&target)
+                );
+                provenance.represented_on = Some(target);
+                provenance.represented_by_commit = Some(representing);
+                text
+            }
+            RecordedRepresentationEvidence::AlreadyHeld => format!(
+                "recorded representation: the default branch already held the net content of \
+                 session head {}",
+                short_commit(session_head)
+            ),
+        };
+        Ok((provenance, reason))
+    }
+
+    /// A recorded representation, when it proves this exact head landed.
+    ///
+    /// The record is evidence because of how narrowly it is bound: to one
+    /// reviewed `(session, head)` pair, naming the one commit that carried the
+    /// work. This checks that binding rather than the far weaker claim that
+    /// the content turns up somewhere. A record written for a different head
+    /// does not apply -- a session that has committed since is judged on its
+    /// current head and finds nothing here -- and a representing commit that
+    /// has not reached a delivery target proves nothing either.
+    fn recorded_representation_evidence(
+        &self,
+        session: &Session,
+        session_head: &str,
+        delivery_targets: &[String],
+    ) -> Result<Option<RecordedRepresentationEvidence>, BrokerOpError> {
+        let Some(record) = self
+            .store
+            .session_representation(session.id, session_head)?
+        else {
+            return Ok(None);
+        };
+        let Some(representing) = record.representing_commit else {
+            // Recorded with no carrying commit: the branch already held this
+            // head's net content, so there is nothing left to locate.
+            return Ok(Some(RecordedRepresentationEvidence::AlreadyHeld));
+        };
+        let Some(target) = delivery_targets
+            .iter()
+            .find(|target| self.repo.is_ancestor(&representing, target))
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        Ok(Some(RecordedRepresentationEvidence::Landed {
+            representing,
+            target,
+        }))
+    }
+
+    fn cleanup_provenance_from_ancestry(
         &self,
         session: &Session,
         session_head: &str,
@@ -6705,6 +6855,7 @@ impl Broker {
             accepted_queue_entry_id: session.accepted_queue_entry_id,
             accepted_queue_status: None,
             represented_on: None,
+            represented_by_commit: None,
             pending_commit_count: 0,
         };
 
@@ -6839,6 +6990,40 @@ impl Broker {
         ))
     }
 
+    /// Eligibility judged from the session branch rather than the worktree.
+    fn branch_provenance_disposition(
+        &self,
+        session: &Session,
+        session_head: &str,
+    ) -> Result<(CleanupDisposition, String, Option<CleanupProvenance>), BrokerOpError> {
+        let mut delivery_targets = vec![self.repo.head_commit()?];
+        if let Some(integration) = self.integration_tip() {
+            delivery_targets.push(integration);
+        }
+        if let Some((_upstream, head)) = self.repo.tracking_upstream() {
+            delivery_targets.push(head);
+        }
+        delivery_targets.sort();
+        delivery_targets.dedup();
+        Ok(
+            match self.cleanup_provenance(session, session_head, &delivery_targets) {
+                Ok((provenance, reason)) => {
+                    let disposition = match provenance.representation {
+                        CleanupRepresentation::Represented => CleanupDisposition::Eligible,
+                        CleanupRepresentation::Pending => CleanupDisposition::PendingCommits,
+                        CleanupRepresentation::Unproven => CleanupDisposition::UnprovenProvenance,
+                    };
+                    (disposition, reason, Some(provenance))
+                }
+                Err(error) => (
+                    CleanupDisposition::InspectionFailed,
+                    format!("cleanup inspection failed: {error}"),
+                    None,
+                ),
+            },
+        )
+    }
+
     fn cleanup_item(
         &self,
         session: &Session,
@@ -6855,52 +7040,41 @@ impl Broker {
         } else {
             Some(0)
         };
-        let (mut disposition, mut reason, provenance) = if !self
-            .is_broker_owned_worktree(session, &worktree_path)
-        {
-            (
-                CleanupDisposition::UnsafePath,
-                "spawned session path is outside the broker-owned worktree directory".into(),
+        let (mut disposition, mut reason, provenance) =
+            if !self.is_broker_owned_worktree(session, &worktree_path) {
+                (
+                    CleanupDisposition::UnsafePath,
+                    "spawned session path is outside the broker-owned worktree directory".into(),
+                    None,
+                )
+            } else if worktree_present && !is_orphaned_worktree_directory(&worktree_path) {
+                match self.cleanup_eligibility(session.id, &worktree_path) {
+                    Ok(result) => result,
+                    Err(error) => (
+                        CleanupDisposition::InspectionFailed,
+                        format!("cleanup inspection failed: {error}"),
+                        None,
+                    ),
+                }
+            } else if let Some(session_head) = branch_tip.as_deref() {
+                // Two states share this path. A worktree that is simply gone, and
+                // one whose removal was interrupted after deregistration (#165):
+                // its files are on disk but git can no longer read them, so the
+                // branch is the only remaining record of what the session did. It
+                // is also the better record -- the interrupted removal already
+                // deleted part of the tree, so the directory describes nothing.
+                self.branch_provenance_disposition(session, session_head)?
+            } else if worktree_present {
+                (
+                CleanupDisposition::UnprovenProvenance,
+                "worktree directory is no longer a registered git worktree and its branch is gone, \
+                 so nothing records what it held"
+                    .into(),
                 None,
             )
-        } else if worktree_present {
-            match self.cleanup_eligibility(session.id, &worktree_path) {
-                Ok(result) => result,
-                Err(error) => (
-                    CleanupDisposition::InspectionFailed,
-                    format!("cleanup inspection failed: {error}"),
-                    None,
-                ),
-            }
-        } else {
-            let session_head = branch_tip
-                .as_deref()
-                .expect("missing worktree entries are retained only when their branch exists");
-            let mut delivery_targets = vec![self.repo.head_commit()?];
-            if let Some(integration) = self.integration_tip() {
-                delivery_targets.push(integration);
-            }
-            if let Some((_upstream, head)) = self.repo.tracking_upstream() {
-                delivery_targets.push(head);
-            }
-            delivery_targets.sort();
-            delivery_targets.dedup();
-            match self.cleanup_provenance(session, session_head, &delivery_targets) {
-                Ok((provenance, reason)) => {
-                    let disposition = match provenance.representation {
-                        CleanupRepresentation::Represented => CleanupDisposition::Eligible,
-                        CleanupRepresentation::Pending => CleanupDisposition::PendingCommits,
-                        CleanupRepresentation::Unproven => CleanupDisposition::UnprovenProvenance,
-                    };
-                    (disposition, reason, Some(provenance))
-                }
-                Err(error) => (
-                    CleanupDisposition::InspectionFailed,
-                    format!("cleanup inspection failed: {error}"),
-                    None,
-                ),
-            }
-        };
+            } else {
+                unreachable!("entries without a worktree or a branch return None above")
+            };
         if worktree_present
             && provenance.is_some()
             && branch_tip.as_deref()
@@ -7125,6 +7299,15 @@ impl Broker {
             .set_session_status(session_id, SessionStatus::Cleaned, None)?;
         Ok(())
     }
+}
+
+/// Whether a directory that exists is no longer a usable git worktree.
+///
+/// True for the remains of an interrupted `git worktree remove`: the files are
+/// there, the `.git` file is there, and the gitdir it points at is not, so
+/// every git command answers `not a git repository` (#165).
+pub(crate) fn is_orphaned_worktree_directory(path: &Path) -> bool {
+    path.exists() && GitRepo::discover(path).is_err()
 }
 
 pub(crate) fn directory_size_without_following_links(path: &Path) -> std::io::Result<u64> {

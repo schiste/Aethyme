@@ -1264,6 +1264,24 @@ impl GitRepo {
 
     /// Remove a linked worktree. `force` discards uncommitted changes —
     /// callers must have applied the dirty-check policy first.
+    ///
+    /// `git worktree remove` deregisters the worktree and *then* deletes the
+    /// directory. When the delete aborts partway — a gitignored file appearing
+    /// mid-walk is enough (#165) — the administrative half is already torn down
+    /// while the files remain, and every later attempt answers
+    /// `is not a working tree`. The directory becomes unrecoverable through
+    /// this lane, which is how sessions ended up needing a manual `rm -rf`.
+    ///
+    /// So that one state is finished here instead of being handed back: delete
+    /// the tree with retries, then `prune` to reconcile the registration.
+    ///
+    /// Recovery is gated on the worktree no longer being a git worktree at all,
+    /// which is deliberately narrow. A dirty checkout that `git` refused to
+    /// remove is still perfectly discoverable, so it takes the untouched error
+    /// path and `force`'s meaning is preserved. The gate does mean an orphan is
+    /// deleted without a dirty check -- but no dirty check exists for it: the
+    /// gitdir that would answer the question is what went missing, and the
+    /// alternative is a directory nothing can ever remove.
     pub fn worktree_remove(&self, worktree: &Path, force: bool) -> Result<(), GitError> {
         let path = worktree.to_str().unwrap_or_default();
         let args: Vec<&str> = if force {
@@ -1271,7 +1289,23 @@ impl GitRepo {
         } else {
             vec!["worktree", "remove", path]
         };
-        run_git(&self.root, &args)?;
+        let Err(error) = run_git(&self.root, &args) else {
+            return Ok(());
+        };
+        if !crate::broker::is_orphaned_worktree_directory(worktree) {
+            // Either nothing was stranded, or the checkout is still a working
+            // tree and the refusal was a real one -- a dirty worktree without
+            // `force`, most often. Reporting it unchanged keeps that visible.
+            return Err(error);
+        }
+        let outcome = crate::removal::remove_tree(worktree);
+        if !outcome.removed {
+            return Err(error);
+        }
+        // The registration may or may not still exist depending on how far the
+        // original command got; prune reconciles both cases and is a no-op when
+        // there is nothing stale.
+        let _ = run_git(&self.root, &["worktree", "prune"]);
         Ok(())
     }
 

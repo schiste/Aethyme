@@ -307,16 +307,24 @@ pub fn apply(plan: &ReclaimPlan) -> ReclaimOutcome {
             ));
             continue;
         }
-        match std::fs::remove_dir_all(&candidate.path) {
-            Ok(()) => {
-                outcome.reclaimed_bytes += candidate.bytes;
-                outcome.removed.push(candidate.path.clone());
-            }
-            // Already gone is the desired state, not a failure.
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => outcome
+        // A build directory is exactly where a removal walk gets interrupted:
+        // it is large, and a tool may still be writing into it. Retrying and
+        // then crediting what was actually freed keeps the report truthful --
+        // an all-or-nothing removal reports zero bytes for a directory it may
+        // have emptied almost completely (#165).
+        let result = crate::removal::remove_tree(&candidate.path);
+        outcome.reclaimed_bytes += result.freed_bytes;
+        if result.removed {
+            outcome.removed.push(candidate.path.clone());
+        } else if let Some(error) = result.error.as_deref() {
+            let progress = if result.is_partial() {
+                format!(" ({} byte(s) freed before it failed)", result.freed_bytes)
+            } else {
+                String::new()
+            };
+            outcome
                 .skipped
-                .push(format!("{}: {error}", candidate.path.display())),
+                .push(format!("{}: {error}{progress}", candidate.path.display()));
         }
     }
     outcome
@@ -417,6 +425,37 @@ mod scan_tests {
         assert!(outcome.removed.is_empty());
         assert_eq!(outcome.skipped.len(), 1);
         assert!(outside.exists(), "a path outside the root survives");
+    }
+
+    /// A plan is reviewed as text and applied later. Crediting the reviewed
+    /// figure would report bytes that were already gone; the apply measures
+    /// instead, which is the same mechanism that makes a partially removed
+    /// tree credit what it actually freed (#165).
+    #[test]
+    fn reclaimed_bytes_describe_the_apply_rather_than_the_reviewed_plan() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wt = tmp.path().join("s");
+        let target = wt.join("target");
+        write(&target.join("debug/big.bin"), 4096);
+        let candidate = classify(&target, &wt, 4096, &[]);
+        assert!(candidate.reclaimable);
+
+        // Between review and apply, a build tool cleared most of it.
+        std::fs::remove_file(target.join("debug/big.bin")).unwrap();
+        write(&target.join("debug/small.bin"), 16);
+
+        let outcome = apply(&ReclaimPlan {
+            digest: "test".into(),
+            root: tmp.path().to_path_buf(),
+            candidates: vec![candidate],
+            reclaimable_bytes: 4096,
+            total_bytes: 4096,
+        });
+        assert_eq!(outcome.removed, vec![target]);
+        assert_eq!(
+            outcome.reclaimed_bytes, 16,
+            "the reviewed 4096 was credited instead of the 16 bytes on disk"
+        );
     }
 
     #[test]

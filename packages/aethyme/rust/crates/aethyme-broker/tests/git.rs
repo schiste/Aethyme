@@ -202,3 +202,41 @@ fn dirty_and_unmerged_guards_for_cleanup() {
     repo.worktree_remove(&wt_path, true).unwrap();
     assert!(repo.worktree_paths().unwrap().is_empty());
 }
+
+/// `force`'s meaning has to survive the #165 recovery: a dirty checkout that
+/// git refused to remove is still a working tree, so it must take the error
+/// path untouched rather than being deleted by the orphan recovery.
+#[test]
+fn a_dirty_worktree_refused_without_force_is_not_removed_by_the_orphan_recovery() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+
+    let worktree = tmp.path().join("linked");
+    sh(
+        tmp.path(),
+        "git",
+        &[
+            "worktree",
+            "add",
+            "-q",
+            worktree.to_str().unwrap(),
+            "-b",
+            "side",
+        ],
+    );
+    std::fs::write(worktree.join("uncommitted.txt"), "work in progress\n").unwrap();
+    sh(&worktree, "git", &["add", "uncommitted.txt"]);
+
+    let repo = GitRepo::discover(tmp.path()).unwrap();
+    assert!(
+        repo.worktree_remove(&worktree, false).is_err(),
+        "a dirty worktree was removed without force"
+    );
+    assert!(
+        worktree.join("uncommitted.txt").exists(),
+        "uncommitted work was discarded by the recovery path"
+    );
+
+    repo.worktree_remove(&worktree, true).unwrap();
+    assert!(!worktree.exists());
+}
