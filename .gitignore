@@ -50,6 +50,11 @@ packages/aethyme/dhat-heap.json
 .claude/*
 !.claude/skills/
 
+# The pattern above contains a slash, so git anchors it to the repository
+# root and it does not reach nested checkouts. Workspaces that Claude Code
+# is opened in directly grow their own runtime directory.
+packages/aethyme/.claude/
+
 # aethyme-broker:begin (managed block — do not edit inside)
 .aethyme/broker.db*
 .aethyme/logs/
