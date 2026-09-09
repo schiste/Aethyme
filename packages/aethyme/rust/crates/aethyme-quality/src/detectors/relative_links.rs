@@ -374,7 +374,13 @@ mod tests {
 
         let findings = RelativeLinksDetector.inspect(&repo);
         assert_eq!(findings.len(), 2);
-        assert_eq!(findings[0].file_path, "config.json");
-        assert_eq!(findings[1].file_path, "settings.py");
+        // Detectors emit in filesystem-walk order; `rendered_findings` in
+        // quality_cli is the one place that promises an order. Asserting the
+        // walk order here read as alphabetical only because APFS returns
+        // sorted `readdir` entries -- ext4 does not, so this passed on every
+        // developer machine and failed on every Linux CI run.
+        let mut paths: Vec<&str> = findings.iter().map(|f| f.file_path.as_str()).collect();
+        paths.sort_unstable();
+        assert_eq!(paths, ["config.json", "settings.py"]);
     }
 }
