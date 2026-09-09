@@ -21,9 +21,6 @@ use crate::delivery::{
     DeliveryStatus, DeliverySubscription,
 };
 use crate::error::BrokerError;
-use crate::types::{
-    NewSessionRepresentation, RepresentationDiscovery, SessionRepresentation,
-};
 use crate::external_events::{
     ExternalEventRecord, ExternalEventStatus, NewExternalEventRecord,
     aggregate_ownership_candidates,
@@ -45,6 +42,7 @@ use crate::types::{
     OperationIdentityProvenance, OperationProvider, OperationStatus, PrWatchState, Session,
     SessionCleanupState, SessionNote, SessionOrigin, SessionStatus,
 };
+use crate::types::{NewSessionRepresentation, RepresentationDiscovery, SessionRepresentation};
 
 /// Milliseconds a writer waits on a locked database before erroring.
 const BUSY_TIMEOUT_MS: u64 = 5_000;
@@ -4843,9 +4841,7 @@ fn merge_from_row(row: &rusqlite::Row<'_>) -> RowResult<MergeQueueEntry> {
     })())
 }
 
-fn session_representation_from_row(
-    row: &rusqlite::Row<'_>,
-) -> RowResult<SessionRepresentation> {
+fn session_representation_from_row(row: &rusqlite::Row<'_>) -> RowResult<SessionRepresentation> {
     let raw: String = row.get(5)?;
     let Some(discovery) = RepresentationDiscovery::parse(&raw) else {
         return Ok(Err(BrokerError::InvalidRepresentationDiscovery(raw)));

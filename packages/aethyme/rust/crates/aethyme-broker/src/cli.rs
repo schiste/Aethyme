@@ -4573,8 +4573,15 @@ fn render_representation_scan(scan: &crate::RepresentationScan) {
     }
     match &scan.search.outcome {
         crate::LandingOutcome::NothingToRepresent => {
-            out!("  nothing to represent: this head adds no net change to {}", scan.branch);
-            out!("  next: aethyme broker representation record --session {} --confirm {}", scan.session_id, scan.digest);
+            out!(
+                "  nothing to represent: this head adds no net change to {}",
+                scan.branch
+            );
+            out!(
+                "  next: aethyme broker representation record --session {} --confirm {}",
+                scan.session_id,
+                scan.digest
+            );
         }
         crate::LandingOutcome::Landed(landing) => {
             out!(
@@ -4589,7 +4596,11 @@ fn render_representation_scan(scan: &crate::RepresentationScan) {
                 scan.paths(),
                 scan.search.examined
             );
-            out!("  next: aethyme broker representation record --session {} --confirm {}", scan.session_id, scan.digest);
+            out!(
+                "  next: aethyme broker representation record --session {} --confirm {}",
+                scan.session_id,
+                scan.digest
+            );
         }
         crate::LandingOutcome::NotFound { closest } => {
             out!(

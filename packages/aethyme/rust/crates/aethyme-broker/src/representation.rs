@@ -153,11 +153,11 @@ pub fn session_content(
     base: &str,
     head: &str,
 ) -> Result<SessionContent, BrokerOpError> {
-    let changed =
-        repo.changed_between(base, head)
-            .map_err(|source| BrokerOpError::RepresentationUnavailable {
-                reason: format!("cannot diff {} to {}: {source}", short(base), short(head)),
-            })?;
+    let changed = repo.changed_between(base, head).map_err(|source| {
+        BrokerOpError::RepresentationUnavailable {
+            reason: format!("cannot diff {} to {}: {source}", short(base), short(head)),
+        }
+    })?;
 
     let mut paths = BTreeMap::new();
     for path in changed {
@@ -187,11 +187,7 @@ pub fn content_at(repo: &GitRepo, content: &SessionContent, target: &str) -> Con
 }
 
 /// How many of the session's paths `target` matches, and the first it does not.
-fn match_depth(
-    repo: &GitRepo,
-    content: &SessionContent,
-    target: &str,
-) -> (usize, Option<String>) {
+fn match_depth(repo: &GitRepo, content: &SessionContent, target: &str) -> (usize, Option<String>) {
     let mut matched = 0usize;
     for (path, wanted) in &content.paths {
         if &repo.blob_at(target, path) == wanted {
@@ -267,7 +263,10 @@ pub fn find_landing(
                 truncated: false,
             });
         };
-        if best.as_ref().is_none_or(|prev| matched > prev.matched_paths) {
+        if best
+            .as_ref()
+            .is_none_or(|prev| matched > prev.matched_paths)
+        {
             best = Some(Closest {
                 commit: candidate.clone(),
                 subject: subject(repo, candidate),
@@ -559,7 +558,10 @@ mod tests {
 
         let capped = find_landing(&repo, &content, &tip, 2).unwrap();
         assert_eq!(capped.examined, 2);
-        assert!(capped.truncated, "a capped walk must not read as conclusive");
+        assert!(
+            capped.truncated,
+            "a capped walk must not read as conclusive"
+        );
 
         let full = find_landing(&repo, &content, &tip, DEFAULT_SEARCH_CAP).unwrap();
         assert_eq!(full.examined, 4);

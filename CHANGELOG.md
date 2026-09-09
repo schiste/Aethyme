@@ -4,6 +4,32 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.7.16] - 2026-09-09
+
+### Added
+
+- A session whose work reached the default branch through a provider-side
+  squash or rebase merge can now be recorded and closed. `aethyme broker
+  representation scan --session <id>` searches the commits the default branch
+  gained since the session branched and reports the commit whose content
+  matches the session's own changed paths; `representation record --session
+  <id> --confirm <digest>` stores it. `broker finish` treats a recorded
+  representation as delivery evidence, so the session no longer reports its
+  work as unsubmitted forever.
+
+### Fixed
+
+- `broker finish` no longer refuses a session solely because ancestry cannot
+  see its work. A squash merge rewrites the commit SHA, so ancestry reports a
+  false negative for every pull request merged that way.
+
+### Upgrade notes
+
+- Broker database schema moves from 31 to 32, adding the
+  `session_representations` table. The migration is additive and runs on first
+  write. Older binaries cannot read a migrated database, so upgrade the router
+  and its engine sibling together, as always.
+
 ## [0.7.15] - 2026-09-08
 
 ### Added
