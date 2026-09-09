@@ -1064,3 +1064,153 @@ fn status_names_the_holder_and_who_is_parked_behind_it() {
         "the hold duration is the number that makes a wedge judgeable"
     );
 }
+
+/// A local Git command and a remote one describe the same repository, so they
+/// must be journaled under the same key. Before issue #166 a local `tag` under
+/// `--repo Owner/Repo` was journaled verbatim while the `push` that published
+/// that tag resolved `github.com/owner/repo`, and no comparison keyed on
+/// `repository` could relate the two.
+#[test]
+fn local_and_remote_git_operations_share_one_repository_key() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    git(
+        tmp.path(),
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/Owner/Repo.git",
+        ],
+    );
+    let worktree = add_worktree(tmp.path(), "one-key");
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let session = broker.adopt(&worktree, None).unwrap();
+
+    let mut remote = request(session.id, &["ls-remote", "--get-url", "origin"]);
+    remote.repository = Some("Owner/Repo".into());
+    let remote_key = broker
+        .run_coordinated_operation(remote)
+        .unwrap()
+        .operation
+        .repository;
+
+    let mut asserted = request(session.id, &["tag", "--list"]);
+    asserted.repository = Some("Owner/Repo".into());
+    asserted.declared_effect = Some(OperationEffect::Read);
+    asserted.scope = Some("refs".into());
+    let asserted_key = broker
+        .run_coordinated_operation(asserted)
+        .unwrap()
+        .operation
+        .repository;
+
+    let mut bare = request(session.id, &["tag", "--list"]);
+    bare.declared_effect = Some(OperationEffect::Read);
+    bare.scope = Some("refs".into());
+    let bare_key = broker
+        .run_coordinated_operation(bare)
+        .unwrap()
+        .operation
+        .repository;
+
+    assert_eq!(remote_key, "github.com/owner/repo");
+    assert_eq!(asserted_key, remote_key);
+    assert_eq!(bare_key, remote_key);
+}
+
+/// The head-of-line check matches `repository` exactly, so sharing a key is
+/// what makes it fail closed: a local write left unreconciled must block a
+/// later remote write on the same repository (issue #166).
+#[test]
+fn an_unreconciled_local_write_blocks_a_later_remote_write() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    git(
+        tmp.path(),
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/Owner/Repo.git",
+        ],
+    );
+    let worktree = add_worktree(tmp.path(), "blocks");
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let session = broker.adopt(&worktree, None).unwrap();
+
+    // A local write, journaled under whatever key the broker computes for it.
+    let mut local = request(session.id, &["tag", "wedged"]);
+    local.repository = Some("Owner/Repo".into());
+    local.declared_effect = Some(OperationEffect::Write);
+    local.scope = Some("refs".into());
+    let wedged = broker.run_coordinated_operation(local).unwrap().operation;
+
+    // Strand it the way a crash between start and outcome would.
+    broker
+        .store()
+        .transition_coordinated_operation(wedged.id, OperationStatus::OutcomeUnknown, None, None)
+        .unwrap();
+
+    let mut later = request(session.id, &["ls-remote", "--get-url", "origin"]);
+    later.repository = Some("Owner/Repo".into());
+    later.declared_effect = Some(OperationEffect::Write);
+    later.scope = Some("refs".into());
+
+    match broker.run_coordinated_operation(later) {
+        Err(BrokerOpError::CoordinatedOperationBlocked { operation_id, .. }) => {
+            assert_eq!(operation_id, wedged.id);
+        }
+        other => panic!("remote write was not blocked by {}: {other:?}", wedged.id),
+    }
+}
+
+/// `--repo` on a local command is an assertion, not a free-form label. Accepting
+/// one that contradicts the checkout would journal the operation under a key
+/// nothing else uses (issue #166).
+#[test]
+fn a_local_command_refuses_a_repository_assertion_that_contradicts_origin() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    git(
+        tmp.path(),
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/Owner/Repo.git",
+        ],
+    );
+    let worktree = add_worktree(tmp.path(), "mismatch");
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let session = broker.adopt(&worktree, None).unwrap();
+
+    let mut command = request(session.id, &["tag", "--list"]);
+    command.repository = Some("Other/Elsewhere".into());
+    command.declared_effect = Some(OperationEffect::Read);
+    command.scope = Some("refs".into());
+
+    let error = broker.run_coordinated_operation(command).unwrap_err();
+    assert!(
+        matches!(error, BrokerOpError::InvalidCoordinatedOperation { .. }),
+        "unexpected error: {error:?}"
+    );
+}
+
+/// A checkout with no resolvable remote keeps working. Nothing can collide with
+/// its key, because no remote operation can resolve there either (issue #166).
+#[test]
+fn a_checkout_without_a_remote_falls_back_to_a_local_key() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let worktree = add_worktree(tmp.path(), "no-remote");
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let session = broker.adopt(&worktree, None).unwrap();
+
+    let mut command = request(session.id, &["tag", "--list"]);
+    command.declared_effect = Some(OperationEffect::Read);
+    command.scope = Some("refs".into());
+
+    let report = broker.run_coordinated_operation(command).unwrap();
+    assert!(report.operation.repository.starts_with("local:"));
+}

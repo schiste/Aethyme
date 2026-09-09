@@ -831,6 +831,36 @@ fn remote_git_operation(args: &[String]) -> bool {
     }
 }
 
+/// Coordination key for a Git command that resolves no remote of its own.
+///
+/// `None` means the checkout has no single usable `origin`. That is a fallback,
+/// not a failure: a repository whose remote cannot be resolved cannot be the
+/// target of a remote operation either, so no other spelling can collide with
+/// whatever the caller falls back to.
+///
+/// A caller assertion that contradicts `origin` is refused rather than accepted
+/// under its own private key, which is the rule remote commands already apply.
+fn canonical_local_repository(
+    cwd: &Path,
+    assertion: Option<&str>,
+) -> Result<Option<String>, BrokerOpError> {
+    let Ok(repo) = crate::GitRepo::discover(cwd) else {
+        return Ok(None);
+    };
+    match repo.resolve_remote_target("origin", assertion) {
+        Ok(target) => Ok(Some(target.coordination_key)),
+        Err(crate::RemoteTargetError::AssertionMismatch {
+            assertion,
+            resolved,
+        }) => Err(BrokerOpError::InvalidCoordinatedOperation {
+            reason: format!(
+                "--repo {assertion:?} does not match the repository this checkout's origin identifies ({resolved:?})"
+            ),
+        }),
+        Err(_) => Ok(None),
+    }
+}
+
 fn journal_details(
     classification: &'static str,
     resolved_target: Option<&crate::ResolvedRemoteTarget>,
@@ -1456,20 +1486,42 @@ impl Broker {
             }
             (None, None, OperationProvider::Git) => None,
         };
-        let repository = match (&resolved_target, &request.repository, request.provider) {
-            (Some(target), _, OperationProvider::Git) => target.coordination_key.clone(),
-            (None, Some(_), OperationProvider::Github) => github_target
-                .as_ref()
-                .expect("resolved GitHub target")
-                .coordination_key
-                .clone(),
-            (None, Some(repository), OperationProvider::Git) => repository.clone(),
-            (None, None, OperationProvider::Git) => {
-                format!("local:{}", self.main_root().display())
-            }
-            (Some(_), _, OperationProvider::Github) => unreachable!("validated above"),
-            (None, None, OperationProvider::Github) => unreachable!("validated above"),
-        };
+        // One repository has exactly one coordination key. The head-of-line
+        // check below matches `repository` exactly, so a second spelling is not
+        // cosmetic: a wedged operation journaled as `owner/Name` would not block
+        // a later push journaled as `github.com/owner/name`, and the check that
+        // exists to fail closed would fail open instead (issue #166).
+        let (repository, canonical_identity) =
+            match (&resolved_target, &request.repository, request.provider) {
+                (Some(target), _, OperationProvider::Git) => {
+                    (target.coordination_key.clone(), true)
+                }
+                (None, Some(_), OperationProvider::Github) => (
+                    github_target
+                        .as_ref()
+                        .expect("resolved GitHub target")
+                        .coordination_key
+                        .clone(),
+                    true,
+                ),
+                // A local Git command selects no remote, so it cannot resolve its
+                // own identity the way `push` does. Anchoring it to `origin` --
+                // the same anchor gates already use -- gives `tag -a` and the
+                // `push` that publishes that tag one key instead of two.
+                (None, assertion, OperationProvider::Git) => {
+                    match canonical_local_repository(cwd, assertion.as_deref())? {
+                        Some(key) => (key, true),
+                        None => (
+                            assertion
+                                .clone()
+                                .unwrap_or_else(|| format!("local:{}", self.main_root().display())),
+                            false,
+                        ),
+                    }
+                }
+                (Some(_), _, OperationProvider::Github) => unreachable!("validated above"),
+                (None, None, OperationProvider::Github) => unreachable!("validated above"),
+            };
         let scope_was_declared = request.scope.is_some();
         let scope = request.scope.unwrap_or_else(|| "repository".into());
         validate_scope(&scope)?;
@@ -1528,7 +1580,7 @@ impl Broker {
                 pid: i64::from(std::process::id()),
                 // Not known until the lock is held and the host guard begins.
                 host_operation_id: None,
-                identity_provenance: if resolved_target.is_some() || github_target.is_some() {
+                identity_provenance: if canonical_identity {
                     OperationIdentityProvenance::VerifiedCanonical
                 } else {
                     OperationIdentityProvenance::LocalRepository
