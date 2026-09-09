@@ -1049,6 +1049,151 @@ fn adopt_reuse_sync_refuses_divergence_without_changing_head_or_session() {
     assert_eq!(persisted.diff_base, session.diff_base);
 }
 
+/// The bug: a squash merge puts the session's work on the default branch under
+/// a brand new SHA with no ancestry link, so `finish` counted the session's
+/// commits as unsubmitted forever and the session could never close (#152).
+#[test]
+fn a_squash_merged_session_can_be_recorded_and_finished() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    sh(
+        tmp.path(),
+        &["update-ref", "refs/remotes/origin/main", "HEAD"],
+    );
+    sh(
+        tmp.path(),
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        ],
+    );
+
+    let wt = tmp.path().join("squash-wt");
+    sh(
+        tmp.path(),
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "agent/squash",
+            wt.to_str().unwrap(),
+            "main",
+        ],
+    );
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let session = broker.adopt(&wt, Some("squash task")).unwrap();
+
+    // Two commits in the session, as a real branch would have.
+    std::fs::write(wt.join("feature.txt"), "first\n").unwrap();
+    sh(&wt, &["add", "-A"]);
+    sh(&wt, &["commit", "-qm", "wip"]);
+    std::fs::write(wt.join("feature.txt"), "final\n").unwrap();
+    sh(&wt, &["add", "-A"]);
+    sh(&wt, &["commit", "-qm", "polish"]);
+
+    // The provider squashes: same content, new SHA, no ancestry to the branch.
+    std::fs::write(tmp.path().join("feature.txt"), "final\n").unwrap();
+    sh(tmp.path(), &["add", "-A"]);
+    sh(tmp.path(), &["commit", "-qm", "feat: add feature (#42)"]);
+    let squash = rev(tmp.path(), "HEAD");
+    assert!(
+        !std::process::Command::new("git")
+            .current_dir(tmp.path())
+            .args(["merge-base", "--is-ancestor", &rev(&wt, "HEAD"), &squash])
+            .status()
+            .unwrap()
+            .success(),
+        "the squash must not be a descendant of the session, or the test proves nothing"
+    );
+
+    let blocked = broker.finish(session.id).unwrap();
+    assert_eq!(blocked.status, FinishStatus::Blocked);
+    assert_eq!(blocked.unsubmitted_commits, 2);
+
+    let scan = broker.scan_session_representation(session.id).unwrap();
+    let landing = scan.search.landing().expect("the squash carries the work");
+    assert_eq!(landing.commit, squash);
+    assert_eq!(scan.changed_paths, vec!["feature.txt".to_string()]);
+
+    // A stale confirmation is refused; the printed one is accepted.
+    broker
+        .record_session_representation(session.id, "not-the-digest")
+        .unwrap_err();
+    let recorded = broker
+        .record_session_representation(session.id, &scan.digest)
+        .unwrap();
+    assert_eq!(
+        recorded
+            .existing
+            .as_ref()
+            .and_then(|record| record.representing_commit.clone()),
+        Some(squash.clone())
+    );
+
+    let finished = broker.finish(session.id).unwrap();
+    assert_eq!(finished.status, FinishStatus::Closed);
+    assert_eq!(finished.unsubmitted_commits, 0);
+    assert_eq!(
+        finished
+            .representation
+            .and_then(|record| record.representing_commit),
+        Some(squash)
+    );
+}
+
+/// A session whose work is genuinely still local must not be recordable, and
+/// the refusal has to name what is missing rather than just saying no.
+#[test]
+fn unlanded_work_is_refused_and_the_session_stays_blocked() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    sh(
+        tmp.path(),
+        &["update-ref", "refs/remotes/origin/main", "HEAD"],
+    );
+    sh(
+        tmp.path(),
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        ],
+    );
+
+    let wt = tmp.path().join("local-wt");
+    sh(
+        tmp.path(),
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "agent/local",
+            wt.to_str().unwrap(),
+            "main",
+        ],
+    );
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let session = broker.adopt(&wt, Some("local task")).unwrap();
+    std::fs::write(wt.join("local.txt"), "never merged\n").unwrap();
+    sh(&wt, &["add", "-A"]);
+    sh(&wt, &["commit", "-qm", "local only"]);
+
+    let scan = broker.scan_session_representation(session.id).unwrap();
+    assert!(scan.search.landing().is_none());
+    let err = broker
+        .record_session_representation(session.id, &scan.digest)
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("not represented"),
+        "refusal should say the work is not on the branch, got: {err}"
+    );
+    assert_eq!(
+        broker.finish(session.id).unwrap().status,
+        FinishStatus::Blocked
+    );
+}
+
 #[test]
 fn finish_blocks_dirty_then_unsubmitted_commits() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1105,9 +1250,17 @@ fn finish_blocks_dirty_then_unsubmitted_commits() {
     assert!(unsubmitted.pending_work.present);
     assert_eq!(unsubmitted.pending_work.dirty_path_count, 0);
     assert_eq!(unsubmitted.pending_work.unsubmitted_commits, 1);
+    // Both cures are offered because the warning alone cannot tell unsubmitted
+    // work apart from work that already landed through a pull request (#152).
     assert_eq!(
         unsubmitted.next_commands,
-        vec![format!("aethyme broker submit --session {}", session.id)]
+        vec![
+            format!("aethyme broker submit --session {}", session.id),
+            format!(
+                "aethyme broker representation scan --session {}",
+                session.id
+            ),
+        ]
     );
     assert_ne!(
         broker.store().session(session.id).unwrap().status,

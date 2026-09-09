@@ -90,6 +90,9 @@ pub enum BrokerError {
     #[error("no review lifecycle for session {0}")]
     ReviewLifecycleNotFound(i64),
 
+    #[error("invalid persisted representation discovery {0:?}")]
+    InvalidRepresentationDiscovery(String),
+
     #[error("invalid persisted review lifecycle state {0:?}")]
     InvalidReviewLifecycleState(String),
 

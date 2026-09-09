@@ -67,6 +67,9 @@ pub struct CoordinatedOperationReport {
     pub stderr: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub post_merge_cleanup: Option<PostMergeCleanupReport>,
+    /// Set when a successful merge was observed to carry this session's work
+    /// onto the default branch, so the session can finish without resubmitting.
+    pub representing_commit: Option<String>,
     /// Pull request this operation created, when it created one. Recorded so
     /// the session that opened it can be told about review activity without a
     /// human first noticing the number (#150). The watch is *not* started
@@ -1184,6 +1187,11 @@ impl Broker {
             report.post_merge_cleanup = Some(
                 self.cleanup_after_github_pull_request_merge(session_id, repository.as_deref()),
             );
+            // The cleanup above fetches the upstream first, so the default
+            // branch now carries the merge and the landing is findable. A
+            // squash rewrites the SHA, so without this the session's own work
+            // would look unsubmitted forever (#152).
+            report.representing_commit = self.note_merge_time_representation(session_id, None);
         }
         Ok(report)
     }
@@ -1850,6 +1858,7 @@ impl Broker {
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
             post_merge_cleanup: None,
+            representing_commit: None,
             created_pull_request: created_pull_request_number,
         })
     }

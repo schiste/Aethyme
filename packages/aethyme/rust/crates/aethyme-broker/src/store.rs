@@ -21,6 +21,9 @@ use crate::delivery::{
     DeliveryStatus, DeliverySubscription,
 };
 use crate::error::BrokerError;
+use crate::types::{
+    NewSessionRepresentation, RepresentationDiscovery, SessionRepresentation,
+};
 use crate::external_events::{
     ExternalEventRecord, ExternalEventStatus, NewExternalEventRecord,
     aggregate_ownership_candidates,
@@ -1749,6 +1752,70 @@ impl BrokerStore {
         )?;
         tx.commit()?;
         Ok(())
+    }
+
+    // ── Session representation ───────────────────────────────────────
+
+    /// The recorded representation for one session head, if any.
+    ///
+    /// Keyed by head rather than by session: a session that commits further
+    /// work after its pull request merged is not represented by that merge, and
+    /// must not inherit its record.
+    pub fn session_representation(
+        &self,
+        session_id: i64,
+        session_head: &str,
+    ) -> Result<Option<SessionRepresentation>, BrokerError> {
+        self.conn
+            .query_row(
+                &format!(
+                    "{SESSION_REPRESENTATION_SELECT} \
+                     WHERE session_id = ?1 AND session_head = ?2"
+                ),
+                params![session_id, session_head],
+                session_representation_from_row,
+            )
+            .optional()?
+            .transpose()
+    }
+
+    /// Record that a session head is represented on the default branch.
+    ///
+    /// Idempotent on `(session_id, session_head)`: recording the same landing
+    /// twice is a no-op rather than an error, so a retried merge hook or a
+    /// re-run scan does not fail.
+    pub fn record_session_representation(
+        &mut self,
+        record: &NewSessionRepresentation,
+    ) -> Result<SessionRepresentation, BrokerError> {
+        self.conn.execute(
+            "INSERT INTO session_representations (
+                 session_id, session_head, representing_commit, representing_ref,
+                 discovery, pr_number, paths_json, evidence, created_at
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(session_id, session_head) DO UPDATE SET
+                 representing_commit = excluded.representing_commit,
+                 representing_ref = excluded.representing_ref,
+                 discovery = excluded.discovery,
+                 pr_number = excluded.pr_number,
+                 paths_json = excluded.paths_json,
+                 evidence = excluded.evidence",
+            params![
+                record.session_id,
+                record.session_head,
+                record.representing_commit,
+                record.representing_ref,
+                record.discovery.as_str(),
+                record.pr_number,
+                record.paths_json,
+                record.evidence,
+                now_ms(),
+            ],
+        )?;
+        Ok(self
+            .session_representation(record.session_id, &record.session_head)?
+            .expect("representation just written"))
     }
 
     // ── PR watch state ───────────────────────────────────────────────
@@ -4612,6 +4679,10 @@ const GATE_RESULT_SELECT: &str = "SELECT id, gate_name, tree_hash, definition_ha
 const MERGE_SELECT: &str = "SELECT id, session_id, head_commit, base_commit, status, \
      merged_tree, details_json, created_at, updated_at FROM merge_queue";
 
+const SESSION_REPRESENTATION_SELECT: &str = "SELECT id, session_id, session_head, \
+     representing_commit, representing_ref, discovery, pr_number, paths_json, evidence, \
+     created_at FROM session_representations";
+
 const PR_WATCH_SELECT: &str = "SELECT id, target_branch, pr_number, activity_fingerprint, \
      marker, last_dispatch_at, last_agent_session_id, updated_at FROM pr_watch_state";
 
@@ -4770,6 +4841,27 @@ fn merge_from_row(row: &rusqlite::Row<'_>) -> RowResult<MergeQueueEntry> {
             updated_at: row.get(8)?,
         })
     })())
+}
+
+fn session_representation_from_row(
+    row: &rusqlite::Row<'_>,
+) -> RowResult<SessionRepresentation> {
+    let raw: String = row.get(5)?;
+    let Some(discovery) = RepresentationDiscovery::parse(&raw) else {
+        return Ok(Err(BrokerError::InvalidRepresentationDiscovery(raw)));
+    };
+    Ok(Ok(SessionRepresentation {
+        id: row.get(0)?,
+        session_id: row.get(1)?,
+        session_head: row.get(2)?,
+        representing_commit: row.get(3)?,
+        representing_ref: row.get(4)?,
+        discovery,
+        pr_number: row.get(6)?,
+        paths_json: row.get(7)?,
+        evidence: row.get(8)?,
+        created_at: row.get(9)?,
+    }))
 }
 
 fn pr_watch_from_row(row: &rusqlite::Row<'_>) -> RowResult<PrWatchState> {

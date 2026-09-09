@@ -85,6 +85,12 @@ pub use reclaim::{
     classify as classify_reclaim, directory_bytes, is_artefact_directory,
     is_within as reclaim_is_within, reclaimable_bytes, scan as scan_reclaim,
 };
+pub mod representation;
+pub use representation::{
+    ContentVerdict, Landing, LandingOutcome, LandingSearch, SessionContent,
+    content_at as representation_content_at, find_landing,
+    plan_digest as representation_plan_digest, session_content,
+};
 mod repository_contract;
 mod resources;
 mod retention;
@@ -116,6 +122,7 @@ pub use broker::{
     IntegrationStabilityReport, IntegrationStatusView, LeaseBlocker, LeaseClaimReport,
     LeaseOverlapRelation, LeasePathPlan, LeasePlan, LeasePlanOverlap, OwnershipAuditReport,
     PromotedConflict, PromotedIntegrationEntry, RepairAction, RepairGateSelection, RepairReport,
+    RepresentationScan,
     RepairSource, SESSION_NOTE_MAX_BYTES, SemanticGateAdvice, SemanticGateSelection,
     SemanticGateSource, SemanticGateSourceStatus, SemanticGateSuggestionChain,
     SessionCheckpointApplyReport, SessionCheckpointRecoveryPlan, SessionHandoffReport,

@@ -72,6 +72,7 @@ product surface.
 - `aethyme broker submit`
 - `aethyme broker repair`
 - `aethyme broker finish`
+- `aethyme broker representation`
 - `aethyme broker handoff`
 - `aethyme broker report capture`
 - `aethyme broker report list`
@@ -488,6 +489,9 @@ continues to expose the complete local `log_path` without embedding log data.
 - `aethyme broker submit --session <id> [--no-cache] [--json]`
 - `aethyme broker repair --session <id> [--json]`
 - `aethyme broker finish --session <id> [--json]`
+- `aethyme broker representation scan --session <id> [--json]`
+- `aethyme broker representation status --session <id> [--json]`
+- `aethyme broker representation record --session <id> --confirm <sha256> [--json]`
 - `aethyme broker cleanup <session-id> [--force] [--json]`
 - `aethyme broker cleanup --all-cleaned [--apply --confirm <sha256>] [--json]`
 - `aethyme broker main reconcile plan [--detail] [--resolution-file <path>] [--write-resolution-template <path>] [--json]`
@@ -892,6 +896,28 @@ then reclaims a represented broker-owned spawned worktree and its exact checked
 branch by default. It reports exact reclaimed bytes and whether each artifact
 was removed. Use `--keep-worktree` to close the session without physical
 cleanup; `broker close` also remains state-only.
+
+Work that reaches the default branch through a reviewed pull request is
+delivered, but leaves no promoted queue entry, and a squash merge rewrites the
+SHA so ancestry cannot see it either. Such a session used to be unfinishable:
+`finish` counted its commits as unsubmitted forever, and resubmitting was the
+wrong cure. `broker representation scan --session <id>` decides the question
+from content instead. It takes the net effect of the session -- the blob at each
+changed path at HEAD, or its absence for a deletion -- and compares it against
+every commit the default branch gained since the session branched, oldest
+first, reporting the earliest commit that carries all of it.
+
+Two things are deliberately not evidence. Ancestry is not, because that is the
+exact case being solved. The branch tip is not: comparing against a moving tip
+reports work as missing as soon as an unrelated commit rewrites the same file,
+whereas the commit that carried it is a fixed historical fact that stays true.
+A refusal names the closest commit and the first path that did not match, so
+partially-landed work is distinguishable from work that never landed.
+
+`broker representation record --session <id> --confirm <sha256>` re-proves the
+scan and stores the landing, after which `finish` treats the head as delivered.
+The digest binds the session, its head, and the representing commit, so a
+record cannot be applied to a scan that has since moved.
 
 The redacted `session.finished` handoff survives both state closure and physical
 cleanup. If cleanup stops part-way, the session remains closed, retained

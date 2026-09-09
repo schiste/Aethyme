@@ -485,6 +485,15 @@ Usage:
       Move the local default branch onto integration after re-proving the
       reviewed plan. Creates a preservation ref at the pre-move tip first, and
       never runs when anything would be lost.
+  aethyme broker representation scan --session <id> [--json]
+  aethyme broker representation status --session <id> [--json]
+      Read-only: decide whether this session's work is already present on the
+      default branch, by comparing its content against each commit the branch
+      gained since the session branched. Ancestry is never consulted, so a
+      provider-side squash under a new SHA is still found.
+  aethyme broker representation record --session <id> --confirm <sha256> [--json]
+      Record the reviewed landing so the session can finish. Re-proves the scan
+      and refuses if anything moved since it was reviewed.
   aethyme broker promotion-record plan [--json]
       Read-only plan for integration commits that no promoted queue entry
       claims. A commit is recoverable when exactly one non-promoted entry
@@ -632,6 +641,9 @@ const KNOWN_COMMAND_WORDS: &[&str] = &[
     "repair",
     "checkpoint",
     "promotion-record",
+    "representation",
+    "scan",
+    "record",
     "main",
     "apply",
     "queue",
@@ -818,6 +830,7 @@ fn command_records_metric(args: &[String]) -> bool {
         Some("ship") => args.get(1).map(String::as_str) != Some("plan"),
         Some("checkpoint") => args.get(1).map(String::as_str) == Some("apply"),
         Some("gc") => args.get(1).map(String::as_str) == Some("apply"),
+        Some("representation") => args.get(1).map(String::as_str) == Some("record"),
         Some("operations") => args.get(1).map(String::as_str) == Some("reconcile"),
         Some("git" | "gh") => {
             let command = args
@@ -4486,6 +4499,127 @@ fn run_pull_request_watch(parsed: Parsed) -> Result<(), UsageError> {
     Ok(())
 }
 
+/// `representation scan|status|record` -- the lane for work that reached the
+/// default branch through a provider-side merge instead of through submit.
+/// Scanning is inspection; recording is the deliberate, digest-bound write that
+/// lets such a session close (#152).
+fn run_representation(parsed: Parsed) -> Result<(), UsageError> {
+    let action = parsed
+        .positional
+        .first()
+        .map(String::as_str)
+        .unwrap_or("scan");
+    let session = parsed.session.ok_or(UsageError::Message(
+        "representation requires --session <id>".into(),
+    ))?;
+    // `record` is the only writer; scanning must not take the write lock.
+    let mut broker = open_broker(action != "record")?;
+    match action {
+        "scan" | "status" => {
+            let scan = broker.scan_session_representation(session)?;
+            if parsed.json {
+                out!("{}", serde_json::to_string_pretty(&scan)?);
+            } else {
+                render_representation_scan(&scan);
+            }
+        }
+        "record" => {
+            let confirm = parsed.confirm.as_deref().ok_or(UsageError::Message(
+                "representation record requires --confirm <sha256>".into(),
+            ))?;
+            let scan = broker.record_session_representation(session, confirm)?;
+            if parsed.json {
+                out!("{}", serde_json::to_string_pretty(&scan)?);
+            } else {
+                render_representation_scan(&scan);
+            }
+        }
+        other => {
+            return Err(UsageError::Message(format!(
+                "unknown representation action {other:?}; expected scan, status, or record"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn short(commit: &str) -> &str {
+    &commit[..12.min(commit.len())]
+}
+
+fn render_representation_scan(scan: &crate::RepresentationScan) {
+    out!(
+        "Session {} head {} ({} changed path(s) since {})",
+        scan.session_id,
+        short(&scan.session_head),
+        scan.paths(),
+        short(&scan.base)
+    );
+    if let Some(record) = &scan.existing {
+        match record.representing_commit.as_deref() {
+            Some(commit) => out!(
+                "  recorded: represented by {} on {} ({})",
+                short(commit),
+                record.representing_ref,
+                record.discovery.as_str()
+            ),
+            None => out!(
+                "  recorded: nothing to represent on {} ({})",
+                record.representing_ref,
+                record.discovery.as_str()
+            ),
+        }
+        return;
+    }
+    match &scan.search.outcome {
+        crate::LandingOutcome::NothingToRepresent => {
+            out!("  nothing to represent: this head adds no net change to {}", scan.branch);
+            out!("  next: aethyme broker representation record --session {} --confirm {}", scan.session_id, scan.digest);
+        }
+        crate::LandingOutcome::Landed(landing) => {
+            out!(
+                "  landed on {} as {} ({})",
+                scan.branch,
+                short(&landing.commit),
+                landing.subject
+            );
+            out!(
+                "  {} of {} path(s) matched; {} commit(s) examined",
+                landing.paths,
+                scan.paths(),
+                scan.search.examined
+            );
+            out!("  next: aethyme broker representation record --session {} --confirm {}", scan.session_id, scan.digest);
+        }
+        crate::LandingOutcome::NotFound { closest } => {
+            out!(
+                "  NOT represented on {} ({} commit(s) examined{})",
+                scan.branch,
+                scan.search.examined,
+                if scan.search.truncated {
+                    ", search truncated"
+                } else {
+                    ""
+                }
+            );
+            match closest {
+                Some(closest) => out!(
+                    "  closest was {} ({}): matched {} path(s), missing {}",
+                    short(&closest.commit),
+                    closest.subject,
+                    closest.matched_paths,
+                    closest.missing_path
+                ),
+                None => out!("  no commit on {} carried any of this work", scan.branch),
+            }
+            out!(
+                "  next: aethyme broker submit --session {}",
+                scan.session_id
+            );
+        }
+    }
+}
+
 fn run_reclaim(parsed: Parsed) -> Result<(), UsageError> {
     let action = parsed
         .positional
@@ -8101,6 +8235,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                 render_repair_report(&report);
             }
         }
+        "representation" => run_representation(parsed)?,
         "main" => {
             let action = parsed.positional.first().map(String::as_str);
             let step = parsed.positional.get(1).map(String::as_str);
