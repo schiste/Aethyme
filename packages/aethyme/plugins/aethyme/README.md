@@ -11,7 +11,8 @@ tokens, and the broker speaks only when something actually changed.
 
 ## Install
 
-Requires the `aethyme` CLI on `PATH`:
+Requires the `aethyme` CLI on `PATH`. The hooks are inert against a CLI
+older than 0.7.17, which is where `aethyme hook` was introduced:
 
 ```bash
 cargo install --path packages/aethyme/rust/crates/aethyme-cli
@@ -55,18 +56,20 @@ codex plugin marketplace remove aethyme
 
 ## What it installs
 
-`hooks/hooks.json` wires five events to one shim, `hooks/aethyme-hook.sh`:
+`hooks/hooks.json` wires four events to one shim, `hooks/aethyme-hook.sh`:
 
 | Event | Broker meaning |
 | --- | --- |
 | `SessionStart` | Register the session. |
 | `UserPromptSubmit` | Mark the session ACTIVE; deliver coordination deltas. |
 | `PreToolUse` | Deny a conflicting write. Never claims a lease. |
-| `PostToolUse` | Record liveness; mark the worktree dirty. |
-| `Stop` | Mark the session IDLE; release leases only if clean. |
+| `Stop` | Mark the session idle. |
 
-`PermissionRequest` is deliberately not wired: nothing in the design needs it,
-and an unused hook is a process spawn per permission prompt for nothing.
+Two events are deliberately left unwired, for the same reason. `UserPromptSubmit`
+and `Stop` already bracket a turn, so `PostToolUse` would spawn a process per
+tool call to record liveness the turn boundaries already carry; and nothing in
+the coordination model reads `PermissionRequest` at all. An unused hook is not
+free — it is a process spawn on the hottest path in the session.
 
 ## Why the shim is thin
 
@@ -94,6 +97,10 @@ The last case is the version-skew fallback. A CLI that predates `aethyme hook`
 exits nonzero; the shim swallows the output, records the invocation for
 liveness, and says nothing to the agent. The plugin stays installable against a
 CLI that cannot yet use it.
+
+The symmetric case is handled on the CLI side: `aethyme hook` treats an event
+name it does not recognise as a silent success, so a newer plugin wiring a new
+event never breaks an older CLI either.
 
 ## What it does not do
 

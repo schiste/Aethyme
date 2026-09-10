@@ -350,6 +350,10 @@ fn main() -> ExitCode {
             }
         },
         "root" => run_root_subcommand(&args[1..]),
+        // The agent-surface hook entry point the Aethyme plugin shims
+        // to. One stable spelling so an installed plugin never has to
+        // match an installed CLI version.
+        "hook" => ExitCode::from(aethyme_broker::agent_hook::run(&args[1..])),
         // Broker commands have been native Rust from birth (issue #31).
         "broker" if readiness_remediation::is_command(command.args) => {
             ExitCode::from(readiness_remediation::run(&command.args[1..]))
@@ -437,6 +441,8 @@ fn print_top_level_help() {
     eprintln!("  broker git|gh --session <id> coordinate Git and GitHub operations");
     eprintln!("  broker operations          inspect/reconcile the remote-operation journal");
     eprintln!("  broker adopt|start-agent|agents|cleanup   (see `broker --help`)");
+    eprintln!("  hook <event>               agent-surface hook entry point (the plugin's");
+    eprintln!("                              only entry point; reads event JSON on stdin)");
     eprintln!("  update check|plan|execute  explicit paired-binary updates; never background");
     eprintln!("  upgrade plan|apply|recover review, apply, or recover repository migrations");
     eprintln!(

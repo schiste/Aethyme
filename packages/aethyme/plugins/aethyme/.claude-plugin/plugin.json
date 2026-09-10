@@ -1,6 +1,6 @@
 {
   "name": "aethyme",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Broker coordination for multi-agent repositories. Registers the session, tracks active/idle state, and delivers coordination deltas at turn boundaries instead of making the agent poll.",
   "author": {
     "name": "Aethyme",
