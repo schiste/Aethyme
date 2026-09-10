@@ -8,6 +8,21 @@ use std::process::{Command, Output};
 
 const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
 
+/// A port is the one thing these tests cannot each get a private copy of.
+/// Every other input is per-test -- its own checkout, its own state dir --
+/// but `plan` proves a port is free by binding it, and that probe reaches
+/// the real machine. The harness runs this file's tests concurrently, so
+/// three tests that plan a port from one shared range race for the same
+/// probe, and `singular` -- whose range is exactly one port -- is always the
+/// one with nowhere to fall back to. Disjoint ranges keep the concurrency
+/// out of the assertions. Off 4173 as well: that is the Vite preview
+/// default, and an operator serving one should not fail this suite.
+const SINGULAR_PORT: u16 = 45173;
+const SINGULAR_PORT_END: u16 = 45199;
+const PER_WORKTREE_PORT: u16 = 45273;
+const PER_WORKTREE_PORT_END: u16 = 45299;
+const HELD_PORT: u16 = 45373;
+
 fn run(cwd: &Path, state: &Path, args: &[&str]) -> Output {
     Command::new(CLI)
         .args(args)
@@ -99,9 +114,9 @@ fn a_linked_worktree_is_reported_as_not_canonical() {
 
 #[test]
 fn singular_plans_one_exclusive_key_and_one_pinned_port() {
-    let (temp, state) = repo(Some(
-        "[console]\nmode = 'singular'\nport = 4173\nport_end = 4199\n",
-    ));
+    let (temp, state) = repo(Some(&format!(
+        "[console]\nmode = 'singular'\nport = {SINGULAR_PORT}\nport_end = {SINGULAR_PORT_END}\n"
+    )));
     let root = temp.path().join("repo");
     let plan = json(&run(&root, &state, &["console", "plan", "--json"]));
     let proposed = plan["proposed"].as_array().unwrap();
@@ -113,14 +128,15 @@ fn singular_plans_one_exclusive_key_and_one_pinned_port() {
             .clone()
     };
     assert_eq!(by_key("console")["kind"], "exclusive_key");
-    assert_eq!(by_key("port")["value"], "4173");
+    assert_eq!(by_key("port")["value"], SINGULAR_PORT.to_string());
 }
 
 #[test]
 fn per_worktree_plans_a_namespace_and_a_bounded_slot_instead_of_a_singleton() {
-    let (temp, state) = repo(Some(
-        "[console]\nmode = 'per_worktree'\nport = 4173\nport_end = 4199\npool_limit = 3\n",
-    ));
+    let (temp, state) = repo(Some(&format!(
+        "[console]\nmode = 'per_worktree'\nport = {PER_WORKTREE_PORT}\nport_end = \
+         {PER_WORKTREE_PORT_END}\npool_limit = 3\n"
+    )));
     let root = temp.path().join("repo");
     let plan = json(&run(&root, &state, &["console", "plan", "--json"]));
     let keys: Vec<&str> = plan["proposed"]
@@ -141,7 +157,9 @@ fn per_worktree_plans_a_namespace_and_a_bounded_slot_instead_of_a_singleton() {
 /// instead of quietly answering on another port.
 #[test]
 fn singular_refuses_a_second_console_and_names_the_one_already_serving() {
-    let (temp, state) = repo(Some("[console]\nmode = 'singular'\nport = 4173\n"));
+    let (temp, state) = repo(Some(&format!(
+        "[console]\nmode = 'singular'\nport = {HELD_PORT}\n"
+    )));
     let root = temp.path().join("repo");
     let identity = json(&run(&root, &state, &["console", "status", "--json"]));
     let repository = identity["identity"]["repository"].as_str().unwrap();
@@ -160,7 +178,7 @@ fn singular_refuses_a_second_console_and_names_the_one_already_serving() {
             "holder_pid": 4242,
             "resources": [
                 {"key": "console", "kind": "exclusive_key", "name": format!("console:{repository}")},
-                {"key": "port", "kind": "tcp_port", "start": 4173, "end": 4173}
+                {"key": "port", "kind": "tcp_port", "start": HELD_PORT, "end": HELD_PORT}
             ]
         }))
         .unwrap(),
@@ -187,7 +205,7 @@ fn singular_refuses_a_second_console_and_names_the_one_already_serving() {
     let status = json(&run(&root, &state, &["console", "status", "--json"]));
     let running = status["running"].as_array().unwrap();
     assert_eq!(running.len(), 1);
-    assert_eq!(running[0]["port"], "4173");
+    assert_eq!(running[0]["port"], HELD_PORT.to_string());
     assert_eq!(
         running[0]["canonical"], false,
         "the holder is another worktree, and saying which one is the point"
@@ -201,7 +219,7 @@ fn singular_refuses_a_second_console_and_names_the_one_already_serving() {
     assert!(!refused.status.success());
     let message = String::from_utf8_lossy(&refused.stderr);
     assert!(
-        message.contains("already running") && message.contains("4173"),
+        message.contains("already running") && message.contains(&HELD_PORT.to_string()),
         "a bare resource conflict does not tell the operator where to look: {message}"
     );
 }

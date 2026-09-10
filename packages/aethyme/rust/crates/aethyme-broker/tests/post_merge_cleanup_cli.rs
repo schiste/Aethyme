@@ -28,13 +28,29 @@ fn git(repo: &Path, args: &[&str]) -> String {
         .to_string()
 }
 
+/// Resolve the `git` the fake `git` below delegates to, skipping wrappers.
+///
+/// `run_merge` prepends the fake bin directory to `PATH`. A `git` that is
+/// itself a script re-resolving `git` through `PATH` — the shape every
+/// developer-environment git wrapper takes — would exec straight back into
+/// the fake, and the two would trade `exec` calls forever inside a single
+/// process: no output, no crash, just a hung test. Only a real executable
+/// terminates the chain, so accept nothing that starts with `#!`.
 fn real_git() -> String {
-    let output = Command::new("sh")
-        .args(["-c", "command -v git"])
-        .output()
-        .unwrap();
-    assert!(output.status.success());
-    String::from_utf8_lossy(&output.stdout).trim().to_string()
+    use std::io::Read;
+
+    std::env::split_paths(&std::env::var_os("PATH").expect("PATH"))
+        .map(|dir| dir.join("git"))
+        .find(|candidate| {
+            let Ok(mut file) = std::fs::File::open(candidate) else {
+                return false;
+            };
+            let mut magic = [0u8; 2];
+            file.read_exact(&mut magic).is_ok() && &magic != b"#!"
+        })
+        .expect("git on PATH")
+        .display()
+        .to_string()
 }
 
 fn prepend_path(directory: &Path) -> String {

@@ -33,14 +33,36 @@ fn run(repo: &Path, state: &Path, path: Option<&Path>, args: &[&str]) -> Output 
     command.output().unwrap()
 }
 
+/// Resolve the `git` the shim below delegates to, skipping wrapper scripts.
+///
+/// The shim's directory goes on `PATH`. A `git` that is itself a script
+/// re-resolving `git` through `PATH` — the shape every developer-environment
+/// git wrapper takes — would exec straight back into the shim, and the two
+/// would trade `exec` calls forever inside a single process: no output, no
+/// crash, just a hung test. Only a real executable terminates the chain, so
+/// accept nothing that starts with `#!`.
+fn real_git() -> String {
+    use std::io::Read;
+
+    std::env::split_paths(&std::env::var_os("PATH").expect("PATH"))
+        .map(|dir| dir.join("git"))
+        .find(|candidate| {
+            let Ok(mut file) = std::fs::File::open(candidate) else {
+                return false;
+            };
+            let mut magic = [0u8; 2];
+            file.read_exact(&mut magic).is_ok() && &magic != b"#!"
+        })
+        .expect("git on PATH")
+        .display()
+        .to_string()
+}
+
 /// A `git` that sleeps for one specific tag name and is otherwise the real thing,
 /// so exactly one coordinated operation holds the lock long enough to observe.
 fn slow_git_shim(dir: &Path) {
     std::fs::create_dir_all(dir).unwrap();
-    let real = String::from_utf8(Command::new("which").arg("git").output().unwrap().stdout)
-        .unwrap()
-        .trim()
-        .to_string();
+    let real = real_git();
     let shim = dir.join("git");
     std::fs::write(
         &shim,

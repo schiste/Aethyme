@@ -273,6 +273,28 @@ fn shared_activation_reaches_pre_enrollment_worktrees_and_certifies_upstream_vis
     );
 }
 
+/// Resolve the `git` the shim below delegates to, skipping wrapper scripts.
+///
+/// The test prepends the shim's own directory to `PATH`. A `git` that is
+/// itself a script re-resolving `git` through `PATH` — the shape every
+/// developer-environment git wrapper takes — would exec straight back into
+/// the shim, and the two would trade `exec` calls forever inside a single
+/// process: no output, no crash, just a hung test. Only a real executable
+/// terminates the chain, so accept nothing that starts with `#!`.
+fn first_real_git_on_path() -> Option<std::path::PathBuf> {
+    use std::io::Read;
+
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .map(|dir| dir.join("git"))
+        .find(|candidate| {
+            let Ok(mut file) = std::fs::File::open(candidate) else {
+                return false;
+            };
+            let mut magic = [0u8; 2];
+            file.read_exact(&mut magic).is_ok() && &magic != b"#!"
+        })
+}
+
 #[test]
 fn certify_names_a_path_git_shim_that_decorates_known_empty_output() {
     const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
@@ -284,13 +306,7 @@ fn certify_names_a_path_git_shim_that_decorates_known_empty_output() {
     std::fs::create_dir_all(&bin).unwrap();
     init_repo(&repo);
 
-    let real_git = std::env::var_os("PATH")
-        .and_then(|path| {
-            std::env::split_paths(&path)
-                .map(|dir| dir.join("git"))
-                .find(|candidate| candidate.is_file())
-        })
-        .expect("git on PATH");
+    let real_git = first_real_git_on_path().expect("git on PATH");
     let shim = bin.join("git");
     std::fs::write(
         &shim,
