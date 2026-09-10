@@ -15,9 +15,41 @@ Requires the `aethyme` CLI on `PATH`. The hooks are inert against a CLI
 older than 0.7.17, which is where `aethyme hook` was introduced:
 
 ```bash
+brew install schiste/tap/aethyme
+# or, from a checkout:
 cargo install --path packages/aethyme/rust/crates/aethyme-cli
 cargo install --path packages/aethyme/rust/crates/aethyme-engine
 ```
+
+Then let the CLI install its own hooks, on every agent surface it finds:
+
+```bash
+aethyme plugin install
+```
+
+This is the recommended path, and not only for convenience. The plugin ships
+files and the CLI ships logic, so the two can be installed separately and end
+up mismatched — which produces no error, just a plugin that quietly does
+nothing. Installing through the CLI means the binary that answers `aethyme
+hook` is the one registering the hooks, and that mismatch cannot arise.
+
+Pass `--surface codex` or `--surface claude` to pick one, `--source
+/path/to/Aethyme` to install from a checkout, and `--dry-run` to see the
+commands first. `aethyme plugin remove` undoes it.
+
+To check an install that already exists — including one done by hand:
+
+```bash
+aethyme plugin status
+```
+
+It reports the plugin version on each surface and, separately, whether the
+`aethyme` on `PATH` actually serves `hook`. Those are different binaries and
+the second is the one the hooks reach, so a `brew`-installed CLI shadowed by a
+`cargo`-installed one (or the reverse) shows up here rather than as silence.
+It exits nonzero when the plugin is installed but inert.
+
+The manual equivalents are below.
 
 ### Codex
 

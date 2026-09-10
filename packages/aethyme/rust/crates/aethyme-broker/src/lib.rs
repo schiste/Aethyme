@@ -56,6 +56,7 @@ mod leases;
 pub mod main_reconcile;
 mod merge;
 mod operations;
+pub mod plugin_cli;
 mod pr;
 mod pr_link;
 mod pr_monitoring;

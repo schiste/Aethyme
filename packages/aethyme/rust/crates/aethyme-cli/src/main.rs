@@ -354,6 +354,11 @@ fn main() -> ExitCode {
         // to. One stable spelling so an installed plugin never has to
         // match an installed CLI version.
         "hook" => ExitCode::from(aethyme_broker::agent_hook::run(&args[1..])),
+        // The other half of that stability: the binary that answers
+        // `hook` is the one that registers the hooks, so a plugin
+        // installed this way cannot be paired with a CLI too old to
+        // serve it.
+        "plugin" => ExitCode::from(aethyme_broker::plugin_cli::run(&args[1..])),
         // Broker commands have been native Rust from birth (issue #31).
         "broker" if readiness_remediation::is_command(command.args) => {
             ExitCode::from(readiness_remediation::run(&command.args[1..]))
@@ -443,6 +448,9 @@ fn print_top_level_help() {
     eprintln!("  broker adopt|start-agent|agents|cleanup   (see `broker --help`)");
     eprintln!("  hook <event>               agent-surface hook entry point (the plugin's");
     eprintln!("                              only entry point; reads event JSON on stdin)");
+    eprintln!("  plugin install|status|remove  install the agent-surface plugin, or");
+    eprintln!("                              report the plugin/CLI version skew that");
+    eprintln!("                              makes an installed one silently inert");
     eprintln!("  update check|plan|execute  explicit paired-binary updates; never background");
     eprintln!("  upgrade plan|apply|recover review, apply, or recover repository migrations");
     eprintln!(

@@ -44,11 +44,15 @@ if [[ $status -eq 0 && -n "$out" ]]; then
     exit 0
 fi
 
-# Fallback for a CLI that predates `aethyme hook`: record that the surface fired
-# so the broker can still see liveness, and say nothing to the agent.
+# Fallback: record that the surface fired so the broker can still see liveness,
+# and say nothing to the agent. Two very different situations land here -- a CLI
+# that predates `aethyme hook` (exit 2, unknown subcommand) and a current one
+# that deliberately had nothing to say (exit 0, empty) -- and from the outside
+# both look like a plugin that does nothing. Carrying the status is what lets
+# `aethyme plugin status` be corroborated after the fact instead of guessed at.
 aethyme repo record-wrapper-invocation "$root" \
     --wrapper "aethyme-plugin-hook" \
-    --detail "event=$event" \
+    --detail "event=$event status=$status" \
     >/dev/null 2>&1 || true
 
 exit 0

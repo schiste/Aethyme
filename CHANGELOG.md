@@ -4,6 +4,35 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.7.17] - 2026-09-10
+
+### Added
+
+- `aethyme plugin install|status|remove` installs the agent-surface plugin from
+  the CLI that serves its hooks. The plugin ships files and the CLI ships the
+  logic behind them, so the two can be installed separately and end up
+  mismatched -- which produces no error, only a plugin that silently does
+  nothing. Installing through the CLI makes that mismatch impossible.
+- `aethyme plugin status` reports whether the `aethyme` on `PATH` -- the copy
+  the hooks actually reach, which is not necessarily the one you invoked --
+  serves `aethyme hook`, and exits nonzero when an installed plugin sits in
+  front of one that does not. It determines this by running the subcommand
+  rather than comparing version strings, so a development build tagged from an
+  earlier release is not misreported as too old.
+
+### Changed
+
+- The hook shim records the CLI's exit status alongside the event name in its
+  fallback telemetry, distinguishing a CLI too old to serve `hook` from a
+  current one that deliberately had nothing to say. Both look identical from
+  outside.
+
+### Upgrade notes
+
+- No database migration; the schema stays at 32 and rollback is unrestricted.
+  Release artifacts and their exact source revision remain recorded in the
+  signed `release-manifest.json`.
+
 ## [0.7.16] - 2026-09-09
 
 ### Added
