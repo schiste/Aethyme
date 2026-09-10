@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
+  "name": "aethyme",
+  "description": "Aethyme plugins for coding agents: broker coordination and repository context.",
+  "owner": {
+    "name": "Aethyme",
+    "email": "christophe@aeptus.com"
+  },
+  "plugins": [
+    {
+      "name": "aethyme",
+      "source": "./packages/aethyme/plugins/aethyme",
+      "description": "Broker coordination for multi-agent repositories. Registers the session, tracks active/idle state, and delivers coordination deltas at turn boundaries instead of making the agent poll.",
+      "author": {
+        "name": "Aethyme"
+      },
+      "category": "development",
+      "homepage": "https://github.com/schiste/Aethyme/tree/main/packages/aethyme/plugins/aethyme"
+    }
+  ]
+}
