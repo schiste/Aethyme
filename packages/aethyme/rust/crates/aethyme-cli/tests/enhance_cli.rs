@@ -383,6 +383,47 @@ fn static_wrapper_template_records_invocation_signal() {
 /// Claude Code would (CLAUDE_PROJECT_DIR set, `aethyme` on PATH) and
 /// asserts the wrapper invocation landed in the repo-local ledger.
 #[test]
+fn deployed_session_hook_injects_nothing_for_an_interactive_session() {
+    let tmp = tmp_dir();
+    let repo = demo_repo(tmp.path());
+    deploy(&repo, false);
+
+    let hook = repo.join(".claude/hooks/aethyme-load-context.sh");
+    let bin_dir = aethyme_bin().parent().unwrap().to_path_buf();
+    let path = format!(
+        "{}:{}",
+        bin_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    // No AETHYME_EVAL_ARM: an ordinary session, where Claude Code has already
+    // auto-loaded CLAUDE.md. Emitting it again would bill the whole policy a
+    // second time in every turn's cached prefix.
+    let output = std::process::Command::new("bash")
+        .arg(&hook)
+        .env("CLAUDE_PROJECT_DIR", &repo)
+        .env("PATH", &path)
+        .output()
+        .expect("run deployed hook");
+
+    assert!(output.status.success());
+    assert!(
+        output.stdout.is_empty(),
+        "interactive session got {} bytes of duplicated context",
+        output.stdout.len()
+    );
+
+    // Silence is not invisibility: the session start is still ledgered.
+    assert!(
+        telemetry_events(&repo).iter().any(|event| {
+            event["event_type"] == "wrapper.invocation"
+                && event["payload"]["wrapper_name"] == "aethyme-sessionstart-hook"
+        }),
+        "hook did not ledger a wrapper.invocation row"
+    );
+}
+
+#[test]
 fn deployed_session_hook_records_native_wrapper_invocation() {
     let tmp = tmp_dir();
     let repo = demo_repo(tmp.path());
@@ -397,10 +438,13 @@ fn deployed_session_hook_records_native_wrapper_invocation() {
         bin_dir.display(),
         std::env::var("PATH").unwrap_or_default()
     );
+    // The hook only injects for a headless harness that skips the standard
+    // CWD auto-load, which the eval runner marks with AETHYME_EVAL_ARM.
     let output = std::process::Command::new("bash")
         .arg(&hook)
         .env("CLAUDE_PROJECT_DIR", &repo)
-        .env("PATH", path)
+        .env("PATH", &path)
+        .env("AETHYME_EVAL_ARM", "aethyme")
         .output()
         .expect("run deployed hook");
     assert!(

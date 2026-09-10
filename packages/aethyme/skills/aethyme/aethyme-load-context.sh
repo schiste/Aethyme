@@ -63,6 +63,18 @@ if [[ -n "$aethyme_bin" ]] && [[ -d "$cwd" ]]; then
         >/dev/null 2>&1 || true
 fi
 
+# Interactive Claude Code sessions auto-load the project's CLAUDE.md and
+# AGENTS.md themselves, so emitting the same bytes here bills the whole
+# policy a second time -- and because it lands in the cached prefix, that
+# duplicate is re-read on every turn, not once per session. Only a headless
+# harness that skips the standard CWD auto-load needs this injection, and
+# the eval runner is what creates that case; it marks every arm with
+# AETHYME_EVAL_ARM. The telemetry above stays unconditional so a session
+# start is still observable on both paths.
+if [[ -z "${AETHYME_EVAL_ARM:-}" ]]; then
+    exit 0
+fi
+
 # Emit the JSON envelope via the native router (python-retirement Phase
 # 6, 2026-08-01; previously a bare `python3` heredoc calling json.dumps
 # — the last Python invocation on the product path). Output is
