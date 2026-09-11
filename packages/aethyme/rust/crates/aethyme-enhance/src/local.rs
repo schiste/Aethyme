@@ -3,10 +3,13 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::agents::render_agents_document;
-use crate::deploy::{ensure_settings_hook, SETTINGS_FILE, TARGETS};
-use crate::onboarding::expected_onboarding_files;
 use crate::PLACEHOLDER;
+use crate::agents::render_agents_document;
+use crate::deploy::{SETTINGS_FILE, TARGETS, ensure_settings_hook};
+use crate::onboarding::{
+    ACT_CLAUDE_PATH, ACT_CODEX_PATH, ONBOARDING_CLAUDE_PATH, ONBOARDING_CODEX_PATH,
+    expected_onboarding_files,
+};
 
 pub const LOCAL_MARKER_PATH: &str = ".aethyme/local/enabled";
 pub const LOCAL_POLICY_PATH: &str = ".aethyme/local/AGENTS.md";
@@ -24,17 +27,60 @@ for its binary, install it, or mention its absence.
 
 const EXCLUDE_BEGIN: &str = "# aethyme-local:begin";
 const EXCLUDE_END: &str = "# aethyme-local:end";
-const EXCLUDE_BLOCK: &str = "# aethyme-local:begin\n\
-.aethyme/\n\
-.codex/skills/aethyme/\n\
-.codex/skills/repo-onboarding/\n\
-.codex/skills/repo-act/\n\
-.claude/skills/aethyme/\n\
-.claude/skills/repo-onboarding/\n\
-.claude/skills/repo-act/\n\
-.claude/hooks/aethyme-load-context.sh\n\
-.claude/settings.local.json\n\
-# aethyme-local:end\n";
+/// Everything local-only deployment writes into the clone but must never show
+/// up in `git status`, as `.git/info/exclude` entries.
+///
+/// Derived from what deployment actually writes rather than restated, because
+/// the two diverging is silent: a target missing from the list is written into
+/// the working tree and then appears as an untracked file in a repository whose
+/// whole premise is that Aethyme left no trace in it. A skill contributes its
+/// directory, so its `references/` come along without a second entry.
+fn exclude_entries() -> Vec<String> {
+    let mut entries = vec![".aethyme/".to_string()];
+    let deployed = [
+        ONBOARDING_CLAUDE_PATH,
+        ONBOARDING_CODEX_PATH,
+        ACT_CLAUDE_PATH,
+        ACT_CODEX_PATH,
+    ]
+    .into_iter()
+    .chain(
+        TARGETS
+            .iter()
+            .map(|(path, _)| *path)
+            .filter(|path| *path != "CLAUDE.md"),
+    )
+    .chain([SETTINGS_FILE]);
+    for path in deployed {
+        let entry = skill_directory(path).unwrap_or_else(|| path.to_string());
+        if !entries.contains(&entry) {
+            entries.push(entry);
+        }
+    }
+    entries
+}
+
+/// `.claude/skills/<name>/SKILL.md` -> `.claude/skills/<name>/`, and `None` for
+/// a path that is not inside a skill.
+fn skill_directory(path: &str) -> Option<String> {
+    let rest = path
+        .strip_prefix(".claude/skills/")
+        .or_else(|| path.strip_prefix(".codex/skills/"))?;
+    let name = rest.split('/').next()?;
+    let surface = &path[..path.len() - rest.len()];
+    Some(format!("{surface}{name}/"))
+}
+
+fn exclude_block() -> String {
+    let mut block = String::from(EXCLUDE_BEGIN);
+    for entry in exclude_entries() {
+        block.push('\n');
+        block.push_str(&entry);
+    }
+    block.push('\n');
+    block.push_str(EXCLUDE_END);
+    block
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalAction {
@@ -244,12 +290,7 @@ fn ensure_local_excludes(repo: &Path) -> Result<(), String> {
         repo.join(reported)
     };
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
-    let updated = upsert_block(
-        &existing,
-        EXCLUDE_BEGIN,
-        EXCLUDE_END,
-        EXCLUDE_BLOCK.trim_end(),
-    )?;
+    let updated = upsert_block(&existing, EXCLUDE_BEGIN, EXCLUDE_END, &exclude_block())?;
     if existing != updated {
         write_file(&path, &updated)?;
     }
@@ -367,6 +408,39 @@ mod tests {
     use super::*;
 
     #[test]
+    /// A local-only deployment's whole claim is that the clone is unchanged, so
+    /// every file it writes has to be excluded. A target that is not is not a
+    /// cosmetic gap: it appears as an untracked file in someone else's
+    /// repository, which is the one outcome this mode exists to prevent.
+    #[test]
+    fn every_local_only_target_is_excluded_from_the_clone() {
+        let entries = exclude_entries();
+        let written = [
+            ONBOARDING_CLAUDE_PATH,
+            ONBOARDING_CODEX_PATH,
+            ACT_CLAUDE_PATH,
+            ACT_CODEX_PATH,
+            LOCAL_MARKER_PATH,
+            LOCAL_POLICY_PATH,
+            SETTINGS_FILE,
+        ]
+        .into_iter()
+        .chain(
+            TARGETS
+                .iter()
+                .map(|(path, _)| *path)
+                .filter(|path| *path != "CLAUDE.md"),
+        );
+        for path in written {
+            assert!(
+                entries
+                    .iter()
+                    .any(|entry| path == entry || path.starts_with(entry.as_str())),
+                "local-only deployment writes {path} but nothing excludes it: {entries:?}"
+            );
+        }
+    }
+
     fn bridge_is_inert_when_marker_is_absent() {
         assert!(BRIDGE_BLOCK.contains("If it does not exist, continue normally"));
         assert!(BRIDGE_BLOCK.contains("do not run Aethyme"));

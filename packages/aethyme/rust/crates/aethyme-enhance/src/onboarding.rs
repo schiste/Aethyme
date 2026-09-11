@@ -12,7 +12,7 @@ use std::process::Command;
 
 use sha2::{Digest, Sha256};
 
-use crate::pyjson::{self, py_bool, Value};
+use crate::pyjson::{self, Value, py_bool};
 use crate::util::{py_splitlines, resolve_path};
 
 pub const ONBOARDING_JSON_PATH: &str = ".aethyme/generated/onboarding.json";
@@ -3589,10 +3589,23 @@ fn filesystem_snapshot(repo_path: &Path) -> Result<(String, usize), String> {
     Ok((format!("{:x}", digest.finalize()), file_count))
 }
 
+/// Whether a path is something `enhance deploy` writes, and so must not count
+/// as repository source when the onboarding digest asks "has this repository
+/// changed?".
+///
+/// Every file `deploy` writes is consulted directly, rather than restated here.
+/// Restating it is what makes this fail: adding a skill to `deploy::TARGETS`
+/// then makes deploying the skill look like the repository changed, and the
+/// onboarding artifact it just generated is stale the moment it lands. The two
+/// hand-written lists below are for paths `deploy` does not own -- generated
+/// state, and whole skill trees whose contents `deploy_skills` fills in.
 fn is_generated_deploy_path(relative: &[u8]) -> bool {
-    GENERATED_DEPLOY_PATHS
+    crate::deploy::TARGETS
         .iter()
-        .any(|generated| generated.as_bytes() == relative)
+        .any(|(target, _)| target.as_bytes() == relative)
+        || GENERATED_DEPLOY_PATHS
+            .iter()
+            .any(|generated| generated.as_bytes() == relative)
         || GENERATED_DEPLOY_PREFIXES
             .iter()
             .any(|generated| relative.starts_with(generated.as_bytes()))
@@ -3833,9 +3846,11 @@ mod tests {
             artifact.get("repo").unwrap().get("name").unwrap().as_str(),
             Some("Canonical-Repository")
         );
-        assert!(render_onboarding_skill(&artifact)
-            .unwrap()
-            .contains("# Repo Onboarding: Canonical-Repository\n"));
+        assert!(
+            render_onboarding_skill(&artifact)
+                .unwrap()
+                .contains("# Repo Onboarding: Canonical-Repository\n")
+        );
 
         std::fs::remove_dir_all(&worktree).unwrap();
         std::fs::remove_dir_all(&repo).unwrap();
@@ -3982,8 +3997,10 @@ mod tests {
             Some("cargo")
         );
         assert!(value_strings(repo_facts.get("languages").unwrap()).contains(&"rust".into()));
-        assert!(value_strings(repo_facts.get("manifests").unwrap())
-            .contains(&"products/tool/Cargo.toml".into()));
+        assert!(
+            value_strings(repo_facts.get("manifests").unwrap())
+                .contains(&"products/tool/Cargo.toml".into())
+        );
         assert_eq!(
             artifact
                 .get("primary_workspace")
@@ -4129,16 +4146,20 @@ mod tests {
             Some("cargo")
         );
         let commands = artifact.get("commands").unwrap().as_array().unwrap();
-        assert!(!commands.iter().any(|command| command
-            .get("command")
-            .unwrap()
-            .py_str()
-            .contains("pytest")));
-        assert!(artifact
-            .get("primary_commands")
-            .unwrap()
-            .get("lint")
-            .is_none());
+        assert!(
+            !commands.iter().any(|command| command
+                .get("command")
+                .unwrap()
+                .py_str()
+                .contains("pytest"))
+        );
+        assert!(
+            artifact
+                .get("primary_commands")
+                .unwrap()
+                .get("lint")
+                .is_none()
+        );
         assert_eq!(
             artifact
                 .get("primary_entrypoints")

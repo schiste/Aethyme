@@ -22,6 +22,16 @@ pub const LOAD_CONTEXT_SH: &str =
     include_str!("../../../../skills/aethyme/aethyme-load-context.sh");
 pub const AETHYME_EXPLORE: &str = include_str!("../../../../skills/aethyme/aethyme-explore");
 
+/// The review-rule-maker skill: the procedure for writing a repository's
+/// `[review.*]` policy, and the field grammar it needs. Shipped with the tool
+/// rather than linked from it, because the skill is read by an agent working
+/// in a repository that may have no network and is certainly not going to
+/// fetch a guide mid-task.
+pub const REVIEW_RULES_SKILL_MD: &str =
+    include_str!("../../../../skills/aethyme-review-rule-maker/SKILL.md");
+pub const REVIEW_RULES_REFERENCE_MD: &str =
+    include_str!("../../../../skills/aethyme-review-rule-maker/references/review-rules.md");
+
 /// The full `skills/aethyme/` template directory as (relative path within
 /// the skill dir, content, executable) — the source tree
 /// `deploy_skills` copies. Order matches a sorted directory walk.
@@ -52,5 +62,11 @@ mod tests {
         assert!(!REF_GRAPH_TASK_MD.is_empty());
         assert!(!REF_DEAD_CODE_MD.is_empty());
         assert!(!AETHYME_EXPLORE.is_empty());
+        assert!(REVIEW_RULES_SKILL_MD.starts_with("---"));
+        assert!(REVIEW_RULES_SKILL_MD.contains("name: aethyme-review-rule-maker"));
+        // The skill's whole value is that it drives the dry run rather than
+        // describing it, so losing that command would leave prose.
+        assert!(REVIEW_RULES_SKILL_MD.contains("aethyme broker review plan"));
+        assert!(REVIEW_RULES_REFERENCE_MD.contains("[[review.trigger.rule]]"));
     }
 }

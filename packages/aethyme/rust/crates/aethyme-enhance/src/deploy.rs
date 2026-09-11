@@ -10,8 +10,8 @@ use crate::agents::{
     render_broker_reference,
 };
 use crate::onboarding::{
-    expected_onboarding_files, override_freshness, recommendation_summary, ACT_STARTER_JSON_PATH,
-    ONBOARDING_JSON_PATH,
+    ACT_STARTER_JSON_PATH, ONBOARDING_JSON_PATH, expected_onboarding_files, override_freshness,
+    recommendation_summary,
 };
 use crate::pyjson::{self, Value};
 use crate::telemetry::{
@@ -61,6 +61,22 @@ pub const TARGETS: &[(&str, &str)] = &[
     (
         ".codex/skills/aethyme/references/dead-code.md",
         templates::REF_DEAD_CODE_MD,
+    ),
+    (
+        ".claude/skills/aethyme-review-rule-maker/SKILL.md",
+        templates::REVIEW_RULES_SKILL_MD,
+    ),
+    (
+        ".codex/skills/aethyme-review-rule-maker/SKILL.md",
+        templates::REVIEW_RULES_SKILL_MD,
+    ),
+    (
+        ".claude/skills/aethyme-review-rule-maker/references/review-rules.md",
+        templates::REVIEW_RULES_REFERENCE_MD,
+    ),
+    (
+        ".codex/skills/aethyme-review-rule-maker/references/review-rules.md",
+        templates::REVIEW_RULES_REFERENCE_MD,
     ),
     (
         ".claude/hooks/aethyme-load-context.sh",
@@ -760,8 +776,8 @@ mod tests {
         assert_eq!(actions.first().unwrap().relative_path, "AGENTS.md");
         assert_eq!(actions.last().unwrap().relative_path, SETTINGS_FILE);
         assert!(actions.iter().all(|a| a.action == "created"));
-        // 1 AGENTS + 6 onboarding + 13 targets + settings = 21.
-        assert_eq!(actions.len(), 21);
+        // 1 AGENTS + 6 onboarding + 17 targets + settings = 25.
+        assert_eq!(actions.len(), 25);
 
         let settings = std::fs::read_to_string(repo.join(SETTINGS_FILE)).unwrap();
         assert_eq!(
@@ -854,12 +870,16 @@ mod tests {
             std::fs::read_to_string(repo.join("CLAUDE.md")).unwrap(),
             "maintainer claude policy\n"
         );
-        assert!(actions
-            .iter()
-            .all(|action| { !matches!(action.relative_path.as_str(), "AGENTS.md" | "CLAUDE.md") }));
-        assert!(!repo
-            .join(".aethyme/generated/experience-telemetry.jsonl")
-            .exists());
+        assert!(
+            actions.iter().all(|action| {
+                !matches!(action.relative_path.as_str(), "AGENTS.md" | "CLAUDE.md")
+            })
+        );
+        assert!(
+            !repo
+                .join(".aethyme/generated/experience-telemetry.jsonl")
+                .exists()
+        );
     }
 
     #[test]
@@ -901,9 +921,11 @@ mod tests {
         std::fs::write(repo.join("AGENTS.md"), "Hand-written policy.\n").unwrap();
         let actions = deploy(&repo, false).unwrap();
         // Migration action reported, override created.
-        assert!(actions
-            .iter()
-            .any(|a| a.relative_path == AGENTS_OVERRIDE_PATH && a.action == "created"));
+        assert!(
+            actions
+                .iter()
+                .any(|a| a.relative_path == AGENTS_OVERRIDE_PATH && a.action == "created")
+        );
         let override_text = std::fs::read_to_string(repo.join(AGENTS_OVERRIDE_PATH)).unwrap();
         assert_eq!(
             override_text,

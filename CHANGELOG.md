@@ -25,6 +25,14 @@ artifacts and their exact source revision are recorded in each signed
   that would appear. It takes no session, performs nothing, and names both the
   tree it read policy from and the tree it read the change from. Full guide in
   `packages/aethyme/docs/guides/review-routing.md`.
+- `aethyme enhance deploy` now installs an `aethyme-review-rule-maker` skill on
+  both agent surfaces. It carries the procedure for writing a repository's
+  `[review.*]` policy -- find the guarded paths by searching the repository
+  rather than guessing them, write the trigger table alone, replay it against
+  real history with `aethyme broker review plan --base`, then turn on
+  projection and routing in that order -- plus a `references/review-rules.md`
+  field grammar loaded only when needed. It is embedded in the binary, so an
+  installed Aethyme deploys it with no checkout and no network.
 
 ## [0.7.17] - 2026-09-10
 
