@@ -2382,6 +2382,106 @@ impl BrokerStore {
         rows.into_iter().collect()
     }
 
+    /// What the router last saw of one pull request, if it has ever looked.
+    pub fn pull_request_observation(
+        &self,
+        repository: &str,
+        pr_number: i64,
+    ) -> Result<Option<crate::PullRequestObservation>, BrokerError> {
+        self.conn
+            .query_row(
+                "SELECT repository, pr_number, head_commit, base_ref, is_draft, state,
+                        dismissed_reviews, observed_at
+                   FROM pull_request_observations
+                  WHERE repository = ?1 AND pr_number = ?2",
+                params![repository, pr_number],
+                |row| {
+                    Ok(crate::PullRequestObservation {
+                        repository: row.get(0)?,
+                        pr_number: row.get(1)?,
+                        head_commit: row.get(2)?,
+                        base_ref: row.get(3)?,
+                        is_draft: row.get::<_, i64>(4)? != 0,
+                        state: row.get(5)?,
+                        dismissed_reviews: row.get(6)?,
+                        observed_at: row.get(7)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(BrokerError::from)
+    }
+
+    /// Remember this look, replacing the last one.
+    ///
+    /// Written *after* the tick has acted, never before. Recording the
+    /// observation first would mean a tick that crashed mid-way had already
+    /// declared the transition handled, and the next tick would derive
+    /// `Scheduled` from its own unfinished work -- losing the event rather than
+    /// retrying it. The ledger's unique index makes the retry harmless.
+    pub fn record_pull_request_observation(
+        &mut self,
+        observation: &crate::PullRequestObservation,
+    ) -> Result<(), BrokerError> {
+        self.conn.execute(
+            "INSERT INTO pull_request_observations (
+                 repository, pr_number, head_commit, base_ref, is_draft, state,
+                 dismissed_reviews, observed_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT (repository, pr_number) DO UPDATE SET
+                 head_commit = excluded.head_commit,
+                 base_ref = excluded.base_ref,
+                 is_draft = excluded.is_draft,
+                 state = excluded.state,
+                 dismissed_reviews = excluded.dismissed_reviews,
+                 observed_at = excluded.observed_at",
+            params![
+                observation.repository,
+                observation.pr_number,
+                observation.head_commit,
+                observation.base_ref,
+                i64::from(observation.is_draft),
+                observation.state,
+                observation.dismissed_reviews,
+                observation.observed_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Every pull request the router has an observation for in one repository.
+    ///
+    /// This is what a sweep iterates: a pull request Aethyme has never looked
+    /// at has no row here, which is why `review tick` takes its candidates from
+    /// the provider and uses these only to decide what changed.
+    pub fn observed_pull_requests(
+        &self,
+        repository: &str,
+    ) -> Result<Vec<crate::PullRequestObservation>, BrokerError> {
+        let mut statement = self.conn.prepare(
+            "SELECT repository, pr_number, head_commit, base_ref, is_draft, state,
+                    dismissed_reviews, observed_at
+               FROM pull_request_observations
+              WHERE repository = ?1
+              ORDER BY pr_number",
+        )?;
+        let rows = statement
+            .query_map(params![repository], |row| {
+                Ok(crate::PullRequestObservation {
+                    repository: row.get(0)?,
+                    pr_number: row.get(1)?,
+                    head_commit: row.get(2)?,
+                    base_ref: row.get(3)?,
+                    is_draft: row.get::<_, i64>(4)? != 0,
+                    state: row.get(5)?,
+                    dismissed_reviews: row.get(6)?,
+                    observed_at: row.get(7)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// Move one request to a new state, recording why.
     pub fn set_review_request_state(
         &mut self,

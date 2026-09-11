@@ -368,7 +368,7 @@ Usage:
       Reads git and .aethyme/config.toml, needs no session, and performs
       nothing. Every review table is off by default, so an unconfigured
       repository plans nothing.
-  aethyme broker review run --session <id> --repo <owner/name> --pr <number> [--base <ref>] [--tabs-file <path>] [--dry-run]
+  aethyme broker review run --session <id> --repo <owner/name> --pr <number> [--base <ref>] [--tabs-file <path>] [--from-provider] [--dry-run]
       Perform one tick of the review router for one pull request: decide as
       `review plan` does but with the spent reviews read from the ledger, the
       in-flight reviews read from a Chau7 tab snapshot, and the pull request
@@ -377,6 +377,13 @@ Usage:
       cannot hold a slot forever. Records each request before it is handed out,
       then performs the GitHub writes through the coordinated lane and prints
       the Chau7 spawns for an adapter to start. --dry-run stops after the plan.
+  aethyme broker review tick --session <id> --repo <owner/name> [--limit <count>] [--tabs-file <path>] [--dry-run]
+      Run `review run --from-provider` over the open pull requests of one
+      repository, oldest first, and print one report for the sweep. This is
+      the whole scheduler: the broker starts no background poller, so a
+      cron entry, a CI step, or a person runs this bounded pass. A pull
+      request that fails is recorded in the report and skipped, never fatal,
+      so one broken pull request cannot stop the rest of the sweep.
   aethyme broker review ledger --repo <owner/name> [--pr <number>] [--json]
       Print the review ledger: every review the router has requested, for
       which head, through which backend, and how it ended. This is the answer
@@ -1681,6 +1688,9 @@ impl<E: std::fmt::Display> From<E> for UsageError {
     }
 }
 
+/// Cloned per pull request by `review tick`, which routes many of them from one
+/// parse of one command line.
+#[derive(Clone)]
 struct Parsed {
     read_only_snapshot: bool,
     positional: Vec<String>,
@@ -1728,6 +1738,12 @@ struct Parsed {
     review_type: Option<String>,
     review_state: Option<String>,
     note: Option<String>,
+    /// Read the change from the provider rather than the working directory.
+    ///
+    /// `review run` normally describes the checkout it is standing in. A tick
+    /// visits many pull requests and stands in none of them, so it asks the
+    /// provider for the files and commit messages instead.
+    from_provider: bool,
     write_resolution_template: Option<PathBuf>,
     worktree: Option<PathBuf>,
     title: Option<String>,
@@ -1815,6 +1831,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         review_type: None,
         review_state: None,
         note: None,
+        from_provider: false,
         write_resolution_template: None,
         worktree: None,
         title: None,
@@ -1901,6 +1918,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
             "--with-gate" => parsed.with_gate = true,
             "--apply" => parsed.apply = true,
             "--dry-run" => parsed.dry_run = true,
+            "--from-provider" => parsed.from_provider = true,
             "--no-wait" => parsed.no_wait = true,
             "--queue-timeout" => {
                 let value = iter.next().ok_or(UsageError::Message(
@@ -5329,13 +5347,18 @@ fn run_review_plan(parsed: Parsed) -> Result<(), UsageError> {
     let routing = crate::ReviewRoutingPolicy::load(&root).map_err(to_usage)?;
     let projection_policy = crate::PrProjectionPolicy::load(&root).map_err(to_usage)?;
 
+    // `review plan` is the offline preview: git and config, no provider call,
+    // runnable while other sessions work. It therefore cannot know which
+    // lifecycle transition this is, and says so in `assumptions` rather than
+    // presenting a guess as a reading. `review run` derives all of this for
+    // real.
     let facts = crate::ChangeFacts {
         trigger: Some(crate::ReviewTrigger::PullRequestOpened),
         paths: paths.clone(),
+        authored_by_model: classification.model.clone(),
         classification: classification.clone(),
         from_fork: false,
         first_time_contributor: false,
-        authored_by_model: None,
     };
     let eligible = crate::eligible_types(&trigger, &facts);
     let head = git_output(&change_root, &["rev-parse", "HEAD"])?
@@ -5407,6 +5430,8 @@ fn run_review_plan(parsed: Parsed) -> Result<(), UsageError> {
             "no reviews have been spent on this pull request yet",
             "no Chau7 tabs and no reviews are in flight",
             "the pull request carries no labels and no Aethyme comment",
+            "the change is a newly opened pull request, by a known contributor, \
+             not from a fork",
         ],
         "performed": false,
     });
@@ -5415,6 +5440,212 @@ fn run_review_plan(parsed: Parsed) -> Result<(), UsageError> {
         serde_json::to_string_pretty(&report).map_err(|e| UsageError::Message(e.to_string()))?
     );
     Ok(())
+}
+
+/// Read what the provider says about a pull request right now, read-only.
+///
+/// `None` means the question could not be answered -- no `gh`, no auth, no such
+/// pull request. Callers treat that as "no observation", which makes the tick
+/// derive `PullRequestOpened` and re-ask rather than invent a transition. An
+/// unnecessary review is the documented cost of an unverified signal; a
+/// silently skipped one is not.
+fn read_pull_request_snapshot(
+    root: &Path,
+    repository: &str,
+    pull_request: i64,
+) -> Option<crate::ProviderPullRequest> {
+    let output = std::process::Command::new("gh")
+        .current_dir(root)
+        .args([
+            "pr",
+            "view",
+            &pull_request.to_string(),
+            "--repo",
+            repository,
+            "--json",
+            "headRefOid,baseRefName,isDraft,state,isCrossRepository,reviews",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    // Dismissal is an event, and a snapshot can only show it as a count that
+    // grew since the last look.
+    let dismissed_reviews = json["reviews"]
+        .as_array()
+        .map(|reviews| {
+            reviews
+                .iter()
+                .filter(|review| {
+                    review["state"]
+                        .as_str()
+                        .is_some_and(|state| state.eq_ignore_ascii_case("dismissed"))
+                })
+                .count() as i64
+        })
+        .unwrap_or(0);
+    Some(crate::ProviderPullRequest {
+        head_commit: json["headRefOid"].as_str().unwrap_or_default().to_string(),
+        base_ref: json["baseRefName"].as_str().unwrap_or_default().to_string(),
+        is_draft: json["isDraft"].as_bool().unwrap_or(false),
+        state: json["state"]
+            .as_str()
+            .unwrap_or("open")
+            .to_ascii_lowercase(),
+        from_fork: json["isCrossRepository"].as_bool().unwrap_or(false),
+        dismissed_reviews,
+        author_association: read_author_association(root, repository, pull_request),
+    })
+}
+
+/// The author's relationship to the repository, from the provider.
+///
+/// A separate call because `gh pr view --json` does not expose
+/// `authorAssociation`; the REST representation does. Read-only, and a failure
+/// answers `None`, which [`crate::first_time_contributor`] treats as "not new"
+/// rather than as "new".
+fn read_author_association(root: &Path, repository: &str, pull_request: i64) -> Option<String> {
+    let output = std::process::Command::new("gh")
+        .current_dir(root)
+        .args([
+            "api",
+            &format!("repos/{repository}/pulls/{pull_request}"),
+            "--jq",
+            ".author_association",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if value.is_empty() || value == "null" {
+        return None;
+    }
+    Some(value.to_ascii_lowercase())
+}
+
+/// The change itself -- paths, declarations, head -- from the provider.
+///
+/// `review run` normally describes the working directory it was invoked in,
+/// which is right for an agent reviewing its own branch and impossible for a
+/// sweep: a tick visits every open pull request and is standing in none of
+/// them. Asking the provider needs no fetch, no checkout, and no local ref, so
+/// one tick can route a repository it has never cloned.
+fn read_change_from_provider(
+    root: &Path,
+    repository: &str,
+    pull_request: i64,
+) -> Option<(Vec<String>, crate::CommitClassification, String)> {
+    let output = std::process::Command::new("gh")
+        .current_dir(root)
+        .args([
+            "pr",
+            "view",
+            &pull_request.to_string(),
+            "--repo",
+            repository,
+            "--json",
+            "files,commits,headRefOid",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    let paths = json["files"]
+        .as_array()
+        .map(|files| {
+            files
+                .iter()
+                .filter_map(|file| file["path"].as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    // Trailers live in the body, and `merge` is oldest-first, so the order the
+    // provider returns commits in is the order declarations must be read in.
+    let classification = crate::CommitClassification::merge(
+        json["commits"]
+            .as_array()
+            .map(|commits| {
+                commits
+                    .iter()
+                    .map(|commit| {
+                        let headline = commit["messageHeadline"].as_str().unwrap_or_default();
+                        let body = commit["messageBody"].as_str().unwrap_or_default();
+                        crate::parse_classification(&format!("{headline}\n{body}"))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default(),
+    );
+    let head = json["headRefOid"].as_str()?.to_string();
+    Some((paths, classification, head))
+}
+
+/// Whether `head` has `previous` in its history.
+///
+/// This is what separates a commit added on top from a head that replaced the
+/// old one, and only a repository can answer it. An unknown answer is `false`,
+/// which reports `ReplacementCommit`: treating a rewrite as an append would
+/// tell a rule that history it already reviewed is still intact when it may not
+/// be, and that is the direction that loses a review.
+fn head_descends_from(root: &Path, previous: &str, head: &str) -> bool {
+    if previous.is_empty() || head.is_empty() {
+        return false;
+    }
+    std::process::Command::new("git")
+        .current_dir(root)
+        .args(["merge-base", "--is-ancestor", previous, head])
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+/// Everything the decision plane reads about a change, gathered for real.
+///
+/// The trigger and the provider-supplied facts used to be hardcoded here, which
+/// meant every rule keyed on `on`, `from_fork` or `first_time_contributor`
+/// parsed, loaded, and never matched. Returns the snapshot alongside the facts
+/// so the caller can record the observation once the tick has acted on it.
+fn gather_change_facts(
+    store_root: &Path,
+    repository: &str,
+    pull_request: i64,
+    paths: Vec<String>,
+    classification: crate::CommitClassification,
+    previous: Option<&crate::PullRequestObservation>,
+) -> (crate::ChangeFacts, Option<crate::ProviderPullRequest>) {
+    let snapshot = read_pull_request_snapshot(store_root, repository, pull_request);
+    let Some(snapshot) = snapshot else {
+        return (
+            crate::ChangeFacts {
+                trigger: Some(crate::ReviewTrigger::PullRequestOpened),
+                authored_by_model: classification.model.clone(),
+                paths,
+                classification,
+                from_fork: false,
+                first_time_contributor: false,
+            },
+            None,
+        );
+    };
+    let descends = previous.is_some_and(|previous| {
+        head_descends_from(store_root, &previous.head_commit, &snapshot.head_commit)
+    });
+    let facts = crate::ChangeFacts {
+        trigger: Some(crate::derive_trigger(previous, &snapshot, descends)),
+        paths,
+        authored_by_model: classification.model.clone(),
+        classification,
+        from_fork: snapshot.from_fork,
+        first_time_contributor: crate::first_time_contributor(
+            snapshot.author_association.as_deref(),
+        ),
+    };
+    (facts, Some(snapshot))
 }
 
 /// Read the pull request facts the projection needs, with read-only `gh`.
@@ -5502,7 +5733,7 @@ fn read_pull_request_facts(
 /// read-only `gh` for what the pull request already says -- followed by the
 /// effects. `--dry-run` stops after the plan, which is what makes the first
 /// run against a real repository safe to look at.
-fn run_review_run(parsed: Parsed) -> Result<(), UsageError> {
+fn run_review_run(parsed: Parsed) -> Result<serde_json::Value, UsageError> {
     // A dry run performs nothing, so it needs neither a session nor a write
     // lock -- which is what makes it runnable while other sessions are working.
     let session_id = match parsed.session {
@@ -5536,23 +5767,38 @@ fn run_review_run(parsed: Parsed) -> Result<(), UsageError> {
     let routing = crate::ReviewRoutingPolicy::load(&root).map_err(to_usage)?;
     let projection_policy = crate::PrProjectionPolicy::load(&root).map_err(to_usage)?;
 
-    let paths = git_lines(
-        &change_root,
-        &["diff", "--name-only", &format!("{base}...HEAD")],
-    )?;
-    let messages = git_output(
-        &change_root,
-        &["log", "--format=%B%x00", &format!("{base}..HEAD")],
-    )?;
-    let classification = crate::CommitClassification::merge(
-        messages
-            .split('\0')
-            .filter(|m| !m.trim().is_empty())
-            .map(crate::parse_classification),
-    );
-    let head = git_output(&change_root, &["rev-parse", "HEAD"])?
-        .trim()
-        .to_string();
+    // Where the change is read from. The working directory is right for an
+    // agent routing its own branch and impossible for a sweep, which visits
+    // every open pull request and is standing in none of them; the git reads
+    // below would fail on the first one. So the source is chosen before either
+    // is attempted, never after.
+    let (paths, classification, head) = if parsed.from_provider {
+        read_change_from_provider(&root, &repository, pull_request).ok_or_else(|| {
+            UsageError::Message(format!(
+                "cannot read pull request {pull_request} from {repository}; \
+                 --from-provider needs an authenticated gh"
+            ))
+        })?
+    } else {
+        let paths = git_lines(
+            &change_root,
+            &["diff", "--name-only", &format!("{base}...HEAD")],
+        )?;
+        let messages = git_output(
+            &change_root,
+            &["log", "--format=%B%x00", &format!("{base}..HEAD")],
+        )?;
+        let classification = crate::CommitClassification::merge(
+            messages
+                .split('\0')
+                .filter(|m| !m.trim().is_empty())
+                .map(crate::parse_classification),
+        );
+        let head = git_output(&change_root, &["rev-parse", "HEAD"])?
+            .trim()
+            .to_string();
+        (paths, classification, head)
+    };
 
     // Before reading anything, stop waiting on reviews nobody is coming back
     // for. This has to happen first: an expired row becomes `abandoned`, which
@@ -5607,14 +5853,18 @@ fn run_review_run(parsed: Parsed) -> Result<(), UsageError> {
     let tabs = read_tab_snapshot(&parsed)?;
     let pr_facts = read_pull_request_facts(&change_root, &repository, pull_request);
 
-    let facts = crate::ChangeFacts {
-        trigger: Some(crate::ReviewTrigger::PullRequestOpened),
-        paths: paths.clone(),
-        classification: classification.clone(),
-        from_fork: false,
-        first_time_contributor: false,
-        authored_by_model: None,
-    };
+    let previous = broker
+        .store()
+        .pull_request_observation(&repository, pull_request)
+        .map_err(to_usage)?;
+    let (facts, snapshot) = gather_change_facts(
+        &root,
+        &repository,
+        pull_request,
+        paths.clone(),
+        classification.clone(),
+        previous.as_ref(),
+    );
     let eligible = crate::eligible_types(&trigger, &facts);
     let decisions = crate::schedule(&trigger, &eligible, &spend, &head, now_ms());
     let dispatch: Vec<crate::ReviewDispatchAction> = decisions
@@ -5663,8 +5913,17 @@ fn run_review_run(parsed: Parsed) -> Result<(), UsageError> {
     let plan = crate::plan_execution(&dispatch, &projection_actions, pull_request);
 
     if parsed.dry_run {
-        emit_review_run_report(&base, &head, pull_request, &plan, &[], &[], &expired, false)?;
-        return Ok(());
+        return Ok(build_review_run_report(
+            &base,
+            &head,
+            pull_request,
+            &plan,
+            &[],
+            &[],
+            &expired,
+            facts.trigger,
+            false,
+        ));
     }
 
     // Record before performing. See `review_execution`'s module comment: a
@@ -5762,7 +6021,10 @@ fn run_review_run(parsed: Parsed) -> Result<(), UsageError> {
                     )
                     .map_err(to_usage)?;
             }
-            emit_review_run_report(
+            // The report still goes out: it names the operation that failed
+            // and the row that went back to `abandoned`, which is what a
+            // caller needs to decide whether to retry.
+            print_json(&build_review_run_report(
                 &base,
                 &head,
                 pull_request,
@@ -5770,8 +6032,9 @@ fn run_review_run(parsed: Parsed) -> Result<(), UsageError> {
                 &performed,
                 &skipped,
                 &expired,
+                facts.trigger,
                 true,
-            )?;
+            ))?;
             return Err(UsageError::Message(format!(
                 "coordinated GitHub write failed: {}",
                 call.purpose
@@ -5779,7 +6042,27 @@ fn run_review_run(parsed: Parsed) -> Result<(), UsageError> {
         }
     }
 
-    emit_review_run_report(
+    // The tick acted, so this look becomes the one the next tick compares
+    // against. Deliberately last: recording it earlier would mean a tick that
+    // failed part-way had already declared the transition handled, and the
+    // next tick would see `Scheduled` and never retry what it missed.
+    if let Some(snapshot) = snapshot.as_ref() {
+        broker
+            .store()
+            .record_pull_request_observation(&crate::PullRequestObservation {
+                repository: repository.clone(),
+                pr_number: pull_request,
+                head_commit: snapshot.head_commit.clone(),
+                base_ref: snapshot.base_ref.clone(),
+                is_draft: snapshot.is_draft,
+                state: snapshot.state.clone(),
+                dismissed_reviews: snapshot.dismissed_reviews,
+                observed_at: now_ms(),
+            })
+            .map_err(to_usage)?;
+    }
+
+    Ok(build_review_run_report(
         &base,
         &head,
         pull_request,
@@ -5787,8 +6070,153 @@ fn run_review_run(parsed: Parsed) -> Result<(), UsageError> {
         &performed,
         &skipped,
         &expired,
+        facts.trigger,
         true,
-    )?;
+    ))
+}
+
+/// Route every open pull request in a repository, once.
+///
+/// One bounded foreground pass, in the same shape as `watch pr tick` and for
+/// the same reason: **the broker never starts a background poller.** A daemon
+/// inside a coordination tool is a second thing to supervise, it holds the
+/// machine-wide database open for its whole life, and it fails silently by
+/// construction because nobody is watching the thing that watches. A command
+/// that does one pass and exits can be run by cron, by a CI schedule, by a
+/// hook, or by a person, and each of those already has a way to tell you it
+/// stopped.
+///
+/// The bound matters as much as the pass. `--limit` caps how many pull requests
+/// one invocation touches, so a repository with sixty open pull requests costs
+/// a predictable number of provider calls rather than however many there happen
+/// to be.
+///
+/// A pull request that fails is recorded and skipped, not fatal: one
+/// unreachable pull request must not stop the other fifty-nine from being
+/// routed.
+fn run_review_tick(parsed: Parsed) -> Result<(), UsageError> {
+    let repository = parsed
+        .repository
+        .clone()
+        .ok_or_else(|| UsageError::Message("review tick requires --repo <owner/name>".into()))?;
+    if parsed.session.is_none() && !parsed.dry_run {
+        return Err(UsageError::Message(
+            "review tick requires --session <id>, or --dry-run to plan only".into(),
+        ));
+    }
+    let limit = parsed.limit.unwrap_or(20).clamp(1, 100);
+
+    let root = {
+        let broker = open_broker(true)?;
+        broker.main_root().to_path_buf()
+    };
+    let open = list_open_pull_requests(&root, &repository, limit)?;
+
+    let mut visited = Vec::new();
+    for pull_request in &open {
+        let mut one = parsed.clone();
+        one.pr_number = Some(*pull_request);
+        // A sweep stands in no pull request's checkout, so it always reads the
+        // change from the provider.
+        one.from_provider = true;
+        match run_review_run(one) {
+            Ok(report) => visited.push(serde_json::json!({
+                "pull_request": pull_request,
+                "trigger": report.get("trigger").cloned(),
+                // The head every handoff below was decided against. An adapter
+                // needs it to check out the right commit and to close the row
+                // it was actually handed, rather than whatever the most recent
+                // push made current in between.
+                "head": report.get("head").cloned(),
+                "requested": report
+                    .get("plan")
+                    .and_then(|plan| plan.get("ledger"))
+                    .cloned(),
+                // Carried whole, not counted: a sweep exists so that one
+                // adapter invocation can start every review it produced, and a
+                // count would force the adapter to re-run `review run` per
+                // pull request to learn what it was handed.
+                "chau7_handoff": report.get("chau7_handoff").cloned(),
+                "expired": report.get("expired").cloned(),
+                "ok": true,
+            })),
+            // A pull request that cannot be routed is reported and left
+            // behind. Stopping here would let one unreachable pull request
+            // decide that none of the others get reviewed.
+            Err(error) => visited.push(serde_json::json!({
+                "pull_request": pull_request,
+                "ok": false,
+                "error": match error {
+                    UsageError::Message(message) => message,
+                    UsageError::Exit { message, .. } => message,
+                    UsageError::Help => "usage".to_string(),
+                    UsageError::SilentExit(code) => format!("exited with code {code}"),
+                },
+            })),
+        }
+    }
+
+    print_json(&serde_json::json!({
+        "repository": repository,
+        "limit": limit,
+        "open_pull_requests": open.len(),
+        "performed": !parsed.dry_run,
+        "visited": visited,
+    }))
+}
+
+/// Open pull request numbers, oldest first, capped.
+///
+/// Oldest first so a repository with more open pull requests than `--limit`
+/// makes progress on a fixed set rather than re-routing whatever happens to be
+/// newest every pass and never reaching the rest.
+fn list_open_pull_requests(
+    root: &Path,
+    repository: &str,
+    limit: u32,
+) -> Result<Vec<i64>, UsageError> {
+    let output = std::process::Command::new("gh")
+        .current_dir(root)
+        .args([
+            "pr",
+            "list",
+            "--repo",
+            repository,
+            "--state",
+            "open",
+            "--limit",
+            &limit.to_string(),
+            "--json",
+            "number",
+        ])
+        .output()
+        .map_err(|error| UsageError::Message(format!("gh pr list: {error}")))?;
+    if !output.status.success() {
+        return Err(UsageError::Message(format!(
+            "cannot list open pull requests in {repository}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|error| UsageError::Message(format!("gh pr list returned no JSON: {error}")))?;
+    let mut numbers: Vec<i64> = json
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|row| row["number"].as_i64())
+                .collect()
+        })
+        .unwrap_or_default();
+    numbers.sort_unstable();
+    Ok(numbers)
+}
+
+/// Print one JSON value, pretty.
+fn print_json(value: &serde_json::Value) -> Result<(), UsageError> {
+    out!(
+        "{}",
+        serde_json::to_string_pretty(value).map_err(|e| UsageError::Message(e.to_string()))?
+    );
     Ok(())
 }
 
@@ -5812,7 +6240,7 @@ fn read_tab_snapshot(parsed: &Parsed) -> Result<Vec<crate::Chau7Tab>, UsageError
     })
 }
 
-fn emit_review_run_report(
+fn build_review_run_report(
     base: &str,
     head: &str,
     pull_request: i64,
@@ -5820,12 +6248,17 @@ fn emit_review_run_report(
     performed: &[serde_json::Value],
     skipped: &[serde_json::Value],
     expired: &[crate::ExpiredReview],
+    trigger: Option<crate::ReviewTrigger>,
     executed: bool,
-) -> Result<(), UsageError> {
-    let report = serde_json::json!({
+) -> serde_json::Value {
+    serde_json::json!({
         "base": base,
         "head": head,
         "pull_request": pull_request,
+        // Which transition this tick decided had happened. Absent when the
+        // provider could not be reached, which is itself worth seeing: the
+        // whole rule set then ran against a change nobody could describe.
+        "trigger": trigger,
         "plan": plan,
         "performed": executed,
         "github_operations": performed,
@@ -5838,12 +6271,7 @@ fn emit_review_run_report(
         // access starts these, then closes each row with
         // `aethyme broker review state --repo <r> --pr <n> --type <t> --state <s>`.
         "chau7_handoff": plan.chau7,
-    });
-    out!(
-        "{}",
-        serde_json::to_string_pretty(&report).map_err(|e| UsageError::Message(e.to_string()))?
-    );
-    Ok(())
+    })
 }
 
 fn to_usage<E: std::fmt::Display>(error: E) -> UsageError {
@@ -6019,7 +6447,14 @@ fn run_review(parsed: Parsed) -> Result<(), UsageError> {
         return run_review_plan(parsed);
     }
     if action == "run" {
-        return run_review_run(parsed);
+        let report = run_review_run(parsed)?;
+        return print_json(&report);
+    }
+    // A sweep over every open pull request, which is `run` repeated. It takes
+    // its own `--session` check rather than the shared one below because
+    // `--dry-run` must stay usable without one, exactly as it is for `run`.
+    if action == "tick" {
+        return run_review_tick(parsed);
     }
     // `ledger` and `state` are about the router's ledger rather than a
     // session's review lifecycle, so they take a repository instead of the

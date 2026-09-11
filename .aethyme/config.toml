@@ -39,6 +39,7 @@ mode = "auto"
 #   Surface: auth
 #   Risk: high
 #   Review: security      # explicitly ask for a dimension
+#   Model: claude-opus-5  # declared, never inferred from Co-Authored-By
 #
 # A declaration can ADD a review; it can never remove one. Every rule below is
 # a floor that an author cannot lower, so a mistaken or gamed trailer costs an
@@ -50,7 +51,7 @@ mode = "auto"
 # This is the one part that cannot be guessed. A rule fires when every
 # condition it names holds; a rule with no conditions matches every change.
 # Conditions: `on`, `paths`, `areas`, `surfaces`, `min_risk`, `from_fork`,
-# `first_time_contributor`.
+# `first_time_contributor`, `authored_by_model`, `models`.
 #
 #> [[review.trigger.rule]]
 #> name = "always-code-review"

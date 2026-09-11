@@ -103,6 +103,7 @@ mod retention;
 mod review;
 mod review_backend;
 mod review_execution;
+mod review_facts;
 mod review_ledger;
 mod review_trigger;
 mod schema;
@@ -343,6 +344,9 @@ pub use review_backend::{
 };
 pub use review_execution::{
     Chau7Handoff, DeferredReview, GhCall, LedgerWrite, ReviewExecutionPlan, plan_execution,
+};
+pub use review_facts::{
+    ProviderPullRequest, PullRequestObservation, derive_trigger, first_time_contributor,
 };
 pub use review_ledger::{
     ExpiredReview, ReviewRequest, ReviewRequestState, expired, in_flight, spend_by_type,

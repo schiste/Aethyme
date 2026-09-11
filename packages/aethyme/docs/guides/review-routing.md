@@ -115,8 +115,15 @@ min_risk = "high"
 [[review.trigger.rule]]
 name = "schema-changes-on-a-retarget"
 require = ["data"]
-on = ["base_retargeted", "merge_queue_entered"]
+on = ["base_retargeted", "replacement_commit"]
 areas = ["database"]
+
+# A model reviewing its own output has correlated blind spots exactly where
+# review is supposed to be independent.
+[[review.trigger.rule]]
+name = "independent-eyes-on-model-authored-work"
+require = ["code"]
+models = ["claude-opus-5"]
 
 # How often a dimension may be spent. Rules decide what a change deserves;
 # this decides what it gets, and is what keeps a rich rule set from becoming a
@@ -196,6 +203,8 @@ with no agent started and no bot mentioned.
 | `min_risk` | string | Declared `Risk:` at or above this level. |
 | `from_fork` | bool | Only when the change comes from a fork. |
 | `first_time_contributor` | bool | Only when the author has not landed here before. |
+| `authored_by_model` | bool | `true` only when a `Model:` trailer names one; `false` only when none does. |
+| `models` | list | Only when the declared `Model:` is one of these, compared case-insensitively. |
 
 Dimension names in `require` are free strings. `code`, `security`,
 `performance`, `data`, `conventions` are conventions, not an enum -- a
@@ -203,10 +212,20 @@ repository that wants `accessibility` or `i18n` simply names it and routes it.
 
 `on` accepts `pull_request_opened`, `ready_for_review`, `reopened`,
 `replacement_commit` (force-push, amend, rebase), `additional_commit`,
-`base_retargeted`, `review_dismissed`, `merge_queue_entered`, `scheduled`, and
-`manual`. A force-push that rewrites the same logical change and a commit
-stacked on top of reviewed work justify different responses, which is why they
-are separate values rather than one "the head moved".
+`base_retargeted`, `review_dismissed`, `scheduled`, and `manual`. A force-push
+that rewrites the same logical change and a commit stacked on top of reviewed
+work justify different responses, which is why they are separate values rather
+than one "the head moved".
+
+`merge_queue_entered` is **rejected at load**. Nothing a tick can ask the
+provider distinguishes it, so a rule waiting for it would never fire -- and
+configuration that looks active and is dead is the exact failure this whole
+vocabulary exists to avoid. The error names the rule and the trigger:
+
+```
+.aethyme/config.toml: review.trigger rule 3 waits for `merge_queue_entered`,
+which no tick can report; remove it from `on` or the rule will never fire
+```
 
 `min_risk` ranks `none` below `low`, `low` below `high` and `critical`. An
 unrecognised value ranks *above* `low`: a typo in a risk trailer escalates
@@ -229,6 +248,7 @@ Area: backend
 Surface: auth
 Risk: high
 Review: security
+Model: claude-opus-5
 ```
 
 | Trailer | Effect |
@@ -237,10 +257,20 @@ Review: security
 | `Surface:` | Matched by a rule's `surfaces`; labelled `aethyme/surface:<value>`. |
 | `Risk:` | Compared against `min_risk`; labelled `aethyme/risk:<value>`. |
 | `Review:` | Asks for a dimension directly, with no rule required. |
+| `Model:` | Matched by a rule's `authored_by_model` and `models`. Not labelled: who wrote a change is the author's to disclose, not Aethyme's to publish. |
 
 Values are comma-separated and case-insensitive. Trailers may appear anywhere
 in the body, and are merged across every commit in the change -- the highest
-risk wins, and the areas union.
+risk wins, the areas union, and the first `Model:` declared wins, because a
+later commit that names a different model must not be able to relabel work
+somebody already declared.
+
+`Model:` is a **declaration, not a detection**. `Co-Authored-By` is the
+lookalike and is deliberately not read: it is written by convention, carries a
+display name rather than a stable identifier, and appears on commits a model
+only helped with. A rule that refuses to let a model review its own output must
+not fire on a guess, so this is populated only when an author says so outright
+-- and, like every other trailer, it can only ever add a review.
 
 **A declaration can add a review; it can never remove one.** Eligibility is the
 union of what the author asked for and what the rules require, never the
@@ -366,10 +396,13 @@ whatever worktree you are standing in. Both appear in the report as
 `policy_root` and `change_root`, so a surprising verdict can be traced to the
 tree it was computed from.
 
-Review spend and live Chau7 tabs are the two inputs it cannot get without a
-network, and the `assumptions` array says so rather than guessing. What it
-shows is the decision for a pull request with nothing spent yet -- which is the
-case an operator is reasoning about while writing rules.
+Review spend, live Chau7 tabs, and everything only the provider knows -- the
+lifecycle transition, whether the change is from a fork, whether the author is
+new -- are the inputs it cannot get without a network, and the `assumptions`
+array says so rather than guessing. It plans as if the change were a newly
+opened pull request by a known contributor, not from a fork, which is the case
+an operator is reasoning about while writing rules. `review run` replaces every
+one of those assumptions with a reading.
 
 With the configuration above, against a change touching `operations.rs` and
 declaring `Area: backend` / `Surface: auth` / `Risk: high`:
@@ -433,6 +466,7 @@ aethyme broker review run --session 408 --repo owner/name --pr 42 \
 | `--pr` | required | The pull request to act on. |
 | `--base` | `aethyme/integration` | What to diff against. |
 | `--tabs-file` | none | A Chau7 `tab_list` snapshot, as JSON. |
+| `--from-provider` | off | Read the changed paths and commit trailers from `gh` instead of the working tree, so the command works from anywhere. |
 | `--dry-run` | off | Plan against real facts and stop. Needs no session and takes no write lock. |
 
 Each of `review plan`'s three assumptions becomes a reading:
@@ -448,6 +482,103 @@ an error: routing then defers every Chau7 review instead of spawning into a
 workspace it cannot see, and the run still records, mentions bots, and projects.
 That is what makes `review run` usable from a scheduler with no Chau7 access at
 all.
+
+### Where the trigger and the facts come from
+
+`on`, `from_fork`, `first_time_contributor` and `authored_by_model` are facts
+about a pull request, not about a diff, so `review run` reads them from the
+provider rather than inventing them. Pass `--from-provider` and it takes the
+changed paths and the commit trailers from `gh pr view --json files,commits`
+too, which is what makes the command usable from a directory that is not the
+pull request's checkout.
+
+| Fact | Source |
+| --- | --- |
+| `on` | compared against `pull_request_observations`, the row holding what the last tick saw |
+| `from_fork` | `gh pr view --json isCrossRepository` |
+| `first_time_contributor` | `gh api repos/{owner}/{name}/pulls/{n} --jq .author_association` |
+| `authored_by_model` | the `Model:` trailer on the change's commits |
+
+The transition is **derived by comparison**, not reported by a webhook. Each
+tick fetches the head, base, draft flag, state, and dismissed-review count, and
+names the transition against the row the previous tick left behind:
+
+| Seen | Reported |
+| --- | --- |
+| nothing -- never observed | `pull_request_opened` |
+| was closed, now open | `reopened` |
+| was draft, now not | `ready_for_review` |
+| more dismissed reviews than before | `review_dismissed` |
+| a different base | `base_retargeted` |
+| a head that descends from the old one | `additional_commit` |
+| a head that does not | `replacement_commit` |
+| nothing changed | `scheduled` |
+
+Several of these are true at once on a busy pull request -- leaving draft
+usually arrives with commits -- and the order above is the precedence: the first
+match is the most informative thing to have happened. `git merge-base
+--is-ancestor` is what separates a stacked commit from a rewrite, and an
+unknown answer reports `replacement_commit`, which is the direction that
+re-reviews rather than assumes reviewed work is still reviewed.
+
+The observation is written **after** the tick has acted, never before. Recording
+it first would mean a tick that crashed halfway had already declared the
+transition handled, and the next tick would derive `scheduled` from its own
+unfinished work -- losing the event instead of retrying it. Retrying is cheap
+because the ledger's unique index makes a duplicate request a no-op.
+
+### Running it on a schedule
+
+`review run` acts on one pull request. `review tick` sweeps a repository:
+
+```bash
+aethyme broker review tick --session 408 --repo owner/name --limit 20 \
+    --tabs-file /tmp/tabs.json
+```
+
+It lists open pull requests oldest first, runs `review run --from-provider` on
+each, and prints one report for the sweep. Oldest first so a repository with
+more open pull requests than `--limit` makes progress on a fixed set instead of
+re-routing whatever happens to be newest and never reaching the rest. A pull
+request that fails is recorded in the report with its error and skipped: one
+unreachable pull request must not decide that none of the others get reviewed.
+
+**This is the whole scheduler.** The broker starts no background poller, here or
+anywhere else -- a daemon is a second thing to supervise, it holds the
+machine-wide database open, and it fails silently. One bounded foreground pass
+is something cron, a CI step, a git hook, or a person can run, and its failure
+is visible wherever it was run from.
+
+```cron
+*/10 * * * * cd /path/to/repo && aethyme broker review tick --session 408 --repo owner/name
+```
+
+### Starting the Chau7 reviews
+
+`chau7_handoff` is the one thing the broker hands off, and
+`scripts/adapters/chau7-review-adapter.py` is the shipped consumer:
+
+```bash
+packages/aethyme/scripts/adapters/chau7-review-adapter.py \
+    --session 408 --repo owner/name --repo-path /path/to/repo
+```
+
+It takes a `tab_list` snapshot, runs `review tick` with it, and for each handoff
+checks the pull request's head out into the workspace, opens a Chau7 tab there,
+runs the reviewing agent with the prompt, and closes the row:
+
+- started: `review state --state running`
+- could not start: `review state --state abandoned --note "<why>"`, which is the
+  one revivable state, so the next tick asks again
+- the adapter itself died in between: the row stays `requested` and the route's
+  `stale_after_minutes` reclaims it
+
+Every git write it makes -- fetching the pull ref, adding and removing the
+review worktree -- runs through `aethyme broker git`, because a review workspace
+is a shared-git mutation like any other. The workspace path *is* the identity of
+an in-flight review, which is why a workspace already sitting on the right
+commit is reused and one sitting on anything else is replaced: reviewing the
+wrong commit is worse than not reviewing.
 
 ### Recorded before performed
 
@@ -568,6 +699,10 @@ for, and inventing a row would bury that.
   silently reviewing nothing is the one failure mode this must not have.
 - It never merges, pushes, or edits a branch under review. The generated Chau7
   prompt says so explicitly.
+- It never starts a background poller. `review tick` is a bounded foreground
+  pass; scheduling it is the operator's choice and the operator's cron.
+- It never guesses who wrote a change. `authored_by_model` reads a declared
+  `Model:` trailer and nothing else.
 
 ## See also
 

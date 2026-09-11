@@ -30,6 +30,8 @@ condition matches every change.
 | `min_risk` | string | no | Declared `Risk:` at or above this level. |
 | `from_fork` | bool | no | Only when the change comes from a fork. |
 | `first_time_contributor` | bool | no | Only when the author has not landed here before. |
+| `authored_by_model` | bool | no | `true` only when a `Model:` trailer names one; `false` only when none does. |
+| `models` | list | no | Only when the declared `Model:` is one of these, compared case-insensitively. |
 
 **Globs.** `*` matches exactly one path segment. `**` matches any number of
 segments including zero. Paths are repository-relative with no leading `/` or
@@ -37,12 +39,19 @@ segments including zero. Paths are repository-relative with no leading `/` or
 
 **`on` values.** `pull_request_opened`, `ready_for_review`, `reopened`,
 `replacement_commit` (force-push, amend, rebase), `additional_commit`,
-`base_retargeted`, `review_dismissed`, `merge_queue_entered`, `scheduled`,
-`manual`.
+`base_retargeted`, `review_dismissed`, `scheduled`, `manual`.
 
 `replacement_commit` and `additional_commit` are separate on purpose: a
 force-push that rewrites the same logical change and a commit stacked on top of
 already-reviewed work justify different responses.
+
+`merge_queue_entered` is **rejected at load**: nothing a tick can ask the
+provider distinguishes it, so a rule waiting for it would never fire. Do not
+write it.
+
+The transition is derived by comparing the pull request against the last
+observation of it, not delivered by a webhook, so it is available to any tick
+and needs no inbound endpoint.
 
 **`min_risk` ranking.** `none` < `low` < `high` = `critical`. An unrecognised
 value ranks *above* `low`, so a typo in a risk trailer escalates rather than
@@ -114,10 +123,15 @@ judgement.
 | `Surface:` | a rule's `surfaces` | `aethyme/surface:<value>` |
 | `Risk:` | a rule's `min_risk` | `aethyme/risk:<value>` |
 | `Review:` | nothing -- asks for a dimension directly | `aethyme/review:<value>` |
+| `Model:` | a rule's `authored_by_model` and `models` | nothing -- who wrote a change is the author's to disclose |
 
 Values are comma-separated and case-insensitive. Trailers may appear anywhere
 in the body and are merged across every commit in the change: areas and
-surfaces union, and the highest risk wins.
+surfaces union, the highest risk wins, and the first `Model:` declared wins.
+
+`Model:` is a declaration, not a detection. `Co-Authored-By` is deliberately not
+read: it is written by convention, carries a display name rather than a stable
+identifier, and appears on commits a model only helped with.
 
 A declaration can add a review and can never remove one.
 
@@ -126,6 +140,7 @@ A declaration can add a review and can never remove one.
 | Error | Cause |
 | --- | --- |
 | `rule N requires no review types` | A rule with an empty `require`. |
+| `rule N waits for <trigger>, which no tick can report` | `on` names `merge_queue_entered`. Remove it; the rule would never fire. |
 | `unknown field` | A typo, or a field from a newer broker. |
 | `schema_version N is newer than this broker understands` | Upgrade `aethyme`, or pin the policy. It refuses rather than falling back, because silently reviewing nothing is the failure this must not have. |
 | `route <name> uses provider_comment without a mention` | `provider_comment` with no bot to mention. |

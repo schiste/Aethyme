@@ -71,6 +71,47 @@ artifacts and their exact source revision are recorded in each signed
   projection and routing in that order -- plus a `references/review-rules.md`
   field grammar loaded only when needed. It is embedded in the binary, so an
   installed Aethyme deploys it with no checkout and no network.
+- The review trigger now has a real event source. `aethyme broker review run
+  --from-provider` reads the pull request from `gh`, compares it against the
+  last observation the broker kept of that pull request, and derives which of
+  the ten `on` transitions happened -- reopened, ready for review, a dismissed
+  review, a retargeted base, an additional or a replacement commit, or no
+  transition at all. Additional and replacement commits are told apart with
+  `git merge-base --is-ancestor`, so a force-push that rewrites history is not
+  reported as more work on top of it. Without the flag the trigger stays
+  `pull_request_opened`, which is what every earlier run assumed. The
+  observation is written last, after the run has acted on the transition it
+  derived: recording it first would let a half-finished tick claim the
+  transition was handled and the next one see nothing to do (broker schema
+  v35).
+- `on = ["merge_queue_entered"]` is now rejected when the config loads, naming
+  the rule: no tick can observe a merge queue from the pull request alone, so
+  the rule could only ever wait forever. Turning dead configuration into a loud
+  load error is the point -- a rule that silently never fires reads exactly
+  like a rule that is working.
+- `from_fork` and `first_time_contributor` are now read from the pull request
+  instead of being assumed false, so rules keyed on them match. `Model:` joins
+  the commit trailers, and two new rule conditions read it: `authored_by_model`
+  (a model declared itself the author, or none did) and `models` (the declared
+  model is one of these). It stays a declaration rather than a detection --
+  `true` means somebody said a model wrote this -- so like every other
+  condition it may only add a review, never waive one. The case it exists for
+  is a repository that reviews with one model and does not want that model
+  reviewing its own output.
+- `aethyme broker review tick --session <id> --repo <owner/name>` runs
+  `review run --from-provider` across a repository's open pull requests, oldest
+  first, and prints one report for the sweep. This is the whole scheduler: the
+  broker still starts no background poller, so a cron entry, a CI step, a hook,
+  or a person runs this one bounded pass. A pull request that fails is recorded
+  in the report and skipped rather than ending the sweep.
+- `scripts/adapters/chau7-review-adapter.py` is the missing half of the Chau7
+  route: it runs a tick, and for each handoff prepares the review worktree
+  through `broker git`, opens a Chau7 tab in it, and starts the reviewing
+  agent. A review that starts is moved to `running`; one that cannot start is
+  moved to `abandoned`, the single state the router will ask about again; an
+  adapter that dies in between leaves the row `requested` for
+  `stale_after_minutes` to reclaim. The broker still never talks to Chau7 --
+  it decides, and the caller holding the transport performs.
 
 ## [0.7.17] - 2026-09-10
 

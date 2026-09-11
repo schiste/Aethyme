@@ -16,7 +16,7 @@ use rusqlite::Connection;
 use crate::error::BrokerError;
 
 /// Current database schema version (== `MIGRATIONS.len()`).
-pub const SCHEMA_VERSION: i64 = 34;
+pub const SCHEMA_VERSION: i64 = 35;
 
 /// Version stamped on every event row written by this binary.
 pub const EVENTS_SCHEMA_VERSION: i64 = 1;
@@ -942,6 +942,31 @@ CREATE INDEX review_requests_by_repository_state
     ON review_requests (repository, state);
 ";
 
+/// What the router last saw of each pull request.
+///
+/// A lifecycle transition is a difference between two looks, so deriving one
+/// needs the previous look kept somewhere. The ledger cannot serve: it records
+/// what was *asked for*, and a pull request whose policy requests nothing
+/// leaves no row at all while still moving through draft, rebases and retargets
+/// that a later rule cares about.
+///
+/// One row per pull request, overwritten in place. This is a memory of the last
+/// observation, not a history of them; keeping every look would grow without
+/// bound to answer a question only the most recent one can answer.
+const MIGRATION_V35: &str = "
+CREATE TABLE pull_request_observations (
+    repository        TEXT NOT NULL,
+    pr_number         INTEGER NOT NULL,
+    head_commit       TEXT NOT NULL,
+    base_ref          TEXT NOT NULL,
+    is_draft          INTEGER NOT NULL,
+    state             TEXT NOT NULL,
+    dismissed_reviews INTEGER NOT NULL,
+    observed_at       INTEGER NOT NULL,
+    PRIMARY KEY (repository, pr_number)
+);
+";
+
 const MIGRATIONS: &[&str] = &[
     MIGRATION_V1,
     MIGRATION_V2,
@@ -977,6 +1002,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_V32,
     MIGRATION_V33,
     MIGRATION_V34,
+    MIGRATION_V35,
 ];
 
 pub(crate) fn current_version(conn: &Connection) -> Result<i64, BrokerError> {
@@ -1930,6 +1956,50 @@ mod tests {
             .is_err(),
             "the state CHECK must survive the rebuild"
         );
+        assert_eq!(current_version(&conn).unwrap(), SCHEMA_VERSION);
+    }
+
+    /// The router used to report `pull_request_opened` for every tick, because
+    /// it had nothing to compare against. v35 is that missing half: one row per
+    /// pull request holding what the last tick saw, so the next one can name
+    /// the transition instead of assuming it.
+    #[test]
+    fn v35_remembers_exactly_one_previous_observation_per_pull_request() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            .unwrap();
+        for (index, sql) in MIGRATIONS[..34].iter().enumerate() {
+            conn.execute_batch(sql).unwrap();
+            conn.execute(
+                "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)
+                 ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                [(index + 1).to_string()],
+            )
+            .unwrap();
+        }
+
+        migrate(&conn).unwrap();
+
+        let insert = "INSERT INTO pull_request_observations
+             (repository, pr_number, head_commit, base_ref, is_draft, state,
+              dismissed_reviews, observed_at)
+             VALUES (?1, ?2, ?3, 'main', 0, 'open', 0, 1)";
+        conn.execute(insert, rusqlite::params!["o/r", 7, "abc"])
+            .unwrap();
+        // Two observations of one pull request would make "what did we see
+        // last time" ambiguous, and the derivation has no tiebreaker: it reads
+        // one row or none. The key is what keeps the write an upsert.
+        assert!(
+            conn.execute(insert, rusqlite::params!["o/r", 7, "def"])
+                .is_err(),
+            "a pull request must have at most one remembered observation"
+        );
+        // Another pull request, and the same number in another repository, are
+        // both different subjects.
+        conn.execute(insert, rusqlite::params!["o/r", 8, "abc"])
+            .unwrap();
+        conn.execute(insert, rusqlite::params!["o/other", 7, "abc"])
+            .unwrap();
         assert_eq!(current_version(&conn).unwrap(), SCHEMA_VERSION);
     }
 }

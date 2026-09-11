@@ -68,6 +68,16 @@ pub struct CommitClassification {
     /// `Review:` -- a dimension the author explicitly asked for.
     #[serde(default)]
     pub requested: BTreeSet<String>,
+    /// `Model:` -- the model that wrote the change.
+    ///
+    /// Declared rather than inferred. A `Co-Authored-By` line is not a
+    /// reliable substitute: it is written by convention, carries a human-facing
+    /// name rather than a stable identifier, and appears on commits a model only
+    /// helped with. A rule that refuses to let a model review its own output
+    /// must not fire on a guess, so this is populated only when an author says
+    /// so outright.
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 impl CommitClassification {
@@ -76,6 +86,10 @@ impl CommitClassification {
     /// Distinguishing "declared nothing" from "declared empty" matters for
     /// [`classification_conflicts`]: a commit with no trailers is the ordinary
     /// case and must not be reported as disagreeing with its own diff.
+    ///
+    /// `model` is deliberately not counted. This gates conflict detection,
+    /// which compares declarations against the diff, and there is nothing in a
+    /// diff that can contradict who wrote it.
     pub fn is_empty(&self) -> bool {
         self.areas.is_empty()
             && self.surfaces.is_empty()
@@ -94,6 +108,10 @@ impl CommitClassification {
             merged.areas.extend(part.areas);
             merged.surfaces.extend(part.surfaces);
             merged.requested.extend(part.requested);
+            // First declaration wins. Commits are merged oldest-first and a
+            // change has one author, so a later commit that omits the trailer
+            // is silence, not a retraction.
+            merged.model = merged.model.take().or(part.model);
             merged.risk = match (merged.risk.take(), part.risk) {
                 (Some(current), Some(other)) => Some(if risk_rank(&other) > risk_rank(&current) {
                     other
@@ -123,6 +141,7 @@ const TRAILER_AREA: &str = "area";
 const TRAILER_SURFACE: &str = "surface";
 const TRAILER_RISK: &str = "risk";
 const TRAILER_REVIEW: &str = "review";
+const TRAILER_MODEL: &str = "model";
 
 /// Read `Area:` / `Surface:` / `Risk:` / `Review:` trailers from one commit
 /// message.
@@ -158,6 +177,15 @@ pub fn parse_classification(message: &str) -> CommitClassification {
             TRAILER_AREA => parsed.areas.extend(values()),
             TRAILER_SURFACE => parsed.surfaces.extend(values()),
             TRAILER_REVIEW => parsed.requested.extend(values()),
+            TRAILER_MODEL => {
+                // First declaration wins, the same way it does across commits
+                // in `merge`. A message naming two models still has one author
+                // and one first claim; letting the last line win would make
+                // the answer depend on where in the body a trailer was added.
+                if parsed.model.is_none() {
+                    parsed.model = values().next();
+                }
+            }
             TRAILER_RISK => {
                 if let Some(risk) = values().next() {
                     parsed.risk = Some(match parsed.risk.take() {
@@ -263,6 +291,25 @@ pub struct ReviewTriggerRule {
     /// Only when the author has not landed here before.
     #[serde(default)]
     pub first_time_contributor: Option<bool>,
+    /// Only when a model declared itself the author (`true`), or only when none
+    /// did (`false`).
+    ///
+    /// Reads the `Model:` trailer, which is a declaration rather than a
+    /// detection: `true` means "somebody said a model wrote this", and it is
+    /// deliberately not the same claim as "a model wrote this". A rule may
+    /// therefore only ever *add* a review on the strength of it, which is the
+    /// same floor every other condition here obeys.
+    #[serde(default)]
+    pub authored_by_model: Option<bool>,
+    /// Only when the declared model is one of these, compared case-insensitively.
+    ///
+    /// Narrower than `authored_by_model` and for the one case that needs it: a
+    /// reviewer running the model that wrote the code shares its blind spots
+    /// exactly where review is supposed to be independent, so a repository that
+    /// reviews with one model can name it here and route those changes
+    /// elsewhere.
+    #[serde(default)]
+    pub models: Vec<String>,
 }
 
 /// How much may be spent, and how often.
@@ -361,6 +408,15 @@ pub enum ReviewTriggerError {
     },
     #[error("{path}: review.trigger rule {index} requires no review types; give it `require`")]
     RuleRequiresNothing { path: String, index: usize },
+    #[error(
+        "{path}: review.trigger rule {index} waits for `{trigger}`, which no tick can \
+         report; remove it from `on` or the rule will never fire"
+    )]
+    RuleWaitsForever {
+        path: String,
+        index: usize,
+        trigger: &'static str,
+    },
 }
 
 impl ReviewTriggerPolicy {
@@ -419,6 +475,19 @@ impl ReviewTriggerPolicy {
                     path: path.to_string(),
                     index,
                 });
+            }
+            // A rule may only wait for something a tick can report. The
+            // spelling parses either way, so without this the rule sits in the
+            // file looking configured and never fires once -- the most
+            // expensive kind of wrong, because nothing ever says so.
+            for trigger in &rule.on {
+                if !trigger.is_observable() {
+                    return Err(ReviewTriggerError::RuleWaitsForever {
+                        path: path.to_string(),
+                        index,
+                        trigger: trigger.as_str(),
+                    });
+                }
             }
         }
         Ok(())
@@ -525,6 +594,28 @@ impl ReviewTriggerRule {
             .is_some_and(|required| required != facts.first_time_contributor)
         {
             return false;
+        }
+        if self
+            .authored_by_model
+            .is_some_and(|required| required != facts.authored_by_model.is_some())
+        {
+            return false;
+        }
+        if !self.models.is_empty() {
+            let declared = facts
+                .authored_by_model
+                .as_deref()
+                .map(str::to_ascii_lowercase);
+            let Some(declared) = declared else {
+                return false;
+            };
+            if !self
+                .models
+                .iter()
+                .any(|model| model.to_ascii_lowercase() == declared)
+            {
+                return false;
+            }
         }
         true
     }
@@ -789,6 +880,8 @@ mod tests {
             min_risk: None,
             from_fork: None,
             first_time_contributor: None,
+            authored_by_model: None,
+            models: Vec::new(),
         }
     }
 
@@ -801,6 +894,84 @@ mod tests {
     }
 
     // -- trailers ----------------------------------------------------------
+
+    #[test]
+    fn the_model_that_wrote_a_change_is_declared_not_guessed() {
+        // `Co-Authored-By` is the lookalike, and deliberately not what this
+        // reads: it is written by convention, carries a display name rather
+        // than an identifier, and appears on commits a model only helped with.
+        let parsed = parse_classification(
+            "feat(x): y\n\nCo-Authored-By: Claude Opus 5 <noreply@anthropic.com>\n",
+        );
+        assert_eq!(parsed.model, None);
+
+        let parsed = parse_classification("feat(x): y\n\nModel: claude-opus-5\n");
+        assert_eq!(parsed.model.as_deref(), Some("claude-opus-5"));
+    }
+
+    #[test]
+    fn the_first_commit_to_name_a_model_is_the_one_that_counts() {
+        // Commits merge oldest-first, and a later commit that names a
+        // different model must not be able to relabel work somebody already
+        // declared -- the same direction `Risk:` escalates in.
+        let merged = CommitClassification::merge([
+            parse_classification("feat(x): first\n\nModel: claude-opus-5\n"),
+            parse_classification("fix(x): second\n\nModel: something-else\n"),
+        ]);
+        assert_eq!(merged.model.as_deref(), Some("claude-opus-5"));
+
+        // Silence in a later commit is not a retraction.
+        let merged = CommitClassification::merge([
+            parse_classification("feat(x): first\n\nModel: claude-opus-5\n"),
+            parse_classification("fix(x): second\n"),
+        ]);
+        assert_eq!(merged.model.as_deref(), Some("claude-opus-5"));
+    }
+
+    #[test]
+    fn a_declared_model_is_not_counted_as_a_classification() {
+        // `is_empty` gates diff-conflict detection, and nothing in a diff can
+        // contradict a claim about who wrote it. Counting `model` would make
+        // every model-authored change look classified when it declared nothing
+        // a rule can act on.
+        let parsed = parse_classification("feat(x): y\n\nModel: claude-opus-5\n");
+        assert!(parsed.is_empty());
+    }
+
+    #[test]
+    fn a_rule_can_require_that_a_model_declared_itself_the_author() {
+        let mut needs_independence = rule("model-authored", &["independent"]);
+        needs_independence.authored_by_model = Some(true);
+        let policy = enabled(vec![needs_independence]);
+
+        let mut authored = facts(&["src/a.rs"]);
+        authored.authored_by_model = Some("claude-opus-5".into());
+        assert_eq!(eligible_types(&policy, &authored).len(), 1);
+
+        // Silence is not a denial and not a claim: the rule simply does not
+        // match, which is why it may only ever add a review.
+        assert!(eligible_types(&policy, &facts(&["src/a.rs"])).is_empty());
+    }
+
+    #[test]
+    fn a_rule_can_name_the_model_it_will_not_let_review_its_own_output() {
+        let mut avoid = rule("not-by-itself", &["security"]);
+        avoid.models = vec!["Claude-Opus-5".into()];
+        let policy = enabled(vec![avoid]);
+
+        let mut same = facts(&["src/a.rs"]);
+        same.authored_by_model = Some("claude-opus-5".into());
+        assert_eq!(
+            eligible_types(&policy, &same).len(),
+            1,
+            "the trailer's casing is the author's choice, not a condition"
+        );
+
+        let mut other = facts(&["src/a.rs"]);
+        other.authored_by_model = Some("some-other-model".into());
+        assert!(eligible_types(&policy, &other).is_empty());
+        assert!(eligible_types(&policy, &facts(&["src/a.rs"])).is_empty());
+    }
 
     #[test]
     fn trailers_are_read_from_anywhere_in_the_body() {
@@ -1280,5 +1451,63 @@ always_on_new_head = true
             ReviewTriggerPolicy::load(temp.path()),
             Err(ReviewTriggerError::Parse { .. })
         ));
+    }
+
+    #[test]
+    fn a_rule_waiting_for_a_transition_no_tick_reports_is_rejected() {
+        // `merge_queue_entered` parses, reads sensibly, and can never fire:
+        // nothing the tick can ask the provider distinguishes it. Accepting it
+        // would reproduce the exact bug this trigger vocabulary was written to
+        // fix -- configuration that looks active and is dead.
+        let temp = tempfile::tempdir().unwrap();
+        write_config(
+            temp.path(),
+            r#"[review.trigger]
+enabled = true
+
+[[review.trigger.rule]]
+name = "queued"
+require = ["code"]
+on = ["merge_queue_entered"]
+"#,
+        );
+        assert!(matches!(
+            ReviewTriggerPolicy::load(temp.path()),
+            Err(ReviewTriggerError::RuleWaitsForever {
+                index: 0,
+                trigger: "merge_queue_entered",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn every_other_transition_is_still_accepted_in_a_rule() {
+        // The guard above rejects by name, so it must not drift into rejecting
+        // the nine triggers a tick genuinely derives.
+        let temp = tempfile::tempdir().unwrap();
+        write_config(
+            temp.path(),
+            r#"[review.trigger]
+enabled = true
+
+[[review.trigger.rule]]
+name = "everything"
+require = ["code"]
+on = [
+    "pull_request_opened",
+    "additional_commit",
+    "replacement_commit",
+    "ready_for_review",
+    "reopened",
+    "base_retargeted",
+    "review_dismissed",
+    "scheduled",
+    "manual",
+]
+"#,
+        );
+        let policy = ReviewTriggerPolicy::load(temp.path()).unwrap();
+        assert_eq!(policy.rule[0].on.len(), 9);
     }
 }

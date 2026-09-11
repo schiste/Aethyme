@@ -862,3 +862,75 @@ fn event_stream_filter_prune_and_cursor_survival() {
     let new_id = store.append_event("lease.overlap", None, None).unwrap();
     assert!(new_id > last_id, "ids strictly increase across prune");
 }
+
+/// The observation table is the router's only memory of "what did this pull
+/// request look like last time", and every derived trigger is a comparison
+/// against it. These three properties are what the derivation assumes.
+#[test]
+fn a_pull_request_observation_round_trips_and_keeps_only_the_latest() {
+    use aethyme_broker::PullRequestObservation;
+
+    let (_tmp, mut store) = open_temp();
+    let observe = |head: &str, at: i64| PullRequestObservation {
+        repository: "acme/product".into(),
+        pr_number: 7,
+        head_commit: head.into(),
+        base_ref: "main".into(),
+        is_draft: true,
+        state: "open".into(),
+        dismissed_reviews: 0,
+        observed_at: at,
+    };
+
+    // Never looked: the derivation reads this as "newly opened", which is why
+    // an absent row must be `None` rather than a defaulted one.
+    assert!(
+        store
+            .pull_request_observation("acme/product", 7)
+            .unwrap()
+            .is_none()
+    );
+
+    store
+        .record_pull_request_observation(&observe("abc", 10))
+        .unwrap();
+    let stored = store
+        .pull_request_observation("acme/product", 7)
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.head_commit, "abc");
+    assert!(
+        stored.is_draft,
+        "the draft flag has to survive the i64 round trip"
+    );
+
+    // Recording again replaces rather than accumulates: the previous
+    // observation is the one immediately before this tick, not a history.
+    store
+        .record_pull_request_observation(&observe("def", 20))
+        .unwrap();
+    let stored = store
+        .pull_request_observation("acme/product", 7)
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.head_commit, "def");
+    assert_eq!(stored.observed_at, 20);
+
+    // Another repository's pull request 7 is a different subject entirely.
+    let mut elsewhere = observe("zzz", 30);
+    elsewhere.repository = "acme/other".into();
+    store.record_pull_request_observation(&elsewhere).unwrap();
+    assert_eq!(
+        store
+            .pull_request_observation("acme/product", 7)
+            .unwrap()
+            .unwrap()
+            .head_commit,
+        "def"
+    );
+    assert_eq!(
+        store.observed_pull_requests("acme/product").unwrap().len(),
+        1
+    );
+    assert_eq!(store.observed_pull_requests("acme/other").unwrap().len(), 1);
+}
