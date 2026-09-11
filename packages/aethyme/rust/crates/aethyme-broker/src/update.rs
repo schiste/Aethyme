@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::update_cache::{self, ManifestFetch};
 use crate::{ReleaseArtifact, ReleaseCompatibility, ReleaseManifest};
 
 pub const UPDATE_PLAN_SCHEMA_VERSION: u32 = 1;
@@ -365,15 +366,15 @@ fn run_update_cli_inner(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         Some("check") => {
-            let json = parse_json_only(&args[1..])?;
-            let plan = resolve_update_plan(UpdateChannel::Stable)?;
-            render_plan(&plan, json, false, None)
+            let (json, refresh) = parse_check_options(&args[1..])?;
+            let (plan, fetch) = resolve_update_plan(UpdateChannel::Stable, refresh)?;
+            render_plan(&plan, json, false, None, &fetch)
         }
         Some("plan") => {
-            let (channel, json) = parse_plan_options(&args[1..])?;
-            let plan = resolve_update_plan(channel)?;
+            let (channel, json, refresh) = parse_plan_options(&args[1..])?;
+            let (plan, fetch) = resolve_update_plan(channel, refresh)?;
             let saved_to = persist_update_plan(&plan)?;
-            render_plan(&plan, json, true, saved_to.as_deref())
+            render_plan(&plan, json, true, saved_to.as_deref(), &fetch)
         }
         Some("execute") => {
             let (confirmation, json) = parse_execute_options(&args[1..])?;
@@ -457,9 +458,16 @@ fn print_update_help() {
     eprintln!("aethyme update — explicit paired-binary updates (never runs in the background)");
     eprintln!();
     eprintln!("Usage:");
-    eprintln!("  aethyme update check [--json]");
-    eprintln!("  aethyme update plan [--channel stable|preview] [--json]");
+    eprintln!("  aethyme update check [--json] [--refresh]");
+    eprintln!("  aethyme update plan [--channel stable|preview] [--json] [--refresh]");
     eprintln!("  aethyme update execute --confirm <manifest-sha256> [--json]");
+    eprintln!();
+    eprintln!(
+        "The release manifest is cached for {}h; --refresh bypasses the cache, and",
+        update_cache::DEFAULT_TTL_SECONDS / 3600
+    );
+    eprintln!("AETHYME_UPDATE_CACHE_TTL_SECONDS=0 disables it. Only the answer is cached:");
+    eprintln!("the plan is recomputed every run, so a reinstall shows up immediately.");
     eprintln!();
     eprintln!("Homebrew installs are updated with `brew upgrade aethyme`.");
     eprintln!(
@@ -467,22 +475,36 @@ fn print_update_help() {
     );
 }
 
-fn parse_json_only(args: &[String]) -> Result<bool, String> {
-    match args {
-        [] => Ok(false),
-        [flag] if flag == "--json" => Ok(true),
-        _ => Err("update check accepts only --json".into()),
+fn parse_check_options(args: &[String]) -> Result<(bool, bool), String> {
+    let mut json = false;
+    let mut refresh = false;
+    for argument in args {
+        match argument.as_str() {
+            "--json" => json = true,
+            "--refresh" => refresh = true,
+            other => {
+                return Err(format!(
+                    "update check: unknown option {other}; accepts --json and --refresh"
+                ));
+            }
+        }
     }
+    Ok((json, refresh))
 }
 
-fn parse_plan_options(args: &[String]) -> Result<(UpdateChannel, bool), String> {
+fn parse_plan_options(args: &[String]) -> Result<(UpdateChannel, bool, bool), String> {
     let mut channel = UpdateChannel::Stable;
     let mut json = false;
+    let mut refresh = false;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
             "--json" => {
                 json = true;
+                index += 1;
+            }
+            "--refresh" => {
+                refresh = true;
                 index += 1;
             }
             "--channel" => {
@@ -497,14 +519,37 @@ fn parse_plan_options(args: &[String]) -> Result<(UpdateChannel, bool), String> 
             other => return Err(format!("update plan: unknown option {other}")),
         }
     }
-    Ok((channel, json))
+    Ok((channel, json, refresh))
 }
 
-fn resolve_update_plan(channel: UpdateChannel) -> Result<UpdatePlan, String> {
+/// The manifest URL this machine would ask for on `channel`.
+///
+/// Shared with read-only callers so they can look up the cached answer under
+/// exactly the key a real fetch would have written.
+pub fn manifest_discovery_url(channel: UpdateChannel) -> Result<String, String> {
+    let base_url = std::env::var("AETHYME_RELEASE_BASE_URL")
+        .unwrap_or_else(|_| DEFAULT_RELEASE_BASE_URL.to_string());
+    resolve_manifest_discovery_url(&base_url, channel)
+}
+
+/// Resolve a plan, and report where its manifest came from.
+///
+/// The fetch travels back with the plan rather than being folded into it: a
+/// plan is a statement about versions and a fetch is a statement about
+/// freshness, and a caller that prints the first must be able to qualify it
+/// with the second.
+fn resolve_update_plan(
+    channel: UpdateChannel,
+    refresh: bool,
+) -> Result<(UpdatePlan, ManifestFetch), String> {
     let base_url = std::env::var("AETHYME_RELEASE_BASE_URL")
         .unwrap_or_else(|_| DEFAULT_RELEASE_BASE_URL.to_string());
     let discovery_url = resolve_manifest_discovery_url(&base_url, channel)?;
-    let manifest_bytes = fetch_bounded(&discovery_url, MAX_MANIFEST_BYTES)?;
+    let fetch =
+        update_cache::fetch_manifest_cached(&discovery_url, now_unix_ms(), refresh, |url| {
+            fetch_bounded(url, MAX_MANIFEST_BYTES)
+        })?;
+    let manifest_bytes = fetch.bytes.clone();
     let manifest = parse_valid_manifest(&manifest_bytes)?;
     let manifest_url = format!(
         "{}/releases/download/v{}/release-manifest.json",
@@ -514,7 +559,7 @@ fn resolve_update_plan(channel: UpdateChannel) -> Result<UpdatePlan, String> {
     let executable = std::env::current_exe().map_err(|error| format!("locate aethyme: {error}"))?;
     let installation = detect_installation(&executable);
     let target = current_release_target().map_err(|error| error.to_string())?;
-    build_update_plan(
+    let plan = build_update_plan(
         &manifest_bytes,
         channel,
         installation,
@@ -524,7 +569,45 @@ fn resolve_update_plan(channel: UpdateChannel) -> Result<UpdatePlan, String> {
         &manifest_url,
         now_unix_ms(),
     )
-    .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string())?;
+    Ok((plan, fetch))
+}
+
+/// Build a plan from an already-cached manifest, or `None` when none is fresh.
+///
+/// The read-only counterpart to [`resolve_update_plan`], for callers that must
+/// not reach the network: a hook at a turn boundary cannot spend a round trip,
+/// and one that failed would either stall the agent or have to swallow the
+/// error. This answers from what is already on disk or does not answer.
+pub fn cached_update_plan(
+    channel: UpdateChannel,
+    now_unix_ms: i64,
+) -> Option<(UpdatePlan, ManifestFetch)> {
+    let base_url = std::env::var("AETHYME_RELEASE_BASE_URL")
+        .unwrap_or_else(|_| DEFAULT_RELEASE_BASE_URL.to_string());
+    let discovery_url = resolve_manifest_discovery_url(&base_url, channel).ok()?;
+    let fetch = update_cache::read_fresh(&discovery_url, now_unix_ms)?;
+    let manifest = parse_valid_manifest(&fetch.bytes).ok()?;
+    let manifest_url = format!(
+        "{}/releases/download/v{}/release-manifest.json",
+        base_url.trim_end_matches('/'),
+        manifest.version
+    );
+    let executable = std::env::current_exe().ok()?;
+    let installation = detect_installation(&executable);
+    let target = current_release_target().ok()?;
+    let plan = build_update_plan(
+        &fetch.bytes,
+        channel,
+        installation,
+        env!("CARGO_PKG_VERSION"),
+        target,
+        &base_url,
+        &manifest_url,
+        now_unix_ms,
+    )
+    .ok()?;
+    Some((plan, fetch))
 }
 
 fn resolve_manifest_discovery_url(
@@ -669,11 +752,26 @@ fn render_plan(
     json: bool,
     detailed: bool,
     saved_to: Option<&Path>,
+    fetch: &ManifestFetch,
 ) -> Result<(), String> {
     if json {
+        let mut document =
+            serde_json::to_value(plan).map_err(|error| format!("encode update plan: {error}"))?;
+        // Machine callers get the provenance as data, not as a sentence
+        // appended to a field they were parsing.
+        if let Some(object) = document.as_object_mut() {
+            object.insert(
+                "manifest_age_seconds".into(),
+                serde_json::json!(fetch.age_seconds),
+            );
+            object.insert(
+                "manifest_from_cache".into(),
+                serde_json::json!(fetch.source != update_cache::ManifestSource::Network),
+            );
+        }
         println!(
             "{}",
-            serde_json::to_string_pretty(plan)
+            serde_json::to_string_pretty(&document)
                 .map_err(|error| format!("encode update plan: {error}"))?
         );
         return Ok(());
@@ -711,6 +809,11 @@ fn render_plan(
         if let Some(command) = &plan.recommended_command {
             println!("Next: {command}");
         }
+    }
+    // Last line, and only when the answer is not live: a verdict that rests on
+    // old bytes must say so where the verdict is still on screen.
+    if let Some(note) = fetch.freshness_note() {
+        println!("({note}; --refresh to re-ask)");
     }
     Ok(())
 }

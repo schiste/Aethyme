@@ -25,6 +25,8 @@ use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use crate::install_health::{self, PairState, first_line_of, resolve_on_path};
+
 /// Oldest CLI that answers `aethyme hook`.
 ///
 /// Below this the shim's fallback path runs and the agent surface is
@@ -313,31 +315,6 @@ fn find_plugin(value: &serde_json::Value) -> Option<(Option<String>, Option<bool
 
 /// First executable named `name` on `PATH`, resolved the way a shell
 /// would — which is the way the shim will resolve it.
-fn resolve_on_path(name: &str) -> Option<PathBuf> {
-    use std::os::unix::fs::PermissionsExt;
-
-    std::env::split_paths(&std::env::var_os("PATH")?)
-        .map(|dir| dir.join(name))
-        .find(|candidate| {
-            std::fs::metadata(candidate)
-                .map(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
-                .unwrap_or(false)
-        })
-}
-
-fn first_line_of(command: &str, args: &[&str]) -> Option<String> {
-    let output = Command::new(command).args(args).output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .next()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(str::to_string)
-}
-
 fn resolved_cli() -> ResolvedCli {
     let path = resolve_on_path("aethyme");
     let version = path
@@ -433,6 +410,7 @@ fn floor_verdict(cli: &ResolvedCli, installed_anywhere: bool) -> Option<String> 
 }
 
 fn print_status(cli: &ResolvedCli, statuses: &[SurfaceStatus]) -> u8 {
+    let pair = install_health::resolve_pair();
     println!("Hook floor:  aethyme >= {MIN_HOOK_CLI_VERSION}");
     match (&cli.path, &cli.version) {
         (Some(path), Some(version)) => println!("On PATH:     {version}  ({})", path.display()),
@@ -448,6 +426,16 @@ fn print_status(cli: &ResolvedCli, statuses: &[SurfaceStatus]) -> u8 {
         }
     );
     println!("This binary: aethyme {}", env!("CARGO_PKG_VERSION"));
+    println!(
+        "Engine pair: {}",
+        match &pair {
+            PairState::Aligned(build) => format!("matched ({build})"),
+            PairState::Split { router, engine } =>
+                format!("SPLIT — aethyme {router}, aethyme-engine-cli {engine}"),
+            PairState::EngineMissing => "aethyme-engine-cli not on PATH".to_string(),
+            PairState::Unknown => "unreadable".to_string(),
+        }
+    );
     println!();
     for status in statuses {
         let detail = match (&status.cli_present, &status.plugin_version) {
@@ -462,23 +450,36 @@ fn print_status(cli: &ResolvedCli, statuses: &[SurfaceStatus]) -> u8 {
     }
 
     let installed_anywhere = statuses.iter().any(SurfaceStatus::installed);
-    match floor_verdict(cli, installed_anywhere) {
-        Some(warning) => {
-            println!();
-            eprintln!("warning: {warning}");
-            // Nonzero only when something is actually installed and
-            // therefore actually broken. A machine that has not installed
-            // the plugin is not in a failed state.
-            u8::from(installed_anywhere)
-        }
-        None => 0,
+    let floor = floor_verdict(cli, installed_anywhere);
+    let pair_problem = install_health::pair_warning(&pair);
+    if floor.is_some() || pair_problem.is_some() {
+        println!();
     }
+    for warning in floor.iter().chain(pair_problem.iter()) {
+        eprintln!("warning: {warning}");
+    }
+    // Nonzero only when something is actually installed and therefore actually
+    // broken. A machine that has not installed the plugin is not in a failed
+    // state -- but a split pair is broken whether or not the plugin is there,
+    // because every command run against it is already running mismatched
+    // binaries.
+    u8::from((floor.is_some() && installed_anywhere) || pair_problem.is_some())
 }
 
 fn status_json(cli: &ResolvedCli, statuses: &[SurfaceStatus]) -> serde_json::Value {
+    let pair = install_health::resolve_pair();
     serde_json::json!({
         "hook_floor": MIN_HOOK_CLI_VERSION,
         "this_binary": env!("CARGO_PKG_VERSION"),
+        "engine_pair": match &pair {
+            PairState::Aligned(build) => serde_json::json!({"state": "aligned", "build": build}),
+            PairState::Split { router, engine } => serde_json::json!({
+                "state": "split", "router": router, "engine": engine,
+            }),
+            PairState::EngineMissing => serde_json::json!({"state": "engine_missing"}),
+            PairState::Unknown => serde_json::json!({"state": "unknown"}),
+        },
+        "engine_pair_warning": install_health::pair_warning(&pair),
         "path_cli": {
             "path": cli.path.as_ref().map(|path| path.display().to_string()),
             "version": cli.version,

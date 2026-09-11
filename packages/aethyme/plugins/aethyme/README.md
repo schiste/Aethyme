@@ -47,7 +47,8 @@ It reports the plugin version on each surface and, separately, whether the
 `aethyme` on `PATH` actually serves `hook`. Those are different binaries and
 the second is the one the hooks reach, so a `brew`-installed CLI shadowed by a
 `cargo`-installed one (or the reverse) shows up here rather than as silence.
-It exits nonzero when the plugin is installed but inert.
+It also reports the engine pair — see [Split pair](#split-pair) below. It exits
+nonzero when the plugin is installed but inert, or when the pair is split.
 
 The manual equivalents are below.
 
@@ -102,6 +103,55 @@ and `Stop` already bracket a turn, so `PostToolUse` would spawn a process per
 tool call to record liveness the turn boundaries already carry; and nothing in
 the coordination model reads `PermissionRequest` at all. An unused hook is not
 free — it is a process spawn on the hottest path in the session.
+
+## What `SessionStart` says about the installation
+
+Two things about this machine's Aethyme are worth a sentence at a session
+start, and are invisible everywhere else.
+
+### Split pair
+
+`aethyme` and `aethyme-engine-cli` are one product in two binaries and must
+come from one tree. On a machine that installs them with `cargo install
+--path`, there is one `~/.cargo/bin` and many worktrees, so two sessions
+installing from different branches on the same afternoon leave a router from
+one beside an engine from the other. Both then report a plausible version, and
+the pair can fail in ways neither version explains.
+
+The two builds usually share a version number and differ only in the
+`-N-g<sha>` suffix `git describe` adds, so the comparison includes it:
+
+```
+aethyme               0.7.16 (v0.7.16-8-gf74bf96b)
+aethyme-engine-cli    0.7.16 (v0.7.16-6-g080d3c8a)   # same version, different commit
+```
+
+Reinstalling both in one go is the fix, and the notice says so. Nothing is
+installed, upgraded, or repaired on your behalf.
+
+### A newer release
+
+Read from a cached copy of the release manifest, never from the network. The
+notice names `aethyme update`'s recommended command for this installation and
+stops there; running it stays a decision a person makes.
+
+`SessionStart` runs at a turn boundary, so it must not wait on a network. It
+reads the cache and nothing else. On a cold or expired entry it spawns a
+detached `aethyme update check --refresh`, says nothing this time, and finds
+the answer on disk — free to read — at the next session. A machine with no
+network is throttled rather than retrying forever, since a failed fetch leaves
+no entry behind to expire.
+
+This does not weaken `aethyme update`'s rule that nothing installs in the
+background: what runs detached downloads a manifest and prints a verdict, and
+nothing it does can change a binary.
+
+| Variable | Effect |
+| --- | --- |
+| `AETHYME_UPDATE_CHECK=off` | Silence both notices and the background refresh. |
+| `AETHYME_UPDATE_CACHE_TTL_SECONDS` | How long a cached manifest counts as current. Default 6 hours; `0` disables the cache, and with it the fallback to an expired copy when the network is down. |
+
+`aethyme update check --refresh` re-asks immediately, whatever the cache holds.
 
 ## Why the shim is thin
 

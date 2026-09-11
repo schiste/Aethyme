@@ -163,17 +163,32 @@ fn decide(
         return Some(HookOutcome::Silent);
     }
 
+    // The installation notice describes the machine, not the repository, so it
+    // is computed before the broker is opened and survives an open that fails.
+    // A broker that will not open is one of the things a mismatched router and
+    // engine can produce, and that is the moment the notice is worth most.
+    let installation_notice = match event {
+        HookEvent::SessionStart => crate::install_health::session_start_warnings(now_ms()),
+        _ => Vec::new(),
+    };
+
     // PreToolUse is the highest-frequency event that reaches the broker,
     // and it only reads. A snapshot keeps it off the write lock.
-    let mut broker = match event {
-        HookEvent::PreToolUse => Broker::open_snapshot(&cwd).ok()?,
-        _ => Broker::open(&cwd).ok()?,
+    let broker = match event {
+        HookEvent::PreToolUse => Broker::open_snapshot(&cwd).ok(),
+        _ => Broker::open(&cwd).ok(),
+    };
+    let Some(mut broker) = broker else {
+        return installation_context(&installation_notice);
     };
     let canonical = std::fs::canonicalize(&cwd).unwrap_or(cwd);
     let session = current_session(&mut broker, &canonical);
 
     let outcome = match event {
-        HookEvent::SessionStart => on_session_start(&mut broker, session.as_ref()),
+        HookEvent::SessionStart => with_installation_notice(
+            on_session_start(&mut broker, session.as_ref()),
+            &installation_notice,
+        ),
         HookEvent::UserPromptSubmit => on_user_prompt_submit(&mut broker, session.as_ref()),
         HookEvent::PreToolUse => on_pre_tool_use(&mut broker, session.as_ref(), event_json),
         HookEvent::Stop => {
@@ -183,6 +198,38 @@ fn decide(
         HookEvent::PostToolUse => HookOutcome::Silent,
     };
     Some(outcome)
+}
+
+/// Append anything wrong with the local installation to a `SessionStart`
+/// outcome.
+///
+/// This is the one event where it belongs. A session start is rare, it is
+/// already producing a paragraph, and the two things it reports — a router and
+/// engine from different builds, and a release newer than the one installed —
+/// are both things the agent is about to act on and cannot otherwise discover.
+/// On every other event it would be noise repeated per turn.
+///
+/// Reporting only, and no network: see [`crate::install_health`]. A `Deny`
+/// outcome is returned untouched, because a refusal must not be diluted by
+/// housekeeping the agent cannot act on right now.
+fn with_installation_notice(outcome: HookOutcome, warnings: &[String]) -> HookOutcome {
+    if warnings.is_empty() {
+        return outcome;
+    }
+    match outcome {
+        HookOutcome::Deny(reason) => HookOutcome::Deny(reason),
+        HookOutcome::Silent => HookOutcome::Context(warnings.join("\n\n")),
+        HookOutcome::Context(text) => {
+            HookOutcome::Context(format!("{text}\n\n{}", warnings.join("\n\n")))
+        }
+    }
+}
+
+/// The notice on its own, for the path where there is no broker outcome to
+/// append it to. Empty stays `None` so an unreachable broker remains
+/// indistinguishable from silence, as before.
+fn installation_context(warnings: &[String]) -> Option<HookOutcome> {
+    (!warnings.is_empty()).then(|| HookOutcome::Context(warnings.join("\n\n")))
 }
 
 /// The broker session owning this checkout, if any.

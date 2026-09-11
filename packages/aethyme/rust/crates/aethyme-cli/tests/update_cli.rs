@@ -74,6 +74,10 @@ fn command(root: &Path) -> Command {
         "AETHYME_RELEASE_BASE_URL",
         format!("file://{}", root.display()),
     );
+    // Manifest fetches are cached host-wide. Anchoring the cache inside the
+    // fixture keeps each test asking its own fake release rather than reading
+    // whatever the developer's last real `update check` left on disk.
+    command.env("AETHYME_HOST_CACHE_DIR", root.join("host-cache"));
     command
 }
 
@@ -230,11 +234,16 @@ fn update_help_is_explicit_and_never_background() {
     let stderr = String::from_utf8(output.stderr).unwrap();
     for expected in [
         "update check",
-        "update plan [--channel stable|preview] [--json]",
+        "update plan [--channel stable|preview] [--json] [--refresh]",
         "update execute --confirm <manifest-sha256>",
         "never runs in the background",
         "brew upgrade aethyme",
         "aethyme upgrade plan",
+        // The cache changes what a check costs and what it can be trusted to
+        // mean, so the help has to say it is there and how to turn it off.
+        "--refresh bypasses the cache",
+        "AETHYME_UPDATE_CACHE_TTL_SECONDS=0",
+        "the plan is recomputed every run",
     ] {
         assert!(stderr.contains(expected), "missing {expected:?}\n{stderr}");
     }
