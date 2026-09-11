@@ -353,6 +353,7 @@ stashing multi-worktree changes.
 - `aethyme broker external-events list [--all] [--json]`
 - `aethyme broker external-events show <id> [--json]`
 - `aethyme broker external-events reconcile <id> --outcome <assign|ignore> --reason <text> [--session <id>] [--json]`
+- `aethyme broker review plan [--base <ref>] [--pr <number>]`
 - `aethyme broker review register --session <id> --repo <owner/name> --pr <number> [--json]`
 - `aethyme broker review show --session <id> [--json]`
 - `aethyme broker review request --session <id> [--json]`
@@ -1560,6 +1561,22 @@ unresolved actor-owned threads. Protect that workflow from pull-request
 modification, or use a dedicated GitHub App; the broad `github-actions` App
 identity is safe only when the workflow producing the named check is itself a
 trusted repository control.
+
+`review plan` is the one review action that is about a change rather than a
+session, so it needs no `--session` and performs nothing. It reads git and
+`.aethyme/config.toml` and prints the reviews the repository's policy would
+ask for, who would perform them, and what it would put on the pull request:
+
+```bash
+aethyme broker review plan --base aethyme/integration --pr 42
+```
+
+Policy is read from the repository's main checkout; the change is read from the
+worktree the command runs in, and the report names both as `policy_root` and
+`change_root`. Review spend and live Chau7 tabs cannot be read without a
+network, so the report lists what it assumed instead of guessing. Every table
+it consults is off by default, so an unconfigured repository gets an empty
+plan. See [`../guides/review-routing.md`](../guides/review-routing.md).
 
 Register only after the draft PR exists and its head is the live session HEAD:
 

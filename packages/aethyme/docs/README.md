@@ -23,6 +23,7 @@ page before reaching for lower-level graph, eval, or architecture references.
 - [`getting-started/quickstart.md`](getting-started/quickstart.md)
 - [`guides/broker-workflows.md`](guides/broker-workflows.md)
 - [`guides/report-capture.md`](guides/report-capture.md)
+- [`guides/review-routing.md`](guides/review-routing.md)
 - [`reference/cli.md`](reference/cli.md)
 - [`architecture/eval-mining-notes.md`](architecture/eval-mining-notes.md)
 - [`guides/testing.md`](guides/testing.md)

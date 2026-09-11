@@ -223,6 +223,35 @@ Highest-value improvements:
 The target product behavior is: before an agent reads the repo, it asks the
 broker for the smallest current-state packet that can steer the next action.
 
+## Broker As A Review Router
+
+A repository can tell the broker which reviews a change needs, who performs
+them, and what the pull request should say about it. Three independent tables
+in `.aethyme/config.toml`: `[review.trigger]` decides eligibility from the
+change and how often a dimension may be spent, `[review.routing]` sends each
+dimension to a Chau7 agent, a provider review bot, or a plain record, and
+`[review.projection]` maintains one Aethyme-owned comment and a namespaced set
+of labels on the pull request.
+
+The split is the same one the rest of the broker uses: **the broker decides,
+the caller performs the transport.** Every decision is a serializable value,
+and every GitHub-touching action renders arguments for `broker gh` rather than
+executing anything itself.
+
+All three tables are off by default at every level -- missing file, missing
+table, and `enabled = false` -- so a repository that has not opted in gets pull
+requests byte-for-byte identical to one running a broker without the feature.
+`aethyme broker review plan` prints the whole decision for a change without a
+session and without performing anything, which is how a policy gets tuned
+before it is switched on.
+
+Authors classify their own changes with commit trailers (`Area:`, `Surface:`,
+`Risk:`, `Review:`), which costs an agent nothing it was not already doing. A
+declaration can escalate a review and can never waive one, so an unverified
+trailer costs at most an unnecessary review.
+
+See [`../packages/aethyme/docs/guides/review-routing.md`](../packages/aethyme/docs/guides/review-routing.md).
+
 ## Broker As Production PR Follow-Up Infrastructure
 
 The broker can also reduce production-PR review loops after a branch has pushed.

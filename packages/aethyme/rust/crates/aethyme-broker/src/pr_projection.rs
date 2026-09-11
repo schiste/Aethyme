@@ -86,9 +86,13 @@ impl ProjectedReviewState {
         matches!(self, Self::Requested | Self::Running | Self::Deferred)
     }
 
+    /// A glyph per state, for the comment's status list.
+    ///
+    /// None of these may be `\u{2022}`: the list they render into is already a
+    /// Markdown bullet list, so a bullet here reads as a doubled bullet.
     fn icon(self) -> &'static str {
         match self {
-            Self::Requested => "•",
+            Self::Requested => "\u{25cb}",
             Self::Running => "…",
             Self::Satisfied => "✓",
             Self::Deferred => "⏸",

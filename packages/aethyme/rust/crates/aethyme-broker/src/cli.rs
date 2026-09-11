@@ -362,6 +362,12 @@ Usage:
       activity prepares a Push2prod prompt. With --dispatch, the broker
       attaches that prompt to an existing matching session when possible
       or spawns a Codex agent command.
+  aethyme broker review plan [--base <ref>] [--pr <number>]
+      Print the reviews this repository's policy would ask for on the current
+      change, who would perform them, and what would go on the pull request.
+      Reads git and .aethyme/config.toml, needs no session, and performs
+      nothing. Every review table is off by default, so an unconfigured
+      repository plans nothing.
   aethyme broker review register --session <id> --repo <owner/name> --pr <number> [--json]
       Opt an exact live session and open draft PR into the configured review
       lifecycle after verifying repository, base, and full head SHA evidence.

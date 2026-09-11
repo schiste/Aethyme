@@ -4,6 +4,28 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [Unreleased]
+
+### Added
+
+- Review routing: three opt-in tables in `.aethyme/config.toml` that decide
+  which reviews a change needs (`[review.trigger]`), who performs them
+  (`[review.routing]` -- a Chau7 agent, a provider review bot, or a plain
+  record), and what the pull request shows about it (`[review.projection]` --
+  one Aethyme-owned comment plus namespaced labels). Every table is off by
+  default at every level, so a repository that has not opted in gets pull
+  requests byte-for-byte identical to before.
+- Authors classify a change with commit trailers -- `Area:`, `Surface:`,
+  `Risk:`, `Review:` -- merged across the commits in the change. A declaration
+  can add a review and can never remove one, so an unverified trailer costs at
+  most an unnecessary review.
+- `aethyme broker review plan [--base <ref>] [--pr <number>]` prints the whole
+  decision for a change: eligible dimensions and why, what would be scheduled
+  or deferred, which backend would perform each, and the comment and labels
+  that would appear. It takes no session, performs nothing, and names both the
+  tree it read policy from and the tree it read the change from. Full guide in
+  `packages/aethyme/docs/guides/review-routing.md`.
+
 ## [0.7.17] - 2026-09-10
 
 ### Added
