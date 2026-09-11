@@ -25,6 +25,17 @@ artifacts and their exact source revision are recorded in each signed
   that would appear. It takes no session, performs nothing, and names both the
   tree it read policy from and the tree it read the change from. Full guide in
   `packages/aethyme/docs/guides/review-routing.md`.
+- `aethyme broker review run --session <id> --repo <owner/name> --pr <number>`
+  performs what `review plan` describes. It replaces the plan's three
+  assumptions with facts -- a new `review_requests` ledger for what has already
+  been spent and what is in flight, an optional Chau7 tab snapshot
+  (`--tabs-file`) for live workspaces, and read-only `gh pr view` for the pull
+  request's current labels and Aethyme comment -- then records each review
+  before it is asked for, performs the GitHub writes through the coordinated
+  operation lane, and prints the Chau7 spawns for an adapter to start. A unique
+  index on `(repository, pr_number, review_type, head_commit)` makes an
+  interrupted run re-runnable without a second reviewer landing on the same
+  head. `--dry-run` plans against those facts and stops, needing no session.
 - `aethyme enhance deploy` now installs an `aethyme-review-rule-maker` skill on
   both agent surfaces. It carries the procedure for writing a repository's
   `[review.*]` policy -- find the guarded paths by searching the repository

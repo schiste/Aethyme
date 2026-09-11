@@ -354,6 +354,7 @@ stashing multi-worktree changes.
 - `aethyme broker external-events show <id> [--json]`
 - `aethyme broker external-events reconcile <id> --outcome <assign|ignore> --reason <text> [--session <id>] [--json]`
 - `aethyme broker review plan [--base <ref>] [--pr <number>]`
+- `aethyme broker review run --session <id> --repo <owner/name> --pr <number> [--base <ref>] [--tabs-file <path>] [--dry-run]`
 - `aethyme broker review register --session <id> --repo <owner/name> --pr <number> [--json]`
 - `aethyme broker review show --session <id> [--json]`
 - `aethyme broker review request --session <id> [--json]`

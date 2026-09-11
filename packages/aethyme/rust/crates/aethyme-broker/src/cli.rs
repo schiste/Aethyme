@@ -368,6 +368,13 @@ Usage:
       Reads git and .aethyme/config.toml, needs no session, and performs
       nothing. Every review table is off by default, so an unconfigured
       repository plans nothing.
+  aethyme broker review run --session <id> --repo <owner/name> --pr <number> [--base <ref>] [--tabs-file <path>] [--dry-run]
+      Perform one tick of the review router for one pull request: decide as
+      `review plan` does but with the spent reviews read from the ledger, the
+      in-flight reviews read from a Chau7 tab snapshot, and the pull request
+      read with read-only gh. Records each request before it is handed out,
+      then performs the GitHub writes through the coordinated lane and prints
+      the Chau7 spawns for an adapter to start. --dry-run stops after the plan.
   aethyme broker review register --session <id> --repo <owner/name> --pr <number> [--json]
       Opt an exact live session and open draft PR into the configured review
       lifecycle after verifying repository, base, and full head SHA evidence.
@@ -5333,6 +5340,353 @@ fn run_review_plan(parsed: Parsed) -> Result<(), UsageError> {
     Ok(())
 }
 
+/// Read the pull request facts the projection needs, with read-only `gh`.
+///
+/// Read-only GitHub inspection runs directly; only writes go through the
+/// coordinated lane. A repository whose `gh` is unauthenticated, or a pull
+/// request that does not exist, is not a hard failure here: the projection then
+/// sees an empty pull request and plans to create its comment and labels, which
+/// the coordinated write refuses loudly if it was wrong. Guessing quietly is
+/// what this avoids.
+fn read_pull_request_facts(
+    root: &Path,
+    repository: &str,
+    pull_request: i64,
+) -> crate::PrProjectionFacts {
+    let mut facts = crate::PrProjectionFacts {
+        pull_request,
+        ..Default::default()
+    };
+    let view = std::process::Command::new("gh")
+        .current_dir(root)
+        .args([
+            "pr",
+            "view",
+            &pull_request.to_string(),
+            "--repo",
+            repository,
+            "--json",
+            "labels,comments",
+        ])
+        .output();
+    if let Ok(output) = view
+        && output.status.success()
+        && let Ok(json) = serde_json::from_slice::<serde_json::Value>(&output.stdout)
+    {
+        facts.current_labels = json["labels"]
+            .as_array()
+            .map(|labels| {
+                labels
+                    .iter()
+                    .filter_map(|label| label["name"].as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let comments: Vec<(i64, String)> = json["comments"]
+            .as_array()
+            .map(|comments| {
+                comments
+                    .iter()
+                    .filter_map(|comment| {
+                        Some((
+                            comment["id"].as_i64()?,
+                            comment["body"].as_str()?.to_string(),
+                        ))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        facts.owned_comment =
+            crate::find_owned_comment(comments.iter().map(|(id, body)| (*id, body.as_str())));
+    }
+    let labels = std::process::Command::new("gh")
+        .current_dir(root)
+        .args([
+            "label", "list", "--repo", repository, "--limit", "200", "--json", "name",
+        ])
+        .output();
+    if let Ok(output) = labels
+        && output.status.success()
+        && let Ok(json) = serde_json::from_slice::<serde_json::Value>(&output.stdout)
+        && let Some(array) = json.as_array()
+    {
+        facts.repository_labels = array
+            .iter()
+            .filter_map(|label| label["name"].as_str().map(String::from))
+            .collect();
+    }
+    facts
+}
+
+/// Perform one tick of the review router for one pull request.
+///
+/// This is `review plan` with the assumptions replaced by facts -- the ledger
+/// for what has been spent, a Chau7 snapshot for what is in flight, and a
+/// read-only `gh` for what the pull request already says -- followed by the
+/// effects. `--dry-run` stops after the plan, which is what makes the first
+/// run against a real repository safe to look at.
+fn run_review_run(parsed: Parsed) -> Result<(), UsageError> {
+    // A dry run performs nothing, so it needs neither a session nor a write
+    // lock -- which is what makes it runnable while other sessions are working.
+    let session_id = match parsed.session {
+        Some(id) => Some(id),
+        None if parsed.dry_run => None,
+        None => {
+            return Err(UsageError::Message(
+                "review run requires --session <id>".into(),
+            ));
+        }
+    };
+    let repository = parsed
+        .repository
+        .clone()
+        .ok_or_else(|| UsageError::Message("review run requires --repo <owner/name>".into()))?;
+    let pull_request = parsed
+        .pr_number
+        .ok_or_else(|| UsageError::Message("review run requires --pr <number>".into()))?;
+
+    let mut broker = open_broker(parsed.dry_run)?;
+    let root = broker.main_root().to_path_buf();
+    let change_root = std::env::current_dir().map_err(|error| {
+        UsageError::Message(format!("cannot read the working directory: {error}"))
+    })?;
+    let base = parsed
+        .base
+        .clone()
+        .unwrap_or_else(|| "aethyme/integration".to_string());
+
+    let trigger = crate::ReviewTriggerPolicy::load(&root).map_err(to_usage)?;
+    let routing = crate::ReviewRoutingPolicy::load(&root).map_err(to_usage)?;
+    let projection_policy = crate::PrProjectionPolicy::load(&root).map_err(to_usage)?;
+
+    let paths = git_lines(
+        &change_root,
+        &["diff", "--name-only", &format!("{base}...HEAD")],
+    )?;
+    let messages = git_output(
+        &change_root,
+        &["log", "--format=%B%x00", &format!("{base}..HEAD")],
+    )?;
+    let classification = crate::CommitClassification::merge(
+        messages
+            .split('\0')
+            .filter(|m| !m.trim().is_empty())
+            .map(crate::parse_classification),
+    );
+    let head = git_output(&change_root, &["rev-parse", "HEAD"])?
+        .trim()
+        .to_string();
+
+    // The three facts `review plan` has to assume.
+    let recorded = broker
+        .store()
+        .review_requests_for_pr(&repository, pull_request)
+        .map_err(to_usage)?;
+    let spend = crate::spend_by_type(&recorded);
+    let in_flight = crate::in_flight(&recorded);
+    let tabs = read_tab_snapshot(&parsed)?;
+    let pr_facts = read_pull_request_facts(&change_root, &repository, pull_request);
+
+    let facts = crate::ChangeFacts {
+        trigger: Some(crate::ReviewTrigger::PullRequestOpened),
+        paths: paths.clone(),
+        classification: classification.clone(),
+        from_fork: false,
+        first_time_contributor: false,
+        authored_by_model: None,
+    };
+    let eligible = crate::eligible_types(&trigger, &facts);
+    let decisions = crate::schedule(&trigger, &eligible, &spend, &head, now_ms());
+    let dispatch: Vec<crate::ReviewDispatchAction> = decisions
+        .iter()
+        .filter_map(|decision| match decision {
+            crate::ReviewTriggerDecision::Request { review_type, .. } => {
+                Some(crate::dispatch_review(
+                    &routing,
+                    &root,
+                    review_type,
+                    pull_request,
+                    &head,
+                    &tabs,
+                    &in_flight,
+                ))
+            }
+            _ => None,
+        })
+        .collect();
+
+    let reviews: Vec<crate::ProjectedReview> = decisions
+        .iter()
+        .map(|decision| crate::ProjectedReview {
+            review_type: decision.review_type().to_string(),
+            state: match decision {
+                crate::ReviewTriggerDecision::Request { .. } => {
+                    crate::ProjectedReviewState::Requested
+                }
+                crate::ReviewTriggerDecision::Defer { .. } => crate::ProjectedReviewState::Deferred,
+                crate::ReviewTriggerDecision::Skip { .. } => crate::ProjectedReviewState::Skipped,
+            },
+            detail: None,
+        })
+        .collect();
+    let projection_actions = crate::project(
+        &projection_policy,
+        &crate::ReviewProjection {
+            head: Some(head.clone()),
+            reviews,
+            classification: classification.clone(),
+            conflicts: Vec::new(),
+        },
+        &pr_facts,
+    );
+
+    let plan = crate::plan_execution(&dispatch, &projection_actions, pull_request);
+
+    if parsed.dry_run {
+        emit_review_run_report(&base, &head, pull_request, &plan, &[], &[], false)?;
+        return Ok(());
+    }
+
+    // Record before performing. See `review_execution`'s module comment: a
+    // crash after this point costs a missed review, and a crash before it would
+    // cost a duplicated one.
+    let mut recorded_now = Vec::new();
+    let mut skipped = Vec::new();
+    for write in &plan.ledger {
+        let (request, created) = broker
+            .store()
+            .record_review_request(
+                &repository,
+                pull_request,
+                &write.review_type,
+                &head,
+                write.backend,
+                now_ms(),
+            )
+            .map_err(to_usage)?;
+        if !created {
+            skipped.push(serde_json::json!({
+                "review_type": write.review_type,
+                "why": "already recorded for this head",
+                "state": request.state,
+            }));
+            continue;
+        }
+        if write.state != crate::ReviewRequestState::Requested {
+            broker
+                .store()
+                .set_review_request_state(
+                    request.id,
+                    write.state,
+                    write.detail.as_deref(),
+                    now_ms(),
+                )
+                .map_err(to_usage)?;
+        }
+        recorded_now.push(write.review_type.clone());
+    }
+
+    // Every GitHub write goes through the coordinated lane, which takes the
+    // repository write lock and records the operation. A failed call stops the
+    // tick: the rest of the projection describes a pull request state this one
+    // was supposed to establish.
+    let mut performed = Vec::new();
+    for call in &plan.gh {
+        let report = broker
+            .run_coordinated_operation(crate::CoordinatedCommand {
+                session_id: session_id.expect("a non-dry run requires a session"),
+                provider: crate::OperationProvider::Github,
+                repository: Some(repository.clone()),
+                resolved_target: None,
+                scope: Some(format!("pr/{pull_request}")),
+                declared_effect: Some(crate::OperationEffect::Write),
+                destructive_confirmed: false,
+                authorization_reason: Some(call.purpose.clone()),
+                args: call.args.clone(),
+            })
+            .map_err(to_usage)?;
+        performed.push(serde_json::json!({
+            "purpose": call.purpose,
+            "operation_id": report.operation.id,
+            "success": report.command_success,
+        }));
+        if !report.command_success {
+            emit_review_run_report(
+                &base,
+                &head,
+                pull_request,
+                &plan,
+                &performed,
+                &skipped,
+                true,
+            )?;
+            return Err(UsageError::Message(format!(
+                "coordinated GitHub write failed: {}",
+                call.purpose
+            )));
+        }
+    }
+
+    emit_review_run_report(
+        &base,
+        &head,
+        pull_request,
+        &plan,
+        &performed,
+        &skipped,
+        true,
+    )?;
+    Ok(())
+}
+
+/// The tab snapshot, or none.
+///
+/// An absent snapshot is not an error: it means "no tabs", and routing then
+/// defers every Chau7 review rather than spawning into a workspace it cannot
+/// see. That is the safe reading, and it is what makes `review run` usable from
+/// a cron that has no Chau7 access at all -- it still records, mentions bots,
+/// and projects.
+fn read_tab_snapshot(parsed: &Parsed) -> Result<Vec<crate::Chau7Tab>, UsageError> {
+    let Some(path) = parsed.tabs_file.as_deref() else {
+        return Ok(Vec::new());
+    };
+    let raw = std::fs::read_to_string(path)
+        .map_err(|error| UsageError::Message(format!("cannot read {}: {error}", path.display())))?;
+    serde_json::from_str(&raw).map_err(|error| {
+        UsageError::Message(format!(
+            "tab snapshot is not a Chau7 tab_list array: {error}"
+        ))
+    })
+}
+
+fn emit_review_run_report(
+    base: &str,
+    head: &str,
+    pull_request: i64,
+    plan: &crate::ReviewExecutionPlan,
+    performed: &[serde_json::Value],
+    skipped: &[serde_json::Value],
+    executed: bool,
+) -> Result<(), UsageError> {
+    let report = serde_json::json!({
+        "base": base,
+        "head": head,
+        "pull_request": pull_request,
+        "plan": plan,
+        "performed": executed,
+        "github_operations": performed,
+        "already_recorded": skipped,
+        // The one thing the broker cannot do itself. An adapter with Chau7
+        // access starts these and then reports back with `review state`.
+        "chau7_handoff": plan.chau7,
+    });
+    out!(
+        "{}",
+        serde_json::to_string_pretty(&report).map_err(|e| UsageError::Message(e.to_string()))?
+    );
+    Ok(())
+}
+
 fn to_usage<E: std::fmt::Display>(error: E) -> UsageError {
     UsageError::Message(error.to_string())
 }
@@ -5369,7 +5723,7 @@ fn run_review(parsed: Parsed) -> Result<(), UsageError> {
         .map(String::as_str)
         .ok_or_else(|| {
             UsageError::Message(
-                "review requires plan, register, show, request, unlock, reassign, or abandon"
+                "review requires plan, run, register, show, request, unlock, reassign, or abandon"
                     .into(),
             )
         })?;
@@ -5383,6 +5737,9 @@ fn run_review(parsed: Parsed) -> Result<(), UsageError> {
     // it performs nothing, so it neither needs nor should require a session.
     if action == "plan" {
         return run_review_plan(parsed);
+    }
+    if action == "run" {
+        return run_review_run(parsed);
     }
     let session_id = parsed
         .session

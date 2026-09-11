@@ -16,7 +16,7 @@ use rusqlite::Connection;
 use crate::error::BrokerError;
 
 /// Current database schema version (== `MIGRATIONS.len()`).
-pub const SCHEMA_VERSION: i64 = 32;
+pub const SCHEMA_VERSION: i64 = 33;
 
 /// Version stamped on every event row written by this binary.
 pub const EVENTS_SCHEMA_VERSION: i64 = 1;
@@ -859,6 +859,38 @@ CREATE UNIQUE INDEX session_representations_head
     ON session_representations (session_id, session_head);
 ";
 
+/// The review spend ledger: what the router has already asked for, per pull
+/// request and per review dimension.
+///
+/// Scheduling already refuses to re-request a review bound to the head it was
+/// requested for. The unique index makes that refusal durable rather than only
+/// decided: an executor that died between writing the row and spawning the
+/// reviewer re-runs and hits the index, so a crash costs a lost reviewer rather
+/// than a duplicated one. `backend` records who was asked, because the same
+/// dimension can be routed differently as policy changes and "why is there no
+/// review" is otherwise unanswerable after the fact.
+const MIGRATION_V33: &str = "
+CREATE TABLE review_requests (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    repository      TEXT NOT NULL,
+    pr_number       INTEGER NOT NULL,
+    review_type     TEXT NOT NULL,
+    head_commit     TEXT NOT NULL,
+    backend         TEXT NOT NULL,
+    state           TEXT NOT NULL CHECK (state IN (
+                        'requested', 'running', 'satisfied', 'failed', 'abandoned')),
+    detail          TEXT,
+    requested_at    INTEGER NOT NULL,
+    updated_at      INTEGER NOT NULL
+);
+
+CREATE UNIQUE INDEX review_requests_head
+    ON review_requests (repository, pr_number, review_type, head_commit);
+
+CREATE INDEX review_requests_by_pr
+    ON review_requests (repository, pr_number);
+";
+
 const MIGRATIONS: &[&str] = &[
     MIGRATION_V1,
     MIGRATION_V2,
@@ -892,6 +924,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_V30,
     MIGRATION_V31,
     MIGRATION_V32,
+    MIGRATION_V33,
 ];
 
 pub(crate) fn current_version(conn: &Connection) -> Result<i64, BrokerError> {
@@ -1719,6 +1752,48 @@ mod tests {
             .unwrap(),
             ("session".into(), "coordination".into())
         );
+        assert_eq!(current_version(&conn).unwrap(), SCHEMA_VERSION);
+    }
+
+    /// The unique index is the whole point of the table: it is what turns
+    /// "the scheduler already decided not to ask again" into a fact the
+    /// database enforces across a crash. Without it a re-run of the executor
+    /// spawns a second reviewer on the same head.
+    #[test]
+    fn v33_makes_one_review_per_head_a_database_fact() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let now = 1_700_000_000_000_i64;
+        let insert = "INSERT INTO review_requests
+             (repository, pr_number, review_type, head_commit, backend, state,
+              requested_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'requested', ?6, ?6)";
+        conn.execute(
+            insert,
+            rusqlite::params!["o/r", 7, "security", "abc", "chau7", now],
+        )
+        .unwrap();
+        let duplicate = conn.execute(
+            insert,
+            rusqlite::params!["o/r", 7, "security", "abc", "chau7", now],
+        );
+        assert!(
+            duplicate.is_err(),
+            "a second request for the same head must be refused"
+        );
+
+        // A new head is a new review, and a different dimension on the same
+        // head is too -- the index constrains the pair, not the pull request.
+        conn.execute(
+            insert,
+            rusqlite::params!["o/r", 7, "security", "def", "chau7", now],
+        )
+        .unwrap();
+        conn.execute(
+            insert,
+            rusqlite::params!["o/r", 7, "performance", "abc", "codex", now],
+        )
+        .unwrap();
         assert_eq!(current_version(&conn).unwrap(), SCHEMA_VERSION);
     }
 }

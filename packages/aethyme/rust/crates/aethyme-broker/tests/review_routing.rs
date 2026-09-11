@@ -13,9 +13,9 @@ use std::path::Path;
 use aethyme_broker::{
     ChangeFacts, Chau7Tab, CommitClassification, InFlightReview, PrProjectionAction,
     PrProjectionFacts, PrProjectionPolicy, ProjectedReview, ProjectedReviewState, ReviewBackend,
-    ReviewDispatchAction, ReviewProjection, ReviewRoutingPolicy, ReviewTrigger,
+    ReviewDispatchAction, ReviewProjection, ReviewRequestState, ReviewRoutingPolicy, ReviewTrigger,
     ReviewTriggerDecision, ReviewTriggerPolicy, dispatch_review, eligible_types,
-    parse_classification, project, schedule,
+    parse_classification, plan_execution, project, schedule,
 };
 
 /// A configuration in the shape `.aethyme/config.toml` documents: always
@@ -421,4 +421,84 @@ fn an_empty_classification_projects_nothing_about_the_author() {
         .flatten()
         .collect();
     assert_eq!(labels, ["aethyme/review:code"]);
+}
+
+/// The last link of the chain: decisions become a ledger, a set of GitHub
+/// writes, and a set of Chau7 spawns, in that order.
+///
+/// This is the seam `review run` performs. What it pins is the ordering rule --
+/// every review is recorded before anyone is asked to do it -- and the routing
+/// of each backend into the right effect. A change that let a Chau7 review be
+/// handed out without a ledger row would pass every unit test above and put two
+/// reviewers on one pull request the first time an executor crashed.
+#[test]
+fn execution_records_every_review_before_it_asks_for_one() {
+    let policies = policies();
+    let change = facts(
+        &["crates/aethyme-broker/src/operations.rs"],
+        "feat(broker): coordinated write\n\nArea: backend\nSurface: auth\nRisk: high\n",
+    );
+    let workspace = policies
+        .root
+        .path()
+        .join(".aethyme/reviews")
+        .display()
+        .to_string();
+    let (_, dispatch, actions) = plan(&policies, &change, "abc123", &[tab(&workspace)], &[]);
+    let plan = plan_execution(&dispatch, &actions, 77);
+
+    // security -> chau7, code -> the provider bot. Both are recorded as
+    // requested; neither is closed by the act of planning.
+    let recorded: Vec<(&str, &str, ReviewRequestState)> = plan
+        .ledger
+        .iter()
+        .map(|write| (write.review_type.as_str(), write.backend, write.state))
+        .collect();
+    assert!(recorded.contains(&("security", "chau7", ReviewRequestState::Requested)));
+    assert!(recorded.contains(&("code", "provider_comment", ReviewRequestState::Requested)));
+
+    assert_eq!(plan.chau7.len(), 1, "one Chau7 spawn, for security");
+    assert_eq!(plan.chau7[0].review_type, "security");
+    assert_eq!(plan.chau7[0].pull_request, 77);
+
+    // The mention comes before the projection: the comment the projection
+    // writes describes reviews that have already been asked for.
+    assert!(
+        plan.gh.len() >= 2,
+        "a mention and at least one projection write"
+    );
+    assert!(
+        plan.gh[0].args.iter().any(|arg| arg.contains("codex")),
+        "the provider mention is the first GitHub write: {:?}",
+        plan.gh[0].args
+    );
+}
+
+/// A review the router declines to spend now must leave no ledger row.
+///
+/// A deferred review is one the router intends to ask for later. Recording it
+/// would make the unique index refuse that later request, which is the one way
+/// a deferral could silently become a cancellation.
+#[test]
+fn a_deferred_review_is_not_recorded_as_spent() {
+    let policies = policies();
+    let change = facts(&["README.md"], "docs: tidy\n");
+    let workspace = policies
+        .root
+        .path()
+        .join(".aethyme/reviews")
+        .display()
+        .to_string();
+    let (_, dispatch, actions) = plan(&policies, &change, "abc123", &[tab(&workspace)], &[]);
+    let plan = plan_execution(&dispatch, &actions, 77);
+    for deferred in &plan.deferred {
+        assert!(
+            !plan
+                .ledger
+                .iter()
+                .any(|write| write.review_type == deferred.review_type),
+            "{} was deferred and recorded",
+            deferred.review_type
+        );
+    }
 }

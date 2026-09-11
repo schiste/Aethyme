@@ -400,6 +400,87 @@ decides; a separate adapter performs the transport. `add_labels` carries every
 label in one entry so six labels become one `gh pr edit`, rather than six
 queued writes behind the same repository lock.
 
+## Performing it
+
+`aethyme broker review run` is `review plan` with the assumptions replaced by
+facts, followed by the effects.
+
+```bash
+aethyme broker review run --session 408 --repo owner/name --pr 42 \
+    --tabs-file /tmp/tabs.json
+```
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--session` | required unless `--dry-run` | Whose coordinated writes these are. |
+| `--repo` | required | `owner/name`, for the ledger and the GitHub writes. |
+| `--pr` | required | The pull request to act on. |
+| `--base` | `aethyme/integration` | What to diff against. |
+| `--tabs-file` | none | A Chau7 `tab_list` snapshot, as JSON. |
+| `--dry-run` | off | Plan against real facts and stop. Needs no session and takes no write lock. |
+
+Each of `review plan`'s three assumptions becomes a reading:
+
+| Assumption | Replaced by |
+| --- | --- |
+| nothing spent on this pull request | the `review_requests` ledger |
+| no reviews in flight | the same ledger, plus the tab snapshot |
+| no labels and no Aethyme comment | read-only `gh pr view --json labels,comments` |
+
+An absent `--tabs-file` means "no tabs", which is the safe reading rather than
+an error: routing then defers every Chau7 review instead of spawning into a
+workspace it cannot see, and the run still records, mentions bots, and projects.
+That is what makes `review run` usable from a scheduler with no Chau7 access at
+all.
+
+### Recorded before performed
+
+Every review is written to the ledger before anyone is asked to do it. The
+ordering is deliberate and it is not free: a crash between the two costs a
+review that was recorded and never performed. The alternative -- perform first,
+record after -- costs two reviewers on one pull request, and a missed review is
+recoverable because CI still runs.
+
+The ledger's unique index on `(repository, pr_number, review_type,
+head_commit)` is what makes that durable rather than merely intended. A
+re-running executor writes the same row, learns it already existed, and does not
+spawn a second reviewer. `already_recorded` in the report names every review
+that took that path.
+
+### The one thing it hands off
+
+GitHub writes go through `run_coordinated_operation`, which is the same
+authorization and locking any `aethyme broker gh` takes. Chau7 spawns do not:
+the broker has no Chau7 client and does not grow one. They come back in the
+report as `chau7_handoff`, for an adapter with Chau7 access to start:
+
+```json
+{
+  "performed": true,
+  "already_recorded": [],
+  "github_operations": [
+    { "purpose": "request the code review from the provider bot", "operation_id": 91, "success": true },
+    { "purpose": "project the review record onto the pull request", "operation_id": 92, "success": true }
+  ],
+  "chau7_handoff": [
+    {
+      "review_type": "security",
+      "pull_request": 42,
+      "workspace": "/repo/.aethyme/reviews/pr-42/security",
+      "prompt": "Review pull request #42 (head `9f3c1a2b...`) for **security**. ..."
+    }
+  ]
+}
+```
+
+This is the same seam `broker deliveries dispatch` uses: the broker decides, the
+caller performs the transport.
+
+A failing GitHub write stops the tick. The rest of the plan describes a pull
+request state that write was supposed to establish, so continuing past it would
+publish a comment about labels that are not there. The ledger rows already
+written stay written, and the next run finds them and does not re-ask.
+
 ## What this never does
 
 - It never performs a GitHub write directly. Every projection action renders

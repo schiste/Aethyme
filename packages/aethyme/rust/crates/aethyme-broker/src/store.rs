@@ -32,6 +32,7 @@ use crate::pr_watch::{
     PullRequestWatchPollStorageResult, PullRequestWatchStatus,
 };
 use crate::review::{NewReviewLifecycle, ReviewLifecycle, ReviewLifecycleState};
+use crate::review_ledger::{ReviewRequest, ReviewRequestState};
 use crate::schema::{self, EVENTS_SCHEMA_VERSION};
 use crate::types::{
     Advisory, AdvisoryResolutionState, AdvisorySeverity, CoordinatedOperation,
@@ -2191,6 +2192,125 @@ impl BrokerStore {
         Ok(self
             .review_lifecycle_by_id(id)?
             .expect("transitioned review lifecycle should be readable"))
+    }
+
+    // ── review router ledger ─────────────────────────────────────────
+
+    /// Record that the router asked for one review, or return the request that
+    /// already exists for this exact (repository, pull request, dimension,
+    /// head).
+    ///
+    /// The boolean says whether this call created the row. That is the whole
+    /// point of the method: an executor that crashed between recording a
+    /// request and starting the reviewer re-runs, sees `false`, and knows not
+    /// to spawn a second one. Callers that treat a duplicate as an error would
+    /// turn every crash into a stuck pull request.
+    pub fn record_review_request(
+        &mut self,
+        repository: &str,
+        pr_number: i64,
+        review_type: &str,
+        head_commit: &str,
+        backend: &str,
+        now: i64,
+    ) -> Result<(ReviewRequest, bool), BrokerError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing = tx
+            .query_row(
+                &format!(
+                    "{REVIEW_REQUEST_SELECT} WHERE repository = ?1 AND pr_number = ?2
+                       AND review_type = ?3 AND head_commit = ?4"
+                ),
+                params![repository, pr_number, review_type, head_commit],
+                review_request_from_row,
+            )
+            .optional()?
+            .transpose()?;
+        if let Some(existing) = existing {
+            return Ok((existing, false));
+        }
+        tx.execute(
+            "INSERT INTO review_requests (
+                 repository, pr_number, review_type, head_commit, backend,
+                 state, detail, requested_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, 'requested', NULL, ?6, ?6)",
+            params![
+                repository,
+                pr_number,
+                review_type,
+                head_commit,
+                backend,
+                now
+            ],
+        )?;
+        let id = tx.last_insert_rowid();
+        tx.commit()?;
+        let created = self
+            .review_request(id)?
+            .expect("just-inserted review request should be readable");
+        Ok((created, true))
+    }
+
+    pub fn review_request(&self, id: i64) -> Result<Option<ReviewRequest>, BrokerError> {
+        self.conn
+            .query_row(
+                &format!("{REVIEW_REQUEST_SELECT} WHERE id = ?1"),
+                [id],
+                review_request_from_row,
+            )
+            .optional()?
+            .transpose()
+    }
+
+    /// Every review the router has ever requested for one pull request,
+    /// oldest first.
+    ///
+    /// Deliberately unfiltered: spend counts finished reviews and in-flight
+    /// counts unfinished ones, so both callers need the whole history and a
+    /// convenience filter here would only tempt one of them to use the wrong
+    /// one.
+    pub fn review_requests_for_pr(
+        &self,
+        repository: &str,
+        pr_number: i64,
+    ) -> Result<Vec<ReviewRequest>, BrokerError> {
+        let mut statement = self.conn.prepare(&format!(
+            "{REVIEW_REQUEST_SELECT} WHERE repository = ?1 AND pr_number = ?2
+             ORDER BY requested_at, id"
+        ))?;
+        let rows = statement.query_map(params![repository, pr_number], review_request_from_row)?;
+        let mut requests = Vec::new();
+        for row in rows {
+            requests.push(row??);
+        }
+        Ok(requests)
+    }
+
+    /// Move one request to a new state, recording why.
+    pub fn set_review_request_state(
+        &mut self,
+        id: i64,
+        state: ReviewRequestState,
+        detail: Option<&str>,
+        now: i64,
+    ) -> Result<ReviewRequest, BrokerError> {
+        let changed = self.conn.execute(
+            "UPDATE review_requests
+                SET state = ?2, detail = ?3, updated_at = ?4
+              WHERE id = ?1",
+            params![id, state.label(), detail, now],
+        )?;
+        if changed == 0 {
+            return Err(BrokerError::InvalidEnumValue {
+                field: "review_request_id",
+                value: id.to_string(),
+            });
+        }
+        Ok(self
+            .review_request(id)?
+            .expect("updated review request should be readable"))
     }
 
     // ── coordinated operations ───────────────────────────────────────
@@ -4965,6 +5085,34 @@ fn delivery_outbox_from_row(row: &rusqlite::Row<'_>) -> RowResult<DeliveryOutbox
     })())
 }
 
+const REVIEW_REQUEST_SELECT: &str =
+    "SELECT id, repository, pr_number, review_type, head_commit, backend,
+            state, detail, requested_at, updated_at
+     FROM review_requests";
+
+fn review_request_from_row(row: &rusqlite::Row<'_>) -> RowResult<ReviewRequest> {
+    let state: String = row.get(6)?;
+    Ok((|| {
+        Ok(ReviewRequest {
+            id: row.get(0)?,
+            repository: row.get(1)?,
+            pr_number: row.get(2)?,
+            review_type: row.get(3)?,
+            head_commit: row.get(4)?,
+            backend: row.get(5)?,
+            state: ReviewRequestState::parse(&state).ok_or_else(|| {
+                BrokerError::InvalidEnumValue {
+                    field: "review_requests.state",
+                    value: state.clone(),
+                }
+            })?,
+            detail: row.get(7)?,
+            requested_at: row.get(8)?,
+            updated_at: row.get(9)?,
+        })
+    })())
+}
+
 const REVIEW_LIFECYCLE_SELECT: &str =
     "SELECT id, session_id, queue_entry_id, repository, target_branch,
             pr_number, commit_sha, state, generation, evidence_digest,
@@ -5499,5 +5647,91 @@ mod operation_history_tests {
             page.operations[1].identity_provenance,
             OperationIdentityProvenance::LegacyUnverifiedIdentity
         );
+    }
+}
+
+#[cfg(test)]
+mod review_ledger_tests {
+    use super::*;
+
+    fn store() -> BrokerStore {
+        let conn = Connection::open_in_memory().unwrap();
+        schema::migrate(&conn).unwrap();
+        BrokerStore {
+            conn,
+            path: PathBuf::from(":memory:"),
+            _snapshot_dir: None,
+        }
+    }
+
+    /// The `created` flag, not the row, is what the executor acts on: it is how
+    /// a re-run after a crash tells "I am the one who asked for this" from "it
+    /// was already asked for". Losing that distinction is the difference
+    /// between a missed review and two reviewers on one pull request.
+    #[test]
+    fn recording_the_same_head_twice_reports_the_second_as_not_created() {
+        let mut store = store();
+        let (first, created) = store
+            .record_review_request("o/r", 7, "security", "abc", "chau7", 100)
+            .unwrap();
+        assert!(created);
+        let (second, created_again) = store
+            .record_review_request("o/r", 7, "security", "abc", "chau7", 200)
+            .unwrap();
+        assert!(!created_again);
+        assert_eq!(first.id, second.id);
+        assert_eq!(second.requested_at, 100, "the first request keeps its time");
+    }
+
+    /// A new head is a new review. The router asks again when the change it was
+    /// reviewing has moved, and the ledger must not read that as a duplicate.
+    #[test]
+    fn a_new_head_is_a_new_request() {
+        let mut store = store();
+        let (first, _) = store
+            .record_review_request("o/r", 7, "security", "abc", "chau7", 100)
+            .unwrap();
+        let (second, created) = store
+            .record_review_request("o/r", 7, "security", "def", "chau7", 200)
+            .unwrap();
+        assert!(created);
+        assert_ne!(first.id, second.id);
+        assert_eq!(store.review_requests_for_pr("o/r", 7).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_state_change_is_readable_and_stamped() {
+        let mut store = store();
+        let (request, _) = store
+            .record_review_request("o/r", 7, "security", "abc", "chau7", 100)
+            .unwrap();
+        assert_eq!(request.state, ReviewRequestState::Requested);
+        let updated = store
+            .set_review_request_state(request.id, ReviewRequestState::Failed, Some("no tab"), 300)
+            .unwrap();
+        assert_eq!(updated.state, ReviewRequestState::Failed);
+        assert_eq!(updated.detail.as_deref(), Some("no tab"));
+        assert_eq!(updated.updated_at, 300);
+        assert_eq!(updated.requested_at, 100);
+        let reread = store.review_request(request.id).unwrap().unwrap();
+        assert_eq!(reread.state, ReviewRequestState::Failed);
+    }
+
+    /// One pull request's ledger is one pull request's ledger. The scheduler
+    /// reads spend per pull request, so a query that leaked a neighbour's rows
+    /// would silently stop asking for reviews.
+    #[test]
+    fn requests_are_scoped_to_their_pull_request_and_repository() {
+        let mut store = store();
+        store
+            .record_review_request("o/r", 7, "security", "abc", "chau7", 100)
+            .unwrap();
+        store
+            .record_review_request("o/r", 8, "security", "abc", "chau7", 100)
+            .unwrap();
+        store
+            .record_review_request("o/other", 7, "security", "abc", "chau7", 100)
+            .unwrap();
+        assert_eq!(store.review_requests_for_pr("o/r", 7).unwrap().len(), 1);
     }
 }

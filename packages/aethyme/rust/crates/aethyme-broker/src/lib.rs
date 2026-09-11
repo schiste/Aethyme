@@ -102,6 +102,8 @@ mod resources;
 mod retention;
 mod review;
 mod review_backend;
+mod review_execution;
+mod review_ledger;
 mod review_trigger;
 mod schema;
 mod ship;
@@ -339,6 +341,10 @@ pub use review_backend::{
     InFlightReview, REVIEW_ROUTING_SCHEMA_VERSION, ReviewBackend, ReviewDispatchAction,
     ReviewRoute, ReviewRoutingError, ReviewRoutingPolicy, dispatch_review, review_prompt,
 };
+pub use review_execution::{
+    Chau7Handoff, DeferredReview, GhCall, LedgerWrite, ReviewExecutionPlan, plan_execution,
+};
+pub use review_ledger::{ReviewRequest, ReviewRequestState, in_flight, spend_by_type};
 pub use review_trigger::{
     ChangeFacts, ClassificationConflict, CommitClassification, EligibleReview,
     REVIEW_TRIGGER_SCHEMA_VERSION, ReviewSchedule, ReviewSpend, ReviewTrigger,
