@@ -16,7 +16,7 @@ use rusqlite::Connection;
 use crate::error::BrokerError;
 
 /// Current database schema version (== `MIGRATIONS.len()`).
-pub const SCHEMA_VERSION: i64 = 33;
+pub const SCHEMA_VERSION: i64 = 34;
 
 /// Version stamped on every event row written by this binary.
 pub const EVENTS_SCHEMA_VERSION: i64 = 1;
@@ -891,6 +891,57 @@ CREATE INDEX review_requests_by_pr
     ON review_requests (repository, pr_number);
 ";
 
+/// Split "the record is the whole outcome" out of "nobody was ever asked".
+///
+/// v33 spelled both `abandoned`, which forced the executor to read `backend` to
+/// tell a settled review from a retryable one. That is the ambiguity a ledger
+/// exists to remove: someone reading this table in a year has only the row.
+///
+/// `recorded` is now what the `record` backend produces -- the policy asked for
+/// nothing to be performed, and the row is the complete answer. `abandoned`
+/// keeps only its original meaning, a review that was never started, and is the
+/// one state the next tick may ask for again.
+const MIGRATION_V34: &str = "
+CREATE TABLE review_requests_v34 (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    repository      TEXT NOT NULL,
+    pr_number       INTEGER NOT NULL,
+    review_type     TEXT NOT NULL,
+    head_commit     TEXT NOT NULL,
+    backend         TEXT NOT NULL,
+    state           TEXT NOT NULL CHECK (state IN (
+                        'requested', 'running', 'satisfied', 'failed',
+                        'recorded', 'abandoned')),
+    detail          TEXT,
+    requested_at    INTEGER NOT NULL,
+    updated_at      INTEGER NOT NULL
+);
+
+INSERT INTO review_requests_v34 (
+    id, repository, pr_number, review_type, head_commit, backend, state,
+    detail, requested_at, updated_at
+)
+SELECT id, repository, pr_number, review_type, head_commit, backend,
+       CASE WHEN state = 'abandoned' AND backend = 'record'
+            THEN 'recorded' ELSE state END,
+       detail, requested_at, updated_at
+FROM review_requests;
+
+DROP TABLE review_requests;
+ALTER TABLE review_requests_v34 RENAME TO review_requests;
+
+CREATE UNIQUE INDEX review_requests_head
+    ON review_requests (repository, pr_number, review_type, head_commit);
+
+CREATE INDEX review_requests_by_pr
+    ON review_requests (repository, pr_number);
+
+-- `max_concurrent` is a per-repository budget, so the slot query reads every
+-- open request in a repository rather than one pull request's.
+CREATE INDEX review_requests_by_repository_state
+    ON review_requests (repository, state);
+";
+
 const MIGRATIONS: &[&str] = &[
     MIGRATION_V1,
     MIGRATION_V2,
@@ -925,6 +976,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_V31,
     MIGRATION_V32,
     MIGRATION_V33,
+    MIGRATION_V34,
 ];
 
 pub(crate) fn current_version(conn: &Connection) -> Result<i64, BrokerError> {
@@ -1794,6 +1846,90 @@ mod tests {
             rusqlite::params!["o/r", 7, "performance", "abc", "codex", now],
         )
         .unwrap();
+        assert_eq!(current_version(&conn).unwrap(), SCHEMA_VERSION);
+    }
+
+    /// v33 spelled two different outcomes `abandoned`: a review the policy
+    /// deliberately performs nothing for, and a review nobody managed to ask
+    /// for. Only the second may be asked for again, so the ledger could not
+    /// answer its own question without also reading `backend`. v34 gives the
+    /// first its own name and leaves `abandoned` meaning exactly one thing.
+    #[test]
+    fn v34_separates_a_settled_record_from_a_review_nobody_was_asked_for() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            .unwrap();
+        for (index, sql) in MIGRATIONS[..33].iter().enumerate() {
+            conn.execute_batch(sql).unwrap();
+            conn.execute(
+                "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)
+                 ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                [(index + 1).to_string()],
+            )
+            .unwrap();
+        }
+        let now = 1_700_000_000_000_i64;
+        let insert = "INSERT INTO review_requests
+             (repository, pr_number, review_type, head_commit, backend, state,
+              requested_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)";
+        // The two v33 rows that need telling apart, plus one that must not move.
+        conn.execute(
+            insert,
+            rusqlite::params!["o/r", 7, "docs", "abc", "record", "abandoned", now],
+        )
+        .unwrap();
+        conn.execute(
+            insert,
+            rusqlite::params!["o/r", 7, "security", "abc", "chau7", "abandoned", now],
+        )
+        .unwrap();
+        conn.execute(
+            insert,
+            rusqlite::params!["o/r", 7, "code", "abc", "chau7", "satisfied", now],
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        let state = |review_type: &str| -> String {
+            conn.query_row(
+                "SELECT state FROM review_requests WHERE review_type = ?1",
+                [review_type],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            state("docs"),
+            "recorded",
+            "a record-only row was always settled, not waiting to be retried"
+        );
+        assert_eq!(
+            state("security"),
+            "abandoned",
+            "a routed review nobody was asked for stays the one revivable state"
+        );
+        assert_eq!(state("code"), "satisfied");
+
+        // The identity that makes "already requested for this head" durable
+        // has to survive the table rebuild, or v34 quietly undoes v33.
+        let duplicate = conn.execute(
+            insert,
+            rusqlite::params!["o/r", 7, "code", "abc", "chau7", "requested", now],
+        );
+        assert!(
+            duplicate.is_err(),
+            "the one-review-per-head index must survive the rebuild"
+        );
+        assert!(
+            conn.execute(
+                insert,
+                rusqlite::params!["o/r", 7, "code", "abc", "chau7", "pending", now],
+            )
+            .is_err(),
+            "the state CHECK must survive the rebuild"
+        );
         assert_eq!(current_version(&conn).unwrap(), SCHEMA_VERSION);
     }
 }

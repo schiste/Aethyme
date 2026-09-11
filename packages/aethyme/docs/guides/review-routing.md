@@ -478,8 +478,65 @@ caller performs the transport.
 
 A failing GitHub write stops the tick. The rest of the plan describes a pull
 request state that write was supposed to establish, so continuing past it would
-publish a comment about labels that are not there. The ledger rows already
-written stay written, and the next run finds them and does not re-ask.
+publish a comment about labels that are not there.
+
+The review that write was asking for goes back to `abandoned` before the tick
+stops, and the next run asks for it again. That one line is load-bearing: the
+unique index makes a row permanent for its head, so a row left at `requested`
+after a failed `gh` call would be read as spend forever and that dimension would
+never be reviewed on that commit. `abandoned` is the only state the router may
+ask about again.
+
+### Reading the ledger
+
+The ledger is what answers "why was there no security review on #412", months
+after anyone remembers the pull request:
+
+```bash
+aethyme broker review ledger --repo owner/repo --pr 412
+```
+
+```
+#412   security   satisfied  chau7            9f3c1a2b4d5e
+#412   docs       recorded   record           9f3c1a2b4d5e
+        no backend routes docs
+#412   code       abandoned  provider_comment 9f3c1a2b4d5e
+        the coordinated GitHub write failed: request the code review from the provider bot
+```
+
+It is read-only and needs no session. Drop `--pr` for the whole repository.
+Each state means one thing and only one:
+
+| State | Meaning | Asked again? |
+| --- | --- | --- |
+| `requested` | Recorded, nobody has picked it up | holds a slot |
+| `running` | A reviewer is working on it | holds a slot |
+| `satisfied` | A verdict landed | no |
+| `failed` | Attempted, no verdict -- re-asking without a new head buys nothing | no |
+| `recorded` | The policy performs nothing here; the row is the whole answer | no |
+| `abandoned` | Nobody was ever asked | **yes** |
+
+### Closing a row
+
+`review run` records and decides; it never learns how a review ended, because
+the reviewer is a Chau7 tab or a provider bot rather than the broker. Whoever
+performed it closes the row:
+
+```bash
+aethyme broker review state --repo owner/repo --pr 412 \
+    --type security --state satisfied --note "no findings"
+```
+
+This is the other half of the `chau7_handoff` seam, and it is what drains the
+router's concurrency slots -- a `requested` row holds one until something says
+otherwise, so an adapter that starts reviews and never reports back throttles
+the repository to `max_concurrent` reviews and then stops dispatching entirely.
+
+`--head <sha>` targets a superseded commit; the default is the most recent
+request for that review type, which is what a reviewer reporting now was asked
+to do. Reporting on a review that was never requested is an error rather than a
+new row: it means the reporter and the router disagree about what was asked
+for, and inventing a row would bury that.
 
 ## What this never does
 

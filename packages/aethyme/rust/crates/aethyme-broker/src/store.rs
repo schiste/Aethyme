@@ -2229,7 +2229,28 @@ impl BrokerStore {
             .optional()?
             .transpose()?;
         if let Some(existing) = existing {
-            return Ok((existing, false));
+            // A revivable row is one nobody was ever asked about -- a `gh` call
+            // that failed, an executor that died before the handoff. Reusing it
+            // is the only way past the unique index, and without it that single
+            // failure would settle the dimension for this head forever. The row
+            // is reset rather than duplicated so the ledger keeps one line per
+            // review, and `backend` is refreshed because policy may have moved
+            // since the attempt.
+            if !existing.state.is_revivable() {
+                return Ok((existing, false));
+            }
+            tx.execute(
+                "UPDATE review_requests
+                    SET state = 'requested', detail = NULL, backend = ?2,
+                        requested_at = ?3, updated_at = ?3
+                  WHERE id = ?1",
+                params![existing.id, backend, now],
+            )?;
+            tx.commit()?;
+            let revived = self
+                .review_request(existing.id)?
+                .expect("just-revived review request should be readable");
+            return Ok((revived, true));
         }
         tx.execute(
             "INSERT INTO review_requests (
@@ -2286,6 +2307,79 @@ impl BrokerStore {
             requests.push(row??);
         }
         Ok(requests)
+    }
+
+    /// Every review the router has ever requested in one repository, oldest
+    /// first.
+    ///
+    /// This is what `review ledger` reads when no pull request is named. The
+    /// ledger's whole purpose is answering "why was there no review" long after
+    /// the fact, and that question is often asked about a repository rather
+    /// than about one pull request somebody already has in mind.
+    pub fn review_requests_for_repository(
+        &self,
+        repository: &str,
+    ) -> Result<Vec<ReviewRequest>, BrokerError> {
+        let mut statement = self.conn.prepare(&format!(
+            "{REVIEW_REQUEST_SELECT} WHERE repository = ?1 ORDER BY requested_at, id"
+        ))?;
+        let rows = statement
+            .query_map(params![repository], review_request_from_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter().collect()
+    }
+
+    /// The most recently requested review of one dimension on one pull request.
+    ///
+    /// A reviewer reporting back knows which review it was asked to do, not
+    /// which row id carries it, and the unique index means there is one row per
+    /// head rather than one row per dimension. Newest wins because a reviewer
+    /// that is reporting now was asked most recently; a report about an older
+    /// head has to name that head explicitly.
+    pub fn latest_review_request(
+        &self,
+        repository: &str,
+        pr_number: i64,
+        review_type: &str,
+        head_commit: Option<&str>,
+    ) -> Result<Option<ReviewRequest>, BrokerError> {
+        let (clause, head): (&str, Option<&str>) = match head_commit {
+            Some(head) => ("AND head_commit = ?4", Some(head)),
+            None => ("AND ?4 IS NULL", None),
+        };
+        self.conn
+            .query_row(
+                &format!(
+                    "{REVIEW_REQUEST_SELECT}
+                      WHERE repository = ?1 AND pr_number = ?2 AND review_type = ?3 {clause}
+                      ORDER BY requested_at DESC, id DESC LIMIT 1"
+                ),
+                params![repository, pr_number, review_type, head],
+                review_request_from_row,
+            )
+            .optional()?
+            .transpose()
+    }
+
+    /// Every request still occupying a concurrency slot in one repository.
+    ///
+    /// `ReviewRoute::max_concurrent` is a per-repository budget, not a
+    /// per-pull-request one: four open pull requests must not each get their
+    /// own security agent when the policy allows one. Reading this per pull
+    /// request is what silently multiplies the cap by the number of open pull
+    /// requests, so the scope of the query is the whole point of it.
+    pub fn review_requests_in_flight(
+        &self,
+        repository: &str,
+    ) -> Result<Vec<ReviewRequest>, BrokerError> {
+        let mut statement = self.conn.prepare(&format!(
+            "{REVIEW_REQUEST_SELECT} WHERE repository = ?1 AND state IN ('requested', 'running')
+             ORDER BY requested_at, id"
+        ))?;
+        let rows = statement
+            .query_map(params![repository], review_request_from_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter().collect()
     }
 
     /// Move one request to a new state, recording why.
@@ -5733,5 +5827,134 @@ mod review_ledger_tests {
             .record_review_request("o/other", 7, "security", "abc", "chau7", 100)
             .unwrap();
         assert_eq!(store.review_requests_for_pr("o/r", 7).unwrap().len(), 1);
+    }
+
+    /// The unique index makes a row permanent for its head, so without revival
+    /// one failed `gh` call would settle a dimension forever: the next tick
+    /// would find the row, count it as spend, and skip. Reviving reuses the row
+    /// rather than inserting beside it, so the ledger keeps one line per review.
+    #[test]
+    fn a_review_nobody_was_asked_for_can_be_asked_for_again() {
+        let mut store = store();
+        let (first, _) = store
+            .record_review_request("o/r", 7, "security", "abc", "chau7", 100)
+            .unwrap();
+        store
+            .set_review_request_state(
+                first.id,
+                ReviewRequestState::Abandoned,
+                Some("the mention did not post"),
+                150,
+            )
+            .unwrap();
+
+        let (revived, created) = store
+            .record_review_request("o/r", 7, "security", "abc", "provider_comment", 200)
+            .unwrap();
+        assert!(
+            created,
+            "reviving is the executor asking for the review, so it must read as created"
+        );
+        assert_eq!(revived.id, first.id, "one line per review, not two");
+        assert_eq!(revived.state, ReviewRequestState::Requested);
+        assert_eq!(
+            revived.detail, None,
+            "the old failure is not the new attempt"
+        );
+        assert_eq!(
+            revived.backend, "provider_comment",
+            "policy may have moved since the attempt"
+        );
+        assert_eq!(revived.requested_at, 200);
+        assert_eq!(store.review_requests_for_pr("o/r", 7).unwrap().len(), 1);
+    }
+
+    /// Every other terminal state is an answer. Asking again would either
+    /// duplicate work already done or re-run something that already produced no
+    /// verdict for this exact head.
+    #[test]
+    fn a_settled_review_is_not_revived() {
+        for settled in [
+            ReviewRequestState::Satisfied,
+            ReviewRequestState::Failed,
+            ReviewRequestState::Recorded,
+        ] {
+            let mut store = store();
+            let (first, _) = store
+                .record_review_request("o/r", 7, "security", "abc", "chau7", 100)
+                .unwrap();
+            store
+                .set_review_request_state(first.id, settled, None, 150)
+                .unwrap();
+            let (again, created) = store
+                .record_review_request("o/r", 7, "security", "abc", "chau7", 200)
+                .unwrap();
+            assert!(!created, "{settled:?} is an answer, not a retry");
+            assert_eq!(again.state, settled);
+        }
+    }
+
+    /// `max_concurrent` is a per-repository budget. Reading it from one pull
+    /// request's rows multiplies the cap by the number of open pull requests,
+    /// which is the exact failure a cap exists to prevent.
+    #[test]
+    fn in_flight_is_counted_across_the_repository() {
+        let mut store = store();
+        store
+            .record_review_request("o/r", 7, "security", "abc", "chau7", 100)
+            .unwrap();
+        store
+            .record_review_request("o/r", 8, "security", "def", "chau7", 100)
+            .unwrap();
+        store
+            .record_review_request("o/other", 9, "security", "ghi", "chau7", 100)
+            .unwrap();
+        let (settled, _) = store
+            .record_review_request("o/r", 10, "security", "jkl", "chau7", 100)
+            .unwrap();
+        store
+            .set_review_request_state(settled.id, ReviewRequestState::Satisfied, None, 200)
+            .unwrap();
+
+        let open = store.review_requests_in_flight("o/r").unwrap();
+        assert_eq!(
+            open.len(),
+            2,
+            "both open pull requests in this repository hold a slot, the neighbouring repository holds none, and a settled review holds nothing"
+        );
+        assert!(open.iter().all(|row| row.repository == "o/r"));
+    }
+
+    /// A reviewer reporting back names the review, not the row. Newest wins so
+    /// a report that arrives now lands on what was most recently asked for;
+    /// naming a head is how a late report about a superseded commit lands on
+    /// the row it is actually about.
+    #[test]
+    fn the_latest_request_is_the_one_a_reviewer_reports_against() {
+        let mut store = store();
+        let (old, _) = store
+            .record_review_request("o/r", 7, "security", "abc", "chau7", 100)
+            .unwrap();
+        let (current, _) = store
+            .record_review_request("o/r", 7, "security", "def", "chau7", 200)
+            .unwrap();
+
+        let latest = store
+            .latest_review_request("o/r", 7, "security", None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(latest.id, current.id);
+        let named = store
+            .latest_review_request("o/r", 7, "security", Some("abc"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(named.id, old.id);
+        assert!(
+            store
+                .latest_review_request("o/r", 7, "performance", None)
+                .unwrap()
+                .is_none(),
+            "a review nobody requested has no row to report against"
+        );
     }
 }

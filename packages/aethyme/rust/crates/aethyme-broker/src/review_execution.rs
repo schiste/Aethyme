@@ -48,6 +48,14 @@ pub struct LedgerWrite {
 /// One coordinated GitHub call, as arguments for the `gh` lane.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct GhCall {
+    /// Which review this call asks for, and `None` for the projection write.
+    ///
+    /// A failed call has to be attributable: the mention that did not post is
+    /// the review nobody was asked for, and that row must be reopened. The
+    /// projection write carries `None` because it describes every review at
+    /// once, and failing it means the pull request is stale rather than that
+    /// any particular reviewer was missed.
+    pub review_type: Option<String>,
     /// What this call is for, for the operation's authorization reason and for
     /// a human reading the audit log later.
     pub purpose: String,
@@ -130,16 +138,21 @@ pub fn plan_execution(
                 });
                 if let Some(args) = action.gh_args() {
                     plan.gh.push(GhCall {
+                        review_type: Some(review_type.clone()),
                         purpose: format!("request the {review_type} review from the provider bot"),
                         args,
                     });
                 }
             }
             ReviewDispatchAction::RecordOnly { review_type, why } => {
+                // Settled on arrival, and deliberately not `Abandoned`: the
+                // policy performs nothing here, so there is nothing for a later
+                // tick to retry. Spelling it `Recorded` is what keeps the one
+                // revivable state meaning only "nobody was ever asked".
                 plan.ledger.push(LedgerWrite {
                     review_type: review_type.clone(),
                     backend: "record",
-                    state: ReviewRequestState::Abandoned,
+                    state: ReviewRequestState::Recorded,
                     detail: Some(why.clone()),
                 });
             }
@@ -153,6 +166,7 @@ pub fn plan_execution(
     }
     for action in projection {
         plan.gh.push(GhCall {
+            review_type: None,
             purpose: "project the review record onto the pull request".into(),
             args: action.gh_args(pull_request),
         });
@@ -197,8 +211,12 @@ mod tests {
             &[],
             12,
         );
-        assert_eq!(plan.ledger[0].state, ReviewRequestState::Abandoned);
+        assert_eq!(plan.ledger[0].state, ReviewRequestState::Recorded);
         assert!(!plan.ledger[0].state.occupies_a_slot());
+        assert!(
+            !plan.ledger[0].state.is_revivable(),
+            "a record-only review is settled; retrying it would rewrite the row every tick"
+        );
         assert!(plan.chau7.is_empty());
         assert!(plan.gh.is_empty());
     }
@@ -239,6 +257,13 @@ mod tests {
         assert_eq!(plan.gh.len(), 2);
         assert!(plan.gh[0].purpose.contains("provider bot"));
         assert!(plan.gh[1].purpose.contains("project"));
+
+        // A mention that fails is a review nobody was asked for, and the
+        // executor reopens that row -- which it can only do if the call says
+        // which review it was. The projection write names none, because
+        // failing it says nothing about any one reviewer.
+        assert_eq!(plan.gh[0].review_type.as_deref(), Some("code"));
+        assert_eq!(plan.gh[1].review_type, None);
     }
 
     #[test]

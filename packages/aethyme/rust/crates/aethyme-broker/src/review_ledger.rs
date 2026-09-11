@@ -29,10 +29,12 @@ use crate::review_trigger::ReviewSpend;
 
 /// Where one requested review has got to.
 ///
-/// `Failed` and `Abandoned` are separate because they mean different things to
-/// the next tick: a failed review was attempted and did not produce a verdict,
-/// while an abandoned one was never started -- the tab was gone, the budget was
-/// spent, the policy changed. Only the second is worth retrying on sight.
+/// The three terminal states are separate because they mean different things to
+/// the next tick, and a reader a year from now has only the row to go on.
+/// `Failed` was attempted and produced no verdict -- asking again without a new
+/// head buys nothing. `Recorded` is the `record` backend's complete outcome:
+/// the policy asked for nothing to be performed. `Abandoned` alone means nobody
+/// was ever asked, which is the one case the router may ask about again.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReviewRequestState {
@@ -44,7 +46,11 @@ pub enum ReviewRequestState {
     Satisfied,
     /// Attempted, no verdict.
     Failed,
-    /// Never started, and not going to be under this request.
+    /// The `record` backend's whole outcome: the policy performs nothing for
+    /// this dimension, so the row itself is the answer.
+    Recorded,
+    /// Nobody was ever asked -- the tab was gone, the mention could not be
+    /// posted, the executor died before it got there.
     Abandoned,
 }
 
@@ -55,6 +61,7 @@ impl ReviewRequestState {
             Self::Running => "running",
             Self::Satisfied => "satisfied",
             Self::Failed => "failed",
+            Self::Recorded => "recorded",
             Self::Abandoned => "abandoned",
         }
     }
@@ -65,6 +72,7 @@ impl ReviewRequestState {
             "running" => Some(Self::Running),
             "satisfied" => Some(Self::Satisfied),
             "failed" => Some(Self::Failed),
+            "recorded" => Some(Self::Recorded),
             "abandoned" => Some(Self::Abandoned),
             _ => None,
         }
@@ -77,6 +85,18 @@ impl ReviewRequestState {
     /// starve a repository one review at a time until nothing dispatched.
     pub fn occupies_a_slot(self) -> bool {
         matches!(self, Self::Requested | Self::Running)
+    }
+
+    /// Whether the router may ask for this review again.
+    ///
+    /// Exactly one state qualifies. The unique index means a row is otherwise
+    /// permanent for its head, so this is the only thing standing between a
+    /// `gh` call that failed and a dimension that is never reviewed again --
+    /// [`crate::spend_by_type`] therefore leaves a revivable row out of the
+    /// spend it reports, and [`crate::BrokerStore::record_review_request`]
+    /// reuses the row rather than colliding with it.
+    pub fn is_revivable(self) -> bool {
+        matches!(self, Self::Abandoned)
     }
 }
 
@@ -103,10 +123,18 @@ pub struct ReviewRequest {
 /// `last_requested_commit` is the most recently requested head, by request
 /// time. Ordering by time rather than by row id keeps this correct if rows are
 /// ever backfilled out of order.
+///
+/// Revivable rows are not spend. `schedule` skips a dimension whose last
+/// request is bound to the current head, so counting a review nobody was ever
+/// asked to do would turn one failed `gh` call into a dimension that is never
+/// reviewed again for that head.
 pub fn spend_by_type(rows: &[ReviewRequest]) -> std::collections::BTreeMap<String, ReviewSpend> {
     let mut spend: std::collections::BTreeMap<String, ReviewSpend> =
         std::collections::BTreeMap::new();
     for row in rows {
+        if row.state.is_revivable() {
+            continue;
+        }
         let entry = spend.entry(row.review_type.clone()).or_default();
         entry.requested_count += 1;
         if entry
@@ -204,6 +232,41 @@ mod tests {
         assert_eq!(types, vec!["code", "perf"]);
     }
 
+    /// The spend a revivable row reports is the difference between one failed
+    /// `gh` call costing a tick and it costing the dimension permanently:
+    /// `schedule` skips whatever is already bound to the current head.
+    #[test]
+    fn a_review_nobody_was_asked_for_is_not_spend() {
+        let rows = vec![
+            row("security", "aaa", 100, ReviewRequestState::Abandoned),
+            row("code", "aaa", 100, ReviewRequestState::Recorded),
+        ];
+        let spend = spend_by_type(&rows);
+        assert!(
+            !spend.contains_key("security"),
+            "an abandoned request must leave the head askable"
+        );
+        let code = spend.get("code").expect("a recorded review is spent");
+        assert_eq!(code.last_requested_commit.as_deref(), Some("aaa"));
+    }
+
+    #[test]
+    fn exactly_one_state_is_revivable() {
+        let revivable: Vec<&str> = [
+            ReviewRequestState::Requested,
+            ReviewRequestState::Running,
+            ReviewRequestState::Satisfied,
+            ReviewRequestState::Failed,
+            ReviewRequestState::Recorded,
+            ReviewRequestState::Abandoned,
+        ]
+        .into_iter()
+        .filter(|state| state.is_revivable())
+        .map(|state| state.label())
+        .collect();
+        assert_eq!(revivable, vec!["abandoned"]);
+    }
+
     #[test]
     fn every_state_round_trips_through_its_label() {
         for state in [
@@ -211,6 +274,7 @@ mod tests {
             ReviewRequestState::Running,
             ReviewRequestState::Satisfied,
             ReviewRequestState::Failed,
+            ReviewRequestState::Recorded,
             ReviewRequestState::Abandoned,
         ] {
             assert_eq!(ReviewRequestState::parse(state.label()), Some(state));

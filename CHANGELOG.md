@@ -36,6 +36,23 @@ artifacts and their exact source revision are recorded in each signed
   index on `(repository, pr_number, review_type, head_commit)` makes an
   interrupted run re-runnable without a second reviewer landing on the same
   head. `--dry-run` plans against those facts and stops, needing no session.
+- `aethyme broker review ledger --repo <owner/name> [--pr <number>]` prints the
+  review ledger -- which reviews the router asked for, for which head, through
+  which backend, and how each ended. It is read-only, needs no session, and is
+  the answer to "why was there no review on this pull request". `aethyme broker
+  review state --repo <owner/name> --pr <number> --type <review-type> --state
+  <state>` is the other half: whoever performs a review closes its row, which
+  is what drains the router's concurrency budget. `--head <sha>` reports on a
+  superseded commit; `--note <text>` records why.
+- The review ledger distinguishes `recorded` -- the `record` backend's complete
+  outcome, where the policy deliberately performs nothing -- from `abandoned`,
+  which now means only that nobody was ever asked. `abandoned` is the single
+  state the router may ask about again, and a GitHub write that fails now
+  returns its review to it, so one failed `gh` call no longer settles a
+  dimension permanently for that commit. Existing rows migrate automatically
+  (broker schema v34).
+- Review concurrency (`max_concurrent`) is counted across the repository rather
+  than within one pull request, which is what the setting always documented.
 - `aethyme enhance deploy` now installs an `aethyme-review-rule-maker` skill on
   both agent surfaces. It carries the procedure for writing a repository's
   `[review.*]` policy -- find the guarded paths by searching the repository

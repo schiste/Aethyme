@@ -375,6 +375,16 @@ Usage:
       read with read-only gh. Records each request before it is handed out,
       then performs the GitHub writes through the coordinated lane and prints
       the Chau7 spawns for an adapter to start. --dry-run stops after the plan.
+  aethyme broker review ledger --repo <owner/name> [--pr <number>] [--json]
+      Print the review ledger: every review the router has requested, for
+      which head, through which backend, and how it ended. This is the answer
+      to \"why was there no review\" -- read-only, needs no session.
+  aethyme broker review state --repo <owner/name> --pr <number> --type <review-type> --state <state> [--head <sha>] [--note <text>] [--json]
+      Report what became of one requested review: running, satisfied, failed,
+      recorded, or abandoned. The broker decides and records; whoever performs
+      the review closes the row here, which is what drains the router's
+      concurrency slots. --head targets a superseded commit; the default is
+      the most recent request for that review type.
   aethyme broker review register --session <id> --repo <owner/name> --pr <number> [--json]
       Opt an exact live session and open draft PR into the configured review
       lifecycle after verifying repository, base, and full head SHA evidence.
@@ -1524,6 +1534,44 @@ mod tests {
         assert_eq!(parsed.cmd.as_deref(), Some("codex exec prompt"));
     }
 
+    /// `review state` is the reviewer's half of the handoff, and the reviewer
+    /// is a script. `--detail` was already a boolean elsewhere, so the free
+    /// text is `--note`; this pins that choice against a future rename that
+    /// would silently drop the text.
+    #[test]
+    fn parse_accepts_the_review_ledger_report_flags() {
+        let args = [
+            "review",
+            "state",
+            "--repo",
+            "Owner/Repo",
+            "--pr",
+            "42",
+            "--type",
+            "security",
+            "--state",
+            "satisfied",
+            "--head",
+            "abc123",
+            "--note",
+            "no findings",
+        ]
+        .map(String::from)
+        .to_vec();
+        let parsed = match super::parse(&args) {
+            Ok(parsed) => parsed,
+            Err(_) => panic!("review state flags should parse"),
+        };
+        assert_eq!(parsed.positional, vec!["review", "state"]);
+        assert_eq!(parsed.repository.as_deref(), Some("Owner/Repo"));
+        assert_eq!(parsed.pr_number, Some(42));
+        assert_eq!(parsed.review_type.as_deref(), Some("security"));
+        assert_eq!(parsed.review_state.as_deref(), Some("satisfied"));
+        assert_eq!(parsed.head.as_deref(), Some("abc123"));
+        assert_eq!(parsed.note.as_deref(), Some("no findings"));
+        assert!(!parsed.detail, "--detail stays the boolean it already was");
+    }
+
     #[test]
     fn parse_accepts_metadata_only_pull_request_watch_flags() {
         let args = vec![
@@ -1675,6 +1723,9 @@ struct Parsed {
     head: Option<String>,
     resolution_file: Option<PathBuf>,
     tabs_file: Option<PathBuf>,
+    review_type: Option<String>,
+    review_state: Option<String>,
+    note: Option<String>,
     write_resolution_template: Option<PathBuf>,
     worktree: Option<PathBuf>,
     title: Option<String>,
@@ -1759,6 +1810,9 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         head: None,
         resolution_file: None,
         tabs_file: None,
+        review_type: None,
+        review_state: None,
+        note: None,
         write_resolution_template: None,
         worktree: None,
         title: None,
@@ -1962,6 +2016,27 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
                         .ok_or(UsageError::Message("--tabs-file requires a path".into()))?
                         .clone(),
                 ));
+            }
+            "--type" => {
+                parsed.review_type = Some(
+                    iter.next()
+                        .ok_or(UsageError::Message("--type requires a review type".into()))?
+                        .clone(),
+                )
+            }
+            "--state" => {
+                parsed.review_state = Some(
+                    iter.next()
+                        .ok_or(UsageError::Message("--state requires a state".into()))?
+                        .clone(),
+                )
+            }
+            "--note" => {
+                parsed.note = Some(
+                    iter.next()
+                        .ok_or(UsageError::Message("--note requires text".into()))?
+                        .clone(),
+                )
             }
             "--resolution-file" => {
                 parsed.resolution_file = Some(PathBuf::from(
@@ -5477,13 +5552,21 @@ fn run_review_run(parsed: Parsed) -> Result<(), UsageError> {
         .trim()
         .to_string();
 
-    // The three facts `review plan` has to assume.
+    // The three facts `review plan` has to assume. Spend is this pull request's
+    // history; concurrency is the whole repository's, because `max_concurrent`
+    // is a per-repository budget. Reading the slot count from this pull
+    // request's rows would quietly multiply the cap by the number of open pull
+    // requests, which is the opposite of what a cap is for.
     let recorded = broker
         .store()
         .review_requests_for_pr(&repository, pull_request)
         .map_err(to_usage)?;
     let spend = crate::spend_by_type(&recorded);
-    let in_flight = crate::in_flight(&recorded);
+    let open = broker
+        .store()
+        .review_requests_in_flight(&repository)
+        .map_err(to_usage)?;
+    let in_flight = crate::in_flight(&open);
     let tabs = read_tab_snapshot(&parsed)?;
     let pr_facts = read_pull_request_facts(&change_root, &repository, pull_request);
 
@@ -5552,6 +5635,10 @@ fn run_review_run(parsed: Parsed) -> Result<(), UsageError> {
     // cost a duplicated one.
     let mut recorded_now = Vec::new();
     let mut skipped = Vec::new();
+    // Which row answers for which dimension, so a `gh` call that fails can
+    // reopen exactly the review it failed to ask for.
+    let mut rows_by_type: std::collections::BTreeMap<String, i64> =
+        std::collections::BTreeMap::new();
     for write in &plan.ledger {
         let (request, created) = broker
             .store()
@@ -5583,6 +5670,7 @@ fn run_review_run(parsed: Parsed) -> Result<(), UsageError> {
                 )
                 .map_err(to_usage)?;
         }
+        rows_by_type.insert(write.review_type.clone(), request.id);
         recorded_now.push(write.review_type.clone());
     }
 
@@ -5590,6 +5678,14 @@ fn run_review_run(parsed: Parsed) -> Result<(), UsageError> {
     // repository write lock and records the operation. A failed call stops the
     // tick: the rest of the projection describes a pull request state this one
     // was supposed to establish.
+    //
+    // Before it stops, the review that call was asking for goes back to
+    // `abandoned`. The ledger's unique index makes a row permanent for its
+    // head, so leaving it at `requested` would mean one failed `gh` call
+    // settles that dimension forever -- the next tick would read the row,
+    // count it as spend, and skip. `abandoned` is the one state the router may
+    // ask about again, which is what turns a transient GitHub failure into a
+    // retry instead of a silently missing review.
     let mut performed = Vec::new();
     for call in &plan.gh {
         let report = broker
@@ -5611,6 +5707,24 @@ fn run_review_run(parsed: Parsed) -> Result<(), UsageError> {
             "success": report.command_success,
         }));
         if !report.command_success {
+            if let Some(id) = call
+                .review_type
+                .as_deref()
+                .and_then(|review_type| rows_by_type.get(review_type))
+            {
+                broker
+                    .store()
+                    .set_review_request_state(
+                        *id,
+                        crate::ReviewRequestState::Abandoned,
+                        Some(&format!(
+                            "the coordinated GitHub write failed: {}",
+                            call.purpose
+                        )),
+                        now_ms(),
+                    )
+                    .map_err(to_usage)?;
+            }
             emit_review_run_report(
                 &base,
                 &head,
@@ -5677,7 +5791,8 @@ fn emit_review_run_report(
         "github_operations": performed,
         "already_recorded": skipped,
         // The one thing the broker cannot do itself. An adapter with Chau7
-        // access starts these and then reports back with `review state`.
+        // access starts these, then closes each row with
+        // `aethyme broker review state --repo <r> --pr <n> --type <t> --state <s>`.
         "chau7_handoff": plan.chau7,
     });
     out!(
@@ -5716,6 +5831,127 @@ fn git_lines(root: &Path, args: &[&str]) -> Result<Vec<String>, UsageError> {
         .collect())
 }
 
+/// Print the review ledger for a repository, or for one pull request in it.
+///
+/// The executor writes this table and nothing reads it back, which is the
+/// difference between a review that is missing and a review that is missing
+/// silently. A row carries who was asked, for which head, and how it ended, so
+/// "why was there no security review on #412" is answered by one command
+/// rather than by reading the router's source.
+fn run_review_ledger(parsed: Parsed) -> Result<(), UsageError> {
+    let repository = parsed
+        .repository
+        .clone()
+        .ok_or_else(|| UsageError::Message("review ledger requires --repo <owner/name>".into()))?;
+    let mut broker = open_broker(true)?;
+    let rows = match parsed.pr_number {
+        Some(pull_request) => broker
+            .store()
+            .review_requests_for_pr(&repository, pull_request),
+        None => broker.store().review_requests_for_repository(&repository),
+    }
+    .map_err(to_usage)?;
+
+    if parsed.json {
+        out!("{}", serde_json::to_string_pretty(&rows)?);
+        return Ok(());
+    }
+    if rows.is_empty() {
+        out!("No reviews recorded for {repository}.");
+        return Ok(());
+    }
+    for row in &rows {
+        let head = &row.head_commit[..12.min(row.head_commit.len())];
+        out!(
+            "#{:<5} {:<10} {:<10} {:<16} {head}",
+            row.pr_number,
+            row.review_type,
+            row.state.label(),
+            row.backend
+        );
+        if let Some(detail) = &row.detail {
+            out!("        {detail}");
+        }
+    }
+    Ok(())
+}
+
+/// Report what became of one requested review.
+///
+/// This is the other half of `review run`'s handoff. The broker decides and
+/// records; a Chau7 adapter or a provider bot performs, and closes the row
+/// here. Without it the ledger only ever says `requested`, and the router's
+/// concurrency slots fill up and never drain.
+///
+/// `--head` is optional because a reviewer reporting now was almost certainly
+/// asked most recently; naming a head is how a late report about a superseded
+/// commit lands on the right row instead of the current one.
+fn run_review_state(parsed: Parsed) -> Result<(), UsageError> {
+    let repository = parsed.repository.clone().ok_or_else(|| {
+        UsageError::Message(
+            "review state requires --repo <owner/name> --pr <number> --type <review-type> --state <state>"
+                .into(),
+        )
+    })?;
+    let pull_request = parsed
+        .pr_number
+        .ok_or_else(|| UsageError::Message("review state requires --pr <number>".into()))?;
+    let review_type = parsed
+        .review_type
+        .clone()
+        .ok_or_else(|| UsageError::Message("review state requires --type <review-type>".into()))?;
+    let label = parsed
+        .review_state
+        .clone()
+        .ok_or_else(|| UsageError::Message("review state requires --state <state>".into()))?;
+    let state = crate::ReviewRequestState::parse(&label).ok_or_else(|| {
+        UsageError::Message(format!(
+            "unknown review state {label:?}; expected requested, running, satisfied, failed, recorded, or abandoned"
+        ))
+    })?;
+
+    let mut broker = open_broker(parsed.read_only_snapshot)?;
+    let existing = broker
+        .store()
+        .latest_review_request(
+            &repository,
+            pull_request,
+            &review_type,
+            parsed.head.as_deref(),
+        )
+        .map_err(to_usage)?
+        // Refusing is the point: a report about a review nobody requested
+        // means the reporter and the router disagree about what was asked
+        // for, and inventing a row here would bury that disagreement.
+        .ok_or_else(|| {
+            UsageError::Message(format!(
+                "no {review_type} review is recorded for {repository}#{pull_request}{}; `aethyme broker review ledger --repo {repository} --pr {pull_request}` lists what is",
+                match parsed.head.as_deref() {
+                    Some(head) => format!(" at {head}"),
+                    None => String::new(),
+                }
+            ))
+        })?;
+    let updated = broker
+        .store()
+        .set_review_request_state(existing.id, state, parsed.note.as_deref(), now_ms())
+        .map_err(to_usage)?;
+
+    if parsed.json {
+        out!("{}", serde_json::to_string_pretty(&updated)?);
+    } else {
+        out!(
+            "{} review on {}#{} at {} is now {}.",
+            updated.review_type,
+            updated.repository,
+            updated.pr_number,
+            &updated.head_commit[..12.min(updated.head_commit.len())],
+            updated.state.label()
+        );
+    }
+    Ok(())
+}
+
 fn run_review(parsed: Parsed) -> Result<(), UsageError> {
     let action = parsed
         .positional
@@ -5723,7 +5959,7 @@ fn run_review(parsed: Parsed) -> Result<(), UsageError> {
         .map(String::as_str)
         .ok_or_else(|| {
             UsageError::Message(
-                "review requires plan, run, register, show, request, unlock, reassign, or abandon"
+                "review requires plan, run, ledger, state, register, show, request, unlock, reassign, or abandon"
                     .into(),
             )
         })?;
@@ -5740,6 +5976,16 @@ fn run_review(parsed: Parsed) -> Result<(), UsageError> {
     }
     if action == "run" {
         return run_review_run(parsed);
+    }
+    // `ledger` and `state` are about the router's ledger rather than a
+    // session's review lifecycle, so they take a repository instead of the
+    // `--session` every action below requires. `ledger` reads and `state` is
+    // written by whoever performed the review, which is never this broker.
+    if action == "ledger" {
+        return run_review_ledger(parsed);
+    }
+    if action == "state" {
+        return run_review_state(parsed);
     }
     let session_id = parsed
         .session
@@ -5854,7 +6100,7 @@ fn run_review(parsed: Parsed) -> Result<(), UsageError> {
         }
         other => {
             return Err(UsageError::Message(format!(
-                "unknown review action {other:?}; expected register, show, request, unlock, reassign, or abandon"
+                "unknown review action {other:?}; expected plan, run, ledger, state, register, show, request, unlock, reassign, or abandon"
             )));
         }
     }
