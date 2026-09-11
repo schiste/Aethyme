@@ -344,7 +344,9 @@ pub use review_backend::{
 pub use review_execution::{
     Chau7Handoff, DeferredReview, GhCall, LedgerWrite, ReviewExecutionPlan, plan_execution,
 };
-pub use review_ledger::{ReviewRequest, ReviewRequestState, in_flight, spend_by_type};
+pub use review_ledger::{
+    ExpiredReview, ReviewRequest, ReviewRequestState, expired, in_flight, spend_by_type,
+};
 pub use review_trigger::{
     ChangeFacts, ClassificationConflict, CommitClassification, EligibleReview,
     REVIEW_TRIGGER_SCHEMA_VERSION, ReviewSchedule, ReviewSpend, ReviewTrigger,

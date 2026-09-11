@@ -31,10 +31,13 @@ use crate::review_trigger::ReviewSpend;
 ///
 /// The three terminal states are separate because they mean different things to
 /// the next tick, and a reader a year from now has only the row to go on.
-/// `Failed` was attempted and produced no verdict -- asking again without a new
-/// head buys nothing. `Recorded` is the `record` backend's complete outcome:
-/// the policy asked for nothing to be performed. `Abandoned` alone means nobody
-/// was ever asked, which is the one case the router may ask about again.
+/// `Failed` was attempted and concluded without a verdict -- asking again on
+/// the same head buys nothing, because the attempt itself is the answer.
+/// `Recorded` is the `record` backend's complete outcome: the policy asked for
+/// nothing to be performed. `Abandoned` is the absence of any conclusion at
+/// all -- nobody was ever asked, or whoever was asked never came back -- which
+/// is the one case where asking again is worth something, and therefore the one
+/// case the router may ask about again.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReviewRequestState {
@@ -49,8 +52,9 @@ pub enum ReviewRequestState {
     /// The `record` backend's whole outcome: the policy performs nothing for
     /// this dimension, so the row itself is the answer.
     Recorded,
-    /// Nobody was ever asked -- the tab was gone, the mention could not be
-    /// posted, the executor died before it got there.
+    /// No conclusion is coming -- nobody was ever asked (the tab was gone, the
+    /// mention could not be posted, the executor died before it got there), or
+    /// whoever was asked never reported back inside `stale_after_minutes`.
     Abandoned,
 }
 
@@ -148,6 +152,67 @@ pub fn spend_by_type(rows: &[ReviewRequest]) -> std::collections::BTreeMap<Strin
     spend
 }
 
+/// One review the router has stopped waiting for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ExpiredReview {
+    pub id: i64,
+    pub review_type: String,
+    pub pull_request: i64,
+    /// What the row's `detail` becomes, phrased for whoever reads the ledger
+    /// months later and was not here when it happened.
+    pub why: String,
+}
+
+/// The open reviews the router should stop waiting for.
+///
+/// A slot is released by whoever reports the outcome, and nothing guarantees
+/// anyone does. The in-flight count is derived from states rather than a
+/// counter precisely so a crash cannot leak a slot -- but a row that stays
+/// `running` forever leaks one just as effectively, and a repository that has
+/// quietly stopped dispatching reviews looks exactly like a repository whose
+/// policy asks for none.
+///
+/// The window is per route because `max_concurrent` is: a security review that
+/// legitimately takes hours and a docs review that should take minutes cannot
+/// share one number without the short one waiting on the long one's patience.
+/// `0` disables expiry for that route, for an operator who would rather wedge
+/// than re-ask.
+///
+/// Pure, and separate from the write, so the executor can show what it would
+/// expire before it expires anything.
+pub fn expired(
+    policy: &crate::ReviewRoutingPolicy,
+    rows: &[ReviewRequest],
+    now: i64,
+) -> Vec<ExpiredReview> {
+    rows.iter()
+        .filter(|row| row.state.occupies_a_slot())
+        .filter_map(|row| {
+            let minutes = policy.route_for(&row.review_type).stale_after_minutes;
+            if minutes == 0 {
+                return None;
+            }
+            let window = i64::from(minutes) * 60_000;
+            // From the last time anything happened to this row, not from when
+            // it was requested: a reviewer that reported `running` an hour ago
+            // is working, and restarting it would duplicate that hour.
+            let idle = now.saturating_sub(row.updated_at);
+            if idle < window {
+                return None;
+            }
+            Some(ExpiredReview {
+                id: row.id,
+                review_type: row.review_type.clone(),
+                pull_request: row.pr_number,
+                why: format!(
+                    "no report in {minutes} minutes while {}; the router stopped waiting",
+                    row.state.label()
+                ),
+            })
+        })
+        .collect()
+}
+
 /// The reviews still occupying a slot, for [`crate::dispatch_review`].
 pub fn in_flight(rows: &[ReviewRequest]) -> Vec<InFlightReview> {
     rows.iter()
@@ -162,6 +227,129 @@ pub fn in_flight(rows: &[ReviewRequest]) -> Vec<InFlightReview> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn routing(toml: &str) -> crate::ReviewRoutingPolicy {
+        toml::from_str(toml).expect("test routing policy should parse")
+    }
+
+    const MINUTE: i64 = 60_000;
+
+    /// The slot budget is only a budget if slots come back. Nothing guarantees
+    /// a reviewer reports, so without this a repository dispatches
+    /// `max_concurrent` reviews and then looks exactly like a repository whose
+    /// policy asks for none.
+    #[test]
+    fn a_reviewer_that_never_reports_stops_holding_its_slot() {
+        let policy = routing(
+            "enabled = true\n[route.security]\nbackend = \"chau7\"\nstale_after_minutes = 60\n",
+        );
+        let now = 1_000 * MINUTE;
+        let fresh = row(
+            "security",
+            "abc",
+            now - 30 * MINUTE,
+            ReviewRequestState::Running,
+        );
+        let stale = ReviewRequest {
+            id: 2,
+            ..row(
+                "security",
+                "def",
+                now - 90 * MINUTE,
+                ReviewRequestState::Running,
+            )
+        };
+        let expired = expired(&policy, &[fresh, stale], now);
+        assert_eq!(expired.len(), 1, "only the one past its window");
+        assert_eq!(expired[0].id, 2);
+        assert!(
+            expired[0].why.contains("60 minutes"),
+            "the row has to say why it was given up on: {}",
+            expired[0].why
+        );
+    }
+
+    /// Measured from the last update, not the request. A reviewer that reported
+    /// `running` is working, and restarting it duplicates everything it has
+    /// done since.
+    #[test]
+    fn progress_resets_the_window() {
+        let policy = routing(
+            "enabled = true\n[route.security]\nbackend = \"chau7\"\nstale_after_minutes = 60\n",
+        );
+        let now = 1_000 * MINUTE;
+        let mut working = row(
+            "security",
+            "abc",
+            now - 600 * MINUTE,
+            ReviewRequestState::Running,
+        );
+        working.updated_at = now - 10 * MINUTE;
+        assert!(
+            expired(&policy, &[working], now).is_empty(),
+            "a long review that is still reporting is not a dead one"
+        );
+    }
+
+    /// Expiry is about slots, and only an open row holds one. Rewriting a
+    /// settled row would turn every tick into a write and lose the outcome it
+    /// already recorded.
+    #[test]
+    fn a_settled_review_is_never_expired() {
+        let policy = routing(
+            "enabled = true\n[route.security]\nbackend = \"chau7\"\nstale_after_minutes = 1\n",
+        );
+        let now = 1_000 * MINUTE;
+        for settled in [
+            ReviewRequestState::Satisfied,
+            ReviewRequestState::Failed,
+            ReviewRequestState::Recorded,
+            ReviewRequestState::Abandoned,
+        ] {
+            let old = row("security", "abc", now - 500 * MINUTE, settled);
+            assert!(
+                expired(&policy, &[old], now).is_empty(),
+                "{settled:?} is an outcome, not a slot"
+            );
+        }
+    }
+
+    /// The window is per route for the same reason the budget is: a security
+    /// review that takes hours and a docs review that takes minutes cannot
+    /// share one number without the short one waiting on the long one.
+    #[test]
+    fn each_route_waits_its_own_length_and_zero_waits_forever() {
+        let policy = routing(
+            "enabled = true\n             [route.security]\nbackend = \"chau7\"\nstale_after_minutes = 0\n             [route.docs]\nbackend = \"chau7\"\nstale_after_minutes = 10\n",
+        );
+        let now = 1_000 * MINUTE;
+        let patient = row(
+            "security",
+            "abc",
+            now - 900 * MINUTE,
+            ReviewRequestState::Running,
+        );
+        let impatient = ReviewRequest {
+            id: 2,
+            ..row(
+                "docs",
+                "abc",
+                now - 11 * MINUTE,
+                ReviewRequestState::Requested,
+            )
+        };
+        let expired = expired(&policy, &[patient, impatient], now);
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].review_type, "docs");
+    }
+
+    /// An expired review has to be askable again, or the window trades a wedged
+    /// repository for a silently unreviewed one.
+    #[test]
+    fn what_expiry_writes_is_the_one_revivable_state() {
+        assert!(ReviewRequestState::Abandoned.is_revivable());
+        assert!(!ReviewRequestState::Abandoned.occupies_a_slot());
+    }
 
     fn row(review_type: &str, head: &str, at: i64, state: ReviewRequestState) -> ReviewRequest {
         ReviewRequest {

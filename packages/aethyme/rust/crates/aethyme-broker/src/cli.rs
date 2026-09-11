@@ -372,7 +372,9 @@ Usage:
       Perform one tick of the review router for one pull request: decide as
       `review plan` does but with the spent reviews read from the ledger, the
       in-flight reviews read from a Chau7 tab snapshot, and the pull request
-      read with read-only gh. Records each request before it is handed out,
+      read with read-only gh. First gives up on any review whose reviewer has
+      not reported inside the route's stale_after_minutes, so a dead reviewer
+      cannot hold a slot forever. Records each request before it is handed out,
       then performs the GitHub writes through the coordinated lane and prints
       the Chau7 spawns for an adapter to start. --dry-run stops after the plan.
   aethyme broker review ledger --repo <owner/name> [--pr <number>] [--json]
@@ -5552,6 +5554,32 @@ fn run_review_run(parsed: Parsed) -> Result<(), UsageError> {
         .trim()
         .to_string();
 
+    // Before reading anything, stop waiting on reviews nobody is coming back
+    // for. This has to happen first: an expired row becomes `abandoned`, which
+    // is neither spend nor in flight, so a tick that read either before
+    // expiring would plan against a repository whose slots are still held by
+    // reviewers that died days ago.
+    let open = broker
+        .store()
+        .review_requests_in_flight(&repository)
+        .map_err(to_usage)?;
+    let expired = crate::expired(&routing, &open, now_ms());
+    if !parsed.dry_run {
+        for review in &expired {
+            broker
+                .store()
+                .set_review_request_state(
+                    review.id,
+                    crate::ReviewRequestState::Abandoned,
+                    Some(&review.why),
+                    now_ms(),
+                )
+                .map_err(to_usage)?;
+        }
+    }
+    let expired_ids: std::collections::BTreeSet<i64> =
+        expired.iter().map(|review| review.id).collect();
+
     // The three facts `review plan` has to assume. Spend is this pull request's
     // history; concurrency is the whole repository's, because `max_concurrent`
     // is a per-repository budget. Reading the slot count from this pull
@@ -5561,12 +5589,21 @@ fn run_review_run(parsed: Parsed) -> Result<(), UsageError> {
         .store()
         .review_requests_for_pr(&repository, pull_request)
         .map_err(to_usage)?;
-    let spend = crate::spend_by_type(&recorded);
-    let open = broker
-        .store()
-        .review_requests_in_flight(&repository)
-        .map_err(to_usage)?;
-    let in_flight = crate::in_flight(&open);
+    let spend = crate::spend_by_type(
+        &recorded
+            .iter()
+            .filter(|row| !expired_ids.contains(&row.id))
+            .cloned()
+            .collect::<Vec<_>>(),
+    );
+    // A dry run performs nothing, so the rows it just decided to expire are
+    // still open in the database. Dropping them here is what makes the plan it
+    // prints the plan a real run would follow.
+    let still_open: Vec<crate::ReviewRequest> = open
+        .into_iter()
+        .filter(|row| !expired_ids.contains(&row.id))
+        .collect();
+    let in_flight = crate::in_flight(&still_open);
     let tabs = read_tab_snapshot(&parsed)?;
     let pr_facts = read_pull_request_facts(&change_root, &repository, pull_request);
 
@@ -5626,7 +5663,7 @@ fn run_review_run(parsed: Parsed) -> Result<(), UsageError> {
     let plan = crate::plan_execution(&dispatch, &projection_actions, pull_request);
 
     if parsed.dry_run {
-        emit_review_run_report(&base, &head, pull_request, &plan, &[], &[], false)?;
+        emit_review_run_report(&base, &head, pull_request, &plan, &[], &[], &expired, false)?;
         return Ok(());
     }
 
@@ -5732,6 +5769,7 @@ fn run_review_run(parsed: Parsed) -> Result<(), UsageError> {
                 &plan,
                 &performed,
                 &skipped,
+                &expired,
                 true,
             )?;
             return Err(UsageError::Message(format!(
@@ -5748,6 +5786,7 @@ fn run_review_run(parsed: Parsed) -> Result<(), UsageError> {
         &plan,
         &performed,
         &skipped,
+        &expired,
         true,
     )?;
     Ok(())
@@ -5780,6 +5819,7 @@ fn emit_review_run_report(
     plan: &crate::ReviewExecutionPlan,
     performed: &[serde_json::Value],
     skipped: &[serde_json::Value],
+    expired: &[crate::ExpiredReview],
     executed: bool,
 ) -> Result<(), UsageError> {
     let report = serde_json::json!({
@@ -5790,6 +5830,10 @@ fn emit_review_run_report(
         "performed": executed,
         "github_operations": performed,
         "already_recorded": skipped,
+        // Reviews this tick stopped waiting for, and therefore may re-ask. An
+        // entry here every tick means something starts reviews and never
+        // reports back, which is worth more attention than the retry it causes.
+        "expired": expired,
         // The one thing the broker cannot do itself. An adapter with Chau7
         // access starts these, then closes each row with
         // `aethyme broker review state --repo <r> --pr <n> --type <t> --state <s>`.

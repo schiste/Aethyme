@@ -76,6 +76,7 @@ these is consulted.
 | `mention` | string | -- | **Required for `provider_comment`.** Stored without the `@`. |
 | `instructions` | string | -- | Appended to the generated Chau7 prompt. The generated part is not replaceable. |
 | `max_concurrent` | int | `2` | Reviews of this dimension in flight at once, repository-wide. `0` is unbounded. |
+| `stale_after_minutes` | int | `360` | Give up on an unfinished review after this long without an update, mark it `abandoned`, and ask again. Stops a dead reviewer holding a slot forever. `0` is never. |
 
 Budgets are per dimension, so a saturated security queue does not stop a code
 review being requested.

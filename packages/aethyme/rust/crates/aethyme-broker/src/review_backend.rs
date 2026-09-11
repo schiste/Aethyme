@@ -69,10 +69,28 @@ pub struct ReviewRoute {
     /// repository. `0` means unbounded.
     #[serde(default = "default_max_concurrent")]
     pub max_concurrent: u32,
+    /// How long an unfinished review of this type may hold a slot before the
+    /// router gives up on it and asks again. `0` means never.
+    ///
+    /// This is the companion to `max_concurrent` and exists because of it. A
+    /// slot is released by whoever reports the outcome, and nothing guarantees
+    /// anyone does: a Chau7 tab can be closed, an adapter can crash, a review
+    /// bot can be uninstalled mid-review. Without a window those slots are
+    /// gone for good, and the repository dispatches `max_concurrent` reviews of
+    /// this type and then silently stops dispatching any.
+    ///
+    /// Long enough that a slow review is not interrupted, short enough that a
+    /// dead one is not waited on for a working day.
+    #[serde(default = "default_stale_after_minutes")]
+    pub stale_after_minutes: u32,
 }
 
 fn default_max_concurrent() -> u32 {
     2
+}
+
+fn default_stale_after_minutes() -> u32 {
+    6 * 60
 }
 
 impl Default for ReviewRoute {
@@ -84,6 +102,7 @@ impl Default for ReviewRoute {
             mention: None,
             instructions: None,
             max_concurrent: default_max_concurrent(),
+            stale_after_minutes: default_stale_after_minutes(),
         }
     }
 }

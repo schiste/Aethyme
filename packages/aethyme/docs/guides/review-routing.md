@@ -144,6 +144,7 @@ backend = "record"
 [review.routing.route.security]
 backend = "chau7"
 max_concurrent = 1            # 0 = unbounded
+stale_after_minutes = 360     # give up on an unfinished review after 6h; 0 = never
 instructions = "Pay attention to the broker's coordinated-write path."
 
 [review.routing.route.code]
@@ -289,6 +290,21 @@ surprise an operator with a process or a comment.
 `max_concurrent` is per dimension, repository-wide. Separate budgets are what
 keep one backlogged dimension from silencing the others: a security review
 queue at its limit does not stop a code review being requested.
+
+`stale_after_minutes` is what keeps that budget from being spent permanently.
+A slot is released by whoever reports the outcome, and nothing guarantees
+anyone does -- a Chau7 tab gets closed, an adapter crashes, a review bot is
+uninstalled mid-review. Each tick of `review run` first gives up on any review
+of that dimension whose row has not been touched in the window, marks it
+`abandoned`, and asks again. It is measured from the last update rather than
+from the request, so a reviewer that reported `running` an hour ago is left
+alone. `0` disables it, for an operator who would rather wedge than re-ask.
+
+The default is six hours: long enough that a slow review is not interrupted,
+short enough that a dead one is not waited on for a working day. Expiries show
+up under `expired` in the `review run` report, and one there every tick means
+something starts reviews and never reports back -- worth more attention than
+the retry it causes.
 
 A Chau7 review whose workspace already has a live tab is deferred rather than
 started again. The check is on the directory, not the branch -- a tab that has
@@ -527,10 +543,11 @@ aethyme broker review state --repo owner/repo --pr 412 \
     --type security --state satisfied --note "no findings"
 ```
 
-This is the other half of the `chau7_handoff` seam, and it is what drains the
-router's concurrency slots -- a `requested` row holds one until something says
-otherwise, so an adapter that starts reviews and never reports back throttles
-the repository to `max_concurrent` reviews and then stops dispatching entirely.
+This is the other half of the `chau7_handoff` seam, and it is the intended way
+a slot is released. `stale_after_minutes` is the backstop for when nothing
+reports: it bounds how long a dead reviewer can hold a slot, but it costs a
+duplicated review every time it fires, so an adapter that reports back is
+strictly better than one that relies on it.
 
 `--head <sha>` targets a superseded commit; the default is the most recent
 request for that review type, which is what a reviewer reporting now was asked

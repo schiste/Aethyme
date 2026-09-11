@@ -53,6 +53,16 @@ artifacts and their exact source revision are recorded in each signed
   (broker schema v34).
 - Review concurrency (`max_concurrent`) is counted across the repository rather
   than within one pull request, which is what the setting always documented.
+- New `stale_after_minutes` on a `[review.routing.route.*]` entry (default
+  `360`, `0` to disable) bounds how long an unfinished review may hold one of
+  those slots. A slot is released by whoever reports the outcome and nothing
+  guarantees anyone does -- a closed Chau7 tab, a crashed adapter, an
+  uninstalled review bot -- so without it a repository dispatches
+  `max_concurrent` reviews of a dimension and then silently stops dispatching
+  any. Each `review run` tick first marks any review of that dimension whose row
+  has not been touched in the window `abandoned` and asks again; the window runs
+  from the last update, so a reviewer that reports progress is left alone.
+  Expiries appear under `expired` in the run report.
 - `aethyme enhance deploy` now installs an `aethyme-review-rule-maker` skill on
   both agent surfaces. It carries the procedure for writing a repository's
   `[review.*]` policy -- find the guarded paths by searching the repository
