@@ -2992,6 +2992,10 @@ impl Broker {
             }
         })?;
         self.write_or_verify_worktree_root_marker(&root)?;
+        // Best effort on purpose: this is a disk-hygiene default, and failing
+        // to start a session over one is a far worse outcome than building a
+        // worktree the way cargo would have anyway.
+        let _ = write_worktree_build_defaults(&root);
         Ok(root)
     }
 
@@ -8231,14 +8235,93 @@ fn slugify(task: &str) -> String {
     if slug.is_empty() { "task".into() } else { slug }
 }
 
+/// Cargo defaults for the worktrees beneath a worktree root.
+///
+/// A session worktree is built a handful of times and then deleted, which
+/// makes two of cargo's defaults pure cost. Incremental state exists to make
+/// the *next* build of a tree cheaper and measured at 35% of a `target/` here;
+/// full debug info is another large share, spent on symbols that a broker
+/// session has no debugger attached to read. Gates already decline both
+/// through `gates.toml`, against one capped shared cache. The worktree the
+/// agent runs its own `cargo test` in had no equivalent, and that asymmetry is
+/// where the disk went -- tens of gigabytes of rebuild state for trees that
+/// are never rebuilt.
+///
+/// Placed one directory above the worktrees rather than inside one, for two
+/// reasons: it is then never an untracked file in anyone's `git status`, and a
+/// repository that ships its own `.cargo/config.toml` sits closer to the build
+/// and keeps precedence. Anything explicit still wins -- a `CARGO_PROFILE_*`
+/// environment variable, or the gates' own `CARGO_TARGET_DIR` discipline.
+const WORKTREE_CARGO_CONFIG: &str = "\
+# Written once by the Aethyme broker, for the session worktrees beside it.
+#
+# These trees are built a few times and then reclaimed, so they do not pay for
+# rebuild state nothing will rebuild from, or for debug info nothing reads.
+# Backtraces keep their file and line numbers.
+#
+# Delete this file to build them with cargo's defaults instead; the broker
+# writes it only when it is absent.
+
+[build]
+incremental = false
+
+[profile.dev]
+debug = \"line-tables-only\"
+";
+
+/// Write [`WORKTREE_CARGO_CONFIG`] beneath `root`, unless something is already
+/// there. An operator who edited or emptied it has said what they want.
+fn write_worktree_build_defaults(root: &Path) -> std::io::Result<()> {
+    let directory = root.join(".cargo");
+    let config = directory.join("config.toml");
+    if config.exists() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(&directory)?;
+    let temporary = directory.join(format!(".config.{}.{}.tmp", std::process::id(), now_ms()));
+    std::fs::write(&temporary, WORKTREE_CARGO_CONFIG)?;
+    // Rename so a worktree created concurrently never reads a half-written
+    // config and builds with a truncated profile.
+    std::fs::rename(&temporary, &config).inspect_err(|_| {
+        let _ = std::fs::remove_file(&temporary);
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         DoctorRepairStatus, DoctorReport, RepairCommandOutput, VersionRepairReport,
-        active_version_matches, execute_version_repair_steps, local_cli_repair_step_specs, slugify,
+        WORKTREE_CARGO_CONFIG, active_version_matches, execute_version_repair_steps,
+        local_cli_repair_step_specs, slugify, write_worktree_build_defaults,
     };
     use crate::types::{MergeQueueEntry, Session, SessionOrigin, SessionStatus};
     use crate::version::{BinaryBuild, VersionDriftReport, VersionDriftStatus};
+
+    #[test]
+    fn worktree_build_defaults_are_written_once_and_never_over_a_choice() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join(".cargo/config.toml");
+
+        write_worktree_build_defaults(tmp.path()).unwrap();
+        let written = std::fs::read_to_string(&config).unwrap();
+        assert_eq!(written, WORKTREE_CARGO_CONFIG);
+        assert!(written.contains("incremental = false"));
+        assert!(written.contains("debug = \"line-tables-only\""));
+
+        // Emptying the file is how an operator turns this off. Rewriting it on
+        // the next session start would make that impossible to express.
+        std::fs::write(&config, "").unwrap();
+        write_worktree_build_defaults(tmp.path()).unwrap();
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), "");
+
+        // Nothing temporary is left behind for a later scan to puzzle over.
+        let leftovers = std::fs::read_dir(tmp.path().join(".cargo"))
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.file_name() != "config.toml")
+            .count();
+        assert_eq!(leftovers, 0);
+    }
 
     #[test]
     fn slugify_is_safe_for_branches_and_paths() {

@@ -905,6 +905,47 @@ deletions. Check `aethyme broker doctor` or `aethyme certify` for pending
 recovery and retention health. Keep the shipped defaults unless repository
 history or storage constraints justify an explicit `.aethyme/broker.toml`.
 
+### Build Caches In Session Worktrees
+
+Build caches are the largest thing a broker worktree holds and the only thing
+in it that no one contributed, so they are reclaimed on their own terms:
+`[retention].artifact_sweep_budget_ms` lets a broker open reclaim them without
+confirmation, since rebuilding recovers everything it removes.
+
+A `target/` of any real size takes minutes to unlink, which no per-open budget
+can hold. Removal therefore stops at the deadline mid-directory and leaves the
+tree still recognisable as the cache it is — the file that classifies it is
+always the last one taken. An unfinished pass withholds the sweep's cadence
+stamp, so the next broker command resumes instead of waiting out
+`artifact_sweep_interval_hours`, and a backlog too large for one budget still
+drains.
+
+`gc apply` re-proves each build cache before removing it, and a cache that no
+longer qualifies — a session live again, a directory no longer carrying its
+witness — is reported as `retained:` while the run continues. Candidates here
+share no fate, and a run that stopped at the first of them left a journal that
+pinned every later `gc plan` with no command to release it.
+
+The broker also writes cargo build defaults once, in a `.cargo/config.toml`
+beside the worktrees rather than inside one:
+
+```toml
+[build]
+incremental = false
+
+[profile.dev]
+debug = "line-tables-only"
+```
+
+A session worktree is built a handful of times and then reclaimed, so it pays
+for neither rebuild state nothing will rebuild from nor debug info nothing
+reads back; backtraces keep their file and line numbers. Gates already decline
+both through `gates.toml`. Because the file sits above the worktree, it is
+never an untracked file in `git status`, a repository shipping its own
+`.cargo/config.toml` outranks it, and `CARGO_PROFILE_*` in a gate command still
+wins over both. Delete or empty it to build with cargo's defaults; the broker
+writes it only when it is absent.
+
 Retrieve the latest completed handoff later with exactly one selector:
 
 ```bash

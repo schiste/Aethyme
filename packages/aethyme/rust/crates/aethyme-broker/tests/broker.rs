@@ -158,6 +158,14 @@ fn start_worktree_creates_broker_managed_session_without_process() {
         Some(external_root.path().canonicalize().unwrap().as_path())
     );
     assert!(wt.ends_with("isolated-edits"));
+    // Build discipline sits one directory above the worktree: cargo finds it
+    // by walking up, it is never an untracked file inside the checkout, and a
+    // repository shipping its own `.cargo/config.toml` still outranks it.
+    let cargo_config = external_root.path().join(".cargo/config.toml");
+    let defaults = std::fs::read_to_string(&cargo_config).unwrap();
+    assert!(defaults.contains("incremental = false"), "{defaults}");
+    assert!(defaults.contains("line-tables-only"), "{defaults}");
+    assert!(!wt.join(".cargo").exists());
     assert!(
         broker
             .store()

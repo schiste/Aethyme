@@ -374,3 +374,84 @@ fn ephemeral_repositories_never_anchor_worktrees_in_durable_host_state() {
         worktree.display()
     );
 }
+
+#[test]
+fn a_resumed_candidate_that_stopped_qualifying_is_retained_without_stranding_the_rest() {
+    let (tmp, broker, _delivered_id, worktree) = fixture();
+    drop(broker);
+    // Reclaim build caches immediately and leave the autonomous sweep off, so
+    // the authorized plan is the only thing that touches them.
+    std::fs::write(
+        tmp.path().join(".aethyme/broker.toml"),
+        "[retention]\nclosed_worktrees_days = 30\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 0\n",
+    )
+    .unwrap();
+    std::fs::write(tmp.path().join(".git/info/exclude"), "target/\n").unwrap();
+    let caches = ["one/target", "two/target"].map(|relative| {
+        let dir = worktree.join(relative);
+        std::fs::create_dir_all(dir.join("debug")).unwrap();
+        std::fs::write(dir.join("CACHEDIR.TAG"), "Signature: 8a477f597d28d172\n").unwrap();
+        std::fs::write(dir.join("debug/artifact.bin"), vec![0_u8; 4096]).unwrap();
+        dir
+    });
+
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let plan = broker.gc_plan().unwrap();
+    assert_eq!(
+        plan.artifacts.len(),
+        2,
+        "expected two build caches: {:?}",
+        plan.artifacts
+    );
+    let first = worktree.join(&plan.artifacts[0].relative_dir);
+    let second = worktree.join(&plan.artifacts[1].relative_dir);
+
+    // Pause immediately: what follows can only be reached by resuming a
+    // journal, because a fresh plan simply would not name a candidate that no
+    // longer qualifies.
+    assert!(
+        !broker
+            .gc_apply_bounded(&plan.digest, Some(0))
+            .unwrap()
+            .complete
+    );
+    assert!(tmp.path().join(".aethyme/gc-journal.json").exists());
+
+    // Take the witness off the candidate the resume reaches first. This is the
+    // state an interrupted removal used to leave behind, and the state a stray
+    // `.DS_Store` produced once the final `rmdir` failed partway through.
+    std::fs::remove_file(first.join("CACHEDIR.TAG")).unwrap();
+
+    let resumed = broker.gc_apply(&plan.digest).unwrap();
+    assert!(
+        resumed.complete,
+        "one disqualified candidate must not leave the run unfinished: {resumed:?}"
+    );
+    assert!(
+        resumed
+            .failures
+            .iter()
+            .any(|failure| failure.contains(&plan.artifacts[0].relative_dir)),
+        "the candidate left in place must be reported: {:?}",
+        resumed.failures
+    );
+    assert!(
+        first.exists(),
+        "a directory that no longer proves it is a build cache must be left alone"
+    );
+    assert!(
+        !second.exists(),
+        "the other candidate must still be reclaimed"
+    );
+    assert!(caches.iter().any(|cache| cache.exists()));
+
+    // The journal is gone, so planning works again. While it survived, a
+    // disqualified candidate pinned every later plan and no command released it.
+    assert!(!tmp.path().join(".aethyme/gc-journal.json").exists());
+    let replanned = broker.gc_plan().unwrap();
+    assert_ne!(replanned.digest, plan.digest);
+    assert!(
+        broker.gc_apply(&replanned.digest).is_ok(),
+        "a fresh plan must be runnable"
+    );
+}

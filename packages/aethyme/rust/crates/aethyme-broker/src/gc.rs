@@ -42,6 +42,19 @@ enum ArtifactWitness {
 }
 
 impl ArtifactWitness {
+    /// The entry that must outlive the rest of the removal, if there is one.
+    ///
+    /// A witness file classifies the directory, so taking it first turns an
+    /// interrupted removal into a directory GC can no longer explain. A
+    /// directory witnessed only by being non-empty needs no such care: while
+    /// anything is left it still witnesses itself.
+    fn deferrable_entry(self) -> Option<&'static str> {
+        match self {
+            Self::File(name) => Some(name),
+            Self::NonEmptyDirectory => None,
+        }
+    }
+
     fn confirms(self, path: &Path) -> bool {
         match self {
             Self::File(name) => path.join(name).is_file(),
@@ -378,6 +391,147 @@ fn runtime_path(main_root: &Path, relative: &str) -> Result<PathBuf, BrokerOpErr
 
 fn check_deadline(deadline: Option<Instant>) -> bool {
     deadline.is_some_and(|deadline| Instant::now() >= deadline)
+}
+
+/// How many times a directory whose `rmdir` raced a writer is swept again
+/// before the failure is reported. macOS writes `.DS_Store` into directories
+/// as they are browsed, so a removal that takes minutes can find a file in a
+/// directory it already emptied. The second sweep has nothing left to walk and
+/// costs milliseconds, which is far too short a window to lose again.
+const TREE_REMOVAL_ATTEMPTS: usize = 3;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TreeRemoval {
+    /// The directory is gone.
+    Complete,
+    /// The budget ran out. The directory is still there, still carrying the
+    /// evidence that classifies it, and the next pass resumes it.
+    Interrupted,
+}
+
+/// Remove a condemned directory tree without ever losing the evidence that it
+/// was condemned.
+///
+/// Two properties `std::fs::remove_dir_all` does not have, both of which this
+/// code path needs:
+///
+/// * **Resumable.** Removing a multi-gigabyte `target/` takes minutes, which
+///   no budget on a broker-open path can absorb, and a deadline checked only
+///   between whole directories is no deadline at all. Entries go one at a
+///   time, and every call removes at least one of them before the deadline is
+///   consulted, so a budget too small to be worth spending still buys ground.
+///
+///   What makes an interrupted removal safe to resume is `keep_until_last`:
+///   the entry that proves what this directory is -- `CACHEDIR.TAG` for a
+///   cargo target, the root marker for an orphaned worktree root -- is taken
+///   only once everything else is gone. Remove it first and an interrupted
+///   run leaves an unclassifiable directory that GC must then refuse to
+///   touch, which is how a half-finished removal becomes permanent.
+///
+/// * **Tolerant of a racing writer.** Finder and Spotlight write `.DS_Store`
+///   into directories while they are being walked, so the final `rmdir` of a
+///   long removal fails `ENOTEMPTY` against a file created after that
+///   directory was already emptied. A directory that refuses to go is swept
+///   again rather than aborting the caller's whole run.
+fn remove_condemned_tree(
+    dir: &Path,
+    keep_until_last: Option<&str>,
+    deadline: Option<Instant>,
+) -> std::io::Result<TreeRemoval> {
+    let mut attempts_left = TREE_REMOVAL_ATTEMPTS;
+    loop {
+        attempts_left -= 1;
+        if !is_real_directory(dir) {
+            return Ok(TreeRemoval::Complete);
+        }
+        if drain_directory(dir, keep_until_last, deadline)? == TreeRemoval::Interrupted {
+            return Ok(TreeRemoval::Interrupted);
+        }
+        if let Some(name) = keep_until_last {
+            remove_entry(&dir.join(name), false)?;
+        }
+        match std::fs::remove_dir(dir) {
+            Ok(()) => return Ok(TreeRemoval::Complete),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(TreeRemoval::Complete);
+            }
+            Err(error) if attempts_left == 0 => return Err(error),
+            // Something reappeared underneath while we walked. Sweep again.
+            Err(_) => {}
+        }
+    }
+}
+
+/// Empty one directory depth-first, leaving the directory itself in place.
+///
+/// `keep_until_last` is skipped at this level only; the recursion never defers
+/// anything, because only the top directory carries the witness.
+fn drain_directory(
+    dir: &Path,
+    keep_until_last: Option<&str>,
+    deadline: Option<Instant>,
+) -> std::io::Result<TreeRemoval> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(TreeRemoval::Complete);
+        }
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        if keep_until_last.is_some_and(|name| entry.file_name() == std::ffi::OsStr::new(name)) {
+            continue;
+        }
+        let path = entry.path();
+        // `DirEntry::file_type` does not follow symlinks, so a link to a
+        // directory is unlinked rather than followed and emptied.
+        let is_directory = match entry.file_type() {
+            Ok(file_type) => file_type.is_dir(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        if is_directory {
+            if drain_directory(&path, None, deadline)? == TreeRemoval::Interrupted {
+                return Ok(TreeRemoval::Interrupted);
+            }
+        }
+        remove_entry(&path, is_directory)?;
+        // Checked after the entry, never before: a pass that removes nothing
+        // is a pass that will be repeated forever. Budgets small enough to be
+        // spent on the scan alone are the normal case on a broker open, so
+        // every call has to be worth at least one unlink.
+        if check_deadline(deadline) {
+            return Ok(TreeRemoval::Interrupted);
+        }
+    }
+    Ok(TreeRemoval::Complete)
+}
+
+/// Unlink one entry, treating "already gone" as the outcome we wanted.
+///
+/// A nested directory that a writer refilled is left alone: it resurfaces as
+/// the parent's `ENOTEMPTY`, which is what the retry in
+/// [`remove_condemned_tree`] exists to absorb. Reporting it here would abort a
+/// removal that is one cheap sweep away from finishing.
+fn remove_entry(path: &Path, is_directory: bool) -> std::io::Result<()> {
+    let removed = if is_directory {
+        std::fs::remove_dir(path)
+    } else {
+        std::fs::remove_file(path)
+    };
+    match removed {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) if is_directory && error.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
 }
 
 impl Broker {
@@ -822,6 +976,14 @@ impl Broker {
     /// for a path that runs on every broker open. Discovery here is a bounded
     /// `read_dir` scan and sizes are never computed; the operator-invoked
     /// `gc plan` remains the surface that reports bytes.
+    ///
+    /// The budget bounds the work, not the number of directories attempted.
+    /// A single `target/` can hold several gigabytes and take minutes to
+    /// unlink, which no per-open budget can absorb in one go, so removal stops
+    /// at the deadline mid-directory and leaves the tree still classified as
+    /// the build cache it is. An unfinished pass withholds the cadence stamp,
+    /// so the next broker open resumes instead of waiting out the interval,
+    /// and a backlog that cannot fit in one budget still drains.
     fn sweep_artifacts_autonomously(
         &mut self,
         policy: &RetentionPolicy,
@@ -855,10 +1017,6 @@ impl Broker {
         let mut eligible_worktree_seen = false;
         let mut scan_completed = true;
         for session in self.store().cleaned_sessions()? {
-            if check_deadline(Some(deadline)) {
-                scan_completed = false;
-                break;
-            }
             if live.contains(&session.id) {
                 continue;
             }
@@ -877,18 +1035,31 @@ impl Broker {
             let mut found = Vec::new();
             collect_artifact_dirs(&root, &root, 0, &mut found);
             for dir in found {
-                if check_deadline(Some(deadline)) {
-                    scan_completed = false;
-                    break;
-                }
                 let Some(relative) = repo_relative(&root, &dir) else {
                     continue;
                 };
                 if !checkout.path_is_ignored(&relative) {
                     continue;
                 }
-                if std::fs::remove_dir_all(&dir).is_ok() {
-                    removed.push(dir.to_string_lossy().into_owned());
+                let deferrable =
+                    artifact_witness_for(&dir).and_then(ArtifactWitness::deferrable_entry);
+                match remove_condemned_tree(&dir, deferrable, Some(deadline)) {
+                    Ok(TreeRemoval::Complete) => {
+                        removed.push(dir.to_string_lossy().into_owned());
+                    }
+                    // The budget stopped a removal partway. The directory is
+                    // still a recognisable build cache, so the next pass finds
+                    // it again and carries on -- and withholding the cadence
+                    // stamp below is what makes a next pass happen today
+                    // rather than after the interval.
+                    Ok(TreeRemoval::Interrupted) => scan_completed = false,
+                    Err(_) => {}
+                }
+                if check_deadline(Some(deadline)) {
+                    scan_completed = false;
+                }
+                if !scan_completed {
+                    break;
                 }
             }
             if !scan_completed {
@@ -1111,25 +1282,67 @@ impl Broker {
             let candidate = journal.remaining_artifacts[0].clone();
             let root = PathBuf::from(&candidate.worktree_path);
             let dir = root.join(&candidate.relative_dir);
-            // Re-prove every precondition: a session may have been reused and
-            // rebuilt since the plan was authorized.
-            let safe = !live.contains(&candidate.session_id)
-                && Path::new(&candidate.relative_dir)
-                    .components()
-                    .all(|component| matches!(component, Component::Normal(_)))
-                && dir.starts_with(&root)
-                && is_real_directory(&dir)
-                && artifact_witness_for(&dir).is_some();
-            if !safe {
+            // A journal naming a path outside the worktree it claims is one
+            // nothing may act on -- but refusing to remove it is the whole of
+            // the refusal. Carrying it forward would pin the journal, and a
+            // pinned journal is a digest no `gc plan` can reproduce and no
+            // command can release.
+            if !Path::new(&candidate.relative_dir)
+                .components()
+                .all(|component| matches!(component, Component::Normal(_)))
+                || !dir.starts_with(&root)
+            {
+                failures.push(format!(
+                    "{}: escapes its worktree and was not removed; review a new GC plan",
+                    candidate.relative_dir
+                ));
+                journal.remaining_artifacts.remove(0);
+                write_journal(&journal_path, &journal)?;
+                continue;
+            }
+            // Every other precondition is re-proven per item, because a
+            // session may have been reused and rebuilt since the plan was
+            // authorized -- and one candidate that no longer qualifies is
+            // retained while the run carries on. These are git-ignored build
+            // caches whose candidates share no fate; stopping the run on the
+            // first of them is what let a single stray file leave a GC that
+            // could not be finished at all.
+            if !is_real_directory(&dir) {
+                // Gone is the outcome this candidate asked for. No bytes are
+                // claimed: this run is not what freed them.
+                journal.remaining_artifacts.remove(0);
+                write_journal(&journal_path, &journal)?;
+                continue;
+            }
+            if live.contains(&candidate.session_id) {
+                failures.push(format!(
+                    "{}: session {} is live again",
+                    candidate.relative_dir, candidate.session_id
+                ));
+                journal.remaining_artifacts.remove(0);
+                write_journal(&journal_path, &journal)?;
+                continue;
+            }
+            let Some(witness) = artifact_witness_for(&dir) else {
                 failures.push(format!(
                     "{}: no longer a reclaimable build directory; review a new GC plan",
                     candidate.relative_dir
                 ));
-                break;
-            }
-            if let Err(error) = std::fs::remove_dir_all(&dir) {
-                failures.push(format!("{}: {error}", candidate.relative_dir));
-                break;
+                journal.remaining_artifacts.remove(0);
+                write_journal(&journal_path, &journal)?;
+                continue;
+            };
+            match remove_condemned_tree(&dir, witness.deferrable_entry(), deadline) {
+                Ok(TreeRemoval::Complete) => {}
+                // Still present and still classified, so the resume that
+                // follows takes it from where this one stopped.
+                Ok(TreeRemoval::Interrupted) => break,
+                Err(error) => {
+                    failures.push(format!("{}: {error}", candidate.relative_dir));
+                    journal.remaining_artifacts.remove(0);
+                    write_journal(&journal_path, &journal)?;
+                    continue;
+                }
             }
             journal.reclaimed_bytes = journal
                 .reclaimed_bytes
@@ -1144,20 +1357,35 @@ impl Broker {
         while !journal.remaining_orphans.is_empty() && !check_deadline(deadline) {
             let candidate = journal.remaining_orphans[0].clone();
             let root = PathBuf::from(&candidate.worktree_root);
-            // The owning repository reappearing revokes the whole premise.
-            let safe = is_real_directory(&root)
-                && root.join(WORKTREE_ROOT_MARKER).is_file()
+            if !is_real_directory(&root) {
+                journal.remaining_orphans.remove(0);
+                write_journal(&journal_path, &journal)?;
+                continue;
+            }
+            // The owning repository reappearing revokes the whole premise --
+            // for this root, and for no other, so the run continues.
+            let safe = root.join(WORKTREE_ROOT_MARKER).is_file()
                 && !Path::new(&candidate.repository_root).exists();
             if !safe {
                 failures.push(format!(
                     "{}: orphan evidence changed; review a new GC plan",
                     candidate.worktree_root
                 ));
-                break;
+                journal.remaining_orphans.remove(0);
+                write_journal(&journal_path, &journal)?;
+                continue;
             }
-            if let Err(error) = std::fs::remove_dir_all(&root) {
-                failures.push(format!("{}: {error}", candidate.worktree_root));
-                break;
+            // The root marker is the orphan evidence, so it goes last for the
+            // same reason a build cache's witness does.
+            match remove_condemned_tree(&root, Some(WORKTREE_ROOT_MARKER), deadline) {
+                Ok(TreeRemoval::Complete) => {}
+                Ok(TreeRemoval::Interrupted) => break,
+                Err(error) => {
+                    failures.push(format!("{}: {error}", candidate.worktree_root));
+                    journal.remaining_orphans.remove(0);
+                    write_journal(&journal_path, &journal)?;
+                    continue;
+                }
             }
             journal.reclaimed_bytes = journal
                 .reclaimed_bytes
@@ -1310,5 +1538,96 @@ mod tests {
             std::os::unix::fs::symlink(root.join("elsewhere"), &linked_root).unwrap();
             assert!(!is_real_directory(&linked_root));
         }
+    }
+
+    /// Build a `target/` holding `files` files spread over subdirectories,
+    /// large enough that no plausible deadline removes it in one pass.
+    fn populated_target(root: &Path, files: usize) -> PathBuf {
+        let target = dir(root, "rust/target");
+        std::fs::write(target.join("CACHEDIR.TAG"), "Signature\n").unwrap();
+        for index in 0..files {
+            let bucket = dir(&target, &format!("debug/deps/{}", index % 16));
+            std::fs::write(bucket.join(format!("{index}.rlib")), b"artifact").unwrap();
+        }
+        target
+    }
+
+    #[test]
+    fn an_interrupted_removal_stays_the_build_cache_it_was() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = populated_target(tmp.path(), 3000);
+        let witness = artifact_witness_for(&target).unwrap().deferrable_entry();
+
+        // A budget that expires mid-tree is the normal case on a broker open,
+        // not an error: what must hold is that every observable intermediate
+        // state is still recognisable as the same candidate. Lose that and a
+        // removal too large for one budget can never be resumed -- which is
+        // exactly how a half-deleted tree became permanent.
+        let mut passes = 0;
+        loop {
+            let deadline = Some(Instant::now() + Duration::from_millis(2));
+            let outcome = remove_condemned_tree(&target, witness, deadline).unwrap();
+            passes += 1;
+            assert!(passes < 10_000, "removal made no progress");
+            if outcome == TreeRemoval::Complete {
+                break;
+            }
+            assert!(
+                artifact_witness_for(&target).is_some(),
+                "an interrupted removal must leave a directory GC can still classify"
+            );
+        }
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn removing_what_is_already_gone_is_the_outcome_not_a_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("rust/target");
+        assert_eq!(
+            remove_condemned_tree(&missing, Some("CACHEDIR.TAG"), None).unwrap(),
+            TreeRemoval::Complete
+        );
+    }
+
+    #[test]
+    fn a_directory_refilled_while_it_was_being_emptied_is_swept_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nested = dir(tmp.path(), "target/debug");
+        std::fs::write(nested.join(".DS_Store"), "finder\n").unwrap();
+
+        // Finder writes into directories as they are walked, so a directory
+        // can gain a file after the removal already emptied it. Reporting
+        // that as an error is what aborted the run; it is left for the retry
+        // that follows to collect.
+        assert!(remove_entry(&nested, true).is_ok());
+        assert!(nested.exists());
+        assert!(remove_entry(&tmp.path().join("target/absent"), false).is_ok());
+
+        // The retry is what actually finishes it.
+        assert_eq!(
+            remove_condemned_tree(&tmp.path().join("target"), None, None).unwrap(),
+            TreeRemoval::Complete
+        );
+    }
+
+    #[test]
+    fn a_symlinked_entry_is_unlinked_rather_than_followed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = dir(tmp.path(), "outside");
+        std::fs::write(outside.join("keep.txt"), "keep\n").unwrap();
+        let target = dir(tmp.path(), "target");
+        std::fs::write(target.join("CACHEDIR.TAG"), "Signature\n").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, target.join("linked")).unwrap();
+
+        assert_eq!(
+            remove_condemned_tree(&target, Some("CACHEDIR.TAG"), None).unwrap(),
+            TreeRemoval::Complete
+        );
+        assert!(
+            outside.join("keep.txt").exists(),
+            "following a symlink out of the tree would delete unrelated files"
+        );
     }
 }

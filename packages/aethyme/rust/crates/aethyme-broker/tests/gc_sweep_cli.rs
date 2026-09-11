@@ -381,3 +381,83 @@ fn a_live_session_keeps_its_build_cache() {
         "a session still in use must keep its build cache"
     );
 }
+
+fn count_entries(dir: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .map(|entry| {
+            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                1 + count_entries(&entry.path())
+            } else {
+                1
+            }
+        })
+        .sum()
+}
+
+#[test]
+fn a_budget_too_small_to_finish_still_makes_ground_and_keeps_the_cache_resumable() {
+    let (repo, container) =
+        fixture("[retention]\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 0\n");
+    let (_id, worktree) = blocked_session_with_build_cache(repo.path(), container.path());
+    let target = worktree.join("rust/target");
+    for index in 0..3000_u32 {
+        let bucket = target.join(format!("debug/deps/{}", index % 16));
+        std::fs::create_dir_all(&bucket).unwrap();
+        std::fs::write(bucket.join(format!("{index}.rlib")), b"artifact").unwrap();
+    }
+    let before = count_entries(&target);
+
+    // A budget this small is spent before the removal even begins, which is
+    // the shape of the original defect: a `target/` of this size takes minutes
+    // to unlink and no budget on a broker-open path can hold one. The removal
+    // must still leave the tree smaller than it found it, and still leave it
+    // recognisable, or the sweep can never converge.
+    std::fs::write(
+        repo.path().join(".aethyme/broker.toml"),
+        "[retention]\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 1\n",
+    )
+    .unwrap();
+    for _ in 0..5 {
+        let output = run(repo.path(), container.path(), &["status"]);
+        assert!(
+            output.status.success(),
+            "status: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            target.join("CACHEDIR.TAG").is_file(),
+            "a partly removed cache must stay classifiable or no later pass resumes it"
+        );
+    }
+    assert!(
+        count_entries(&target) < before,
+        "every pass must be worth at least one unlink"
+    );
+
+    // An unfinished pass withholds the cadence stamp, so the next open sweeps
+    // again rather than waiting out the interval. Give one enough budget and
+    // it finishes what the others started.
+    std::fs::write(
+        repo.path().join(".aethyme/broker.toml"),
+        "[retention]\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 30000\n",
+    )
+    .unwrap();
+    let output = run(repo.path(), container.path(), &["status"]);
+    assert!(
+        output.status.success(),
+        "status: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !target.exists(),
+        "the resumed sweep must finish the removal"
+    );
+    assert!(
+        worktree.join("work.txt").exists(),
+        "committed work must be untouched"
+    );
+}
