@@ -147,6 +147,30 @@ pub fn resolve_session_tab(
     })
 }
 
+/// Tabs whose working directory is `workspace`.
+///
+/// The provisioning counterpart to [`resolve_session_tab`]: before a new tab is
+/// spawned for a job, whether one is already doing that job is a question about
+/// the directory it would run in. Exposed separately so path comparison stays
+/// in this module -- it decides who receives someone else's review, and a
+/// second spelling of it elsewhere would eventually disagree with this one.
+///
+/// No branch check, deliberately. Divergence means a session's tab has moved on
+/// and is the wrong recipient; here the same fact means a tab is still occupying
+/// the directory, which is exactly the reason not to spawn another.
+pub fn workspace_tab_ids(tabs: &[Chau7Tab], workspace: &str) -> Vec<String> {
+    let wanted = normalize_path(workspace);
+    tabs.iter()
+        .filter(|tab| {
+            tab.cwd
+                .as_deref()
+                .map(|cwd| normalize_path(cwd) == wanted)
+                .unwrap_or(false)
+        })
+        .map(|tab| tab.tab_id.clone())
+        .collect()
+}
+
 /// Trailing separators only. Anything cleverer -- symlink resolution, case
 /// folding -- would compare paths the filesystem may not agree are the same,
 /// and this comparison decides who receives someone else's review.

@@ -65,6 +65,7 @@ pub use pr_monitoring::{
     activate as activate_pr_monitoring, active_sessions as pr_monitoring_sessions,
     deactivate as deactivate_pr_monitoring, is_active as pr_monitoring_is_active,
 };
+mod pr_projection;
 mod pr_watch;
 mod preparation;
 mod promotion_record;
@@ -81,7 +82,7 @@ mod report;
 mod report_filing;
 pub use chau7_tabs::{
     Chau7DispatchAction, Chau7Resolution, Chau7ResolutionRefusal, Chau7Tab, Chau7TabReadiness,
-    dispatch_action, resolve_session_tab,
+    dispatch_action, resolve_session_tab, workspace_tab_ids,
 };
 pub use pr_link::{creates_pull_request, pull_request_number_from_output};
 mod reclaim;
@@ -100,6 +101,8 @@ mod repository_contract;
 mod resources;
 mod retention;
 mod review;
+mod review_backend;
+mod review_trigger;
 mod schema;
 mod ship;
 mod store;
@@ -223,6 +226,11 @@ pub use pr::{
     PrActivityItem, PrCheckOptions, PrCheckReport, PrCheckRun, PrDecision, PrDecisionStatus,
     PrDispatchReport, PrDispatchStatus, PrError, PrMarker, PrSummary,
 };
+pub use pr_projection::{
+    COMMENT_MARKER, OwnedComment, PR_PROJECTION_SCHEMA_VERSION, PrProjectionAction,
+    PrProjectionError, PrProjectionFacts, PrProjectionPolicy, ProjectedReview,
+    ProjectedReviewState, ReviewProjection, find_owned_comment, project, render_comment,
+};
 pub use pr_watch::{
     DEFAULT_PR_SCHEDULER_LIMIT, DEFAULT_PR_WATCH_INTERVAL_SECONDS,
     GithubCliPullRequestWatchProvider, MAX_PR_SCHEDULER_LIMIT, NewPullRequestWatch,
@@ -326,6 +334,16 @@ pub use review::{
     ReviewLifecycleAbandonReport, ReviewLifecycleReport, ReviewLifecycleState, ReviewPolicy,
     ReviewProvider, ReviewProviderSnapshot, ReviewSatisfactionEvidence, ValidationUnlockAdapter,
     load_review_provider_snapshot,
+};
+pub use review_backend::{
+    InFlightReview, REVIEW_ROUTING_SCHEMA_VERSION, ReviewBackend, ReviewDispatchAction,
+    ReviewRoute, ReviewRoutingError, ReviewRoutingPolicy, dispatch_review, review_prompt,
+};
+pub use review_trigger::{
+    ChangeFacts, ClassificationConflict, CommitClassification, EligibleReview,
+    REVIEW_TRIGGER_SCHEMA_VERSION, ReviewSchedule, ReviewSpend, ReviewTrigger,
+    ReviewTriggerDecision, ReviewTriggerError, ReviewTriggerPolicy, ReviewTriggerRule,
+    classification_conflicts, decide, eligible_types, parse_classification, schedule,
 };
 pub use schema::{EVENTS_SCHEMA_VERSION, SCHEMA_VERSION};
 pub use ship::{

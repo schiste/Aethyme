@@ -13,3 +13,98 @@ mode = "auto"
 # Entries ending in "/" are directory prefixes. Gitignored paths never
 # produce leases, so most generated artifacts need no entry here.
 # ignore = ["docs/reports/"]
+
+# ---------------------------------------------------------------------------
+# Review routing. Every table below is off by default; a repository that does
+# not enable them gets pull requests byte-for-byte identical to one without.
+#
+# Inspect a change against these rules without performing anything:
+#   aethyme broker review plan --base aethyme/integration --pr <number>
+#
+# Lines below prefixed `#>` are the configuration itself; plain `#` lines are
+# prose about it. Strip the `#> ` to switch a table on. A test asserts that the
+# `#>` lines, taken alone, still load -- so this scaffold cannot drift out of
+# date with the code that reads it.
+# ---------------------------------------------------------------------------
+
+#> [review.trigger]
+# Which reviews a change needs. Two passes: rules decide eligibility from the
+# change alone, `schedule` decides whether to spend one now.
+#> enabled = true
+
+# Authors declare classification with commit trailers, which costs the agent
+# writing the commit nothing and is already known at the time:
+#
+#   Area: backend
+#   Surface: auth
+#   Risk: high
+#   Review: security      # explicitly ask for a dimension
+#
+# A declaration can ADD a review; it can never remove one. Every rule below is
+# a floor that an author cannot lower, so a mistaken or gamed trailer costs an
+# unnecessary review and nothing worse.
+
+# ---------------------------------------------------------------------------
+# TODO(operator): the path -> dimension rules for THIS repository.
+#
+# This is the one part that cannot be guessed. A rule fires when every
+# condition it names holds; a rule with no conditions matches every change.
+# Conditions: `on`, `paths`, `areas`, `surfaces`, `min_risk`, `from_fork`,
+# `first_time_contributor`.
+#
+#> [[review.trigger.rule]]
+#> name = "always-code-review"
+#> require = ["code"]
+#
+#> [[review.trigger.rule]]
+#> name = "security-sensitive-paths"
+#> require = ["security"]
+#> paths = [
+#   # Which paths here must force a security review regardless of what a
+#   # commit trailer claims? Candidates worth deciding on:
+#   #   "packages/aethyme/rust/crates/aethyme-broker/src/operations.rs",
+#   #   "packages/aethyme/rust/crates/aethyme-broker/src/ship.rs",
+#   #   ".github/workflows/**",
+#> ]
+# ---------------------------------------------------------------------------
+
+# How often a dimension may be spent. Predicates decide what a change
+# deserves; this decides what it gets, and is what keeps a rich rule set from
+# becoming a quota bonfire on a branch with forty pushes.
+#
+#> [review.trigger.default_schedule]
+#> debounce_seconds = 600       # absorb a burst of pushes
+#> max_per_pull_request = 8     # 0 = no cap
+#> always_on_new_head = false
+#
+#> [review.trigger.schedule.security]
+#> debounce_seconds = 0         # never delay a security review
+#> max_per_pull_request = 0
+
+#> [review.routing]
+# Who performs a review: "chau7" (spawn a terminal agent in its own
+# workspace), "provider_comment" (mention a bot on the pull request), or
+# "record" (write the record and stop -- CI still runs).
+#> enabled = true
+#> workspace_root = ".aethyme/reviews"
+#
+#> [review.routing.default_route]
+#> backend = "record"
+#
+#> [review.routing.route.security]
+#> backend = "chau7"
+#> max_concurrent = 1
+#> instructions = "Pay attention to the broker's coordinated-write path."
+#
+#> [review.routing.route.code]
+#> backend = "provider_comment"
+#> mention = "codex"
+
+#> [review.projection]
+# Publish the record onto the pull request: one comment Aethyme owns and edits
+# in place, plus labels under one namespace. Labels outside the prefix are
+# never touched, and `reserved` names labels inside it that the broker reads
+# but never writes -- that is where a human parks a decision.
+#> enabled = true
+#> label_prefix = "aethyme/"
+#> reserved = ["skip-review"]

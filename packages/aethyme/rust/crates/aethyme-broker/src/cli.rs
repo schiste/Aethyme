@@ -5191,6 +5191,171 @@ fn render_coordinated_operation(
     Ok(())
 }
 
+/// `broker review plan` -- evaluate the review policies against a change and
+/// print what they would do.
+///
+/// A dry run with no exceptions: it reads git, reads `.aethyme/config.toml`,
+/// and writes nothing. Every mutation it would make is printed as the exact
+/// `aethyme broker gh` command that would make it, so an operator can read the
+/// decision and run it themselves before ever switching the policy on.
+///
+/// It deliberately does not consult the provider. Review *spend* and live
+/// Chau7 tabs are the two inputs it cannot get without a network, and the plan
+/// says so rather than guessing: what it shows is the decision for a pull
+/// request with no reviews spent yet, which is the case an operator is trying
+/// to reason about when they are writing the rules.
+fn run_review_plan(parsed: Parsed) -> Result<(), UsageError> {
+    let broker = open_broker(true)?;
+    // Policy is repository-level and lives in the main checkout; the change
+    // being planned is in whatever worktree the caller is standing in. Reading
+    // both from the main root would plan the main branch against itself, which
+    // is an empty diff and an answer that looks perfectly correct.
+    let root = broker.main_root().to_path_buf();
+    let change_root = std::env::current_dir().map_err(|error| {
+        UsageError::Message(format!("cannot read the working directory: {error}"))
+    })?;
+    let base = parsed
+        .base
+        .clone()
+        .unwrap_or_else(|| "aethyme/integration".to_string());
+    let pull_request = parsed.pr_number.unwrap_or(0);
+
+    let paths = git_lines(
+        &change_root,
+        &["diff", "--name-only", &format!("{base}...HEAD")],
+    )?;
+    let messages = git_output(
+        &change_root,
+        &["log", "--format=%B%x00", &format!("{base}..HEAD")],
+    )?;
+    let classification = crate::CommitClassification::merge(
+        messages
+            .split('\0')
+            .filter(|m| !m.trim().is_empty())
+            .map(crate::parse_classification),
+    );
+
+    let trigger = crate::ReviewTriggerPolicy::load(&root).map_err(to_usage)?;
+    let routing = crate::ReviewRoutingPolicy::load(&root).map_err(to_usage)?;
+    let projection_policy = crate::PrProjectionPolicy::load(&root).map_err(to_usage)?;
+
+    let facts = crate::ChangeFacts {
+        trigger: Some(crate::ReviewTrigger::PullRequestOpened),
+        paths: paths.clone(),
+        classification: classification.clone(),
+        from_fork: false,
+        first_time_contributor: false,
+        authored_by_model: None,
+    };
+    let eligible = crate::eligible_types(&trigger, &facts);
+    let head = git_output(&change_root, &["rev-parse", "HEAD"])?
+        .trim()
+        .to_string();
+    let decisions = crate::schedule(
+        &trigger,
+        &eligible,
+        &std::collections::BTreeMap::new(),
+        &head,
+        now_ms(),
+    );
+
+    let dispatch: Vec<crate::ReviewDispatchAction> = decisions
+        .iter()
+        .filter_map(|decision| match decision {
+            crate::ReviewTriggerDecision::Request { review_type, .. } => Some(
+                crate::dispatch_review(&routing, &root, review_type, pull_request, &head, &[], &[]),
+            ),
+            _ => None,
+        })
+        .collect();
+
+    let reviews: Vec<crate::ProjectedReview> = decisions
+        .iter()
+        .map(|decision| crate::ProjectedReview {
+            review_type: decision.review_type().to_string(),
+            state: match decision {
+                crate::ReviewTriggerDecision::Request { .. } => {
+                    crate::ProjectedReviewState::Requested
+                }
+                crate::ReviewTriggerDecision::Defer { .. } => crate::ProjectedReviewState::Deferred,
+                crate::ReviewTriggerDecision::Skip { .. } => crate::ProjectedReviewState::Skipped,
+            },
+            detail: None,
+        })
+        .collect();
+    let projection = crate::ReviewProjection {
+        head: Some(head.clone()),
+        reviews,
+        classification: classification.clone(),
+        conflicts: Vec::new(),
+    };
+    let projection_actions = crate::project(
+        &projection_policy,
+        &projection,
+        &crate::PrProjectionFacts {
+            pull_request,
+            ..Default::default()
+        },
+    );
+
+    let report = serde_json::json!({
+        "policy_root": root.display().to_string(),
+        "change_root": change_root.display().to_string(),
+        "base": base,
+        "head": head,
+        "pull_request": pull_request,
+        "changed_paths": paths.len(),
+        "classification": classification,
+        "trigger_enabled": trigger.enabled,
+        "routing_enabled": routing.enabled,
+        "projection_enabled": projection_policy.enabled,
+        "eligible": eligible,
+        "decisions": decisions,
+        "dispatch": dispatch,
+        "projection": projection_actions,
+        "assumptions": [
+            "no reviews have been spent on this pull request yet",
+            "no Chau7 tabs and no reviews are in flight",
+            "the pull request carries no labels and no Aethyme comment",
+        ],
+        "performed": false,
+    });
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report).map_err(|e| UsageError::Message(e.to_string()))?
+    );
+    Ok(())
+}
+
+fn to_usage<E: std::fmt::Display>(error: E) -> UsageError {
+    UsageError::Message(error.to_string())
+}
+
+fn git_output(root: &Path, args: &[&str]) -> Result<String, UsageError> {
+    let output = std::process::Command::new("git")
+        .current_dir(root)
+        .args(args)
+        .output()
+        .map_err(|error| UsageError::Message(format!("git {}: {error}", args.join(" "))))?;
+    if !output.status.success() {
+        return Err(UsageError::Message(format!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+fn git_lines(root: &Path, args: &[&str]) -> Result<Vec<String>, UsageError> {
+    Ok(git_output(root, args)?
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(String::from)
+        .collect())
+}
+
 fn run_review(parsed: Parsed) -> Result<(), UsageError> {
     let action = parsed
         .positional
@@ -5198,13 +5363,20 @@ fn run_review(parsed: Parsed) -> Result<(), UsageError> {
         .map(String::as_str)
         .ok_or_else(|| {
             UsageError::Message(
-                "review requires register, show, request, unlock, reassign, or abandon".into(),
+                "review requires plan, register, show, request, unlock, reassign, or abandon"
+                    .into(),
             )
         })?;
     if parsed.positional.len() != 1 {
         return Err(UsageError::Message(format!(
             "review {action} accepts no positional arguments"
         )));
+    }
+    // `plan` is the only review action that is about a change rather than a
+    // session: it answers "what would this repository do about this diff", and
+    // it performs nothing, so it neither needs nor should require a session.
+    if action == "plan" {
+        return run_review_plan(parsed);
     }
     let session_id = parsed
         .session
