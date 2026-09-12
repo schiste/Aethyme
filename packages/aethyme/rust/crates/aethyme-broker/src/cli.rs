@@ -6559,6 +6559,12 @@ fn run_review_state(parsed: Parsed) -> Result<(), UsageError> {
     // the full forty, so the one value an operator has in front of them was the
     // one value this refused -- and the refusal below names `review ledger` as
     // where to look, which closed the loop. Resolving a prefix opens it.
+    //
+    // A prefix that resolves to nothing keeps the operator's own spelling, so
+    // the "no code review is recorded" refusal below names what they typed.
+    // A prefix that is not a commit at all is refused here instead: it is a
+    // usage error, and reporting it as an absent review would be this command's
+    // original defect wearing the other face.
     let head = match parsed.head.as_deref() {
         Some(prefix) if prefix.len() < 40 => {
             let recorded: Vec<String> = broker
@@ -6574,12 +6580,13 @@ fn run_review_state(parsed: Parsed) -> Result<(), UsageError> {
                 prefix,
             ) {
                 Ok(Some(head)) => Some(head),
-                // Hand the operator's own spelling back to the refusal below,
-                // so the error names what they typed rather than nothing.
                 Ok(None) => Some(prefix.to_string()),
-                Err(candidates) => {
+                Err(crate::review::HeadPrefixError::Malformed(message)) => {
+                    return Err(UsageError::Message(message));
+                }
+                Err(crate::review::HeadPrefixError::Ambiguous(candidates)) => {
                     return Err(UsageError::Message(format!(
-                        "head {prefix:?} matches {} recorded {review_type} reviews on \
+                        "head {prefix:?} matches {} recorded {review_type} commits on \
                          {repository}#{pull_request} ({}); name the full commit",
                         candidates.len(),
                         candidates.join(", ")

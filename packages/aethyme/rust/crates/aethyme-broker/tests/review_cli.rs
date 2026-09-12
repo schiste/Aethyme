@@ -1233,3 +1233,185 @@ fn closed_review_lifecycle_can_be_reassigned_or_abandoned_without_losing_audit_h
     assert!(!events.contains("continue the same reviewed commit"));
     assert!(!events.contains("restart review coordination"));
 }
+
+/// Seed the routed ledger directly.
+///
+/// `review run` is the only command that writes these rows, and driving it
+/// needs a routing policy, a provider snapshot and a dispatch -- all of it
+/// beside the point here, which is what `review state` does with the `--head`
+/// it is handed. The store is the same file the CLI opens, so the rows are
+/// real rows.
+fn seed_review_request(fixture: &Fixture, review_type: &str, head: &str) {
+    let mut store = aethyme_broker::BrokerStore::open_in_repo(fixture.root.path()).unwrap();
+    store
+        .record_review_request("acme/product", 42, review_type, head, "chau7", 1_000)
+        .unwrap();
+}
+
+fn review_state(fixture: &Fixture, review_type: &str, head: &str, state: &str) -> Output {
+    fixture.run(
+        &[
+            "review",
+            "state",
+            "--repo",
+            "acme/product",
+            "--pr",
+            "42",
+            "--type",
+            review_type,
+            "--head",
+            head,
+            "--state",
+            state,
+        ],
+        "",
+        true,
+        None,
+    )
+}
+
+/// One ledger row, read back through the CLI the way an operator would.
+fn review_row(fixture: &Fixture, review_type: &str) -> serde_json::Value {
+    let ledger = fixture.run(
+        &[
+            "review",
+            "ledger",
+            "--repo",
+            "acme/product",
+            "--pr",
+            "42",
+            "--json",
+        ],
+        "",
+        true,
+        None,
+    );
+    let rows: serde_json::Value =
+        serde_json::from_slice(&ledger.stdout).expect("the ledger stays readable");
+    rows.as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["review_type"] == review_type)
+        .unwrap_or_else(|| panic!("no {review_type} row recorded"))
+        .clone()
+}
+
+/// `review state` had no integration coverage anywhere, and head resolution is
+/// the half of this command that does not live in `resolve_review_head_prefix`:
+/// the dimension filter and the fate of a prefix that matched nothing are only
+/// reachable through the CLI.
+#[test]
+fn review_state_resolves_a_head_prefix_within_one_dimension() {
+    let fixture = Fixture::new();
+    // Deliberately sharing `c0de60`. A prefix is only ambiguous among the heads
+    // of the dimension being reported on -- these two are one commit each for
+    // two different reviews, which is the ordinary shape of a routed pull
+    // request, not an ambiguity.
+    let code = "c0de60a36a12f4c9b0d1e2f3a4b5c6d7e8f90123";
+    let security = "c0de60bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    seed_review_request(&fixture, "code", code);
+    seed_review_request(&fixture, "security", security);
+
+    // The spelling `review ledger` prints -- twelve characters -- which was the
+    // one value this command used to refuse. Resolving it is the fix.
+    let resolved = review_state(&fixture, "code", &code[..12], "satisfied");
+    let stdout = String::from_utf8_lossy(&resolved.stdout);
+    assert!(
+        resolved.status.success() && stdout.contains("is now satisfied"),
+        "a ledger-width prefix should resolve: {stdout}{}",
+        String::from_utf8_lossy(&resolved.stderr)
+    );
+
+    // Six characters, shared with the `security` head and unique within `code`.
+    // Without the dimension filter this is two candidates and refuses, so a
+    // reviewer reporting on a perfectly ordinary pull request would be told its
+    // own head is ambiguous with a commit belonging to another review.
+    let shared = review_state(&fixture, "security", "c0de60", "satisfied");
+    assert!(
+        shared.status.success(),
+        "a prefix unique within its dimension must resolve: {}",
+        String::from_utf8_lossy(&shared.stderr)
+    );
+    assert_eq!(review_row(&fixture, "security")["state"], "satisfied");
+    assert_eq!(
+        review_row(&fixture, "security")["head_commit"],
+        security,
+        "it must resolve to its own dimension's commit"
+    );
+}
+
+/// A prefix that matches nothing must stay the operator's own spelling all the
+/// way to the lookup.
+///
+/// `latest_review_request` treats a `None` head as "no head filter" and returns
+/// the dimension's newest row, so letting an unmatched prefix become `None`
+/// would turn a typo into a verdict filed against whatever review happens to be
+/// newest -- the exact permissive failure this command's prefix support was
+/// meant to remove rather than add.
+#[test]
+fn a_head_prefix_that_matches_nothing_does_not_fall_through_to_the_newest_review() {
+    let fixture = Fixture::new();
+    let head = "c0de60a36a12f4c9b0d1e2f3a4b5c6d7e8f90123";
+    seed_review_request(&fixture, "code", head);
+
+    let missing = review_state(&fixture, "code", "deadbeef", "satisfied");
+    let message = String::from_utf8_lossy(&missing.stderr);
+    assert!(!missing.status.success(), "an unrecorded head must refuse");
+    assert!(
+        message.contains("deadbeef") && message.contains("review ledger"),
+        "the refusal must echo the operator's spelling and point at the ledger: \
+         {message}"
+    );
+    assert_eq!(
+        review_row(&fixture, "code")["state"],
+        "requested",
+        "the recorded review must be untouched"
+    );
+}
+
+/// An unset `$HEAD` in a script arrives as `--head ""`. It is shorter than
+/// forty and every recorded head starts with it, so an unguarded resolver hands
+/// back the dimension's only review and writes a verdict against a commit the
+/// operator never named. With one row recorded there is no ambiguity to catch
+/// it, and one row is the common case.
+#[test]
+fn an_empty_head_is_refused_as_a_usage_error_rather_than_matching_everything() {
+    let fixture = Fixture::new();
+    seed_review_request(&fixture, "code", "c0de60a36a12f4c9b0d1e2f3a4b5c6d7e8f90123");
+
+    let empty = review_state(&fixture, "code", "", "satisfied");
+    assert!(!empty.status.success(), "an empty --head must refuse");
+    assert!(
+        String::from_utf8_lossy(&empty.stderr).contains("is not a commit"),
+        "an empty --head must refuse as a usage error, not as an absent review: {}",
+        String::from_utf8_lossy(&empty.stderr)
+    );
+    assert_eq!(
+        review_row(&fixture, "code")["state"],
+        "requested",
+        "the refused report must not have written"
+    );
+}
+
+/// Two heads under one prefix within one dimension: the reporter cannot say
+/// which review it performed, so the refusal names both rather than choosing.
+/// Taking the newer one would file a judgement on a commit nobody read.
+#[test]
+fn an_ambiguous_head_prefix_names_both_commits_rather_than_choosing() {
+    let fixture = Fixture::new();
+    let first = "c0de60a36a12f4c9b0d1e2f3a4b5c6d7e8f90123";
+    let second = "c0de60bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    seed_review_request(&fixture, "code", first);
+    seed_review_request(&fixture, "code", second);
+
+    let ambiguous = review_state(&fixture, "code", "c0de60", "satisfied");
+    let message = String::from_utf8_lossy(&ambiguous.stderr);
+    assert!(
+        !ambiguous.status.success(),
+        "an ambiguous prefix must refuse"
+    );
+    assert!(
+        message.contains(first) && message.contains(second),
+        "the refusal must name both commits it is choosing between: {message}"
+    );
+}
