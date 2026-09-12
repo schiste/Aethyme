@@ -6554,14 +6554,52 @@ fn run_review_state(parsed: Parsed) -> Result<(), UsageError> {
     })?;
 
     let mut broker = open_broker(parsed.read_only_snapshot)?;
+
+    // `review ledger` prints a 12-character head while this command matched on
+    // the full forty, so the one value an operator has in front of them was the
+    // one value this refused -- and the refusal below names `review ledger` as
+    // where to look, which closed the loop. Resolving a prefix opens it.
+    //
+    // A prefix that resolves to nothing keeps the operator's own spelling, so
+    // the "no code review is recorded" refusal below names what they typed.
+    // A prefix that is not a commit at all is refused here instead: it is a
+    // usage error, and reporting it as an absent review would be this command's
+    // original defect wearing the other face.
+    let head = match parsed.head.as_deref() {
+        Some(prefix) if prefix.len() < 40 => {
+            let recorded: Vec<String> = broker
+                .store()
+                .review_requests_for_pr(&repository, pull_request)
+                .map_err(to_usage)?
+                .into_iter()
+                .filter(|row| row.review_type == review_type)
+                .map(|row| row.head_commit)
+                .collect();
+            match crate::review::resolve_review_head_prefix(
+                recorded.iter().map(String::as_str),
+                prefix,
+            ) {
+                Ok(Some(head)) => Some(head),
+                Ok(None) => Some(prefix.to_string()),
+                Err(crate::review::HeadPrefixError::Malformed(message)) => {
+                    return Err(UsageError::Message(message));
+                }
+                Err(crate::review::HeadPrefixError::Ambiguous(candidates)) => {
+                    return Err(UsageError::Message(format!(
+                        "head {prefix:?} matches {} recorded {review_type} commits on \
+                         {repository}#{pull_request} ({}); name the full commit",
+                        candidates.len(),
+                        candidates.join(", ")
+                    )));
+                }
+            }
+        }
+        other => other.map(str::to_string),
+    };
+
     let existing = broker
         .store()
-        .latest_review_request(
-            &repository,
-            pull_request,
-            &review_type,
-            parsed.head.as_deref(),
-        )
+        .latest_review_request(&repository, pull_request, &review_type, head.as_deref())
         .map_err(to_usage)?
         // Refusing is the point: a report about a review nobody requested
         // means the reporter and the router disagree about what was asked
