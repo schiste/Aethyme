@@ -94,13 +94,26 @@ mode = "auto"
 #   Self-update swaps the installed binary pair. A provenance bug here
 #   installs unverified code on every machine that updates.
 #>     "packages/aethyme/rust/crates/aethyme-broker/src/update.rs",
+#   Every safety predicate in the broker is a parse of this module's output,
+#   so it decides what the controls above are even shown. Added 2026-09-12
+#   after #176: `is_dirty` compared raw command output instead of using the
+#   validated status grammar its three sibling readers already used, and six
+#   bytes from a PATH wrapper made every worktree on the machine read dirty
+#   and permanently ineligible for cleanup -- with nothing failing anywhere.
+#>     "packages/aethyme/rust/crates/aethyme-broker/src/git.rs",
 #> ]
+#
+# Note that `git.rs` widens the list past "files that authorize something" to
+# "files the authorizations are computed from". That is deliberate and it is
+# where the line now sits: a module that decides what a control sees is as
+# able to disable that control as the control itself.
 #
 # Deliberately NOT on the list, so the next person does not re-add them
 # without a reason: `hooks.rs` (the installed shims are thin and the logic
 # they call stays in this tested crate), `agent_hook.rs` (advisory output
 # only), and `leases.rs` / `exposures.rs` (coordination and reporting, not
-# authorization). None of them can silently grant something.
+# authorization). None of them can silently grant something, and none of
+# them is an input to something that can.
 # ---------------------------------------------------------------------------
 
 # How often a dimension may be spent. Predicates decide what a change
