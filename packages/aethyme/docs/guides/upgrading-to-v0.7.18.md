@@ -191,9 +191,10 @@ The review workspaces under `.aethyme/reviews/pr-<n>/<dimension>/` are
 registered git worktrees, and nothing reclaims them on a schedule. A dimension's
 workspace is reused by the *next* review of the same pull request and dimension,
 so a closed pull request's workspaces persist until removed by hand with
-`aethyme broker worktree remove`. They are invisible to `broker status` and to
-the retained-bytes budget, and a single pull request's pair measured 5.6 GB on
-this project.
+`git worktree remove`. Neither `aethyme broker cleanup` nor `aethyme broker gc`
+reclaims them: both act on session worktrees, and a review workspace is not one.
+They are invisible to `broker status` and to the retained-bytes budget, and a
+single pull request's pair measured 5.6 GB on this project.
 
 `stale_after_minutes` now force-closes a live reviewer's tab rather than only
 freeing a slot. Re-tune any value that was chosen under the old meaning; too
