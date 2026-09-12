@@ -172,11 +172,25 @@ backend = "chau7"
 # change, so this is the dimension that decides how many Codex shells a busy
 # afternoon opens -- and the one whose findings are least likely to be urgent.
 max_concurrent = 2
-# Below the 6h default because the cost of guessing wrong is asymmetric: too
-# long strands a slot behind a tab someone closed, too short asks for a second
-# review of a head the first reviewer is still reading. A Codex Luna pass at
-# max reasoning effort on a single dimension has not needed ninety minutes.
-stale_after_minutes = 90
+# Left at the 6h default, stated here rather than inherited because this
+# number acquired a second meaning on 2026-09-12 and the site should say so.
+#
+# It used to buy back only a slot: a review the router had given up on freed
+# its `max_concurrent` seat, and 90 minutes was chosen because stranding a
+# seat behind a tab someone closed cost more than asking twice. Now a review
+# the router has given up on is `abandoned`, `abandoned` releases the
+# workspace, and releasing the workspace FORCE-CLOSES the reviewer's tab.
+# The window is a kill timer.
+#
+# That reverses the asymmetry it was set under. Too long now costs a held
+# seat on a genuine hang, which an operator undoes the moment they notice
+# with `review abandon`; too short kills a working reviewer mid-thought and
+# files the dimension as never answered, which nothing detects and nobody
+# undoes. A finished review no longer waits for this timer at all -- the
+# reviewer reports `satisfied` or `failed` and its slot and tab go back
+# immediately -- so the only reviews this value can reach are ones that have
+# already stopped reporting. Six hours to be sure of that is cheap.
+stale_after_minutes = 360
 instructions = """
 Prefer a permissive-failure finding over a style one. A parse that returns
 "nothing here" on failure, a check whose negative result is indistinguishable

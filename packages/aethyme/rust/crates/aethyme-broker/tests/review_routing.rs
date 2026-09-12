@@ -486,6 +486,31 @@ fn this_repositorys_own_review_configuration_loads_and_routes_as_written() {
     );
     assert!(routing.route_for("security").max_concurrent > 0);
 
+    // The cap's companion, and the field that quietly gained a second meaning
+    // on 2026-09-12. `stale_after_minutes` used to buy back a slot and nothing
+    // else. Now a review that crosses it is marked `abandoned`, `abandoned`
+    // releases the workspace, and releasing the workspace force-closes the
+    // reviewer's tab. Too small a value no longer means "ask for a second
+    // review" -- it kills an agent that is still reading and files its
+    // dimension as never answered, which nothing detects and nobody undoes.
+    //
+    // A floor rather than an exact value: the number is an operator's to tune,
+    // but it is now a kill timer on a live session, and a chau7 reviewer at
+    // max reasoning effort has been observed to finish well inside ninety
+    // minutes. Note that `0` -- "never stale" -- fails this too, and should:
+    // it is safe for the reviewer and fatal for the dimension, because the cap
+    // asserted just above is then held forever by the first review nobody
+    // reports.
+    for dimension in ["code", "security"] {
+        let route = routing.route_for(dimension);
+        assert!(
+            route.stale_after_minutes >= 180,
+            "the {dimension} route's stale_after_minutes is {}; that is now \
+             how long a reviewer has before its tab is force-closed",
+            route.stale_after_minutes
+        );
+    }
+
     // `always-code-review` plus `security-sensitive-paths`. A rule list that
     // silently shrank to nothing still loads and still routes -- it just finds
     // every change ineligible.
