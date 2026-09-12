@@ -5691,7 +5691,7 @@ fn head_descends_from(root: &Path, previous: &str, head: &str) -> bool {
     if previous.is_empty() || head.is_empty() {
         return false;
     }
-    std::process::Command::new("git")
+    crate::git::git_command()
         .current_dir(root)
         .args(["merge-base", "--is-ancestor", previous, head])
         .output()
@@ -6413,7 +6413,7 @@ fn to_usage<E: std::fmt::Display>(error: E) -> UsageError {
 }
 
 fn git_output(root: &Path, args: &[&str]) -> Result<String, UsageError> {
-    let output = std::process::Command::new("git")
+    let output = crate::git::git_command()
         .current_dir(root)
         .args(args)
         .output()

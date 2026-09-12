@@ -47,7 +47,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 /// Tokens shorter than this are too noisy to track (`a`, `it`, `of`).
 const MIN_SYMBOL_LEN: usize = 4;
@@ -342,7 +341,7 @@ fn is_excluded(token: &str) -> bool {
 
 /// Return the unified diff against `base`.
 fn read_diff(repo_root: &Path, base: &str) -> Result<Vec<String>, String> {
-    let output = Command::new("git")
+    let output = crate::git::git_command()
         .args(["diff", "--unified=0", base, "--", "."])
         .current_dir(repo_root)
         .output()
