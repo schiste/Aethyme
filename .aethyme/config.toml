@@ -46,27 +46,61 @@ mode = "auto"
 # unnecessary review and nothing worse.
 
 # ---------------------------------------------------------------------------
-# TODO(operator): the path -> dimension rules for THIS repository.
+# The path -> dimension rules for THIS repository.
 #
-# This is the one part that cannot be guessed. A rule fires when every
-# condition it names holds; a rule with no conditions matches every change.
-# Conditions: `on`, `paths`, `areas`, `surfaces`, `min_risk`, `from_fork`,
-# `first_time_contributor`, `authored_by_model`, `models`.
+# A rule fires when every condition it names holds; a rule with no conditions
+# matches every change. Conditions: `on`, `paths`, `areas`, `surfaces`,
+# `min_risk`, `from_fork`, `first_time_contributor`, `authored_by_model`,
+# `models`. In `paths`, `*` spans one segment and `**` spans any number;
+# everything else is literal, and paths are repository-relative.
 #
 #> [[review.trigger.rule]]
 #> name = "always-code-review"
 #> require = ["code"]
 #
+# The security list answers one question, and it is narrower than "what is
+# important": which files, changed wrongly, REMOVE A SAFETY PROPERTY WITHOUT
+# PRODUCING AN ERROR? A bug that makes something fail loudly does not belong
+# here -- CI already covers it, and a review dimension routed at
+# `max_concurrent = 1` is a budget, not a wish list. Measured over the last
+# 200 commits (2026-09-12), this list fires on about a third of them, which is
+# the cost being accepted.
+#
 #> [[review.trigger.rule]]
 #> name = "security-sensitive-paths"
 #> require = ["security"]
 #> paths = [
-#   # Which paths here must force a security review regardless of what a
-#   # commit trailer claims? Candidates worth deciding on:
-#   #   "packages/aethyme/rust/crates/aethyme-broker/src/operations.rs",
-#   #   "packages/aethyme/rust/crates/aethyme-broker/src/ship.rs",
-#   #   ".github/workflows/**",
+#   Runs with repository credentials and can publish releases; release.yml is
+#   42 of the 69 workflow edits in that window, and it is the one that signs
+#   and uploads artifacts.
+#>     ".github/workflows/**",
+#   The gate definitions themselves. Narrowing a `triggers` glob disables a
+#   gate for a whole class of change and looks exactly like a tidy-up.
+#>     ".aethyme/gates.toml",
+#   Classifies every git and gh command as read/write/destructive and decides
+#   what must go through the coordinated lane. A command misclassified as
+#   `read` runs uncoordinated against shared state and reports success.
+#>     "packages/aethyme/rust/crates/aethyme-broker/src/operations.rs",
+#   The publication lane: full-SHA confirmation and operator authorization.
+#   Everything this repository refuses to do by accident, it refuses here.
+#>     "packages/aethyme/rust/crates/aethyme-broker/src/ship.rs",
+#   The verification authority, including the tree-hash result cache. Every
+#   other control is downstream of it, and a wrong cache key turns each gate
+#   into a silent no-op that still prints `pass`.
+#>     "packages/aethyme/rust/crates/aethyme-broker/src/gates.rs",
+#   The per-user crash barrier for remote mutations -- what stops a second
+#   clone from retrying an ambiguous remote outcome.
+#>     "packages/aethyme/rust/crates/aethyme-broker/src/host_operations.rs",
+#   Self-update swaps the installed binary pair. A provenance bug here
+#   installs unverified code on every machine that updates.
+#>     "packages/aethyme/rust/crates/aethyme-broker/src/update.rs",
 #> ]
+#
+# Deliberately NOT on the list, so the next person does not re-add them
+# without a reason: `hooks.rs` (the installed shims are thin and the logic
+# they call stays in this tested crate), `agent_hook.rs` (advisory output
+# only), and `leases.rs` / `exposures.rs` (coordination and reporting, not
+# authorization). None of them can silently grant something.
 # ---------------------------------------------------------------------------
 
 # How often a dimension may be spent. Predicates decide what a change
