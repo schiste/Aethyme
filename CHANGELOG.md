@@ -4,7 +4,7 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
-## [Unreleased]
+## [0.7.18] - 2026-09-12
 
 ### Added
 
@@ -149,6 +149,44 @@ artifacts and their exact source revision are recorded in each signed
   or block a push, because a wrapper that *swallows* a status line makes a
   dirty tree read clean, and that mistake costs work rather than disk. A probe
   that could not run is not proof of a wrapper and does not refuse.
+- A routed review now closes its own tab and its own ledger row when it
+  finishes. A reviewer's shell is interactive and never exits, so until now
+  nothing ever closed one: a finished review held its workspace,
+  `dispatch_review` refuses to spawn into an occupied workspace, and the
+  dimension stayed blocked until `stale_after_minutes` expired the row as
+  `abandoned` -- recording a review that ran and posted as one where nobody
+  looked. Teardown runs before dispatch within a tick, because a tick may both
+  reclaim a dimension's workspace and dispatch a new review into it, which is
+  what the first tick after a push to an already-reviewed pull request does.
+  Known limitation: a tab is matched to its workspace by an exact `cwd`
+  comparison, so a reviewer that runs `cd` out of its workspace -- ordinary
+  behaviour for an agent reading a repository -- is never matched and never
+  closed. See the upgrade guide's known issues.
+- `review state --head` accepts an abbreviated commit. `review ledger` prints
+  twelve characters and this command required forty, so the one spelling of the
+  head an operator could see was the one spelling it refused -- while its
+  refusal named `review ledger` as where to look. A short head now resolves
+  against the heads recorded for that pull request and dimension, the way `git`
+  resolves a short commit, case-insensitively. Two candidates under one prefix
+  are refused by name rather than settled by recency: the reporter cannot say
+  which review it performed, and taking the newer one would file a verdict
+  against a commit nobody read. A prefix that is not a commit -- empty, shorter
+  than git's four-character floor, or not hexadecimal -- is refused as a usage
+  error before it is matched against anything, so `--head "$HEAD"` with `HEAD`
+  unset cannot resolve to whatever review the dimension happens to hold.
+
+### Changed
+
+- `stale_after_minutes` has a second meaning and repositories should re-tune it.
+  It used to buy back only a concurrency slot; now a review that crosses it is
+  marked `abandoned`, `abandoned` releases the workspace, and releasing the
+  workspace force-closes the reviewer's tab. It is a kill timer on a live
+  session. That reverses the asymmetry it was usually set under: too long costs
+  a held slot on a genuine hang, which an operator undoes the moment they
+  notice; too short kills a working reviewer mid-thought and files its
+  dimension as never answered, which nothing detects and nobody undoes. The
+  default is unchanged at six hours, and a finished review no longer waits for
+  the timer at all.
 
 ## [0.7.17] - 2026-09-10
 
