@@ -107,13 +107,38 @@ impl ReviewPolicy {
         let Some(review) = value.get("review") else {
             return Ok(Self::default());
         };
-        let policy: Self =
-            review
-                .clone()
-                .try_into()
-                .map_err(|error| BrokerOpError::ReviewLifecycle {
-                    reason: format!("invalid [review] policy: {error}"),
-                })?;
+        let Some(review) = review.as_table() else {
+            return Err(BrokerOpError::ReviewLifecycle {
+                reason: "[review] must be a table".to_string(),
+            });
+        };
+
+        // `[review]` is a shared namespace, and this policy owns only its
+        // scalar keys. `[review.trigger]`, `[review.routing]`,
+        // `[review.reporting]` and `[review.projection]` are four other
+        // policies, each with its own loader and its own schema version.
+        //
+        // `deny_unknown_fields` is still wanted -- a misspelled `unlock_labl`
+        // must fail rather than silently take the default -- but it has to
+        // judge only the keys this struct is the owner of. Until 2026-09-12
+        // it judged the whole namespace, and the first repository to configure
+        // review routing could not `broker submit` at all: every submission
+        // died on ``unknown field `projection```, naming a table this policy
+        // has nothing to do with and cannot be configured out of.
+        //
+        // Dropping sub-tables rather than listing the four siblings by name is
+        // deliberate: a fifth policy under `[review]` must not have to come
+        // back and edit this function to be loadable.
+        let scalars: toml::value::Table = review
+            .iter()
+            .filter(|(_, value)| !value.is_table())
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        let policy: Self = toml::Value::Table(scalars).try_into().map_err(|error| {
+            BrokerOpError::ReviewLifecycle {
+                reason: format!("invalid [review] policy: {error}"),
+            }
+        })?;
         policy.validate()?;
         Ok(policy)
     }
@@ -1086,6 +1111,70 @@ fn now_ms() -> i64 {
 mod tests {
     use super::*;
     use std::process::Command;
+
+    fn config(root: &std::path::Path, body: &str) {
+        std::fs::create_dir_all(root.join(".aethyme")).expect("mkdir .aethyme");
+        std::fs::write(root.join(".aethyme/config.toml"), body).expect("write config");
+    }
+
+    /// The bug that broke `broker submit` for this repository on 2026-09-12:
+    /// four other policies live under `[review]`, and this one refused to load
+    /// while any of them was configured. `projection` is the name the failure
+    /// used, because `toml::Value` sorts its keys and that one sorts first --
+    /// so the error pointed at whichever sibling happened to be alphabetically
+    /// earliest, never at the real cause.
+    #[test]
+    fn the_lifecycle_policy_ignores_the_other_policies_under_review() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        config(
+            dir.path(),
+            r#"
+[review]
+enabled = true
+unlock_label = "aethyme-validated"
+
+[review.trigger]
+enabled = true
+
+[review.routing]
+enabled = true
+
+[review.reporting]
+max_findings = 3
+
+[review.projection]
+enabled = true
+"#,
+        );
+        let policy = ReviewPolicy::load(dir.path())
+            .unwrap_or_else(|e| panic!("sibling policies must not block this one: {e}"));
+        assert!(policy.enabled);
+        assert_eq!(policy.unlock_label, "aethyme-validated");
+    }
+
+    /// The half of `deny_unknown_fields` worth keeping. A misspelled scalar
+    /// must fail rather than silently take its default -- `unlock_label`
+    /// decides which label unlocks validation, and a typo there would leave
+    /// the documented label doing nothing with no error anywhere.
+    #[test]
+    fn a_misspelled_scalar_still_fails_to_load() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        config(
+            dir.path(),
+            r#"
+[review]
+enabled = true
+unlock_labl = "ready"
+"#,
+        );
+        match ReviewPolicy::load(dir.path()) {
+            Err(BrokerOpError::ReviewLifecycle { reason }) => assert!(
+                reason.contains("unlock_labl"),
+                "the rejection should name the typo: {reason}"
+            ),
+            other => panic!("a misspelled key must not be ignored, got {other:?}"),
+        }
+    }
 
     fn git(repo: &Path, args: &[&str]) -> String {
         let output = Command::new("git")

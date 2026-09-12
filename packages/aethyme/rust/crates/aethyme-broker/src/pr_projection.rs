@@ -346,6 +346,24 @@ pub fn find_owned_comment<'a>(
         })
 }
 
+/// The REST comment id, recovered from a comment's `url`.
+///
+/// `gh pr view --json comments` reports `id` as a GraphQL node id
+/// (`IC_kwDOQ07FcM8AAAABUHRMPQ`) and never as a number, while the endpoint that
+/// edits a comment -- `repos/{owner}/{repo}/issues/comments/{id}` -- takes the
+/// REST integer. That integer appears nowhere in the payload except the
+/// `#issuecomment-<id>` fragment of the comment's own URL, so this is where it
+/// has to come from.
+///
+/// Reading the node id as a number instead is not a parse that fails loudly: it
+/// yields "no comments at all", which is indistinguishable from a pull request
+/// Aethyme has never commented on -- and the projection answers that by writing
+/// a fresh comment, every sweep, forever.
+pub fn rest_comment_id(url: &str) -> Option<i64> {
+    url.rsplit_once("#issuecomment-")
+        .and_then(|(_, id)| id.parse().ok())
+}
+
 // ---------------------------------------------------------------------------
 // Decisions
 // ---------------------------------------------------------------------------
@@ -790,6 +808,28 @@ mod tests {
         // consistently beats alternating between the two.
         assert_eq!(found.unwrap().id, 2);
         assert!(find_owned_comment([(1, "nothing of ours")]).is_none());
+    }
+
+    #[test]
+    fn the_rest_comment_id_comes_from_the_url_not_the_node_id() {
+        // A real payload from `gh pr view --json comments`. The node id is the
+        // only thing in it that looks like an identifier, and it is the wrong
+        // one -- reading it as a number is how a repository ends up with one
+        // Aethyme comment per sweep.
+        assert_eq!(
+            rest_comment_id(
+                "https://github.com/schiste/Aethyme/pull/179#issuecomment-5644766269"
+            ),
+            Some(5_644_766_269)
+        );
+        assert_eq!(rest_comment_id("IC_kwDOQ07FcM8AAAABUHRMPQ"), None);
+        // A review comment carries a different fragment and a different REST
+        // collection; borrowing its id would edit an unrelated comment.
+        assert_eq!(
+            rest_comment_id("https://github.com/o/r/pull/1#discussion_r123"),
+            None
+        );
+        assert_eq!(rest_comment_id("https://github.com/o/r/pull/1"), None);
     }
 
     #[test]

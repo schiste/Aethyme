@@ -14,7 +14,8 @@ use aethyme_broker::{
     ChangeFacts, Chau7Tab, CommitClassification, InFlightReview, PrProjectionAction,
     PrProjectionFacts, PrProjectionPolicy, ProjectedReview, ProjectedReviewState, ReviewBackend,
     ReviewDispatchAction, ReviewProjection, ReviewRequestState, ReviewRoutingPolicy, ReviewTrigger,
-    ReviewTriggerDecision, ReviewTriggerPolicy, dispatch_review, eligible_types,
+    ReviewReportingPolicy, ReviewTriggerDecision, ReviewTriggerPolicy, dispatch_review,
+    eligible_types,
     parse_classification, plan_execution, project, schedule,
 };
 
@@ -53,6 +54,18 @@ max_concurrent = 1
 backend = "provider_comment"
 mention = "codex"
 
+[review.reporting]
+request_changes_at = "blocker"
+max_findings = 4
+
+[[review.reporting.severity]]
+label = "blocker"
+means = "do not merge"
+
+[[review.reporting.severity]]
+label = "nit"
+means = "taste"
+
 [review.projection]
 enabled = true
 label_prefix = "aethyme/"
@@ -62,6 +75,7 @@ reserved = ["skip-review"]
 struct Policies {
     trigger: ReviewTriggerPolicy,
     routing: ReviewRoutingPolicy,
+    reporting: ReviewReportingPolicy,
     projection: PrProjectionPolicy,
     root: tempfile::TempDir,
 }
@@ -73,6 +87,7 @@ fn policies() -> Policies {
     Policies {
         trigger: ReviewTriggerPolicy::load(root.path()).unwrap(),
         routing: ReviewRoutingPolicy::load(root.path()).unwrap(),
+        reporting: ReviewReportingPolicy::load(root.path()).unwrap(),
         projection: PrProjectionPolicy::load(root.path()).unwrap(),
         root,
     }
@@ -115,7 +130,9 @@ fn plan(
         .filter_map(|decision| match decision {
             ReviewTriggerDecision::Request { review_type, .. } => Some(dispatch_review(
                 &policies.routing,
+                &policies.reporting,
                 policies.root.path(),
+                "o/r",
                 review_type,
                 77,
                 head,
@@ -401,22 +418,62 @@ fn this_repositorys_own_review_configuration_loads_and_routes_as_written() {
     assert_eq!(routing.route_for("security").backend, ReviewBackend::Chau7);
     assert_eq!(routing.route_for("unrouted").backend, ReviewBackend::Record);
 
-    // Every routed reviewer is a shell with credentials, so both routes carry
-    // the clause that keeps a review comment inside the coordinated lane.
-    // A route whose instructions were dropped still reviews, which is why
-    // losing this is not otherwise visible.
+    // Every policy under `[review]`, including the one this file is not about.
+    // `ReviewPolicy` is the review *lifecycle* -- a fifth reader of the same
+    // namespace -- and it is loaded on the submission path, so a config it
+    // rejects does not degrade review routing, it stops `broker submit`
+    // outright. That is what happened when routing went live on 2026-09-12,
+    // and nothing in this file noticed because nothing here loaded it.
+    aethyme_broker::ReviewPolicy::load(&root).unwrap_or_else(|e| {
+        panic!("this repository's config breaks the submission path: {e}")
+    });
+
+    let reporting = ReviewReportingPolicy::load(&root)
+        .unwrap_or_else(|e| panic!("[review.reporting] does not load: {e}"));
+
+    // Assert on the assembled prompt rather than on any one table. Where these
+    // sentences come from has already moved once -- the coordination clause
+    // was copied into each route's `instructions` before `[review.reporting]`
+    // existed -- and the reviewer only ever sees the total. A test pinned to
+    // the layer would have had to be rewritten to keep passing; this one had
+    // to be rewritten only because the wording it checks is worth checking.
     for dimension in ["code", "security"] {
-        let route = routing.route_for(dimension);
-        let instructions = route
-            .instructions
-            .as_deref()
-            .unwrap_or_else(|| panic!("the {dimension} route lost its instructions"));
+        let prompt = aethyme_broker::review_prompt(
+            dimension,
+            "schiste/Aethyme",
+            179,
+            "abc123",
+            &reporting,
+            routing.route_for(dimension).instructions.as_deref(),
+        );
+        // A reviewer is a shell with credentials; posting with bare `gh` puts
+        // a shared-state write outside the operations journal.
         assert!(
-            instructions.contains("broker gh"),
-            "the {dimension} route stopped telling its reviewer to post through \
-             the coordinated lane:\n{instructions}"
+            prompt.contains("aethyme broker gh"),
+            "the {dimension} reviewer is no longer told to post through the \
+             coordinated lane:\n{prompt}"
+        );
+        // Without a ladder and an anchor, two reviewers of one pull request
+        // produce two documents that cannot be read side by side -- which is
+        // the state this repository was in until #179.
+        assert!(prompt.contains("### [LABEL]"), "{prompt}");
+        assert!(prompt.contains("P0"), "{prompt}");
+        assert!(prompt.contains("`path:line`"), "{prompt}");
+        // The review IS the record. A reviewer that reports "nothing found"
+        // only in its terminal leaves a ledger row nobody can interpret.
+        assert!(
+            prompt.contains(&format!("No {dimension} findings.")),
+            "{prompt}"
         );
     }
+
+    // Requesting changes is refused by GitHub on your own pull request, and
+    // these reviewers run under the owner's credentials. A threshold here
+    // would produce reviews that are written and then refused at the post.
+    assert!(
+        reporting.blocking_labels().is_empty(),
+        "request_changes_at is set, but the reviewers share the author's account"
+    );
 
     // A cap of zero is "unbounded", so a route that lost its budget does not
     // fail -- it opens an agent session per eligible pull request.

@@ -912,7 +912,81 @@ fn command_records_metric(args: &[String]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::repository_wide_publication_lines;
+    use super::{UsageError, owned_comment_from_view, repository_wide_publication_lines};
+
+    /// One entry of `gh pr view --json comments`. `id` is spelled the way `gh`
+    /// really spells it -- a GraphQL node id -- so a test can never accidentally
+    /// pass by reading the field the edit endpoint cannot use.
+    fn gh_comment(url: &str, body: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": "IC_kwDOQ07FcM8AAAABUHRMPQ",
+            "url": url,
+            "body": body,
+        })
+    }
+
+    /// A body carrying the marker the projection recognises as its own.
+    fn ours(body: &str) -> String {
+        format!("{}\n{body}", crate::COMMENT_MARKER)
+    }
+
+    // `UsageError` derives no `Debug` -- it cannot implement `Display` either,
+    // because the blanket `From<E: Display>` above would then collide with
+    // core's reflexive `From<T> for T` -- so these match rather than `expect`.
+
+    #[test]
+    fn an_aethyme_comment_is_found_by_the_rest_id_in_its_url() {
+        let comments = [
+            gh_comment("https://github.com/o/r/pull/9#issuecomment-11", "hello"),
+            gh_comment(
+                "https://github.com/o/r/pull/9#issuecomment-5644766269",
+                &ours("body"),
+            ),
+        ];
+        let Ok(Some(owned)) = owned_comment_from_view("o/r", 9, &comments) else {
+            panic!("a readable url on our own comment is the ordinary case");
+        };
+        assert_eq!(owned.id, 5_644_766_269);
+    }
+
+    /// Issue #178's shape once more: a marker with an unreadable id is the one
+    /// place where refusing beats guessing, because guessing posts a second
+    /// comment beside the first and does it again every sweep, forever.
+    #[test]
+    fn an_unreadable_url_on_our_own_comment_is_refused_not_dropped() {
+        let comments = [gh_comment("https://github.com/o/r/pull/9", &ours("body"))];
+        let Err(UsageError::Message(message)) = owned_comment_from_view("o/r", 9, &comments) else {
+            panic!("our own comment with no recoverable id must refuse");
+        };
+        assert!(message.contains("o/r#9"), "{message}");
+        assert!(message.contains("refusing to project"), "{message}");
+    }
+
+    /// Someone else's comment was never a candidate, so an unreadable url on it
+    /// costs nothing -- refusing there would stall the projection on a stranger.
+    #[test]
+    fn an_unreadable_url_on_a_foreign_comment_is_skipped() {
+        let comments = [
+            gh_comment("https://github.com/o/r/pull/9", "drive-by"),
+            gh_comment("https://github.com/o/r/pull/9#issuecomment-12", &ours("body")),
+        ];
+        let Ok(Some(owned)) = owned_comment_from_view("o/r", 9, &comments) else {
+            panic!("a stranger's unreadable url is not our problem");
+        };
+        assert_eq!(owned.id, 12);
+    }
+
+    #[test]
+    fn a_pull_request_aethyme_has_never_commented_on_owns_nothing() {
+        let comments = [gh_comment(
+            "https://github.com/o/r/pull/9#issuecomment-11",
+            "hello",
+        )];
+        assert!(matches!(
+            owned_comment_from_view("o/r", 9, &comments),
+            Ok(None)
+        ));
+    }
 
     fn assessment(fast_forward: bool, dirty: &[&str]) -> crate::ship::ShipLocalMainSyncAssessment {
         crate::ship::ShipLocalMainSyncAssessment {
@@ -5327,6 +5401,15 @@ fn run_review_plan(parsed: Parsed) -> Result<(), UsageError> {
         .clone()
         .unwrap_or_else(|| "aethyme/integration".to_string());
     let pull_request = parsed.pr_number.unwrap_or(0);
+    // `review plan` is an offline preview and `--repo` is optional on it, but
+    // the reviewer prompt it shows is the real one -- and the real one names
+    // the repository in every posting command. A placeholder is the honest
+    // answer: filling in a guess from the remote would print a plan that
+    // differs from the prompt `review run` will actually send.
+    let repository = parsed
+        .repository
+        .clone()
+        .unwrap_or_else(|| "<owner/name>".to_string());
 
     let paths = git_lines(
         &change_root,
@@ -5345,6 +5428,7 @@ fn run_review_plan(parsed: Parsed) -> Result<(), UsageError> {
 
     let trigger = crate::ReviewTriggerPolicy::load(&root).map_err(to_usage)?;
     let routing = crate::ReviewRoutingPolicy::load(&root).map_err(to_usage)?;
+    let reporting = crate::ReviewReportingPolicy::load(&root).map_err(to_usage)?;
     let projection_policy = crate::PrProjectionPolicy::load(&root).map_err(to_usage)?;
 
     // `review plan` is the offline preview: git and config, no provider call,
@@ -5376,7 +5460,17 @@ fn run_review_plan(parsed: Parsed) -> Result<(), UsageError> {
         .iter()
         .filter_map(|decision| match decision {
             crate::ReviewTriggerDecision::Request { review_type, .. } => Some(
-                crate::dispatch_review(&routing, &root, review_type, pull_request, &head, &[], &[]),
+                crate::dispatch_review(
+                    &routing,
+                    &reporting,
+                    &root,
+                    &repository,
+                    review_type,
+                    pull_request,
+                    &head,
+                    &[],
+                    &[],
+                ),
             ),
             _ => None,
         })
@@ -5648,6 +5742,52 @@ fn gather_change_facts(
     (facts, Some(snapshot))
 }
 
+/// Aethyme's own comment on a pull request, from the `comments` array of
+/// `gh pr view --json comments`.
+///
+/// The id is read from each comment's `url` and never from its `id`: `gh`
+/// reports the latter as a GraphQL node id, while the endpoint that edits a
+/// comment takes the REST integer. See [`crate::rest_comment_id`].
+///
+/// A comment whose url yields no id is skipped when it is someone else's --
+/// it was never a candidate, so nothing is lost -- and is an error when it
+/// carries [`crate::COMMENT_MARKER`]. That asymmetry is the whole point of
+/// this function. Elsewhere in `read_pull_request_facts`, missing data means
+/// the pull request really might be untouched, and planning to create is the
+/// right guess. Here the pull request demonstrably is not untouched: Aethyme's
+/// own comment is sitting in the payload. Reporting it absent is not a guess
+/// but a known-false statement, and the write it licenses posts a second
+/// comment beside the first. Refusing costs one sweep; guessing costs a comment
+/// per sweep, forever, and the duplicates cannot be told apart afterwards.
+fn owned_comment_from_view(
+    repository: &str,
+    pull_request: i64,
+    comments: &[serde_json::Value],
+) -> Result<Option<crate::OwnedComment>, UsageError> {
+    let mut readable: Vec<(i64, String)> = Vec::new();
+    for comment in comments {
+        let Some(body) = comment["body"].as_str() else {
+            continue;
+        };
+        match comment["url"].as_str().and_then(crate::rest_comment_id) {
+            Some(id) => readable.push((id, body.to_string())),
+            None if body.contains(crate::COMMENT_MARKER) => {
+                return Err(UsageError::Message(format!(
+                    "{repository}#{pull_request} already carries an Aethyme review comment, but \
+                     its REST id could not be read from its url ({}); refusing to project rather \
+                     than post a second comment beside it. `gh pr view --json comments` must \
+                     report a url ending in `#issuecomment-<id>`.",
+                    comment["url"].as_str().unwrap_or("<no url>")
+                )));
+            }
+            None => {}
+        }
+    }
+    Ok(crate::find_owned_comment(
+        readable.iter().map(|(id, body)| (*id, body.as_str())),
+    ))
+}
+
 /// Read the pull request facts the projection needs, with read-only `gh`.
 ///
 /// Read-only GitHub inspection runs directly; only writes go through the
@@ -5656,11 +5796,13 @@ fn gather_change_facts(
 /// sees an empty pull request and plans to create its comment and labels, which
 /// the coordinated write refuses loudly if it was wrong. Guessing quietly is
 /// what this avoids.
+///
+/// One observation *is* a hard failure, and `owned_comment_from_view` says why.
 fn read_pull_request_facts(
     root: &Path,
     repository: &str,
     pull_request: i64,
-) -> crate::PrProjectionFacts {
+) -> Result<crate::PrProjectionFacts, UsageError> {
     let mut facts = crate::PrProjectionFacts {
         pull_request,
         ..Default::default()
@@ -5690,22 +5832,11 @@ fn read_pull_request_facts(
                     .collect()
             })
             .unwrap_or_default();
-        let comments: Vec<(i64, String)> = json["comments"]
-            .as_array()
-            .map(|comments| {
-                comments
-                    .iter()
-                    .filter_map(|comment| {
-                        Some((
-                            comment["id"].as_i64()?,
-                            comment["body"].as_str()?.to_string(),
-                        ))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        facts.owned_comment =
-            crate::find_owned_comment(comments.iter().map(|(id, body)| (*id, body.as_str())));
+        facts.owned_comment = owned_comment_from_view(
+            repository,
+            pull_request,
+            json["comments"].as_array().map(Vec::as_slice).unwrap_or(&[]),
+        )?;
     }
     let labels = std::process::Command::new("gh")
         .current_dir(root)
@@ -5723,7 +5854,7 @@ fn read_pull_request_facts(
             .filter_map(|label| label["name"].as_str().map(String::from))
             .collect();
     }
-    facts
+    Ok(facts)
 }
 
 /// Perform one tick of the review router for one pull request.
@@ -5765,6 +5896,7 @@ fn run_review_run(parsed: Parsed) -> Result<serde_json::Value, UsageError> {
 
     let trigger = crate::ReviewTriggerPolicy::load(&root).map_err(to_usage)?;
     let routing = crate::ReviewRoutingPolicy::load(&root).map_err(to_usage)?;
+    let reporting = crate::ReviewReportingPolicy::load(&root).map_err(to_usage)?;
     let projection_policy = crate::PrProjectionPolicy::load(&root).map_err(to_usage)?;
 
     // Where the change is read from. The working directory is right for an
@@ -5851,7 +5983,7 @@ fn run_review_run(parsed: Parsed) -> Result<serde_json::Value, UsageError> {
         .collect();
     let in_flight = crate::in_flight(&still_open);
     let tabs = read_tab_snapshot(&parsed)?;
-    let pr_facts = read_pull_request_facts(&change_root, &repository, pull_request);
+    let pr_facts = read_pull_request_facts(&change_root, &repository, pull_request)?;
 
     let previous = broker
         .store()
@@ -5873,7 +6005,9 @@ fn run_review_run(parsed: Parsed) -> Result<serde_json::Value, UsageError> {
             crate::ReviewTriggerDecision::Request { review_type, .. } => {
                 Some(crate::dispatch_review(
                     &routing,
+                    &reporting,
                     &root,
+                    &repository,
                     review_type,
                     pull_request,
                     &head,

@@ -178,9 +178,18 @@ def broker_json(broker: str, cwd: str | None, args: list[str]) -> Any:
     return json.loads(result.stdout)
 
 
-def broker_git(broker: str, cwd: str | None, session: str, reason: str, args: list[str]) -> None:
+def broker_git(broker: str, cwd: str | None, session: str, repository: str,
+               reason: str, args: list[str]) -> None:
+    """Run one coordinated git command against `repository`.
+
+    `--repo` is unconditional even though the broker only demands it for remote
+    commands. Every call here targets the pull request's repository, and naming
+    it per call site would be a list of which spellings reach the network --
+    maintained against a broker that is free to add one.
+    """
     result = subprocess.run(
-        [broker, "broker", "git", "--session", session, "--reason", reason, "--", *args],
+        [broker, "broker", "git", "--session", session, "--repo", repository,
+         "--reason", reason, "--", *args],
         capture_output=True,
         text=True,
         cwd=cwd,
@@ -238,17 +247,17 @@ def prepare_workspace(
     if os.path.isdir(workspace):
         if head_of(workspace) == head:
             return
-        broker_git(broker, repo_path, session,
+        broker_git(broker, repo_path, session, repository,
                    f"replace the stale review workspace for {repository}#{pull_request}",
                    ["worktree", "remove", "--force", workspace])
 
     os.makedirs(os.path.dirname(workspace) or ".", exist_ok=True)
     # The head of a pull request is not necessarily a local ref: it may live on
     # a fork, and fetching the pull ref is the only spelling that reaches both.
-    broker_git(broker, repo_path, session,
+    broker_git(broker, repo_path, session, repository,
                f"fetch the head of {repository}#{pull_request} to review it",
                ["fetch", "origin", f"refs/pull/{pull_request}/head"])
-    broker_git(broker, repo_path, session,
+    broker_git(broker, repo_path, session, repository,
                f"check out {repository}#{pull_request} for review",
                ["worktree", "add", "--detach", workspace, head])
 

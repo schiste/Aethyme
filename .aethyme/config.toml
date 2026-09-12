@@ -150,15 +150,9 @@ backend = "record"
 
 # A reviewer is a shell with a checkout and credentials, so `instructions` is
 # the only place to say what it must NOT do that the generated prompt does not
-# already cover. Both routes carry the same coordination clause for one
-# reason: `gh pr review` run directly is a shared-state write outside the
-# broker's operations journal, and this repository forbids that for agents
-# doing the work -- a reviewer is not exempt because it is only commenting.
-#
-# The clause has to start by getting a session, because a routed reviewer has
-# none: the adapter's session opened the workspace, and lending it out would
-# attribute every reviewer's writes to the sweeper. The workspace is already a
-# dedicated worktree, which is exactly the case `broker adopt` exists for.
+# already cover. Keep it to what is true of THIS repository and this dimension
+# only: how to post, how to tag, and how to lay a finding out now come from
+# [review.reporting] below, so every reviewer answers in the same shape.
 
 [review.routing.route.security]
 backend = "chau7"
@@ -167,14 +161,9 @@ backend = "chau7"
 # open as many shells as there were pushes.
 max_concurrent = 1
 instructions = """
-Pay attention to the broker's coordinated-write path.
-
-Posting is a coordinated write. Take a session for this workspace first --
-`aethyme broker adopt --task "security review of #<n>"` -- and post with
-`aethyme broker gh --session <id> --repo schiste/Aethyme --reason "post the
-security review on #<n>" -- pr review <n> ...`. Running `gh` directly puts a
-shared-state write outside the operations journal. Close with `aethyme broker
-close --session <id>` when the review is posted.
+Pay attention to the broker's coordinated-write path, and to the difference
+between a check and the thing it authorises: this repository's recurring
+defect is code that verifies one command and then runs a different one.
 """
 
 [review.routing.route.code]
@@ -189,13 +178,67 @@ max_concurrent = 2
 # max reasoning effort on a single dimension has not needed ninety minutes.
 stale_after_minutes = 90
 instructions = """
-Posting is a coordinated write. Take a session for this workspace first --
-`aethyme broker adopt --task "code review of #<n>"` -- and post with
-`aethyme broker gh --session <id> --repo schiste/Aethyme --reason "post the
-code review on #<n>" -- pr review <n> ...`. Running `gh` directly puts a
-shared-state write outside the operations journal. Close with `aethyme broker
-close --session <id>` when the review is posted.
+Prefer a permissive-failure finding over a style one. A parse that returns
+"nothing here" on failure, a check whose negative result is indistinguishable
+from a clean result, or an error swallowed into a default -- those are the
+defects this repository keeps shipping, and they are invisible in review
+unless someone is looking for them.
 """
+
+[review.reporting]
+# How a reviewer answers. Routing decides who reviews; this decides what comes
+# back, and it is separate for a reason: the shape of a finding should not
+# change when the backend does. A `provider_comment` bot and a Codex Luna
+# shell reviewing the same pull request must produce documents that can be
+# read side by side.
+#
+# Everything here reaches the reviewer verbatim inside the generated prompt.
+schema_version = 1
+
+# Post through `aethyme broker gh`, not bare `gh`. A reviewer is an agent
+# doing work in a shared repository, and a posted review is a GitHub mutation
+# like any other; "it is only a comment" is how writes end up outside the
+# operations journal. The generated prompt spells out `broker adopt` first,
+# because a routed reviewer has no session of its own -- the adapter's session
+# opened the workspace, and lending it out would attribute every reviewer's
+# writes to the sweeper.
+coordinated = true
+
+# A finding the reader cannot locate is not actionable: the reviewer has the
+# diff open and whoever reads the review does not.
+require_location = true
+
+# Not a quota -- a forcing function. A reviewer that must choose ten ranks its
+# findings; one that need not choose reports forty observations nobody reads
+# to the end of.
+max_findings = 10
+
+# Deliberately unset. GitHub refuses `--request-changes` on a pull request the
+# caller authored, and these reviewers run under the repository owner's own
+# `gh` credentials, so a threshold here would produce reviews that are written,
+# refused at the post, and then exist nowhere. Set it the day the reviewers get
+# an identity of their own.
+# request_changes_at = "P1"
+
+# The ladder. P0/P1 are about whether the change is safe to merge; P2/P3 are
+# about whether the next person can work on it. A reviewer that cannot tell
+# them apart produces a list sorted by how interesting each finding was to
+# write.
+[[review.reporting.severity]]
+label = "P0"
+means = "ship-blocking: data loss, a security hole, a broken build, or a correctness bug on a path users reach"
+
+[[review.reporting.severity]]
+label = "P1"
+means = "must fix before merge: a real defect with a narrower trigger, or a missing check the change itself depends on"
+
+[[review.reporting.severity]]
+label = "P2"
+means = "worth fixing, not blocking: maintainability, a gap in test coverage, a comment that will mislead the next reader"
+
+[[review.reporting.severity]]
+label = "P3"
+means = "optional: naming, style, preference. Say so rather than padding a review with them"
 
 [review.projection]
 # Publish the record onto the pull request: one comment Aethyme owns and edits

@@ -53,12 +53,15 @@ fi
 # `--approve-for-me` because nobody is sitting at the tab: an unattended
 # reviewer blocked on an approval prompt holds its concurrency slot until
 # `stale_after_minutes` reclaims it, which reads as "the review never ran".
-# `workspace-write` with network, not full access: the reviewer must reach
-# `gh` and the broker, and its checkout is a detached throwaway -- but the
-# rest of the filesystem is not part of reviewing a pull request.
+#
+# It also *is* the sandbox choice -- it routes approvals through automatic
+# review and selects workspace-write itself -- so naming `--sandbox` beside it
+# is not redundant but an error codex refuses to start on. The policy it picks
+# is the one wanted anyway: the reviewer must reach `gh` and the broker, and
+# its checkout is a detached throwaway, but the rest of the filesystem is not
+# part of reviewing a pull request. Only the network override is ours to set.
 AGENT="env PATH=$(printf '%q' "$CLEAN_PATH") codex \
 --model gpt-5.6-luna \
---sandbox workspace-write \
 -c sandbox_workspace_write.network_access=true \
 --approve-for-me"
 

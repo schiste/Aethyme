@@ -105,6 +105,7 @@ mod review_backend;
 mod review_execution;
 mod review_facts;
 mod review_ledger;
+mod review_report;
 mod review_trigger;
 mod schema;
 mod ship;
@@ -233,6 +234,7 @@ pub use pr_projection::{
     COMMENT_MARKER, OwnedComment, PR_PROJECTION_SCHEMA_VERSION, PrProjectionAction,
     PrProjectionError, PrProjectionFacts, PrProjectionPolicy, ProjectedReview,
     ProjectedReviewState, ReviewProjection, find_owned_comment, project, render_comment,
+    rest_comment_id,
 };
 pub use pr_watch::{
     DEFAULT_PR_SCHEDULER_LIMIT, DEFAULT_PR_WATCH_INTERVAL_SECONDS,
@@ -344,6 +346,9 @@ pub use review_backend::{
 };
 pub use review_execution::{
     Chau7Handoff, DeferredReview, GhCall, LedgerWrite, ReviewExecutionPlan, plan_execution,
+};
+pub use review_report::{
+    REVIEW_REPORTING_SCHEMA_VERSION, ReviewReportingError, ReviewReportingPolicy, ReviewSeverity,
 };
 pub use review_facts::{
     ProviderPullRequest, PullRequestObservation, derive_trigger, first_time_contributor,

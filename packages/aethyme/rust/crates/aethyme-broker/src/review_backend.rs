@@ -33,6 +33,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::chau7_tabs::{Chau7Tab, workspace_tab_ids};
+use crate::review_report::ReviewReportingPolicy;
 use crate::review_trigger::ReviewType;
 
 /// Current shape of the `[review.routing]` table.
@@ -354,7 +355,9 @@ impl ReviewDispatchAction {
 /// dispatcher that died between deciding and spawning leaves no phantom slot.
 pub fn dispatch_review(
     policy: &ReviewRoutingPolicy,
+    reporting: &ReviewReportingPolicy,
     repo_root: &Path,
+    repository: &str,
     review_type: &str,
     pull_request: i64,
     head: &str,
@@ -418,8 +421,10 @@ pub fn dispatch_review(
                 pull_request,
                 prompt: review_prompt(
                     review_type,
+                    repository,
                     pull_request,
                     head,
+                    reporting,
                     route.instructions.as_deref(),
                 ),
                 workspace,
@@ -435,21 +440,29 @@ pub fn dispatch_review(
 /// on the pull request reads the diff. The instruction not to push is not
 /// decoration -- a reviewer with a checkout can commit, and a review that
 /// edited the code under review is no longer a review.
+///
+/// Three parts, in descending order of how much a repository may change them.
+/// The task is generated and fixed. The reporting half comes from
+/// [`ReviewReportingPolicy`], so a repository chooses its severity ladder and
+/// its posting lane but never whether findings are tagged and located at all.
+/// `instructions` is free text and last, for what only this repository knows.
 pub fn review_prompt(
     review_type: &str,
+    repository: &str,
     pull_request: i64,
     head: &str,
+    reporting: &ReviewReportingPolicy,
     instructions: Option<&str>,
 ) -> String {
     let mut prompt = format!(
-        "Review pull request #{pull_request} (head `{head}`) for **{review_type}**.\n\n\
+        "Review pull request #{pull_request} in {repository} (head `{head}`) for \
+         **{review_type}**.\n\n\
          - Read the diff with `gh pr diff {pull_request}`; the checkout in this \
            directory is at that head.\n\
          - Limit the review to {review_type}. Another reviewer covers the rest.\n\
-         - Report findings as a review on the pull request, most severe first. \
-           Say so explicitly if you find nothing.\n\
-         - Do not commit, push, or edit the branch under review.\n"
+         - Do not commit, push, or edit the branch under review.\n\n"
     );
+    prompt.push_str(&reporting.instructions(review_type, repository, pull_request));
     if let Some(extra) = instructions {
         prompt.push('\n');
         prompt.push_str(extra.trim_end());
@@ -492,7 +505,9 @@ mod tests {
     ) -> ReviewDispatchAction {
         dispatch_review(
             policy,
+            &ReviewReportingPolicy::default(),
             Path::new("/repo"),
+            "o/r",
             "security",
             42,
             "abc123",
