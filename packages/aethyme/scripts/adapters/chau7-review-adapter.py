@@ -186,8 +186,25 @@ class Chau7Client:
         refusal several ways and none of them mean the workspace is still
         occupied -- the next tick reads `tab_list` again and will simply not
         plan this teardown a second time.
+
+        `force` is not optional, and leaving it off made this whole path
+        inert when it was first written on 2026-09-12: a bare `tab_close`
+        refuses with "Tab has a running process (status: running)", and a
+        reviewer tab is ALWAYS `running` -- the Codex shell is interactive,
+        so it reports `running` while sitting at its prompt with the review
+        posted an hour ago. That refusal is the same ambiguity that made the
+        broker read the ledger instead of tab status, so honouring it here
+        would be deferring to the one signal already known to be worthless
+        and every teardown would fail forever.
+
+        The claim being made is not "nothing is running". It is "the broker
+        read the ledger and no row for this dimension is in flight", which is
+        strictly better evidence than the status byte being overridden. The
+        risk force carries -- killing a reviewer mid-thought -- is the one
+        `finished_workspaces` exists to exclude, and a live row keeps its tab
+        out of the teardown list entirely.
         """
-        self.call_tool("tab_close", {"tab_id": tab_id})
+        self.call_tool("tab_close", {"tab_id": tab_id, "force": True})
 
 
 class BrokerError(RuntimeError):
