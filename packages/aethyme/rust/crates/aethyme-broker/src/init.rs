@@ -729,131 +729,48 @@ fn check_git_version() -> Check {
 }
 
 fn check_git_output() -> Check {
-    let Some(resolved_git) = which_program("git") else {
-        return Check {
-            id: "certify.git-output",
-            status: CheckStatus::Fail,
-            detail: "git not found on PATH; output behavior cannot be certified".into(),
-        };
-    };
-    let resolved = resolved_git.display();
-    let probe = match tempfile::tempdir() {
-        Ok(probe) => probe,
-        Err(err) => {
-            return Check {
+    // Deliberately not a second probe. The dirtiness predicates refuse to
+    // answer when git output is rewritten, and an operator reading `certify`
+    // is trying to find out whether that refusal will fire -- two
+    // independent implementations of "is this git honest" could answer that
+    // question differently, which is the one outcome nobody could debug.
+    match crate::git::git_output_trust() {
+        crate::git::GitOutputTrust::Undecorated { resolved, bypassed } if bypassed.is_empty() => {
+            Check {
                 id: "certify.git-output",
-                status: CheckStatus::Skipped,
+                status: CheckStatus::Pass,
                 detail: format!(
-                    "could not create a temporary repository to probe git output ({err}); resolved: {resolved}"
+                    "git preserves known-empty porcelain output (resolved: {})",
+                    resolved.display()
                 ),
-            };
+            }
         }
-    };
-    let empty_template = probe.path().join("empty-template");
-    let probe_repo = probe.path().join("repo");
-    if let Err(err) =
-        std::fs::create_dir(&empty_template).and_then(|()| std::fs::create_dir(&probe_repo))
-    {
-        return Check {
+        // The broker routed around the wrapper; the machine still has one.
+        // Gate commands run through `sh -c` with the caller's PATH and get no
+        // such protection, so this stays visible -- as a warning, because
+        // nothing the broker decides is wrong and failing CI over someone
+        // else's PATH would be false.
+        crate::git::GitOutputTrust::Undecorated { resolved, bypassed } => Check {
             id: "certify.git-output",
-            status: CheckStatus::Skipped,
+            status: CheckStatus::Warn,
             detail: format!(
-                "could not prepare the temporary git probe ({err}); resolved: {resolved}"
+                "git output is rewritten earlier on PATH ({}); the broker uses {} instead, \
+                 but gate commands inherit PATH and do not -- remove the wrapper",
+                bypassed.join("; "),
+                resolved.display()
             ),
-        };
-    }
-    let empty_config = probe.path().join("empty-gitconfig");
-    if let Err(err) = std::fs::write(&empty_config, []) {
-        return Check {
-            id: "certify.git-output",
-            status: CheckStatus::Skipped,
-            detail: format!(
-                "could not isolate the temporary git probe ({err}); resolved: {resolved}"
-            ),
-        };
-    }
-
-    let mut init = isolated_git_probe(&probe_repo, &empty_config);
-    let init_output = init
-        .arg("init")
-        .arg("-q")
-        .arg(format!("--template={}", empty_template.display()))
-        .output();
-    let Ok(init_output) = init_output else {
-        return Check {
-            id: "certify.git-output",
-            status: CheckStatus::Skipped,
-            detail: format!(
-                "could not execute git in the temporary output probe; resolved: {resolved}"
-            ),
-        };
-    };
-    if !init_output.status.success() {
-        return Check {
-            id: "certify.git-output",
-            status: CheckStatus::Skipped,
-            detail: format!(
-                "git init failed in the temporary output probe (exit {}); resolved: {resolved}",
-                init_output.status
-            ),
-        };
-    }
-
-    let status_output = isolated_git_probe(&probe_repo, &empty_config)
-        .arg("status")
-        .arg("--porcelain=v1")
-        .arg("-z")
-        .arg("--untracked-files=all")
-        .output();
-    let Ok(status_output) = status_output else {
-        return Check {
+        },
+        crate::git::GitOutputTrust::Decorated { detail } => Check {
             id: "certify.git-output",
             status: CheckStatus::Fail,
-            detail: format!(
-                "git status could not execute in a clean temporary repository; resolved: {resolved}"
-            ),
-        };
-    };
-    if !status_output.status.success() {
-        return Check {
+            detail: detail.clone(),
+        },
+        crate::git::GitOutputTrust::Indeterminate { detail } => Check {
             id: "certify.git-output",
-            status: CheckStatus::Fail,
-            detail: format!(
-                "git status failed in a clean temporary repository (exit {}); resolved: {resolved}",
-                status_output.status
-            ),
-        };
+            status: CheckStatus::Skipped,
+            detail: detail.clone(),
+        },
     }
-    if !status_output.stdout.is_empty() {
-        return Check {
-            id: "certify.git-output",
-            status: CheckStatus::Fail,
-            detail: format!(
-                "git status --porcelain emitted {} bytes on a clean temporary repository; a PATH wrapper is rewriting git output (resolved: {resolved})",
-                status_output.stdout.len()
-            ),
-        };
-    }
-
-    Check {
-        id: "certify.git-output",
-        status: CheckStatus::Pass,
-        detail: format!("git preserves known-empty porcelain output (resolved: {resolved})"),
-    }
-}
-
-fn isolated_git_probe(repo: &Path, empty_config: &Path) -> std::process::Command {
-    let mut command = std::process::Command::new("git");
-    command
-        .current_dir(repo)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", empty_config)
-        .env_remove("GIT_CONFIG_PARAMETERS")
-        .env_remove("GIT_CONFIG_COUNT")
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE");
-    command
 }
 
 fn check_binary_shadowing() -> Check {

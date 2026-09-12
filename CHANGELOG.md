@@ -113,6 +113,29 @@ artifacts and their exact source revision are recorded in each signed
   `stale_after_minutes` to reclaim. The broker still never talks to Chau7 --
   it decides, and the caller holding the transport performs.
 
+### Fixed
+
+- The broker now runs a `git` it has proven does not rewrite porcelain output,
+  instead of whatever PATH resolves. A wrapper script that decorated every
+  command with six bytes made `git status --porcelain` non-empty on a
+  spotlessly clean checkout, so `is_dirty` answered "dirty" for every worktree
+  on the machine, permanently -- `broker cleanup --all-cleaned` reported 0 of
+  11 eligible and 0 bytes reclaimable where 11 and 4.2 GiB were actually free
+  (#176). Candidates on PATH are probed against a known-empty repository and
+  the first honest one is used, so a wrapped machine repairs itself with no
+  operator action; `certify.git-output` now reports that same probe rather than
+  a second copy of it.
+- `GitRepo::is_dirty` asks whether there are any dirty *paths* instead of
+  whether the output was non-empty. It was the last porcelain reader in the git
+  module that skipped the validated status grammar added in #43 -- the grammar
+  that already discarded exactly this decoration everywhere else.
+- When no `git` on PATH survives the probe, the dirtiness predicates refuse
+  with an error naming the wrapper rather than returning a verdict. The refusal
+  is deliberately narrow: only the answers that authorize removing a worktree
+  or block a push, because a wrapper that *swallows* a status line makes a
+  dirty tree read clean, and that mistake costs work rather than disk. A probe
+  that could not run is not proof of a wrapper and does not refuse.
+
 ## [0.7.17] - 2026-09-10
 
 ### Added

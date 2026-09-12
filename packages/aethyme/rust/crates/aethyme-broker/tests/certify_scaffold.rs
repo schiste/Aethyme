@@ -329,10 +329,17 @@ fn certify_names_a_path_git_shim_that_decorates_known_empty_output() {
         .unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);
 
-    assert!(!output.status.success(), "{stdout}");
+    // The broker now probes PATH and uses the first git that does not rewrite
+    // porcelain, so a shim ahead of an honest git no longer decides anything
+    // the broker reads -- certification is not failed by it (#176). It is
+    // still reported, and still names the shim: gate commands run through
+    // `sh -c` with the caller's PATH and get none of that protection, so an
+    // operator who sees this has a real thing to fix.
+    assert!(output.status.success(), "{stdout}");
     assert!(stdout.contains("certify.git-output"), "{stdout}");
     assert!(stdout.contains("emitted 6 bytes"), "{stdout}");
     assert!(stdout.contains(&shim.display().to_string()), "{stdout}");
+    assert!(stdout.contains("gate commands inherit PATH"), "{stdout}");
 }
 
 #[test]

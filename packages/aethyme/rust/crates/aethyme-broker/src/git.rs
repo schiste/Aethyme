@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_PRIVATE_INDEX_ID: AtomicU64 = AtomicU64::new(1);
@@ -29,6 +30,12 @@ pub enum GitError {
 
     #[error("{path} is not inside a git repository")]
     NotARepository { path: PathBuf },
+
+    /// No `git` on PATH emits unmodified porcelain, so a dirtiness question
+    /// has no honest answer. Carried separately from `Git` because nothing
+    /// failed: the command would have succeeded and lied.
+    #[error("refusing to judge this checkout: {detail}")]
+    UntrustedOutput { detail: String },
 }
 
 /// Extract paths from `git status --porcelain` output, validating each
@@ -121,6 +128,255 @@ fn parse_nul_paths(out: &str) -> Vec<String> {
         .collect()
 }
 
+/// The `git` this process runs, and why it is trusted.
+///
+/// `Command::new("git")` resolves through the inherited PATH, which on a
+/// developer machine is not a neutral place: wrapper scripts that decorate
+/// output live there. One observed wrapper appends `ok \u{2713}` to every
+/// command, so `git status --porcelain` returns six bytes on a clean
+/// repository -- and every dirtiness predicate in the broker answers "dirty",
+/// forever, for every checkout on the machine (#176).
+///
+/// [`parse_porcelain_paths`] already discards decoration a wrapper *adds*
+/// (#43). It cannot see what a wrapper *removes*, and a suppressed status
+/// line makes a dirty tree read clean -- which would authorize deleting work.
+/// So rather than parse harder, find a `git` that does not need parsing
+/// around: probe PATH candidates in order and keep the first whose porcelain
+/// output on a known-empty repository is actually empty.
+struct GitProgram {
+    /// What to spawn. Always usable: when no candidate proved trustworthy
+    /// this is plain `git`, because the majority of git calls here read refs
+    /// and commit -- work that a decorating wrapper does not corrupt, and
+    /// that a machine with such a wrapper still needs to do.
+    program: PathBuf,
+    trust: GitOutputTrust,
+}
+
+/// What this machine's `git` was proven to do with porcelain output.
+///
+/// Three states, not two, and the third is the point: a probe that could not
+/// run proves nothing. Treating "unknown" as "untrustworthy" would refuse to
+/// judge a checkout in any sandbox without a writable temporary directory --
+/// an environment where nothing is actually wrong. Refusal is reserved for
+/// evidence.
+#[derive(Debug)]
+pub enum GitOutputTrust {
+    /// A candidate emitted exactly nothing on a known-empty repository.
+    ///
+    /// `bypassed` names the candidates ahead of it that were rejected. The
+    /// broker is safe once it has an honest git, but the machine is not:
+    /// gate commands run through `sh -c` with the caller's PATH, so a wrapper
+    /// the broker routed around still breaks them. Carrying the list is what
+    /// lets `certify` stay loud about a repaired-for-us-only machine.
+    Undecorated {
+        resolved: PathBuf,
+        bypassed: Vec<String>,
+    },
+    /// Every candidate that ran decorated its output. This is the wrapper.
+    Decorated { detail: String },
+    /// No candidate could be probed, so the question stays open.
+    Indeterminate { detail: String },
+}
+
+static GIT_PROGRAM: OnceLock<GitProgram> = OnceLock::new();
+
+fn git_program() -> &'static GitProgram {
+    GIT_PROGRAM.get_or_init(resolve_git_program)
+}
+
+/// What `aethyme certify` reports about git output, from the same probe the
+/// dirtiness predicates consult -- so the diagnostic and the refusal can
+/// never disagree about the same machine.
+pub fn git_output_trust() -> &'static GitOutputTrust {
+    &git_program().trust
+}
+
+fn resolve_git_program() -> GitProgram {
+    let mut decorated: Vec<String> = Vec::new();
+    let mut unusable: Vec<String> = Vec::new();
+    for candidate in path_candidates("git") {
+        match porcelain_probe(&candidate) {
+            PorcelainProbe::Undecorated => {
+                let mut bypassed = decorated;
+                bypassed.append(&mut unusable);
+                return GitProgram {
+                    program: candidate.clone(),
+                    trust: GitOutputTrust::Undecorated {
+                        resolved: candidate,
+                        bypassed,
+                    },
+                };
+            }
+            PorcelainProbe::Decorated { bytes } => decorated.push(format!(
+                "{} emitted {bytes} bytes of porcelain on a clean temporary repository",
+                candidate.display()
+            )),
+            // PATH routinely holds stale entries, and one that cannot run is
+            // not evidence of a wrapper. Keep looking.
+            PorcelainProbe::Unusable { reason } => {
+                unusable.push(format!("{}: {reason}", candidate.display()));
+            }
+        }
+    }
+    let trust = if !decorated.is_empty() {
+        GitOutputTrust::Decorated {
+            detail: format!(
+                "a PATH wrapper is rewriting git output ({}); \
+                 remove it from PATH, then rerun",
+                decorated.join("; ")
+            ),
+        }
+    } else if !unusable.is_empty() {
+        GitOutputTrust::Indeterminate {
+            detail: format!("no git on PATH could be probed ({})", unusable.join("; ")),
+        }
+    } else {
+        GitOutputTrust::Indeterminate {
+            detail: "git was not found on PATH".to_string(),
+        }
+    };
+    GitProgram {
+        program: PathBuf::from("git"),
+        trust,
+    }
+}
+
+/// Refuse rather than guess -- but only on proof.
+///
+/// Called only by the dirtiness predicates, which is deliberate: those are
+/// the answers that authorize removing a worktree or refuse to publish one,
+/// and a wrong answer there costs work rather than bytes. Every other git
+/// call stays available on a wrapped machine, because making the whole broker
+/// unusable would not protect anything -- it would only remove the tool the
+/// operator needs to recover.
+fn require_trustworthy_porcelain() -> Result<(), GitError> {
+    match &git_program().trust {
+        GitOutputTrust::Undecorated { .. } | GitOutputTrust::Indeterminate { .. } => Ok(()),
+        GitOutputTrust::Decorated { detail } => Err(GitError::UntrustedOutput {
+            detail: detail.clone(),
+        }),
+    }
+}
+
+/// Executable files named `program` on PATH, in PATH order.
+fn path_candidates(program: &str) -> Vec<PathBuf> {
+    let Some(path) = std::env::var_os("PATH") else {
+        return Vec::new();
+    };
+    let cwd = std::env::current_dir().ok();
+    std::env::split_paths(&path)
+        .filter_map(|dir| {
+            let dir = if dir.is_absolute() {
+                dir
+            } else {
+                cwd.as_ref()?.join(dir)
+            };
+            let candidate = dir.join(program);
+            is_executable_file(&candidate).then_some(candidate)
+        })
+        .collect()
+}
+
+#[cfg(unix)]
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    std::fs::metadata(path)
+        .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn is_executable_file(path: &Path) -> bool {
+    path.is_file()
+}
+
+/// What one candidate did when asked for porcelain it could not embellish.
+#[derive(Debug, PartialEq, Eq)]
+enum PorcelainProbe {
+    Undecorated,
+    Decorated { bytes: usize },
+    Unusable { reason: String },
+}
+
+/// Run `program` against a freshly created empty repository and require
+/// `git status --porcelain` to say nothing at all.
+///
+/// The repository is built with an empty template and an empty global config
+/// so the answer describes the binary rather than the machine's hooks or
+/// aliases: a `status.showUntrackedFiles` setting or a template hook that
+/// prints would otherwise be indistinguishable from a wrapper.
+fn porcelain_probe(program: &Path) -> PorcelainProbe {
+    let probe = match tempfile::tempdir() {
+        Ok(probe) => probe,
+        Err(err) => {
+            return PorcelainProbe::Unusable {
+                reason: format!("could not create a probe directory ({err})"),
+            };
+        }
+    };
+    let template = probe.path().join("empty-template");
+    let repo = probe.path().join("repo");
+    let config = probe.path().join("empty-gitconfig");
+    if let Err(err) = std::fs::create_dir(&template)
+        .and_then(|()| std::fs::create_dir(&repo))
+        .and_then(|()| std::fs::write(&config, []))
+    {
+        return PorcelainProbe::Unusable {
+            reason: format!("could not prepare the probe repository ({err})"),
+        };
+    }
+
+    let isolated = |program: &Path| {
+        let mut command = Command::new(program);
+        command
+            .current_dir(&repo)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", &config)
+            .env_remove("GIT_CONFIG_PARAMETERS")
+            .env_remove("GIT_CONFIG_COUNT")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE");
+        command
+    };
+
+    match isolated(program)
+        .args(["init", "-q"])
+        .arg(format!("--template={}", template.display()))
+        .output()
+    {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => {
+            return PorcelainProbe::Unusable {
+                reason: format!("git init exited {}", output.status),
+            };
+        }
+        Err(err) => {
+            return PorcelainProbe::Unusable {
+                reason: format!("could not execute it ({err})"),
+            };
+        }
+    }
+
+    // `-z` so the answer cannot be a trailing newline argument: a clean
+    // repository's NUL-separated porcelain is exactly zero bytes.
+    match isolated(program)
+        .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
+        .output()
+    {
+        Ok(output) if !output.status.success() => PorcelainProbe::Unusable {
+            reason: format!("git status exited {}", output.status),
+        },
+        Ok(output) if output.stdout.is_empty() => PorcelainProbe::Undecorated,
+        Ok(output) => PorcelainProbe::Decorated {
+            bytes: output.stdout.len(),
+        },
+        Err(err) => PorcelainProbe::Unusable {
+            reason: format!("could not execute git status ({err})"),
+        },
+    }
+}
+
 fn run_git(cwd: &Path, args: &[&str]) -> Result<String, GitError> {
     run_git_inner(cwd, None, args)
 }
@@ -132,7 +388,7 @@ fn run_git_with_index(cwd: &Path, index_file: &str, args: &[&str]) -> Result<Str
 }
 
 fn run_git_inner(cwd: &Path, index_file: Option<&str>, args: &[&str]) -> Result<String, GitError> {
-    let mut command = Command::new("git");
+    let mut command = Command::new(&git_program().program);
     command.args(args).current_dir(cwd);
     if let Some(index) = index_file {
         command.env("GIT_INDEX_FILE", index);
@@ -1144,7 +1400,13 @@ impl GitRepo {
 
     /// Paths with uncommitted or untracked changes — the submit preflight
     /// warns about these because only committed work integrates.
+    ///
+    /// Refuses outright when no trustworthy `git` was found: this answer
+    /// decides whether a worktree may be removed and whether a push may
+    /// proceed, and "clean" from a wrapper that swallowed a line is the one
+    /// wrong answer that costs work rather than disk.
     pub fn dirty_paths(&self) -> Result<Vec<String>, GitError> {
+        require_trustworthy_porcelain()?;
         Ok(parse_porcelain_paths(&run_git(
             &self.root,
             &["status", "--porcelain", "--untracked-files=all"],
@@ -1211,12 +1473,15 @@ impl GitRepo {
 
     /// True when the checkout has uncommitted changes or untracked files —
     /// the guard `broker cleanup` consults before removing a worktree.
+    ///
+    /// Deliberately expressed as "are there any dirty paths" rather than "is
+    /// the output non-empty". The raw-emptiness spelling was the last
+    /// porcelain reader in this module that did not go through the validated
+    /// grammar, and it is what made six bytes of wrapper decoration read as a
+    /// dirty worktree -- every worktree on the machine, permanently
+    /// ineligible for cleanup (#176).
     pub fn is_dirty(&self) -> Result<bool, GitError> {
-        Ok(!run_git(
-            &self.root,
-            &["status", "--porcelain", "--untracked-files=all"],
-        )?
-        .is_empty())
+        Ok(!self.dirty_paths()?.is_empty())
     }
 
     /// Commits on HEAD that are not reachable from `base` — cleanup
@@ -1430,5 +1695,98 @@ mod nul_path_tests {
     fn empty_output_yields_no_paths() {
         assert!(parse_nul_paths("").is_empty());
         assert!(parse_nul_paths("\0\0").is_empty());
+    }
+}
+
+/// The probe that decides whether this machine's `git` may be believed (#176).
+///
+/// Every test here wraps a git the probe has already accepted, so the
+/// assertions are about the wrapper rather than about the machine. On a
+/// machine where every candidate is wrapped there is nothing honest to wrap,
+/// and the tests say so instead of failing.
+#[cfg(test)]
+mod git_program_tests {
+    use super::*;
+
+    fn trustworthy_git() -> Option<PathBuf> {
+        match git_output_trust() {
+            GitOutputTrust::Undecorated { resolved, .. } => Some(resolved.clone()),
+            _ => None,
+        }
+    }
+
+    /// Write a `git`-named wrapper that forwards to `real`, optionally
+    /// printing the decoration observed in the wild.
+    fn wrapper(dir: &Path, real: &Path, decorate: bool) -> PathBuf {
+        let path = dir.join("git");
+        let tail = if decorate {
+            // Exactly what the observed wrapper emits: six bytes and no
+            // trailing newline, so `trim_end` on the captured output is no
+            // defence against it.
+            "printf 'ok \\342\\234\\223'\n"
+        } else {
+            ""
+        };
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\n\"{}\" \"$@\"\nstatus=$?\n{tail}exit $status\n",
+                real.display()
+            ),
+        )
+        .expect("write wrapper");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod wrapper");
+        }
+        path
+    }
+
+    /// A wrapper is not itself the problem — plenty of machines route git
+    /// through one legitimately. Rejecting on shape rather than on behaviour
+    /// would make the refusal fire where nothing is wrong.
+    #[test]
+    fn a_wrapper_that_forwards_faithfully_is_accepted() {
+        let Some(real) = trustworthy_git() else {
+            eprintln!("every git on PATH is wrapped; nothing honest to wrap");
+            return;
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = wrapper(dir.path(), &real, false);
+        assert_eq!(porcelain_probe(&path), PorcelainProbe::Undecorated);
+    }
+
+    /// The #176 wrapper: six bytes on a clean repository, which made every
+    /// worktree on the machine read dirty and permanently ineligible for
+    /// cleanup.
+    #[test]
+    fn a_wrapper_that_decorates_porcelain_is_caught() {
+        let Some(real) = trustworthy_git() else {
+            eprintln!("every git on PATH is wrapped; nothing honest to wrap");
+            return;
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = wrapper(dir.path(), &real, true);
+        assert_eq!(
+            porcelain_probe(&path),
+            PorcelainProbe::Decorated { bytes: 6 },
+            "`ok \u{2713}\\n` is six bytes, and none of them are a porcelain entry"
+        );
+    }
+
+    /// A candidate that cannot run proves nothing about wrappers, and only
+    /// `Decorated` makes the dirtiness predicates refuse. Conflating the two
+    /// would turn a stale PATH entry into a broker that will not judge any
+    /// checkout on the machine.
+    #[test]
+    fn a_candidate_that_cannot_run_is_unusable_rather_than_decorated() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("not-a-real-git");
+        assert!(matches!(
+            porcelain_probe(&missing),
+            PorcelainProbe::Unusable { .. }
+        ));
     }
 }
