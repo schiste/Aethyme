@@ -2,7 +2,6 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::gates::GateRunOutcome;
@@ -369,7 +368,7 @@ fn short_commit(commit: &str) -> &str {
 }
 
 fn git(cwd: &Path, args: &[&str]) -> Result<String, QuickTestError> {
-    let output = Command::new("git").args(args).current_dir(cwd).output()?;
+    let output = crate::git::git_command().args(args).current_dir(cwd).output()?;
     if !output.status.success() {
         return Err(QuickTestError::Git {
             args: args.join(" "),

@@ -191,13 +191,28 @@ pub fn git_output_trust() -> &'static GitOutputTrust {
     &git_program().trust
 }
 
+/// A [`Command`] for the `git` this process proved, rather than the one the
+/// ambient PATH happens to offer.
+///
+/// Every direct spawn in this crate goes through here, including the ones
+/// whose subcommand no known wrapper touches. Routing only the sites that a
+/// wrapper is observed to intercept would be a list to maintain against
+/// wrappers nobody has written yet, and #178 is what that list costs when it
+/// falls behind: three call sites kept `Command::new("git")` after #176
+/// resolved an honest binary, and one of them authorized discarding work.
+/// The probe already answers "which binary"; the cheap invariant is that no
+/// call site answers it again.
+pub(crate) fn git_command() -> Command {
+    Command::new(&git_program().program)
+}
+
 fn resolve_git_program() -> GitProgram {
-    let mut decorated: Vec<String> = Vec::new();
+    let mut dishonest: Vec<String> = Vec::new();
     let mut unusable: Vec<String> = Vec::new();
     for candidate in path_candidates("git") {
         match porcelain_probe(&candidate) {
             PorcelainProbe::Undecorated => {
-                let mut bypassed = decorated;
+                let mut bypassed = dishonest;
                 bypassed.append(&mut unusable);
                 return GitProgram {
                     program: candidate.clone(),
@@ -207,10 +222,13 @@ fn resolve_git_program() -> GitProgram {
                     },
                 };
             }
-            PorcelainProbe::Decorated { bytes } => decorated.push(format!(
+            PorcelainProbe::Decorated { bytes } => dishonest.push(format!(
                 "{} emitted {bytes} bytes of porcelain on a clean temporary repository",
                 candidate.display()
             )),
+            PorcelainProbe::StatusRewritten { detail } => {
+                dishonest.push(format!("{}: {detail}", candidate.display()));
+            }
             // PATH routinely holds stale entries, and one that cannot run is
             // not evidence of a wrapper. Keep looking.
             PorcelainProbe::Unusable { reason } => {
@@ -218,12 +236,12 @@ fn resolve_git_program() -> GitProgram {
             }
         }
     }
-    let trust = if !decorated.is_empty() {
+    let trust = if !dishonest.is_empty() {
         GitOutputTrust::Decorated {
             detail: format!(
-                "a PATH wrapper is rewriting git output ({}); \
+                "a PATH wrapper is rewriting git output or exit codes ({}); \
                  remove it from PATH, then rerun",
-                decorated.join("; ")
+                dishonest.join("; ")
             ),
         }
     } else if !unusable.is_empty() {
@@ -295,6 +313,11 @@ fn is_executable_file(path: &Path) -> bool {
 enum PorcelainProbe {
     Undecorated,
     Decorated { bytes: usize },
+    /// Said the right bytes and the wrong thing: an exit code that does not
+    /// match the repository state the probe built. Separate from
+    /// [`PorcelainProbe::Decorated`] only so the rejection can say which
+    /// kind of dishonesty it found; both refuse the candidate.
+    StatusRewritten { detail: String },
     Unusable { reason: String },
 }
 
@@ -332,6 +355,10 @@ fn porcelain_probe(program: &Path) -> PorcelainProbe {
             .current_dir(&repo)
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", &config)
+            .env("GIT_AUTHOR_NAME", "aethyme probe")
+            .env("GIT_AUTHOR_EMAIL", "probe@aethyme.invalid")
+            .env("GIT_COMMITTER_NAME", "aethyme probe")
+            .env("GIT_COMMITTER_EMAIL", "probe@aethyme.invalid")
             .env_remove("GIT_CONFIG_PARAMETERS")
             .env_remove("GIT_CONFIG_COUNT")
             .env_remove("GIT_DIR")
@@ -364,16 +391,97 @@ fn porcelain_probe(program: &Path) -> PorcelainProbe {
         .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
         .output()
     {
-        Ok(output) if !output.status.success() => PorcelainProbe::Unusable {
-            reason: format!("git status exited {}", output.status),
+        Ok(output) if !output.status.success() => {
+            return PorcelainProbe::Unusable {
+                reason: format!("git status exited {}", output.status),
+            };
+        }
+        Ok(output) if output.stdout.is_empty() => {}
+        Ok(output) => {
+            return PorcelainProbe::Decorated {
+                bytes: output.stdout.len(),
+            };
+        }
+        Err(err) => {
+            return PorcelainProbe::Unusable {
+                reason: format!("could not execute git status ({err})"),
+            };
+        }
+    }
+
+    // Everything above proves a property of stdout, and an exit code is not
+    // stdout. The wrapper behind #178 returns 0 from `git diff --quiet` where
+    // real git returns 1 -- emitting no bytes at all, so the emptiness check
+    // above sees a perfectly honest binary. `paths_equal` read that status and
+    // reported differing content as identical, which is the sole automatic
+    // evidence an unattended cleanup uses to discard local work.
+    //
+    // So ask the same binary a question whose answer this function already
+    // knows, in both directions: a committed file that matches, then the same
+    // file modified. A candidate that cannot tell those apart is refused for
+    // the same reason a decorating one is.
+    let tracked = repo.join("probe.txt");
+    if std::fs::write(&tracked, "before\n").is_err() {
+        return PorcelainProbe::Unusable {
+            reason: "could not write the probe file".to_string(),
+        };
+    }
+    for args in [&["add", "probe.txt"][..], &["commit", "-q", "-m", "probe"][..]] {
+        match isolated(program).args(args).output() {
+            Ok(output) if output.status.success() => {}
+            Ok(output) => {
+                return PorcelainProbe::Unusable {
+                    reason: format!("git {} exited {}", args.join(" "), output.status),
+                };
+            }
+            Err(err) => {
+                return PorcelainProbe::Unusable {
+                    reason: format!("could not execute git {} ({err})", args.join(" ")),
+                };
+            }
+        }
+    }
+
+    // `--` so a file named like a revision cannot change what is compared.
+    let quiet_exit = |program: &Path| match isolated(program)
+        .args(["diff", "--quiet", "--", "probe.txt"])
+        .status()
+    {
+        Ok(status) => status.code().ok_or_else(|| {
+            format!("git diff --quiet was terminated without an exit code ({status})")
+        }),
+        Err(err) => Err(format!("could not execute git diff --quiet ({err})")),
+    };
+
+    match quiet_exit(program) {
+        Ok(0) => {}
+        Ok(code) => {
+            return PorcelainProbe::StatusRewritten {
+                detail: format!(
+                    "git diff --quiet exited {code} on an unmodified tracked file, \
+                     where git exits 0"
+                ),
+            };
+        }
+        Err(reason) => return PorcelainProbe::Unusable { reason },
+    }
+
+    if std::fs::write(&tracked, "after\n").is_err() {
+        return PorcelainProbe::Unusable {
+            reason: "could not modify the probe file".to_string(),
+        };
+    }
+    match quiet_exit(program) {
+        Ok(1) => PorcelainProbe::Undecorated,
+        // The dangerous direction, and the reason this check exists: 0 here
+        // means "identical", for a file this function just changed.
+        Ok(code) => PorcelainProbe::StatusRewritten {
+            detail: format!(
+                "git diff --quiet exited {code} on a modified tracked file, \
+                 where git exits 1"
+            ),
         },
-        Ok(output) if output.stdout.is_empty() => PorcelainProbe::Undecorated,
-        Ok(output) => PorcelainProbe::Decorated {
-            bytes: output.stdout.len(),
-        },
-        Err(err) => PorcelainProbe::Unusable {
-            reason: format!("could not execute git status ({err})"),
-        },
+        Err(reason) => PorcelainProbe::Unusable { reason },
     }
 }
 
@@ -513,7 +621,7 @@ impl GitRepo {
     /// This never fetches and is suitable for read-only certification.
     pub fn path_exists_at(&self, revision: &str, path: &str) -> Result<bool, GitError> {
         let object = format!("{revision}:{path}");
-        let output = Command::new("git")
+        let output = git_command()
             .args(["cat-file", "-e", &object])
             .current_dir(&self.root)
             .output()
@@ -654,7 +762,7 @@ impl GitRepo {
     ) -> Result<BTreeMap<String, Option<String>>, GitError> {
         let push_url = run_git(&self.root, &["remote", "get-url", "--push", remote])?;
         let display_args = format!("ls-remote --refs <push-url> {}", destinations.join(" "));
-        let output = Command::new("git")
+        let output = git_command()
             .args(["ls-remote", "--refs", "aethyme-push-evidence"])
             .args(destinations)
             .current_dir(&self.root)
@@ -801,7 +909,7 @@ impl GitRepo {
     /// True when `ancestor` is reachable from `descendant`
     /// (`git merge-base --is-ancestor`).
     pub fn is_ancestor(&self, ancestor: &str, descendant: &str) -> bool {
-        Command::new("git")
+        git_command()
             .args(["merge-base", "--is-ancestor", ancestor, descendant])
             .current_dir(&self.root)
             .status()
@@ -1024,7 +1132,7 @@ impl GitRepo {
     /// Stable patch id for the cumulative diff `from..to`. Empty diffs
     /// have no patch id and return `None`.
     pub fn patch_id_between(&self, from: &str, to: &str) -> Result<Option<String>, GitError> {
-        let diff = Command::new("git")
+        let diff = git_command()
             .args(["diff", "--binary", from, to, "--"])
             .current_dir(&self.root)
             .output()
@@ -1041,7 +1149,7 @@ impl GitRepo {
         if diff.stdout.is_empty() {
             return Ok(None);
         }
-        let mut child = Command::new("git")
+        let mut child = git_command()
             .args(["patch-id", "--stable"])
             .current_dir(&self.root)
             .stdin(std::process::Stdio::piped())
@@ -1081,34 +1189,55 @@ impl GitRepo {
     }
 
     /// Whether two commits have identical content for the supplied paths.
+    ///
+    /// Reads a path list, not an exit code, and that shape is the substance
+    /// (#178). `git diff --quiet` answers in a status, and the #176 probe
+    /// cannot audit a status -- it proves what a candidate writes to stdout,
+    /// and an exit code is not stdout. A wrapper returning 0 where git
+    /// returns 1 therefore passed that probe while telling this function that
+    /// differing content was identical.
+    ///
+    /// That matters more here than at most call sites: this answer is the
+    /// sole automatic evidence for classifying a promoted entry
+    /// `SupersededUpstream`, and an unattended post-merge cleanup discards
+    /// local work on the strength of it. So it is read the way `is_dirty` is
+    /// read -- through the validated NUL grammar, and only once the machine's
+    /// git has been believed.
     pub fn paths_equal(&self, left: &str, right: &str, paths: &[String]) -> Result<bool, GitError> {
         if paths.is_empty() {
             return Ok(true);
         }
-        let mut args = vec![
-            "diff".to_string(),
-            "--quiet".to_string(),
+        require_trustworthy_porcelain()?;
+        let mut args: Vec<String> = vec![
+            "diff".into(),
+            "--name-only".into(),
+            "-z".into(),
             left.into(),
             right.into(),
             "--".into(),
         ];
         args.extend(paths.iter().cloned());
-        let status = Command::new("git")
-            .args(&args)
-            .current_dir(&self.root)
-            .status()
-            .map_err(|source| GitError::Spawn {
-                args: "diff --quiet".into(),
-                source,
-            })?;
-        match status.code() {
-            Some(0) => Ok(true),
-            Some(1) => Ok(false),
-            _ => Err(GitError::Git {
-                args: "diff --quiet".into(),
-                stderr: "git diff could not compare reconciled paths".into(),
-            }),
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let out = run_git(&self.root, &args)?;
+        if out.is_empty() {
+            return Ok(true);
         }
+        if !parse_nul_paths(&out).is_empty() {
+            return Ok(false);
+        }
+        // Bytes that are neither a path nor nothing. [`parse_nul_paths`] is
+        // conservative for dirtiness -- it drops a decoration rather than let
+        // it become a lease -- but dropping it here would answer "identical",
+        // and this predicate's wrong answer costs work rather than bytes.
+        // Decoration-only output is indistinguishable from a real path
+        // swallowed by a decoration glued to it, so refuse instead of guess.
+        Err(GitError::UntrustedOutput {
+            detail: format!(
+                "git diff --name-only emitted {} bytes holding no path while comparing \
+                 {left} and {right}; a PATH wrapper is rewriting git output",
+                out.len()
+            ),
+        })
     }
 
     /// Simulate merging `head` onto `base` without touching any worktree
@@ -1116,7 +1245,7 @@ impl GitRepo {
     /// the conflicted file list (empty = clean).
     pub fn merge_tree_simulate(&self, base: &str, head: &str) -> Result<MergeSimulation, GitError> {
         // Exit code 1 = conflicts (still writes a tree); >1 = real error.
-        let output = Command::new("git")
+        let output = git_command()
             .args([
                 "merge-tree",
                 "--write-tree",
@@ -1158,7 +1287,7 @@ impl GitRepo {
         current: &str,
         incoming: &str,
     ) -> Result<MergeSimulation, GitError> {
-        let output = Command::new("git")
+        let output = git_command()
             .args([
                 "merge-tree",
                 "--write-tree",
@@ -1223,7 +1352,7 @@ impl GitRepo {
         args.push("-m".into());
         args.push(message.into());
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        let output = Command::new("git")
+        let output = git_command()
             .args(&arg_refs)
             .current_dir(&self.root)
             .env("GIT_AUTHOR_NAME", &attribution.author.name)
@@ -1744,6 +1873,36 @@ mod git_program_tests {
         path
     }
 
+    /// A wrapper that prints only git's own bytes and lies in its exit code:
+    /// `git diff --quiet` always succeeds. This is #178's wrapper reduced to
+    /// the one behaviour that matters, and it is exactly what a probe reading
+    /// stdout cannot see.
+    fn quiet_rewriting_wrapper(dir: &Path, real: &Path) -> PathBuf {
+        let path = dir.join("git");
+        std::fs::write(
+            &path,
+            format!(
+                r#"#!/bin/sh
+"{}" "$@"
+status=$?
+for arg in "$@"; do
+    if [ "$arg" = "--quiet" ]; then exit 0; fi
+done
+exit $status
+"#,
+                real.display()
+            ),
+        )
+        .expect("write wrapper");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod wrapper");
+        }
+        path
+    }
+
     /// A wrapper is not itself the problem — plenty of machines route git
     /// through one legitimately. Rejecting on shape rather than on behaviour
     /// would make the refusal fire where nothing is wrong.
@@ -1776,6 +1935,71 @@ mod git_program_tests {
         );
     }
 
+    /// The gap #178 found: every byte this wrapper prints is git's own, so
+    /// the emptiness check accepts it, and `diff --quiet` still always
+    /// succeeds. `paths_equal` read that status as proof that differing
+    /// content was identical -- the sole automatic evidence an unattended
+    /// cleanup discards local work on.
+    #[test]
+    fn a_wrapper_that_rewrites_an_exit_code_is_caught_despite_printing_nothing() {
+        let Some(real) = trustworthy_git() else {
+            eprintln!("every git on PATH is wrapped; nothing honest to wrap");
+            return;
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = quiet_rewriting_wrapper(dir.path(), &real);
+        match porcelain_probe(&path) {
+            PorcelainProbe::StatusRewritten { detail } => assert!(
+                detail.contains("where git exits 1"),
+                "the rejection should name the direction that costs work: {detail}"
+            ),
+            other => panic!("a rewritten exit code should be refused, got {other:?}"),
+        }
+    }
+
+    /// The complement, and the reason the probe checks both directions: a
+    /// wrapper forcing `--quiet` to *fail* would make every comparison read
+    /// "differs", which is merely conservative. Refusing it anyway keeps the
+    /// probe a statement about honesty rather than about which way the lie
+    /// happens to lean.
+    #[test]
+    fn the_probe_asks_about_an_unmodified_file_too() {
+        let Some(real) = trustworthy_git() else {
+            eprintln!("every git on PATH is wrapped; nothing honest to wrap");
+            return;
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("git");
+        std::fs::write(
+            &path,
+            format!(
+                r#"#!/bin/sh
+"{}" "$@"
+status=$?
+for arg in "$@"; do
+    if [ "$arg" = "--quiet" ]; then exit 1; fi
+done
+exit $status
+"#,
+                real.display()
+            ),
+        )
+        .expect("write wrapper");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod wrapper");
+        }
+        match porcelain_probe(&path) {
+            PorcelainProbe::StatusRewritten { detail } => assert!(
+                detail.contains("where git exits 0"),
+                "the unmodified case should be the one that fired: {detail}"
+            ),
+            other => panic!("a rewritten exit code should be refused, got {other:?}"),
+        }
+    }
+
     /// A candidate that cannot run proves nothing about wrappers, and only
     /// `Decorated` makes the dirtiness predicates refuse. Conflating the two
     /// would turn a stale PATH entry into a broker that will not judge any
@@ -1788,5 +2012,76 @@ mod git_program_tests {
             porcelain_probe(&missing),
             PorcelainProbe::Unusable { .. }
         ));
+    }
+}
+
+/// `paths_equal` is the predicate #178 was about: the only automatic evidence
+/// for calling a promoted entry superseded, read by an unattended cleanup.
+#[cfg(test)]
+mod paths_equal_tests {
+    use super::*;
+
+    fn run(root: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@example.test")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@example.test")
+            .output()
+            .expect("run git");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// Two commits, one path changed between them, one untouched. The
+    /// untouched path must read equal and the changed one must not -- the
+    /// answer this function got wrong on a wrapped machine, in the direction
+    /// that discards work.
+    #[test]
+    fn a_changed_path_is_not_equal_and_an_untouched_one_is() {
+        if !matches!(git_output_trust(), GitOutputTrust::Undecorated { .. }) {
+            eprintln!("no honest git on PATH; the predicate refuses by design");
+            return;
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        run(root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("changed.txt"), "one\n").expect("write");
+        std::fs::write(root.join("stable.txt"), "same\n").expect("write");
+        run(root, &["add", "-A"]);
+        run(root, &["commit", "-qm", "first"]);
+        std::fs::write(root.join("changed.txt"), "two\n").expect("write");
+        run(root, &["add", "-A"]);
+        run(root, &["commit", "-qm", "second"]);
+
+        let repo = GitRepo::discover(root).expect("discover");
+        assert!(
+            !repo
+                .paths_equal("HEAD~1", "HEAD", &["changed.txt".to_string()])
+                .expect("compare"),
+            "a path with different content is not equal"
+        );
+        assert!(
+            repo.paths_equal("HEAD~1", "HEAD", &["stable.txt".to_string()])
+                .expect("compare"),
+            "a path neither commit touched is equal"
+        );
+    }
+
+    /// No paths is not evidence of anything, and the caller asking about none
+    /// is asking a vacuous question. Answering `true` keeps the classifier's
+    /// "every changed path matches upstream" reading correct for an entry that
+    /// changed nothing; it is never reached with a real candidate's file list.
+    #[test]
+    fn an_empty_path_list_is_equal_without_running_git() {
+        let repo = GitRepo {
+            root: PathBuf::from("/nonexistent-on-purpose"),
+        };
+        assert!(repo.paths_equal("a", "b", &[]).expect("compare"));
     }
 }

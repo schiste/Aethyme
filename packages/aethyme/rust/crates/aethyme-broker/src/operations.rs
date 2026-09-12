@@ -1599,7 +1599,7 @@ impl Broker {
             && is_push(&request.args)
             && hooks_outside_lock_enabled(&self.main_root().to_path_buf());
         let prechecked_plan = if hooks_ran_outside_lock {
-            let mut dry_run = Command::new("git");
+            let mut dry_run = crate::git::git_command();
             dry_run.arg("push").arg("--dry-run");
             for arg in request.args.iter().filter(|arg| *arg != "push") {
                 dry_run.arg(arg);

@@ -545,7 +545,7 @@ impl ProbeState {
 }
 
 fn capture_probe_state(root: &std::path::Path) -> Result<ProbeState, GateDoctorError> {
-    let output = std::process::Command::new("git")
+    let output = crate::git::git_command()
         .args([
             "status",
             "--porcelain=v1",
