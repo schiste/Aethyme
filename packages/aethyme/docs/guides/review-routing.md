@@ -580,6 +580,35 @@ an in-flight review, which is why a workspace already sitting on the right
 commit is reused and one sitting on anything else is replaced: reviewing the
 wrong commit is worse than not reviewing.
 
+### Which agent performs it
+
+The adapter's `--agent` is a command prefix, and the prompt is appended to it as
+one quoted argument. Anything that reviews when handed a prompt on the command
+line works; nothing in the broker or the adapter names a model.
+
+Aethyme reviews its own pull requests with Codex Luna, and
+`scripts/adapters/codex-luna-review.sh` is the one file that says so:
+
+```bash
+packages/aethyme/scripts/adapters/codex-luna-review.sh --session 416
+packages/aethyme/scripts/adapters/codex-luna-review.sh --session 416 -- --dry-run
+```
+
+It wraps the adapter with three choices worth naming, because each is a failure
+you would otherwise diagnose from an empty tab:
+
+- `--approve-for-me`. Nobody is sitting at the tab. A reviewer blocked on an
+  approval prompt holds its concurrency slot until `stale_after_minutes`
+  reclaims it, and the symptom is a review that never appears rather than one
+  that failed.
+- `--sandbox workspace-write` with `network_access`. The reviewer must reach
+  `gh` to read the diff and the broker to post the result; its checkout is a
+  detached throwaway, so writes there cost nothing, and the rest of the
+  filesystem is not part of reviewing a pull request.
+- A PATH with the machine's `git` wrappers stripped. The broker resolves an
+  honest `git` for itself (#176, #178); a reviewer typing `git diff` by hand has
+  no such protection and would review bytes nobody wrote.
+
 ### Recorded before performed
 
 Every review is written to the ledger before anyone is asked to do it. The

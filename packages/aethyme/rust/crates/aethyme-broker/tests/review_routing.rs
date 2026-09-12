@@ -358,52 +358,85 @@ fn every_backend_config_the_scaffold_documents_actually_parses() {
 }
 
 #[test]
-fn the_repositorys_own_scaffold_is_a_valid_configuration_when_uncommented() {
-    // The commented scaffold in this repository's `.aethyme/config.toml` is the
-    // only documentation an operator reads before switching any of this on. A
-    // field renamed in the code and not there produces a configuration that
-    // fails to load in their hands, and nothing else catches it.
+fn this_repositorys_own_review_configuration_loads_and_routes_as_written() {
+    // `.aethyme/config.toml` stopped being a commented scaffold on 2026-09-12
+    // and became the configuration this repository actually reviews itself
+    // with. While it was commented, the risk was drift: a field renamed in the
+    // code and not there produced a configuration that failed to load in an
+    // operator's hands, and nothing else caught it.
     //
-    // The scaffold marks its configuration lines `#>` and its prose `#`, so
-    // recovering it is a prefix strip rather than a guess at which comment is
-    // TOML.
-    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../../../.aethyme/config.toml");
-    let text =
-        std::fs::read_to_string(&source).unwrap_or_else(|e| panic!("{}: {e}", source.display()));
+    // Live, the risk is worse and this test is the same shape. A file that
+    // fails to load does not fall back to the documented behaviour -- it
+    // routes nothing, and a repository that has stopped reviewing its own pull
+    // requests looks exactly like one where no pull request happened to be
+    // eligible. Nothing fails anywhere. So load the real file, from the real
+    // path `review run` reads it from, and assert the routing it is supposed
+    // to express.
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../../..");
+    let source = root.join(".aethyme/config.toml");
+    assert!(source.is_file(), "{} is missing", source.display());
 
-    let scaffold: String = text
-        .lines()
-        .filter_map(|line| line.strip_prefix("#>"))
-        .map(|rest| rest.strip_prefix(' ').unwrap_or(rest))
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(
-        scaffold.contains("[review.trigger]")
-            && scaffold.contains("[review.routing]")
-            && scaffold.contains("[review.projection]"),
-        "the scaffold lost a table:\n{scaffold}"
-    );
+    let trigger = ReviewTriggerPolicy::load(&root)
+        .unwrap_or_else(|e| panic!("[review.trigger] does not load: {e}"));
+    let routing = ReviewRoutingPolicy::load(&root)
+        .unwrap_or_else(|e| panic!("[review.routing] does not load: {e}"));
+    let projection = PrProjectionPolicy::load(&root)
+        .unwrap_or_else(|e| panic!("[review.projection] does not load: {e}"));
 
-    let root = tempfile::tempdir().unwrap();
-    std::fs::create_dir_all(root.path().join(".aethyme")).unwrap();
-    std::fs::write(root.path().join(".aethyme/config.toml"), &scaffold).unwrap();
+    // Loading is not enough: all three have an `enabled` flag that defaults
+    // false, so a table that parsed but was never switched on reads as a
+    // perfectly healthy configuration that performs nothing.
+    assert!(trigger.enabled, "[review.trigger] parsed but is disabled");
+    assert!(routing.enabled, "[review.routing] parsed but is disabled");
+    assert!(projection.enabled, "[review.projection] parsed but is disabled");
 
-    let trigger = ReviewTriggerPolicy::load(root.path())
-        .unwrap_or_else(|e| panic!("[review.trigger] does not load: {e}\n{scaffold}"));
-    let routing = ReviewRoutingPolicy::load(root.path())
-        .unwrap_or_else(|e| panic!("[review.routing] does not load: {e}\n{scaffold}"));
-    let projection = PrProjectionPolicy::load(root.path())
-        .unwrap_or_else(|e| panic!("[review.projection] does not load: {e}\n{scaffold}"));
-
-    // Loading is not enough: uncommenting has to yield the behaviour the prose
-    // around it promises.
-    assert!(trigger.enabled && routing.enabled && projection.enabled);
-    assert_eq!(routing.route_for("security").backend, ReviewBackend::Chau7);
+    // Both live dimensions are performed by an agent in its own workspace.
+    // `record` here would be the quiet failure above wearing a valid config:
+    // rows accumulate, labels appear, and nobody ever reads the diff.
     assert_eq!(
         routing.route_for("code").backend,
-        ReviewBackend::ProviderComment
+        ReviewBackend::Chau7,
+        "code review must be performed, not merely recorded"
     );
+    assert_eq!(routing.route_for("security").backend, ReviewBackend::Chau7);
     assert_eq!(routing.route_for("unrouted").backend, ReviewBackend::Record);
+
+    // Every routed reviewer is a shell with credentials, so both routes carry
+    // the clause that keeps a review comment inside the coordinated lane.
+    // A route whose instructions were dropped still reviews, which is why
+    // losing this is not otherwise visible.
+    for dimension in ["code", "security"] {
+        let route = routing.route_for(dimension);
+        let instructions = route
+            .instructions
+            .as_deref()
+            .unwrap_or_else(|| panic!("the {dimension} route lost its instructions"));
+        assert!(
+            instructions.contains("broker gh"),
+            "the {dimension} route stopped telling its reviewer to post through \
+             the coordinated lane:\n{instructions}"
+        );
+    }
+
+    // A cap of zero is "unbounded", so a route that lost its budget does not
+    // fail -- it opens an agent session per eligible pull request.
+    assert!(
+        routing.route_for("code").max_concurrent > 0,
+        "the code route is unbounded; a busy afternoon would open one Codex \
+         shell per pull request"
+    );
+    assert!(routing.route_for("security").max_concurrent > 0);
+
+    // `always-code-review` plus `security-sensitive-paths`. A rule list that
+    // silently shrank to nothing still loads and still routes -- it just finds
+    // every change ineligible.
+    assert!(
+        trigger.rule.len() >= 2,
+        "expected the always-code-review and security-sensitive-paths rules, \
+         found {}",
+        trigger.rule.len()
+    );
+    assert!(projection.reserved.contains("skip-review"));
 }
 
 #[test]

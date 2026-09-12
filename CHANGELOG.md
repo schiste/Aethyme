@@ -8,6 +8,20 @@ artifacts and their exact source revision are recorded in each signed
 
 ### Added
 
+- `scripts/adapters/codex-luna-review.sh` performs this repository's routed
+  reviews in Codex Luna shells. The broker decides which review and which
+  workspace, `chau7-review-adapter.py` performs the Chau7 half, and this script
+  is the only file that names a model -- so changing reviewer is an edit in one
+  place. It runs the agent unattended (`--approve-for-me`, because a reviewer
+  blocked on an approval prompt holds its slot until the staleness window
+  reclaims it), confines it to its throwaway checkout with network reach for
+  `gh` and the broker, and strips the machine's `git` wrappers from the PATH it
+  hands on, so a reviewer typing `git diff` does not review bytes nobody wrote.
+- Aethyme's own `.aethyme/config.toml` now enables all three review tables: the
+  repository reviews its own pull requests, routing both `code` and `security`
+  to a Codex Luna shell. `review run` reads policy from the main checkout, not
+  from the branch under review, so a pull request cannot alter the rules that
+  judge it.
 - Review routing: three opt-in tables in `.aethyme/config.toml` that decide
   which reviews a change needs (`[review.trigger]`), who performs them
   (`[review.routing]` -- a Chau7 agent, a provider review bot, or a plain

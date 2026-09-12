@@ -15,22 +15,25 @@ mode = "auto"
 # ignore = ["docs/reports/"]
 
 # ---------------------------------------------------------------------------
-# Review routing. Every table below is off by default; a repository that does
-# not enable them gets pull requests byte-for-byte identical to one without.
+# Review routing. Live since 2026-09-12: this repository reviews its own pull
+# requests. Everything below was a commented scaffold until then, and the
+# prose reads that way -- it is addressed to an operator deciding, because
+# every line of it is still a decision someone can revisit.
 #
 # Inspect a change against these rules without performing anything:
 #   aethyme broker review plan --base aethyme/integration --pr <number>
 #
-# Lines below prefixed `#>` are the configuration itself; plain `#` lines are
-# prose about it. Strip the `#> ` to switch a table on. A test asserts that the
-# `#>` lines, taken alone, still load -- so this scaffold cannot drift out of
-# date with the code that reads it.
+# `review run` loads this file from the MAIN CHECKOUT, not from the branch
+# under review. A change here therefore does nothing until it reaches `main`,
+# and a pull request cannot alter the rules that judge it. That is the
+# property worth keeping, and the reason editing this file is a separate
+# submission from the work it will end up reviewing.
 # ---------------------------------------------------------------------------
 
-#> [review.trigger]
+[review.trigger]
 # Which reviews a change needs. Two passes: rules decide eligibility from the
 # change alone, `schedule` decides whether to spend one now.
-#> enabled = true
+enabled = true
 
 # Authors declare classification with commit trailers, which costs the agent
 # writing the commit nothing and is already known at the time:
@@ -53,11 +56,11 @@ mode = "auto"
 # `min_risk`, `from_fork`, `first_time_contributor`, `authored_by_model`,
 # `models`. In `paths`, `*` spans one segment and `**` spans any number;
 # everything else is literal, and paths are repository-relative.
-#
-#> [[review.trigger.rule]]
-#> name = "always-code-review"
-#> require = ["code"]
-#
+
+[[review.trigger.rule]]
+name = "always-code-review"
+require = ["code"]
+
 # The security list answers one question, and it is narrower than "what is
 # important": which files, changed wrongly, REMOVE A SAFETY PROPERTY WITHOUT
 # PRODUCING AN ERROR? A bug that makes something fail loudly does not belong
@@ -65,44 +68,44 @@ mode = "auto"
 # `max_concurrent = 1` is a budget, not a wish list. Measured over the last
 # 200 commits (2026-09-12), this list fires on about a third of them, which is
 # the cost being accepted.
-#
-#> [[review.trigger.rule]]
-#> name = "security-sensitive-paths"
-#> require = ["security"]
-#> paths = [
+
+[[review.trigger.rule]]
+name = "security-sensitive-paths"
+require = ["security"]
+paths = [
 #   Runs with repository credentials and can publish releases; release.yml is
 #   42 of the 69 workflow edits in that window, and it is the one that signs
 #   and uploads artifacts.
-#>     ".github/workflows/**",
+    ".github/workflows/**",
 #   The gate definitions themselves. Narrowing a `triggers` glob disables a
 #   gate for a whole class of change and looks exactly like a tidy-up.
-#>     ".aethyme/gates.toml",
+    ".aethyme/gates.toml",
 #   Classifies every git and gh command as read/write/destructive and decides
 #   what must go through the coordinated lane. A command misclassified as
 #   `read` runs uncoordinated against shared state and reports success.
-#>     "packages/aethyme/rust/crates/aethyme-broker/src/operations.rs",
+    "packages/aethyme/rust/crates/aethyme-broker/src/operations.rs",
 #   The publication lane: full-SHA confirmation and operator authorization.
 #   Everything this repository refuses to do by accident, it refuses here.
-#>     "packages/aethyme/rust/crates/aethyme-broker/src/ship.rs",
+    "packages/aethyme/rust/crates/aethyme-broker/src/ship.rs",
 #   The verification authority, including the tree-hash result cache. Every
 #   other control is downstream of it, and a wrong cache key turns each gate
 #   into a silent no-op that still prints `pass`.
-#>     "packages/aethyme/rust/crates/aethyme-broker/src/gates.rs",
+    "packages/aethyme/rust/crates/aethyme-broker/src/gates.rs",
 #   The per-user crash barrier for remote mutations -- what stops a second
 #   clone from retrying an ambiguous remote outcome.
-#>     "packages/aethyme/rust/crates/aethyme-broker/src/host_operations.rs",
+    "packages/aethyme/rust/crates/aethyme-broker/src/host_operations.rs",
 #   Self-update swaps the installed binary pair. A provenance bug here
 #   installs unverified code on every machine that updates.
-#>     "packages/aethyme/rust/crates/aethyme-broker/src/update.rs",
+    "packages/aethyme/rust/crates/aethyme-broker/src/update.rs",
 #   Every safety predicate in the broker is a parse of this module's output,
 #   so it decides what the controls above are even shown. Added 2026-09-12
 #   after #176: `is_dirty` compared raw command output instead of using the
 #   validated status grammar its three sibling readers already used, and six
 #   bytes from a PATH wrapper made every worktree on the machine read dirty
 #   and permanently ineligible for cleanup -- with nothing failing anywhere.
-#>     "packages/aethyme/rust/crates/aethyme-broker/src/git.rs",
-#> ]
-#
+    "packages/aethyme/rust/crates/aethyme-broker/src/git.rs",
+]
+
 # Note that `git.rs` widens the list past "files that authorize something" to
 # "files the authorizations are computed from". That is deliberate and it is
 # where the line now sits: a module that decides what a control sees is as
@@ -119,40 +122,86 @@ mode = "auto"
 # How often a dimension may be spent. Predicates decide what a change
 # deserves; this decides what it gets, and is what keeps a rich rule set from
 # becoming a quota bonfire on a branch with forty pushes.
-#
-#> [review.trigger.default_schedule]
-#> debounce_seconds = 600       # absorb a burst of pushes
-#> max_per_pull_request = 8     # 0 = no cap
-#> always_on_new_head = false
-#
-#> [review.trigger.schedule.security]
-#> debounce_seconds = 0         # never delay a security review
-#> max_per_pull_request = 0
 
-#> [review.routing]
+[review.trigger.default_schedule]
+debounce_seconds = 600       # absorb a burst of pushes
+max_per_pull_request = 8     # 0 = no cap
+always_on_new_head = false
+
+[review.trigger.schedule.security]
+debounce_seconds = 0         # never delay a security review
+max_per_pull_request = 0
+
+[review.routing]
 # Who performs a review: "chau7" (spawn a terminal agent in its own
 # workspace), "provider_comment" (mention a bot on the pull request), or
 # "record" (write the record and stop -- CI still runs).
-#> enabled = true
-#> workspace_root = ".aethyme/reviews"
 #
-#> [review.routing.default_route]
-#> backend = "record"
-#
-#> [review.routing.route.security]
-#> backend = "chau7"
-#> max_concurrent = 1
-#> instructions = "Pay attention to the broker's coordinated-write path."
-#
-#> [review.routing.route.code]
-#> backend = "provider_comment"
-#> mention = "codex"
+# Both live dimensions are "chau7", which means a Codex Luna shell in a
+# detached checkout of the pull request head. The transport is
+# packages/aethyme/scripts/adapters/codex-luna-review.sh, which is what pins
+# the model; nothing in this file names one, because the broker decides which
+# review and the adapter decides who performs it.
+enabled = true
+workspace_root = ".aethyme/reviews"
 
-#> [review.projection]
+[review.routing.default_route]
+backend = "record"
+
+# A reviewer is a shell with a checkout and credentials, so `instructions` is
+# the only place to say what it must NOT do that the generated prompt does not
+# already cover. Both routes carry the same coordination clause for one
+# reason: `gh pr review` run directly is a shared-state write outside the
+# broker's operations journal, and this repository forbids that for agents
+# doing the work -- a reviewer is not exempt because it is only commenting.
+#
+# The clause has to start by getting a session, because a routed reviewer has
+# none: the adapter's session opened the workspace, and lending it out would
+# attribute every reviewer's writes to the sweeper. The workspace is already a
+# dedicated worktree, which is exactly the case `broker adopt` exists for.
+
+[review.routing.route.security]
+backend = "chau7"
+# One at a time. This dimension fires on about a third of commits and each
+# reviewer is a full agent session; a burst of pull requests would otherwise
+# open as many shells as there were pushes.
+max_concurrent = 1
+instructions = """
+Pay attention to the broker's coordinated-write path.
+
+Posting is a coordinated write. Take a session for this workspace first --
+`aethyme broker adopt --task "security review of #<n>"` -- and post with
+`aethyme broker gh --session <id> --repo schiste/Aethyme --reason "post the
+security review on #<n>" -- pr review <n> ...`. Running `gh` directly puts a
+shared-state write outside the operations journal. Close with `aethyme broker
+close --session <id>` when the review is posted.
+"""
+
+[review.routing.route.code]
+backend = "chau7"
+# Two, against security's one. The `always-code-review` rule matches every
+# change, so this is the dimension that decides how many Codex shells a busy
+# afternoon opens -- and the one whose findings are least likely to be urgent.
+max_concurrent = 2
+# Below the 6h default because the cost of guessing wrong is asymmetric: too
+# long strands a slot behind a tab someone closed, too short asks for a second
+# review of a head the first reviewer is still reading. A Codex Luna pass at
+# max reasoning effort on a single dimension has not needed ninety minutes.
+stale_after_minutes = 90
+instructions = """
+Posting is a coordinated write. Take a session for this workspace first --
+`aethyme broker adopt --task "code review of #<n>"` -- and post with
+`aethyme broker gh --session <id> --repo schiste/Aethyme --reason "post the
+code review on #<n>" -- pr review <n> ...`. Running `gh` directly puts a
+shared-state write outside the operations journal. Close with `aethyme broker
+close --session <id>` when the review is posted.
+"""
+
+[review.projection]
 # Publish the record onto the pull request: one comment Aethyme owns and edits
 # in place, plus labels under one namespace. Labels outside the prefix are
 # never touched, and `reserved` names labels inside it that the broker reads
 # but never writes -- that is where a human parks a decision.
-#> enabled = true
-#> label_prefix = "aethyme/"
-#> reserved = ["skip-review"]
+enabled = true
+label_prefix = "aethyme/"
+reserved = ["skip-review"]
