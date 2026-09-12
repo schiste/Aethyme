@@ -968,7 +968,10 @@ mod tests {
     fn an_unreadable_url_on_a_foreign_comment_is_skipped() {
         let comments = [
             gh_comment("https://github.com/o/r/pull/9", "drive-by"),
-            gh_comment("https://github.com/o/r/pull/9#issuecomment-12", &ours("body")),
+            gh_comment(
+                "https://github.com/o/r/pull/9#issuecomment-12",
+                &ours("body"),
+            ),
         ];
         let Ok(Some(owned)) = owned_comment_from_view("o/r", 9, &comments) else {
             panic!("a stranger's unreadable url is not our problem");
@@ -5459,8 +5462,8 @@ fn run_review_plan(parsed: Parsed) -> Result<(), UsageError> {
     let dispatch: Vec<crate::ReviewDispatchAction> = decisions
         .iter()
         .filter_map(|decision| match decision {
-            crate::ReviewTriggerDecision::Request { review_type, .. } => Some(
-                crate::dispatch_review(
+            crate::ReviewTriggerDecision::Request { review_type, .. } => {
+                Some(crate::dispatch_review(
                     &routing,
                     &reporting,
                     &root,
@@ -5470,8 +5473,8 @@ fn run_review_plan(parsed: Parsed) -> Result<(), UsageError> {
                     &head,
                     &[],
                     &[],
-                ),
-            ),
+                ))
+            }
             _ => None,
         })
         .collect();
@@ -5835,7 +5838,10 @@ fn read_pull_request_facts(
         facts.owned_comment = owned_comment_from_view(
             repository,
             pull_request,
-            json["comments"].as_array().map(Vec::as_slice).unwrap_or(&[]),
+            json["comments"]
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or(&[]),
         )?;
     }
     let labels = std::process::Command::new("gh")
@@ -5983,6 +5989,28 @@ fn run_review_run(parsed: Parsed) -> Result<serde_json::Value, UsageError> {
         .collect();
     let in_flight = crate::in_flight(&still_open);
     let tabs = read_tab_snapshot(&parsed)?;
+
+    // Reviewer workspaces nobody is using any more. Every row this pull
+    // request ever had, with this tick's expiries applied so a dry run plans
+    // what a real run would do, and the tab list as the other half: a
+    // dimension whose rows have all settled but whose tab is still standing in
+    // the workspace is a reviewer that finished and was never released.
+    //
+    // Derived here rather than inside `dispatch_review` because it is not a
+    // per-requested-review decision. A dimension can need reclaiming on a tick
+    // that requests nothing at all -- which is the common case, since the
+    // reviewer usually posts long after the push that asked for it.
+    let reconciled: Vec<crate::ReviewRequest> = recorded
+        .iter()
+        .cloned()
+        .map(|mut row| {
+            if expired_ids.contains(&row.id) {
+                row.state = crate::ReviewRequestState::Abandoned;
+            }
+            row
+        })
+        .collect();
+    let teardown = crate::finished_workspaces(&routing, &root, pull_request, &reconciled, &tabs);
     let pr_facts = read_pull_request_facts(&change_root, &repository, pull_request)?;
 
     let previous = broker
@@ -6044,7 +6072,7 @@ fn run_review_run(parsed: Parsed) -> Result<serde_json::Value, UsageError> {
         &pr_facts,
     );
 
-    let plan = crate::plan_execution(&dispatch, &projection_actions, pull_request);
+    let plan = crate::plan_execution(&dispatch, &projection_actions, &teardown, pull_request);
 
     if parsed.dry_run {
         return Ok(build_review_run_report(
@@ -6271,6 +6299,10 @@ fn run_review_tick(parsed: Parsed) -> Result<(), UsageError> {
                 // count would force the adapter to re-run `review run` per
                 // pull request to learn what it was handed.
                 "chau7_handoff": report.get("chau7_handoff").cloned(),
+                // Carried for the same reason as the handoffs: the adapter
+                // performs both, and a sweep that reported only what to start
+                // would leak a tab per finished review across the repository.
+                "chau7_teardown": report.get("chau7_teardown").cloned(),
                 "expired": report.get("expired").cloned(),
                 "ok": true,
             })),
@@ -6405,6 +6437,11 @@ fn build_review_run_report(
         // access starts these, then closes each row with
         // `aethyme broker review state --repo <r> --pr <n> --type <t> --state <s>`.
         "chau7_handoff": plan.chau7,
+        // Tabs to close, performed before `chau7_handoff` is started: a tick
+        // may reclaim a dimension's workspace and dispatch a new review of
+        // that same dimension into it, and the other order spawns into an
+        // occupied directory.
+        "chau7_teardown": plan.chau7_close,
     })
 }
 

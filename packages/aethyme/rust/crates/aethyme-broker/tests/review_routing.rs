@@ -13,9 +13,9 @@ use std::path::Path;
 use aethyme_broker::{
     ChangeFacts, Chau7Tab, CommitClassification, InFlightReview, PrProjectionAction,
     PrProjectionFacts, PrProjectionPolicy, ProjectedReview, ProjectedReviewState, ReviewBackend,
-    ReviewDispatchAction, ReviewProjection, ReviewRequestState, ReviewRoutingPolicy, ReviewTrigger,
-    ReviewReportingPolicy, ReviewTriggerDecision, ReviewTriggerPolicy, dispatch_review,
-    eligible_types,
+    ReviewDispatchAction, ReviewProjection, ReviewReportingPolicy, ReviewRequest,
+    ReviewRequestState, ReviewRoutingPolicy, ReviewTrigger, ReviewTriggerDecision,
+    ReviewTriggerPolicy, dispatch_review, eligible_types, finished_workspaces,
     parse_classification, plan_execution, project, schedule,
 };
 
@@ -405,7 +405,10 @@ fn this_repositorys_own_review_configuration_loads_and_routes_as_written() {
     // perfectly healthy configuration that performs nothing.
     assert!(trigger.enabled, "[review.trigger] parsed but is disabled");
     assert!(routing.enabled, "[review.routing] parsed but is disabled");
-    assert!(projection.enabled, "[review.projection] parsed but is disabled");
+    assert!(
+        projection.enabled,
+        "[review.projection] parsed but is disabled"
+    );
 
     // Both live dimensions are performed by an agent in its own workspace.
     // `record` here would be the quiet failure above wearing a valid config:
@@ -424,9 +427,8 @@ fn this_repositorys_own_review_configuration_loads_and_routes_as_written() {
     // rejects does not degrade review routing, it stops `broker submit`
     // outright. That is what happened when routing went live on 2026-09-12,
     // and nothing in this file noticed because nothing here loaded it.
-    aethyme_broker::ReviewPolicy::load(&root).unwrap_or_else(|e| {
-        panic!("this repository's config breaks the submission path: {e}")
-    });
+    aethyme_broker::ReviewPolicy::load(&root)
+        .unwrap_or_else(|e| panic!("this repository's config breaks the submission path: {e}"));
 
     let reporting = ReviewReportingPolicy::load(&root)
         .unwrap_or_else(|e| panic!("[review.reporting] does not load: {e}"));
@@ -535,7 +537,7 @@ fn execution_records_every_review_before_it_asks_for_one() {
         .display()
         .to_string();
     let (_, dispatch, actions) = plan(&policies, &change, "abc123", &[tab(&workspace)], &[]);
-    let plan = plan_execution(&dispatch, &actions, 77);
+    let plan = plan_execution(&dispatch, &actions, &[], 77);
 
     // security -> chau7, code -> the provider bot. Both are recorded as
     // requested; neither is closed by the act of planning.
@@ -580,7 +582,7 @@ fn a_deferred_review_is_not_recorded_as_spent() {
         .display()
         .to_string();
     let (_, dispatch, actions) = plan(&policies, &change, "abc123", &[tab(&workspace)], &[]);
-    let plan = plan_execution(&dispatch, &actions, 77);
+    let plan = plan_execution(&dispatch, &actions, &[], 77);
     for deferred in &plan.deferred {
         assert!(
             !plan
@@ -591,4 +593,105 @@ fn a_deferred_review_is_not_recorded_as_spent() {
             deferred.review_type
         );
     }
+}
+
+/// The reviewer lifecycle end to end: dispatched, occupying, settled,
+/// reclaimed, and dispatchable again.
+///
+/// Every step of this held in isolation before 2026-09-12 and the sequence
+/// still did not terminate, because the last two steps did not exist. A
+/// reviewer's shell is interactive and never exits, so the tab it opened
+/// outlived the review; `dispatch_review` refuses to spawn into an occupied
+/// workspace; and nothing closed a tab. One finished security review therefore
+/// blocked every later security review of that pull request until
+/// `stale_after_minutes` expired the row -- recording a review that ran and
+/// posted as `abandoned`, meaning nobody ever looked.
+///
+/// This asserts the whole cycle rather than the teardown alone, because the
+/// property that matters is that it closes. A teardown test that never
+/// re-dispatched would pass just as happily against a router that deferred
+/// forever afterwards.
+#[test]
+fn a_finished_reviewers_workspace_is_reclaimed_and_becomes_dispatchable_again() {
+    let policies = policies();
+    let change = facts(
+        &["crates/aethyme-broker/src/operations.rs"],
+        "feat(broker): coordinated write\n\nArea: backend\nSurface: auth\nRisk: high\n",
+    );
+    let workspace = policies
+        .routing
+        .workspace(policies.root.path(), 77, "security");
+
+    // 1. Nothing is standing in the workspace, so the review is dispatched.
+    let (_, dispatch, actions) = plan(&policies, &change, "aaa111", &[], &[]);
+    let first = plan_execution(&dispatch, &actions, &[], 77);
+    assert_eq!(first.chau7.len(), 1, "the security review is handed out");
+    assert_eq!(first.chau7[0].workspace, workspace);
+    assert!(first.chau7_close.is_empty(), "nothing has finished yet");
+
+    // 2. The reviewer's tab now occupies it. A second dispatch must defer --
+    //    two agents in one checkout read each other's edits.
+    let occupied = vec![tab(&workspace)];
+    let row = |state| ReviewRequest {
+        id: 1,
+        repository: "o/r".into(),
+        pr_number: 77,
+        review_type: "security".into(),
+        head_commit: "aaa111".into(),
+        backend: "chau7".into(),
+        state,
+        detail: None,
+        requested_at: 0,
+        updated_at: 0,
+    };
+    let live = [row(ReviewRequestState::Running)];
+    assert!(
+        finished_workspaces(
+            &policies.routing,
+            policies.root.path(),
+            77,
+            &live,
+            &occupied
+        )
+        .is_empty(),
+        "a reviewer that is still working keeps its tab"
+    );
+    let (_, dispatch, _) = plan(&policies, &change, "aaa111", &occupied, &[]);
+    assert!(
+        dispatch
+            .iter()
+            .any(|action| matches!(action, ReviewDispatchAction::Defer { .. })),
+        "an occupied workspace defers: {dispatch:?}"
+    );
+
+    // 3. The reviewer posts and reports. Now the tab is the only thing left,
+    //    and reclaiming it is what the tick plans.
+    let settled = [row(ReviewRequestState::Satisfied)];
+    let teardown = finished_workspaces(
+        &policies.routing,
+        policies.root.path(),
+        77,
+        &settled,
+        &occupied,
+    );
+    assert_eq!(teardown.len(), 1, "the settled workspace is reclaimed");
+    assert_eq!(teardown[0].workspace, workspace);
+    assert_eq!(teardown[0].tab_ids.len(), 1);
+
+    // The plan carries it, and carries it as its own step: an adapter that
+    // only read `chau7` would start reviews and never release one.
+    let (_, dispatch, actions) = plan(&policies, &change, "aaa111", &occupied, &[]);
+    let reclaiming = plan_execution(&dispatch, &actions, &teardown, 77);
+    assert_eq!(reclaiming.chau7_close.len(), 1);
+    assert_eq!(reclaiming.chau7_close[0].workspace, workspace);
+
+    // 4. With the tab gone, the next head is dispatchable. This is the
+    //    assertion the old behaviour could not satisfy at any point.
+    let (_, dispatch, _) = plan(&policies, &change, "bbb222", &[], &[]);
+    assert!(
+        dispatch
+            .iter()
+            .any(|action| matches!(action, ReviewDispatchAction::SpawnChau7Review { .. })),
+        "the reclaimed workspace accepts the next review: {dispatch:?}"
+    );
 }

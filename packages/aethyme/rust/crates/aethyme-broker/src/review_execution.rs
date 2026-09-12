@@ -75,6 +75,35 @@ pub struct Chau7Handoff {
     pub prompt: String,
 }
 
+/// One reviewer workspace whose review is over and whose tab is still open.
+///
+/// The symmetric half of [`Chau7Handoff`], and it did not exist until
+/// 2026-09-12. A spawned reviewer had no release: the shell is interactive, so
+/// it never exits on its own, and nothing else ever called `tab_close`. Two
+/// costs followed, and the second is the expensive one.
+///
+/// The tab occupies its workspace, and `dispatch_review` refuses to spawn into
+/// an occupied workspace -- correctly, since two reviewers in one checkout
+/// would read each other's edits. So one finished review blocked every later
+/// review of that dimension on that pull request, and the only thing that ever
+/// cleared it was `stale_after_minutes` expiring the row, which files the
+/// review as `abandoned`: never answered. A review that ran, posted, and was
+/// then recorded as having never happened is worse than no record at all.
+///
+/// `tab_ids` is plural because the workspace is the identity and the tabs are
+/// whatever is standing in it. One is the ordinary case; more means an earlier
+/// tick spawned into a workspace this pass is now reclaiming, and closing only
+/// the first would leave the workspace occupied and the defer permanent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Chau7Teardown {
+    pub review_type: String,
+    pub pull_request: i64,
+    pub workspace: String,
+    pub tab_ids: Vec<String>,
+    /// The state that settled the review, for an operator reading the tick.
+    pub why: String,
+}
+
 /// Everything one tick should do, in the order it should do it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct ReviewExecutionPlan {
@@ -82,6 +111,13 @@ pub struct ReviewExecutionPlan {
     pub ledger: Vec<LedgerWrite>,
     /// Bot mentions and the pull request's projection, in that order.
     pub gh: Vec<GhCall>,
+    /// Closed before `chau7` is started, never after.
+    ///
+    /// A tick may both reclaim a finished review's workspace and dispatch a
+    /// new review of the same dimension into it -- that is exactly what the
+    /// first tick after a push to an already-reviewed pull request does. Doing
+    /// these in the other order spawns into an occupied directory.
+    pub chau7_close: Vec<Chau7Teardown>,
     /// Handed to the adapter last.
     pub chau7: Vec<Chau7Handoff>,
     /// Eligible, not started, not recorded. The next tick reconsiders, which
@@ -102,12 +138,21 @@ pub struct DeferredReview {
 /// comment is written once, after the requests it describes have been recorded.
 /// Writing it first would announce reviews that a crash then prevented, and the
 /// comment is the only thing a human reads.
+///
+/// `teardown` arrives already decided rather than derived here, because
+/// deciding it needs the ledger and the live tab list and this function reads
+/// neither -- it orders work, it does not discover it. What it does own is the
+/// order: reclaiming a workspace has to precede spawning into one.
 pub fn plan_execution(
     dispatch: &[ReviewDispatchAction],
     projection: &[PrProjectionAction],
+    teardown: &[Chau7Teardown],
     pull_request: i64,
 ) -> ReviewExecutionPlan {
-    let mut plan = ReviewExecutionPlan::default();
+    let mut plan = ReviewExecutionPlan {
+        chau7_close: teardown.to_vec(),
+        ..Default::default()
+    };
     for action in dispatch {
         match action {
             ReviewDispatchAction::SpawnChau7Review {
@@ -192,7 +237,7 @@ mod tests {
     /// the next tick knows nothing about, and it would start a second one.
     #[test]
     fn a_chau7_review_is_recorded_before_it_is_handed_out() {
-        let plan = plan_execution(&[spawn("security")], &[], 12);
+        let plan = plan_execution(&[spawn("security")], &[], &[], 12);
         assert_eq!(plan.ledger.len(), 1);
         assert_eq!(plan.ledger[0].state, ReviewRequestState::Requested);
         assert_eq!(plan.chau7.len(), 1);
@@ -208,6 +253,7 @@ mod tests {
                 review_type: "docs".into(),
                 why: "no backend routes docs".into(),
             }],
+            &[],
             &[],
             12,
         );
@@ -232,6 +278,7 @@ mod tests {
                 why: "all slots busy".into(),
             }],
             &[],
+            &[],
             12,
         );
         assert!(plan.ledger.is_empty());
@@ -252,6 +299,7 @@ mod tests {
             &[PrProjectionAction::CreateComment {
                 body: "status".into(),
             }],
+            &[],
             12,
         );
         assert_eq!(plan.gh.len(), 2);
@@ -268,6 +316,9 @@ mod tests {
 
     #[test]
     fn an_empty_decision_set_plans_nothing() {
-        assert_eq!(plan_execution(&[], &[], 12), ReviewExecutionPlan::default());
+        assert_eq!(
+            plan_execution(&[], &[], &[], 12),
+            ReviewExecutionPlan::default()
+        );
     }
 }

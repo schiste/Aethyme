@@ -342,19 +342,21 @@ pub use review::{
 };
 pub use review_backend::{
     InFlightReview, REVIEW_ROUTING_SCHEMA_VERSION, ReviewBackend, ReviewDispatchAction,
-    ReviewRoute, ReviewRoutingError, ReviewRoutingPolicy, dispatch_review, review_prompt,
+    ReviewRoute, ReviewRoutingError, ReviewRoutingPolicy, dispatch_review, finished_workspaces,
+    review_prompt,
 };
 pub use review_execution::{
-    Chau7Handoff, DeferredReview, GhCall, LedgerWrite, ReviewExecutionPlan, plan_execution,
-};
-pub use review_report::{
-    REVIEW_REPORTING_SCHEMA_VERSION, ReviewReportingError, ReviewReportingPolicy, ReviewSeverity,
+    Chau7Handoff, Chau7Teardown, DeferredReview, GhCall, LedgerWrite, ReviewExecutionPlan,
+    plan_execution,
 };
 pub use review_facts::{
     ProviderPullRequest, PullRequestObservation, derive_trigger, first_time_contributor,
 };
 pub use review_ledger::{
     ExpiredReview, ReviewRequest, ReviewRequestState, expired, in_flight, spend_by_type,
+};
+pub use review_report::{
+    REVIEW_REPORTING_SCHEMA_VERSION, ReviewReportingError, ReviewReportingPolicy, ReviewSeverity,
 };
 pub use review_trigger::{
     ChangeFacts, ClassificationConflict, CommitClassification, EligibleReview,

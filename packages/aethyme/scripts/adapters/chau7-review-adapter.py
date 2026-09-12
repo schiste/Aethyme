@@ -9,7 +9,10 @@ side effects that decision implies.
 
 Loop, per invocation:
 
-    tab_list (Chau7)  ->  review tick (broker)  ->  per handoff:
+    tab_list (Chau7)  ->  review tick (broker)  ->  per teardown:
+                                                      tab_close
+                                                          |
+                                                    per handoff:
                                                       checkout head into
                                                       the workspace
                                                           |
@@ -17,6 +20,21 @@ Loop, per invocation:
                                                           |
                                                       review state --state
                                                         running | abandoned
+
+Teardown comes first, and both halves of that matter. A reviewer's shell is
+interactive, so it never exits on its own; until 2026-09-12 nothing ever closed
+one, and a finished review held its workspace until `stale_after_minutes`
+reclaimed the row as `abandoned` -- filing a review that ran and posted as one
+that never happened. And a tick may both reclaim a dimension's workspace and
+dispatch a new review of that dimension into it, which is what the first tick
+after a push to an already-reviewed pull request does: the other order spawns
+into an occupied directory.
+
+The broker decides which tabs those are; it reads the ledger, and a tab is
+closed only when no row for its dimension is still in flight. This script does
+not look at tab status, and could not: Chau7 reports `running` both for a shell
+that is thinking and for one sitting at its prompt with the review posted an
+hour ago.
 
 The broker has already written each handoff's ledger row as `requested` before
 printing it -- record before perform -- so this script never creates a row, only
@@ -160,6 +178,17 @@ class Chau7Client:
         self.call_tool("tab_rename", {"tab_id": tab_id, "title": title})
         return tab_id
 
+    def close_review(self, tab_id: str) -> None:
+        """Close a reviewer tab whose review has settled.
+
+        The goal state is "that tab is not standing in the workspace", so a
+        tab that is already gone is success, not an error. Chau7 spells that
+        refusal several ways and none of them mean the workspace is still
+        occupied -- the next tick reads `tab_list` again and will simply not
+        plan this teardown a second time.
+        """
+        self.call_tool("tab_close", {"tab_id": tab_id})
+
 
 class BrokerError(RuntimeError):
     """A broker command refused or failed."""
@@ -299,13 +328,40 @@ def main() -> int:
     finally:
         os.unlink(tabs_file)
 
-    started = abandoned = 0
+    started = abandoned = closed = 0
     for visited in report.get("visited") or []:
         if not visited.get("ok"):
             print(f"#{visited['pull_request']}: {visited.get('error')}", file=sys.stderr)
             continue
         pull_request = visited["pull_request"]
         head = visited.get("head")
+
+        # Before any spawn, for this pull request: a handoff below may be for
+        # the very dimension being reclaimed here, and its workspace has to be
+        # free before a second reviewer is put in it.
+        for teardown in visited.get("chau7_teardown") or []:
+            review_type, workspace = teardown["review_type"], teardown["workspace"]
+            if args.dry_run:
+                print(f"[dry-run] would close {len(teardown['tab_ids'])} tab(s) in {workspace}")
+                continue
+            for tab_id in teardown["tab_ids"]:
+                try:
+                    client.close_review(tab_id)
+                except Chau7Error as error:
+                    # Never fatal, and never a reason to touch the ledger. The
+                    # row this tab belonged to is already settled -- that is
+                    # why the broker planned the teardown -- so there is
+                    # nothing here to abandon or retry. The cost of failing is
+                    # that the workspace stays occupied and the next tick
+                    # plans the same teardown again, which is the right
+                    # outcome and needs no bookkeeping.
+                    print(f"could not close {tab_id} in {workspace}: {error}",
+                          file=sys.stderr)
+                    continue
+                closed += 1
+            print(f"released the {review_type} workspace on #{pull_request}: "
+                  f"{teardown['why']}")
+
         for handoff in visited.get("chau7_handoff") or []:
             review_type, workspace = handoff["review_type"], handoff["workspace"]
             if args.dry_run:
@@ -331,7 +387,7 @@ def main() -> int:
             started += 1
             print(f"started the {review_type} review on #{pull_request} in {workspace}")
 
-    print(f"started={started} abandoned={abandoned}")
+    print(f"started={started} abandoned={abandoned} closed={closed}")
     return 0
 
 

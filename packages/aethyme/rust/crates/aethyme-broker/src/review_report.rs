@@ -272,9 +272,7 @@ impl ReviewReportingPolicy {
     }
 
     fn index_of(&self, label: &str) -> Option<usize> {
-        self.severity
-            .iter()
-            .position(|level| level.label == label)
+        self.severity.iter().position(|level| level.label == label)
     }
 
     /// The labels that make a review `--request-changes`, most severe first.
@@ -300,7 +298,13 @@ impl ReviewReportingPolicy {
     /// the pull request, the dimension, or the repository. A reviewer handed a
     /// generic version would have to fill in the blanks, and the one that
     /// matters most -- the pull request number -- is the one it cannot guess.
-    pub fn instructions(&self, review_type: &str, repository: &str, pull_request: i64) -> String {
+    pub fn instructions(
+        &self,
+        review_type: &str,
+        repository: &str,
+        pull_request: i64,
+        head: &str,
+    ) -> String {
         let mut out = String::new();
         out.push_str(
             "## Reporting\n\n\
@@ -379,6 +383,28 @@ impl ReviewReportingPolicy {
             "- Stay inside {review_type}; another reviewer covers the rest.\n\
              - Found nothing? Post `No {review_type} findings.` and nothing else.\n"
         ));
+
+        // The reviewer is the only witness to its own completion, so it has to
+        // be the one that says so. Nothing downstream can infer it: the shell
+        // is interactive and never exits, the tab reports `running` whether it
+        // is thinking or sitting at a prompt, and a review posted under the
+        // author's own account is not distinguishable on the pull request from
+        // any other comment. Until this line runs, a finished review and a
+        // hung one are the same row.
+        out.push_str(&format!(
+            "\n## Finishing\n\n\
+             Close the row once the review is posted:\n\n    \
+             aethyme broker review state --repo {repository} --pr {pull_request} \\\n        \
+             --type {review_type} --head {head} --state satisfied\n\n\
+             Nothing else writes it. The router reads that row to decide whether this \
+             dimension is still occupying one of its slots and whether this workspace's tab \
+             may be closed, so a review that is not reported is a review that is still \
+             running -- until the staleness window files it as never answered, which is the \
+             wrong story about a review that ran.\n\n\
+             Use `--state failed` if you could not reach a verdict. That is a third claim, \
+             distinct from `satisfied` and from silence: a reviewer looked, the attempt is \
+             the answer, and nobody is asked again for this commit.\n"
+        ));
         out
     }
 }
@@ -444,7 +470,7 @@ means = "annoys a maintainer"
         );
         let policy = ReviewReportingPolicy::load(temp.path()).unwrap();
         assert_eq!(policy.blocking_labels(), vec!["major"]);
-        let text = policy.instructions("security", "o/r", 7);
+        let text = policy.instructions("security", "o/r", 7, "abc1234");
         assert!(text.contains("breaks a user"), "{text}");
         assert!(!text.contains("P0"), "the default ladder is gone: {text}");
         assert!(text.contains("At most 3 findings"), "{text}");
@@ -506,7 +532,7 @@ severity = []
     #[test]
     fn the_instructions_name_the_pull_request_the_repository_and_the_dimension() {
         let policy = ReviewReportingPolicy::default();
-        let text = policy.instructions("security", "schiste/Aethyme", 179);
+        let text = policy.instructions("security", "schiste/Aethyme", 179, "e53b60a3");
         assert!(text.contains("#179"), "{text}");
         assert!(text.contains("schiste/Aethyme"), "{text}");
         assert!(text.contains("## Security review"), "{text}");
@@ -516,17 +542,51 @@ severity = []
 
     #[test]
     fn coordinated_posting_takes_a_session_and_bare_posting_does_not() {
-        let coordinated = ReviewReportingPolicy::default().instructions("code", "o/r", 1);
-        assert!(coordinated.contains("aethyme broker adopt"), "{coordinated}");
+        let coordinated =
+            ReviewReportingPolicy::default().instructions("code", "o/r", 1, "abc1234");
+        assert!(
+            coordinated.contains("aethyme broker adopt"),
+            "{coordinated}"
+        );
         assert!(coordinated.contains("aethyme broker gh"), "{coordinated}");
 
         let direct = ReviewReportingPolicy {
             coordinated: false,
             ..Default::default()
         }
-        .instructions("code", "o/r", 1);
-        assert!(!direct.contains("broker"), "{direct}");
+        .instructions("code", "o/r", 1, "abc1234");
+        // The claim is about the posting lane, not about the word "broker":
+        // the ledger row belongs to the broker whatever posts the review, so
+        // the finishing step below stays either way.
+        assert!(!direct.contains("aethyme broker gh"), "{direct}");
+        assert!(!direct.contains("aethyme broker adopt"), "{direct}");
         assert!(direct.contains("gh pr review 1 --repo o/r"), "{direct}");
+    }
+
+    /// The reviewer is the only thing that knows it is done, and that is true
+    /// whether or not this repository routes its posting through the broker.
+    /// Tying the finishing step to `coordinated` would leave an uncoordinated
+    /// repository's tabs open forever.
+    #[test]
+    fn the_finishing_step_names_the_exact_row_and_survives_uncoordinated_posting() {
+        for coordinated in [true, false] {
+            let text = ReviewReportingPolicy {
+                coordinated,
+                ..Default::default()
+            }
+            .instructions("security", "schiste/Aethyme", 179, "e53b60a3");
+            assert!(
+                text.contains("aethyme broker review state --repo schiste/Aethyme --pr 179"),
+                "coordinated={coordinated}: {text}"
+            );
+            // The head is what makes a late report land on the row it was
+            // asked for rather than on whatever the most recent push made
+            // current in the meantime.
+            assert!(
+                text.contains("--type security --head e53b60a3 --state satisfied"),
+                "coordinated={coordinated}: {text}"
+            );
+        }
     }
 
     #[test]
@@ -535,7 +595,7 @@ severity = []
             require_location: false,
             ..Default::default()
         }
-        .instructions("code", "o/r", 1);
+        .instructions("code", "o/r", 1, "abc1234");
         assert!(!text.contains("path/to/file.rs"), "{text}");
         assert!(!text.contains("path:line"), "{text}");
     }
@@ -549,7 +609,7 @@ severity = []
         assert_eq!(policy.blocking_labels(), vec!["P0", "P1"]);
         assert!(
             policy
-                .instructions("code", "o/r", 1)
+                .instructions("code", "o/r", 1, "abc1234")
                 .contains("any finding is P0 or P1")
         );
     }

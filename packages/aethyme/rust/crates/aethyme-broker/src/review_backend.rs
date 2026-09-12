@@ -27,12 +27,14 @@
 //! As elsewhere in this area, nothing here performs anything. The output is a
 //! [`ReviewDispatchAction`] an adapter executes.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
 use crate::chau7_tabs::{Chau7Tab, workspace_tab_ids};
+use crate::review_execution::Chau7Teardown;
+use crate::review_ledger::ReviewRequest;
 use crate::review_report::ReviewReportingPolicy;
 use crate::review_trigger::ReviewType;
 
@@ -390,13 +392,26 @@ pub fn dispatch_review(
         ReviewBackend::Chau7 => {
             let workspace = policy.workspace(repo_root, pull_request, review_type);
 
-            // Already running. Checked before the slot count, so a repeated
-            // tick reports the truth rather than "no slots" -- an operator
-            // reading the second would go looking for a capacity problem.
+            // The workspace is occupied. Checked before the slot count, so a
+            // repeated tick reports the truth rather than "no slots" -- an
+            // operator reading the second would go looking for a capacity
+            // problem.
+            //
+            // A tab is evidence of occupancy and nothing more. It is not
+            // evidence that a review is in progress: the reviewer's shell is
+            // interactive, so a finished reviewer sits at its prompt looking
+            // exactly like a working one, and this message said "a review is
+            // already running" about both until 2026-09-12. The ledger is what
+            // knows which -- and [`finished_workspaces`] is what turns the
+            // finished case into a closed tab instead of a defer that never
+            // ends.
             if !workspace_tab_ids(tabs, &workspace).is_empty() {
                 return ReviewDispatchAction::Defer {
                     review_type: review_type.to_string(),
-                    why: format!("a review is already running in {workspace}"),
+                    why: format!(
+                        "a tab still occupies {workspace}; the next tick reclaims it if its \
+                         review is settled"
+                    ),
                 };
             }
 
@@ -433,6 +448,73 @@ pub fn dispatch_review(
     }
 }
 
+/// Reviewer workspaces this tick should reclaim.
+///
+/// The counterpart to [`dispatch_review`], and the answer to the question that
+/// function deliberately does not ask: a tab occupies a workspace, but is
+/// anyone still using it?
+///
+/// The signal is the ledger, not the tab. Tab status cannot answer this --
+/// `running` is what Chau7 reports for a shell that is thinking and for one
+/// sitting at its prompt with the review posted an hour ago, and the reviewer
+/// shell is interactive, so it never exits to report anything else. So a
+/// dimension is finished exactly when no row for it still
+/// [`ReviewRequestState::occupies_a_slot`], which covers every way a review
+/// can end: reported `satisfied` by the reviewer, `failed` by a reviewer that
+/// could not conclude, or `abandoned` by the staleness sweep for one that
+/// never came back.
+///
+/// Keyed on the dimension rather than on one row, because the workspace is
+/// per pull request and per dimension and outlives any single head. A reviewer
+/// working on the current head holds a live row, so its tab is never in this
+/// list even though older settled rows for the same dimension are.
+///
+/// `rows` must already carry this tick's expiries. Reading them straight from
+/// the database would make a dry run plan a teardown a real run would not, and
+/// the point of the dry run is that it prints what would happen.
+pub fn finished_workspaces(
+    policy: &ReviewRoutingPolicy,
+    repo_root: &Path,
+    pull_request: i64,
+    rows: &[ReviewRequest],
+    tabs: &[Chau7Tab],
+) -> Vec<Chau7Teardown> {
+    let mut live: BTreeSet<&str> = BTreeSet::new();
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    for row in rows {
+        // Only this pull request's own rows. The caller passes them already
+        // scoped, but a workspace path is derived from `pull_request` below
+        // and reclaiming a neighbour's tab on a mismatch would be silent.
+        if row.pr_number != pull_request {
+            continue;
+        }
+        seen.insert(row.review_type.as_str());
+        if row.state.occupies_a_slot() {
+            live.insert(row.review_type.as_str());
+        }
+    }
+
+    let mut teardown = Vec::new();
+    for review_type in seen.difference(&live) {
+        // Only Chau7 routes have a workspace. A dimension re-routed to
+        // `record` since its tab was spawned still has one on disk, which is
+        // why the tab list decides this and the current policy does not.
+        let workspace = policy.workspace(repo_root, pull_request, review_type);
+        let tab_ids = workspace_tab_ids(tabs, &workspace);
+        if tab_ids.is_empty() {
+            continue;
+        }
+        teardown.push(Chau7Teardown {
+            review_type: (*review_type).to_string(),
+            pull_request,
+            workspace,
+            tab_ids,
+            why: format!("every {review_type} review of #{pull_request} has settled"),
+        });
+    }
+    teardown
+}
+
 /// The prompt a spawned reviewer receives.
 ///
 /// Bounded on purpose. An agent told to "review this" reads the whole
@@ -462,7 +544,7 @@ pub fn review_prompt(
          - Limit the review to {review_type}. Another reviewer covers the rest.\n\
          - Do not commit, push, or edit the branch under review.\n\n"
     );
-    prompt.push_str(&reporting.instructions(review_type, repository, pull_request));
+    prompt.push_str(&reporting.instructions(review_type, repository, pull_request, head));
     if let Some(extra) = instructions {
         prompt.push('\n');
         prompt.push_str(extra.trim_end());
@@ -474,6 +556,7 @@ pub fn review_prompt(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::review_ledger::ReviewRequestState;
 
     fn tab(id: &str, cwd: &str) -> Chau7Tab {
         Chau7Tab {
@@ -566,9 +649,180 @@ mod tests {
         // stays correct across a dispatcher restart with nothing persisted.
         let tabs = vec![tab("tab_9", "/repo/.aethyme/reviews/pr-42/security")];
         match dispatch(&chau7_policy(), &tabs, &[]) {
-            ReviewDispatchAction::Defer { why, .. } => assert!(why.contains("already running")),
+            ReviewDispatchAction::Defer { why, .. } => {
+                // The claim is occupancy, not activity. A tab whose reviewer
+                // posted an hour ago is indistinguishable from a working one
+                // here, and saying "a review is already running" about the
+                // first sends an operator looking for a reviewer that is not
+                // there.
+                assert!(why.contains("occupies"), "{why}");
+                assert!(
+                    !why.contains("already running"),
+                    "the tab list cannot support that claim: {why}"
+                );
+            }
             other => panic!("expected a defer, got {other:?}"),
         }
+    }
+
+    // -- reclaiming a finished reviewer's workspace -------------------------
+
+    fn row(id: i64, review_type: &str, head: &str, state: ReviewRequestState) -> ReviewRequest {
+        ReviewRequest {
+            id,
+            repository: "o/r".into(),
+            pr_number: 42,
+            review_type: review_type.into(),
+            head_commit: head.into(),
+            backend: "chau7".into(),
+            state,
+            detail: None,
+            requested_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    fn reclaim(rows: &[ReviewRequest], tabs: &[Chau7Tab]) -> Vec<Chau7Teardown> {
+        finished_workspaces(&chau7_policy(), Path::new("/repo"), 42, rows, tabs)
+    }
+
+    /// The defect this whole path exists for. A reviewer that posted and
+    /// reported `satisfied` left its shell sitting at a prompt, the workspace
+    /// stayed occupied, and every later security review of #42 deferred --
+    /// until `stale_after_minutes` filed the finished review as `abandoned`.
+    #[test]
+    fn a_settled_review_whose_tab_is_still_open_is_reclaimed() {
+        let tabs = vec![tab("tab_9", "/repo/.aethyme/reviews/pr-42/security")];
+        let teardown = reclaim(
+            &[row(1, "security", "abc123", ReviewRequestState::Satisfied)],
+            &tabs,
+        );
+        assert_eq!(teardown.len(), 1);
+        assert_eq!(teardown[0].review_type, "security");
+        assert_eq!(teardown[0].tab_ids, vec!["tab_9".to_string()]);
+        assert_eq!(
+            teardown[0].workspace,
+            "/repo/.aethyme/reviews/pr-42/security"
+        );
+    }
+
+    /// Every way a review can end, because the question is "is anyone still
+    /// using this workspace" and all three answer it the same way. `Failed`
+    /// and `Abandoned` especially: those are the tabs most likely to be
+    /// stranded, since nothing about them was ever tidy.
+    #[test]
+    fn every_settled_state_releases_the_workspace() {
+        for state in [
+            ReviewRequestState::Satisfied,
+            ReviewRequestState::Failed,
+            ReviewRequestState::Recorded,
+            ReviewRequestState::Abandoned,
+        ] {
+            let tabs = vec![tab("tab_9", "/repo/.aethyme/reviews/pr-42/security")];
+            assert_eq!(
+                reclaim(&[row(1, "security", "abc123", state)], &tabs).len(),
+                1,
+                "{} should release the workspace",
+                state.label()
+            );
+        }
+    }
+
+    /// The check that keeps this from being a bug worse than the one it fixes:
+    /// closing the tab of a reviewer that is still reading is a review
+    /// destroyed with no trace, and the ledger row would still say `running`.
+    #[test]
+    fn a_live_review_is_never_reclaimed() {
+        for state in [ReviewRequestState::Requested, ReviewRequestState::Running] {
+            let tabs = vec![tab("tab_9", "/repo/.aethyme/reviews/pr-42/security")];
+            assert!(
+                reclaim(&[row(1, "security", "abc123", state)], &tabs).is_empty(),
+                "{} must hold its workspace",
+                state.label()
+            );
+        }
+    }
+
+    /// A workspace outlives any one head, so the question has to be asked of
+    /// the dimension. Three settled rows from earlier pushes do not mean the
+    /// reviewer currently reading the fourth head may be shut down.
+    #[test]
+    fn an_older_heads_settled_row_does_not_reclaim_a_live_reviewer() {
+        let tabs = vec![tab("tab_9", "/repo/.aethyme/reviews/pr-42/security")];
+        let rows = vec![
+            row(1, "security", "aaa", ReviewRequestState::Satisfied),
+            row(2, "security", "bbb", ReviewRequestState::Abandoned),
+            row(3, "security", "ccc", ReviewRequestState::Running),
+        ];
+        assert!(
+            reclaim(&rows, &tabs).is_empty(),
+            "the running reviewer on head ccc is still using that workspace"
+        );
+    }
+
+    /// Each dimension has its own workspace, so settling one says nothing
+    /// about the other. Getting this wrong would close the code reviewer's tab
+    /// the moment the security reviewer finished.
+    #[test]
+    fn one_dimension_settling_does_not_reclaim_another() {
+        let tabs = vec![
+            tab("tab_9", "/repo/.aethyme/reviews/pr-42/security"),
+            tab("tab_10", "/repo/.aethyme/reviews/pr-42/code"),
+        ];
+        let rows = vec![
+            row(1, "security", "abc", ReviewRequestState::Satisfied),
+            row(2, "code", "abc", ReviewRequestState::Running),
+        ];
+        let teardown = reclaim(&rows, &tabs);
+        assert_eq!(teardown.len(), 1);
+        assert_eq!(teardown[0].review_type, "security");
+        assert_eq!(teardown[0].tab_ids, vec!["tab_9".to_string()]);
+    }
+
+    /// Nothing to close is not a teardown. Emitting one would make every tick
+    /// after a review hand the adapter a `tab_close` for a tab that is not
+    /// there, and an adapter that treats that as an error would then fail
+    /// forever on a pull request nobody is reviewing.
+    #[test]
+    fn a_settled_review_with_no_tab_plans_nothing() {
+        assert!(
+            reclaim(
+                &[row(1, "security", "abc123", ReviewRequestState::Satisfied)],
+                &[]
+            )
+            .is_empty()
+        );
+    }
+
+    /// Two tabs in one workspace is not the expected shape, but closing only
+    /// the first would leave it occupied and the defer permanent -- which is
+    /// the exact failure this function exists to end.
+    #[test]
+    fn every_tab_in_a_reclaimed_workspace_is_closed() {
+        let tabs = vec![
+            tab("tab_9", "/repo/.aethyme/reviews/pr-42/security"),
+            tab("tab_11", "/repo/.aethyme/reviews/pr-42/security"),
+        ];
+        let teardown = reclaim(
+            &[row(1, "security", "abc", ReviewRequestState::Satisfied)],
+            &tabs,
+        );
+        assert_eq!(teardown.len(), 1);
+        assert_eq!(
+            teardown[0].tab_ids,
+            vec!["tab_9".to_string(), "tab_11".to_string()]
+        );
+    }
+
+    /// A pull request's rows decide only that pull request's workspaces. The
+    /// path is derived from the number passed in, so a row that belongs to a
+    /// neighbour must not be allowed to name a workspace it does not own.
+    #[test]
+    fn another_pull_requests_row_reclaims_nothing_here() {
+        let tabs = vec![tab("tab_9", "/repo/.aethyme/reviews/pr-42/security")];
+        let mut stranger = row(1, "security", "abc", ReviewRequestState::Satisfied);
+        stranger.pr_number = 41;
+        assert!(reclaim(&[stranger], &tabs).is_empty());
     }
 
     #[test]
@@ -626,7 +880,7 @@ mod tests {
     }
 
     #[test]
-    fn an_already_running_review_is_reported_as_such_and_not_as_a_capacity_problem() {
+    fn an_occupied_workspace_is_reported_as_such_and_not_as_a_capacity_problem() {
         // Both conditions hold at once. Reporting "no slots" would send an
         // operator looking for capacity they already have.
         let tabs = vec![tab("tab_9", "/repo/.aethyme/reviews/pr-42/security")];
@@ -641,7 +895,10 @@ mod tests {
             },
         ];
         match dispatch(&chau7_policy(), &tabs, &in_flight) {
-            ReviewDispatchAction::Defer { why, .. } => assert!(why.contains("already running")),
+            ReviewDispatchAction::Defer { why, .. } => {
+                assert!(why.contains("occupies"), "{why}");
+                assert!(!why.contains("in flight"), "{why}");
+            }
             other => panic!("expected a defer, got {other:?}"),
         }
     }
