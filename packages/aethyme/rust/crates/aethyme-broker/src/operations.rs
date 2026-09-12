@@ -1092,6 +1092,38 @@ fn reconcile_failed_push(
     Some((status, value))
 }
 
+/// How a provider's CLI is spelled on disk. Not `OperationProvider::as_str`,
+/// which is the wire spelling stored in the journal: that says `github` where
+/// the binary is `gh`.
+fn provider_executable(provider: OperationProvider) -> &'static str {
+    match provider {
+        OperationProvider::Git => "git",
+        OperationProvider::Github => "gh",
+    }
+}
+
+/// The binary that performs a coordinated operation.
+///
+/// The git arm is [`crate::git::git_command`] -- the probed binary -- and
+/// never `Command::new("git")`. Until #179's review this was the one spawn in
+/// the crate that still resolved its own executable through PATH, and it was
+/// invisible to any audit grepping for `Command::new("git")` because the
+/// literal had been factored into a `match` on the provider. Extracting it
+/// here is half the fix: the choice now has a name, a doc comment, and a test.
+///
+/// Sharing the *name* with the pre-push dry run is not enough. On a machine
+/// whose wrapper the probe rejects, the check would run the trusted binary and
+/// the mutation a different one -- verifying one command and performing
+/// another, which is the shape of every defect #176 and #178 were about -- and
+/// the `--no-verify` this function's caller appends then removes the pre-push
+/// hook that was the last thing able to notice.
+fn provider_command(provider: OperationProvider) -> Command {
+    match provider {
+        OperationProvider::Git => crate::git::git_command(),
+        OperationProvider::Github => Command::new(provider_executable(provider)),
+    }
+}
+
 fn redacted_command(provider: OperationProvider, args: &[String]) -> Result<String, BrokerOpError> {
     let sensitive_flags = [
         "-m",
@@ -1112,11 +1144,7 @@ fn redacted_command(provider: OperationProvider, args: &[String]) -> Result<Stri
         "--raw-field",
         "--input",
     ];
-    let executable = match provider {
-        OperationProvider::Git => "git",
-        OperationProvider::Github => "gh",
-    };
-    let mut redacted = vec![executable.to_string()];
+    let mut redacted = vec![provider_executable(provider).to_string()];
     let mut hide_next = false;
     for arg in args {
         if hide_next {
@@ -1758,11 +1786,10 @@ impl Broker {
             ),
         )?;
 
-        let executable = match request.provider {
-            OperationProvider::Git => "git",
-            OperationProvider::Github => "gh",
-        };
-        let mut command = Command::new(executable);
+        // This is the spawn that performs the remote mutation, so the binary
+        // it names is the whole point -- see `provider_command`.
+        let executable = provider_executable(request.provider);
+        let mut command = provider_command(request.provider);
         command.args(&request.args);
         // Appended after the subcommand, where `git push` accepts it. The
         // repository opted in, the same hook already ran against these exact
@@ -1978,6 +2005,46 @@ impl Broker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #179's security finding. The coordinated write performs the remote
+    /// mutation; the pre-push dry run beside it decides whether that mutation
+    /// is allowed. They must be the same binary, and comparing the *program*
+    /// rather than the name is the whole assertion -- both spell "git", and
+    /// only one of them is the one the probe accepted.
+    #[test]
+    fn a_coordinated_git_operation_spawns_the_probed_binary() {
+        assert_eq!(
+            provider_command(OperationProvider::Git).get_program(),
+            crate::git::git_command().get_program(),
+            "the coordinated write must spawn the binary the dry run verified"
+        );
+
+        // The equality above holds trivially if both sides are the bare name
+        // `git`, which is exactly what `git_command` falls back to when no
+        // candidate probes clean. Where a candidate did, the probe resolved an
+        // absolute path, and a regression to `Command::new("git")` becomes
+        // visible rather than equal by coincidence.
+        if matches!(
+            crate::git::git_output_trust(),
+            crate::git::GitOutputTrust::Undecorated { .. }
+        ) {
+            let program = provider_command(OperationProvider::Git);
+            assert!(
+                Path::new(program.get_program()).is_absolute(),
+                "an accepted git resolves to a path, not to whatever PATH offers next: {:?}",
+                program.get_program()
+            );
+        } else {
+            eprintln!("no git on PATH probed clean; only the equality was checked");
+        }
+
+        // `gh` has no probe and needs none -- nothing in the broker parses its
+        // output to authorize anything -- so PATH resolution is correct there.
+        assert_eq!(
+            provider_command(OperationProvider::Github).get_program(),
+            std::ffi::OsStr::new("gh")
+        );
+    }
 
     #[test]
     fn wait_durations_read_naturally() {

@@ -443,14 +443,38 @@ fn porcelain_probe(program: &Path) -> PorcelainProbe {
     }
 
     // `--` so a file named like a revision cannot change what is compared.
+    //
+    // `output()` rather than `status()`, which every other probe command here
+    // already uses. `status()` hands the child this process's own stdout, so a
+    // wrapper that gets the exit codes right but prints while doing it writes
+    // its banner straight into the broker's stdout -- and the first
+    // `aethyme ... --json` of the run then emits those bytes ahead of its
+    // JSON. The probe is the first thing any command does, so it is the worst
+    // possible place to inherit a stream.
+    //
+    // Capturing also makes the check stricter for free: a `--quiet` that
+    // prints anything is not quiet, whatever it exits.
+    // `Err` carries the verdict rather than a string: printing on `--quiet` is
+    // decoration and marks the candidate dishonest, while failing to spawn is
+    // merely unusable, and only the first makes the dirtiness predicates
+    // refuse the machine. Collapsing them into one message would file a lying
+    // wrapper as a broken one.
     let quiet_exit = |program: &Path| match isolated(program)
         .args(["diff", "--quiet", "--", "probe.txt"])
-        .status()
+        .output()
     {
-        Ok(status) => status.code().ok_or_else(|| {
-            format!("git diff --quiet was terminated without an exit code ({status})")
+        Ok(output) if !output.stdout.is_empty() => Err(PorcelainProbe::Decorated {
+            bytes: output.stdout.len(),
         }),
-        Err(err) => Err(format!("could not execute git diff --quiet ({err})")),
+        Ok(output) => output.status.code().ok_or_else(|| PorcelainProbe::Unusable {
+            reason: format!(
+                "git diff --quiet was terminated without an exit code ({})",
+                output.status
+            ),
+        }),
+        Err(err) => Err(PorcelainProbe::Unusable {
+            reason: format!("could not execute git diff --quiet ({err})"),
+        }),
     };
 
     match quiet_exit(program) {
@@ -463,7 +487,7 @@ fn porcelain_probe(program: &Path) -> PorcelainProbe {
                 ),
             };
         }
-        Err(reason) => return PorcelainProbe::Unusable { reason },
+        Err(verdict) => return verdict,
     }
 
     if std::fs::write(&tracked, "after\n").is_err() {
@@ -472,16 +496,94 @@ fn porcelain_probe(program: &Path) -> PorcelainProbe {
         };
     }
     match quiet_exit(program) {
-        Ok(1) => PorcelainProbe::Undecorated,
+        Ok(1) => {}
         // The dangerous direction, and the reason this check exists: 0 here
         // means "identical", for a file this function just changed.
-        Ok(code) => PorcelainProbe::StatusRewritten {
-            detail: format!(
-                "git diff --quiet exited {code} on a modified tracked file, \
-                 where git exits 1"
-            ),
-        },
-        Err(reason) => PorcelainProbe::Unusable { reason },
+        Ok(code) => {
+            return PorcelainProbe::StatusRewritten {
+                detail: format!(
+                    "git diff --quiet exited {code} on a modified tracked file, \
+                     where git exits 1"
+                ),
+            };
+        }
+        Err(verdict) => return verdict,
+    }
+
+    // Everything above proves a property of `status` and of exit codes.
+    // `paths_equal` reads neither: it reads the stdout of
+    // `git diff --name-only -z <left> <right> -- <paths>`, and treats empty
+    // output as proof that the two commits agree. A wrapper that answers
+    // `status` honestly, exits correctly from `diff --quiet`, and discards
+    // stdout for `diff --name-only` alone passes every check above, is filed
+    // `Undecorated`, and then makes `paths_equal` report differing commits as
+    // identical -- the sole automatic evidence for classifying a promotion
+    // `SupersededUpstream`, on the strength of which an unattended cleanup
+    // discards local work.
+    //
+    // So ask this binary the exact question, in the shape the caller parses,
+    // with an answer this function already knows. The probe file is modified
+    // on disk; commit it and the two commits differ in exactly one path.
+    for args in [
+        &["add", "probe.txt"][..],
+        &["commit", "-q", "-m", "probe-changed"][..],
+    ] {
+        match isolated(program).args(args).output() {
+            Ok(output) if output.status.success() => {}
+            Ok(output) => {
+                return PorcelainProbe::Unusable {
+                    reason: format!("git {} exited {}", args.join(" "), output.status),
+                };
+            }
+            Err(err) => {
+                return PorcelainProbe::Unusable {
+                    reason: format!("could not execute git {} ({err})", args.join(" ")),
+                };
+            }
+        }
+    }
+
+    let name_only = |program: &Path, left: &str, right: &str| {
+        match isolated(program)
+            .args(["diff", "--name-only", "-z", left, right, "--", "probe.txt"])
+            .output()
+        {
+            Ok(output) if !output.status.success() => Err(PorcelainProbe::Unusable {
+                reason: format!(
+                    "git diff --name-only exited {} comparing {left} and {right}",
+                    output.status
+                ),
+            }),
+            Ok(output) => Ok(output.stdout),
+            Err(err) => Err(PorcelainProbe::Unusable {
+                reason: format!("could not execute git diff --name-only ({err})"),
+            }),
+        }
+    };
+
+    // The load-bearing direction: two commits that differ in `probe.txt` and
+    // nothing else. Real git answers with exactly one NUL-terminated path.
+    match name_only(program, "HEAD~1", "HEAD") {
+        Ok(out) if out == b"probe.txt\0" => {}
+        Ok(out) => {
+            return PorcelainProbe::StatusRewritten {
+                detail: format!(
+                    "git diff --name-only -z reported {:?} for two commits differing \
+                     only in probe.txt, where git reports \"probe.txt\\0\"; a wrapper \
+                     that empties this output makes differing commits look identical",
+                    String::from_utf8_lossy(&out)
+                ),
+            };
+        }
+        Err(verdict) => return verdict,
+    }
+
+    // And the direction whose emptiness is trusted, so that "empty" has been
+    // observed to mean "equal" for this binary rather than assumed to.
+    match name_only(program, "HEAD", "HEAD") {
+        Ok(out) if out.is_empty() => PorcelainProbe::Undecorated,
+        Ok(out) => PorcelainProbe::Decorated { bytes: out.len() },
+        Err(verdict) => verdict,
     }
 }
 
@@ -1998,6 +2100,91 @@ exit $status
             ),
             other => panic!("a rewritten exit code should be refused, got {other:?}"),
         }
+    }
+
+    /// Write a `git`-named shim whose body is `script`, with `{real}`
+    /// replaced by the honest binary. The two tests below differ only in a
+    /// few lines of shell, so the file-writing half is not worth repeating.
+    fn shim(dir: &Path, real: &Path, script: &str) -> PathBuf {
+        let path = dir.join("git");
+        std::fs::write(&path, script.replace("{real}", &real.display().to_string()))
+            .expect("write shim");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod shim");
+        }
+        path
+    }
+
+    /// The gap #179's review found, and the narrowest wrapper that exploits
+    /// it: honest `status`, honest exit codes, honest everything the probe
+    /// asked about before this commit -- and stdout discarded for
+    /// `diff --name-only` alone. That is the one command `paths_equal`
+    /// actually reads, and empty output is what it takes for proof that two
+    /// commits agree. Filed `Undecorated`, this binary makes every comparison
+    /// answer "identical", which is the sole automatic evidence for
+    /// classifying a promotion `SupersededUpstream` and discarding local work.
+    #[test]
+    fn a_wrapper_that_empties_name_only_is_caught_though_every_exit_code_is_honest() {
+        let Some(real) = trustworthy_git() else {
+            eprintln!("every git on PATH is wrapped; nothing honest to wrap");
+            return;
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = shim(
+            dir.path(),
+            &real,
+            r#"#!/bin/sh
+for arg in "$@"; do
+    if [ "$arg" = "--name-only" ]; then
+        "{real}" "$@" >/dev/null
+        exit $?
+    fi
+done
+exec "{real}" "$@"
+"#,
+        );
+        match porcelain_probe(&path) {
+            PorcelainProbe::StatusRewritten { detail } => assert!(
+                detail.contains("look identical"),
+                "the rejection should name the consequence, not just the bytes: {detail}"
+            ),
+            other => panic!("an emptied --name-only should be refused, got {other:?}"),
+        }
+    }
+
+    /// Printing on `--quiet` is decoration even though the exit code is
+    /// right, and it reaches further than a wrong answer: before this commit
+    /// the probe ran `diff --quiet` with `status()`, handing the child the
+    /// broker's own stdout, so these bytes landed ahead of the JSON of
+    /// whichever `aethyme ... --json` ran first. `Decorated` and not
+    /// `Unusable` -- the binary works, it lies.
+    #[test]
+    fn a_wrapper_that_prints_while_being_quiet_is_decoration_not_breakage() {
+        let Some(real) = trustworthy_git() else {
+            eprintln!("every git on PATH is wrapped; nothing honest to wrap");
+            return;
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = shim(
+            dir.path(),
+            &real,
+            r#"#!/bin/sh
+"{real}" "$@"
+status=$?
+for arg in "$@"; do
+    if [ "$arg" = "--quiet" ]; then printf 'ok'; fi
+done
+exit $status
+"#,
+        );
+        assert_eq!(
+            porcelain_probe(&path),
+            PorcelainProbe::Decorated { bytes: 2 },
+            "a --quiet that writes two bytes to the broker's stdout is not quiet"
+        );
     }
 
     /// A candidate that cannot run proves nothing about wrappers, and only
