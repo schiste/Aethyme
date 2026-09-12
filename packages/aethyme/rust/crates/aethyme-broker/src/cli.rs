@@ -6554,14 +6554,45 @@ fn run_review_state(parsed: Parsed) -> Result<(), UsageError> {
     })?;
 
     let mut broker = open_broker(parsed.read_only_snapshot)?;
+
+    // `review ledger` prints a 12-character head while this command matched on
+    // the full forty, so the one value an operator has in front of them was the
+    // one value this refused -- and the refusal below names `review ledger` as
+    // where to look, which closed the loop. Resolving a prefix opens it.
+    let head = match parsed.head.as_deref() {
+        Some(prefix) if prefix.len() < 40 => {
+            let recorded: Vec<String> = broker
+                .store()
+                .review_requests_for_pr(&repository, pull_request)
+                .map_err(to_usage)?
+                .into_iter()
+                .filter(|row| row.review_type == review_type)
+                .map(|row| row.head_commit)
+                .collect();
+            match crate::review::resolve_review_head_prefix(
+                recorded.iter().map(String::as_str),
+                prefix,
+            ) {
+                Ok(Some(head)) => Some(head),
+                // Hand the operator's own spelling back to the refusal below,
+                // so the error names what they typed rather than nothing.
+                Ok(None) => Some(prefix.to_string()),
+                Err(candidates) => {
+                    return Err(UsageError::Message(format!(
+                        "head {prefix:?} matches {} recorded {review_type} reviews on \
+                         {repository}#{pull_request} ({}); name the full commit",
+                        candidates.len(),
+                        candidates.join(", ")
+                    )));
+                }
+            }
+        }
+        other => other.map(str::to_string),
+    };
+
     let existing = broker
         .store()
-        .latest_review_request(
-            &repository,
-            pull_request,
-            &review_type,
-            parsed.head.as_deref(),
-        )
+        .latest_review_request(&repository, pull_request, &review_type, head.as_deref())
         .map_err(to_usage)?
         // Refusing is the point: a report about a review nobody requested
         // means the reporter and the router disagree about what was asked

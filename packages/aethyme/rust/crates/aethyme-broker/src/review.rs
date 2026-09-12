@@ -1107,6 +1107,37 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// Resolve an abbreviated head against the heads already recorded for one
+/// dimension, the way `git` resolves a short commit everywhere else.
+///
+/// `review ledger` prints twelve characters and `review state` matched on
+/// forty, so the value an operator could see was the one value the command
+/// refused -- while its refusal pointed them back at the ledger. That is a
+/// closed loop, and it is the shape this repository keeps shipping: a negative
+/// result ("no such review") that cannot be told apart from a usage error
+/// ("you abbreviated it").
+///
+/// `Err` carries the candidates rather than a choice. Two rows sharing a prefix
+/// mean the reporter cannot say which review it performed, and taking the newer
+/// one would file a verdict against a commit nobody read.
+pub fn resolve_review_head_prefix<'a>(
+    recorded: impl IntoIterator<Item = &'a str>,
+    prefix: &str,
+) -> Result<Option<String>, Vec<String>> {
+    let mut matches: Vec<String> = recorded
+        .into_iter()
+        .filter(|head| head.starts_with(prefix))
+        .map(str::to_string)
+        .collect();
+    matches.sort();
+    matches.dedup();
+    match matches.len() {
+        0 => Ok(None),
+        1 => Ok(Some(matches.remove(0))),
+        _ => Err(matches),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1524,5 +1555,81 @@ unlock_labl = "ready"
         );
         assert!(restarted.operation_id.is_none());
         assert!(broker.store().coordinated_operations().unwrap().is_empty());
+    }
+    /// The head an operator can actually see. `review ledger` prints twelve
+    /// characters; before this resolved, twelve characters was the one spelling
+    /// `review state` would not take, and its refusal named `review ledger` as
+    /// where to look.
+    #[test]
+    fn a_prefix_resolves_to_the_head_it_abbreviates() {
+        let recorded = ["e53b60a36a12f4c9b0d1e2f3a4b5c6d7e8f90123"];
+        assert_eq!(
+            resolve_review_head_prefix(recorded, "e53b60a36a12").unwrap(),
+            Some("e53b60a36a12f4c9b0d1e2f3a4b5c6d7e8f90123".to_string())
+        );
+        // Short enough to be a nuisance and still unambiguous here. `git`
+        // resolves these; so should this.
+        assert_eq!(
+            resolve_review_head_prefix(recorded, "e53b60a").unwrap(),
+            Some("e53b60a36a12f4c9b0d1e2f3a4b5c6d7e8f90123".to_string())
+        );
+    }
+
+    /// A full head is not a prefix of anything but itself, so the same call
+    /// covers the spelling every real reviewer uses -- `review_report.rs`
+    /// interpolates all forty characters into the `## Finishing` block.
+    #[test]
+    fn a_full_head_still_resolves_to_itself() {
+        let head = "e53b60a36a12f4c9b0d1e2f3a4b5c6d7e8f90123";
+        assert_eq!(
+            resolve_review_head_prefix([head], head).unwrap(),
+            Some(head.to_string())
+        );
+    }
+
+    /// `None` rather than an error: nothing recorded starts with this, and the
+    /// caller already has the right words for that -- it names the ledger the
+    /// operator should read. Collapsing the two here would put a usage error
+    /// and a genuine "no such review" behind one message again.
+    #[test]
+    fn a_prefix_matching_nothing_resolves_to_nothing() {
+        assert_eq!(
+            resolve_review_head_prefix(["e53b60a36a12f4c9b0d1e2f3a4b5c6d7e8f90123"], "deadbee")
+                .unwrap(),
+            None
+        );
+        assert_eq!(resolve_review_head_prefix([], "e53b60a").unwrap(), None);
+    }
+
+    /// The case worth refusing. Two heads under one prefix mean the reporter
+    /// cannot say which review it performed; recording a verdict against the
+    /// newer one would file a judgement on a commit nobody read, which is the
+    /// failure this ledger exists to make impossible.
+    ///
+    /// Asserted on the payload, not merely on `is_err`: the candidates are what
+    /// let the refusal tell the operator which two commits it is choosing
+    /// between, and they are sorted so the message is stable to read.
+    #[test]
+    fn an_ambiguous_prefix_is_refused_and_names_both_candidates() {
+        let a = "e53b60aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let b = "e53b60bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        // Newest first, the order the ledger hands them over, so a resolver
+        // that silently took `recorded[0]` would look correct on a happy path.
+        let candidates =
+            resolve_review_head_prefix([b, a], "e53b60").expect_err("two heads share this prefix");
+        assert_eq!(candidates, vec![a.to_string(), b.to_string()]);
+    }
+
+    /// A review requested twice on the same commit has two ledger rows and one
+    /// head. Without the dedup that is indistinguishable from the ambiguity
+    /// above, and the commonest case -- re-requesting a review after a reviewer
+    /// dropped it -- would become the one that refuses.
+    #[test]
+    fn repeated_requests_on_one_head_are_not_ambiguity() {
+        let head = "e53b60a36a12f4c9b0d1e2f3a4b5c6d7e8f90123";
+        assert_eq!(
+            resolve_review_head_prefix([head, head, head], "e53b60a").unwrap(),
+            Some(head.to_string())
+        );
     }
 }
