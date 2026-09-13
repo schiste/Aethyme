@@ -98,10 +98,22 @@ jobs:
           aethyme repo commit-message-template --type fix --scope api > /dev/null
 
           # The deployed SessionStart hook — the last thing on the product
-          # path that used a Python heredoc (flipped in Phase 6).
-          CLAUDE_PROJECT_DIR="$TARGET" bash .claude/hooks/aethyme-load-context.sh > envelope.json
+          # path that used a Python heredoc (flipped in Phase 6). Since
+          # ecedc21f the envelope is gated behind AETHYME_EVAL_ARM: an
+          # interactive session auto-loads CLAUDE.md itself, so emitting the
+          # same bytes here would bill the whole policy a second time inside
+          # the cached prefix. Assert both sides of that gate, so neither the
+          # envelope nor the gate can regress unnoticed.
+          AETHYME_EVAL_ARM=ci CLAUDE_PROJECT_DIR="$TARGET" \
+            bash .claude/hooks/aethyme-load-context.sh > envelope.json
           grep -q '"hookEventName": "SessionStart"' envelope.json
           test -s envelope.json
+          CLAUDE_PROJECT_DIR="$TARGET" \
+            bash .claude/hooks/aethyme-load-context.sh > interactive.json
+          if [[ -s interactive.json ]]; then
+            echo "FAIL: hook injected context outside an eval arm" >&2
+            exit 1
+          fi
 
           # Index + the Explore chain and both readers over one saved file.
           aethyme-graph-index --repo-root "$TARGET" --repo-name demo --engine-version ci
