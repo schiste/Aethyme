@@ -857,18 +857,20 @@ impl Broker {
             .iter()
             .map(|worktree| worktree.session_id)
             .collect::<Vec<_>>();
-        let artifacts = self.artifact_candidates(
+        let mut artifacts = self.artifact_candidates(
             evaluated_at,
             &policy,
             &cleanup.worktrees,
             &sessions,
             &removed_sessions,
         );
-        let orphans = self.orphan_candidates(evaluated_at, &policy, &mut blockers)?;
+        let mut orphans = self.orphan_candidates(evaluated_at, &policy, &mut blockers)?;
 
         rows.sort_by_key(|row| (row.kind, row.id));
         let mut files = files.into_values().collect::<Vec<_>>();
         files.sort_by(|left, right| left.path.cmp(&right.path));
+        // Ordered below, once the budget is known: which rule applies is a
+        // function of how much is retained, so it cannot be decided yet.
         worktrees.sort_by_key(|worktree| worktree.session_id);
         blockers.sort_by(|left, right| {
             (&left.kind, left.id, &left.reason).cmp(&(&right.kind, right.id, &right.reason))
@@ -904,6 +906,45 @@ impl Broker {
             .fold(0_u64, u64::saturating_add);
         let estimated_blocked_bytes =
             estimated_retained_bytes.saturating_sub(worktree_scoped_reclaimable);
+
+        // Being over budget now decides what a bounded `gc apply` spends its
+        // time on, rather than only setting a flag somebody reads (#176).
+        // `gc_apply_bounded` drains these lists in order and stops at its
+        // deadline, so the front of the list is the part that is real.
+        let policy_budget = policy.retained_bytes_budget;
+        let reclaim_order =
+            crate::reclaim_order::order_for(estimated_retained_bytes, policy_budget);
+        crate::reclaim_order::sort_by_order(&mut worktrees, reclaim_order, |worktree| {
+            crate::ReclaimRanking {
+                id: worktree.session_id,
+                retained_since_ms: worktree.closed_at,
+                estimated_bytes: worktree.estimated_bytes,
+            }
+        });
+        crate::reclaim_order::sort_by_order(&mut artifacts, reclaim_order, |artifact| {
+            crate::ReclaimRanking {
+                id: artifact.session_id,
+                // Build caches record idleness, not a closing time. Converting
+                // it back to an instant keeps one comparison rule for every
+                // kind of reclamation instead of a second rule for this one.
+                retained_since_ms: evaluated_at
+                    .saturating_sub(i64::from(artifact.idle_days).saturating_mul(86_400_000)),
+                estimated_bytes: artifact.estimated_bytes,
+            }
+        });
+        // Orphaned roots carry no age -- their owning database is gone, which
+        // is what makes them orphans -- so the budget rule has nothing extra
+        // to say about them and routing them through it would be ordering
+        // theatre. Bytes are the only fact available, and the largest
+        // abandoned root is the one a bounded sweep should reach first either
+        // way. Path breaks ties so the plan stays byte-identical run to run.
+        orphans.sort_by(|left, right| {
+            right
+                .estimated_bytes
+                .cmp(&left.estimated_bytes)
+                .then_with(|| left.worktree_root.cmp(&right.worktree_root))
+        });
+
         let mut plan = GcPlan {
             schema_version: GC_PLAN_SCHEMA_VERSION,
             digest: String::new(),
@@ -918,6 +959,16 @@ impl Broker {
             estimated_reclaimable_bytes,
             estimated_retained_bytes,
             estimated_blocked_bytes,
+            reclaim_order,
+            retained_bytes_deficit: crate::reclaim_order::deficit_bytes(
+                estimated_retained_bytes,
+                policy_budget,
+            ),
+            clears_retained_bytes_budget: crate::reclaim_order::clears_budget(
+                estimated_retained_bytes,
+                policy_budget,
+                worktree_scoped_reclaimable,
+            ),
             // The full walk: `gc plan` is the expensive path an operator asks
             // for, so it is the one that can afford to size what it found.
             reconciliation: Some(self.reconcile_worktree_directories(true)?),
@@ -947,6 +998,9 @@ impl Broker {
             estimated_retained_bytes: plan.estimated_retained_bytes,
             estimated_blocked_bytes: plan.estimated_blocked_bytes,
             over_retained_bytes_budget,
+            retained_bytes_deficit: plan.retained_bytes_deficit,
+            clears_retained_bytes_budget: plan.clears_retained_bytes_budget,
+            reclaim_order: plan.reclaim_order,
             blockers: plan.blockers.len(),
             unclaimed_worktree_count: plan
                 .reconciliation

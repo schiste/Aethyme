@@ -1021,6 +1021,37 @@ than only the bytes this plan will act on. The two reporting totals are excluded
 from the authorization digest: a measured size change must never invalidate a
 plan an operator already confirmed.
 
+### The retained-bytes budget
+
+`retained_bytes_budget` used to set a boolean and nothing else, which made it a
+gauge rather than a budget. It now decides two things a plan reports.
+
+**Ordering.** `gc apply --budget-ms` drains the plan's candidate lists in the
+order they are printed and stops at its deadline, so the front of each list is
+the part of a bounded sweep that is real. Within budget the plan is ordered
+`oldest_first`, because age is the binding policy. Over budget it is ordered
+`largest_first`, because bytes are the binding pressure: a sweep that gets
+through three of forty candidates should have spent that time on the three that
+matter. The rule that applied is reported as `reclaim_order`.
+
+Build caches are ranked by the same rule, converting their recorded idle days
+back to an instant. Orphaned worktree roots are always ordered largest first:
+their owning repository is gone, so no age is recoverable for them and size is
+the only fact available.
+
+**Sufficiency.** `retained_bytes_deficit` is how many bytes are above the
+budget, and `clears_retained_bytes_budget` says whether applying all of the plan
+would get back under it. The two together separate a backlog somebody can work
+off from a budget that reclamation cannot satisfy — megabytes reclaimable
+against gigabytes retained — which previously read identically. `broker status`
+carries the same two fields and its warning says which case it is instead of
+recommending cleanup that provably would not help.
+
+Both reporting fields are excluded from the authorization digest, like the other
+byte totals. The *ordering* is not: it changes the candidate lists, so a plan
+that crosses the budget threshold produces a different digest and has to be
+re-confirmed.
+
 ### Directories no session claims
 
 Every cleanup lane reasons from session rows, so a directory under a worktree

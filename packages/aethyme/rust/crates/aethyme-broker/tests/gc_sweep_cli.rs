@@ -461,3 +461,29 @@ fn a_budget_too_small_to_finish_still_makes_ground_and_keeps_the_cache_resumable
         "committed work must be untouched"
     );
 }
+
+/// An orphaned root's owning database is gone, which is what makes it an
+/// orphan, so no age is recoverable for it and only its size can order it.
+/// Path order -- what the sweep used before -- is arbitrary with respect to
+/// what a time-bounded `gc apply` should reach first (#176).
+#[test]
+fn the_largest_orphaned_root_is_planned_before_smaller_ones() {
+    let (repo, container) =
+        fixture("[retention]\norphan_worktree_roots_days = 0\nartifact_sweep_budget_ms = 0\n");
+    let missing = container.path().join("deleted-repository");
+    // Named so that alphabetical order and size order disagree: if the plan
+    // still sorted by path, `repo-a-small` would come first.
+    let small = stamp_root(container.path(), "repo-a-small", &missing);
+    let large = stamp_root(container.path(), "repo-z-large", &missing);
+    std::fs::write(large.join("some-session/bulk.bin"), vec![b'x'; 512 * 1_024]).unwrap();
+
+    let plan = plan_json(repo.path(), container.path());
+    let keys: Vec<&str> = plan["orphans"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|orphan| orphan["repository_key"].as_str().unwrap())
+        .collect();
+    assert_eq!(keys, vec!["repo-z-large", "repo-a-small"]);
+    assert!(small.exists() && large.exists(), "planning removes nothing");
+}

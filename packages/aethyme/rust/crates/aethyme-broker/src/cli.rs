@@ -3311,6 +3311,26 @@ fn render_gc_plan(plan: &crate::GcPlan, detail: bool) {
         human_bytes(plan.estimated_retained_bytes),
         human_bytes(plan.estimated_blocked_bytes),
     );
+    // The ordering line is not decoration: `gc apply --budget-ms` drains these
+    // lists in the order printed and stops at its deadline, so this says which
+    // end of the backlog a bounded sweep actually reaches (#176).
+    if plan.retained_bytes_deficit > 0 {
+        out!(
+            "  over budget by {}: candidates ordered {}{}",
+            human_bytes(plan.retained_bytes_deficit),
+            plan.reclaim_order.as_str().replace('_', " "),
+            if plan.clears_retained_bytes_budget {
+                "; applying this plan clears the budget"
+            } else {
+                "; applying all of this plan still leaves retention over budget"
+            },
+        );
+    } else {
+        out!(
+            "  within budget: candidates ordered {}",
+            plan.reclaim_order.as_str().replace('_', " "),
+        );
+    }
     // Listed apart from the candidate sections above because it is not a
     // candidate list: `gc apply` will not touch any of these, and printing
     // them among things the digest authorizes would imply otherwise (#176).

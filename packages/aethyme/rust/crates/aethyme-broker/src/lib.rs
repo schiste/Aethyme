@@ -86,6 +86,7 @@ pub use chau7_tabs::{
 };
 pub use pr_link::{creates_pull_request, pull_request_number_from_output};
 mod reclaim;
+mod reclaim_order;
 pub use reclaim::{
     ReclaimCandidate, ReclaimOutcome, ReclaimPlan, apply as apply_reclaim,
     classify as classify_reclaim, directory_bytes, is_artefact_directory,
@@ -322,6 +323,10 @@ pub use repository_contract::{
     CANONICAL_REPOSITORY_MARKER_PATH, LOCAL_REPOSITORY_MARKER_PATH, RepositoryContract,
     RepositoryDeploymentMode, detect_repository_mode, repository_managed_paths,
     repository_state_digest,
+};
+pub use reclaim_order::{
+    ReclaimOrder, ReclaimRanking, clears_budget, deficit_bytes,
+    order_for as reclaim_order_for, over_budget,
 };
 pub use resources::{
     HOST_RESOURCE_REQUEST_SCHEMA_VERSION, HOST_RESOURCE_SCHEMA_VERSION, HostLeaseState,

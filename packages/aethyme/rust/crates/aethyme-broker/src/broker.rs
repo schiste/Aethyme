@@ -932,6 +932,13 @@ pub struct CleanupRetention {
     pub estimated_blocked_bytes: u64,
     pub retained_bytes_budget: u64,
     pub over_retained_bytes_budget: bool,
+    /// Bytes above the budget. `0` within budget or with no budget set.
+    pub retained_bytes_deficit: u64,
+    /// Whether removing everything currently eligible would get back under
+    /// budget. `false` alongside a deficit is the shape #176 was reported in:
+    /// megabytes reclaimable against gigabytes retained. That is not a backlog
+    /// somebody can work off, so it must not be advised as one.
+    pub clears_retained_bytes_budget: bool,
     pub oldest_closed_age_days: u64,
     pub closed_worktrees_policy_days: u32,
     pub severity: StatusAdviceSeverity,
@@ -5424,10 +5431,25 @@ impl Broker {
                 id: "cleanup.retained-worktrees",
                 severity: cleanup_retention.severity,
                 reason: "closed broker-owned worktrees are retained until explicit cleanup",
-                summary: format!(
-                    "{count} closed broker-owned {} remain on disk; review reclaimable bytes and remove only eligible worktrees",
-                    plural_word(count, "worktree", "worktrees")
-                ),
+                // An unmeetable budget is a different situation from a
+                // backlog and must not be advised as one: telling an operator
+                // to run cleanup when cleanup provably cannot close the gap is
+                // how a budget stays a gauge (#176).
+                summary: if cleanup_retention.over_retained_bytes_budget
+                    && !cleanup_retention.clears_retained_bytes_budget
+                {
+                    format!(
+                        "retained broker storage is {} bytes over the {} byte budget and removing everything currently eligible would reclaim only {}; the budget cannot be met by cleanup alone",
+                        cleanup_retention.retained_bytes_deficit,
+                        cleanup_retention.retained_bytes_budget,
+                        cleanup_retention.estimated_reclaimable_bytes
+                    )
+                } else {
+                    format!(
+                        "{count} closed broker-owned {} remain on disk; review reclaimable bytes and remove only eligible worktrees",
+                        plural_word(count, "worktree", "worktrees")
+                    )
+                },
                 session_id: None,
                 queue_entry_id: None,
                 evidence: vec![
@@ -5449,6 +5471,17 @@ impl Broker {
                             " (budget exceeded)"
                         } else {
                             ""
+                        }
+                    ),
+                    format!(
+                        "budget deficit: {} bytes ({})",
+                        cleanup_retention.retained_bytes_deficit,
+                        if !cleanup_retention.over_retained_bytes_budget {
+                            "within budget"
+                        } else if cleanup_retention.clears_retained_bytes_budget {
+                            "reclaimable work closes the gap"
+                        } else {
+                            "not closable by reclaiming eligible worktrees"
                         }
                     ),
                     format!(
@@ -7581,8 +7614,10 @@ impl Broker {
         let estimated_blocked_bytes = plan
             .estimated_retained_bytes
             .saturating_sub(plan.estimated_reclaimable_bytes);
-        let over_retained_bytes_budget = policy.retained_bytes_budget > 0
-            && plan.estimated_retained_bytes >= policy.retained_bytes_budget;
+        let over_retained_bytes_budget = crate::reclaim_order::over_budget(
+            plan.estimated_retained_bytes,
+            policy.retained_bytes_budget,
+        );
         Ok(CleanupRetention {
             broker_owned_worktree_count: plan.retained_worktree_count,
             retained_session_branch_count: plan.retained_branch_count,
@@ -7592,6 +7627,15 @@ impl Broker {
             estimated_blocked_bytes,
             retained_bytes_budget: policy.retained_bytes_budget,
             over_retained_bytes_budget,
+            retained_bytes_deficit: crate::reclaim_order::deficit_bytes(
+                plan.estimated_retained_bytes,
+                policy.retained_bytes_budget,
+            ),
+            clears_retained_bytes_budget: crate::reclaim_order::clears_budget(
+                plan.estimated_retained_bytes,
+                policy.retained_bytes_budget,
+                plan.estimated_reclaimable_bytes,
+            ),
             oldest_closed_age_days,
             closed_worktrees_policy_days: policy.closed_worktrees_days,
             severity,
@@ -7914,10 +7958,22 @@ fn unclaimed_worktree_severity(unclaimed: usize) -> StatusAdviceSeverity {
 
 fn cleanup_retention_warning(retention: &CleanupRetention) -> Option<String> {
     retention.over_retained_bytes_budget.then(|| {
-        format!(
-            "retained broker storage is {} bytes, exceeding the configured {} byte budget; review `aethyme broker gc plan`",
-            retention.estimated_retained_bytes, retention.retained_bytes_budget
-        )
+        // Naming the deficit rather than the total is what makes this
+        // actionable, and saying when reclamation cannot close it stops the
+        // warning from recommending work that would not help (#176).
+        if retention.clears_retained_bytes_budget {
+            format!(
+                "retained broker storage is {} bytes over the configured {} byte budget; reclaiming eligible worktrees would clear it -- review `aethyme broker gc plan`",
+                retention.retained_bytes_deficit, retention.retained_bytes_budget
+            )
+        } else {
+            format!(
+                "retained broker storage is {} bytes over the configured {} byte budget and only {} bytes are reclaimable; the budget cannot be met by cleanup alone -- review `aethyme broker gc plan`",
+                retention.retained_bytes_deficit,
+                retention.retained_bytes_budget,
+                retention.estimated_reclaimable_bytes
+            )
+        }
     })
 }
 
@@ -8971,7 +9027,7 @@ mod tests {
             super::cleanup_retention_severity(1, u64::MAX, 1, 7, 0),
             super::StatusAdviceSeverity::Notice
         );
-        let retention = super::CleanupRetention {
+        let mut retention = super::CleanupRetention {
             reconciliation: crate::WorktreeReconciliation {
                 schema_version: crate::WORKTREE_RECONCILIATION_SCHEMA_VERSION,
                 scanned_root_count: 0,
@@ -8990,15 +9046,28 @@ mod tests {
             estimated_blocked_bytes: 2048,
             retained_bytes_budget: 1024,
             over_retained_bytes_budget: true,
+            retained_bytes_deficit: 1024,
+            clears_retained_bytes_budget: false,
             oldest_closed_age_days: 1,
             closed_worktrees_policy_days: 7,
             severity: super::StatusAdviceSeverity::Warning,
         };
-        assert!(
-            super::cleanup_retention_warning(&retention)
-                .unwrap()
-                .contains("aethyme broker gc plan")
-        );
+        let unmeetable = super::cleanup_retention_warning(&retention).unwrap();
+        assert!(unmeetable.contains("aethyme broker gc plan"));
+        // The deficit, not the total, is what an operator has to act on.
+        assert!(unmeetable.contains("1024 bytes over"));
+        assert!(unmeetable.contains("cannot be met by cleanup alone"));
+
+        // Same overage, but reclaimable work covers it: a backlog, not a wall.
+        retention.estimated_reclaimable_bytes = 2048;
+        retention.clears_retained_bytes_budget = true;
+        let backlog = super::cleanup_retention_warning(&retention).unwrap();
+        assert!(backlog.contains("would clear it"));
+        assert!(!backlog.contains("cannot be met"));
+
+        // Within budget there is nothing to warn about at all.
+        retention.over_retained_bytes_budget = false;
+        assert!(super::cleanup_retention_warning(&retention).is_none());
     }
 
     fn doctor_report(
@@ -9040,6 +9109,9 @@ mod tests {
                 estimated_retained_bytes: 0,
                 estimated_blocked_bytes: 0,
                 over_retained_bytes_budget: false,
+                retained_bytes_deficit: 0,
+                clears_retained_bytes_budget: true,
+                reclaim_order: crate::ReclaimOrder::OldestFirst,
                 blockers: 0,
             },
             integration_movement: None,

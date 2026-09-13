@@ -44,6 +44,31 @@ artifacts and their exact source revision are recorded in each signed
   operator already gave. The broker did not create these directories and cannot
   reason about their contents; naming them for a human is the whole remedy.
 
+- `retained_bytes_budget` now drives reclamation instead of only reporting on
+  it. Over budget, `gc plan` orders its candidates largest first; within budget
+  it orders them oldest first. The applied rule ships as `reclaim_order`.
+
+  `gc apply --budget-ms` drains the plan in order and stops at its deadline, so
+  the order is what a bounded sweep actually reclaims. Candidates used to be
+  listed in session-id order — insertion order wearing a policy's clothes — and
+  a sweep that got through three of forty spent its deadline on whichever three
+  happened to be oldest by row id (#176). Build caches follow the same rule,
+  ranked on their recorded idle days. Orphaned worktree roots are always ordered
+  largest first: their owning repository is gone, so no age is recoverable and
+  size is the only fact left.
+
+  The plan and `broker status` also now report `retained_bytes_deficit` — the
+  bytes above the budget — and `clears_retained_bytes_budget`, which says
+  whether applying everything would get back under it. A budget that reclamation
+  cannot satisfy, 3.2 MB reclaimable against 37.4 GB retained, used to read
+  exactly like a backlog somebody could work off; the status warning now says
+  which it is rather than recommending cleanup that provably would not help.
+
+  Both reporting fields stay out of the plan's authorization digest, like the
+  other byte totals. The ordering does change the digest, because it changes the
+  candidate lists: a plan that crosses the budget threshold has to be
+  re-confirmed.
+
 - `aethyme broker review waive` excuses one review dimension at one head, on the
   record:
 

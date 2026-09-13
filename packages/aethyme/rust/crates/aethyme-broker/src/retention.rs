@@ -302,6 +302,19 @@ pub struct GcPlan {
     /// directory appearing or vanishing must not invalidate an operator's
     /// authorization to remove something else.
     ///
+    /// Which rule the candidate lists above are ordered by, and therefore
+    /// what a time-bounded `gc apply` will reach before its deadline.
+    #[serde(default = "default_reclaim_order")]
+    pub reclaim_order: crate::ReclaimOrder,
+    /// Bytes above `retained_bytes_budget`. `0` within budget or unset.
+    /// Reporting only: excluded from the digest with the other totals.
+    #[serde(default)]
+    pub retained_bytes_deficit: u64,
+    /// Whether applying all of this plan would bring retention under budget.
+    /// `false` with a non-zero deficit is a budget no reclamation can satisfy,
+    /// which is a different problem from a backlog and reads differently.
+    #[serde(default = "default_clears_budget")]
+    pub clears_retained_bytes_budget: bool,
     /// `None` only when re-reading a plan written before the sweep existed.
     /// That is deliberately not the same value as a sweep that found nothing:
     /// a plan that never looked must not read as a plan that looked and found
@@ -338,10 +351,25 @@ pub struct GcHealth {
     pub estimated_retained_bytes: u64,
     pub estimated_blocked_bytes: u64,
     pub over_retained_bytes_budget: bool,
+    pub retained_bytes_deficit: u64,
+    pub clears_retained_bytes_budget: bool,
+    pub reclaim_order: crate::ReclaimOrder,
     pub blockers: usize,
     /// Directories under a broker worktree root that no session claims.
     pub unclaimed_worktree_count: usize,
     pub unclaimed_worktree_bytes: u64,
+}
+
+/// A plan written before ordering was policy-driven was ordered by session id,
+/// which is what oldest-first approximates.
+fn default_reclaim_order() -> crate::ReclaimOrder {
+    crate::ReclaimOrder::OldestFirst
+}
+
+/// An older plan carried no budget verdict. Reading it as "cannot be cleared"
+/// would raise an alarm about a plan nobody can re-evaluate.
+fn default_clears_budget() -> bool {
+    true
 }
 
 impl GcPlan {
