@@ -745,18 +745,20 @@ fn check_git_output() -> Check {
                 ),
             }
         }
-        // The broker routed around the wrapper; the machine still has one.
-        // Gate commands run through `sh -c` with the caller's PATH and get no
-        // such protection, so this stays visible -- as a warning, because
+        // The broker routed around the wrapper and, since #177, drops its
+        // directory from the PATH it hands gate commands. The machine still
+        // has one, and everything the operator runs by hand still meets it --
+        // so this stays visible, as a warning rather than a failure, because
         // nothing the broker decides is wrong and failing CI over someone
         // else's PATH would be false.
         crate::git::GitOutputTrust::Undecorated { resolved, bypassed } => Check {
             id: "certify.git-output",
             status: CheckStatus::Warn,
             detail: format!(
-                "git output is rewritten earlier on PATH ({}); the broker uses {} instead, \
-                 but gate commands inherit PATH and do not -- remove the wrapper",
-                bypassed.join("; "),
+                "git output is rewritten earlier on PATH ({}); the broker uses {} instead \
+                 and keeps the wrapper out of gate PATH, but your own shell still resolves \
+                 it -- remove the wrapper",
+                crate::git::join_reasons(bypassed),
                 resolved.display()
             ),
         },

@@ -2455,21 +2455,35 @@ fn render_gate_failure_tail(outcome: &crate::gates::GateRunOutcome) {
     };
     let start = bytes.len().saturating_sub(GATE_FAILURE_TAIL_BYTES);
     let text = String::from_utf8_lossy(&bytes[start..]);
-    let mut lines = text
+    // aethyme writes an environment header into every gate log, so it has to
+    // be held out of the count and the label here: reporting our own line as
+    // "gate <name> output" would misattribute it, and on a gate that failed in
+    // one line it would double the tail an operator is asked to read.
+    let (environment, produced): (Vec<&str>, Vec<&str>) = text
         .lines()
+        .partition(|line| line.starts_with(crate::git::SUBPROCESS_PATH_NOTE_PREFIX));
+    let mut lines = produced
+        .into_iter()
         .rev()
         .take(GATE_FAILURE_TAIL_LINES)
         .collect::<Vec<_>>();
     lines.reverse();
-    if lines.is_empty() {
+    if lines.is_empty() && environment.is_empty() {
         return;
     }
-    eprintln!(
-        "gate {} output (last {} line(s)):",
-        outcome.gate,
-        lines.len()
-    );
-    for line in lines {
+    if !lines.is_empty() {
+        eprintln!(
+            "gate {} output (last {} line(s)):",
+            outcome.gate,
+            lines.len()
+        );
+        for line in lines {
+            eprintln!("  {line}");
+        }
+    }
+    // After the output, not before: the failure is what the operator came for,
+    // and this is the context for deciding whether to believe it.
+    for line in environment {
         eprintln!("  {line}");
     }
 }

@@ -167,15 +167,42 @@ pub enum GitOutputTrust {
     /// broker is safe once it has an honest git, but the machine is not:
     /// gate commands run through `sh -c` with the caller's PATH, so a wrapper
     /// the broker routed around still breaks them. Carrying the list is what
-    /// lets `certify` stay loud about a repaired-for-us-only machine.
+    /// lets `certify` stay loud about a repaired-for-us-only machine -- and,
+    /// since #177, what lets [`sanitized_subprocess_path`] keep the wrapper
+    /// out of the gate's PATH instead of only reporting it.
     Undecorated {
         resolved: PathBuf,
-        bypassed: Vec<String>,
+        bypassed: Vec<BypassedGit>,
     },
     /// Every candidate that ran decorated its output. This is the wrapper.
     Decorated { detail: String },
     /// No candidate could be probed, so the question stays open.
     Indeterminate { detail: String },
+}
+
+/// A `git` on PATH that the probe did not select, and why.
+///
+/// Structured rather than pre-formatted because the two consumers need
+/// different halves of it. `aethyme certify` prints `reason` to an operator.
+/// [`sanitized_subprocess_path`] needs `path`, and needs it only for the
+/// candidates flagged `dishonest`: a stale PATH entry that could not be
+/// executed is not evidence of a wrapper, and removing its directory from a
+/// subprocess PATH would take unrelated tools with it.
+#[derive(Debug, Clone)]
+pub struct BypassedGit {
+    /// The rejected `git` itself, absolute.
+    pub path: PathBuf,
+    /// Operator-facing explanation, already naming `path`.
+    pub reason: String,
+    /// The probe caught this one rewriting porcelain output or exit codes,
+    /// as opposed to merely failing to run.
+    pub dishonest: bool,
+}
+
+impl std::fmt::Display for BypassedGit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.reason)
+    }
 }
 
 static GIT_PROGRAM: OnceLock<GitProgram> = OnceLock::new();
@@ -207,8 +234,8 @@ pub(crate) fn git_command() -> Command {
 }
 
 fn resolve_git_program() -> GitProgram {
-    let mut dishonest: Vec<String> = Vec::new();
-    let mut unusable: Vec<String> = Vec::new();
+    let mut dishonest: Vec<BypassedGit> = Vec::new();
+    let mut unusable: Vec<BypassedGit> = Vec::new();
     for candidate in path_candidates("git") {
         match porcelain_probe(&candidate) {
             PorcelainProbe::Undecorated => {
@@ -222,18 +249,26 @@ fn resolve_git_program() -> GitProgram {
                     },
                 };
             }
-            PorcelainProbe::Decorated { bytes } => dishonest.push(format!(
-                "{} emitted {bytes} bytes of porcelain on a clean temporary repository",
-                candidate.display()
-            )),
-            PorcelainProbe::StatusRewritten { detail } => {
-                dishonest.push(format!("{}: {detail}", candidate.display()));
-            }
+            PorcelainProbe::Decorated { bytes } => dishonest.push(BypassedGit {
+                reason: format!(
+                    "{} emitted {bytes} bytes of porcelain on a clean temporary repository",
+                    candidate.display()
+                ),
+                path: candidate,
+                dishonest: true,
+            }),
+            PorcelainProbe::StatusRewritten { detail } => dishonest.push(BypassedGit {
+                reason: format!("{}: {detail}", candidate.display()),
+                path: candidate,
+                dishonest: true,
+            }),
             // PATH routinely holds stale entries, and one that cannot run is
             // not evidence of a wrapper. Keep looking.
-            PorcelainProbe::Unusable { reason } => {
-                unusable.push(format!("{}: {reason}", candidate.display()));
-            }
+            PorcelainProbe::Unusable { reason } => unusable.push(BypassedGit {
+                reason: format!("{}: {reason}", candidate.display()),
+                path: candidate,
+                dishonest: false,
+            }),
         }
     }
     let trust = if !dishonest.is_empty() {
@@ -241,12 +276,15 @@ fn resolve_git_program() -> GitProgram {
             detail: format!(
                 "a PATH wrapper is rewriting git output or exit codes ({}); \
                  remove it from PATH, then rerun",
-                dishonest.join("; ")
+                join_reasons(&dishonest)
             ),
         }
     } else if !unusable.is_empty() {
         GitOutputTrust::Indeterminate {
-            detail: format!("no git on PATH could be probed ({})", unusable.join("; ")),
+            detail: format!(
+                "no git on PATH could be probed ({})",
+                join_reasons(&unusable)
+            ),
         }
     } else {
         GitOutputTrust::Indeterminate {
@@ -256,6 +294,126 @@ fn resolve_git_program() -> GitProgram {
     GitProgram {
         program: PathBuf::from("git"),
         trust,
+    }
+}
+
+/// The operator-facing half of a set of rejected candidates, in probe order.
+pub fn join_reasons(bypassed: &[BypassedGit]) -> String {
+    bypassed
+        .iter()
+        .map(BypassedGit::to_string)
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// PATH for a subprocess the broker spawns on an operator's behalf, with the
+/// directory of every `git` the probe caught lying removed.
+///
+/// [`git_command`] protects this crate's own git calls by resolving one
+/// trustworthy binary (#176, #178). It does nothing for gate commands, which
+/// run through `sh -c` and resolve `git` -- and `cargo`, and everything else
+/// -- through whatever PATH the operator happened to have. A wrapper the
+/// broker routed around still corrupts them.
+///
+/// That matters more than it looks, because of where the verdict lands. A gate
+/// whose tools were replaced by a wrapper does not fail as an environment
+/// error; it fails like a test failure, and `fail` / `test_failure` is the one
+/// combination the tree-hash cache reuses. So the gate inherits a wrong answer
+/// and then remembers it against the tree (#177).
+///
+/// Removing a directory is deliberately blunt: if it held the only copy of a
+/// tool the gate needs, the gate now exits 127 and classifies as an
+/// environment error, which is loud and is never cached. The failure mode of
+/// this repair is the honest one.
+///
+/// `None` means leave PATH exactly as inherited -- either nothing was proven,
+/// or nothing proven needs removing. An untouched PATH is never rebuilt from a
+/// probe that concluded nothing.
+pub fn sanitized_subprocess_path() -> Option<std::ffi::OsString> {
+    let GitOutputTrust::Undecorated { bypassed, .. } = &git_program().trust else {
+        return None;
+    };
+    let remove: std::collections::BTreeSet<PathBuf> = bypassed
+        .iter()
+        .filter(|entry| entry.dishonest)
+        .filter_map(|entry| entry.path.parent().map(Path::to_path_buf))
+        .collect();
+    if remove.is_empty() {
+        return None;
+    }
+    path_without(&std::env::var_os("PATH")?, &remove)
+}
+
+/// `inherited` with every directory in `remove` dropped, preserving order.
+///
+/// Split out from [`sanitized_subprocess_path`] so the filtering is testable
+/// against a constructed PATH: the caller's half depends on a `OnceLock` probe
+/// of the real machine, which is exactly the thing a test cannot arrange.
+fn path_without(
+    inherited: &std::ffi::OsStr,
+    remove: &std::collections::BTreeSet<PathBuf>,
+) -> Option<std::ffi::OsString> {
+    let kept: Vec<PathBuf> = std::env::split_paths(inherited)
+        .filter(|dir| !absolute_path_dir(dir).is_some_and(|dir| remove.contains(&dir)))
+        .collect();
+    std::env::join_paths(kept).ok()
+}
+
+/// Marks the line [`subprocess_path_note`] writes into a subprocess log.
+///
+/// Public because the line is aethyme's, not the command's: anything replaying
+/// a gate log back to an operator has to be able to tell them apart, or
+/// aethyme's own header gets reported as output the gate produced.
+pub const SUBPROCESS_PATH_NOTE_PREFIX: &str = "aethyme gate environment: ";
+
+/// What [`sanitized_subprocess_path`] did, for the subprocess's own log.
+///
+/// Always a line, including when nothing was changed. A gate log that says
+/// which git the command will resolve is how a wrapper-corrupted verdict stops
+/// being indistinguishable from a real one after the fact; saying nothing when
+/// nothing was removed would leave exactly the ambiguity this is for.
+pub fn subprocess_path_note() -> String {
+    match &git_program().trust {
+        GitOutputTrust::Undecorated { resolved, bypassed } => {
+            let removed: Vec<String> = bypassed
+                .iter()
+                .filter(|entry| entry.dishonest)
+                .filter_map(|entry| entry.path.parent())
+                .map(|dir| dir.display().to_string())
+                .collect();
+            if removed.is_empty() {
+                format!(
+                    "aethyme gate environment: git resolves to {}; PATH inherited unchanged\n",
+                    resolved.display()
+                )
+            } else {
+                format!(
+                    "{SUBPROCESS_PATH_NOTE_PREFIX}git resolves to {}; removed {} from PATH because a git there rewrites output ({})\n",
+                    resolved.display(),
+                    removed.join(", "),
+                    join_reasons(bypassed)
+                )
+            }
+        }
+        GitOutputTrust::Decorated { detail } => format!(
+            "{SUBPROCESS_PATH_NOTE_PREFIX}WARNING every git on PATH rewrites output, so this gate's tools are not trustworthy and its verdict may not be about the code ({detail})\n"
+        ),
+        GitOutputTrust::Indeterminate { detail } => format!(
+            "{SUBPROCESS_PATH_NOTE_PREFIX}git trust unproven ({detail}); PATH inherited unchanged\n"
+        ),
+    }
+}
+
+/// A PATH entry as an absolute directory, or `None` when it cannot be one.
+///
+/// Shared with [`path_candidates`] so the sanitizer compares the same
+/// directories the probe walked. Resolving these differently is how a removal
+/// silently misses the entry it was built to remove.
+fn absolute_path_dir(dir: &Path) -> Option<PathBuf> {
+    if dir.is_absolute() {
+        Some(dir.to_path_buf())
+    } else {
+        Some(std::env::current_dir().ok()?.join(dir))
     }
 }
 
@@ -281,15 +439,9 @@ fn path_candidates(program: &str) -> Vec<PathBuf> {
     let Some(path) = std::env::var_os("PATH") else {
         return Vec::new();
     };
-    let cwd = std::env::current_dir().ok();
     std::env::split_paths(&path)
         .filter_map(|dir| {
-            let dir = if dir.is_absolute() {
-                dir
-            } else {
-                cwd.as_ref()?.join(dir)
-            };
-            let candidate = dir.join(program);
+            let candidate = absolute_path_dir(&dir)?.join(program);
             is_executable_file(&candidate).then_some(candidate)
         })
         .collect()
@@ -312,13 +464,19 @@ fn is_executable_file(path: &Path) -> bool {
 #[derive(Debug, PartialEq, Eq)]
 enum PorcelainProbe {
     Undecorated,
-    Decorated { bytes: usize },
+    Decorated {
+        bytes: usize,
+    },
     /// Said the right bytes and the wrong thing: an exit code that does not
     /// match the repository state the probe built. Separate from
     /// [`PorcelainProbe::Decorated`] only so the rejection can say which
     /// kind of dishonesty it found; both refuse the candidate.
-    StatusRewritten { detail: String },
-    Unusable { reason: String },
+    StatusRewritten {
+        detail: String,
+    },
+    Unusable {
+        reason: String,
+    },
 }
 
 /// Run `program` against a freshly created empty repository and require
@@ -426,7 +584,10 @@ fn porcelain_probe(program: &Path) -> PorcelainProbe {
             reason: "could not write the probe file".to_string(),
         };
     }
-    for args in [&["add", "probe.txt"][..], &["commit", "-q", "-m", "probe"][..]] {
+    for args in [
+        &["add", "probe.txt"][..],
+        &["commit", "-q", "-m", "probe"][..],
+    ] {
         match isolated(program).args(args).output() {
             Ok(output) if output.status.success() => {}
             Ok(output) => {
@@ -466,12 +627,15 @@ fn porcelain_probe(program: &Path) -> PorcelainProbe {
         Ok(output) if !output.stdout.is_empty() => Err(PorcelainProbe::Decorated {
             bytes: output.stdout.len(),
         }),
-        Ok(output) => output.status.code().ok_or_else(|| PorcelainProbe::Unusable {
-            reason: format!(
-                "git diff --quiet was terminated without an exit code ({})",
-                output.status
-            ),
-        }),
+        Ok(output) => output
+            .status
+            .code()
+            .ok_or_else(|| PorcelainProbe::Unusable {
+                reason: format!(
+                    "git diff --quiet was terminated without an exit code ({})",
+                    output.status
+                ),
+            }),
         Err(err) => Err(PorcelainProbe::Unusable {
             reason: format!("could not execute git diff --quiet ({err})"),
         }),
@@ -543,22 +707,20 @@ fn porcelain_probe(program: &Path) -> PorcelainProbe {
         }
     }
 
-    let name_only = |program: &Path, left: &str, right: &str| {
-        match isolated(program)
-            .args(["diff", "--name-only", "-z", left, right, "--", "probe.txt"])
-            .output()
-        {
-            Ok(output) if !output.status.success() => Err(PorcelainProbe::Unusable {
-                reason: format!(
-                    "git diff --name-only exited {} comparing {left} and {right}",
-                    output.status
-                ),
-            }),
-            Ok(output) => Ok(output.stdout),
-            Err(err) => Err(PorcelainProbe::Unusable {
-                reason: format!("could not execute git diff --name-only ({err})"),
-            }),
-        }
+    let name_only = |program: &Path, left: &str, right: &str| match isolated(program)
+        .args(["diff", "--name-only", "-z", left, right, "--", "probe.txt"])
+        .output()
+    {
+        Ok(output) if !output.status.success() => Err(PorcelainProbe::Unusable {
+            reason: format!(
+                "git diff --name-only exited {} comparing {left} and {right}",
+                output.status
+            ),
+        }),
+        Ok(output) => Ok(output.stdout),
+        Err(err) => Err(PorcelainProbe::Unusable {
+            reason: format!("could not execute git diff --name-only ({err})"),
+        }),
     };
 
     // The load-bearing direction: two commits that differ in `probe.txt` and
@@ -2270,5 +2432,97 @@ mod paths_equal_tests {
             root: PathBuf::from("/nonexistent-on-purpose"),
         };
         assert!(repo.paths_equal("a", "b", &[]).expect("compare"));
+    }
+}
+
+/// The PATH the broker hands a subprocess, as opposed to the git it runs
+/// itself. Separate from `paths_equal_tests` because the subject is different:
+/// those cover what this crate does with git output, these cover what a gate
+/// resolves when it goes looking for tools on its own.
+#[cfg(test)]
+mod subprocess_path_tests {
+    use super::*;
+
+    /// #177: the probe finds an honest git, but a gate resolves its own tools
+    /// through PATH and meets the wrapper anyway.
+    ///
+    /// The directory is dropped, not the single binary -- a shim directory
+    /// that rewrites `git` is the same directory that rewrites `cargo`, and
+    /// PATH has no finer unit than a directory to remove.
+    #[test]
+    fn a_dishonest_git_s_directory_is_dropped_from_a_subprocess_path() {
+        let mut remove = std::collections::BTreeSet::new();
+        remove.insert(PathBuf::from("/opt/shims"));
+        let inherited = std::env::join_paths(["/opt/shims", "/usr/local/bin", "/usr/bin"]).unwrap();
+
+        let sanitized = path_without(&inherited, &remove).expect("PATH stays joinable");
+
+        let kept: Vec<PathBuf> = std::env::split_paths(&sanitized).collect();
+        assert_eq!(
+            kept,
+            vec![PathBuf::from("/usr/local/bin"), PathBuf::from("/usr/bin")],
+            "the shim directory must be gone and the order of the rest preserved"
+        );
+    }
+
+    /// The control for the test above: filtering must be driven by the probe's
+    /// verdict, never by the name of a directory. A build that starts removing
+    /// plausible-looking entries would break machines where nothing is wrong.
+    #[test]
+    fn nothing_is_dropped_when_the_probe_condemned_nothing() {
+        let remove = std::collections::BTreeSet::new();
+        let inherited = std::env::join_paths(["/opt/shims", "/usr/local/bin", "/usr/bin"]).unwrap();
+
+        let sanitized = path_without(&inherited, &remove).unwrap();
+
+        assert_eq!(
+            sanitized, inherited,
+            "an unproven PATH is returned untouched"
+        );
+    }
+
+    /// A stale PATH entry that could not be executed is not evidence of a
+    /// wrapper, and its directory may hold the only copy of something the gate
+    /// needs. Only `dishonest` candidates may cost a directory.
+    #[test]
+    fn an_unusable_candidate_is_reported_but_never_removed() {
+        let bypassed = vec![
+            BypassedGit {
+                path: PathBuf::from("/stale/bin/git"),
+                reason: "/stale/bin/git: no such file or directory".into(),
+                dishonest: false,
+            },
+            BypassedGit {
+                path: PathBuf::from("/opt/shims/git"),
+                reason: "/opt/shims/git emitted 6 bytes of porcelain".into(),
+                dishonest: true,
+            },
+        ];
+
+        let remove: std::collections::BTreeSet<PathBuf> = bypassed
+            .iter()
+            .filter(|entry| entry.dishonest)
+            .filter_map(|entry| entry.path.parent().map(Path::to_path_buf))
+            .collect();
+
+        assert_eq!(
+            remove,
+            std::collections::BTreeSet::from([PathBuf::from("/opt/shims")])
+        );
+        assert!(
+            join_reasons(&bypassed).contains("/stale/bin/git"),
+            "the operator still hears about it, it just does not cost a directory"
+        );
+    }
+
+    /// The note is what makes a past verdict attributable, so it may never be
+    /// empty -- including in the case where nothing was changed, which is
+    /// precisely the case that would otherwise be indistinguishable from a
+    /// gate that ran before this existed.
+    #[test]
+    fn the_subprocess_note_always_names_the_trust_state() {
+        let note = subprocess_path_note();
+        assert!(note.starts_with(SUBPROCESS_PATH_NOTE_PREFIX), "{note}");
+        assert!(note.ends_with('\n'), "{note}");
     }
 }

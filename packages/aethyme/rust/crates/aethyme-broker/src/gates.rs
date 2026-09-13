@@ -1753,7 +1753,28 @@ fn classify_gate_result(
             resource_error: None,
             ..
         }) => (GateStatus::Cancelled, None, None),
-        Err(_) => (GateStatus::Error, Some(GateFailureClass::Environment), None),
+        // The gate never started, so nothing wrote to the log and the only
+        // account of why is `error` itself. Discarding it is what made #167's
+        // headroom refusal unreachable: the message was composed, returned,
+        // and dropped, leaving an operator with an empty log and a verdict
+        // that named no cause. `write_gate_diagnostic` rather than
+        // `append_gate_log` because the refusal is raised *before* the log
+        // file is created, so an append-only write would lose the same message
+        // a second time.
+        Err(error) => {
+            let class = match error.kind() {
+                // Not a different condition from the `resource_error` arm
+                // above, just one detected early enough to refuse instead of
+                // letting the build discover it as link failures.
+                std::io::ErrorKind::StorageFull => GateFailureClass::ResourceContention,
+                _ => GateFailureClass::Environment,
+            };
+            let _ = write_gate_diagnostic(
+                log_path,
+                &format!("aethyme could not start this gate: {error}\n"),
+            );
+            (GateStatus::Error, Some(class), None)
+        }
     }
 }
 
@@ -1897,7 +1918,21 @@ fn run_gate_command(
         ));
     }
 
-    let log = std::fs::File::create(context.log_path)?;
+    let mut log = std::fs::File::create(context.log_path)?;
+    // Before the command's own output, so the head of every gate log says
+    // which toolchain produced the verdict below it. A gate that ran against
+    // a wrapper is otherwise indistinguishable after the fact from one that
+    // ran against the real thing (#177).
+    //
+    // Through this handle, not a second one opened on the path: the child
+    // inherits this descriptor and its offset, and a separate append-mode
+    // write would leave that offset at zero for the child to overwrite.
+    // `try_clone` below dups it, so stdout and stderr both continue after the
+    // note rather than on top of it.
+    {
+        use std::io::Write as _;
+        let _ = log.write_all(crate::git::subprocess_path_note().as_bytes());
+    }
     let log_err = log.try_clone()?;
     let mut process = std::process::Command::new("sh");
     process
@@ -1918,6 +1953,13 @@ fn run_gate_command(
     }
     if let Some(cache) = context.managed_cache {
         process.env("AETHYME_GATE_CACHE_DIR", &cache.directory);
+    }
+    // A gate resolves `git` and `cargo` through PATH, not through the binary
+    // this crate proved for itself, so a wrapper the broker routed around
+    // still reaches the gate. Left alone when the probe proved nothing to
+    // remove.
+    if let Some(path) = crate::git::sanitized_subprocess_path() {
+        process.env("PATH", path);
     }
     let mut child = process.spawn()?;
 
@@ -2084,6 +2126,24 @@ fn append_gate_log(path: &Path, message: &str) -> Result<(), std::io::Error> {
     file.write_all(message.as_bytes())
 }
 
+/// Record why a gate could not start, creating the log if it does not exist.
+///
+/// [`append_gate_log`] opens for append only, which is correct while a gate is
+/// running: the log was created before the spawn, so a missing file there
+/// means something else is wrong and should not be papered over. It is wrong
+/// for a start failure. `run_gate_command` refuses on disk headroom *before*
+/// `File::create`, so the log does not exist yet -- and an append-only write
+/// returns `NotFound`, which is how the one message explaining the empty log
+/// got discarded twice over (#167, #168).
+fn write_gate_diagnostic(path: &Path, message: &str) -> Result<(), std::io::Error> {
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    file.write_all(message.as_bytes())
+}
+
 fn epoch_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2098,6 +2158,101 @@ mod tests {
     fn write_config(dir: &Path, body: &str) {
         std::fs::create_dir_all(dir.join(".aethyme")).unwrap();
         std::fs::write(dir.join(GATES_CONFIG_RELPATH), body).unwrap();
+    }
+
+    /// #168: the spawn error was the only account of why the gate produced no
+    /// output, and the `Err` arm dropped it on the floor.
+    ///
+    /// Asserted against the log rather than the returned tuple, because the
+    /// tuple was never the bug -- `Error` / `Environment` was already correct.
+    /// What an operator got was a verdict with a cause that existed for one
+    /// stack frame and was then discarded.
+    #[test]
+    fn a_gate_that_could_not_start_says_why_in_its_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log_path = tmp.path().join("gate.log");
+        // Created, so this test is only about the error surviving. Whether the
+        // writer can create a missing log is the separate concern that
+        // `a_headroom_refusal_reaches_a_log_that_does_not_exist_yet` owns.
+        std::fs::write(&log_path, "").unwrap();
+
+        let (status, class, exit) = classify_gate_result(
+            "cargo test",
+            &log_path,
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "sh: permission denied",
+            )),
+        );
+
+        assert_eq!(status, GateStatus::Error);
+        assert_eq!(class, Some(GateFailureClass::Environment));
+        assert_eq!(exit, None);
+        let log = std::fs::read_to_string(&log_path).expect("the diagnostic created the log");
+        assert!(
+            log.contains("sh: permission denied"),
+            "the spawn error must survive into the log an operator reads: {log:?}"
+        );
+    }
+
+    /// #167: the headroom refusal is raised *before* the log file is created,
+    /// so an append-only write loses it a second time.
+    ///
+    /// This is the case that made the refusal unreachable in practice, and it
+    /// is why the diagnostic writer creates rather than appends. The
+    /// classification travels with it: a full disk is the same resource
+    /// condition the running-gate arm reports, just caught early enough to
+    /// refuse instead of letting cargo discover it as link failures.
+    #[test]
+    fn a_headroom_refusal_reaches_a_log_that_does_not_exist_yet() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log_path = tmp.path().join("never-created.log");
+
+        let (status, class, _) = classify_gate_result(
+            "cargo test",
+            &log_path,
+            Err(std::io::Error::new(
+                std::io::ErrorKind::StorageFull,
+                "gate refusing to start: 1.4 GiB free, 8.0 GiB required",
+            )),
+        );
+
+        assert_eq!(status, GateStatus::Error);
+        assert_eq!(
+            class,
+            Some(GateFailureClass::ResourceContention),
+            "a full disk is a host resource condition, not a property of the code"
+        );
+        let log = std::fs::read_to_string(&log_path)
+            .expect("the refusal must create the log it is the only content of");
+        assert!(log.contains("1.4 GiB free"), "{log:?}");
+    }
+
+    /// The control: a gate that genuinely ran and failed must keep reporting a
+    /// test failure, because that is the one verdict the tree-hash cache
+    /// reuses. A fix for #167/#168 that reclassified real failures would make
+    /// every gate re-run forever.
+    #[test]
+    fn a_gate_that_ran_and_failed_is_still_a_test_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log_path = tmp.path().join("gate.log");
+        std::fs::write(&log_path, "test result: FAILED. 1 failed\n").unwrap();
+
+        let (status, class, exit) = classify_gate_result(
+            "cargo test",
+            &log_path,
+            Ok(GateCommandOutcome {
+                exit_code: Some(101),
+                timed_out: false,
+                resource_error: None,
+                first_output_ms: Some(12),
+                output_bytes: 30,
+            }),
+        );
+
+        assert_eq!(status, GateStatus::Fail);
+        assert_eq!(class, Some(GateFailureClass::TestFailure));
+        assert_eq!(exit, Some(101));
     }
 
     #[test]

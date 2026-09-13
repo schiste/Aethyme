@@ -48,6 +48,15 @@ fn gibibytes(bytes: u64) -> String {
 /// The refusal message for a gate that cannot safely start, or `None`.
 ///
 /// Separated from the syscall so the decision is testable without a full disk.
+///
+/// The recovery it names is a broker subcommand, not a shell pipeline. This
+/// message used to suggest `du -sh "$(aethyme broker paths worktrees)"/*/`,
+/// and there is no `paths` subcommand -- so the substitution produced nothing
+/// and the suggestion expanded to `du -sh /*/`, telling an operator who had
+/// just run out of disk to walk the entire root filesystem (#167). A command
+/// substitution inside a diagnostic fails open: when it is wrong the command
+/// still runs, against something else. `gc plan` cannot be wrong that way, and
+/// it reports reclaimable bytes per worktree rather than raw sizes.
 pub fn refusal(available: Option<u64>, required: u64) -> Option<String> {
     let available = available?;
     if available >= required {
@@ -59,8 +68,8 @@ pub fn refusal(available: Option<u64>, required: u64) -> Option<String> {
          incremental cache and unrelated test failures, and that verdict is then \
          cached against this tree. Reclaim space and retry.\n\
          Build artefacts in finished session worktrees are usually the largest \
-         reclaimable set:\n  \
-         du -sh \"$(aethyme broker paths worktrees)\"/*/ 2>/dev/null | sort -rh | head",
+         reclaimable set, and the broker already measures them:\n  \
+         aethyme broker gc plan",
         gibibytes(available),
         gibibytes(required)
     ))
@@ -103,6 +112,29 @@ mod tests {
         let message = refusal(Some(0), DEFAULT_GATE_HEADROOM_BYTES).unwrap();
         assert!(message.contains("cached"), "{message}");
         assert!(message.contains("Reclaim space"), "{message}");
+    }
+
+    /// The regression that made #167 worth filing: the recovery command has to
+    /// survive being pasted into a shell.
+    ///
+    /// Asserted as a property rather than against the literal text, because
+    /// the failure was not "the wrong command" -- it was a command whose
+    /// meaning depended on a substitution that silently produced nothing.
+    /// Any future edit that reintroduces one fails here regardless of which
+    /// subcommand it names.
+    #[test]
+    fn the_recovery_command_does_not_depend_on_a_command_substitution() {
+        let message = refusal(Some(0), DEFAULT_GATE_HEADROOM_BYTES).unwrap();
+        assert!(
+            !message.contains("$("),
+            "a substitution that resolves to nothing turns the suggestion into a \
+             different command, and the operator reading this has no disk to spare \
+             for finding that out: {message}"
+        );
+        assert!(
+            !message.contains("/*/"),
+            "an unanchored glob is what the empty substitution expanded against: {message}"
+        );
     }
 
     /// Refusing every gate because the syscall failed would be worse than the
