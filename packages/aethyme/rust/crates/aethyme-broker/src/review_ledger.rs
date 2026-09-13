@@ -29,8 +29,8 @@ use crate::review_trigger::ReviewSpend;
 
 /// Where one requested review has got to.
 ///
-/// The three terminal states are separate because they mean different things to
-/// the next tick, and a reader a year from now has only the row to go on.
+/// The terminal states are separate because they mean different things to the
+/// next tick, and a reader a year from now has only the row to go on.
 /// `Failed` was attempted and concluded without a verdict -- asking again on
 /// the same head buys nothing, because the attempt itself is the answer.
 /// `Recorded` is the `record` backend's complete outcome: the policy asked for
@@ -56,6 +56,15 @@ pub enum ReviewRequestState {
     /// mention could not be posted, the executor died before it got there), or
     /// whoever was asked never reported back inside `stale_after_minutes`.
     Abandoned,
+    /// A person decided this dimension does not have to happen for this head.
+    ///
+    /// Separate from `Satisfied` because it is a different claim about the
+    /// world: `Satisfied` says a review happened, `Waived` says one was
+    /// excused. Collapsing them is #172 -- the only way to unblock one stuck
+    /// dimension was to assert a review that never ran, after which no reader
+    /// could tell the two apart. The row carries a [`ReviewWaiver`] in
+    /// `detail`, so the decision keeps its author and its reason.
+    Waived,
 }
 
 impl ReviewRequestState {
@@ -67,6 +76,7 @@ impl ReviewRequestState {
             Self::Failed => "failed",
             Self::Recorded => "recorded",
             Self::Abandoned => "abandoned",
+            Self::Waived => "waived",
         }
     }
 
@@ -78,6 +88,7 @@ impl ReviewRequestState {
             "failed" => Some(Self::Failed),
             "recorded" => Some(Self::Recorded),
             "abandoned" => Some(Self::Abandoned),
+            "waived" => Some(Self::Waived),
             _ => None,
         }
     }
@@ -274,6 +285,87 @@ fn flatten(text: &str) -> String {
     }
     let kept: String = single.chars().take(REFUSAL_TEXT_LIMIT).collect();
     format!("{kept}…")
+}
+
+/// Who excused a review dimension, and why.
+///
+/// A waiver is the one ledger outcome no machine produces, so it is the one
+/// that must carry a person. `ReviewRefusal` records what a provider said;
+/// this records what somebody decided, and the two are kept in the same
+/// `detail` column for the same reason -- every existing reader of a review row
+/// already renders `detail`, so a decision stored anywhere else is a decision
+/// the operator reading the pull request never sees.
+///
+/// `reason` is stored as text rather than as the SHA-256 digest the broker's
+/// coordinated operations use for their `--reason`. Those digests exist to
+/// prove an authorization was given without retaining it; a waiver's reason is
+/// the opposite -- it is addressed to the next person who asks why this
+/// dimension is green, and a digest would answer them with nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewWaiver {
+    /// The operator's own identity, as `--agent` or `AETHYME_AGENT` gave it.
+    pub who: String,
+    /// Why this dimension does not have to happen for this head.
+    pub reason: String,
+}
+
+/// How a waiver is spelled in `detail`, and what tells it apart from a refusal.
+const WAIVER_PREFIX: &str = "waived by ";
+
+/// What is recorded when the operator could not be identified.
+///
+/// Never an error: refusing to waive because `AETHYME_AGENT` is unset would
+/// send the operator to `review state --state satisfied`, which is the
+/// unattributable escape hatch this type exists to replace. An anonymous
+/// waiver that says so is strictly better evidence than a forged review.
+const WAIVER_UNKNOWN_WHO: &str = "an unidentified operator";
+
+impl ReviewWaiver {
+    /// Build a waiver, bounding both fields the way a refusal bounds its text.
+    pub fn new(who: Option<&str>, reason: &str) -> Self {
+        let who = who.map(str::trim).filter(|who| !who.is_empty());
+        Self {
+            who: who.map_or_else(|| WAIVER_UNKNOWN_WHO.to_string(), flatten),
+            reason: flatten(reason),
+        }
+    }
+
+    /// The ledger `detail` for this waiver.
+    pub fn detail(&self) -> String {
+        format!("{WAIVER_PREFIX}{}: {}", self.who, self.reason)
+    }
+
+    /// Recover a waiver from a `detail` written by [`Self::detail`].
+    ///
+    /// `None` for anything else. The column also carries refusals, rule names
+    /// and debounce windows, and reading one of those as a waiver would invent
+    /// a human decision that nobody made -- the precise failure this type is
+    /// here to prevent, inverted.
+    pub fn parse(detail: &str) -> Option<Self> {
+        let rest = detail.strip_prefix(WAIVER_PREFIX)?;
+        let (who, reason) = rest.split_once(": ")?;
+        if who.trim().is_empty() || reason.trim().is_empty() {
+            return None;
+        }
+        Some(Self {
+            who: who.to_string(),
+            reason: reason.to_string(),
+        })
+    }
+}
+
+/// The waiver excusing one dimension at exactly this head, if there is one.
+///
+/// Scoped on all three of repository-local rows, `review_type` and `head`
+/// together. A waiver recorded against an earlier head is not returned and
+/// cannot be: that is what makes this a per-dimension, per-head decision rather
+/// than a standing exemption, and it is why nothing has to remember to withdraw
+/// one when the branch moves.
+pub fn waiver_for(rows: &[ReviewRequest], review_type: &str, head: &str) -> Option<ReviewWaiver> {
+    rows.iter()
+        .filter(|row| row.review_type == review_type && row.head_commit == head)
+        .filter(|row| row.state == ReviewRequestState::Waived)
+        .find_map(|row| ReviewWaiver::parse(row.detail.as_deref()?))
 }
 
 /// One row of the ledger.
@@ -904,5 +996,120 @@ mod tests {
             assert_eq!(ReviewRequestState::parse(state.label()), Some(state));
         }
         assert_eq!(ReviewRequestState::parse("in_progress"), None);
+    }
+}
+
+#[cfg(test)]
+mod waiver_tests {
+    use super::*;
+
+    fn row(
+        review_type: &str,
+        head: &str,
+        state: ReviewRequestState,
+        detail: &str,
+    ) -> ReviewRequest {
+        ReviewRequest {
+            id: 1,
+            repository: "owner/repo".into(),
+            pr_number: 7,
+            review_type: review_type.into(),
+            head_commit: head.into(),
+            base_commit: None,
+            backend: "waiver".into(),
+            state,
+            detail: Some(detail.to_string()),
+            requested_at: 100,
+            updated_at: 100,
+        }
+    }
+
+    fn waived(review_type: &str, head: &str) -> ReviewRequest {
+        row(
+            review_type,
+            head,
+            ReviewRequestState::Waived,
+            &ReviewWaiver::new(Some("Ada <ada@example.com>"), "hotfix, reviewed offline").detail(),
+        )
+    }
+
+    /// The provenance has to survive the column, or it is not provenance.
+    #[test]
+    fn a_waiver_round_trips_through_the_detail_column() {
+        let waiver = ReviewWaiver::new(Some("Ada <ada@example.com>"), "hotfix, reviewed offline");
+        assert_eq!(ReviewWaiver::parse(&waiver.detail()), Some(waiver));
+    }
+
+    /// `detail` also carries refusals, rule names and debounce windows. Reading
+    /// any of those as a waiver would invent a human decision nobody made.
+    #[test]
+    fn only_a_waiver_detail_parses_as_a_waiver() {
+        for detail in [
+            "quota_exhausted: You have exceeded your usage limit",
+            "debounced: another review ran 4 minutes ago",
+            "waived by : no author",
+            "waived by Ada <ada@example.com>",
+            "waived by Ada <ada@example.com>:    ",
+        ] {
+            assert_eq!(ReviewWaiver::parse(detail), None, "{detail:?}");
+        }
+    }
+
+    /// An anonymous waiver that says it is anonymous beats sending the operator
+    /// back to `review state --state satisfied`, which attributes nothing and
+    /// claims a review instead.
+    #[test]
+    fn an_unidentified_operator_still_records_a_readable_waiver() {
+        for who in [None, Some(""), Some("   ")] {
+            let waiver = ReviewWaiver::new(who, "shipping without a docs review");
+            assert_eq!(waiver.who, "an unidentified operator");
+            assert_eq!(ReviewWaiver::parse(&waiver.detail()), Some(waiver));
+        }
+    }
+
+    /// The whole claim of #172: waiving one dimension waives one dimension.
+    #[test]
+    fn a_waiver_does_not_reach_another_dimension() {
+        let rows = vec![waived("code", "aaa")];
+        assert!(waiver_for(&rows, "code", "aaa").is_some());
+        assert_eq!(waiver_for(&rows, "security", "aaa"), None);
+    }
+
+    /// Bound to the head, so it expires when the branch moves without anyone
+    /// remembering to withdraw it.
+    #[test]
+    fn a_waiver_does_not_reach_another_head() {
+        let rows = vec![waived("code", "aaa")];
+        assert_eq!(waiver_for(&rows, "code", "bbb"), None);
+    }
+
+    /// A row in some other state is not a waiver however its detail reads --
+    /// otherwise a satisfied review whose note happened to start "waived by"
+    /// would be reported as excused.
+    #[test]
+    fn only_a_waived_row_yields_a_waiver() {
+        let detail = ReviewWaiver::new(Some("Ada"), "excused").detail();
+        let rows = vec![row("code", "aaa", ReviewRequestState::Satisfied, &detail)];
+        assert_eq!(waiver_for(&rows, "code", "aaa"), None);
+    }
+
+    /// Waived is settled, not retryable: the router must not re-ask for a
+    /// dimension a person just excused, which would make the waiver useless.
+    #[test]
+    fn a_waived_dimension_is_settled_and_holds_no_slot() {
+        assert!(!ReviewRequestState::Waived.is_revivable());
+        assert!(!ReviewRequestState::Waived.occupies_a_slot());
+
+        let spend = spend_by_type(&[waived("code", "aaa")]);
+        assert_eq!(spend["code"].requested_count, 1);
+        assert_eq!(spend["code"].last_requested_commit.as_deref(), Some("aaa"));
+    }
+
+    #[test]
+    fn the_waived_state_round_trips_its_label() {
+        assert_eq!(
+            ReviewRequestState::parse(ReviewRequestState::Waived.label()),
+            Some(ReviewRequestState::Waived)
+        );
     }
 }

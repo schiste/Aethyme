@@ -16,7 +16,7 @@ use rusqlite::Connection;
 use crate::error::BrokerError;
 
 /// Current database schema version (== `MIGRATIONS.len()`).
-pub const SCHEMA_VERSION: i64 = 36;
+pub const SCHEMA_VERSION: i64 = 37;
 
 /// Version stamped on every event row written by this binary.
 pub const EVENTS_SCHEMA_VERSION: i64 = 1;
@@ -989,6 +989,59 @@ ALTER TABLE review_requests ADD COLUMN base_commit TEXT;
 ALTER TABLE pull_request_observations ADD COLUMN base_commit TEXT;
 ";
 
+/// A waived review is its own state, so waiving cannot be read as reviewing.
+///
+/// Before this, the only way to unblock one stuck dimension was `review state
+/// --state satisfied`, which writes the state that means "a verdict landed".
+/// The row then claims a review happened. Nobody can later tell a security
+/// review that passed from a security review somebody waived at 2am to ship a
+/// hotfix, and the distinction is the entire value of the ledger: #172 is
+/// exactly this confusion, and the scope of the damage is one dimension per
+/// mistake precisely because the ledger is keyed per dimension.
+///
+/// `waived` is terminal and settles the dimension for one head, no more. The
+/// unique index on (repository, pr_number, review_type, head_commit) is what
+/// bounds it: a new head has no waived row, so the waiver expires by
+/// construction rather than by anyone remembering to withdraw it. There is no
+/// repository-wide waiver and no cross-dimension waiver to add later without
+/// changing this key, which is the property the issue asks for.
+///
+/// A full table rebuild rather than an `ALTER`: SQLite cannot widen a CHECK
+/// constraint in place, so the v34 rebuild pattern is repeated here -- carrying
+/// v36's `base_commit` with it, since the new table must be the current shape
+/// and not v34's.
+const MIGRATION_V37: &str = "
+CREATE TABLE review_requests_v37 (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    repository      TEXT NOT NULL,
+    pr_number       INTEGER NOT NULL,
+    review_type     TEXT NOT NULL,
+    head_commit     TEXT NOT NULL,
+    base_commit     TEXT,
+    backend         TEXT NOT NULL,
+    state           TEXT NOT NULL CHECK (state IN (
+                        'requested', 'running', 'satisfied', 'failed',
+                        'recorded', 'abandoned', 'waived')),
+    detail          TEXT,
+    requested_at    INTEGER NOT NULL,
+    updated_at      INTEGER NOT NULL
+);
+
+INSERT INTO review_requests_v37 (
+    id, repository, pr_number, review_type, head_commit, base_commit, backend,
+    state, detail, requested_at, updated_at
+)
+SELECT id, repository, pr_number, review_type, head_commit, base_commit,
+       backend, state, detail, requested_at, updated_at
+FROM review_requests;
+
+DROP TABLE review_requests;
+ALTER TABLE review_requests_v37 RENAME TO review_requests;
+
+CREATE UNIQUE INDEX review_requests_head
+    ON review_requests (repository, pr_number, review_type, head_commit);
+";
+
 const MIGRATIONS: &[&str] = &[
     MIGRATION_V1,
     MIGRATION_V2,
@@ -1026,6 +1079,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_V34,
     MIGRATION_V35,
     MIGRATION_V36,
+    MIGRATION_V37,
 ];
 
 pub(crate) fn current_version(conn: &Connection) -> Result<i64, BrokerError> {
@@ -1896,6 +1950,163 @@ mod tests {
         )
         .unwrap();
         assert_eq!(current_version(&conn).unwrap(), SCHEMA_VERSION);
+    }
+
+    /// v37 widens the state CHECK, which SQLite can only do by rebuilding the
+    /// table. A rebuild is where a column added by an `ALTER` quietly goes
+    /// missing, and v36's `base_commit` is exactly such a column -- losing it
+    /// would silently turn every `head_and_base` dimension back into `head`.
+    #[test]
+    fn v37_admits_a_waived_review_and_carries_the_recorded_base() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            .unwrap();
+        for (index, sql) in MIGRATIONS[..36].iter().enumerate() {
+            conn.execute_batch(sql).unwrap();
+            conn.execute(
+                "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)
+                 ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                [(index + 1).to_string()],
+            )
+            .unwrap();
+        }
+        let now = 1_700_000_000_000_i64;
+        let insert = "INSERT INTO review_requests
+             (repository, pr_number, review_type, head_commit, base_commit,
+              backend, state, detail, requested_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)";
+        conn.execute(
+            insert,
+            rusqlite::params![
+                "o/r",
+                7,
+                "code",
+                "abc",
+                "base111",
+                "chau7",
+                "satisfied",
+                "shipped",
+                now
+            ],
+        )
+        .unwrap();
+        // A row with no recorded base, which is every row written before v36.
+        conn.execute(
+            insert,
+            rusqlite::params![
+                "o/r",
+                7,
+                "security",
+                "abc",
+                None::<String>,
+                "chau7",
+                "requested",
+                None::<String>,
+                now
+            ],
+        )
+        .unwrap();
+
+        // `waived` must be impossible before the migration, or this test would
+        // pass without v37 doing anything at all.
+        assert!(
+            conn.execute(
+                insert,
+                rusqlite::params![
+                    "o/r",
+                    7,
+                    "docs",
+                    "abc",
+                    None::<String>,
+                    "waiver",
+                    "waived",
+                    "d",
+                    now
+                ],
+            )
+            .is_err(),
+            "v36 must reject `waived`, otherwise v37 is a no-op"
+        );
+
+        migrate(&conn).unwrap();
+
+        let (base, detail): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT base_commit, detail FROM review_requests WHERE review_type = 'code'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            base.as_deref(),
+            Some("base111"),
+            "the rebuild must carry v36's base_commit or freshness silently regresses"
+        );
+        assert_eq!(detail.as_deref(), Some("shipped"));
+        let missing: Option<String> = conn
+            .query_row(
+                "SELECT base_commit FROM review_requests WHERE review_type = 'security'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            missing, None,
+            "and must not invent one for a row that had none"
+        );
+
+        conn.execute(
+            insert,
+            rusqlite::params![
+                "o/r",
+                7,
+                "docs",
+                "abc",
+                None::<String>,
+                "waiver",
+                "waived",
+                "d",
+                now
+            ],
+        )
+        .expect("v37 admits the waived state");
+
+        assert!(
+            conn.execute(
+                insert,
+                rusqlite::params![
+                    "o/r",
+                    7,
+                    "perf",
+                    "abc",
+                    None::<String>,
+                    "chau7",
+                    "pending",
+                    None::<String>,
+                    now
+                ],
+            )
+            .is_err(),
+            "the state CHECK must survive the rebuild"
+        );
+        assert!(
+            conn.execute(
+                insert,
+                rusqlite::params![
+                    "o/r",
+                    7,
+                    "docs",
+                    "abc",
+                    None::<String>,
+                    "waiver",
+                    "waived",
+                    "d",
+                    now
+                ],
+            )
+            .is_err(),
+            "the one-review-per-head index must survive the rebuild"
+        );
     }
 
     /// v33 spelled two different outcomes `abandoned`: a review the policy

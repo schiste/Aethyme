@@ -67,6 +67,13 @@ pub enum ProjectedReviewState {
     /// Asked for, and the attempt failed. Distinct from `Skipped` because
     /// nobody chose this one, and a reader needs to tell those apart.
     Failed,
+    /// A person excused this dimension for this head, on the record.
+    ///
+    /// Never rendered as `Satisfied`, however convenient that would be for
+    /// whoever wants the pull request green. The comment is where a reviewer
+    /// looks to see what Aethyme actually did, and a waiver shown as a tick
+    /// would make the comment assert a review that never ran (#172).
+    Waived,
 }
 
 impl ProjectedReviewState {
@@ -78,6 +85,7 @@ impl ProjectedReviewState {
             Self::Deferred => "deferred",
             Self::Skipped => "skipped",
             Self::Failed => "failed",
+            Self::Waived => "waived",
         }
     }
 
@@ -98,6 +106,7 @@ impl ProjectedReviewState {
             Self::Deferred => "⏸",
             Self::Skipped => "–",
             Self::Failed => "✗",
+            Self::Waived => "⊘",
         }
     }
 }
@@ -986,6 +995,61 @@ mod tests {
             .find(|a| matches!(a, PrProjectionAction::RemoveLabels { .. }))
             .expect("the outstanding marker to go");
         assert_eq!(names(remove), vec!["aethyme/review:security"]);
+    }
+
+    /// A waiver settles the dimension, so the outstanding marker goes -- that
+    /// is the point of waiving. What must not go with it is the distinction
+    /// from a review that happened.
+    #[test]
+    fn a_waived_review_drops_its_outstanding_label_without_claiming_a_review() {
+        let mut record = projection();
+        record.reviews = vec![ProjectedReview {
+            review_type: "security".to_string(),
+            state: ProjectedReviewState::Waived,
+            detail: Some("Ada <ada@example.com>: reviewed offline".to_string()),
+        }];
+        let mut current = facts();
+        current.current_labels = vec!["aethyme/review:security".into()];
+        let actions = project(&policy(), &record, &current);
+        let remove = actions
+            .iter()
+            .find(|a| matches!(a, PrProjectionAction::RemoveLabels { .. }))
+            .expect("the outstanding marker to go");
+        assert_eq!(names(remove), vec!["aethyme/review:security"]);
+
+        let comment = render_comment(&record);
+        assert!(
+            comment.contains("waived"),
+            "the comment has to say it was waived: {comment}"
+        );
+        assert!(
+            comment.contains("Ada <ada@example.com>: reviewed offline"),
+            "and by whom, and why: {comment}"
+        );
+        assert!(
+            !comment.contains("satisfied"),
+            "a waiver rendered as a completed review is the confusion #172 is \
+             about: {comment}"
+        );
+    }
+
+    /// Every state needs its own glyph and word. Two states sharing either one
+    /// would make the comment lie about one of them.
+    #[test]
+    fn no_two_projected_states_read_alike() {
+        let states = [
+            ProjectedReviewState::Requested,
+            ProjectedReviewState::Running,
+            ProjectedReviewState::Satisfied,
+            ProjectedReviewState::Deferred,
+            ProjectedReviewState::Skipped,
+            ProjectedReviewState::Failed,
+            ProjectedReviewState::Waived,
+        ];
+        let words: BTreeSet<&str> = states.iter().map(|state| state.as_str()).collect();
+        let icons: BTreeSet<&str> = states.iter().map(|state| state.icon()).collect();
+        assert_eq!(words.len(), states.len(), "{words:?}");
+        assert_eq!(icons.len(), states.len(), "{icons:?}");
     }
 
     // -- transport ---------------------------------------------------------

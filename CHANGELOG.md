@@ -8,6 +8,35 @@ artifacts and their exact source revision are recorded in each signed
 
 ### Added
 
+- `aethyme broker review waive` excuses one review dimension at one head, on the
+  record:
+
+  ```bash
+  aethyme broker review waive --repo owner/repo --pr 412 \
+      --type code --head 9f3c1a2b4d5e --reason "reverting the outage; reviewed offline"
+  ```
+
+  Until now the only way to unblock a dimension that would not clear was
+  `review state --state satisfied`, which writes "a review happened" into the
+  one record anyone ever consults. Nobody could later tell a security review
+  that passed from a security review somebody waived at 2am, and the whole value
+  of the ledger is that distinction.
+
+  A waiver is bound to repository, pull request, **dimension** and **head
+  commit** together. Waiving `code` leaves `security` exactly as blocking as it
+  was; a new head has no waiver, so it expires by construction rather than by
+  anyone remembering to withdraw it. `--reason` is required and is stored as
+  text rather than as the SHA-256 digest the broker's coordinated operations
+  use, because it is addressed to whoever later asks why this dimension is
+  green; the author comes from `--agent` or `AETHYME_AGENT`, and an
+  unidentified operator is recorded as one rather than refused.
+
+  The pull request comment renders `⊘ <type> — waived` with the author and
+  reason, never a tick. Two refusals are deliberate: `review state --state
+  waived` does not work, because that command takes no author and no reason, and
+  a review already `satisfied` cannot be waived, because that would overwrite
+  the evidence that a review actually ran.
+
 - Review freshness is declared per dimension. A `[review.trigger.schedule.<type>]`
   table may set `freshness = "head"` (the default, and what every dimension has
   always done) or `"head_and_base"`, which additionally invalidates a completed
@@ -37,6 +66,13 @@ artifacts and their exact source revision are recorded in each signed
 
 ### Changed
 
+- Broker database schema v37 adds `waived` to the `review_requests.state` CHECK
+  constraint, which SQLite can only do by rebuilding the table. A reader that
+  matches the six previous states exhaustively must handle a seventh; treating
+  an unknown state as *settled* is correct, and treating it as *reviewed* is the
+  defect this state exists to prevent. **Every `aethyme` binary on a machine
+  must be reinstalled to open a v37 database**; an older binary is locked out
+  until it is.
 - Broker database schema v36 adds a nullable `base_commit` to `review_requests`
   and to `pull_request_observations`. The column is deliberately left null on
   existing rows: backfilling it from today's branch tip would assert a

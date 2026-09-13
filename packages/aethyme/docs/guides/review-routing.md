@@ -810,6 +810,7 @@ Each state means one thing and only one:
 | `failed` | Attempted, no verdict -- re-asking without a new head buys nothing | no |
 | `recorded` | The policy performs nothing here; the row is the whole answer | no |
 | `abandoned` | Nobody was ever asked, or a provider refused | **yes** |
+| `waived` | A person excused this dimension at this head, on the record | no |
 
 ### When a provider refuses
 
@@ -850,7 +851,8 @@ the next push makes a new head, the router asks again, and the old refusal
 becomes history rather than a current cause.
 
 This states the cause; it does not clear the gate. The unblock is still a new
-request against a provider that will answer, or a scoped override.
+request against a provider that will answer, or [a scoped
+waiver](#waiving-one-dimension).
 
 ### Closing a row
 
@@ -875,6 +877,53 @@ to do. Reporting on a review that was never requested is an error rather than a
 new row: it means the reporter and the router disagree about what was asked
 for, and inventing a row would bury that.
 
+### Waiving one dimension
+
+Sometimes a dimension will not clear and the change has to ship anyway: the
+provider is out of quota, the reviewer is asleep, the fix is a one-line revert
+of an outage. The tempting move is to close the row as `satisfied`, and it is
+the wrong one -- that writes "a review happened" into the only record anybody
+will ever consult:
+
+```bash
+aethyme broker review waive --repo owner/repo --pr 412 \
+    --type code --head 9f3c1a2b4d5e --reason "reverting the outage; reviewed offline"
+```
+
+`--head` is required and takes an abbreviation, resolved against the commits
+this pull request has recorded. A dimension nobody ever requested has no
+recorded commit to abbreviate from, so name the full forty characters there.
+There is no default: the head *is* the waiver's scope, and defaulting it would
+excuse a dimension at a commit nobody named.
+
+The waiver is bound to four things together -- repository, pull request,
+dimension, and head commit -- and that binding is the whole design:
+
+- **One dimension.** Waiving `code` leaves `security` exactly as blocking as it
+  was. There is no flag that waives everything, and there is nowhere to add one
+  without changing the ledger's key.
+- **One commit.** A new head has no waiver. It expires by construction, so
+  nobody has to remember to withdraw it, and a waiver granted for a one-line
+  revert cannot silently cover the rewrite that lands on top of it.
+- **One person.** `--agent "<name> <email>"`, or `AETHYME_AGENT`. An
+  unidentified operator is recorded as *an unidentified operator* rather than
+  refused -- an anonymous waiver that admits it is anonymous is better evidence
+  than a forged review, which is the alternative people actually reach for.
+- **One reason, in words.** Every other `--reason` in the broker is kept only
+  as a SHA-256 digest, because those exist to prove an authorization was given
+  without retaining it. This one is stored as text, because it is addressed to
+  whoever asks in March why this dimension is green.
+
+The pull request comment shows `⊘ code — waived` with the author and reason
+beside it, never a tick. `review ledger` shows `waived`, never `satisfied`.
+
+Two refusals are deliberate. `review state --state waived` does not work: that
+command takes no author and no reason, so accepting the label there would
+reinstate the unattributed override this replaces. And a review already
+`satisfied` cannot be waived, because that would overwrite the evidence of a
+review that actually ran -- if a satisfied dimension is blocking something, the
+problem is elsewhere.
+
 ## What this never does
 
 - It never performs a GitHub write directly. Every projection action renders
@@ -883,6 +932,8 @@ for, and inventing a row would bury that.
   coordination live.
 - It never touches a label outside `label_prefix`, or a reserved one inside it.
 - It never lets a commit trailer remove a review a rule required.
+- It never waives more than the one dimension at the one head it was
+  asked to waive, and never carries a waiver across a new head.
 - It never falls back to a permissive default on a policy it cannot read. A
   `schema_version` newer than the broker understands is an error, because
   silently reviewing nothing is the one failure mode this must not have.

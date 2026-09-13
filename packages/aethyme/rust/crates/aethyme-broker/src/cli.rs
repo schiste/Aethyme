@@ -394,6 +394,13 @@ Usage:
       the review closes the row here, which is what drains the router's
       concurrency slots. --head targets a superseded commit; the default is
       the most recent request for that review type.
+  aethyme broker review waive --repo <owner/name> --pr <number> --type <review-type> --head <sha> --reason <text> [--agent <name-and-email>] [--json]
+      Excuse one review dimension at one head, on the record. Waives exactly
+      the named type at the named commit and nothing else: a new head has no
+      waiver, so it expires without anyone withdrawing it. --reason is stored
+      as text, not as a digest, because it is addressed to whoever later asks
+      why this dimension is green. Never use `review state --state satisfied`
+      for this -- that claims a review ran.
   aethyme broker review register --session <id> --repo <owner/name> --pr <number> [--json]
       Opt an exact live session and open draft PR into the configured review
       lifecycle after verifying repository, base, and full head SHA evidence.
@@ -6121,16 +6128,37 @@ fn run_review_run(parsed: Parsed) -> Result<serde_json::Value, UsageError> {
 
     let reviews: Vec<crate::ProjectedReview> = decisions
         .iter()
-        .map(|decision| crate::ProjectedReview {
-            review_type: decision.review_type().to_string(),
-            state: match decision {
-                crate::ReviewTriggerDecision::Request { .. } => {
-                    crate::ProjectedReviewState::Requested
+        .map(|decision| {
+            // A waived dimension settles, so `schedule` reports it exactly as
+            // it reports one already reviewed: `Skip`. Rendering that as
+            // "skipped" would put a waiver and a completed review under the
+            // same word on the pull request, which is the confusion #172 is
+            // about. The ledger is consulted only for the `Skip` case and only
+            // at this head, so nothing else can be relabelled by a waiver.
+            let waiver = match decision {
+                crate::ReviewTriggerDecision::Skip { .. } => {
+                    crate::waiver_for(&reconciled, decision.review_type(), &head)
                 }
-                crate::ReviewTriggerDecision::Defer { .. } => crate::ProjectedReviewState::Deferred,
-                crate::ReviewTriggerDecision::Skip { .. } => crate::ProjectedReviewState::Skipped,
-            },
-            detail: None,
+                _ => None,
+            };
+            crate::ProjectedReview {
+                review_type: decision.review_type().to_string(),
+                state: match decision {
+                    crate::ReviewTriggerDecision::Request { .. } => {
+                        crate::ProjectedReviewState::Requested
+                    }
+                    crate::ReviewTriggerDecision::Defer { .. } => {
+                        crate::ProjectedReviewState::Deferred
+                    }
+                    crate::ReviewTriggerDecision::Skip { .. } if waiver.is_some() => {
+                        crate::ProjectedReviewState::Waived
+                    }
+                    crate::ReviewTriggerDecision::Skip { .. } => {
+                        crate::ProjectedReviewState::Skipped
+                    }
+                },
+                detail: waiver.map(|waiver| format!("{}: {}", waiver.who, waiver.reason)),
+            }
         })
         .collect();
     let projection_actions = crate::project(
@@ -6644,6 +6672,18 @@ fn run_review_state(parsed: Parsed) -> Result<(), UsageError> {
             "unknown review state {label:?}; expected requested, running, satisfied, failed, recorded, or abandoned"
         ))
     })?;
+    // `waived` is reachable through `review waive` and nowhere else. This
+    // command takes no reason and no author, so accepting the label here would
+    // reintroduce the unattributed override in the very place that is supposed
+    // to have stopped being one.
+    if state == crate::ReviewRequestState::Waived {
+        return Err(UsageError::Message(
+            "`review state --state waived` is not a thing; use `aethyme broker review waive \
+             --repo <owner/name> --pr <number> --type <review-type> --head <sha> --reason <text>`, \
+             which records who waived it and why"
+                .into(),
+        ));
+    }
 
     let mut broker = open_broker(parsed.read_only_snapshot)?;
 
@@ -6725,6 +6765,151 @@ fn run_review_state(parsed: Parsed) -> Result<(), UsageError> {
     Ok(())
 }
 
+/// Excuse one dimension at one head, with an author and a reason.
+///
+/// Repository-scoped rather than session-scoped, like `ledger` and `state`: a
+/// waiver is a statement about a pull request, and binding it to a session
+/// would make it expire with a worktree instead of with a commit.
+fn run_review_waive(parsed: Parsed) -> Result<(), UsageError> {
+    let repository = parsed.repository.clone().ok_or_else(|| {
+        UsageError::Message(
+            "review waive requires --repo <owner/name> --pr <number> --type <review-type> --head <sha> --reason <text>"
+                .into(),
+        )
+    })?;
+    let pull_request = parsed
+        .pr_number
+        .ok_or_else(|| UsageError::Message("review waive requires --pr <number>".into()))?;
+    let review_type = parsed
+        .review_type
+        .clone()
+        .ok_or_else(|| UsageError::Message("review waive requires --type <review-type>".into()))?;
+    // Required, unlike `review state`, and deliberately not defaulted to the
+    // pull request's current head. The head *is* the waiver's scope, so a
+    // default would have the operator excuse a dimension at a commit they never
+    // named -- and for the dimension most worth waiving, the one no review was
+    // ever requested for, there is no latest request to default to.
+    let head_argument = parsed.head.clone().ok_or_else(|| {
+        UsageError::Message(
+            "review waive requires --head <sha>: a waiver applies to one commit, and \
+             defaulting it would excuse a dimension at a commit nobody named"
+                .into(),
+        )
+    })?;
+    // Text, not a digest. Every other `--reason` in this CLI authorizes a
+    // coordinated operation and is retained only as a SHA-256 so the
+    // authorization can be proven without being kept; this one is the
+    // explanation a reviewer reads months later, and a digest tells them
+    // nothing.
+    let reason = parsed
+        .reason
+        .clone()
+        .map(|reason| reason.trim().to_string())
+        .filter(|reason| !reason.is_empty())
+        .ok_or_else(|| {
+            UsageError::Message(
+                "review waive requires --reason <text>: a waiver with no reason is the \
+                 unexplained override this command exists to replace"
+                    .into(),
+            )
+        })?;
+
+    let mut broker = open_broker(parsed.read_only_snapshot)?;
+
+    // Resolved against every recorded head on this pull request, not just this
+    // dimension's: the dimension being waived is frequently the one with no row
+    // at all, so filtering by type would refuse the prefix exactly when the
+    // operator most needs it.
+    let head = if head_argument.len() < 40 {
+        let recorded: Vec<String> = broker
+            .store()
+            .review_requests_for_pr(&repository, pull_request)
+            .map_err(to_usage)?
+            .into_iter()
+            .map(|row| row.head_commit)
+            .collect();
+        match crate::review::resolve_review_head_prefix(
+            recorded.iter().map(String::as_str),
+            &head_argument,
+        ) {
+            Ok(Some(head)) => head,
+            // Nothing recorded matches, which is ordinary here -- a dimension
+            // nobody ever requested leaves no head to match against. Refusing
+            // is still right: an abbreviation cannot be expanded from nothing,
+            // and waiving a commit this command guessed at would be worse.
+            Ok(None) => {
+                return Err(UsageError::Message(format!(
+                    "head {head_argument:?} matches no commit recorded for \
+                     {repository}#{pull_request}; give the full 40-character commit"
+                )));
+            }
+            Err(crate::review::HeadPrefixError::Malformed(message)) => {
+                return Err(UsageError::Message(message));
+            }
+            Err(crate::review::HeadPrefixError::Ambiguous(candidates)) => {
+                return Err(UsageError::Message(format!(
+                    "head {head_argument:?} matches {} recorded commits on \
+                     {repository}#{pull_request} ({}); name the full commit",
+                    candidates.len(),
+                    candidates.join(", ")
+                )));
+            }
+        }
+    } else {
+        head_argument
+    };
+
+    // A satisfied row is the one thing a waiver must never overwrite. The row
+    // records that a review happened; replacing it with "excused" destroys the
+    // only evidence that it did, and the operator asking for this has almost
+    // certainly named the wrong dimension -- a satisfied review is not blocking
+    // anything.
+    if let Some(existing) = broker
+        .store()
+        .latest_review_request(&repository, pull_request, &review_type, Some(&head))
+        .map_err(to_usage)?
+        && existing.state == crate::ReviewRequestState::Satisfied
+    {
+        return Err(UsageError::Message(format!(
+            "the {review_type} review on {repository}#{pull_request} at {} is already \
+             satisfied; waiving it would replace a recorded verdict with an excuse",
+            &head[..12.min(head.len())]
+        )));
+    }
+
+    let waiver = crate::ReviewWaiver::new(
+        session_agent_identity(parsed.agent.as_deref()).as_deref(),
+        &reason,
+    );
+    let waived = broker
+        .store()
+        .waive_review_request(
+            &repository,
+            pull_request,
+            &review_type,
+            &head,
+            &waiver.detail(),
+            now_ms(),
+        )
+        .map_err(to_usage)?;
+
+    if parsed.json {
+        out!("{}", serde_json::to_string_pretty(&waived)?);
+    } else {
+        out!(
+            "{} review on {}#{} at {} is waived by {}: {}",
+            waived.review_type,
+            waived.repository,
+            waived.pr_number,
+            &waived.head_commit[..12.min(waived.head_commit.len())],
+            waiver.who,
+            waiver.reason
+        );
+        out!("Only this dimension, only this head. A new head is unwaived.");
+    }
+    Ok(())
+}
+
 fn run_review(parsed: Parsed) -> Result<(), UsageError> {
     let action = parsed
         .positional
@@ -6732,7 +6917,7 @@ fn run_review(parsed: Parsed) -> Result<(), UsageError> {
         .map(String::as_str)
         .ok_or_else(|| {
             UsageError::Message(
-                "review requires plan, run, ledger, state, register, show, request, unlock, reassign, or abandon"
+                "review requires plan, run, ledger, state, waive, register, show, request, unlock, reassign, or abandon"
                     .into(),
             )
         })?;
@@ -6766,6 +6951,12 @@ fn run_review(parsed: Parsed) -> Result<(), UsageError> {
     }
     if action == "state" {
         return run_review_state(parsed);
+    }
+    // Beside `state` rather than below: a waiver is about a pull request, not
+    // about a session, so requiring `--session` would tie a decision about a
+    // commit to the lifetime of a worktree.
+    if action == "waive" {
+        return run_review_waive(parsed);
     }
     let session_id = parsed
         .session

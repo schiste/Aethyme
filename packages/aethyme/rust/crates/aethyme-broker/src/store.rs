@@ -2605,6 +2605,73 @@ impl BrokerStore {
             .expect("updated review request should be readable"))
     }
 
+    /// Record that one dimension is excused at exactly this head.
+    ///
+    /// Creates the row when none exists, which is the difference between this
+    /// and [`Self::set_review_request_state`] and the reason it is a separate
+    /// method rather than a state argument. `review state` refuses to invent a
+    /// row because it *reports* an outcome, and a report about a review nobody
+    /// requested means the reporter and the router disagree. A waiver
+    /// *decides*, and the dimension most worth excusing is precisely the one
+    /// that never got requested -- a provider that refused on quota, a
+    /// dispatch that never happened. Refusing there would leave the operator
+    /// exactly where #172 found them.
+    ///
+    /// `backend` is the `waiver` sentinel, beside `record`, because no backend
+    /// performed this and naming a real one would misattribute the decision to
+    /// a reviewer.
+    pub fn waive_review_request(
+        &mut self,
+        repository: &str,
+        pr_number: i64,
+        review_type: &str,
+        head_commit: &str,
+        detail: &str,
+        now: i64,
+    ) -> Result<ReviewRequest, BrokerError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing = tx
+            .query_row(
+                &format!(
+                    "{REVIEW_REQUEST_SELECT} WHERE repository = ?1 AND pr_number = ?2
+                       AND review_type = ?3 AND head_commit = ?4"
+                ),
+                params![repository, pr_number, review_type, head_commit],
+                review_request_from_row,
+            )
+            .optional()?
+            .transpose()?;
+        let id = match existing {
+            Some(existing) => {
+                tx.execute(
+                    "UPDATE review_requests
+                        SET state = 'waived', detail = ?2, updated_at = ?3
+                      WHERE id = ?1",
+                    params![existing.id, detail, now],
+                )?;
+                existing.id
+            }
+            None => {
+                tx.execute(
+                    "INSERT INTO review_requests (
+                         repository, pr_number, review_type, head_commit,
+                         base_commit, backend, state, detail, requested_at,
+                         updated_at
+                     ) VALUES (?1, ?2, ?3, ?4, NULL, 'waiver', 'waived', ?5,
+                               ?6, ?6)",
+                    params![repository, pr_number, review_type, head_commit, detail, now],
+                )?;
+                tx.last_insert_rowid()
+            }
+        };
+        tx.commit()?;
+        Ok(self
+            .review_request(id)?
+            .expect("just-waived review request should be readable"))
+    }
+
     // ── coordinated operations ───────────────────────────────────────
 
     pub fn create_coordinated_operation(
@@ -6008,6 +6075,98 @@ mod review_ledger_tests {
         assert_eq!(updated.requested_at, 100);
         let reread = store.review_request(request.id).unwrap().unwrap();
         assert_eq!(reread.state, ReviewRequestState::Failed);
+    }
+
+    /// The dimension most worth waiving is usually the one with no row at all
+    /// -- a provider that refused on quota, a dispatch that never happened. If
+    /// waiving needed an existing request it would be unavailable exactly
+    /// there, which is where #172 leaves the operator stuck.
+    #[test]
+    fn a_dimension_nobody_requested_can_still_be_waived() {
+        let mut store = store();
+        assert!(store.review_requests_for_pr("o/r", 7).unwrap().is_empty());
+
+        let waived = store
+            .waive_review_request("o/r", 7, "security", "abc", "waived by Ada: hotfix", 100)
+            .unwrap();
+        assert_eq!(waived.state, ReviewRequestState::Waived);
+        assert_eq!(waived.detail.as_deref(), Some("waived by Ada: hotfix"));
+        assert_eq!(
+            waived.backend, "waiver",
+            "no backend performed this, and naming one would credit a reviewer \
+             who never looked"
+        );
+        assert_eq!(store.review_requests_for_pr("o/r", 7).unwrap().len(), 1);
+    }
+
+    /// One line per review per head, as everywhere else in this table. A second
+    /// row would break the unique index, and duplicating the dimension in the
+    /// ledger would make spend count it twice.
+    #[test]
+    fn waiving_a_requested_review_reuses_its_row() {
+        let mut store = store();
+        let (request, _) = store
+            .record_review_request("o/r", 7, "security", "abc", None, "chau7", 100)
+            .unwrap();
+
+        let waived = store
+            .waive_review_request("o/r", 7, "security", "abc", "waived by Ada: hotfix", 300)
+            .unwrap();
+        assert_eq!(waived.id, request.id);
+        assert_eq!(waived.state, ReviewRequestState::Waived);
+        assert_eq!(
+            waived.requested_at, 100,
+            "when the review was asked for is history, not something a waiver rewrites"
+        );
+        assert_eq!(waived.updated_at, 300);
+        assert_eq!(store.review_requests_for_pr("o/r", 7).unwrap().len(), 1);
+    }
+
+    /// The scope claim, at the storage layer: waiving one dimension at one head
+    /// leaves every other row exactly as it was.
+    #[test]
+    fn waiving_one_dimension_leaves_the_others_untouched() {
+        let mut store = store();
+        store
+            .record_review_request("o/r", 7, "security", "abc", None, "chau7", 100)
+            .unwrap();
+        store
+            .record_review_request("o/r", 7, "code", "abc", None, "chau7", 100)
+            .unwrap();
+        store
+            .record_review_request("o/r", 7, "code", "def", None, "chau7", 100)
+            .unwrap();
+
+        store
+            .waive_review_request("o/r", 7, "code", "abc", "waived by Ada: hotfix", 300)
+            .unwrap();
+
+        let states: Vec<(String, String, ReviewRequestState)> = store
+            .review_requests_for_pr("o/r", 7)
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.review_type, row.head_commit, row.state))
+            .collect();
+        assert_eq!(
+            states,
+            vec![
+                (
+                    "security".to_string(),
+                    "abc".to_string(),
+                    ReviewRequestState::Requested
+                ),
+                (
+                    "code".to_string(),
+                    "abc".to_string(),
+                    ReviewRequestState::Waived
+                ),
+                (
+                    "code".to_string(),
+                    "def".to_string(),
+                    ReviewRequestState::Requested
+                ),
+            ]
+        );
     }
 
     /// One pull request's ledger is one pull request's ledger. The scheduler

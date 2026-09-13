@@ -1274,6 +1274,163 @@ fn review_state(fixture: &Fixture, review_type: &str, head: &str, state: &str) -
     )
 }
 
+fn review_waive(fixture: &Fixture, args: &[&str]) -> Output {
+    let mut argv = vec!["review", "waive", "--repo", "acme/product", "--pr", "42"];
+    argv.extend_from_slice(args);
+    fixture.run(&argv, "", true, None)
+}
+
+const WAIVE_HEAD: &str = "0000000000111111111122222222223333333333";
+
+/// The issue in one test: waiving the dimension that is stuck must leave every
+/// other dimension exactly as blocking as it was, and must say who did it.
+#[test]
+fn waiving_one_dimension_records_its_author_and_spares_the_others() {
+    let fixture = Fixture::new();
+    seed_review_request(&fixture, "code", WAIVE_HEAD);
+    seed_review_request(&fixture, "security", WAIVE_HEAD);
+
+    let waived = review_waive(
+        &fixture,
+        &[
+            "--type",
+            "code",
+            "--head",
+            WAIVE_HEAD,
+            "--reason",
+            "reviewed offline before the outage",
+            "--agent",
+            "Ada <ada@example.com>",
+        ],
+    );
+    assert!(
+        waived.status.success(),
+        "{}",
+        String::from_utf8_lossy(&waived.stderr)
+    );
+
+    let code = review_row(&fixture, "code");
+    assert_eq!(code["state"], "waived");
+    let detail = code["detail"].as_str().unwrap();
+    assert!(
+        detail.contains("Ada <ada@example.com>"),
+        "a waiver has to name its author: {detail}"
+    );
+    assert!(
+        detail.contains("reviewed offline before the outage"),
+        "the reason is stored as text, not as a digest: {detail}"
+    );
+
+    assert_eq!(
+        review_row(&fixture, "security")["state"],
+        "requested",
+        "waiving code must not waive security -- that is the whole of #172"
+    );
+}
+
+/// The dimension worth waiving is often the one that was never requested,
+/// because the provider refused before anything was recorded.
+#[test]
+fn a_dimension_with_no_recorded_request_can_be_waived() {
+    let fixture = Fixture::new();
+    let waived = review_waive(
+        &fixture,
+        &[
+            "--type",
+            "security",
+            "--head",
+            WAIVE_HEAD,
+            "--reason",
+            "provider out of quota, escalated by hand",
+        ],
+    );
+    assert!(
+        waived.status.success(),
+        "{}",
+        String::from_utf8_lossy(&waived.stderr)
+    );
+    assert_eq!(review_row(&fixture, "security")["state"], "waived");
+}
+
+/// A waiver with no reason is the unexplained override this command replaces.
+#[test]
+fn a_waiver_needs_a_reason() {
+    let fixture = Fixture::new();
+    seed_review_request(&fixture, "code", WAIVE_HEAD);
+    let refused = review_waive(&fixture, &["--type", "code", "--head", WAIVE_HEAD]);
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("--reason"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert_eq!(review_row(&fixture, "code")["state"], "requested");
+}
+
+/// The head is the waiver's scope. Defaulting it would excuse a dimension at a
+/// commit the operator never named.
+#[test]
+fn a_waiver_needs_an_explicit_head() {
+    let fixture = Fixture::new();
+    seed_review_request(&fixture, "code", WAIVE_HEAD);
+    let refused = review_waive(&fixture, &["--type", "code", "--reason", "shipping now"]);
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("--head"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert_eq!(review_row(&fixture, "code")["state"], "requested");
+}
+
+/// A waiver must never replace the evidence that a review actually happened.
+#[test]
+fn a_satisfied_review_cannot_be_waived() {
+    let fixture = Fixture::new();
+    seed_review_request(&fixture, "code", WAIVE_HEAD);
+    assert!(
+        review_state(&fixture, "code", WAIVE_HEAD, "satisfied")
+            .status
+            .success()
+    );
+
+    let refused = review_waive(
+        &fixture,
+        &[
+            "--type",
+            "code",
+            "--head",
+            WAIVE_HEAD,
+            "--reason",
+            "tidying up",
+        ],
+    );
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("already satisfied"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert_eq!(review_row(&fixture, "code")["state"], "satisfied");
+}
+
+/// `review state` takes no author and no reason, so letting it write `waived`
+/// would reinstate the unattributed override in the place that is supposed to
+/// have stopped being one.
+#[test]
+fn review_state_cannot_write_the_waived_label() {
+    let fixture = Fixture::new();
+    seed_review_request(&fixture, "code", WAIVE_HEAD);
+    let refused = review_state(&fixture, "code", WAIVE_HEAD, "waived");
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("review waive"),
+        "the refusal has to name the command that does work: {}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert_eq!(review_row(&fixture, "code")["state"], "requested");
+}
+
 /// One ledger row, read back through the CLI the way an operator would.
 fn review_row(fixture: &Fixture, review_type: &str) -> serde_json::Value {
     let ledger = fixture.run(
