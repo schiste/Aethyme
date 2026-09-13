@@ -31,6 +31,7 @@ use crate::types::{
     SessionStatus,
 };
 use crate::version::{VersionDriftReport, VersionDriftStatus};
+use crate::worktree_reconcile::WorktreeReconciliation;
 
 /// Idle/stale thresholds for activity-derived liveness (issue #9).
 /// Configurable via `.aethyme/config.toml` in a later phase; constants
@@ -934,6 +935,10 @@ pub struct CleanupRetention {
     pub oldest_closed_age_days: u64,
     pub closed_worktrees_policy_days: u32,
     pub severity: StatusAdviceSeverity,
+    /// Directories under a broker worktree root that no session row claims
+    /// (#176). Unsized on this path -- status runs often, and the count is
+    /// the signal; `gc plan` measures the bytes.
+    pub reconciliation: WorktreeReconciliation,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -3354,6 +3359,94 @@ impl Broker {
         Ok(views)
     }
 
+    // ── disk / ledger reconciliation ──────────────────────────────────
+
+    /// Compare the directories under broker-owned worktree roots against the
+    /// worktrees sessions actually claim (#176, ownership drift).
+    ///
+    /// `sized` walks every unclaimed directory to estimate its bytes, which is
+    /// the expensive half. Counts are available without it, and the report says
+    /// which of the two it is rather than leaving a caller to infer that zero
+    /// bytes across sixteen directories means "unsized" and not "empty".
+    ///
+    /// Reporting only. A directory with no session row is a directory whose
+    /// contents the broker cannot reason about, so naming it is the most this
+    /// may do; nothing downstream removes on this evidence.
+    pub fn reconcile_worktree_directories(
+        &self,
+        sized: bool,
+    ) -> Result<WorktreeReconciliation, BrokerOpError> {
+        let roots = self.broker_owned_worktree_roots()?;
+        // Both sides are compared as the strings the broker itself produced,
+        // which is sound only because they descend from one canonical root:
+        // `Broker::open` canonicalises `main_root`, so a session started
+        // through a symlinked checkout still records the real path, and
+        // `read_dir` on a root derived from the same place yields the same
+        // spelling. `a_worktree_reached_by_another_spelling_is_still_owned`
+        // pins that invariant; if it ever stops holding, healthy worktrees
+        // start being reported as drift rather than silently mismatching.
+        let claims: Vec<(i64, String)> = self
+            .store
+            .live_sessions()?
+            .into_iter()
+            .chain(self.store.cleaned_sessions()?)
+            .map(|session| (session.id, session.worktree_path.clone()))
+            .collect();
+
+        let mut observed = Vec::new();
+        for root in &roots {
+            let Ok(entries) = std::fs::read_dir(root) else {
+                // An unreadable root is not drift; claiming it held nothing
+                // would understate the problem this sweep exists to surface.
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !is_real_directory(&path) || is_worktree_root_infrastructure(&entry.file_name())
+                {
+                    continue;
+                }
+                observed.push(crate::worktree_reconcile::ObservedDirectory {
+                    path: path.to_string_lossy().into_owned(),
+                    git_marker: path.join(".git").exists(),
+                    estimated_bytes: None,
+                });
+            }
+        }
+
+        let mut reconciled = crate::worktree_reconcile::reconcile(&observed, &claims);
+        if sized {
+            for entry in reconciled.iter_mut().filter(|entry| entry.unclaimed()) {
+                entry.estimated_bytes = Some(
+                    directory_size_without_following_links(Path::new(&entry.path)).unwrap_or(0),
+                );
+            }
+        }
+        Ok(crate::worktree_reconcile::summarise(
+            &reconciled,
+            roots.len(),
+        ))
+    }
+
+    /// The worktree roots this broker creates session worktrees in.
+    ///
+    /// Deliberately only these. A session may be adopted at any path --
+    /// including the main checkout -- and sweeping the parent of an adopted
+    /// worktree would enumerate unrelated repositories as broker drift.
+    fn broker_owned_worktree_roots(&self) -> Result<Vec<PathBuf>, BrokerOpError> {
+        let plan = self.worktree_root_plan()?;
+        let mut roots = Vec::new();
+        for root in [plan.preferred_root.clone(), Some(plan.legacy_fallback_root)]
+            .into_iter()
+            .flatten()
+        {
+            if is_real_directory(&root) && !roots.contains(&root) {
+                roots.push(root);
+            }
+        }
+        Ok(roots)
+    }
+
     /// How long a session may go unattended before the broker treats its agent
     /// as gone, in milliseconds. `0` disables the lane.
     ///
@@ -5376,6 +5469,50 @@ impl Broker {
                             .into(),
                     ]
                 },
+            });
+        }
+        // Every other cleanup surface starts from a session row, so a
+        // directory no row names is invisible to all of them -- not retained,
+        // not reclaimable, not blocked, just absent from the arithmetic. That
+        // is how a root grows to 54 directories while the broker reports 38
+        // (#176). Naming them is the whole remedy: the broker cannot know what
+        // is inside a directory it never created, so nothing here removes.
+        let drift = &cleanup_retention.reconciliation;
+        if drift.unclaimed_count > 0 {
+            let count = drift.unclaimed_count;
+            advice.push(StatusAdvice {
+                id: "cleanup.unclaimed-worktrees",
+                severity: unclaimed_worktree_severity(count),
+                reason: "directories under a broker worktree root are claimed by no session",
+                summary: format!(
+                    "{count} {} under broker worktree roots {} to no session and no cleanup lane can reach {}; inspect and remove by hand",
+                    plural_word(count, "directory", "directories"),
+                    plural_word(count, "belongs", "belong"),
+                    plural_word(count, "it", "them")
+                ),
+                session_id: None,
+                queue_entry_id: None,
+                evidence: {
+                    let mut evidence = vec![format!(
+                        "directories/claimed/unclaimed: {}/{}/{count}",
+                        drift.directory_count, drift.claimed_count
+                    )];
+                    evidence.extend(
+                        drift
+                            .unclaimed
+                            .iter()
+                            .take(UNCLAIMED_EVIDENCE_LIMIT)
+                            .map(|entry| format!("{} ({})", entry.path, entry.kind)),
+                    );
+                    if count > UNCLAIMED_EVIDENCE_LIMIT {
+                        evidence.push(format!(
+                            "... and {} more; `aethyme broker gc plan --json` lists all of them with sizes",
+                            count - UNCLAIMED_EVIDENCE_LIMIT
+                        ));
+                    }
+                    evidence
+                },
+                commands: vec!["aethyme broker gc plan --json".into()],
             });
         }
         // A review a provider refused, said out loud. The ledger has always
@@ -7458,6 +7595,7 @@ impl Broker {
             oldest_closed_age_days,
             closed_worktrees_policy_days: policy.closed_worktrees_days,
             severity,
+            reconciliation: self.reconcile_worktree_directories(false)?,
         })
     }
 
@@ -7531,6 +7669,28 @@ pub(crate) fn is_orphaned_worktree_directory(path: &Path) -> bool {
     path.exists() && GitRepo::discover(path).is_err()
 }
 
+/// Whether a directory sitting in a worktree root is the broker's own, rather
+/// than something that drifted in.
+///
+/// The rule is the exact complement of how worktree directories are named:
+/// `slugify` emits only `[a-z0-9-]` and trims leading dashes, so a session
+/// worktree can never begin with a dot, while the shared state the broker
+/// parks beside them -- `.cargo`, the root marker -- always does. Reporting
+/// those as unaccounted-for would raise the same advisory on every healthy
+/// install, which is how a warning stops being read.
+///
+/// The cost is that a dotted stray directory goes unreported. That is the
+/// right side to err on: this lane's output is a list a human is asked to act
+/// on, and a list that is wrong on every machine is worth less than a list
+/// that is occasionally incomplete.
+fn is_worktree_root_infrastructure(name: &std::ffi::OsStr) -> bool {
+    name.to_string_lossy().starts_with('.')
+}
+
+fn is_real_directory(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir())
+}
+
 pub(crate) fn directory_size_without_following_links(path: &Path) -> std::io::Result<u64> {
     let metadata = std::fs::symlink_metadata(path)?;
     if metadata.file_type().is_symlink() {
@@ -7546,7 +7706,11 @@ pub(crate) fn directory_size_without_following_links(path: &Path) -> std::io::Re
     Ok(total)
 }
 
-fn plural_word(count: usize, singular: &'static str, plural: &'static str) -> &'static str {
+pub(crate) fn plural_word(
+    count: usize,
+    singular: &'static str,
+    plural: &'static str,
+) -> &'static str {
     if count == 1 { singular } else { plural }
 }
 
@@ -7722,6 +7886,26 @@ fn cleanup_retention_severity(
         || (retained_bytes_budget > 0 && retained_bytes >= retained_bytes_budget)
         || oldest_age_days >= u64::from(policy_days)
     {
+        StatusAdviceSeverity::Warning
+    } else {
+        StatusAdviceSeverity::Notice
+    }
+}
+
+/// How many drifted directories to name inline before deferring to `gc plan`.
+///
+/// Status advice is read in a terminal. A root that has drifted badly would
+/// otherwise bury every other advisory under its own path list, which is the
+/// failure mode -- a warning nobody reads -- reproduced in a new place.
+const UNCLAIMED_EVIDENCE_LIMIT: usize = 5;
+
+/// Drift severity on the same threshold the retained-worktree advice uses.
+///
+/// One unexplained directory is worth saying; five is worth interrupting for,
+/// because at that point the broker's records describe materially less of the
+/// disk than the disk holds.
+fn unclaimed_worktree_severity(unclaimed: usize) -> StatusAdviceSeverity {
+    if unclaimed >= 5 {
         StatusAdviceSeverity::Warning
     } else {
         StatusAdviceSeverity::Notice
@@ -8541,6 +8725,30 @@ mod tests {
     }
 
     #[test]
+    fn a_worktree_directory_is_never_mistaken_for_broker_infrastructure() {
+        // `is_worktree_root_infrastructure` skips dotted entries on the
+        // grounds that `slugify` cannot produce one. If that ever stops being
+        // true, the sweep silently stops reporting a whole class of drift.
+        for task in [
+            ".hidden",
+            "...",
+            "-.-",
+            "   .leading space",
+            "\u{2022} bullet",
+            "",
+        ] {
+            let slug = super::slugify(task);
+            assert!(
+                !std::path::Path::new(&slug)
+                    .file_name()
+                    .map(super::is_worktree_root_infrastructure)
+                    .unwrap_or(false),
+                "slugify({task:?}) produced {slug:?}, which the sweep would skip"
+            );
+        }
+    }
+
+    #[test]
     fn slugify_is_safe_for_branches_and_paths() {
         assert_eq!(slugify("Fix auth bug!"), "fix-auth-bug");
         assert_eq!(slugify("  weird///name  "), "weird-name");
@@ -8764,6 +8972,16 @@ mod tests {
             super::StatusAdviceSeverity::Notice
         );
         let retention = super::CleanupRetention {
+            reconciliation: crate::WorktreeReconciliation {
+                schema_version: crate::WORKTREE_RECONCILIATION_SCHEMA_VERSION,
+                scanned_root_count: 0,
+                directory_count: 0,
+                claimed_count: 0,
+                unclaimed_count: 0,
+                unclaimed_bytes: 0,
+                sized: false,
+                unclaimed: Vec::new(),
+            },
             broker_owned_worktree_count: 1,
             retained_session_branch_count: 1,
             eligible_worktree_count: 0,
@@ -8809,6 +9027,8 @@ mod tests {
             orphaned_pidfiles: Vec::new(),
             purged_stale_leases: 0,
             retention: crate::GcHealth {
+                unclaimed_worktree_count: 0,
+                unclaimed_worktree_bytes: 0,
                 policy: crate::RetentionPolicy::default(),
                 pending_recovery_digest: None,
                 candidate_rows: 0,

@@ -27,6 +27,23 @@ artifacts and their exact source revision are recorded in each signed
   cannot reclaim work. Each transition appends `session.abandoned` carrying the
   observed idle time and the threshold that was applied.
 
+- `broker status` and `broker gc plan` now report the directories under a
+  worktree root that no session claims. Status counts them; `gc plan` also
+  sizes them, and both carry them as `reconciliation` alongside the existing
+  totals.
+
+  Every cleanup lane starts from a session row, so a directory with no row was
+  invisible to all of them — not retained, not reclaimable, not blocked, simply
+  missing from the arithmetic. On the dogfood machine 54 directories sat under a
+  root the broker described as holding 38 (#176), and no policy could reach the
+  difference because nothing reported that it existed.
+
+  Report only. `gc apply` never removes an unclaimed directory, no retention
+  window reaches one, and the sweep is excluded from the plan's authorization
+  digest so a directory appearing on disk cannot revoke a confirmation an
+  operator already gave. The broker did not create these directories and cannot
+  reason about their contents; naming them for a human is the whole remedy.
+
 - `aethyme broker review waive` excuses one review dimension at one head, on the
   record:
 

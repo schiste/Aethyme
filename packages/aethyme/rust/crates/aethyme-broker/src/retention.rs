@@ -296,6 +296,18 @@ pub struct GcPlan {
     /// Bytes this plan deliberately leaves in place because a retention or
     /// provenance gate blocked them.
     pub estimated_blocked_bytes: u64,
+    /// Directories under a broker worktree root that no session row claims
+    /// (#176). Reporting only, and excluded from the digest for the same
+    /// reason the byte totals are: this plan does not act on these, so a
+    /// directory appearing or vanishing must not invalidate an operator's
+    /// authorization to remove something else.
+    ///
+    /// `None` only when re-reading a plan written before the sweep existed.
+    /// That is deliberately not the same value as a sweep that found nothing:
+    /// a plan that never looked must not read as a plan that looked and found
+    /// a clean root.
+    #[serde(default)]
+    pub reconciliation: Option<crate::WorktreeReconciliation>,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
@@ -327,6 +339,9 @@ pub struct GcHealth {
     pub estimated_blocked_bytes: u64,
     pub over_retained_bytes_budget: bool,
     pub blockers: usize,
+    /// Directories under a broker worktree root that no session claims.
+    pub unclaimed_worktree_count: usize,
+    pub unclaimed_worktree_bytes: u64,
 }
 
 impl GcPlan {

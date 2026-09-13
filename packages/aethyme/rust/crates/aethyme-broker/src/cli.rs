@@ -3311,6 +3311,37 @@ fn render_gc_plan(plan: &crate::GcPlan, detail: bool) {
         human_bytes(plan.estimated_retained_bytes),
         human_bytes(plan.estimated_blocked_bytes),
     );
+    // Listed apart from the candidate sections above because it is not a
+    // candidate list: `gc apply` will not touch any of these, and printing
+    // them among things the digest authorizes would imply otherwise (#176).
+    if let Some(sweep) = &plan.reconciliation {
+        if sweep.unclaimed_count > 0 {
+            out!(
+                "  unclaimed by any session ({} of {} {} under {} broker worktree {}, {}): reported only, `gc apply` does not remove these",
+                sweep.unclaimed_count,
+                sweep.directory_count,
+                crate::broker::plural_word(sweep.directory_count, "directory", "directories"),
+                sweep.scanned_root_count,
+                crate::broker::plural_word(sweep.scanned_root_count, "root", "roots"),
+                if sweep.sized {
+                    human_bytes(sweep.unclaimed_bytes)
+                } else {
+                    "unsized".to_string()
+                },
+            );
+            render_capped(&sweep.unclaimed, GC_LIST_CAP, detail, |entry| {
+                out!(
+                    "  unclaimed: {} ({}{})",
+                    entry.path,
+                    entry.kind,
+                    entry
+                        .estimated_bytes
+                        .map(|bytes| format!(", {}", human_bytes(bytes)))
+                        .unwrap_or_default()
+                );
+            });
+        }
+    }
     render_capped(&plan.rows, GC_LIST_CAP, detail, |row| {
         out!(
             "  row: {:?} {} at {} ({} bytes)",

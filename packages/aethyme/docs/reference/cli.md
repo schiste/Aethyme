@@ -1021,6 +1021,46 @@ than only the bytes this plan will act on. The two reporting totals are excluded
 from the authorization digest: a measured size change must never invalidate a
 plan an operator already confirmed.
 
+### Directories no session claims
+
+Every cleanup lane reasons from session rows, so a directory under a worktree
+root that no row references was not retained, not reclaimable and not blocked —
+it was absent from the arithmetic. That is how a root reaches 54 directories
+while the broker reports 38.
+
+`broker status` and `gc plan` now reconcile the two. Status counts them; `gc
+plan` also sizes them, and both report the directories under `reconciliation`:
+
+```json
+{
+  "scanned_root_count": 1,
+  "directory_count": 54,
+  "claimed_count": 38,
+  "unclaimed_count": 16,
+  "unclaimed_bytes": 12884901888,
+  "sized": true,
+  "unclaimed": [
+    { "path": "…/worktrees/old-task", "kind": "untracked_worktree", "estimated_bytes": 943718400 }
+  ]
+}
+```
+
+`sized` is the field to read first: `unclaimed_bytes: 0` from `broker status`
+means the routine path did not walk the disk, not that the directories are
+empty. `kind` separates a directory carrying a `.git` entry
+(`untracked_worktree`) from one that does not (`stray_directory`).
+
+This is a report and nothing more. `gc apply` does not remove these, no
+retention window reaches them, and the sweep is excluded from the authorization
+digest for the same reason the byte totals are. The broker did not create these
+directories and cannot reason about what is inside them, so naming them for a
+human is the most it should do.
+
+Directories whose name begins with `.` are the broker's own shared state — the
+per-root Cargo home, the root marker — and are never reported. A session
+worktree name is derived from the task slug, which contains only `[a-z0-9-]`,
+so the two sets cannot overlap.
+
 ### Build caches and orphaned roots
 
 A blocked cleanup disposition protects committed work. A git-ignored build cache

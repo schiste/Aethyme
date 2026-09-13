@@ -918,6 +918,9 @@ impl Broker {
             estimated_reclaimable_bytes,
             estimated_retained_bytes,
             estimated_blocked_bytes,
+            // The full walk: `gc plan` is the expensive path an operator asks
+            // for, so it is the one that can afford to size what it found.
+            reconciliation: Some(self.reconcile_worktree_directories(true)?),
         };
         plan.finish_digest()?;
         Ok(plan)
@@ -945,6 +948,14 @@ impl Broker {
             estimated_blocked_bytes: plan.estimated_blocked_bytes,
             over_retained_bytes_budget,
             blockers: plan.blockers.len(),
+            unclaimed_worktree_count: plan
+                .reconciliation
+                .as_ref()
+                .map_or(0, |sweep| sweep.unclaimed_count),
+            unclaimed_worktree_bytes: plan
+                .reconciliation
+                .as_ref()
+                .map_or(0, |sweep| sweep.unclaimed_bytes),
         })
     }
 

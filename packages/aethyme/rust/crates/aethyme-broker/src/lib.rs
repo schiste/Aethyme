@@ -117,6 +117,7 @@ mod update_cache;
 mod verification;
 mod verify_loop;
 mod version;
+mod worktree_reconcile;
 
 pub use aethyme_graph_storage::{
     GRAPH_CONFIG_RELPATH, GraphAuthority, GraphIntegrityPolicy, GraphIntegrityPolicyError,
@@ -403,6 +404,11 @@ pub use verify_loop::{
 };
 pub use version::{
     BinaryBuild, VersionDriftReport, VersionDriftStatus, current_binary_build, inspect_version,
+};
+pub use worktree_reconcile::{
+    DirectoryClaim, ObservedDirectory, ReconciledDirectory, UnclaimedDirectory,
+    WORKTREE_RECONCILIATION_SCHEMA_VERSION, WorktreeReconciliation,
+    reconcile as reconcile_worktree_directories, summarise as summarise_worktree_reconciliation,
 };
 
 /// Repo-relative location of the broker database.
