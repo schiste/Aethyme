@@ -94,6 +94,36 @@ key = "rust-workspace-v3"
 max_bytes = 12884901888
 
 [[gate]]
+# 2026-09-13: `.github/workflows/**` matched no trigger, so an entry that
+# touched only a workflow file selected no Rust gate and auto-promoted
+# without the suites that assert over that very file — the third instance
+# of the silent-narrowing family already documented twice above (the
+# untriggered new package, and `pytest-local`'s `src/**` outliving `src/`).
+# Caught when entry 473 changed oss-ci.yml and ran one 37s gate; the test
+# reading oss-ci.yml never executed, and passed only by luck.
+#
+# This is a narrow gate rather than a `.github/workflows/**` entry on
+# `cargo-test` because the whole workspace suite costs ~10 minutes and this
+# pair costs ~30s warm. The repository's own guidance is that a required
+# check must be scoped to the diff and finish in minutes; charging every
+# workflow edit the full suite would violate it to cover two files.
+#
+# COUPLING: this gate names the suites that read `.github/` from
+# `repo_root()`. A new test that reads a workflow file must be added here,
+# or it is unguarded on the workflow-only path. Both suites also run under
+# `cargo-test`, so nothing here is lost when Rust changes.
+name = "workflow-contract"
+command = 'export CHAU7_CTO_OPTIM_ACTIVE=1 CARGO_INCREMENTAL=0 CARGO_PROFILE_TEST_DEBUG=1 CARGO_TARGET_DIR="$AETHYME_GATE_CACHE_DIR" && cargo test --quiet --manifest-path packages/aethyme/rust/Cargo.toml -p aethyme-testkit --test release_contract && cargo test --quiet --manifest-path packages/aethyme/rust/Cargo.toml -p aethyme-cli --test repository_deploy_cli'
+cost = 1
+timeout_seconds = 600
+resource_wait_seconds = 900
+triggers = [".github/workflows/**"]
+
+[gate.managed_cache]
+key = "rust-workspace-v3"
+max_bytes = 12884901888
+
+[[gate]]
 # 2026-07-27: the registry's enforcement previously ran ONLY in the
 # GitHub PR workflow — a path broker submissions never take. That hole
 # shipped the 12-day `query deps` break (d8bbe85 removed tracked
