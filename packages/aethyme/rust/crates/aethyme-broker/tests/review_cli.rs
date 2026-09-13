@@ -1248,7 +1248,7 @@ fn closed_review_lifecycle_can_be_reassigned_or_abandoned_without_losing_audit_h
 fn seed_review_request(fixture: &Fixture, review_type: &str, head: &str) {
     let mut store = aethyme_broker::BrokerStore::open_in_repo(fixture.root.path()).unwrap();
     store
-        .record_review_request("acme/product", 42, review_type, head, "chau7", 1_000)
+        .record_review_request("acme/product", 42, review_type, head, None, "chau7", 1_000)
         .unwrap();
 }
 
@@ -1631,6 +1631,7 @@ fn a_refusal_a_later_request_superseded_stops_being_reported() {
                 42,
                 "code",
                 "0000000000111111111122222222223333333333",
+                None,
                 "chau7",
                 refused[0].requested_at + 1,
             )

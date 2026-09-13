@@ -803,6 +803,7 @@ mod tests {
             pr_number: 42,
             review_type: review_type.into(),
             head_commit: head.into(),
+            base_commit: None,
             backend: "chau7".into(),
             state,
             detail: None,

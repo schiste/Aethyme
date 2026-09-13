@@ -8,6 +8,42 @@ artifacts and their exact source revision are recorded in each signed
 
 ### Added
 
+- Review freshness is declared per dimension. A `[review.trigger.schedule.<type>]`
+  table may set `freshness = "head"` (the default, and what every dimension has
+  always done) or `"head_and_base"`, which additionally invalidates a completed
+  review when the base commit moves:
+
+  ```toml
+  [review.trigger.schedule.security]
+  freshness = "head"            # valid until the head SHA changes
+
+  [review.trigger.schedule.code]
+  freshness = "head_and_base"   # a moving base changes what the diff means
+  ```
+
+  One staleness rule applied to every dimension is what forces an operator to
+  reach for a blanket override, which waives every dimension rather than the one
+  that is actually stale -- so clearing a stale code review silently clears
+  security too. `Aeptus/mockup`'s PR #619 held a completed security review bound
+  to its own current head and was still permanently unmergeable, because the only
+  way to clear a timestamp-derived staleness flag was a re-run the provider's
+  exhausted quota could not serve.
+
+  Two properties are deliberate. The base is compared as a **commit**, never a
+  timestamp: a clock-derived floor is what produced that deadlock. And a base
+  that cannot be compared -- no base recorded on the row, or no base resolvable
+  now -- counts as *moved*, because the question is whether the base is proven
+  unchanged and silence does not prove it.
+
+### Changed
+
+- Broker database schema v36 adds a nullable `base_commit` to `review_requests`
+  and to `pull_request_observations`. The column is deliberately left null on
+  existing rows: backfilling it from today's branch tip would assert a
+  comparison nobody made, and `head_and_base` would then silently pass stale
+  reviews. **Every `aethyme` binary on a machine must be reinstalled to open a
+  v36 database**; an older binary is locked out until it is.
+
 - Review routing: a route may declare `on_refusal`, a one-hop escape taken when
   the previous attempt at that dimension came back refused. A spent provider
   quota is the one refusal a retry cannot clear -- it is what left ten

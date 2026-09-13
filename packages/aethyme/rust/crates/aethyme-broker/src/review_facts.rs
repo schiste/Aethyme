@@ -26,6 +26,14 @@ use crate::ReviewTrigger;
 pub struct ProviderPullRequest {
     pub head_commit: String,
     pub base_ref: String,
+    /// The commit `base_ref` currently points at.
+    ///
+    /// Distinct from `base_ref` and not a refinement of it. The name answers
+    /// "was this pull request retargeted"; the SHA answers "has the branch it
+    /// targets advanced", which is the question a `head_and_base` dimension
+    /// asks. `None` when the provider did not report one -- read as unproven,
+    /// never as unchanged (#172).
+    pub base_commit: Option<String>,
     pub is_draft: bool,
     /// `open`, `closed`, or `merged`, lowercased.
     pub state: String,
@@ -49,6 +57,8 @@ pub struct PullRequestObservation {
     pub pr_number: i64,
     pub head_commit: String,
     pub base_ref: String,
+    /// The commit `base_ref` pointed at when this observation was taken.
+    pub base_commit: Option<String>,
     pub is_draft: bool,
     pub state: String,
     pub dismissed_reviews: i64,
@@ -167,6 +177,7 @@ mod tests {
             pr_number: 7,
             head_commit: head.into(),
             base_ref: "main".into(),
+            base_commit: None,
             is_draft: false,
             state: "open".into(),
             dismissed_reviews: 0,
@@ -178,6 +189,7 @@ mod tests {
         ProviderPullRequest {
             head_commit: head.into(),
             base_ref: "main".into(),
+            base_commit: None,
             is_draft: false,
             state: "open".into(),
             from_fork: false,

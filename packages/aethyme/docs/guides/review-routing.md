@@ -136,6 +136,13 @@ always_on_new_head = false   # re-review on a new head even past the cap
 [review.trigger.schedule.security]
 debounce_seconds = 0         # never delay a security review
 max_per_pull_request = 0     # and never cap one
+freshness = "head"           # the default: valid until the head SHA changes
+
+[review.trigger.schedule.code]
+# A moving base changes what this diff means, so invalidate on it too.
+# Opt-in, and it costs a re-review of every open pull request per merge
+# into the base branch.
+freshness = "head_and_base"
 
 # ---------------------------------------------------------------------------
 # Who performs a review.
@@ -308,10 +315,59 @@ is *how often*.
   Without it a pull request with forty pushes spends forty security reviews and
   starves every other pull request in the repository. `0` means no cap.
 - `always_on_new_head` -- re-review when the head moves even past the cap. Off
-  by default, because the cap exists precisely to survive an active branch.
+  by default, because the cap exists precisely to survive an active branch. It
+  says *head*: a base that moved does not lift the cap, or `head_and_base` on a
+  busy trunk would become one review per merge, with no ceiling at all.
+- `freshness` -- what invalidates a completed review of this dimension.
 
-A dimension that already ran against the current head is skipped outright,
-before either of these is consulted.
+A dimension that already ran against the current head, and whose `freshness`
+has nothing further to say, is skipped outright before any of these is
+consulted.
+
+### What makes a review stale
+
+One rule applied to every dimension is the thing `freshness` exists to stop,
+and the failure it prevents is specific. `Aeptus/mockup`'s PR #619, on
+2026-09-11, carried a completed security review bound to its own current head.
+A staleness rule derived from timestamps called that review stale anyway, the
+only way to clear the flag was a re-run, and the provider's security-review
+quota was already spent. The pull request was permanently unmergeable while
+holding exactly the evidence it was being blocked for. Across ten open pull
+requests, zero merge-queue trains ran for about 48 hours, and the only unblock
+available was a blanket override that waives *every* dimension -- so clearing a
+stale code review silently cleared security too.
+
+| `freshness` | A completed review stays valid until |
+| --- | --- |
+| `head` (default) | the head SHA changes |
+| `head_and_base` | the head SHA changes, **or** the base commit moves |
+
+Which dimension wants which is a judgement about what the review was looking
+at. When the base moves, what a *code* diff means changes: the same lines now
+sit on top of code the reviewer never saw. A *security* finding surface is
+mostly the head's own content, and advancing the base does not retroactively
+introduce a vulnerability into code already reviewed at that exact SHA. So
+`code` is the dimension worth declaring `head_and_base` for, and `security` is
+the one that should stay `head`.
+
+The accepted cost of `head` on a security dimension is real: a head-bound
+review can miss an interaction between newly-arrived base code and
+already-reviewed head code. CI gates the merged result, so review is one signal
+among several rather than the sole guard. A repository that wants the stricter
+reading declares `head_and_base` and pays for it in re-reviews.
+
+Three rules follow from how this is decided, and each is load-bearing:
+
+- **`head` is the default for every dimension**, so a repository that never
+  writes this key keeps exactly the behaviour it had.
+- **A base that cannot be compared counts as moved.** A ledger row written
+  before schema v36 has no recorded base, and a caller that cannot resolve
+  today's base supplies none. Either way the question -- is the base *proven*
+  unchanged -- is unanswered, and silence does not prove it. That costs one
+  review; the other reading passes a stale one.
+- **The base is a commit, never a timestamp.** A clock-derived floor is what
+  produced #619's deadlock. `review run` records the base SHA each review was
+  requested against and compares SHAs.
 
 ## Backends
 

@@ -16,7 +16,7 @@ use rusqlite::Connection;
 use crate::error::BrokerError;
 
 /// Current database schema version (== `MIGRATIONS.len()`).
-pub const SCHEMA_VERSION: i64 = 35;
+pub const SCHEMA_VERSION: i64 = 36;
 
 /// Version stamped on every event row written by this binary.
 pub const EVENTS_SCHEMA_VERSION: i64 = 1;
@@ -967,6 +967,28 @@ CREATE TABLE pull_request_observations (
 );
 ";
 
+/// The base commit a review was requested against, so "the base moved" becomes
+/// observable.
+///
+/// v35 recorded `base_ref` -- a branch *name*. That answers "was this pull
+/// request retargeted", which is a different question from "has the branch it
+/// targets advanced since the review ran", and only the second one can make a
+/// completed review stale. A timestamp comparison is the usual substitute and
+/// is why `Aeptus/mockup` deadlocked on 2026-09-11: a floor derived from clocks
+/// called a review stale that had run against the exact head still under
+/// consideration. A recorded SHA is the fact itself rather than a proxy for it.
+///
+/// Nullable on purpose, on both tables. A row written before this migration
+/// genuinely has no recorded base, and backfilling one -- from the branch tip
+/// today, say -- would assert a comparison nobody made. `freshness =
+/// "head_and_base"` reads a missing base as "cannot prove the base is
+/// unchanged" and re-requests, which costs one review and never silently
+/// passes a stale one.
+const MIGRATION_V36: &str = "
+ALTER TABLE review_requests ADD COLUMN base_commit TEXT;
+ALTER TABLE pull_request_observations ADD COLUMN base_commit TEXT;
+";
+
 const MIGRATIONS: &[&str] = &[
     MIGRATION_V1,
     MIGRATION_V2,
@@ -1003,6 +1025,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_V33,
     MIGRATION_V34,
     MIGRATION_V35,
+    MIGRATION_V36,
 ];
 
 pub(crate) fn current_version(conn: &Connection) -> Result<i64, BrokerError> {

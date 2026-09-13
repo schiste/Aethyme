@@ -361,7 +361,7 @@ pub use review_report::{
 };
 pub use review_trigger::{
     ChangeFacts, ClassificationConflict, CommitClassification, EligibleReview,
-    REVIEW_TRIGGER_SCHEMA_VERSION, ReviewSchedule, ReviewSpend, ReviewTrigger,
+    REVIEW_TRIGGER_SCHEMA_VERSION, ReviewFreshness, ReviewSchedule, ReviewSpend, ReviewTrigger,
     ReviewTriggerDecision, ReviewTriggerError, ReviewTriggerPolicy, ReviewTriggerRule,
     classification_conflicts, decide, eligible_types, parse_classification, schedule,
 };

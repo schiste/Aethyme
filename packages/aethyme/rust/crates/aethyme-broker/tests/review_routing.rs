@@ -138,6 +138,10 @@ fn plan_after(
         &eligible,
         &BTreeMap::new(),
         head,
+        // Empty spend, so there is no completed review for a moving base to
+        // invalidate. Freshness is exercised where it is decided, in
+        // `review_trigger`'s unit tests.
+        None,
         1_000_000_000_000,
     );
 
@@ -680,6 +684,7 @@ fn a_finished_reviewers_workspace_is_reclaimed_and_becomes_dispatchable_again() 
         pr_number: 77,
         review_type: "security".into(),
         head_commit: "aaa111".into(),
+        base_commit: None,
         backend: "chau7".into(),
         state,
         detail: None,

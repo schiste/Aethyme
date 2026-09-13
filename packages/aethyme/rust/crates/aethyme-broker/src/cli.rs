@@ -5486,6 +5486,10 @@ fn run_review_plan(parsed: Parsed) -> Result<(), UsageError> {
         &eligible,
         &std::collections::BTreeMap::new(),
         &head,
+        // Freshness invalidates a review that was already requested, and the
+        // empty spend above says none was. Resolving a base here would change
+        // no decision; `review run` derives it for real.
+        None,
         now_ms(),
     );
 
@@ -5595,7 +5599,7 @@ fn read_pull_request_snapshot(
             "--repo",
             repository,
             "--json",
-            "headRefOid,baseRefName,isDraft,state,isCrossRepository,reviews",
+            "headRefOid,baseRefOid,baseRefName,isDraft,state,isCrossRepository,reviews",
         ])
         .output()
         .ok()?;
@@ -5621,6 +5625,13 @@ fn read_pull_request_snapshot(
     Some(crate::ProviderPullRequest {
         head_commit: json["headRefOid"].as_str().unwrap_or_default().to_string(),
         base_ref: json["baseRefName"].as_str().unwrap_or_default().to_string(),
+        // Absent rather than empty when the provider did not report one:
+        // `schedule` distinguishes "unproven" from "unchanged", and an empty
+        // string would compare unequal to itself across ticks anyway.
+        base_commit: json["baseRefOid"]
+            .as_str()
+            .filter(|oid| !oid.is_empty())
+            .map(String::from),
         is_draft: json["isDraft"].as_bool().unwrap_or(false),
         state: json["state"]
             .as_str()
@@ -6061,7 +6072,28 @@ fn run_review_run(parsed: Parsed) -> Result<serde_json::Value, UsageError> {
         previous.as_ref(),
     );
     let eligible = crate::eligible_types(&trigger, &facts);
-    let decisions = crate::schedule(&trigger, &eligible, &spend, &head, now_ms());
+    // The provider's answer first: on a sweep there is no local checkout of
+    // this pull request's base to resolve. Falling back to the local ref keeps
+    // an agent routing its own branch working without `gh`, and `None` --
+    // neither available -- makes a `head_and_base` dimension re-review rather
+    // than trust a base it cannot name (#172).
+    let base_commit = snapshot
+        .as_ref()
+        .and_then(|snapshot| snapshot.base_commit.clone())
+        .or_else(|| {
+            git_output(&change_root, &["rev-parse", &base])
+                .ok()
+                .map(|oid| oid.trim().to_string())
+                .filter(|oid| !oid.is_empty())
+        });
+    let decisions = crate::schedule(
+        &trigger,
+        &eligible,
+        &spend,
+        &head,
+        base_commit.as_deref(),
+        now_ms(),
+    );
     let dispatch: Vec<crate::ReviewDispatchAction> = decisions
         .iter()
         .filter_map(|decision| match decision {
@@ -6145,6 +6177,7 @@ fn run_review_run(parsed: Parsed) -> Result<serde_json::Value, UsageError> {
                 pull_request,
                 &write.review_type,
                 &head,
+                base_commit.as_deref(),
                 write.backend,
                 now_ms(),
             )
@@ -6274,6 +6307,7 @@ fn run_review_run(parsed: Parsed) -> Result<serde_json::Value, UsageError> {
                 pr_number: pull_request,
                 head_commit: snapshot.head_commit.clone(),
                 base_ref: snapshot.base_ref.clone(),
+                base_commit: snapshot.base_commit.clone(),
                 is_draft: snapshot.is_draft,
                 state: snapshot.state.clone(),
                 dismissed_reviews: snapshot.dismissed_reviews,

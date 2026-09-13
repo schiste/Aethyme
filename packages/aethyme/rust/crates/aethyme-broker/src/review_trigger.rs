@@ -312,6 +312,41 @@ pub struct ReviewTriggerRule {
     pub models: Vec<String>,
 }
 
+/// What makes a completed review stale for one dimension.
+///
+/// One rule for every dimension is the thing this exists to stop. When the base
+/// moves, what a *code* diff means changes -- the same lines now sit on top of
+/// code the reviewer never saw. A *security* finding surface is mostly the
+/// head's own content, and advancing the base does not retroactively introduce
+/// a vulnerability into code already reviewed at that exact SHA. Forcing both
+/// dimensions onto whichever rule is stricter is what left `Aeptus/mockup`'s
+/// PR #619 permanently unmergeable on 2026-09-11: it had a full security review
+/// bound to its current head, and the only way to clear the flag was a re-run
+/// the provider's exhausted quota could not serve (#172).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewFreshness {
+    /// A review stays valid until the head SHA changes.
+    ///
+    /// The default, and the rule every dimension has followed since the router
+    /// existed -- so a repository that does not write this key keeps exactly
+    /// today's behaviour.
+    Head,
+    /// The head SHA changing invalidates, and so does the base commit moving.
+    ///
+    /// Opt-in, and worth declaring for `code`. The cost is real: every merge
+    /// into the base branch invalidates every open pull request's review, which
+    /// on a busy trunk can be more re-reviews than the quota affords. That is
+    /// the trade the operator is making, and why it is not the default.
+    HeadAndBase,
+}
+
+impl Default for ReviewFreshness {
+    fn default() -> Self {
+        Self::Head
+    }
+}
+
 /// How much may be spent, and how often.
 ///
 /// This is the half that keeps a rich predicate set from becoming a quota
@@ -334,6 +369,13 @@ pub struct ReviewSchedule {
     /// Off by default: the cap exists precisely to survive an active branch.
     #[serde(default)]
     pub always_on_new_head: bool,
+    /// What invalidates a completed review of this dimension.
+    ///
+    /// Per dimension because that is the whole point: an operator who has to
+    /// apply one rule to every dimension ends up applying the strictest one,
+    /// and then reaches for a blanket override to escape it.
+    #[serde(default)]
+    pub freshness: ReviewFreshness,
 }
 
 impl Default for ReviewSchedule {
@@ -345,6 +387,7 @@ impl Default for ReviewSchedule {
             debounce_seconds: 600,
             max_per_pull_request: 8,
             always_on_new_head: false,
+            freshness: ReviewFreshness::Head,
         }
     }
 }
@@ -738,6 +781,12 @@ pub struct ReviewSpend {
     pub last_requested_ms: Option<i64>,
     /// The commit the most recent one was bound to.
     pub last_requested_commit: Option<String>,
+    /// The base commit the most recent one was requested against.
+    ///
+    /// `None` for a row written before the ledger recorded one, and read as
+    /// "cannot prove the base is unchanged" rather than "unchanged": under
+    /// `head_and_base` that costs one re-review and never passes a stale one.
+    pub last_requested_base: Option<String>,
 }
 
 /// What to do about one eligible review type, now.
@@ -775,14 +824,20 @@ impl ReviewTriggerDecision {
 
 /// Turn eligibility into decisions, given what has already been spent.
 ///
-/// `head` is the commit under consideration; `now_ms` is the caller's clock.
-/// A manual request bypasses eligibility entirely -- an operator asking for a
-/// review by name has already made the decision this function exists to make.
+/// `head` is the commit under consideration and `base` is the commit its target
+/// branch currently points at; `now_ms` is the caller's clock. A manual request
+/// bypasses eligibility entirely -- an operator asking for a review by name has
+/// already made the decision this function exists to make.
+///
+/// `base` is read only by a dimension declaring `freshness = "head_and_base"`,
+/// so a caller that cannot determine one passes `None` and every dimension
+/// routes exactly as it did before the key existed.
 pub fn schedule(
     policy: &ReviewTriggerPolicy,
     eligible: &[EligibleReview],
     spend: &BTreeMap<ReviewType, ReviewSpend>,
     head: &str,
+    base: Option<&str>,
     now_ms: i64,
 ) -> Vec<ReviewTriggerDecision> {
     eligible
@@ -798,17 +853,38 @@ pub fn schedule(
                 .as_deref()
                 .is_none_or(|last| last != head);
 
-            // A review already bound to this exact head is the answer we
-            // wanted; spending another buys nothing.
-            if !head_is_new {
+            // Under `head_and_base` the base moving invalidates too. A base
+            // that cannot be compared -- the caller did not supply one, or the
+            // row predates the ledger recording it -- counts as moved: the
+            // question is whether the base is *proven* unchanged, and silence
+            // does not prove it. That costs one review; the other reading
+            // passes a stale one.
+            let base_is_new = match schedule.freshness {
+                ReviewFreshness::Head => false,
+                ReviewFreshness::HeadAndBase => {
+                    match (base, spent.last_requested_base.as_deref()) {
+                        (Some(now), Some(then)) => now != then,
+                        _ => true,
+                    }
+                }
+            };
+
+            // A review already bound to this exact head -- and, where the
+            // dimension says so, this exact base -- is the answer we wanted;
+            // spending another buys nothing.
+            if !head_is_new && !base_is_new {
                 return ReviewTriggerDecision::Skip {
                     review_type: candidate.review_type.clone(),
                     why: format!("already requested for {head}"),
                 };
             }
+            // `always_on_new_head` says what it says. A base that moved is
+            // not a new head, so it does not lift the cap: `head_and_base` on
+            // a busy trunk would otherwise turn an uncapped dimension into one
+            // review per merge into the base branch, forever.
             if schedule.max_per_pull_request > 0
                 && spent.requested_count >= schedule.max_per_pull_request
-                && !schedule.always_on_new_head
+                && !(schedule.always_on_new_head && head_is_new)
             {
                 return ReviewTriggerDecision::Skip {
                     review_type: candidate.review_type.clone(),
@@ -849,9 +925,17 @@ pub fn decide(
     facts: &ChangeFacts,
     spend: &BTreeMap<ReviewType, ReviewSpend>,
     head: &str,
+    base: Option<&str>,
     now_ms: i64,
 ) -> Vec<ReviewTriggerDecision> {
-    schedule(policy, &eligible_types(policy, facts), spend, head, now_ms)
+    schedule(
+        policy,
+        &eligible_types(policy, facts),
+        spend,
+        head,
+        base,
+        now_ms,
+    )
 }
 
 #[cfg(test)]
@@ -1175,10 +1259,238 @@ mod tests {
         }]
     }
 
+    // -- freshness (#172) --------------------------------------------------
+
+    /// One dimension's settled review, bound to `head` on base `base`.
+    fn settled(
+        review_type: &str,
+        head: &str,
+        base: Option<&str>,
+    ) -> BTreeMap<ReviewType, ReviewSpend> {
+        let mut spend = BTreeMap::new();
+        spend.insert(
+            review_type.to_string(),
+            ReviewSpend {
+                requested_count: 1,
+                last_requested_ms: Some(0),
+                last_requested_commit: Some(head.to_string()),
+                last_requested_base: base.map(str::to_string),
+            },
+        );
+        spend
+    }
+
+    /// `freshness` on one dimension, everything else left at its default.
+    fn with_freshness(review_type: &str, freshness: ReviewFreshness) -> ReviewTriggerPolicy {
+        let mut policy = enabled(Vec::new());
+        policy.schedule.insert(
+            review_type.to_string(),
+            ReviewSchedule {
+                freshness,
+                ..Default::default()
+            },
+        );
+        policy
+    }
+
+    /// The default, and the regression that matters most: a repository that
+    /// never writes `freshness` must not notice this feature exists.
+    #[test]
+    fn a_moving_base_does_not_invalidate_by_default() {
+        let policy = enabled(Vec::new());
+        let spend = settled("code", "head1", Some("base1"));
+        let decisions = schedule(
+            &policy,
+            &one("code"),
+            &spend,
+            "head1",
+            Some("base2"),
+            10_000_000,
+        );
+        assert!(
+            matches!(decisions[0], ReviewTriggerDecision::Skip { .. }),
+            "{decisions:?}"
+        );
+    }
+
+    #[test]
+    fn a_moving_base_invalidates_a_head_and_base_dimension() {
+        let policy = with_freshness("code", ReviewFreshness::HeadAndBase);
+        let spend = settled("code", "head1", Some("base1"));
+        let decisions = schedule(
+            &policy,
+            &one("code"),
+            &spend,
+            "head1",
+            Some("base2"),
+            10_000_000,
+        );
+        assert!(
+            matches!(decisions[0], ReviewTriggerDecision::Request { .. }),
+            "{decisions:?}"
+        );
+    }
+
+    #[test]
+    fn a_still_base_leaves_a_head_and_base_dimension_settled() {
+        let policy = with_freshness("code", ReviewFreshness::HeadAndBase);
+        let spend = settled("code", "head1", Some("base1"));
+        let decisions = schedule(
+            &policy,
+            &one("code"),
+            &spend,
+            "head1",
+            Some("base1"),
+            10_000_000,
+        );
+        assert!(
+            matches!(decisions[0], ReviewTriggerDecision::Skip { .. }),
+            "{decisions:?}"
+        );
+    }
+
+    /// The whole point of #172: the strict rule is declared per dimension, so
+    /// `security` stays valid on the exact head it was reviewed at while
+    /// `code` re-reviews. One rule for both is what forced the blanket
+    /// override that waived security along with code.
+    #[test]
+    fn freshness_is_declared_per_dimension() {
+        let mut policy = with_freshness("code", ReviewFreshness::HeadAndBase);
+        policy.schedule.insert(
+            "security".to_string(),
+            ReviewSchedule {
+                freshness: ReviewFreshness::Head,
+                ..Default::default()
+            },
+        );
+        let eligible = vec![
+            EligibleReview {
+                review_type: "code".to_string(),
+                because: vec!["rule".to_string()],
+            },
+            EligibleReview {
+                review_type: "security".to_string(),
+                because: vec!["rule".to_string()],
+            },
+        ];
+        let mut spend = settled("code", "head1", Some("base1"));
+        spend.extend(settled("security", "head1", Some("base1")));
+        let decisions = schedule(
+            &policy,
+            &eligible,
+            &spend,
+            "head1",
+            Some("base2"),
+            10_000_000,
+        );
+        let by_type: BTreeMap<&str, &ReviewTriggerDecision> = decisions
+            .iter()
+            .map(|decision| (decision.review_type(), decision))
+            .collect();
+        assert!(
+            matches!(by_type["code"], ReviewTriggerDecision::Request { .. }),
+            "{decisions:?}"
+        );
+        assert!(
+            matches!(by_type["security"], ReviewTriggerDecision::Skip { .. }),
+            "{decisions:?}"
+        );
+    }
+
+    /// A base nobody recorded is not a base nobody moved. The ledger predates
+    /// `base_commit`, so the row says nothing; re-reviewing costs one review,
+    /// and the other reading passes a review that may well be stale.
+    #[test]
+    fn a_base_that_cannot_be_compared_counts_as_moved() {
+        let policy = with_freshness("code", ReviewFreshness::HeadAndBase);
+        let unrecorded = settled("code", "head1", None);
+        assert!(
+            matches!(
+                schedule(
+                    &policy,
+                    &one("code"),
+                    &unrecorded,
+                    "head1",
+                    Some("base1"),
+                    10_000_000
+                )[0],
+                ReviewTriggerDecision::Request { .. }
+            ),
+            "a row with no recorded base must re-review"
+        );
+        let uncallable = settled("code", "head1", Some("base1"));
+        assert!(
+            matches!(
+                schedule(
+                    &policy,
+                    &one("code"),
+                    &uncallable,
+                    "head1",
+                    None,
+                    10_000_000
+                )[0],
+                ReviewTriggerDecision::Request { .. }
+            ),
+            "a caller that cannot name today's base must re-review"
+        );
+    }
+
+    /// `always_on_new_head` says new *head*. Letting a moved base lift the cap
+    /// would turn a `head_and_base` dimension on a busy trunk into one review
+    /// per merge into the base branch, with no ceiling at all.
+    #[test]
+    fn a_moved_base_does_not_lift_the_per_pull_request_cap() {
+        let mut policy = with_freshness("code", ReviewFreshness::HeadAndBase);
+        policy.schedule.insert(
+            "code".to_string(),
+            ReviewSchedule {
+                freshness: ReviewFreshness::HeadAndBase,
+                max_per_pull_request: 2,
+                always_on_new_head: true,
+                ..Default::default()
+            },
+        );
+        let mut spend = settled("code", "head1", Some("base1"));
+        spend.get_mut("code").unwrap().requested_count = 2;
+        let decisions = schedule(
+            &policy,
+            &one("code"),
+            &spend,
+            "head1",
+            Some("base2"),
+            10_000_000,
+        );
+        assert!(
+            matches!(decisions[0], ReviewTriggerDecision::Skip { .. }),
+            "{decisions:?}"
+        );
+        // The same exhausted budget still re-reviews on a genuinely new head,
+        // which is what `always_on_new_head` was asked for.
+        let on_new_head = schedule(
+            &policy,
+            &one("code"),
+            &spend,
+            "head2",
+            Some("base2"),
+            10_000_000,
+        );
+        assert!(
+            matches!(on_new_head[0], ReviewTriggerDecision::Request { .. }),
+            "{on_new_head:?}"
+        );
+    }
+
     #[test]
     fn a_first_review_is_requested() {
         let policy = enabled(Vec::new());
-        let decisions = schedule(&policy, &one("code"), &BTreeMap::new(), "abc123", 1_000);
+        let decisions = schedule(
+            &policy,
+            &one("code"),
+            &BTreeMap::new(),
+            "abc123",
+            None,
+            1_000,
+        );
         assert!(matches!(
             decisions[0],
             ReviewTriggerDecision::Request { .. }
@@ -1197,9 +1509,10 @@ mod tests {
                 requested_count: 1,
                 last_requested_ms: Some(0),
                 last_requested_commit: Some("abc123".to_string()),
+                last_requested_base: None,
             },
         );
-        let decisions = schedule(&policy, &one("code"), &spend, "abc123", 10_000_000);
+        let decisions = schedule(&policy, &one("code"), &spend, "abc123", None, 10_000_000);
         assert!(
             matches!(decisions[0], ReviewTriggerDecision::Skip { .. }),
             "{decisions:?}"
@@ -1216,10 +1529,11 @@ mod tests {
                 requested_count: 1,
                 last_requested_ms: Some(1_000),
                 last_requested_commit: Some("old".to_string()),
+                last_requested_base: None,
             },
         );
         // Default debounce is 600s; 60s have passed.
-        let decisions = schedule(&policy, &one("code"), &spend, "new", 61_000);
+        let decisions = schedule(&policy, &one("code"), &spend, "new", None, 61_000);
         match &decisions[0] {
             ReviewTriggerDecision::Defer { retry_after_ms, .. } => {
                 assert_eq!(*retry_after_ms, Some(601_000));
@@ -1238,9 +1552,10 @@ mod tests {
                 requested_count: 1,
                 last_requested_ms: Some(1_000),
                 last_requested_commit: Some("old".to_string()),
+                last_requested_base: None,
             },
         );
-        let decisions = schedule(&policy, &one("code"), &spend, "new", 601_001);
+        let decisions = schedule(&policy, &one("code"), &spend, "new", None, 601_001);
         assert!(
             matches!(decisions[0], ReviewTriggerDecision::Request { .. }),
             "{decisions:?}"
@@ -1257,9 +1572,10 @@ mod tests {
                 requested_count: 8,
                 last_requested_ms: Some(0),
                 last_requested_commit: Some("old".to_string()),
+                last_requested_base: None,
             },
         );
-        let decisions = schedule(&policy, &one("code"), &spend, "new", 10_000_000);
+        let decisions = schedule(&policy, &one("code"), &spend, "new", None, 10_000_000);
         assert!(
             matches!(decisions[0], ReviewTriggerDecision::Skip { .. }),
             "{decisions:?}"
@@ -1275,6 +1591,7 @@ mod tests {
                 debounce_seconds: 600,
                 max_per_pull_request: 1,
                 always_on_new_head: true,
+                freshness: ReviewFreshness::Head,
             },
         );
         let mut spend = BTreeMap::new();
@@ -1284,16 +1601,17 @@ mod tests {
                 requested_count: 9,
                 last_requested_ms: Some(0),
                 last_requested_commit: Some("old".to_string()),
+                last_requested_base: None,
             },
         );
         assert!(matches!(
-            schedule(&policy, &one("code"), &spend, "new", 10_000_000)[0],
+            schedule(&policy, &one("code"), &spend, "new", None, 10_000_000)[0],
             ReviewTriggerDecision::Request { .. }
         ));
         // Still debounced, because the cap and the rate limit bound different
         // things: total spend versus burst.
         assert!(matches!(
-            schedule(&policy, &one("code"), &spend, "new", 1_000)[0],
+            schedule(&policy, &one("code"), &spend, "new", None, 1_000)[0],
             ReviewTriggerDecision::Defer { .. }
         ));
     }
@@ -1307,6 +1625,7 @@ mod tests {
                 debounce_seconds: 0,
                 max_per_pull_request: 0,
                 always_on_new_head: false,
+                freshness: ReviewFreshness::Head,
             },
         );
         let eligible = vec![
@@ -1327,10 +1646,11 @@ mod tests {
                     requested_count: 2,
                     last_requested_ms: Some(0),
                     last_requested_commit: Some("old".to_string()),
+                    last_requested_base: None,
                 },
             );
         }
-        let decisions = schedule(&policy, &eligible, &spend, "new", 1_000);
+        let decisions = schedule(&policy, &eligible, &spend, "new", None, 1_000);
         assert!(
             matches!(decisions[0], ReviewTriggerDecision::Defer { .. }),
             "{decisions:?}"

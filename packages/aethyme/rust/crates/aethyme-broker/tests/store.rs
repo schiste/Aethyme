@@ -949,6 +949,7 @@ fn a_pull_request_observation_round_trips_and_keeps_only_the_latest() {
         pr_number: 7,
         head_commit: head.into(),
         base_ref: "main".into(),
+        base_commit: None,
         is_draft: true,
         state: "open".into(),
         dismissed_reviews: 0,

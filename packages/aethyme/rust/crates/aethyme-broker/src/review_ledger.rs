@@ -284,6 +284,13 @@ pub struct ReviewRequest {
     pub pr_number: i64,
     pub review_type: String,
     pub head_commit: String,
+    /// The base commit this review was requested against.
+    ///
+    /// `None` for a row written before the ledger recorded one. Read as "the
+    /// base cannot be proven unchanged" rather than "unchanged", so a
+    /// `head_and_base` dimension re-reviews instead of trusting a comparison
+    /// nobody made (#172).
+    pub base_commit: Option<String>,
     /// Who was asked, as `ReviewBackend`'s label. Kept as text because the
     /// answer to "why was there no review" has to survive a policy change that
     /// removes the backend the row names.
@@ -319,6 +326,7 @@ pub fn spend_by_type(rows: &[ReviewRequest]) -> std::collections::BTreeMap<Strin
         {
             entry.last_requested_ms = Some(row.requested_at);
             entry.last_requested_commit = Some(row.head_commit.clone());
+            entry.last_requested_base = row.base_commit.clone();
         }
     }
     spend
@@ -436,6 +444,7 @@ mod last_refusal_tests {
             pr_number: 7,
             review_type: review_type.into(),
             head_commit: "abc123".into(),
+            base_commit: None,
             backend: "provider_comment".into(),
             state,
             detail: detail.map(str::to_string),
@@ -784,6 +793,7 @@ mod tests {
             pr_number: 7,
             review_type: review_type.into(),
             head_commit: head.into(),
+            base_commit: None,
             backend: "chau7".into(),
             state,
             detail: None,

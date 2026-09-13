@@ -2251,6 +2251,7 @@ impl BrokerStore {
         pr_number: i64,
         review_type: &str,
         head_commit: &str,
+        base_commit: Option<&str>,
         backend: &str,
         now: i64,
     ) -> Result<(ReviewRequest, bool), BrokerError> {
@@ -2282,9 +2283,9 @@ impl BrokerStore {
             tx.execute(
                 "UPDATE review_requests
                     SET state = 'requested', detail = NULL, backend = ?2,
-                        requested_at = ?3, updated_at = ?3
+                        base_commit = ?4, requested_at = ?3, updated_at = ?3
                   WHERE id = ?1",
-                params![existing.id, backend, now],
+                params![existing.id, backend, now, base_commit],
             )?;
             tx.commit()?;
             let revived = self
@@ -2294,16 +2295,17 @@ impl BrokerStore {
         }
         tx.execute(
             "INSERT INTO review_requests (
-                 repository, pr_number, review_type, head_commit, backend,
-                 state, detail, requested_at, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, 'requested', NULL, ?6, ?6)",
+                 repository, pr_number, review_type, head_commit, base_commit,
+                 backend, state, detail, requested_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?7, ?5, 'requested', NULL, ?6, ?6)",
             params![
                 repository,
                 pr_number,
                 review_type,
                 head_commit,
                 backend,
-                now
+                now,
+                base_commit
             ],
         )?;
         let id = tx.last_insert_rowid();
@@ -2483,7 +2485,7 @@ impl BrokerStore {
         self.conn
             .query_row(
                 "SELECT repository, pr_number, head_commit, base_ref, is_draft, state,
-                        dismissed_reviews, observed_at
+                        dismissed_reviews, observed_at, base_commit
                    FROM pull_request_observations
                   WHERE repository = ?1 AND pr_number = ?2",
                 params![repository, pr_number],
@@ -2497,6 +2499,7 @@ impl BrokerStore {
                         state: row.get(5)?,
                         dismissed_reviews: row.get(6)?,
                         observed_at: row.get(7)?,
+                        base_commit: row.get(8)?,
                     })
                 },
             )
@@ -2518,11 +2521,12 @@ impl BrokerStore {
         self.conn.execute(
             "INSERT INTO pull_request_observations (
                  repository, pr_number, head_commit, base_ref, is_draft, state,
-                 dismissed_reviews, observed_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 dismissed_reviews, observed_at, base_commit
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
              ON CONFLICT (repository, pr_number) DO UPDATE SET
                  head_commit = excluded.head_commit,
                  base_ref = excluded.base_ref,
+                 base_commit = excluded.base_commit,
                  is_draft = excluded.is_draft,
                  state = excluded.state,
                  dismissed_reviews = excluded.dismissed_reviews,
@@ -2536,6 +2540,7 @@ impl BrokerStore {
                 observation.state,
                 observation.dismissed_reviews,
                 observation.observed_at,
+                observation.base_commit,
             ],
         )?;
         Ok(())
@@ -2552,7 +2557,7 @@ impl BrokerStore {
     ) -> Result<Vec<crate::PullRequestObservation>, BrokerError> {
         let mut statement = self.conn.prepare(
             "SELECT repository, pr_number, head_commit, base_ref, is_draft, state,
-                    dismissed_reviews, observed_at
+                    dismissed_reviews, observed_at, base_commit
                FROM pull_request_observations
               WHERE repository = ?1
               ORDER BY pr_number",
@@ -2568,6 +2573,7 @@ impl BrokerStore {
                     state: row.get(5)?,
                     dismissed_reviews: row.get(6)?,
                     observed_at: row.get(7)?,
+                    base_commit: row.get(8)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -5373,7 +5379,7 @@ fn delivery_outbox_from_row(row: &rusqlite::Row<'_>) -> RowResult<DeliveryOutbox
 
 const REVIEW_REQUEST_SELECT: &str =
     "SELECT id, repository, pr_number, review_type, head_commit, backend,
-            state, detail, requested_at, updated_at
+            state, detail, requested_at, updated_at, base_commit
      FROM review_requests";
 
 fn review_request_from_row(row: &rusqlite::Row<'_>) -> RowResult<ReviewRequest> {
@@ -5395,6 +5401,7 @@ fn review_request_from_row(row: &rusqlite::Row<'_>) -> RowResult<ReviewRequest> 
             detail: row.get(7)?,
             requested_at: row.get(8)?,
             updated_at: row.get(9)?,
+            base_commit: row.get(10)?,
         })
     })())
 }
@@ -5958,11 +5965,11 @@ mod review_ledger_tests {
     fn recording_the_same_head_twice_reports_the_second_as_not_created() {
         let mut store = store();
         let (first, created) = store
-            .record_review_request("o/r", 7, "security", "abc", "chau7", 100)
+            .record_review_request("o/r", 7, "security", "abc", None, "chau7", 100)
             .unwrap();
         assert!(created);
         let (second, created_again) = store
-            .record_review_request("o/r", 7, "security", "abc", "chau7", 200)
+            .record_review_request("o/r", 7, "security", "abc", None, "chau7", 200)
             .unwrap();
         assert!(!created_again);
         assert_eq!(first.id, second.id);
@@ -5975,10 +5982,10 @@ mod review_ledger_tests {
     fn a_new_head_is_a_new_request() {
         let mut store = store();
         let (first, _) = store
-            .record_review_request("o/r", 7, "security", "abc", "chau7", 100)
+            .record_review_request("o/r", 7, "security", "abc", None, "chau7", 100)
             .unwrap();
         let (second, created) = store
-            .record_review_request("o/r", 7, "security", "def", "chau7", 200)
+            .record_review_request("o/r", 7, "security", "def", None, "chau7", 200)
             .unwrap();
         assert!(created);
         assert_ne!(first.id, second.id);
@@ -5989,7 +5996,7 @@ mod review_ledger_tests {
     fn a_state_change_is_readable_and_stamped() {
         let mut store = store();
         let (request, _) = store
-            .record_review_request("o/r", 7, "security", "abc", "chau7", 100)
+            .record_review_request("o/r", 7, "security", "abc", None, "chau7", 100)
             .unwrap();
         assert_eq!(request.state, ReviewRequestState::Requested);
         let updated = store
@@ -6010,13 +6017,13 @@ mod review_ledger_tests {
     fn requests_are_scoped_to_their_pull_request_and_repository() {
         let mut store = store();
         store
-            .record_review_request("o/r", 7, "security", "abc", "chau7", 100)
+            .record_review_request("o/r", 7, "security", "abc", None, "chau7", 100)
             .unwrap();
         store
-            .record_review_request("o/r", 8, "security", "abc", "chau7", 100)
+            .record_review_request("o/r", 8, "security", "abc", None, "chau7", 100)
             .unwrap();
         store
-            .record_review_request("o/other", 7, "security", "abc", "chau7", 100)
+            .record_review_request("o/other", 7, "security", "abc", None, "chau7", 100)
             .unwrap();
         assert_eq!(store.review_requests_for_pr("o/r", 7).unwrap().len(), 1);
     }
@@ -6029,7 +6036,7 @@ mod review_ledger_tests {
     fn a_review_nobody_was_asked_for_can_be_asked_for_again() {
         let mut store = store();
         let (first, _) = store
-            .record_review_request("o/r", 7, "security", "abc", "chau7", 100)
+            .record_review_request("o/r", 7, "security", "abc", None, "chau7", 100)
             .unwrap();
         store
             .set_review_request_state(
@@ -6041,7 +6048,7 @@ mod review_ledger_tests {
             .unwrap();
 
         let (revived, created) = store
-            .record_review_request("o/r", 7, "security", "abc", "provider_comment", 200)
+            .record_review_request("o/r", 7, "security", "abc", None, "provider_comment", 200)
             .unwrap();
         assert!(
             created,
@@ -6073,13 +6080,13 @@ mod review_ledger_tests {
         ] {
             let mut store = store();
             let (first, _) = store
-                .record_review_request("o/r", 7, "security", "abc", "chau7", 100)
+                .record_review_request("o/r", 7, "security", "abc", None, "chau7", 100)
                 .unwrap();
             store
                 .set_review_request_state(first.id, settled, None, 150)
                 .unwrap();
             let (again, created) = store
-                .record_review_request("o/r", 7, "security", "abc", "chau7", 200)
+                .record_review_request("o/r", 7, "security", "abc", None, "chau7", 200)
                 .unwrap();
             assert!(!created, "{settled:?} is an answer, not a retry");
             assert_eq!(again.state, settled);
@@ -6093,16 +6100,16 @@ mod review_ledger_tests {
     fn in_flight_is_counted_across_the_repository() {
         let mut store = store();
         store
-            .record_review_request("o/r", 7, "security", "abc", "chau7", 100)
+            .record_review_request("o/r", 7, "security", "abc", None, "chau7", 100)
             .unwrap();
         store
-            .record_review_request("o/r", 8, "security", "def", "chau7", 100)
+            .record_review_request("o/r", 8, "security", "def", None, "chau7", 100)
             .unwrap();
         store
-            .record_review_request("o/other", 9, "security", "ghi", "chau7", 100)
+            .record_review_request("o/other", 9, "security", "ghi", None, "chau7", 100)
             .unwrap();
         let (settled, _) = store
-            .record_review_request("o/r", 10, "security", "jkl", "chau7", 100)
+            .record_review_request("o/r", 10, "security", "jkl", None, "chau7", 100)
             .unwrap();
         store
             .set_review_request_state(settled.id, ReviewRequestState::Satisfied, None, 200)
@@ -6125,10 +6132,10 @@ mod review_ledger_tests {
     fn the_latest_request_is_the_one_a_reviewer_reports_against() {
         let mut store = store();
         let (old, _) = store
-            .record_review_request("o/r", 7, "security", "abc", "chau7", 100)
+            .record_review_request("o/r", 7, "security", "abc", None, "chau7", 100)
             .unwrap();
         let (current, _) = store
-            .record_review_request("o/r", 7, "security", "def", "chau7", 200)
+            .record_review_request("o/r", 7, "security", "def", None, "chau7", 200)
             .unwrap();
 
         let latest = store
