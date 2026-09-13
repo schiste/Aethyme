@@ -821,6 +821,140 @@ pub fn classify_gh(args: &[String]) -> Option<OperationEffect> {
     }
 }
 
+/// `gh` flags that consume the following argument, so a positional scan does
+/// not mistake a flag's value for the command's own operand.
+const GH_VALUE_FLAGS: &[&str] = &[
+    "-X",
+    "--method",
+    "-f",
+    "--raw-field",
+    "-F",
+    "--field",
+    "-H",
+    "--header",
+    "-q",
+    "--jq",
+    "-t",
+    "--template",
+    "--input",
+    "--hostname",
+    "--cache",
+    "-b",
+    "--body",
+    "--body-file",
+    "-R",
+    "--repo",
+    "--title",
+];
+
+/// First operand that is not a flag or a flag's value.
+///
+/// `--flag=value` is skipped by the leading-dash test; a bare `--flag value`
+/// pair is skipped by `GH_VALUE_FLAGS`. Anything unrecognized falls through to
+/// the caller, which treats a parse it cannot explain as repository-wide.
+fn first_positional(args: &[String]) -> Option<&str> {
+    let mut skip_value = false;
+    for arg in args {
+        if skip_value {
+            skip_value = false;
+            continue;
+        }
+        if GH_VALUE_FLAGS.contains(&arg.as_str()) {
+            skip_value = true;
+            continue;
+        }
+        if arg.starts_with('-') {
+            continue;
+        }
+        return Some(arg.as_str());
+    }
+    None
+}
+
+/// Per-resource coordination scope for a provider write that provably mutates
+/// no Git ref and no repository setting.
+///
+/// `None` means repository-wide, and is the conservative default: every
+/// command not on this closed list keeps the historical lock, as does any
+/// spelling this cannot parse with certainty. Widening the list is a decision
+/// about what "touches no ref" means; narrowing it is always safe.
+///
+/// Derived from the command line alone. That is the property that makes it
+/// usable: the scope must be known *before* the operation queues, so resolving
+/// it cannot involve a provider round-trip (#181). A comment or review write
+/// has no affected ref, and the resource it does touch is already an operand.
+fn resource_lock_scope(provider: OperationProvider, args: &[String]) -> Option<String> {
+    if provider != OperationProvider::Github {
+        return None;
+    }
+    match args.first()?.as_str() {
+        command @ ("pr" | "issue") => {
+            let resource = match (command, args.get(1)?.as_str()) {
+                (_, "comment") => "comments",
+                ("pr", "review") => "reviews",
+                _ => return None,
+            };
+            let collection = if command == "pr" { "pull" } else { "issue" };
+            // A selector that is not a plain number may be a URL or a branch,
+            // which this cannot resolve without asking the provider.
+            let number: u64 = first_positional(args.get(2..)?)?.parse().ok()?;
+            Some(format!("{collection}/{number}/{resource}"))
+        }
+        "api" => api_resource_scope(args),
+        _ => None,
+    }
+}
+
+/// Resource scope for the `gh api` spelling of a comment or review write.
+///
+/// Only the exact six-segment collection endpoints qualify. A longer path
+/// reaches something else (a reaction, a single comment's replies), and a
+/// shorter one is a collection this has no opinion about.
+fn api_resource_scope(args: &[String]) -> Option<String> {
+    let path = first_positional(args.get(1..)?)?;
+    // A query string addresses the same resource; anything after `?` only
+    // filters or paginates it.
+    let path = path.split('?').next()?.trim_matches('/');
+    let segments: Vec<&str> = path.split('/').collect();
+    if segments.len() != 6 || segments[0] != "repos" {
+        return None;
+    }
+    let number: u64 = segments[4].parse().ok()?;
+    match (segments[3], segments[5]) {
+        ("pulls", "reviews") => Some(format!("pull/{number}/reviews")),
+        ("pulls", "comments") => Some(format!("pull/{number}/comments")),
+        ("issues", "comments") => Some(format!("issue/{number}/comments")),
+        _ => None,
+    }
+}
+
+/// The key two operations must share before they serialise against each other.
+///
+/// Repository-wide operations keep the bare canonical repository, so #166's
+/// "one repository, one lock" still holds for everything that can touch a ref.
+/// A resource-scoped operation gets a sub-key derived from that same
+/// canonical string, so no spelling difference can fragment it either.
+///
+/// `::` is deliberate: `validate_remote_key` rejects `#`, `@`, `?` and `://`
+/// as credential or URL syntax, and `owner/repo` cannot contain a colon.
+fn coordination_lock_key(repository: &str, resource: Option<&str>) -> String {
+    match resource {
+        Some(resource) => format!("{repository}::{resource}"),
+        None => repository.to_string(),
+    }
+}
+
+/// Recompute a recorded operation's resource scope from its stored command.
+///
+/// `redacted_command` hides flag *values* only, so every operand this reads
+/// survives redaction. Recomputing beats trusting the stored `scope` column:
+/// that column accepts a caller-declared string, and a caller must never be
+/// able to name its way out of the repository lock.
+fn stored_resource_scope(operation: &CoordinatedOperation) -> Option<String> {
+    let command: Vec<String> = serde_json::from_str(&operation.command_json).ok()?;
+    resource_lock_scope(operation.provider, command.get(1..)?)
+}
+
 fn remote_git_operation(args: &[String]) -> bool {
     match args.first().map(String::as_str) {
         Some("clone" | "fetch" | "pull" | "push" | "ls-remote" | "submodule") => true,
@@ -1550,8 +1684,24 @@ impl Broker {
                 (Some(_), _, OperationProvider::Github) => unreachable!("validated above"),
                 (None, None, OperationProvider::Github) => unreachable!("validated above"),
             };
+        // Derived before anything queues, from the command line alone. A
+        // recognized comment or review write coordinates per resource; every
+        // other command stays repository-wide (#181).
+        let resource_scope = if effect == OperationEffect::Read {
+            None
+        } else {
+            resource_lock_scope(request.provider, &request.args)
+        };
+        let lock_key = coordination_lock_key(&repository, resource_scope.as_deref());
+
         let scope_was_declared = request.scope.is_some();
-        let scope = request.scope.unwrap_or_else(|| "repository".into());
+        // The derived scope is also the audit scope, so the journal names the
+        // resource the lock actually protects. A caller-declared scope still
+        // wins for the record, but never changes which lock is taken.
+        let scope = request
+            .scope
+            .or_else(|| resource_scope.clone())
+            .unwrap_or_else(|| "repository".into());
         validate_scope(&scope)?;
         if inferred.is_none() && !scope_was_declared {
             return Err(BrokerOpError::InvalidCoordinatedOperation {
@@ -1669,7 +1819,7 @@ impl Broker {
             let main_root = self.main_root().to_path_buf();
             match RepositoryWriteLock::acquire(
                 &main_root,
-                &repository,
+                &lock_key,
                 || describe_lock_holder(self.store(), &repository),
                 queue_wait,
             ) {
@@ -1686,6 +1836,13 @@ impl Broker {
                 .store()
                 .unresolved_coordinated_operations(&repository)?;
             for operation in unresolved {
+                // Two operations block each other only where they would have
+                // serialised. An unknown-outcome comment write leaves no ref
+                // ambiguous, so it must not write-block a push -- and a stalled
+                // push says nothing about a comment thread (#181).
+                if stored_resource_scope(&operation) != resource_scope {
+                    continue;
+                }
                 match operation.status {
                     // A prepared record now also covers an operation queued for
                     // this lock, so only a record whose owner is gone is abandoned.
@@ -1730,7 +1887,7 @@ impl Broker {
         let mut host_guard = if is_remote_write {
             Some(crate::HostOperationGuard::begin(
                 &self.host_operation_database_path()?,
-                &repository,
+                &lock_key,
                 request.provider,
                 effect,
             )?)
@@ -2004,6 +2161,104 @@ impl Broker {
 
 #[cfg(test)]
 mod tests {
+
+    fn gh(args: &[&str]) -> Vec<String> {
+        args.iter().map(|arg| (*arg).to_string()).collect()
+    }
+
+    fn scope(args: &[&str]) -> Option<String> {
+        resource_lock_scope(OperationProvider::Github, &gh(args))
+    }
+
+    /// The scope must come from the command line alone: it decides which lock
+    /// to queue for, so it has to be known before the operation queues (#181).
+    #[test]
+    fn comment_and_review_writes_resolve_to_a_per_resource_scope() {
+        assert_eq!(
+            scope(&["pr", "comment", "7", "--body", "hi"]).as_deref(),
+            Some("pull/7/comments")
+        );
+        assert_eq!(
+            scope(&["issue", "comment", "12", "--body", "hi"]).as_deref(),
+            Some("issue/12/comments")
+        );
+        assert_eq!(
+            scope(&["pr", "review", "7", "--approve"]).as_deref(),
+            Some("pull/7/reviews")
+        );
+        assert_eq!(
+            scope(&["api", "repos/o/r/pulls/7/reviews", "--method", "POST"]).as_deref(),
+            Some("pull/7/reviews")
+        );
+        assert_eq!(
+            scope(&["api", "repos/o/r/issues/12/comments", "-f", "body=hi"]).as_deref(),
+            Some("issue/12/comments")
+        );
+    }
+
+    /// A flag's value is not an operand. `--method POST` in front of the path
+    /// must not make `POST` the resource.
+    #[test]
+    fn a_flag_value_is_never_read_as_the_resource() {
+        assert_eq!(
+            scope(&["api", "--method", "POST", "repos/o/r/pulls/7/reviews"]).as_deref(),
+            Some("pull/7/reviews")
+        );
+        assert_eq!(
+            scope(&["pr", "comment", "--body", "9", "7"]).as_deref(),
+            Some("pull/7/comments")
+        );
+    }
+
+    /// Everything not provably ref-free keeps the repository lock. These are
+    /// the cases that must NOT narrow: a merge moves a ref, a protection
+    /// change is a repository setting, and a selector this cannot resolve
+    /// without asking the provider is not a resource it may assume.
+    #[test]
+    fn anything_not_provably_resource_scoped_stays_repository_wide() {
+        assert_eq!(scope(&["pr", "merge", "7"]), None);
+        assert_eq!(scope(&["pr", "create", "--title", "x"]), None);
+        assert_eq!(scope(&["issue", "create"]), None);
+        assert_eq!(
+            scope(&["api", "repos/o/r/branches/main/protection", "--method", "PUT"]),
+            None
+        );
+        // A URL or branch selector, not a number.
+        assert_eq!(scope(&["pr", "comment", "https://github.com/o/r/pull/7"]), None);
+        // Deeper than the collection endpoint: a reaction, not the thread.
+        assert_eq!(
+            scope(&["api", "repos/o/r/issues/comments/99/reactions", "--method", "POST"]),
+            None
+        );
+        // A different provider never narrows.
+        assert_eq!(
+            resource_lock_scope(OperationProvider::Git, &gh(&["push", "origin", "main"])),
+            None
+        );
+    }
+
+    /// Repository-wide operations keep the bare canonical key, so #166's
+    /// "one repository, one lock" is untouched for anything touching a ref.
+    #[test]
+    fn lock_keys_separate_resources_without_fragmenting_the_repository() {
+        let repo = "github.com/o/r";
+        assert_eq!(coordination_lock_key(repo, None), repo);
+        assert_ne!(
+            coordination_lock_key(repo, Some("pull/7/comments")),
+            coordination_lock_key(repo, None)
+        );
+        assert_ne!(
+            coordination_lock_key(repo, Some("pull/7/comments")),
+            coordination_lock_key(repo, Some("pull/9/comments")),
+        );
+        assert_eq!(
+            coordination_lock_key(repo, Some("pull/7/comments")),
+            coordination_lock_key(repo, Some("pull/7/comments")),
+        );
+        // The host key validator rejects credential and URL syntax; the
+        // separator must survive it.
+        assert!(!coordination_lock_key(repo, Some("pull/7/comments")).contains('#'));
+    }
     use super::*;
 
     /// #179's security finding. The coordinated write performs the remote

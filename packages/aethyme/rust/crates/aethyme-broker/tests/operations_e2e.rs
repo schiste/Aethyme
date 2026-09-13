@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use aethyme_broker::{
     Broker, BrokerOpError, CoordinatedCommand, GitRepo, NewCoordinatedOperation, OperationEffect,
-    OperationProvider, OperationReconciliationState, OperationStatus,
+    OperationIdentityProvenance, OperationProvider, OperationReconciliationState, OperationStatus,
 };
 
 fn git(cwd: &Path, args: &[&str]) {
@@ -1213,4 +1213,141 @@ fn a_checkout_without_a_remote_falls_back_to_a_local_key() {
 
     let report = broker.run_coordinated_operation(command).unwrap();
     assert!(report.operation.repository.starts_with("local:"));
+}
+
+/// Issue #181. A comment or review write takes about a second of real work but
+/// was classified `scope: repository`, so it queued behind every unrelated
+/// push and rebase on the same repository — measured waits of 4.5 and 17
+/// minutes for a POST whose service time was 1046 ms.
+///
+/// These tests assert the coordination consequence rather than the timing: two
+/// operations block each other exactly when they share a lock key. They wedge
+/// records directly instead of running the commands, because a real
+/// `gh pr comment` from a test would post to a live repository.
+fn canonical_github_key(broker: &mut Broker, session_id: i64) -> String {
+    broker
+        .run_coordinated_operation(github_request(session_id, "Owner/Repo", &["--version"]))
+        .unwrap()
+        .operation
+        .repository
+}
+
+/// Strand an operation the way a crash between start and outcome would.
+fn wedge(broker: &mut Broker, session_id: i64, repository: &str, args: &[&str]) -> i64 {
+    let command: Vec<String> = std::iter::once("gh".to_string())
+        .chain(args.iter().map(|arg| (*arg).to_string()))
+        .collect();
+    let operation = broker
+        .store()
+        .create_coordinated_operation(&NewCoordinatedOperation {
+            session_id,
+            provider: OperationProvider::Github,
+            repository: repository.into(),
+            scope: "wedged".into(),
+            effect: OperationEffect::Write,
+            authorization_reason: Some("regression fixture".into()),
+            command_json: serde_json::to_string(&command).unwrap(),
+            pid: i64::from(std::process::id()),
+            host_operation_id: None,
+            identity_provenance: OperationIdentityProvenance::VerifiedCanonical,
+        })
+        .unwrap();
+    broker
+        .store()
+        .transition_coordinated_operation(operation.id, OperationStatus::OutcomeUnknown, None, None)
+        .unwrap();
+    operation.id
+}
+
+/// An unknown-outcome comment write leaves no ref ambiguous, so it must
+/// write-block its own thread and nothing else. Before this, it blocked every
+/// write in the repository.
+#[test]
+fn a_wedged_comment_write_does_not_block_a_ref_scoped_operation() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    git(
+        tmp.path(),
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/Owner/Repo.git",
+        ],
+    );
+    let worktree = add_worktree(tmp.path(), "comment-scope");
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let session = broker.adopt(&worktree, None).unwrap();
+    let repository = canonical_github_key(&mut broker, session.id);
+
+    wedge(
+        &mut broker,
+        session.id,
+        &repository,
+        &["pr", "comment", "7", "--body", "[REDACTED]"],
+    );
+
+    // A local ref write shares the same canonical repository key but a
+    // different lock key, so it proceeds.
+    let mut tag = request(session.id, &["tag", "unblocked"]);
+    tag.repository = Some("Owner/Repo".into());
+    tag.declared_effect = Some(OperationEffect::Write);
+    match broker.run_coordinated_operation(tag) {
+        Err(BrokerOpError::CoordinatedOperationBlocked { operation_id, .. }) => {
+            panic!("a wedged comment write blocked a ref operation ({operation_id})")
+        }
+        Err(other) => panic!("unexpected refusal: {other:?}"),
+        Ok(report) => assert!(report.ok()),
+    }
+}
+
+/// The other direction, and the one the issue measured: a long ref-scoped
+/// operation must not park a comment write behind it. Both a wedged push and a
+/// wedged comment are present, and the comment write must be stopped by the
+/// comment — naming the push would mean it had serialised on ref work.
+#[test]
+fn a_ref_scoped_block_is_invisible_to_a_comment_write_on_its_own_thread() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    git(
+        tmp.path(),
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/Owner/Repo.git",
+        ],
+    );
+    let worktree = add_worktree(tmp.path(), "both-wedged");
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let session = broker.adopt(&worktree, None).unwrap();
+    let repository = canonical_github_key(&mut broker, session.id);
+
+    let ref_scoped = wedge(&mut broker, session.id, &repository, &["pr", "merge", "7"]);
+    let same_thread = wedge(
+        &mut broker,
+        session.id,
+        &repository,
+        &["pr", "comment", "7", "--body", "[REDACTED]"],
+    );
+
+    let mut comment = github_request(
+        session.id,
+        "Owner/Repo",
+        &["pr", "comment", "7", "--body", "second"],
+    );
+    comment.scope = None;
+    comment.declared_effect = Some(OperationEffect::Write);
+    comment.authorization_reason = Some("regression".into());
+
+    match broker.run_coordinated_operation(comment) {
+        Err(BrokerOpError::CoordinatedOperationBlocked { operation_id, .. }) => {
+            assert_eq!(
+                operation_id, same_thread,
+                "a comment write must serialise on its own thread, not on the \
+                 ref-scoped operation {ref_scoped}"
+            );
+        }
+        other => panic!("two writes to one comment thread must still serialise: {other:?}"),
+    }
 }
