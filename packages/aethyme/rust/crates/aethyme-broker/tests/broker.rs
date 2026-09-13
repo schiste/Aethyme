@@ -1752,8 +1752,11 @@ fn status_brief_still_records_liveness_transitions() {
         SessionStatus::Active
     );
 
-    let week = now_ms() + 7 * 24 * 60 * 60 * 1_000;
-    let brief = broker.status_brief(week).unwrap();
+    // Stale, but inside the abandonment window: this test is about whether a
+    // cheap orientation call persists liveness, not about the terminal
+    // transition that follows it (see `tests/session_abandonment.rs`).
+    let later = now_ms() + 3 * 60 * 60 * 1_000;
+    let brief = broker.status_brief(later).unwrap();
     assert_eq!(brief.summary.stale_sessions, 1);
     assert_eq!(
         broker.store().session(session.id).unwrap().status,

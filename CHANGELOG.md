@@ -8,6 +8,25 @@ artifacts and their exact source revision are recorded in each signed
 
 ### Added
 
+- Sessions now reach a terminal state on their own. A session with no evidence
+  of a working agent for `session_abandoned_after_hours` (default 72, `0` to
+  disable) is closed by the broker, which releases its leases and makes a
+  broker-owned worktree a cleanup candidate.
+
+  `stale` was only ever a label. Nothing moved a stale session anywhere, so it
+  pinned its worktree, its branch and its leases indefinitely — on the dogfood
+  machine, 16 of 19 sessions sat stale, one worktree of 38 was eligible for
+  cleanup, and essentially all retained bytes reported as blocked (#176). The
+  warning was accurate and no policy could act on it.
+
+  A session whose process is alive is never abandoned, however long it has been
+  quiet: a long-thinking agent is indistinguishable from a departed one on every
+  signal except the process itself. Abandonment grants *candidacy*, never
+  eligibility — dirty trees, unpromoted commits and unproven provenance block
+  removal exactly as before, so this reclaims disk that nothing was using and
+  cannot reclaim work. Each transition appends `session.abandoned` carrying the
+  observed idle time and the threshold that was applied.
+
 - `aethyme broker review waive` excuses one review dimension at one head, on the
   record:
 

@@ -28,6 +28,16 @@ pub struct RetentionPolicy {
     /// itself; a maintainer may raise it to trade disk space for faster reuse.
     pub artifact_reclaim_days: u32,
     pub orphan_worktree_roots_days: u32,
+    /// Hours a session may go without any evidence of a working agent
+    /// before the broker concludes the agent is gone and stops letting
+    /// the session pin its worktree and branch. `0` disables the lane and
+    /// restores the previous unbounded hold.
+    ///
+    /// This only makes a worktree a cleanup *candidate*. Dirty trees,
+    /// unpromoted commits, and unproven provenance still block removal, so
+    /// raising this trades disk against how long a dead session's disk is
+    /// held -- never against whether committed work survives.
+    pub session_abandoned_after_hours: u32,
     /// Wall-clock budget for the autonomous artifact sweep. `0` disables it.
     pub artifact_sweep_budget_ms: u64,
     /// Minimum spacing between autonomous artifact sweeps.
@@ -47,6 +57,7 @@ impl Default for RetentionPolicy {
             retained_bytes_budget: 1_073_741_824,
             artifact_reclaim_days: 0,
             orphan_worktree_roots_days: 1,
+            session_abandoned_after_hours: 72,
             artifact_sweep_budget_ms: 5_000,
             artifact_sweep_interval_hours: 24,
             startup_budget_ms: 25,
@@ -100,6 +111,16 @@ impl RetentionPolicy {
                     constraint: "must be between 0 (no grace period) and 36500 days",
                 });
             }
+        }
+        // 0 disables the lane. The ceiling is a year: a longer window is
+        // indistinguishable from the unbounded hold this field exists to
+        // end, and is almost certainly a units mistake.
+        if self.session_abandoned_after_hours > 8_760 {
+            return Err(RetentionConfigError::InvalidValue {
+                field: "session_abandoned_after_hours",
+                value: self.session_abandoned_after_hours.to_string(),
+                constraint: "must be between 0 (disabled) and 8760 hours",
+            });
         }
         if self.artifact_sweep_budget_ms > 60_000 {
             return Err(RetentionConfigError::InvalidValue {

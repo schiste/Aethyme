@@ -982,6 +982,7 @@ closed_worktrees_days = 7
 retained_bytes_budget = 1073741824
 artifact_reclaim_days = 0
 orphan_worktree_roots_days = 1
+session_abandoned_after_hours = 72
 artifact_sweep_budget_ms = 5000
 artifact_sweep_interval_hours = 24
 startup_budget_ms = 25
@@ -995,6 +996,17 @@ default: preserving a contribution must not also retain multi-gigabyte derived
 outputs. Raise `artifact_reclaim_days` to trade disk space for faster worktree
 reuse, or set `artifact_sweep_budget_ms = 0` to disable autonomous cache
 reclamation entirely.
+
+`session_abandoned_after_hours` bounds how long a session may go without any
+evidence of a working agent before the broker closes it. A session with a live
+process is never abandoned no matter how long it has been quiet, so a
+long-thinking agent is safe; sessions the broker cannot interrogate — adopted
+checkouts, or a spawned session whose process is gone — are judged on the clock.
+Closing releases the session's leases and makes a broker-owned worktree a
+cleanup *candidate*; it never removes anything on its own. Dirty trees,
+unpromoted commits, and unproven provenance still block removal exactly as
+before. Set it to `0` to restore the previous behaviour, where a session held
+its worktree, its branch, and its leases until a human intervened.
 
 Run `aethyme broker gc plan` first. Its text and stable JSON enumerate every
 eligible database row, runtime file, represented worktree and exact branch ref,

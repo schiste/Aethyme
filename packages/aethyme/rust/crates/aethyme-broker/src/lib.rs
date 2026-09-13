@@ -108,6 +108,7 @@ mod review_ledger;
 mod review_report;
 mod review_trigger;
 mod schema;
+mod session_abandonment;
 mod ship;
 mod store;
 mod types;
@@ -366,6 +367,10 @@ pub use review_trigger::{
     classification_conflicts, decide, eligible_types, parse_classification, schedule,
 };
 pub use schema::{EVENTS_SCHEMA_VERSION, SCHEMA_VERSION};
+pub use session_abandonment::{
+    AbandonmentDecision, AbandonmentVerdict, SessionActivity, abandoned as abandoned_sessions,
+    decide as decide_abandonment, survey as survey_abandonment,
+};
 pub use ship::{
     PUBLICATION_POLICY_SCHEMA_VERSION, ShipExecutionReport, ShipFreshness, ShipFreshnessResult,
     ShipLocalMainSync, ShipPlan, ShipPublicationAssessment, ShipPublicationAuthorization,

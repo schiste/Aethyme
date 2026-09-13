@@ -21,6 +21,9 @@ use crate::graph_impact::{
     GRAPH_IMPACT_MAX_DEPTH, GRAPH_IMPACT_MAX_NODES, GRAPH_IMPACT_RESULT_LIMIT, GraphImpactProvider,
     GraphImpactQuery, GraphImpactStatus, GraphStoreImpactProvider,
 };
+use crate::session_abandonment::{
+    AbandonmentVerdict, SessionActivity, decide as decide_abandonment,
+};
 use crate::store::BrokerStore;
 use crate::types::{
     Advisory, AdvisoryList, GateStatus, LeaseKind, MergeQueueEntry, MergeStatus, NewAdvisory,
@@ -3272,6 +3275,7 @@ impl Broker {
     /// processes to `exited` in the store as a side effect.
     pub fn agents(&mut self, now_ms: i64) -> Result<Vec<AgentView>, BrokerOpError> {
         let sessions = self.store.live_sessions()?;
+        let abandon_after_ms = self.abandonment_window_ms();
         let mut views = Vec::with_capacity(sessions.len());
         for session in sessions {
             let fs_activity = worktree_activity_ms(&self.main_root, &session);
@@ -3306,6 +3310,40 @@ impl Broker {
                     }
                 }
             }
+            // Staleness above is only a label: `stale` is still a live status,
+            // so a stale session keeps pinning its worktree and its branch
+            // forever. Abandonment is the terminal transition that label never
+            // had (#176). Closing here does not delete anything -- it makes the
+            // worktree a cleanup *candidate*, which `cleanup_item` then judges
+            // on its own merits. Candidacy is granted; eligibility is earned.
+            if !derived_status.is_closed() {
+                let activity = SessionActivity {
+                    session_id: session.id,
+                    last_activity_at: activity_at,
+                    created_at: session.created_at,
+                    agent_alive: pid_alive,
+                    closed: false,
+                };
+                if let AbandonmentVerdict::Abandoned { idle_ms } =
+                    decide_abandonment(&activity, now_ms, abandon_after_ms)
+                {
+                    self.store.append_event(
+                        "session.abandoned",
+                        Some(session.id),
+                        Some(&format!(
+                            r#"{{"idle_ms":{idle_ms},"abandon_after_ms":{abandon_after_ms},"pid_alive":{}}}"#,
+                            match pid_alive {
+                                Some(true) => "true",
+                                Some(false) => "false",
+                                None => "null",
+                            }
+                        )),
+                    )?;
+                    self.store
+                        .set_session_status(session.id, SessionStatus::Closed, None)?;
+                    derived_status = SessionStatus::Closed;
+                }
+            }
             views.push(AgentView {
                 session,
                 activity_at,
@@ -3314,6 +3352,21 @@ impl Broker {
             });
         }
         Ok(views)
+    }
+
+    /// How long a session may go unattended before the broker treats its agent
+    /// as gone, in milliseconds. `0` disables the lane.
+    ///
+    /// A malformed `.aethyme/broker.toml` disables abandonment rather than
+    /// failing the caller. Every caller of this is a listing or status surface,
+    /// and a retention typo must not make the broker unable to say what is
+    /// running -- least of all when the operator is reading status precisely
+    /// because something is wrong. Config errors still surface, loudly, from
+    /// the retention commands that exist to report them.
+    fn abandonment_window_ms(&self) -> i64 {
+        crate::load_retention_policy(&self.main_root)
+            .map(|policy| i64::from(policy.session_abandoned_after_hours) * 3_600_000)
+            .unwrap_or(0)
     }
 
     /// Derive current liveness without persisting status transitions. This is
