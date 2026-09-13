@@ -124,6 +124,37 @@ key = "rust-workspace-v3"
 max_bytes = 12884901888
 
 [[gate]]
+# 2026-09-13: this file matched no trigger, so an entry that rewrote gate
+# policy selected only the always-on gates — the gate being weakened never
+# ran to object. Fourth instance of the silent-narrowing family documented
+# above (the untriggered new package, `pytest-local`'s `src/**` outliving
+# `src/`, and `.github/workflows/**` one day earlier). The config is source:
+# editing it changes which gates run, so it needs a gate of its own.
+#
+# `gate_policy.rs` is the only suite that reads the LIVE config; every other
+# gates test writes a fixture into a temp repository, which is why a broken
+# policy could never fail a test. It asserts two things this file has now
+# gotten wrong four times: that `.aethyme/gates.toml` is reachable by some
+# trigger, and that no trigger glob has outlived the paths it named.
+#
+# Narrow rather than an entry on `cargo-test`: the workspace suite costs
+# ~10 minutes and this one costs seconds warm. The repository's own rule is
+# that a required check must be scoped to the diff and finish in minutes.
+#
+# COUPLING: the suite also runs under `cargo-test`, so nothing here is lost
+# when Rust changes; this gate only adds the config-only path.
+name = "gate-policy"
+command = 'export CHAU7_CTO_OPTIM_ACTIVE=1 CARGO_INCREMENTAL=0 CARGO_PROFILE_TEST_DEBUG=1 CARGO_TARGET_DIR="$AETHYME_GATE_CACHE_DIR" && cargo test --quiet --manifest-path packages/aethyme/rust/Cargo.toml -p aethyme-broker --test gate_policy'
+cost = 1
+timeout_seconds = 600
+resource_wait_seconds = 900
+triggers = [".aethyme/gates.toml"]
+
+[gate.managed_cache]
+key = "rust-workspace-v3"
+max_bytes = 12884901888
+
+[[gate]]
 # 2026-07-27: the registry's enforcement previously ran ONLY in the
 # GitHub PR workflow — a path broker submissions never take. That hole
 # shipped the 12-day `query deps` break (d8bbe85 removed tracked

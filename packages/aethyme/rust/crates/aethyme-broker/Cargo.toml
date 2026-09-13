@@ -51,3 +51,10 @@ tempfile = "3"
 # Release availability and downgrade decisions use semantic versions rather
 # than string ordering.
 semver = "1"
+
+# `tests/gate_policy.rs` asserts over the live `.aethyme/gates.toml`, so it
+# needs the monorepo root rather than this crate's. `repo_root()` discovers
+# it from the process cwd, which stays correct when a gate reuses a test
+# binary compiled in a different merge worktree.
+[dev-dependencies]
+aethyme-testkit = { path = "../aethyme-testkit" }

@@ -25,6 +25,7 @@ dependencies = [
  "aethyme-enhance",
  "aethyme-graph-indexer",
  "aethyme-graph-storage",
+ "aethyme-testkit",
  "globset",
  "libc",
  "noyalib",
