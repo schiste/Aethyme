@@ -1000,6 +1000,39 @@ pub struct StatusView {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub integration_reconciliation: Option<crate::IntegrationDriftAssessment>,
     pub cleanup_retention: CleanupRetention,
+    /// Reviews a provider refused and nothing has re-asked for since.
+    pub review_refusals: Vec<ReviewRefusalView>,
+}
+
+/// How many refused reviews `broker status` carries.
+///
+/// `broker status` is mandated as every session's first command, so its cost
+/// is a tax on every agent (#182). The newest refusals are the ones an
+/// operator can still act on; `aethyme broker review ledger` has the rest.
+const REVIEW_REFUSAL_STATUS_LIMIT: usize = 20;
+
+/// One refused review, with the cause stated rather than reconstructed.
+///
+/// #173: a provider refusal was discarded, so `pending or stale: Security
+/// Review` was all an operator ever saw -- the same row a review that was
+/// never requested produces, and the same row one still running produces.
+/// Ten pull requests in `Aeptus/mockup` sat unmergeable for roughly 48 hours
+/// on 2026-09-11 because the difference was only ever found by inference.
+///
+/// [`Self::class`] says whether waiting helps. [`Self::text`] is what the
+/// provider actually said, kept beside the classification rather than
+/// replaced by it: the scrape misfires whenever a provider rewords a message,
+/// and a misfire must cost precision, never the evidence.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ReviewRefusalView {
+    pub repository: String,
+    pub pull_request: i64,
+    pub review_type: String,
+    pub head_commit: String,
+    pub class: crate::RefusalClass,
+    pub text: String,
+    /// When the row was moved to `abandoned` -- the moment of the refusal.
+    pub refused_at: i64,
 }
 
 /// The two fields an agent needs before it starts work, without the
@@ -5292,6 +5325,86 @@ impl Broker {
                 },
             });
         }
+        // A review a provider refused, said out loud. The ledger has always
+        // held these rows; what it could not say was why, so they arrived
+        // looking exactly like a review nobody had asked for yet (#173).
+        let review_refusals = self
+            .store
+            .review_refusals(REVIEW_REFUSAL_STATUS_LIMIT)?
+            .into_iter()
+            .filter_map(|row| {
+                let refusal = crate::ReviewRefusal::parse(row.detail.as_deref()?)?;
+                Some(ReviewRefusalView {
+                    repository: row.repository,
+                    pull_request: row.pr_number,
+                    review_type: row.review_type,
+                    head_commit: row.head_commit,
+                    class: refusal.class,
+                    text: refusal.text,
+                    refused_at: row.updated_at,
+                })
+            })
+            .collect::<Vec<_>>();
+        if !review_refusals.is_empty() {
+            let count = review_refusals.len();
+            // Whether waiting helps is the question the operator in #173 could
+            // not answer, so it leads. A spent budget is the class where
+            // waiting is not the answer, which is why it is called out apart
+            // from the classes where it is.
+            let quota = review_refusals
+                .iter()
+                .filter(|refusal| refusal.class == crate::RefusalClass::QuotaExhausted)
+                .count();
+            advice.push(StatusAdvice {
+                id: "review.provider-refusals",
+                severity: if quota > 0 {
+                    StatusAdviceSeverity::Warning
+                } else {
+                    StatusAdviceSeverity::Notice
+                },
+                reason: "a review provider refused, so those gates cannot clear on their own",
+                summary: format!(
+                    "{count} refused {} outstanding{}",
+                    plural_word(count, "review", "reviews"),
+                    if quota > 0 {
+                        format!(
+                            "; {quota} on exhausted provider quota, which retrying does not clear"
+                        )
+                    } else {
+                        String::new()
+                    }
+                ),
+                session_id: None,
+                queue_entry_id: None,
+                // The provider's own words, not a paraphrase: the
+                // classification is scraped and may be wrong, and the reader
+                // needs to be able to see that for themselves.
+                evidence: review_refusals
+                    .iter()
+                    .take(4)
+                    .map(|refusal| {
+                        format!(
+                            "{}#{} {} ({}) at {}: {}",
+                            refusal.repository,
+                            refusal.pull_request,
+                            refusal.review_type,
+                            short_commit(&refusal.head_commit),
+                            refusal.class.label(),
+                            refusal.text
+                        )
+                    })
+                    .collect(),
+                commands: review_refusals
+                    .first()
+                    .map(|refusal| {
+                        vec![format!(
+                            "aethyme broker review ledger --repo {} --pr {}",
+                            refusal.repository, refusal.pull_request
+                        )]
+                    })
+                    .unwrap_or_default(),
+            });
+        }
         // Within a repository the lock is held by the running operation; every
         // other unresolved row there is parked behind it. Naming that
         // relationship is the point -- a parked caller cannot say so itself.
@@ -5354,6 +5467,7 @@ impl Broker {
             main_behind_upstream_commits,
             integration_reconciliation,
             cleanup_retention,
+            review_refusals,
         })
     }
 

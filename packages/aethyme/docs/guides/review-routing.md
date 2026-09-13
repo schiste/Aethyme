@@ -677,7 +677,7 @@ aethyme broker review ledger --repo owner/repo --pr 412
 #412   docs       recorded   record           9f3c1a2b4d5e
         no backend routes docs
 #412   code       abandoned  provider_comment 9f3c1a2b4d5e
-        the coordinated GitHub write failed: request the code review from the provider bot
+        quota_exhausted: You have exceeded your usage limit for the current billing period
 ```
 
 It is read-only and needs no session. Drop `--pr` for the whole repository.
@@ -690,7 +690,48 @@ Each state means one thing and only one:
 | `satisfied` | A verdict landed | no |
 | `failed` | Attempted, no verdict -- re-asking without a new head buys nothing | no |
 | `recorded` | The policy performs nothing here; the row is the whole answer | no |
-| `abandoned` | Nobody was ever asked | **yes** |
+| `abandoned` | Nobody was ever asked, or a provider refused | **yes** |
+
+### When a provider refuses
+
+`abandoned` covers two different situations that used to look identical: a
+reviewer nobody ever reached, and a provider that was reached and said no. The
+second one now says so.
+
+When a review's GitHub write fails, the row's detail carries the provider's
+answer -- classified, and then quoted:
+
+```
+quota_exhausted: You have exceeded your usage limit for the current billing period
+```
+
+The classification is one of `quota_exhausted`, `rate_limited`,
+`provider_error` or `unknown`, and it answers the only question that matters in
+the moment: whether waiting helps. `unknown` is an ordinary outcome rather than
+a defect -- the refusal surface is scraped from prose no provider promises to
+keep, so a message nobody has seen before still reaches you with the provider's
+own words attached.
+
+That is also why the words are kept *beside* the classification rather than
+replaced by it. When the scrape misfires, you lose precision and never the
+evidence.
+
+Outstanding refusals surface without being asked for, because the operator who
+needs them does not yet know which pull request to interrogate -- that is the
+question:
+
+```bash
+aethyme broker status          # "2 refused reviews outstanding; 1 on exhausted
+                               #  provider quota, which retrying does not clear"
+aethyme broker status --json   # .review_refusals[]  and  .advice[]
+```
+
+A refusal drops off once a later request for the same dimension supersedes it:
+the next push makes a new head, the router asks again, and the old refusal
+becomes history rather than a current cause.
+
+This states the cause; it does not clear the gate. The unblock is still a new
+request against a provider that will answer, or a scoped override.
 
 ### Closing a row
 

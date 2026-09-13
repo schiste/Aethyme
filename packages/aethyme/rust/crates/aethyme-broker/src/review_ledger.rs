@@ -104,6 +104,175 @@ impl ReviewRequestState {
     }
 }
 
+/// Why a provider would not do the review it was asked for.
+///
+/// Scraped, not typed: no provider returns a machine-readable reason, so this
+/// is pattern matching over prose that a provider may reword tomorrow. Two
+/// consequences shape the type. The raw text is kept *beside* the
+/// classification rather than replaced by it, so a misfire costs precision and
+/// never the evidence. And [`Self::Unknown`] is an ordinary outcome, not a bug:
+/// "a provider refused, here is what it said" already answers the question this
+/// exists to answer -- why a gate will not clear -- even when nothing matched.
+///
+/// #173: the refusal was discarded entirely, so quota exhaustion looked exactly
+/// like "not requested yet" and like "still running". Ten pull requests in
+/// `Aeptus/mockup` sat unmergeable for about 48 hours on 2026-09-11, and the
+/// cause was only ever found by someone who already suspected it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RefusalClass {
+    /// The budget is spent. Waiting helps only when it refills.
+    QuotaExhausted,
+    /// Too many requests too quickly. Waiting helps.
+    RateLimited,
+    /// The provider failed rather than declined. Retrying may help.
+    ProviderError,
+    /// Refused, and nothing in the text said why.
+    Unknown,
+}
+
+impl RefusalClass {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::QuotaExhausted => "quota_exhausted",
+            Self::RateLimited => "rate_limited",
+            Self::ProviderError => "provider_error",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    pub fn parse(label: &str) -> Option<Self> {
+        match label {
+            "quota_exhausted" => Some(Self::QuotaExhausted),
+            "rate_limited" => Some(Self::RateLimited),
+            "provider_error" => Some(Self::ProviderError),
+            "unknown" => Some(Self::Unknown),
+            _ => None,
+        }
+    }
+
+    /// Read a classification out of what the provider said.
+    ///
+    /// Ordered most specific first, because the vocabularies overlap: a
+    /// provider that refuses on a spent budget often says when the budget
+    /// refills, and "retry after" is rate-limit vocabulary. Reading a
+    /// refill-bound wait as a retriable one is the error that sends an
+    /// operator straight back to the same wall, so the budget wins the tie.
+    pub fn classify(text: &str) -> Self {
+        let text = text.to_ascii_lowercase();
+        const QUOTA: &[&str] = &[
+            "quota",
+            "usage limit",
+            "credit balance",
+            "insufficient credit",
+            "out of credit",
+            "billing",
+        ];
+        const RATE: &[&str] = &[
+            "rate limit",
+            "too many requests",
+            "429",
+            "retry after",
+            "slow down",
+        ];
+        const ERROR: &[&str] = &[
+            "internal server error",
+            "service unavailable",
+            "bad gateway",
+            "timed out",
+            "timeout",
+            "connection reset",
+            "500",
+            "502",
+            "503",
+        ];
+        if QUOTA.iter().any(|needle| text.contains(needle)) {
+            return Self::QuotaExhausted;
+        }
+        if RATE.iter().any(|needle| text.contains(needle)) {
+            return Self::RateLimited;
+        }
+        if ERROR.iter().any(|needle| text.contains(needle)) {
+            return Self::ProviderError;
+        }
+        Self::Unknown
+    }
+}
+
+/// What a provider said when it would not do the review, and what that means.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewRefusal {
+    pub class: RefusalClass,
+    /// The provider's own words, bounded and flattened to one line.
+    pub text: String,
+}
+
+/// How much of a refusal is kept.
+///
+/// A provider can answer with an HTML error page, and the ledger's `detail` is
+/// rendered into a pull-request comment. Enough to recognise the refusal, not
+/// enough to bury the row it explains.
+const REFUSAL_TEXT_LIMIT: usize = 300;
+
+impl ReviewRefusal {
+    /// Build a refusal from what a failed provider call left behind.
+    ///
+    /// `stderr` first: a CLI that fails says why on stderr, and stdout in that
+    /// case is usually a partial or empty payload. Falling back to stdout
+    /// covers the providers that report refusals as ordinary output.
+    pub fn from_provider_output(stdout: &str, stderr: &str, fallback: &str) -> Self {
+        let source = [stderr, stdout, fallback]
+            .into_iter()
+            .map(str::trim)
+            .find(|candidate| !candidate.is_empty())
+            .unwrap_or("");
+        Self {
+            class: RefusalClass::classify(source),
+            text: flatten(source),
+        }
+    }
+
+    /// The ledger `detail` for this refusal: classification, then evidence.
+    ///
+    /// One string rather than two columns because every reader of a review row
+    /// already renders `detail` -- the pull-request comment, the run report,
+    /// the ledger dump. A column nothing displays would state the cause in a
+    /// place the operator in #173 was never going to look. [`Self::parse`]
+    /// reads it back, so this stays a typed outcome rather than prose.
+    pub fn detail(&self) -> String {
+        if self.text.is_empty() {
+            return self.class.label().to_string();
+        }
+        format!("{}: {}", self.class.label(), self.text)
+    }
+
+    /// Recover a refusal from a `detail` written by [`Self::detail`].
+    ///
+    /// `None` for any other detail -- the column carries rule names and
+    /// debounce windows too, and reporting one of those as an `unknown`
+    /// refusal would invent a provider refusal that never happened.
+    pub fn parse(detail: &str) -> Option<Self> {
+        let (label, text) = match detail.split_once(": ") {
+            Some((label, text)) => (label, text),
+            None => (detail, ""),
+        };
+        Some(Self {
+            class: RefusalClass::parse(label)?,
+            text: text.to_string(),
+        })
+    }
+}
+
+/// One line, bounded, with the truncation visible.
+fn flatten(text: &str) -> String {
+    let single: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if single.chars().count() <= REFUSAL_TEXT_LIMIT {
+        return single;
+    }
+    let kept: String = single.chars().take(REFUSAL_TEXT_LIMIT).collect();
+    format!("{kept}…")
+}
+
 /// One row of the ledger.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReviewRequest {
@@ -222,6 +391,137 @@ pub fn in_flight(rows: &[ReviewRequest]) -> Vec<InFlightReview> {
             pull_request: row.pr_number,
         })
         .collect()
+}
+
+#[cfg(test)]
+mod refusal_tests {
+    use super::*;
+
+    /// The refusal that caused #173. A spent budget is the one class where
+    /// retrying is not the answer, so reading it as anything else sends an
+    /// operator back to the same wall.
+    #[test]
+    fn a_spent_budget_reads_as_quota_exhausted() {
+        assert_eq!(
+            RefusalClass::classify(
+                "Error: your usage limit has been reached for this billing period"
+            ),
+            RefusalClass::QuotaExhausted
+        );
+    }
+
+    /// Both vocabularies contain "limit", and the two mean opposite things to
+    /// whoever is deciding whether to wait. Ordering the scrape is the whole
+    /// defence, so the overlapping case is the one worth pinning.
+    #[test]
+    fn a_rate_limit_is_not_read_as_a_spent_budget() {
+        assert_eq!(
+            RefusalClass::classify(
+                "You have exceeded a secondary rate limit. Please retry after 60s"
+            ),
+            RefusalClass::RateLimited
+        );
+    }
+
+    /// The tie the ordering exists to settle. A provider that refuses on a
+    /// spent budget and then says when it refills speaks both vocabularies at
+    /// once, and reading it as a rate limit tells the operator to wait
+    /// minutes for something that will not come back for hours.
+    #[test]
+    fn a_quota_refusal_that_names_a_refill_time_is_not_a_rate_limit() {
+        assert_eq!(
+            RefusalClass::classify(
+                "You have exceeded your usage limit. Please retry after your quota resets at 00:00 UTC"
+            ),
+            RefusalClass::QuotaExhausted
+        );
+    }
+
+    #[test]
+    fn a_provider_failure_reads_as_a_provider_error() {
+        assert_eq!(
+            RefusalClass::classify("HTTP 503: Service Unavailable"),
+            RefusalClass::ProviderError
+        );
+    }
+
+    /// `unknown` is an outcome, not a bug: the refusal still answers "why is
+    /// this gate unclearable" because the provider's words travel with it.
+    #[test]
+    fn an_unrecognised_refusal_is_unknown_rather_than_guessed() {
+        assert_eq!(
+            RefusalClass::classify("the reviewer declined"),
+            RefusalClass::Unknown
+        );
+    }
+
+    /// A CLI that fails says why on stderr; stdout in that case is usually a
+    /// truncated payload that classifies as nothing.
+    #[test]
+    fn stderr_outranks_stdout_as_the_refusal_source() {
+        let refusal = ReviewRefusal::from_provider_output(
+            "{}",
+            "quota exceeded",
+            "the coordinated GitHub write failed",
+        );
+        assert_eq!(refusal.class, RefusalClass::QuotaExhausted);
+        assert_eq!(refusal.text, "quota exceeded");
+    }
+
+    /// A provider that says nothing at all still has to produce a row, or the
+    /// silent case goes back to being indistinguishable from "never asked".
+    #[test]
+    fn a_silent_refusal_falls_back_to_what_the_caller_was_doing() {
+        let refusal =
+            ReviewRefusal::from_provider_output("", "   ", "requesting a security review");
+        assert_eq!(refusal.class, RefusalClass::Unknown);
+        assert_eq!(refusal.text, "requesting a security review");
+    }
+
+    /// The classification is precision; the text is evidence. A misfire must
+    /// cost the first and never the second, so the words survive verbatim.
+    #[test]
+    fn the_providers_words_survive_a_misclassification() {
+        let refusal = ReviewRefusal::from_provider_output("", "the reviewer declined", "");
+        assert_eq!(refusal.class, RefusalClass::Unknown);
+        assert_eq!(refusal.detail(), "unknown: the reviewer declined");
+    }
+
+    /// `detail` is rendered into pull-request comments, and a provider can
+    /// answer with an HTML error page.
+    #[test]
+    fn an_enormous_refusal_is_bounded_and_says_so() {
+        let refusal = ReviewRefusal::from_provider_output("", &"x".repeat(5_000), "");
+        assert_eq!(refusal.text.chars().count(), REFUSAL_TEXT_LIMIT + 1);
+        assert!(refusal.text.ends_with('\u{2026}'));
+    }
+
+    #[test]
+    fn a_multiline_refusal_becomes_one_line() {
+        let refusal = ReviewRefusal::from_provider_output("", "quota\n  exceeded\n", "");
+        assert_eq!(refusal.text, "quota exceeded");
+    }
+
+    #[test]
+    fn a_refusal_round_trips_through_the_detail_column() {
+        let refusal = ReviewRefusal::from_provider_output("", "API rate limit exceeded", "");
+        assert_eq!(ReviewRefusal::parse(&refusal.detail()), Some(refusal));
+    }
+
+    /// The column also carries rule names and debounce windows. Reading one of
+    /// those back as a refusal would invent a provider refusal that never
+    /// happened -- exactly the fabricated cause #173 exists to avoid.
+    #[test]
+    fn a_detail_that_is_not_a_refusal_reads_back_as_none() {
+        assert_eq!(
+            ReviewRefusal::parse("debounced: another review ran 4 minutes ago"),
+            None
+        );
+        assert_eq!(
+            ReviewRefusal::parse("the coordinated GitHub write failed"),
+            None
+        );
+    }
 }
 
 #[cfg(test)]

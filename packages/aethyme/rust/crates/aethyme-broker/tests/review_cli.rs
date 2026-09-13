@@ -101,6 +101,10 @@ printf '%s %s\n' "$1" "$2" >> "$AETHYME_REVIEW_WRITES"
 if [ "$AETHYME_FAKE_GH_MODE" = "write-fail" ]; then
   exit 1
 fi
+if [ "$AETHYME_FAKE_GH_MODE" = "quota-fail" ]; then
+  echo "You have exceeded your usage limit for the current billing period" >&2
+  exit 1
+fi
 exit 0
 "#,
         )
@@ -1413,5 +1417,238 @@ fn an_ambiguous_head_prefix_names_both_commits_rather_than_choosing() {
     assert!(
         message.contains(first) && message.contains(second),
         "the refusal must name both commits it is choosing between: {message}"
+    );
+}
+
+/// A routing configuration whose `code` review is asked for by commenting on
+/// the pull request -- the one backend whose dispatch is a GitHub write, and
+/// therefore the one that can be refused.
+const ROUTED_POLICY: &str = r#"
+[review]
+enabled = true
+required_approvals = 1
+
+[review.trigger]
+enabled = true
+
+[[review.trigger.rule]]
+name = "always-code-review"
+require = ["code"]
+
+[review.routing]
+enabled = true
+workspace_root = ".aethyme/reviews"
+
+[review.routing.default_route]
+backend = "record"
+
+[review.routing.route.code]
+backend = "provider_comment"
+mention = "codex"
+"#;
+
+/// Drive one router tick whose single GitHub write the provider refuses.
+///
+/// Returns the session, the head it planned against, and the `review run`
+/// output. The refusal is a spent quota because that is the class where the
+/// distinction matters most: it is the one an operator cannot wait out.
+fn refused_review_tick(fixture: &Fixture) -> (String, String, Output) {
+    let start = fixture.run(
+        &["start", "--task", "routed review", "--json"],
+        "",
+        true,
+        None,
+    );
+    assert!(
+        start.status.success(),
+        "{}",
+        String::from_utf8_lossy(&start.stderr)
+    );
+    let session: serde_json::Value = serde_json::from_slice(&start.stdout).unwrap();
+    let session_id = session["id"].as_i64().unwrap().to_string();
+    let worktree = PathBuf::from(session["worktree_path"].as_str().unwrap());
+    std::fs::write(worktree.join("README.md"), "routed review\n").unwrap();
+    git(&worktree, &["add", "README.md"]);
+    git(&worktree, &["commit", "-qm", "feat: routed review"]);
+    let head = git(&worktree, &["rev-parse", "HEAD"]);
+    let run = fixture.run_with_evidence(
+        &[
+            "review",
+            "run",
+            "--session",
+            &session_id,
+            "--repo",
+            "acme/product",
+            "--pr",
+            "42",
+            "--from-provider",
+        ],
+        &head,
+        "main",
+        "OPEN",
+        false,
+        None,
+        Some("quota-fail"),
+    );
+    (session_id, head, run)
+}
+
+/// #173: the provider's refusal was discarded, so a review it declined to do
+/// was recorded as `abandoned` with a detail that said only that a GitHub
+/// write had failed. `abandoned` is also what a dead reviewer and a missing
+/// tab produce, so `pending or stale: Code Review` was the whole story an
+/// operator got -- for roughly 48 hours, across ten pull requests, in the
+/// incident this issue was filed from.
+///
+/// What this pins is that the words the provider used reach the ledger, and
+/// that they arrive with a classification saying whether waiting helps.
+#[test]
+fn a_refused_review_records_the_providers_words_and_what_they_mean() {
+    let fixture = Fixture::new_with_policy(ROUTED_POLICY);
+    let (_session, head, run) = refused_review_tick(&fixture);
+    assert!(
+        !run.status.success(),
+        "a refused GitHub write still stops the tick"
+    );
+    let message = String::from_utf8_lossy(&run.stderr);
+    assert!(
+        message.contains("quota_exhausted"),
+        "the failure names the class of refusal: {message}"
+    );
+
+    let ledger = fixture.run(
+        &[
+            "review",
+            "ledger",
+            "--repo",
+            "acme/product",
+            "--pr",
+            "42",
+            "--json",
+        ],
+        &head,
+        true,
+        None,
+    );
+    let rows: serde_json::Value = serde_json::from_slice(&ledger.stdout).unwrap();
+    let row = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["review_type"] == "code")
+        .expect("the refused review still has a row");
+    assert_eq!(row["state"], "abandoned");
+    let detail = row["detail"].as_str().expect("the row states a cause");
+    assert!(
+        detail.starts_with("quota_exhausted: "),
+        "the classification leads the detail: {detail}"
+    );
+    // The classification is scraped and may be wrong tomorrow. The provider's
+    // own sentence is what lets a reader see that for themselves, so it has to
+    // survive verbatim rather than be replaced by the label.
+    assert!(
+        detail.contains("exceeded your usage limit"),
+        "the provider's own words survive: {detail}"
+    );
+}
+
+/// The second half of #173: recording the cause is worth nothing if the
+/// operator asking "why will this gate not clear" has to already know which
+/// repository and which pull request to interrogate. `broker status` is the
+/// command every session runs first, so that is where the answer has to be.
+#[test]
+fn broker_status_states_why_a_refused_review_cannot_clear() {
+    let fixture = Fixture::new_with_policy(ROUTED_POLICY);
+    let (_session, head, run) = refused_review_tick(&fixture);
+    assert!(!run.status.success());
+
+    let status = fixture.run(&["status", "--json"], &head, true, None);
+    assert!(
+        status.status.success(),
+        "{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let view: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    let refusal = view["review_refusals"]
+        .as_array()
+        .expect("status carries the refusals")
+        .first()
+        .expect("the refused review is one of them");
+    assert_eq!(refusal["repository"], "acme/product");
+    assert_eq!(refusal["pull_request"], 42);
+    assert_eq!(refusal["review_type"], "code");
+    assert_eq!(refusal["head_commit"], head.as_str());
+    assert_eq!(refusal["class"], "quota_exhausted");
+    assert!(
+        refusal["text"]
+            .as_str()
+            .unwrap()
+            .contains("exceeded your usage limit")
+    );
+    assert!(
+        refusal["refused_at"].as_i64().unwrap() > 0,
+        "the refusal is timestamped"
+    );
+
+    let advice = view["advice"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["id"] == "review.provider-refusals")
+        .expect("a refused review raises an advisory rather than only a JSON field");
+    // Whether waiting helps is the question that went unanswered for 48 hours.
+    assert!(
+        advice["summary"]
+            .as_str()
+            .unwrap()
+            .contains("retrying does not clear"),
+        "the advisory says waiting will not help: {}",
+        advice["summary"]
+    );
+}
+
+/// A refusal on a head that has since been re-asked is history. Reporting it
+/// would send an operator to look at a wall that is no longer there, which is
+/// the same failure as reporting nothing -- a stated cause that is not the
+/// current one.
+#[test]
+fn a_refusal_a_later_request_superseded_stops_being_reported() {
+    let fixture = Fixture::new_with_policy(ROUTED_POLICY);
+    let (_session, head, run) = refused_review_tick(&fixture);
+    assert!(!run.status.success());
+
+    {
+        let mut store = aethyme_broker::BrokerStore::open_in_repo(fixture.root.path()).unwrap();
+        let refused = store.review_refusals(20).unwrap();
+        assert_eq!(refused.len(), 1);
+        // The next push makes a new head, and the router asks again. Later
+        // than the refusal by construction: "superseded" is an ordering over
+        // the rows, and a test that guessed a wall-clock value would be
+        // asserting the clock rather than the rule.
+        store
+            .record_review_request(
+                "acme/product",
+                42,
+                "code",
+                "0000000000111111111122222222223333333333",
+                "chau7",
+                refused[0].requested_at + 1,
+            )
+            .unwrap();
+        assert!(
+            store.review_refusals(20).unwrap().is_empty(),
+            "a superseded refusal is history, not a current cause"
+        );
+    }
+
+    let status = fixture.run(&["status", "--json"], &head, true, None);
+    let view: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert!(view["review_refusals"].as_array().unwrap().is_empty());
+    assert!(
+        !view["advice"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["id"] == "review.provider-refusals")
     );
 }

@@ -6189,10 +6189,22 @@ fn run_review_run(parsed: Parsed) -> Result<serde_json::Value, UsageError> {
                 args: call.args.clone(),
             })
             .map_err(to_usage)?;
+        // What the provider said, classified. Built for every call because the
+        // failing branch below needs it in two places and the report needs it
+        // whether or not a review row is attached to this call.
+        let refusal = crate::ReviewRefusal::from_provider_output(
+            &report.stdout,
+            &report.stderr,
+            &format!("the coordinated GitHub write failed: {}", call.purpose),
+        );
         performed.push(serde_json::json!({
             "purpose": call.purpose,
             "operation_id": report.operation.id,
             "success": report.command_success,
+            // Why it failed, in the provider's own words and as a class. #173:
+            // this was dropped, so a spent quota reached the operator as a row
+            // indistinguishable from "not requested yet".
+            "refusal": (!report.command_success).then(|| refusal.clone()),
         }));
         if !report.command_success {
             if let Some(id) = call
@@ -6205,10 +6217,12 @@ fn run_review_run(parsed: Parsed) -> Result<serde_json::Value, UsageError> {
                     .set_review_request_state(
                         *id,
                         crate::ReviewRequestState::Abandoned,
-                        Some(&format!(
-                            "the coordinated GitHub write failed: {}",
-                            call.purpose
-                        )),
+                        // The classification and the provider's words, not the
+                        // fact that something failed -- which the state
+                        // already said. `abandoned` is where a refused review
+                        // lands, and until now the row could not say whether
+                        // waiting would help (#173).
+                        Some(&refusal.detail()),
                         now_ms(),
                     )
                     .map_err(to_usage)?;
@@ -6227,9 +6241,13 @@ fn run_review_run(parsed: Parsed) -> Result<serde_json::Value, UsageError> {
                 facts.trigger,
                 true,
             ))?;
+            // The classification rides on the error too. A caller that only
+            // reads exit status and stderr is the common case, and it is the
+            // one that spent 48 hours not knowing in #173.
             return Err(UsageError::Message(format!(
-                "coordinated GitHub write failed: {}",
-                call.purpose
+                "coordinated GitHub write failed: {} [{}]",
+                call.purpose,
+                refusal.detail()
             )));
         }
     }

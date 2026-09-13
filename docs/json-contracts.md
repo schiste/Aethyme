@@ -47,9 +47,20 @@ part of the contract.
   ],
   "queue": [ MergeQueueEntry ],
   "integration_branch": "...",
-  "integration_head": "<commit>"
+  "integration_head": "<commit>",
+  "review_refusals": [
+    { "repository", "pull_request", "review_type", "head_commit",
+      "class", "text", "refused_at" }
+  ]
 }
 ```
+
+`review_refusals` lists reviews a provider declined and nothing has re-asked
+for since. `class` is `quota_exhausted`, `rate_limited`, `provider_error` or
+`unknown`, and answers whether waiting helps; `text` is the provider's own
+words, kept beside the classification rather than replaced by it, because the
+refusal surface is scraped from prose and a misfire must cost precision and
+not evidence. `unknown` is an ordinary value, not a defect.
 
 `Session` fields: `id`, `worktree_path`, `branch`, `origin`, `status`,
 `task`, `diff_base`, `pid`, `command`, `log_path`, `exit_code`,

@@ -2401,6 +2401,58 @@ impl BrokerStore {
             .transpose()
     }
 
+    /// Reviews a provider refused, that nothing has re-asked for since.
+    ///
+    /// Every repository at once, because `broker status` is per-machine and the
+    /// operator asking "why will this gate not clear" does not yet know which
+    /// repository to name -- that is the question. The rows are the ledger's
+    /// own: review type, pull request, head commit, when it was refused, and a
+    /// `detail` that [`crate::ReviewRefusal::parse`] reads back into a
+    /// classification plus the provider's words. Nothing new is stored (#173);
+    /// what was missing was that the refusal was never written down at all.
+    ///
+    /// `NOT EXISTS` drops a refusal that a later request for the same
+    /// dimension has superseded. A refusal on a head that has since been
+    /// re-asked is history, and reporting it would tell an operator to go
+    /// looking at a wall that is no longer there.
+    ///
+    /// `limit` bounds a view that already costs every caller of `broker
+    /// status`; the newest refusals are the ones an operator can still act on.
+    pub fn review_refusals(&self, limit: usize) -> Result<Vec<ReviewRequest>, BrokerError> {
+        let mut statement = self.conn.prepare(&format!(
+            "{REVIEW_REQUEST_SELECT}
+              WHERE state = 'abandoned'
+                AND detail IS NOT NULL
+                AND NOT EXISTS (
+                  SELECT 1 FROM review_requests newer
+                   WHERE newer.repository = review_requests.repository
+                     AND newer.pr_number = review_requests.pr_number
+                     AND newer.review_type = review_requests.review_type
+                     AND (newer.requested_at > review_requests.requested_at
+                          OR (newer.requested_at = review_requests.requested_at
+                              AND newer.id > review_requests.id))
+                )
+              ORDER BY updated_at DESC, id DESC
+              LIMIT ?1"
+        ))?;
+        let rows = statement
+            .query_map(params![limit as i64], review_request_from_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        let rows = rows.into_iter().collect::<Result<Vec<_>, _>>()?;
+        // The classification lives in `detail`, which also carries rule names
+        // and debounce windows from every other path that abandons a row.
+        // Filtering on what parses keeps this to refusals a provider actually
+        // made.
+        Ok(rows
+            .into_iter()
+            .filter(|row| {
+                row.detail
+                    .as_deref()
+                    .is_some_and(|detail| crate::ReviewRefusal::parse(detail).is_some())
+            })
+            .collect())
+    }
+
     /// Every request still occupying a concurrency slot in one repository.
     ///
     /// `ReviewRoute::max_concurrent` is a per-repository budget, not a

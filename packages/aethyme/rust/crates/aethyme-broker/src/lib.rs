@@ -353,7 +353,8 @@ pub use review_facts::{
     ProviderPullRequest, PullRequestObservation, derive_trigger, first_time_contributor,
 };
 pub use review_ledger::{
-    ExpiredReview, ReviewRequest, ReviewRequestState, expired, in_flight, spend_by_type,
+    ExpiredReview, RefusalClass, ReviewRefusal, ReviewRequest, ReviewRequestState, expired,
+    in_flight, spend_by_type,
 };
 pub use review_report::{
     REVIEW_REPORTING_SCHEMA_VERSION, ReviewReportingError, ReviewReportingPolicy, ReviewSeverity,
