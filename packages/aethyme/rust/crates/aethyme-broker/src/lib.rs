@@ -402,5 +402,80 @@ pub use version::{
 /// Repo-relative location of the broker database.
 pub const BROKER_DB_RELPATH: &str = ".aethyme/broker.db";
 
+/// Absolute path that overrides where a repository's broker database lives.
+///
+/// Broker state is per-repository, and `main_root()` resolves it from the git
+/// common directory -- which for a worktree is the *main* checkout. That is
+/// deliberate for the product and hostile to a test: a test binary's working
+/// directory is its crate directory inside a real checkout, so a CLI it spawns
+/// resolved the developer's live database and migrated it (#163). A branch that
+/// added a migration therefore bricked every installed binary on the machine the
+/// moment its tests ran.
+///
+/// A harness sets this to a file it owns. Unset -- the only state a shipped
+/// binary ever runs in -- resolution is exactly what it was.
+pub const BROKER_DB_ENV: &str = "AETHYME_BROKER_DB";
+
+/// Where a repository's broker database lives, honouring [`BROKER_DB_ENV`].
+///
+/// The override is used verbatim, so a relative value resolves against the
+/// process working directory. Deliberate: an env var that silently rewrote the
+/// path it was given would be one more place a caller cannot predict what it
+/// opened, which is the whole complaint behind #163.
+pub fn broker_db_path(repo_root: &std::path::Path) -> std::path::PathBuf {
+    broker_db_path_with(repo_root, std::env::var_os(BROKER_DB_ENV))
+}
+
+/// The resolution itself, with the environment passed in.
+///
+/// Split out so it is testable: mutating a process-wide environment variable
+/// from a test races every other test in the binary, and a resolution rule
+/// this load-bearing should not go untested for that reason.
+fn broker_db_path_with(
+    repo_root: &std::path::Path,
+    override_value: Option<std::ffi::OsString>,
+) -> std::path::PathBuf {
+    match override_value {
+        Some(path) if !path.is_empty() => std::path::PathBuf::from(path),
+        // An empty value is the shell's way of saying "unset" (`VAR= cmd`), and
+        // the empty path is not a database anyone meant to name.
+        _ => repo_root.join(BROKER_DB_RELPATH),
+    }
+}
+
+#[cfg(test)]
+mod broker_db_path_tests {
+    use super::*;
+    use std::ffi::OsString;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn without_an_override_the_database_stays_under_the_repository() {
+        assert_eq!(
+            broker_db_path_with(Path::new("/repo"), None),
+            PathBuf::from("/repo/.aethyme/broker.db")
+        );
+    }
+
+    #[test]
+    fn an_override_replaces_the_path_rather_than_relocating_the_repository() {
+        // Verbatim: the override names the file, not a root to join
+        // `.aethyme/broker.db` onto. A harness that pointed at a temp *file*
+        // and got a temp *directory* back would silently write next door.
+        assert_eq!(
+            broker_db_path_with(Path::new("/repo"), Some(OsString::from("/tmp/t/pinned.db"))),
+            PathBuf::from("/tmp/t/pinned.db")
+        );
+    }
+
+    #[test]
+    fn an_empty_override_is_the_same_as_no_override() {
+        assert_eq!(
+            broker_db_path_with(Path::new("/repo"), Some(OsString::new())),
+            PathBuf::from("/repo/.aethyme/broker.db")
+        );
+    }
+}
+
 /// Repo-relative generated projection of outstanding advisory rows.
 pub const BROKER_ADVISORY_RELPATH: &str = ".aethyme/broker-advisory.md";

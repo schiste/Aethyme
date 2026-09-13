@@ -110,9 +110,10 @@ pub(crate) struct PreparedIntegrationReconciliation {
 
 impl BrokerStore {
     /// Open (creating and migrating if needed) the broker database for a
-    /// repository root: `<repo>/.aethyme/broker.db`.
+    /// repository root: `<repo>/.aethyme/broker.db`, or wherever
+    /// [`crate::BROKER_DB_ENV`] points.
     pub fn open_in_repo(repo_root: &Path) -> Result<Self, BrokerError> {
-        Self::open(&repo_root.join(crate::BROKER_DB_RELPATH))
+        Self::open(&crate::broker_db_path(repo_root))
     }
 
     /// Open the current broker schema without creating, migrating, or
@@ -120,7 +121,7 @@ impl BrokerStore {
     /// path so an observational command cannot become the write that upgrades
     /// storage or refreshes a session.
     pub fn open_snapshot_in_repo(repo_root: &Path) -> Result<Self, BrokerError> {
-        let path = repo_root.join(crate::BROKER_DB_RELPATH);
+        let path = crate::broker_db_path(repo_root);
         if !path.is_file() {
             let conn = Connection::open_in_memory()?;
             schema::migrate(&conn)?;
@@ -185,7 +186,7 @@ impl BrokerStore {
     /// an in-memory database or a migrated temporary copy. Readiness uses it to
     /// keep the absence and age of broker state observable facts.
     pub(crate) fn open_current_read_only_in_repo(repo_root: &Path) -> Result<Self, BrokerError> {
-        let path = repo_root.join(crate::BROKER_DB_RELPATH);
+        let path = crate::broker_db_path(repo_root);
         let conn = Connection::open_with_flags(
             &path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -205,6 +206,45 @@ impl BrokerStore {
             path,
             _snapshot_dir: None,
         })
+    }
+
+    /// Open a repository's broker database for a best-effort write, or decline.
+    ///
+    /// `Ok(None)` means there is nothing this binary may safely write to: no
+    /// database exists yet, or the one that does is at a different schema
+    /// version. Neither is an error. The caller is telemetry, and telemetry
+    /// must never be the write that brings a repository's broker state into
+    /// existence or moves it forward.
+    ///
+    /// #163: a test binary's working directory is its crate directory inside a
+    /// real checkout, so the post-command metric hook resolved the developer's
+    /// live database through `main_root()` and called `migrate` on it. On a
+    /// branch that added a migration, `cargo test --workspace` moved the shared
+    /// database ahead of every installed binary on the machine -- silently, and
+    /// before the branch merged. Declining is the fix rather than redirecting,
+    /// because the redirect ([`crate::BROKER_DB_ENV`]) only helps a harness that
+    /// remembers to set it, and the developer in the bug report had not.
+    pub fn open_current_in_repo(repo_root: &Path) -> Result<Option<Self>, BrokerError> {
+        let path = crate::broker_db_path(repo_root);
+        if !path.is_file() {
+            return Ok(None);
+        }
+        // No `SQLITE_OPEN_CREATE`: an absent database stays absent even if it
+        // is deleted between the check above and this open.
+        let conn = Connection::open_with_flags(
+            &path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        conn.busy_timeout(std::time::Duration::from_millis(BUSY_TIMEOUT_MS))?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        if schema::current_version(&conn)? != crate::SCHEMA_VERSION {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            conn,
+            path,
+            _snapshot_dir: None,
+        }))
     }
 
     /// Open (creating and migrating if needed) a broker database at an

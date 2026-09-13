@@ -102,6 +102,28 @@ so it can never enter `cargo install`:
 - `paths` — the three checkout roots, resolved from `CARGO_MANIFEST_DIR`
   rather than cwd.
 
+### The live broker database is not the suite's to touch
+
+A test binary's working directory is its crate directory, which sits inside
+a real checkout. Broker state is per-repository and resolves through
+`main_root()` — the git *common* directory's parent — so from a worktree it
+lands in the main checkout. A CLI spawned by a test therefore has a path to
+the developer's own `.aethyme/broker.db` that nothing in the test wrote.
+
+Two rules keep that path harmless (#163):
+
+- **A metric never migrates.** The post-command metric hook opens the
+  database only if one already exists at exactly this binary's schema
+  version, and otherwise writes nothing. Before this, `cargo test
+  --workspace` on a branch that added a migration moved the shared database
+  ahead of every installed `aethyme` on the machine — silently, and long
+  before the branch merged. Recovery was manual.
+- **`AETHYME_BROKER_DB` pins the file.** Set it to an absolute path and
+  every opener uses that database instead of `<repo>/.aethyme/broker.db`.
+  It is used verbatim, so a relative value resolves against the process
+  working directory. Unset in production; a harness that wants a database
+  it owns, rather than one it merely does not corrupt, sets it.
+
 ## Static Analysis
 
 ```bash

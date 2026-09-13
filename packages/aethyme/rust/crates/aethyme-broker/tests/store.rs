@@ -50,6 +50,79 @@ fn opens_in_repo_at_documented_path_and_reopens() {
     BrokerStore::open_in_repo(tmp.path()).unwrap();
 }
 
+/// #163: telemetry must never be the write that creates broker state.
+///
+/// The bug was not that the metric was written to the wrong repository -- it
+/// was that writing it ran `migrate`, so a test binary whose working directory
+/// sat inside a real checkout moved that checkout's database forward.
+#[test]
+fn a_metric_open_declines_a_repository_with_no_database_and_creates_none() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = BrokerStore::open_current_in_repo(tmp.path()).unwrap();
+    assert!(store.is_none(), "no database means nothing to write to");
+    assert!(
+        !tmp.path().join(aethyme_broker::BROKER_DB_RELPATH).exists(),
+        "declining must not leave the database it declined to open"
+    );
+}
+
+#[test]
+fn a_metric_open_accepts_a_database_at_this_binary_s_schema() {
+    let tmp = tempfile::tempdir().unwrap();
+    drop(BrokerStore::open_in_repo(tmp.path()).unwrap());
+    assert!(
+        BrokerStore::open_current_in_repo(tmp.path())
+            .unwrap()
+            .is_some(),
+        "a current database is exactly what a metric may write to"
+    );
+}
+
+/// The repro from #163, in one process: a database a *newer* binary migrated.
+///
+/// The old opener would have raised `SchemaTooNew` here; on the other side of
+/// the bug -- a newer binary meeting an older database -- it would have
+/// migrated it, which is the direction that bricked the machine. Both are
+/// "schema is not mine", and the assertion below is that the file is left
+/// exactly as it was found.
+#[test]
+fn a_metric_open_declines_a_database_from_another_binary_without_touching_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    drop(BrokerStore::open_in_repo(tmp.path()).unwrap());
+    let path = tmp.path().join(aethyme_broker::BROKER_DB_RELPATH);
+
+    let ahead = aethyme_broker::SCHEMA_VERSION + 1;
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute(
+        "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)
+         ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+        [ahead.to_string()],
+    )
+    .unwrap();
+    drop(conn);
+
+    assert!(
+        BrokerStore::open_current_in_repo(tmp.path())
+            .unwrap()
+            .is_none(),
+        "a schema this binary does not own is not a schema it may write"
+    );
+
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let found: String = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'schema_version'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        found,
+        ahead.to_string(),
+        "the database must come back unchanged, not migrated"
+    );
+}
+
 #[test]
 fn session_round_trip_attach_first() {
     let (_tmp, mut store) = open_temp();

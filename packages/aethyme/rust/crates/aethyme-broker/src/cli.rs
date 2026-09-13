@@ -773,7 +773,12 @@ fn record_command_outcome(args: &[String], exit: u8) {
     let Ok(main_root) = repo.main_root() else {
         return;
     };
-    let Ok(mut store) = crate::BrokerStore::open_in_repo(&main_root) else {
+    // `open_current_in_repo`, not `open_in_repo`: this is a metric, and a
+    // metric may not create a repository's broker state or migrate it. The
+    // repository here came from the process working directory, which for a
+    // spawned test binary is a checkout nobody asked this command to touch
+    // (#163).
+    let Ok(Some(mut store)) = crate::BrokerStore::open_current_in_repo(&main_root) else {
         return;
     };
     let explicit_session = args
