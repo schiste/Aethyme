@@ -550,6 +550,7 @@ impl Broker {
         cleanup: &[crate::CleanupWorktreePlan],
         sessions: &BTreeMap<i64, crate::Session>,
         already_removed: &[i64],
+        scan: crate::SizeScan,
     ) -> Vec<GcArtifactCandidate> {
         let mut candidates = Vec::new();
         for item in cleanup {
@@ -581,10 +582,20 @@ impl Broker {
                 if !checkout.path_is_ignored(&relative) {
                     continue;
                 }
-                let bytes = directory_size_without_following_links(&dir).unwrap_or(0);
-                if bytes == 0 {
-                    continue;
-                }
+                // Discovery is `read_dir` plus one `check-ignore`; sizing is
+                // the walk. A recorded-size pass keeps the candidate and
+                // reports zero bytes for it, because here zero means "not
+                // measured" -- dropping it would understate the count as well
+                // as the bytes (#176).
+                let bytes = if scan.measures() {
+                    let measured = directory_size_without_following_links(&dir).unwrap_or(0);
+                    if measured == 0 {
+                        continue;
+                    }
+                    measured
+                } else {
+                    0
+                };
                 candidates.push(GcArtifactCandidate {
                     session_id: item.session_id,
                     worktree_path: item.worktree_path.clone(),
@@ -611,6 +622,7 @@ impl Broker {
         evaluated_at: i64,
         policy: &RetentionPolicy,
         blockers: &mut Vec<GcBlocker>,
+        scan: crate::SizeScan,
     ) -> Result<Vec<GcOrphanCandidate>, BrokerOpError> {
         let plan = self.worktree_root_plan()?;
         let Some(container) = plan.root_container.clone() else {
@@ -671,7 +683,11 @@ impl Broker {
                 repository_key: marker.repository_key,
                 worktree_root: root.to_string_lossy().into_owned(),
                 repository_root: marker.repository_root.to_string_lossy().into_owned(),
-                estimated_bytes: directory_size_without_following_links(&root).unwrap_or(0),
+                estimated_bytes: if scan.measures() {
+                    directory_size_without_following_links(&root).unwrap_or(0)
+                } else {
+                    0
+                },
                 reason: "owning repository no longer exists".into(),
             });
         }
@@ -679,11 +695,33 @@ impl Broker {
         Ok(candidates)
     }
 
+    /// The full audit: walk every retained worktree, build cache and orphaned
+    /// root, and size what it finds.
+    ///
+    /// This is the expensive path, and the only one whose digest authorizes
+    /// `gc apply`. On the machine behind #176 it took over five minutes, which
+    /// is acceptable for something an operator asks for and unacceptable for
+    /// anything that runs on its own -- hence [`Broker::gc_plan_recorded`].
     pub fn gc_plan(&mut self) -> Result<GcPlan, BrokerOpError> {
+        self.gc_plan_scanned(crate::SizeScan::Measure)
+    }
+
+    /// The same plan assembled without walking a single tree.
+    ///
+    /// Everything but sizing survives: row queries, blockers, gate logs, and
+    /// build-cache discovery are all cheap. Byte totals come from what the
+    /// last full audit recorded, so they are floors, and the plan carries no
+    /// digest -- a plan that does not know how big things are must not be able
+    /// to authorize removing them.
+    pub fn gc_plan_recorded(&mut self) -> Result<GcPlan, BrokerOpError> {
+        self.gc_plan_scanned(crate::SizeScan::Recorded)
+    }
+
+    fn gc_plan_scanned(&mut self, scan: crate::SizeScan) -> Result<GcPlan, BrokerOpError> {
         let evaluated_at = now_ms();
         let main_root = self.main_root().to_path_buf();
         let policy = load_retention_policy(&main_root)?;
-        let cleanup = self.cleanup_plan()?;
+        let cleanup = self.cleanup_plan_scanned(scan)?;
         let sessions = self
             .store()
             .cleaned_sessions()?
@@ -863,8 +901,9 @@ impl Broker {
             &cleanup.worktrees,
             &sessions,
             &removed_sessions,
+            scan,
         );
-        let mut orphans = self.orphan_candidates(evaluated_at, &policy, &mut blockers)?;
+        let mut orphans = self.orphan_candidates(evaluated_at, &policy, &mut blockers, scan)?;
 
         rows.sort_by_key(|row| (row.kind, row.id));
         let mut files = files.into_values().collect::<Vec<_>>();
@@ -912,6 +951,21 @@ impl Broker {
         // `gc_apply_bounded` drains these lists in order and stops at its
         // deadline, so the front of the list is the part that is real.
         let policy_budget = policy.retained_bytes_budget;
+        // Orphaned roots that were not sized are unknown bytes too, so they
+        // count against the total's completeness exactly as unmeasured
+        // worktrees do. Only `Over` is conclusive from a floor (#176).
+        let unmeasured_directory_count =
+            cleanup.unmeasured_worktree_count + if scan.measures() { 0 } else { orphans.len() };
+        let retained_total = crate::MeasuredTotal {
+            bytes: estimated_retained_bytes,
+            measured: cleanup
+                .worktrees
+                .len()
+                .saturating_sub(cleanup.unmeasured_worktree_count),
+            unmeasured: unmeasured_directory_count,
+            oldest_measured_at_ms: cleanup.sizes_measured_at_ms,
+        };
+        let budget_verdict = crate::budget_verdict(&retained_total, policy_budget);
         let reclaim_order =
             crate::reclaim_order::order_for(estimated_retained_bytes, policy_budget);
         crate::reclaim_order::sort_by_order(&mut worktrees, reclaim_order, |worktree| {
@@ -969,11 +1023,16 @@ impl Broker {
                 policy_budget,
                 worktree_scoped_reclaimable,
             ),
-            // The full walk: `gc plan` is the expensive path an operator asks
-            // for, so it is the one that can afford to size what it found.
-            reconciliation: Some(self.reconcile_worktree_directories(true)?),
+            // Sizing unclaimed directories is another full walk, so it
+            // belongs to whichever pass was already paying for walks.
+            reconciliation: Some(self.reconcile_worktree_directories(scan.measures())?),
+            unmeasured_directory_count,
+            sizes_measured_at_ms: cleanup.sizes_measured_at_ms,
+            budget_verdict,
         };
-        plan.finish_digest()?;
+        if scan.measures() {
+            plan.finish_digest()?;
+        }
         Ok(plan)
     }
 
@@ -981,11 +1040,15 @@ impl Broker {
         self.gc_apply_bounded(confirm, None)
     }
 
+    /// The retention summary `doctor`, `certify` and the verify loop report.
+    ///
+    /// All three run unattended, so this takes the recorded-size path. Its
+    /// counts are exact; its byte totals are floors, and `budget_verdict` says
+    /// which questions those floors can answer (#176).
     pub fn gc_health(&mut self) -> Result<GcHealth, BrokerOpError> {
-        let plan = self.gc_plan()?;
+        let plan = self.gc_plan_recorded()?;
         let journal = load_journal(&self.main_root().join(".aethyme/gc-journal.json"))?;
-        let over_retained_bytes_budget = plan.policy.retained_bytes_budget > 0
-            && plan.estimated_retained_bytes >= plan.policy.retained_bytes_budget;
+        let over_retained_bytes_budget = plan.budget_verdict.exceeded();
         Ok(GcHealth {
             policy: plan.policy,
             pending_recovery_digest: journal.map(|journal| journal.digest),
@@ -1001,6 +1064,9 @@ impl Broker {
             retained_bytes_deficit: plan.retained_bytes_deficit,
             clears_retained_bytes_budget: plan.clears_retained_bytes_budget,
             reclaim_order: plan.reclaim_order,
+            budget_verdict: plan.budget_verdict,
+            unmeasured_directory_count: plan.unmeasured_directory_count,
+            sizes_measured_at_ms: plan.sizes_measured_at_ms,
             blockers: plan.blockers.len(),
             unclaimed_worktree_count: plan
                 .reconciliation

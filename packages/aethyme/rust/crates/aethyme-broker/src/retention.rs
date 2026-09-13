@@ -43,6 +43,20 @@ pub struct RetentionPolicy {
     /// Minimum spacing between autonomous artifact sweeps.
     pub artifact_sweep_interval_hours: u32,
     pub startup_budget_ms: u64,
+    /// Wall-clock budget a *routine* check -- `broker status`, `doctor` --
+    /// may spend measuring one directory it has never sized. `0` disables
+    /// warming -- no walk clears a deadline that has already passed -- leaving
+    /// routine totals frozen at whatever `gc plan` last recorded.
+    ///
+    /// This is not a budget for sizing everything. Routine checks read
+    /// recorded sizes and walk nothing; this buys exactly one measurement per
+    /// pass so a machine nobody audits still converges on knowing its own
+    /// size. The ceiling is deliberately small: a routine check that can
+    /// afford the whole walk has become the expensive walk again (#176).
+    pub routine_size_budget_ms: u64,
+    /// How long a recorded directory size is treated as current. Past this, a
+    /// routine check prefers to spend its measurement budget refreshing it.
+    pub size_record_ttl_hours: u32,
 }
 
 impl Default for RetentionPolicy {
@@ -61,6 +75,8 @@ impl Default for RetentionPolicy {
             artifact_sweep_budget_ms: 5_000,
             artifact_sweep_interval_hours: 24,
             startup_budget_ms: 25,
+            routine_size_budget_ms: 200,
+            size_record_ttl_hours: 24,
         }
     }
 }
@@ -133,6 +149,23 @@ impl RetentionPolicy {
             return Err(RetentionConfigError::InvalidValue {
                 field: "artifact_sweep_interval_hours",
                 value: self.artifact_sweep_interval_hours.to_string(),
+                constraint: "must be between 1 and 8760 hours",
+            });
+        }
+        // A routine check may spend at most a quarter second measuring. Any
+        // larger and the split this bounds -- routine check against expensive
+        // walk -- stops being a split.
+        if self.routine_size_budget_ms > 250 {
+            return Err(RetentionConfigError::InvalidValue {
+                field: "routine_size_budget_ms",
+                value: self.routine_size_budget_ms.to_string(),
+                constraint: "must be between 0 (no warming) and 250 milliseconds",
+            });
+        }
+        if !(1..=8_760).contains(&self.size_record_ttl_hours) {
+            return Err(RetentionConfigError::InvalidValue {
+                field: "size_record_ttl_hours",
+                value: self.size_record_ttl_hours.to_string(),
                 constraint: "must be between 1 and 8760 hours",
             });
         }
@@ -315,6 +348,19 @@ pub struct GcPlan {
     /// which is a different problem from a backlog and reads differently.
     #[serde(default = "default_clears_budget")]
     pub clears_retained_bytes_budget: bool,
+    /// What the byte totals are actually able to conclude about the budget.
+    /// A plan assembled without walking the trees reports floors, and a floor
+    /// answers "over budget" but never "within budget" (#176).
+    #[serde(default = "default_budget_verdict")]
+    pub budget_verdict: crate::BudgetVerdict,
+    /// Directories whose bytes are missing from the totals above because
+    /// nobody walked them -- retained worktrees and orphaned worktree roots
+    /// alike. `0` on the full audit, which measures everything it lists.
+    #[serde(default)]
+    pub unmeasured_directory_count: usize,
+    /// The oldest recorded measurement behind the byte totals.
+    #[serde(default)]
+    pub sizes_measured_at_ms: Option<i64>,
     /// `None` only when re-reading a plan written before the sweep existed.
     /// That is deliberately not the same value as a sweep that found nothing:
     /// a plan that never looked must not read as a plan that looked and found
@@ -354,6 +400,14 @@ pub struct GcHealth {
     pub retained_bytes_deficit: u64,
     pub clears_retained_bytes_budget: bool,
     pub reclaim_order: crate::ReclaimOrder,
+    /// What the byte totals can conclude about the budget. `doctor` reads
+    /// recorded sizes, so this is where an unmeasured remainder surfaces.
+    pub budget_verdict: crate::BudgetVerdict,
+    /// Directories whose bytes are missing from the totals above. Counts
+    /// orphaned worktree roots as well as retained worktrees, because an
+    /// unsized orphan is exactly as absent from the total.
+    pub unmeasured_directory_count: usize,
+    pub sizes_measured_at_ms: Option<i64>,
     pub blockers: usize,
     /// Directories under a broker worktree root that no session claims.
     pub unclaimed_worktree_count: usize,
@@ -370,6 +424,13 @@ fn default_reclaim_order() -> crate::ReclaimOrder {
 /// would raise an alarm about a plan nobody can re-evaluate.
 fn default_clears_budget() -> bool {
     true
+}
+
+/// Every plan written before the cheap path existed came from the full walk,
+/// so its totals were measurements. `Unknown` would claim those plans skipped
+/// something; they did not.
+fn default_budget_verdict() -> crate::BudgetVerdict {
+    crate::BudgetVerdict::Within
 }
 
 impl GcPlan {
@@ -414,6 +475,8 @@ mod tests {
         assert!(policy.startup_budget_ms <= 25);
         assert_eq!(policy.artifact_reclaim_days, 0);
         assert_eq!(policy.artifact_sweep_budget_ms, 5_000);
+        assert_eq!(policy.routine_size_budget_ms, 200);
+        assert_eq!(policy.size_record_ttl_hours, 24);
         assert_eq!(policy.retained_bytes_budget, 1_073_741_824);
     }
 

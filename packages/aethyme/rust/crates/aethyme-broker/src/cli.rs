@@ -3314,21 +3314,43 @@ fn render_gc_plan(plan: &crate::GcPlan, detail: bool) {
     // The ordering line is not decoration: `gc apply --budget-ms` drains these
     // lists in the order printed and stops at its deadline, so this says which
     // end of the backlog a bounded sweep actually reaches (#176).
-    if plan.retained_bytes_deficit > 0 {
-        out!(
+    let ordered = plan.reclaim_order.as_str().replace('_', " ");
+    match plan.budget_verdict {
+        crate::BudgetVerdict::Over => out!(
             "  over budget by {}: candidates ordered {}{}",
             human_bytes(plan.retained_bytes_deficit),
-            plan.reclaim_order.as_str().replace('_', " "),
+            ordered,
             if plan.clears_retained_bytes_budget {
                 "; applying this plan clears the budget"
             } else {
                 "; applying all of this plan still leaves retention over budget"
             },
-        );
-    } else {
+        ),
+        crate::BudgetVerdict::Within => {
+            out!("  within budget: candidates ordered {ordered}")
+        }
+        // Distinguished from "within budget" on purpose. The bytes this
+        // total skipped are exactly the ones that would have decided the
+        // question, so silence here would read as a pass (#176).
+        crate::BudgetVerdict::Unknown => {
+            out!("  budget undecided, retained total is a floor: candidates ordered {ordered}")
+        }
+        crate::BudgetVerdict::Unset => {
+            out!("  no retained bytes budget configured: candidates ordered {ordered}")
+        }
+    }
+    // Says which of the byte figures above are measurements. A plan that
+    // reports a floor as a total lets the budget read as satisfied because
+    // nobody looked (#176).
+    if plan.unmeasured_directory_count > 0 {
         out!(
-            "  within budget: candidates ordered {}",
-            plan.reclaim_order.as_str().replace('_', " "),
+            "  size measurement: {} retained {} never been sized, so byte totals are a floor",
+            plan.unmeasured_directory_count,
+            crate::broker::plural_word(
+                plan.unmeasured_directory_count,
+                "directory has",
+                "directories have",
+            ),
         );
     }
     // Listed apart from the candidate sections above because it is not a
@@ -11272,11 +11294,32 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     human_bytes(report.retention.estimated_reclaimable_bytes),
                     report.retention.blockers,
                 );
-                if report.retention.over_retained_bytes_budget {
+                // Doctor takes the recorded-size path, so its byte figures
+                // can be floors. Say so before the budget line: a floor
+                // under the budget is not a pass, it is an unanswered
+                // question, and reporting only the pass is how the budget
+                // stopped meaning anything (#176).
+                if report.retention.unmeasured_directory_count > 0 {
                     out!(
+                        "  retention: {} retained {} never been sized; byte totals above are a floor -- measure with `aethyme broker gc plan`",
+                        report.retention.unmeasured_directory_count,
+                        crate::broker::plural_word(
+                            report.retention.unmeasured_directory_count,
+                            "directory has",
+                            "directories have",
+                        ),
+                    );
+                }
+                match report.retention.budget_verdict {
+                    crate::BudgetVerdict::Over => out!(
                         "  warning: retained storage exceeds the configured {} budget; review `aethyme broker gc plan`",
                         human_bytes(report.retention.policy.retained_bytes_budget)
-                    );
+                    ),
+                    crate::BudgetVerdict::Unknown => out!(
+                        "  warning: cannot tell whether retained storage is within the configured {} budget; run `aethyme broker gc plan`",
+                        human_bytes(report.retention.policy.retained_bytes_budget)
+                    ),
+                    crate::BudgetVerdict::Within | crate::BudgetVerdict::Unset => {}
                 }
                 if let Some(digest) = &report.retention.pending_recovery_digest {
                     out!("  recovery pending: aethyme broker gc apply --confirm {digest}");

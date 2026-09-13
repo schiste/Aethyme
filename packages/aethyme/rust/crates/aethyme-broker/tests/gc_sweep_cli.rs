@@ -487,3 +487,38 @@ fn the_largest_orphaned_root_is_planned_before_smaller_ones() {
     assert_eq!(keys, vec!["repo-z-large", "repo-a-small"]);
     assert!(small.exists() && large.exists(), "planning removes nothing");
 }
+
+/// An orphaned root's bytes are retained bytes, and `doctor` takes the
+/// recorded-size path, which never walks one. If those missing bytes did not
+/// count against the total's completeness, `doctor` would report a floor as a
+/// total and the budget would read as satisfied because nobody looked (#176).
+#[test]
+fn doctor_counts_an_unsized_orphaned_root_against_its_own_totals() {
+    let (repo, container) = fixture(
+        "[retention]\norphan_worktree_roots_days = 0\nartifact_sweep_budget_ms = 0\nroutine_size_budget_ms = 0\nretained_bytes_budget = 1073741824\n",
+    );
+    let missing = container.path().join("gone-repository");
+    stamp_root(container.path(), "repo-orphaned", &missing);
+
+    // The expensive audit sizes it, so the orphan is a real, non-zero cost.
+    let plan = plan_json(repo.path(), container.path());
+    assert_eq!(plan["orphans"].as_array().unwrap().len(), 1);
+    assert!(plan["orphans"][0]["estimated_bytes"].as_u64().unwrap() > 0);
+    assert_eq!(plan["unmeasured_directory_count"].as_u64().unwrap(), 0);
+    assert_eq!(plan["budget_verdict"].as_str().unwrap(), "within");
+
+    let output = run(repo.path(), container.path(), &["doctor", "--json"]);
+    assert!(
+        output.status.success(),
+        "doctor: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let retention = &report["retention"];
+    assert_eq!(retention["unmeasured_directory_count"].as_u64().unwrap(), 1);
+    assert_eq!(retention["budget_verdict"].as_str().unwrap(), "unknown");
+    assert!(
+        !retention["over_retained_bytes_budget"].as_bool().unwrap(),
+        "undecided is not a breach"
+    );
+}

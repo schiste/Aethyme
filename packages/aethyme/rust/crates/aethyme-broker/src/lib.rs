@@ -55,6 +55,7 @@ mod issue_form;
 mod lease_export;
 mod leases;
 pub mod main_reconcile;
+mod measurement;
 mod merge;
 mod operations;
 pub mod plugin_cli;
@@ -323,6 +324,9 @@ pub use repository_contract::{
     CANONICAL_REPOSITORY_MARKER_PATH, LOCAL_REPOSITORY_MARKER_PATH, RepositoryContract,
     RepositoryDeploymentMode, detect_repository_mode, repository_managed_paths,
     repository_state_digest,
+};
+pub use measurement::{
+    BudgetVerdict, MeasuredTotal, SizeRecord, SizeRecords, SizeScan, budget_verdict,
 };
 pub use reclaim_order::{
     ReclaimOrder, ReclaimRanking, clears_budget, deficit_bytes,

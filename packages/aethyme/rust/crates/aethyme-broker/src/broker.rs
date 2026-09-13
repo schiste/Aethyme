@@ -887,8 +887,18 @@ pub struct CleanupPlan {
     pub eligible_worktree_count: usize,
     pub retained_branch_count: usize,
     pub eligible_branch_count: usize,
+    /// Sum over worktrees whose size is known. A floor when
+    /// `unmeasured_worktree_count` is non-zero -- read that before treating
+    /// this as a total.
     pub estimated_retained_bytes: u64,
     pub estimated_reclaimable_bytes: u64,
+    /// Retained worktrees nobody has ever walked. Always `0` after a
+    /// [`SizeScan::Measure`](crate::SizeScan) pass, which measures everything
+    /// it lists.
+    pub unmeasured_worktree_count: usize,
+    /// The oldest recorded measurement that went into the totals, so a reader
+    /// can tell a fresh figure from one assembled out of stale records.
+    pub sizes_measured_at_ms: Option<i64>,
     pub worktrees: Vec<CleanupWorktreePlan>,
 }
 
@@ -903,6 +913,8 @@ impl Default for CleanupPlan {
             eligible_branch_count: 0,
             estimated_retained_bytes: 0,
             estimated_reclaimable_bytes: 0,
+            unmeasured_worktree_count: 0,
+            sizes_measured_at_ms: None,
             worktrees: Vec::new(),
         }
     }
@@ -939,6 +951,16 @@ pub struct CleanupRetention {
     /// megabytes reclaimable against gigabytes retained. That is not a backlog
     /// somebody can work off, so it must not be advised as one.
     pub clears_retained_bytes_budget: bool,
+    /// What the byte totals above are actually able to conclude about the
+    /// budget. Status reads recorded sizes rather than walking the disk, so
+    /// its total is a floor, and a floor answers "over budget" but not "within
+    /// budget" -- the bytes it skipped are exactly the ones that would decide
+    /// (#176).
+    pub budget_verdict: crate::BudgetVerdict,
+    /// Retained worktrees whose size nobody has measured yet.
+    pub unmeasured_worktree_count: usize,
+    /// The oldest measurement behind these totals.
+    pub sizes_measured_at_ms: Option<i64>,
     pub oldest_closed_age_days: u64,
     pub closed_worktrees_policy_days: u32,
     pub severity: StatusAdviceSeverity,
@@ -5476,12 +5498,38 @@ impl Broker {
                     format!(
                         "budget deficit: {} bytes ({})",
                         cleanup_retention.retained_bytes_deficit,
-                        if !cleanup_retention.over_retained_bytes_budget {
-                            "within budget"
-                        } else if cleanup_retention.clears_retained_bytes_budget {
-                            "reclaimable work closes the gap"
+                        match cleanup_retention.budget_verdict {
+                            crate::BudgetVerdict::Unset => "no budget configured",
+                            crate::BudgetVerdict::Within => "within budget",
+                            crate::BudgetVerdict::Unknown =>
+                                "unknown: part of the total was never measured",
+                            crate::BudgetVerdict::Over
+                                if cleanup_retention.clears_retained_bytes_budget =>
+                                "reclaimable work closes the gap",
+                            crate::BudgetVerdict::Over =>
+                                "not closable by reclaiming eligible worktrees",
+                        }
+                    ),
+                    // Status never walks the trees, so it has to say which of
+                    // its numbers are measurements and which are floors.
+                    // Reporting a floor as a total is how a budget reads as
+                    // satisfied because nobody looked (#176).
+                    format!(
+                        "size measurement: {}{}",
+                        if cleanup_retention.unmeasured_worktree_count == 0 {
+                            "complete".to_string()
                         } else {
-                            "not closable by reclaiming eligible worktrees"
+                            format!(
+                                "{} worktree(s) never sized, so byte totals are a floor",
+                                cleanup_retention.unmeasured_worktree_count
+                            )
+                        },
+                        match cleanup_retention.sizes_measured_at_ms {
+                            Some(measured_at) => format!(
+                                "; oldest measurement {} days old",
+                                now_ms.saturating_sub(measured_at).max(0) / 86_400_000
+                            ),
+                            None => String::new(),
                         }
                     ),
                     format!(
@@ -7419,6 +7467,22 @@ impl Broker {
         &self,
         session: &Session,
     ) -> Result<Option<CleanupWorktreePlan>, BrokerOpError> {
+        let mut records = crate::measurement::SizeRecords::default();
+        self.cleanup_item_scanned(session, crate::SizeScan::Measure, &mut records)
+    }
+
+    /// One retained worktree, sized according to `scan`.
+    ///
+    /// `estimated_bytes: None` already meant "the broker does not know", so a
+    /// recorded-size pass reuses it rather than inventing a second way to say
+    /// so. Everything else here -- git dirtiness, ancestry, provenance -- is
+    /// milliseconds and runs either way; the walk is the whole cost (#176).
+    fn cleanup_item_scanned(
+        &self,
+        session: &Session,
+        scan: crate::SizeScan,
+        records: &mut crate::measurement::SizeRecords,
+    ) -> Result<Option<CleanupWorktreePlan>, BrokerOpError> {
         let worktree_path = PathBuf::from(&session.worktree_path);
         let worktree_present = worktree_path.exists();
         let branch_ref = format!("refs/heads/{}", session.branch);
@@ -7426,10 +7490,19 @@ impl Broker {
         if !worktree_present && branch_tip.is_none() {
             return Ok(None);
         }
-        let estimated_bytes = if worktree_present {
-            directory_size_without_following_links(&worktree_path).ok()
-        } else {
+        let estimated_bytes = if !worktree_present {
+            // Nothing on disk is a measured zero, not an unknown.
             Some(0)
+        } else if scan.measures() {
+            let measured = directory_size_without_following_links(&worktree_path).ok();
+            if let Some(bytes) = measured {
+                records.record(&session.worktree_path, bytes, now_ms());
+            }
+            measured
+        } else {
+            records
+                .get(&session.worktree_path)
+                .map(|record| record.bytes)
         };
         let (mut disposition, mut reason, provenance) =
             if !self.is_broker_owned_worktree(session, &worktree_path) {
@@ -7513,40 +7586,145 @@ impl Broker {
 
     /// Read-only inventory of retained broker-owned worktrees belonging to
     /// sessions that are already closed in broker state.
+    ///
+    /// Walks and sizes every retained worktree. This is the expensive path and
+    /// the only one whose digest may authorize a removal.
     pub fn cleanup_plan(&self) -> Result<CleanupPlan, BrokerOpError> {
+        self.cleanup_plan_scanned(crate::SizeScan::Measure)
+    }
+
+    /// The same inventory, assembled from sizes an earlier walk recorded.
+    ///
+    /// This is what `broker status` and `doctor` use. It touches no worktree
+    /// contents, so its byte totals omit anything never measured -- read
+    /// `unmeasured_worktree_count` before reporting them as totals -- and it
+    /// carries no digest, because a plan that does not know how big things are
+    /// must not be able to authorize removing them.
+    ///
+    /// Before returning it spends `routine_size_budget_ms` measuring at most
+    /// one directory, so the records fill in over successive routine checks
+    /// instead of waiting for somebody to run `gc plan` (#176).
+    pub fn cleanup_plan_recorded(&self) -> Result<CleanupPlan, BrokerOpError> {
+        let plan = self.cleanup_plan_scanned(crate::SizeScan::Recorded)?;
+        self.warm_one_size_record(&plan)?;
+        Ok(plan)
+    }
+
+    pub(crate) fn cleanup_plan_scanned(
+        &self,
+        scan: crate::SizeScan,
+    ) -> Result<CleanupPlan, BrokerOpError> {
         let mut plan = CleanupPlan::default();
+        let mut records = crate::measurement::load_size_records(&self.main_root);
+        let mut retained = crate::MeasuredTotal::default();
+        let mut reclaimable = crate::MeasuredTotal::default();
+        let mut known = std::collections::BTreeSet::new();
         for session in self.store.cleaned_sessions()? {
             if session.origin != SessionOrigin::Spawned {
                 continue;
             }
-            let Some(item) = self.cleanup_item(&session)? else {
+            let Some(item) = self.cleanup_item_scanned(&session, scan, &mut records)? else {
                 continue;
             };
+            known.insert(item.worktree_path.clone());
             if item.worktree_present {
                 plan.retained_worktree_count += 1;
             }
             if item.branch_tip.is_some() {
                 plan.retained_branch_count += 1;
             }
-            plan.estimated_retained_bytes = plan
-                .estimated_retained_bytes
-                .saturating_add(item.estimated_bytes.unwrap_or(0));
-            if item.eligible() {
+            let measured_at = records
+                .get(&item.worktree_path)
+                .map(|record| record.measured_at_ms);
+            let eligible = item.eligible();
+            match (item.estimated_bytes, measured_at) {
+                // A worktree that is gone contributes a known zero and no
+                // record; there was nothing to walk.
+                (Some(bytes), None) => {
+                    retained.add_measured(bytes, i64::MAX);
+                    if eligible {
+                        reclaimable.add_measured(bytes, i64::MAX);
+                    }
+                }
+                (Some(bytes), Some(at)) => {
+                    retained.add_measured(bytes, at);
+                    if eligible {
+                        reclaimable.add_measured(bytes, at);
+                    }
+                }
+                (None, _) => {
+                    retained.add_unmeasured();
+                    if eligible {
+                        reclaimable.add_unmeasured();
+                    }
+                }
+            }
+            if eligible {
                 if item.worktree_present {
                     plan.eligible_worktree_count += 1;
                 }
                 if item.branch_tip.is_some() {
                     plan.eligible_branch_count += 1;
                 }
-                plan.estimated_reclaimable_bytes = plan
-                    .estimated_reclaimable_bytes
-                    .saturating_add(item.estimated_bytes.unwrap_or(0));
             }
             plan.worktrees.push(item);
         }
-        let bytes = serde_json::to_vec(&plan)?;
-        plan.digest = format!("{:x}", Sha256::digest(bytes));
+        plan.estimated_retained_bytes = retained.bytes;
+        plan.estimated_reclaimable_bytes = reclaimable.bytes;
+        plan.unmeasured_worktree_count = retained.unmeasured;
+        if scan.measures() {
+            // Only a pass that enumerated everything may prune: a routine
+            // check sees whatever subset it asked about.
+            records.retain_paths(&known);
+            let _ = crate::measurement::save_size_records(&self.main_root, &records);
+            let bytes = serde_json::to_vec(&plan)?;
+            plan.digest = format!("{:x}", Sha256::digest(bytes));
+        }
+        // Set after the digest, deliberately. The digest is what an operator
+        // confirms and what `cleanup_cleaned_worktrees` re-plans to match, so
+        // it must cover what would be removed and nothing else. *When* the
+        // sizes were taken is a reporting field; hashing it would make every
+        // plan's digest unique to the instant it was built and no confirmation
+        // could ever match (#176).
+        plan.sizes_measured_at_ms = retained
+            .oldest_measured_at_ms
+            .filter(|oldest| *oldest != i64::MAX);
         Ok(plan)
+    }
+
+    /// Measure one directory the broker has never sized, or whose recorded
+    /// size has aged out, and write the result down.
+    ///
+    /// Bounded to one directory and to `routine_size_budget_ms`, because the
+    /// caller is a routine check. A measurement that does not finish inside
+    /// the budget records nothing: a partial sum written down as a size would
+    /// be indistinguishable from a real one afterwards.
+    fn warm_one_size_record(&self, plan: &CleanupPlan) -> Result<(), BrokerOpError> {
+        let policy = crate::load_retention_policy(&self.main_root)?;
+        let mut records = crate::measurement::load_size_records(&self.main_root);
+        let paths = plan
+            .worktrees
+            .iter()
+            .filter(|item| item.worktree_present)
+            .map(|item| item.worktree_path.clone())
+            .collect::<Vec<_>>();
+        let ttl_ms = i64::from(policy.size_record_ttl_hours).saturating_mul(3_600_000);
+        let Some(path) = records.next_to_measure(&paths, now_ms(), ttl_ms) else {
+            return Ok(());
+        };
+        // No explicit test for `routine_size_budget_ms == 0`: a walk checks the
+        // deadline before its first `read_dir`, so a zero budget cannot
+        // complete a measurement and nothing is ever recorded. An early return
+        // here would say the same thing twice, and only one of the two could
+        // be falsified by a test.
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_millis(policy.routine_size_budget_ms);
+        let Some(bytes) = directory_size_bounded(Path::new(&path), deadline) else {
+            return Ok(());
+        };
+        records.record(&path, bytes, now_ms());
+        let _ = crate::measurement::save_size_records(&self.main_root, &records);
+        Ok(())
     }
 
     /// Remove every currently eligible worktree from a read-only cleanup
@@ -7588,8 +7766,14 @@ impl Broker {
         })
     }
 
+    /// The retention picture `broker status` shows.
+    ///
+    /// Deliberately the recorded-size path. Status is the mandated first step
+    /// of every session, so it runs constantly; sizing every retained worktree
+    /// here is what made the routine check and the five-minute audit the same
+    /// code (#176).
     fn cleanup_retention(&self, now_ms: i64) -> Result<CleanupRetention, BrokerOpError> {
-        let plan = self.cleanup_plan()?;
+        let plan = self.cleanup_plan_recorded()?;
         let policy = crate::load_retention_policy(&self.main_root)?;
         let oldest_closed_at = self
             .store
@@ -7614,10 +7798,20 @@ impl Broker {
         let estimated_blocked_bytes = plan
             .estimated_retained_bytes
             .saturating_sub(plan.estimated_reclaimable_bytes);
-        let over_retained_bytes_budget = crate::reclaim_order::over_budget(
-            plan.estimated_retained_bytes,
-            policy.retained_bytes_budget,
-        );
+        let retained_total = crate::MeasuredTotal {
+            bytes: plan.estimated_retained_bytes,
+            measured: plan
+                .worktrees
+                .len()
+                .saturating_sub(plan.unmeasured_worktree_count),
+            unmeasured: plan.unmeasured_worktree_count,
+            oldest_measured_at_ms: plan.sizes_measured_at_ms,
+        };
+        let budget_verdict = crate::budget_verdict(&retained_total, policy.retained_bytes_budget);
+        // Only `Over` asserts that the budget is broken. A floor under the
+        // budget is not a pass -- the bytes it skipped are exactly the ones
+        // that would have decided it.
+        let over_retained_bytes_budget = budget_verdict.exceeded();
         Ok(CleanupRetention {
             broker_owned_worktree_count: plan.retained_worktree_count,
             retained_session_branch_count: plan.retained_branch_count,
@@ -7636,6 +7830,9 @@ impl Broker {
                 policy.retained_bytes_budget,
                 plan.estimated_reclaimable_bytes,
             ),
+            budget_verdict,
+            unmeasured_worktree_count: plan.unmeasured_worktree_count,
+            sizes_measured_at_ms: plan.sizes_measured_at_ms,
             oldest_closed_age_days,
             closed_worktrees_policy_days: policy.closed_worktrees_days,
             severity,
@@ -7748,6 +7945,35 @@ pub(crate) fn directory_size_without_following_links(path: &Path) -> std::io::Re
         total = total.saturating_add(directory_size_without_following_links(&entry?.path())?);
     }
     Ok(total)
+}
+
+/// Size a tree, abandoning the walk when `deadline` passes.
+///
+/// `None` means the budget ran out. A partial sum is deliberately not
+/// returned: written to the size records it would be a wrong number that
+/// outlives the walk that produced it, and there is no way to tell it apart
+/// from a real one afterwards. A routine check that cannot finish a
+/// measurement learns nothing, which is the honest outcome.
+pub(crate) fn directory_size_bounded(path: &Path, deadline: std::time::Instant) -> Option<u64> {
+    fn walk(path: &Path, deadline: std::time::Instant) -> Option<u64> {
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        let metadata = std::fs::symlink_metadata(path).ok()?;
+        if metadata.file_type().is_symlink() {
+            return Some(0);
+        }
+        if metadata.is_file() {
+            return Some(metadata.len());
+        }
+        let mut total = 0_u64;
+        for entry in std::fs::read_dir(path).ok()? {
+            let Ok(entry) = entry else { continue };
+            total = total.saturating_add(walk(&entry.path(), deadline)?);
+        }
+        Some(total)
+    }
+    walk(path, deadline)
 }
 
 pub(crate) fn plural_word(
@@ -7961,14 +8187,38 @@ fn cleanup_retention_warning(retention: &CleanupRetention) -> Option<String> {
         // Naming the deficit rather than the total is what makes this
         // actionable, and saying when reclamation cannot close it stops the
         // warning from recommending work that would not help (#176).
-        if retention.clears_retained_bytes_budget {
+        //
+        // A floor proves the budget is broken -- unmeasured bytes are still
+        // bytes -- but it cannot prove the gap is closable: everything nobody
+        // walked counts against the deficit and none of it is known to be
+        // reclaimable. So an incomplete measurement may report the breach and
+        // must not promise the cure.
+        if retention.unmeasured_worktree_count > 0 {
             format!(
-                "retained broker storage is {} bytes over the configured {} byte budget; reclaiming eligible worktrees would clear it -- review `aethyme broker gc plan`",
+                "retained broker storage is at least {} bytes over the configured {} byte budget, \
+                 and {} retained {} never been sized -- measure first with \
+                 `aethyme broker gc plan`",
+                retention.retained_bytes_deficit,
+                retention.retained_bytes_budget,
+                retention.unmeasured_worktree_count,
+                if retention.unmeasured_worktree_count == 1 {
+                    "worktree has"
+                } else {
+                    "worktrees have"
+                }
+            )
+        } else if retention.clears_retained_bytes_budget {
+            format!(
+                "retained broker storage is {} bytes over the configured {} byte budget; \
+                 reclaiming eligible worktrees would clear it -- review \
+                 `aethyme broker gc plan`",
                 retention.retained_bytes_deficit, retention.retained_bytes_budget
             )
         } else {
             format!(
-                "retained broker storage is {} bytes over the configured {} byte budget and only {} bytes are reclaimable; the budget cannot be met by cleanup alone -- review `aethyme broker gc plan`",
+                "retained broker storage is {} bytes over the configured {} byte budget and only \
+                 {} bytes are reclaimable; the budget cannot be met by cleanup alone -- review \
+                 `aethyme broker gc plan`",
                 retention.retained_bytes_deficit,
                 retention.retained_bytes_budget,
                 retention.estimated_reclaimable_bytes
@@ -9048,6 +9298,9 @@ mod tests {
             over_retained_bytes_budget: true,
             retained_bytes_deficit: 1024,
             clears_retained_bytes_budget: false,
+            budget_verdict: crate::BudgetVerdict::Over,
+            unmeasured_worktree_count: 0,
+            sizes_measured_at_ms: None,
             oldest_closed_age_days: 1,
             closed_worktrees_policy_days: 7,
             severity: super::StatusAdviceSeverity::Warning,
@@ -9064,6 +9317,16 @@ mod tests {
         let backlog = super::cleanup_retention_warning(&retention).unwrap();
         assert!(backlog.contains("would clear it"));
         assert!(!backlog.contains("cannot be met"));
+
+        // A floor may report the breach and must not promise the cure: the
+        // bytes nobody walked all count against the deficit and none of them
+        // are known to be reclaimable.
+        retention.unmeasured_worktree_count = 2;
+        let floor = super::cleanup_retention_warning(&retention).unwrap();
+        assert!(floor.contains("at least 1024 bytes over"));
+        assert!(floor.contains("2 retained worktrees have never been sized"));
+        assert!(!floor.contains("would clear it"));
+        retention.unmeasured_worktree_count = 0;
 
         // Within budget there is nothing to warn about at all.
         retention.over_retained_bytes_budget = false;
@@ -9112,6 +9375,9 @@ mod tests {
                 retained_bytes_deficit: 0,
                 clears_retained_bytes_budget: true,
                 reclaim_order: crate::ReclaimOrder::OldestFirst,
+                budget_verdict: crate::BudgetVerdict::Within,
+                unmeasured_directory_count: 0,
+                sizes_measured_at_ms: None,
                 blockers: 0,
             },
             integration_movement: None,

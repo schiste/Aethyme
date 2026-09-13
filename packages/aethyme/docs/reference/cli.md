@@ -986,6 +986,8 @@ session_abandoned_after_hours = 72
 artifact_sweep_budget_ms = 5000
 artifact_sweep_interval_hours = 24
 startup_budget_ms = 25
+routine_size_budget_ms = 200
+size_record_ttl_hours = 24
 ```
 
 `retained_bytes_budget` is a soft, non-blocking budget used by status, doctor,
@@ -1051,6 +1053,60 @@ Both reporting fields are excluded from the authorization digest, like the other
 byte totals. The *ordering* is not: it changes the candidate lists, so a plan
 that crosses the budget threshold produces a different digest and has to be
 re-confirmed.
+
+### The routine check and the expensive audit
+
+Sizing a directory has no shortcut: the filesystem stores no subtree total, so
+every byte figure costs a full recursive walk. On the machine that motivated
+this work that walk covered about 96 GB and `gc plan --json` took over five
+minutes. The problem was not the walk. It was that `broker status` — the
+mandated first step of every session — reached the same walk through the same
+code, so the routine check and the expensive audit were one path wearing two
+names.
+
+They are now two paths.
+
+**The expensive audit** is `gc plan`, `gc apply`, and `cleanup --apply`. It
+walks every retained worktree, build cache and orphaned root, and writes each
+measured size to `.aethyme/worktree-sizes.json`. Its totals are measurements and
+it alone produces an authorization digest.
+
+**The routine check** is `broker status`, `broker doctor`, `broker certify` and
+the verify loop. It reads those records and walks nothing. Counts, dispositions,
+git state and provenance are exact as before — only the byte totals come from
+records, because only they were ever expensive. A routine plan carries no
+digest: a plan that does not know how big things are must not be able to
+authorize removing them.
+
+Records warm themselves so this does not depend on somebody remembering to run
+the audit. Each routine check spends up to `routine_size_budget_ms` (default
+200, maximum 250) measuring exactly one directory that has never been sized, or
+whose record is older than `size_record_ttl_hours` (default 24). A directory too
+large to measure in that budget is left unmeasured rather than recorded from a
+partial walk — a truncated sum written down would be a wrong number that
+outlives the walk that produced it, and nothing afterwards could tell it from a
+real one. Set `routine_size_budget_ms = 0` to disable warming entirely, which
+freezes routine totals at whatever the last audit recorded.
+
+**Reading a routine total.** `unmeasured_directory_count` is how many retained
+worktrees and orphaned roots contributed no bytes. When it is non-zero the byte
+totals are a *floor*, not a total, and `budget_verdict` says what that floor can
+conclude:
+
+| verdict | meaning |
+| --- | --- |
+| `over` | the floor already exceeds the budget; unmeasured bytes could only add to it, so the breach is proven |
+| `within` | everything was measured and the total is under the budget |
+| `unknown` | the floor is under the budget but something was never sized — the skipped bytes are exactly the ones that would decide it |
+| `unset` | `retained_bytes_budget = 0`, so there is no question to answer |
+
+The verdict is deliberately one-sided. An incomplete measurement may report a
+breach and must never report a pass: a floor read as a total is how a budget
+comes to read as satisfied because nobody looked. `over_retained_bytes_budget`
+is raised only by `over`, so `unknown` never fires a false alarm either; status
+and doctor say plainly that the question is open and point at `gc plan`.
+`sizes_measured_at_ms` carries the oldest measurement behind the totals, so a
+fresh figure is distinguishable from one assembled out of month-old records.
 
 ### Directories no session claims
 

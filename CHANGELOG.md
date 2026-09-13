@@ -127,6 +127,35 @@ artifacts and their exact source revision are recorded in each signed
 
 ### Changed
 
+- `broker status`, `doctor`, `certify` and the verify loop no longer walk the
+  disk. Sizing a directory has no shortcut — the filesystem stores no subtree
+  total — so every byte figure costs a full recursive walk, and status reached
+  that walk through the same code as `gc plan`. On the dogfood machine that
+  shared path covered about 96 GB and took over five minutes (#176), on the
+  command every session is told to run first.
+
+  The expensive walk now belongs to `gc plan`, `gc apply` and `cleanup --apply`
+  alone, and records each measured size to `.aethyme/worktree-sizes.json`. The
+  routine commands read those records. Counts, dispositions, git state and
+  provenance are exact as before; only byte totals come from records, because
+  only they were ever expensive. Records warm themselves: each routine check
+  spends up to `routine_size_budget_ms` (default 200, max 250) measuring one
+  directory that has never been sized or whose record is older than
+  `size_record_ttl_hours` (default 24), so a machine nobody audits converges on
+  knowing its own size. A directory too large for that budget stays unmeasured
+  rather than being recorded from a partial walk.
+
+  Plans now report `unmeasured_directory_count`, `sizes_measured_at_ms` and
+  `budget_verdict`. When something was never sized the byte totals are a floor,
+  and the verdict is one-sided on purpose: `over` is trustworthy because
+  unmeasured bytes could only add to the total, while a floor *under* the budget
+  reports `unknown` rather than passing. A floor read as a total is how a budget
+  comes to read as satisfied because nobody looked. `over_retained_bytes_budget`
+  is raised only by `over`, so the cheap path raises no false alarms either.
+
+  A routine plan carries no authorization digest: a plan that does not know how
+  big things are must not be able to authorize removing them. `gc apply` still
+  requires a digest from the full audit.
 - Broker database schema v37 adds `waived` to the `review_requests.state` CHECK
   constraint, which SQLite can only do by rebuilding the table. A reader that
   matches the six previous states exhaustively must handle a seventh; treating
