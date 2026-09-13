@@ -481,11 +481,18 @@ Usage:
       queue attestations and per-SHA unrecorded-commit dispositions. The
       template option atomically writes a no-clobber schema-v2 document with
       exact identifiers and deliberately invalid null operator judgments.
-  aethyme broker status [--json]
+  aethyme broker status [--json] [--summary]
       The whole picture: agents, overlaps, promoted conflicts, merge
       queue, integration head. Session records are reported under the
       `agents` key; the id every `--session <id>` flag expects is
       `agents[].id`. There is no `sessions` key.
+      --summary prints only `summary` and `advice`, and skips the
+      per-session diff that dominates the full view's cost. Prefer it for
+      the orientation step at the start of a session: it is cheap, and
+      small enough that truncating it does not yield unparseable JSON.
+      Its `overlap_count` is as of the last refresh, which it reports as
+      `leases_refreshed: false`; use the full view when lease truth must
+      be current.
   aethyme broker events [--since <id>] [--kind <prefix>] [--follow] [--json]
       Show the append-only event log (see docs/events-contract.md).
       --kind filters by prefix (e.g. merge. or lease.overlap); --follow
@@ -1770,6 +1777,8 @@ impl<E: std::fmt::Display> From<E> for UsageError {
 #[derive(Clone)]
 struct Parsed {
     read_only_snapshot: bool,
+    /// `status --summary`: skip the per-session lease refresh (#182).
+    summary: bool,
     positional: Vec<String>,
     task: Option<String>,
     cmd: Option<String>,
@@ -1863,6 +1872,7 @@ struct Parsed {
 fn parse(args: &[String]) -> Result<Parsed, UsageError> {
     let mut parsed = Parsed {
         read_only_snapshot: false,
+        summary: false,
         positional: Vec::new(),
         task: None,
         cmd: None,
@@ -1956,6 +1966,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
                 break;
             }
             "--json" => parsed.json = true,
+            "--summary" => parsed.summary = true,
             "--follow" => parsed.follow = true,
             "--since" => {
                 let value = iter
@@ -10424,6 +10435,19 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
         }
         "status" => {
             let mut broker = open_broker(parsed.read_only_snapshot)?;
+            // The mandated first step of every session, so its cost is a tax
+            // on every agent. `--summary` skips the per-session diff that
+            // dominates it and prints only what that step is read for (#182).
+            if parsed.summary {
+                let brief = broker.status_brief(now_ms())?;
+                if parsed.json {
+                    out!("{}", serde_json::to_string_pretty(&brief)?);
+                } else {
+                    out!("{}", brief.summary.message);
+                    render_status_advice(&brief.advice);
+                }
+                return Ok(());
+            }
             let status = if parsed.read_only_snapshot {
                 broker.status_snapshot(now_ms())?
             } else {

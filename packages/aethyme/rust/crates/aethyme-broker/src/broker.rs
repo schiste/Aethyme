@@ -1002,6 +1002,31 @@ pub struct StatusView {
     pub cleanup_retention: CleanupRetention,
 }
 
+/// The two fields an agent needs before it starts work, without the
+/// per-session diff that dominates the cost of the full view.
+///
+/// `CLAUDE.md` in a consuming repository mandates `broker status` as the first
+/// step of every session, which makes its cost a tax on every agent. The
+/// expensive part is recomputing implicit leases: that walks each live
+/// session's worktree with two git subprocesses, so it scales with accumulated
+/// worktree state rather than with anything the caller asked for -- worst
+/// exactly when a fleet is busiest. A reporter measured 2m54s at 19 live
+/// sessions, of which only 6.2s was user time (#182).
+///
+/// This is also small enough to truncate safely. The full document was 377867
+/// bytes in that report, so piping it through `head` is a well-founded reflex
+/// that silently yields unparseable JSON.
+#[derive(Debug, serde::Serialize)]
+pub struct StatusBrief {
+    pub summary: StatusSummary,
+    pub advice: Vec<StatusAdvice>,
+    /// Always false, and serialized rather than implied: `overlap_count` and
+    /// `dirty_sessions` here are as of the last refresh by any command, not as
+    /// of this call. A caller that needs current lease truth wants the full
+    /// view, and should be able to see which one it got.
+    pub leases_refreshed: bool,
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct StatusSummary {
     pub message: String,
@@ -5019,6 +5044,31 @@ impl Broker {
         )?;
         view.advisory_delivery = self.store.advisory_delivery_summary()?;
         Ok(view)
+    }
+
+    /// `status` minus the implicit-lease refresh: the fast path behind
+    /// `broker status --summary` (#182).
+    ///
+    /// Liveness is still derived and still persisted, so the event timeline
+    /// keeps recording stale-session transitions and a cheap call does not
+    /// create a blind spot. Only the per-session diff is skipped, because that
+    /// is both the expensive part and the part a caller reading `summary` and
+    /// `advice` does not consume. Overlap counts therefore come from the last
+    /// refresh -- `leases_refreshed: false` says so in the output.
+    ///
+    /// Outstanding advisories are deliberately not marked as shown: this view
+    /// does not render them, and recording a delivery that never happened
+    /// would corrupt the shown-to-action correlation.
+    pub fn status_brief(&mut self, now_ms: i64) -> Result<StatusBrief, BrokerOpError> {
+        let overlaps = self.lease_overlaps_snapshot()?;
+        let agents = self.agents(now_ms)?;
+        let integration = self.integration_head()?;
+        let view = self.build_status(agents, overlaps, integration, now_ms)?;
+        Ok(StatusBrief {
+            summary: view.summary,
+            advice: view.advice,
+            leases_refreshed: false,
+        })
     }
 
     /// Render the same status contract from persisted state and derived

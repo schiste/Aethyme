@@ -1693,3 +1693,71 @@ fn adopting_a_worktree_with_pre_existing_commits_says_they_are_not_owned() {
         "the warning must name a remedy: {warning}"
     );
 }
+
+/// Issue #182. `broker status` is the mandated first step of every session, so
+/// its cost is a tax on every agent -- measured at 2m54s with 19 live
+/// sessions, of which only 6.2s was user time. The system time is the
+/// implicit-lease refresh: two git subprocesses per live session, each walking
+/// a worktree, so the cost scales with accumulated worktree state rather than
+/// with anything the caller asked for.
+///
+/// The observable contract is that `status_brief` does not recompute implicit
+/// leases. Asserting on the lease rows rather than on elapsed time keeps this
+/// from being a flaky benchmark: the refresh is what costs, so not having run
+/// it is the property worth pinning.
+#[test]
+fn status_brief_skips_the_implicit_lease_refresh() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let session = broker.adopt(tmp.path(), Some("brief task")).unwrap();
+    std::fs::write(tmp.path().join("README.md"), "edited, uncommitted\n").unwrap();
+    assert!(broker.store().active_leases().unwrap().is_empty());
+
+    let brief = broker.status_brief(now_ms()).unwrap();
+    assert!(
+        !brief.leases_refreshed,
+        "the cheap path must report that its lease counts are not current"
+    );
+    assert!(
+        broker.store().active_leases().unwrap().is_empty(),
+        "status_brief recomputed implicit leases, which is the expensive work \
+         it exists to skip"
+    );
+    assert_eq!(brief.summary.live_sessions, 1);
+
+    // The full view is what refreshes, so the fixture is genuinely one that
+    // *would* have produced a lease. Without this the assertion above would
+    // also pass against a repository that simply had nothing to claim.
+    broker.status(now_ms()).unwrap();
+    let refreshed = broker.store().active_leases().unwrap();
+    assert!(
+        refreshed.iter().any(|lease| lease.path == "README.md"),
+        "expected the full view to derive an implicit lease: {refreshed:?}"
+    );
+    assert_eq!(refreshed[0].session_id, session.id);
+}
+
+/// What separates this from the existing `status_snapshot`: liveness is still
+/// derived *and persisted*, so a cheap orientation call does not create a blind
+/// spot in the event timeline. Only the per-session diff is skipped.
+#[test]
+fn status_brief_still_records_liveness_transitions() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let session = broker.adopt(tmp.path(), Some("liveness task")).unwrap();
+    assert_eq!(
+        broker.store().session(session.id).unwrap().status,
+        SessionStatus::Active
+    );
+
+    let week = now_ms() + 7 * 24 * 60 * 60 * 1_000;
+    let brief = broker.status_brief(week).unwrap();
+    assert_eq!(brief.summary.stale_sessions, 1);
+    assert_eq!(
+        broker.store().session(session.id).unwrap().status,
+        SessionStatus::Stale,
+        "the transition must be persisted, unlike status_snapshot"
+    );
+}

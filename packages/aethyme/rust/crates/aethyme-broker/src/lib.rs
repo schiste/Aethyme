@@ -139,8 +139,8 @@ pub use broker::{
     SemanticGateSelection, SemanticGateSource, SemanticGateSourceStatus,
     SemanticGateSuggestionChain, SessionCheckpointApplyReport, SessionCheckpointRecoveryPlan,
     SessionHandoffReport, SessionStartBase, SessionStartBaseEvidence, StartAgentReport,
-    StartReport, StatusAdvice, StatusAdviceSeverity, StatusIntegrationRelation, StatusSummary,
-    StatusView, VersionRepairReport, VersionRepairStep, WORKTREE_ROOT_SCHEMA_VERSION,
+    StartReport, StatusAdvice, StatusAdviceSeverity, StatusBrief, StatusIntegrationRelation,
+    StatusSummary, StatusView, VersionRepairReport, VersionRepairStep, WORKTREE_ROOT_SCHEMA_VERSION,
     WorktreePlacement, WorktreeRootPlan, WorktreeRootSource,
 };
 pub use console::{
