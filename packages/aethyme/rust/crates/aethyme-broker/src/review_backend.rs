@@ -34,7 +34,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::chau7_tabs::{Chau7Tab, workspace_tab_ids};
 use crate::review_execution::Chau7Teardown;
-use crate::review_ledger::ReviewRequest;
+use crate::review_ledger::{RefusalClass, ReviewRequest};
 use crate::review_report::ReviewReportingPolicy;
 use crate::review_trigger::ReviewType;
 
@@ -72,6 +72,19 @@ pub struct ReviewRoute {
     /// repository. `0` means unbounded.
     #[serde(default = "default_max_concurrent")]
     pub max_concurrent: u32,
+    /// Where this review goes when its own backend refuses, keyed by why.
+    ///
+    /// Empty by default, and that is the whole safety story: a repository that
+    /// declares nothing keeps exactly today's behaviour. An edge here is an
+    /// operator saying "when the provider is spent, this dimension is worth
+    /// paying a local agent for" -- a sentence only they can say, because only
+    /// they know what that compute costs them (#175).
+    ///
+    /// Consulted only for a *classified* refusal. An `unknown` refusal is a
+    /// scrape the classifier could not read, and spending an agent slot on a
+    /// guess is the one outcome worse than leaving the gate stated-but-unclear.
+    #[serde(default)]
+    pub on_refusal: BTreeMap<RefusalClass, ReviewFallback>,
     /// How long an unfinished review of this type may hold a slot before the
     /// router gives up on it and asks again. `0` means never.
     ///
@@ -104,8 +117,54 @@ impl Default for ReviewRoute {
             backend: ReviewBackend::Record,
             mention: None,
             instructions: None,
+            on_refusal: BTreeMap::new(),
             max_concurrent: default_max_concurrent(),
             stale_after_minutes: default_stale_after_minutes(),
+        }
+    }
+}
+
+/// Where a review goes when its declared backend refuses.
+///
+/// Deliberately not a [`ReviewRoute`]: a fallback has no fallback of its own.
+/// Making that a property of the type rather than a depth check means no
+/// configuration can describe a chain, so nothing has to decide at runtime
+/// where to cut one off. One hop is also all the problem needs -- the point is
+/// an escape hatch from a spent provider, not a cascade.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewFallback {
+    pub backend: ReviewBackend,
+    /// Who to mention, for [`ReviewBackend::ProviderComment`].
+    #[serde(default)]
+    pub mention: Option<String>,
+    #[serde(default)]
+    pub instructions: Option<String>,
+    /// Slot count for the fallback, independent of the route's own.
+    ///
+    /// Separate because the backends are not interchangeable in cost: two
+    /// concurrent provider mentions are two comments, and two concurrent
+    /// Chau7 reviews are two agents on the operator's machine. A fallback that
+    /// inherited the provider's slot count would inherit a number chosen for
+    /// the cheap case.
+    #[serde(default = "default_max_concurrent")]
+    pub max_concurrent: u32,
+    #[serde(default = "default_stale_after_minutes")]
+    pub stale_after_minutes: u32,
+}
+
+impl ReviewFallback {
+    /// The route this fallback stands in for.
+    ///
+    /// `on_refusal` is empty by construction, which is what stops a chain.
+    fn as_route(&self) -> ReviewRoute {
+        ReviewRoute {
+            backend: self.backend,
+            mention: self.mention.clone(),
+            instructions: self.instructions.clone(),
+            on_refusal: BTreeMap::new(),
+            max_concurrent: self.max_concurrent,
+            stale_after_minutes: self.stale_after_minutes,
         }
     }
 }
@@ -173,6 +232,14 @@ pub enum ReviewRoutingError {
     },
     #[error("{path}: review.routing route {review_type:?} uses provider_comment without `mention`")]
     MentionRequired { path: String, review_type: String },
+    #[error(
+        "{path}: review.routing route {review_type:?} falls back to the same backend it is          escaping on {class:?}; a fallback must differ from the route that refused"
+    )]
+    FallbackIsNoOp {
+        path: String,
+        review_type: String,
+        class: String,
+    },
 }
 
 impl ReviewRoutingPolicy {
@@ -232,12 +299,58 @@ impl ReviewRoutingPolicy {
                     review_type: review_type.clone(),
                 });
             }
+            for (class, fallback) in &route.on_refusal {
+                if fallback.backend == ReviewBackend::ProviderComment && fallback.mention.is_none()
+                {
+                    return Err(ReviewRoutingError::MentionRequired {
+                        path: path.to_string(),
+                        review_type: review_type.clone(),
+                    });
+                }
+                // Escaping to the thing that just refused is not an escape.
+                // It reads as a configured recovery and behaves as a second
+                // refusal, which is worse than declaring nothing: the operator
+                // believes the dimension has an exit.
+                //
+                // The mention is part of the identity, so provider A falling
+                // back to provider B is a real edge and is allowed.
+                if fallback.backend == route.backend && fallback.mention == route.mention {
+                    return Err(ReviewRoutingError::FallbackIsNoOp {
+                        path: path.to_string(),
+                        review_type: review_type.clone(),
+                        class: class.label().to_string(),
+                    });
+                }
+            }
         }
         Ok(())
     }
 
     pub fn route_for(&self, review_type: &str) -> &ReviewRoute {
         self.route.get(review_type).unwrap_or(&self.default_route)
+    }
+
+    /// The declared escape for `review_type` when its backend refused with
+    /// `class`, if the repository declared one.
+    pub fn fallback_for(&self, review_type: &str, class: RefusalClass) -> Option<&ReviewFallback> {
+        self.route_for(review_type).on_refusal.get(&class)
+    }
+
+    /// The route that should actually perform this review.
+    ///
+    /// `refused` is what the *previous* attempt at this exact dimension came
+    /// back with, read from the ledger rather than remembered: a refusal is
+    /// already a durable row, so a dispatcher that restarts between the
+    /// refusal and the retry still takes the same edge (#175).
+    ///
+    /// Owned rather than borrowed because a fallback is not a `ReviewRoute` in
+    /// the policy -- there is no `&ReviewRoute` to hand back.
+    pub fn effective_route(&self, review_type: &str, refused: Option<RefusalClass>) -> ReviewRoute {
+        let route = self.route_for(review_type);
+        match refused.and_then(|class| route.on_refusal.get(&class)) {
+            Some(fallback) => fallback.as_route(),
+            None => route.clone(),
+        }
     }
 
     /// Where a Chau7 review of `review_type` on `pull_request` runs.
@@ -355,6 +468,11 @@ impl ReviewDispatchAction {
 /// running, both observed. Deriving the slot count from observation rather than
 /// from a stored counter is what makes this safe to run after a crash: a
 /// dispatcher that died between deciding and spawning leaves no phantom slot.
+///
+/// `refused` is how the previous attempt at this dimension ended, and selects
+/// a declared `on_refusal` edge when there is one. `None` is both "first
+/// attempt" and "the last one did not refuse", which route identically -- the
+/// edge exists to escape a refusal, so nothing else may take it.
 pub fn dispatch_review(
     policy: &ReviewRoutingPolicy,
     reporting: &ReviewReportingPolicy,
@@ -365,6 +483,7 @@ pub fn dispatch_review(
     head: &str,
     tabs: &[Chau7Tab],
     in_flight: &[InFlightReview],
+    refused: Option<RefusalClass>,
 ) -> ReviewDispatchAction {
     if !policy.enabled {
         return ReviewDispatchAction::RecordOnly {
@@ -372,7 +491,7 @@ pub fn dispatch_review(
             why: "review routing is not enabled for this repository".into(),
         };
     }
-    let route = policy.route_for(review_type);
+    let route = &policy.effective_route(review_type, refused);
     match route.backend {
         ReviewBackend::Record => ReviewDispatchAction::RecordOnly {
             review_type: review_type.to_string(),
@@ -586,6 +705,15 @@ mod tests {
         tabs: &[Chau7Tab],
         in_flight: &[InFlightReview],
     ) -> ReviewDispatchAction {
+        dispatch_after(policy, tabs, in_flight, None)
+    }
+
+    fn dispatch_after(
+        policy: &ReviewRoutingPolicy,
+        tabs: &[Chau7Tab],
+        in_flight: &[InFlightReview],
+        refused: Option<RefusalClass>,
+    ) -> ReviewDispatchAction {
         dispatch_review(
             policy,
             &ReviewReportingPolicy::default(),
@@ -596,6 +724,7 @@ mod tests {
             "abc123",
             tabs,
             in_flight,
+            refused,
         )
     }
 
@@ -1054,6 +1183,237 @@ mention = "codex"
         assert!(matches!(
             ReviewRoutingPolicy::load(temp.path()),
             Err(ReviewRoutingError::UnsupportedSchema { found: 99, .. })
+        ));
+    }
+
+    /// The shape an operator writes for #175: routine review goes to the
+    /// provider, and a spent budget is the one condition that buys an agent.
+    #[test]
+    fn a_declared_refusal_edge_parses_and_routes() {
+        let temp = tempfile::tempdir().unwrap();
+        write_config(
+            temp.path(),
+            "[review.routing]\nenabled = true\n\n\
+             [review.routing.route.code]\nbackend = \"provider_comment\"\nmention = \"codex\"\n\n\
+             [review.routing.route.code.on_refusal.quota_exhausted]\nbackend = \"chau7\"\n",
+        );
+        let policy = ReviewRoutingPolicy::load(temp.path()).unwrap();
+
+        // The declared backend is untouched for a first attempt.
+        assert_eq!(
+            policy.route_for("code").backend,
+            ReviewBackend::ProviderComment
+        );
+        assert_eq!(
+            policy.effective_route("code", None).backend,
+            ReviewBackend::ProviderComment
+        );
+        // And the edge is taken for the class that declared it.
+        assert_eq!(
+            policy
+                .effective_route("code", Some(RefusalClass::QuotaExhausted))
+                .backend,
+            ReviewBackend::Chau7
+        );
+    }
+
+    /// An edge is per class. A rate limit clears itself by waiting, so a
+    /// policy that bought an agent only for a spent budget must not spend one
+    /// on a refusal that a retry would have fixed for free.
+    #[test]
+    fn an_undeclared_refusal_class_keeps_the_declared_backend() {
+        let temp = tempfile::tempdir().unwrap();
+        write_config(
+            temp.path(),
+            "[review.routing]\nenabled = true\n\n\
+             [review.routing.route.code]\nbackend = \"provider_comment\"\nmention = \"codex\"\n\n\
+             [review.routing.route.code.on_refusal.quota_exhausted]\nbackend = \"chau7\"\n",
+        );
+        let policy = ReviewRoutingPolicy::load(temp.path()).unwrap();
+        for class in [
+            RefusalClass::RateLimited,
+            RefusalClass::ProviderError,
+            RefusalClass::Unknown,
+        ] {
+            assert_eq!(
+                policy.effective_route("code", Some(class)).backend,
+                ReviewBackend::ProviderComment,
+                "{class:?} was not declared and must not reroute"
+            );
+        }
+    }
+
+    /// Declaring nothing must change nothing. This is the whole safety
+    /// argument for shipping #175 on by default: an existing repository has no
+    /// `on_refusal` table, so no refusal can ever reroute it.
+    #[test]
+    fn a_policy_with_no_edges_routes_identically_however_it_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        write_config(
+            temp.path(),
+            "[review.routing]\nenabled = true\n\n\
+             [review.routing.route.code]\nbackend = \"provider_comment\"\nmention = \"codex\"\n",
+        );
+        let policy = ReviewRoutingPolicy::load(temp.path()).unwrap();
+        for class in [
+            RefusalClass::QuotaExhausted,
+            RefusalClass::RateLimited,
+            RefusalClass::ProviderError,
+            RefusalClass::Unknown,
+        ] {
+            assert_eq!(
+                &policy.effective_route("code", Some(class)),
+                policy.route_for("code")
+            );
+        }
+    }
+
+    /// Escaping to the backend that just refused is not an escape. Refused at
+    /// load, because the failure is otherwise invisible: the operator sees a
+    /// configured recovery and gets a second refusal.
+    #[test]
+    fn a_fallback_to_the_refusing_backend_is_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        write_config(
+            temp.path(),
+            "[review.routing]\nenabled = true\n\n\
+             [review.routing.route.code]\nbackend = \"provider_comment\"\nmention = \"codex\"\n\n\
+             [review.routing.route.code.on_refusal.quota_exhausted]\n\
+             backend = \"provider_comment\"\nmention = \"codex\"\n",
+        );
+        assert!(matches!(
+            ReviewRoutingPolicy::load(temp.path()),
+            Err(ReviewRoutingError::FallbackIsNoOp { .. })
+        ));
+    }
+
+    /// The same backend with a *different* mention is a real edge: one bot is
+    /// spent, another is not. Identity is backend plus mention, not backend.
+    #[test]
+    fn a_fallback_to_a_different_bot_is_allowed() {
+        let temp = tempfile::tempdir().unwrap();
+        write_config(
+            temp.path(),
+            "[review.routing]\nenabled = true\n\n\
+             [review.routing.route.code]\nbackend = \"provider_comment\"\nmention = \"codex\"\n\n\
+             [review.routing.route.code.on_refusal.quota_exhausted]\n\
+             backend = \"provider_comment\"\nmention = \"claude\"\n",
+        );
+        let policy = ReviewRoutingPolicy::load(temp.path()).unwrap();
+        assert_eq!(
+            policy
+                .effective_route("code", Some(RefusalClass::QuotaExhausted))
+                .mention
+                .as_deref(),
+            Some("claude")
+        );
+    }
+
+    /// A mention-less provider fallback posts a comment nobody is listening
+    /// for -- the same defect `MentionRequired` already refuses on a route,
+    /// which an edge must not be able to sneak past.
+    #[test]
+    fn a_mention_less_provider_fallback_is_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        write_config(
+            temp.path(),
+            "[review.routing]\nenabled = true\n\n\
+             [review.routing.route.code]\nbackend = \"chau7\"\n\n\
+             [review.routing.route.code.on_refusal.quota_exhausted]\n\
+             backend = \"provider_comment\"\n",
+        );
+        assert!(matches!(
+            ReviewRoutingPolicy::load(temp.path()),
+            Err(ReviewRoutingError::MentionRequired { .. })
+        ));
+    }
+
+    /// A fallback has no fallback: `ReviewFallback` has no `on_refusal` field,
+    /// and `deny_unknown_fields` turns an attempted chain into a parse error
+    /// rather than a silently ignored key.
+    #[test]
+    fn a_chain_of_fallbacks_cannot_be_configured() {
+        let temp = tempfile::tempdir().unwrap();
+        write_config(
+            temp.path(),
+            "[review.routing]\nenabled = true\n\n\
+             [review.routing.route.code]\nbackend = \"provider_comment\"\nmention = \"codex\"\n\n\
+             [review.routing.route.code.on_refusal.quota_exhausted]\nbackend = \"chau7\"\n\n\
+             [review.routing.route.code.on_refusal.quota_exhausted.on_refusal.quota_exhausted]\n\
+             backend = \"record\"\n",
+        );
+        assert!(matches!(
+            ReviewRoutingPolicy::load(temp.path()),
+            Err(ReviewRoutingError::Parse { .. })
+        ));
+    }
+
+    /// End of the chain: the edge must actually change what gets dispatched,
+    /// not merely what `effective_route` reports.
+    #[test]
+    fn a_quota_refusal_dispatches_the_fallback_backend() {
+        let policy = ReviewRoutingPolicy {
+            enabled: true,
+            default_route: ReviewRoute {
+                backend: ReviewBackend::ProviderComment,
+                mention: Some("codex".into()),
+                on_refusal: BTreeMap::from([(
+                    RefusalClass::QuotaExhausted,
+                    ReviewFallback {
+                        backend: ReviewBackend::Chau7,
+                        mention: None,
+                        instructions: None,
+                        max_concurrent: 1,
+                        stale_after_minutes: 60,
+                    },
+                )]),
+                ..ReviewRoute::default()
+            },
+            ..Default::default()
+        };
+
+        assert!(matches!(
+            dispatch(&policy, &[], &[]),
+            ReviewDispatchAction::MentionOnPullRequest { .. }
+        ));
+        assert!(matches!(
+            dispatch_after(&policy, &[], &[], Some(RefusalClass::QuotaExhausted)),
+            ReviewDispatchAction::SpawnChau7Review { .. }
+        ));
+    }
+
+    /// The fallback's own slot count governs once the edge is taken. A route
+    /// that allows two cheap provider mentions must not thereby allow two
+    /// concurrent agents on the operator's machine.
+    #[test]
+    fn the_fallback_bounds_concurrency_with_its_own_slot_count() {
+        let policy = ReviewRoutingPolicy {
+            enabled: true,
+            default_route: ReviewRoute {
+                backend: ReviewBackend::ProviderComment,
+                mention: Some("codex".into()),
+                max_concurrent: 8,
+                on_refusal: BTreeMap::from([(
+                    RefusalClass::QuotaExhausted,
+                    ReviewFallback {
+                        backend: ReviewBackend::Chau7,
+                        mention: None,
+                        instructions: None,
+                        max_concurrent: 1,
+                        stale_after_minutes: 60,
+                    },
+                )]),
+                ..ReviewRoute::default()
+            },
+            ..Default::default()
+        };
+        let running = [InFlightReview {
+            review_type: "security".into(),
+            pull_request: 41,
+        }];
+        assert!(matches!(
+            dispatch_after(&policy, &[], &running, Some(RefusalClass::QuotaExhausted)),
+            ReviewDispatchAction::Defer { .. }
         ));
     }
 

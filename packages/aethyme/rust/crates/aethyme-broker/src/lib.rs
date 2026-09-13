@@ -342,8 +342,8 @@ pub use review::{
 };
 pub use review_backend::{
     InFlightReview, REVIEW_ROUTING_SCHEMA_VERSION, ReviewBackend, ReviewDispatchAction,
-    ReviewRoute, ReviewRoutingError, ReviewRoutingPolicy, dispatch_review, finished_workspaces,
-    review_prompt,
+    ReviewFallback, ReviewRoute, ReviewRoutingError, ReviewRoutingPolicy, dispatch_review,
+    finished_workspaces, review_prompt,
 };
 pub use review_execution::{
     Chau7Handoff, Chau7Teardown, DeferredReview, GhCall, LedgerWrite, ReviewExecutionPlan,
@@ -354,7 +354,7 @@ pub use review_facts::{
 };
 pub use review_ledger::{
     ExpiredReview, RefusalClass, ReviewRefusal, ReviewRequest, ReviewRequestState, expired,
-    in_flight, spend_by_type,
+    in_flight, last_refusal, spend_by_type,
 };
 pub use review_report::{
     REVIEW_REPORTING_SCHEMA_VERSION, ReviewReportingError, ReviewReportingPolicy, ReviewSeverity,

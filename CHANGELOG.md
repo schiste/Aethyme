@@ -4,6 +4,37 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [Unreleased]
+
+### Added
+
+- Review routing: a route may declare `on_refusal`, a one-hop escape taken when
+  the previous attempt at that dimension came back refused. A spent provider
+  quota is the one refusal a retry cannot clear -- it is what left ten
+  `Aeptus/mockup` pull requests blocked on a dimension whose only exit was the
+  re-run that was unavailable -- so a repository can now say "when the provider
+  is spent, this dimension is worth paying a local agent for":
+
+  ```toml
+  [review.routing.route.code]
+  backend = "provider_comment"
+  mention = "codex"
+
+  [review.routing.route.code.on_refusal.quota_exhausted]
+  backend = "chau7"
+  max_concurrent = 1
+  ```
+
+  Declaring nothing changes nothing, so an existing policy routes exactly as
+  before. The edge is keyed by the classification #173 records, is never taken
+  on a first attempt, and reverts as soon as any later attempt exists -- so one
+  quota refusal cannot pin a dimension to the expensive backend for the life of
+  the pull request. A fallback has no fallback of its own (a nested
+  `on_refusal` is a parse error, not an ignored key), carries its own slot
+  budget because an agent does not cost what a comment costs, and may not name
+  the backend it is escaping: that is refused when the policy loads rather than
+  discovered as a second refusal.
+
 ## [0.7.18] - 2026-09-12
 
 ### Added

@@ -12,8 +12,8 @@ use std::path::Path;
 
 use aethyme_broker::{
     ChangeFacts, Chau7Tab, CommitClassification, InFlightReview, PrProjectionAction,
-    PrProjectionFacts, PrProjectionPolicy, ProjectedReview, ProjectedReviewState, ReviewBackend,
-    ReviewDispatchAction, ReviewProjection, ReviewReportingPolicy, ReviewRequest,
+    PrProjectionFacts, PrProjectionPolicy, ProjectedReview, ProjectedReviewState, RefusalClass,
+    ReviewBackend, ReviewDispatchAction, ReviewProjection, ReviewReportingPolicy, ReviewRequest,
     ReviewRequestState, ReviewRoutingPolicy, ReviewTrigger, ReviewTriggerDecision,
     ReviewTriggerPolicy, dispatch_review, eligible_types, finished_workspaces,
     parse_classification, plan_execution, project, schedule,
@@ -116,6 +116,22 @@ fn plan(
     Vec<ReviewDispatchAction>,
     Vec<PrProjectionAction>,
 ) {
+    plan_after(policies, facts, head, tabs, in_flight, None)
+}
+
+/// The same chain, for a dimension whose previous attempt refused.
+fn plan_after(
+    policies: &Policies,
+    facts: &ChangeFacts,
+    head: &str,
+    tabs: &[Chau7Tab],
+    in_flight: &[InFlightReview],
+    refused: Option<RefusalClass>,
+) -> (
+    Vec<ReviewTriggerDecision>,
+    Vec<ReviewDispatchAction>,
+    Vec<PrProjectionAction>,
+) {
     let eligible = eligible_types(&policies.trigger, facts);
     let decisions = schedule(
         &policies.trigger,
@@ -138,6 +154,7 @@ fn plan(
                 head,
                 tabs,
                 in_flight,
+                refused,
             )),
             _ => None,
         })

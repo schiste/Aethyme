@@ -5503,6 +5503,11 @@ fn run_review_plan(parsed: Parsed) -> Result<(), UsageError> {
                     &head,
                     &[],
                     &[],
+                    // A projection has no ledger to read, so it plans the
+                    // first-attempt route. Consistent with the `&[]` tabs and
+                    // slots above, and with the comment at the top of this
+                    // function: `review run` derives all of this for real.
+                    None,
                 ))
             }
             _ => None,
@@ -6071,6 +6076,11 @@ fn run_review_run(parsed: Parsed) -> Result<serde_json::Value, UsageError> {
                     &head,
                     &tabs,
                     &in_flight,
+                    // From `reconciled` rather than `recorded`: this tick's
+                    // expiries are already applied there, so a review the
+                    // router just gave up on is read as the abandoned row it
+                    // has become.
+                    crate::last_refusal(&reconciled, review_type),
                 ))
             }
             _ => None,

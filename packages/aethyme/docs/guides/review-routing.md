@@ -158,6 +158,13 @@ instructions = "Pay attention to the broker's coordinated-write path."
 backend = "provider_comment"
 mention = "codex"             # stored without the `@`
 
+# Where this dimension goes when the provider refuses, keyed by why.
+# Omit it and a refusal changes nothing -- which is what every repository
+# that does not write this table gets.
+[review.routing.route.code.on_refusal.quota_exhausted]
+backend = "chau7"
+max_concurrent = 1            # the fallback's own budget, not the route's
+
 # ---------------------------------------------------------------------------
 # What the pull request shows.
 # ---------------------------------------------------------------------------
@@ -340,6 +347,62 @@ A Chau7 review whose workspace already has a live tab is deferred rather than
 started again. The check is on the directory, not the branch -- a tab that has
 wandered onto another branch is still occupying that workspace, which is the
 reason not to spawn a second one.
+
+### When the provider refuses
+
+A spent provider quota is the one refusal that a retry cannot clear, and it is
+also the state that produced the `Aeptus/mockup` deadlock on 2026-09-11: ten
+pull requests blocked on a dimension whose only exit was a re-run, and the
+re-run was the unavailable thing. The only unblock was a blanket maintainer
+override, which waives the review rather than performing it.
+
+`on_refusal` declares an escape, keyed by the refusal class the ledger
+recorded:
+
+```toml
+[review.routing.route.code]
+backend = "provider_comment"
+mention = "codex"
+
+[review.routing.route.code.on_refusal.quota_exhausted]
+backend = "chau7"
+max_concurrent = 1
+```
+
+The classes are the ones in the ledger's `detail` column: `quota_exhausted`,
+`rate_limited`, `provider_error`, `unknown`. Declare only the ones worth
+escaping. `rate_limited` and `provider_error` clear themselves by waiting, so
+an edge on those spends an agent on a refusal a retry would have fixed for
+free -- `quota_exhausted` is the one that genuinely has no other exit.
+
+Four rules, and each exists because its absence is a silent failure:
+
+- **A refusal edge is never taken for the first attempt.** It is selected by
+  how the *previous* attempt at that dimension ended, read from the ledger.
+- **Only the immediately previous attempt counts.** Once any later attempt
+  exists -- requested, running, or satisfied -- the refusal is history and the
+  route reverts. Without this a single quota refusal would pin the dimension
+  to the expensive backend for the life of the pull request.
+- **A fallback has no fallback.** There are no chains; the escape is one hop.
+  Nesting an `on_refusal` inside one is a parse error, not a silently ignored
+  key.
+- **A fallback must differ from the route it escapes.** Falling back to the
+  backend that just refused reads as a configured recovery and behaves as a
+  second refusal. Refused when the policy loads. The mention is part of the
+  identity, so one bot falling back to a different bot is a real edge and is
+  allowed.
+
+The fallback carries its own `max_concurrent` and `stale_after_minutes`
+because the backends are not interchangeable in cost. Two concurrent provider
+mentions are two comments; two concurrent `chau7` reviews are two agents on
+the operator's machine. A fallback that inherited the provider's slot count
+would inherit a number chosen for the cheap case.
+
+Reviewer independence is worth a thought before writing one of these. A local
+reviewer running the same model that authored the code has correlated blind
+spots exactly where review is supposed to be independent. The ledger records
+which backend answered, so the correlation is at least visible when it
+happens.
 
 ## What the pull request shows
 

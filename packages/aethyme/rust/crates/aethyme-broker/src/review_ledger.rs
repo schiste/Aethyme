@@ -118,7 +118,10 @@ impl ReviewRequestState {
 /// like "not requested yet" and like "still running". Ten pull requests in
 /// `Aeptus/mockup` sat unmergeable for about 48 hours on 2026-09-11, and the
 /// cause was only ever found by someone who already suspected it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+// `Ord` so a class can key a configuration map: `[..on_refusal]` is written
+// per class, and a BTreeMap keeps the parsed table in a stable order for
+// round-tripping and for error messages that name several classes at once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RefusalClass {
     /// The budget is spent. Waiting helps only when it refills.
@@ -391,6 +394,129 @@ pub fn in_flight(rows: &[ReviewRequest]) -> Vec<InFlightReview> {
             pull_request: row.pr_number,
         })
         .collect()
+}
+
+/// How the most recent attempt at one dimension ended, when it ended in a
+/// classified refusal.
+///
+/// Deliberately only the *most recent* row. A quota refusal from last week says
+/// nothing about the provider's budget today, and a routing edge that read it
+/// would pin the dimension to the expensive backend for good. Once any later
+/// attempt exists -- requested, running, or completed -- the refusal is history
+/// and this returns `None`, so the edge un-takes itself the moment the provider
+/// answers again (#175).
+///
+/// An `unknown` refusal returns `Some(RefusalClass::Unknown)` rather than
+/// `None`: it genuinely refused, and whether that is worth an escape is the
+/// policy's decision to make, not this function's.
+pub fn last_refusal(rows: &[ReviewRequest], review_type: &str) -> Option<RefusalClass> {
+    let latest = rows
+        .iter()
+        .filter(|row| row.review_type == review_type)
+        .max_by_key(|row| (row.requested_at, row.id))?;
+    if latest.state != ReviewRequestState::Abandoned {
+        return None;
+    }
+    ReviewRefusal::parse(latest.detail.as_deref()?).map(|refusal| refusal.class)
+}
+
+#[cfg(test)]
+mod last_refusal_tests {
+    use super::*;
+
+    fn row(
+        id: i64,
+        review_type: &str,
+        state: ReviewRequestState,
+        detail: Option<&str>,
+    ) -> ReviewRequest {
+        ReviewRequest {
+            id,
+            repository: "o/r".into(),
+            pr_number: 7,
+            review_type: review_type.into(),
+            head_commit: "abc123".into(),
+            backend: "provider_comment".into(),
+            state,
+            detail: detail.map(str::to_string),
+            // `requested_at` tracks `id` so ordering is unambiguous; the
+            // production ordering breaks ties on `id` for exactly the case
+            // where it does not.
+            requested_at: id * 1_000,
+            updated_at: id * 1_000,
+        }
+    }
+
+    const QUOTA: &str = "quota_exhausted: You have exceeded your usage limit";
+
+    /// The case the routing edge exists for.
+    #[test]
+    fn the_previous_attempt_refusing_on_quota_is_reported() {
+        let rows = vec![row(1, "code", ReviewRequestState::Abandoned, Some(QUOTA))];
+        assert_eq!(
+            last_refusal(&rows, "code"),
+            Some(RefusalClass::QuotaExhausted)
+        );
+    }
+
+    /// The expiry rule, and the reason this reads one row rather than scanning
+    /// for any refusal: once the provider answers again, the edge must stop
+    /// being taken. Without this a single quota refusal would pin the
+    /// dimension to the expensive backend for the life of the pull request.
+    #[test]
+    fn a_refusal_a_later_attempt_replaced_is_history() {
+        let rows = vec![
+            row(1, "code", ReviewRequestState::Abandoned, Some(QUOTA)),
+            row(2, "code", ReviewRequestState::Satisfied, None),
+        ];
+        assert_eq!(last_refusal(&rows, "code"), None);
+    }
+
+    /// A later attempt that is merely *running* also clears it. The edge asks
+    /// "did the last attempt refuse", not "has anything ever refused", so a
+    /// review in progress must not be second-guessed by spawning a rival.
+    #[test]
+    fn an_attempt_still_running_is_not_a_refusal() {
+        let rows = vec![
+            row(1, "code", ReviewRequestState::Abandoned, Some(QUOTA)),
+            row(2, "code", ReviewRequestState::Running, None),
+        ];
+        assert_eq!(last_refusal(&rows, "code"), None);
+    }
+
+    /// Dimensions are independent: a spent provider on `code` says nothing
+    /// about `security`, which may be routed to a different backend entirely.
+    #[test]
+    fn a_refusal_on_one_dimension_does_not_reroute_another() {
+        let rows = vec![row(1, "code", ReviewRequestState::Abandoned, Some(QUOTA))];
+        assert_eq!(last_refusal(&rows, "security"), None);
+    }
+
+    /// An abandoned row whose detail is not a refusal -- a router timeout, say
+    /// -- is not a provider refusal and must not take a refusal edge.
+    #[test]
+    fn an_abandonment_that_is_not_a_refusal_is_not_one() {
+        let rows = vec![row(
+            1,
+            "code",
+            ReviewRequestState::Abandoned,
+            Some("no report in 360 minutes while in_progress"),
+        )];
+        assert_eq!(last_refusal(&rows, "code"), None);
+    }
+
+    /// `unknown` is returned rather than swallowed. Whether an unreadable
+    /// refusal is worth an escape is the policy's call; this only reports.
+    #[test]
+    fn an_unknown_refusal_is_reported_as_unknown() {
+        let rows = vec![row(
+            1,
+            "code",
+            ReviewRequestState::Abandoned,
+            Some("unknown: ?"),
+        )];
+        assert_eq!(last_refusal(&rows, "code"), Some(RefusalClass::Unknown));
+    }
 }
 
 #[cfg(test)]
