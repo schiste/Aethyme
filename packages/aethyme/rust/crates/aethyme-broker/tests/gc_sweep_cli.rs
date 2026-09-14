@@ -61,6 +61,16 @@ fn plan_json(repo: &Path, container: &Path) -> serde_json::Value {
     serde_json::from_slice(&output.stdout).unwrap()
 }
 
+fn reclaim_plan_json(repo: &Path, container: &Path) -> serde_json::Value {
+    let output = run(repo, container, &["reclaim", "plan", "--json"]);
+    assert!(
+        output.status.success(),
+        "reclaim plan: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
 /// A worktree root left behind by a repository that no longer exists.
 fn stamp_root(container: &Path, key: &str, repository_root: &Path) -> PathBuf {
     let root = container.join(key);
@@ -122,6 +132,62 @@ fn orphaned_roots_are_swept_while_owned_and_unmarked_roots_are_protected() {
     assert!(!orphan.exists(), "the orphaned root should be reclaimed");
     assert!(owned.exists(), "a root with a live owner must survive");
     assert!(unmarked.exists(), "an unmarked root must survive");
+}
+
+#[test]
+fn reclaim_confirmation_binds_decisions_not_sizes_and_explains_changes() {
+    let (repo, container) = fixture("");
+    let root_output = run(repo.path(), container.path(), &["worktree-root", "--json"]);
+    assert!(
+        root_output.status.success(),
+        "worktree root: {}",
+        String::from_utf8_lossy(&root_output.stderr)
+    );
+    let worktree_root =
+        serde_json::from_slice::<serde_json::Value>(&root_output.stdout).unwrap()["preferred_root"]
+            .as_str()
+            .map(PathBuf::from)
+            .unwrap();
+    let target = worktree_root.join("session/target");
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::write(target.join("artifact"), "small\n").unwrap();
+
+    let plan = reclaim_plan_json(repo.path(), container.path());
+    let digest = plan["digest"].as_str().unwrap().to_string();
+
+    // The reviewed deletion decision is unchanged even though the build output
+    // grew after the plan was printed.
+    std::fs::write(target.join("artifact"), "larger build output\n").unwrap();
+    let apply = run(
+        repo.path(),
+        container.path(),
+        &["reclaim", "apply", "--confirm", &digest],
+    );
+    assert!(
+        apply.status.success(),
+        "reclaim apply: {}",
+        String::from_utf8_lossy(&apply.stderr)
+    );
+    assert!(!target.exists(), "the reviewed candidate should be removed");
+
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::write(target.join("artifact"), "small\n").unwrap();
+    let plan = reclaim_plan_json(repo.path(), container.path());
+    let digest = plan["digest"].as_str().unwrap().to_string();
+    let added = worktree_root.join("session/build");
+    std::fs::create_dir_all(&added).unwrap();
+    std::fs::write(added.join("artifact"), "new\n").unwrap();
+
+    let refused = run(
+        repo.path(),
+        container.path(),
+        &["reclaim", "apply", "--confirm", &digest],
+    );
+    assert!(!refused.status.success());
+    let message = String::from_utf8_lossy(&refused.stderr);
+    assert!(message.contains("added candidate"), "{message}");
+    assert!(message.contains("build"), "{message}");
+    assert!(target.exists(), "a changed plan must not remove candidates");
 }
 
 #[test]

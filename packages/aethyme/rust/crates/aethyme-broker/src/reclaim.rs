@@ -12,22 +12,213 @@
 //! real cost. So this reports candidates and only removes what an operator
 //! reviewed, following the same digest-bound plan/apply contract as `gc`.
 
+use std::collections::BTreeMap;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
-/// Digest over exactly what the operator reads: each reclaimable path and its
-/// size. A candidate appearing, vanishing or changing size invalidates the
-/// plan, because the reviewed total is no longer the one being applied.
-pub fn plan_digest(root: &Path, candidates: &[ReclaimCandidate]) -> String {
+const RECLAIM_PLAN_SCHEMA_VERSION: u8 = 1;
+const RECLAIM_PLAN_FILENAME: &str = ".aethyme-reclaim-plan.json";
+
+/// The part of a candidate that determines whether an apply would touch it.
+/// Measured bytes deliberately do not belong here: a build may grow while the
+/// operator is reviewing the same deletion decision.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ReclaimDecision {
+    pub path: PathBuf,
+    pub reclaimable: bool,
+}
+
+/// Return the stable, decision-only view of a scan.
+pub fn decisions(candidates: &[ReclaimCandidate]) -> Vec<ReclaimDecision> {
+    let mut decisions = candidates
+        .iter()
+        .map(|candidate| ReclaimDecision {
+            path: candidate.path.clone(),
+            reclaimable: candidate.reclaimable,
+        })
+        .collect::<Vec<_>>();
+    decisions.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.reclaimable.cmp(&right.reclaimable))
+    });
+    decisions
+}
+
+fn decision_digest(root: &Path, decisions: &[ReclaimDecision]) -> String {
     let mut hasher = Sha256::new();
+    hasher.update(b"aethyme-reclaim-plan-v1\0");
     hasher.update(root.as_os_str().as_encoded_bytes());
-    for candidate in candidates {
+    for decision in decisions {
         hasher.update(b"\n");
-        hasher.update(candidate.path.as_os_str().as_encoded_bytes());
-        hasher.update(format!(":{}:{}", candidate.bytes, candidate.reclaimable).as_bytes());
+        hasher.update(decision.path.as_os_str().as_encoded_bytes());
+        hasher.update(if decision.reclaimable {
+            &b"\0reclaimable"[..]
+        } else {
+            &b"\0kept"[..]
+        });
     }
     format!("{:x}", hasher.finalize())
+}
+
+/// Digest over exactly the deletion decision: the sorted candidate paths and
+/// whether each is reclaimable. A candidate's measured size is displayed in a
+/// plan but is not authorization-bearing, so an active build can grow without
+/// invalidating an otherwise unchanged review.
+pub fn plan_digest(root: &Path, candidates: &[ReclaimCandidate]) -> String {
+    decision_digest(root, &decisions(candidates))
+}
+
+/// Describe the decision changes between the plan the operator reviewed and
+/// the fresh scan used for apply. Byte-only changes intentionally produce no
+/// entries because they do not alter what will be deleted.
+pub fn decision_changes(reviewed: &[ReclaimDecision], current: &[ReclaimDecision]) -> Vec<String> {
+    let reviewed = reviewed
+        .iter()
+        .map(|decision| (decision.path.clone(), decision.reclaimable))
+        .collect::<BTreeMap<_, _>>();
+    let current = current
+        .iter()
+        .map(|decision| (decision.path.clone(), decision.reclaimable))
+        .collect::<BTreeMap<_, _>>();
+    let mut paths = reviewed.keys().cloned().collect::<Vec<_>>();
+    paths.extend(
+        current
+            .keys()
+            .filter(|path| !reviewed.contains_key(*path))
+            .cloned(),
+    );
+    paths.sort();
+
+    paths
+        .into_iter()
+        .filter_map(|path| match (reviewed.get(&path), current.get(&path)) {
+            (None, Some(reclaimable)) => Some(format!(
+                "added candidate {} ({})",
+                path.display(),
+                if *reclaimable { "reclaimable" } else { "kept" }
+            )),
+            (Some(_), None) => Some(format!("removed candidate {}", path.display())),
+            (Some(reviewed), Some(current)) if reviewed != current => Some(format!(
+                "{} changed from {} to {}",
+                path.display(),
+                if *reviewed { "reclaimable" } else { "kept" },
+                if *current { "reclaimable" } else { "kept" }
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct ReclaimPlanSnapshot {
+    schema_version: u8,
+    digest: String,
+    root: PathBuf,
+    decisions: Vec<ReclaimDecision>,
+}
+
+fn snapshot_path(root: &Path) -> PathBuf {
+    root.join(RECLAIM_PLAN_FILENAME)
+}
+
+fn ensure_regular_snapshot(path: &Path) -> io::Result<()> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return Err(io::Error::other(format!(
+            "reclaim plan snapshot is not a regular file: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Save the last reviewed decision set beside the host-scoped worktree root.
+/// Only one snapshot is retained, avoiding an unbounded stream of plan files.
+pub fn save_snapshot(root: &Path, digest: &str, candidates: &[ReclaimCandidate]) -> io::Result<()> {
+    std::fs::create_dir_all(root)?;
+    let decisions = decisions(candidates);
+    if decision_digest(root, &decisions) != digest {
+        return Err(io::Error::other(
+            "reclaim plan snapshot digest does not match its decision set",
+        ));
+    }
+    let path = snapshot_path(root);
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => ensure_regular_snapshot(&path)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let snapshot = ReclaimPlanSnapshot {
+        schema_version: RECLAIM_PLAN_SCHEMA_VERSION,
+        digest: digest.to_string(),
+        root: root.to_path_buf(),
+        decisions,
+    };
+    let bytes = serde_json::to_vec_pretty(&snapshot).map_err(io::Error::other)?;
+    let temporary = root.join(format!(
+        ".{RECLAIM_PLAN_FILENAME}.{}.tmp",
+        std::process::id()
+    ));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    drop(file);
+    let result = std::fs::rename(&temporary, &path);
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
+}
+
+/// Load and verify the saved decision set for a failed confirmation. Invalid
+/// or tampered snapshots are not used to manufacture a misleading diff.
+pub fn load_snapshot(root: &Path) -> io::Result<Option<(String, Vec<ReclaimDecision>)>> {
+    let path = snapshot_path(root);
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return Err(io::Error::other(format!(
+            "reclaim plan snapshot is not a regular file: {}",
+            path.display()
+        )));
+    }
+    let bytes = std::fs::read(&path)?;
+    let snapshot: ReclaimPlanSnapshot = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+    if snapshot.schema_version != RECLAIM_PLAN_SCHEMA_VERSION
+        || snapshot.root != root
+        || snapshot.decisions != decisions_sorted(&snapshot.decisions)
+        || decision_digest(root, &snapshot.decisions) != snapshot.digest
+    {
+        return Err(io::Error::other(format!(
+            "reclaim plan snapshot is invalid: {}",
+            path.display()
+        )));
+    }
+    Ok(Some((snapshot.digest, snapshot.decisions)))
+}
+
+fn decisions_sorted(decisions: &[ReclaimDecision]) -> Vec<ReclaimDecision> {
+    let mut sorted = decisions.to_vec();
+    sorted.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.reclaimable.cmp(&right.reclaimable))
+    });
+    sorted
 }
 
 /// Directory names that hold regenerable build output.
@@ -162,6 +353,93 @@ mod tests {
             classify(&p("/w/b/target"), &p("/w/b"), 200, &[p("/w/b")]),
         ];
         assert_eq!(reclaimable_bytes(&candidates), 100);
+    }
+
+    #[test]
+    fn plan_digest_ignores_measured_bytes_and_order() {
+        let first = vec![
+            classify(&p("/w/b/target"), &p("/w/b"), 200, &[p("/w/b")]),
+            classify(&p("/w/a/target"), &p("/w/a"), 100, &[]),
+        ];
+        let second = vec![
+            classify(&p("/w/a/target"), &p("/w/a"), 900, &[]),
+            classify(&p("/w/b/target"), &p("/w/b"), 7, &[p("/w/b")]),
+        ];
+        assert_eq!(
+            plan_digest(&p("/w"), &first),
+            plan_digest(&p("/w"), &second)
+        );
+    }
+
+    #[test]
+    fn plan_digest_changes_for_candidate_set_or_reclaimability_changes() {
+        let original = vec![classify(&p("/w/a/target"), &p("/w/a"), 100, &[])];
+        let added = vec![
+            classify(&p("/w/a/target"), &p("/w/a"), 100, &[]),
+            classify(&p("/w/b/target"), &p("/w/b"), 100, &[]),
+        ];
+        let kept = vec![classify(&p("/w/a/target"), &p("/w/a"), 100, &[p("/w/a")])];
+        assert_ne!(
+            plan_digest(&p("/w"), &original),
+            plan_digest(&p("/w"), &added)
+        );
+        assert_ne!(
+            plan_digest(&p("/w"), &original),
+            plan_digest(&p("/w"), &kept)
+        );
+    }
+
+    #[test]
+    fn decision_changes_name_added_removed_and_reclassified_candidates() {
+        let reviewed = vec![
+            ReclaimDecision {
+                path: p("/w/a/target"),
+                reclaimable: true,
+            },
+            ReclaimDecision {
+                path: p("/w/b/target"),
+                reclaimable: true,
+            },
+        ];
+        let current = vec![
+            ReclaimDecision {
+                path: p("/w/a/target"),
+                reclaimable: false,
+            },
+            ReclaimDecision {
+                path: p("/w/c/target"),
+                reclaimable: true,
+            },
+        ];
+        assert_eq!(
+            decision_changes(&reviewed, &current),
+            vec![
+                "/w/a/target changed from reclaimable to kept",
+                "removed candidate /w/b/target",
+                "added candidate /w/c/target (reclaimable)",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_saved_snapshot_round_trips_the_reviewed_decision() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        let candidates = vec![classify(&root.join("s/target"), &root.join("s"), 42, &[])];
+        let digest = plan_digest(&root, &candidates);
+
+        save_snapshot(&root, &digest, &candidates).unwrap();
+
+        assert_eq!(
+            load_snapshot(&root).unwrap(),
+            Some((
+                digest,
+                vec![ReclaimDecision {
+                    path: root.join("s/target"),
+                    reclaimable: true,
+                }]
+            ))
+        );
     }
 
     #[test]
