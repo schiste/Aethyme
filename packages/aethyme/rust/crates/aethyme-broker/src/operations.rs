@@ -12,6 +12,7 @@ use std::fs::{File, OpenOptions};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::Instant;
 
 use serde_json::json;
 
@@ -402,6 +403,9 @@ impl OperationShowReport {
 
 struct RepositoryWriteLock {
     file: File,
+    acquired_at: Instant,
+    acquired_at_ms: i64,
+    queue_wait_ms: i64,
 }
 
 impl RepositoryWriteLock {
@@ -431,7 +435,12 @@ impl RepositoryWriteLock {
         // syscall and the holder lookup only runs when it can actually help.
         let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if rc == 0 {
-            return Ok(Self { file });
+            return Ok(Self {
+                file,
+                acquired_at: Instant::now(),
+                acquired_at_ms: unix_now_ms(),
+                queue_wait_ms: 0,
+            });
         }
         let would_block = std::io::Error::last_os_error().raw_os_error() == Some(libc::EWOULDBLOCK);
         if !would_block {
@@ -497,7 +506,16 @@ impl RepositoryWriteLock {
             "[coordination] acquired the {repository} write lock after {}",
             humanize_duration(waited.elapsed().as_secs())
         );
-        Ok(Self { file })
+        Ok(Self {
+            file,
+            acquired_at: Instant::now(),
+            acquired_at_ms: unix_now_ms(),
+            queue_wait_ms: waited.elapsed().as_millis() as i64,
+        })
+    }
+
+    fn hold_duration_ms(&self) -> i64 {
+        self.acquired_at.elapsed().as_millis() as i64
     }
 }
 
@@ -546,6 +564,60 @@ fn hooks_outside_lock_enabled(main_root: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Opt-in measurement of the provider read a future ref-scoped merge would
+/// need. The result is deliberately not used to choose today's lock: this
+/// probe measures the cost without changing the conservative repository-wide
+/// policy or making a merge depend on a second provider call.
+fn measure_pr_merge_ref_enabled(main_root: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(main_root.join(".aethyme/config.toml")) else {
+        return false;
+    };
+    let Ok(value) = text.parse::<toml::Value>() else {
+        return false;
+    };
+    value
+        .get("coordination")
+        .and_then(|section| section.get("measure_pr_merge_ref"))
+        .and_then(toml::Value::as_bool)
+        .unwrap_or(false)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RefDeterminationMeasurement {
+    duration_ms: i64,
+    succeeded: bool,
+}
+
+fn measure_pr_merge_ref_determination(
+    main_root: &Path,
+    cwd: &Path,
+    args: &[String],
+    github_target: Option<&crate::ResolvedGithubTarget>,
+) -> Option<RefDeterminationMeasurement> {
+    if !measure_pr_merge_ref_enabled(main_root) || !is_github_pull_request_merge(args) {
+        return None;
+    }
+    let selector = first_positional(args.get(2..)?)?;
+    let target = github_target?;
+    let started = Instant::now();
+    let mut command = provider_command(OperationProvider::Github);
+    command
+        .args(["pr", "view", selector, "--json", "baseRefName"])
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .env("GH_REPO", &target.display_slug);
+    let succeeded = command
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false);
+    Some(RefDeterminationMeasurement {
+        duration_ms: started.elapsed().as_millis() as i64,
+        succeeded,
+    })
+}
+
 fn is_push(args: &[String]) -> bool {
     args.iter().any(|arg| arg == "push")
 }
@@ -555,6 +627,49 @@ pub(crate) fn humanize_duration(seconds: u64) -> String {
         0..=59 => format!("{seconds}s"),
         _ => format!("{}m {}s", seconds / 60, seconds % 60),
     }
+}
+
+fn unix_now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+fn add_coordination_timing(
+    details: &mut serde_json::Value,
+    lock_key: &str,
+    lock_wait_started_at: Option<i64>,
+    lock: Option<&RepositoryWriteLock>,
+    hooks_outside_lock: bool,
+    ref_determination: Option<RefDeterminationMeasurement>,
+) {
+    let Some(details) = details.as_object_mut() else {
+        return;
+    };
+    let (lock_acquired_at, queue_wait_ms, lock_hold_ms) = match lock {
+        Some(lock) => (
+            Some(lock.acquired_at_ms),
+            Some(lock.queue_wait_ms),
+            Some(lock.hold_duration_ms()),
+        ),
+        None => (None, None, None),
+    };
+    details.insert(
+        "coordination_timing".into(),
+        json!({
+            "schema_version": 1,
+            "lock_key": lock_key,
+            "lock_wait_started_at": lock_wait_started_at,
+            "lock_acquired_at": lock_acquired_at,
+            "lock_released_at": lock.map(|_| unix_now_ms()),
+            "queue_wait_ms": queue_wait_ms,
+            "lock_hold_ms": lock_hold_ms,
+            "hooks_outside_lock": hooks_outside_lock,
+            "ref_determination_ms": ref_determination.map(|measurement| measurement.duration_ms),
+            "ref_determination_succeeded": ref_determination.map(|measurement| measurement.succeeded),
+        }),
+    );
 }
 
 /// The holder is whichever operation on this repository is recorded as running.
@@ -1827,6 +1942,22 @@ fn deferred_post_merge_cleanup(
 }
 
 impl Broker {
+    /// Return a bounded, read-only coordination measurement snapshot. The
+    /// lock policy intentionally stays unchanged until this evidence shows
+    /// that repository-wide contention remains material after local hooks are
+    /// moved outside the lock.
+    pub fn coordinated_operation_stats(
+        &mut self,
+        repository: Option<&str>,
+        limit: u32,
+    ) -> Result<crate::OperationStats, BrokerOpError> {
+        Ok(crate::operation_stats::from_store(
+            self.store(),
+            repository,
+            limit,
+        )?)
+    }
+
     pub fn show_coordinated_operation(
         &mut self,
         operation_id: i64,
@@ -2220,6 +2351,11 @@ impl Broker {
         // re-issued it (issue #138).
         let command_json = redacted_command(request.provider, &request.args)?;
 
+        let hooks_ran_outside_lock = effect != OperationEffect::Read
+            && request.provider == OperationProvider::Git
+            && is_push(&request.args)
+            && hooks_outside_lock_enabled(&self.main_root().to_path_buf());
+
         // Two identical commands from one session cannot both be intended: the
         // second would fire against state the first already changed. Now that a
         // queued operation is recorded, refusing the duplicate is possible before
@@ -2268,15 +2404,18 @@ impl Broker {
 
         let queued_operation_id = operation.id;
 
+        let ref_determination = measure_pr_merge_ref_determination(
+            &self.main_root().to_path_buf(),
+            cwd,
+            &request.args,
+            github_target.as_ref(),
+        );
+
         // Run the push's local hooks before queueing for the lock, when the
         // repository opts in. A dry run executes `pre-push` against exactly the
         // commits the real push will send, so the expensive part happens outside
         // the lock and the fleet no longer serialises on the slowest gate
         // (issues #138, #146).
-        let hooks_ran_outside_lock = effect != OperationEffect::Read
-            && request.provider == OperationProvider::Git
-            && is_push(&request.args)
-            && hooks_outside_lock_enabled(&self.main_root().to_path_buf());
         let prechecked_plan = if hooks_ran_outside_lock {
             let mut dry_run = crate::git::git_command();
             dry_run.arg("push").arg("--dry-run");
@@ -2314,7 +2453,8 @@ impl Broker {
             None
         };
 
-        let _lock = if effect == OperationEffect::Read {
+        let lock_wait_started_at = (effect != OperationEffect::Read).then(unix_now_ms);
+        let lock = if effect == OperationEffect::Read {
             None
         } else {
             let main_root = self.main_root().to_path_buf();
@@ -2490,19 +2630,25 @@ impl Broker {
         let output = match command.output() {
             Ok(output) => output,
             Err(source) => {
+                let mut details = journal_details(
+                    classification,
+                    resolved_target.as_ref(),
+                    github_target.as_ref(),
+                    with_push_planning(json!({ "reason": "spawn_failed" }), &push_planning),
+                );
+                add_coordination_timing(
+                    &mut details,
+                    &lock_key,
+                    lock_wait_started_at,
+                    lock.as_ref(),
+                    hooks_ran_outside_lock,
+                    ref_determination,
+                );
                 let operation = self.store().transition_coordinated_operation(
                     operation.id,
                     OperationStatus::Failed,
                     None,
-                    Some(
-                        &journal_details(
-                            classification,
-                            resolved_target.as_ref(),
-                            github_target.as_ref(),
-                            with_push_planning(json!({ "reason": "spawn_failed" }), &push_planning),
-                        )
-                        .to_string(),
-                    ),
+                    Some(&details.to_string()),
                 )?;
                 if let Some(guard) = &mut host_guard {
                     guard.finish(operation.status)?;
@@ -2514,7 +2660,7 @@ impl Broker {
             }
         };
         let exit_code = output.status.code().map(i64::from);
-        let (status, details) = if output.status.success() {
+        let (status, mut details) = if output.status.success() {
             match on_success(&output.stdout, operation.id) {
                 Ok(Some(result)) => (
                     OperationStatus::Succeeded,
@@ -2605,6 +2751,14 @@ impl Broker {
                 ),
             )
         };
+        add_coordination_timing(
+            &mut details,
+            &lock_key,
+            lock_wait_started_at,
+            lock.as_ref(),
+            hooks_ran_outside_lock,
+            ref_determination,
+        );
         let operation = self.store().transition_coordinated_operation(
             operation.id,
             status,

@@ -17,6 +17,8 @@ const RESOURCES_RECONCILE_USAGE: &str =
 const OPERATIONS_RECONCILE_USAGE: &str = "usage: aethyme broker operations reconcile \
      --operation <id> --outcome <succeeded|failed> --reason <text> [--json]";
 const OPERATIONS_SHOW_USAGE: &str = "usage: aethyme broker operations show <id> [--json]";
+const OPERATIONS_STATS_USAGE: &str =
+    "usage: aethyme broker operations stats [--repo <canonical-id>] [--limit <n>] [--json]";
 const ADVISORIES_SHOW_USAGE: &str = "usage: aethyme broker advisories show <id> [--json]";
 const ADVISORIES_ACK_USAGE: &str = "usage: aethyme broker advisories ack <id> [--json]";
 const ADVISORIES_SUPPRESS_USAGE: &str = "usage: aethyme broker advisories suppress <id> [--json]";
@@ -235,6 +237,10 @@ Usage:
   aethyme broker operations reconcile --operation <id> --outcome <succeeded|failed> --reason <text> [--json]
       Resolve a crash-ambiguous operation after independently inspecting the
       remote state. Overlapping writes remain blocked until reconciliation.
+  aethyme broker operations stats [--repo <canonical-id>] [--limit <n>] [--json]
+      Read bounded lock-hold, queue-wait, queue-depth, and known-unrelated
+      contention measurements. Older operations without timing data are
+      reported as unmeasured; this command never changes lock policy.
   aethyme broker advisories list [--all] [--json]
       List outstanding non-blocking advisories newest-first. --all includes
       acknowledged, suppressed, and resolved history. Deliberate inventory
@@ -670,6 +676,7 @@ const KNOWN_COMMAND_WORDS: &[&str] = &[
     "git",
     "gh",
     "operations",
+    "stats",
     "advisories",
     "exposures",
     "note",
@@ -1121,6 +1128,7 @@ mod tests {
             args(&["doctor"]),
             args(&["gc", "plan"]),
             args(&["operations"]),
+            args(&["operations", "stats"]),
             args(&["advisories", "list"]),
             args(&["advisories", "show", "1"]),
             args(&["external-events", "list"]),
@@ -5439,6 +5447,96 @@ fn render_operation_show(report: &crate::OperationShowReport) {
     }
 }
 
+fn render_operation_stats(report: &crate::OperationStats) {
+    let repository = report.repository.as_deref().unwrap_or("all repositories");
+    out!("Coordination statistics for {repository}:");
+    out!(
+        "  observed: {} (measured: {}, unmeasured: {}, history truncated: {})",
+        report.observed_operations,
+        report.measured_operations,
+        report.unmeasured_operations,
+        if report.history_truncated {
+            "yes"
+        } else {
+            "no"
+        },
+    );
+    render_timing_distribution("lock hold", &report.lock_hold_ms);
+    render_timing_distribution("queue wait", &report.queue_wait_ms);
+    out!(
+        "  queue depth: {} samples, p50 {}, p99 {}, max {}",
+        report.queue_depth.sample_count,
+        format_optional_usize(report.queue_depth.p50),
+        format_optional_usize(report.queue_depth.p99),
+        format_optional_usize(report.queue_depth.max),
+    );
+    out!(
+        "  known unrelated contention: {} waits, {}ms total, max {}ms",
+        report.unrelated_contention.sample_count,
+        report.unrelated_contention.total_queue_wait_ms,
+        format_optional_ms(report.unrelated_contention.max_queue_wait_ms),
+    );
+    out!(
+        "  hooks outside lock: {} samples",
+        report.hooks_outside_lock.sample_count
+    );
+    render_timing_distribution(
+        "    hook lock hold",
+        &report.hooks_outside_lock.lock_hold_ms,
+    );
+    render_timing_distribution(
+        "    hook queue wait",
+        &report.hooks_outside_lock.queue_wait_ms,
+    );
+    let ref_stats = &report.pr_merge_ref_determination;
+    out!(
+        "  pr merge ref determination: {} measured ({} succeeded, {} failed), {} unmeasured",
+        ref_stats.measured_count,
+        ref_stats.succeeded_count,
+        ref_stats.failed_count,
+        ref_stats.unmeasured_count,
+    );
+    render_timing_distribution("    ref determination", &ref_stats.duration_ms);
+    if !report.by_kind.is_empty() {
+        out!("  by operation kind:");
+        for kind in &report.by_kind {
+            out!(
+                "    {} ({} samples): hold p50 {}, p99 {}; wait p50 {}, p99 {}",
+                kind.kind,
+                kind.sample_count,
+                format_optional_ms(kind.lock_hold_ms.p50_ms),
+                format_optional_ms(kind.lock_hold_ms.p99_ms),
+                format_optional_ms(kind.queue_wait_ms.p50_ms),
+                format_optional_ms(kind.queue_wait_ms.p99_ms),
+            );
+        }
+    }
+    out!("  note: {}", report.interpretation);
+}
+
+fn render_timing_distribution(label: &str, distribution: &crate::OperationTimingDistribution) {
+    out!(
+        "  {label}: {} samples, total {}ms, p50 {}, p99 {}, max {}",
+        distribution.sample_count,
+        distribution.total_ms,
+        format_optional_ms(distribution.p50_ms),
+        format_optional_ms(distribution.p99_ms),
+        format_optional_ms(distribution.max_ms),
+    );
+}
+
+fn format_optional_ms(value: Option<i64>) -> String {
+    value
+        .map(|value| format!("{value}ms"))
+        .unwrap_or_else(|| "n/a".into())
+}
+
+fn format_optional_usize(value: Option<usize>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "n/a".into())
+}
+
 fn render_coordinated_operation(
     report: &crate::CoordinatedOperationReport,
     json: bool,
@@ -9579,6 +9677,25 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                         render_operation_show(&report);
                     }
                 }
+                Some("stats") => {
+                    if parsed.positional.len() != 1 {
+                        return Err(UsageError::Message(OPERATIONS_STATS_USAGE.into()));
+                    }
+                    let limit = parsed.limit.unwrap_or(crate::DEFAULT_OPERATION_STATS_LIMIT);
+                    if limit == 0 || limit > crate::MAX_OPERATION_STATS_LIMIT {
+                        return Err(UsageError::Message(format!(
+                            "--limit must be between 1 and {}\n{OPERATIONS_STATS_USAGE}",
+                            crate::MAX_OPERATION_STATS_LIMIT
+                        )));
+                    }
+                    let report =
+                        broker.coordinated_operation_stats(parsed.repository.as_deref(), limit)?;
+                    if parsed.json {
+                        out!("{}", serde_json::to_string_pretty(&report)?);
+                    } else {
+                        render_operation_stats(&report);
+                    }
+                }
                 Some("reconcile") => {
                     if parsed.operation.is_none()
                         || parsed.outcome.is_none()
@@ -9616,7 +9733,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                 }
                 Some(other) => {
                     return Err(UsageError::Message(format!(
-                        "unknown operations action {other:?} — expected list, show, or reconcile"
+                        "unknown operations action {other:?} — expected list, show, stats, or reconcile"
                     )));
                 }
             }
