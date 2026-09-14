@@ -988,6 +988,9 @@ fn stored_resource_scope(operation: &CoordinatedOperation) -> Option<String> {
 }
 
 fn remote_git_operation(args: &[String]) -> bool {
+    let Some(args) = git_subcommand_args(args) else {
+        return false;
+    };
     match args.first().map(String::as_str) {
         Some("clone" | "fetch" | "pull" | "push" | "ls-remote" | "submodule") => true,
         Some("remote") => args
@@ -2560,6 +2563,25 @@ impl Broker {
                     json!({}),
                 ),
             )
+        } else if request.provider == OperationProvider::Git && !is_remote_git {
+            // A local Git command can leave the worktree or index in a
+            // conflict state, but it cannot have an uncertain remote effect.
+            // Keeping it as `outcome_unknown` write-blocked the canonical
+            // repository and told the operator to inspect remote state that
+            // the command could never have touched (#185).
+            (
+                OperationStatus::Failed,
+                journal_details(
+                    classification,
+                    resolved_target.as_ref(),
+                    github_target.as_ref(),
+                    json!({
+                        "failure_class": "local_git_command_failed",
+                        "remote_contact": "not_applicable",
+                        "recovery": "inspect_or_abort_local_worktree_state",
+                    }),
+                ),
+            )
         } else if let Some((status, push_reconciliation)) =
             reconcile_failed_push(cwd, &push_planning)
         {
@@ -3285,6 +3307,23 @@ mod tests {
             Some(OperationEffect::Destructive)
         );
         assert_eq!(classify_gh(&args(&["extension", "exec", "x"])), None);
+    }
+
+    #[test]
+    fn remote_git_detection_ignores_global_checkout_options() {
+        assert!(remote_git_operation(&args(&[
+            "-C",
+            "/tmp/checkout",
+            "push",
+            "origin",
+            "main"
+        ])));
+        assert!(!remote_git_operation(&args(&[
+            "-C",
+            "/tmp/checkout",
+            "rebase",
+            "main"
+        ])));
     }
 
     #[test]
