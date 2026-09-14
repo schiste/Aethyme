@@ -4473,6 +4473,15 @@ fn open_broker(read_only_snapshot: bool) -> Result<Broker, UsageError> {
     }
 }
 
+/// Starting or adopting a session is the one useful moment to surface a
+/// stale installed broker. The check is advisory and writes to stderr so a
+/// `--json` session report remains machine-readable.
+fn warn_stale_broker_binary(broker: &Broker) {
+    if let Some(warning) = crate::version::broker_start_warning(broker.main_root()) {
+        eprintln!("warning: {warning}");
+    }
+}
+
 fn parse_operation_effect(
     value: Option<&str>,
 ) -> Result<Option<crate::OperationEffect>, UsageError> {
@@ -8956,6 +8965,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     "--sync-integration requires --reuse".into(),
                 ));
             }
+            warn_stale_broker_binary(&broker);
             let agent_identity = session_agent_identity(parsed.agent.as_deref());
             let report = broker.adopt_with_options(
                 &path,
@@ -9082,6 +9092,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                 .task
                 .ok_or(UsageError::Message("start requires --task".into()))?;
             let mut broker = open_broker(parsed.read_only_snapshot)?;
+            warn_stale_broker_binary(&broker);
             let agent_identity = session_agent_identity(parsed.agent.as_deref());
             let report = broker.start_worktree_with_planned_paths(
                 &task,
@@ -9139,6 +9150,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                 .cmd
                 .ok_or(UsageError::Message("start-agent requires --cmd".into()))?;
             let mut broker = open_broker(parsed.read_only_snapshot)?;
+            warn_stale_broker_binary(&broker);
             let agent_identity = session_agent_identity(parsed.agent.as_deref());
             let report = broker.start_agent_report(&task, &cmd, agent_identity.as_deref())?;
             let session = &report.session;
