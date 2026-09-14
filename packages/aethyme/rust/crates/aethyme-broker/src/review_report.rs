@@ -395,7 +395,9 @@ impl ReviewReportingPolicy {
             "\n## Finishing\n\n\
              Close the row once the review is posted:\n\n    \
              aethyme broker review state --repo {repository} --pr {pull_request} \\\n        \
-             --type {review_type} --head {head} --state satisfied\n\n\
+             --type {review_type} --head {head} --state satisfied \\\n        \
+             --completed-for-commit {head} --verdict pass \\\n        \
+             --reviewer-provider <provider> [--reviewer-model <model>]\n\n\
              Nothing else writes it. The router reads that row to decide whether this \
              dimension is still occupying one of its slots and whether this workspace's tab \
              may be closed, so a review that is not reported is a review that is still \
@@ -584,6 +586,12 @@ severity = []
             // current in the meantime.
             assert!(
                 text.contains("--type security --head e53b60a3 --state satisfied"),
+                "coordinated={coordinated}: {text}"
+            );
+            assert!(
+                text.contains(
+                    "--completed-for-commit e53b60a3 --verdict pass \\\n        --reviewer-provider <provider>"
+                ),
                 "coordinated={coordinated}: {text}"
             );
         }

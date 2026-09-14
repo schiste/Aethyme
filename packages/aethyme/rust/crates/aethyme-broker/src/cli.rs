@@ -385,15 +385,17 @@ Usage:
       request that fails is recorded in the report and skipped, never fatal,
       so one broken pull request cannot stop the rest of the sweep.
   aethyme broker review ledger --repo <owner/name> [--pr <number>] [--json]
-      Print the review ledger: every review the router has requested, for
-      which head, through which backend, and how it ended. This is the answer
+      Print the review ledger: every review request or provider completion, for
+      which heads, through which backend, and how it ended. This is the answer
       to \"why was there no review\" -- read-only, needs no session.
-  aethyme broker review state --repo <owner/name> --pr <number> --type <review-type> --state <state> [--head <sha>] [--note <text>] [--json]
+  aethyme broker review state --repo <owner/name> --pr <number> --type <review-type> --state <state> [--head <sha>] [--note <text>] [--completed-for-commit <sha> --verdict <verdict> --reviewer-provider <provider> [--reviewer-model <model>]] [--json]
       Report what became of one requested review: running, satisfied, failed,
-      recorded, or abandoned. The broker decides and records; whoever performs
-      the review closes the row here, which is what drains the router's
-      concurrency slots. --head targets a superseded commit; the default is
-      the most recent request for that review type.
+      recorded, or abandoned. A satisfied report includes the typed completion
+      commit, verdict, and reviewer identity. Without --head, an exact
+      completion-head match is used or a new unsolicited provider result is
+      recorded. The broker decides and records; whoever performs the review
+      closes the row here, which is what drains the router's concurrency slots.
+      --head targets a superseded request.
   aethyme broker review waive --repo <owner/name> --pr <number> --type <review-type> --head <sha> --reason <text> [--agent <name-and-email>] [--json]
       Excuse one review dimension at one head, on the record. Waives exactly
       the named type at the named commit and nothing else: a new head has no
@@ -1660,6 +1662,14 @@ mod tests {
             "abc123",
             "--note",
             "no findings",
+            "--completed-for-commit",
+            "def456",
+            "--verdict",
+            "pass",
+            "--reviewer-provider",
+            "github",
+            "--reviewer-model",
+            "gpt-reviewer",
         ]
         .map(String::from)
         .to_vec();
@@ -1674,6 +1684,10 @@ mod tests {
         assert_eq!(parsed.review_state.as_deref(), Some("satisfied"));
         assert_eq!(parsed.head.as_deref(), Some("abc123"));
         assert_eq!(parsed.note.as_deref(), Some("no findings"));
+        assert_eq!(parsed.completed_for_commit.as_deref(), Some("def456"));
+        assert_eq!(parsed.verdict.as_deref(), Some("pass"));
+        assert_eq!(parsed.reviewer_provider.as_deref(), Some("github"));
+        assert_eq!(parsed.reviewer_model.as_deref(), Some("gpt-reviewer"));
         assert!(!parsed.detail, "--detail stays the boolean it already was");
     }
 
@@ -1836,6 +1850,10 @@ struct Parsed {
     review_type: Option<String>,
     review_state: Option<String>,
     note: Option<String>,
+    verdict: Option<String>,
+    completed_for_commit: Option<String>,
+    reviewer_provider: Option<String>,
+    reviewer_model: Option<String>,
     /// Read the change from the provider rather than the working directory.
     ///
     /// `review run` normally describes the checkout it is standing in. A tick
@@ -1930,6 +1948,10 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         review_type: None,
         review_state: None,
         note: None,
+        verdict: None,
+        completed_for_commit: None,
+        reviewer_provider: None,
+        reviewer_model: None,
         from_provider: false,
         write_resolution_template: None,
         worktree: None,
@@ -2155,6 +2177,40 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
                 parsed.note = Some(
                     iter.next()
                         .ok_or(UsageError::Message("--note requires text".into()))?
+                        .clone(),
+                )
+            }
+            "--verdict" => {
+                parsed.verdict = Some(
+                    iter.next()
+                        .ok_or(UsageError::Message("--verdict requires a value".into()))?
+                        .clone(),
+                )
+            }
+            "--completed-for-commit" => {
+                parsed.completed_for_commit = Some(
+                    iter.next()
+                        .ok_or(UsageError::Message(
+                            "--completed-for-commit requires a commit".into(),
+                        ))?
+                        .clone(),
+                )
+            }
+            "--reviewer-provider" => {
+                parsed.reviewer_provider = Some(
+                    iter.next()
+                        .ok_or(UsageError::Message(
+                            "--reviewer-provider requires a provider".into(),
+                        ))?
+                        .clone(),
+                )
+            }
+            "--reviewer-model" => {
+                parsed.reviewer_model = Some(
+                    iter.next()
+                        .ok_or(UsageError::Message(
+                            "--reviewer-model requires a model".into(),
+                        ))?
                         .clone(),
                 )
             }
@@ -6279,13 +6335,14 @@ fn run_review_run(parsed: Parsed) -> Result<serde_json::Value, UsageError> {
     for write in &plan.ledger {
         let (request, created) = broker
             .store()
-            .record_review_request(
+            .record_review_request_with_trigger(
                 &repository,
                 pull_request,
                 &write.review_type,
                 &head,
                 base_commit.as_deref(),
                 write.backend,
+                facts.trigger,
                 now_ms(),
             )
             .map_err(to_usage)?;
@@ -6718,16 +6775,19 @@ fn run_review_ledger(parsed: Parsed) -> Result<(), UsageError> {
     Ok(())
 }
 
-/// Report what became of one requested review.
+/// Report what became of one review, or record a provider completion that was
+/// never requested by Aethyme.
 ///
 /// This is the other half of `review run`'s handoff. The broker decides and
 /// records; a Chau7 adapter or a provider bot performs, and closes the row
 /// here. Without it the ledger only ever says `requested`, and the router's
 /// concurrency slots fill up and never drain.
 ///
-/// `--head` is optional because a reviewer reporting now was almost certainly
-/// asked most recently; naming a head is how a late report about a superseded
-/// commit lands on the right row instead of the current one.
+/// `--head` names the request being reported. For a completion without
+/// `--head`, an exact completion-head match is used; if none exists, the
+/// result is recorded as unsolicited. Naming a head is therefore required for
+/// a late result whose completion commit differs from the request it belongs
+/// to.
 fn run_review_state(parsed: Parsed) -> Result<(), UsageError> {
     let repository = parsed.repository.clone().ok_or_else(|| {
         UsageError::Message(
@@ -6763,6 +6823,63 @@ fn run_review_state(parsed: Parsed) -> Result<(), UsageError> {
                 .into(),
         ));
     }
+
+    let has_completion_argument = parsed.verdict.is_some()
+        || parsed.completed_for_commit.is_some()
+        || parsed.reviewer_provider.is_some()
+        || parsed.reviewer_model.is_some();
+    let completion = if state == crate::ReviewRequestState::Satisfied {
+        let verdict_label = parsed.verdict.as_deref().ok_or_else(|| {
+            UsageError::Message(
+                "review state --state satisfied requires --verdict <pass|fail|changes_requested|commented>"
+                    .into(),
+            )
+        })?;
+        let verdict = crate::ReviewVerdict::parse(verdict_label).ok_or_else(|| {
+            UsageError::Message(format!(
+                "unknown review verdict {verdict_label:?}; expected pass, fail, changes_requested, or commented"
+            ))
+        })?;
+        let completed_for_commit = parsed
+            .completed_for_commit
+            .clone()
+            .map(|commit| commit.trim().to_string())
+            .filter(|commit| !commit.is_empty())
+            .ok_or_else(|| {
+                UsageError::Message(
+                    "review state --state satisfied requires --completed-for-commit <sha>".into(),
+                )
+            })?;
+        let reviewer_provider = parsed
+            .reviewer_provider
+            .clone()
+            .map(|provider| provider.trim().to_string())
+            .filter(|provider| !provider.is_empty())
+            .ok_or_else(|| {
+                UsageError::Message(
+                    "review state --state satisfied requires --reviewer-provider <provider>".into(),
+                )
+            })?;
+        let reviewer_model = parsed
+            .reviewer_model
+            .clone()
+            .map(|model| model.trim().to_string())
+            .filter(|model| !model.is_empty());
+        Some((
+            completed_for_commit,
+            verdict,
+            reviewer_provider,
+            reviewer_model,
+        ))
+    } else {
+        if has_completion_argument {
+            return Err(UsageError::Message(
+                "--verdict, --completed-for-commit, and reviewer identity are only valid when --state satisfied"
+                    .into(),
+            ));
+        }
+        None
+    };
 
     let mut broker = open_broker(parsed.read_only_snapshot)?;
 
@@ -6808,14 +6925,65 @@ fn run_review_state(parsed: Parsed) -> Result<(), UsageError> {
         other => other.map(str::to_string),
     };
 
+    // A completion without --head is unambiguous only when its completion
+    // commit already identifies a row. If it names a different commit from
+    // the latest request, attach it as unsolicited rather than silently
+    // rewriting an older request; the reviewer can pass --head to report a
+    // late result for that request explicitly.
+    let existing_head = match (head.as_deref(), completion.as_ref()) {
+        (Some(head), _) => Some(head),
+        (None, Some((completed_for_commit, ..))) => Some(completed_for_commit.as_str()),
+        (None, None) => None,
+    };
     let existing = broker
         .store()
-        .latest_review_request(&repository, pull_request, &review_type, head.as_deref())
-        .map_err(to_usage)?
-        // Refusing is the point: a report about a review nobody requested
-        // means the reporter and the router disagree about what was asked
-        // for, and inventing a row here would bury that disagreement.
-        .ok_or_else(|| {
+        .latest_review_request(&repository, pull_request, &review_type, existing_head)
+        .map_err(to_usage)?;
+    let updated = if let Some((completed_for_commit, verdict, reviewer_provider, reviewer_model)) =
+        completion
+    {
+        match existing {
+            Some(existing) => broker
+                .store()
+                .complete_review_request(
+                    existing.id,
+                    &completed_for_commit,
+                    verdict,
+                    &reviewer_provider,
+                    reviewer_model.as_deref(),
+                    parsed.note.as_deref(),
+                    now_ms(),
+                )
+                .map_err(to_usage)?,
+            None if parsed.head.is_none() => {
+                broker
+                    .store()
+                    .record_unsolicited_review_completion(
+                        &repository,
+                        pull_request,
+                        &review_type,
+                        &completed_for_commit,
+                        verdict,
+                        &reviewer_provider,
+                        reviewer_model.as_deref(),
+                        parsed.note.as_deref(),
+                        now_ms(),
+                    )
+                    .map_err(to_usage)?
+                    .0
+            }
+            None => {
+                return Err(UsageError::Message(format!(
+                    "no {review_type} review is recorded for {repository}#{pull_request}{}; `aethyme broker review ledger --repo {repository} --pr {pull_request}` lists what is, and omit --head only for an unsolicited completion",
+                    match parsed.head.as_deref() {
+                        Some(head) => format!(" at {head}"),
+                        None => String::new(),
+                    }
+                )));
+            }
+        }
+    } else {
+        let existing = existing.ok_or_else(|| {
             UsageError::Message(format!(
                 "no {review_type} review is recorded for {repository}#{pull_request}{}; `aethyme broker review ledger --repo {repository} --pr {pull_request}` lists what is",
                 match parsed.head.as_deref() {
@@ -6824,10 +6992,11 @@ fn run_review_state(parsed: Parsed) -> Result<(), UsageError> {
                 }
             ))
         })?;
-    let updated = broker
-        .store()
-        .set_review_request_state(existing.id, state, parsed.note.as_deref(), now_ms())
-        .map_err(to_usage)?;
+        broker
+            .store()
+            .set_review_request_state(existing.id, state, parsed.note.as_deref(), now_ms())
+            .map_err(to_usage)?
+    };
 
     if parsed.json {
         out!("{}", serde_json::to_string_pretty(&updated)?);
