@@ -84,6 +84,34 @@ impl CoordinatedOperationReport {
         self.operation.status == OperationStatus::Succeeded
     }
 
+    /// What external inspection concluded about a create that exited non-zero.
+    ///
+    /// The ambiguity #184 reports is "did it create the issue or not", and by
+    /// the time this is rendered the journal already holds the answer. Saying
+    /// it out loud is the difference between having an answer and having a
+    /// record of one. `None` where there is nothing to say: a command that
+    /// creates nothing, or an outcome still unknown -- which
+    /// [`Self::unknown_outcome_recovery`] reports far more loudly.
+    pub fn create_outcome(&self) -> Option<String> {
+        let details: serde_json::Value =
+            serde_json::from_str(self.operation.details_json.as_deref()?).ok()?;
+        let evidence = details.get("create_reconciliation")?.get("evidence")?;
+        match evidence.get("classification")?.as_str()? {
+            "succeeded" => Some(
+                match evidence.get("created").and_then(serde_json::Value::as_str) {
+                    Some(created) => {
+                        format!("the command failed, but it had already created {created}")
+                    }
+                    None => "the command failed, but it had already created the resource".into(),
+                },
+            ),
+            "failed" => {
+                Some("the command failed and the repository shows nothing was created".into())
+            }
+            _ => None,
+        }
+    }
+
     pub fn unknown_outcome_recovery(&self) -> Option<UnknownOutcomeRecovery> {
         (self.operation.status == OperationStatus::OutcomeUnknown)
             .then(|| UnknownOutcomeRecovery::from_operation(&self.operation))
@@ -343,7 +371,11 @@ impl OperationShowReport {
         });
         let evidence = details
             .as_ref()
-            .and_then(|details| details.get("push_reconciliation"))
+            .and_then(|details| {
+                details
+                    .get("push_reconciliation")
+                    .or_else(|| details.get("create_reconciliation"))
+            })
             .cloned();
         let operator_reason = details.as_ref().and_then(|details| {
             details
@@ -1226,6 +1258,467 @@ fn reconcile_failed_push(
     Some((status, value))
 }
 
+/// The `(command, action)` pair a `gh` invocation names.
+///
+/// Flags may precede the subcommand (`--repo o/n issue create`), and dropping
+/// every `-` token would leave a flag's *value* looking positional. So match an
+/// adjacent pair neither of whose halves is a flag, and require that the first
+/// half is not itself the value of a preceding flag -- the same rule
+/// [`crate::creates_pull_request`] applies to one hard-coded pair, generalised.
+fn gh_subcommand(args: &[String]) -> Option<(&str, &str)> {
+    args.windows(2).enumerate().find_map(|(index, pair)| {
+        (!pair[0].starts_with('-')
+            && !pair[1].starts_with('-')
+            && (index == 0 || !args[index - 1].starts_with('-')))
+        .then(|| (pair[0].as_str(), pair[1].as_str()))
+    })
+}
+
+/// Every value a repeatable `gh` flag carries, in either spelling.
+///
+/// A spelling this does not recognise -- `pflag` also accepts the attached
+/// shorthand `-lbug` -- yields no value, and every caller is written so that no
+/// value means "behave as if this check did not exist". Missing a label is
+/// then the status quo `gh` already reports; inventing one would refuse a
+/// command that was going to work.
+fn gh_flag_values<'a>(args: &'a [String], long: &str, short: Option<&str>) -> Vec<&'a str> {
+    let long_assigned = format!("{long}=");
+    let short_assigned = short.map(|short| format!("{short}="));
+    let mut values = Vec::new();
+    let mut pending = false;
+    for arg in args {
+        if pending {
+            values.push(arg.as_str());
+            pending = false;
+        } else if arg == long || short.is_some_and(|short| arg == short) {
+            pending = true;
+        } else if let Some(value) = arg.strip_prefix(&long_assigned) {
+            values.push(value);
+        } else if let Some(value) = short_assigned
+            .as_deref()
+            .and_then(|prefix| arg.strip_prefix(prefix))
+        {
+            values.push(value);
+        }
+    }
+    values
+}
+
+/// `gh` flags whose value must already name a label in the repository.
+const GH_LABEL_FLAGS: &[(&str, Option<&str>)] = &[
+    ("--label", Some("-l")),
+    ("--add-label", None),
+    ("--remove-label", None),
+];
+
+/// How many label names a refusal spells out before summarising the rest.
+const LABEL_VOCABULARY_PREVIEW: usize = 40;
+
+/// The labels a `gh` write asks GitHub to resolve by name.
+///
+/// `gh` resolves these against the repository *before* it creates anything and
+/// refuses the whole command when one is unknown, so the vocabulary is a
+/// precondition of the write rather than a part of it that could half-apply
+/// (#184). Reads are excluded by the caller for a different reason: `--label`
+/// on `issue list` is a filter, where an unknown name returns nothing instead
+/// of failing.
+///
+/// One flag may carry several names -- `gh` parses these as comma-separated
+/// lists -- and may be repeated.
+fn gh_requested_labels(args: &[String]) -> Vec<String> {
+    if !matches!(
+        gh_subcommand(args),
+        Some(("issue" | "pr", "create" | "edit"))
+    ) {
+        return Vec::new();
+    }
+    let mut labels: Vec<String> = Vec::new();
+    for (long, short) in GH_LABEL_FLAGS {
+        for value in gh_flag_values(args, long, *short) {
+            for name in value.split(',') {
+                let name = name.trim();
+                if !name.is_empty() && !labels.iter().any(|seen| seen == name) {
+                    labels.push(name.to_string());
+                }
+            }
+        }
+    }
+    labels
+}
+
+/// The repository's label vocabulary, or `None` when it cannot be read.
+///
+/// Unreadable is not empty, and neither is a refusal. A machine that is
+/// offline, unauthenticated or rate-limited may still be one where the write
+/// itself would work, and turning that into "unknown label" would refuse valid
+/// commands for a reason that has nothing to do with labels. The caller
+/// degrades to the behaviour that existed before this check -- `gh` reports the
+/// unknown name itself -- and the reconciliation below then says whether
+/// anything was created.
+fn github_label_vocabulary(repository: &str, cwd: &Path) -> Option<Vec<String>> {
+    let output = provider_command(OperationProvider::Github)
+        .args([
+            "label", "list", "--repo", repository, "--limit", "500", "--json", "name",
+        ])
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let parsed: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    Some(
+        parsed
+            .as_array()?
+            .iter()
+            .filter_map(|label| label["name"].as_str().map(str::to_string))
+            .collect(),
+    )
+}
+
+/// Refuse a labelled write naming a label the repository does not define.
+///
+/// Refusing is the whole point: the caller runs this before anything is
+/// journaled, queued or sent, so "was the issue created?" has exactly one
+/// answer -- which the message states outright rather than leaving to be
+/// inferred (#184).
+fn refuse_undefined_labels(
+    args: &[String],
+    repository: &str,
+    cwd: &Path,
+) -> Result<(), BrokerOpError> {
+    let requested = gh_requested_labels(args);
+    if requested.is_empty() {
+        return Ok(());
+    }
+    let Some(vocabulary) = github_label_vocabulary(repository, cwd) else {
+        return Ok(());
+    };
+    // GitHub matches label names without regard to case, so refusing on case
+    // alone would reject a name the command was going to apply.
+    let unknown = requested
+        .iter()
+        .filter(|name| {
+            !vocabulary
+                .iter()
+                .any(|known| known.eq_ignore_ascii_case(name))
+        })
+        .map(|name| format!("{name:?}"))
+        .collect::<Vec<_>>();
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    let noun = if unknown.len() == 1 {
+        "label"
+    } else {
+        "labels"
+    };
+    let unknown = unknown.join(", ");
+    let mut defined = vocabulary;
+    defined.sort();
+    let remainder = defined.len().saturating_sub(LABEL_VOCABULARY_PREVIEW);
+    let defined = if defined.is_empty() {
+        "it defines none".to_string()
+    } else {
+        let listed = defined
+            .iter()
+            .take(LABEL_VOCABULARY_PREVIEW)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        match remainder {
+            0 => listed,
+            more => format!("{listed}, and {more} more"),
+        }
+    };
+    Err(BrokerOpError::InvalidCoordinatedOperation {
+        reason: format!(
+            "{repository} does not define the {noun} {unknown}, and `gh` resolves labels before it \
+             creates anything -- so nothing was sent and nothing was created. Labels defined \
+             there: {defined}"
+        ),
+    })
+}
+
+/// How many entries a post-failure listing reads back.
+const CREATE_OBSERVATION_LIMIT: usize = 50;
+
+/// A `gh` command that would have GitHub assign a new number.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CreatePlanning {
+    NotApplicable,
+    Unplannable { reason: &'static str },
+    Planned(CreatePlan),
+}
+
+/// What makes a created resource findable after a run that exited non-zero.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+struct CreatePlan {
+    /// The `gh` subcommand, which is also the collection to list.
+    collection: String,
+    /// The listing field whose value names this particular create.
+    identity_field: String,
+    identity: String,
+    /// The highest number the repository had already assigned.
+    ///
+    /// A create that lands takes a number strictly greater than every number
+    /// the repository had, so this one integer separates the resource this run
+    /// created from one that merely looks like it. `None` means the
+    /// observation failed, which is what keeps such an outcome unknown.
+    watermark: Option<i64>,
+}
+
+impl CreatePlanning {
+    fn journal_value(&self) -> Option<serde_json::Value> {
+        match self {
+            Self::NotApplicable => None,
+            Self::Unplannable { reason } => Some(json!({
+                "planning": "unplannable",
+                "reason": reason,
+            })),
+            Self::Planned(plan) => Some(json!({
+                "planning": "planned",
+                "plan": plan,
+            })),
+        }
+    }
+}
+
+/// Plan how a failed `gh issue create` / `gh pr create` would be recognised.
+///
+/// Identity is the title for an issue and the head branch for a pull request.
+/// Neither is unique on its own, which is why the number watermark taken in
+/// [`observe_create_watermark`] is what makes the pair conclusive.
+///
+/// Reading the checkout's branch is not a guess: it is the same thing `gh pr
+/// create` does with an omitted `--head`. A detached HEAD has no branch to
+/// read, and says so rather than proposing the literal `HEAD`.
+fn plan_github_create(args: &[String], cwd: &Path) -> CreatePlanning {
+    match gh_subcommand(args) {
+        Some(("issue", "create")) => match gh_flag_values(args, "--title", Some("-t")).first() {
+            Some(title) => CreatePlanning::Planned(CreatePlan {
+                collection: "issue".into(),
+                identity_field: "title".into(),
+                identity: (*title).to_string(),
+                watermark: None,
+            }),
+            None => CreatePlanning::Unplannable {
+                reason: "issue_create_without_an_explicit_title",
+            },
+        },
+        Some(("pr", "create")) => {
+            let head = gh_flag_values(args, "--head", Some("-H"))
+                .first()
+                .map(|head| (*head).to_string())
+                .or_else(|| {
+                    crate::GitRepo::discover(cwd)
+                        .ok()?
+                        .current_branch()
+                        .ok()
+                        .filter(|branch| branch != "HEAD")
+                });
+            match head {
+                Some(head) => CreatePlanning::Planned(CreatePlan {
+                    collection: "pr".into(),
+                    identity_field: "headRefName".into(),
+                    identity: head,
+                    watermark: None,
+                }),
+                None => CreatePlanning::Unplannable {
+                    reason: "pull_request_create_without_a_resolvable_head",
+                },
+            }
+        }
+        _ => CreatePlanning::NotApplicable,
+    }
+}
+
+/// One page of `gh <collection> list`, newest first.
+fn github_list(
+    collection: &str,
+    repository: &str,
+    fields: &[&str],
+    limit: usize,
+    cwd: &Path,
+) -> Option<Vec<serde_json::Value>> {
+    let limit = limit.to_string();
+    let fields = fields.join(",");
+    let output = provider_command(OperationProvider::Github)
+        .args([
+            collection, "list", "--repo", repository, "--state", "all", "--limit", &limit,
+            "--json", &fields,
+        ])
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let parsed: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    parsed.as_array().cloned()
+}
+
+/// Record the number the repository stands at before a create runs.
+///
+/// Costs one listing, and only for a create whose result could be recognised
+/// at all. Taking it afterwards would be worthless: the whole question is
+/// which numbers are new.
+fn observe_create_watermark(planning: &mut CreatePlanning, repository: &str, cwd: &Path) {
+    let CreatePlanning::Planned(plan) = planning else {
+        return;
+    };
+    plan.watermark = github_list(&plan.collection, repository, &["number"], 1, cwd).map(|listed| {
+        // A repository with nothing in the collection yet has no number, and 0
+        // is below every number GitHub assigns.
+        listed
+            .first()
+            .and_then(|entry| entry["number"].as_i64())
+            .unwrap_or(0)
+    });
+}
+
+/// The URL `gh` prints for a resource it just created in this repository.
+///
+/// Scoped to the asserted repository, so an unrelated link in the output -- one
+/// quoted by an error message, one in a template -- cannot be read as proof
+/// that something was created.
+fn created_resource_url(stdout: &str, repository: &str) -> Option<String> {
+    let mut segments = repository.rsplit('/');
+    let name = segments.next()?;
+    let owner = segments.next()?;
+    let needle = format!("/{owner}/{name}/").to_ascii_lowercase();
+    stdout
+        .split_whitespace()
+        .find(|token| {
+            let token = token.to_ascii_lowercase();
+            token.starts_with("https://")
+                && token.contains(&needle)
+                && ["/issues/", "/pull/"].iter().any(|collection| {
+                    token.rsplit_once(collection).is_some_and(|(_, number)| {
+                        !number.is_empty() && number.chars().all(|digit| digit.is_ascii_digit())
+                    })
+                })
+        })
+        .map(str::to_string)
+}
+
+/// Decide whether a failed `gh` create nevertheless created something.
+///
+/// The same shape as [`reconcile_failed_push`]: observe external state, then
+/// classify, and record what was observed. Two independent kinds of evidence
+/// answer it and the stronger one wins. `gh` prints the new resource's URL once
+/// the API call has returned, so a URL on stdout is proof even when the process
+/// then exits non-zero. When stdout is silent the repository itself is asked,
+/// and the watermark taken before the run is what separates what this run
+/// created from what was already there.
+///
+/// Every path that cannot see far enough records a named reason and stays
+/// unknown rather than guessing, because it is a wrong "failed" that makes a
+/// blind retry look safe (#184).
+fn reconcile_failed_github_create(
+    cwd: &Path,
+    repository: &str,
+    planning: &CreatePlanning,
+    stdout: &[u8],
+) -> Option<(OperationStatus, serde_json::Value)> {
+    let CreatePlanning::Planned(plan) = planning else {
+        return planning.journal_value().map(|mut value| {
+            value["evidence"] = json!({
+                "classification": "unknown",
+                "reason": "create_plan_unavailable",
+            });
+            (OperationStatus::OutcomeUnknown, value)
+        });
+    };
+    let mut value = planning.journal_value().expect("planned create");
+    if let Some(created) = created_resource_url(&String::from_utf8_lossy(stdout), repository) {
+        value["evidence"] = json!({
+            "classification": "succeeded",
+            "source": "command_output",
+            "created": created,
+        });
+        return Some((OperationStatus::Succeeded, value));
+    }
+    let Some(watermark) = plan.watermark else {
+        value["evidence"] = json!({
+            "classification": "unknown",
+            "reason": "pre_create_number_watermark_unavailable",
+        });
+        return Some((OperationStatus::OutcomeUnknown, value));
+    };
+    let Some(listed) = github_list(
+        &plan.collection,
+        repository,
+        &["number", "url", plan.identity_field.as_str()],
+        CREATE_OBSERVATION_LIMIT,
+        cwd,
+    ) else {
+        value["evidence"] = json!({
+            "classification": "unknown",
+            "reason": "post_create_repository_evidence_unavailable",
+        });
+        return Some((OperationStatus::OutcomeUnknown, value));
+    };
+    let (status, evidence) = classify_create_observation(plan, watermark, &listed);
+    value["evidence"] = evidence;
+    Some((status, value))
+}
+
+/// Read a listing of the collection, newest first, for the planned create.
+///
+/// Kept apart from the `gh` call so the question it answers -- what does this
+/// listing prove? -- can be asked of any listing, including the ones a test
+/// writes by hand.
+fn classify_create_observation(
+    plan: &CreatePlan,
+    watermark: i64,
+    listed: &[serde_json::Value],
+) -> (OperationStatus, serde_json::Value) {
+    let identity_field = plan.identity_field.as_str();
+    if let Some(created) = listed.iter().find(|entry| {
+        entry["number"]
+            .as_i64()
+            .is_some_and(|number| number > watermark)
+            && entry[identity_field].as_str() == Some(plan.identity.as_str())
+    }) {
+        return (
+            OperationStatus::Succeeded,
+            json!({
+                "classification": "succeeded",
+                "source": "post_create_observation",
+                "created": created["url"],
+                "number": created["number"],
+            }),
+        );
+    }
+    // The listing is newest first, so its last entry is the oldest it reached.
+    // A full page that never got back to the watermark leaves a gap the create
+    // could be hiding in, and "absent from the page" is then not "not created".
+    let reached_watermark = listed.len() < CREATE_OBSERVATION_LIMIT
+        || listed
+            .last()
+            .and_then(|entry| entry["number"].as_i64())
+            .is_some_and(|oldest| oldest <= watermark);
+    if !reached_watermark {
+        return (
+            OperationStatus::OutcomeUnknown,
+            json!({
+                "classification": "unknown",
+                "reason": "post_create_listing_did_not_reach_the_watermark",
+                "watermark": watermark,
+            }),
+        );
+    }
+    (
+        OperationStatus::Failed,
+        json!({
+            "classification": "failed",
+            "source": "post_create_observation",
+            "watermark": watermark,
+        }),
+    )
+}
+
 /// How a provider's CLI is spelled on disk. Not `OperationProvider::as_str`,
 /// which is the wire spelling stored in the journal: that says `github` where
 /// the binary is `gh`.
@@ -1648,6 +2141,14 @@ impl Broker {
             }
             (None, None, OperationProvider::Git) => None,
         };
+        // Before anything is journaled, queued or sent, because that is the
+        // whole value of the check: a refusal leaves no operation to reconcile
+        // and no question about what reached GitHub (#184).
+        if let Some(target) = &github_target
+            && effect != OperationEffect::Read
+        {
+            refuse_undefined_labels(&request.args, &target.display_slug, cwd)?;
+        }
         // One repository has exactly one coordination key. The head-of-line
         // check below matches `repository` exactly, so a second spelling is not
         // cosmetic: a wedged operation journaled as `owner/Name` would not block
@@ -1903,6 +2404,20 @@ impl Broker {
         } else {
             PushPlanning::NotApplicable
         };
+        // The counterpart for GitHub: what a create would produce, and the
+        // number the repository already stands at. Taken here and not earlier
+        // so the watermark is as close to the spawn as the lock allows --
+        // every number assigned after it is a candidate for "this run did
+        // that" (#184).
+        let mut create_planning =
+            if request.provider == OperationProvider::Github && effect != OperationEffect::Read {
+                plan_github_create(&request.args, cwd)
+            } else {
+                CreatePlanning::NotApplicable
+            };
+        if let Some(target) = &github_target {
+            observe_create_watermark(&mut create_planning, &target.display_slug, cwd);
+        }
 
         // The hook verified specific commits. If any local ref moved while this
         // operation waited for the lock, that verification no longer describes
@@ -2057,6 +2572,25 @@ impl Broker {
                     json!({ "push_reconciliation": push_reconciliation }),
                 ),
             )
+        } else if let Some((status, create_reconciliation)) =
+            github_target.as_ref().and_then(|target| {
+                reconcile_failed_github_create(
+                    cwd,
+                    &target.display_slug,
+                    &create_planning,
+                    &output.stdout,
+                )
+            })
+        {
+            (
+                status,
+                journal_details(
+                    classification,
+                    resolved_target.as_ref(),
+                    github_target.as_ref(),
+                    json!({ "create_reconciliation": create_reconciliation }),
+                ),
+            )
         } else {
             // A mutating command may have applied a subset of its effects
             // before returning non-zero. Treating that as safely failed would
@@ -2168,6 +2702,233 @@ mod tests {
 
     fn scope(args: &[&str]) -> Option<String> {
         resource_lock_scope(OperationProvider::Github, &gh(args))
+    }
+
+    fn issue_plan(identity: &str, watermark: Option<i64>) -> CreatePlan {
+        CreatePlan {
+            collection: "issue".into(),
+            identity_field: "title".into(),
+            identity: identity.into(),
+            watermark,
+        }
+    }
+
+    fn listed(entries: &[(i64, &str)]) -> Vec<serde_json::Value> {
+        entries
+            .iter()
+            .map(|(number, title)| {
+                json!({
+                    "number": number,
+                    "title": title,
+                    "url": format!("https://github.com/o/r/issues/{number}"),
+                })
+            })
+            .collect()
+    }
+
+    /// The subcommand is what decides whether a command is labelled at all, and
+    /// `gh` accepts flags in front of it.
+    #[test]
+    fn the_subcommand_is_found_behind_leading_flags_but_never_inside_one() {
+        assert_eq!(
+            gh_subcommand(&gh(&["issue", "create", "--title", "x"])),
+            Some(("issue", "create"))
+        );
+        assert_eq!(
+            gh_subcommand(&gh(&["--repo", "o/r", "issue", "create"])),
+            Some(("issue", "create"))
+        );
+        // `issue` here is the value of `--title`, not the command.
+        assert_eq!(
+            gh_subcommand(&gh(&["--title", "issue", "create", "later"])),
+            Some(("create", "later"))
+        );
+    }
+
+    /// Every spelling `gh` accepts for a label has to be seen, because a label
+    /// this misses is one the pre-flight check cannot refuse (#184).
+    #[test]
+    fn labels_are_collected_across_spellings_repetitions_and_comma_lists() {
+        assert_eq!(
+            gh_requested_labels(&gh(&[
+                "issue",
+                "create",
+                "--title",
+                "t",
+                "--label",
+                "bug,dette",
+                "-l",
+                "area:broker",
+                "--label=chore",
+            ])),
+            vec!["bug", "dette", "area:broker", "chore"]
+        );
+        assert_eq!(
+            gh_requested_labels(&gh(&[
+                "issue",
+                "edit",
+                "7",
+                "--add-label",
+                "bug",
+                "--remove-label",
+                "stale",
+            ])),
+            vec!["bug", "stale"]
+        );
+    }
+
+    /// `--label` on a listing is a filter: an unknown name returns nothing
+    /// rather than failing, so refusing it would break a working read.
+    #[test]
+    fn a_label_filter_on_a_listing_is_not_a_label_to_resolve() {
+        assert!(gh_requested_labels(&gh(&["issue", "list", "--label", "dette"])).is_empty());
+        assert!(gh_requested_labels(&gh(&["label", "create", "dette"])).is_empty());
+    }
+
+    /// The identity has to come from the command line, and a create whose
+    /// result could not be named afterwards must say so rather than be planned
+    /// against something that does not identify it.
+    #[test]
+    fn a_create_is_planned_from_its_identity_or_declared_unplannable() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(
+            plan_github_create(&gh(&["issue", "create", "--title", "a bug"]), tmp.path()),
+            CreatePlanning::Planned(issue_plan("a bug", None))
+        );
+        assert_eq!(
+            plan_github_create(&gh(&["issue", "create", "--body", "b"]), tmp.path()),
+            CreatePlanning::Unplannable {
+                reason: "issue_create_without_an_explicit_title"
+            }
+        );
+        assert_eq!(
+            plan_github_create(
+                &gh(&["pr", "create", "--title", "t", "--head", "topic"]),
+                tmp.path()
+            ),
+            CreatePlanning::Planned(CreatePlan {
+                collection: "pr".into(),
+                identity_field: "headRefName".into(),
+                identity: "topic".into(),
+                watermark: None,
+            })
+        );
+        assert_eq!(
+            plan_github_create(&gh(&["issue", "comment", "7", "--body", "b"]), tmp.path()),
+            CreatePlanning::NotApplicable
+        );
+    }
+
+    /// `gh` prints the new resource's URL once the API call has returned, so a
+    /// URL on stdout survives a later non-zero exit as proof. A URL for some
+    /// other repository proves nothing about this one.
+    #[test]
+    fn only_a_url_under_the_asserted_repository_counts_as_a_created_resource() {
+        assert_eq!(
+            created_resource_url(
+                "https://github.com/Schiste/Aethyme/issues/184\n",
+                "github.com/schiste/aethyme"
+            )
+            .as_deref(),
+            Some("https://github.com/Schiste/Aethyme/issues/184")
+        );
+        assert_eq!(
+            created_resource_url(
+                "https://github.com/other/repo/issues/9\n",
+                "schiste/aethyme"
+            ),
+            None
+        );
+        assert_eq!(
+            created_resource_url("could not add label: dette not found\n", "schiste/aethyme"),
+            None
+        );
+    }
+
+    /// The watermark is what separates the resource this run created from one
+    /// that merely carries the same title.
+    #[test]
+    fn only_a_number_above_the_watermark_proves_this_run_created_it() {
+        let plan = issue_plan("a bug", Some(10));
+        let (status, evidence) =
+            classify_create_observation(&plan, 10, &listed(&[(11, "a bug"), (9, "older")]));
+        assert_eq!(status, OperationStatus::Succeeded);
+        assert_eq!(evidence["classification"], "succeeded");
+        assert_eq!(evidence["number"], 11);
+
+        // Same title, but it predates the command: this run created nothing.
+        let (status, evidence) =
+            classify_create_observation(&plan, 10, &listed(&[(9, "a bug"), (8, "older")]));
+        assert_eq!(status, OperationStatus::Failed);
+        assert_eq!(evidence["classification"], "failed");
+    }
+
+    /// A page that never reached back to the watermark leaves a gap the create
+    /// could be hiding in, and a wrong "failed" is what makes a blind retry
+    /// look safe (#184).
+    #[test]
+    fn a_listing_that_stops_above_the_watermark_stays_unknown() {
+        let plan = issue_plan("a bug", Some(10));
+        let full: Vec<(i64, &str)> = (0..CREATE_OBSERVATION_LIMIT)
+            .map(|index| (200 - index as i64, "unrelated"))
+            .collect();
+        let (status, evidence) = classify_create_observation(&plan, 10, &listed(&full));
+        assert_eq!(status, OperationStatus::OutcomeUnknown);
+        assert_eq!(
+            evidence["reason"],
+            "post_create_listing_did_not_reach_the_watermark"
+        );
+
+        // One entry short of a full page is a listing that ran out, not one
+        // that was truncated, so it does prove absence.
+        let (status, _) = classify_create_observation(&plan, 10, &listed(&full[1..]));
+        assert_eq!(status, OperationStatus::Failed);
+    }
+
+    /// A create nobody could recognise afterwards is unknown, not failed.
+    #[test]
+    fn an_unplannable_create_and_a_missing_watermark_both_stay_unknown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (status, value) = reconcile_failed_github_create(
+            tmp.path(),
+            "o/r",
+            &CreatePlanning::Unplannable {
+                reason: "issue_create_without_an_explicit_title",
+            },
+            b"",
+        )
+        .unwrap();
+        assert_eq!(status, OperationStatus::OutcomeUnknown);
+        assert_eq!(value["evidence"]["reason"], "create_plan_unavailable");
+
+        let (status, value) = reconcile_failed_github_create(
+            tmp.path(),
+            "o/r",
+            &CreatePlanning::Planned(issue_plan("a bug", None)),
+            b"",
+        )
+        .unwrap();
+        assert_eq!(status, OperationStatus::OutcomeUnknown);
+        assert_eq!(
+            value["evidence"]["reason"],
+            "pre_create_number_watermark_unavailable"
+        );
+    }
+
+    /// Nothing to reconcile for a command that creates nothing: the caller's
+    /// existing conservative fallback still applies.
+    #[test]
+    fn a_command_that_creates_nothing_is_left_to_the_conservative_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(
+            reconcile_failed_github_create(
+                tmp.path(),
+                "o/r",
+                &CreatePlanning::NotApplicable,
+                b"whatever",
+            )
+            .is_none()
+        );
     }
 
     /// The scope must come from the command line alone: it decides which lock

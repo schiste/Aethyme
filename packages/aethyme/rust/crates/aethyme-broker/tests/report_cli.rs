@@ -128,6 +128,21 @@ body:
     }
 }
 
+/// How many times the fake `gh` was asked to create an issue.
+///
+/// Filing also reads the repository -- to resolve labels, and to take the
+/// issue-number watermark that says whether a failed create nevertheless
+/// created something -- so counting every invocation would count reads that
+/// change nothing. What these tests are about is that the *write* runs once.
+#[cfg(unix)]
+fn issue_creates(calls_path: &str) -> usize {
+    std::fs::read_to_string(calls_path)
+        .unwrap()
+        .lines()
+        .filter(|call| call.starts_with("issue create"))
+        .count()
+}
+
 #[cfg(unix)]
 fn install_fake_gh(repo: &Path) -> (String, String, String, String) {
     use std::os::unix::fs::PermissionsExt;
@@ -139,7 +154,7 @@ fn install_fake_gh(repo: &Path) -> (String, String, String, String) {
         &gh,
         r#"#!/bin/sh
 printf '%s\n' "$@" > "$AETHYME_FAKE_GH_ARGS"
-printf 'called\n' >> "$AETHYME_FAKE_GH_CALLS"
+printf '%s\n' "$*" >> "$AETHYME_FAKE_GH_CALLS"
 body_file=''
 while [ "$#" -gt 0 ]; do
   if [ "$1" = '--body-file' ]; then
@@ -1045,13 +1060,7 @@ fn file_uses_the_confirmed_render_and_journals_the_returned_issue() {
     );
     assert!(!duplicate.status.success());
     assert!(String::from_utf8_lossy(&duplicate.stderr).contains("already filed"));
-    assert_eq!(
-        std::fs::read_to_string(&calls_path)
-            .unwrap()
-            .lines()
-            .count(),
-        1
-    );
+    assert_eq!(issue_creates(&calls_path), 1);
 }
 
 #[cfg(unix)]
@@ -1198,13 +1207,7 @@ body:
         "{}",
         String::from_utf8_lossy(&filed.stderr)
     );
-    assert_eq!(
-        std::fs::read_to_string(&calls_path)
-            .unwrap()
-            .lines()
-            .count(),
-        1
-    );
+    assert_eq!(issue_creates(&calls_path), 1);
 }
 
 #[cfg(unix)]
@@ -1266,13 +1269,7 @@ fn ambiguous_file_outcome_requires_reconciliation_and_is_never_retried() {
     assert!(stderr.contains(&format!("--operation {operation_id} --outcome succeeded")));
     assert!(stderr.contains(&format!("--operation {operation_id} --outcome failed")));
     assert!(stderr.contains("Blind retry is forbidden"));
-    assert_eq!(
-        std::fs::read_to_string(&calls_path)
-            .unwrap()
-            .lines()
-            .count(),
-        1
-    );
+    assert_eq!(issue_creates(&calls_path), 1);
 
     let mut broker = test_broker(tmp.path());
     broker
@@ -1286,13 +1283,7 @@ fn ambiguous_file_outcome_requires_reconciliation_and_is_never_retried() {
         reconciliation_stderr.contains("already has completed filing operation"),
         "{reconciliation_stderr}"
     );
-    assert_eq!(
-        std::fs::read_to_string(&calls_path)
-            .unwrap()
-            .lines()
-            .count(),
-        1
-    );
+    assert_eq!(issue_creates(&calls_path), 1);
 
     let shown = run(tmp.path(), &["report", "show", "source.json", "--json"]);
     assert!(shown.status.success());

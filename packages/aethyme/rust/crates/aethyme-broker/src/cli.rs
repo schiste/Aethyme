@@ -5466,6 +5466,12 @@ fn render_coordinated_operation(
             report.operation.repository,
             report.classification,
         );
+        // A create that exited non-zero has already been reconciled against the
+        // repository by now, so the operator reads the answer here rather than
+        // going to look for the issue by hand (#184).
+        if let Some(outcome) = report.create_outcome() {
+            out!("{outcome}");
+        }
         // The PR is linkable the moment it exists; starting the watch is left
         // to the caller because it polls the provider, and this command may
         // still be inside the repository write lock (#150, and #138 for why).

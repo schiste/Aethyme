@@ -1451,6 +1451,30 @@ unplannable shape remain conservatively unknown. Output text never participates
 in this classification. V1 deliberately serializes all writes for one
 repository.
 
+A labelled `gh issue`/`pr` `create` or `edit` is pre-flighted before anything is
+journaled, queued, or sent: every `--label`, `--add-label`, and `--remove-label`
+value (comma-separated lists and the `-l` spelling included) is resolved against
+the repository's label vocabulary, matched without regard to case. An undefined
+name is refused with the names the repository does define, and because the
+refusal precedes the journal there is no operation to reconcile and nothing
+reached GitHub. A vocabulary that cannot be read -- offline, unauthenticated,
+rate-limited -- does not refuse the write; `gh` then reports the unknown label
+itself and the reconciliation below says whether anything was created.
+
+The broker also resolves a non-zero `gh issue create` / `gh pr create` rather
+than leaving it unknown. Before the command runs it records the highest number
+the collection has already assigned; afterward, a resource URL under the
+asserted repository on the command's own output is conclusive evidence of
+creation, and otherwise the collection is listed and an entry numbered above
+that watermark whose title (issue) or head branch (pull request) matches the
+request proves it. A listing that reaches back past the watermark without a
+match is a proven `failed`. An unreadable watermark, an unreadable listing, a
+full page that never reaches the watermark, or a create with no resolvable
+identity (an untitled issue, a pull request with no `--head` and a detached
+HEAD) all remain `outcome_unknown`. The verdict and its evidence are recorded
+in the journal, surfaced by `operations show`, and stated in words on the
+command's own output.
+
 After a successful coordinated `gh pr merge`, the broker performs a second,
 journaled fetch of the primary branch's configured remote-tracking target. It
 then removes stale integration history automatically only when the complete

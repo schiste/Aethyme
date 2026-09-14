@@ -199,6 +199,40 @@ artifacts and their exact source revision are recorded in each signed
 
 ### Fixed
 
+- `broker gh` now answers "was the issue created?" for a `gh issue create` or
+  `gh pr create` that exits non-zero, instead of recording `outcome_unknown` and
+  leaving an operator to look. Before the command runs the broker records the
+  highest number the collection has assigned. A resource URL under the asserted
+  repository on the command's own output is conclusive; failing that, the
+  collection is listed and an entry above the watermark whose title (issue) or
+  head branch (pull request) matches proves creation, while a listing that
+  reaches back past the watermark without a match proves none. The verdict and
+  its evidence are journaled, shown by `operations show`, and stated in words on
+  the command's output.
+
+  Evidence that cannot see far enough still refuses to guess: an unreadable
+  watermark or listing, a full page that never reaches the watermark, and a
+  create with no resolvable identity — an untitled issue, a pull request with no
+  `--head` on a detached HEAD — all remain `outcome_unknown`. A wrong "failed"
+  is what would make a blind retry look safe, and a duplicate issue is exactly
+  the cost of getting it wrong (#184).
+
+- A labelled `gh issue`/`pr` `create` or `edit` naming a label the repository
+  does not define is now refused before anything is journaled, queued, or sent,
+  naming the unknown label and the ones that exist. `gh` resolves labels before
+  it creates anything, so the whole command failed with `could not add label`
+  after the payload was written — costing a full round trip and leaving the
+  operator to work out whether the issue existed (#184). The refusal precedes
+  the journal, so there is no operation to reconcile and the answer is
+  unambiguous: nothing was created.
+
+  Names match without regard to case, as GitHub matches them. A vocabulary that
+  cannot be read — offline, unauthenticated, rate-limited — does not refuse the
+  write: that machine may be one where the write works, and turning an
+  unreadable vocabulary into "unknown label" would refuse valid commands for a
+  reason unrelated to labels. The command then behaves exactly as it did before,
+  and the create reconciliation above says what happened.
+
 - One repository now has one gate coordination key, whatever checkout asks for
   it. The key is resolved from the main checkout instead of from the calling
   worktree, so a session and the primary checkout agree.
