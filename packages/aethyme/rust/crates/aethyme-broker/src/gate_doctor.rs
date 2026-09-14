@@ -19,6 +19,7 @@ pub enum GateDiagnosticId {
     ExpensiveBroadTrigger,
     UncoveredSourceArea,
     MissingResourceIsolation,
+    OriginlessCoordinationKey,
     FixedResourceIdentifier,
     SharedWritableCache,
     MainCheckoutAssumption,
@@ -312,6 +313,12 @@ pub fn inspect_gate_quality(repo: &crate::GitRepo) -> Result<GateDoctorReport, G
         })?;
     let (gates, mut findings) = parse_doctor_gates(&head, &text)?;
 
+    // #170: with no `origin` the coordination key falls back to the main
+    // checkout's absolute path. That is stable across this repository's
+    // worktrees, but it is not the cross-clone identity a declared pool
+    // reads as, and it rotates if the checkout moves. Resolved once: it
+    // costs a `git remote` call.
+    let key_source = crate::gates::repository_key(repo).1;
     let tracked = repo.tracked_files_at(&head)?;
     let sources = tracked
         .iter()
@@ -337,6 +344,37 @@ pub fn inspect_gate_quality(repo: &crate::GitRepo) -> Result<GateDoctorReport, G
             repository_coverage_percent: percent,
             execution_definition_hash: gate.definition_hash.clone(),
         });
+
+        // Raised per gate, and only for a gate that actually stakes
+        // something on the key: a gate declaring neither a resource pool nor
+        // a managed cache loses nothing to a path-derived key, so saying so
+        // would be noise.
+        if key_source == crate::gates::RepositoryKeySource::MainCheckoutPath {
+            let mut staked = Vec::new();
+            if !gate.resources.is_empty() {
+                staked.push(format!("{} declared resource(s)", gate.resources.len()));
+            }
+            if let Some(cache) = &gate.managed_cache {
+                staked.push(format!("managed cache {:?}", cache.key));
+            }
+            if !staked.is_empty() {
+                findings.push(finding(
+                    GateDiagnosticId::OriginlessCoordinationKey,
+                    Some(&gate.name),
+                    GateDiagnosticSeverity::Notice,
+                    GateDiagnosticConfidence::High,
+                    format!(
+                        "gate {:?} coordinates under a path-derived repository key",
+                        gate.name
+                    ),
+                    vec![
+                        "no `origin` remote is configured, so the coordination key is the main checkout's absolute path".into(),
+                        format!("at stake: {}", staked.join(", ")),
+                    ],
+                    "Configure an `origin` remote, or accept that this gate shares its pool and managed cache only with checkouts of this path on this machine.",
+                ));
+            }
+        }
 
         let unmatched = gate
             .triggers
@@ -1058,6 +1096,72 @@ end = 55999
             crate::load_gates(tmp.path()),
             Err(crate::GateConfigError::BadTimeout { .. })
         ));
+    }
+
+    /// #170: the fallback key is now correct, but it is still not the
+    /// cross-clone identity a declared pool reads as -- and it rotates if
+    /// the checkout moves. Raised only for a gate that stakes something on
+    /// it, so a repository with no pools and no caches stays quiet.
+    #[test]
+    fn an_originless_key_is_reported_only_for_gates_that_stake_something_on_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".aethyme")).unwrap();
+        std::fs::write(
+            tmp.path().join(crate::GATES_CONFIG_RELPATH),
+            concat!(
+                "[[gate]]\nname='plain'\ncommand='true'\ntimeout_seconds=30\n\n",
+                "[[gate]]\nname='pooled'\ncommand='true'\ntimeout_seconds=30\nresource_ttl_seconds=30\n",
+                "[[gate.resources]]\nkey='slot'\nkind='exclusive_key'\nname='aethyme-unit-170'\n",
+            ),
+        )
+        .unwrap();
+        for args in [
+            vec!["init", "-q", "-b", "main"],
+            vec!["add", "-A"],
+            vec![
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-qm",
+                "fixture",
+            ],
+        ] {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(tmp.path())
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+
+        let repo = crate::GitRepo::discover(tmp.path()).unwrap();
+        let flagged = |report: &GateDoctorReport| {
+            report
+                .findings
+                .iter()
+                .filter(|f| f.id == GateDiagnosticId::OriginlessCoordinationKey)
+                .map(|f| f.gate.clone().unwrap())
+                .collect::<Vec<_>>()
+        };
+
+        // No origin: only the gate with something to lose is named.
+        assert_eq!(flagged(&inspect_gate_quality(&repo).unwrap()), ["pooled"]);
+
+        // With an origin the key is the remote's, and the notice goes away.
+        let status = std::process::Command::new("git")
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "https://example.invalid/org/app.git",
+            ])
+            .current_dir(tmp.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert!(flagged(&inspect_gate_quality(&repo).unwrap()).is_empty());
     }
 
     #[test]

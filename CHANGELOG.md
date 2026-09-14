@@ -197,6 +197,43 @@ artifacts and their exact source revision are recorded in each signed
   the backend it is escaping: that is refused when the policy loads rather than
   discovered as a second refusal.
 
+### Fixed
+
+- One repository now has one gate coordination key, whatever checkout asks for
+  it. The key is resolved from the main checkout instead of from the calling
+  worktree, so a session and the primary checkout agree.
+
+  Two configurations disagreed before. A repository with no `origin` fell back
+  to the calling worktree's directory name, and broker worktrees are named
+  after their task, so no two sessions ever matched. A repository whose
+  `origin` is a *relative* local path (`../upstream`) resolved that path
+  against the calling checkout's root, which differs per worktree for the same
+  reason. In both, a gate declaring an `ExclusiveKey` or a `Capacity` pool to
+  stop two workers touching one piece of external state got a per-worktree
+  pool: every worker acquired, every worker ran, and nothing reported that the
+  guard had become a no-op (#170). Managed gate caches fragmented the same way,
+  each worktree building its own from cold. An absolute or network `origin` was
+  always worktree-independent and is unaffected.
+
+- The origin-less fallback now hashes the main checkout's absolute path rather
+  than its bare directory name, so two unrelated repositories both called `app`
+  stop sharing one key, one managed gate cache and one exclusive pool — as did
+  every repository whose directory name was not valid UTF-8, which all
+  collided on the literal `repository`.
+
+  Upgrade note: in a repository with no `origin`, or with a relative local
+  `origin`, existing gate resource leases and managed gate caches are keyed
+  under the old value and are abandoned rather than migrated. Leases expire on
+  their configured TTL and each managed cache is rebuilt once. Repositories
+  with an absolute or network `origin` — the usual case — keep their keys and
+  their caches.
+
+- `broker gates doctor` reports a gate that coordinates under a path-derived
+  key. The fallback is correct now but it is still not the cross-clone identity
+  a declared pool reads as, and it rotates if the checkout is moved or renamed.
+  The notice names only gates that actually declare a resource pool or a
+  managed cache, since a gate that declares neither loses nothing to it.
+
 ## [0.7.18] - 2026-09-12
 
 ### Added

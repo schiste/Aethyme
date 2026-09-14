@@ -1247,18 +1247,63 @@ fn acquire_gate_resources(
     }))
 }
 
+/// Where a repository coordination key came from.
+///
+/// Both variants are stable across the worktrees of one repository. They
+/// differ in what *else* they are stable across: an `origin` key names the
+/// same repository from any clone on any machine, while the fallback names
+/// one checkout on one machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RepositoryKeySource {
+    Origin,
+    MainCheckoutPath,
+}
+
+/// The coordination key for `repo`'s repository, and where it came from.
+///
+/// #170: resolved from the **main** checkout, never from the calling
+/// worktree. Reading it from the caller gave every session its own
+/// "repository", which silently turned a gate's `ExclusiveKey` pool into a
+/// per-worktree no-op and made every worktree populate its own managed cache
+/// from cold. Two configurations took that path:
+///
+/// - No `origin` at all, which #170 reports.
+/// - A *relative* local-path `origin` such as `../upstream`, which
+///   `parse_local_path` joins onto the resolving checkout's root. Linked
+///   worktrees share the config but not the root, so they disagree for the
+///   same reason. An absolute or network `origin` was always worktree-
+///   independent and is unaffected.
+pub(crate) fn repository_key(repo: &GitRepo) -> (String, RepositoryKeySource) {
+    // Degrades to the calling checkout rather than failing: a key an
+    // operator can still coordinate under beats a gate that cannot run. The
+    // repository has to have become unreadable between discovery and here
+    // for this to bind.
+    let anchor = repo
+        .main_root()
+        .ok()
+        .and_then(|root| GitRepo::discover(&root).ok());
+    let anchor = anchor.as_ref().unwrap_or(repo);
+    match anchor.resolve_remote_target("origin", None) {
+        Ok(target) => (
+            sha256_text(&target.coordination_key),
+            RepositoryKeySource::Origin,
+        ),
+        // The main root's absolute path, not the bare directory name it used
+        // to be: two unrelated origin-less repositories both called `app`
+        // would otherwise share one key, one managed gate cache and one
+        // exclusive pool -- and every non-UTF-8 name collided on the literal
+        // `"repository"`. Host resources and managed caches are per-user
+        // machine state, so a local path is exactly as durable as the things
+        // it keys.
+        Err(_) => (
+            sha256_text(&anchor.root().to_string_lossy()),
+            RepositoryKeySource::MainCheckoutPath,
+        ),
+    }
+}
+
 pub(crate) fn git_origin_fingerprint(repo: &GitRepo) -> String {
-    let material = repo
-        .resolve_remote_target("origin", None)
-        .map(|target| target.coordination_key)
-        .unwrap_or_else(|_| {
-            repo.root()
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("repository")
-                .to_string()
-        });
-    sha256_text(&material)
+    repository_key(repo).0
 }
 
 fn prepare_managed_gate_cache(
@@ -2158,6 +2203,182 @@ mod tests {
     fn write_config(dir: &Path, body: &str) {
         std::fs::create_dir_all(dir.join(".aethyme")).unwrap();
         std::fs::write(dir.join(GATES_CONFIG_RELPATH), body).unwrap();
+    }
+
+    fn git_in(dir: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} failed in {dir:?}");
+    }
+
+    /// A repository with one commit, so `worktree add` has something to
+    /// check out. No `origin` unless the caller adds one.
+    fn init_repo(root: &Path) {
+        std::fs::create_dir_all(root).unwrap();
+        git_in(root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("file.txt"), "fixture\n").unwrap();
+        git_in(root, &["add", "-A"]);
+        git_in(
+            root,
+            &[
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-qm",
+                "fixture",
+            ],
+        );
+    }
+
+    /// #170: the whole point. A linked worktree is not a different
+    /// repository, and a gate resource pool declared to serialise two
+    /// workers has to reach both of them.
+    #[test]
+    fn an_origin_less_repository_keys_every_worktree_the_same() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("app");
+        init_repo(&root);
+        let linked = tmp.path().join("linked");
+        git_in(
+            &root,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                linked.to_str().unwrap(),
+                "-b",
+                "side",
+            ],
+        );
+
+        let primary = repository_key(&GitRepo::discover(&root).unwrap());
+        let worktree = repository_key(&GitRepo::discover(&linked).unwrap());
+
+        assert_eq!(primary.1, RepositoryKeySource::MainCheckoutPath);
+        assert_eq!(worktree.1, RepositoryKeySource::MainCheckoutPath);
+        assert_eq!(
+            primary.0, worktree.0,
+            "a linked worktree must coordinate under its repository's key"
+        );
+    }
+
+    /// The inverse hazard, which the old bare-directory-name material had
+    /// and nobody filed: over-sharing. Two unrelated checkouts called `app`
+    /// hashed to one key, so they would have shared one managed gate cache.
+    #[test]
+    fn two_origin_less_repositories_with_the_same_name_do_not_share_a_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let left = tmp.path().join("one").join("app");
+        let right = tmp.path().join("two").join("app");
+        init_repo(&left);
+        init_repo(&right);
+
+        let left_key = repository_key(&GitRepo::discover(&left).unwrap());
+        let right_key = repository_key(&GitRepo::discover(&right).unwrap());
+
+        assert_eq!(left_key.1, RepositoryKeySource::MainCheckoutPath);
+        assert_ne!(
+            left_key.0, right_key.0,
+            "unrelated repositories sharing a directory name must not share a cache"
+        );
+    }
+
+    /// A *relative* local-path origin is joined onto the resolving
+    /// checkout's root, so it disagreed across worktrees for the same reason
+    /// the missing-origin fallback did. #170 reported only the second.
+    #[test]
+    fn a_relative_local_origin_keys_every_worktree_the_same() {
+        let tmp = tempfile::tempdir().unwrap();
+        let upstream = tmp.path().join("upstream");
+        init_repo(&upstream);
+        let root = tmp.path().join("app");
+        init_repo(&root);
+        git_in(&root, &["remote", "add", "origin", "../upstream"]);
+        // Deliberately at a different depth from `app`: a sibling would let
+        // `../upstream` resolve to the same absolute path from both roots
+        // and the test would pass against the unfixed code.
+        let linked = tmp.path().join("nested").join("linked");
+        git_in(
+            &root,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                linked.to_str().unwrap(),
+                "-b",
+                "side",
+            ],
+        );
+
+        let primary = repository_key(&GitRepo::discover(&root).unwrap());
+        let worktree = repository_key(&GitRepo::discover(&linked).unwrap());
+
+        assert_eq!(primary.1, RepositoryKeySource::Origin);
+        assert_eq!(worktree.1, RepositoryKeySource::Origin);
+        assert_eq!(
+            primary.0, worktree.0,
+            "one origin is one repository, however the URL is spelled"
+        );
+    }
+
+    /// An absolute origin was already worktree-independent. Asserted so the
+    /// anchoring cannot quietly start deriving the key from a path in the
+    /// case that was never broken -- that would rotate every real
+    /// repository's gate cache.
+    #[test]
+    fn an_absolute_origin_still_keys_on_the_remote_and_not_the_checkout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let left = tmp.path().join("here");
+        let right = tmp.path().join("elsewhere");
+        init_repo(&left);
+        init_repo(&right);
+        for root in [&left, &right] {
+            git_in(
+                root,
+                &[
+                    "remote",
+                    "add",
+                    "origin",
+                    "https://example.invalid/org/app.git",
+                ],
+            );
+        }
+
+        let left_key = repository_key(&GitRepo::discover(&left).unwrap());
+        let right_key = repository_key(&GitRepo::discover(&right).unwrap());
+
+        assert_eq!(left_key.1, RepositoryKeySource::Origin);
+        assert_eq!(
+            left_key.0, right_key.0,
+            "two clones of one remote are one repository"
+        );
+        assert_eq!(
+            left_key.0,
+            sha256_text("example.invalid/org/app"),
+            "sanity: the key is still the origin coordination key"
+        );
+    }
+
+    /// The `unwrap_or(repo)` anchor fallback. A repository that becomes
+    /// unreadable between discovery and keying still yields a key: a gate
+    /// coordinating under a degraded key beats a gate that cannot start.
+    #[test]
+    fn an_unreadable_repository_still_yields_a_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("app");
+        init_repo(&root);
+        let repo = GitRepo::discover(&root).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+
+        let (key, source) = repository_key(&repo);
+
+        assert_eq!(source, RepositoryKeySource::MainCheckoutPath);
+        assert!(!key.is_empty());
     }
 
     /// #168: the spawn error was the only account of why the gate produced no

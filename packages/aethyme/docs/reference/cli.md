@@ -766,7 +766,11 @@ confidence and redacted evidence for missing or invalid timeouts, missing
 cheap/full lanes, dead or overly broad triggers, uncovered source areas,
 undeclared Docker/PostgreSQL isolation, fixed database/port/project names,
 unmanaged writable caches, main-checkout assumptions, weak failure evidence,
-and equivalent gates. It reads tracked paths from the committed tree with
+equivalent gates, and gates coordinating under a path-derived repository key.
+That last one is raised only where something is staked on the key -- a gate
+declaring a resource pool or a managed cache -- in a repository with no
+`origin`, where the key falls back to the main checkout's absolute path
+instead of a remote identity. It reads tracked paths from the committed tree with
 NUL-safe Git output. Dirty, untracked, and ignored files are not inputs, it
 does not open normal broker storage, and it never changes gate selection or
 runs during ordinary readiness inspection.

@@ -7897,14 +7897,11 @@ fn console_context() -> Result<(crate::ConsoleConfig, String, PathBuf, PathBuf),
     let main_root = repo
         .main_root()
         .map_err(|error| UsageError::Message(error.to_string()))?;
-    // The same `origin` anchor gates use, so one repository keeps one key
-    // across gate leases and console leases alike. Anchored on the primary
-    // checkout rather than this one: with no `origin` the fingerprint falls
-    // back to a directory name, and taking it from a linked worktree would
-    // give every worktree its own key -- which is exactly the contention
-    // `singular` exists to create.
-    let anchor = crate::GitRepo::discover(&main_root).unwrap_or(repo);
-    let repository = crate::gates::git_origin_fingerprint(&anchor);
+    // The same key gates use, so one repository keeps one key across gate
+    // leases and console leases alike. The main-checkout anchoring this call
+    // site used to do by hand now lives in `git_origin_fingerprint` itself
+    // (#170), so every caller gets it.
+    let repository = crate::gates::git_origin_fingerprint(&repo);
     let config = crate::ConsoleConfig::load(&main_root);
     Ok((config, repository, main_root, worktree_root))
 }
