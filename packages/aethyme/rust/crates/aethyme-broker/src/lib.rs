@@ -197,7 +197,7 @@ pub use graph_impact::{
 };
 pub use graph_integrity::{GraphIntegrityOutcome, GraphIntegrityRejection, GraphIntegrityStatus};
 pub use homebrew::render_homebrew_formula;
-pub use hooks::{HookReport, HookState, HooksError};
+pub use hooks::{HookReport, HookSnippet, HookState, HooksError};
 pub use host_operations::{
     HostOperation, HostOperationError, HostOperationGuard, default_host_operation_db_path,
     host_operation, reconcile_host_operation,

@@ -31,6 +31,9 @@ pub const MARKER_END: &str = "# <<< aethyme hooks <<<";
 /// The hooks this module manages, in install/report order.
 pub const MANAGED_HOOKS: [&str; 3] = ["pre-commit", "post-commit", "pre-push"];
 
+/// Version of the machine-readable hook snippet contract.
+pub const HOOK_SNIPPET_SCHEMA_VERSION: u32 = 1;
+
 /// Only gates this cheap run at commit time: the pre-commit hook must
 /// stay in the "instant feedback" budget, and everything heavier belongs
 /// to `gates run` / `submit` where caching and cancellation apply.
@@ -49,6 +52,10 @@ pub enum HooksError {
         path: PathBuf,
         source: std::io::Error,
     },
+    #[error(
+        "unknown hook {hook:?}; expected one of pre-commit, post-commit, or pre-push"
+    )]
+    InvalidHook { hook: String },
     #[error("failed to replay pre-commit gate {stream}: {source}")]
     ReplayOutput {
         stream: &'static str,
@@ -165,6 +172,12 @@ pub enum HookState {
     Absent,
     /// status: a hook file exists without our marker (user-owned).
     Foreign,
+    /// status: the Aethyme invocation was found in a hook managed by another
+    /// hook manager. The external file is intentionally not owned by us.
+    External,
+    /// status: an external snippet was found, but its embedded binary path no
+    /// longer points at an executable file.
+    ExternalStale,
     /// uninstall: marker block removed, user content kept.
     Removed,
     /// uninstall: file deleted — nothing but our block (and a shebang)
@@ -179,6 +192,8 @@ impl HookState {
             Self::Updated => "updated",
             Self::Absent => "absent",
             Self::Foreign => "foreign",
+            Self::External => "external",
+            Self::ExternalStale => "external_stale",
             Self::Removed => "removed",
             Self::Deleted => "deleted",
         }
@@ -197,6 +212,20 @@ pub struct HookReport {
     pub hook: &'static str,
     pub path: String,
     pub state: HookState,
+}
+
+/// A copy-pasteable hook-manager fragment and the structured pieces needed by
+/// an installer that prefers to compose its own wrapper. `snippet` and the
+/// installed marker block share the same invocation renderer below.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct HookSnippet {
+    pub schema_version: u32,
+    pub hook: String,
+    pub snippet: String,
+    pub binary: String,
+    pub subcommand: &'static str,
+    pub arguments: Vec<String>,
+    pub forwards_hook_arguments: bool,
 }
 
 /// Where managed hooks live: `<git-common-dir>/hooks`, shared by all
@@ -218,37 +247,80 @@ fn sh_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-fn hook_block(hook: &str, binary: &Path) -> String {
-    let bin = sh_quote(&binary.display().to_string());
-    let invoke = if hook == "pre-commit" {
-        "if [ -x \"$AETHYME\" ]; then\n    \
+fn hook_parts(hook: &str) -> Result<(&'static str, Vec<String>, bool), HooksError> {
+    match hook {
+        "pre-commit" => Ok(("broker hooks", vec!["pre-commit".into()], false)),
+        "post-commit" => Ok(("broker hooks", vec!["post-commit".into()], false)),
+        "pre-push" => Ok(("broker hooks", vec!["pre-push".into()], true)),
+        other => Err(HooksError::InvalidHook {
+            hook: other.to_string(),
+        }),
+    }
+}
+
+/// The command body shared by the installed marker and an external snippet.
+/// Keeping this as one renderer makes the invocation line a contract rather
+/// than two templates that can drift apart.
+fn hook_invocation(hook: &str) -> Result<String, HooksError> {
+    hook_parts(hook)?;
+    Ok(match hook {
+        "pre-commit" => {
+            "if [ -x \"$AETHYME\" ]; then\n    \
              \"$AETHYME\" broker hooks pre-commit || exit $?\n\
          else\n    \
              echo \"aethyme hooks: $AETHYME missing — skipping pre-commit gates\" >&2\n\
          fi"
-        .to_string()
-    } else if hook == "pre-push" {
-        "if [ -x \"$AETHYME\" ]; then\n    \
+            .to_string()
+        }
+        "pre-push" => {
+            "if [ -x \"$AETHYME\" ]; then\n    \
              \"$AETHYME\" broker hooks pre-push \"$@\" || exit $?\n\
          else\n    \
              echo \"aethyme hooks: $AETHYME missing — refusing protected push until the paired binary is restored\" >&2\n    \
              exit 1\n\
          fi"
             .to_string()
-    } else {
-        format!(
+        }
+        "post-commit" => {
             "if [ -x \"$AETHYME\" ]; then\n    \
-                 \"$AETHYME\" broker hooks {hook} || true\n\
+                 \"$AETHYME\" broker hooks post-commit || true\n\
              fi"
-        )
-    };
-    format!(
+            .to_string()
+        }
+        _ => unreachable!("hook_parts validated the hook"),
+    })
+}
+
+fn hook_block(hook: &str, binary: &Path) -> Result<String, HooksError> {
+    let bin = sh_quote(&binary.display().to_string());
+    let invoke = hook_invocation(hook)?;
+    Ok(format!(
         "{MARKER_BEGIN}\n\
          # Managed by `aethyme broker hooks install` — edits inside the markers are overwritten.\n\
          AETHYME={bin}\n\
          {invoke}\n\
          {MARKER_END}\n"
-    )
+    ))
+}
+
+/// Render the same invocation used by an installed hook without the ownership
+/// markers. The resulting fragment can be pasted into Husky, lefthook, or a
+/// similar manager; its runtime entry point retains the normal no-op behavior
+/// when the checkout has no broker state.
+pub fn snippet(hook: &str, binary: &Path) -> Result<HookSnippet, HooksError> {
+    let (subcommand, arguments, forwards_hook_arguments) = hook_parts(hook)?;
+    let binary_text = binary.display().to_string();
+    let assignment = format!("AETHYME={}\n", sh_quote(&binary_text));
+    let invoke = hook_invocation(hook)?;
+    Ok(HookSnippet {
+        schema_version: HOOK_SNIPPET_SCHEMA_VERSION,
+        hook: hook.to_string(),
+        snippet: format!("{assignment}{invoke}\n"),
+        binary: binary_text,
+        subcommand,
+        arguments,
+        forwards_hook_arguments,
+    })
 }
 
 /// Remove the marker block from `text`. `None` when no block is present;
@@ -362,7 +434,7 @@ pub fn install(repo: &GitRepo, binary: &Path) -> Result<Vec<HookReport>, HooksEr
     let mut reports = Vec::new();
     for hook in MANAGED_HOOKS {
         let path = dir.join(hook);
-        let block = hook_block(hook, binary);
+        let block = hook_block(hook, binary)?;
         let state = match std::fs::read_to_string(&path) {
             Ok(existing) => {
                 write_executable(&path, &replace_marker_block(&existing, &block))?;
@@ -413,20 +485,124 @@ pub fn uninstall(repo: &GitRepo) -> Result<Vec<HookReport>, HooksError> {
     Ok(reports)
 }
 
-/// Report installed/absent/foreign per managed hook.
+fn configured_hooks_dir(repo: &GitRepo) -> Option<PathBuf> {
+    let configured = repo.config_get("core.hooksPath")?;
+    let path = PathBuf::from(configured);
+    Some(if path.is_relative() {
+        repo.root().join(path)
+    } else {
+        path
+    })
+}
+
+fn is_executable(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        return std::fs::metadata(path)
+            .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0);
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::metadata(path).is_ok_and(|meta| meta.is_file())
+    }
+}
+
+/// Extract the assignment emitted by [`snippet`]. This is deliberately a
+/// narrow parser: status should only call a snippet stale when it can prove
+/// which embedded binary it names, not when an arbitrary external shell file
+/// happens to mention Aethyme.
+fn assigned_binary(text: &str) -> Option<PathBuf> {
+    let value = text
+        .lines()
+        .map(str::trim)
+        .find_map(|line| line.strip_prefix("AETHYME="))?
+        .trim();
+    if let Some(value) = value.strip_prefix('\'') {
+        let mut output = String::new();
+        let mut chars = value.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch == '\'' {
+                if chars.peek() == Some(&'\\') {
+                    chars.next();
+                    if chars.next() == Some('\'') {
+                        output.push('\'');
+                        continue;
+                    }
+                }
+                return Some(PathBuf::from(output));
+            }
+            output.push(ch);
+        }
+        return None;
+    }
+    value
+        .split_whitespace()
+        .next()
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+fn contains_hook_invocation(text: &str, hook: &str) -> bool {
+    let invocation = format!("broker hooks {hook}");
+    text.lines().any(|line| {
+        let trimmed = line.trim_start();
+        !trimmed.starts_with('#') && trimmed.contains(&invocation)
+    })
+}
+
+fn external_hook_paths(repo: &GitRepo, hook: &str) -> Result<Vec<PathBuf>, HooksError> {
+    let default = hooks_dir(repo)?.join(hook);
+    let mut paths = vec![default.clone()];
+    if let Some(configured) = configured_hooks_dir(repo) {
+        let path = configured.join(hook);
+        if path != default {
+            paths.push(path);
+        }
+    }
+    Ok(paths)
+}
+
+/// Report installed/absent/foreign per managed hook. An `external` state is
+/// returned only when the actual Aethyme invocation is present in a hook file;
+/// merely configuring Husky or another hook manager is not evidence that the
+/// snippet was installed.
 pub fn status(repo: &GitRepo) -> Result<Vec<HookReport>, HooksError> {
     let dir = hooks_dir(repo)?;
     let mut reports = Vec::new();
     for hook in MANAGED_HOOKS {
         let path = dir.join(hook);
-        let state = match std::fs::read_to_string(&path) {
-            Err(_) => HookState::Absent,
-            Ok(existing) if existing.contains(MARKER_BEGIN) => HookState::Installed,
-            Ok(_) => HookState::Foreign,
+        let mut external = None;
+        for candidate in external_hook_paths(repo, hook)? {
+            let Ok(existing) = std::fs::read_to_string(&candidate) else {
+                continue;
+            };
+            if contains_hook_invocation(&existing, hook) {
+                let stale = assigned_binary(&existing).is_some_and(|binary| !is_executable(&binary));
+                external = Some((candidate, stale));
+                break;
+            }
+        }
+        let (report_path, state) = if let Some((external_path, stale)) = external {
+            (
+                external_path,
+                if stale {
+                    HookState::ExternalStale
+                } else {
+                    HookState::External
+                },
+            )
+        } else {
+            let state = match std::fs::read_to_string(&path) {
+                Err(_) => HookState::Absent,
+                Ok(existing) if existing.contains(MARKER_BEGIN) => HookState::Installed,
+                Ok(_) => HookState::Foreign,
+            };
+            (path, state)
         };
         reports.push(HookReport {
             hook,
-            path: path.to_string_lossy().into_owned(),
+            path: report_path.to_string_lossy().into_owned(),
             state,
         });
     }
@@ -806,14 +982,14 @@ mod tests {
 
     #[test]
     fn marker_block_strip_and_replace_preserve_user_content() {
-        let block = hook_block("pre-commit", Path::new("/usr/bin/aethyme"));
+        let block = hook_block("pre-commit", Path::new("/usr/bin/aethyme")).unwrap();
         let user = format!("#!/bin/sh\necho before\n{block}echo after\n");
 
         let stripped = strip_marker_block(&user).unwrap();
         assert_eq!(stripped, "#!/bin/sh\necho before\necho after\n");
         assert!(strip_marker_block("#!/bin/sh\necho mine\n").is_none());
 
-        let newer = hook_block("pre-commit", Path::new("/opt/aethyme"));
+        let newer = hook_block("pre-commit", Path::new("/opt/aethyme")).unwrap();
         let replaced = replace_marker_block(&user, &newer);
         assert!(replaced.contains("/opt/aethyme"));
         assert!(!replaced.contains("/usr/bin/aethyme"));
@@ -836,7 +1012,7 @@ mod tests {
             .unwrap();
         assert_eq!(String::from_utf8_lossy(&out.stdout), hostile);
 
-        let block = hook_block("pre-commit", Path::new(hostile));
+        let block = hook_block("pre-commit", Path::new(hostile)).unwrap();
         assert!(
             block.contains(&format!("AETHYME={quoted}")),
             "shim embeds the sh-quoted path: {block}"
@@ -848,5 +1024,39 @@ mod tests {
         assert!(only_shebang_left("#!/bin/sh\n\n"));
         assert!(only_shebang_left(""));
         assert!(!only_shebang_left("#!/bin/sh\necho user\n"));
+    }
+
+    #[test]
+    fn snippets_and_managed_shims_share_the_same_invocation() {
+        for hook in MANAGED_HOOKS {
+            let snippet = snippet(hook, Path::new("/usr/bin/aethyme")).unwrap();
+            let block = hook_block(hook, Path::new("/usr/bin/aethyme")).unwrap();
+            let invocation = hook_invocation(hook).unwrap();
+            assert!(snippet.snippet.contains(&invocation));
+            assert!(block.contains(&invocation));
+            assert_eq!(snippet.hook, hook);
+            assert_eq!(snippet.subcommand, "broker hooks");
+            assert_eq!(snippet.arguments, vec![hook.to_string()]);
+        }
+    }
+
+    #[test]
+    fn unknown_snippet_hook_is_rejected() {
+        let Err(HooksError::InvalidHook { hook }) = snippet("commit-msg", Path::new("aethyme"))
+        else {
+            panic!("unknown hooks must not receive a plausible command");
+        };
+        assert_eq!(hook, "commit-msg");
+    }
+
+    #[test]
+    fn external_detection_ignores_comments_and_reads_embedded_binary() {
+        assert!(!contains_hook_invocation(
+            "# aethyme broker hooks pre-commit\necho no\n",
+            "pre-commit"
+        ));
+        let text = "AETHYME='/missing/aethyme'\n    \"$AETHYME\" broker hooks pre-commit\n";
+        assert!(contains_hook_invocation(text, "pre-commit"));
+        assert_eq!(assigned_binary(text), Some(PathBuf::from("/missing/aethyme")));
     }
 }

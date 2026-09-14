@@ -186,6 +186,59 @@ fn core_hooks_path_override_refuses_install() {
 }
 
 #[test]
+fn external_snippets_are_reported_only_when_present_and_stale_when_binary_moves() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    sh(tmp.path(), &["config", "core.hooksPath", ".husky"]);
+    let repo = GitRepo::discover(tmp.path()).unwrap();
+    let external = tmp.path().join(".husky");
+    std::fs::create_dir_all(&external).unwrap();
+
+    // Merely using an external manager is not evidence that Aethyme is wired
+    // into it; status must remain absent until the invocation is found.
+    std::fs::write(external.join("pre-commit"), "#!/bin/sh\necho husky\n").unwrap();
+    let absent = hooks::status(&repo).unwrap();
+    assert_eq!(absent[0].state, HookState::Absent);
+
+    let snippet = hooks::snippet("pre-commit", Path::new(SHIM)).unwrap();
+    std::fs::write(
+        external.join("pre-commit"),
+        format!("#!/bin/sh\n{}", snippet.snippet),
+    )
+    .unwrap();
+    let wired = hooks::status(&repo).unwrap();
+    assert_eq!(wired[0].state, HookState::External);
+    assert!(wired[0].path.ends_with(".husky/pre-commit"));
+
+    let stale = hooks::snippet("pre-commit", Path::new("/missing/aethyme")).unwrap();
+    std::fs::write(external.join("pre-commit"), stale.snippet).unwrap();
+    let stale = hooks::status(&repo).unwrap();
+    assert_eq!(stale[0].state, HookState::ExternalStale);
+}
+
+#[test]
+fn external_snippets_are_silent_noops_without_local_broker_state() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    for hook in hooks::MANAGED_HOOKS {
+        let snippet = hooks::snippet(hook, Path::new(SHIM)).unwrap();
+        let output = Command::new("sh")
+            .arg("-c")
+            .arg(&snippet.snippet)
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "external {hook} snippet failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stdout.is_empty(), "external {hook} wrote stdout");
+        assert!(output.stderr.is_empty(), "external {hook} wrote stderr");
+    }
+}
+
+#[test]
 fn pre_push_blocks_direct_default_branch_updates_and_journals_break_glass() {
     let tmp = tempfile::tempdir().unwrap();
     let remote = tempfile::tempdir().unwrap();
