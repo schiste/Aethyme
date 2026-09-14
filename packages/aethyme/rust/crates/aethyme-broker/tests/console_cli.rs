@@ -291,10 +291,9 @@ fn wait_for_running(root: &Path, state: &Path, expected: usize) -> serde_json::V
         let status = run(root, state, &["console", "list", "--json"]);
         if status.status.success() {
             if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&status.stdout) {
-                if value["running"]
-                    .as_array()
-                    .is_some_and(|running| running.len() == expected)
-                {
+                if value["running"].as_array().is_some_and(|running| {
+                    running.len() == expected && running.iter().all(|row| row["marker"].is_object())
+                }) {
                     return value;
                 }
             }
