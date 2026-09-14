@@ -1,6 +1,8 @@
 use std::path::Path;
 use std::process::{Command, Output};
 
+use aethyme_broker::Broker;
+
 const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
 
 fn git(repo: &Path, args: &[&str]) {
@@ -183,6 +185,25 @@ fn start_refuses_ambiguous_or_missing_default_refs() {
         String::from_utf8_lossy(&output.stderr).contains("no integration tip"),
         "{}",
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn start_refuses_a_pull_request_review_before_creating_a_session() {
+    let tmp = fixture();
+    let output = run(tmp.path(), &["start", "--task", "review PR #42"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(!output.status.success());
+    assert!(stderr.contains("integration-tip worktree"), "{stderr}");
+    assert!(stderr.contains("pull-request review #42"), "{stderr}");
+    assert!(
+        Broker::open(tmp.path())
+            .unwrap()
+            .store()
+            .live_sessions()
+            .unwrap()
+            .is_empty()
     );
 }
 

@@ -335,6 +335,10 @@ stashing multi-worktree changes.
 - `aethyme broker status [--json]`
 - `aethyme broker worktree-root [--json]`
 - `aethyme broker start --task "..." [--path <repo-path>]... [--agent "<Name> <email>"] [--json]`
+- A task naming a specific pull-request review is refused by `broker start` and
+  `start-agent`: those commands anchor new worktrees to integration, while a
+  review must run in a checkout proven at the pull request's exact head. Use
+  the routed review adapter for that case.
 - `aethyme broker adopt [<path>] --task "..." [--path <repo-path>]... [--agent "<Name> <email>"] [--reuse [--sync-integration]] [--json]`
 - `aethyme broker prepare status --session <id> [--json]`
 - `aethyme broker prepare --session <id> [--offline] [--wait <duration>] [--json]`

@@ -221,6 +221,10 @@ pub enum BrokerOpError {
     },
     #[error("cannot select a safe base for broker start: {reason}")]
     StartBaseUnavailable { reason: String },
+    #[error(
+        "refusing an integration-tip worktree for pull-request review #{pull_request}; use the routed review adapter, which provisions a detached checkout at the exact PR head, or create and verify that checkout explicitly"
+    )]
+    ReviewRequiresPullRequestHead { pull_request: i64 },
     #[error("cannot prepare broker worktree root {path}: {reason}")]
     WorktreeRootUnavailable { path: PathBuf, reason: String },
     #[error("refusing nested broker worktree path {path}: it is inside linked worktree {owner}")]
@@ -2790,6 +2794,61 @@ impl Broker {
         Ok(())
     }
 
+    /// A normal broker start is intentionally anchored to integration. That
+    /// is the right base for editing work, but the wrong revision for
+    /// reviewing a specific pull request: the prompt and the surrounding
+    /// checkout would then describe different trees. Keep the refusal narrow
+    /// enough that ordinary tasks mentioning reviews (or an issue number)
+    /// remain valid, while making a task that names a PR impossible to start
+    /// in the wrong lane.
+    fn reject_integration_based_review_task(task: &str) -> Result<(), BrokerOpError> {
+        let words: Vec<String> = task
+            .to_ascii_lowercase()
+            .split(|character: char| !character.is_ascii_alphanumeric())
+            .filter(|word| !word.is_empty())
+            .map(str::to_owned)
+            .collect();
+        let is_review = words.iter().enumerate().any(|(index, word)| {
+            if !matches!(
+                word.as_str(),
+                "review" | "reviewer" | "reviewing" | "reviews"
+            ) {
+                return false;
+            }
+            !matches!(
+                words.get(index + 1).map(String::as_str),
+                Some("feedback") | Some("comment") | Some("comments") | Some("findings")
+            )
+        });
+        if !is_review {
+            return Ok(());
+        }
+
+        let pull_request_marker = words.iter().enumerate().find_map(|(index, word)| {
+            if word == "pr" {
+                Some(index)
+            } else if word == "pull" && words.get(index + 1).map(String::as_str) == Some("request")
+            {
+                Some(index + 1)
+            } else {
+                None
+            }
+        });
+        let Some(marker) = pull_request_marker else {
+            return Ok(());
+        };
+        let Some(number) = words
+            .get(marker + 1)
+            .and_then(|word| word.parse::<i64>().ok())
+            .filter(|number| *number > 0)
+        else {
+            return Ok(());
+        };
+        Err(BrokerOpError::ReviewRequiresPullRequestHead {
+            pull_request: number,
+        })
+    }
+
     // ── start-agent (spawn convenience) ───────────────────────────────
 
     /// Create a broker-owned worktree + branch for `task` without
@@ -2815,6 +2874,7 @@ impl Broker {
         paths: &[String],
         agent_identity: Option<&str>,
     ) -> Result<StartReport, BrokerOpError> {
+        Self::reject_integration_based_review_task(task)?;
         let planned_paths = normalize_planned_paths(paths)?;
         self.ensure_planned_paths_available(&planned_paths, None)?;
         let (_slug, branch, start_base, worktree, worktree_placement) =
@@ -2880,6 +2940,7 @@ impl Broker {
         command: &str,
         agent_identity: Option<&str>,
     ) -> Result<StartAgentReport, BrokerOpError> {
+        Self::reject_integration_based_review_task(task)?;
         let (slug, branch, start_base, worktree, worktree_placement) =
             self.create_session_worktree(task)?;
         let base = start_base.commit.clone();
@@ -9052,6 +9113,32 @@ mod tests {
         assert_eq!(slugify("émojis 🎉 stripped"), "mojis-stripped");
         assert_eq!(slugify(""), "task");
         assert!(slugify(&"x".repeat(100)).len() <= 40);
+    }
+
+    #[test]
+    fn integration_based_start_rejects_only_specific_pull_request_reviews() {
+        for (task, expected) in [
+            ("review PR #42", 42),
+            ("reviewing pull request 7", 7),
+            ("PR #18 security review", 18),
+        ] {
+            match super::Broker::reject_integration_based_review_task(task) {
+                Err(super::BrokerOpError::ReviewRequiresPullRequestHead { pull_request }) => {
+                    assert_eq!(pull_request, expected)
+                }
+                other => panic!("expected a PR-head refusal for {task:?}, got {other:?}"),
+            }
+        }
+        for task in [
+            "review issue #42",
+            "review the integration plan",
+            "implement PR #42 review feedback",
+        ] {
+            assert!(
+                super::Broker::reject_integration_based_review_task(task).is_ok(),
+                "ordinary editing task was refused: {task:?}"
+            );
+        }
     }
 
     #[test]

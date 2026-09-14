@@ -48,12 +48,13 @@ closes one. Two consequences worth knowing:
   `requested` and the route's `stale_after_minutes` reclaims it. That window is
   exactly what it is for; nothing here needs its own crash recovery.
 
-The workspace must exist and hold a checkout of the pull request's head -- the
-broker says so and deliberately does not do it, because the workspace path *is*
-the identity of an in-flight review and creating one is a shared-git mutation.
-Every git write here therefore runs through `aethyme broker git`, which is the
-coordinated lane; running git directly would race the sessions that share the
-repository.
+The workspace must exist and hold a checkout of the pull request's head. This
+adapter provisions it through `aethyme broker git` and proves the exact head
+again immediately before spawning; a mismatch abandons the handoff instead of
+letting the prompt's revision claim go unchecked. The workspace path *is* the
+identity of an in-flight review and creating one is a shared-git mutation, so
+every git write here runs through the coordinated lane; running git directly
+would race the sessions that share the repository.
 
 Usage:
     chau7-review-adapter.py --session <id> --repo <owner/name>
@@ -278,6 +279,16 @@ def head_of(workspace: str) -> str | None:
     return result.stdout.strip() if result.returncode == 0 else None
 
 
+def require_workspace_head(workspace: str, expected: str) -> None:
+    """Refuse to spawn unless the checkout proves the handoff's exact head."""
+    actual = head_of(workspace)
+    if actual != expected:
+        raise RuntimeError(
+            f"review workspace {workspace} is at {actual or 'no commit'}, "
+            f"expected pull-request head {expected}"
+        )
+
+
 def prepare_workspace(
     broker: str, repo_path: str | None, session: str, repository: str,
     pull_request: int, head: str, workspace: str,
@@ -292,6 +303,7 @@ def prepare_workspace(
     """
     if os.path.isdir(workspace):
         if head_of(workspace) == head:
+            require_workspace_head(workspace, head)
             return
         broker_git(broker, repo_path, session, repository,
                    f"replace the stale review workspace for {repository}#{pull_request}",
@@ -306,6 +318,7 @@ def prepare_workspace(
     broker_git(broker, repo_path, session, repository,
                f"check out {repository}#{pull_request} for review",
                ["worktree", "add", "--detach", workspace, head])
+    require_workspace_head(workspace, head)
 
 
 def main() -> int:
@@ -387,12 +400,16 @@ def main() -> int:
             try:
                 prepare_workspace(args.broker, args.repo_path, args.session, args.repo,
                                   pull_request, head, workspace)
+                # Keep the proof at the transport boundary too: the workspace
+                # must still name the handoff's commit after preparation and
+                # immediately before the tab is opened.
+                require_workspace_head(workspace, head)
                 client.start_review(
                     workspace,
                     f"{args.agent} {shlex.quote(handoff['prompt'])}",
                     f"{review_type} review #{pull_request}",
                 )
-            except (Chau7Error, BrokerError, OSError) as error:
+            except (Chau7Error, BrokerError, OSError, RuntimeError) as error:
                 close_row(args.broker, args.repo_path, args.repo, pull_request,
                           review_type, head, "abandoned", str(error)[:500])
                 abandoned += 1
