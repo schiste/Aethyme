@@ -13,10 +13,10 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Class, Comment, ConfigValue, Directory, DocSection, Docstring, Enum, Expression, Field, File,
-    Function, GlobalVariable, Interface, Lambda, Method, Module, NodeId, NodeKind, NonCodeFile,
-    Package, Parameter, Repository, Statement, Struct, SurfaceFlowNode, Trait, TypeAlias,
-    UnresolvedSymbol,
+    Callable, Class, Comment, ConfigValue, Directory, DocSection, Docstring, Enum, Expression,
+    Field, File, Function, GlobalVariable, Interface, Lambda, Method, Module, NodeId, NodeKind,
+    NonCodeFile, Package, Parameter, Repository, SourceRange, Statement, Struct, SurfaceFlowNode,
+    Trait, TypeAlias, UnresolvedSymbol,
 };
 
 /// A node of any kind. Every variant wraps the corresponding
@@ -214,6 +214,53 @@ impl Node {
             Node::RouteSurface(n) => n.id(),
             Node::WebhookSurface(n) => n.id(),
             Node::WorkerSurface(n) => n.id(),
+        }
+    }
+
+    /// Return the node's source range when the schema carries one.
+    ///
+    /// This intentionally remains optional: container nodes, unresolved
+    /// symbols, and fields/parameters are identified by their owning graph
+    /// relationship rather than an independently addressable source span.
+    /// Consumers that need a byte-exact boundary can combine this range with
+    /// the source file's line index.
+    pub fn source_range(&self) -> Option<SourceRange> {
+        match self {
+            Node::Function(node) => Some(node.source_range()),
+            Node::Lambda(node) => Some(node.source_range()),
+            Node::Method(node) => Some(node.source_range()),
+            Node::Class(node) => Some(node.source_range()),
+            Node::Enum(node) => Some(node.source_range()),
+            Node::Interface(node) => Some(node.source_range()),
+            Node::Struct(node) => Some(node.source_range()),
+            Node::Trait(node) => Some(node.source_range()),
+            Node::TypeAlias(node) => Some(node.source_range()),
+            Node::GlobalVariable(node) => Some(node.source_range()),
+            Node::Statement(node) => Some(node.source_range()),
+            Node::Expression(node) => Some(node.source_range()),
+            Node::DocSection(node) => Some(node.source_range()),
+            Node::Docstring(node) => Some(node.source_range()),
+            Node::BehaviorTestSurface(node)
+            | Node::CliSurface(node)
+            | Node::CredentialOperation(node)
+            | Node::JobSurface(node)
+            | Node::MiddlewareInstallation(node)
+            | Node::ProxySurface(node)
+            | Node::QueueSurface(node)
+            | Node::RouteSurface(node)
+            | Node::WebhookSurface(node)
+            | Node::WorkerSurface(node) => Some(node.source_range()),
+            Node::Directory(_)
+            | Node::File(_)
+            | Node::Module(_)
+            | Node::NonCodeFile(_)
+            | Node::Repository(_)
+            | Node::Package(_)
+            | Node::Field(_)
+            | Node::Parameter(_)
+            | Node::Comment(_)
+            | Node::ConfigValue(_)
+            | Node::UnresolvedSymbol(_) => None,
         }
     }
 }

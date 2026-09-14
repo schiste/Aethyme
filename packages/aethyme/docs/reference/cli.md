@@ -2278,6 +2278,34 @@ refresh supports `--json` so benchmark and diagnostic tooling can capture the
 actual revalidated execution rather than only its preliminary plan. Timing and
 memory evidence are excluded from the deterministic plan digest.
 
+`status --json` also exposes a separate `coverage` object. It reports the
+source and indexed revisions, the non-graph source-tree digests, file/byte
+counts, language and parser buckets, node and edge categories, stable
+path-free exclusion reasons, and explicit `gaps` plus the negative
+`safe_to_use` signal. Coverage is observational: an unavailable or partial
+coverage artifact does not change the graph fragment health verdict. A graph
+output commit may change `HEAD` after indexing; the source-tree digest is what
+proves that the committed artifacts still describe the current source inputs.
+
+Downstream semantic tooling can consume the bounded, content-free unit
+projection from committed `HEAD`:
+
+```bash
+aethyme graph units --repo . [--revision <head>] [--limit 100] [--cursor <opaque-cursor>] [--json]
+```
+
+Each page carries the graph revision, the indexed source revision, coverage
+mode/gaps, stable relative paths, symbol identity when known, language and
+parser, line and UTF-8 byte boundaries, a digest of the exact bounded source
+range (the inclusive source lines carried by the graph node; decorators or
+doc comments are included only when that range includes them), graph node
+reference, and unit coverage status. The reader fetches only
+the committed coverage and units artifacts; it never reads the active
+worktree, source files, vectors, or embeddings. Cursors are revision-bound
+and are refused when reused against a different committed `HEAD`. Pagination
+is ordered by `(path, start_offset)` and does not split units sharing one
+boundary.
+
 `materialize` validates committed policy, pin, manifest, and fragment bytes
 against exact `HEAD`, then atomically builds only the ignored worktree-local
 redb store. It never clones, parses source, or regenerates fragments. It does

@@ -188,6 +188,101 @@ fn confirmed_execute_refreshes_fragments_then_materializes_the_local_store() {
 }
 
 #[test]
+fn committed_coverage_and_units_are_bound_to_the_source_tree() {
+    let (_temporary, repo) = fixture();
+    fs::write(
+        repo.join("app.py"),
+        "# leading comment\ndef answer():\n    return 1\n",
+    )
+    .unwrap();
+    commit_all(&repo, "source change");
+
+    let planned = plan(&repo);
+    success(run(
+        &repo,
+        &[
+            "graph",
+            "refresh",
+            "execute",
+            "--repo",
+            ".",
+            "--confirm",
+            planned["plan_sha256"].as_str().unwrap(),
+        ],
+    ));
+    let indexed_revision = git(&repo, &["rev-parse", "HEAD"]);
+    commit_all(&repo, "commit graph artifacts");
+    let graph_revision = git(&repo, &["rev-parse", "HEAD"]);
+    assert_ne!(indexed_revision, graph_revision);
+
+    let status: Value = serde_json::from_str(&success(run(
+        &repo,
+        &["graph", "status", "--repo", ".", "--json"],
+    )))
+    .unwrap();
+    assert_eq!(status["coverage"]["available"], true);
+    assert_eq!(status["coverage"]["source_revision"], indexed_revision);
+    assert_eq!(status["coverage"]["indexed_revision"], indexed_revision);
+    assert!(status["coverage"]["source_tree_sha256"].is_string());
+    assert_eq!(status["coverage"]["safe_to_use"], false);
+    assert!(
+        status["coverage"]["gaps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|gap| gap == "excluded_files")
+    );
+
+    let first: Value = serde_json::from_str(&success(run(
+        &repo,
+        &["graph", "units", "--repo", ".", "--json", "--limit", "1"],
+    )))
+    .unwrap();
+    assert_eq!(first["source_revision"], graph_revision);
+    assert_eq!(first["indexed_revision"], indexed_revision);
+    assert_eq!(first["items"].as_array().unwrap().len(), 1);
+    assert!(first["next_cursor"].is_string());
+    let first_json = serde_json::to_string(&first).unwrap();
+    assert!(!first_json.contains("return 1"));
+
+    let second: Value = serde_json::from_str(&success(run(
+        &repo,
+        &[
+            "graph",
+            "units",
+            "--repo",
+            ".",
+            "--json",
+            "--limit",
+            "1",
+            "--cursor",
+            first["next_cursor"].as_str().unwrap(),
+        ],
+    )))
+    .unwrap();
+    assert!(
+        second["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["kind"] == "function")
+    );
+    assert!(second["next_cursor"].is_null());
+
+    let cursor = first["next_cursor"].as_str().unwrap().to_owned();
+    fs::write(repo.join(".aethyme/graph/sidecar"), b"graph-only commit\n").unwrap();
+    commit_all(&repo, "move graph HEAD without changing source");
+    let mismatch = run(
+        &repo,
+        &[
+            "graph", "units", "--repo", ".", "--json", "--cursor", &cursor,
+        ],
+    );
+    assert!(!mismatch.status.success());
+    assert!(String::from_utf8_lossy(&mismatch.stderr).contains("cursor revision"));
+}
+
+#[test]
 fn materialize_rebuilds_only_the_local_store_from_verified_committed_fragments() {
     let (_temporary, repo) = fixture();
     let planned = plan(&repo);

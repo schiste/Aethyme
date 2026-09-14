@@ -53,6 +53,7 @@
 pub mod binary;
 pub mod bootstrap;
 pub mod cache;
+pub mod coverage;
 pub mod disk;
 pub mod fragment;
 pub mod index_shard;
@@ -73,6 +74,12 @@ pub use bootstrap::{
 pub use cache::{
     CachedGraphStoreArtifact, GRAPH_STORE_CACHE_SCHEMA_VERSION, GraphStoreArtifactCache,
     GraphStoreCacheEntry, GraphStoreCacheKey,
+};
+pub use coverage::{
+    CoverageArtifactError, CoverageBucket, CoverageBytes, CoverageFileStatus, CoverageFiles,
+    ExclusionReason, GRAPH_COVERAGE_RELPATH, GRAPH_COVERAGE_SCHEMA_VERSION, GRAPH_UNITS_RELPATH,
+    GraphCoverage, GraphUnit, UnitCoverageStatus, UnitPosition, decode_units, read_coverage,
+    read_units, sort_units, write_coverage_artifacts,
 };
 pub use disk::{
     FragmentReadError, FragmentWriteError, IndexShardReadError, IndexShardWriteError,
