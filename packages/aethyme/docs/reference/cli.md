@@ -454,9 +454,9 @@ until an explicit fetch makes ancestry verification possible.
 - `aethyme broker resources release <grant.json> [--json]`
 - `aethyme broker resources list [--all] [--json]`
 - `aethyme broker resources reconcile <lease-id> --confirm <generation> [--json]`
-- `aethyme broker console [status] [--json]`
-- `aethyme broker console plan [--json]`
-- `aethyme broker console run [--wait <duration>] [--json] -- <command> ...`
+- `aethyme broker console [status|list] [--json]`
+- `aethyme broker console plan [--allow-parallel] [--json]`
+- `aethyme broker console run [--wait <duration>] [--allow-parallel] [--json] -- <command> ...`
 
 A dev server is a host resource, and agent isolation and operator singularity
 want opposite defaults from it. `console` composes the `resources` primitives
@@ -474,7 +474,19 @@ costs an operator a debugging session, while defaulting wrong for a large
 repository costs one line of configuration. Allocations reach the command as
 `AETHYME_RESOURCE_PORT`, `AETHYME_RESOURCE_NAMESPACE`, and
 `AETHYME_RESOURCE_SLOT`. Other keys: `port`, `port_end`, `pool_limit`,
-`ttl_seconds`.
+`ttl_seconds`. Managed commands also receive `AETHYME_CONSOLE_MARKER` and
+`AETHYME_CONSOLE_MARKER_DIGEST`; the marker is an atomically written,
+content-addressed JSON document in host state containing the repository,
+branch, exact commit, dirty state, resolved worktree, port, and relation to
+`aethyme/integration`. `console run` prints that same source, branch, commit,
+dirty, canonical, integration, port, and marker identity at startup, and its
+JSON event carries the full marker. The marker is removed after clean shutdown.
+`console status`
+and its `console list` alias verify and join those markers to the live resource
+registry, so a missing or tampered marker is never presented as revision
+evidence. `--allow-parallel` is an explicit testing escape hatch for
+`singular`: it bypasses only the repository singleton and allocates another
+port from the configured range; the process remains visible in `console list`.
 - `aethyme broker gates validate [--json]`
 - `aethyme broker gates doctor [--probe] [--only <gate>] [--json]`
 - `aethyme broker gates manifest [--head <ref>] [--json]`

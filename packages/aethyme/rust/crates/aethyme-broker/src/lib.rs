@@ -148,10 +148,14 @@ pub use broker::{
     WorktreePlacement, WorktreeRootPlan, WorktreeRootSource,
 };
 pub use console::{
-    CONSOLE_EXCLUSIVE_KEY, CONSOLE_NAMESPACE_KEY, CONSOLE_PORT_KEY, CONSOLE_SLOT_KEY,
-    ConsoleConfig, ConsoleIdentity, ConsoleMode, DEFAULT_CONSOLE_POOL_LIMIT, DEFAULT_CONSOLE_PORT,
+    CONSOLE_EXCLUSIVE_KEY, CONSOLE_INTEGRATION_REF, CONSOLE_MARKER_DIGEST_ENV, CONSOLE_MARKER_ENV,
+    CONSOLE_MARKER_SCHEMA_VERSION, CONSOLE_NAMESPACE_KEY, CONSOLE_PORT_KEY, CONSOLE_SLOT_KEY,
+    ConsoleConfig, ConsoleIdentity, ConsoleIntegrationRelation, ConsoleMarkerRecord, ConsoleMode,
+    ConsoleRevision, ConsoleRuntimeMarker, DEFAULT_CONSOLE_POOL_LIMIT, DEFAULT_CONSOLE_PORT,
     DEFAULT_CONSOLE_PORT_END, DEFAULT_CONSOLE_TTL_SECONDS, console_identity, console_leases,
-    console_port, console_request, worktree_fingerprint,
+    console_marker_directory, console_marker_for_lease, console_port, console_request,
+    console_request_with_options, console_revision, read_console_markers, remove_console_marker,
+    worktree_fingerprint, write_console_marker,
 };
 pub use delivery::{
     DEFAULT_DELIVERY_CLAIM_SECONDS, DELIVERY_ADAPTER_PROTOCOL_VERSION,
