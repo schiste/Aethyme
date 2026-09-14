@@ -499,6 +499,46 @@ fn exact_rejected_push_is_failed_when_every_destination_remains_at_its_base() {
 
 #[cfg(unix)]
 #[test]
+fn local_pre_push_rejection_records_that_the_remote_was_not_contacted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut fixture = push_fixture(tmp.path(), "push-local-hook");
+    let base = git_output(&fixture.remote, &["rev-parse", "refs/heads/main"]);
+    let proposed = commit_push_fixture(&fixture, "local hook rejected\n");
+    let hooks = git_output(&fixture.worktree, &["rev-parse", "--git-path", "hooks"]);
+    write_executable(
+        &Path::new(&hooks).join("pre-push"),
+        "#!/bin/sh\nprintf 'local pre-push hook rejected\\n' >&2\nexit 1\n",
+    );
+
+    let report = fixture
+        .broker
+        .run_coordinated_operation(exact_push_request(
+            fixture.session_id,
+            &fixture.worktree,
+            &["HEAD:refs/heads/main"],
+        ))
+        .unwrap();
+    assert!(!report.command_success);
+    assert_eq!(report.operation.status, OperationStatus::Failed);
+    assert_eq!(
+        git_output(&fixture.remote, &["rev-parse", "refs/heads/main"]),
+        base
+    );
+    let details: serde_json::Value =
+        serde_json::from_str(report.operation.details_json.as_deref().unwrap()).unwrap();
+    let evidence = &details["push_reconciliation"]["evidence"];
+    assert_eq!(evidence["classification"], "failed");
+    assert_eq!(evidence["remote_contact"], "contacted");
+    assert_eq!(evidence["remote_write_contact"], "not_contacted");
+    assert_eq!(evidence["remote_not_contacted"], true);
+    assert_eq!(
+        details["push_reconciliation"]["plan"]["destinations"][0]["proposed_sha"],
+        proposed
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn exact_push_is_succeeded_when_transport_exits_nonzero_after_every_update() {
     let tmp = tempfile::tempdir().unwrap();
     let mut fixture = push_fixture(tmp.path(), "push-succeeded");

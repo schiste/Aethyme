@@ -1060,6 +1060,9 @@ fn plan_exact_push(
     args: &[String],
     target: Option<&crate::ResolvedRemoteTarget>,
 ) -> PushPlanning {
+    let Some(args) = git_subcommand_args(args) else {
+        return PushPlanning::NotApplicable;
+    };
     if args.first().map(String::as_str) != Some("push") {
         return PushPlanning::NotApplicable;
     }
@@ -1188,6 +1191,7 @@ fn plan_exact_push(
 fn reconcile_failed_push(
     cwd: &Path,
     planning: &PushPlanning,
+    remote_contact: Option<RemoteContactEvidence>,
 ) -> Option<(OperationStatus, serde_json::Value)> {
     let PushPlanning::Planned(plan) = planning else {
         return planning.journal_value().map(|mut value| {
@@ -1255,7 +1259,108 @@ fn reconcile_failed_push(
         "classification": classification,
         "destinations": observations,
     });
+    if let Some(remote_contact) = remote_contact {
+        value["evidence"]["remote_contact"] = json!(remote_contact.remote_contact);
+        value["evidence"]["remote_write_contact"] = json!(remote_contact.remote_write_contact);
+        value["evidence"]["remote_not_contacted"] = json!(remote_contact.remote_not_contacted);
+    }
     Some((status, value))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RemoteContactEvidence {
+    remote_contact: &'static str,
+    remote_write_contact: &'static str,
+    remote_not_contacted: bool,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct GitTransferTrace {
+    pre_push_hook: bool,
+    pre_push_hook_failed: bool,
+    remote_transport: bool,
+}
+
+impl GitTransferTrace {
+    fn remote_contact(self) -> Option<RemoteContactEvidence> {
+        if self.pre_push_hook_failed {
+            Some(RemoteContactEvidence {
+                remote_contact: if self.remote_transport {
+                    "contacted"
+                } else {
+                    "not_contacted"
+                },
+                remote_write_contact: "not_contacted",
+                remote_not_contacted: true,
+            })
+        } else if self.remote_transport {
+            Some(RemoteContactEvidence {
+                remote_contact: "contacted",
+                remote_write_contact: "unknown",
+                remote_not_contacted: false,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+fn inspect_git_transfer_trace(path: &Path) -> GitTransferTrace {
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return GitTransferTrace::default();
+    };
+    let mut pre_push_child_ids = BTreeSet::new();
+    let mut trace = GitTransferTrace::default();
+    for line in contents.lines() {
+        let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        match event.get("event").and_then(serde_json::Value::as_str) {
+            Some("child_start") => {
+                let Some(arguments) = event
+                    .get("argv")
+                    .or_else(|| event.get("child").and_then(|child| child.get("argv")))
+                else {
+                    continue;
+                };
+                let Some(arguments) = arguments.as_array() else {
+                    continue;
+                };
+                let command = arguments
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .to_ascii_lowercase();
+                if command.contains("pre-push") {
+                    trace.pre_push_hook = true;
+                    if let Some(child_id) =
+                        event.get("child_id").and_then(serde_json::Value::as_u64)
+                    {
+                        pre_push_child_ids.insert(child_id);
+                    }
+                }
+                trace.remote_transport |= ["receive-pack", "upload-pack", "git-remote-", "ssh"]
+                    .iter()
+                    .any(|marker| command.contains(marker));
+            }
+            Some("child_exit") => {
+                if event
+                    .get("child_id")
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some_and(|child_id| pre_push_child_ids.contains(&child_id))
+                    && event
+                        .get("code")
+                        .and_then(serde_json::Value::as_i64)
+                        .is_some_and(|code| code != 0)
+                {
+                    trace.pre_push_hook_failed = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    trace
 }
 
 /// The `(command, action)` pair a `gh` invocation names.
@@ -2471,6 +2576,19 @@ impl Broker {
         if hooks_ran_outside_lock {
             command.arg("--no-verify");
         }
+        // Trace2 gives us process-level evidence for the one useful
+        // pre-transfer distinction Git itself does not expose in its exit
+        // status: a local pre-push hook can reject the command before any
+        // transport child starts. Keep the trace private and use it only for
+        // the journal; it must not alter the command's user-facing output.
+        let git_trace = (request.provider == OperationProvider::Git
+            && is_remote_git
+            && effect != OperationEffect::Read)
+            .then(|| tempfile::NamedTempFile::new().ok())
+            .flatten();
+        if let Some(trace) = &git_trace {
+            command.env("GIT_TRACE2_EVENT", trace.path());
+        }
         command
             .current_dir(cwd)
             .stdin(Stdio::inherit())
@@ -2499,7 +2617,14 @@ impl Broker {
                             classification,
                             resolved_target.as_ref(),
                             github_target.as_ref(),
-                            with_push_planning(json!({ "reason": "spawn_failed" }), &push_planning),
+                            with_push_planning(
+                                json!({
+                                    "reason": "spawn_failed",
+                                    "remote_contact": "not_contacted",
+                                    "remote_not_contacted": true,
+                                }),
+                                &push_planning,
+                            ),
                         )
                         .to_string(),
                     ),
@@ -2513,6 +2638,10 @@ impl Broker {
                 });
             }
         };
+        let remote_contact = git_trace
+            .as_ref()
+            .map(|trace| inspect_git_transfer_trace(trace.path()))
+            .and_then(GitTransferTrace::remote_contact);
         let exit_code = output.status.code().map(i64::from);
         let (status, details) = if output.status.success() {
             match on_success(&output.stdout, operation.id) {
@@ -2561,7 +2690,7 @@ impl Broker {
                 ),
             )
         } else if let Some((status, push_reconciliation)) =
-            reconcile_failed_push(cwd, &push_planning)
+            reconcile_failed_push(cwd, &push_planning, remote_contact)
         {
             (
                 status,
@@ -2601,7 +2730,16 @@ impl Broker {
                     classification,
                     resolved_target.as_ref(),
                     github_target.as_ref(),
-                    json!({}),
+                    remote_contact.map_or_else(
+                        || json!({}),
+                        |remote_contact| {
+                            json!({
+                                "remote_contact": remote_contact.remote_contact,
+                                "remote_write_contact": remote_contact.remote_write_contact,
+                                "remote_not_contacted": remote_contact.remote_not_contacted,
+                            })
+                        },
+                    ),
                 ),
             )
         };
@@ -3216,8 +3354,8 @@ mod tests {
             vec!["push", "origin", "refs/tags/v1.0.0"],
         ] {
             let planning = plan_exact_push(tmp.path(), &args(&argv), Some(&target));
-            let (status, value) =
-                reconcile_failed_push(tmp.path(), &planning).expect("a planned push reconciles");
+            let (status, value) = reconcile_failed_push(tmp.path(), &planning, None)
+                .expect("a planned push reconciles");
             assert_eq!(
                 status,
                 OperationStatus::Failed,
@@ -3285,6 +3423,45 @@ mod tests {
             Some(OperationEffect::Destructive)
         );
         assert_eq!(classify_gh(&args(&["extension", "exec", "x"])), None);
+    }
+
+    #[test]
+    fn failed_pre_push_hook_marks_remote_write_as_not_contacted() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            tmp.path(),
+            r#"{"event":"child_start","child_id":1,"child_class":"hook","hook_name":"pre-push","argv":[".git/hooks/pre-push","origin"]}
+{"event":"child_exit","child_id":1,"code":1}
+"#,
+        )
+        .unwrap();
+        let trace = inspect_git_transfer_trace(tmp.path());
+        assert_eq!(
+            trace.remote_contact(),
+            Some(RemoteContactEvidence {
+                remote_contact: "not_contacted",
+                remote_write_contact: "not_contacted",
+                remote_not_contacted: true,
+            })
+        );
+
+        std::fs::write(
+            tmp.path(),
+            r#"{"event":"child_start","child_id":1,"argv":[".git/hooks/pre-push","origin"]}
+{"event":"child_exit","child_id":1,"code":1}
+{"event":"child_start","child_id":2,"argv":["git-receive-pack","repo.git"]}
+"#,
+        )
+        .unwrap();
+        let trace = inspect_git_transfer_trace(tmp.path());
+        assert_eq!(
+            trace.remote_contact(),
+            Some(RemoteContactEvidence {
+                remote_contact: "contacted",
+                remote_write_contact: "not_contacted",
+                remote_not_contacted: true,
+            })
+        );
     }
 
     #[test]
