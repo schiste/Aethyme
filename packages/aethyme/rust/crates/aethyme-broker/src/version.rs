@@ -10,6 +10,18 @@ use std::path::Path;
 use crate::git::GitRepo;
 use crate::merge::PromoteConfig;
 
+/// Changes that can make an installed broker unsafe to use with the source
+/// checkout it is coordinating. Keep this list deliberately narrow: a docs,
+/// engine, or unrelated CLI change should not turn every session start into a
+/// stale-binary warning.
+const BROKER_CORRECTNESS_PATHS: &[&str] = &[
+    "packages/aethyme/rust/crates/aethyme-broker/src/operations.rs",
+    "packages/aethyme/rust/crates/aethyme-broker/src/gates.rs",
+    "packages/aethyme/rust/crates/aethyme-broker/src/retention.rs",
+    "packages/aethyme/rust/crates/aethyme-broker/src/gc.rs",
+    "packages/aethyme/rust/crates/aethyme-broker/src/reclaim.rs",
+];
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct BinaryBuild {
     pub version: String,
@@ -74,6 +86,56 @@ pub fn current_binary_build() -> BinaryBuild {
 
 pub fn inspect_version(main_root: &Path) -> VersionDriftReport {
     inspect_version_with_binary(main_root, current_binary_build())
+}
+
+/// Return the one-time advisory shown before a new session is created when
+/// this broker binary predates correctness changes already on local `main`.
+///
+/// This is intentionally separate from [`inspect_version`]. Doctor compares
+/// a binary with the integration tip and is useful for a full installation
+/// diagnosis; session start needs a cheaper, non-blocking check against the
+/// enrolled checkout's `main`, and must not treat unrelated source drift as a
+/// correctness risk. A missing local `main`, an unresolvable build revision,
+/// or unrelated history is inconclusive and therefore silent.
+pub(crate) fn broker_start_warning(main_root: &Path) -> Option<String> {
+    broker_start_warning_with_binary(main_root, current_binary_build())
+}
+
+fn broker_start_warning_with_binary(main_root: &Path, binary: BinaryBuild) -> Option<String> {
+    if !is_aethyme_source_checkout(main_root) {
+        return None;
+    }
+    let repo = GitRepo::discover(main_root).ok()?;
+    let main = repo.resolve_ref("refs/heads/main")?;
+    let binary_commit = resolve_binary_commit(&repo, &binary)?;
+    if binary_commit == main || !repo.is_ancestor(&binary_commit, &main) {
+        return None;
+    }
+
+    let mut changed = repo
+        .changed_between(&binary_commit, &main)
+        .ok()?
+        .into_iter()
+        .filter(|path| BROKER_CORRECTNESS_PATHS.contains(&path.as_str()))
+        .collect::<Vec<_>>();
+    if changed.is_empty() {
+        return None;
+    }
+    changed.sort();
+    changed.dedup();
+
+    let binary_label = binary.describe.as_deref().unwrap_or(binary_commit.as_str());
+    Some(format!(
+        concat!(
+            "installed broker build {} ({}) predates main {}; newer ",
+            "broker correctness changes affect {}; this is advisory and the session will ",
+            "continue, but reinstall Aethyme before relying on broker operations",
+        ),
+        binary_label,
+        binary_commit,
+        main,
+        changed.join(", ")
+    ))
 }
 
 pub(crate) fn inspect_version_with_binary(
@@ -358,5 +420,73 @@ mod tests {
 
         let report = inspect_version_with_binary(tmp.path(), binary("deadbeef", "v0.1.1"));
         assert_eq!(report.status, VersionDriftStatus::NotAethymeSource);
+    }
+
+    #[test]
+    fn session_start_warns_for_stale_broker_correctness_code() {
+        let tmp = tempfile::tempdir().unwrap();
+        sh(tmp.path(), &["init", "-q", "-b", "main"]);
+        marker_source_checkout(tmp.path());
+        sh(tmp.path(), &["add", "-A"]);
+        sh(tmp.path(), &["commit", "-qm", "installed build"]);
+        let installed = GitRepo::discover(tmp.path())
+            .unwrap()
+            .head_commit()
+            .unwrap();
+
+        let operations = tmp
+            .path()
+            .join("packages/aethyme/rust/crates/aethyme-broker/src/operations.rs");
+        std::fs::create_dir_all(operations.parent().unwrap()).unwrap();
+        std::fs::write(operations, "new broker correctness code\n").unwrap();
+        sh(tmp.path(), &["add", "-A"]);
+        sh(tmp.path(), &["commit", "-qm", "broker correctness fix"]);
+
+        let warning = broker_start_warning_with_binary(tmp.path(), binary(&installed, "v0.1.1"))
+            .expect("a correctness change after the installed build must warn");
+        assert!(warning.contains("predates main"), "{warning}");
+        assert!(warning.contains("operations.rs"), "{warning}");
+        assert!(warning.contains("advisory"), "{warning}");
+    }
+
+    #[test]
+    fn session_start_ignores_unrelated_drift_and_missing_main() {
+        let docs_only = tempfile::tempdir().unwrap();
+        sh(docs_only.path(), &["init", "-q", "-b", "main"]);
+        marker_source_checkout(docs_only.path());
+        sh(docs_only.path(), &["add", "-A"]);
+        sh(docs_only.path(), &["commit", "-qm", "installed build"]);
+        let installed = GitRepo::discover(docs_only.path())
+            .unwrap()
+            .head_commit()
+            .unwrap();
+        std::fs::write(docs_only.path().join("README.md"), "docs\n").unwrap();
+        sh(docs_only.path(), &["add", "-A"]);
+        sh(docs_only.path(), &["commit", "-qm", "docs change"]);
+        assert!(
+            broker_start_warning_with_binary(docs_only.path(), binary(&installed, "v0.1.1"),)
+                .is_none()
+        );
+
+        let no_main = tempfile::tempdir().unwrap();
+        sh(no_main.path(), &["init", "-q", "-b", "feature"]);
+        marker_source_checkout(no_main.path());
+        sh(no_main.path(), &["add", "-A"]);
+        sh(no_main.path(), &["commit", "-qm", "feature"]);
+        let installed = GitRepo::discover(no_main.path())
+            .unwrap()
+            .head_commit()
+            .unwrap();
+        let gates = no_main
+            .path()
+            .join("packages/aethyme/rust/crates/aethyme-broker/src/gates.rs");
+        std::fs::create_dir_all(gates.parent().unwrap()).unwrap();
+        std::fs::write(gates, "new gate code\n").unwrap();
+        sh(no_main.path(), &["add", "-A"]);
+        sh(no_main.path(), &["commit", "-qm", "gate change"]);
+        assert!(
+            broker_start_warning_with_binary(no_main.path(), binary(&installed, "v0.1.1"),)
+                .is_none()
+        );
     }
 }
