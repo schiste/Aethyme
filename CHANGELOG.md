@@ -199,6 +199,27 @@ artifacts and their exact source revision are recorded in each signed
 
 ### Fixed
 
+- The exact-tree verification slot -- the disposable checkout that merge
+  simulation, graph-integrity verification, and the gate-doctor probe run in --
+  now lives outside the repository it verifies, beside the broker worktree root
+  in host state (`AETHYME_HOST_STATE_DIR`), or under the system temporary
+  directory for a repository that is itself ephemeral.
+
+  A slot is a checkout, and nesting it at `.aethyme/run/<namespace>` put it
+  inside the tree under test. Anything discovering a workspace by walking
+  upward -- the ordinary idiom -- then resolved to the *enclosing* checkout
+  whenever the slot was absent or half-built, and answered confidently with the
+  wrong tree instead of failing (#149). Outside the repository that same walk
+  terminates with nothing, which is loud. Gate isolation no longer depends on a
+  directory inside the repository being present.
+
+  A sandbox that confines writes to the invoking checkout has nowhere else to
+  put it. There the slot still falls back to `.aethyme/run/<namespace>`, but the
+  placement is recorded and `broker gates doctor` reports it as
+  `nested_verification_slot`, naming where the slot was wanted, why each
+  location outside the repository was refused, and the discovery hazard the
+  fallback carries.
+
 - `broker gh` now answers "was the issue created?" for a `gh issue create` or
   `gh pr create` that exits non-zero, instead of recording `outcome_unknown` and
   leaving an operator to look. Before the command runs the broker records the

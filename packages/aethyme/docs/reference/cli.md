@@ -766,7 +766,8 @@ confidence and redacted evidence for missing or invalid timeouts, missing
 cheap/full lanes, dead or overly broad triggers, uncovered source areas,
 undeclared Docker/PostgreSQL isolation, fixed database/port/project names,
 unmanaged writable caches, main-checkout assumptions, weak failure evidence,
-equivalent gates, and gates coordinating under a path-derived repository key.
+equivalent gates, gates coordinating under a path-derived repository key, and a
+verification slot that had to be placed inside the repository.
 That last one is raised only where something is staked on the key -- a gate
 declaring a resource pool or a managed cache -- in a repository with no
 `origin`, where the key falls back to the main checkout's absolute path
@@ -774,6 +775,24 @@ instead of a remote identity. It reads tracked paths from the committed tree wit
 NUL-safe Git output. Dirty, untracked, and ignored files are not inputs, it
 does not open normal broker storage, and it never changes gate selection or
 runs during ordinary readiness inspection.
+
+The verification slot -- the disposable checkout merge simulation,
+graph-integrity verification, and the probe below all run in -- is placed
+outside the repository it verifies: under `<host state>/run/<repository>/`
+(`AETHYME_HOST_STATE_DIR`, else the platform state directory), or under the
+system temporary directory when the repository is itself ephemeral and no host
+state directory was named. A checkout nested inside the tree under test is not
+isolated from it: discovery that walks upward for a workspace root resolves to
+the enclosing checkout whenever the slot is absent or half-built, and answers
+with the wrong tree instead of failing. Outside the repository that walk finds
+nothing and fails loudly.
+
+Where every location outside the repository is unwritable -- a sandbox
+confining writes to the invoking checkout -- the slot falls back to
+`.aethyme/run/<namespace>` inside it. That is recorded, not silently accepted:
+`nested_verification_slot` reports where the slot was placed, where it was
+wanted, the refusal for each location outside the repository, and the discovery
+hazard the fallback carries.
 
 Probe execution is always explicit:
 

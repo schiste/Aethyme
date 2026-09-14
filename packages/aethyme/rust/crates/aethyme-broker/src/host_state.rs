@@ -6,6 +6,34 @@
 
 use std::path::{Path, PathBuf};
 
+use sha2::{Digest, Sha256};
+
+/// A stable, human-legible name for one repository in host-scoped storage.
+///
+/// Keyed on the *common* Git directory so every worktree and linked checkout
+/// of one repository resolves to the same name, prefixed with the checkout's
+/// own directory name so the storage directory stays readable. `None` for the
+/// common directory means Git could not be asked, and the checkout path
+/// stands in -- worse as an identity, but still stable for the caller that
+/// has nothing better.
+pub(crate) fn repository_key(main_root: &Path, git_common_dir: Option<&Path>) -> String {
+    let identity = git_common_dir.unwrap_or(main_root);
+    let identity = identity
+        .canonicalize()
+        .unwrap_or_else(|_| identity.to_path_buf());
+    let digest = format!(
+        "{:x}",
+        Sha256::digest(identity.to_string_lossy().as_bytes())
+    );
+    let name = main_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(crate::broker::slugify)
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "repository".into());
+    format!("{name}-{}", &digest[..16])
+}
+
 pub(crate) fn default_host_state_dir() -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("AETHYME_HOST_STATE_DIR").filter(|path| !path.is_empty()) {
         return Some(PathBuf::from(path));

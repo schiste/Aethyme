@@ -3175,19 +3175,10 @@ impl Broker {
     }
 
     fn repository_worktree_key(&self) -> Result<String, BrokerOpError> {
-        let common_dir = self.repo.git_common_dir()?;
-        let canonical = common_dir.canonicalize().unwrap_or(common_dir);
-        let mut hasher = Sha256::new();
-        hasher.update(canonical.to_string_lossy().as_bytes());
-        let digest = format!("{:x}", hasher.finalize());
-        let name = self
-            .main_root
-            .file_name()
-            .and_then(|name| name.to_str())
-            .map(slugify)
-            .filter(|name| !name.is_empty())
-            .unwrap_or_else(|| "repository".into());
-        Ok(format!("{name}-{}", &digest[..16]))
+        Ok(crate::host_state::repository_key(
+            &self.main_root,
+            Some(&self.repo.git_common_dir()?),
+        ))
     }
 
     fn absolute_worktree_root(&self, path: &Path) -> PathBuf {
@@ -8923,7 +8914,7 @@ pub(crate) fn pid_alive(pid: i64) -> bool {
 
 /// Task → worktree/branch slug: lowercase alphanumerics with dashes,
 /// capped at 40 chars, never empty.
-fn slugify(task: &str) -> String {
+pub(crate) fn slugify(task: &str) -> String {
     let mut slug = String::new();
     let mut last_dash = true;
     for ch in task.chars().flat_map(char::to_lowercase) {

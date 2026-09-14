@@ -26,6 +26,7 @@ pub enum GateDiagnosticId {
     MissingFailureClassificationEvidence,
     InconsistentFailureClassification,
     DuplicateGate,
+    NestedVerificationSlot,
     ProbeMutatesTracked,
     ProbeCreatesUntracked,
     ProbeCreatesIgnored,
@@ -153,6 +154,53 @@ fn finding(
         evidence,
         remediation: remediation.into(),
     }
+}
+
+/// Report a verification slot that had to be placed inside the repository.
+///
+/// The slot is a checkout, and a checkout nested inside the tree under test is
+/// not isolated from it: anything walking upward for a workspace root -- the
+/// ordinary discovery idiom -- resolves to the *enclosing* checkout whenever
+/// the slot is absent or half-built, and answers with the wrong tree instead
+/// of failing. Outside the repository the same walk finds nothing and fails
+/// loudly, which is the property gate isolation actually depends on (#149).
+///
+/// Placement is decided at runtime from what the process can write, so only a
+/// live inspection can say whether it landed outside. Nothing here is
+/// actionable from the gate definitions alone, which is why it is not a static
+/// diagnostic.
+fn nested_verification_slot_finding(
+    placement: &crate::verification::SlotPlacement,
+) -> Option<GateDiagnostic> {
+    if !placement.inside_repository {
+        return None;
+    }
+    let mut evidence = vec![format!(
+        "placed  {} (fallback)",
+        placement.directory.display()
+    )];
+    if let Some(preferred) = &placement.preferred {
+        evidence.push(format!("wanted  {}", preferred.display()));
+    }
+    evidence.extend(
+        placement
+            .refusals
+            .iter()
+            .map(|refusal| format!("because {refusal}")),
+    );
+    evidence.push(
+        "risk    ancestor-walk discovery started below this slot resolves to the enclosing checkout instead of failing"
+            .into(),
+    );
+    Some(finding(
+        GateDiagnosticId::NestedVerificationSlot,
+        None,
+        GateDiagnosticSeverity::Warning,
+        GateDiagnosticConfidence::High,
+        "verification slot is nested inside the repository",
+        evidence,
+        "Give the broker a writable directory outside this checkout: set AETHYME_HOST_STATE_DIR, or lift the sandbox restriction confining writes to the checkout.",
+    ))
 }
 
 /// Inspect only gate definitions. Repository-path coverage is added by the
@@ -438,6 +486,14 @@ pub fn inspect_gate_quality(repo: &crate::GitRepo) -> Result<GateDoctorReport, G
                 "Add a gate trigger for this source area or document why it is intentionally unvalidated.",
             ));
         }
+    }
+
+    // Planning creates the directory it selects, which is the directory a
+    // slot would use anyway, so asking costs nothing a gate run would not
+    // have already spent.
+    if let Ok(root) = repo.main_root() {
+        let placement = crate::verification::plan_slot_placement(&root, "merge-sim");
+        findings.extend(nested_verification_slot_finding(&placement));
     }
 
     sort_findings(&mut findings);
@@ -1227,5 +1283,73 @@ end = 55999
                 .unwrap()
                 .is_none()
         );
+    }
+
+    /// A placement standing in for one the environment produced.
+    fn placement(
+        directory: &str,
+        inside_repository: bool,
+        preferred: Option<&str>,
+        refusals: &[&str],
+    ) -> crate::verification::SlotPlacement {
+        crate::verification::SlotPlacement {
+            directory: directory.into(),
+            inside_repository,
+            preferred: preferred.map(Into::into),
+            refusals: refusals.iter().map(|refusal| (*refusal).into()).collect(),
+        }
+    }
+
+    #[test]
+    fn a_slot_outside_the_repository_is_not_reported() {
+        assert!(
+            nested_verification_slot_finding(&placement(
+                "/host/run/repo-abc/merge-sim",
+                false,
+                None,
+                &[],
+            ))
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn a_slot_inside_the_repository_names_the_hazard_and_what_was_refused() {
+        let found = nested_verification_slot_finding(&placement(
+            "/repo/.aethyme/run/merge-sim",
+            true,
+            Some("/host/run/repo-abc/merge-sim"),
+            &["/host/run/repo-abc/merge-sim: Operation not permitted (os error 1)"],
+        ))
+        .expect("a nested slot is reported");
+        assert_eq!(found.id, GateDiagnosticId::NestedVerificationSlot);
+        assert_eq!(found.severity, GateDiagnosticSeverity::Warning);
+        assert_eq!(
+            found.summary,
+            "verification slot is nested inside the repository"
+        );
+        let evidence = found.evidence.join("\n");
+        assert!(
+            evidence.contains("placed  /repo/.aethyme/run/merge-sim (fallback)"),
+            "{evidence}"
+        );
+        assert!(
+            evidence.contains("wanted  /host/run/repo-abc/merge-sim"),
+            "{evidence}"
+        );
+        assert!(
+            evidence.contains("because /host/run/repo-abc/merge-sim: Operation not permitted"),
+            "{evidence}"
+        );
+        // The hazard is the point of the finding: without it a reader sees an
+        // unusual path and no reason to care about it.
+        assert!(
+            found
+                .evidence
+                .iter()
+                .any(|line| line.starts_with("risk") && line.contains("enclosing checkout")),
+            "{evidence}"
+        );
+        assert!(found.remediation.contains("AETHYME_HOST_STATE_DIR"));
     }
 }
