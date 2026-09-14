@@ -11,9 +11,10 @@ use crate::broker::{
     WORKTREE_ROOT_MARKER, WorktreeRootMarker, directory_size_without_following_links,
 };
 use crate::{
-    Broker, BrokerOpError, GcApplyReport, GcArtifactCandidate, GcBlocker, GcFileAction,
-    GcFileCandidate, GcHealth, GcOrphanCandidate, GcPlan, GcRowCandidate, GcWorktreeCandidate,
-    GitRepo, OperationStatus, RetentionPolicy, load_retention_policy, load_retention_policy_report,
+    Broker, BrokerOpError, GcApplyReport, GcArtifactCandidate, GcBlocker, GcBlockerSummary,
+    GcFileAction, GcFileCandidate, GcHealth, GcOrphanCandidate, GcPlan, GcRowCandidate,
+    GcWorktreeCandidate, GitRepo, OperationStatus, RetentionPolicy, load_retention_policy,
+    load_retention_policy_report,
 };
 
 pub const GC_PLAN_SCHEMA_VERSION: u32 = 2;
@@ -736,6 +737,7 @@ impl Broker {
             cutoff(evaluated_at, policy.terminal_merge_queue_days),
         )?;
         let mut blockers = Vec::new();
+        let mut blocked_worktree_bytes = BTreeMap::<(String, Option<i64>), u64>::new();
         for session in sessions.values() {
             if let Some(queue_entry_id) = session.accepted_queue_entry_id {
                 blockers.push(GcBlocker {
@@ -863,34 +865,44 @@ impl Broker {
                 continue;
             };
             let closed_at = session.closed_at.unwrap_or(session.updated_at);
-            if !item.eligible() {
-                blockers.push(GcBlocker {
-                    kind: "unproven_contribution".into(),
-                    id: Some(item.session_id),
-                    reason: item.reason,
+            let retained_bytes = item.estimated_bytes.unwrap_or(0);
+            // Cleanup eligibility is the representation proof. Once it holds,
+            // GC must schedule the same worktree regardless of its age; an
+            // age gate here made `cleanup --all-cleaned` and `gc` disagree.
+            if item.eligible() {
+                worktrees.push(GcWorktreeCandidate {
+                    session_id: item.session_id,
+                    worktree_path: item.worktree_path,
+                    worktree_present: item.worktree_present,
+                    branch_ref: item.branch_ref,
+                    branch_tip: item.branch_tip,
+                    estimated_bytes: retained_bytes,
+                    closed_at,
                 });
                 continue;
             }
-            if closed_at >= worktree_cutoff {
-                blockers.push(GcBlocker {
+            // Without representation proof, the age policy is the first
+            // bounded protection. Once that window has elapsed, retain the
+            // more specific provenance blocker instead of ever scheduling
+            // the contribution for whole-worktree removal.
+            let blocker = if closed_at >= worktree_cutoff {
+                GcBlocker {
                     kind: "retention_age".into(),
                     id: Some(item.session_id),
                     reason: format!(
-                        "closed worktree is younger than the {} day policy",
-                        policy.closed_worktrees_days
+                        "closed worktree is younger than the {} day policy; cleanup eligibility: {}",
+                        policy.closed_worktrees_days, item.reason
                     ),
-                });
-                continue;
-            }
-            worktrees.push(GcWorktreeCandidate {
-                session_id: item.session_id,
-                worktree_path: item.worktree_path,
-                worktree_present: item.worktree_present,
-                branch_ref: item.branch_ref,
-                branch_tip: item.branch_tip,
-                estimated_bytes: item.estimated_bytes.unwrap_or(0),
-                closed_at,
-            });
+                }
+            } else {
+                GcBlocker {
+                    kind: "unproven_contribution".into(),
+                    id: Some(item.session_id),
+                    reason: item.reason,
+                }
+            };
+            blocked_worktree_bytes.insert((blocker.kind.clone(), blocker.id), retained_bytes);
+            blockers.push(blocker);
         }
 
         let removed_sessions = worktrees
@@ -917,6 +929,36 @@ impl Broker {
             (&left.kind, left.id, &left.reason).cmp(&(&right.kind, right.id, &right.reason))
         });
         blockers.dedup();
+        let mut blocker_summary = blocked_worktree_bytes
+            .into_iter()
+            .filter_map(|((kind, id), retained_bytes)| {
+                let blocker = blockers
+                    .iter()
+                    .find(|blocker| blocker.kind == kind && blocker.id == id)?;
+                Some((blocker.kind.clone(), retained_bytes))
+            })
+            .fold(
+                BTreeMap::<String, (usize, u64)>::new(),
+                |mut summary, (kind, bytes)| {
+                    let entry = summary.entry(kind).or_default();
+                    entry.0 += 1;
+                    entry.1 = entry.1.saturating_add(bytes);
+                    summary
+                },
+            )
+            .into_iter()
+            .map(|(kind, (count, retained_bytes))| GcBlockerSummary {
+                kind,
+                count,
+                retained_bytes,
+            })
+            .collect::<Vec<_>>();
+        blocker_summary.sort_by(|left, right| {
+            right
+                .retained_bytes
+                .cmp(&left.retained_bytes)
+                .then_with(|| left.kind.cmp(&right.kind))
+        });
         let estimated_reclaimable_bytes = rows
             .iter()
             .map(|row| row.estimated_bytes)
@@ -1013,6 +1055,7 @@ impl Broker {
             artifacts,
             orphans,
             blockers,
+            blocker_summary,
             estimated_reclaimable_bytes,
             estimated_retained_bytes,
             estimated_blocked_bytes,
