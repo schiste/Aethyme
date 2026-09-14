@@ -1291,7 +1291,7 @@ impl GitTransferTrace {
                     "not_contacted"
                 },
                 remote_write_contact: "not_contacted",
-                remote_not_contacted: true,
+                remote_not_contacted: !self.remote_transport,
             })
         } else if self.remote_transport {
             Some(RemoteContactEvidence {
@@ -3460,6 +3460,45 @@ mod tests {
                 remote_contact: "contacted",
                 remote_write_contact: "not_contacted",
                 remote_not_contacted: true,
+            })
+        );
+    }
+
+    #[test]
+    fn failed_pre_push_hook_marks_remote_write_as_not_contacted() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            tmp.path(),
+            r#"{"event":"child_start","child_id":1,"child_class":"hook","hook_name":"pre-push","argv":[".git/hooks/pre-push","origin"]}
+{"event":"child_exit","child_id":1,"code":1}
+"#,
+        )
+        .unwrap();
+        let trace = inspect_git_transfer_trace(tmp.path());
+        assert_eq!(
+            trace.remote_contact(),
+            Some(RemoteContactEvidence {
+                remote_contact: "not_contacted",
+                remote_write_contact: "not_contacted",
+                remote_not_contacted: true,
+            })
+        );
+
+        std::fs::write(
+            tmp.path(),
+            r#"{"event":"child_start","child_id":1,"argv":[".git/hooks/pre-push","origin"]}
+{"event":"child_exit","child_id":1,"code":1}
+{"event":"child_start","child_id":2,"argv":["git-receive-pack","repo.git"]}
+"#,
+        )
+        .unwrap();
+        let trace = inspect_git_transfer_trace(tmp.path());
+        assert_eq!(
+            trace.remote_contact(),
+            Some(RemoteContactEvidence {
+                remote_contact: "contacted",
+                remote_write_contact: "not_contacted",
+                remote_not_contacted: false,
             })
         );
     }
