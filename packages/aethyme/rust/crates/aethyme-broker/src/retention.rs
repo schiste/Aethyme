@@ -25,6 +25,7 @@ const RETENTION_POLICY_FIELDS: &[&str] = &[
     "session_abandoned_after_hours",
     "artifact_sweep_budget_ms",
     "artifact_sweep_interval_hours",
+    "artefact_directories",
     "startup_budget_ms",
     "routine_size_budget_ms",
     "size_record_ttl_hours",
@@ -60,6 +61,10 @@ pub struct RetentionPolicy {
     pub artifact_sweep_budget_ms: u64,
     /// Minimum spacing between autonomous artifact sweeps.
     pub artifact_sweep_interval_hours: u32,
+    /// Additional single-component directory names that may be treated as
+    /// regenerable artifacts. This is additive to the built-in catalog; an
+    /// operator cannot use configuration to weaken a built-in witness.
+    pub artefact_directories: Vec<String>,
     pub startup_budget_ms: u64,
     /// Wall-clock budget a *routine* check -- `broker status`, `doctor` --
     /// may spend measuring one directory it has never sized. `0` disables
@@ -92,6 +97,7 @@ impl Default for RetentionPolicy {
             session_abandoned_after_hours: 72,
             artifact_sweep_budget_ms: 5_000,
             artifact_sweep_interval_hours: 24,
+            artefact_directories: Vec::new(),
             startup_budget_ms: 25,
             routine_size_budget_ms: 200,
             size_record_ttl_hours: 24,
@@ -169,6 +175,23 @@ impl RetentionPolicy {
                 value: self.artifact_sweep_interval_hours.to_string(),
                 constraint: "must be between 1 and 8760 hours",
             });
+        }
+        for directory in &self.artefact_directories {
+            let mut components = Path::new(directory).components();
+            let valid = !directory.is_empty()
+                && !directory.contains('/')
+                && !directory.contains('\\')
+                && !directory.contains('\0')
+                && matches!(components.next(), Some(std::path::Component::Normal(_)))
+                && components.next().is_none();
+            if !valid {
+                return Err(RetentionConfigError::InvalidValue {
+                    field: "artefact_directories",
+                    value: directory.clone(),
+                    constraint:
+                        "each entry must be one non-empty directory name without path separators",
+                });
+            }
         }
         // A routine check may spend at most a quarter second measuring. Any
         // larger and the split this bounds -- routine check against expensive
@@ -393,6 +416,20 @@ pub struct GcArtifactCandidate {
     pub idle_days: u32,
 }
 
+/// A large git-ignored directory that was deliberately not classified as
+/// regenerable artifact output. This is evidence for an operator, never a GC
+/// candidate: the broker does not infer that an arbitrary ignored directory is
+/// safe to delete.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct GcDeclinedArtifact {
+    pub session_id: i64,
+    pub worktree_path: String,
+    /// Path of the ignored directory relative to the worktree root.
+    pub relative_dir: String,
+    pub estimated_bytes: u64,
+    pub reason: String,
+}
+
 /// A host worktree root whose owning repository no longer exists.
 ///
 /// Worktree storage is host-scoped but ownership records are repository-local,
@@ -448,6 +485,10 @@ pub struct GcPlan {
     /// digest, like the other measured byte totals.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blocker_summary: Vec<GcBlockerSummary>,
+    /// Large ignored directories outside the safe artifact catalog. These
+    /// are reporting-only and excluded from the authorization digest.
+    #[serde(default)]
+    pub declined_artifacts: Vec<GcDeclinedArtifact>,
     pub estimated_reclaimable_bytes: u64,
     /// Every byte held by retained worktrees, whether or not this plan acts on
     /// it. Reporting only: excluded from the digest so measured sizes never
@@ -456,6 +497,11 @@ pub struct GcPlan {
     /// Bytes this plan deliberately leaves in place because a retention or
     /// provenance gate blocked them.
     pub estimated_blocked_bytes: u64,
+    /// Bytes in [`GcPlan::declined_artifacts`]. Kept separate from
+    /// `estimated_reclaimable_bytes` so evidence can never be mistaken for a
+    /// deletion authorization.
+    #[serde(default)]
+    pub estimated_declined_artifact_bytes: u64,
     /// Directories under a broker worktree root that no session row claims
     /// (#176). Reporting only, and excluded from the digest for the same
     /// reason the byte totals are: this plan does not act on these, so a
@@ -607,6 +653,7 @@ mod tests {
         assert_eq!(policy.routine_size_budget_ms, 200);
         assert_eq!(policy.size_record_ttl_hours, 24);
         assert_eq!(policy.retained_bytes_budget, 1_073_741_824);
+        assert!(policy.artefact_directories.is_empty());
     }
 
     #[test]
@@ -629,6 +676,38 @@ mod tests {
             policy.startup_budget_ms,
             RetentionPolicy::default().startup_budget_ms
         );
+    }
+
+    #[test]
+    fn configured_artifact_directories_are_additive_and_path_scoped() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir(repo.path().join(".aethyme")).unwrap();
+        std::fs::write(
+            repo.path().join(BROKER_CONFIG_RELPATH),
+            "[retention]\nartefact_directories = [\".pnpm-store\", \"cache\"]\n",
+        )
+        .unwrap();
+
+        let policy = load_retention_policy(repo.path()).unwrap();
+        assert_eq!(
+            policy.artefact_directories,
+            vec![".pnpm-store".to_string(), "cache".to_string()]
+        );
+
+        for directory in ["", ".", "..", "nested/cache", "/tmp", "foo\\bar"] {
+            let mut policy = RetentionPolicy::default();
+            policy.artefact_directories = vec![directory.into()];
+            assert!(
+                matches!(
+                    policy.validate(),
+                    Err(RetentionConfigError::InvalidValue {
+                        field: "artefact_directories",
+                        ..
+                    })
+                ),
+                "{directory:?} should not escape one directory component"
+            );
+        }
     }
 
     #[test]

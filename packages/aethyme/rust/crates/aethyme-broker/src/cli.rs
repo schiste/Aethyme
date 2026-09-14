@@ -3372,6 +3372,14 @@ fn render_gc_plan(plan: &crate::GcPlan, detail: bool) {
     for warning in &plan.retention_config_warnings {
         out!("  retention warning: {warning}");
     }
+    if !plan.declined_artifacts.is_empty() {
+        out!(
+            "  ignored but unclassified: {} {}, {}; reported only, not reclaimable",
+            plan.declined_artifacts.len(),
+            crate::broker::plural_word(plan.declined_artifacts.len(), "directory", "directories"),
+            human_bytes(plan.estimated_declined_artifact_bytes),
+        );
+    }
     out!(
         "  retained: {}; blocked by policy or provenance: {}",
         human_bytes(plan.estimated_retained_bytes),
@@ -3490,6 +3498,16 @@ fn render_gc_plan(plan: &crate::GcPlan, detail: bool) {
             artifact.relative_dir,
             human_bytes(artifact.estimated_bytes),
             artifact.idle_days,
+        );
+    });
+    render_capped(&plan.declined_artifacts, GC_LIST_CAP, detail, |artifact| {
+        out!(
+            "  ignored but unclassified: session {} {}/{} ({}) — {}",
+            artifact.session_id,
+            artifact.worktree_path,
+            artifact.relative_dir,
+            human_bytes(artifact.estimated_bytes),
+            artifact.reason,
         );
     });
     render_capped(&plan.orphans, GC_LIST_CAP, detail, |orphan| {
@@ -5039,6 +5057,7 @@ fn run_reclaim(parsed: Parsed) -> Result<(), UsageError> {
         .map(String::as_str)
         .unwrap_or("plan");
     let mut broker = open_broker(true)?;
+    let retention_policy = crate::load_retention_policy(broker.main_root())?;
     // This repository's own worktree directory, not the shared container:
     // reclaiming another repository's build output from here would be a
     // surprise, and that repository's broker knows which of its sessions are
@@ -5059,7 +5078,11 @@ fn run_reclaim(parsed: Parsed) -> Result<(), UsageError> {
         .filter(|agent| agent.derived_status == crate::SessionStatus::Active)
         .map(|agent| std::path::PathBuf::from(agent.session.worktree_path.clone()))
         .collect();
-    let candidates = crate::scan_reclaim(&root, &active);
+    let candidates = crate::scan_reclaim_with_extra_directories(
+        &root,
+        &active,
+        &retention_policy.artefact_directories,
+    );
     let digest = crate::reclaim::plan_digest(&root, &candidates);
     let plan = crate::ReclaimPlan {
         digest: digest.clone(),

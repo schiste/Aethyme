@@ -1030,6 +1030,7 @@ orphan_worktree_roots_days = 1
 session_abandoned_after_hours = 72
 artifact_sweep_budget_ms = 5000
 artifact_sweep_interval_hours = 24
+artefact_directories = [] # e.g. [".pnpm-store"]; additive to built-ins
 startup_budget_ms = 25
 routine_size_budget_ms = 200
 size_record_ttl_hours = 24
@@ -1041,6 +1042,13 @@ applying the known settings; this keeps a newer config from disabling all
 reclamation. A schema version newer than the binary remains an explicit
 `UnsupportedSchema` error. `broker status` and `broker gates doctor` surface
 ignored or invalid retention keys with the remediation to edit this file.
+
+`artefact_directories` is an additive list of single directory names. It can
+extend the built-in artifact catalog (`target` and `node_modules`) for a
+repository-specific cache such as `.pnpm-store`; it cannot remove or weaken a
+built-in witness. Configured names still have to be git-ignored and live inside
+the owning session worktree before GC can reclaim them. The legacy
+`broker reclaim` plan uses the same additive list.
 
 `retained_bytes_budget` is a soft, non-blocking budget used by status, doctor,
 and finish warnings; `0` disables only those warnings. It never authorizes
@@ -1201,8 +1209,9 @@ digest for the same reason the byte totals are. The broker did not create these
 directories and cannot reason about what is inside them, so naming them for a
 human is the most it should do.
 
-Directories whose name begins with `.` are the broker's own shared state — the
-per-root Cargo home, the root marker — and are never reported. A session
+Directories whose name begins with `.` in the unclaimed reconciliation list
+are the broker's own shared state — the per-root Cargo home, the root marker —
+and are never reported there. A session
 worktree name is derived from the task slug, which contains only `[a-z0-9-]`,
 so the two sets cannot overlap.
 
@@ -1218,6 +1227,13 @@ source directory that merely shares the name is never removed. Git must also
 confirm the exact repository-relative directory is ignored; tracked content is
 never reclaimed even when its name and witness resemble a cache. The scan is
 depth-bounded, skips git metadata, and never follows symlinks.
+
+The full `gc plan` also reports any git-ignored directory larger than 4 KiB
+that is outside this catalog as `declined_artifacts`. These entries are
+evidence for an operator only: their byte total is shown separately from
+`estimated_reclaimable_bytes`, and `gc apply` never removes them. This keeps
+large caches such as an unconfigured `.pnpm-store` visible without turning a
+heuristic into a deletion rule.
 
 By default, build caches from sessions idle for `artifact_reclaim_days` are
 reclaimed automatically on broker startup, without per-run confirmation.

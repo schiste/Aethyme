@@ -223,9 +223,9 @@ fn decisions_sorted(decisions: &[ReclaimDecision]) -> Vec<ReclaimDecision> {
 
 /// Directory names that hold regenerable build output.
 ///
-/// A fixed list rather than a heuristic. "Large and ignored" would also match a
-/// downloaded dataset or a local database someone cannot rebuild, and this
-/// deletes things.
+/// A narrow built-in list rather than a heuristic. Configured names are
+/// additive, but "large and ignored" would also match a downloaded dataset or
+/// a local database someone cannot rebuild, and this deletes things.
 const ARTEFACT_DIRECTORIES: &[&str] = &["target", "node_modules", ".venv", "build", "dist"];
 
 /// One reclaimable directory.
@@ -243,6 +243,13 @@ pub struct ReclaimCandidate {
 /// Whether a directory name is regenerable build output.
 pub fn is_artefact_directory(name: &str) -> bool {
     ARTEFACT_DIRECTORIES.contains(&name)
+}
+
+/// Whether a directory name is regenerable build output under the built-in
+/// catalog plus additive configured names. Configuration never removes a
+/// built-in name from the catalog.
+pub fn is_artefact_directory_with_extras(name: &str, extras: &[String]) -> bool {
+    is_artefact_directory(name) || extras.iter().any(|candidate| candidate == name)
 }
 
 /// Decide whether a candidate found under `worktree` may be reclaimed.
@@ -509,6 +516,15 @@ pub fn directory_bytes(path: &Path) -> u64 {
 /// finds one -- a `target/` inside a `target/` is already accounted for, and
 /// walking into a multi-gigabyte build tree to confirm that is pure cost.
 pub fn scan(root: &Path, active: &[PathBuf]) -> Vec<ReclaimCandidate> {
+    scan_with_extra_directories(root, active, &[])
+}
+
+/// Scan `root` with additive configured artifact directory names.
+pub fn scan_with_extra_directories(
+    root: &Path,
+    active: &[PathBuf],
+    extras: &[String],
+) -> Vec<ReclaimCandidate> {
     let mut found = Vec::new();
     let Ok(worktrees) = std::fs::read_dir(root) else {
         return found;
@@ -518,7 +534,7 @@ pub fn scan(root: &Path, active: &[PathBuf]) -> Vec<ReclaimCandidate> {
         if !base.is_dir() {
             continue;
         }
-        collect(&base, &base, active, &mut found, 0);
+        collect(&base, &base, active, extras, &mut found, 0);
     }
     found.sort_by(|a, b| b.bytes.cmp(&a.bytes));
     found
@@ -528,6 +544,7 @@ fn collect(
     dir: &Path,
     worktree: &Path,
     active: &[PathBuf],
+    extras: &[String],
     found: &mut Vec<ReclaimCandidate>,
     depth: usize,
 ) {
@@ -553,12 +570,12 @@ fn collect(
         if name == ".git" {
             continue;
         }
-        if is_artefact_directory(name) {
+        if is_artefact_directory_with_extras(name, extras) {
             let bytes = directory_bytes(&path);
             found.push(classify(&path, worktree, bytes, active));
             continue;
         }
-        collect(&path, worktree, active, found, depth + 1);
+        collect(&path, worktree, active, extras, found, depth + 1);
     }
 }
 
@@ -650,6 +667,18 @@ mod scan_tests {
         let found = scan(tmp.path(), &[]);
         assert_eq!(found.len(), 1);
         assert!(found[0].path.ends_with("target"));
+    }
+
+    #[test]
+    fn configured_artifact_directories_extend_the_built_in_catalog() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(&tmp.path().join("s/.pnpm-store/v3/index"), 16);
+
+        assert!(scan(tmp.path(), &[]).is_empty());
+        let found = scan_with_extra_directories(tmp.path(), &[], &[".pnpm-store".into()]);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].path.ends_with(".pnpm-store"));
+        assert_eq!(found[0].bytes, 16);
     }
 
     #[test]

@@ -12,9 +12,9 @@ use crate::broker::{
 };
 use crate::{
     Broker, BrokerOpError, GcApplyReport, GcArtifactCandidate, GcBlocker, GcBlockerSummary,
-    GcFileAction, GcFileCandidate, GcHealth, GcOrphanCandidate, GcPlan, GcRowCandidate,
-    GcWorktreeCandidate, GitRepo, OperationStatus, RetentionPolicy, load_retention_policy,
-    load_retention_policy_report,
+    GcDeclinedArtifact, GcFileAction, GcFileCandidate, GcHealth, GcOrphanCandidate, GcPlan,
+    GcRowCandidate, GcWorktreeCandidate, GitRepo, OperationStatus, RetentionPolicy,
+    load_retention_policy, load_retention_policy_report,
 };
 
 pub const GC_PLAN_SCHEMA_VERSION: u32 = 2;
@@ -32,6 +32,12 @@ const ARTIFACT_DIRECTORIES: &[(&str, ArtifactWitness)] = &[
 /// for nested workspaces and package directories, shallow enough to keep the
 /// scan bounded on large trees.
 const ARTIFACT_SCAN_DEPTH: usize = 6;
+
+/// An ignored directory must be larger than this before `gc plan` reports it
+/// as an unclassified artifact. Small ignored directories are common project
+/// metadata and would make the evidence list noisy without helping an
+/// operator find meaningful disk pressure.
+pub const UNCLASSIFIED_ARTIFACT_REPORT_THRESHOLD_BYTES: u64 = 4 * 1024;
 
 /// `meta` key holding the last autonomous artifact sweep time.
 const ARTIFACT_SWEEP_STAMP_KEY: &str = "gc.artifact_sweep.last_run_ms";
@@ -75,18 +81,54 @@ fn days_between(now: i64, earlier: i64) -> u32 {
 }
 
 /// Classify a build directory found beneath `root`, if it is one.
+#[cfg(test)]
 fn artifact_witness_for(path: &Path) -> Option<ArtifactWitness> {
+    artifact_witness_for_with_extras(path, &[])
+}
+
+/// Classify a directory with the built-in catalog plus additive configured
+/// names. Built-in entries always keep their built-in witness, even when a
+/// configuration repeats the name, so configuration cannot weaken safety.
+fn artifact_witness_for_with_extras(path: &Path, extras: &[String]) -> Option<ArtifactWitness> {
     let name = path.file_name()?.to_str()?;
-    ARTIFACT_DIRECTORIES
+    let witness = ARTIFACT_DIRECTORIES
         .iter()
         .find(|(candidate, _)| *candidate == name)
         .map(|(_, witness)| *witness)
-        .filter(|witness| witness.confirms(path))
+        .or_else(|| {
+            extras
+                .iter()
+                .any(|candidate| candidate == name)
+                .then_some(ArtifactWitness::NonEmptyDirectory)
+        })?;
+    witness.confirms(path).then_some(witness)
 }
 
-/// Collect build directories beneath `root`, never descending into one that
-/// already matched and never following symlinks.
-fn collect_artifact_dirs(root: &Path, current: &Path, depth: usize, found: &mut Vec<PathBuf>) {
+fn is_known_artifact_name(name: &str, extras: &[String]) -> bool {
+    ARTIFACT_DIRECTORIES
+        .iter()
+        .any(|(candidate, _)| *candidate == name)
+        || extras.iter().any(|candidate| candidate == name)
+}
+
+#[derive(Default)]
+struct ArtifactScan {
+    classified: Vec<PathBuf>,
+    declined: Vec<PathBuf>,
+}
+
+/// Collect classified artifact directories and, when a checkout is supplied,
+/// large ignored directories outside the catalog. The latter are opaque
+/// evidence only; stopping at their boundary keeps the scan bounded and avoids
+/// double-counting nested ignored trees.
+fn collect_artifact_dirs_with_report(
+    root: &Path,
+    current: &Path,
+    depth: usize,
+    extras: &[String],
+    checkout: Option<&GitRepo>,
+    scan: &mut ArtifactScan,
+) {
     if depth > ARTIFACT_SCAN_DEPTH {
         return;
     }
@@ -102,12 +144,75 @@ fn collect_artifact_dirs(root: &Path, current: &Path, depth: usize, found: &mut 
         if path.file_name().is_some_and(|name| name == ".git") {
             continue;
         }
-        if artifact_witness_for(&path).is_some() {
-            found.push(path);
+        if artifact_witness_for_with_extras(&path, extras).is_some() {
+            scan.classified.push(path);
             continue;
         }
-        collect_artifact_dirs(root, &path, depth + 1, found);
+        let name = path.file_name().and_then(|name| name.to_str());
+        if checkout.is_some()
+            && name.is_some_and(|name| !is_known_artifact_name(name, extras))
+            && repo_relative(root, &path).is_some_and(|relative| {
+                checkout.is_some_and(|checkout| checkout.path_is_ignored(&relative))
+            })
+        {
+            scan.declined.push(path);
+            continue;
+        }
+        collect_artifact_dirs_with_report(root, &path, depth + 1, extras, checkout, scan);
     }
+}
+
+/// Collect build directories beneath `root`, never descending into one that
+/// already matched and never following symlinks. This compatibility wrapper is
+/// also used by the unit tests for the built-in catalog.
+#[cfg(test)]
+fn collect_artifact_dirs(root: &Path, current: &Path, depth: usize, found: &mut Vec<PathBuf>) {
+    let mut scan = ArtifactScan::default();
+    collect_artifact_dirs_with_report(root, current, depth, &[], None, &mut scan);
+    found.extend(scan.classified);
+}
+
+fn collect_artifact_dirs_with_extras(
+    root: &Path,
+    current: &Path,
+    depth: usize,
+    extras: &[String],
+    found: &mut Vec<PathBuf>,
+) {
+    let mut scan = ArtifactScan::default();
+    collect_artifact_dirs_with_report(root, current, depth, extras, None, &mut scan);
+    found.extend(scan.classified);
+}
+
+fn collect_artifact_scan(root: &Path, extras: &[String], checkout: &GitRepo) -> ArtifactScan {
+    let mut scan = ArtifactScan::default();
+    collect_artifact_dirs_with_report(root, root, 0, extras, Some(checkout), &mut scan);
+    scan
+}
+
+fn declined_artifacts(
+    session_id: i64,
+    worktree_path: &str,
+    root: &Path,
+    paths: Vec<PathBuf>,
+) -> Vec<GcDeclinedArtifact> {
+    paths
+        .into_iter()
+        .filter_map(|path| {
+            let relative_dir = repo_relative(root, &path)?;
+            let estimated_bytes = directory_size_without_following_links(&path).ok()?;
+            (estimated_bytes > UNCLASSIFIED_ARTIFACT_REPORT_THRESHOLD_BYTES).then(|| {
+                GcDeclinedArtifact {
+                    session_id,
+                    worktree_path: worktree_path.to_owned(),
+                    relative_dir,
+                    estimated_bytes,
+                    reason: "git-ignored directory is outside the regenerable artifact catalog"
+                        .into(),
+                }
+            })
+        })
+        .collect()
 }
 
 fn now_ms() -> i64 {
@@ -551,9 +656,10 @@ impl Broker {
         cleanup: &[crate::CleanupWorktreePlan],
         sessions: &BTreeMap<i64, crate::Session>,
         already_removed: &[i64],
-        scan: crate::SizeScan,
-    ) -> Vec<GcArtifactCandidate> {
+        size_scan: crate::SizeScan,
+    ) -> (Vec<GcArtifactCandidate>, Vec<GcDeclinedArtifact>) {
         let mut candidates = Vec::new();
+        let mut declined = Vec::new();
         for item in cleanup {
             if !item.worktree_present || already_removed.contains(&item.session_id) {
                 continue;
@@ -574,9 +680,9 @@ impl Broker {
             let Ok(checkout) = GitRepo::discover(&root) else {
                 continue;
             };
-            let mut found = Vec::new();
-            collect_artifact_dirs(&root, &root, 0, &mut found);
-            for dir in found {
+            let artifact_scan =
+                collect_artifact_scan(&root, &policy.artefact_directories, &checkout);
+            for dir in artifact_scan.classified {
                 let Some(relative) = repo_relative(&root, &dir) else {
                     continue;
                 };
@@ -588,7 +694,7 @@ impl Broker {
                 // reports zero bytes for it, because here zero means "not
                 // measured" -- dropping it would understate the count as well
                 // as the bytes (#176).
-                let bytes = if scan.measures() {
+                let bytes = if size_scan.measures() {
                     let measured = directory_size_without_following_links(&dir).unwrap_or(0);
                     if measured == 0 {
                         continue;
@@ -605,11 +711,22 @@ impl Broker {
                     idle_days,
                 });
             }
+            if size_scan.measures() {
+                declined.extend(declined_artifacts(
+                    item.session_id,
+                    &item.worktree_path,
+                    &root,
+                    artifact_scan.declined,
+                ));
+            }
         }
         candidates.sort_by(|left, right| {
             (left.session_id, &left.relative_dir).cmp(&(right.session_id, &right.relative_dir))
         });
-        candidates
+        declined.sort_by(|left, right| {
+            (left.session_id, &left.relative_dir).cmp(&(right.session_id, &right.relative_dir))
+        });
+        (candidates, declined)
     }
 
     /// Host worktree roots whose owning repository is gone.
@@ -909,7 +1026,7 @@ impl Broker {
             .iter()
             .map(|worktree| worktree.session_id)
             .collect::<Vec<_>>();
-        let mut artifacts = self.artifact_candidates(
+        let (mut artifacts, declined_artifacts) = self.artifact_candidates(
             evaluated_at,
             &policy,
             &cleanup.worktrees,
@@ -970,6 +1087,10 @@ impl Broker {
             .chain(worktrees.iter().map(|worktree| worktree.estimated_bytes))
             .chain(artifacts.iter().map(|artifact| artifact.estimated_bytes))
             .chain(orphans.iter().map(|orphan| orphan.estimated_bytes))
+            .fold(0_u64, u64::saturating_add);
+        let estimated_declined_artifact_bytes = declined_artifacts
+            .iter()
+            .map(|artifact| artifact.estimated_bytes)
             .fold(0_u64, u64::saturating_add);
         // Retained bytes describe disk pressure, not authorized work: every
         // byte held by a retained worktree plus every orphaned host root.
@@ -1056,9 +1177,11 @@ impl Broker {
             orphans,
             blockers,
             blocker_summary,
+            declined_artifacts,
             estimated_reclaimable_bytes,
             estimated_retained_bytes,
             estimated_blocked_bytes,
+            estimated_declined_artifact_bytes,
             reclaim_order,
             retained_bytes_deficit: crate::reclaim_order::deficit_bytes(
                 estimated_retained_bytes,
@@ -1211,7 +1334,13 @@ impl Broker {
             };
             eligible_worktree_seen = true;
             let mut found = Vec::new();
-            collect_artifact_dirs(&root, &root, 0, &mut found);
+            collect_artifact_dirs_with_extras(
+                &root,
+                &root,
+                0,
+                &policy.artefact_directories,
+                &mut found,
+            );
             for dir in found {
                 let Some(relative) = repo_relative(&root, &dir) else {
                     continue;
@@ -1220,7 +1349,8 @@ impl Broker {
                     continue;
                 }
                 let deferrable =
-                    artifact_witness_for(&dir).and_then(ArtifactWitness::deferrable_entry);
+                    artifact_witness_for_with_extras(&dir, &policy.artefact_directories)
+                        .and_then(ArtifactWitness::deferrable_entry);
                 match remove_condemned_tree(&dir, deferrable, Some(deadline)) {
                     Ok(TreeRemoval::Complete) => {
                         removed.push(dir.to_string_lossy().into_owned());
@@ -1501,7 +1631,27 @@ impl Broker {
                 write_journal(&journal_path, &journal)?;
                 continue;
             }
-            let Some(witness) = artifact_witness_for(&dir) else {
+            let Ok(checkout) = GitRepo::discover(&root) else {
+                failures.push(format!(
+                    "{}: its checkout disappeared; review a new GC plan",
+                    candidate.relative_dir
+                ));
+                journal.remaining_artifacts.remove(0);
+                write_journal(&journal_path, &journal)?;
+                continue;
+            };
+            if !checkout.path_is_ignored(&candidate.relative_dir) {
+                failures.push(format!(
+                    "{}: is no longer git-ignored; review a new GC plan",
+                    candidate.relative_dir
+                ));
+                journal.remaining_artifacts.remove(0);
+                write_journal(&journal_path, &journal)?;
+                continue;
+            }
+            let Some(witness) =
+                artifact_witness_for_with_extras(&dir, &journal.policy.artefact_directories)
+            else {
                 failures.push(format!(
                     "{}: no longer a reclaimable build directory; review a new GC plan",
                     candidate.relative_dir
