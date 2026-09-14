@@ -241,6 +241,53 @@ pub struct HostResourcePlan {
     pub advisory: bool,
 }
 
+/// A read-only diagnosis of why a resource request is or is not runnable.
+/// Unlike [`HostResourcePlan`], this joins every conflict to the lease and
+/// holder information an operator needs to decide whether waiting or
+/// generation-fenced reconciliation is appropriate.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct HostResourceExplanation {
+    pub schema_version: u32,
+    pub request_id: String,
+    pub request_digest: String,
+    pub available: bool,
+    pub proposed: Vec<HostResourceAllocation>,
+    pub blockers: Vec<HostResourceBlocker>,
+    pub wait: HostResourceWaitAdvice,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct HostResourceBlocker {
+    pub conflict: HostResourceConflict,
+    /// Full public lease records, never ownership tokens. There can be more
+    /// than one holder for a capacity pool or a port range.
+    pub leases: Vec<HostResourceLease>,
+    pub holders: Vec<HostResourceHolder>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub os_bindable: Option<bool>,
+    pub recovery: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct HostResourceHolder {
+    pub lease_id: String,
+    pub generation: u64,
+    pub run_id: String,
+    pub repository: String,
+    pub worktree_fingerprint: String,
+    pub state: HostLeaseState,
+    pub holder_pid: Option<u32>,
+    pub process_alive: Option<bool>,
+    pub expires_at: i64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct HostResourceWaitAdvice {
+    pub waitable: bool,
+    pub reason: String,
+    pub action: String,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct HostResourceRunReport {
     pub schema_version: u32,
@@ -355,6 +402,46 @@ impl HostResourceCoordinator {
             proposed,
             conflicts,
             advisory: true,
+        })
+    }
+
+    /// Explain a plan using only read queries. The returned blocker records
+    /// intentionally carry no ownership credential, and this method never
+    /// reclaims, renews, or otherwise changes host state.
+    pub fn explain(
+        &self,
+        request: &HostResourceRequest,
+    ) -> Result<HostResourceExplanation, HostResourceError> {
+        let plan = self.plan(request)?;
+        let leases = self.list(false)?;
+        let blockers = plan
+            .conflicts
+            .iter()
+            .cloned()
+            .map(|conflict| {
+                let leases = leases_for_conflict(&conflict, &leases);
+                let holders = leases.iter().map(host_resource_holder).collect();
+                let os_bindable =
+                    (conflict.kind == "tcp_port").then(|| any_port_bindable(&conflict.requested));
+                let recovery = blocker_recovery(&conflict, &leases);
+                HostResourceBlocker {
+                    conflict,
+                    leases,
+                    holders,
+                    os_bindable,
+                    recovery,
+                }
+            })
+            .collect::<Vec<_>>();
+        let wait = wait_advice(&blockers);
+        Ok(HostResourceExplanation {
+            schema_version: HOST_RESOURCE_REQUEST_SCHEMA_VERSION,
+            request_id: request.request_id.clone(),
+            request_digest: request_digest(request)?,
+            available: plan.available,
+            proposed: plan.proposed,
+            blockers,
+            wait,
         })
     }
 
@@ -1264,6 +1351,126 @@ fn conflict(
         requested,
         reason: reason.into(),
         owning_lease: owner,
+    }
+}
+
+fn leases_for_conflict(
+    conflict: &HostResourceConflict,
+    leases: &[HostResourceLease],
+) -> Vec<HostResourceLease> {
+    let matches = leases.iter().filter(|lease| {
+        lease.allocations.iter().any(|allocation| {
+            if allocation.kind != conflict.kind {
+                return false;
+            }
+            match conflict.kind.as_str() {
+                "capacity" => conflict
+                    .requested
+                    .split_once(':')
+                    .is_some_and(|(pool, _)| allocation.value == pool),
+                "exclusive_key" => allocation.value == conflict.requested,
+                "tcp_port" => parse_port_range(&conflict.requested).is_some_and(|(start, end)| {
+                    allocation
+                        .value
+                        .parse::<u16>()
+                        .is_ok_and(|port| (start..=end).contains(&port))
+                }),
+                _ => false,
+            }
+        })
+    });
+    let mut selected = matches.cloned().collect::<Vec<_>>();
+    if let Some(owner) = conflict.owning_lease.as_deref()
+        && !selected.iter().any(|lease| lease.lease_id == owner)
+        && let Some(lease) = leases.iter().find(|lease| lease.lease_id == owner)
+    {
+        selected.push(lease.clone());
+    }
+    selected
+}
+
+fn host_resource_holder(lease: &HostResourceLease) -> HostResourceHolder {
+    HostResourceHolder {
+        lease_id: lease.lease_id.clone(),
+        generation: lease.generation,
+        run_id: lease.run_id.clone(),
+        repository: lease.repository.clone(),
+        worktree_fingerprint: lease.worktree_fingerprint.clone(),
+        state: lease.state,
+        holder_pid: lease.holder_pid,
+        process_alive: lease
+            .holder_pid
+            .map(|pid| !holder_process_is_gone(i64::from(pid))),
+        expires_at: lease.expires_at,
+    }
+}
+
+fn parse_port_range(value: &str) -> Option<(u16, u16)> {
+    let (start, end) = value.split_once('-')?;
+    Some((start.parse().ok()?, end.parse().ok()?))
+}
+
+fn any_port_bindable(value: &str) -> bool {
+    let Some((start, end)) = parse_port_range(value) else {
+        return false;
+    };
+    (start..=end)
+        .any(|port| TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)).is_ok())
+}
+
+fn blocker_recovery(conflict: &HostResourceConflict, leases: &[HostResourceLease]) -> String {
+    if conflict.code == "capacity_policy_mismatch" {
+        return "the pool limit differs from an existing holder; use the same limit or wait until the existing lease is released".into();
+    }
+    if let Some(lease) = leases.iter().find(|lease| {
+        lease
+            .holder_pid
+            .is_some_and(|pid| holder_process_is_gone(i64::from(pid)))
+    }) {
+        return format!(
+            "holder process is gone; review cleanup, then run `aethyme broker resources reconcile {} --confirm {}` after the lease is quarantined",
+            lease.lease_id, lease.generation
+        );
+    }
+    "ordinary contention; wait for the holder to release the lease and retry the same request"
+        .into()
+}
+
+fn wait_advice(blockers: &[HostResourceBlocker]) -> HostResourceWaitAdvice {
+    if blockers.is_empty() {
+        return HostResourceWaitAdvice {
+            waitable: true,
+            reason: "no_conflict".into(),
+            action: "no wait is required; acquire can proceed".into(),
+        };
+    }
+    if blockers
+        .iter()
+        .any(|blocker| blocker.conflict.code == "capacity_policy_mismatch")
+    {
+        return HostResourceWaitAdvice {
+            waitable: false,
+            reason: "capacity_policy_mismatch".into(),
+            action: "align the requested pool limit with the existing lease; waiting cannot change policy".into(),
+        };
+    }
+    if blockers.iter().any(|blocker| {
+        blocker
+            .holders
+            .iter()
+            .any(|holder| holder.process_alive == Some(false))
+    }) {
+        return HostResourceWaitAdvice {
+            waitable: false,
+            reason: "orphaned_holder".into(),
+            action: "review cleanup and reconcile the exact quarantined lease before retrying"
+                .into(),
+        };
+    }
+    HostResourceWaitAdvice {
+        waitable: true,
+        reason: "resource_contention".into(),
+        action: "wait for the identified lease(s) to release, then retry this request".into(),
     }
 }
 
