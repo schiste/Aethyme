@@ -180,11 +180,13 @@ text_enum!(AdvisoryResolutionState, "advisories.resolution_state", {
 text_enum!(EntryExposureState, "entry_path_exposures.state", {
     Outstanding => "outstanding",
     Resolved => "resolved",
+    Expired => "expired",
 });
 
 text_enum!(EntryExposureResolutionKind, "entry_path_exposures.resolution_kind", {
     ShipVerified => "ship_verified",
     ExternalReconciliation => "external_reconciliation",
+    Expired => "expired",
 });
 
 /// One bounded, structured fact supporting a non-blocking advisory.

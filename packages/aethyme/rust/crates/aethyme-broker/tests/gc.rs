@@ -1,7 +1,10 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use aethyme_broker::{Broker, FinishOptions, GateStatus, GcFileAction, GcRowKind, NewGateResult};
+use aethyme_broker::{
+    Broker, EntryExposureResolutionKind, EntryExposureState, FinishOptions, GateStatus,
+    GcFileAction, GcRowKind, NewGateResult,
+};
 
 fn git(repo: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
@@ -54,6 +57,181 @@ fn fixture() -> (tempfile::TempDir, Broker, i64, PathBuf) {
             .closed
     );
     (tmp, broker, delivered.id, worktree)
+}
+
+#[test]
+fn closing_session_releases_checkpoint_pin_without_erasing_provenance() {
+    let (tmp, mut broker, delivered_id, _worktree) = fixture();
+    let session = broker.store().session(delivered_id).unwrap();
+    let queue_entry_id = session.accepted_queue_entry_id.unwrap();
+
+    assert!(
+        broker
+            .store()
+            .gc_checkpoint_pin_candidates()
+            .unwrap()
+            .is_empty(),
+        "the terminal close transaction should release the pin immediately"
+    );
+    let cleanup = broker.cleanup_plan().unwrap();
+    assert!(
+        cleanup
+            .worktrees
+            .iter()
+            .any(|item| item.session_id == delivered_id && item.eligible()),
+        "pin release must not remove cleanup representation proof"
+    );
+    drop(broker);
+
+    let db = rusqlite::Connection::open(tmp.path().join(".aethyme/broker.db")).unwrap();
+    let released: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM gc_checkpoint_pin_releases
+             WHERE session_id = ?1 AND queue_entry_id = ?2",
+            rusqlite::params![delivered_id, queue_entry_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(released, 1);
+    let accepted_queue_still_exists: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM merge_queue WHERE id = ?1",
+            [queue_entry_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(accepted_queue_still_exists, 1);
+}
+
+#[test]
+fn reviewed_gc_plan_releases_legacy_pin_and_keeps_provenance_and_files() {
+    let (tmp, mut broker, delivered_id, worktree) = fixture();
+    let session = broker.store().session(delivered_id).unwrap();
+    let queue_entry_id = session.accepted_queue_entry_id.unwrap();
+    drop(broker);
+
+    std::fs::write(worktree.join("pending.txt"), "keep me\n").unwrap();
+    let db_path = tmp.path().join(".aethyme/broker.db");
+    let db = rusqlite::Connection::open(&db_path).unwrap();
+    db.execute(
+        "DELETE FROM gc_checkpoint_pin_releases
+         WHERE session_id = ?1 AND queue_entry_id = ?2",
+        rusqlite::params![delivered_id, queue_entry_id],
+    )
+    .unwrap();
+    drop(db);
+
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let plan = broker.gc_plan().unwrap();
+    assert_eq!(plan.checkpoint_pin_releases.len(), 1);
+    assert_eq!(plan.checkpoint_pin_releases[0].session_id, delivered_id);
+    assert_eq!(
+        plan.checkpoint_pin_releases[0].queue_entry_id,
+        queue_entry_id
+    );
+    assert!(
+        plan.blockers
+            .iter()
+            .any(|blocker| blocker.kind == "accepted_checkpoint"
+                && blocker.id == Some(queue_entry_id))
+    );
+    let accepted_summary = plan
+        .blocker_summary
+        .iter()
+        .find(|summary| summary.kind == "accepted_checkpoint")
+        .unwrap();
+    assert_eq!(accepted_summary.count, 1);
+    assert_eq!(accepted_summary.oldest_id, Some(queue_entry_id));
+    assert!(accepted_summary.age_exceeded);
+
+    let applied = broker.gc_apply(&plan.digest).unwrap();
+    assert!(
+        applied.complete,
+        "reviewed metadata release should finish: {applied:?}"
+    );
+    assert_eq!(applied.checkpoint_pins_released, vec![delivered_id]);
+    assert!(worktree.join("done.txt").exists());
+    assert!(worktree.join("pending.txt").exists());
+    assert!(
+        broker
+            .store()
+            .gc_checkpoint_pin_candidates()
+            .unwrap()
+            .is_empty()
+    );
+    let preserved = broker.store().session(delivered_id).unwrap();
+    assert_eq!(preserved.accepted_queue_entry_id, Some(queue_entry_id));
+    assert!(
+        broker
+            .cleanup_plan()
+            .unwrap()
+            .worktrees
+            .iter()
+            .any(|item| item.session_id == delivered_id && !item.eligible()),
+        "the dirty worktree remains protected after pin release"
+    );
+}
+
+#[test]
+fn reviewed_gc_plan_expires_old_publication_exposure_to_terminal_state() {
+    let (tmp, mut broker, _delivered_id, _worktree) = fixture();
+    let exposure = broker
+        .store()
+        .outstanding_entry_path_exposures()
+        .unwrap()
+        .pop()
+        .unwrap();
+    drop(broker);
+
+    let db_path = tmp.path().join(".aethyme/broker.db");
+    let db = rusqlite::Connection::open(&db_path).unwrap();
+    db.execute(
+        "UPDATE entry_path_exposures SET created_at = 1 WHERE id = ?1",
+        [exposure.id],
+    )
+    .unwrap();
+    drop(db);
+
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let plan = broker.gc_plan().unwrap();
+    assert_eq!(plan.publication_exposure_expiries.len(), 1);
+    assert_eq!(
+        plan.publication_exposure_expiries[0].exposure_id,
+        exposure.id
+    );
+    let summary = plan
+        .blocker_summary
+        .iter()
+        .find(|summary| summary.kind == "publication_exposure")
+        .unwrap();
+    assert_eq!(summary.count, 1);
+    assert_eq!(summary.oldest_id, Some(exposure.id));
+    assert!(summary.age_exceeded);
+
+    let applied = broker.gc_apply(&plan.digest).unwrap();
+    assert!(
+        applied.complete,
+        "reviewed expiry should finish: {applied:?}"
+    );
+    assert_eq!(applied.publication_exposures_expired, vec![exposure.id]);
+    let expired = broker
+        .store()
+        .entry_path_exposure(exposure.queue_entry_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(expired.state, EntryExposureState::Expired);
+    assert_eq!(
+        expired.resolution_kind,
+        Some(EntryExposureResolutionKind::Expired)
+    );
+    assert!(
+        broker
+            .gc_plan()
+            .unwrap()
+            .blockers
+            .iter()
+            .all(|blocker| blocker.kind != "publication_exposure")
+    );
 }
 
 #[test]
@@ -288,7 +466,10 @@ fn digest_confirmed_apply_resumes_a_deadline_and_preserves_monotonic_ids() {
 
     std::fs::write(&gate_log, "changed after confirmation\n").unwrap();
     let drift = broker.gc_apply(&plan.digest).unwrap_err();
-    assert!(drift.to_string().contains("reviewed artifact drifted"));
+    assert!(
+        drift.to_string().contains("reviewed artifact drifted"),
+        "unexpected drift error: {drift}"
+    );
     assert!(gate_log.exists());
     assert!(main_root.join(".aethyme/gc-journal.json").exists());
     std::fs::write(&gate_log, "old gate output\n").unwrap();
@@ -319,7 +500,10 @@ fn digest_confirmed_apply_resumes_a_deadline_and_preserves_monotonic_ids() {
     let queue_rows: i64 = db
         .query_row("SELECT COUNT(*) FROM merge_queue", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(queue_rows, 1, "the accepted checkpoint remains protected");
+    assert_eq!(
+        queue_rows, 0,
+        "released accepted checkpoints may age out safely"
+    );
 }
 
 #[cfg(unix)]
