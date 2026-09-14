@@ -3369,6 +3369,9 @@ fn render_gc_plan(plan: &crate::GcPlan, detail: bool) {
         plan.orphans.len(),
         human_bytes(plan.estimated_reclaimable_bytes),
     );
+    for warning in &plan.retention_config_warnings {
+        out!("  retention warning: {warning}");
+    }
     out!(
         "  retained: {}; blocked by policy or provenance: {}",
         human_bytes(plan.estimated_retained_bytes),
@@ -11689,6 +11692,9 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     human_bytes(report.retention.estimated_reclaimable_bytes),
                     report.retention.blockers,
                 );
+                for warning in &report.retention.retention_config_warnings {
+                    out!("  retention warning: {warning}");
+                }
                 // Doctor takes the recorded-size path, so its byte figures
                 // can be floors. Say so before the budget line: a floor
                 // under the budget is not a pass, it is an unanswered

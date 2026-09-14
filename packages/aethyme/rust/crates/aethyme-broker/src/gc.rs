@@ -13,7 +13,7 @@ use crate::broker::{
 use crate::{
     Broker, BrokerOpError, GcApplyReport, GcArtifactCandidate, GcBlocker, GcFileAction,
     GcFileCandidate, GcHealth, GcOrphanCandidate, GcPlan, GcRowCandidate, GcWorktreeCandidate,
-    GitRepo, OperationStatus, RetentionPolicy, load_retention_policy,
+    GitRepo, OperationStatus, RetentionPolicy, load_retention_policy, load_retention_policy_report,
 };
 
 pub const GC_PLAN_SCHEMA_VERSION: u32 = 2;
@@ -720,7 +720,9 @@ impl Broker {
     fn gc_plan_scanned(&mut self, scan: crate::SizeScan) -> Result<GcPlan, BrokerOpError> {
         let evaluated_at = now_ms();
         let main_root = self.main_root().to_path_buf();
-        let policy = load_retention_policy(&main_root)?;
+        let retention_config = load_retention_policy_report(&main_root)?;
+        let policy = retention_config.policy;
+        let retention_config_warnings = retention_config.warnings;
         let cleanup = self.cleanup_plan_scanned(scan)?;
         let sessions = self
             .store()
@@ -1004,6 +1006,7 @@ impl Broker {
             digest: String::new(),
             evaluated_at,
             policy,
+            retention_config_warnings,
             rows,
             files,
             worktrees,
@@ -1051,6 +1054,7 @@ impl Broker {
         let over_retained_bytes_budget = plan.budget_verdict.exceeded();
         Ok(GcHealth {
             policy: plan.policy,
+            retention_config_warnings: plan.retention_config_warnings,
             pending_recovery_digest: journal.map(|journal| journal.digest),
             candidate_rows: plan.rows.len(),
             candidate_files: plan.files.len(),

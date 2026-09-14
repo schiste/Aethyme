@@ -310,6 +310,71 @@ fn explicit_opt_out_preserves_closed_session_build_caches() {
 }
 
 #[test]
+fn unknown_retention_fields_warn_without_disabling_gc_or_status() {
+    let (repo, container) = fixture(
+        "[retention]\nartifact_sweep_budget_ms = 0\nfuture_sweep_days = 14\n",
+    );
+
+    let plan = plan_json(repo.path(), container.path());
+    assert_eq!(plan["policy"]["artifact_sweep_budget_ms"], 0);
+    assert_eq!(
+        plan["retention_config_warnings"][0]["field"],
+        "retention.future_sweep_days"
+    );
+
+    let output = run(repo.path(), container.path(), &["status", "--json"]);
+    assert!(
+        output.status.success(),
+        "status: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        status["cleanup_retention"]["retention_config"]["warnings"][0]["field"],
+        "retention.future_sweep_days"
+    );
+    assert!(status["advice"].as_array().unwrap().iter().any(|advice| {
+        advice["id"] == "retention.config"
+            && advice["evidence"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item.as_str().unwrap().contains("future_sweep_days"))
+    }));
+}
+
+#[test]
+fn invalid_retention_config_is_explained_by_status_instead_of_hiding_the_error() {
+    let (repo, container) = fixture("[retention]\nstartup_budget_ms = 0\n");
+
+    let output = run(repo.path(), container.path(), &["status", "--json"]);
+    assert!(
+        output.status.success(),
+        "status: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        status["cleanup_retention"]["retention_config"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("startup_budget_ms")
+    );
+    assert!(status["advice"].as_array().unwrap().iter().any(|advice| {
+        advice["id"] == "retention.config"
+            && advice["summary"]
+                .as_str()
+                .unwrap()
+                .contains("conservative defaults")
+            && advice["commands"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item.as_str().unwrap().contains("broker gc plan"))
+    }));
+}
+
+#[test]
 fn tracked_directory_with_a_cache_witness_is_never_reclaimed() {
     let (repo, container) = fixture("");
     let output = run(
