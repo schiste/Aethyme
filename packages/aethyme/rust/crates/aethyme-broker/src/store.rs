@@ -122,7 +122,15 @@ impl BrokerStore {
     /// path so an observational command cannot become the write that upgrades
     /// storage or refreshes a session.
     pub fn open_snapshot_in_repo(repo_root: &Path) -> Result<Self, BrokerError> {
-        let path = crate::broker_db_path(repo_root);
+        Self::open_snapshot_at(&crate::broker_db_path(repo_root))
+    }
+
+    /// Open an exact broker database path read-only, without applying the
+    /// process-wide repository-database override. Host storage inventory uses
+    /// this when joining several repositories' ledgers: one test or embedding
+    /// override must not make every owner appear to share the same database.
+    pub fn open_snapshot_at(path: &Path) -> Result<Self, BrokerError> {
+        let path = path.to_path_buf();
         if !path.is_file() {
             let conn = Connection::open_in_memory()?;
             schema::migrate(&conn)?;

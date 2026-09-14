@@ -105,6 +105,7 @@ fn broker_command_capability(args: &[String]) -> repository_upgrade::CommandCapa
         (Some("close" | "finish" | "git" | "gh" | "cleanup"), _) => {
             CommandCapability::RecoveryWrite
         }
+        (Some("storage"), Some("apply")) => CommandCapability::RecoveryWrite,
         (Some("checkpoint"), Some("apply")) => CommandCapability::RecoveryWrite,
         (Some("report"), Some("file")) => CommandCapability::RecoveryWrite,
         (Some("operations" | "resources"), Some("reconcile"))
@@ -153,7 +154,7 @@ fn broker_command_capability(args: &[String]) -> repository_upgrade::CommandCapa
         | (
             Some(
                 "handoff" | "queue" | "status" | "agents" | "metrics" | "certify" | "readiness"
-                | "worktree-root",
+                | "worktree-root" | "storage",
             ),
             _,
         )
@@ -778,6 +779,14 @@ mod compatibility_command_tests {
     fn parsed_commands_cover_every_compatibility_capability() {
         let cases = [
             (&["broker", "status"][..], CommandCapability::DiagnosticRead),
+            (
+                &["broker", "storage"][..],
+                CommandCapability::DiagnosticRead,
+            ),
+            (
+                &["broker", "storage", "apply"][..],
+                CommandCapability::RecoveryWrite,
+            ),
             (
                 &["broker", "readiness", "--require", "agent-ready"][..],
                 CommandCapability::DiagnosticRead,

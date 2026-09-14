@@ -1,6 +1,6 @@
 # CLI Reference
 
-Last Updated: 2026-09-05
+Last Updated: 2026-09-14
 
 ## Install
 
@@ -103,6 +103,7 @@ product surface.
 - `aethyme broker leases ...`
 - `aethyme broker pr check`
 - `aethyme broker cleanup`
+- `aethyme broker storage ...`
 - `aethyme graph ...`
 - `aethyme facts ...`
 - `aethyme task ...`
@@ -536,6 +537,9 @@ continues to expose the complete local `log_path` without embedding log data.
 - `aethyme broker main reconcile apply --session <id> --confirm <sha256> [--resolution-file <path>] [--json]`
 - `aethyme broker gc plan [--json]`
 - `aethyme broker gc apply --confirm <sha256> [--json]`
+- `aethyme broker storage [--json]`
+- `aethyme broker storage plan [--json]`
+- `aethyme broker storage apply --confirm <sha256> [--json]`
 - `aethyme broker handoff (--session <id> | --worktree <path>) [--json]`
 - `aethyme broker report capture --kind <bug|improvement> --title <text> [--session <id>] [--include-task] [--stdout | --output <filename>] [--json]`
 - `aethyme broker report list [--json]`
@@ -1246,6 +1250,35 @@ stops binding the moment the owning repository reappears. Repositories under the
 system temporary directory are never anchored in the implicit platform host-state
 directory for this reason, though an explicitly configured
 `AETHYME_HOST_STATE_DIR` or `AETHYME_WORKTREE_ROOT` is always honoured.
+
+`broker storage` is the host-wide inventory for that boundary. It enumerates
+every direct entry below the host worktree container, including roots whose
+owner is missing, and reconciles each usable root's on-disk directories with
+Git's worktree registrations and the owning repository's live and closed
+session ledger. The JSON projection is versioned and identifies paths missing
+from one or more of those sources, unreadable or unmarked roots, Git metadata,
+session IDs, and bounded byte estimates. Existing repository-local `gc` and
+`reclaim` commands remain the policy unit for an owner that still exists; when
+an owner has been deleted, the invoking repository's orphan grace setting is
+used and is reported in the plan.
+
+The inventory and `storage plan` are read-only. A directory that is absent from
+both Git registrations and the session ledger is reported as a possible stray,
+but it is not eligible unless the owning root has valid marker evidence. A
+valid marker whose owner is gone becomes an orphan candidate only after the
+reported grace period. Unmarked roots, non-directory entries, unreadable
+ledgers, and any ownership disagreement remain blockers. Apply only the exact
+reviewed digest:
+
+```bash
+aethyme broker storage apply --confirm <sha256>
+```
+
+Apply rechecks the root marker, owner checkout, direct containment, Git
+registrations, and session ledger immediately before each removal. A changed
+plan refuses before touching anything; a later race retains the affected path
+and reports the exact recovery command. The root ownership marker is kept
+until the final removal step so an interrupted deletion remains identifiable.
 
 Apply only the reviewed plan:
 

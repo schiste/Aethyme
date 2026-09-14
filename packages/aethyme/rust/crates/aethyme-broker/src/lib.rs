@@ -113,6 +113,7 @@ mod schema;
 mod session_abandonment;
 mod ship;
 mod store;
+mod storage;
 mod types;
 mod update;
 mod update_cache;
@@ -393,6 +394,13 @@ pub use ship::{
     ShipReviewEvidence,
 };
 pub use store::BrokerStore;
+pub use storage::{
+    STORAGE_PLAN_SCHEMA_VERSION, STORAGE_RECONCILIATION_SCHEMA_VERSION, StorageApplyFailure,
+    StorageApplyReport, StorageAppliedItem, StorageCandidate, StorageCandidateKind,
+    StorageDirectoryKind, StorageEntry, StorageError, StorageFilesystemKind, StorageMarkerStatus,
+    StoragePlan, StorageReconciliation, StorageRoot, StorageSource, StorageSummary,
+    storage_apply, storage_plan,
+};
 pub use types::{
     Advisory, AdvisoryAction, AdvisoryAudience, AdvisoryDeliveryMetric, AdvisoryDeliverySummary,
     AdvisoryDeliverySurface, AdvisoryEvidence, AdvisoryList, AdvisoryProducer,
