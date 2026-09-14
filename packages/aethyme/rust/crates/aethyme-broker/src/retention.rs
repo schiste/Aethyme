@@ -415,6 +415,18 @@ pub struct GcBlocker {
     pub reason: String,
 }
 
+/// A byte-backed aggregation of the worktree blockers in a GC plan.
+///
+/// The individual blocker list remains the authoritative explanation for each
+/// session. This companion view makes the retained disk pressure actionable by
+/// grouping it by the rule that held it, with the largest group first.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct GcBlockerSummary {
+    pub kind: String,
+    pub count: usize,
+    pub retained_bytes: u64,
+}
+
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct GcPlan {
     pub schema_version: u32,
@@ -431,6 +443,11 @@ pub struct GcPlan {
     pub artifacts: Vec<GcArtifactCandidate>,
     pub orphans: Vec<GcOrphanCandidate>,
     pub blockers: Vec<GcBlocker>,
+    /// Retained worktree bytes grouped by the blocker that holds them. This
+    /// is reporting only and intentionally excluded from the authorization
+    /// digest, like the other measured byte totals.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocker_summary: Vec<GcBlockerSummary>,
     pub estimated_reclaimable_bytes: u64,
     /// Every byte held by retained worktrees, whether or not this plan acts on
     /// it. Reporting only: excluded from the digest so measured sizes never

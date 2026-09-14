@@ -3504,6 +3504,18 @@ fn render_gc_plan(plan: &crate::GcPlan, detail: bool) {
             orphan.repository_root
         );
     });
+    if !plan.blocker_summary.is_empty() {
+        out!("  blocked retained bytes by kind:");
+        for summary in &plan.blocker_summary {
+            out!(
+                "    {}: {} {}, {} retained",
+                summary.kind,
+                summary.count,
+                crate::broker::plural_word(summary.count, "blocker", "blockers"),
+                human_bytes(summary.retained_bytes),
+            );
+        }
+    }
     render_capped(&plan.blockers, GC_LIST_CAP, detail, |blocker| {
         out!(
             "  protected: {}{} — {}",

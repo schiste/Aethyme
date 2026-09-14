@@ -344,9 +344,9 @@ pub use resources::{
     default_host_resource_db_path, resource_environment_key, validate_host_resource_requirements,
 };
 pub use retention::{
-    BROKER_CONFIG_RELPATH, GcApplyReport, GcArtifactCandidate, GcBlocker, GcFileAction,
-    GcFileCandidate, GcHealth, GcOrphanCandidate, GcPlan, GcRowCandidate, GcRowKind,
-    GcWorktreeCandidate, RETENTION_POLICY_SCHEMA_VERSION, RetentionConfigError,
+    BROKER_CONFIG_RELPATH, GcApplyReport, GcArtifactCandidate, GcBlocker, GcBlockerSummary,
+    GcFileAction, GcFileCandidate, GcHealth, GcOrphanCandidate, GcPlan, GcRowCandidate,
+    GcRowKind, GcWorktreeCandidate, RETENTION_POLICY_SCHEMA_VERSION, RetentionConfigError,
     RetentionConfigWarning, RetentionPolicy, RetentionPolicyLoadReport, load_retention_policy,
     load_retention_policy_report,
 };
