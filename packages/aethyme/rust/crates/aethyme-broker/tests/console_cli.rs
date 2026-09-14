@@ -22,6 +22,9 @@ const SINGULAR_PORT_END: u16 = 45199;
 const PER_WORKTREE_PORT: u16 = 45273;
 const PER_WORKTREE_PORT_END: u16 = 45299;
 const HELD_PORT: u16 = 45373;
+const MARKER_PORT: u16 = 45473;
+const PARALLEL_PORT: u16 = 45476;
+const PARALLEL_PORT_END: u16 = 45479;
 
 fn run(cwd: &Path, state: &Path, args: &[&str]) -> Output {
     Command::new(CLI)
@@ -60,6 +63,7 @@ fn repo(console_section: Option<&str>) -> (tempfile::TempDir, std::path::PathBuf
     .unwrap();
     git(&root, &["add", "-A"]);
     git(&root, &["commit", "-qm", "init"]);
+    git(&root, &["branch", "aethyme/integration"]);
     let state = temp.path().join("state");
     (temp, state)
 }
@@ -280,4 +284,134 @@ fn an_unknown_action_names_the_ones_that_exist() {
     assert!(message.contains("status"), "{message}");
     assert!(message.contains("plan"), "{message}");
     assert!(message.contains("run"), "{message}");
+}
+
+fn wait_for_running(root: &Path, state: &Path, expected: usize) -> serde_json::Value {
+    for _ in 0..80 {
+        let status = run(root, state, &["console", "list", "--json"]);
+        if status.status.success() {
+            if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&status.stdout) {
+                if value["running"].as_array().is_some_and(|running| {
+                    running.len() == expected && running.iter().all(|row| row["marker"].is_object())
+                }) {
+                    return value;
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    let status = run(root, state, &["console", "list", "--json"]);
+    panic!(
+        "expected {expected} running console(s), got {}",
+        String::from_utf8_lossy(&status.stdout)
+    );
+}
+
+#[test]
+fn managed_console_publishes_and_lists_its_exact_revision_marker() {
+    let (temp, state) = repo(Some(&format!(
+        "[console]\nmode = 'singular'\nport = {MARKER_PORT}\n"
+    )));
+    let root = temp.path().join("repo");
+    let mut child = Command::new(CLI)
+        .args([
+            "console",
+            "run",
+            "--json",
+            "--",
+            "/bin/sh",
+            "-c",
+            "test -s \"$AETHYME_CONSOLE_MARKER\" && sleep 2",
+        ])
+        .current_dir(&root)
+        .env("AETHYME_HOST_STATE_DIR", &state)
+        .spawn()
+        .unwrap();
+
+    let status = wait_for_running(&root, &state, 1);
+    let running = status["running"].as_array().unwrap();
+    let serving = &running[0];
+    assert_eq!(status["identity"]["branch"], "main");
+    assert_eq!(status["identity"]["commit"].as_str().unwrap().len(), 40);
+    assert_eq!(status["identity"]["dirty"], false);
+    assert_eq!(status["identity"]["integration_relation"], "current");
+    assert_eq!(serving["port"], MARKER_PORT.to_string());
+    assert_eq!(serving["branch"], "main");
+    assert_eq!(serving["commit"].as_str().unwrap().len(), 40);
+    assert_eq!(serving["dirty"], false);
+    assert_eq!(serving["integration_relation"], "current");
+    assert_eq!(serving["parallel"], false);
+    let marker_path = Path::new(serving["marker"]["path"].as_str().unwrap());
+    assert!(marker_path.is_file(), "marker path was not published");
+    let marker: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(marker_path).unwrap()).expect("marker JSON");
+    assert_eq!(marker["marker_digest"], serving["marker"]["digest"]);
+    assert_eq!(marker["commit"], serving["commit"]);
+    assert_eq!(marker["port"], MARKER_PORT);
+    assert_eq!(marker["integration_branch"], "aethyme/integration");
+    assert_eq!(
+        Path::new(marker["worktree"].as_str().unwrap()),
+        std::fs::canonicalize(&root).unwrap()
+    );
+
+    let alias = json(&run(&root, &state, &["console", "status", "--json"]));
+    assert_eq!(alias["running"], status["running"]);
+    child.wait().unwrap();
+    let stopped = json(&run(&root, &state, &["console", "list", "--json"]));
+    assert!(stopped["running"].as_array().unwrap().is_empty());
+    assert!(
+        !marker_path.exists(),
+        "clean shutdown must remove its marker"
+    );
+}
+
+#[test]
+fn allow_parallel_keeps_both_processes_in_the_registry_on_distinct_ports() {
+    let (temp, state) = repo(Some(&format!(
+        "[console]\nmode = 'singular'\nport = {PARALLEL_PORT}\nport_end = {PARALLEL_PORT_END}\n"
+    )));
+    let root = temp.path().join("repo");
+    let mut first = Command::new(CLI)
+        .args(["console", "run", "--", "/bin/sh", "-c", "sleep 2"])
+        .current_dir(&root)
+        .env("AETHYME_HOST_STATE_DIR", &state)
+        .spawn()
+        .unwrap();
+    wait_for_running(&root, &state, 1);
+
+    let mut second = Command::new(CLI)
+        .args([
+            "console",
+            "run",
+            "--allow-parallel",
+            "--",
+            "/bin/sh",
+            "-c",
+            "sleep 1",
+        ])
+        .current_dir(&root)
+        .env("AETHYME_HOST_STATE_DIR", &state)
+        .spawn()
+        .unwrap();
+    let status = wait_for_running(&root, &state, 2);
+    let running = status["running"].as_array().unwrap();
+    let ports: std::collections::BTreeSet<String> = running
+        .iter()
+        .map(|row| row["port"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(ports.len(), 2, "parallel consoles must not share a port");
+    assert_eq!(
+        running.iter().filter(|row| row["parallel"] == true).count(),
+        1
+    );
+    assert!(running.iter().all(|row| {
+        row["commit"]
+            .as_str()
+            .is_some_and(|commit| commit.len() == 40)
+    }));
+
+    assert!(second.wait().unwrap().success());
+    assert!(first.wait().unwrap().success());
+    let stopped = json(&run(&root, &state, &["console", "list", "--json"]));
+    assert!(stopped["running"].as_array().unwrap().is_empty());
 }

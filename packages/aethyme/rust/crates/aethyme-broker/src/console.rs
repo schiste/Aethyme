@@ -20,19 +20,31 @@
 //! | `per_worktree` | a port from a range, a private namespace, a pool slot |
 //! | `unmanaged`    | nothing                                               |
 //!
-//! `unmanaged` is a named mode rather than an `--allow-parallel` flag on the
-//! others. A flag that silently disables coordination reads as an option; a mode
-//! the repository had to select reads as a decision, and shows up in status
-//! output as one.
+//! `unmanaged` remains an explicit opt-out. `--allow-parallel` is a narrower
+//! escape hatch for tests: it keeps the console in the broker registry and
+//! takes another port, while deliberately bypassing only the repository-wide
+//! singleton key.
 
-use std::path::Path;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::git::{GitError, GitRepo};
 use crate::resources::{
-    HOST_RESOURCE_REQUEST_SCHEMA_VERSION, HostResourceKind, HostResourceRequest,
-    HostResourceRequirement,
+    HOST_RESOURCE_REQUEST_SCHEMA_VERSION, HostResourceGrant, HostResourceKind, HostResourceLease,
+    HostResourceRequest, HostResourceRequirement,
 };
+
+/// The local runtime contract between `console run` and the server it starts.
+pub const CONSOLE_MARKER_SCHEMA_VERSION: u32 = 1;
+pub const CONSOLE_MARKER_ENV: &str = "AETHYME_CONSOLE_MARKER";
+pub const CONSOLE_MARKER_DIGEST_ENV: &str = "AETHYME_CONSOLE_MARKER_DIGEST";
+pub const CONSOLE_INTEGRATION_REF: &str = "aethyme/integration";
+const CONSOLE_MARKER_DIRECTORY: &str = "console-markers";
 
 /// Port for `singular`, and the base of the range for `per_worktree`.
 pub const DEFAULT_CONSOLE_PORT: u16 = 4173;
@@ -53,6 +65,88 @@ pub const CONSOLE_PORT_KEY: &str = "port";
 pub const CONSOLE_NAMESPACE_KEY: &str = "namespace";
 pub const CONSOLE_SLOT_KEY: &str = "slot";
 pub const CONSOLE_EXCLUSIVE_KEY: &str = "console";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsoleIntegrationRelation {
+    Current,
+    Behind,
+    Ahead,
+    Diverged,
+    Unavailable,
+}
+
+impl ConsoleIntegrationRelation {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Current => "current",
+            Self::Behind => "behind",
+            Self::Ahead => "ahead",
+            Self::Diverged => "diverged",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+/// Exact source revision observed when a console starts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConsoleRevision {
+    pub branch: String,
+    pub commit: String,
+    pub dirty: bool,
+    pub integration_branch: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub integration_head: Option<String>,
+    pub integration_relation: ConsoleIntegrationRelation,
+    pub ahead_commits: u64,
+    pub behind_commits: u64,
+}
+
+/// The repository/checkout identity shown before a revision is attached.
+///
+/// The path-only constructor remains useful to callers that only have paths;
+/// the CLI uses [`ConsoleIdentity::with_revision`] so its status answer always
+/// includes the exact Git observation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ConsoleIdentity {
+    pub repository: String,
+    pub mode: ConsoleMode,
+    pub worktree_fingerprint: String,
+    /// True when the console is served from the primary checkout. A console
+    /// served from an agent worktree is legitimate but not canonical, and
+    /// saying so is the difference between a URL and a trustworthy URL.
+    pub canonical: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dirty: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub integration_branch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub integration_head: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub integration_relation: Option<ConsoleIntegrationRelation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ahead_commits: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub behind_commits: Option<u64>,
+}
+
+impl ConsoleIdentity {
+    pub fn with_revision(mut self, revision: &ConsoleRevision) -> Self {
+        self.branch = Some(revision.branch.clone());
+        self.commit = Some(revision.commit.clone());
+        self.dirty = Some(revision.dirty);
+        self.integration_branch = Some(revision.integration_branch.clone());
+        self.integration_head = revision.integration_head.clone();
+        self.integration_relation = Some(revision.integration_relation);
+        self.ahead_commits = Some(revision.ahead_commits);
+        self.behind_commits = Some(revision.behind_commits);
+        self
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -198,6 +292,38 @@ fn short_fingerprint(fingerprint: &str) -> String {
     fingerprint.chars().take(12).collect()
 }
 
+/// Exact source identity for a checkout, including its local integration drift.
+pub fn console_revision(repo: &GitRepo) -> Result<ConsoleRevision, GitError> {
+    let branch = repo.current_branch()?;
+    let commit = repo.head_commit()?;
+    let dirty = repo.is_dirty()?;
+    let integration_head = repo.resolve_ref(CONSOLE_INTEGRATION_REF);
+    let (integration_relation, ahead_commits, behind_commits) =
+        if let Some(integration_head) = integration_head.as_deref() {
+            let ahead_commits = repo.commit_count_between(integration_head, &commit)?;
+            let behind_commits = repo.commit_count_between(&commit, integration_head)?;
+            let relation = match (ahead_commits, behind_commits) {
+                (0, 0) => ConsoleIntegrationRelation::Current,
+                (0, _) => ConsoleIntegrationRelation::Behind,
+                (_, 0) => ConsoleIntegrationRelation::Ahead,
+                _ => ConsoleIntegrationRelation::Diverged,
+            };
+            (relation, ahead_commits, behind_commits)
+        } else {
+            (ConsoleIntegrationRelation::Unavailable, 0, 0)
+        };
+    Ok(ConsoleRevision {
+        branch,
+        commit,
+        dirty,
+        integration_branch: CONSOLE_INTEGRATION_REF.into(),
+        integration_head,
+        integration_relation,
+        ahead_commits,
+        behind_commits,
+    })
+}
+
 /// What a console would reserve, or `None` under `unmanaged`.
 ///
 /// `None` is the honest answer rather than an empty request: a request with no
@@ -211,13 +337,37 @@ pub fn console_request(
     run_id: &str,
     holder_pid: Option<u32>,
 ) -> Option<HostResourceRequest> {
+    console_request_with_options(config, repository, worktree_root, run_id, holder_pid, false)
+}
+
+/// What a console would reserve with an explicit parallel-process escape
+/// hatch. The hatch is intentionally narrow: it bypasses only the singular
+/// repository key and allocates from the configured port range, so every
+/// parallel process remains visible in the same registry and has a distinct
+/// URL.
+pub fn console_request_with_options(
+    config: &ConsoleConfig,
+    repository: &str,
+    worktree_root: &Path,
+    run_id: &str,
+    holder_pid: Option<u32>,
+    allow_parallel: bool,
+) -> Option<HostResourceRequest> {
     let fingerprint = worktree_fingerprint(worktree_root);
-    let (start, end) = config.effective_port_range();
+    let (start, end) = if allow_parallel && config.mode == ConsoleMode::Singular {
+        (config.port_start, config.port_end)
+    } else {
+        config.effective_port_range()
+    };
     let resources = match config.mode {
         ConsoleMode::Unmanaged => return None,
         // The exclusive key is what makes a second launch fail instead of
         // succeeding onto another port. The port is pinned beside it so the
         // canonical URL never moves.
+        ConsoleMode::Singular if allow_parallel => vec![HostResourceRequirement {
+            key: CONSOLE_PORT_KEY.into(),
+            resource: HostResourceKind::TcpPort { start, end },
+        }],
         ConsoleMode::Singular => vec![
             HostResourceRequirement {
                 key: CONSOLE_EXCLUSIVE_KEY.into(),
@@ -267,19 +417,6 @@ pub fn console_request(
     })
 }
 
-/// Which checkout a console is served from, and whether that is the canonical
-/// one.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-pub struct ConsoleIdentity {
-    pub repository: String,
-    pub mode: ConsoleMode,
-    pub worktree_fingerprint: String,
-    /// True when the console is served from the primary checkout. A console
-    /// served from an agent worktree is legitimate but not canonical, and
-    /// saying so is the difference between a URL and a trustworthy URL.
-    pub canonical: bool,
-}
-
 pub fn console_identity(
     config: &ConsoleConfig,
     repository: &str,
@@ -295,7 +432,330 @@ pub fn console_identity(
         mode: config.mode,
         worktree_fingerprint: worktree_fingerprint(worktree_root),
         canonical: resolve(main_root) == resolve(worktree_root),
+        branch: None,
+        commit: None,
+        dirty: None,
+        integration_branch: None,
+        integration_head: None,
+        integration_relation: None,
+        ahead_commits: None,
+        behind_commits: None,
     }
+}
+
+/// Content-addressed runtime identity published for the process serving a
+/// loopback console. The marker is local host state, not repository state, so
+/// it can include the resolved worktree path without dirtying the checkout.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConsoleRuntimeMarker {
+    pub schema_version: u32,
+    pub marker_digest: String,
+    pub request_id: String,
+    pub lease_id: String,
+    pub repository: String,
+    pub branch: String,
+    pub commit: String,
+    pub dirty: bool,
+    pub worktree: String,
+    pub worktree_fingerprint: String,
+    pub port: u16,
+    pub mode: ConsoleMode,
+    pub canonical: bool,
+    pub parallel: bool,
+    pub integration_branch: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub integration_head: Option<String>,
+    pub integration_relation: ConsoleIntegrationRelation,
+    pub ahead_commits: u64,
+    pub behind_commits: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct ConsoleMarkerDigestInput<'a> {
+    schema_version: u32,
+    request_id: &'a str,
+    lease_id: &'a str,
+    repository: &'a str,
+    branch: &'a str,
+    commit: &'a str,
+    dirty: bool,
+    worktree: &'a str,
+    worktree_fingerprint: &'a str,
+    port: u16,
+    mode: ConsoleMode,
+    canonical: bool,
+    parallel: bool,
+    integration_branch: &'a str,
+    integration_head: &'a Option<String>,
+    integration_relation: ConsoleIntegrationRelation,
+    ahead_commits: u64,
+    behind_commits: u64,
+}
+
+impl ConsoleRuntimeMarker {
+    pub fn for_grant(
+        grant: &HostResourceGrant,
+        repository: &str,
+        worktree_root: &Path,
+        mode: ConsoleMode,
+        canonical: bool,
+        parallel: bool,
+        revision: &ConsoleRevision,
+    ) -> io::Result<Self> {
+        let port = console_port(&grant.lease)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "console lease has no port"))?
+            .parse::<u16>()
+            .map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("console lease has an invalid port: {error}"),
+                )
+            })?;
+        let worktree = worktree_root
+            .canonicalize()
+            .unwrap_or_else(|_| worktree_root.to_path_buf())
+            .to_string_lossy()
+            .into_owned();
+        let mut marker = Self {
+            schema_version: CONSOLE_MARKER_SCHEMA_VERSION,
+            marker_digest: String::new(),
+            request_id: grant.lease.request_id.clone(),
+            lease_id: grant.lease.lease_id.clone(),
+            repository: repository.into(),
+            branch: revision.branch.clone(),
+            commit: revision.commit.clone(),
+            dirty: revision.dirty,
+            worktree,
+            worktree_fingerprint: grant.lease.worktree_fingerprint.clone(),
+            port,
+            mode,
+            canonical,
+            parallel,
+            integration_branch: revision.integration_branch.clone(),
+            integration_head: revision.integration_head.clone(),
+            integration_relation: revision.integration_relation,
+            ahead_commits: revision.ahead_commits,
+            behind_commits: revision.behind_commits,
+        };
+        marker.marker_digest = marker.content_digest();
+        Ok(marker)
+    }
+
+    fn digest_input(&self) -> ConsoleMarkerDigestInput<'_> {
+        ConsoleMarkerDigestInput {
+            schema_version: self.schema_version,
+            request_id: &self.request_id,
+            lease_id: &self.lease_id,
+            repository: &self.repository,
+            branch: &self.branch,
+            commit: &self.commit,
+            dirty: self.dirty,
+            worktree: &self.worktree,
+            worktree_fingerprint: &self.worktree_fingerprint,
+            port: self.port,
+            mode: self.mode,
+            canonical: self.canonical,
+            parallel: self.parallel,
+            integration_branch: &self.integration_branch,
+            integration_head: &self.integration_head,
+            integration_relation: self.integration_relation,
+            ahead_commits: self.ahead_commits,
+            behind_commits: self.behind_commits,
+        }
+    }
+
+    fn content_digest(&self) -> String {
+        let bytes = serde_json::to_vec(&self.digest_input())
+            .expect("console marker digest input is always serializable");
+        format!("{:x}", Sha256::digest(bytes))
+    }
+
+    pub fn is_content_addressed(&self) -> bool {
+        self.schema_version == CONSOLE_MARKER_SCHEMA_VERSION
+            && self.marker_digest == self.content_digest()
+    }
+
+    fn file_name(&self) -> String {
+        format!("console-{}.json", self.marker_digest)
+    }
+}
+
+/// A verified marker and its host-state path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConsoleMarkerRecord {
+    pub path: PathBuf,
+    pub marker: ConsoleRuntimeMarker,
+}
+
+fn marker_directory(create: bool) -> io::Result<PathBuf> {
+    let state = crate::host_state::default_host_state_dir().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "cannot find per-user state directory; set AETHYME_HOST_STATE_DIR",
+        )
+    })?;
+    let directory = state.join(CONSOLE_MARKER_DIRECTORY);
+    if create {
+        fs::create_dir_all(&directory)?;
+    }
+    match fs::symlink_metadata(&directory) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "console marker directory is not a regular directory: {}",
+                    directory.display()
+                ),
+            ));
+        }
+        Ok(_) if create => crate::host_state::protect_host_state_path(&directory, true)?,
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound && !create => {}
+        Err(error) => return Err(error),
+    }
+    Ok(directory)
+}
+
+/// Host-state directory in which a console publishes its marker.
+pub fn console_marker_directory() -> io::Result<PathBuf> {
+    marker_directory(false)
+}
+
+/// Publish one marker atomically. The filename and the embedded digest both
+/// bind the document contents, so a consumer can reject a tampered marker.
+pub fn write_console_marker(marker: &ConsoleRuntimeMarker) -> io::Result<PathBuf> {
+    if !marker.is_content_addressed() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "refusing to publish a marker with an invalid content digest",
+        ));
+    }
+    let directory = marker_directory(true)?;
+    let path = directory.join(marker.file_name());
+    let encoded = serde_json::to_vec_pretty(marker).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("cannot encode console marker: {error}"),
+        )
+    })?;
+    let mut encoded_file = encoded.clone();
+    encoded_file.push(b'\n');
+    if let Ok(metadata) = fs::symlink_metadata(&path) {
+        if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "console marker path is not a regular file: {}",
+                    path.display()
+                ),
+            ));
+        }
+        if fs::read(&path)? == encoded_file {
+            return Ok(path);
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("console marker digest collision: {}", path.display()),
+        ));
+    }
+
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temporary = directory.join(format!(".{}.{}.tmp", marker.file_name(), nonce));
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)?;
+        crate::host_state::protect_host_state_path(&temporary, false)?;
+        file.write_all(&encoded_file)?;
+        file.sync_all()?;
+        drop(file);
+        match fs::hard_link(&temporary, &path) {
+            Ok(()) => {
+                let _ = fs::remove_file(&temporary);
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                let metadata = fs::symlink_metadata(&path)?;
+                if metadata.file_type().is_symlink() || !metadata.is_file() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        format!(
+                            "console marker path is not a regular file: {}",
+                            path.display()
+                        ),
+                    ));
+                }
+                if fs::read(&path)? == encoded_file {
+                    let _ = fs::remove_file(&temporary);
+                } else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        format!("console marker digest collision: {}", path.display()),
+                    ));
+                }
+            }
+            Err(error) => return Err(error),
+        }
+        crate::host_state::protect_host_state_path(&path, false)?;
+        Ok(path.clone())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+/// Remove a marker after its supervised process and lease have shut down.
+pub fn remove_console_marker(path: &Path) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+/// Read and verify all content-addressed markers without creating host state.
+/// Invalid or foreign files are ignored; a status answer never treats an
+/// unverified document as a running console.
+pub fn read_console_markers() -> io::Result<Vec<ConsoleMarkerRecord>> {
+    let directory = marker_directory(false)?;
+    if !directory.exists() {
+        return Ok(Vec::new());
+    }
+    let mut records = Vec::new();
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if !file_type.is_file() || file_type.is_symlink() {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(marker) = serde_json::from_slice::<ConsoleRuntimeMarker>(&fs::read(&path)?) else {
+            continue;
+        };
+        if marker.is_content_addressed()
+            && path.file_name().and_then(|name| name.to_str()) == Some(marker.file_name().as_str())
+        {
+            records.push(ConsoleMarkerRecord { path, marker });
+        }
+    }
+    records.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(records)
+}
+
+pub fn console_marker_for_lease<'a>(
+    markers: &'a [ConsoleMarkerRecord],
+    lease: &HostResourceLease,
+) -> Option<&'a ConsoleMarkerRecord> {
+    let port = console_port(lease)?.parse::<u16>().ok()?;
+    markers.iter().find(|record| {
+        record.marker.lease_id == lease.lease_id
+            && record.marker.request_id == lease.request_id
+            && record.marker.port == port
+    })
 }
 
 /// The console leases this repository currently holds.
@@ -569,5 +1029,120 @@ mod tests {
         let found = console_leases(&leases, "repo");
         assert_eq!(found.len(), 1);
         assert_eq!(console_port(&found[0]), Some("4173"));
+    }
+
+    #[test]
+    fn allow_parallel_bypasses_only_the_singleton_and_uses_the_range() {
+        let config = ConsoleConfig {
+            mode: ConsoleMode::Singular,
+            port_start: 45_987,
+            port_end: 45_999,
+            ..ConsoleConfig::default()
+        };
+        let regular = console_request(&config, "repo", Path::new("/w"), "regular", None)
+            .expect("regular request");
+        assert!(requirement(&regular, CONSOLE_EXCLUSIVE_KEY).is_some());
+        assert_eq!(
+            match &requirement(&regular, CONSOLE_PORT_KEY).unwrap().resource {
+                HostResourceKind::TcpPort { start, end } => (*start, *end),
+                other => panic!("expected a port, got {other:?}"),
+            },
+            (45_987, 45_987)
+        );
+
+        let parallel =
+            console_request_with_options(&config, "repo", Path::new("/w"), "parallel", None, true)
+                .expect("parallel request");
+        assert!(requirement(&parallel, CONSOLE_EXCLUSIVE_KEY).is_none());
+        assert_eq!(
+            match &requirement(&parallel, CONSOLE_PORT_KEY).unwrap().resource {
+                HostResourceKind::TcpPort { start, end } => (*start, *end),
+                other => panic!("expected a port, got {other:?}"),
+            },
+            (45_987, 45_999)
+        );
+    }
+
+    #[test]
+    fn console_revision_reports_exact_head_dirty_state_and_integration_drift() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        std::fs::write(root.join("file.txt"), "initial\n").unwrap();
+        git(&["add", "file.txt"]);
+        git(&["commit", "-qm", "initial"]);
+        git(&["branch", CONSOLE_INTEGRATION_REF]);
+        std::fs::write(root.join("file.txt"), "ahead\n").unwrap();
+        git(&["commit", "-qam", "ahead"]);
+        let repo = GitRepo::discover(&root).unwrap();
+
+        let clean = console_revision(&repo).unwrap();
+        assert_eq!(clean.branch, "main");
+        assert_eq!(clean.commit.len(), 40);
+        assert!(!clean.dirty);
+        assert_eq!(clean.integration_branch, CONSOLE_INTEGRATION_REF);
+        assert_eq!(
+            clean.integration_relation,
+            ConsoleIntegrationRelation::Ahead
+        );
+        assert_eq!(clean.ahead_commits, 1);
+        assert_eq!(clean.behind_commits, 0);
+
+        std::fs::write(root.join("untracked.txt"), "local\n").unwrap();
+        assert!(console_revision(&repo).unwrap().dirty);
+    }
+
+    #[test]
+    fn runtime_marker_digest_covers_revision_and_process_identity() {
+        let config = ConsoleConfig {
+            port_start: 45_986,
+            ..ConsoleConfig::default()
+        };
+        let request = console_request(&config, "repo", Path::new("/w"), "run", Some(1)).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut coordinator =
+            crate::HostResourceCoordinator::open(&temp.path().join("resources.db")).unwrap();
+        let grant = coordinator.acquire(&request).unwrap();
+        let revision = ConsoleRevision {
+            branch: "main".into(),
+            commit: "0123456789012345678901234567890123456789".into(),
+            dirty: false,
+            integration_branch: CONSOLE_INTEGRATION_REF.into(),
+            integration_head: Some("0123456789012345678901234567890123456789".into()),
+            integration_relation: ConsoleIntegrationRelation::Current,
+            ahead_commits: 0,
+            behind_commits: 0,
+        };
+        let marker = ConsoleRuntimeMarker::for_grant(
+            &grant,
+            "repo",
+            Path::new("/w"),
+            ConsoleMode::Singular,
+            true,
+            false,
+            &revision,
+        )
+        .unwrap();
+        assert_eq!(marker.port, 45_986);
+        assert!(marker.is_content_addressed());
+        let mut altered = marker.clone();
+        altered.commit = "9876543210987654321098765432109876543210".into();
+        assert!(!altered.is_content_addressed());
     }
 }
