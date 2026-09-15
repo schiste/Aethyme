@@ -26,10 +26,35 @@ const RETENTION_POLICY_FIELDS: &[&str] = &[
     "session_abandoned_after_hours",
     "artifact_sweep_budget_ms",
     "artifact_sweep_interval_hours",
+    "artefact_directories",
     "startup_budget_ms",
     "routine_size_budget_ms",
     "size_record_ttl_hours",
 ];
+
+/// Directory names that are repository source or control roots rather than
+/// regenerable build output. Configured artefact names use a deliberately
+/// broad non-empty-directory witness, so allowing these names would let a
+/// typo turn normal repository content into a deletion candidate.
+///
+/// Two groups, and the second carries the larger loss. Source and tooling roots
+/// (`src`, `lib`, `tests`, `docs`) are tracked, so removing one costs a
+/// checkout. Data roots (`data`, `fixtures`, `logs`, `coverage`) are usually
+/// ignored, and being ignored is exactly what makes them grow large enough to
+/// tempt an operator into listing them -- and unrecoverable once removed. That
+/// is the case the built-in catalog's fixed list was written to refuse:
+/// "large and ignored" also matches a downloaded dataset or a local database
+/// someone cannot rebuild.
+const PROTECTED_ARTEFACT_DIRECTORY_NAMES: &[&str] = &[
+    ".aethyme", ".git", ".github", ".gitlab", ".idea", ".vscode", "coverage", "data", "doc",
+    "docs", "example", "examples", "fixtures", "include", "lib", "logs", "src", "test", "tests",
+];
+
+pub(crate) fn is_safe_artefact_directory_name(name: &str) -> bool {
+    !PROTECTED_ARTEFACT_DIRECTORY_NAMES
+        .iter()
+        .any(|protected| name.eq_ignore_ascii_case(protected))
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -68,6 +93,10 @@ pub struct RetentionPolicy {
     pub artifact_sweep_budget_ms: u64,
     /// Minimum spacing between autonomous artifact sweeps.
     pub artifact_sweep_interval_hours: u32,
+    /// Additional single-component directory names that may be treated as
+    /// regenerable artifacts. This is additive to the built-in catalog; an
+    /// operator cannot use configuration to weaken a built-in witness.
+    pub artefact_directories: Vec<String>,
     pub startup_budget_ms: u64,
     /// Wall-clock budget a *routine* check -- `broker status`, `doctor` --
     /// may spend measuring one directory it has never sized. `0` disables
@@ -101,6 +130,7 @@ impl Default for RetentionPolicy {
             session_abandoned_after_hours: 72,
             artifact_sweep_budget_ms: 5_000,
             artifact_sweep_interval_hours: 24,
+            artefact_directories: Vec::new(),
             startup_budget_ms: 25,
             routine_size_budget_ms: 200,
             size_record_ttl_hours: 24,
@@ -179,6 +209,22 @@ impl RetentionPolicy {
                 value: self.artifact_sweep_interval_hours.to_string(),
                 constraint: "must be between 1 and 8760 hours",
             });
+        }
+        for directory in &self.artefact_directories {
+            let mut components = Path::new(directory).components();
+            let valid = !directory.is_empty()
+                && !directory.contains('/')
+                && !directory.contains('\\')
+                && !directory.contains('\0')
+                && matches!(components.next(), Some(std::path::Component::Normal(_)))
+                && components.next().is_none();
+            if !valid || !is_safe_artefact_directory_name(directory) {
+                return Err(RetentionConfigError::InvalidValue {
+                    field: "artefact_directories",
+                    value: directory.clone(),
+                    constraint: "each entry must be one non-empty safe directory name without path separators or reserved source/control names",
+                });
+            }
         }
         // A routine check may spend at most a quarter second measuring. Any
         // larger and the split this bounds -- routine check against expensive
@@ -414,6 +460,20 @@ pub struct GcArtifactCandidate {
     pub idle_days: u32,
 }
 
+/// A large git-ignored directory that was deliberately not classified as
+/// regenerable artifact output. This is evidence for an operator, never a GC
+/// candidate: the broker does not infer that an arbitrary ignored directory is
+/// safe to delete.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct GcDeclinedArtifact {
+    pub session_id: i64,
+    pub worktree_path: String,
+    /// Path of the ignored directory relative to the worktree root.
+    pub relative_dir: String,
+    pub estimated_bytes: u64,
+    pub reason: String,
+}
+
 /// A host worktree root whose owning repository no longer exists.
 ///
 /// Worktree storage is host-scoped but ownership records are repository-local,
@@ -531,6 +591,10 @@ pub struct GcPlan {
     /// digest, like the other measured byte totals.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub worktree_blocker_summary: Vec<GcWorktreeBlockerSummary>,
+    /// Large ignored directories outside the safe artifact catalog. These
+    /// are reporting-only and excluded from the authorization digest.
+    #[serde(default)]
+    pub declined_artifacts: Vec<GcDeclinedArtifact>,
     pub estimated_reclaimable_bytes: u64,
     /// Every byte held by retained worktrees, whether or not this plan acts on
     /// it. Reporting only: excluded from the digest so measured sizes never
@@ -539,6 +603,11 @@ pub struct GcPlan {
     /// Bytes this plan deliberately leaves in place because a retention or
     /// provenance gate blocked them.
     pub estimated_blocked_bytes: u64,
+    /// Bytes in [`GcPlan::declined_artifacts`]. Kept separate from
+    /// `estimated_reclaimable_bytes` so evidence can never be mistaken for a
+    /// deletion authorization.
+    #[serde(default)]
+    pub estimated_declined_artifact_bytes: u64,
     /// Directories under a broker worktree root that no session row claims
     /// (#176). Reporting only, and excluded from the digest for the same
     /// reason the byte totals are: this plan does not act on these, so a
@@ -697,6 +766,7 @@ mod tests {
         assert_eq!(policy.routine_size_budget_ms, 200);
         assert_eq!(policy.size_record_ttl_hours, 24);
         assert_eq!(policy.retained_bytes_budget, 1_073_741_824);
+        assert!(policy.artefact_directories.is_empty());
     }
 
     #[test]
@@ -719,6 +789,88 @@ mod tests {
             policy.startup_budget_ms,
             RetentionPolicy::default().startup_budget_ms
         );
+    }
+
+    #[test]
+    fn configured_artifact_directories_are_additive_and_path_scoped() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir(repo.path().join(".aethyme")).unwrap();
+        std::fs::write(
+            repo.path().join(BROKER_CONFIG_RELPATH),
+            "[retention]\nartefact_directories = [\".pnpm-store\", \"cache\"]\n",
+        )
+        .unwrap();
+
+        let policy = load_retention_policy(repo.path()).unwrap();
+        assert_eq!(
+            policy.artefact_directories,
+            vec![".pnpm-store".to_string(), "cache".to_string()]
+        );
+
+        for directory in ["", ".", "..", "nested/cache", "/tmp", "foo\\bar"] {
+            let mut policy = RetentionPolicy::default();
+            policy.artefact_directories = vec![directory.into()];
+            assert!(
+                matches!(
+                    policy.validate(),
+                    Err(RetentionConfigError::InvalidValue {
+                        field: "artefact_directories",
+                        ..
+                    })
+                ),
+                "{directory:?} should not escape one directory component"
+            );
+        }
+
+        for directory in [
+            ".aethyme", ".git", "SRC", "lib", "tests", "docs", "examples",
+        ] {
+            let mut policy = RetentionPolicy::default();
+            policy.artefact_directories = vec![directory.into()];
+            assert!(
+                matches!(
+                    policy.validate(),
+                    Err(RetentionConfigError::InvalidValue {
+                        field: "artefact_directories",
+                        ..
+                    })
+                ),
+                "{directory:?} should remain outside the configurable artifact catalog"
+            );
+        }
+    }
+
+    /// The built-in catalog and the protected list describe the same
+    /// directories from opposite sides, and nothing else keeps them agreeing.
+    /// A built-in artefact that is also protected would make the two contradict
+    /// each other; an unrecoverable data root that is not protected is exactly
+    /// the loss the fixed catalog was written to prevent.
+    #[test]
+    fn protected_names_cover_unrecoverable_roots_without_contradicting_the_catalog() {
+        for name in ["target", "node_modules", ".venv", "build", "dist"] {
+            assert!(
+                crate::is_artefact_directory(name),
+                "{name} must stay in the built-in artefact catalog"
+            );
+            assert!(
+                is_safe_artefact_directory_name(name),
+                "{name} is a built-in artefact and must not also be protected"
+            );
+        }
+
+        // Ignored, large, and not rebuildable from the repository -- the
+        // combination that makes an operator want to list them and makes the
+        // removal permanent.
+        for name in ["data", "fixtures", "logs", "coverage"] {
+            assert!(
+                !crate::is_artefact_directory(name),
+                "{name} must not be a built-in artefact"
+            );
+            assert!(
+                !is_safe_artefact_directory_name(name),
+                "{name} must stay outside the configurable artefact catalog"
+            );
+        }
     }
 
     #[test]
