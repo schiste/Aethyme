@@ -347,7 +347,8 @@ pub use resources::{
 pub use retention::{
     BROKER_CONFIG_RELPATH, GcApplyReport, GcArtifactCandidate, GcBlocker, GcFileAction,
     GcFileCandidate, GcHealth, GcOrphanCandidate, GcPlan, GcRowCandidate, GcRowKind,
-    GcWorktreeCandidate, RETENTION_POLICY_SCHEMA_VERSION, RetentionConfigError,
+    GcWorktreeBlockerSummary, GcWorktreeCandidate, RETENTION_POLICY_SCHEMA_VERSION,
+    RetentionConfigError,
     RetentionConfigWarning, RetentionPolicy, RetentionPolicyLoadReport, load_retention_policy,
     load_retention_policy_report,
 };

@@ -1060,6 +1060,13 @@ outputs. Raise `artifact_reclaim_days` to trade disk space for faster worktree
 reuse, or set `artifact_sweep_budget_ms = 0` to disable autonomous cache
 reclamation entirely.
 
+`closed_worktrees_days` applies only to closed worktrees without representation
+proof: it is the age grace period before GC reports a `retention_age` blocker.
+Worktrees whose cleanup proof represents their contribution are eligible
+regardless of age, while their build caches remain governed by
+`artifact_reclaim_days`. The age setting never authorizes removal of an
+unproven contribution.
+
 `session_abandoned_after_hours` bounds how long a session may go without any
 evidence of a working agent before the broker closes it. A session with a live
 process is never abandoned no matter how long it has been quiet, so a
@@ -1074,7 +1081,11 @@ its worktree, its branch, and its leases until a human intervened.
 Run `aethyme broker gc plan` first. Its text and stable JSON enumerate every
 eligible database row, runtime file, represented worktree and exact branch ref,
 build cache, orphaned root, estimated bytes, protected finding, and the SHA-256
-authorization digest. GC never ages out live sessions, outstanding or
+authorization digest. A worktree whose cleanup proof says its contribution is
+represented is eligible here regardless of age, exactly as it is for
+`cleanup --all-cleaned`. Without that proof, `closed_worktrees_days` remains
+the first protection; once it is past, the plan retains the more specific
+unproven-contribution blocker. GC never ages out live sessions, outstanding or
 acknowledged advisories, unpublished exposures, unresolved coordinated
 operations, accepted checkpoints, or unproven contributions.
 
@@ -1082,7 +1093,9 @@ The plan also reports `estimated_retained_bytes` and `estimated_blocked_bytes`
 alongside `estimated_reclaimable_bytes`, so it states total disk pressure rather
 than only the bytes this plan will act on. The two reporting totals are excluded
 from the authorization digest: a measured size change must never invalidate a
-plan an operator already confirmed.
+plan an operator already confirmed. `worktree_blocker_summary` groups retained
+worktree bytes by blocker kind, largest first, so a large protected backlog is
+visible before the individual findings.
 
 ### The retained-bytes budget
 

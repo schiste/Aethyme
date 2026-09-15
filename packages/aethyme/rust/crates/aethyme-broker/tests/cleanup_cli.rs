@@ -77,6 +77,28 @@ fn bulk_cleanup_is_dry_run_by_default_and_apply_revalidates() {
     assert!(plan["removed_session_ids"].as_array().unwrap().is_empty());
     assert!(worktree.exists());
 
+    // GC must use the same representation proof as cleanup. This session was
+    // closed only moments ago, so the old GC age gate would have omitted it
+    // even though cleanup reported it as eligible.
+    let gc = run(tmp.path(), &["gc", "plan", "--json"]);
+    assert!(
+        gc.status.success(),
+        "{}",
+        String::from_utf8_lossy(&gc.stderr)
+    );
+    let gc: serde_json::Value = serde_json::from_slice(&gc.stdout).unwrap();
+    assert!(
+        gc["worktrees"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|candidate| candidate["session_id"].as_i64() == Some(session.id)),
+        "GC omitted cleanup's eligible worktree: {gc}"
+    );
+    assert!(!gc["blockers"].as_array().unwrap().iter().any(|blocker| {
+        blocker["kind"] == "retention_age" && blocker["id"].as_i64() == Some(session.id)
+    }));
+
     let unconfirmed = run(
         tmp.path(),
         &["cleanup", "--all-cleaned", "--apply", "--json"],

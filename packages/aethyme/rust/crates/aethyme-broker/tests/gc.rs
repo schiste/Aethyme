@@ -386,6 +386,11 @@ fn a_resumed_candidate_that_stopped_qualifying_is_retained_without_stranding_the
         "[retention]\nclosed_worktrees_days = 30\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 0\n",
     )
     .unwrap();
+    // The shared fixture is represented and therefore intentionally bypasses
+    // the age gate now. Keep this scenario age-held by making the retained
+    // checkout dirty; the test is about resuming independently reclaimable
+    // caches under a worktree that whole-worktree cleanup cannot remove.
+    std::fs::write(worktree.join("pending.txt"), "pending\n").unwrap();
     std::fs::write(tmp.path().join(".git/info/exclude"), "target/\n").unwrap();
     let caches = ["one/target", "two/target"].map(|relative| {
         let dir = worktree.join(relative);

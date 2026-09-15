@@ -38,9 +38,13 @@ pub struct RetentionPolicy {
     pub gate_results_days: u32,
     pub terminal_merge_queue_days: u32,
     pub command_metrics_days: u32,
-    pub closed_worktrees_days: u32,
     /// Soft repository storage budget. `0` disables budget warnings.
     pub retained_bytes_budget: u64,
+    /// Idle days before a closed session's unproven worktree is eligible for
+    /// GC. Worktrees with representation proof are eligible regardless of age;
+    /// build caches use `artifact_reclaim_days` instead. This does not affect
+    /// committed work or authorize removal without provenance proof.
+    pub closed_worktrees_days: u32,
     /// Idle days before a closed session's build caches are reclaimed without
     /// confirmation. This does not affect committed work or the worktree
     /// itself; a maintainer may raise it to trade disk space for faster reuse.
@@ -426,6 +430,18 @@ pub struct GcBlocker {
     pub reason: String,
 }
 
+/// A byte-backed aggregation of the worktree blockers in a GC plan.
+///
+/// The individual blocker list remains the authoritative explanation for each
+/// session. This companion view makes the retained disk pressure actionable by
+/// grouping it by the rule that held it, with the largest group first.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct GcWorktreeBlockerSummary {
+    pub kind: String,
+    pub count: usize,
+    pub retained_bytes: u64,
+}
+
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct GcPlan {
     pub schema_version: u32,
@@ -442,6 +458,11 @@ pub struct GcPlan {
     pub artifacts: Vec<GcArtifactCandidate>,
     pub orphans: Vec<GcOrphanCandidate>,
     pub blockers: Vec<GcBlocker>,
+    /// Retained worktree bytes grouped by the blocker that holds them. This
+    /// is reporting only and intentionally excluded from the authorization
+    /// digest, like the other measured byte totals.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub worktree_blocker_summary: Vec<GcWorktreeBlockerSummary>,
     pub estimated_reclaimable_bytes: u64,
     /// Every byte held by retained worktrees, whether or not this plan acts on
     /// it. Reporting only: excluded from the digest so measured sizes never
