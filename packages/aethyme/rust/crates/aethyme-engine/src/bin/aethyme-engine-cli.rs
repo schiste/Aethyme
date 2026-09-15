@@ -772,14 +772,20 @@ fn run() -> Result<(), String> {
 
 fn print_version() {
     let describe = env!("AETHYME_GIT_DESCRIBE");
-    if describe.is_empty() {
-        println!("aethyme-engine-cli {}", env!("CARGO_PKG_VERSION"));
+    let commit = {
+        let value = env!("AETHYME_GIT_COMMIT");
+        if value.is_empty() { "unknown" } else { value }
+    };
+    let build_date = env!("AETHYME_BUILD_DATE");
+    let stable = if describe.is_empty() {
+        format!("build_commit={commit}")
     } else {
-        println!(
-            "aethyme-engine-cli {} ({describe})",
-            env!("CARGO_PKG_VERSION")
-        );
-    }
+        format!("{describe} build_commit={commit}")
+    };
+    println!(
+        "aethyme-engine-cli {} ({stable}) build_date={build_date}",
+        env!("CARGO_PKG_VERSION")
+    );
 }
 
 fn run_verify_targets_via_shared_cli(args: &[String]) -> Result<(), String> {
