@@ -21,6 +21,7 @@
 //!   sessions, stress-tested at 20 (see `tests/stress.rs`).
 
 mod advisories;
+mod atomic_file;
 pub mod agent_hook;
 pub mod attribution;
 mod broker;
