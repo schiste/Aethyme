@@ -91,6 +91,88 @@ fn acquire_wait_is_structured_and_grant_out_is_private() {
 }
 
 #[test]
+fn explain_joins_capacity_contention_to_the_live_holder_without_a_token() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = temp.path().join("state");
+    let first_request = temp.path().join("first.json");
+    let second_request = temp.path().join("second.json");
+    let request = |id: &str| {
+        serde_json::json!({
+            "schema_version": 1,
+            "request_id": id,
+            "repository": "owner/repo",
+            "worktree_fingerprint": id,
+            "run_id": id,
+            "ttl_seconds": 60,
+            "holder_pid": std::process::id(),
+            "resources": [{
+                "key": "workers",
+                "kind": "capacity",
+                "pool": "host-work",
+                "units": 1,
+                "limit": 1
+            }]
+        })
+    };
+    std::fs::write(
+        &first_request,
+        serde_json::to_vec_pretty(&request("first")).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        &second_request,
+        serde_json::to_vec_pretty(&request("second")).unwrap(),
+    )
+    .unwrap();
+
+    let acquired = run(
+        temp.path(),
+        &state,
+        &[
+            "resources",
+            "acquire",
+            first_request.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    assert!(
+        acquired.status.success(),
+        "{}",
+        String::from_utf8_lossy(&acquired.stderr)
+    );
+
+    let explained = run(
+        temp.path(),
+        &state,
+        &[
+            "resources",
+            "explain",
+            second_request.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    assert!(
+        explained.status.success(),
+        "{}",
+        String::from_utf8_lossy(&explained.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&explained.stdout).unwrap();
+    assert_eq!(value["request_id"], "second");
+    assert!(value["request_digest"].as_str().is_some());
+    assert_eq!(value["available"], false);
+    assert_eq!(value["blockers"][0]["conflict"]["resource_key"], "workers");
+    assert_eq!(value["blockers"][0]["leases"][0]["run_id"], "first");
+    assert_eq!(
+        value["blockers"][0]["holders"][0]["holder_pid"],
+        std::process::id()
+    );
+    assert_eq!(value["blockers"][0]["holders"][0]["process_alive"], true);
+    assert_eq!(value["wait"]["waitable"], true);
+    assert_eq!(value["wait"]["reason"], "resource_contention");
+    assert!(!String::from_utf8_lossy(&explained.stdout).contains("ownership_token"));
+}
+
+#[test]
 fn supervised_run_preserves_child_status_and_quarantines_failed_cleanup() {
     let temp = tempfile::tempdir().unwrap();
     let state = temp.path().join("state");

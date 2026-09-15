@@ -13,6 +13,8 @@ use crate::Gate;
 pub enum GateDiagnosticId {
     MissingTimeout,
     InvalidTimeout,
+    UnknownRetentionField,
+    InvalidRetentionConfig,
     NoCheapGate,
     NoFullGate,
     TriggerMatchesNoTrackedPath,
@@ -488,10 +490,39 @@ pub fn inspect_gate_quality(repo: &crate::GitRepo) -> Result<GateDoctorReport, G
         }
     }
 
-    // Planning creates the directory it selects, which is the directory a
-    // slot would use anyway, so asking costs nothing a gate run would not
-    // have already spent.
+    // Retention is repository-local configuration rather than a committed
+    // gate definition. Inspect it here because this is the other read-only
+    // health surface operators use when checking whether the broker can keep
+    // its runtime state bounded.
     if let Ok(root) = repo.main_root() {
+        match crate::load_retention_policy_report(&root) {
+            Ok(report) => {
+                for warning in report.warnings {
+                    findings.push(finding(
+                        GateDiagnosticId::UnknownRetentionField,
+                        None,
+                        GateDiagnosticSeverity::Warning,
+                        GateDiagnosticConfidence::High,
+                        "retention configuration contains an unknown field",
+                        vec![warning.to_string()],
+                        "Remove or correct the named field in `.aethyme/broker.toml`, or upgrade the binary if the field is intentional.",
+                    ));
+                }
+            }
+            Err(error) => findings.push(finding(
+                GateDiagnosticId::InvalidRetentionConfig,
+                None,
+                GateDiagnosticSeverity::Warning,
+                GateDiagnosticConfidence::High,
+                "retention configuration cannot be loaded",
+                vec![error.to_string()],
+                "Fix the named retention field in `.aethyme/broker.toml`, then rerun `aethyme broker gc plan`.",
+            )),
+        }
+
+        // Planning creates the directory it selects, which is the directory a
+        // slot would use anyway, so asking costs nothing a gate run would not
+        // have already spent.
         let placement = crate::verification::plan_slot_placement(&root, "merge-sim");
         findings.extend(nested_verification_slot_finding(&placement));
     }

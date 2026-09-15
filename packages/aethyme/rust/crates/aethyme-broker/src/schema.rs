@@ -16,7 +16,7 @@ use rusqlite::Connection;
 use crate::error::BrokerError;
 
 /// Current database schema version (== `MIGRATIONS.len()`).
-pub const SCHEMA_VERSION: i64 = 37;
+pub const SCHEMA_VERSION: i64 = 39;
 
 /// Version stamped on every event row written by this binary.
 pub const EVENTS_SCHEMA_VERSION: i64 = 1;
@@ -1042,6 +1042,125 @@ CREATE UNIQUE INDEX review_requests_head
     ON review_requests (repository, pr_number, review_type, head_commit);
 ";
 
+/// Keep request facts and completion facts independent.
+///
+/// `head_commit` remains the durable identity column for compatibility with
+/// the one-review-per-head index and older readers. New rows also carry the
+/// explicit fact columns: requested rows copy their request head into
+/// `requested_for_commit`, while an unsolicited completion uses its completed
+/// head as the identity and leaves request fields null. This lets a later
+/// request for that same head fill in Aethyme's request facts without
+/// overwriting what the provider completed.
+const MIGRATION_V38: &str = "
+CREATE TABLE review_requests_v38 (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    repository            TEXT NOT NULL,
+    pr_number             INTEGER NOT NULL,
+    review_type           TEXT NOT NULL,
+    head_commit           TEXT NOT NULL,
+    requested_for_commit  TEXT,
+    base_commit           TEXT,
+    trigger               TEXT CHECK (trigger IS NULL OR trigger IN (
+                              'pull_request_opened', 'ready_for_review',
+                              'reopened', 'replacement_commit',
+                              'additional_commit', 'base_retargeted',
+                              'review_dismissed', 'merge_queue_entered',
+                              'scheduled', 'manual', 'unsolicited')),
+    backend               TEXT NOT NULL,
+    state                 TEXT NOT NULL CHECK (state IN (
+                              'requested', 'running', 'satisfied', 'failed',
+                              'recorded', 'abandoned', 'waived')),
+    detail                TEXT,
+    requested_at          INTEGER,
+    completed_at          INTEGER,
+    completed_for_commit  TEXT,
+    verdict               TEXT CHECK (verdict IS NULL OR verdict IN (
+                              'pass', 'fail', 'changes_requested', 'commented')),
+    reviewer_provider     TEXT CHECK (
+                              reviewer_provider IS NULL OR
+                              length(trim(reviewer_provider)) > 0),
+    reviewer_model        TEXT,
+    updated_at            INTEGER NOT NULL,
+    CHECK (reviewer_model IS NULL OR reviewer_provider IS NOT NULL),
+    CHECK ((completed_at IS NULL AND completed_for_commit IS NULL
+             AND verdict IS NULL AND reviewer_provider IS NULL
+             AND reviewer_model IS NULL)
+           OR (completed_at IS NOT NULL AND completed_for_commit IS NOT NULL
+               AND verdict IS NOT NULL AND reviewer_provider IS NOT NULL))
+);
+
+INSERT INTO review_requests_v38 (
+    id, repository, pr_number, review_type, head_commit,
+    requested_for_commit, base_commit, trigger, backend, state, detail,
+    requested_at, completed_at, completed_for_commit, verdict,
+    reviewer_provider, reviewer_model, updated_at
+)
+SELECT id, repository, pr_number, review_type, head_commit,
+       head_commit, base_commit, NULL, backend, state, detail,
+       requested_at, NULL, NULL, NULL, NULL, NULL, updated_at
+FROM review_requests;
+
+DROP TABLE review_requests;
+ALTER TABLE review_requests_v38 RENAME TO review_requests;
+
+CREATE UNIQUE INDEX review_requests_head
+    ON review_requests (repository, pr_number, review_type, head_commit);
+
+CREATE INDEX review_requests_by_pr
+    ON review_requests (repository, pr_number);
+
+CREATE INDEX review_requests_by_repository_state
+    ON review_requests (repository, state);
+";
+
+/// v39 makes broker protection state monotonic without making it permanent:
+/// closed-session checkpoint pins get an explicit release ledger, while old
+/// publication exposures can reach a terminal expiry state. The exposure
+/// rebuild is intentional so the CHECK constraints remain authoritative for
+/// databases created before expiry existed.
+const MIGRATION_V39: &str = "
+CREATE TABLE gc_checkpoint_pin_releases (
+    session_id     INTEGER NOT NULL REFERENCES sessions (id),
+    queue_entry_id INTEGER NOT NULL,
+    released_at    INTEGER NOT NULL,
+    PRIMARY KEY (session_id, queue_entry_id)
+);
+
+CREATE INDEX gc_checkpoint_pin_releases_by_queue
+    ON gc_checkpoint_pin_releases (queue_entry_id);
+
+DROP INDEX IF EXISTS entry_path_exposures_by_state;
+ALTER TABLE entry_path_exposures RENAME TO entry_path_exposures_v38;
+
+CREATE TABLE entry_path_exposures (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    queue_entry_id      INTEGER NOT NULL UNIQUE REFERENCES merge_queue (id),
+    promotion_sha       TEXT NOT NULL,
+    paths_json          TEXT NOT NULL,
+    created_at          INTEGER NOT NULL,
+    state               TEXT NOT NULL DEFAULT 'outstanding'
+                        CHECK (state IN ('outstanding', 'resolved', 'expired')),
+    resolved_at         INTEGER,
+    resolution_kind     TEXT CHECK (resolution_kind IS NULL OR resolution_kind IN (
+                            'ship_verified', 'external_reconciliation', 'expired'
+                        )),
+    resolution_sha      TEXT,
+    resolution_evidence TEXT
+);
+
+INSERT INTO entry_path_exposures (
+    id, queue_entry_id, promotion_sha, paths_json, created_at, state,
+    resolved_at, resolution_kind, resolution_sha, resolution_evidence
+)
+SELECT id, queue_entry_id, promotion_sha, paths_json, created_at, state,
+       resolved_at, resolution_kind, resolution_sha, resolution_evidence
+FROM entry_path_exposures_v38;
+
+DROP TABLE entry_path_exposures_v38;
+
+CREATE INDEX entry_path_exposures_by_state
+    ON entry_path_exposures (state, id);
+";
 const MIGRATIONS: &[&str] = &[
     MIGRATION_V1,
     MIGRATION_V2,
@@ -1080,6 +1199,8 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_V35,
     MIGRATION_V36,
     MIGRATION_V37,
+    MIGRATION_V38,
+    MIGRATION_V39,
 ];
 
 pub(crate) fn current_version(conn: &Connection) -> Result<i64, BrokerError> {
@@ -2107,6 +2228,168 @@ mod tests {
             .is_err(),
             "the one-review-per-head index must survive the rebuild"
         );
+    }
+
+    /// v38 makes request and completion provenance independent. Existing rows
+    /// are request facts from the old schema, so their request head is copied
+    /// explicitly while completion facts remain unknown rather than inferred.
+    #[test]
+    fn v38_adds_typed_completion_facts_and_allows_unsolicited_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            .unwrap();
+        for (index, sql) in MIGRATIONS[..37].iter().enumerate() {
+            conn.execute_batch(sql).unwrap();
+            conn.execute(
+                "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)
+                 ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                [(index + 1).to_string()],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO review_requests
+             (repository, pr_number, review_type, head_commit, base_commit,
+              backend, state, detail, requested_at, updated_at)
+             VALUES ('o/r', 7, 'security', 'requested', NULL, 'chau7',
+                     'requested', NULL, 100, 100)",
+            [],
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        let columns = conn
+            .prepare("PRAGMA table_info(review_requests)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        for expected in [
+            "requested_for_commit",
+            "trigger",
+            "completed_at",
+            "completed_for_commit",
+            "verdict",
+            "reviewer_provider",
+            "reviewer_model",
+        ] {
+            assert!(
+                columns.iter().any(|column| column == expected),
+                "{expected}"
+            );
+        }
+        let old: (Option<String>, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT requested_for_commit, completed_for_commit, verdict
+                 FROM review_requests WHERE review_type = 'security'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(old, (Some("requested".into()), None, None));
+
+        conn.execute(
+            "INSERT INTO review_requests (
+                 repository, pr_number, review_type, head_commit,
+                 trigger, backend, state, requested_at, completed_at,
+                 completed_for_commit, verdict, reviewer_provider,
+                 reviewer_model, updated_at
+             ) VALUES ('o/r', 7, 'code', 'completed', 'unsolicited',
+                       'unsolicited', 'satisfied', NULL, 200, 'completed',
+                       'pass', 'github', 'reviewer-model', 200)",
+            [],
+        )
+        .unwrap();
+        let unsolicited: (Option<i64>, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT requested_at, trigger, completed_for_commit
+                 FROM review_requests WHERE review_type = 'code'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            unsolicited,
+            (None, Some("unsolicited".into()), Some("completed".into()))
+        );
+        assert_eq!(current_version(&conn).unwrap(), SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn v39_adds_releasable_checkpoint_pins_and_expired_exposures() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON").unwrap();
+        conn.execute_batch("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            .unwrap();
+        for (index, sql) in MIGRATIONS[..38].iter().enumerate() {
+            conn.execute_batch(sql).unwrap();
+            conn.execute(
+                "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)
+                 ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                [(index + 1).to_string()],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO sessions (
+                 id, worktree_path, branch, origin, created_at, updated_at,
+                 last_activity_at
+             ) VALUES (1, '/tmp/worktree', 'branch', 'adopted', 1, 1, 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO merge_queue (
+                 id, session_id, head_commit, base_commit, status, created_at, updated_at
+             ) VALUES (1, 1, 'head', 'base', 'promoted', 1, 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO entry_path_exposures (
+                 queue_entry_id, promotion_sha, paths_json, created_at, state
+             ) VALUES (1, 'promotion', '[\"src/lib.rs\"]', 1, 'outstanding')",
+            [],
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        let preserved: (String, String) = conn
+            .query_row(
+                "SELECT promotion_sha, state
+                 FROM entry_path_exposures WHERE queue_entry_id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(preserved, ("promotion".into(), "outstanding".into()));
+        conn.execute(
+            "INSERT INTO gc_checkpoint_pin_releases
+                 (session_id, queue_entry_id, released_at)
+             VALUES (1, 1, 2)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE entry_path_exposures
+             SET state = 'expired', resolved_at = 2,
+                 resolution_kind = 'expired'
+             WHERE queue_entry_id = 1",
+            [],
+        )
+        .unwrap();
+        assert!(
+            conn.execute(
+                "UPDATE entry_path_exposures
+                 SET state = 'unknown' WHERE queue_entry_id = 1",
+                [],
+            )
+            .is_err()
+        );
+        assert_eq!(current_version(&conn).unwrap(), SCHEMA_VERSION);
     }
 
     /// v33 spelled two different outcomes `abandoned`: a review the policy

@@ -872,8 +872,19 @@ performed it closes the row:
 
 ```bash
 aethyme broker review state --repo owner/repo --pr 412 \
-    --type security --state satisfied --note "no findings"
+    --type security --head 9f3c1a2b4d5e --state satisfied \
+    --completed-for-commit 9f3c1a2b4d5e --verdict pass \
+    --reviewer-provider github --reviewer-model reviewer-model \
+    --note "no findings"
 ```
+
+`--state satisfied` requires all three typed completion facts: the commit the
+provider actually inspected, a normalized verdict (`pass`, `fail`,
+`changes_requested`, or `commented`), and the provider identity. The optional
+model is recorded when the provider exposes it; it is left unknown otherwise.
+The request head and completion head are stored independently, so a late
+result can be attached to the request it belongs to without claiming that
+Aethyme asked for the commit the provider reported.
 
 This is the other half of the `chau7_handoff` seam, and it is the intended way
 a slot is released. `stale_after_minutes` is the backstop for when nothing
@@ -881,11 +892,16 @@ reports: it bounds how long a dead reviewer can hold a slot, but it costs a
 duplicated review every time it fires, so an adapter that reports back is
 strictly better than one that relies on it.
 
-`--head <sha>` targets a superseded commit; the default is the most recent
-request for that review type, which is what a reviewer reporting now was asked
-to do. Reporting on a review that was never requested is an error rather than a
-new row: it means the reporter and the router disagree about what was asked
-for, and inventing a row would bury that.
+`--head <sha>` targets the request being reported, including a superseded one.
+Without `--head`, an exact match for `--completed-for-commit` is used. If no
+such row exists, the completion is accepted as an unsolicited provider result.
+It creates a satisfied row with
+`requested_at = null`, `requested_for_commit = null`, and `trigger =
+unsolicited`, while retaining the completion commit, verdict, and reviewer
+identity. A later request for that same commit fills in only the Aethyme-owned
+request facts. A late result whose completion commit differs from its request
+must name `--head`; an explicit head that names no request remains an error, so
+a typo cannot create a result against an unrecorded request.
 
 ### Waiving one dimension
 

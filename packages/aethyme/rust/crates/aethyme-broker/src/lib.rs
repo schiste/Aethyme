@@ -21,6 +21,7 @@
 //!   sessions, stress-tested at 20 (see `tests/stress.rs`).
 
 mod advisories;
+mod atomic_file;
 pub mod agent_hook;
 pub mod attribution;
 mod broker;
@@ -57,6 +58,7 @@ mod leases;
 pub mod main_reconcile;
 mod measurement;
 mod merge;
+mod operation_stats;
 mod operations;
 pub mod plugin_cli;
 mod pr;
@@ -91,7 +93,8 @@ mod reclaim_order;
 pub use reclaim::{
     ReclaimCandidate, ReclaimOutcome, ReclaimPlan, apply as apply_reclaim,
     classify as classify_reclaim, directory_bytes, is_artefact_directory,
-    is_within as reclaim_is_within, reclaimable_bytes, scan as scan_reclaim,
+    is_artefact_directory_with_extras, is_within as reclaim_is_within, reclaimable_bytes,
+    scan as scan_reclaim, scan_with_extra_directories as scan_reclaim_with_extra_directories,
 };
 pub mod representation;
 pub use representation::{
@@ -113,6 +116,7 @@ mod schema;
 mod session_abandonment;
 mod ship;
 mod store;
+mod storage;
 mod types;
 mod update;
 mod update_cache;
@@ -139,7 +143,7 @@ pub use broker::{
     IntegrationStabilityReport, IntegrationStatusView, LeaseBlocker, LeaseClaimReport,
     LeaseOverlapRelation, LeasePathPlan, LeasePlan, LeasePlanOverlap, OwnershipAuditReport,
     PromotedConflict, PromotedIntegrationEntry, RepairAction, RepairGateSelection, RepairReport,
-    RepairSource, RepresentationScan, SESSION_NOTE_MAX_BYTES, SemanticGateAdvice,
+    RepairSource, RepresentationScan, RetentionConfigStatus, SESSION_NOTE_MAX_BYTES, SemanticGateAdvice,
     SemanticGateSelection, SemanticGateSource, SemanticGateSourceStatus,
     SemanticGateSuggestionChain, SessionCheckpointApplyReport, SessionCheckpointRecoveryPlan,
     SessionHandoffReport, SessionStartBase, SessionStartBaseEvidence, StartAgentReport,
@@ -148,10 +152,14 @@ pub use broker::{
     WorktreePlacement, WorktreeRootPlan, WorktreeRootSource,
 };
 pub use console::{
-    CONSOLE_EXCLUSIVE_KEY, CONSOLE_NAMESPACE_KEY, CONSOLE_PORT_KEY, CONSOLE_SLOT_KEY,
-    ConsoleConfig, ConsoleIdentity, ConsoleMode, DEFAULT_CONSOLE_POOL_LIMIT, DEFAULT_CONSOLE_PORT,
+    CONSOLE_EXCLUSIVE_KEY, CONSOLE_INTEGRATION_REF, CONSOLE_MARKER_DIGEST_ENV, CONSOLE_MARKER_ENV,
+    CONSOLE_MARKER_SCHEMA_VERSION, CONSOLE_NAMESPACE_KEY, CONSOLE_PORT_KEY, CONSOLE_SLOT_KEY,
+    ConsoleConfig, ConsoleIdentity, ConsoleIntegrationRelation, ConsoleMarkerRecord, ConsoleMode,
+    ConsoleRevision, ConsoleRuntimeMarker, DEFAULT_CONSOLE_POOL_LIMIT, DEFAULT_CONSOLE_PORT,
     DEFAULT_CONSOLE_PORT_END, DEFAULT_CONSOLE_TTL_SECONDS, console_identity, console_leases,
-    console_port, console_request, worktree_fingerprint,
+    console_marker_directory, console_marker_for_lease, console_port, console_request,
+    console_request_with_options, console_revision, read_console_markers, remove_console_marker,
+    worktree_fingerprint, write_console_marker,
 };
 pub use delivery::{
     DEFAULT_DELIVERY_CLAIM_SECONDS, DELIVERY_ADAPTER_PROTOCOL_VERSION,
@@ -185,7 +193,7 @@ pub use gates::{
     gate_scope_manifest_with_graph, load_gates, load_gates_at_commit, parse_gates, plan_pre_push,
     select_gates, verify_gate_scope_manifest,
 };
-pub use gc::GC_PLAN_SCHEMA_VERSION;
+pub use gc::{GC_PLAN_SCHEMA_VERSION, UNCLASSIFIED_ARTIFACT_REPORT_THRESHOLD_BYTES};
 pub use git::{GitError, GitRepo, MergeSimulation, RemoteDefaultBranch};
 pub use github_target::{
     GithubApiTargetEvidence, GithubTargetError, ResolvedGithubTarget, resolve_github_target,
@@ -197,7 +205,7 @@ pub use graph_impact::{
 };
 pub use graph_integrity::{GraphIntegrityOutcome, GraphIntegrityRejection, GraphIntegrityStatus};
 pub use homebrew::render_homebrew_formula;
-pub use hooks::{HookReport, HookState, HooksError};
+pub use hooks::{HookReport, HookSnippet, HookState, HooksError};
 pub use host_operations::{
     HostOperation, HostOperationError, HostOperationGuard, default_host_operation_db_path,
     host_operation, reconcile_host_operation,
@@ -223,6 +231,11 @@ pub use merge::{
     ACTION_REQUIRED_RELPATH, PromoteConfig, SubmissionCommitOwnership, SubmissionCommitProvenance,
     SubmissionConflict, SubmissionGateVerification, SubmissionGateVerificationStatus,
     SubmissionIntegrationState, SubmissionPlan, SubmitOutcome,
+};
+pub use operation_stats::{
+    DEFAULT_OPERATION_STATS_LIMIT, HooksOutsideLockStats, MAX_OPERATION_STATS_LIMIT,
+    OPERATION_STATS_SCHEMA_VERSION, OperationKindStats, OperationQueueDepthStats, OperationStats,
+    OperationTimingDistribution, RefDeterminationStats, UnrelatedContentionStats,
 };
 pub use operations::{
     CoordinatedCommand, CoordinatedOperationReport, OperationReconcileReport,
@@ -335,15 +348,19 @@ pub use reclaim_order::{
 pub use resources::{
     HOST_RESOURCE_REQUEST_SCHEMA_VERSION, HOST_RESOURCE_SCHEMA_VERSION, HostLeaseState,
     HostResourceAllocation, HostResourceConflict, HostResourceCoordinator, HostResourceError,
-    HostResourceGrant, HostResourceKind, HostResourceLease, HostResourcePlan, HostResourceRequest,
-    HostResourceRequirement, HostResourceRunError, HostResourceRunReport,
+    HostResourceBlocker, HostResourceExplanation, HostResourceGrant, HostResourceHolder,
+    HostResourceKind, HostResourceLease, HostResourcePlan, HostResourceRequest,
+    HostResourceRequirement, HostResourceRunError, HostResourceRunReport, HostResourceWaitAdvice,
     default_host_resource_db_path, resource_environment_key, validate_host_resource_requirements,
 };
 pub use retention::{
-    BROKER_CONFIG_RELPATH, GcApplyReport, GcArtifactCandidate, GcBlocker, GcFileAction,
-    GcFileCandidate, GcHealth, GcOrphanCandidate, GcPlan, GcRowCandidate, GcRowKind,
-    GcWorktreeCandidate, RETENTION_POLICY_SCHEMA_VERSION, RetentionConfigError, RetentionPolicy,
-    load_retention_policy,
+    BROKER_CONFIG_RELPATH, GcApplyReport, GcArtifactCandidate, GcBlocker, GcBlockerSummary,
+    GcCheckpointPinRelease, GcDeclinedArtifact, GcFileAction, GcFileCandidate, GcHealth,
+    GcOrphanCandidate, GcPlan,
+    GcPublicationExposureExpiry, GcRowCandidate, GcRowKind, GcWorktreeCandidate,
+    GcWorktreeBlockerSummary,
+    RETENTION_POLICY_SCHEMA_VERSION, RetentionConfigError, RetentionConfigWarning, RetentionPolicy,
+    RetentionPolicyLoadReport, load_retention_policy, load_retention_policy_report,
 };
 pub use review::{
     REVIEW_POLICY_SCHEMA_VERSION, ReviewEvidenceAdapter, ReviewLifecycle,
@@ -364,8 +381,8 @@ pub use review_facts::{
     ProviderPullRequest, PullRequestObservation, derive_trigger, first_time_contributor,
 };
 pub use review_ledger::{
-    ExpiredReview, RefusalClass, ReviewRefusal, ReviewRequest, ReviewRequestState, ReviewWaiver,
-    expired, in_flight, last_refusal, spend_by_type, waiver_for,
+    ExpiredReview, RefusalClass, ReviewRefusal, ReviewRequest, ReviewRequestState, ReviewVerdict,
+    ReviewWaiver, ReviewerIdentity, expired, in_flight, last_refusal, spend_by_type, waiver_for,
 };
 pub use review_report::{
     REVIEW_REPORTING_SCHEMA_VERSION, ReviewReportingError, ReviewReportingPolicy, ReviewSeverity,
@@ -388,6 +405,13 @@ pub use ship::{
     ShipReviewEvidence,
 };
 pub use store::BrokerStore;
+pub use storage::{
+    STORAGE_PLAN_SCHEMA_VERSION, STORAGE_RECONCILIATION_SCHEMA_VERSION, StorageApplyFailure,
+    StorageApplyReport, StorageAppliedItem, StorageCandidate, StorageCandidateKind,
+    StorageDirectoryKind, StorageEntry, StorageError, StorageFilesystemKind, StorageMarkerStatus,
+    StoragePlan, StorageReconciliation, StorageRoot, StorageSource, StorageSummary,
+    storage_apply, storage_plan,
+};
 pub use types::{
     Advisory, AdvisoryAction, AdvisoryAudience, AdvisoryDeliveryMetric, AdvisoryDeliverySummary,
     AdvisoryDeliverySurface, AdvisoryEvidence, AdvisoryList, AdvisoryProducer,

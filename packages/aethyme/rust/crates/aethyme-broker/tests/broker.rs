@@ -624,6 +624,16 @@ fn cleanup_distinguishes_pending_commits_from_missing_acceptance_provenance() {
             [unproven.id],
         )
         .unwrap();
+    // The terminal close path records a released checkpoint pin. Remove that
+    // recovery evidence too so this fixture models genuinely missing
+    // acceptance provenance rather than a stale pin that #196 deliberately
+    // knows how to recover.
+    connection
+        .execute(
+            "DELETE FROM gc_checkpoint_pin_releases WHERE session_id = ?1",
+            [unproven.id],
+        )
+        .unwrap();
     drop(connection);
 
     let broker = Broker::open(tmp.path()).unwrap();

@@ -105,6 +105,7 @@ fn broker_command_capability(args: &[String]) -> repository_upgrade::CommandCapa
         (Some("close" | "finish" | "git" | "gh" | "cleanup"), _) => {
             CommandCapability::RecoveryWrite
         }
+        (Some("storage"), Some("apply")) => CommandCapability::RecoveryWrite,
         (Some("checkpoint"), Some("apply")) => CommandCapability::RecoveryWrite,
         (Some("report"), Some("file")) => CommandCapability::RecoveryWrite,
         (Some("operations" | "resources"), Some("reconcile"))
@@ -153,7 +154,7 @@ fn broker_command_capability(args: &[String]) -> repository_upgrade::CommandCapa
         | (
             Some(
                 "handoff" | "queue" | "status" | "agents" | "metrics" | "certify" | "readiness"
-                | "worktree-root",
+                | "worktree-root" | "storage",
             ),
             _,
         )
@@ -408,15 +409,23 @@ fn main() -> ExitCode {
     }
 }
 
-/// Crate version plus `git describe` from build time (empty when the
-/// binary was built outside a git checkout — see build.rs).
+/// Crate version plus the source identity and build time captured by build.rs.
 fn print_version() {
     let describe = env!("AETHYME_GIT_DESCRIBE");
-    if describe.is_empty() {
-        println!("aethyme {}", env!("CARGO_PKG_VERSION"));
+    let commit = {
+        let value = env!("AETHYME_GIT_COMMIT");
+        if value.is_empty() { "unknown" } else { value }
+    };
+    let build_date = env!("AETHYME_BUILD_DATE");
+    let stable = if describe.is_empty() {
+        format!("build_commit={commit}")
     } else {
-        println!("aethyme {} ({describe})", env!("CARGO_PKG_VERSION"));
-    }
+        format!("{describe} build_commit={commit}")
+    };
+    println!(
+        "aethyme {} ({stable}) build_date={build_date}",
+        env!("CARGO_PKG_VERSION")
+    );
 }
 
 fn print_top_level_help() {
@@ -454,7 +463,7 @@ fn print_top_level_help() {
     eprintln!("  update check|plan|execute  explicit paired-binary updates; never background");
     eprintln!("  upgrade plan|apply|recover review, apply, or recover repository migrations");
     eprintln!(
-        "  graph status|materialize|refresh  inspect, materialize, or refresh graph artifacts"
+        "  graph status|units|materialize|refresh  inspect, page, materialize, or refresh graph artifacts"
     );
     eprintln!();
     eprintln!("Setup:");
@@ -770,6 +779,14 @@ mod compatibility_command_tests {
     fn parsed_commands_cover_every_compatibility_capability() {
         let cases = [
             (&["broker", "status"][..], CommandCapability::DiagnosticRead),
+            (
+                &["broker", "storage"][..],
+                CommandCapability::DiagnosticRead,
+            ),
+            (
+                &["broker", "storage", "apply"][..],
+                CommandCapability::RecoveryWrite,
+            ),
             (
                 &["broker", "readiness", "--require", "agent-ready"][..],
                 CommandCapability::DiagnosticRead,

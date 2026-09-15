@@ -1090,6 +1090,34 @@ fn gate_doctor_is_exact_head_read_only_and_advisory() {
 }
 
 #[test]
+fn gate_doctor_reports_invalid_retention_configuration() {
+    let repo = fixture();
+    std::fs::write(
+        repo.path().join(".aethyme/broker.toml"),
+        "[retention]\nstartup_budget_ms = 0\n",
+    )
+    .unwrap();
+
+    let report: serde_json::Value = serde_json::from_str(&stdout(run(
+        repo.path(),
+        &["gates", "doctor", "--json"],
+    )))
+    .unwrap();
+    assert!(report["findings"].as_array().unwrap().iter().any(|finding| {
+        finding["id"] == "invalid_retention_config"
+            && finding["evidence"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item.as_str().unwrap().contains("startup_budget_ms"))
+            && finding["remediation"]
+                .as_str()
+                .unwrap()
+                .contains("broker gc plan")
+    }));
+}
+
+#[test]
 fn gate_doctor_probe_is_disposable_resource_aware_and_cache_isolated() {
     let repo = fixture();
     let host_state = tempfile::tempdir().unwrap();

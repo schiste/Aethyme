@@ -17,7 +17,7 @@
 //!   2 — argument validation failed (clap-default)
 
 use std::path::PathBuf;
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
 use std::time::Instant;
 
 use clap::Parser;
@@ -25,7 +25,7 @@ use clap::Parser;
 use aethyme_graph_indexer::{
     IndexRepoSummary, IndexerContext, LinkSummary, WalkOptions, index_repo_to_disk, link_repo,
 };
-use aethyme_graph_storage::bootstrap_repo;
+use aethyme_graph_storage::{bootstrap_repo, committed_source_tree_digest};
 
 /// Indexes a source repository into the Aethyme graph format.
 ///
@@ -107,6 +107,16 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // relative repo-root would create `relative/<path>/.aethyme/`
     // under the CWD before the IndexerContext::new error surfaced.
     let ctx = IndexerContext::new(&cli.repo_name, cli.repo_root.clone(), &cli.engine_version)?;
+    let ctx = match committed_revision(ctx.repo_root()) {
+        Some(revision) => {
+            let ctx = ctx.with_source_revision(&revision)?;
+            match committed_source_tree_digest(ctx.repo_root(), &revision) {
+                Ok(tree_digest) => ctx.with_source_tree_digest(&tree_digest)?,
+                Err(_) => ctx,
+            }
+        }
+        None => ctx,
+    };
 
     if !cli.skip_bootstrap {
         bootstrap_repo(ctx.repo_root(), &cli.engine_version)?;
@@ -156,6 +166,29 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Bind standalone indexing output only when the source checkout is clean.
+/// A dirty worktree must not publish an artifact claiming to describe HEAD.
+fn committed_revision(repo: &std::path::Path) -> Option<String> {
+    let status = Command::new("git")
+        .args(["status", "--porcelain", "--untracked-files=all"])
+        .current_dir(repo)
+        .output()
+        .ok()?;
+    if !status.status.success() || !status.stdout.is_empty() {
+        return None;
+    }
+    let head = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(repo)
+        .output()
+        .ok()?;
+    if !head.status.success() {
+        return None;
+    }
+    let revision = String::from_utf8(head.stdout).ok()?.trim().to_owned();
+    (!revision.is_empty()).then_some(revision)
+}
+
 fn emit_text_summary(summary: &IndexRepoSummary, elapsed: &std::time::Duration) {
     println!(
         "aethyme-graph-index: indexed {} files ({} skipped) in {:.2}s",
@@ -175,6 +208,15 @@ fn emit_text_summary(summary: &IndexRepoSummary, elapsed: &std::time::Duration) 
         summary.observability.source_bytes_read,
         summary.observability.fragment_bytes_written,
     );
+    println!(
+        "  coverage: {} files, {} units; safe to use: {}",
+        summary.coverage.report.files.discovered,
+        summary.coverage.report.unit_count,
+        summary.coverage.report.safe_to_use,
+    );
+    for gap in &summary.coverage.report.gaps {
+        println!("    coverage gap: {gap}");
+    }
     if !summary.counts_by_kind.is_empty() {
         println!("  nodes by kind:");
         // BTreeMap iteration is sorted by kind; canonical-order
@@ -192,10 +234,8 @@ fn emit_json_summary(
     index_elapsed_ms: u64,
     link: Option<&LinkSummary>,
 ) {
-    // Hand-rolled JSON to avoid an extra serde_json dep in the
-    // binary's compile graph and to keep the output shape
-    // explicitly under our control (it's a wire format for
-    // downstream consumers).
+    // Keep the legacy summary fields explicitly controlled, while using the
+    // storage crate's serde representation for the revision-bound contract.
     print!("{{");
     print!("\"total_files\":{},", summary.total_files);
     print!("\"total_skipped\":{},", summary.total_skipped);
@@ -235,6 +275,10 @@ fn emit_json_summary(
         print!("\"{}\":{}", kind.name(), count);
     }
     print!("}}");
+    print!(
+        ",\"coverage\":{}",
+        serde_json::to_string(&summary.coverage.report).expect("coverage is serializable")
+    );
     if let Some(link) = link {
         print!(",\"link\":{{");
         print!("\"fragments_visited\":{},", link.fragments_visited);

@@ -71,6 +71,10 @@ impl LanguageIndexer for PythonIndexer {
         "python"
     }
 
+    fn parser(&self) -> &'static str {
+        "ruff_python_parser"
+    }
+
     fn index_file(
         &self,
         ctx: &IndexerContext,

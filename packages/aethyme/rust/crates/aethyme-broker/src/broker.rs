@@ -938,6 +938,19 @@ pub struct CleanupSweepReport {
     pub failures: Vec<CleanupSweepFailure>,
 }
 
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct RetentionConfigStatus {
+    pub warnings: Vec<crate::RetentionConfigWarning>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl RetentionConfigStatus {
+    fn is_healthy(&self) -> bool {
+        self.warnings.is_empty() && self.error.is_none()
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct CleanupRetention {
     pub broker_owned_worktree_count: usize,
@@ -968,6 +981,10 @@ pub struct CleanupRetention {
     pub oldest_closed_age_days: u64,
     pub closed_worktrees_policy_days: u32,
     pub severity: StatusAdviceSeverity,
+    /// Config warnings/errors are carried with the retention picture so
+    /// status can explain a bad file without failing before it can report it.
+    #[serde(skip_serializing_if = "RetentionConfigStatus::is_healthy")]
+    pub retention_config: RetentionConfigStatus,
     /// Directories under a broker worktree root that no session row claims
     /// (#176). Unsized on this path -- status runs often, and the count is
     /// the signal; `gc plan` measures the bytes.
@@ -5454,6 +5471,9 @@ impl Broker {
             });
         }
         let cleanup_retention = self.cleanup_retention(now_ms)?;
+        if let Some(config_advice) = retention_config_advice(&cleanup_retention.retention_config) {
+            advice.insert(0, config_advice);
+        }
         if cleanup_retention.broker_owned_worktree_count > 0 {
             let count = cleanup_retention.broker_owned_worktree_count;
             advice.push(StatusAdvice {
@@ -7291,6 +7311,12 @@ impl Broker {
         session_head: &str,
         delivery_targets: &[String],
     ) -> Result<(CleanupProvenance, String), BrokerOpError> {
+        let released_queue_entry_id = if session.accepted_queue_entry_id.is_none() {
+            self.store.released_checkpoint_queue_entry(session.id)?
+        } else {
+            None
+        };
+        let accepted_queue_entry_id = session.accepted_queue_entry_id.or(released_queue_entry_id);
         let mut provenance = CleanupProvenance {
             representation: CleanupRepresentation::Unproven,
             session_head: session_head.into(),
@@ -7298,7 +7324,7 @@ impl Broker {
             accepted_session_head: session.accepted_session_head.clone(),
             accepted_integration_commit: session.accepted_integration_commit.clone(),
             accepted_integration_tree: session.accepted_integration_tree.clone(),
-            accepted_queue_entry_id: session.accepted_queue_entry_id,
+            accepted_queue_entry_id,
             accepted_queue_status: None,
             represented_on: None,
             represented_by_commit: None,
@@ -7372,7 +7398,7 @@ impl Broker {
         }
 
         let (Some(queue_entry_id), Some(integration_commit), Some(integration_tree)) = (
-            session.accepted_queue_entry_id,
+            accepted_queue_entry_id,
             session.accepted_integration_commit.as_deref(),
             session.accepted_integration_tree.as_deref(),
         ) else {
@@ -7388,6 +7414,25 @@ impl Broker {
             .into_iter()
             .find(|entry| entry.id == queue_entry_id);
         let Some(entry) = entry else {
+            if released_queue_entry_id == Some(queue_entry_id)
+                && self.repo.commit_tree_id(integration_commit).ok().as_deref()
+                    == Some(integration_tree)
+            {
+                let represented_on = delivery_targets
+                    .iter()
+                    .find(|target| self.repo.is_ancestor(integration_commit, target))
+                    .cloned();
+                if let Some(represented_on) = represented_on {
+                    provenance.representation = CleanupRepresentation::Represented;
+                    provenance.represented_on = Some(represented_on.clone());
+                    return Ok((
+                        provenance,
+                        format!(
+                            "accepted queue entry {queue_entry_id} was GC-released after its checkpoint pin; integration commit is represented on {represented_on}"
+                        ),
+                    ));
+                }
+            }
             return Ok((
                 provenance,
                 format!("accepted queue entry {queue_entry_id} is missing"),
@@ -7707,7 +7752,12 @@ impl Broker {
     /// the budget records nothing: a partial sum written down as a size would
     /// be indistinguishable from a real one afterwards.
     fn warm_one_size_record(&self, plan: &CleanupPlan) -> Result<(), BrokerOpError> {
-        let policy = crate::load_retention_policy(&self.main_root)?;
+        // Status must remain able to report a malformed policy. It uses the
+        // conservative defaults for its picture and simply skips warming when
+        // the configured warming budget cannot be trusted.
+        let Ok(policy) = crate::load_retention_policy(&self.main_root) else {
+            return Ok(());
+        };
         let mut records = crate::measurement::load_size_records(&self.main_root);
         let paths = plan
             .worktrees
@@ -7780,8 +7830,24 @@ impl Broker {
     /// here is what made the routine check and the five-minute audit the same
     /// code (#176).
     fn cleanup_retention(&self, now_ms: i64) -> Result<CleanupRetention, BrokerOpError> {
+        let (policy, retention_config) = match crate::load_retention_policy_report(&self.main_root)
+        {
+            Ok(report) => (
+                report.policy,
+                RetentionConfigStatus {
+                    warnings: report.warnings,
+                    error: None,
+                },
+            ),
+            Err(error) => (
+                crate::RetentionPolicy::default(),
+                RetentionConfigStatus {
+                    warnings: Vec::new(),
+                    error: Some(error.to_string()),
+                },
+            ),
+        };
         let plan = self.cleanup_plan_recorded()?;
-        let policy = crate::load_retention_policy(&self.main_root)?;
         let oldest_closed_at = self
             .store
             .cleaned_sessions()?
@@ -7843,6 +7909,7 @@ impl Broker {
             oldest_closed_age_days,
             closed_worktrees_policy_days: policy.closed_worktrees_days,
             severity,
+            retention_config,
             reconciliation: self.reconcile_worktree_directories(false)?,
         })
     }
@@ -8231,6 +8298,49 @@ fn cleanup_retention_warning(retention: &CleanupRetention) -> Option<String> {
                 retention.estimated_reclaimable_bytes
             )
         }
+    })
+}
+
+fn retention_config_advice(status: &RetentionConfigStatus) -> Option<StatusAdvice> {
+    if status.is_healthy() {
+        return None;
+    }
+
+    let mut evidence = status
+        .warnings
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    let (severity, reason, summary, command) = if let Some(error) = &status.error {
+        evidence.insert(0, format!("broker.toml: {error}"));
+        (
+            StatusAdviceSeverity::Warning,
+            "retention_config_invalid",
+            "retention configuration could not be loaded; status is using conservative defaults and reclamation commands remain blocked".into(),
+            "edit .aethyme/broker.toml to fix the named field, then run aethyme broker gc plan",
+        )
+    } else {
+        let count = status.warnings.len();
+        (
+            StatusAdviceSeverity::Warning,
+            "retention_config_unknown_fields",
+            format!(
+                "retention configuration ignored {count} unknown {}; known retention settings remain active",
+                plural_word(count, "field", "fields")
+            ),
+            "edit .aethyme/broker.toml to remove or correct the named field(s)",
+        )
+    };
+
+    Some(StatusAdvice {
+        id: "retention.config",
+        severity,
+        reason,
+        summary,
+        session_id: None,
+        queue_entry_id: None,
+        evidence,
+        commands: vec![command.into()],
     })
 }
 
@@ -9323,6 +9433,7 @@ mod tests {
             oldest_closed_age_days: 1,
             closed_worktrees_policy_days: 7,
             severity: super::StatusAdviceSeverity::Warning,
+            retention_config: Default::default(),
         };
         let unmeetable = super::cleanup_retention_warning(&retention).unwrap();
         assert!(unmeetable.contains("aethyme broker gc plan"));
@@ -9381,6 +9492,7 @@ mod tests {
                 unclaimed_worktree_count: 0,
                 unclaimed_worktree_bytes: 0,
                 policy: crate::RetentionPolicy::default(),
+                retention_config_warnings: Vec::new(),
                 pending_recovery_digest: None,
                 candidate_rows: 0,
                 candidate_files: 0,
