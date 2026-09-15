@@ -223,6 +223,42 @@ fn reclaim_confirmation_binds_decisions_not_sizes_and_explains_changes() {
 }
 
 #[test]
+fn reclaim_confirmation_keeps_digest_mismatch_primary_when_snapshot_is_unreadable() {
+    let (repo, container) = fixture("");
+    let root_output = run(repo.path(), container.path(), &["worktree-root", "--json"]);
+    let worktree_root =
+        serde_json::from_slice::<serde_json::Value>(&root_output.stdout).unwrap()["preferred_root"]
+            .as_str()
+            .map(PathBuf::from)
+            .unwrap();
+
+    let plan = reclaim_plan_json(repo.path(), container.path());
+    let digest = plan["digest"].as_str().unwrap().to_string();
+    let snapshot = worktree_root.join(format!(".aethyme-reclaim-plan-{digest}.json"));
+    std::fs::write(&snapshot, b"not a reclaim snapshot\n").unwrap();
+
+    let added = worktree_root.join("session/build");
+    std::fs::create_dir_all(&added).unwrap();
+    std::fs::write(added.join("artifact"), "new\n").unwrap();
+
+    let refused = run(
+        repo.path(),
+        container.path(),
+        &["reclaim", "apply", "--confirm", &digest],
+    );
+    assert!(!refused.status.success());
+    let message = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        message.contains("confirmation does not match the current plan"),
+        "{message}"
+    );
+    assert!(
+        message.contains("saved review could not be read"),
+        "{message}"
+    );
+}
+
+#[test]
 fn a_reappearing_repository_revokes_an_authorized_orphan_removal() {
     let (repo, container) =
         fixture("[retention]\norphan_worktree_roots_days = 0\nartifact_sweep_budget_ms = 0\n");
