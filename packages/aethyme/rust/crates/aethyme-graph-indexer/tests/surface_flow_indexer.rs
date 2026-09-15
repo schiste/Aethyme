@@ -64,6 +64,7 @@ REST_FRAMEWORK = {
         "rest_framework.permissions.IsAuthenticated",
     ],
 }
+
 "#,
     );
     write(
@@ -235,4 +236,29 @@ fn ignores_bare_middleware_mentions_without_registration_call() {
     assert!(node_kinds(tmp.path(), "server.js").contains(&NodeKind::MiddlewareInstallation));
     assert!(!node_kinds(tmp.path(), "notes.js").contains(&NodeKind::MiddlewareInstallation));
     assert!(!node_kinds(tmp.path(), "comments.js").contains(&NodeKind::MiddlewareInstallation));
+}
+
+#[test]
+fn recognises_both_quote_forms_for_fetch_worker_registration() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "edge/double-quoted.js",
+        r#"addEventListener("fetch", event => event.respondWith(new Response("ok")))"#,
+    );
+    write(
+        tmp.path(),
+        "edge/single-quoted.js",
+        r#"addEventListener('fetch', event => event.respondWith(new Response('ok')))"#,
+    );
+
+    let summary = index_repo_to_disk(&ctx(tmp.path()), &WalkOptions::default()).unwrap();
+
+    assert_eq!(
+        summary.counts_by_kind.get(&NodeKind::WorkerSurface),
+        Some(&2),
+        "both quote forms should emit an isolated WorkerSurface"
+    );
+    assert!(node_kinds(tmp.path(), "edge/double-quoted.js").contains(&NodeKind::WorkerSurface));
+    assert!(node_kinds(tmp.path(), "edge/single-quoted.js").contains(&NodeKind::WorkerSurface));
 }

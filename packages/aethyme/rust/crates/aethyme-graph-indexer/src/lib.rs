@@ -19,6 +19,7 @@
 //! non-code).
 
 pub mod context;
+pub mod coverage;
 pub mod filesystem;
 pub mod language;
 pub mod language_map;
@@ -31,6 +32,7 @@ pub mod surface_flow;
 pub mod typescript;
 
 pub use context::IndexerContext;
+pub use coverage::IndexCoverage;
 pub use filesystem::{
     FilesystemIndexResult, FilesystemIndexerError, IndexedFile, SkipReason, SkippedFile,
     WalkOptions, walk_source_tree,
@@ -43,7 +45,7 @@ pub use linker::{LinkError, LinkSummary, link_repo, link_repo_path, link_with_st
 pub use php::PhpIndexer;
 pub use pipeline::{
     BuildFragmentError, BuiltFragment, IndexRepoError, IndexRepoSummary, build_fragment,
-    build_index_records, default_registry, index_repo_to_disk,
+    build_index_records, default_registry, index_repo_to_disk, index_repo_to_disk_with,
 };
 pub use python::PythonIndexer;
 pub use rust_lang::RustIndexer;

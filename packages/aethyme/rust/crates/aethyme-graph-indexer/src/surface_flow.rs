@@ -304,7 +304,7 @@ fn extract_js_ts(
     let path = builder.indexed.source_path.to_ascii_lowercase();
     let lower_content = content.to_ascii_lowercase();
 
-    if lower_content.contains("addEventListener(\"fetch\"")
+    if lower_content.contains("addeventlistener(\"fetch\"")
         || lower_content.contains("addeventlistener('fetch'")
         || lower_content.contains("export default")
             && (lower_content.contains(" fetch(") || lower_content.contains("async fetch("))

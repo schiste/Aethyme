@@ -14,8 +14,9 @@ use aethyme_broker::{
     GraphImpactStatus, NewAdvisory,
 };
 use aethyme_graph_indexer::{IndexerContext, WalkOptions, index_repo_to_disk, link_repo};
-use aethyme_graph_storage::bootstrap_repo;
-use aethyme_graph_storage::write_graph_authority_manifest;
+use aethyme_graph_storage::{
+    bootstrap_repo, committed_source_tree_digest, write_graph_authority_manifest,
+};
 
 #[derive(Clone)]
 struct FixedGraphImpactProvider {
@@ -146,22 +147,18 @@ fn add_worktree(root: &Path, name: &str) -> std::path::PathBuf {
 
 fn refresh_committed_graph(root: &Path) {
     bootstrap_repo(root, env!("CARGO_PKG_VERSION")).unwrap();
-    let context =
-        IndexerContext::new("fixture", root.to_path_buf(), env!("CARGO_PKG_VERSION")).unwrap();
+    let repository = GitRepo::discover(root).unwrap();
+    let head = repository.head_commit().unwrap();
+    let source_tree_digest = committed_source_tree_digest(root, &head).unwrap();
+    let context = IndexerContext::new("fixture", root.to_path_buf(), env!("CARGO_PKG_VERSION"))
+        .unwrap()
+        .with_source_revision(&head)
+        .unwrap()
+        .with_source_tree_digest(&source_tree_digest)
+        .unwrap();
     index_repo_to_disk(&context, &WalkOptions::default()).unwrap();
     link_repo(&context).unwrap();
-    let repository = GitRepo::discover(root).unwrap();
-    let tree = repository.working_tree_hash().unwrap();
-    let head = repository.head_commit().unwrap();
-    let source = repository
-        .commit_tree(
-            &tree,
-            &[&head],
-            "test: bind graph source snapshot",
-            &aethyme_broker::Attribution::broker_only(),
-        )
-        .unwrap();
-    write_graph_authority_manifest(root, &source, "fixture", env!("CARGO_PKG_VERSION")).unwrap();
+    write_graph_authority_manifest(root, "HEAD", "fixture", env!("CARGO_PKG_VERSION")).unwrap();
 }
 
 #[test]
@@ -215,7 +212,12 @@ fn session_and_full_tree_gates_enforce_committed_graph_authority() {
         "refusal must not rewrite the caller worktree or index"
     );
 
+    commit_all(&worktree, "commit source edit before graph refresh");
     refresh_committed_graph(&worktree);
+    // Refreshing the graph updates the authority artifacts in the worktree;
+    // gates are intentionally checked against committed graph state, so the
+    // fixture must commit the new coverage, manifest, and units together.
+    commit_all(&worktree, "refresh authoritative graph after source edit");
     let refreshed = broker.run_gates(session.id).unwrap();
     assert_eq!(refreshed.len(), 1);
     assert_eq!(refreshed[0].status, GateStatus::Pass);

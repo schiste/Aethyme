@@ -36,6 +36,13 @@ pub trait LanguageIndexer: Send + Sync {
     /// values from `language_map::infer_language_from_extension`).
     fn language(&self) -> &'static str;
 
+    /// Stable parser identity for coverage consumers.  Implementations that
+    /// do not need a more specific label inherit the language name, which is
+    /// intentionally a valid parser identity for third-party indexers.
+    fn parser(&self) -> &'static str {
+        self.language()
+    }
+
     /// Parse `content` and produce additional graph payload to
     /// attach to `indexed_file`'s fragment.
     ///
@@ -82,6 +89,10 @@ impl LanguageRegistry {
 
     pub fn get(&self, language: &str) -> Option<&dyn LanguageIndexer> {
         self.indexers.get(language).map(|b| &**b)
+    }
+
+    pub fn parser_for(&self, language: &str) -> Option<&'static str> {
+        self.get(language).map(LanguageIndexer::parser)
     }
 
     pub fn languages(&self) -> impl Iterator<Item = &'static str> + '_ {

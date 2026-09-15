@@ -10,10 +10,14 @@ use sha2::{Digest, Sha256};
 use crate::broker::{
     WORKTREE_ROOT_MARKER, WorktreeRootMarker, directory_size_without_following_links,
 };
+use crate::retention::is_safe_artefact_directory_name;
 use crate::{
-    Broker, BrokerOpError, GcApplyReport, GcArtifactCandidate, GcBlocker, GcFileAction,
-    GcFileCandidate, GcHealth, GcOrphanCandidate, GcPlan, GcRowCandidate, GcWorktreeCandidate,
-    GitRepo, OperationStatus, RetentionPolicy, load_retention_policy,
+    Broker, BrokerOpError, GcApplyReport, GcArtifactCandidate, GcBlocker, GcBlockerSummary,
+    GcCheckpointPinRelease, GcDeclinedArtifact,
+    GcFileAction, GcFileCandidate, GcHealth, GcOrphanCandidate, GcPlan, GcRowCandidate,
+    GcPublicationExposureExpiry, GcWorktreeBlockerSummary, GcWorktreeCandidate, GitRepo,
+    OperationStatus, RetentionPolicy,
+    load_retention_policy, load_retention_policy_report,
 };
 
 pub const GC_PLAN_SCHEMA_VERSION: u32 = 2;
@@ -31,6 +35,12 @@ const ARTIFACT_DIRECTORIES: &[(&str, ArtifactWitness)] = &[
 /// for nested workspaces and package directories, shallow enough to keep the
 /// scan bounded on large trees.
 const ARTIFACT_SCAN_DEPTH: usize = 6;
+
+/// An ignored directory must be larger than this before `gc plan` reports it
+/// as an unclassified artifact. Small ignored directories are common project
+/// metadata and would make the evidence list noisy without helping an
+/// operator find meaningful disk pressure.
+pub const UNCLASSIFIED_ARTIFACT_REPORT_THRESHOLD_BYTES: u64 = 4 * 1024;
 
 /// `meta` key holding the last autonomous artifact sweep time.
 const ARTIFACT_SWEEP_STAMP_KEY: &str = "gc.artifact_sweep.last_run_ms";
@@ -74,18 +84,56 @@ fn days_between(now: i64, earlier: i64) -> u32 {
 }
 
 /// Classify a build directory found beneath `root`, if it is one.
+#[cfg(test)]
 fn artifact_witness_for(path: &Path) -> Option<ArtifactWitness> {
+    artifact_witness_for_with_extras(path, &[])
+}
+
+/// Classify a directory with the built-in catalog plus additive configured
+/// names. Built-in entries always keep their built-in witness, even when a
+/// configuration repeats the name, so configuration cannot weaken safety.
+fn artifact_witness_for_with_extras(path: &Path, extras: &[String]) -> Option<ArtifactWitness> {
     let name = path.file_name()?.to_str()?;
-    ARTIFACT_DIRECTORIES
+    let witness = ARTIFACT_DIRECTORIES
         .iter()
         .find(|(candidate, _)| *candidate == name)
         .map(|(_, witness)| *witness)
-        .filter(|witness| witness.confirms(path))
+        .or_else(|| {
+            extras
+                .iter()
+                .any(|candidate| is_safe_artefact_directory_name(candidate) && candidate == name)
+                .then_some(ArtifactWitness::NonEmptyDirectory)
+        })?;
+    witness.confirms(path).then_some(witness)
 }
 
-/// Collect build directories beneath `root`, never descending into one that
-/// already matched and never following symlinks.
-fn collect_artifact_dirs(root: &Path, current: &Path, depth: usize, found: &mut Vec<PathBuf>) {
+fn is_known_artifact_name(name: &str, extras: &[String]) -> bool {
+    ARTIFACT_DIRECTORIES
+        .iter()
+        .any(|(candidate, _)| *candidate == name)
+        || extras
+            .iter()
+            .any(|candidate| is_safe_artefact_directory_name(candidate) && candidate == name)
+}
+
+#[derive(Default)]
+struct ArtifactScan {
+    classified: Vec<PathBuf>,
+    declined: Vec<PathBuf>,
+}
+
+/// Collect classified artifact directories and, when a checkout is supplied,
+/// large ignored directories outside the catalog. The latter are opaque
+/// evidence only; stopping at their boundary keeps the scan bounded and avoids
+/// double-counting nested ignored trees.
+fn collect_artifact_dirs_with_report(
+    root: &Path,
+    current: &Path,
+    depth: usize,
+    extras: &[String],
+    checkout: Option<&GitRepo>,
+    scan: &mut ArtifactScan,
+) {
     if depth > ARTIFACT_SCAN_DEPTH {
         return;
     }
@@ -101,12 +149,75 @@ fn collect_artifact_dirs(root: &Path, current: &Path, depth: usize, found: &mut 
         if path.file_name().is_some_and(|name| name == ".git") {
             continue;
         }
-        if artifact_witness_for(&path).is_some() {
-            found.push(path);
+        if artifact_witness_for_with_extras(&path, extras).is_some() {
+            scan.classified.push(path);
             continue;
         }
-        collect_artifact_dirs(root, &path, depth + 1, found);
+        let name = path.file_name().and_then(|name| name.to_str());
+        if checkout.is_some()
+            && name.is_some_and(|name| !is_known_artifact_name(name, extras))
+            && repo_relative(root, &path).is_some_and(|relative| {
+                checkout.is_some_and(|checkout| checkout.path_is_ignored(&relative))
+            })
+        {
+            scan.declined.push(path);
+            continue;
+        }
+        collect_artifact_dirs_with_report(root, &path, depth + 1, extras, checkout, scan);
     }
+}
+
+/// Collect build directories beneath `root`, never descending into one that
+/// already matched and never following symlinks. This compatibility wrapper is
+/// also used by the unit tests for the built-in catalog.
+#[cfg(test)]
+fn collect_artifact_dirs(root: &Path, current: &Path, depth: usize, found: &mut Vec<PathBuf>) {
+    let mut scan = ArtifactScan::default();
+    collect_artifact_dirs_with_report(root, current, depth, &[], None, &mut scan);
+    found.extend(scan.classified);
+}
+
+fn collect_artifact_dirs_with_extras(
+    root: &Path,
+    current: &Path,
+    depth: usize,
+    extras: &[String],
+    found: &mut Vec<PathBuf>,
+) {
+    let mut scan = ArtifactScan::default();
+    collect_artifact_dirs_with_report(root, current, depth, extras, None, &mut scan);
+    found.extend(scan.classified);
+}
+
+fn collect_artifact_scan(root: &Path, extras: &[String], checkout: &GitRepo) -> ArtifactScan {
+    let mut scan = ArtifactScan::default();
+    collect_artifact_dirs_with_report(root, root, 0, extras, Some(checkout), &mut scan);
+    scan
+}
+
+fn declined_artifacts(
+    session_id: i64,
+    worktree_path: &str,
+    root: &Path,
+    paths: Vec<PathBuf>,
+) -> Vec<GcDeclinedArtifact> {
+    paths
+        .into_iter()
+        .filter_map(|path| {
+            let relative_dir = repo_relative(root, &path)?;
+            let estimated_bytes = directory_size_without_following_links(&path).ok()?;
+            (estimated_bytes > UNCLASSIFIED_ARTIFACT_REPORT_THRESHOLD_BYTES).then(|| {
+                GcDeclinedArtifact {
+                    session_id,
+                    worktree_path: worktree_path.to_owned(),
+                    relative_dir,
+                    estimated_bytes,
+                    reason: "git-ignored directory is outside the regenerable artifact catalog"
+                        .into(),
+                }
+            })
+        })
+        .collect()
 }
 
 fn now_ms() -> i64 {
@@ -216,6 +327,10 @@ struct GcJournal {
     remaining_artifacts: Vec<GcArtifactCandidate>,
     #[serde(default)]
     remaining_orphans: Vec<GcOrphanCandidate>,
+    #[serde(default)]
+    remaining_checkpoint_pin_releases: Vec<GcCheckpointPinRelease>,
+    #[serde(default)]
+    remaining_publication_exposure_expiries: Vec<GcPublicationExposureExpiry>,
     rows_removed: usize,
     files_completed: Vec<String>,
     sessions_cleaned: Vec<i64>,
@@ -223,6 +338,10 @@ struct GcJournal {
     artifacts_reclaimed: Vec<String>,
     #[serde(default)]
     orphans_removed: Vec<String>,
+    #[serde(default)]
+    checkpoint_pins_released: Vec<i64>,
+    #[serde(default)]
+    publication_exposures_expired: Vec<i64>,
     reclaimed_bytes: u64,
 }
 
@@ -238,11 +357,15 @@ impl From<GcPlan> for GcJournal {
             remaining_worktrees: plan.worktrees,
             remaining_artifacts: plan.artifacts,
             remaining_orphans: plan.orphans,
+            remaining_checkpoint_pin_releases: plan.checkpoint_pin_releases,
+            remaining_publication_exposure_expiries: plan.publication_exposure_expiries,
             rows_removed: 0,
             files_completed: Vec::new(),
             sessions_cleaned: Vec::new(),
             artifacts_reclaimed: Vec::new(),
             orphans_removed: Vec::new(),
+            checkpoint_pins_released: Vec::new(),
+            publication_exposures_expired: Vec::new(),
             reclaimed_bytes: 0,
         }
     }
@@ -318,30 +441,9 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), BrokerOpError> {
         path: parent.to_path_buf(),
         source,
     })?;
-    let temporary = parent.join(format!(
-        ".{}.tmp-{}-{}",
-        path.file_name().unwrap_or_default().to_string_lossy(),
-        std::process::id(),
-        now_ms()
-    ));
-    let result = (|| {
-        let mut file = std::fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temporary)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        }
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        std::fs::rename(&temporary, path)?;
-        Ok::<_, std::io::Error>(())
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&temporary);
-    }
+    let result = crate::atomic_file::with_synced_temporary(path, bytes, |temporary| {
+        std::fs::rename(temporary, path)
+    });
     result.map_err(|source| crate::BrokerError::Io {
         path: path.to_path_buf(),
         source,
@@ -401,7 +503,7 @@ fn check_deadline(deadline: Option<Instant>) -> bool {
 const TREE_REMOVAL_ATTEMPTS: usize = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TreeRemoval {
+pub(crate) enum TreeRemoval {
     /// The directory is gone.
     Complete,
     /// The budget ran out. The directory is still there, still carrying the
@@ -433,7 +535,7 @@ enum TreeRemoval {
 ///   long removal fails `ENOTEMPTY` against a file created after that
 ///   directory was already emptied. A directory that refuses to go is swept
 ///   again rather than aborting the caller's whole run.
-fn remove_condemned_tree(
+pub(crate) fn remove_condemned_tree(
     dir: &Path,
     keep_until_last: Option<&str>,
     deadline: Option<Instant>,
@@ -550,9 +652,10 @@ impl Broker {
         cleanup: &[crate::CleanupWorktreePlan],
         sessions: &BTreeMap<i64, crate::Session>,
         already_removed: &[i64],
-        scan: crate::SizeScan,
-    ) -> Vec<GcArtifactCandidate> {
+        size_scan: crate::SizeScan,
+    ) -> (Vec<GcArtifactCandidate>, Vec<GcDeclinedArtifact>) {
         let mut candidates = Vec::new();
+        let mut declined = Vec::new();
         for item in cleanup {
             if !item.worktree_present || already_removed.contains(&item.session_id) {
                 continue;
@@ -573,9 +676,9 @@ impl Broker {
             let Ok(checkout) = GitRepo::discover(&root) else {
                 continue;
             };
-            let mut found = Vec::new();
-            collect_artifact_dirs(&root, &root, 0, &mut found);
-            for dir in found {
+            let artifact_scan =
+                collect_artifact_scan(&root, &policy.artefact_directories, &checkout);
+            for dir in artifact_scan.classified {
                 let Some(relative) = repo_relative(&root, &dir) else {
                     continue;
                 };
@@ -587,7 +690,7 @@ impl Broker {
                 // reports zero bytes for it, because here zero means "not
                 // measured" -- dropping it would understate the count as well
                 // as the bytes (#176).
-                let bytes = if scan.measures() {
+                let bytes = if size_scan.measures() {
                     let measured = directory_size_without_following_links(&dir).unwrap_or(0);
                     if measured == 0 {
                         continue;
@@ -604,11 +707,22 @@ impl Broker {
                     idle_days,
                 });
             }
+            if size_scan.measures() {
+                declined.extend(declined_artifacts(
+                    item.session_id,
+                    &item.worktree_path,
+                    &root,
+                    artifact_scan.declined,
+                ));
+            }
         }
         candidates.sort_by(|left, right| {
             (left.session_id, &left.relative_dir).cmp(&(right.session_id, &right.relative_dir))
         });
-        candidates
+        declined.sort_by(|left, right| {
+            (left.session_id, &left.relative_dir).cmp(&(right.session_id, &right.relative_dir))
+        });
+        (candidates, declined)
     }
 
     /// Host worktree roots whose owning repository is gone.
@@ -720,7 +834,10 @@ impl Broker {
     fn gc_plan_scanned(&mut self, scan: crate::SizeScan) -> Result<GcPlan, BrokerOpError> {
         let evaluated_at = now_ms();
         let main_root = self.main_root().to_path_buf();
-        let policy = load_retention_policy(&main_root)?;
+        let retention_config = load_retention_policy_report(&main_root)?;
+        let policy = retention_config.policy;
+        let retention_config_warnings = retention_config.warnings;
+        let exposure_cutoff = cutoff(evaluated_at, policy.publication_exposure_days);
         let cleanup = self.cleanup_plan_scanned(scan)?;
         let sessions = self
             .store()
@@ -733,9 +850,41 @@ impl Broker {
             cutoff(evaluated_at, policy.gate_results_days),
             cutoff(evaluated_at, policy.terminal_merge_queue_days),
         )?;
+        let checkpoint_pin_releases = self.store().gc_checkpoint_pin_candidates()?;
+        let live_sessions = self.store().live_sessions()?;
+        let advisories = self.store().advisories(false)?;
+        let exposures = self.store().outstanding_entry_path_exposures()?;
+        let operations = self.store().coordinated_operations()?;
+        let publication_exposure_expiries = exposures
+            .iter()
+            .filter(|exposure| exposure.created_at < exposure_cutoff)
+            .map(|exposure| GcPublicationExposureExpiry {
+                exposure_id: exposure.id,
+                queue_entry_id: exposure.queue_entry_id,
+                created_at: exposure.created_at,
+                age_days: days_between(evaluated_at, exposure.created_at),
+                reason: format!(
+                    "publication exposure exceeded the {} day retention policy; explicit expiry does not claim publication was verified",
+                    policy.publication_exposure_days
+                ),
+            })
+            .collect::<Vec<_>>();
         let mut blockers = Vec::new();
+        let mut blocked_worktree_bytes = BTreeMap::<(String, Option<i64>), u64>::new();
+        for pin in &checkpoint_pin_releases {
+            blockers.push(GcBlocker {
+                kind: "accepted_checkpoint".into(),
+                id: Some(pin.queue_entry_id),
+                reason: format!("session {}: {}", pin.session_id, pin.reason),
+            });
+        }
         for session in sessions.values() {
             if let Some(queue_entry_id) = session.accepted_queue_entry_id {
+                if checkpoint_pin_releases.iter().any(|pin| {
+                    pin.session_id == session.id && pin.queue_entry_id == queue_entry_id
+                }) {
+                    continue;
+                }
                 blockers.push(GcBlocker {
                     kind: "accepted_checkpoint".into(),
                     id: Some(queue_entry_id),
@@ -746,28 +895,28 @@ impl Broker {
                 });
             }
         }
-        for session in self.store().live_sessions()? {
+        for session in &live_sessions {
             blockers.push(GcBlocker {
                 kind: "live_session".into(),
                 id: Some(session.id),
                 reason: "live sessions and their rows are never aged out".into(),
             });
         }
-        for advisory in self.store().advisories(false)? {
+        for advisory in &advisories {
             blockers.push(GcBlocker {
                 kind: "outstanding_advisory".into(),
                 id: Some(advisory.id),
                 reason: "outstanding and acknowledged advisories remain authoritative".into(),
             });
         }
-        for exposure in self.store().outstanding_entry_path_exposures()? {
+        for exposure in &exposures {
             blockers.push(GcBlocker {
                 kind: "publication_exposure".into(),
                 id: Some(exposure.id),
                 reason: "publication has not been verified".into(),
             });
         }
-        for operation in self.store().coordinated_operations()? {
+        for operation in &operations {
             if matches!(
                 operation.status,
                 OperationStatus::Prepared
@@ -861,41 +1010,51 @@ impl Broker {
                 continue;
             };
             let closed_at = session.closed_at.unwrap_or(session.updated_at);
-            if !item.eligible() {
-                blockers.push(GcBlocker {
-                    kind: "unproven_contribution".into(),
-                    id: Some(item.session_id),
-                    reason: item.reason,
+            let retained_bytes = item.estimated_bytes.unwrap_or(0);
+            // Cleanup eligibility is the representation proof. Once it holds,
+            // GC must schedule the same worktree regardless of its age; an
+            // age gate here made `cleanup --all-cleaned` and `gc` disagree.
+            if item.eligible() {
+                worktrees.push(GcWorktreeCandidate {
+                    session_id: item.session_id,
+                    worktree_path: item.worktree_path,
+                    worktree_present: item.worktree_present,
+                    branch_ref: item.branch_ref,
+                    branch_tip: item.branch_tip,
+                    estimated_bytes: retained_bytes,
+                    closed_at,
                 });
                 continue;
             }
-            if closed_at >= worktree_cutoff {
-                blockers.push(GcBlocker {
+            // Without representation proof, the age policy is the first
+            // bounded protection. Once that window has elapsed, retain the
+            // more specific provenance blocker instead of ever scheduling
+            // the contribution for whole-worktree removal.
+            let blocker = if closed_at >= worktree_cutoff {
+                GcBlocker {
                     kind: "retention_age".into(),
                     id: Some(item.session_id),
                     reason: format!(
-                        "closed worktree is younger than the {} day policy",
-                        policy.closed_worktrees_days
+                        "closed worktree is younger than the {} day policy; cleanup eligibility: {}",
+                        policy.closed_worktrees_days, item.reason
                     ),
-                });
-                continue;
-            }
-            worktrees.push(GcWorktreeCandidate {
-                session_id: item.session_id,
-                worktree_path: item.worktree_path,
-                worktree_present: item.worktree_present,
-                branch_ref: item.branch_ref,
-                branch_tip: item.branch_tip,
-                estimated_bytes: item.estimated_bytes.unwrap_or(0),
-                closed_at,
-            });
+                }
+            } else {
+                GcBlocker {
+                    kind: "unproven_contribution".into(),
+                    id: Some(item.session_id),
+                    reason: item.reason,
+                }
+            };
+            blocked_worktree_bytes.insert((blocker.kind.clone(), blocker.id), retained_bytes);
+            blockers.push(blocker);
         }
 
         let removed_sessions = worktrees
             .iter()
             .map(|worktree| worktree.session_id)
             .collect::<Vec<_>>();
-        let mut artifacts = self.artifact_candidates(
+        let (mut artifacts, declined_artifacts) = self.artifact_candidates(
             evaluated_at,
             &policy,
             &cleanup.worktrees,
@@ -915,6 +1074,147 @@ impl Broker {
             (&left.kind, left.id, &left.reason).cmp(&(&right.kind, right.id, &right.reason))
         });
         blockers.dedup();
+        let mut blocker_facts = BTreeMap::<(String, Option<i64>), (u64, i64)>::new();
+        for pin in &checkpoint_pin_releases {
+            blocker_facts.insert(
+                ("accepted_checkpoint".into(), Some(pin.queue_entry_id)),
+                (pin.estimated_bytes, pin.recorded_at),
+            );
+        }
+        for session in &live_sessions {
+            blocker_facts.insert(
+                ("live_session".into(), Some(session.id)),
+                (0, session.created_at),
+            );
+        }
+        for advisory in &advisories {
+            blocker_facts.insert(
+                ("outstanding_advisory".into(), Some(advisory.id)),
+                (0, advisory.created_at),
+            );
+        }
+        for exposure in &exposures {
+            let estimated_bytes = exposure
+                .promotion_sha
+                .len()
+                .saturating_add(exposure.paths.iter().map(String::len).sum::<usize>())
+                .saturating_add(96) as u64;
+            blocker_facts.insert(
+                ("publication_exposure".into(), Some(exposure.id)),
+                (estimated_bytes, exposure.created_at),
+            );
+        }
+        for operation in &operations {
+            if matches!(
+                operation.status,
+                OperationStatus::Prepared
+                    | OperationStatus::Running
+                    | OperationStatus::OutcomeUnknown
+            ) {
+                blocker_facts.insert(
+                    ("unresolved_operation".into(), Some(operation.id)),
+                    (0, operation.created_at),
+                );
+            }
+        }
+        for ((kind, id), retained_bytes) in &blocked_worktree_bytes {
+            if let Some(session_id) = id {
+                if let Some(session) = sessions.get(session_id) {
+                    blocker_facts.insert(
+                        (kind.clone(), *id),
+                        (
+                            *retained_bytes,
+                            session.closed_at.unwrap_or(session.updated_at),
+                        ),
+                    );
+                }
+            }
+        }
+        let mut grouped = BTreeMap::<String, (usize, u64, Option<(i64, Option<i64>)>)>::new();
+        for blocker in &blockers {
+            let (retained_bytes, recorded_at) = blocker_facts
+                .get(&(blocker.kind.clone(), blocker.id))
+                .copied()
+                .unwrap_or((0, 0));
+            let entry = grouped.entry(blocker.kind.clone()).or_default();
+            entry.0 += 1;
+            entry.1 = entry.1.saturating_add(retained_bytes);
+            if recorded_at > 0 {
+                let member = (recorded_at, blocker.id);
+                entry.2 = Some(entry.2.map_or(member, |oldest| {
+                    if member.0 < oldest.0 || (member.0 == oldest.0 && member.1 < oldest.1) {
+                        member
+                    } else {
+                        oldest
+                    }
+                }));
+            }
+        }
+        let mut blocker_summary = grouped
+            .into_iter()
+            .map(|(kind, (count, retained_bytes, oldest))| {
+                let age_policy_days = match kind.as_str() {
+                    "accepted_checkpoint" => Some(0),
+                    "publication_exposure" => Some(policy.publication_exposure_days),
+                    "retention_age" => Some(policy.closed_worktrees_days),
+                    _ => None,
+                };
+                let oldest_id = oldest.and_then(|(_, id)| id);
+                let oldest_recorded_at = oldest.map(|(recorded_at, _)| recorded_at);
+                let oldest_age_days =
+                    oldest_recorded_at.map(|recorded_at| days_between(evaluated_at, recorded_at));
+                let age_exceeded = age_policy_days
+                    .zip(oldest_age_days)
+                    .is_some_and(|(policy_days, age_days)| age_days >= policy_days);
+                GcBlockerSummary {
+                    kind,
+                    count,
+                    retained_bytes,
+                    oldest_id,
+                    oldest_recorded_at,
+                    oldest_age_days,
+                    age_policy_days,
+                    age_exceeded,
+                }
+            })
+            .collect::<Vec<_>>();
+        blocker_summary.sort_by(|left, right| {
+            right
+                .retained_bytes
+                .cmp(&left.retained_bytes)
+                .then_with(|| right.count.cmp(&left.count))
+                .then_with(|| left.kind.cmp(&right.kind))
+        });
+        let mut worktree_blocker_summary = blocked_worktree_bytes
+            .iter()
+            .filter_map(|((kind, id), retained_bytes)| {
+                let blocker = blockers
+                    .iter()
+                    .find(|blocker| blocker.kind == *kind && blocker.id == *id)?;
+                Some((blocker.kind.clone(), *retained_bytes))
+            })
+            .fold(
+                BTreeMap::<String, (usize, u64)>::new(),
+                |mut summary, (kind, bytes)| {
+                    let entry = summary.entry(kind).or_default();
+                    entry.0 += 1;
+                    entry.1 = entry.1.saturating_add(bytes);
+                    summary
+                },
+            )
+            .into_iter()
+            .map(|(kind, (count, retained_bytes))| GcWorktreeBlockerSummary {
+                kind,
+                count,
+                retained_bytes,
+            })
+            .collect::<Vec<_>>();
+        worktree_blocker_summary.sort_by(|left, right| {
+            right
+                .retained_bytes
+                .cmp(&left.retained_bytes)
+                .then_with(|| left.kind.cmp(&right.kind))
+        });
         let estimated_reclaimable_bytes = rows
             .iter()
             .map(|row| row.estimated_bytes)
@@ -926,6 +1226,10 @@ impl Broker {
             .chain(worktrees.iter().map(|worktree| worktree.estimated_bytes))
             .chain(artifacts.iter().map(|artifact| artifact.estimated_bytes))
             .chain(orphans.iter().map(|orphan| orphan.estimated_bytes))
+            .fold(0_u64, u64::saturating_add);
+        let estimated_declined_artifact_bytes = declined_artifacts
+            .iter()
+            .map(|artifact| artifact.estimated_bytes)
             .fold(0_u64, u64::saturating_add);
         // Retained bytes describe disk pressure, not authorized work: every
         // byte held by a retained worktree plus every orphaned host root.
@@ -1004,15 +1308,22 @@ impl Broker {
             digest: String::new(),
             evaluated_at,
             policy,
+            retention_config_warnings,
             rows,
             files,
             worktrees,
             artifacts,
             orphans,
             blockers,
+            checkpoint_pin_releases,
+            publication_exposure_expiries,
+            blocker_summary,
+            worktree_blocker_summary,
+            declined_artifacts,
             estimated_reclaimable_bytes,
             estimated_retained_bytes,
             estimated_blocked_bytes,
+            estimated_declined_artifact_bytes,
             reclaim_order,
             retained_bytes_deficit: crate::reclaim_order::deficit_bytes(
                 estimated_retained_bytes,
@@ -1051,6 +1362,7 @@ impl Broker {
         let over_retained_bytes_budget = plan.budget_verdict.exceeded();
         Ok(GcHealth {
             policy: plan.policy,
+            retention_config_warnings: plan.retention_config_warnings,
             pending_recovery_digest: journal.map(|journal| journal.digest),
             candidate_rows: plan.rows.len(),
             candidate_files: plan.files.len(),
@@ -1164,7 +1476,13 @@ impl Broker {
             };
             eligible_worktree_seen = true;
             let mut found = Vec::new();
-            collect_artifact_dirs(&root, &root, 0, &mut found);
+            collect_artifact_dirs_with_extras(
+                &root,
+                &root,
+                0,
+                &policy.artefact_directories,
+                &mut found,
+            );
             for dir in found {
                 let Some(relative) = repo_relative(&root, &dir) else {
                     continue;
@@ -1173,7 +1491,8 @@ impl Broker {
                     continue;
                 }
                 let deferrable =
-                    artifact_witness_for(&dir).and_then(ArtifactWitness::deferrable_entry);
+                    artifact_witness_for_with_extras(&dir, &policy.artefact_directories)
+                        .and_then(ArtifactWitness::deferrable_entry);
                 match remove_condemned_tree(&dir, deferrable, Some(deadline)) {
                     Ok(TreeRemoval::Complete) => {
                         removed.push(dir.to_string_lossy().into_owned());
@@ -1266,6 +1585,68 @@ impl Broker {
         };
         let deadline = budget_ms.map(|budget| Instant::now() + Duration::from_millis(budget));
         let mut failures = Vec::new();
+
+        while !journal.remaining_checkpoint_pin_releases.is_empty() && !check_deadline(deadline) {
+            let candidate = journal.remaining_checkpoint_pin_releases[0].clone();
+            let consume = match self.store().release_gc_checkpoint_pin(&candidate) {
+                Ok(true) => {
+                    journal.checkpoint_pins_released.push(candidate.session_id);
+                    true
+                }
+                Ok(false) => {
+                    failures.push(format!(
+                        "session {} checkpoint pin changed; review a new GC plan",
+                        candidate.session_id
+                    ));
+                    true
+                }
+                Err(error) => {
+                    failures.push(format!(
+                        "session {} checkpoint pin release failed: {error}",
+                        candidate.session_id
+                    ));
+                    false
+                }
+            };
+            if !consume {
+                break;
+            }
+            journal.remaining_checkpoint_pin_releases.remove(0);
+            write_journal(&journal_path, &journal)?;
+        }
+
+        while !journal.remaining_publication_exposure_expiries.is_empty()
+            && !check_deadline(deadline)
+        {
+            let candidate = journal.remaining_publication_exposure_expiries[0].clone();
+            let consume = match self.store().expire_gc_publication_exposure(&candidate) {
+                Ok(true) => {
+                    journal
+                        .publication_exposures_expired
+                        .push(candidate.exposure_id);
+                    true
+                }
+                Ok(false) => {
+                    failures.push(format!(
+                        "publication exposure {} changed; review a new GC plan",
+                        candidate.exposure_id
+                    ));
+                    true
+                }
+                Err(error) => {
+                    failures.push(format!(
+                        "publication exposure {} expiry failed: {error}",
+                        candidate.exposure_id
+                    ));
+                    false
+                }
+            };
+            if !consume {
+                break;
+            }
+            journal.remaining_publication_exposure_expiries.remove(0);
+            write_journal(&journal_path, &journal)?;
+        }
 
         while !journal.remaining_rows.is_empty() && !check_deadline(deadline) {
             let count = journal.remaining_rows.len().min(128);
@@ -1454,7 +1835,27 @@ impl Broker {
                 write_journal(&journal_path, &journal)?;
                 continue;
             }
-            let Some(witness) = artifact_witness_for(&dir) else {
+            let Ok(checkout) = GitRepo::discover(&root) else {
+                failures.push(format!(
+                    "{}: its checkout disappeared; review a new GC plan",
+                    candidate.relative_dir
+                ));
+                journal.remaining_artifacts.remove(0);
+                write_journal(&journal_path, &journal)?;
+                continue;
+            };
+            if !checkout.path_is_ignored(&candidate.relative_dir) {
+                failures.push(format!(
+                    "{}: is no longer git-ignored; review a new GC plan",
+                    candidate.relative_dir
+                ));
+                journal.remaining_artifacts.remove(0);
+                write_journal(&journal_path, &journal)?;
+                continue;
+            }
+            let Some(witness) =
+                artifact_witness_for_with_extras(&dir, &journal.policy.artefact_directories)
+            else {
                 failures.push(format!(
                     "{}: no longer a reclaimable build directory; review a new GC plan",
                     candidate.relative_dir
@@ -1527,12 +1928,16 @@ impl Broker {
         }
 
         let deadline_reached = check_deadline(deadline)
-            && (!journal.remaining_rows.is_empty()
+            && (!journal.remaining_checkpoint_pin_releases.is_empty()
+                || !journal.remaining_publication_exposure_expiries.is_empty()
+                || !journal.remaining_rows.is_empty()
                 || !journal.remaining_files.is_empty()
                 || !journal.remaining_worktrees.is_empty()
                 || !journal.remaining_artifacts.is_empty()
                 || !journal.remaining_orphans.is_empty());
         let complete = journal.remaining_rows.is_empty()
+            && journal.remaining_checkpoint_pin_releases.is_empty()
+            && journal.remaining_publication_exposure_expiries.is_empty()
             && journal.remaining_files.is_empty()
             && journal.remaining_worktrees.is_empty()
             && journal.remaining_artifacts.is_empty()
@@ -1548,6 +1953,8 @@ impl Broker {
             sessions_cleaned: journal.sessions_cleaned.clone(),
             artifacts_reclaimed: journal.artifacts_reclaimed.clone(),
             orphans_removed: journal.orphans_removed.clone(),
+            checkpoint_pins_released: journal.checkpoint_pins_released.clone(),
+            publication_exposures_expired: journal.publication_exposures_expired.clone(),
             reclaimed_bytes: journal.reclaimed_bytes,
             failures,
             recovery_action,
@@ -1560,6 +1967,8 @@ impl Broker {
                 "sessions_cleaned": report.sessions_cleaned.len(),
                 "artifacts_reclaimed": report.artifacts_reclaimed.len(),
                 "orphans_removed": report.orphans_removed.len(),
+                "checkpoint_pins_released": report.checkpoint_pins_released.len(),
+                "publication_exposures_expired": report.publication_exposures_expired.len(),
                 "reclaimed_bytes": report.reclaimed_bytes,
             })
             .to_string();
@@ -1577,6 +1986,35 @@ impl Broker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_gc_journal_defaults_new_protection_work() {
+        let mut policy = serde_json::to_value(RetentionPolicy::default()).unwrap();
+        policy
+            .as_object_mut()
+            .unwrap()
+            .remove("publication_exposure_days");
+        let journal = serde_json::json!({
+            "schema_version": GC_PLAN_SCHEMA_VERSION,
+            "digest": "a".repeat(64),
+            "evaluated_at": 1,
+            "policy": policy,
+            "remaining_rows": [],
+            "remaining_files": [],
+            "remaining_worktrees": [],
+            "rows_removed": 0,
+            "files_completed": [],
+            "sessions_cleaned": [],
+            "reclaimed_bytes": 0
+        });
+        let parsed: GcJournal = serde_json::from_value(journal).unwrap();
+        assert_eq!(
+            parsed.policy.publication_exposure_days,
+            RetentionPolicy::default().publication_exposure_days
+        );
+        assert!(parsed.remaining_checkpoint_pin_releases.is_empty());
+        assert!(parsed.remaining_publication_exposure_expiries.is_empty());
+    }
 
     fn dir(root: &Path, relative: &str) -> PathBuf {
         let path = root.join(relative);
@@ -1605,6 +2043,18 @@ mod tests {
         let source = dir(root, "src/target");
         std::fs::write(source.join("main.rs"), "fn main() {}\n").unwrap();
         assert!(artifact_witness_for(&source).is_none());
+    }
+
+    #[test]
+    fn configured_source_and_control_names_are_never_artifacts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = dir(tmp.path(), "src");
+        std::fs::write(source.join("main.rs"), "fn main() {}\n").unwrap();
+
+        assert!(
+            artifact_witness_for_with_extras(&source, &["src".into()]).is_none(),
+            "configured source roots must not become deletion candidates"
+        );
     }
 
     #[test]

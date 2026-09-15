@@ -684,11 +684,17 @@ fn a_finished_reviewers_workspace_is_reclaimed_and_becomes_dispatchable_again() 
         pr_number: 77,
         review_type: "security".into(),
         head_commit: "aaa111".into(),
+        requested_for_commit: Some("aaa111".into()),
         base_commit: None,
         backend: "chau7".into(),
+        trigger: None,
         state,
         detail: None,
-        requested_at: 0,
+        requested_at: Some(0),
+        completed_at: None,
+        completed_for_commit: None,
+        verdict: None,
+        reviewer: None,
         updated_at: 0,
     };
     let live = [row(ReviewRequestState::Running)];

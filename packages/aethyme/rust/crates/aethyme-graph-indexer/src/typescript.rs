@@ -69,6 +69,10 @@ impl LanguageIndexer for TypeScriptIndexer {
         "typescript"
     }
 
+    fn parser(&self) -> &'static str {
+        "oxc_parser"
+    }
+
     fn index_file(
         &self,
         ctx: &IndexerContext,

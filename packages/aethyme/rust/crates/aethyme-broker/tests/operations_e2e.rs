@@ -175,12 +175,32 @@ fn successful_operation_is_durably_journaled_with_events() {
         Some("test workflow")
     );
     assert!(report.operation.command_json.contains("coordinated"));
+    let details: serde_json::Value =
+        serde_json::from_str(report.operation.details_json.as_deref().unwrap()).unwrap();
+    let timing = &details["coordination_timing"];
+    assert_eq!(timing["schema_version"], 1);
+    assert!(
+        timing["lock_key"]
+            .as_str()
+            .is_some_and(|key| !key.is_empty())
+    );
+    assert!(timing["lock_acquired_at"].as_i64().is_some());
+    assert!(timing["lock_released_at"].as_i64().is_some());
+    assert!(
+        timing["lock_hold_ms"]
+            .as_i64()
+            .is_some_and(|value| value >= 0)
+    );
 
     let events = broker.store().events_after(0, i64::MAX).unwrap();
     let kinds: Vec<&str> = events.iter().map(|event| event.kind.as_str()).collect();
     assert!(kinds.contains(&"operation.prepared"));
     assert!(kinds.contains(&"operation.running"));
     assert!(kinds.contains(&"operation.succeeded"));
+
+    let stats = broker.coordinated_operation_stats(None, 50).unwrap();
+    assert_eq!(stats.measured_operations, 1);
+    assert_eq!(stats.by_kind[0].kind, "git.branch");
 }
 
 #[test]
@@ -255,6 +275,23 @@ fn destructive_and_ambiguous_operations_fail_closed() {
             .contains("exact owner/name slug")
     );
     assert!(broker.store().coordinated_operations().unwrap().is_empty());
+}
+
+#[test]
+fn unknown_mutating_git_commands_are_recorded_as_outcome_unknown() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let worktree = add_worktree(tmp.path(), "unknown-command");
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let session = broker.adopt(&worktree, None).unwrap();
+    let mut command = request(session.id, &["-c", "core.test=true", "unknown-extension"]);
+    command.declared_effect = Some(OperationEffect::Write);
+    command.scope = Some("repository".into());
+
+    let report = broker.run_coordinated_operation(command).unwrap();
+
+    assert_eq!(report.operation.status, OperationStatus::OutcomeUnknown);
+    assert!(!report.command_success);
 }
 
 #[test]
@@ -789,7 +826,7 @@ fn crashed_write_blocks_until_operator_reconciliation() {
 }
 
 #[test]
-fn nonzero_write_is_unknown_because_partial_effects_are_possible() {
+fn local_git_conflict_is_failed_without_remote_recovery_or_write_block() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());
     let worktree = add_worktree(tmp.path(), "partial");
@@ -800,31 +837,18 @@ fn nonzero_write_is_unknown_because_partial_effects_are_possible() {
         .run_coordinated_operation(request(session.id, &["branch", "main"]))
         .unwrap();
     assert!(!report.command_success);
-    assert_eq!(report.operation.status, OperationStatus::OutcomeUnknown);
-    let recovery = report.unknown_outcome_recovery().unwrap().to_string();
-    assert!(recovery.contains("Canonical repository local:"));
-    assert!(recovery.contains("is now write-blocked"));
-    assert!(recovery.contains(&format!("Operation ID: {}", report.operation.id)));
-    assert!(recovery.contains("Inspect local Git refs and worktree state"));
-    assert!(recovery.contains(&format!(
-        "aethyme broker operations reconcile --operation {} --outcome succeeded --reason \"external inspection confirmed operation {} took effect\"",
-        report.operation.id, report.operation.id
-    )));
-    assert!(recovery.contains(&format!(
-        "aethyme broker operations reconcile --operation {} --outcome failed --reason \"external inspection confirmed operation {} did not take effect\"",
-        report.operation.id, report.operation.id
-    )));
-    assert!(recovery.contains("Blind retry is forbidden"));
+    assert_eq!(report.operation.status, OperationStatus::Failed);
+    let details: serde_json::Value =
+        serde_json::from_str(report.operation.details_json.as_deref().unwrap()).unwrap();
+    assert_eq!(details["failure_class"], "local_git_command_failed");
+    assert_eq!(details["remote_contact"], "not_applicable");
+    assert_eq!(details["recovery"], "inspect_or_abort_local_worktree_state");
+    assert!(report.unknown_outcome_recovery().is_none());
 
-    let blocked = broker
+    let retry = broker
         .run_coordinated_operation(request(session.id, &["branch", "after-nonzero"]))
-        .unwrap_err();
-    assert_eq!(blocked.to_string(), recovery);
-    assert!(matches!(
-        blocked,
-        BrokerOpError::CoordinatedOperationBlocked { operation_id, .. }
-            if operation_id == report.operation.id
-    ));
+        .unwrap();
+    assert!(retry.ok());
 }
 
 #[test]

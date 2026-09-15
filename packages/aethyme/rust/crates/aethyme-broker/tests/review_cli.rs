@@ -1253,25 +1253,45 @@ fn seed_review_request(fixture: &Fixture, review_type: &str, head: &str) {
 }
 
 fn review_state(fixture: &Fixture, review_type: &str, head: &str, state: &str) -> Output {
-    fixture.run(
-        &[
-            "review",
-            "state",
-            "--repo",
-            "acme/product",
-            "--pr",
-            "42",
-            "--type",
-            review_type,
-            "--head",
-            head,
-            "--state",
-            state,
-        ],
-        "",
-        true,
-        None,
-    )
+    let completion_head = if state == "satisfied" {
+        let store = aethyme_broker::BrokerStore::open_in_repo(fixture.root.path()).unwrap();
+        store
+            .review_requests_for_pr("acme/product", 42)
+            .unwrap()
+            .into_iter()
+            .find(|row| row.review_type == review_type && row.head_commit.starts_with(head))
+            .map(|row| row.head_commit)
+            .unwrap_or_else(|| head.to_string())
+    } else {
+        head.to_string()
+    };
+    let mut args = vec![
+        "review",
+        "state",
+        "--repo",
+        "acme/product",
+        "--pr",
+        "42",
+        "--type",
+        review_type,
+        "--head",
+        head,
+        "--state",
+        state,
+    ];
+    if state == "satisfied" {
+        args.extend_from_slice(&[
+            "--completed-for-commit",
+            &completion_head,
+            "--verdict",
+            "pass",
+            "--reviewer-provider",
+            "test-provider",
+            "--reviewer-model",
+            "test-model",
+        ]);
+    }
+    fixture.run(&args, "", true, None)
 }
 
 fn review_waive(fixture: &Fixture, args: &[&str]) -> Output {
@@ -1281,6 +1301,201 @@ fn review_waive(fixture: &Fixture, args: &[&str]) -> Output {
 }
 
 const WAIVE_HEAD: &str = "0000000000111111111122222222223333333333";
+
+const COMPLETION_HEAD: &str = "1111111111222222222233333333334444444444";
+
+/// A lifecycle label alone is not a review result. Requiring the typed
+/// completion facts prevents the old free-text-only path from creating a
+/// satisfied row that no gate can safely interpret.
+#[test]
+fn a_satisfied_state_requires_typed_completion_facts() {
+    let fixture = Fixture::new();
+    seed_review_request(&fixture, "code", WAIVE_HEAD);
+    let refused = fixture.run(
+        &[
+            "review",
+            "state",
+            "--repo",
+            "acme/product",
+            "--pr",
+            "42",
+            "--type",
+            "code",
+            "--head",
+            WAIVE_HEAD,
+            "--state",
+            "satisfied",
+        ],
+        "",
+        true,
+        None,
+    );
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("--verdict"),
+        "the refusal must name the missing typed fact: {}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert_eq!(review_row(&fixture, "code")["state"], "requested");
+}
+
+/// A completion can be bound to a different commit than the one Aethyme
+/// requested. Both facts and the actual reviewer identity must survive the
+/// state transition independently.
+#[test]
+fn a_completion_records_distinct_commit_and_reviewer_identity() {
+    let fixture = Fixture::new();
+    seed_review_request(&fixture, "code", WAIVE_HEAD);
+    let completed = fixture.run(
+        &[
+            "review",
+            "state",
+            "--repo",
+            "acme/product",
+            "--pr",
+            "42",
+            "--type",
+            "code",
+            "--head",
+            WAIVE_HEAD,
+            "--state",
+            "satisfied",
+            "--completed-for-commit",
+            COMPLETION_HEAD,
+            "--verdict",
+            "changes_requested",
+            "--reviewer-provider",
+            "github",
+            "--reviewer-model",
+            "reviewer-model",
+            "--note",
+            "one blocking finding",
+            "--json",
+        ],
+        "",
+        true,
+        None,
+    );
+    assert!(
+        completed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&completed.stderr)
+    );
+    let row = review_row(&fixture, "code");
+    assert_eq!(row["state"], "satisfied");
+    assert_eq!(row["head_commit"], WAIVE_HEAD);
+    assert_eq!(row["requested_for_commit"], WAIVE_HEAD);
+    assert_eq!(row["completed_for_commit"], COMPLETION_HEAD);
+    assert_eq!(row["verdict"], "changes_requested");
+    assert_eq!(row["reviewer"]["provider"], "github");
+    assert_eq!(row["reviewer"]["model"], "reviewer-model");
+    assert_eq!(row["trigger"], "manual");
+    assert_eq!(row["detail"], "one blocking finding");
+    assert!(row["requested_at"].is_number());
+    assert!(row["completed_at"].is_number());
+}
+
+/// Providers can finish a review that arrived outside Aethyme's router. The
+/// completion is retained without fabricating request provenance, and the
+/// explicit trigger makes that distinction visible to later reconciliation.
+#[test]
+fn an_unsolicited_completion_is_recorded_without_request_facts() {
+    let fixture = Fixture::new();
+    let completed = fixture.run(
+        &[
+            "review",
+            "state",
+            "--repo",
+            "acme/product",
+            "--pr",
+            "42",
+            "--type",
+            "security",
+            "--state",
+            "satisfied",
+            "--completed-for-commit",
+            COMPLETION_HEAD,
+            "--verdict",
+            "pass",
+            "--reviewer-provider",
+            "github",
+            "--reviewer-model",
+            "reviewer-model",
+            "--json",
+        ],
+        "",
+        true,
+        None,
+    );
+    assert!(
+        completed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&completed.stderr)
+    );
+    let row = review_row(&fixture, "security");
+    assert_eq!(row["state"], "satisfied");
+    assert_eq!(row["requested_for_commit"], serde_json::Value::Null);
+    assert_eq!(row["requested_at"], serde_json::Value::Null);
+    assert_eq!(row["trigger"], "unsolicited");
+    assert_eq!(row["completed_for_commit"], COMPLETION_HEAD);
+    assert_eq!(row["verdict"], "pass");
+    assert_eq!(row["reviewer"]["provider"], "github");
+}
+
+/// A completion for a new head must not be attached to the latest unrelated
+/// request merely because `--head` was omitted. The completion commit is the
+/// identity for the unsolicited row; a late result for the older request must
+/// name that request explicitly.
+#[test]
+fn an_unmatched_completion_does_not_rewrite_the_latest_request() {
+    let fixture = Fixture::new();
+    seed_review_request(&fixture, "code", WAIVE_HEAD);
+    let completed = fixture.run(
+        &[
+            "review",
+            "state",
+            "--repo",
+            "acme/product",
+            "--pr",
+            "42",
+            "--type",
+            "code",
+            "--state",
+            "satisfied",
+            "--completed-for-commit",
+            COMPLETION_HEAD,
+            "--verdict",
+            "pass",
+            "--reviewer-provider",
+            "github",
+        ],
+        "",
+        true,
+        None,
+    );
+    assert!(
+        completed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&completed.stderr)
+    );
+
+    let store = aethyme_broker::BrokerStore::open_in_repo(fixture.root.path()).unwrap();
+    let rows = store
+        .review_requests_for_pr("acme/product", 42)
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    let requested = rows
+        .iter()
+        .find(|row| row.head_commit == WAIVE_HEAD)
+        .unwrap();
+    assert_eq!(requested.state, aethyme_broker::ReviewRequestState::Requested);
+    let unsolicited = rows
+        .iter()
+        .find(|row| row.head_commit == COMPLETION_HEAD)
+        .unwrap();
+    assert_eq!(unsolicited.requested_for_commit, None);
+    assert_eq!(unsolicited.trigger, Some(aethyme_broker::ReviewTrigger::Unsolicited));
+}
 
 /// The issue in one test: waiving the dimension that is stuck must leave every
 /// other dimension exactly as blocking as it was, and must say who did it.
@@ -1790,7 +2005,10 @@ fn a_refusal_a_later_request_superseded_stops_being_reported() {
                 "0000000000111111111122222222223333333333",
                 None,
                 "chau7",
-                refused[0].requested_at + 1,
+                refused[0]
+                    .requested_at
+                    .expect("a routed refusal has a request")
+                    + 1,
             )
             .unwrap();
         assert!(

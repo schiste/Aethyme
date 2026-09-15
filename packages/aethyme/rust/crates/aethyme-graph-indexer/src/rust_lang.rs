@@ -66,6 +66,10 @@ impl LanguageIndexer for RustIndexer {
         "rust"
     }
 
+    fn parser(&self) -> &'static str {
+        "ra_ap_syntax"
+    }
+
     fn index_file(
         &self,
         ctx: &IndexerContext,
