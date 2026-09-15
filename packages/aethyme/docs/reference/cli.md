@@ -1460,7 +1460,11 @@ because it may apply only part of its requested change before failing. A
 non-zero local Git command is instead recorded as `failed` with
 `local_git_command_failed` recovery metadata: it cannot have an uncertain
 remote effect, so it does not trigger remote reconciliation or write-block the
-canonical repository. The broker can resolve a non-zero `git push` more
+canonical repository. The journal also records
+`remote_contact: not_applicable` and
+`recovery: inspect_or_abort_local_worktree_state`, so the operator can
+repair or abandon the local checkout without consulting remote state. The
+broker can resolve a non-zero `git push` more
 precisely when every refspec explicitly
 names one non-deletion source and one fully-qualified destination
 (`[+]source:refs/...`). Before execution it records each proposed object and
