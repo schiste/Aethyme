@@ -258,6 +258,23 @@ fn destructive_and_ambiguous_operations_fail_closed() {
 }
 
 #[test]
+fn unknown_mutating_git_commands_are_recorded_as_outcome_unknown() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let worktree = add_worktree(tmp.path(), "unknown-command");
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let session = broker.adopt(&worktree, None).unwrap();
+    let mut command = request(session.id, &["-c", "core.test=true", "unknown-extension"]);
+    command.declared_effect = Some(OperationEffect::Write);
+    command.scope = Some("repository".into());
+
+    let report = broker.run_coordinated_operation(command).unwrap();
+
+    assert_eq!(report.operation.status, OperationStatus::OutcomeUnknown);
+    assert!(!report.command_success);
+}
+
+#[test]
 fn leading_git_directory_selects_a_linked_worktree_but_refuses_other_repositories() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());
