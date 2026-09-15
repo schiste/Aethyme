@@ -140,7 +140,7 @@ pub use broker::{
     IntegrationStabilityReport, IntegrationStatusView, LeaseBlocker, LeaseClaimReport,
     LeaseOverlapRelation, LeasePathPlan, LeasePlan, LeasePlanOverlap, OwnershipAuditReport,
     PromotedConflict, PromotedIntegrationEntry, RepairAction, RepairGateSelection, RepairReport,
-    RepairSource, RepresentationScan, SESSION_NOTE_MAX_BYTES, SemanticGateAdvice,
+    RepairSource, RepresentationScan, RetentionConfigStatus, SESSION_NOTE_MAX_BYTES, SemanticGateAdvice,
     SemanticGateSelection, SemanticGateSource, SemanticGateSourceStatus,
     SemanticGateSuggestionChain, SessionCheckpointApplyReport, SessionCheckpointRecoveryPlan,
     SessionHandoffReport, SessionStartBase, SessionStartBaseEvidence, StartAgentReport,
@@ -347,8 +347,9 @@ pub use resources::{
 pub use retention::{
     BROKER_CONFIG_RELPATH, GcApplyReport, GcArtifactCandidate, GcBlocker, GcFileAction,
     GcFileCandidate, GcHealth, GcOrphanCandidate, GcPlan, GcRowCandidate, GcRowKind,
-    GcWorktreeCandidate, RETENTION_POLICY_SCHEMA_VERSION, RetentionConfigError, RetentionPolicy,
-    load_retention_policy,
+    GcWorktreeCandidate, RETENTION_POLICY_SCHEMA_VERSION, RetentionConfigError,
+    RetentionConfigWarning, RetentionPolicy, RetentionPolicyLoadReport, load_retention_policy,
+    load_retention_policy_report,
 };
 pub use review::{
     REVIEW_POLICY_SCHEMA_VERSION, ReviewEvidenceAdapter, ReviewLifecycle,

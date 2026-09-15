@@ -1044,6 +1044,13 @@ routine_size_budget_ms = 200
 size_record_ttl_hours = 24
 ```
 
+Retention parsing reads `schema_version` before the field set. An older binary
+therefore ignores and reports each retention key it does not know while still
+applying the known settings; this keeps a newer config from disabling all
+reclamation. A schema version newer than the binary remains an explicit
+`UnsupportedSchema` error. `broker status` and `broker gates doctor` surface
+ignored or invalid retention keys with the remediation to edit this file.
+
 `retained_bytes_budget` is a soft, non-blocking budget used by status, doctor,
 and finish warnings; `0` disables only those warnings. It never authorizes
 deletion. `artifact_reclaim_days` and `orphan_worktree_roots_days` accept `0`,

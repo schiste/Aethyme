@@ -12,6 +12,24 @@ use sha2::{Digest, Sha256};
 pub const BROKER_CONFIG_RELPATH: &str = ".aethyme/broker.toml";
 pub const RETENTION_POLICY_SCHEMA_VERSION: u32 = 1;
 
+const RETENTION_POLICY_FIELDS: &[&str] = &[
+    "schema_version",
+    "terminal_events_days",
+    "gate_results_days",
+    "terminal_merge_queue_days",
+    "command_metrics_days",
+    "closed_worktrees_days",
+    "retained_bytes_budget",
+    "artifact_reclaim_days",
+    "orphan_worktree_roots_days",
+    "session_abandoned_after_hours",
+    "artifact_sweep_budget_ms",
+    "artifact_sweep_interval_hours",
+    "startup_budget_ms",
+    "routine_size_budget_ms",
+    "size_record_ttl_hours",
+];
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RetentionPolicy {
@@ -180,12 +198,6 @@ impl RetentionPolicy {
     }
 }
 
-#[derive(Debug, Clone, Default, serde::Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct BrokerConfig {
-    retention: RetentionPolicy,
-}
-
 #[derive(Debug, thiserror::Error)]
 pub enum RetentionConfigError {
     #[error("cannot read broker retention config at {path}: {source}")]
@@ -195,7 +207,9 @@ pub enum RetentionConfigError {
     },
     #[error("broker.toml: {0}")]
     Parse(String),
-    #[error("unsupported retention policy schema {found}; this binary supports schema {supported}")]
+    #[error(
+        "unsupported retention policy schema {found}; this binary supports schema {supported}"
+    )]
     UnsupportedSchema { found: u32, supported: u32 },
     #[error("retention.{field}={value} is invalid: {constraint}")]
     InvalidValue {
@@ -205,19 +219,122 @@ pub enum RetentionConfigError {
     },
 }
 
-pub fn load_retention_policy(repo: &Path) -> Result<RetentionPolicy, RetentionConfigError> {
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct RetentionConfigWarning {
+    /// The dotted configuration key that was ignored.
+    pub field: String,
+    pub message: String,
+}
+
+impl std::fmt::Display for RetentionConfigWarning {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}: {}", self.field, self.message)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RetentionPolicyLoadReport {
+    pub policy: RetentionPolicy,
+    pub warnings: Vec<RetentionConfigWarning>,
+}
+
+fn unknown_retention_field_warning(field: String, schema_version: u32) -> RetentionConfigWarning {
+    RetentionConfigWarning {
+        message: format!(
+            "unknown field `{field}` for retention schema {schema_version}; ignored so known retention settings remain active; check its spelling or upgrade Aethyme if intentional"
+        ),
+        field,
+    }
+}
+
+fn unknown_broker_field_warning(field: String) -> RetentionConfigWarning {
+    RetentionConfigWarning {
+        message: format!(
+            "unknown broker configuration field `{field}`; ignored so known broker settings remain active; check its spelling or upgrade Aethyme if intentional"
+        ),
+        field,
+    }
+}
+
+/// Read the version marker before deserializing the policy's field set.
+///
+/// The version is the compatibility boundary: an older binary can safely
+/// ignore a field it does not know while still applying the fields it does
+/// know, but it must refuse a schema whose semantics it cannot interpret.
+pub fn load_retention_policy_report(
+    repo: &Path,
+) -> Result<RetentionPolicyLoadReport, RetentionConfigError> {
     let path = repo.join(BROKER_CONFIG_RELPATH);
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(RetentionPolicy::default());
+            return Ok(RetentionPolicyLoadReport {
+                policy: RetentionPolicy::default(),
+                warnings: Vec::new(),
+            });
         }
         Err(source) => return Err(RetentionConfigError::Io { path, source }),
     };
-    let config: BrokerConfig = toml::from_str(&text)
+
+    let root: toml::Value = toml::from_str(&text)
         .map_err(|error: toml::de::Error| RetentionConfigError::Parse(error.to_string()))?;
-    config.retention.validate()?;
-    Ok(config.retention)
+    let root = root.as_table().ok_or_else(|| {
+        RetentionConfigError::Parse("the document root must be a TOML table".into())
+    })?;
+    let mut warnings = Vec::new();
+    for field in root.keys().filter(|field| field.as_str() != "retention") {
+        warnings.push(unknown_broker_field_warning(format!("broker.{field}")));
+    }
+
+    let retention = match root.get("retention") {
+        None => toml::map::Map::new(),
+        Some(toml::Value::Table(retention)) => retention.clone(),
+        Some(_) => {
+            return Err(RetentionConfigError::Parse(
+                "the `retention` value must be a TOML table".into(),
+            ));
+        }
+    };
+    let schema_version = match retention.get("schema_version") {
+        None => RETENTION_POLICY_SCHEMA_VERSION,
+        Some(toml::Value::Integer(value)) if (0..=i64::from(u32::MAX)).contains(value) => {
+            *value as u32
+        }
+        Some(_) => {
+            return Err(RetentionConfigError::Parse(
+                "retention.schema_version must be an unsigned integer".into(),
+            ));
+        }
+    };
+    if schema_version != RETENTION_POLICY_SCHEMA_VERSION {
+        return Err(RetentionConfigError::UnsupportedSchema {
+            found: schema_version,
+            supported: RETENTION_POLICY_SCHEMA_VERSION,
+        });
+    }
+
+    let mut known_fields = toml::map::Map::new();
+    for (field, value) in retention {
+        if RETENTION_POLICY_FIELDS.contains(&field.as_str()) {
+            known_fields.insert(field, value);
+        } else {
+            warnings.push(unknown_retention_field_warning(
+                format!("retention.{field}"),
+                schema_version,
+            ));
+        }
+    }
+    warnings.sort_by(|left, right| left.field.cmp(&right.field));
+
+    let policy: RetentionPolicy = toml::Value::Table(known_fields)
+        .try_into()
+        .map_err(|error: toml::de::Error| RetentionConfigError::Parse(error.to_string()))?;
+    policy.validate()?;
+    Ok(RetentionPolicyLoadReport { policy, warnings })
+}
+
+pub fn load_retention_policy(repo: &Path) -> Result<RetentionPolicy, RetentionConfigError> {
+    Ok(load_retention_policy_report(repo)?.policy)
 }
 
 #[derive(
@@ -315,6 +432,10 @@ pub struct GcPlan {
     pub digest: String,
     pub evaluated_at: i64,
     pub policy: RetentionPolicy,
+    /// Unknown fields are ignored for forward compatibility, but remain in
+    /// the plan so the operator sees exactly what this binary did not apply.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retention_config_warnings: Vec<RetentionConfigWarning>,
     pub rows: Vec<GcRowCandidate>,
     pub files: Vec<GcFileCandidate>,
     pub worktrees: Vec<GcWorktreeCandidate>,
@@ -387,6 +508,8 @@ pub struct GcApplyReport {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct GcHealth {
     pub policy: RetentionPolicy,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retention_config_warnings: Vec<RetentionConfigWarning>,
     pub pending_recovery_digest: Option<String>,
     pub candidate_rows: usize,
     pub candidate_files: usize,
@@ -464,6 +587,7 @@ impl GcPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     #[test]
     fn missing_config_uses_conservative_bounded_defaults() {
@@ -503,10 +627,87 @@ mod tests {
     }
 
     #[test]
-    fn unknown_fields_versions_and_unbounded_values_fail_closed() {
+    fn retention_field_allowlist_matches_serialized_policy_keys() {
+        let serialized = toml::Value::try_from(RetentionPolicy::default()).unwrap();
+        let serialized_fields = serialized
+            .as_table()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        let allowlisted_fields = RETENTION_POLICY_FIELDS
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(
+            serialized_fields, allowlisted_fields,
+            "retention parsing allowlist must stay in lockstep with RetentionPolicy"
+        );
+    }
+
+    #[test]
+    fn unknown_fields_warn_and_known_values_still_apply() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir(repo.path().join(".aethyme")).unwrap();
+        std::fs::write(
+            repo.path().join(BROKER_CONFIG_RELPATH),
+            "[retention]\nartifact_sweep_budget_ms = 0\nroutine_size_budget_ms = 0\nfuture_sweep_days = 14\n",
+        )
+        .unwrap();
+
+        let report = load_retention_policy_report(repo.path()).unwrap();
+        assert_eq!(report.policy.artifact_sweep_budget_ms, 0);
+        assert_eq!(report.policy.routine_size_budget_ms, 0);
+        assert_eq!(report.warnings.len(), 1);
+        assert_eq!(report.warnings[0].field, "retention.future_sweep_days");
+        assert!(report.warnings[0]
+            .message
+            .contains("known retention settings remain active"));
+        assert_eq!(load_retention_policy(repo.path()).unwrap(), report.policy);
+    }
+
+    #[test]
+    fn unknown_top_level_fields_use_broker_configuration_warning() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir(repo.path().join(".aethyme")).unwrap();
+        std::fs::write(
+            repo.path().join(BROKER_CONFIG_RELPATH),
+            "future_broker_setting = true\n[retention]\n",
+        )
+        .unwrap();
+
+        let report = load_retention_policy_report(repo.path()).unwrap();
+        assert_eq!(report.warnings.len(), 1);
+        assert_eq!(report.warnings[0].field, "broker.future_broker_setting");
+        assert!(report.warnings[0]
+            .message
+            .contains("unknown broker configuration field"));
+        assert!(!report.warnings[0].message.contains("retention schema 0"));
+    }
+
+    #[test]
+    fn unsupported_schema_is_checked_before_unknown_fields() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir(repo.path().join(".aethyme")).unwrap();
+        std::fs::write(
+            repo.path().join(BROKER_CONFIG_RELPATH),
+            "[retention]\nschema_version = 2\nfuture_sweep_days = 14\n",
+        )
+        .unwrap();
+
+        assert!(matches!(
+            load_retention_policy_report(repo.path()),
+            Err(RetentionConfigError::UnsupportedSchema {
+                found: 2,
+                supported: RETENTION_POLICY_SCHEMA_VERSION,
+            })
+        ));
+    }
+
+    #[test]
+    fn invalid_known_values_still_fail_closed() {
         let cases = [
-            "[retention]\nunknown = 1\n",
-            "[retention]\nschema_version = 2\n",
             "[retention]\nterminal_events_days = 0\n",
             "[retention]\nstartup_budget_ms = 5001\n",
             "[retention]\nretained_bytes_budget = 1125899906842625\n",
