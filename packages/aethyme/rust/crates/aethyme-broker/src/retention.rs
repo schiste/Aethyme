@@ -35,9 +35,18 @@ const RETENTION_POLICY_FIELDS: &[&str] = &[
 /// regenerable build output. Configured artefact names use a deliberately
 /// broad non-empty-directory witness, so allowing these names would let a
 /// typo turn normal repository content into a deletion candidate.
+///
+/// Two groups, and the second carries the larger loss. Source and tooling roots
+/// (`src`, `lib`, `tests`, `docs`) are tracked, so removing one costs a
+/// checkout. Data roots (`data`, `fixtures`, `logs`, `coverage`) are usually
+/// ignored, and being ignored is exactly what makes them grow large enough to
+/// tempt an operator into listing them -- and unrecoverable once removed. That
+/// is the case the built-in catalog's fixed list was written to refuse:
+/// "large and ignored" also matches a downloaded dataset or a local database
+/// someone cannot rebuild.
 const PROTECTED_ARTEFACT_DIRECTORY_NAMES: &[&str] = &[
-    ".aethyme", ".git", ".github", ".gitlab", ".idea", ".vscode", "doc", "docs", "example",
-    "examples", "include", "lib", "src", "test", "tests",
+    ".aethyme", ".git", ".github", ".gitlab", ".idea", ".vscode", "coverage", "data", "doc",
+    "docs", "example", "examples", "fixtures", "include", "lib", "logs", "src", "test", "tests",
 ];
 
 pub(crate) fn is_safe_artefact_directory_name(name: &str) -> bool {
@@ -753,6 +762,39 @@ mod tests {
                     })
                 ),
                 "{directory:?} should remain outside the configurable artifact catalog"
+            );
+        }
+    }
+
+    /// The built-in catalog and the protected list describe the same
+    /// directories from opposite sides, and nothing else keeps them agreeing.
+    /// A built-in artefact that is also protected would make the two contradict
+    /// each other; an unrecoverable data root that is not protected is exactly
+    /// the loss the fixed catalog was written to prevent.
+    #[test]
+    fn protected_names_cover_unrecoverable_roots_without_contradicting_the_catalog() {
+        for name in ["target", "node_modules", ".venv", "build", "dist"] {
+            assert!(
+                crate::is_artefact_directory(name),
+                "{name} must stay in the built-in artefact catalog"
+            );
+            assert!(
+                is_safe_artefact_directory_name(name),
+                "{name} is a built-in artefact and must not also be protected"
+            );
+        }
+
+        // Ignored, large, and not rebuildable from the repository -- the
+        // combination that makes an operator want to list them and makes the
+        // removal permanent.
+        for name in ["data", "fixtures", "logs", "coverage"] {
+            assert!(
+                !crate::is_artefact_directory(name),
+                "{name} must not be a built-in artefact"
+            );
+            assert!(
+                !is_safe_artefact_directory_name(name),
+                "{name} must stay outside the configurable artefact catalog"
             );
         }
     }
