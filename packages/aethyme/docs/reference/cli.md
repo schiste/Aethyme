@@ -1460,9 +1460,13 @@ persisted; content- and secret-bearing argument values are redacted from the
 journal. If a process dies after starting, the next overlapping write marks the
 operation `outcome_unknown` and refuses to run. Inspect external state, then use
 `operations reconcile` to attest `succeeded` or `failed`; never retry an unknown
-operation blindly. A non-zero write is also `outcome_unknown`, because a remote
-command may apply only part of its requested change before failing. The broker
-can resolve a non-zero `git push` more precisely when every refspec explicitly
+operation blindly. A non-zero remote-capable write is also `outcome_unknown`,
+because it may apply only part of its requested change before failing. A
+non-zero local Git command is instead recorded as `failed` with
+`local_git_command_failed` recovery metadata: it cannot have an uncertain
+remote effect, so it does not trigger remote reconciliation or write-block the
+canonical repository. The broker can resolve a non-zero `git push` more
+precisely when every refspec explicitly
 names one non-deletion source and one fully-qualified destination
 (`[+]source:refs/...`). Before execution it records each proposed object and
 the exact destination's advertised SHA (or proven absence); afterward it
