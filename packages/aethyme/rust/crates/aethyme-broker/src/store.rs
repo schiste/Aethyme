@@ -31,6 +31,7 @@ use crate::pr_watch::{
     PullRequestBatchAckOutcome, PullRequestBatchStatus, PullRequestSnapshot, PullRequestWatch,
     PullRequestWatchPollStorageResult, PullRequestWatchStatus,
 };
+use crate::retention::{GcCheckpointPinRelease, GcPublicationExposureExpiry};
 use crate::review::{NewReviewLifecycle, ReviewLifecycle, ReviewLifecycleState};
 use crate::review_ledger::{ReviewRequest, ReviewRequestState, ReviewVerdict, ReviewerIdentity};
 use crate::review_trigger::ReviewTrigger;
@@ -122,7 +123,15 @@ impl BrokerStore {
     /// path so an observational command cannot become the write that upgrades
     /// storage or refreshes a session.
     pub fn open_snapshot_in_repo(repo_root: &Path) -> Result<Self, BrokerError> {
-        let path = crate::broker_db_path(repo_root);
+        Self::open_snapshot_at(&crate::broker_db_path(repo_root))
+    }
+
+    /// Open an exact broker database path read-only, without applying the
+    /// process-wide repository-database override. Host storage inventory uses
+    /// this when joining several repositories' ledgers: one test or embedding
+    /// override must not make every owner appear to share the same database.
+    pub fn open_snapshot_at(path: &Path) -> Result<Self, BrokerError> {
+        let path = path.to_path_buf();
         if !path.is_file() {
             let conn = Connection::open_in_memory()?;
             schema::migrate(&conn)?;
@@ -438,6 +447,7 @@ impl BrokerStore {
         if changed == 0 {
             return Err(BrokerError::SessionNotFound(replaced_id));
         }
+        release_checkpoint_pin_in_tx(&tx, replaced_id, now)?;
         tx.execute("DELETE FROM leases WHERE session_id = ?1", [replaced_id])?;
         tx.execute(
             "DELETE FROM session_foreign_files WHERE session_id = ?1",
@@ -556,6 +566,7 @@ impl BrokerStore {
         // implicit-lease snapshot behind forever (722 orphaned rows for
         // ~25 sessions observed in the 2026-07-17 dogfood database).
         if status.is_closed() {
+            release_checkpoint_pin_in_tx(&tx, id, now)?;
             tx.execute("DELETE FROM leases WHERE session_id = ?1", [id])?;
             tx.execute(
                 "DELETE FROM session_foreign_files WHERE session_id = ?1",
@@ -598,6 +609,7 @@ impl BrokerStore {
             }
             return Err(BrokerError::SessionNotFound(id));
         }
+        release_checkpoint_pin_in_tx(&tx, id, now)?;
         tx.execute("DELETE FROM leases WHERE session_id = ?1", [id])?;
         tx.execute(
             "DELETE FROM session_foreign_files WHERE session_id = ?1",
@@ -652,6 +664,7 @@ impl BrokerStore {
                  WHERE id = ?1",
                 params![id, now],
             )?;
+            release_checkpoint_pin_in_tx(&tx, id, now)?;
             tx.execute("DELETE FROM leases WHERE session_id = ?1", [id])?;
             tx.execute(
                 "DELETE FROM session_foreign_files WHERE session_id = ?1",
@@ -4012,6 +4025,61 @@ impl BrokerStore {
             .collect()
     }
 
+    /// Move one exact, reviewed publication exposure to an explicit terminal
+    /// state. The identity and creation timestamp are rechecked so a plan
+    /// cannot expire a row that has since been replaced or verified.
+    pub(crate) fn expire_gc_publication_exposure(
+        &mut self,
+        candidate: &GcPublicationExposureExpiry,
+    ) -> Result<bool, BrokerError> {
+        let now = now_ms();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let expired = tx.execute(
+            "UPDATE entry_path_exposures
+             SET state = 'expired', resolved_at = ?4, resolution_kind = 'expired',
+                 resolution_sha = NULL, resolution_evidence = ?5
+             WHERE id = ?1 AND queue_entry_id = ?2 AND created_at = ?3
+               AND state = 'outstanding'",
+            params![
+                candidate.exposure_id,
+                candidate.queue_entry_id,
+                candidate.created_at,
+                now,
+                candidate.reason,
+            ],
+        )?;
+        if expired == 0 {
+            let already_expired: bool = tx.query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM entry_path_exposures
+                     WHERE id = ?1 AND queue_entry_id = ?2
+                       AND created_at = ?3 AND state = 'expired'
+                 )",
+                params![
+                    candidate.exposure_id,
+                    candidate.queue_entry_id,
+                    candidate.created_at
+                ],
+                |row| row.get(0),
+            )?;
+            tx.commit()?;
+            return Ok(already_expired);
+        }
+        let payload = serde_json::json!({
+            "exposure_id": candidate.exposure_id,
+            "queue_entry_id": candidate.queue_entry_id,
+            "created_at": candidate.created_at,
+            "age_days": candidate.age_days,
+            "reason": candidate.reason,
+        })
+        .to_string();
+        insert_event(&tx, now, "exposure.expired", None, Some(&payload))?;
+        tx.commit()?;
+        Ok(true)
+    }
+
     /// Resolve publication advisories only after their affected session no
     /// longer has a live lease overlapping the advisory paths. Acknowledged
     /// advisories still complete their lifecycle once the condition clears.
@@ -4958,6 +5026,11 @@ impl BrokerStore {
               AND NOT EXISTS (
                   SELECT 1 FROM sessions s
                   WHERE s.accepted_queue_entry_id = q.id
+                    AND NOT EXISTS (
+                        SELECT 1 FROM gc_checkpoint_pin_releases r
+                        WHERE r.session_id = s.id
+                          AND r.queue_entry_id = q.id
+                    )
               )
               AND NOT EXISTS (
                   SELECT 1 FROM entry_path_exposures x
@@ -5025,6 +5098,110 @@ impl BrokerStore {
         Ok(candidates)
     }
 
+    /// Closed sessions normally release this pin in their terminal
+    /// transition. Rows returned here are legacy or crash-recovered pins that
+    /// still need an explicit, reviewed GC plan before they can be released.
+    pub fn gc_checkpoint_pin_candidates(&self) -> Result<Vec<GcCheckpointPinRelease>, BrokerError> {
+        const REASON: &str = "accepted checkpoint pin remains after session close; releasing this broker pin does not remove committed work";
+        let mut statement = self.conn.prepare(
+            "SELECT s.id, s.accepted_queue_entry_id,
+                    COALESCE(s.closed_at, s.updated_at),
+                    COALESCE(
+                        length(q.head_commit) + length(q.base_commit)
+                          + COALESCE(length(q.merged_tree), 0)
+                          + COALESCE(length(q.details_json), 0) + 96,
+                        0
+                    )
+             FROM sessions s
+             LEFT JOIN merge_queue q ON q.id = s.accepted_queue_entry_id
+             WHERE s.status = 'cleaned'
+               AND s.accepted_queue_entry_id IS NOT NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM gc_checkpoint_pin_releases r
+                   WHERE r.session_id = s.id
+                     AND r.queue_entry_id = s.accepted_queue_entry_id
+               )
+             ORDER BY COALESCE(s.closed_at, s.updated_at), s.id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(GcCheckpointPinRelease {
+                session_id: row.get(0)?,
+                queue_entry_id: row.get(1)?,
+                recorded_at: row.get(2)?,
+                estimated_bytes: row.get::<_, i64>(3)?.max(0) as u64,
+                reason: REASON.into(),
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Release one reviewed legacy checkpoint pin without touching the queue,
+    /// session provenance, Git refs, or any committed worktree files.
+    pub fn release_gc_checkpoint_pin(
+        &mut self,
+        candidate: &GcCheckpointPinRelease,
+    ) -> Result<bool, BrokerError> {
+        let now = now_ms();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let inserted = tx.execute(
+            "INSERT OR IGNORE INTO gc_checkpoint_pin_releases
+                 (session_id, queue_entry_id, released_at)
+             SELECT id, accepted_queue_entry_id, ?3
+             FROM sessions
+             WHERE id = ?1 AND status = 'cleaned'
+               AND accepted_queue_entry_id = ?2",
+            params![candidate.session_id, candidate.queue_entry_id, now],
+        )?;
+        if inserted == 0 {
+            let already_released: bool = tx.query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM gc_checkpoint_pin_releases
+                     WHERE session_id = ?1 AND queue_entry_id = ?2
+                 )",
+                params![candidate.session_id, candidate.queue_entry_id],
+                |row| row.get(0),
+            )?;
+            tx.commit()?;
+            return Ok(already_released);
+        }
+        let payload = serde_json::json!({
+            "session_id": candidate.session_id,
+            "queue_entry_id": candidate.queue_entry_id,
+            "committed_work_untouched": true,
+            "reason": candidate.reason,
+        })
+        .to_string();
+        insert_event(
+            &tx,
+            now,
+            "gc.checkpoint_pin_released",
+            Some(candidate.session_id),
+            Some(&payload),
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    pub(crate) fn released_checkpoint_queue_entry(
+        &self,
+        session_id: i64,
+    ) -> Result<Option<i64>, BrokerError> {
+        self.conn
+            .query_row(
+                "SELECT queue_entry_id
+                 FROM gc_checkpoint_pin_releases
+                 WHERE session_id = ?1
+                 ORDER BY released_at DESC, queue_entry_id DESC
+                 LIMIT 1",
+                [session_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     /// Delete one reviewed GC batch atomically. Child rows sort before their
     /// merge-queue parent; missing rows are accepted for crash-idempotent
     /// journal replay and primary keys are never reused.
@@ -5036,6 +5213,19 @@ impl BrokerStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut removed = 0_usize;
         for row in rows {
+            if row.kind == crate::GcRowKind::MergeQueue {
+                tx.execute(
+                    "UPDATE sessions
+                     SET accepted_queue_entry_id = NULL
+                     WHERE accepted_queue_entry_id = ?1
+                       AND EXISTS (
+                           SELECT 1 FROM gc_checkpoint_pin_releases r
+                           WHERE r.session_id = sessions.id
+                             AND r.queue_entry_id = ?1
+                       )",
+                    [row.id],
+                )?;
+            }
             let table = match row.kind {
                 crate::GcRowKind::Event => "events",
                 crate::GcRowKind::GateResult => "gate_results",
@@ -5974,6 +6164,49 @@ fn update_accepted_checkpoint(
         return Err(BrokerError::SessionNotFound(session_id));
     }
     Ok(())
+}
+
+fn release_checkpoint_pin_in_tx(
+    conn: &Connection,
+    session_id: i64,
+    released_at: i64,
+) -> Result<bool, BrokerError> {
+    let Some(queue_entry_id) = conn
+        .query_row(
+            "SELECT accepted_queue_entry_id
+             FROM sessions
+             WHERE id = ?1 AND status = 'cleaned'
+               AND accepted_queue_entry_id IS NOT NULL",
+            [session_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+    else {
+        return Ok(false);
+    };
+    let inserted = conn.execute(
+        "INSERT OR IGNORE INTO gc_checkpoint_pin_releases
+             (session_id, queue_entry_id, released_at)
+         VALUES (?1, ?2, ?3)",
+        params![session_id, queue_entry_id, released_at],
+    )?;
+    if inserted > 0 {
+        let payload = serde_json::json!({
+            "session_id": session_id,
+            "queue_entry_id": queue_entry_id,
+            "committed_work_untouched": true,
+            "automatic_terminal_transition": true,
+        })
+        .to_string();
+        insert_event(
+            conn,
+            released_at,
+            "gc.checkpoint_pin_released",
+            Some(session_id),
+            Some(&payload),
+        )?;
+    }
+    Ok(inserted > 0)
 }
 
 fn insert_event(

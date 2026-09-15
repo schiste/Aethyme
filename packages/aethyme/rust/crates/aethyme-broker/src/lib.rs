@@ -115,6 +115,7 @@ mod schema;
 mod session_abandonment;
 mod ship;
 mod store;
+mod storage;
 mod types;
 mod update;
 mod update_cache;
@@ -346,11 +347,13 @@ pub use resources::{
     default_host_resource_db_path, resource_environment_key, validate_host_resource_requirements,
 };
 pub use retention::{
-    BROKER_CONFIG_RELPATH, GcApplyReport, GcArtifactCandidate, GcBlocker,
-    GcDeclinedArtifact, GcFileAction, GcFileCandidate, GcHealth, GcOrphanCandidate, GcPlan,
-    GcRowCandidate, GcRowKind, GcWorktreeBlockerSummary, GcWorktreeCandidate,
-    RETENTION_POLICY_SCHEMA_VERSION, RetentionConfigError, RetentionConfigWarning,
-    RetentionPolicy, RetentionPolicyLoadReport, load_retention_policy, load_retention_policy_report,
+    BROKER_CONFIG_RELPATH, GcApplyReport, GcArtifactCandidate, GcBlocker, GcBlockerSummary,
+    GcCheckpointPinRelease, GcDeclinedArtifact, GcFileAction, GcFileCandidate, GcHealth,
+    GcOrphanCandidate, GcPlan,
+    GcPublicationExposureExpiry, GcRowCandidate, GcRowKind, GcWorktreeCandidate,
+    GcWorktreeBlockerSummary,
+    RETENTION_POLICY_SCHEMA_VERSION, RetentionConfigError, RetentionConfigWarning, RetentionPolicy,
+    RetentionPolicyLoadReport, load_retention_policy, load_retention_policy_report,
 };
 pub use review::{
     REVIEW_POLICY_SCHEMA_VERSION, ReviewEvidenceAdapter, ReviewLifecycle,
@@ -395,6 +398,13 @@ pub use ship::{
     ShipReviewEvidence,
 };
 pub use store::BrokerStore;
+pub use storage::{
+    STORAGE_PLAN_SCHEMA_VERSION, STORAGE_RECONCILIATION_SCHEMA_VERSION, StorageApplyFailure,
+    StorageApplyReport, StorageAppliedItem, StorageCandidate, StorageCandidateKind,
+    StorageDirectoryKind, StorageEntry, StorageError, StorageFilesystemKind, StorageMarkerStatus,
+    StoragePlan, StorageReconciliation, StorageRoot, StorageSource, StorageSummary,
+    storage_apply, storage_plan,
+};
 pub use types::{
     Advisory, AdvisoryAction, AdvisoryAudience, AdvisoryDeliveryMetric, AdvisoryDeliverySummary,
     AdvisoryDeliverySurface, AdvisoryEvidence, AdvisoryList, AdvisoryProducer,

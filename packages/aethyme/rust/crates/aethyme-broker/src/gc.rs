@@ -12,9 +12,11 @@ use crate::broker::{
 };
 use crate::retention::is_safe_artefact_directory_name;
 use crate::{
-    Broker, BrokerOpError, GcApplyReport, GcArtifactCandidate, GcBlocker, GcDeclinedArtifact,
+    Broker, BrokerOpError, GcApplyReport, GcArtifactCandidate, GcBlocker, GcBlockerSummary,
+    GcCheckpointPinRelease, GcDeclinedArtifact,
     GcFileAction, GcFileCandidate, GcHealth, GcOrphanCandidate, GcPlan, GcRowCandidate,
-    GcWorktreeBlockerSummary, GcWorktreeCandidate, GitRepo, OperationStatus, RetentionPolicy,
+    GcPublicationExposureExpiry, GcWorktreeBlockerSummary, GcWorktreeCandidate, GitRepo,
+    OperationStatus, RetentionPolicy,
     load_retention_policy, load_retention_policy_report,
 };
 
@@ -325,6 +327,10 @@ struct GcJournal {
     remaining_artifacts: Vec<GcArtifactCandidate>,
     #[serde(default)]
     remaining_orphans: Vec<GcOrphanCandidate>,
+    #[serde(default)]
+    remaining_checkpoint_pin_releases: Vec<GcCheckpointPinRelease>,
+    #[serde(default)]
+    remaining_publication_exposure_expiries: Vec<GcPublicationExposureExpiry>,
     rows_removed: usize,
     files_completed: Vec<String>,
     sessions_cleaned: Vec<i64>,
@@ -332,6 +338,10 @@ struct GcJournal {
     artifacts_reclaimed: Vec<String>,
     #[serde(default)]
     orphans_removed: Vec<String>,
+    #[serde(default)]
+    checkpoint_pins_released: Vec<i64>,
+    #[serde(default)]
+    publication_exposures_expired: Vec<i64>,
     reclaimed_bytes: u64,
 }
 
@@ -347,11 +357,15 @@ impl From<GcPlan> for GcJournal {
             remaining_worktrees: plan.worktrees,
             remaining_artifacts: plan.artifacts,
             remaining_orphans: plan.orphans,
+            remaining_checkpoint_pin_releases: plan.checkpoint_pin_releases,
+            remaining_publication_exposure_expiries: plan.publication_exposure_expiries,
             rows_removed: 0,
             files_completed: Vec::new(),
             sessions_cleaned: Vec::new(),
             artifacts_reclaimed: Vec::new(),
             orphans_removed: Vec::new(),
+            checkpoint_pins_released: Vec::new(),
+            publication_exposures_expired: Vec::new(),
             reclaimed_bytes: 0,
         }
     }
@@ -489,7 +503,7 @@ fn check_deadline(deadline: Option<Instant>) -> bool {
 const TREE_REMOVAL_ATTEMPTS: usize = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TreeRemoval {
+pub(crate) enum TreeRemoval {
     /// The directory is gone.
     Complete,
     /// The budget ran out. The directory is still there, still carrying the
@@ -521,7 +535,7 @@ enum TreeRemoval {
 ///   long removal fails `ENOTEMPTY` against a file created after that
 ///   directory was already emptied. A directory that refuses to go is swept
 ///   again rather than aborting the caller's whole run.
-fn remove_condemned_tree(
+pub(crate) fn remove_condemned_tree(
     dir: &Path,
     keep_until_last: Option<&str>,
     deadline: Option<Instant>,
@@ -823,6 +837,7 @@ impl Broker {
         let retention_config = load_retention_policy_report(&main_root)?;
         let policy = retention_config.policy;
         let retention_config_warnings = retention_config.warnings;
+        let exposure_cutoff = cutoff(evaluated_at, policy.publication_exposure_days);
         let cleanup = self.cleanup_plan_scanned(scan)?;
         let sessions = self
             .store()
@@ -835,10 +850,41 @@ impl Broker {
             cutoff(evaluated_at, policy.gate_results_days),
             cutoff(evaluated_at, policy.terminal_merge_queue_days),
         )?;
+        let checkpoint_pin_releases = self.store().gc_checkpoint_pin_candidates()?;
+        let live_sessions = self.store().live_sessions()?;
+        let advisories = self.store().advisories(false)?;
+        let exposures = self.store().outstanding_entry_path_exposures()?;
+        let operations = self.store().coordinated_operations()?;
+        let publication_exposure_expiries = exposures
+            .iter()
+            .filter(|exposure| exposure.created_at < exposure_cutoff)
+            .map(|exposure| GcPublicationExposureExpiry {
+                exposure_id: exposure.id,
+                queue_entry_id: exposure.queue_entry_id,
+                created_at: exposure.created_at,
+                age_days: days_between(evaluated_at, exposure.created_at),
+                reason: format!(
+                    "publication exposure exceeded the {} day retention policy; explicit expiry does not claim publication was verified",
+                    policy.publication_exposure_days
+                ),
+            })
+            .collect::<Vec<_>>();
         let mut blockers = Vec::new();
         let mut blocked_worktree_bytes = BTreeMap::<(String, Option<i64>), u64>::new();
+        for pin in &checkpoint_pin_releases {
+            blockers.push(GcBlocker {
+                kind: "accepted_checkpoint".into(),
+                id: Some(pin.queue_entry_id),
+                reason: format!("session {}: {}", pin.session_id, pin.reason),
+            });
+        }
         for session in sessions.values() {
             if let Some(queue_entry_id) = session.accepted_queue_entry_id {
+                if checkpoint_pin_releases.iter().any(|pin| {
+                    pin.session_id == session.id && pin.queue_entry_id == queue_entry_id
+                }) {
+                    continue;
+                }
                 blockers.push(GcBlocker {
                     kind: "accepted_checkpoint".into(),
                     id: Some(queue_entry_id),
@@ -849,28 +895,28 @@ impl Broker {
                 });
             }
         }
-        for session in self.store().live_sessions()? {
+        for session in &live_sessions {
             blockers.push(GcBlocker {
                 kind: "live_session".into(),
                 id: Some(session.id),
                 reason: "live sessions and their rows are never aged out".into(),
             });
         }
-        for advisory in self.store().advisories(false)? {
+        for advisory in &advisories {
             blockers.push(GcBlocker {
                 kind: "outstanding_advisory".into(),
                 id: Some(advisory.id),
                 reason: "outstanding and acknowledged advisories remain authoritative".into(),
             });
         }
-        for exposure in self.store().outstanding_entry_path_exposures()? {
+        for exposure in &exposures {
             blockers.push(GcBlocker {
                 kind: "publication_exposure".into(),
                 id: Some(exposure.id),
                 reason: "publication has not been verified".into(),
             });
         }
-        for operation in self.store().coordinated_operations()? {
+        for operation in &operations {
             if matches!(
                 operation.status,
                 OperationStatus::Prepared
@@ -1028,13 +1074,124 @@ impl Broker {
             (&left.kind, left.id, &left.reason).cmp(&(&right.kind, right.id, &right.reason))
         });
         blockers.dedup();
-        let mut worktree_blocker_summary = blocked_worktree_bytes
+        let mut blocker_facts = BTreeMap::<(String, Option<i64>), (u64, i64)>::new();
+        for pin in &checkpoint_pin_releases {
+            blocker_facts.insert(
+                ("accepted_checkpoint".into(), Some(pin.queue_entry_id)),
+                (pin.estimated_bytes, pin.recorded_at),
+            );
+        }
+        for session in &live_sessions {
+            blocker_facts.insert(
+                ("live_session".into(), Some(session.id)),
+                (0, session.created_at),
+            );
+        }
+        for advisory in &advisories {
+            blocker_facts.insert(
+                ("outstanding_advisory".into(), Some(advisory.id)),
+                (0, advisory.created_at),
+            );
+        }
+        for exposure in &exposures {
+            let estimated_bytes = exposure
+                .promotion_sha
+                .len()
+                .saturating_add(exposure.paths.iter().map(String::len).sum::<usize>())
+                .saturating_add(96) as u64;
+            blocker_facts.insert(
+                ("publication_exposure".into(), Some(exposure.id)),
+                (estimated_bytes, exposure.created_at),
+            );
+        }
+        for operation in &operations {
+            if matches!(
+                operation.status,
+                OperationStatus::Prepared
+                    | OperationStatus::Running
+                    | OperationStatus::OutcomeUnknown
+            ) {
+                blocker_facts.insert(
+                    ("unresolved_operation".into(), Some(operation.id)),
+                    (0, operation.created_at),
+                );
+            }
+        }
+        for ((kind, id), retained_bytes) in &blocked_worktree_bytes {
+            if let Some(session_id) = id {
+                if let Some(session) = sessions.get(session_id) {
+                    blocker_facts.insert(
+                        (kind.clone(), *id),
+                        (
+                            *retained_bytes,
+                            session.closed_at.unwrap_or(session.updated_at),
+                        ),
+                    );
+                }
+            }
+        }
+        let mut grouped = BTreeMap::<String, (usize, u64, Option<(i64, Option<i64>)>)>::new();
+        for blocker in &blockers {
+            let (retained_bytes, recorded_at) = blocker_facts
+                .get(&(blocker.kind.clone(), blocker.id))
+                .copied()
+                .unwrap_or((0, 0));
+            let entry = grouped.entry(blocker.kind.clone()).or_default();
+            entry.0 += 1;
+            entry.1 = entry.1.saturating_add(retained_bytes);
+            if recorded_at > 0 {
+                let member = (recorded_at, blocker.id);
+                entry.2 = Some(entry.2.map_or(member, |oldest| {
+                    if member.0 < oldest.0 || (member.0 == oldest.0 && member.1 < oldest.1) {
+                        member
+                    } else {
+                        oldest
+                    }
+                }));
+            }
+        }
+        let mut blocker_summary = grouped
             .into_iter()
+            .map(|(kind, (count, retained_bytes, oldest))| {
+                let age_policy_days = match kind.as_str() {
+                    "accepted_checkpoint" => Some(0),
+                    "publication_exposure" => Some(policy.publication_exposure_days),
+                    "retention_age" => Some(policy.closed_worktrees_days),
+                    _ => None,
+                };
+                let oldest_id = oldest.and_then(|(_, id)| id);
+                let oldest_recorded_at = oldest.map(|(recorded_at, _)| recorded_at);
+                let oldest_age_days =
+                    oldest_recorded_at.map(|recorded_at| days_between(evaluated_at, recorded_at));
+                let age_exceeded = age_policy_days
+                    .zip(oldest_age_days)
+                    .is_some_and(|(policy_days, age_days)| age_days >= policy_days);
+                GcBlockerSummary {
+                    kind,
+                    count,
+                    retained_bytes,
+                    oldest_id,
+                    oldest_recorded_at,
+                    oldest_age_days,
+                    age_policy_days,
+                    age_exceeded,
+                }
+            })
+            .collect::<Vec<_>>();
+        blocker_summary.sort_by(|left, right| {
+            right
+                .retained_bytes
+                .cmp(&left.retained_bytes)
+                .then_with(|| right.count.cmp(&left.count))
+                .then_with(|| left.kind.cmp(&right.kind))
+        });
+        let mut worktree_blocker_summary = blocked_worktree_bytes
+            .iter()
             .filter_map(|((kind, id), retained_bytes)| {
                 let blocker = blockers
                     .iter()
-                    .find(|blocker| blocker.kind == kind && blocker.id == id)?;
-                Some((blocker.kind.clone(), retained_bytes))
+                    .find(|blocker| blocker.kind == *kind && blocker.id == *id)?;
+                Some((blocker.kind.clone(), *retained_bytes))
             })
             .fold(
                 BTreeMap::<String, (usize, u64)>::new(),
@@ -1158,6 +1315,9 @@ impl Broker {
             artifacts,
             orphans,
             blockers,
+            checkpoint_pin_releases,
+            publication_exposure_expiries,
+            blocker_summary,
             worktree_blocker_summary,
             declined_artifacts,
             estimated_reclaimable_bytes,
@@ -1425,6 +1585,68 @@ impl Broker {
         };
         let deadline = budget_ms.map(|budget| Instant::now() + Duration::from_millis(budget));
         let mut failures = Vec::new();
+
+        while !journal.remaining_checkpoint_pin_releases.is_empty() && !check_deadline(deadline) {
+            let candidate = journal.remaining_checkpoint_pin_releases[0].clone();
+            let consume = match self.store().release_gc_checkpoint_pin(&candidate) {
+                Ok(true) => {
+                    journal.checkpoint_pins_released.push(candidate.session_id);
+                    true
+                }
+                Ok(false) => {
+                    failures.push(format!(
+                        "session {} checkpoint pin changed; review a new GC plan",
+                        candidate.session_id
+                    ));
+                    true
+                }
+                Err(error) => {
+                    failures.push(format!(
+                        "session {} checkpoint pin release failed: {error}",
+                        candidate.session_id
+                    ));
+                    false
+                }
+            };
+            if !consume {
+                break;
+            }
+            journal.remaining_checkpoint_pin_releases.remove(0);
+            write_journal(&journal_path, &journal)?;
+        }
+
+        while !journal.remaining_publication_exposure_expiries.is_empty()
+            && !check_deadline(deadline)
+        {
+            let candidate = journal.remaining_publication_exposure_expiries[0].clone();
+            let consume = match self.store().expire_gc_publication_exposure(&candidate) {
+                Ok(true) => {
+                    journal
+                        .publication_exposures_expired
+                        .push(candidate.exposure_id);
+                    true
+                }
+                Ok(false) => {
+                    failures.push(format!(
+                        "publication exposure {} changed; review a new GC plan",
+                        candidate.exposure_id
+                    ));
+                    true
+                }
+                Err(error) => {
+                    failures.push(format!(
+                        "publication exposure {} expiry failed: {error}",
+                        candidate.exposure_id
+                    ));
+                    false
+                }
+            };
+            if !consume {
+                break;
+            }
+            journal.remaining_publication_exposure_expiries.remove(0);
+            write_journal(&journal_path, &journal)?;
+        }
 
         while !journal.remaining_rows.is_empty() && !check_deadline(deadline) {
             let count = journal.remaining_rows.len().min(128);
@@ -1706,12 +1928,16 @@ impl Broker {
         }
 
         let deadline_reached = check_deadline(deadline)
-            && (!journal.remaining_rows.is_empty()
+            && (!journal.remaining_checkpoint_pin_releases.is_empty()
+                || !journal.remaining_publication_exposure_expiries.is_empty()
+                || !journal.remaining_rows.is_empty()
                 || !journal.remaining_files.is_empty()
                 || !journal.remaining_worktrees.is_empty()
                 || !journal.remaining_artifacts.is_empty()
                 || !journal.remaining_orphans.is_empty());
         let complete = journal.remaining_rows.is_empty()
+            && journal.remaining_checkpoint_pin_releases.is_empty()
+            && journal.remaining_publication_exposure_expiries.is_empty()
             && journal.remaining_files.is_empty()
             && journal.remaining_worktrees.is_empty()
             && journal.remaining_artifacts.is_empty()
@@ -1727,6 +1953,8 @@ impl Broker {
             sessions_cleaned: journal.sessions_cleaned.clone(),
             artifacts_reclaimed: journal.artifacts_reclaimed.clone(),
             orphans_removed: journal.orphans_removed.clone(),
+            checkpoint_pins_released: journal.checkpoint_pins_released.clone(),
+            publication_exposures_expired: journal.publication_exposures_expired.clone(),
             reclaimed_bytes: journal.reclaimed_bytes,
             failures,
             recovery_action,
@@ -1739,6 +1967,8 @@ impl Broker {
                 "sessions_cleaned": report.sessions_cleaned.len(),
                 "artifacts_reclaimed": report.artifacts_reclaimed.len(),
                 "orphans_removed": report.orphans_removed.len(),
+                "checkpoint_pins_released": report.checkpoint_pins_released.len(),
+                "publication_exposures_expired": report.publication_exposures_expired.len(),
                 "reclaimed_bytes": report.reclaimed_bytes,
             })
             .to_string();
@@ -1756,6 +1986,35 @@ impl Broker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_gc_journal_defaults_new_protection_work() {
+        let mut policy = serde_json::to_value(RetentionPolicy::default()).unwrap();
+        policy
+            .as_object_mut()
+            .unwrap()
+            .remove("publication_exposure_days");
+        let journal = serde_json::json!({
+            "schema_version": GC_PLAN_SCHEMA_VERSION,
+            "digest": "a".repeat(64),
+            "evaluated_at": 1,
+            "policy": policy,
+            "remaining_rows": [],
+            "remaining_files": [],
+            "remaining_worktrees": [],
+            "rows_removed": 0,
+            "files_completed": [],
+            "sessions_cleaned": [],
+            "reclaimed_bytes": 0
+        });
+        let parsed: GcJournal = serde_json::from_value(journal).unwrap();
+        assert_eq!(
+            parsed.policy.publication_exposure_days,
+            RetentionPolicy::default().publication_exposure_days
+        );
+        assert!(parsed.remaining_checkpoint_pin_releases.is_empty());
+        assert!(parsed.remaining_publication_exposure_expiries.is_empty());
+    }
 
     fn dir(root: &Path, relative: &str) -> PathBuf {
         let path = root.join(relative);

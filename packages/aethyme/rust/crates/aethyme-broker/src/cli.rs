@@ -584,6 +584,12 @@ Usage:
   aethyme broker gc apply --confirm <sha256> [--json]
       Apply or resume the exact reviewed plan under an exclusive lock. A
       recovery journal makes interrupted row, file, and worktree cleanup safe.
+  aethyme broker storage [--json]
+  aethyme broker storage plan [--json]
+  aethyme broker storage apply --confirm <sha256> [--json]
+      Inventory every host worktree root by reconciling disk directories,
+      Git registrations, and repository session ledgers. Apply removes only
+      exact reviewed orphan roots or stray directories.
   aethyme broker check-contract [--base <ref>] [--pr-body <file>]
       Cross-process contract gate: refuse a diff that removes symbols
       listed in the consumers registry unless the PR body or commit
@@ -750,6 +756,7 @@ const KNOWN_COMMAND_WORDS: &[&str] = &[
     "capture",
     "cleanup",
     "gc",
+    "storage",
     "certify",
     "readiness",
     "scaffold",
@@ -893,7 +900,11 @@ fn output_measurement_opted_in() -> bool {
 
 fn command_records_metric(args: &[String]) -> bool {
     match args.first().map(String::as_str) {
-        Some("certify" | "readiness" | "queue" | "metrics" | "handoff" | "worktree-root") => false,
+        Some(
+            "certify" | "readiness" | "queue" | "metrics" | "handoff" | "worktree-root",
+        ) => {
+            false
+        }
         Some("advisories") => matches!(args.get(1).map(String::as_str), Some("ack" | "suppress")),
         Some("exposures") => args.get(1).map(String::as_str) == Some("apply"),
         Some("report") => args.get(1).map(String::as_str) == Some("file"),
@@ -905,6 +916,7 @@ fn command_records_metric(args: &[String]) -> bool {
         Some("ship") => args.get(1).map(String::as_str) != Some("plan"),
         Some("checkpoint") => args.get(1).map(String::as_str) == Some("apply"),
         Some("gc") => args.get(1).map(String::as_str) == Some("apply"),
+        Some("storage") => args.get(1).map(String::as_str) == Some("apply"),
         Some("representation") => args.get(1).map(String::as_str) == Some("record"),
         Some("operations") => args.get(1).map(String::as_str) == Some("reconcile"),
         Some("git" | "gh") => {
@@ -1126,6 +1138,8 @@ mod tests {
             args(&["gates", "doctor"]),
             args(&["doctor"]),
             args(&["gc", "plan"]),
+            args(&["storage"]),
+            args(&["storage", "plan"]),
             args(&["operations"]),
             args(&["advisories", "list"]),
             args(&["advisories", "show", "1"]),
@@ -1158,6 +1172,7 @@ mod tests {
             args(&["gates", "doctor", "--probe"]),
             args(&["doctor", "--fix-version"]),
             args(&["gc", "apply", "--confirm", "digest"]),
+            args(&["storage", "apply", "--confirm", "digest"]),
             args(&["report", "file", "reviewed.issue.md"]),
             args(&[
                 "checkpoint",
@@ -3358,6 +3373,112 @@ fn render_capped<T>(items: &[T], cap: usize, detail: bool, mut render: impl FnMu
     }
 }
 
+fn render_storage_plan(plan: &crate::StoragePlan, detail: bool) {
+    out!(
+        "Host storage plan {}: {} root(s), {} on-disk directory entries, {} candidate(s), {} reclaimable",
+        plan.digest,
+        plan.summary.root_count,
+        plan.summary.on_disk_directory_count,
+        plan.summary.candidate_count,
+        plan.summary
+            .reclaimable_bytes
+            .map(human_bytes)
+            .unwrap_or_else(|| "unknown bytes".into()),
+    );
+    out!(
+        "  storage root: {} (orphan grace {} day(s))",
+        plan.storage_root.display(),
+        plan.orphan_worktree_roots_days
+    );
+    for warning in &plan.warnings {
+        out!("  warning: {warning}");
+    }
+    for root in &plan.roots {
+        out!(
+            "  root: {} ({:?}, marker {:?}, owner {}, {}, {})",
+            root.path.display(),
+            root.filesystem_kind,
+            root.marker_status,
+            match root.owner_exists {
+                Some(true) => "present",
+                Some(false) => "missing",
+                None => "unknown",
+            },
+            root.worktree_count,
+            root.estimated_bytes
+                .map(human_bytes)
+                .unwrap_or_else(|| "unknown bytes".into()),
+        );
+        for blocker in &root.blockers {
+            out!("    blocker: {blocker}");
+        }
+        if detail {
+            for entry in &root.reconciliation.entries {
+                if !entry.missing_from.is_empty() {
+                    out!(
+                        "    drift: {} (missing {:?}{})",
+                        entry.path.display(),
+                        entry.missing_from,
+                        if entry.git_marker { "; git marker" } else { "" },
+                    );
+                }
+            }
+        }
+    }
+    render_capped(&plan.candidates, GC_LIST_CAP, detail, |candidate| {
+        out!(
+            "  candidate: {:?} {} ({}) — {}",
+            candidate.kind,
+            candidate.path.display(),
+            candidate
+                .estimated_bytes
+                .map(human_bytes)
+                .unwrap_or_else(|| "unknown bytes".into()),
+            candidate.reason,
+        );
+    });
+    if plan.candidates.is_empty() {
+        out!("  apply: nothing eligible");
+    } else {
+        out!(
+            "  apply: aethyme broker storage apply --confirm {}",
+            plan.digest
+        );
+    }
+}
+
+fn render_storage_apply(report: &crate::StorageApplyReport) {
+    out!(
+        "Host storage apply {}: {} removed, {} reclaimed",
+        if report.complete {
+            "complete"
+        } else {
+            "paused"
+        },
+        report.applied.len(),
+        human_bytes(report.reclaimed_bytes),
+    );
+    for item in &report.applied {
+        out!(
+            "  removed: {:?} {} ({})",
+            item.kind,
+            item.path.display(),
+            human_bytes(item.reclaimed_bytes),
+        );
+    }
+    for failure in &report.failures {
+        out!(
+            "  retained: {:?} {} — {}",
+            failure.kind,
+            failure.path.display(),
+            failure.reason,
+        );
+    }
+    if let Some(action) = &report.recovery_action {
+        out!("  recovery: {action}");
+    }
+}
+
 fn render_gc_plan(plan: &crate::GcPlan, detail: bool) {
     out!(
         "GC plan {}: {} rows, {} files, {} represented worktrees, {} build caches, {} orphaned roots, {} reclaimable",
@@ -3522,6 +3643,62 @@ fn render_gc_plan(plan: &crate::GcPlan, detail: bool) {
             orphan.repository_root
         );
     });
+    render_capped(&plan.checkpoint_pin_releases, GC_LIST_CAP, detail, |pin| {
+        out!(
+            "  checkpoint pin: session {} queue {} ({}; releasing broker metadata does not remove committed work)",
+            pin.session_id,
+            pin.queue_entry_id,
+            pin.reason,
+        );
+    });
+    render_capped(
+        &plan.publication_exposure_expiries,
+        GC_LIST_CAP,
+        detail,
+        |expiry| {
+            out!(
+                "  publication expiry: exposure {} queue {} ({} days old; {})",
+                expiry.exposure_id,
+                expiry.queue_entry_id,
+                expiry.age_days,
+                expiry.reason,
+            );
+        },
+    );
+    if !plan.blocker_summary.is_empty() {
+        out!("  protections by kind:");
+        for summary in &plan.blocker_summary {
+            let age = summary
+                .oldest_age_days
+                .map(|days| {
+                    let member = summary
+                        .oldest_id
+                        .map(|id| format!(", oldest member {id}"))
+                        .unwrap_or_default();
+                    let policy = summary
+                        .age_policy_days
+                        .map(|policy| format!(", policy {policy}d"))
+                        .unwrap_or_default();
+                    format!(
+                        ", oldest {days}d{member}{policy}{}",
+                        if summary.age_exceeded {
+                            ", age exceeded"
+                        } else {
+                            ""
+                        }
+                    )
+                })
+                .unwrap_or_default();
+            out!(
+                "    {}: {} {}, {} retained{}",
+                summary.kind,
+                summary.count,
+                crate::broker::plural_word(summary.count, "blocker", "blockers"),
+                human_bytes(summary.retained_bytes),
+                age,
+            );
+        }
+    }
     if !plan.worktree_blocker_summary.is_empty() {
         out!("  blocked retained bytes by kind:");
         for summary in &plan.worktree_blocker_summary {
@@ -3547,6 +3724,8 @@ fn render_gc_plan(plan: &crate::GcPlan, detail: bool) {
         && plan.worktrees.is_empty()
         && plan.artifacts.is_empty()
         && plan.orphans.is_empty()
+        && plan.checkpoint_pin_releases.is_empty()
+        && plan.publication_exposure_expiries.is_empty()
     {
         out!("  apply: nothing eligible");
     } else {
@@ -3556,7 +3735,7 @@ fn render_gc_plan(plan: &crate::GcPlan, detail: bool) {
 
 fn render_gc_apply(report: &crate::GcApplyReport) {
     out!(
-        "GC apply {}: {} rows, {} files, {} worktrees, {} build caches, {} orphaned roots, {} reclaimed",
+        "GC apply {}: {} rows, {} files, {} worktrees, {} build caches, {} orphaned roots, {} checkpoint pins released, {} exposures expired, {} reclaimed",
         if report.complete {
             "complete"
         } else {
@@ -3567,6 +3746,8 @@ fn render_gc_apply(report: &crate::GcApplyReport) {
         report.sessions_cleaned.len(),
         report.artifacts_reclaimed.len(),
         report.orphans_removed.len(),
+        report.checkpoint_pins_released.len(),
+        report.publication_exposures_expired.len(),
         human_bytes(report.reclaimed_bytes),
     );
     for failure in &report.failures {
@@ -5140,21 +5321,28 @@ fn run_reclaim(parsed: Parsed) -> Result<(), UsageError> {
             // Re-derived from a fresh scan, so a plan whose decision set moved
             // is refused rather than applied to a different set than was reviewed.
             if confirm != plan.digest {
-                let changes = crate::reclaim::load_snapshot(&root, confirm)
-                    .map_err(|error| {
-                        UsageError::Message(format!(
-                            "cannot inspect the saved reclaim plan review: {error}"
-                        ))
-                    })?
-                    .map(|(_, reviewed)| {
+                let (changes, snapshot_error) = match crate::reclaim::load_snapshot(&root, confirm)
+                {
+                    Ok(Some((_, reviewed))) => (
                         crate::reclaim::decision_changes(
                             &reviewed,
                             &crate::reclaim::decisions(&plan.candidates),
-                        )
-                    })
-                    .unwrap_or_default();
+                        ),
+                        None,
+                    ),
+                    Ok(None) => (Vec::new(), None),
+                    Err(error) => (Vec::new(), Some(error.to_string())),
+                };
                 let detail = if changes.is_empty() {
-                    "the saved review is unavailable; no decision diff can be established".into()
+                    match snapshot_error {
+                        Some(error) => format!(
+                            "the saved review could not be read ({error}); no decision diff can be established"
+                        ),
+                        None => {
+                            "the saved review is unavailable; no decision diff can be established"
+                                .into()
+                        }
+                    }
                 } else {
                     format!("changes since review: {}", capped_join(&changes, 8))
                 };
@@ -12007,6 +12195,54 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                 }
             }
         }
+        "storage" => {
+            let action = parsed.positional.first().map(String::as_str);
+            if parsed.positional.len() > 1 {
+                return Err(UsageError::Message(
+                    "storage accepts at most one action: `plan` or `apply --confirm <sha256>`"
+                        .into(),
+                ));
+            }
+            let cwd = std::env::current_dir()
+                .map_err(|error| UsageError::Message(format!("cannot resolve cwd: {error}")))?;
+            match action {
+                None | Some("plan") => {
+                    if parsed.confirm.is_some() {
+                        return Err(UsageError::Message(
+                            "storage plan does not accept --confirm; review its emitted digest"
+                                .into(),
+                        ));
+                    }
+                    let plan = crate::storage_plan(&cwd)?;
+                    if parsed.json {
+                        out!("{}", serde_json::to_string_pretty(&plan)?);
+                    } else {
+                        render_storage_plan(&plan, parsed.detail);
+                    }
+                }
+                Some("apply") => {
+                    let confirm = parsed.confirm.as_deref().ok_or_else(|| {
+                        UsageError::Message("storage apply requires --confirm <sha256>".into())
+                    })?;
+                    let report = crate::storage_apply(&cwd, confirm)?;
+                    if parsed.json {
+                        out!("{}", serde_json::to_string_pretty(&report)?);
+                    } else {
+                        render_storage_apply(&report);
+                    }
+                    if !report.complete {
+                        return Err(UsageError::Message(report.recovery_action.unwrap_or_else(
+                            || "review a new plan with `aethyme broker storage plan`".into(),
+                        )));
+                    }
+                }
+                Some(other) => {
+                    return Err(UsageError::Message(format!(
+                        "unknown storage action {other:?}; expected `plan` or `apply`"
+                    )));
+                }
+            }
+        }
         "cleanup" => {
             let mut broker = open_broker(parsed.read_only_snapshot)?;
             if parsed.all_cleaned {
@@ -12071,7 +12307,7 @@ fn surface_command_advisories(subcommand: &str, parsed: &Parsed) {
     // Internal hooks are not interactive broker commands. Pre-commit remains
     // quiet on success, while post-commit surfaces through run_post_commit
     // after its conflict radar and therefore does not print twice.
-    if matches!(subcommand, "hooks" | "readiness") {
+    if matches!(subcommand, "hooks" | "readiness" | "storage") {
         return;
     }
     let Ok(cwd) = std::env::current_dir() else {

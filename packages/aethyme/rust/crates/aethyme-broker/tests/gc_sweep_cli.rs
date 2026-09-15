@@ -223,6 +223,42 @@ fn reclaim_confirmation_binds_decisions_not_sizes_and_explains_changes() {
 }
 
 #[test]
+fn reclaim_confirmation_keeps_digest_mismatch_primary_when_snapshot_is_unreadable() {
+    let (repo, container) = fixture("");
+    let root_output = run(repo.path(), container.path(), &["worktree-root", "--json"]);
+    let worktree_root =
+        serde_json::from_slice::<serde_json::Value>(&root_output.stdout).unwrap()["preferred_root"]
+            .as_str()
+            .map(PathBuf::from)
+            .unwrap();
+
+    let plan = reclaim_plan_json(repo.path(), container.path());
+    let digest = plan["digest"].as_str().unwrap().to_string();
+    let snapshot = worktree_root.join(format!(".aethyme-reclaim-plan-{digest}.json"));
+    std::fs::write(&snapshot, b"not a reclaim snapshot\n").unwrap();
+
+    let added = worktree_root.join("session/build");
+    std::fs::create_dir_all(&added).unwrap();
+    std::fs::write(added.join("artifact"), "new\n").unwrap();
+
+    let refused = run(
+        repo.path(),
+        container.path(),
+        &["reclaim", "apply", "--confirm", &digest],
+    );
+    assert!(!refused.status.success());
+    let message = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        message.contains("confirmation does not match the current plan"),
+        "{message}"
+    );
+    assert!(
+        message.contains("saved review could not be read"),
+        "{message}"
+    );
+}
+
+#[test]
 fn a_reappearing_repository_revokes_an_authorized_orphan_removal() {
     let (repo, container) =
         fixture("[retention]\norphan_worktree_roots_days = 0\nartifact_sweep_budget_ms = 0\n");
@@ -595,7 +631,7 @@ fn build_caches_are_reclaimable_even_when_the_worktree_itself_is_blocked() {
             .all(|worktree| worktree["session_id"].as_i64().unwrap().to_string() != id),
         "a session with unaccepted commits must not be scheduled for removal"
     );
-    let retained_summary = plan["worktree_blocker_summary"]
+    let retained_summary = plan["blocker_summary"]
         .as_array()
         .unwrap()
         .iter()
@@ -606,6 +642,14 @@ fn build_caches_are_reclaimable_even_when_the_worktree_itself_is_blocked() {
         retained_summary["retained_bytes"].as_u64().unwrap() > 0,
         "age blocker should account for the retained worktree bytes: {retained_summary}"
     );
+    let worktree_summary = plan["worktree_blocker_summary"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|summary| summary["kind"] == "retention_age")
+        .expect("worktree-specific summary should include the age blocker");
+    assert_eq!(worktree_summary["count"], 1);
+    assert!(worktree_summary["retained_bytes"].as_u64().unwrap() > 0);
 
     let digest = plan["digest"].as_str().unwrap();
     let output = run(
