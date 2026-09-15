@@ -136,8 +136,7 @@ Usage:
       Prefer this over adopting the main
       checkout for agent work; it isolates the git index and worktree.
       --agent as in adopt (see above).
-  aethyme broker start-agent --task <text> --cmd <command> [--pull-request <number>]
-                             [--agent <identity>] [--json]
+  aethyme broker start-agent --task <text> --cmd <command> [--pull-request <number>] [--agent <identity>] [--json]
       Create a worktree + branch and spawn <command> in it (sh -c),
       logging to .aethyme/logs/.
   aethyme broker prepare status --session <id> [--json]
