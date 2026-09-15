@@ -192,23 +192,27 @@ Usage:
   aethyme broker resources reconcile <lease-id> --confirm <generation> [--json]
       Release an expired, quarantined allocation after reviewing host cleanup.
       The generation confirmation fences stale cleanup commands.
-  aethyme broker console [status] [--json]
-      Show which consoles are serving this repository right now, this
-      repository's console mode, and whether this checkout is the canonical
-      one. Read-only; reserves nothing.
-  aethyme broker console plan [--json]
+  aethyme broker console [status|list] [--json]
+      Show the exact revision of this checkout and list consoles serving this
+      repository right now, including each marker's branch, commit, worktree,
+      port, and integration relation. Read-only; reserves nothing.
+  aethyme broker console plan [--allow-parallel] [--json]
       Show exactly what a console launch would reserve under the current mode
       without reserving it.
-  aethyme broker console run [--wait <duration>] [--json] -- <command> ...
+  aethyme broker console run [--wait <duration>] [--allow-parallel] [--json] -- <command> ...
       Run a dev server under the repository's console mode. `singular` takes
       one exclusive key and one pinned port, so a second launch anywhere on
       this host is refused with the console that already holds it.
+      `--allow-parallel` is an explicit testing escape hatch: it keeps a
+      registry lease and allocates another port from the configured range.
       `per_worktree` takes a distinct port, namespace, and one slot from a
       bounded pool, so worktrees run side by side without exhausting the host.
       `unmanaged` reserves nothing and executes directly. Allocations reach
       the command as AETHYME_RESOURCE_PORT, AETHYME_RESOURCE_NAMESPACE, and
-      AETHYME_RESOURCE_SLOT. Configure with [console] in .aethyme/config.toml:
-      mode, port, port_end, pool_limit, ttl_seconds.
+      AETHYME_RESOURCE_SLOT. Managed commands also receive
+      AETHYME_CONSOLE_MARKER and AETHYME_CONSOLE_MARKER_DIGEST; the marker is
+      removed after clean shutdown. Configure with [console] in
+      .aethyme/config.toml: mode, port, port_end, pool_limit, ttl_seconds.
   aethyme broker exec --session <id> -- <command> [--json]
       Run a command in the session worktree, then fail if it creates or
       modifies dirty paths outside explicit leases or in adoption-time
@@ -1884,6 +1888,7 @@ struct Parsed {
     dry_run: bool,
     destructive: bool,
     no_wait: bool,
+    allow_parallel: bool,
     queue_timeout_seconds: Option<u64>,
     break_glass: bool,
     sync_main: bool,
@@ -1977,6 +1982,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         dry_run: false,
         destructive: false,
         no_wait: false,
+        allow_parallel: false,
         queue_timeout_seconds: None,
 
         break_glass: false,
@@ -2053,6 +2059,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
                 })?);
             }
             "--destructive" => parsed.destructive = true,
+            "--allow-parallel" => parsed.allow_parallel = true,
             "--break-glass" => parsed.break_glass = true,
             "--sync-main" => parsed.sync_main = true,
             "--sync-integration" => parsed.sync_integration = true,
@@ -8063,7 +8070,16 @@ fn short_sha(value: &str) -> &str {
 /// from a session id: an operator starting a dev server is not necessarily in
 /// a broker session, and requiring one would put coordination behind exactly
 /// the step people skip.
-fn console_context() -> Result<(crate::ConsoleConfig, String, PathBuf, PathBuf), UsageError> {
+fn console_context() -> Result<
+    (
+        crate::ConsoleConfig,
+        String,
+        crate::GitRepo,
+        PathBuf,
+        PathBuf,
+    ),
+    UsageError,
+> {
     let cwd = std::env::current_dir().map_err(|error| UsageError::Message(error.to_string()))?;
     let repo = crate::GitRepo::discover(&cwd).map_err(|error| {
         UsageError::Message(format!("console requires a git checkout: {error}"))
@@ -8078,7 +8094,7 @@ fn console_context() -> Result<(crate::ConsoleConfig, String, PathBuf, PathBuf),
     // (#170), so every caller gets it.
     let repository = crate::gates::git_origin_fingerprint(&repo);
     let config = crate::ConsoleConfig::load(&main_root);
-    Ok((config, repository, main_root, worktree_root))
+    Ok((config, repository, repo, main_root, worktree_root))
 }
 
 fn run_console(parsed: Parsed) -> Result<(), UsageError> {
@@ -8087,22 +8103,56 @@ fn run_console(parsed: Parsed) -> Result<(), UsageError> {
         .first()
         .map(String::as_str)
         .unwrap_or("status");
-    let (config, repository, main_root, worktree_root) = console_context()?;
-    let identity = crate::console_identity(&config, &repository, &main_root, &worktree_root);
+    let (config, repository, repo, main_root, worktree_root) = console_context()?;
+    let revision = crate::console_revision(&repo)?;
+    let identity = crate::console_identity(&config, &repository, &main_root, &worktree_root)
+        .with_revision(&revision);
     match action {
-        "status" => {
+        "status" | "list" => {
             let coordinator = crate::HostResourceCoordinator::open_read_only_default()?;
             let leases = crate::console_leases(&coordinator.list(false)?, &repository);
+            let markers = crate::read_console_markers()?;
             let canonical_fingerprint = crate::worktree_fingerprint(&main_root);
             if parsed.json {
                 let running: Vec<_> = leases
                     .iter()
                     .map(|lease| {
+                        let marker = crate::console_marker_for_lease(&markers, lease);
+                        let marker_revision = marker.map(|record| {
+                            serde_json::json!({
+                                "branch": record.marker.branch,
+                                "commit": record.marker.commit,
+                                "dirty": record.marker.dirty,
+                                "integration_branch": record.marker.integration_branch,
+                                "integration_head": record.marker.integration_head,
+                                "integration_relation": record.marker.integration_relation,
+                                "ahead_commits": record.marker.ahead_commits,
+                                "behind_commits": record.marker.behind_commits,
+                            })
+                        });
                         serde_json::json!({
                             "lease_id": lease.lease_id,
                             "port": crate::console_port(lease),
                             "worktree_fingerprint": lease.worktree_fingerprint,
-                            "canonical": lease.worktree_fingerprint == canonical_fingerprint,
+                            "canonical": marker.map_or(
+                                lease.worktree_fingerprint == canonical_fingerprint,
+                                |record| record.marker.canonical,
+                            ),
+                            "parallel": marker.is_some_and(|record| record.marker.parallel),
+                            "worktree": marker.map(|record| record.marker.worktree.clone()),
+                            "branch": marker.map(|record| record.marker.branch.clone()),
+                            "commit": marker.map(|record| record.marker.commit.clone()),
+                            "dirty": marker.map(|record| record.marker.dirty),
+                            "integration_branch": marker.map(|record| record.marker.integration_branch.clone()),
+                            "integration_head": marker.and_then(|record| record.marker.integration_head.clone()),
+                            "integration_relation": marker.map(|record| record.marker.integration_relation),
+                            "ahead_commits": marker.map(|record| record.marker.ahead_commits),
+                            "behind_commits": marker.map(|record| record.marker.behind_commits),
+                            "revision": marker_revision,
+                            "marker": marker.map(|record| serde_json::json!({
+                                "path": record.path,
+                                "digest": record.marker.marker_digest,
+                            })),
                             "state": lease.state.as_str(),
                             "holder_pid": lease.holder_pid,
                             "expires_at": lease.expires_at,
@@ -8130,13 +8180,44 @@ fn run_console(parsed: Parsed) -> Result<(), UsageError> {
                         "agent worktree — not canonical"
                     }
                 );
+                out!(
+                    "Current revision: {} @ {} ({}, integration: {}{}{})",
+                    revision.branch,
+                    short_sha(&revision.commit),
+                    if revision.dirty { "dirty" } else { "clean" },
+                    revision.integration_relation.as_str(),
+                    revision
+                        .integration_head
+                        .as_deref()
+                        .map(|head| format!(" @ {}", short_sha(head)))
+                        .unwrap_or_default(),
+                    if revision.integration_relation
+                        == crate::ConsoleIntegrationRelation::Unavailable
+                    {
+                        " (ref unavailable)"
+                    } else {
+                        ""
+                    }
+                );
                 if leases.is_empty() {
                     out!("Running consoles: none");
                 } else {
                     out!("Running consoles: {}", leases.len());
                     for lease in &leases {
+                        let marker = crate::console_marker_for_lease(&markers, lease);
+                        let revision_label = marker.map_or_else(
+                            || "marker missing".to_string(),
+                            |record| {
+                                format!(
+                                    "{} @ {}{}",
+                                    record.marker.branch,
+                                    short_sha(&record.marker.commit),
+                                    if record.marker.dirty { " (dirty)" } else { "" }
+                                )
+                            },
+                        );
                         out!(
-                            "  {:<10} port {:<6} pid {:<8} {}{}",
+                            "  {:<10} port {:<6} pid {:<8} {}{} — {}{}",
                             lease.state.as_str(),
                             crate::console_port(lease).unwrap_or("-"),
                             lease
@@ -8147,22 +8228,35 @@ fn run_console(parsed: Parsed) -> Result<(), UsageError> {
                                 " (canonical)"
                             } else {
                                 " (worktree)"
-                            }
+                            },
+                            revision_label,
+                            if marker.is_some_and(|record| record.marker.parallel) {
+                                " [parallel]"
+                            } else {
+                                ""
+                            },
                         );
                     }
                 }
             }
         }
         "plan" => {
-            let Some(request) =
-                crate::console_request(&config, &repository, &worktree_root, "plan", None)
-            else {
+            let Some(request) = crate::console_request_with_options(
+                &config,
+                &repository,
+                &worktree_root,
+                "plan",
+                None,
+                parsed.allow_parallel,
+            ) else {
                 return unmanaged_notice(parsed.json, "plan");
             };
             let coordinator = crate::HostResourceCoordinator::open_read_only_default()?;
             let plan = coordinator.plan(&request)?;
             if parsed.json {
-                out!("{}", serde_json::to_string_pretty(&plan)?);
+                let mut value = serde_json::to_value(&plan)?;
+                value["allow_parallel"] = serde_json::Value::Bool(parsed.allow_parallel);
+                out!("{}", serde_json::to_string_pretty(&value)?);
             } else {
                 out!(
                     "Console plan ({}) — {} (advisory; run is authoritative)",
@@ -8196,13 +8290,21 @@ fn run_console(parsed: Parsed) -> Result<(), UsageError> {
                     "console run requires -- <command> [args...]".into(),
                 ));
             }
-            let run_id = format!("pid{}", std::process::id());
-            let Some(request) = crate::console_request(
+            let run_id = format!(
+                "pid{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis()
+            );
+            let Some(request) = crate::console_request_with_options(
                 &config,
                 &repository,
                 &worktree_root,
                 &run_id,
                 Some(std::process::id()),
+                parsed.allow_parallel,
             ) else {
                 // Unmanaged reserves nothing, so there is nothing to supervise.
                 // Running the command anyway keeps one spelling of "start the
@@ -8217,12 +8319,79 @@ fn run_console(parsed: Parsed) -> Result<(), UsageError> {
                 .unwrap_or_default();
             let mut coordinator = crate::HostResourceCoordinator::open_default()?;
             let json = parsed.json;
-            let report = coordinator.run_supervised(
+            let mut marker_path = None;
+            let marker_repository = repository.clone();
+            let marker_worktree = worktree_root.clone();
+            let report = coordinator.run_supervised_with_environment(
                 &request,
                 wait,
                 &parsed.exec_command,
                 parsed.cleanup_command.as_deref(),
                 &worktree_root,
+                |grant| {
+                    let marker = crate::ConsoleRuntimeMarker::for_grant(
+                        grant,
+                        &marker_repository,
+                        &marker_worktree,
+                        config.mode,
+                        identity.canonical,
+                        parsed.allow_parallel,
+                        &crate::console_revision(&repo).map_err(|error| {
+                            std::io::Error::other(format!(
+                                "cannot identify console revision: {error}"
+                            ))
+                        })?,
+                    )?;
+                    let path = crate::write_console_marker(&marker)?;
+                    marker_path = Some(path.clone());
+                    if json {
+                        eprintln!(
+                            "{}",
+                            serde_json::json!({
+                                "type": "console_marker",
+                                "marker": {
+                                    "path": path,
+                                    "digest": marker.marker_digest,
+                                    "repository": marker.repository,
+                                    "branch": marker.branch,
+                                    "commit": marker.commit,
+                                    "dirty": marker.dirty,
+                                    "worktree": marker.worktree,
+                                    "port": marker.port,
+                                    "canonical": marker.canonical,
+                                    "parallel": marker.parallel,
+                                    "integration_branch": marker.integration_branch,
+                                    "integration_head": marker.integration_head,
+                                    "integration_relation": marker.integration_relation,
+                                    "ahead_commits": marker.ahead_commits,
+                                    "behind_commits": marker.behind_commits,
+                                },
+                            })
+                        );
+                    } else {
+                        eprintln!(
+                            "console: source={} branch={} commit={} dirty={} canonical={} integration={} port={} marker={}",
+                            marker.worktree,
+                            marker.branch,
+                            marker.commit,
+                            if marker.dirty { "yes" } else { "no" },
+                            if marker.canonical { "yes" } else { "no" },
+                            marker.integration_relation.as_str(),
+                            marker.port,
+                            path.display()
+                        );
+                    }
+                    Ok(std::collections::BTreeMap::from([
+                        (
+                            crate::CONSOLE_MARKER_ENV.to_string(),
+                            path.display().to_string(),
+                        ),
+                        (
+                            crate::CONSOLE_MARKER_DIGEST_ENV.to_string(),
+                            marker.marker_digest.clone(),
+                        ),
+                    ]))
+                },
                 |message| {
                     if json {
                         eprintln!(
@@ -8267,10 +8436,26 @@ fn run_console(parsed: Parsed) -> Result<(), UsageError> {
                             ));
                         }
                     }
+                    if let Some(path) = marker_path.as_deref() {
+                        crate::remove_console_marker(path)?;
+                    }
                     return Err(UsageError::Message(message));
                 }
-                Err(error) => return Err(error.into()),
+                Err(error) => {
+                    if let Some(path) = marker_path.as_deref() {
+                        crate::remove_console_marker(path)?;
+                    }
+                    return Err(error.into());
+                }
             };
+            if let Some(path) = marker_path.as_deref() {
+                crate::remove_console_marker(path).map_err(|error| {
+                    UsageError::Message(format!(
+                        "console stopped but could not remove runtime marker {}: {error}",
+                        path.display()
+                    ))
+                })?;
+            }
             if json {
                 eprintln!("{}", serde_json::to_string(&report)?);
             } else {
@@ -8295,7 +8480,7 @@ fn run_console(parsed: Parsed) -> Result<(), UsageError> {
         }
         other => {
             return Err(UsageError::Message(format!(
-                "unknown console action {other:?}; expected status, plan, or run"
+                "unknown console action {other:?}; expected status, list, plan, or run"
             )));
         }
     }
