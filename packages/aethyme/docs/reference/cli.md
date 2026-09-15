@@ -351,6 +351,7 @@ stashing multi-worktree changes.
 - `aethyme broker operations list [--limit <n>] [--before <id>] [--session <id>] [--status <status>] [--repo <canonical-id>] [--provider <git|github>] [--json]`
 - `aethyme broker operations [same options]` (compatibility alias during deprecation)
 - `aethyme broker operations show <id> [--json]`
+- `aethyme broker operations stats [--repo <canonical-id>] [--limit <n>] [--json]`
 - `aethyme broker operations reconcile --operation <id> --outcome <succeeded|failed> --reason <text> [--json]`
 - `aethyme broker advisories list [--all] [--json]`
 - `aethyme broker advisories show <id> [--json]`
@@ -594,6 +595,23 @@ Every `operations reconcile` usage or validation error repeats the complete
 contract—`--operation`, `--outcome`, and `--reason`—in one message. Successful
 manual reconciliation appends the operator outcome and reason without deleting
 the original push plan or remote evidence.
+
+`broker operations stats` is a bounded, read-only measurement surface for the
+coordination-lock decision. It reports p50/p99 lock-hold and queue-wait
+durations by operation kind, queue depth, samples that used
+`hooks_outside_lock`, and known disjoint-scope waits. It counts only completed
+rows with timing data; older rows remain visible as `unmeasured`, and
+repository-wide or unknown scopes are not guessed to be unrelated. Use
+`--repo` to isolate one canonical repository and `--limit` (1–500) to choose
+the newest history window. The JSON payload is versioned by
+`schema_version`.
+
+The optional `[coordination] measure_pr_merge_ref = true` setting runs a
+read-only `gh pr view <selector> --json baseRefName` probe before a
+`gh pr merge`, records its duration in the operation timing, and never uses
+the result to narrow today's repository lock. This makes the provider
+round-trip cost measurable before a future ref-scoped design is considered;
+it is off by default.
 
 `broker advisories` exposes durable, explicitly non-blocking findings. Each row
 has an immutable producer identity, optional session and queue-entry links,

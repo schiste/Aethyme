@@ -175,12 +175,32 @@ fn successful_operation_is_durably_journaled_with_events() {
         Some("test workflow")
     );
     assert!(report.operation.command_json.contains("coordinated"));
+    let details: serde_json::Value =
+        serde_json::from_str(report.operation.details_json.as_deref().unwrap()).unwrap();
+    let timing = &details["coordination_timing"];
+    assert_eq!(timing["schema_version"], 1);
+    assert!(
+        timing["lock_key"]
+            .as_str()
+            .is_some_and(|key| !key.is_empty())
+    );
+    assert!(timing["lock_acquired_at"].as_i64().is_some());
+    assert!(timing["lock_released_at"].as_i64().is_some());
+    assert!(
+        timing["lock_hold_ms"]
+            .as_i64()
+            .is_some_and(|value| value >= 0)
+    );
 
     let events = broker.store().events_after(0, i64::MAX).unwrap();
     let kinds: Vec<&str> = events.iter().map(|event| event.kind.as_str()).collect();
     assert!(kinds.contains(&"operation.prepared"));
     assert!(kinds.contains(&"operation.running"));
     assert!(kinds.contains(&"operation.succeeded"));
+
+    let stats = broker.coordinated_operation_stats(None, 50).unwrap();
+    assert_eq!(stats.measured_operations, 1);
+    assert_eq!(stats.by_kind[0].kind, "git.branch");
 }
 
 #[test]

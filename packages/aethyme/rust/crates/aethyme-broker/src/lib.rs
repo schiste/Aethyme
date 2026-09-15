@@ -58,6 +58,7 @@ mod leases;
 pub mod main_reconcile;
 mod measurement;
 mod merge;
+mod operation_stats;
 mod operations;
 pub mod plugin_cli;
 mod pr;
@@ -231,6 +232,11 @@ pub use merge::{
     SubmissionConflict, SubmissionGateVerification, SubmissionGateVerificationStatus,
     SubmissionIntegrationState, SubmissionPlan, SubmitOutcome,
 };
+pub use operation_stats::{
+    DEFAULT_OPERATION_STATS_LIMIT, HooksOutsideLockStats, MAX_OPERATION_STATS_LIMIT,
+    OPERATION_STATS_SCHEMA_VERSION, OperationKindStats, OperationQueueDepthStats, OperationStats,
+    OperationTimingDistribution, RefDeterminationStats, UnrelatedContentionStats,
+};
 pub use operations::{
     CoordinatedCommand, CoordinatedOperationReport, OperationReconcileReport,
     OperationReconciliation, OperationReconciliationRecovery, OperationReconciliationState,
@@ -342,8 +348,9 @@ pub use reclaim_order::{
 pub use resources::{
     HOST_RESOURCE_REQUEST_SCHEMA_VERSION, HOST_RESOURCE_SCHEMA_VERSION, HostLeaseState,
     HostResourceAllocation, HostResourceConflict, HostResourceCoordinator, HostResourceError,
-    HostResourceGrant, HostResourceKind, HostResourceLease, HostResourcePlan, HostResourceRequest,
-    HostResourceRequirement, HostResourceRunError, HostResourceRunReport,
+    HostResourceBlocker, HostResourceExplanation, HostResourceGrant, HostResourceHolder,
+    HostResourceKind, HostResourceLease, HostResourcePlan, HostResourceRequest,
+    HostResourceRequirement, HostResourceRunError, HostResourceRunReport, HostResourceWaitAdvice,
     default_host_resource_db_path, resource_environment_key, validate_host_resource_requirements,
 };
 pub use retention::{

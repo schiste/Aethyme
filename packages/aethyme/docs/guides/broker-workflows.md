@@ -385,6 +385,33 @@ for secret scanning or signing checks is choosing to run those in the dry run
 alone. Enable it when the hook's cost is the constraint and its checks are
 deterministic over the same commits.
 
+### Measuring whether repository locking is still the bottleneck
+
+Before designing a finer ref lock, inspect the bounded timing window:
+
+```bash
+aethyme broker operations stats --repo github.com/org/repo --json
+```
+
+The report includes p50 and p99 lock-hold and queue-wait durations by
+operation kind, queue depth, the subset that ran with `hooks_outside_lock`,
+and waits where both sides named disjoint known scopes. Rows written before
+timing instrumentation are counted as unmeasured rather than reconstructed
+from wall-clock timestamps. Repository-wide or provider-unknown targets stay
+out of the unrelated-wait count because the broker cannot safely infer that
+they do not overlap.
+
+To measure the provider round-trip a future `gh pr merge` ref-scoping design
+would add, opt in explicitly:
+
+```toml
+[coordination]
+measure_pr_merge_ref = true
+```
+
+This runs a read-only `gh pr view <selector> --json baseRefName` probe, records
+its duration, and leaves the current repository-wide lock policy unchanged.
+
 ### Reconciling a local default branch
 
 `ship` publishes an exact promoted prefix and refuses to discard local work the

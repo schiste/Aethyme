@@ -17,6 +17,8 @@ const RESOURCES_RECONCILE_USAGE: &str =
 const OPERATIONS_RECONCILE_USAGE: &str = "usage: aethyme broker operations reconcile \
      --operation <id> --outcome <succeeded|failed> --reason <text> [--json]";
 const OPERATIONS_SHOW_USAGE: &str = "usage: aethyme broker operations show <id> [--json]";
+const OPERATIONS_STATS_USAGE: &str =
+    "usage: aethyme broker operations stats [--repo <canonical-id>] [--limit <n>] [--json]";
 const ADVISORIES_SHOW_USAGE: &str = "usage: aethyme broker advisories show <id> [--json]";
 const ADVISORIES_ACK_USAGE: &str = "usage: aethyme broker advisories ack <id> [--json]";
 const ADVISORIES_SUPPRESS_USAGE: &str = "usage: aethyme broker advisories suppress <id> [--json]";
@@ -175,6 +177,9 @@ Usage:
   aethyme broker resources plan <request.json> [--json]
       Read-only host-wide availability estimate for a typed resource bundle.
       Never reserves a port, namespace, capacity slot, or exclusive key.
+  aethyme broker resources explain <request.json> [--json]
+      Read-only diagnosis joining each blocked resource to its exact lease,
+      holder process, liveness, and wait/reconcile guidance.
   aethyme broker resources acquire <request.json> [--wait <duration>] [--grant-out <path>] [--json]
       Atomically reserve the full bundle. --wait bounds contention retries.
       --grant-out atomically creates a mode-0600 private grant and keeps the
@@ -239,6 +244,10 @@ Usage:
   aethyme broker operations reconcile --operation <id> --outcome <succeeded|failed> --reason <text> [--json]
       Resolve a crash-ambiguous operation after independently inspecting the
       remote state. Overlapping writes remain blocked until reconciliation.
+  aethyme broker operations stats [--repo <canonical-id>] [--limit <n>] [--json]
+      Read bounded lock-hold, queue-wait, queue-depth, and known-unrelated
+      contention measurements. Older operations without timing data are
+      reported as unmeasured; this command never changes lock policy.
   aethyme broker advisories list [--all] [--json]
       List outstanding non-blocking advisories newest-first. --all includes
       acknowledged, suppressed, and resolved history. Deliberate inventory
@@ -686,6 +695,7 @@ const KNOWN_COMMAND_WORDS: &[&str] = &[
     "git",
     "gh",
     "operations",
+    "stats",
     "advisories",
     "exposures",
     "note",
@@ -942,7 +952,10 @@ fn command_records_metric(args: &[String]) -> bool {
         ),
         Some("leases") => !matches!(args.get(1).map(String::as_str), Some("plan" | "export")),
         Some("console") => args.get(1).map(String::as_str) == Some("run"),
-        Some("resources") => !matches!(args.get(1).map(String::as_str), Some("plan" | "list")),
+        Some("resources") => !matches!(
+            args.get(1).map(String::as_str),
+            Some("plan" | "explain" | "list")
+        ),
         Some("events") => args.get(1).map(String::as_str) == Some("prune"),
         Some("gates") => match args.get(1).map(String::as_str) {
             Some("validate" | "manifest" | "scope" | "affected" | "semantic") => false,
@@ -1148,6 +1161,7 @@ mod tests {
             args(&["storage"]),
             args(&["storage", "plan"]),
             args(&["operations"]),
+            args(&["operations", "stats"]),
             args(&["advisories", "list"]),
             args(&["advisories", "show", "1"]),
             args(&["external-events", "list"]),
@@ -5770,6 +5784,96 @@ fn render_operation_show(report: &crate::OperationShowReport) {
     }
 }
 
+fn render_operation_stats(report: &crate::OperationStats) {
+    let repository = report.repository.as_deref().unwrap_or("all repositories");
+    out!("Coordination statistics for {repository}:");
+    out!(
+        "  observed: {} (measured: {}, unmeasured: {}, history truncated: {})",
+        report.observed_operations,
+        report.measured_operations,
+        report.unmeasured_operations,
+        if report.history_truncated {
+            "yes"
+        } else {
+            "no"
+        },
+    );
+    render_timing_distribution("lock hold", &report.lock_hold_ms);
+    render_timing_distribution("queue wait", &report.queue_wait_ms);
+    out!(
+        "  queue depth: {} samples, p50 {}, p99 {}, max {}",
+        report.queue_depth.sample_count,
+        format_optional_usize(report.queue_depth.p50),
+        format_optional_usize(report.queue_depth.p99),
+        format_optional_usize(report.queue_depth.max),
+    );
+    out!(
+        "  known unrelated contention: {} waits, {}ms total, max {}ms",
+        report.unrelated_contention.sample_count,
+        report.unrelated_contention.total_queue_wait_ms,
+        format_optional_ms(report.unrelated_contention.max_queue_wait_ms),
+    );
+    out!(
+        "  hooks outside lock: {} samples",
+        report.hooks_outside_lock.sample_count
+    );
+    render_timing_distribution(
+        "    hook lock hold",
+        &report.hooks_outside_lock.lock_hold_ms,
+    );
+    render_timing_distribution(
+        "    hook queue wait",
+        &report.hooks_outside_lock.queue_wait_ms,
+    );
+    let ref_stats = &report.pr_merge_ref_determination;
+    out!(
+        "  pr merge ref determination: {} measured ({} succeeded, {} failed), {} unmeasured",
+        ref_stats.measured_count,
+        ref_stats.succeeded_count,
+        ref_stats.failed_count,
+        ref_stats.unmeasured_count,
+    );
+    render_timing_distribution("    ref determination", &ref_stats.duration_ms);
+    if !report.by_kind.is_empty() {
+        out!("  by operation kind:");
+        for kind in &report.by_kind {
+            out!(
+                "    {} ({} samples): hold p50 {}, p99 {}; wait p50 {}, p99 {}",
+                kind.kind,
+                kind.sample_count,
+                format_optional_ms(kind.lock_hold_ms.p50_ms),
+                format_optional_ms(kind.lock_hold_ms.p99_ms),
+                format_optional_ms(kind.queue_wait_ms.p50_ms),
+                format_optional_ms(kind.queue_wait_ms.p99_ms),
+            );
+        }
+    }
+    out!("  note: {}", report.interpretation);
+}
+
+fn render_timing_distribution(label: &str, distribution: &crate::OperationTimingDistribution) {
+    out!(
+        "  {label}: {} samples, total {}ms, p50 {}, p99 {}, max {}",
+        distribution.sample_count,
+        distribution.total_ms,
+        format_optional_ms(distribution.p50_ms),
+        format_optional_ms(distribution.p99_ms),
+        format_optional_ms(distribution.max_ms),
+    );
+}
+
+fn format_optional_ms(value: Option<i64>) -> String {
+    value
+        .map(|value| format!("{value}ms"))
+        .unwrap_or_else(|| "n/a".into())
+}
+
+fn format_optional_usize(value: Option<usize>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "n/a".into())
+}
+
 fn render_coordinated_operation(
     report: &crate::CoordinatedOperationReport,
     json: bool,
@@ -8247,6 +8351,55 @@ fn render_host_lease(lease: &crate::HostResourceLease) {
     }
 }
 
+fn render_host_resource_explanation(explanation: &crate::HostResourceExplanation) {
+    out!(
+        "Request {} — {}",
+        explanation.request_id,
+        if explanation.available {
+            "available"
+        } else {
+            "blocked"
+        }
+    );
+    out!(
+        "  waitable: {} ({})",
+        explanation.wait.waitable,
+        explanation.wait.reason
+    );
+    out!("  action: {}", explanation.wait.action);
+    for blocker in &explanation.blockers {
+        let conflict = &blocker.conflict;
+        out!(
+            "  blocker {} [{}] — {}",
+            conflict.resource_key,
+            conflict.kind,
+            conflict.reason
+        );
+        if let Some(bindable) = blocker.os_bindable {
+            out!("    OS port available in requested range: {bindable}");
+        }
+        if blocker.leases.is_empty() {
+            out!("    broker leases: none");
+        } else {
+            for holder in &blocker.holders {
+                out!(
+                    "    lease {} generation {} run {} pid {} ({})",
+                    holder.lease_id,
+                    holder.generation,
+                    holder.run_id,
+                    holder
+                        .holder_pid
+                        .map_or_else(|| "-".into(), |pid| pid.to_string()),
+                    holder
+                        .process_alive
+                        .map_or("unknown", |alive| { if alive { "alive" } else { "gone" } })
+                );
+            }
+        }
+        out!("    recovery: {}", blocker.recovery);
+    }
+}
+
 fn render_submission_plan(plan: &crate::SubmissionPlan, checkout: &crate::GitRepo) {
     out!(
         "Submitting session {} — HEAD {} onto integration {}",
@@ -8801,11 +8954,12 @@ fn run_resources(parsed: Parsed) -> Result<(), UsageError> {
         .map(String::as_str)
         .ok_or_else(|| {
             UsageError::Message(
-                "resources requires plan, acquire, run, renew, release, list, or reconcile".into(),
-            )
+            "resources requires plan, explain, acquire, run, renew, release, list, or reconcile"
+                .into(),
+        )
         })?;
     match action {
-        "plan" | "acquire" => {
+        "plan" | "explain" | "acquire" => {
             let path = parsed.positional.get(1).map(PathBuf::from).ok_or_else(|| {
                 UsageError::Message(format!("resources {action} requires <request.json>"))
             })?;
@@ -8840,6 +8994,14 @@ fn run_resources(parsed: Parsed) -> Result<(), UsageError> {
                             conflict.reason
                         );
                     }
+                }
+            } else if action == "explain" {
+                let coordinator = crate::HostResourceCoordinator::open_read_only_default()?;
+                let explanation = coordinator.explain(&request)?;
+                if parsed.json {
+                    out!("{}", serde_json::to_string_pretty(&explanation)?);
+                } else {
+                    render_host_resource_explanation(&explanation);
                 }
             } else {
                 let mut coordinator = crate::HostResourceCoordinator::open_default()?;
@@ -9075,7 +9237,7 @@ fn run_resources(parsed: Parsed) -> Result<(), UsageError> {
         }
         other => {
             return Err(UsageError::Message(format!(
-                "unknown resources action {other:?}; expected plan, acquire, run, renew, release, list, or reconcile"
+                "unknown resources action {other:?}; expected plan, explain, acquire, run, renew, release, list, or reconcile"
             )));
         }
     }
@@ -10204,6 +10366,25 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                         render_operation_show(&report);
                     }
                 }
+                Some("stats") => {
+                    if parsed.positional.len() != 1 {
+                        return Err(UsageError::Message(OPERATIONS_STATS_USAGE.into()));
+                    }
+                    let limit = parsed.limit.unwrap_or(crate::DEFAULT_OPERATION_STATS_LIMIT);
+                    if limit == 0 || limit > crate::MAX_OPERATION_STATS_LIMIT {
+                        return Err(UsageError::Message(format!(
+                            "--limit must be between 1 and {}\n{OPERATIONS_STATS_USAGE}",
+                            crate::MAX_OPERATION_STATS_LIMIT
+                        )));
+                    }
+                    let report =
+                        broker.coordinated_operation_stats(parsed.repository.as_deref(), limit)?;
+                    if parsed.json {
+                        out!("{}", serde_json::to_string_pretty(&report)?);
+                    } else {
+                        render_operation_stats(&report);
+                    }
+                }
                 Some("reconcile") => {
                     if parsed.operation.is_none()
                         || parsed.outcome.is_none()
@@ -10241,7 +10422,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                 }
                 Some(other) => {
                     return Err(UsageError::Message(format!(
-                        "unknown operations action {other:?} — expected list, show, or reconcile"
+                        "unknown operations action {other:?} — expected list, show, stats, or reconcile"
                     )));
                 }
             }
