@@ -31,6 +31,21 @@ const RETENTION_POLICY_FIELDS: &[&str] = &[
     "size_record_ttl_hours",
 ];
 
+/// Directory names that are repository source or control roots rather than
+/// regenerable build output. Configured artefact names use a deliberately
+/// broad non-empty-directory witness, so allowing these names would let a
+/// typo turn normal repository content into a deletion candidate.
+const PROTECTED_ARTEFACT_DIRECTORY_NAMES: &[&str] = &[
+    ".aethyme", ".git", ".github", ".gitlab", ".idea", ".vscode", "doc", "docs", "example",
+    "examples", "include", "lib", "src", "test", "tests",
+];
+
+pub(crate) fn is_safe_artefact_directory_name(name: &str) -> bool {
+    !PROTECTED_ARTEFACT_DIRECTORY_NAMES
+        .iter()
+        .any(|protected| name.eq_ignore_ascii_case(protected))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RetentionPolicy {
@@ -188,12 +203,11 @@ impl RetentionPolicy {
                 && !directory.contains('\0')
                 && matches!(components.next(), Some(std::path::Component::Normal(_)))
                 && components.next().is_none();
-            if !valid {
+            if !valid || !is_safe_artefact_directory_name(directory) {
                 return Err(RetentionConfigError::InvalidValue {
                     field: "artefact_directories",
                     value: directory.clone(),
-                    constraint:
-                        "each entry must be one non-empty directory name without path separators",
+                    constraint: "each entry must be one non-empty safe directory name without path separators or reserved source/control names",
                 });
             }
         }
@@ -722,6 +736,23 @@ mod tests {
                     })
                 ),
                 "{directory:?} should not escape one directory component"
+            );
+        }
+
+        for directory in [
+            ".aethyme", ".git", "SRC", "lib", "tests", "docs", "examples",
+        ] {
+            let mut policy = RetentionPolicy::default();
+            policy.artefact_directories = vec![directory.into()];
+            assert!(
+                matches!(
+                    policy.validate(),
+                    Err(RetentionConfigError::InvalidValue {
+                        field: "artefact_directories",
+                        ..
+                    })
+                ),
+                "{directory:?} should remain outside the configurable artifact catalog"
             );
         }
     }

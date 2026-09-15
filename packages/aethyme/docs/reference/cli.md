@@ -1049,9 +1049,12 @@ ignored or invalid retention keys with the remediation to edit this file.
 `artefact_directories` is an additive list of single directory names. It can
 extend the built-in artifact catalog (`target` and `node_modules`) for a
 repository-specific cache such as `.pnpm-store`; it cannot remove or weaken a
-built-in witness. Configured names still have to be git-ignored and live inside
-the owning session worktree before GC can reclaim them. The legacy
-`broker reclaim` plan uses the same additive list.
+built-in witness. Configured names must also avoid repository source and control
+roots such as `.git`, `.aethyme`, `src`, `lib`,
+`tests`, and `docs`; invalid names fail retention-policy validation.
+Configured names still have to be git-ignored and live inside the owning session
+worktree before GC can reclaim them. The legacy `broker reclaim` plan uses
+the same additive list.
 
 `retained_bytes_budget` is a soft, non-blocking budget used by status, doctor,
 and finish warnings; `0` disables only those warnings. It never authorizes

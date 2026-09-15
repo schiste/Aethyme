@@ -18,6 +18,8 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
+use crate::retention::is_safe_artefact_directory_name;
+
 const RECLAIM_PLAN_SCHEMA_VERSION: u8 = 1;
 const RECLAIM_PLAN_FILENAME_PREFIX: &str = ".aethyme-reclaim-plan-";
 const RECLAIM_PLAN_FILENAME_SUFFIX: &str = ".json";
@@ -246,7 +248,10 @@ pub fn is_artefact_directory(name: &str) -> bool {
 /// catalog plus additive configured names. Configuration never removes a
 /// built-in name from the catalog.
 pub fn is_artefact_directory_with_extras(name: &str, extras: &[String]) -> bool {
-    is_artefact_directory(name) || extras.iter().any(|candidate| candidate == name)
+    is_artefact_directory(name)
+        || extras
+            .iter()
+            .any(|candidate| is_safe_artefact_directory_name(candidate) && candidate == name)
 }
 
 /// Decide whether a candidate found under `worktree` may be reclaimed.
@@ -699,6 +704,18 @@ mod scan_tests {
         assert_eq!(found.len(), 1, "{found:?}");
         assert!(found[0].path.ends_with(".pnpm-store"));
         assert_eq!(found[0].bytes, 16);
+    }
+
+    #[test]
+    fn configured_source_and_control_names_are_not_candidates() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(&tmp.path().join("s/src/main.rs"), 16);
+
+        let found = scan_with_extra_directories(tmp.path(), &[], &["src".into()]);
+        assert!(
+            found.is_empty(),
+            "configured source roots must stay outside reclaim: {found:?}"
+        );
     }
 
     #[test]

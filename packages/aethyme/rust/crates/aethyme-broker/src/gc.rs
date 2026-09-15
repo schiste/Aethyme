@@ -10,11 +10,12 @@ use sha2::{Digest, Sha256};
 use crate::broker::{
     WORKTREE_ROOT_MARKER, WorktreeRootMarker, directory_size_without_following_links,
 };
+use crate::retention::is_safe_artefact_directory_name;
 use crate::{
-    Broker, BrokerOpError, GcApplyReport, GcArtifactCandidate, GcBlocker,
-    GcDeclinedArtifact, GcFileAction, GcFileCandidate, GcHealth, GcOrphanCandidate, GcPlan,
-    GcRowCandidate, GcWorktreeBlockerSummary, GcWorktreeCandidate, GitRepo, OperationStatus,
-    RetentionPolicy, load_retention_policy, load_retention_policy_report,
+    Broker, BrokerOpError, GcApplyReport, GcArtifactCandidate, GcBlocker, GcDeclinedArtifact,
+    GcFileAction, GcFileCandidate, GcHealth, GcOrphanCandidate, GcPlan, GcRowCandidate,
+    GcWorktreeBlockerSummary, GcWorktreeCandidate, GitRepo, OperationStatus, RetentionPolicy,
+    load_retention_policy, load_retention_policy_report,
 };
 
 pub const GC_PLAN_SCHEMA_VERSION: u32 = 2;
@@ -98,7 +99,7 @@ fn artifact_witness_for_with_extras(path: &Path, extras: &[String]) -> Option<Ar
         .or_else(|| {
             extras
                 .iter()
-                .any(|candidate| candidate == name)
+                .any(|candidate| is_safe_artefact_directory_name(candidate) && candidate == name)
                 .then_some(ArtifactWitness::NonEmptyDirectory)
         })?;
     witness.confirms(path).then_some(witness)
@@ -108,7 +109,9 @@ fn is_known_artifact_name(name: &str, extras: &[String]) -> bool {
     ARTIFACT_DIRECTORIES
         .iter()
         .any(|(candidate, _)| *candidate == name)
-        || extras.iter().any(|candidate| candidate == name)
+        || extras
+            .iter()
+            .any(|candidate| is_safe_artefact_directory_name(candidate) && candidate == name)
 }
 
 #[derive(Default)]
@@ -1781,6 +1784,18 @@ mod tests {
         let source = dir(root, "src/target");
         std::fs::write(source.join("main.rs"), "fn main() {}\n").unwrap();
         assert!(artifact_witness_for(&source).is_none());
+    }
+
+    #[test]
+    fn configured_source_and_control_names_are_never_artifacts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = dir(tmp.path(), "src");
+        std::fs::write(source.join("main.rs"), "fn main() {}\n").unwrap();
+
+        assert!(
+            artifact_witness_for_with_extras(&source, &["src".into()]).is_none(),
+            "configured source roots must not become deletion candidates"
+        );
     }
 
     #[test]
