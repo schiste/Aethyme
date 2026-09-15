@@ -21,6 +21,7 @@
 //!   sessions, stress-tested at 20 (see `tests/stress.rs`).
 
 mod advisories;
+mod atomic_file;
 pub mod agent_hook;
 pub mod attribution;
 mod broker;
@@ -345,7 +346,8 @@ pub use resources::{
     default_host_resource_db_path, resource_environment_key, validate_host_resource_requirements,
 };
 pub use retention::{
-    BROKER_CONFIG_RELPATH, GcApplyReport, GcArtifactCandidate, GcBlocker, GcBlockerSummary,
+    BROKER_CONFIG_RELPATH, GcApplyReport, GcArtifactCandidate, GcBlocker,
+    GcWorktreeBlockerSummary,
     GcFileAction, GcFileCandidate, GcHealth, GcOrphanCandidate, GcPlan, GcRowCandidate,
     GcRowKind, GcWorktreeCandidate, RETENTION_POLICY_SCHEMA_VERSION, RetentionConfigError,
     RetentionConfigWarning, RetentionPolicy, RetentionPolicyLoadReport, load_retention_policy,
