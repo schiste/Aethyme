@@ -59,8 +59,12 @@ fn production_crates_and_binaries_share_the_release_version() {
 
     if let Ok(tag) = std::env::var("AETHYME_RELEASE_TAG") {
         assert_eq!(tag, format!("v{expected}"));
-        assert!(router.contains(&format!("({tag})")), "{router}");
-        assert!(engine.contains(&format!("({tag})")), "{engine}");
+        for output in [router.as_str(), engine.as_str()] {
+            let embedded_tag = output
+                .split_once('(')
+                .and_then(|(_, details)| details.split_whitespace().next());
+            assert_eq!(embedded_tag, Some(tag.as_str()), "{output}");
+        }
     }
 }
 
