@@ -577,6 +577,13 @@ pub fn status(repo: &GitRepo) -> Result<Vec<HookReport>, HooksError> {
             let Ok(existing) = std::fs::read_to_string(&candidate) else {
                 continue;
             };
+            // The default hook is owned by Aethyme when its marker is
+            // present. Its invocation is intentionally the same text that
+            // external managers embed, so check ownership before treating
+            // the invocation as evidence of an external integration.
+            if candidate == path && existing.contains(MARKER_BEGIN) {
+                continue;
+            }
             if contains_hook_invocation(&existing, hook) {
                 let stale = assigned_binary(&existing).is_some_and(|binary| !is_executable(&binary));
                 external = Some((candidate, stale));
