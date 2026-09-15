@@ -261,6 +261,8 @@ pub struct HostResourceRunReport {
 pub enum HostResourceRunError {
     #[error(transparent)]
     Resource(#[from] HostResourceError),
+    #[error("cannot prepare supervised command environment: {0}")]
+    Environment(#[source] std::io::Error),
     #[error("cannot start supervised command {program:?}: {source}")]
     Spawn {
         program: String,
@@ -550,10 +552,39 @@ impl HostResourceCoordinator {
         command: &[String],
         cleanup_command: Option<&str>,
         cwd: &Path,
+        event: F,
+    ) -> Result<HostResourceRunReport, HostResourceRunError>
+    where
+        F: FnMut(&str),
+    {
+        self.run_supervised_with_environment(
+            request,
+            wait,
+            command,
+            cleanup_command,
+            cwd,
+            |_grant| Ok(BTreeMap::new()),
+            event,
+        )
+    }
+
+    /// Run a command under a complete host-resource lifecycle, preparing
+    /// supplemental environment values after acquisition has selected the
+    /// actual allocations. This is the narrow hook consumers need when a
+    /// child-facing value depends on the granted port or namespace.
+    pub fn run_supervised_with_environment<F, P>(
+        &mut self,
+        request: &HostResourceRequest,
+        wait: std::time::Duration,
+        command: &[String],
+        cleanup_command: Option<&str>,
+        cwd: &Path,
+        mut prepare_environment: P,
         mut event: F,
     ) -> Result<HostResourceRunReport, HostResourceRunError>
     where
         F: FnMut(&str),
+        P: FnMut(&HostResourceGrant) -> Result<BTreeMap<String, String>, std::io::Error>,
     {
         if command.is_empty() {
             return Err(HostResourceRunError::Resource(
@@ -577,7 +608,19 @@ impl HostResourceCoordinator {
             grant.lease.lease_id, grant.lease.generation, waited_ms
         ));
 
-        let child = spawn_resource_process(command, cwd, &grant).map_err(|source| {
+        let environment = match prepare_environment(&grant) {
+            Ok(environment) => environment,
+            Err(source) => {
+                let _ = self.quarantine(
+                    &grant.lease.lease_id,
+                    grant.lease.generation,
+                    &grant.ownership_token,
+                );
+                return Err(HostResourceRunError::Environment(source));
+            }
+        };
+
+        let child = spawn_resource_process(command, cwd, &grant, &environment).map_err(|source| {
             HostResourceRunError::Spawn {
                 program: command[0].clone(),
                 source,
@@ -609,12 +652,10 @@ impl HostResourceCoordinator {
         if let Some(cleanup) = cleanup_command {
             event("running exact cleanup command");
             let cleanup_argv = vec!["sh".to_string(), "-c".to_string(), cleanup.to_string()];
-            let cleanup_child =
-                spawn_resource_process(&cleanup_argv, cwd, &grant).map_err(|source| {
-                    HostResourceRunError::Spawn {
-                        program: "sh".into(),
-                        source,
-                    }
+            let cleanup_child = spawn_resource_process(&cleanup_argv, cwd, &grant, &environment)
+                .map_err(|source| HostResourceRunError::Spawn {
+                    program: "sh".into(),
+                    source,
                 });
             let mut cleanup_child = match cleanup_child {
                 Ok(child) => child,
@@ -795,6 +836,7 @@ fn spawn_resource_process(
     command: &[String],
     cwd: &Path,
     grant: &HostResourceGrant,
+    environment: &BTreeMap<String, String>,
 ) -> std::io::Result<ResourceChild> {
     #[cfg(unix)]
     use std::os::unix::process::CommandExt as _;
@@ -808,6 +850,12 @@ fn spawn_resource_process(
         .stdin(std::process::Stdio::inherit())
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::inherit());
+    for (key, value) in environment {
+        process.env(key, value);
+    }
+    // The coordinator owns allocation variables; supplemental values may add
+    // a consumer contract but must not be able to make the child report a
+    // different port, namespace, slot, or lease generation.
     for (key, value) in grant.environment() {
         process.env(key, value);
     }

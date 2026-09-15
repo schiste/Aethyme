@@ -54,7 +54,10 @@ pub enum PairState {
 /// one part guaranteed to differ between the two binaries. Everything from the
 /// first digit-leading token onward is what must match:
 /// `aethyme 0.7.17 (v0.7.17)` and `aethyme-engine-cli 0.7.17 (v0.7.17)` both
-/// reduce to `0.7.17 (v0.7.17)`.
+/// reduce to `0.7.17 (v0.7.17)`. Newer banners append a build date after that
+/// stable identity; it is deliberately omitted so separately installed
+/// binaries built from the same source commit do not look split merely because
+/// they were built seconds apart.
 ///
 /// Comparing the whole thing, `describe` included, is deliberate. Two builds
 /// from different commits of the same unreleased version share a `version` and
@@ -69,7 +72,12 @@ pub fn build_identity(banner: &str) -> Option<&str> {
                 && (*index == 0 || banner[..*index].ends_with(char::is_whitespace))
         })
         .map(|(index, _)| index)?;
-    Some(banner[offset..].trim())
+    let identity = banner[offset..].trim();
+    Some(
+        identity
+            .split_once(" build_date=")
+            .map_or(identity, |(stable, _)| stable.trim_end()),
+    )
 }
 
 /// Compare two build identities. Pure, so the interesting cases are testable
@@ -254,6 +262,21 @@ mod tests {
         assert_eq!(
             build_identity("aethyme-engine-cli 0.7.17 (v0.7.17)"),
             Some("0.7.17 (v0.7.17)")
+        );
+    }
+
+    #[test]
+    fn build_date_is_not_part_of_the_pair_identity() {
+        let router = build_identity(
+            "aethyme 0.7.18 (v0.7.18-1-gabcdef0 build_commit=abcdef0123456789) build_date=2026-09-14T10:00:00Z",
+        );
+        let engine = build_identity(
+            "aethyme-engine-cli 0.7.18 (v0.7.18-1-gabcdef0 build_commit=abcdef0123456789) build_date=2026-09-14T10:00:01Z",
+        );
+        assert_eq!(router, engine);
+        assert_eq!(
+            router,
+            Some("0.7.18 (v0.7.18-1-gabcdef0 build_commit=abcdef0123456789)")
         );
     }
 

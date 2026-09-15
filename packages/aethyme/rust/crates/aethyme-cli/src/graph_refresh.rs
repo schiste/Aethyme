@@ -16,20 +16,22 @@ use aethyme_broker::{Broker, GitRepo, GraphIntegrityStatus, SessionStatus};
 use aethyme_engine::store::redb::graph_store::GraphStore;
 use aethyme_graph_indexer::{IndexerContext, WalkOptions, index_repo_to_disk, link_repo};
 use aethyme_graph_storage::{
-    GRAPH_CONFIG_RELPATH, GRAPH_MANIFEST_RELPATH, GraphAuthorityManifest, GraphEntityCounts,
-    GraphIntegrityPolicy, GraphLifecycleObservability, GraphStoreArtifactCache, GraphStoreCacheKey,
-    committed_source_tree_digest, graph_fragment_set_digest, read_engine_version,
-    write_graph_authority_manifest,
+    GRAPH_CONFIG_RELPATH, GRAPH_COVERAGE_RELPATH, GRAPH_MANIFEST_RELPATH, GRAPH_UNITS_RELPATH,
+    GraphAuthorityManifest, GraphCoverage, GraphEntityCounts, GraphIntegrityPolicy,
+    GraphLifecycleObservability, GraphStoreArtifactCache, GraphStoreCacheKey, GraphUnit,
+    committed_source_tree_digest, decode_units, graph_fragment_set_digest, read_coverage,
+    read_engine_version, write_graph_authority_manifest,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 const PLAN_SCHEMA_VERSION: u32 = 1;
+const UNITS_PAGE_MAX: usize = 1_000;
 
 pub(crate) fn handles(args: &[String]) -> bool {
     matches!(
         args.first().map(String::as_str),
-        Some("status" | "materialize" | "refresh")
+        Some("status" | "units" | "materialize" | "refresh")
     )
 }
 
@@ -50,6 +52,32 @@ fn run_inner(args: &[String]) -> Result<(), String> {
             let json = has_flag(args, "--json");
             let status = GraphStatusInspector::inspect(&repo)?;
             render_status(&status, json)
+        }
+        Some("units") => {
+            let repo = option_path(args, "--repo")?;
+            let revision = optional_option(args, "--revision");
+            let cursor = optional_option(args, "--cursor");
+            let limit = optional_option(args, "--limit")
+                .map(|value| {
+                    value
+                        .parse::<usize>()
+                        .map_err(|_| "--limit must be a positive integer".to_string())
+                })
+                .transpose()?
+                .unwrap_or(100);
+            if limit == 0 {
+                return Err("--limit must be a positive integer".into());
+            }
+            let page = read_units_page(&repo, revision, cursor, limit)?;
+            if has_flag(args, "--json") || has_flag(args, "--json-output") {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&page).map_err(|error| error.to_string())?
+                );
+            } else {
+                render_units_text(&page);
+            }
+            Ok(())
         }
         Some("materialize") => {
             let repo = option_path(args, "--repo")?;
@@ -129,7 +157,7 @@ fn run_inner(args: &[String]) -> Result<(), String> {
                     .into(),
             ),
         },
-        _ => Err("usage: aethyme graph <status|materialize|refresh> --repo <path>".into()),
+        _ => Err("usage: aethyme graph <status|units|materialize|refresh> --repo <path>".into()),
     }
 }
 
@@ -145,6 +173,7 @@ struct GraphMaterializationReport {
     work: GraphLifecycleWork,
     performance: GraphLifecycleObservability,
     cache: GraphMaterializationCache,
+    coverage: GraphCoverage,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -199,6 +228,27 @@ struct GraphStatusReport {
     next_action: String,
     work: GraphLifecycleWork,
     performance: GraphLifecycleObservability,
+    coverage: GraphCoverage,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct GraphUnitsPage {
+    schema_version: u32,
+    source_revision: String,
+    indexed_revision: String,
+    coverage_mode: String,
+    safe_to_use: bool,
+    gaps: Vec<String>,
+    items: Vec<GraphUnit>,
+    next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct UnitCursor {
+    schema_version: u32,
+    source_revision: String,
+    path: String,
+    start_offset: u64,
 }
 
 struct GraphStatusInspector;
@@ -211,6 +261,7 @@ struct GraphMaterializationPlan {
     committed_files: BTreeMap<String, GraphFileBytes>,
     work: GraphLifecycleWork,
     performance: GraphLifecycleObservability,
+    coverage: GraphCoverage,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -460,12 +511,15 @@ impl GraphStatusInspector {
                     .into(),
                 work,
                 performance,
+                coverage: GraphCoverage::unavailable(running_version),
             });
         }
 
         let mut blockers = compatibility_blockers(compatibility, pinned_engine_version.as_deref());
         let validation_started = std::time::Instant::now();
         let committed_files = committed_graph_files(root)?;
+        let coverage =
+            committed_coverage(root, &committed_files, &source.head_sha, &running_version);
         let committed_validation = validate_fragment_authority(
             root,
             &source.head_sha,
@@ -550,6 +604,7 @@ impl GraphStatusInspector {
             next_action,
             work,
             performance,
+            coverage,
         })
     }
 }
@@ -841,6 +896,7 @@ impl GraphMaterializationPlan {
             committed_files,
             work: status.work,
             performance,
+            coverage: status.coverage,
         })
     }
 }
@@ -936,6 +992,7 @@ fn materialize(repo_hint: &Path) -> Result<GraphMaterializationReport, String> {
         work: plan.work,
         performance: plan.performance,
         cache,
+        coverage: plan.coverage,
     })
 }
 
@@ -1003,6 +1060,216 @@ fn committed_graph_files(repo: &Path) -> Result<BTreeMap<String, GraphFileBytes>
         files.insert(path, GraphFileBytes { bytes, mode });
     }
     Ok(files)
+}
+
+fn committed_coverage(
+    repo: &Path,
+    files: &BTreeMap<String, GraphFileBytes>,
+    head: &str,
+    running_version: &str,
+) -> GraphCoverage {
+    let Some(file) = files.get(GRAPH_COVERAGE_RELPATH) else {
+        return GraphCoverage::unavailable(running_version);
+    };
+    let coverage = match serde_json::from_slice::<GraphCoverage>(&file.bytes) {
+        Ok(coverage) => coverage,
+        Err(_) => {
+            return GraphCoverage::unavailable_with_gap(
+                running_version,
+                "coverage_artifact_invalid",
+            );
+        }
+    };
+    if coverage.validate().is_err() {
+        return GraphCoverage::unavailable_with_gap(running_version, "coverage_artifact_invalid");
+    }
+    if !coverage.available {
+        return coverage;
+    }
+    if coverage.source_revision.is_none()
+        || coverage.indexed_revision.is_none()
+        || coverage.source_revision != coverage.indexed_revision
+    {
+        return GraphCoverage::unavailable_with_gap(running_version, "coverage_revision_mismatch");
+    }
+    if coverage.engine_version != running_version {
+        return GraphCoverage::unavailable_with_gap(
+            running_version,
+            "coverage_engine_version_mismatch",
+        );
+    }
+    let source_tree_digest = match committed_source_tree_digest(repo, head) {
+        Ok(digest) => digest,
+        Err(_) => {
+            return GraphCoverage::unavailable_with_gap(
+                running_version,
+                "coverage_tree_unavailable",
+            );
+        }
+    };
+    if coverage.source_tree_sha256.as_deref() != Some(source_tree_digest.as_str())
+        || coverage.indexed_tree_sha256.as_deref() != Some(source_tree_digest.as_str())
+    {
+        return GraphCoverage::unavailable_with_gap(running_version, "coverage_tree_mismatch");
+    }
+    if !files.contains_key(GRAPH_UNITS_RELPATH) {
+        return GraphCoverage::unavailable_with_gap(running_version, "units_artifact_missing");
+    }
+    coverage
+}
+
+fn read_units_page(
+    repo_hint: &Path,
+    requested_revision: Option<&str>,
+    requested_cursor: Option<&str>,
+    limit: usize,
+) -> Result<GraphUnitsPage, String> {
+    if limit > UNITS_PAGE_MAX {
+        return Err(format!("--limit must not exceed {UNITS_PAGE_MAX}"));
+    }
+    let repository = GitRepo::discover(repo_hint).map_err(|error| error.to_string())?;
+    let root = repository.root();
+    let head = repository
+        .head_commit()
+        .map_err(|error| error.to_string())?;
+    let revision = match requested_revision {
+        Some(requested) => git(
+            root,
+            &["rev-parse", "--verify", &format!("{requested}^{{commit}}")],
+        )?,
+        None => head.clone(),
+    };
+    if revision != head {
+        return Err(format!(
+            "requested revision {revision} does not match committed graph HEAD {head}"
+        ));
+    }
+
+    let coverage_bytes = committed_artifact(root, GRAPH_COVERAGE_RELPATH)?;
+    let coverage = serde_json::from_slice::<GraphCoverage>(&coverage_bytes)
+        .map_err(|error| format!("decode committed graph coverage: {error}"))?;
+    coverage
+        .validate()
+        .map_err(|error| format!("validate committed graph coverage: {error}"))?;
+    if !coverage.available {
+        return Err(format!(
+            "committed graph coverage is unavailable: {}",
+            coverage.gaps.join(", ")
+        ));
+    }
+    if coverage.source_revision.is_none()
+        || coverage.indexed_revision.is_none()
+        || coverage.source_revision != coverage.indexed_revision
+    {
+        return Err("committed graph coverage has mismatched source revisions".into());
+    }
+    let indexed_revision = coverage
+        .indexed_revision
+        .clone()
+        .ok_or_else(|| "committed graph coverage has no indexed revision".to_string())?;
+    // A graph-output commit changes Git's HEAD after refresh execution, while
+    // the artifact correctly remains bound to the source commit that was
+    // indexed.  The source-tree check below is the freshness authority for
+    // that normal lifecycle transition.
+    let source_tree_digest = committed_source_tree_digest(root, &head)
+        .map_err(|error| format!("resolve committed source tree: {error}"))?;
+    if coverage.source_tree_sha256.as_deref() != Some(source_tree_digest.as_str())
+        || coverage.indexed_tree_sha256.as_deref() != Some(source_tree_digest.as_str())
+    {
+        return Err("committed graph coverage does not match the current source tree".into());
+    }
+    if coverage.engine_version != env!("CARGO_PKG_VERSION") {
+        return Err("committed graph coverage was produced by another engine version".into());
+    }
+
+    let units_bytes = committed_artifact(root, GRAPH_UNITS_RELPATH)?;
+    let mut units = decode_units(&units_bytes)
+        .map_err(|error| format!("decode committed graph units: {error}"))?;
+    aethyme_graph_storage::sort_units(&mut units);
+    if coverage.unit_count != units.len() as u64 {
+        return Err(format!(
+            "committed graph coverage reports {} units, but the units artifact contains {}",
+            coverage.unit_count,
+            units.len()
+        ));
+    }
+
+    let cursor = requested_cursor.map(decode_unit_cursor).transpose()?;
+    if let Some(cursor) = &cursor {
+        if cursor.schema_version != PLAN_SCHEMA_VERSION {
+            return Err("unit cursor schema is unsupported".into());
+        }
+        if cursor.source_revision != revision {
+            return Err("unit cursor revision does not match committed graph HEAD".into());
+        }
+    }
+    let units = units
+        .into_iter()
+        .filter(|unit| {
+            let Some(cursor) = &cursor else {
+                return true;
+            };
+            unit.path.as_str() > cursor.path.as_str()
+                || unit.path == cursor.path && unit.start.byte_offset > cursor.start_offset
+        })
+        .collect::<Vec<_>>();
+    let mut end = limit.min(units.len());
+    if end < units.len() && end > 0 {
+        let last_path = &units[end - 1].path;
+        let last_offset = units[end - 1].start.byte_offset;
+        while end < units.len()
+            && units[end].path == *last_path
+            && units[end].start.byte_offset == last_offset
+        {
+            end += 1;
+        }
+    }
+    let items = units[..end].to_vec();
+    let next_cursor = if end < units.len() {
+        items.last().map(|unit| {
+            encode_unit_cursor(&UnitCursor {
+                schema_version: PLAN_SCHEMA_VERSION,
+                source_revision: revision.clone(),
+                path: unit.path.clone(),
+                start_offset: unit.start.byte_offset,
+            })
+        })
+    } else {
+        None
+    };
+
+    Ok(GraphUnitsPage {
+        schema_version: PLAN_SCHEMA_VERSION,
+        source_revision: revision.clone(),
+        indexed_revision,
+        coverage_mode: coverage.coverage_mode,
+        safe_to_use: coverage.safe_to_use,
+        gaps: coverage.gaps,
+        items,
+        next_cursor: next_cursor.transpose()?,
+    })
+}
+
+fn committed_artifact(repo: &Path, path: &str) -> Result<Vec<u8>, String> {
+    git_bytes(repo, &["show", &format!("HEAD:{path}")])
+}
+
+fn encode_unit_cursor(cursor: &UnitCursor) -> Result<String, String> {
+    let bytes = serde_json::to_vec(cursor).map_err(|error| error.to_string())?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+fn decode_unit_cursor(encoded: &str) -> Result<UnitCursor, String> {
+    if encoded.is_empty() || encoded.len() > 16_384 || encoded.len() % 2 != 0 {
+        return Err("unit cursor is malformed".into());
+    }
+    let mut bytes = Vec::with_capacity(encoded.len() / 2);
+    for pair in encoded.as_bytes().chunks_exact(2) {
+        let text = std::str::from_utf8(pair).map_err(|_| "unit cursor is not hexadecimal")?;
+        let byte = u8::from_str_radix(text, 16).map_err(|_| "unit cursor is not hexadecimal")?;
+        bytes.push(byte);
+    }
+    serde_json::from_slice(&bytes).map_err(|error| format!("decode unit cursor: {error}"))
 }
 
 fn git_blob_batch<'a>(
@@ -1144,6 +1411,13 @@ fn regenerate_fragments(
     work: &mut GraphLifecycleWork,
     performance: &mut GraphLifecycleObservability,
 ) -> Result<(), String> {
+    let head_revision = git(repo, &["rev-parse", "HEAD"])?;
+    let source_revision = read_coverage(repo)
+        .ok()
+        .and_then(|coverage| coverage.source_revision)
+        .unwrap_or_else(|| head_revision.clone());
+    let source_tree_digest =
+        committed_source_tree_digest(repo, &head_revision).map_err(|error| error.to_string())?;
     let graph = repo.join(".aethyme/graph");
     if let Err(error) = std::fs::remove_dir_all(&graph)
         && error.kind() != std::io::ErrorKind::NotFound
@@ -1151,6 +1425,8 @@ fn regenerate_fragments(
         return Err(format!("reset disposable graph output: {error}"));
     }
     let context = IndexerContext::new(repository, repo.to_path_buf(), version)
+        .and_then(|context| context.with_source_revision(&source_revision))
+        .and_then(|context| context.with_source_tree_digest(&source_tree_digest))
         .map_err(|error| error.to_string())?;
     work.source_index_runs += 1;
     let summary =
@@ -1941,12 +2217,43 @@ fn render_status(status: &GraphStatusReport, json: bool) -> Result<(), String> {
         println!("  fragments: {:?}", status.fragments.status);
         println!("  derived store: {:?}", status.derived_store.status);
         println!("  compatibility: {:?}", status.compatibility);
+        println!(
+            "  coverage: {} (safe to use: {})",
+            status.coverage.coverage_mode, status.coverage.safe_to_use
+        );
+        for gap in &status.coverage.gaps {
+            println!("  coverage gap: {gap}");
+        }
         println!("  healthy: {}", status.healthy);
         println!("  action required: {}", status.action_required);
         render_performance_text(&status.performance);
         println!("  next: {}", status.next_action);
     }
     Ok(())
+}
+
+fn render_units_text(page: &GraphUnitsPage) {
+    println!(
+        "Graph units for {} ({} item(s), coverage {}, safe to use: {})",
+        short(&page.source_revision),
+        page.items.len(),
+        page.coverage_mode,
+        page.safe_to_use
+    );
+    for unit in &page.items {
+        println!(
+            "  {}:{}-{} {} {} {}",
+            unit.path,
+            unit.start.line,
+            unit.end.line,
+            unit.kind,
+            unit.symbol_identity.as_deref().unwrap_or("<anonymous>"),
+            unit.content_digest
+        );
+    }
+    if page.next_cursor.is_some() {
+        println!("  next cursor: available");
+    }
 }
 
 fn render_plan_text(plan: &GraphRefreshPlan) {
@@ -2025,6 +2332,12 @@ fn required_option<'a>(args: &'a [String], name: &str) -> Result<&'a str, String
         .find(|pair| pair[0] == name)
         .map(|pair| pair[1].as_str())
         .ok_or_else(|| format!("missing required {name} value"))
+}
+
+fn optional_option<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
+    args.windows(2)
+        .find(|pair| pair[0] == name)
+        .map(|pair| pair[1].as_str())
 }
 
 fn has_flag(args: &[String], flag: &str) -> bool {

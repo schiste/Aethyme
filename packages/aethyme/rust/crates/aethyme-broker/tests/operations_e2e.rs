@@ -846,7 +846,7 @@ fn crashed_write_blocks_until_operator_reconciliation() {
 }
 
 #[test]
-fn nonzero_local_write_is_failed_without_remote_reconciliation() {
+fn local_git_conflict_is_failed_without_remote_recovery_or_write_block() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());
     let worktree = add_worktree(tmp.path(), "partial");
@@ -870,7 +870,7 @@ fn nonzero_local_write_is_failed_without_remote_reconciliation() {
         OperationReconciliationState::NotRequired
     );
     assert!(!shown.reconciliation.write_blocked);
-
+    assert!(report.unknown_outcome_recovery().is_none());
     let retry = broker
         .run_coordinated_operation(request(session.id, &["branch", "after-nonzero"]))
         .unwrap();

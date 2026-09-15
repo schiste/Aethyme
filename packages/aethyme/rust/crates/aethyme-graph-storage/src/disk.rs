@@ -132,7 +132,7 @@ pub fn read_overlay<P: DeserializeOwned>(
 /// dir) so the rename is guaranteed to be within the same
 /// filesystem — `fs::rename` is only atomic across same-filesystem
 /// renames on POSIX.
-fn atomic_write(target: &Path, bytes: &[u8]) -> io::Result<()> {
+pub(crate) fn atomic_write(target: &Path, bytes: &[u8]) -> io::Result<()> {
     if let Some(parent) = target.parent() {
         fs::create_dir_all(parent)?;
     }

@@ -75,6 +75,10 @@ impl LanguageIndexer for PhpIndexer {
         "php"
     }
 
+    fn parser(&self) -> &'static str {
+        "tree_sitter_php"
+    }
+
     fn index_file(
         &self,
         ctx: &IndexerContext,

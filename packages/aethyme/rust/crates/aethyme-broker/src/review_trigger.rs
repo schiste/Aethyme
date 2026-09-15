@@ -227,6 +227,12 @@ pub enum ReviewTrigger {
     Scheduled,
     /// `broker review request`, which bypasses eligibility entirely.
     Manual,
+    /// A provider completed a review that Aethyme did not request.
+    ///
+    /// This is a ledger fact, not a policy trigger. It is deliberately part
+    /// of the shared vocabulary so an unsolicited completion can be recorded
+    /// without inventing a request or a backend-specific state.
+    Unsolicited,
 }
 
 /// Everything a predicate may read about one change.
@@ -1829,5 +1835,15 @@ on = [
         );
         let policy = ReviewTriggerPolicy::load(temp.path()).unwrap();
         assert_eq!(policy.rule[0].on.len(), 9);
+    }
+
+    #[test]
+    fn unsolicited_is_a_ledger_trigger_but_not_a_policy_trigger() {
+        assert_eq!(
+            ReviewTrigger::parse("unsolicited"),
+            Some(ReviewTrigger::Unsolicited)
+        );
+        assert_eq!(ReviewTrigger::Unsolicited.as_str(), "unsolicited");
+        assert!(!ReviewTrigger::Unsolicited.is_observable());
     }
 }

@@ -12,29 +12,219 @@
 //! real cost. So this reports candidates and only removes what an operator
 //! reviewed, following the same digest-bound plan/apply contract as `gc`.
 
+use std::collections::BTreeMap;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
-/// Digest over exactly what the operator reads: each reclaimable path and its
-/// size. A candidate appearing, vanishing or changing size invalidates the
-/// plan, because the reviewed total is no longer the one being applied.
-pub fn plan_digest(root: &Path, candidates: &[ReclaimCandidate]) -> String {
+use crate::retention::is_safe_artefact_directory_name;
+
+const RECLAIM_PLAN_SCHEMA_VERSION: u8 = 1;
+const RECLAIM_PLAN_FILENAME_PREFIX: &str = ".aethyme-reclaim-plan-";
+const RECLAIM_PLAN_FILENAME_SUFFIX: &str = ".json";
+
+/// The part of a candidate that determines whether an apply would touch it.
+/// Measured bytes deliberately do not belong here: a build may grow while the
+/// operator is reviewing the same deletion decision.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ReclaimDecision {
+    pub path: PathBuf,
+    pub reclaimable: bool,
+}
+
+/// Return the stable, decision-only view of a scan.
+pub fn decisions(candidates: &[ReclaimCandidate]) -> Vec<ReclaimDecision> {
+    let mut decisions = candidates
+        .iter()
+        .map(|candidate| ReclaimDecision {
+            path: candidate.path.clone(),
+            reclaimable: candidate.reclaimable,
+        })
+        .collect::<Vec<_>>();
+    decisions.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.reclaimable.cmp(&right.reclaimable))
+    });
+    decisions
+}
+
+fn decision_digest(root: &Path, decisions: &[ReclaimDecision]) -> String {
     let mut hasher = Sha256::new();
+    hasher.update(b"aethyme-reclaim-plan-v1\0");
     hasher.update(root.as_os_str().as_encoded_bytes());
-    for candidate in candidates {
+    for decision in decisions {
         hasher.update(b"\n");
-        hasher.update(candidate.path.as_os_str().as_encoded_bytes());
-        hasher.update(format!(":{}:{}", candidate.bytes, candidate.reclaimable).as_bytes());
+        hasher.update(decision.path.as_os_str().as_encoded_bytes());
+        hasher.update(if decision.reclaimable {
+            &b"\0reclaimable"[..]
+        } else {
+            &b"\0kept"[..]
+        });
     }
     format!("{:x}", hasher.finalize())
 }
 
+/// Digest over exactly the deletion decision: the sorted candidate paths and
+/// whether each is reclaimable. A candidate's measured size is displayed in a
+/// plan but is not authorization-bearing, so an active build can grow without
+/// invalidating an otherwise unchanged review.
+pub fn plan_digest(root: &Path, candidates: &[ReclaimCandidate]) -> String {
+    decision_digest(root, &decisions(candidates))
+}
+
+/// Describe the decision changes between the plan the operator reviewed and
+/// the fresh scan used for apply. Byte-only changes intentionally produce no
+/// entries because they do not alter what will be deleted.
+pub fn decision_changes(reviewed: &[ReclaimDecision], current: &[ReclaimDecision]) -> Vec<String> {
+    let reviewed = reviewed
+        .iter()
+        .map(|decision| (decision.path.clone(), decision.reclaimable))
+        .collect::<BTreeMap<_, _>>();
+    let current = current
+        .iter()
+        .map(|decision| (decision.path.clone(), decision.reclaimable))
+        .collect::<BTreeMap<_, _>>();
+    let mut paths = reviewed.keys().cloned().collect::<Vec<_>>();
+    paths.extend(
+        current
+            .keys()
+            .filter(|path| !reviewed.contains_key(*path))
+            .cloned(),
+    );
+    paths.sort();
+
+    paths
+        .into_iter()
+        .filter_map(|path| match (reviewed.get(&path), current.get(&path)) {
+            (None, Some(reclaimable)) => Some(format!(
+                "added candidate {} ({})",
+                path.display(),
+                if *reclaimable { "reclaimable" } else { "kept" }
+            )),
+            (Some(_), None) => Some(format!("removed candidate {}", path.display())),
+            (Some(reviewed), Some(current)) if reviewed != current => Some(format!(
+                "{} changed from {} to {}",
+                path.display(),
+                if *reviewed { "reclaimable" } else { "kept" },
+                if *current { "reclaimable" } else { "kept" }
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct ReclaimPlanSnapshot {
+    schema_version: u8,
+    digest: String,
+    root: PathBuf,
+    decisions: Vec<ReclaimDecision>,
+}
+
+fn snapshot_path(root: &Path, digest: &str) -> io::Result<PathBuf> {
+    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "reclaim plan digest must be a 64-character hexadecimal SHA-256",
+        ));
+    }
+    Ok(root.join(format!(
+        "{RECLAIM_PLAN_FILENAME_PREFIX}{digest}{RECLAIM_PLAN_FILENAME_SUFFIX}"
+    )))
+}
+
+fn ensure_regular_snapshot(path: &Path) -> io::Result<()> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return Err(io::Error::other(format!(
+            "reclaim plan snapshot is not a regular file: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Save a reviewed decision set beside the host-scoped worktree root.
+///
+/// The digest is part of the filename so concurrent operators do not overwrite
+/// one another's review evidence. The caller supplies the exact digest again
+/// when loading the snapshot for a mismatch explanation.
+pub fn save_snapshot(root: &Path, digest: &str, candidates: &[ReclaimCandidate]) -> io::Result<()> {
+    std::fs::create_dir_all(root)?;
+    let decisions = decisions(candidates);
+    if decision_digest(root, &decisions) != digest {
+        return Err(io::Error::other(
+            "reclaim plan snapshot digest does not match its decision set",
+        ));
+    }
+    let path = snapshot_path(root, digest)?;
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => ensure_regular_snapshot(&path)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let snapshot = ReclaimPlanSnapshot {
+        schema_version: RECLAIM_PLAN_SCHEMA_VERSION,
+        digest: digest.to_string(),
+        root: root.to_path_buf(),
+        decisions,
+    };
+    let bytes = serde_json::to_vec_pretty(&snapshot).map_err(io::Error::other)?;
+    crate::atomic_file::with_synced_temporary(&path, &bytes, |temporary| {
+        std::fs::rename(temporary, &path)
+    })
+}
+
+/// Load and verify the saved decision set for a failed confirmation. Invalid
+/// or tampered snapshots are not used to manufacture a misleading diff.
+pub fn load_snapshot(
+    root: &Path,
+    digest: &str,
+) -> io::Result<Option<(String, Vec<ReclaimDecision>)>> {
+    let path = snapshot_path(root, digest)?;
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return Err(io::Error::other(format!(
+            "reclaim plan snapshot is not a regular file: {}",
+            path.display()
+        )));
+    }
+    let bytes = std::fs::read(&path)?;
+    let snapshot: ReclaimPlanSnapshot = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+    if snapshot.schema_version != RECLAIM_PLAN_SCHEMA_VERSION
+        || snapshot.root != root
+        || snapshot.decisions != decisions_sorted(&snapshot.decisions)
+        || decision_digest(root, &snapshot.decisions) != snapshot.digest
+    {
+        return Err(io::Error::other(format!(
+            "reclaim plan snapshot is invalid: {}",
+            path.display()
+        )));
+    }
+    Ok(Some((snapshot.digest, snapshot.decisions)))
+}
+
+fn decisions_sorted(decisions: &[ReclaimDecision]) -> Vec<ReclaimDecision> {
+    let mut sorted = decisions.to_vec();
+    sorted.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.reclaimable.cmp(&right.reclaimable))
+    });
+    sorted
+}
+
 /// Directory names that hold regenerable build output.
 ///
-/// A fixed list rather than a heuristic. "Large and ignored" would also match a
-/// downloaded dataset or a local database someone cannot rebuild, and this
-/// deletes things.
+/// A narrow built-in list rather than a heuristic. Configured names are
+/// additive, but "large and ignored" would also match a downloaded dataset or
+/// a local database someone cannot rebuild, and this deletes things.
 const ARTEFACT_DIRECTORIES: &[&str] = &["target", "node_modules", ".venv", "build", "dist"];
 
 /// One reclaimable directory.
@@ -52,6 +242,16 @@ pub struct ReclaimCandidate {
 /// Whether a directory name is regenerable build output.
 pub fn is_artefact_directory(name: &str) -> bool {
     ARTEFACT_DIRECTORIES.contains(&name)
+}
+
+/// Whether a directory name is regenerable build output under the built-in
+/// catalog plus additive configured names. Configuration never removes a
+/// built-in name from the catalog.
+pub fn is_artefact_directory_with_extras(name: &str, extras: &[String]) -> bool {
+    is_artefact_directory(name)
+        || extras
+            .iter()
+            .any(|candidate| is_safe_artefact_directory_name(candidate) && candidate == name)
 }
 
 /// Decide whether a candidate found under `worktree` may be reclaimed.
@@ -165,6 +365,116 @@ mod tests {
     }
 
     #[test]
+    fn plan_digest_ignores_measured_bytes_and_order() {
+        let first = vec![
+            classify(&p("/w/b/target"), &p("/w/b"), 200, &[p("/w/b")]),
+            classify(&p("/w/a/target"), &p("/w/a"), 100, &[]),
+        ];
+        let second = vec![
+            classify(&p("/w/a/target"), &p("/w/a"), 900, &[]),
+            classify(&p("/w/b/target"), &p("/w/b"), 7, &[p("/w/b")]),
+        ];
+        assert_eq!(
+            plan_digest(&p("/w"), &first),
+            plan_digest(&p("/w"), &second)
+        );
+    }
+
+    #[test]
+    fn plan_digest_changes_for_candidate_set_or_reclaimability_changes() {
+        let original = vec![classify(&p("/w/a/target"), &p("/w/a"), 100, &[])];
+        let added = vec![
+            classify(&p("/w/a/target"), &p("/w/a"), 100, &[]),
+            classify(&p("/w/b/target"), &p("/w/b"), 100, &[]),
+        ];
+        let kept = vec![classify(&p("/w/a/target"), &p("/w/a"), 100, &[p("/w/a")])];
+        assert_ne!(
+            plan_digest(&p("/w"), &original),
+            plan_digest(&p("/w"), &added)
+        );
+        assert_ne!(
+            plan_digest(&p("/w"), &original),
+            plan_digest(&p("/w"), &kept)
+        );
+    }
+
+    #[test]
+    fn decision_changes_name_added_removed_and_reclassified_candidates() {
+        let reviewed = vec![
+            ReclaimDecision {
+                path: p("/w/a/target"),
+                reclaimable: true,
+            },
+            ReclaimDecision {
+                path: p("/w/b/target"),
+                reclaimable: true,
+            },
+        ];
+        let current = vec![
+            ReclaimDecision {
+                path: p("/w/a/target"),
+                reclaimable: false,
+            },
+            ReclaimDecision {
+                path: p("/w/c/target"),
+                reclaimable: true,
+            },
+        ];
+        assert_eq!(
+            decision_changes(&reviewed, &current),
+            vec![
+                "/w/a/target changed from reclaimable to kept",
+                "removed candidate /w/b/target",
+                "added candidate /w/c/target (reclaimable)",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_saved_snapshot_round_trips_the_reviewed_decision() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        let candidates = vec![classify(&root.join("s/target"), &root.join("s"), 42, &[])];
+        let digest = plan_digest(&root, &candidates);
+
+        save_snapshot(&root, &digest, &candidates).unwrap();
+
+        assert_eq!(
+            load_snapshot(&root, &digest).unwrap(),
+            Some((
+                digest,
+                vec![ReclaimDecision {
+                    path: root.join("s/target"),
+                    reclaimable: true,
+                }]
+            ))
+        );
+    }
+
+    #[test]
+    fn snapshots_for_concurrent_reviews_are_keyed_by_digest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        let first = classify(&root.join("first/target"), &root.join("first"), 42, &[]);
+        let second = classify(&root.join("second/target"), &root.join("second"), 84, &[]);
+        let first_digest = plan_digest(&root, std::slice::from_ref(&first));
+        let second_digest = plan_digest(&root, std::slice::from_ref(&second));
+
+        save_snapshot(&root, &first_digest, &[first]).unwrap();
+        save_snapshot(&root, &second_digest, &[second]).unwrap();
+
+        assert!(load_snapshot(&root, &first_digest).unwrap().is_some());
+        assert!(load_snapshot(&root, &second_digest).unwrap().is_some());
+        assert_eq!(
+            std::fs::read_dir(&root)
+                .unwrap()
+                .filter_map(Result::ok)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
     fn a_path_inside_the_root_is_allowed() {
         assert!(is_within(&p("/w"), &p("/w/session/target")));
     }
@@ -231,6 +541,15 @@ pub fn directory_bytes(path: &Path) -> u64 {
 /// finds one -- a `target/` inside a `target/` is already accounted for, and
 /// walking into a multi-gigabyte build tree to confirm that is pure cost.
 pub fn scan(root: &Path, active: &[PathBuf]) -> Vec<ReclaimCandidate> {
+    scan_with_extra_directories(root, active, &[])
+}
+
+/// Scan `root` with additive configured artifact directory names.
+pub fn scan_with_extra_directories(
+    root: &Path,
+    active: &[PathBuf],
+    extras: &[String],
+) -> Vec<ReclaimCandidate> {
     let mut found = Vec::new();
     let Ok(worktrees) = std::fs::read_dir(root) else {
         return found;
@@ -240,7 +559,7 @@ pub fn scan(root: &Path, active: &[PathBuf]) -> Vec<ReclaimCandidate> {
         if !base.is_dir() {
             continue;
         }
-        collect(&base, &base, active, &mut found, 0);
+        collect(&base, &base, active, extras, &mut found, 0);
     }
     found.sort_by(|a, b| b.bytes.cmp(&a.bytes));
     found
@@ -250,6 +569,7 @@ fn collect(
     dir: &Path,
     worktree: &Path,
     active: &[PathBuf],
+    extras: &[String],
     found: &mut Vec<ReclaimCandidate>,
     depth: usize,
 ) {
@@ -275,12 +595,12 @@ fn collect(
         if name == ".git" {
             continue;
         }
-        if is_artefact_directory(name) {
+        if is_artefact_directory_with_extras(name, extras) {
             let bytes = directory_bytes(&path);
             found.push(classify(&path, worktree, bytes, active));
             continue;
         }
-        collect(&path, worktree, active, found, depth + 1);
+        collect(&path, worktree, active, extras, found, depth + 1);
     }
 }
 
@@ -372,6 +692,30 @@ mod scan_tests {
         let found = scan(tmp.path(), &[]);
         assert_eq!(found.len(), 1);
         assert!(found[0].path.ends_with("target"));
+    }
+
+    #[test]
+    fn configured_artifact_directories_extend_the_built_in_catalog() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(&tmp.path().join("s/.pnpm-store/v3/index"), 16);
+
+        assert!(scan(tmp.path(), &[]).is_empty());
+        let found = scan_with_extra_directories(tmp.path(), &[], &[".pnpm-store".into()]);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].path.ends_with(".pnpm-store"));
+        assert_eq!(found[0].bytes, 16);
+    }
+
+    #[test]
+    fn configured_source_and_control_names_are_not_candidates() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(&tmp.path().join("s/src/main.rs"), 16);
+
+        let found = scan_with_extra_directories(tmp.path(), &[], &["src".into()]);
+        assert!(
+            found.is_empty(),
+            "configured source roots must stay outside reclaim: {found:?}"
+        );
     }
 
     #[test]

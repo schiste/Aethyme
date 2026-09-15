@@ -2826,7 +2826,7 @@ impl Broker {
                         "recovery": "inspect_or_abort_local_worktree_state",
                     }),
                 ),
-        )
+            )
         } else if let Some((status, push_reconciliation)) =
             reconcile_failed_push(cwd, &push_planning, remote_contact)
         {

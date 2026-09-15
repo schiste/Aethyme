@@ -31,8 +31,10 @@ use crate::pr_watch::{
     PullRequestBatchAckOutcome, PullRequestBatchStatus, PullRequestSnapshot, PullRequestWatch,
     PullRequestWatchPollStorageResult, PullRequestWatchStatus,
 };
+use crate::retention::{GcCheckpointPinRelease, GcPublicationExposureExpiry};
 use crate::review::{NewReviewLifecycle, ReviewLifecycle, ReviewLifecycleState};
-use crate::review_ledger::{ReviewRequest, ReviewRequestState};
+use crate::review_ledger::{ReviewRequest, ReviewRequestState, ReviewVerdict, ReviewerIdentity};
+use crate::review_trigger::ReviewTrigger;
 use crate::schema::{self, EVENTS_SCHEMA_VERSION};
 use crate::types::{
     Advisory, AdvisoryResolutionState, AdvisorySeverity, CoordinatedOperation,
@@ -121,7 +123,15 @@ impl BrokerStore {
     /// path so an observational command cannot become the write that upgrades
     /// storage or refreshes a session.
     pub fn open_snapshot_in_repo(repo_root: &Path) -> Result<Self, BrokerError> {
-        let path = crate::broker_db_path(repo_root);
+        Self::open_snapshot_at(&crate::broker_db_path(repo_root))
+    }
+
+    /// Open an exact broker database path read-only, without applying the
+    /// process-wide repository-database override. Host storage inventory uses
+    /// this when joining several repositories' ledgers: one test or embedding
+    /// override must not make every owner appear to share the same database.
+    pub fn open_snapshot_at(path: &Path) -> Result<Self, BrokerError> {
+        let path = path.to_path_buf();
         if !path.is_file() {
             let conn = Connection::open_in_memory()?;
             schema::migrate(&conn)?;
@@ -437,6 +447,7 @@ impl BrokerStore {
         if changed == 0 {
             return Err(BrokerError::SessionNotFound(replaced_id));
         }
+        release_checkpoint_pin_in_tx(&tx, replaced_id, now)?;
         tx.execute("DELETE FROM leases WHERE session_id = ?1", [replaced_id])?;
         tx.execute(
             "DELETE FROM session_foreign_files WHERE session_id = ?1",
@@ -555,6 +566,7 @@ impl BrokerStore {
         // implicit-lease snapshot behind forever (722 orphaned rows for
         // ~25 sessions observed in the 2026-07-17 dogfood database).
         if status.is_closed() {
+            release_checkpoint_pin_in_tx(&tx, id, now)?;
             tx.execute("DELETE FROM leases WHERE session_id = ?1", [id])?;
             tx.execute(
                 "DELETE FROM session_foreign_files WHERE session_id = ?1",
@@ -597,6 +609,7 @@ impl BrokerStore {
             }
             return Err(BrokerError::SessionNotFound(id));
         }
+        release_checkpoint_pin_in_tx(&tx, id, now)?;
         tx.execute("DELETE FROM leases WHERE session_id = ?1", [id])?;
         tx.execute(
             "DELETE FROM session_foreign_files WHERE session_id = ?1",
@@ -651,6 +664,7 @@ impl BrokerStore {
                  WHERE id = ?1",
                 params![id, now],
             )?;
+            release_checkpoint_pin_in_tx(&tx, id, now)?;
             tx.execute("DELETE FROM leases WHERE session_id = ?1", [id])?;
             tx.execute(
                 "DELETE FROM session_foreign_files WHERE session_id = ?1",
@@ -2255,6 +2269,36 @@ impl BrokerStore {
         backend: &str,
         now: i64,
     ) -> Result<(ReviewRequest, bool), BrokerError> {
+        self.record_review_request_with_trigger(
+            repository,
+            pr_number,
+            review_type,
+            head_commit,
+            base_commit,
+            backend,
+            Some(ReviewTrigger::Manual),
+            now,
+        )
+    }
+
+    /// Record a request and the lifecycle trigger that caused it.
+    ///
+    /// The compatibility wrapper above treats a direct store call as an
+    /// explicit/manual request. The router uses this method so the trigger it
+    /// derived from the provider observation is persisted before any backend
+    /// is invoked.
+    pub fn record_review_request_with_trigger(
+        &mut self,
+        repository: &str,
+        pr_number: i64,
+        review_type: &str,
+        head_commit: &str,
+        base_commit: Option<&str>,
+        backend: &str,
+        trigger: Option<ReviewTrigger>,
+        now: i64,
+    ) -> Result<(ReviewRequest, bool), BrokerError> {
+        let trigger = trigger.map(ReviewTrigger::as_str);
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -2270,6 +2314,26 @@ impl BrokerStore {
             .optional()?
             .transpose()?;
         if let Some(existing) = existing {
+            // A provider may finish before the router records its request.
+            // Fill only Aethyme-owned request facts in that case; completion
+            // facts belong to the provider and must survive reconciliation.
+            if existing.requested_for_commit.is_none()
+                && existing.state != ReviewRequestState::Waived
+            {
+                tx.execute(
+                    "UPDATE review_requests
+                        SET requested_for_commit = ?2, base_commit = ?3,
+                            trigger = ?4, backend = ?5, requested_at = ?6,
+                            updated_at = ?6
+                      WHERE id = ?1",
+                    params![existing.id, head_commit, base_commit, trigger, backend, now],
+                )?;
+                tx.commit()?;
+                let reconciled = self
+                    .review_request(existing.id)?
+                    .expect("reconciled review request should be readable");
+                return Ok((reconciled, false));
+            }
             // A revivable row is one nobody was ever asked about -- a `gh` call
             // that failed, an executor that died before the handoff. Reusing it
             // is the only way past the unique index, and without it that single
@@ -2283,9 +2347,13 @@ impl BrokerStore {
             tx.execute(
                 "UPDATE review_requests
                     SET state = 'requested', detail = NULL, backend = ?2,
-                        base_commit = ?4, requested_at = ?3, updated_at = ?3
+                        requested_for_commit = ?3, base_commit = ?4,
+                        trigger = ?5, requested_at = ?6,
+                        completed_at = NULL, completed_for_commit = NULL,
+                        verdict = NULL, reviewer_provider = NULL,
+                        reviewer_model = NULL, updated_at = ?6
                   WHERE id = ?1",
-                params![existing.id, backend, now, base_commit],
+                params![existing.id, backend, head_commit, base_commit, trigger, now],
             )?;
             tx.commit()?;
             let revived = self
@@ -2295,9 +2363,12 @@ impl BrokerStore {
         }
         tx.execute(
             "INSERT INTO review_requests (
-                 repository, pr_number, review_type, head_commit, base_commit,
-                 backend, state, detail, requested_at, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?7, ?5, 'requested', NULL, ?6, ?6)",
+                 repository, pr_number, review_type, head_commit,
+                 requested_for_commit, base_commit, trigger, backend, state,
+                 detail, requested_at, completed_at, completed_for_commit,
+                 verdict, reviewer_provider, reviewer_model, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?4, ?7, ?8, ?5, 'requested', NULL,
+                       ?6, NULL, NULL, NULL, NULL, NULL, ?6)",
             params![
                 repository,
                 pr_number,
@@ -2305,7 +2376,8 @@ impl BrokerStore {
                 head_commit,
                 backend,
                 now,
-                base_commit
+                base_commit,
+                trigger
             ],
         )?;
         let id = tx.last_insert_rowid();
@@ -2327,8 +2399,8 @@ impl BrokerStore {
             .transpose()
     }
 
-    /// Every review the router has ever requested for one pull request,
-    /// oldest first.
+    /// Every review request or provider completion for one pull request,
+    /// oldest fact first.
     ///
     /// Deliberately unfiltered: spend counts finished reviews and in-flight
     /// counts unfinished ones, so both callers need the whole history and a
@@ -2341,7 +2413,7 @@ impl BrokerStore {
     ) -> Result<Vec<ReviewRequest>, BrokerError> {
         let mut statement = self.conn.prepare(&format!(
             "{REVIEW_REQUEST_SELECT} WHERE repository = ?1 AND pr_number = ?2
-             ORDER BY requested_at, id"
+             ORDER BY COALESCE(requested_at, completed_at, updated_at), id"
         ))?;
         let rows = statement.query_map(params![repository, pr_number], review_request_from_row)?;
         let mut requests = Vec::new();
@@ -2351,8 +2423,8 @@ impl BrokerStore {
         Ok(requests)
     }
 
-    /// Every review the router has ever requested in one repository, oldest
-    /// first.
+    /// Every review request or provider completion in one repository, oldest
+    /// fact first.
     ///
     /// This is what `review ledger` reads when no pull request is named. The
     /// ledger's whole purpose is answering "why was there no review" long after
@@ -2363,7 +2435,8 @@ impl BrokerStore {
         repository: &str,
     ) -> Result<Vec<ReviewRequest>, BrokerError> {
         let mut statement = self.conn.prepare(&format!(
-            "{REVIEW_REQUEST_SELECT} WHERE repository = ?1 ORDER BY requested_at, id"
+            "{REVIEW_REQUEST_SELECT} WHERE repository = ?1
+             ORDER BY COALESCE(requested_at, completed_at, updated_at), id"
         ))?;
         let rows = statement
             .query_map(params![repository], review_request_from_row)?
@@ -2371,7 +2444,8 @@ impl BrokerStore {
         rows.into_iter().collect()
     }
 
-    /// The most recently requested review of one dimension on one pull request.
+    /// The most recent review request or completion of one dimension on one
+    /// pull request.
     ///
     /// A reviewer reporting back knows which review it was asked to do, not
     /// which row id carries it, and the unique index means there is one row per
@@ -2394,7 +2468,7 @@ impl BrokerStore {
                 &format!(
                     "{REVIEW_REQUEST_SELECT}
                       WHERE repository = ?1 AND pr_number = ?2 AND review_type = ?3 {clause}
-                      ORDER BY requested_at DESC, id DESC LIMIT 1"
+                      ORDER BY COALESCE(requested_at, completed_at, updated_at) DESC, id DESC LIMIT 1"
                 ),
                 params![repository, pr_number, review_type, head],
                 review_request_from_row,
@@ -2430,8 +2504,14 @@ impl BrokerStore {
                    WHERE newer.repository = review_requests.repository
                      AND newer.pr_number = review_requests.pr_number
                      AND newer.review_type = review_requests.review_type
-                     AND (newer.requested_at > review_requests.requested_at
-                          OR (newer.requested_at = review_requests.requested_at
+                     AND (COALESCE(newer.requested_at, newer.completed_at, newer.updated_at)
+                              > COALESCE(review_requests.requested_at,
+                                         review_requests.completed_at,
+                                         review_requests.updated_at)
+                          OR (COALESCE(newer.requested_at, newer.completed_at, newer.updated_at)
+                                  = COALESCE(review_requests.requested_at,
+                                             review_requests.completed_at,
+                                             review_requests.updated_at)
                               AND newer.id > review_requests.id))
                 )
               ORDER BY updated_at DESC, id DESC
@@ -2468,7 +2548,7 @@ impl BrokerStore {
     ) -> Result<Vec<ReviewRequest>, BrokerError> {
         let mut statement = self.conn.prepare(&format!(
             "{REVIEW_REQUEST_SELECT} WHERE repository = ?1 AND state IN ('requested', 'running')
-             ORDER BY requested_at, id"
+             ORDER BY COALESCE(requested_at, completed_at, updated_at), id"
         ))?;
         let rows = statement
             .query_map(params![repository], review_request_from_row)?
@@ -2588,6 +2668,12 @@ impl BrokerStore {
         detail: Option<&str>,
         now: i64,
     ) -> Result<ReviewRequest, BrokerError> {
+        if state == ReviewRequestState::Satisfied {
+            return Err(BrokerError::InvalidEnumValue {
+                field: "review_requests.satisfied",
+                value: "completion facts are required; use complete_review_request".into(),
+            });
+        }
         let changed = self.conn.execute(
             "UPDATE review_requests
                 SET state = ?2, detail = ?3, updated_at = ?4
@@ -2603,6 +2689,171 @@ impl BrokerStore {
         Ok(self
             .review_request(id)?
             .expect("updated review request should be readable"))
+    }
+
+    /// Record the provider-owned facts for a completion of a requested row.
+    ///
+    /// Request facts are never rewritten here: the row id selects the request
+    /// Aethyme recorded, while the provider supplies the completion commit,
+    /// verdict, and identity. That separation is what lets a late result be
+    /// attached to the head it actually reviewed.
+    pub fn complete_review_request(
+        &mut self,
+        id: i64,
+        completed_for_commit: &str,
+        verdict: ReviewVerdict,
+        reviewer_provider: &str,
+        reviewer_model: Option<&str>,
+        detail: Option<&str>,
+        now: i64,
+    ) -> Result<ReviewRequest, BrokerError> {
+        let completed_for_commit = completed_for_commit.trim();
+        let reviewer_provider = reviewer_provider.trim();
+        let reviewer_model = reviewer_model
+            .map(str::trim)
+            .filter(|model| !model.is_empty());
+        if completed_for_commit.is_empty() {
+            return Err(BrokerError::InvalidEnumValue {
+                field: "review_requests.completed_for_commit",
+                value: "empty commit".into(),
+            });
+        }
+        if reviewer_provider.is_empty() {
+            return Err(BrokerError::InvalidEnumValue {
+                field: "review_requests.reviewer_provider",
+                value: "empty provider".into(),
+            });
+        }
+        let changed = self.conn.execute(
+            "UPDATE review_requests
+                SET state = 'satisfied', detail = ?2, completed_at = ?3,
+                    completed_for_commit = ?4, verdict = ?5,
+                    reviewer_provider = ?6, reviewer_model = ?7,
+                    updated_at = ?3
+              WHERE id = ?1",
+            params![
+                id,
+                detail,
+                now,
+                completed_for_commit,
+                verdict.label(),
+                reviewer_provider,
+                reviewer_model
+            ],
+        )?;
+        if changed == 0 {
+            return Err(BrokerError::InvalidEnumValue {
+                field: "review_request_id",
+                value: id.to_string(),
+            });
+        }
+        Ok(self
+            .review_request(id)?
+            .expect("completed review request should be readable"))
+    }
+
+    /// Record a provider completion that arrived without an Aethyme request.
+    ///
+    /// The effective `head_commit` identity is the completed commit solely so
+    /// a later request for that same head can reconcile into this row. Request
+    /// fields remain null and the trigger is `unsolicited`; no provenance is
+    /// invented to make the row look like a routed request.
+    pub fn record_unsolicited_review_completion(
+        &mut self,
+        repository: &str,
+        pr_number: i64,
+        review_type: &str,
+        completed_for_commit: &str,
+        verdict: ReviewVerdict,
+        reviewer_provider: &str,
+        reviewer_model: Option<&str>,
+        detail: Option<&str>,
+        now: i64,
+    ) -> Result<(ReviewRequest, bool), BrokerError> {
+        let completed_for_commit = completed_for_commit.trim();
+        let reviewer_provider = reviewer_provider.trim();
+        let reviewer_model = reviewer_model
+            .map(str::trim)
+            .filter(|model| !model.is_empty());
+        if completed_for_commit.is_empty() {
+            return Err(BrokerError::InvalidEnumValue {
+                field: "review_requests.completed_for_commit",
+                value: "empty commit".into(),
+            });
+        }
+        if reviewer_provider.is_empty() {
+            return Err(BrokerError::InvalidEnumValue {
+                field: "review_requests.reviewer_provider",
+                value: "empty provider".into(),
+            });
+        }
+
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing = tx
+            .query_row(
+                &format!(
+                    "{REVIEW_REQUEST_SELECT} WHERE repository = ?1 AND pr_number = ?2
+                       AND review_type = ?3 AND head_commit = ?4"
+                ),
+                params![repository, pr_number, review_type, completed_for_commit],
+                review_request_from_row,
+            )
+            .optional()?
+            .transpose()?;
+        let (id, created) = match existing {
+            Some(existing) => {
+                tx.execute(
+                    "UPDATE review_requests
+                        SET state = 'satisfied', detail = ?2, completed_at = ?3,
+                            completed_for_commit = ?4, verdict = ?5,
+                            reviewer_provider = ?6, reviewer_model = ?7,
+                            updated_at = ?3
+                      WHERE id = ?1",
+                    params![
+                        existing.id,
+                        detail,
+                        now,
+                        completed_for_commit,
+                        verdict.label(),
+                        reviewer_provider,
+                        reviewer_model
+                    ],
+                )?;
+                (existing.id, false)
+            }
+            None => {
+                tx.execute(
+                    "INSERT INTO review_requests (
+                         repository, pr_number, review_type, head_commit,
+                         requested_for_commit, base_commit, trigger, backend,
+                         state, detail, requested_at, completed_at,
+                         completed_for_commit, verdict, reviewer_provider,
+                         reviewer_model, updated_at
+                     ) VALUES (?1, ?2, ?3, ?4, NULL, NULL, 'unsolicited',
+                               'unsolicited', 'satisfied', ?5, NULL, ?6,
+                               ?4, ?7, ?8, ?9, ?6)",
+                    params![
+                        repository,
+                        pr_number,
+                        review_type,
+                        completed_for_commit,
+                        detail,
+                        now,
+                        verdict.label(),
+                        reviewer_provider,
+                        reviewer_model
+                    ],
+                )?;
+                (tx.last_insert_rowid(), true)
+            }
+        };
+        tx.commit()?;
+        let completed = self
+            .review_request(id)?
+            .expect("recorded review completion should be readable");
+        Ok((completed, created))
     }
 
     /// Record that one dimension is excused at exactly this head.
@@ -2657,10 +2908,13 @@ impl BrokerStore {
                 tx.execute(
                     "INSERT INTO review_requests (
                          repository, pr_number, review_type, head_commit,
-                         base_commit, backend, state, detail, requested_at,
-                         updated_at
-                     ) VALUES (?1, ?2, ?3, ?4, NULL, 'waiver', 'waived', ?5,
-                               ?6, ?6)",
+                         requested_for_commit, base_commit, trigger, backend,
+                         state, detail, requested_at, completed_at,
+                         completed_for_commit, verdict, reviewer_provider,
+                         reviewer_model, updated_at
+                     ) VALUES (?1, ?2, ?3, ?4, NULL, NULL, NULL, 'waiver',
+                               'waived', ?5, NULL, NULL, NULL, NULL, NULL,
+                               NULL, ?6)",
                     params![repository, pr_number, review_type, head_commit, detail, now],
                 )?;
                 tx.last_insert_rowid()
@@ -3771,6 +4025,61 @@ impl BrokerStore {
             .collect()
     }
 
+    /// Move one exact, reviewed publication exposure to an explicit terminal
+    /// state. The identity and creation timestamp are rechecked so a plan
+    /// cannot expire a row that has since been replaced or verified.
+    pub(crate) fn expire_gc_publication_exposure(
+        &mut self,
+        candidate: &GcPublicationExposureExpiry,
+    ) -> Result<bool, BrokerError> {
+        let now = now_ms();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let expired = tx.execute(
+            "UPDATE entry_path_exposures
+             SET state = 'expired', resolved_at = ?4, resolution_kind = 'expired',
+                 resolution_sha = NULL, resolution_evidence = ?5
+             WHERE id = ?1 AND queue_entry_id = ?2 AND created_at = ?3
+               AND state = 'outstanding'",
+            params![
+                candidate.exposure_id,
+                candidate.queue_entry_id,
+                candidate.created_at,
+                now,
+                candidate.reason,
+            ],
+        )?;
+        if expired == 0 {
+            let already_expired: bool = tx.query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM entry_path_exposures
+                     WHERE id = ?1 AND queue_entry_id = ?2
+                       AND created_at = ?3 AND state = 'expired'
+                 )",
+                params![
+                    candidate.exposure_id,
+                    candidate.queue_entry_id,
+                    candidate.created_at
+                ],
+                |row| row.get(0),
+            )?;
+            tx.commit()?;
+            return Ok(already_expired);
+        }
+        let payload = serde_json::json!({
+            "exposure_id": candidate.exposure_id,
+            "queue_entry_id": candidate.queue_entry_id,
+            "created_at": candidate.created_at,
+            "age_days": candidate.age_days,
+            "reason": candidate.reason,
+        })
+        .to_string();
+        insert_event(&tx, now, "exposure.expired", None, Some(&payload))?;
+        tx.commit()?;
+        Ok(true)
+    }
+
     /// Resolve publication advisories only after their affected session no
     /// longer has a live lease overlapping the advisory paths. Acknowledged
     /// advisories still complete their lifecycle once the condition clears.
@@ -4717,6 +5026,11 @@ impl BrokerStore {
               AND NOT EXISTS (
                   SELECT 1 FROM sessions s
                   WHERE s.accepted_queue_entry_id = q.id
+                    AND NOT EXISTS (
+                        SELECT 1 FROM gc_checkpoint_pin_releases r
+                        WHERE r.session_id = s.id
+                          AND r.queue_entry_id = q.id
+                    )
               )
               AND NOT EXISTS (
                   SELECT 1 FROM entry_path_exposures x
@@ -4784,6 +5098,110 @@ impl BrokerStore {
         Ok(candidates)
     }
 
+    /// Closed sessions normally release this pin in their terminal
+    /// transition. Rows returned here are legacy or crash-recovered pins that
+    /// still need an explicit, reviewed GC plan before they can be released.
+    pub fn gc_checkpoint_pin_candidates(&self) -> Result<Vec<GcCheckpointPinRelease>, BrokerError> {
+        const REASON: &str = "accepted checkpoint pin remains after session close; releasing this broker pin does not remove committed work";
+        let mut statement = self.conn.prepare(
+            "SELECT s.id, s.accepted_queue_entry_id,
+                    COALESCE(s.closed_at, s.updated_at),
+                    COALESCE(
+                        length(q.head_commit) + length(q.base_commit)
+                          + COALESCE(length(q.merged_tree), 0)
+                          + COALESCE(length(q.details_json), 0) + 96,
+                        0
+                    )
+             FROM sessions s
+             LEFT JOIN merge_queue q ON q.id = s.accepted_queue_entry_id
+             WHERE s.status = 'cleaned'
+               AND s.accepted_queue_entry_id IS NOT NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM gc_checkpoint_pin_releases r
+                   WHERE r.session_id = s.id
+                     AND r.queue_entry_id = s.accepted_queue_entry_id
+               )
+             ORDER BY COALESCE(s.closed_at, s.updated_at), s.id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(GcCheckpointPinRelease {
+                session_id: row.get(0)?,
+                queue_entry_id: row.get(1)?,
+                recorded_at: row.get(2)?,
+                estimated_bytes: row.get::<_, i64>(3)?.max(0) as u64,
+                reason: REASON.into(),
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Release one reviewed legacy checkpoint pin without touching the queue,
+    /// session provenance, Git refs, or any committed worktree files.
+    pub fn release_gc_checkpoint_pin(
+        &mut self,
+        candidate: &GcCheckpointPinRelease,
+    ) -> Result<bool, BrokerError> {
+        let now = now_ms();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let inserted = tx.execute(
+            "INSERT OR IGNORE INTO gc_checkpoint_pin_releases
+                 (session_id, queue_entry_id, released_at)
+             SELECT id, accepted_queue_entry_id, ?3
+             FROM sessions
+             WHERE id = ?1 AND status = 'cleaned'
+               AND accepted_queue_entry_id = ?2",
+            params![candidate.session_id, candidate.queue_entry_id, now],
+        )?;
+        if inserted == 0 {
+            let already_released: bool = tx.query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM gc_checkpoint_pin_releases
+                     WHERE session_id = ?1 AND queue_entry_id = ?2
+                 )",
+                params![candidate.session_id, candidate.queue_entry_id],
+                |row| row.get(0),
+            )?;
+            tx.commit()?;
+            return Ok(already_released);
+        }
+        let payload = serde_json::json!({
+            "session_id": candidate.session_id,
+            "queue_entry_id": candidate.queue_entry_id,
+            "committed_work_untouched": true,
+            "reason": candidate.reason,
+        })
+        .to_string();
+        insert_event(
+            &tx,
+            now,
+            "gc.checkpoint_pin_released",
+            Some(candidate.session_id),
+            Some(&payload),
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    pub(crate) fn released_checkpoint_queue_entry(
+        &self,
+        session_id: i64,
+    ) -> Result<Option<i64>, BrokerError> {
+        self.conn
+            .query_row(
+                "SELECT queue_entry_id
+                 FROM gc_checkpoint_pin_releases
+                 WHERE session_id = ?1
+                 ORDER BY released_at DESC, queue_entry_id DESC
+                 LIMIT 1",
+                [session_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     /// Delete one reviewed GC batch atomically. Child rows sort before their
     /// merge-queue parent; missing rows are accepted for crash-idempotent
     /// journal replay and primary keys are never reused.
@@ -4795,6 +5213,19 @@ impl BrokerStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut removed = 0_usize;
         for row in rows {
+            if row.kind == crate::GcRowKind::MergeQueue {
+                tx.execute(
+                    "UPDATE sessions
+                     SET accepted_queue_entry_id = NULL
+                     WHERE accepted_queue_entry_id = ?1
+                       AND EXISTS (
+                           SELECT 1 FROM gc_checkpoint_pin_releases r
+                           WHERE r.session_id = sessions.id
+                             AND r.queue_entry_id = ?1
+                       )",
+                    [row.id],
+                )?;
+            }
             let table = match row.kind {
                 crate::GcRowKind::Event => "events",
                 crate::GcRowKind::GateResult => "gate_results",
@@ -5444,13 +5875,18 @@ fn delivery_outbox_from_row(row: &rusqlite::Row<'_>) -> RowResult<DeliveryOutbox
     })())
 }
 
-const REVIEW_REQUEST_SELECT: &str =
-    "SELECT id, repository, pr_number, review_type, head_commit, backend,
-            state, detail, requested_at, updated_at, base_commit
+const REVIEW_REQUEST_SELECT: &str = "SELECT id, repository, pr_number, review_type, head_commit,
+            requested_for_commit, base_commit, trigger, backend, state, detail,
+            requested_at, completed_at, completed_for_commit, verdict,
+            reviewer_provider, reviewer_model, updated_at
      FROM review_requests";
 
 fn review_request_from_row(row: &rusqlite::Row<'_>) -> RowResult<ReviewRequest> {
-    let state: String = row.get(6)?;
+    let trigger: Option<String> = row.get(7)?;
+    let state: String = row.get(9)?;
+    let verdict: Option<String> = row.get(14)?;
+    let reviewer_provider: Option<String> = row.get(15)?;
+    let reviewer_model: Option<String> = row.get(16)?;
     Ok((|| {
         Ok(ReviewRequest {
             id: row.get(0)?,
@@ -5458,17 +5894,42 @@ fn review_request_from_row(row: &rusqlite::Row<'_>) -> RowResult<ReviewRequest> 
             pr_number: row.get(2)?,
             review_type: row.get(3)?,
             head_commit: row.get(4)?,
-            backend: row.get(5)?,
+            requested_for_commit: row.get(5)?,
+            base_commit: row.get(6)?,
+            trigger: match trigger.as_deref() {
+                None => None,
+                Some(value) => Some(ReviewTrigger::parse(value).ok_or_else(|| {
+                    BrokerError::InvalidEnumValue {
+                        field: "review_requests.trigger",
+                        value: value.to_string(),
+                    }
+                })?),
+            },
+            backend: row.get(8)?,
             state: ReviewRequestState::parse(&state).ok_or_else(|| {
                 BrokerError::InvalidEnumValue {
                     field: "review_requests.state",
                     value: state.clone(),
                 }
             })?,
-            detail: row.get(7)?,
-            requested_at: row.get(8)?,
-            updated_at: row.get(9)?,
-            base_commit: row.get(10)?,
+            detail: row.get(10)?,
+            requested_at: row.get(11)?,
+            completed_at: row.get(12)?,
+            completed_for_commit: row.get(13)?,
+            verdict: match verdict.as_deref() {
+                None => None,
+                Some(value) => Some(ReviewVerdict::parse(value).ok_or_else(|| {
+                    BrokerError::InvalidEnumValue {
+                        field: "review_requests.verdict",
+                        value: value.to_string(),
+                    }
+                })?),
+            },
+            reviewer: reviewer_provider.map(|provider| ReviewerIdentity {
+                provider,
+                model: reviewer_model,
+            }),
+            updated_at: row.get(17)?,
         })
     })())
 }
@@ -5703,6 +6164,49 @@ fn update_accepted_checkpoint(
         return Err(BrokerError::SessionNotFound(session_id));
     }
     Ok(())
+}
+
+fn release_checkpoint_pin_in_tx(
+    conn: &Connection,
+    session_id: i64,
+    released_at: i64,
+) -> Result<bool, BrokerError> {
+    let Some(queue_entry_id) = conn
+        .query_row(
+            "SELECT accepted_queue_entry_id
+             FROM sessions
+             WHERE id = ?1 AND status = 'cleaned'
+               AND accepted_queue_entry_id IS NOT NULL",
+            [session_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+    else {
+        return Ok(false);
+    };
+    let inserted = conn.execute(
+        "INSERT OR IGNORE INTO gc_checkpoint_pin_releases
+             (session_id, queue_entry_id, released_at)
+         VALUES (?1, ?2, ?3)",
+        params![session_id, queue_entry_id, released_at],
+    )?;
+    if inserted > 0 {
+        let payload = serde_json::json!({
+            "session_id": session_id,
+            "queue_entry_id": queue_entry_id,
+            "committed_work_untouched": true,
+            "automatic_terminal_transition": true,
+        })
+        .to_string();
+        insert_event(
+            conn,
+            released_at,
+            "gc.checkpoint_pin_released",
+            Some(session_id),
+            Some(&payload),
+        )?;
+    }
+    Ok(inserted > 0)
 }
 
 fn insert_event(
@@ -6040,7 +6544,11 @@ mod review_ledger_tests {
             .unwrap();
         assert!(!created_again);
         assert_eq!(first.id, second.id);
-        assert_eq!(second.requested_at, 100, "the first request keeps its time");
+        assert_eq!(
+            second.requested_at,
+            Some(100),
+            "the first request keeps its time"
+        );
     }
 
     /// A new head is a new review. The router asks again when the change it was
@@ -6072,9 +6580,160 @@ mod review_ledger_tests {
         assert_eq!(updated.state, ReviewRequestState::Failed);
         assert_eq!(updated.detail.as_deref(), Some("no tab"));
         assert_eq!(updated.updated_at, 300);
-        assert_eq!(updated.requested_at, 100);
+        assert_eq!(updated.requested_at, Some(100));
         let reread = store.review_request(request.id).unwrap().unwrap();
         assert_eq!(reread.state, ReviewRequestState::Failed);
+    }
+
+    #[test]
+    fn completion_keeps_request_and_provider_facts_separate() {
+        let mut store = store();
+        let (request, _) = store
+            .record_review_request_with_trigger(
+                "o/r",
+                7,
+                "security",
+                "requested-commit",
+                Some("base-commit"),
+                "chau7",
+                Some(ReviewTrigger::AdditionalCommit),
+                100,
+            )
+            .unwrap();
+
+        let completed = store
+            .complete_review_request(
+                request.id,
+                "completed-commit",
+                ReviewVerdict::ChangesRequested,
+                "github",
+                Some("reviewer-model"),
+                Some("found a blocking issue"),
+                200,
+            )
+            .unwrap();
+        assert_eq!(completed.head_commit, "requested-commit");
+        assert_eq!(
+            completed.requested_for_commit.as_deref(),
+            Some("requested-commit")
+        );
+        assert_eq!(completed.trigger, Some(ReviewTrigger::AdditionalCommit));
+        assert_eq!(completed.requested_at, Some(100));
+        assert_eq!(completed.completed_at, Some(200));
+        assert_eq!(
+            completed.completed_for_commit.as_deref(),
+            Some("completed-commit")
+        );
+        assert_eq!(completed.verdict, Some(ReviewVerdict::ChangesRequested));
+        assert_eq!(
+            completed.reviewer,
+            Some(ReviewerIdentity {
+                provider: "github".into(),
+                model: Some("reviewer-model".into()),
+            })
+        );
+        assert_eq!(completed.detail.as_deref(), Some("found a blocking issue"));
+    }
+
+    #[test]
+    fn an_unsolicited_completion_is_a_first_class_row() {
+        let mut store = store();
+        let (completion, created) = store
+            .record_unsolicited_review_completion(
+                "o/r",
+                7,
+                "security",
+                "provider-commit",
+                ReviewVerdict::Pass,
+                "github",
+                Some("reviewer-model"),
+                Some("no findings"),
+                200,
+            )
+            .unwrap();
+        assert!(created);
+        assert_eq!(completion.head_commit, "provider-commit");
+        assert_eq!(completion.requested_for_commit, None);
+        assert_eq!(completion.requested_at, None);
+        assert_eq!(completion.trigger, Some(ReviewTrigger::Unsolicited));
+        assert_eq!(completion.completed_at, Some(200));
+        assert_eq!(
+            completion.completed_for_commit.as_deref(),
+            Some("provider-commit")
+        );
+        assert_eq!(completion.verdict, Some(ReviewVerdict::Pass));
+        assert_eq!(completion.backend, "unsolicited");
+        assert_eq!(
+            completion
+                .reviewer
+                .as_ref()
+                .map(|reviewer| reviewer.provider.as_str()),
+            Some("github")
+        );
+
+        let (updated, duplicate) = store
+            .record_unsolicited_review_completion(
+                "o/r",
+                7,
+                "security",
+                "provider-commit",
+                ReviewVerdict::Commented,
+                "github",
+                None,
+                None,
+                300,
+            )
+            .unwrap();
+        assert!(!duplicate);
+        assert_eq!(updated.id, completion.id);
+        assert_eq!(updated.verdict, Some(ReviewVerdict::Commented));
+        assert_eq!(updated.completed_at, Some(300));
+        assert_eq!(updated.reviewer.unwrap().model, None);
+    }
+
+    #[test]
+    fn a_late_request_reconciles_an_unsolicited_completion_without_overwriting_it() {
+        let mut store = store();
+        let (completion, _) = store
+            .record_unsolicited_review_completion(
+                "o/r",
+                7,
+                "security",
+                "same-commit",
+                ReviewVerdict::Pass,
+                "github",
+                Some("reviewer-model"),
+                Some("no findings"),
+                200,
+            )
+            .unwrap();
+        let (request, created) = store
+            .record_review_request_with_trigger(
+                "o/r",
+                7,
+                "security",
+                "same-commit",
+                None,
+                "provider_comment",
+                Some(ReviewTrigger::Scheduled),
+                300,
+            )
+            .unwrap();
+        assert!(!created);
+        assert_eq!(request.id, completion.id);
+        assert_eq!(request.requested_for_commit.as_deref(), Some("same-commit"));
+        assert_eq!(request.requested_at, Some(300));
+        assert_eq!(request.trigger, Some(ReviewTrigger::Scheduled));
+        assert_eq!(request.backend, "provider_comment");
+        assert_eq!(request.completed_at, Some(200));
+        assert_eq!(request.verdict, Some(ReviewVerdict::Pass));
+        assert_eq!(
+            request
+                .reviewer
+                .as_ref()
+                .and_then(|reviewer| reviewer.model.as_deref()),
+            Some("reviewer-model")
+        );
     }
 
     /// The dimension most worth waiving is usually the one with no row at all
@@ -6115,7 +6774,8 @@ mod review_ledger_tests {
         assert_eq!(waived.id, request.id);
         assert_eq!(waived.state, ReviewRequestState::Waived);
         assert_eq!(
-            waived.requested_at, 100,
+            waived.requested_at,
+            Some(100),
             "when the review was asked for is history, not something a waiver rewrites"
         );
         assert_eq!(waived.updated_at, 300);
@@ -6223,7 +6883,7 @@ mod review_ledger_tests {
             revived.backend, "provider_comment",
             "policy may have moved since the attempt"
         );
-        assert_eq!(revived.requested_at, 200);
+        assert_eq!(revived.requested_at, Some(200));
         assert_eq!(store.review_requests_for_pr("o/r", 7).unwrap().len(), 1);
     }
 
@@ -6241,9 +6901,23 @@ mod review_ledger_tests {
             let (first, _) = store
                 .record_review_request("o/r", 7, "security", "abc", None, "chau7", 100)
                 .unwrap();
-            store
-                .set_review_request_state(first.id, settled, None, 150)
-                .unwrap();
+            if settled == ReviewRequestState::Satisfied {
+                store
+                    .complete_review_request(
+                        first.id,
+                        "abc",
+                        ReviewVerdict::Pass,
+                        "test-provider",
+                        Some("test-model"),
+                        None,
+                        150,
+                    )
+                    .unwrap();
+            } else {
+                store
+                    .set_review_request_state(first.id, settled, None, 150)
+                    .unwrap();
+            }
             let (again, created) = store
                 .record_review_request("o/r", 7, "security", "abc", None, "chau7", 200)
                 .unwrap();
@@ -6271,7 +6945,15 @@ mod review_ledger_tests {
             .record_review_request("o/r", 10, "security", "jkl", None, "chau7", 100)
             .unwrap();
         store
-            .set_review_request_state(settled.id, ReviewRequestState::Satisfied, None, 200)
+            .complete_review_request(
+                settled.id,
+                "jkl",
+                ReviewVerdict::Pass,
+                "test-provider",
+                Some("test-model"),
+                None,
+                200,
+            )
             .unwrap();
 
         let open = store.review_requests_in_flight("o/r").unwrap();
@@ -6314,5 +6996,38 @@ mod review_ledger_tests {
                 .is_none(),
             "a review nobody requested has no row to report against"
         );
+    }
+
+    /// An unsolicited completion has no request timestamp, but it is still a
+    /// newer review fact when its completion arrived after the last request.
+    /// The default reporting path must not attach a later provider result to an
+    /// older requested row merely because that row has a non-null timestamp.
+    #[test]
+    fn the_latest_review_fact_includes_unsolicited_completions() {
+        let mut store = store();
+        store
+            .record_review_request("o/r", 7, "security", "requested", None, "chau7", 100)
+            .unwrap();
+        store
+            .record_unsolicited_review_completion(
+                "o/r",
+                7,
+                "security",
+                "completed",
+                ReviewVerdict::Pass,
+                "github",
+                None,
+                None,
+                200,
+            )
+            .unwrap();
+
+        let latest = store
+            .latest_review_request("o/r", 7, "security", None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(latest.head_commit, "completed");
+        assert_eq!(latest.requested_at, None);
+        assert_eq!(latest.completed_at, Some(200));
     }
 }
