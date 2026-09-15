@@ -137,18 +137,41 @@ impl ReviewTrigger {
             ReviewTrigger::MergeQueueEntered => "merge_queue_entered",
             ReviewTrigger::Scheduled => "scheduled",
             ReviewTrigger::Manual => "manual",
+            ReviewTrigger::Unsolicited => "unsolicited",
         }
+    }
+
+    /// Parse the stable database spelling of a trigger.
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "pull_request_opened" => Self::PullRequestOpened,
+            "ready_for_review" => Self::ReadyForReview,
+            "reopened" => Self::Reopened,
+            "replacement_commit" => Self::ReplacementCommit,
+            "additional_commit" => Self::AdditionalCommit,
+            "base_retargeted" => Self::BaseRetargeted,
+            "review_dismissed" => Self::ReviewDismissed,
+            "merge_queue_entered" => Self::MergeQueueEntered,
+            "scheduled" => Self::Scheduled,
+            "manual" => Self::Manual,
+            "unsolicited" => Self::Unsolicited,
+            _ => return None,
+        })
     }
 
     /// Whether a tick can ever report this trigger.
     ///
     /// Everything [`derive_trigger`] can conclude from two snapshots, plus
     /// `Manual`, which `review request` supplies directly. `MergeQueueEntered`
-    /// is the one transition no `gh pr view` field exposes; a rule that waits
-    /// for it would wait forever, so the policy loader refuses it by name
-    /// rather than letting it sit in the file looking configured.
+    /// is the one transition no `gh pr view` field exposes, and `Unsolicited`
+    /// is completion provenance rather than a transition; rules that wait for
+    /// either would wait forever, so the policy loader refuses them by name
+    /// rather than letting them sit in the file looking configured.
     pub fn is_observable(self) -> bool {
-        !matches!(self, ReviewTrigger::MergeQueueEntered)
+        !matches!(
+            self,
+            ReviewTrigger::MergeQueueEntered | ReviewTrigger::Unsolicited
+        )
     }
 }
 
@@ -158,7 +181,7 @@ mod tests {
 
     /// Every variant, so a new one cannot be added without deciding whether a
     /// tick can report it.
-    const ALL_TRIGGERS: [ReviewTrigger; 10] = [
+    const ALL_TRIGGERS: [ReviewTrigger; 11] = [
         ReviewTrigger::PullRequestOpened,
         ReviewTrigger::ReadyForReview,
         ReviewTrigger::Reopened,
@@ -169,6 +192,7 @@ mod tests {
         ReviewTrigger::MergeQueueEntered,
         ReviewTrigger::Scheduled,
         ReviewTrigger::Manual,
+        ReviewTrigger::Unsolicited,
     ];
 
     fn seen(head: &str) -> PullRequestObservation {
@@ -307,7 +331,8 @@ mod tests {
         for trigger in ALL_TRIGGERS {
             assert_eq!(
                 trigger.is_observable(),
-                trigger != ReviewTrigger::MergeQueueEntered,
+                trigger != ReviewTrigger::MergeQueueEntered
+                    && trigger != ReviewTrigger::Unsolicited,
                 "{}",
                 trigger.as_str(),
             );

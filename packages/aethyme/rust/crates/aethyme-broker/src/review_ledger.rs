@@ -1,10 +1,11 @@
-//! What the review router has already asked for.
+//! What the review router asked for and what providers completed.
 //!
 //! The decision plane in [`crate::review_trigger`] and [`crate::review_backend`]
 //! is deliberately pure: it takes what has been spent and what is in flight as
 //! arguments rather than reading them. This module is where those arguments
-//! come from -- the durable record of every review the router requested, which
-//! dimension it was, which commit it was bound to, and who was asked to do it.
+//! come from -- the durable record of every review the router requested or
+//! provider completed, which dimension it was, which commits the two facts
+//! name, and who was asked to do it or actually answered.
 //!
 //! Two properties matter more than the shape of the rows.
 //!
@@ -112,6 +113,143 @@ impl ReviewRequestState {
     /// reuses the row rather than colliding with it.
     pub fn is_revivable(self) -> bool {
         matches!(self, Self::Abandoned)
+    }
+}
+
+/// The provider's typed conclusion about one completed review.
+///
+/// This is intentionally separate from [`ReviewRequestState`]. `Satisfied`
+/// says that a reviewer returned an outcome; this says what that outcome was.
+/// A missing value is therefore not an implicit pass, especially for rows
+/// written by an older binary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewVerdict {
+    /// The review found no issue that blocks the reviewed dimension.
+    Pass,
+    /// The review found a blocking issue.
+    Fail,
+    /// The provider explicitly asked the author to make changes.
+    ChangesRequested,
+    /// The provider returned observations without an approval or rejection.
+    Commented,
+}
+
+impl ReviewVerdict {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Pass => "pass",
+            Self::Fail => "fail",
+            Self::ChangesRequested => "changes_requested",
+            Self::Commented => "commented",
+        }
+    }
+
+    /// Parse the stable CLI/database spelling. Provider-native aliases are
+    /// accepted at the boundary and normalized to the shared vocabulary.
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "pass" | "passed" | "approve" | "approved" => Self::Pass,
+            "fail" | "failed" | "reject" | "rejected" => Self::Fail,
+            "changes_requested" | "request_changes" => Self::ChangesRequested,
+            "commented" | "comment" => Self::Commented,
+            _ => return None,
+        })
+    }
+}
+
+/// The identity of the system that produced a completion.
+///
+/// `backend` on [`ReviewRequest`] remains the route Aethyme selected. This is
+/// the provider/model that actually produced the result, so a completion that
+/// arrived through a different path cannot be misattributed to the route.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewerIdentity {
+    pub provider: String,
+    /// `None` means the provider did not expose a model identity. It is kept
+    /// unknown rather than guessed from a backend label.
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+#[cfg(test)]
+mod completion_fact_tests {
+    use super::*;
+    use crate::review_trigger::ReviewTrigger;
+
+    #[test]
+    fn verdicts_round_trip_to_stable_labels() {
+        for verdict in [
+            ReviewVerdict::Pass,
+            ReviewVerdict::Fail,
+            ReviewVerdict::ChangesRequested,
+            ReviewVerdict::Commented,
+        ] {
+            assert_eq!(ReviewVerdict::parse(verdict.label()), Some(verdict));
+        }
+        assert_eq!(ReviewVerdict::parse("approved"), Some(ReviewVerdict::Pass));
+        assert_eq!(
+            ReviewVerdict::parse("changes_requested"),
+            Some(ReviewVerdict::ChangesRequested)
+        );
+        assert_eq!(ReviewVerdict::parse("unknown"), None);
+    }
+
+    #[test]
+    fn an_unsolicited_completion_uses_completion_facts_for_spend_without_a_request_time() {
+        let row = ReviewRequest {
+            id: 1,
+            repository: "o/r".into(),
+            pr_number: 7,
+            review_type: "security".into(),
+            head_commit: "provider-head".into(),
+            requested_for_commit: None,
+            base_commit: None,
+            backend: "unsolicited".into(),
+            trigger: Some(ReviewTrigger::Unsolicited),
+            state: ReviewRequestState::Satisfied,
+            detail: Some("no findings".into()),
+            requested_at: None,
+            completed_at: Some(200),
+            completed_for_commit: Some("provider-head".into()),
+            verdict: Some(ReviewVerdict::Pass),
+            reviewer: Some(ReviewerIdentity {
+                provider: "github".into(),
+                model: None,
+            }),
+            updated_at: 200,
+        };
+        let spend = spend_by_type(&[row]);
+        assert_eq!(spend["security"].requested_count, 1);
+        assert_eq!(
+            spend["security"].last_requested_commit.as_deref(),
+            Some("provider-head")
+        );
+        assert_eq!(spend["security"].last_requested_ms, Some(200));
+    }
+
+    #[test]
+    fn an_old_ledger_json_row_defaults_new_optional_facts() {
+        let row: ReviewRequest = serde_json::from_str(
+            r#"{
+                "id": 1,
+                "repository": "o/r",
+                "pr_number": 7,
+                "review_type": "security",
+                "head_commit": "old-head",
+                "base_commit": null,
+                "backend": "chau7",
+                "state": "requested",
+                "detail": null,
+                "requested_at": 100,
+                "updated_at": 100
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(row.requested_for_commit, None);
+        assert_eq!(row.completed_for_commit, None);
+        assert_eq!(row.verdict, None);
+        assert_eq!(row.reviewer, None);
     }
 }
 
@@ -375,29 +513,57 @@ pub struct ReviewRequest {
     pub repository: String,
     pub pr_number: i64,
     pub review_type: String,
+    /// The stable row identity. For a requested row it is the requested head;
+    /// for an unsolicited completion it is the completion head, which lets a
+    /// later request for that exact commit reconcile with this row.
     pub head_commit: String,
+    /// The commit Aethyme asked the reviewer to inspect. This is nullable for
+    /// an unsolicited completion, where no request fact exists.
+    #[serde(default)]
+    pub requested_for_commit: Option<String>,
     /// The base commit this review was requested against.
     ///
     /// `None` for a row written before the ledger recorded one. Read as "the
     /// base cannot be proven unchanged" rather than "unchanged", so a
     /// `head_and_base` dimension re-reviews instead of trusting a comparison
     /// nobody made (#172).
+    #[serde(default)]
     pub base_commit: Option<String>,
     /// Who was asked, as `ReviewBackend`'s label. Kept as text because the
     /// answer to "why was there no review" has to survive a policy change that
     /// removes the backend the row names.
     pub backend: String,
+    /// The lifecycle event that caused the request, or `unsolicited` for a
+    /// provider completion that arrived without an Aethyme request.
+    #[serde(default)]
+    pub trigger: Option<crate::ReviewTrigger>,
     pub state: ReviewRequestState,
     pub detail: Option<String>,
-    pub requested_at: i64,
+    /// The time Aethyme recorded the request. Unsolicited completions have no
+    /// request and therefore keep this null.
+    #[serde(default)]
+    pub requested_at: Option<i64>,
+    /// The time the provider reported a completion, when one exists.
+    #[serde(default)]
+    pub completed_at: Option<i64>,
+    /// The commit the provider actually reviewed. It is independent from the
+    /// request binding because a provider can complete work for another head.
+    #[serde(default)]
+    pub completed_for_commit: Option<String>,
+    #[serde(default)]
+    pub verdict: Option<ReviewVerdict>,
+    #[serde(default)]
+    pub reviewer: Option<ReviewerIdentity>,
     pub updated_at: i64,
 }
 
 /// What has been spent per dimension, for [`crate::schedule`].
 ///
-/// `last_requested_commit` is the most recently requested head, by request
-/// time. Ordering by time rather than by row id keeps this correct if rows are
-/// ever backfilled out of order.
+/// `last_requested_commit` is the most recently requested or externally
+/// completed head, by the timestamp available for that fact. Including a
+/// completed unsolicited row prevents the scheduler from asking twice for a
+/// review the provider already performed, while its row still makes clear
+/// that no Aethyme request existed.
 ///
 /// Revivable rows are not spend. `schedule` skips a dimension whose last
 /// request is bound to the current head, so counting a review nobody was ever
@@ -412,12 +578,17 @@ pub fn spend_by_type(rows: &[ReviewRequest]) -> std::collections::BTreeMap<Strin
         }
         let entry = spend.entry(row.review_type.clone()).or_default();
         entry.requested_count += 1;
-        if entry
-            .last_requested_ms
-            .is_none_or(|last| row.requested_at >= last)
-        {
-            entry.last_requested_ms = Some(row.requested_at);
-            entry.last_requested_commit = Some(row.head_commit.clone());
+        let at = row
+            .requested_at
+            .or(row.completed_at)
+            .unwrap_or(row.updated_at);
+        if entry.last_requested_ms.is_none_or(|last| at >= last) {
+            entry.last_requested_ms = Some(at);
+            entry.last_requested_commit = row
+                .requested_for_commit
+                .clone()
+                .or_else(|| row.completed_for_commit.clone())
+                .or_else(|| Some(row.head_commit.clone()));
             entry.last_requested_base = row.base_commit.clone();
         }
     }
@@ -513,7 +684,14 @@ pub fn last_refusal(rows: &[ReviewRequest], review_type: &str) -> Option<Refusal
     let latest = rows
         .iter()
         .filter(|row| row.review_type == review_type)
-        .max_by_key(|row| (row.requested_at, row.id))?;
+        .max_by_key(|row| {
+            (
+                row.requested_at
+                    .or(row.completed_at)
+                    .unwrap_or(row.updated_at),
+                row.id,
+            )
+        })?;
     if latest.state != ReviewRequestState::Abandoned {
         return None;
     }
@@ -536,14 +714,20 @@ mod last_refusal_tests {
             pr_number: 7,
             review_type: review_type.into(),
             head_commit: "abc123".into(),
+            requested_for_commit: Some("abc123".into()),
             base_commit: None,
             backend: "provider_comment".into(),
+            trigger: None,
             state,
             detail: detail.map(str::to_string),
             // `requested_at` tracks `id` so ordering is unambiguous; the
             // production ordering breaks ties on `id` for exactly the case
             // where it does not.
-            requested_at: id * 1_000,
+            requested_at: Some(id * 1_000),
+            completed_at: None,
+            completed_for_commit: None,
+            verdict: None,
+            reviewer: None,
             updated_at: id * 1_000,
         }
     }
@@ -885,11 +1069,17 @@ mod tests {
             pr_number: 7,
             review_type: review_type.into(),
             head_commit: head.into(),
+            requested_for_commit: Some(head.into()),
             base_commit: None,
             backend: "chau7".into(),
+            trigger: None,
             state,
             detail: None,
-            requested_at: at,
+            requested_at: Some(at),
+            completed_at: None,
+            completed_for_commit: None,
+            verdict: None,
+            reviewer: None,
             updated_at: at,
         }
     }
@@ -1015,11 +1205,17 @@ mod waiver_tests {
             pr_number: 7,
             review_type: review_type.into(),
             head_commit: head.into(),
+            requested_for_commit: Some(head.into()),
             base_commit: None,
             backend: "waiver".into(),
+            trigger: None,
             state,
             detail: Some(detail.to_string()),
-            requested_at: 100,
+            requested_at: Some(100),
+            completed_at: None,
+            completed_for_commit: None,
+            verdict: None,
+            reviewer: None,
             updated_at: 100,
         }
     }
