@@ -348,6 +348,7 @@ pub use retention::{
     BROKER_CONFIG_RELPATH, GcApplyReport, GcArtifactCandidate, GcBlocker, GcBlockerSummary,
     GcCheckpointPinRelease, GcFileAction, GcFileCandidate, GcHealth, GcOrphanCandidate, GcPlan,
     GcPublicationExposureExpiry, GcRowCandidate, GcRowKind, GcWorktreeCandidate,
+    GcWorktreeBlockerSummary,
     RETENTION_POLICY_SCHEMA_VERSION, RetentionConfigError, RetentionConfigWarning, RetentionPolicy,
     RetentionPolicyLoadReport, load_retention_policy, load_retention_policy_report,
 };

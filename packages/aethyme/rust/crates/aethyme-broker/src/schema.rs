@@ -1161,7 +1161,6 @@ DROP TABLE entry_path_exposures_v38;
 CREATE INDEX entry_path_exposures_by_state
     ON entry_path_exposures (state, id);
 ";
-
 const MIGRATIONS: &[&str] = &[
     MIGRATION_V1,
     MIGRATION_V2,

@@ -14,6 +14,7 @@ use crate::{
     Broker, BrokerOpError, GcApplyReport, GcArtifactCandidate, GcBlocker, GcBlockerSummary,
     GcCheckpointPinRelease, GcFileAction, GcFileCandidate, GcHealth, GcOrphanCandidate, GcPlan,
     GcPublicationExposureExpiry, GcRowCandidate, GcWorktreeCandidate, GitRepo, OperationStatus,
+    GcWorktreeBlockerSummary,
     RetentionPolicy, load_retention_policy, load_retention_policy_report,
 };
 
@@ -756,6 +757,23 @@ impl Broker {
                 reason: format!("session {}: {}", pin.session_id, pin.reason),
             });
         }
+        for session in sessions.values() {
+            if let Some(queue_entry_id) = session.accepted_queue_entry_id {
+                if checkpoint_pin_releases.iter().any(|pin| {
+                    pin.session_id == session.id && pin.queue_entry_id == queue_entry_id
+                }) {
+                    continue;
+                }
+                blockers.push(GcBlocker {
+                    kind: "accepted_checkpoint".into(),
+                    id: Some(queue_entry_id),
+                    reason: format!(
+                        "session {} still names this queue entry as accepted provenance",
+                        session.id
+                    ),
+                });
+            }
+        }
         for session in &live_sessions {
             blockers.push(GcBlocker {
                 kind: "live_session".into(),
@@ -1046,6 +1064,36 @@ impl Broker {
                 .then_with(|| right.count.cmp(&left.count))
                 .then_with(|| left.kind.cmp(&right.kind))
         });
+        let mut worktree_blocker_summary = blocked_worktree_bytes
+            .iter()
+            .filter_map(|((kind, id), retained_bytes)| {
+                let blocker = blockers
+                    .iter()
+                    .find(|blocker| blocker.kind == *kind && blocker.id == *id)?;
+                Some((blocker.kind.clone(), *retained_bytes))
+            })
+            .fold(
+                BTreeMap::<String, (usize, u64)>::new(),
+                |mut summary, (kind, bytes)| {
+                    let entry = summary.entry(kind).or_default();
+                    entry.0 += 1;
+                    entry.1 = entry.1.saturating_add(bytes);
+                    summary
+                },
+            )
+            .into_iter()
+            .map(|(kind, (count, retained_bytes))| GcWorktreeBlockerSummary {
+                kind,
+                count,
+                retained_bytes,
+            })
+            .collect::<Vec<_>>();
+        worktree_blocker_summary.sort_by(|left, right| {
+            right
+                .retained_bytes
+                .cmp(&left.retained_bytes)
+                .then_with(|| left.kind.cmp(&right.kind))
+        });
         let estimated_reclaimable_bytes = rows
             .iter()
             .map(|row| row.estimated_bytes)
@@ -1145,6 +1193,7 @@ impl Broker {
             checkpoint_pin_releases,
             publication_exposure_expiries,
             blocker_summary,
+            worktree_blocker_summary,
             estimated_reclaimable_bytes,
             estimated_retained_bytes,
             estimated_blocked_bytes,
