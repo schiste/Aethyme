@@ -506,7 +506,7 @@ fn build_caches_are_reclaimable_even_when_the_worktree_itself_is_blocked() {
             .all(|worktree| worktree["session_id"].as_i64().unwrap().to_string() != id),
         "a session with unaccepted commits must not be scheduled for removal"
     );
-    let retained_summary = plan["worktree_blocker_summary"]
+    let retained_summary = plan["blocker_summary"]
         .as_array()
         .unwrap()
         .iter()
@@ -517,6 +517,14 @@ fn build_caches_are_reclaimable_even_when_the_worktree_itself_is_blocked() {
         retained_summary["retained_bytes"].as_u64().unwrap() > 0,
         "age blocker should account for the retained worktree bytes: {retained_summary}"
     );
+    let worktree_summary = plan["worktree_blocker_summary"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|summary| summary["kind"] == "retention_age")
+        .expect("worktree-specific summary should include the age blocker");
+    assert_eq!(worktree_summary["count"], 1);
+    assert!(worktree_summary["retained_bytes"].as_u64().unwrap() > 0);
 
     let digest = plan["digest"].as_str().unwrap();
     let output = run(

@@ -19,6 +19,7 @@ const RETENTION_POLICY_FIELDS: &[&str] = &[
     "terminal_merge_queue_days",
     "command_metrics_days",
     "closed_worktrees_days",
+    "publication_exposure_days",
     "retained_bytes_budget",
     "artifact_reclaim_days",
     "orphan_worktree_roots_days",
@@ -38,6 +39,9 @@ pub struct RetentionPolicy {
     pub gate_results_days: u32,
     pub terminal_merge_queue_days: u32,
     pub command_metrics_days: u32,
+    /// Days an unverified promoted publication may remain outstanding before
+    /// it becomes an explicit terminal expiry rather than an eternal blocker.
+    pub publication_exposure_days: u32,
     /// Soft repository storage budget. `0` disables budget warnings.
     pub retained_bytes_budget: u64,
     /// Idle days before a closed session's unproven worktree is eligible for
@@ -90,6 +94,7 @@ impl Default for RetentionPolicy {
             terminal_merge_queue_days: 180,
             command_metrics_days: 30,
             closed_worktrees_days: 7,
+            publication_exposure_days: 30,
             retained_bytes_budget: 1_073_741_824,
             artifact_reclaim_days: 0,
             orphan_worktree_roots_days: 1,
@@ -117,6 +122,7 @@ impl RetentionPolicy {
             ("terminal_merge_queue_days", self.terminal_merge_queue_days),
             ("command_metrics_days", self.command_metrics_days),
             ("closed_worktrees_days", self.closed_worktrees_days),
+            ("publication_exposure_days", self.publication_exposure_days),
         ] {
             if value == 0 || value > 36_500 {
                 return Err(RetentionConfigError::InvalidValue {
@@ -430,6 +436,56 @@ pub struct GcBlocker {
     pub reason: String,
 }
 
+/// A closed session's accepted queue checkpoint that still has a GC pin.
+///
+/// Releasing this record changes only broker metadata. The accepted session
+/// head, integration commit, and tree remain available for cleanup provenance,
+/// and no committed worktree or branch is touched.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct GcCheckpointPinRelease {
+    pub session_id: i64,
+    pub queue_entry_id: i64,
+    pub recorded_at: i64,
+    pub estimated_bytes: u64,
+    pub reason: String,
+}
+
+/// An outstanding publication exposure past its stated retention age. The
+/// plan names the exact row; only an explicit `gc apply` may expire it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct GcPublicationExposureExpiry {
+    pub exposure_id: i64,
+    pub queue_entry_id: i64,
+    pub created_at: i64,
+    pub age_days: u32,
+    pub reason: String,
+}
+
+/// An aggregate view of the protections in a GC plan.
+///
+/// The individual blocker list remains the authoritative explanation for each
+/// row. This companion view makes retained disk pressure and ageing actionable
+/// by grouping it by the rule that held it, with the largest group first.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct GcBlockerSummary {
+    pub kind: String,
+    pub count: usize,
+    pub retained_bytes: u64,
+    /// The row or session identifier of the oldest member, when the blocker
+    /// kind has one. A null value means the kind only has path-level or
+    /// otherwise unaddressable findings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oldest_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oldest_recorded_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oldest_age_days: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub age_policy_days: Option<u32>,
+    #[serde(default)]
+    pub age_exceeded: bool,
+}
+
 /// A byte-backed aggregation of the worktree blockers in a GC plan.
 ///
 /// The individual blocker list remains the authoritative explanation for each
@@ -458,6 +514,18 @@ pub struct GcPlan {
     pub artifacts: Vec<GcArtifactCandidate>,
     pub orphans: Vec<GcOrphanCandidate>,
     pub blockers: Vec<GcBlocker>,
+    /// Closed-session checkpoint pins that a reviewed `gc apply` may release.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checkpoint_pin_releases: Vec<GcCheckpointPinRelease>,
+    /// Publication exposures past policy age that a reviewed `gc apply` may
+    /// move to the terminal `expired` state.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub publication_exposure_expiries: Vec<GcPublicationExposureExpiry>,
+    /// Protection counts and byte estimates grouped by blocker kind. This is
+    /// reporting only and intentionally excluded from the authorization
+    /// digest, like the other measured byte totals.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocker_summary: Vec<GcBlockerSummary>,
     /// Retained worktree bytes grouped by the blocker that holds them. This
     /// is reporting only and intentionally excluded from the authorization
     /// digest, like the other measured byte totals.
@@ -521,6 +589,8 @@ pub struct GcApplyReport {
     pub sessions_cleaned: Vec<i64>,
     pub artifacts_reclaimed: Vec<String>,
     pub orphans_removed: Vec<String>,
+    pub checkpoint_pins_released: Vec<i64>,
+    pub publication_exposures_expired: Vec<i64>,
     pub reclaimed_bytes: u64,
     pub failures: Vec<String>,
     pub recovery_action: Option<String>,
@@ -589,6 +659,8 @@ impl GcPlan {
             artifacts: &'a [GcArtifactCandidate],
             orphans: &'a [GcOrphanCandidate],
             blockers: &'a [GcBlocker],
+            checkpoint_pin_releases: &'a [GcCheckpointPinRelease],
+            publication_exposure_expiries: &'a [GcPublicationExposureExpiry],
         }
         let bytes = serde_json::to_vec(&Authorization {
             schema_version: self.schema_version,
@@ -599,6 +671,8 @@ impl GcPlan {
             artifacts: &self.artifacts,
             orphans: &self.orphans,
             blockers: &self.blockers,
+            checkpoint_pin_releases: &self.checkpoint_pin_releases,
+            publication_exposure_expiries: &self.publication_exposure_expiries,
         })?;
         self.digest = format!("{:x}", Sha256::digest(bytes));
         Ok(())

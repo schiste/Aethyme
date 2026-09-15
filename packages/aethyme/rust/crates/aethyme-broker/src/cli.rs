@@ -3504,6 +3504,62 @@ fn render_gc_plan(plan: &crate::GcPlan, detail: bool) {
             orphan.repository_root
         );
     });
+    render_capped(&plan.checkpoint_pin_releases, GC_LIST_CAP, detail, |pin| {
+        out!(
+            "  checkpoint pin: session {} queue {} ({}; releasing broker metadata does not remove committed work)",
+            pin.session_id,
+            pin.queue_entry_id,
+            pin.reason,
+        );
+    });
+    render_capped(
+        &plan.publication_exposure_expiries,
+        GC_LIST_CAP,
+        detail,
+        |expiry| {
+            out!(
+                "  publication expiry: exposure {} queue {} ({} days old; {})",
+                expiry.exposure_id,
+                expiry.queue_entry_id,
+                expiry.age_days,
+                expiry.reason,
+            );
+        },
+    );
+    if !plan.blocker_summary.is_empty() {
+        out!("  protections by kind:");
+        for summary in &plan.blocker_summary {
+            let age = summary
+                .oldest_age_days
+                .map(|days| {
+                    let member = summary
+                        .oldest_id
+                        .map(|id| format!(", oldest member {id}"))
+                        .unwrap_or_default();
+                    let policy = summary
+                        .age_policy_days
+                        .map(|policy| format!(", policy {policy}d"))
+                        .unwrap_or_default();
+                    format!(
+                        ", oldest {days}d{member}{policy}{}",
+                        if summary.age_exceeded {
+                            ", age exceeded"
+                        } else {
+                            ""
+                        }
+                    )
+                })
+                .unwrap_or_default();
+            out!(
+                "    {}: {} {}, {} retained{}",
+                summary.kind,
+                summary.count,
+                crate::broker::plural_word(summary.count, "blocker", "blockers"),
+                human_bytes(summary.retained_bytes),
+                age,
+            );
+        }
+    }
     if !plan.worktree_blocker_summary.is_empty() {
         out!("  blocked retained bytes by kind:");
         for summary in &plan.worktree_blocker_summary {
@@ -3529,6 +3585,8 @@ fn render_gc_plan(plan: &crate::GcPlan, detail: bool) {
         && plan.worktrees.is_empty()
         && plan.artifacts.is_empty()
         && plan.orphans.is_empty()
+        && plan.checkpoint_pin_releases.is_empty()
+        && plan.publication_exposure_expiries.is_empty()
     {
         out!("  apply: nothing eligible");
     } else {
@@ -3538,7 +3596,7 @@ fn render_gc_plan(plan: &crate::GcPlan, detail: bool) {
 
 fn render_gc_apply(report: &crate::GcApplyReport) {
     out!(
-        "GC apply {}: {} rows, {} files, {} worktrees, {} build caches, {} orphaned roots, {} reclaimed",
+        "GC apply {}: {} rows, {} files, {} worktrees, {} build caches, {} orphaned roots, {} checkpoint pins released, {} exposures expired, {} reclaimed",
         if report.complete {
             "complete"
         } else {
@@ -3549,6 +3607,8 @@ fn render_gc_apply(report: &crate::GcApplyReport) {
         report.sessions_cleaned.len(),
         report.artifacts_reclaimed.len(),
         report.orphans_removed.len(),
+        report.checkpoint_pins_released.len(),
+        report.publication_exposures_expired.len(),
         human_bytes(report.reclaimed_bytes),
     );
     for failure in &report.failures {
