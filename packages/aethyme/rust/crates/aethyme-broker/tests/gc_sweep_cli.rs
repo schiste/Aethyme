@@ -71,6 +71,38 @@ fn reclaim_plan_json(repo: &Path, container: &Path) -> serde_json::Value {
     serde_json::from_slice(&output.stdout).unwrap()
 }
 
+#[test]
+fn reclaim_plan_warns_but_prints_when_snapshot_storage_is_unavailable() {
+    let (repo, container) = fixture("");
+    let root_output = run(repo.path(), container.path(), &["worktree-root", "--json"]);
+    assert!(root_output.status.success());
+    let worktree_root =
+        serde_json::from_slice::<serde_json::Value>(&root_output.stdout).unwrap()["preferred_root"]
+            .as_str()
+            .map(PathBuf::from)
+            .unwrap();
+
+    let first = reclaim_plan_json(repo.path(), container.path());
+    let digest = first["digest"].as_str().unwrap();
+    let snapshot = worktree_root.join(format!(".aethyme-reclaim-plan-{digest}.json"));
+    std::fs::remove_file(&snapshot).unwrap();
+    std::fs::create_dir(&snapshot).unwrap();
+
+    let output = run(repo.path(), container.path(), &["reclaim", "plan", "--json"]);
+    assert!(
+        output.status.success(),
+        "reclaim plan should remain available: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let plan: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(plan["digest"], digest);
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("continuing with the digest-bound plan"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 /// A worktree root left behind by a repository that no longer exists.
 fn stamp_root(container: &Path, key: &str, repository_root: &Path) -> PathBuf {
     let root = container.join(key);
@@ -563,7 +595,7 @@ fn build_caches_are_reclaimable_even_when_the_worktree_itself_is_blocked() {
             .all(|worktree| worktree["session_id"].as_i64().unwrap().to_string() != id),
         "a session with unaccepted commits must not be scheduled for removal"
     );
-    let retained_summary = plan["blocker_summary"]
+    let retained_summary = plan["worktree_blocker_summary"]
         .as_array()
         .unwrap()
         .iter()

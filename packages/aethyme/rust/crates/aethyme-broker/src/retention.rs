@@ -39,9 +39,13 @@ pub struct RetentionPolicy {
     pub gate_results_days: u32,
     pub terminal_merge_queue_days: u32,
     pub command_metrics_days: u32,
-    pub closed_worktrees_days: u32,
     /// Soft repository storage budget. `0` disables budget warnings.
     pub retained_bytes_budget: u64,
+    /// Idle days before a closed session's unproven worktree is eligible for
+    /// GC. Worktrees with representation proof are eligible regardless of age;
+    /// build caches use `artifact_reclaim_days` instead. This does not affect
+    /// committed work or authorize removal without provenance proof.
+    pub closed_worktrees_days: u32,
     /// Idle days before a closed session's build caches are reclaimed without
     /// confirmation. This does not affect committed work or the worktree
     /// itself; a maintainer may raise it to trade disk space for faster reuse.
@@ -230,7 +234,9 @@ pub enum RetentionConfigError {
     },
     #[error("broker.toml: {0}")]
     Parse(String),
-    #[error("unsupported retention policy schema {found}; this binary supports schema {supported}")]
+    #[error(
+        "unsupported retention policy schema {found}; this binary supports schema {supported}"
+    )]
     UnsupportedSchema { found: u32, supported: u32 },
     #[error("retention.{field}={value} is invalid: {constraint}")]
     InvalidValue {
@@ -259,10 +265,19 @@ pub struct RetentionPolicyLoadReport {
     pub warnings: Vec<RetentionConfigWarning>,
 }
 
-fn unknown_field_warning(field: String, schema_version: u32) -> RetentionConfigWarning {
+fn unknown_retention_field_warning(field: String, schema_version: u32) -> RetentionConfigWarning {
     RetentionConfigWarning {
         message: format!(
             "unknown field `{field}` for retention schema {schema_version}; ignored so known retention settings remain active; check its spelling or upgrade Aethyme if intentional"
+        ),
+        field,
+    }
+}
+
+fn unknown_broker_field_warning(field: String) -> RetentionConfigWarning {
+    RetentionConfigWarning {
+        message: format!(
+            "unknown broker configuration field `{field}`; ignored so known broker settings remain active; check its spelling or upgrade Aethyme if intentional"
         ),
         field,
     }
@@ -295,7 +310,7 @@ pub fn load_retention_policy_report(
     })?;
     let mut warnings = Vec::new();
     for field in root.keys().filter(|field| field.as_str() != "retention") {
-        warnings.push(unknown_field_warning(format!("broker.{field}"), 0));
+        warnings.push(unknown_broker_field_warning(format!("broker.{field}")));
     }
 
     let retention = match root.get("retention") {
@@ -330,7 +345,7 @@ pub fn load_retention_policy_report(
         if RETENTION_POLICY_FIELDS.contains(&field.as_str()) {
             known_fields.insert(field, value);
         } else {
-            warnings.push(unknown_field_warning(
+            warnings.push(unknown_retention_field_warning(
                 format!("retention.{field}"),
                 schema_version,
             ));
@@ -458,7 +473,7 @@ pub struct GcBlocker {
 /// session. This companion view makes the retained disk pressure actionable by
 /// grouping it by the rule that held it, with the largest group first.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
-pub struct GcBlockerSummary {
+pub struct GcWorktreeBlockerSummary {
     pub kind: String,
     pub count: usize,
     pub retained_bytes: u64,
@@ -484,7 +499,7 @@ pub struct GcPlan {
     /// is reporting only and intentionally excluded from the authorization
     /// digest, like the other measured byte totals.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub blocker_summary: Vec<GcBlockerSummary>,
+    pub worktree_blocker_summary: Vec<GcWorktreeBlockerSummary>,
     /// Large ignored directories outside the safe artifact catalog. These
     /// are reporting-only and excluded from the authorization digest.
     #[serde(default)]
@@ -639,6 +654,7 @@ impl GcPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     #[test]
     fn missing_config_uses_conservative_bounded_defaults() {
@@ -711,6 +727,26 @@ mod tests {
     }
 
     #[test]
+    fn retention_field_allowlist_matches_serialized_policy_keys() {
+        let serialized = toml::Value::try_from(RetentionPolicy::default()).unwrap();
+        let serialized_fields = serialized
+            .as_table()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        let allowlisted_fields = RETENTION_POLICY_FIELDS
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(
+            serialized_fields, allowlisted_fields,
+            "retention parsing allowlist must stay in lockstep with RetentionPolicy"
+        );
+    }
+
+    #[test]
     fn unknown_fields_warn_and_known_values_still_apply() {
         let repo = tempfile::tempdir().unwrap();
         std::fs::create_dir(repo.path().join(".aethyme")).unwrap();
@@ -725,12 +761,29 @@ mod tests {
         assert_eq!(report.policy.routine_size_budget_ms, 0);
         assert_eq!(report.warnings.len(), 1);
         assert_eq!(report.warnings[0].field, "retention.future_sweep_days");
-        assert!(
-            report.warnings[0]
-                .message
-                .contains("known retention settings remain active")
-        );
+        assert!(report.warnings[0]
+            .message
+            .contains("known retention settings remain active"));
         assert_eq!(load_retention_policy(repo.path()).unwrap(), report.policy);
+    }
+
+    #[test]
+    fn unknown_top_level_fields_use_broker_configuration_warning() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir(repo.path().join(".aethyme")).unwrap();
+        std::fs::write(
+            repo.path().join(BROKER_CONFIG_RELPATH),
+            "future_broker_setting = true\n[retention]\n",
+        )
+        .unwrap();
+
+        let report = load_retention_policy_report(repo.path()).unwrap();
+        assert_eq!(report.warnings.len(), 1);
+        assert_eq!(report.warnings[0].field, "broker.future_broker_setting");
+        assert!(report.warnings[0]
+            .message
+            .contains("unknown broker configuration field"));
+        assert!(!report.warnings[0].message.contains("retention schema 0"));
     }
 
     #[test]

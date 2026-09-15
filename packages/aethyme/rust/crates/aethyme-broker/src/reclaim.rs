@@ -13,13 +13,14 @@
 //! reviewed, following the same digest-bound plan/apply contract as `gc`.
 
 use std::collections::BTreeMap;
-use std::io::{self, Write};
+use std::io;
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
 const RECLAIM_PLAN_SCHEMA_VERSION: u8 = 1;
-const RECLAIM_PLAN_FILENAME: &str = ".aethyme-reclaim-plan.json";
+const RECLAIM_PLAN_FILENAME_PREFIX: &str = ".aethyme-reclaim-plan-";
+const RECLAIM_PLAN_FILENAME_SUFFIX: &str = ".json";
 
 /// The part of a candidate that determines whether an apply would touch it.
 /// Measured bytes deliberately do not belong here: a build may grow while the
@@ -120,8 +121,16 @@ struct ReclaimPlanSnapshot {
     decisions: Vec<ReclaimDecision>,
 }
 
-fn snapshot_path(root: &Path) -> PathBuf {
-    root.join(RECLAIM_PLAN_FILENAME)
+fn snapshot_path(root: &Path, digest: &str) -> io::Result<PathBuf> {
+    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "reclaim plan digest must be a 64-character hexadecimal SHA-256",
+        ));
+    }
+    Ok(root.join(format!(
+        "{RECLAIM_PLAN_FILENAME_PREFIX}{digest}{RECLAIM_PLAN_FILENAME_SUFFIX}"
+    )))
 }
 
 fn ensure_regular_snapshot(path: &Path) -> io::Result<()> {
@@ -135,8 +144,11 @@ fn ensure_regular_snapshot(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Save the last reviewed decision set beside the host-scoped worktree root.
-/// Only one snapshot is retained, avoiding an unbounded stream of plan files.
+/// Save a reviewed decision set beside the host-scoped worktree root.
+///
+/// The digest is part of the filename so concurrent operators do not overwrite
+/// one another's review evidence. The caller supplies the exact digest again
+/// when loading the snapshot for a mismatch explanation.
 pub fn save_snapshot(root: &Path, digest: &str, candidates: &[ReclaimCandidate]) -> io::Result<()> {
     std::fs::create_dir_all(root)?;
     let decisions = decisions(candidates);
@@ -145,7 +157,7 @@ pub fn save_snapshot(root: &Path, digest: &str, candidates: &[ReclaimCandidate])
             "reclaim plan snapshot digest does not match its decision set",
         ));
     }
-    let path = snapshot_path(root);
+    let path = snapshot_path(root, digest)?;
     match std::fs::symlink_metadata(&path) {
         Ok(_) => ensure_regular_snapshot(&path)?,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -158,33 +170,18 @@ pub fn save_snapshot(root: &Path, digest: &str, candidates: &[ReclaimCandidate])
         decisions,
     };
     let bytes = serde_json::to_vec_pretty(&snapshot).map_err(io::Error::other)?;
-    let temporary = root.join(format!(
-        ".{RECLAIM_PLAN_FILENAME}.{}.tmp",
-        std::process::id()
-    ));
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temporary)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    }
-    file.write_all(&bytes)?;
-    file.sync_all()?;
-    drop(file);
-    let result = std::fs::rename(&temporary, &path);
-    if result.is_err() {
-        let _ = std::fs::remove_file(&temporary);
-    }
-    result
+    crate::atomic_file::with_synced_temporary(&path, &bytes, |temporary| {
+        std::fs::rename(temporary, &path)
+    })
 }
 
 /// Load and verify the saved decision set for a failed confirmation. Invalid
 /// or tampered snapshots are not used to manufacture a misleading diff.
-pub fn load_snapshot(root: &Path) -> io::Result<Option<(String, Vec<ReclaimDecision>)>> {
-    let path = snapshot_path(root);
+pub fn load_snapshot(
+    root: &Path,
+    digest: &str,
+) -> io::Result<Option<(String, Vec<ReclaimDecision>)>> {
+    let path = snapshot_path(root, digest)?;
     let metadata = match std::fs::symlink_metadata(&path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -438,7 +435,7 @@ mod tests {
         save_snapshot(&root, &digest, &candidates).unwrap();
 
         assert_eq!(
-            load_snapshot(&root).unwrap(),
+            load_snapshot(&root, &digest).unwrap(),
             Some((
                 digest,
                 vec![ReclaimDecision {
@@ -446,6 +443,29 @@ mod tests {
                     reclaimable: true,
                 }]
             ))
+        );
+    }
+
+    #[test]
+    fn snapshots_for_concurrent_reviews_are_keyed_by_digest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        let first = classify(&root.join("first/target"), &root.join("first"), 42, &[]);
+        let second = classify(&root.join("second/target"), &root.join("second"), 84, &[]);
+        let first_digest = plan_digest(&root, std::slice::from_ref(&first));
+        let second_digest = plan_digest(&root, std::slice::from_ref(&second));
+
+        save_snapshot(&root, &first_digest, &[first]).unwrap();
+        save_snapshot(&root, &second_digest, &[second]).unwrap();
+
+        assert!(load_snapshot(&root, &first_digest).unwrap().is_some());
+        assert!(load_snapshot(&root, &second_digest).unwrap().is_some());
+        assert_eq!(
+            std::fs::read_dir(&root)
+                .unwrap()
+                .filter_map(Result::ok)
+                .count(),
+            2
         );
     }
 

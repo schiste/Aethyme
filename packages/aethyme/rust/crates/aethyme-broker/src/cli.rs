@@ -3522,9 +3522,9 @@ fn render_gc_plan(plan: &crate::GcPlan, detail: bool) {
             orphan.repository_root
         );
     });
-    if !plan.blocker_summary.is_empty() {
+    if !plan.worktree_blocker_summary.is_empty() {
         out!("  blocked retained bytes by kind:");
-        for summary in &plan.blocker_summary {
+        for summary in &plan.worktree_blocker_summary {
             out!(
                 "    {}: {} {}, {} retained",
                 summary.kind,
@@ -5094,13 +5094,14 @@ fn run_reclaim(parsed: Parsed) -> Result<(), UsageError> {
     let gib = |bytes: u64| format!("{:.1} GiB", bytes as f64 / (1024.0 * 1024.0 * 1024.0));
     match action {
         "plan" => {
-            crate::reclaim::save_snapshot(&root, &plan.digest, &plan.candidates).map_err(
-                |error| {
-                    UsageError::Message(format!(
-                        "cannot save reclaim plan review snapshot: {error}"
-                    ))
-                },
-            )?;
+            if let Err(error) =
+                crate::reclaim::save_snapshot(&root, &plan.digest, &plan.candidates)
+            {
+                eprintln!(
+                    "Warning: cannot save reclaim plan review snapshot; continuing with the \
+                     digest-bound plan: {error}"
+                );
+            }
             if parsed.json {
                 out!("{}", serde_json::to_string_pretty(&plan)?);
             } else {
@@ -5139,13 +5140,12 @@ fn run_reclaim(parsed: Parsed) -> Result<(), UsageError> {
             // Re-derived from a fresh scan, so a plan whose decision set moved
             // is refused rather than applied to a different set than was reviewed.
             if confirm != plan.digest {
-                let changes = crate::reclaim::load_snapshot(&root)
+                let changes = crate::reclaim::load_snapshot(&root, confirm)
                     .map_err(|error| {
                         UsageError::Message(format!(
                             "cannot inspect the saved reclaim plan review: {error}"
                         ))
                     })?
-                    .filter(|(reviewed_digest, _)| reviewed_digest == confirm)
                     .map(|(_, reviewed)| {
                         crate::reclaim::decision_changes(
                             &reviewed,
