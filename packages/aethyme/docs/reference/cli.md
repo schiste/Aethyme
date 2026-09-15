@@ -1001,7 +1001,10 @@ untouched. `--force` is available only for one exact session and is rejected
 with `--all-cleaned`; there is no blanket discard authorization.
 
 `broker reclaim plan` inventories regenerable build directories inside this
-repository's broker worktree root and saves the last reviewed decision set.
+repository's broker worktree root and saves the reviewed decision set under a
+digest-keyed host-state filename. A snapshot write failure is reported as a
+warning and does not suppress the plan; the digest is still recomputed at apply
+time, so deletion safety does not depend on the diagnostic snapshot.
 `broker reclaim apply --confirm <sha256>` re-scans and removes only the exact
 reviewed paths that are still reclaimable. The digest binds the root and the
 sorted candidate paths plus their kept/reclaimable decisions; measured byte
