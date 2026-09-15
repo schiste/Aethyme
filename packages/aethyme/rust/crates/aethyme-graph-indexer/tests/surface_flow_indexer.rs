@@ -211,3 +211,28 @@ def test_token_route_requires_bearer(client):
         );
     }
 }
+
+#[test]
+fn ignores_bare_middleware_mentions_without_registration_call() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(tmp.path(), "server.js", "app.use(authMiddleware);");
+    write(
+        tmp.path(),
+        "notes.js",
+        r#"const status = "middleware changed";"#,
+    );
+    write(tmp.path(), "comments.js", "// middleware(changed)");
+
+    let summary = index_repo_to_disk(&ctx(tmp.path()), &WalkOptions::default()).unwrap();
+
+    assert_eq!(
+        summary
+            .counts_by_kind
+            .get(&NodeKind::MiddlewareInstallation),
+        Some(&1),
+        "only the structurally recognizable .use() call should emit middleware"
+    );
+    assert!(node_kinds(tmp.path(), "server.js").contains(&NodeKind::MiddlewareInstallation));
+    assert!(!node_kinds(tmp.path(), "notes.js").contains(&NodeKind::MiddlewareInstallation));
+    assert!(!node_kinds(tmp.path(), "comments.js").contains(&NodeKind::MiddlewareInstallation));
+}

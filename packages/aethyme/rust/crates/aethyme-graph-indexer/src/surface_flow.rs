@@ -338,7 +338,7 @@ fn extract_js_ts(
             )?;
         }
 
-        if lower.contains(".use(") || lower.contains("middleware") {
+        if lower.contains(".use(") {
             if let Some(name) = first_quoted_value(trimmed).or_else(|| callable_name(trimmed)) {
                 builder.push(
                     NodeKind::MiddlewareInstallation,
