@@ -394,7 +394,7 @@ fn check_deadline(deadline: Option<Instant>) -> bool {
 const TREE_REMOVAL_ATTEMPTS: usize = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TreeRemoval {
+pub(crate) enum TreeRemoval {
     /// The directory is gone.
     Complete,
     /// The budget ran out. The directory is still there, still carrying the
@@ -426,7 +426,7 @@ enum TreeRemoval {
 ///   long removal fails `ENOTEMPTY` against a file created after that
 ///   directory was already emptied. A directory that refuses to go is swept
 ///   again rather than aborting the caller's whole run.
-fn remove_condemned_tree(
+pub(crate) fn remove_condemned_tree(
     dir: &Path,
     keep_until_last: Option<&str>,
     deadline: Option<Instant>,
