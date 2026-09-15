@@ -221,6 +221,10 @@ pub enum BrokerOpError {
     },
     #[error("cannot select a safe base for broker start: {reason}")]
     StartBaseUnavailable { reason: String },
+    #[error(
+        "refusing an integration-tip worktree for pull-request review #{pull_request}; use the routed review adapter, which provisions a detached checkout at the exact PR head, or create and verify that checkout explicitly"
+    )]
+    ReviewRequiresPullRequestHead { pull_request: i64 },
     #[error("cannot prepare broker worktree root {path}: {reason}")]
     WorktreeRootUnavailable { path: PathBuf, reason: String },
     #[error("refusing nested broker worktree path {path}: it is inside linked worktree {owner}")]
@@ -2804,6 +2808,18 @@ impl Broker {
     pub fn close(&mut self, session_id: i64) -> Result<(), BrokerOpError> {
         self.store
             .set_session_status(session_id, SessionStatus::Closed, None)?;
+        Ok(())
+    }
+
+    /// Ordinary starts are intentionally anchored to integration. A caller
+    /// that explicitly identifies a pull request must use the routed review
+    /// adapter, which provisions and verifies that pull request's exact head.
+    pub(crate) fn reject_integration_based_review_task(
+        pull_request: Option<i64>,
+    ) -> Result<(), BrokerOpError> {
+        if let Some(pull_request) = pull_request {
+            return Err(BrokerOpError::ReviewRequiresPullRequestHead { pull_request });
+        }
         Ok(())
     }
 
@@ -9162,6 +9178,18 @@ mod tests {
         assert_eq!(slugify("émojis 🎉 stripped"), "mojis-stripped");
         assert_eq!(slugify(""), "task");
         assert!(slugify(&"x".repeat(100)).len() <= 40);
+    }
+
+    #[test]
+    fn integration_based_start_requires_an_explicit_pull_request_target() {
+        assert!(super::Broker::reject_integration_based_review_task(None).is_ok());
+
+        match super::Broker::reject_integration_based_review_task(Some(42)) {
+            Err(super::BrokerOpError::ReviewRequiresPullRequestHead { pull_request }) => {
+                assert_eq!(pull_request, 42)
+            }
+            other => panic!("expected a PR-head refusal, got {other:?}"),
+        }
     }
 
     #[test]

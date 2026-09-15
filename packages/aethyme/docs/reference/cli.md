@@ -341,7 +341,12 @@ stashing multi-worktree changes.
 - `aethyme broker readiness recover [--repo <path>] --plan <plan-sha256> [--json]`
 - `aethyme broker status [--json]`
 - `aethyme broker worktree-root [--json]`
-- `aethyme broker start --task "..." [--path <repo-path>]... [--agent "<Name> <email>"] [--json]`
+- `aethyme broker start --task "..." [--pull-request <number>] [--path <repo-path>]... [--agent "<Name> <email>"] [--json]`
+- `aethyme broker start-agent --task "..." --cmd <command> [--pull-request <number>] [--agent "<Name> <email>"] [--json]`
+- Supplying `--pull-request` explicitly refuses the integration-tip lane:
+  pull-request reviews must use the routed review adapter, which provisions and
+  verifies the exact pull-request head. Ordinary task text is not inspected for
+  review-looking phrases.
 - `aethyme broker adopt [<path>] --task "..." [--path <repo-path>]... [--agent "<Name> <email>"] [--reuse [--sync-integration]] [--json]`
 - `aethyme broker prepare status --session <id> [--json]`
 - `aethyme broker prepare --session <id> [--offline] [--wait <duration>] [--json]`
