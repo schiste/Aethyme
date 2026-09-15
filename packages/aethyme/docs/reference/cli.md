@@ -31,6 +31,12 @@ manifest signature verification, migration, and rollback.
 
 `aethyme` and its required `aethyme-engine-cli` sibling are native Rust
 binaries; no interpreter, virtualenv, or pip step is involved.
+When Aethyme is run from its source checkout, session start, adopt, and
+start-agent also compare the installed broker build with the checkout's
+correctness sources. A stale installed build emits a non-blocking stderr
+warning; it does not silently block the lifecycle command. Run
+`aethyme broker doctor --fix-version` from the source checkout to install and
+verify the router/engine pair from the current revision.
 **`python -m src.cli` no longer exists** — the Python
 package was deleted on 2026-08-01 (python-retirement Phase 6) with no
 shim, and the old spelling fails with `No module named src`. Every
@@ -1031,6 +1037,7 @@ gate_results_days = 30
 terminal_merge_queue_days = 180
 command_metrics_days = 30
 closed_worktrees_days = 7
+publication_exposure_days = 30
 retained_bytes_budget = 1073741824
 artifact_reclaim_days = 0
 orphan_worktree_roots_days = 1
@@ -1076,24 +1083,41 @@ unpromoted commits, and unproven provenance still block removal exactly as
 before. Set it to `0` to restore the previous behaviour, where a session held
 its worktree, its branch, and its leases until a human intervened.
 
+When a session closes, its accepted-checkpoint pin is released in the same
+terminal transaction. The accepted session head, integration commit, tree, and
+queue row remain stored as cleanup provenance; releasing the pin changes broker
+metadata only. Pins left behind by older databases are named in a reviewed GC
+plan and are not released implicitly.
+
 Run `aethyme broker gc plan` first. Its text and stable JSON enumerate every
 eligible database row, runtime file, represented worktree and exact branch ref,
-build cache, orphaned root, estimated bytes, protected finding, and the SHA-256
+build cache, orphaned root, estimated bytes, protected finding, stale
+checkpoint-pin release, publication-expiry candidate, and the SHA-256
 authorization digest. A worktree whose cleanup proof says its contribution is
 represented is eligible here regardless of age, exactly as it is for
 `cleanup --all-cleaned`. Without that proof, `closed_worktrees_days` remains
 the first protection; once it is past, the plan retains the more specific
 unproven-contribution blocker. GC never ages out live sessions, outstanding or
-acknowledged advisories, unpublished exposures, unresolved coordinated
-operations, accepted checkpoints, or unproven contributions.
+acknowledged advisories, unresolved coordinated operations, or unproven
+contributions. An old publication exposure remains a blocker until the
+reviewed apply marks that exact row `expired`; expiry records that publication
+could no longer be verified and is not a claim that it was published.
 
 The plan also reports `estimated_retained_bytes` and `estimated_blocked_bytes`
 alongside `estimated_reclaimable_bytes`, so it states total disk pressure rather
 than only the bytes this plan will act on. The two reporting totals are excluded
 from the authorization digest: a measured size change must never invalidate a
-plan an operator already confirmed. `worktree_blocker_summary` groups retained
-worktree bytes by blocker kind, largest first, so a large protected backlog is
-visible before the individual findings.
+plan an operator already confirmed. `blocker_summary` groups every protection
+kind with its count, estimated bytes, oldest member, and age-policy flag,
+largest first, so a large or over-age protected backlog is visible before the
+individual findings. Where a protection has an addressable row or session, the
+oldest member's identifier is included too. `gc apply` releases only named
+broker pins and expires only named exposure rows; neither action deletes
+committed work or asserts publication verification.
+The more focused
+`worktree_blocker_summary` also groups retained worktree bytes by blocker kind,
+largest first, so disk pressure is visible independently of the full
+protection summary.
 
 ### The retained-bytes budget
 

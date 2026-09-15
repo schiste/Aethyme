@@ -7295,6 +7295,12 @@ impl Broker {
         session_head: &str,
         delivery_targets: &[String],
     ) -> Result<(CleanupProvenance, String), BrokerOpError> {
+        let released_queue_entry_id = if session.accepted_queue_entry_id.is_none() {
+            self.store.released_checkpoint_queue_entry(session.id)?
+        } else {
+            None
+        };
+        let accepted_queue_entry_id = session.accepted_queue_entry_id.or(released_queue_entry_id);
         let mut provenance = CleanupProvenance {
             representation: CleanupRepresentation::Unproven,
             session_head: session_head.into(),
@@ -7302,7 +7308,7 @@ impl Broker {
             accepted_session_head: session.accepted_session_head.clone(),
             accepted_integration_commit: session.accepted_integration_commit.clone(),
             accepted_integration_tree: session.accepted_integration_tree.clone(),
-            accepted_queue_entry_id: session.accepted_queue_entry_id,
+            accepted_queue_entry_id,
             accepted_queue_status: None,
             represented_on: None,
             represented_by_commit: None,
@@ -7376,7 +7382,7 @@ impl Broker {
         }
 
         let (Some(queue_entry_id), Some(integration_commit), Some(integration_tree)) = (
-            session.accepted_queue_entry_id,
+            accepted_queue_entry_id,
             session.accepted_integration_commit.as_deref(),
             session.accepted_integration_tree.as_deref(),
         ) else {
@@ -7392,6 +7398,25 @@ impl Broker {
             .into_iter()
             .find(|entry| entry.id == queue_entry_id);
         let Some(entry) = entry else {
+            if released_queue_entry_id == Some(queue_entry_id)
+                && self.repo.commit_tree_id(integration_commit).ok().as_deref()
+                    == Some(integration_tree)
+            {
+                let represented_on = delivery_targets
+                    .iter()
+                    .find(|target| self.repo.is_ancestor(integration_commit, target))
+                    .cloned();
+                if let Some(represented_on) = represented_on {
+                    provenance.representation = CleanupRepresentation::Represented;
+                    provenance.represented_on = Some(represented_on.clone());
+                    return Ok((
+                        provenance,
+                        format!(
+                            "accepted queue entry {queue_entry_id} was GC-released after its checkpoint pin; integration commit is represented on {represented_on}"
+                        ),
+                    ));
+                }
+            }
             return Ok((
                 provenance,
                 format!("accepted queue entry {queue_entry_id} is missing"),
