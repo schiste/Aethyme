@@ -846,7 +846,7 @@ fn crashed_write_blocks_until_operator_reconciliation() {
 }
 
 #[test]
-fn nonzero_write_is_unknown_because_partial_effects_are_possible() {
+fn nonzero_local_write_is_failed_without_remote_reconciliation() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());
     let worktree = add_worktree(tmp.path(), "partial");
@@ -857,31 +857,24 @@ fn nonzero_write_is_unknown_because_partial_effects_are_possible() {
         .run_coordinated_operation(request(session.id, &["branch", "main"]))
         .unwrap();
     assert!(!report.command_success);
-    assert_eq!(report.operation.status, OperationStatus::OutcomeUnknown);
-    let recovery = report.unknown_outcome_recovery().unwrap().to_string();
-    assert!(recovery.contains("Canonical repository local:"));
-    assert!(recovery.contains("is now write-blocked"));
-    assert!(recovery.contains(&format!("Operation ID: {}", report.operation.id)));
-    assert!(recovery.contains("Inspect local Git refs and worktree state"));
-    assert!(recovery.contains(&format!(
-        "aethyme broker operations reconcile --operation {} --outcome succeeded --reason \"external inspection confirmed operation {} took effect\"",
-        report.operation.id, report.operation.id
-    )));
-    assert!(recovery.contains(&format!(
-        "aethyme broker operations reconcile --operation {} --outcome failed --reason \"external inspection confirmed operation {} did not take effect\"",
-        report.operation.id, report.operation.id
-    )));
-    assert!(recovery.contains("Blind retry is forbidden"));
+    assert_eq!(report.operation.status, OperationStatus::Failed);
+    let details: serde_json::Value =
+        serde_json::from_str(report.operation.details_json.as_deref().unwrap()).unwrap();
+    assert_eq!(details["failure_class"], "local_git_command_failed");
+    assert_eq!(details["remote_contact"], "not_applicable");
+    assert_eq!(details["recovery"], "inspect_or_abort_local_worktree_state");
 
-    let blocked = broker
+    let shown = broker.show_coordinated_operation(report.operation.id).unwrap();
+    assert_eq!(
+        shown.reconciliation.state,
+        OperationReconciliationState::NotRequired
+    );
+    assert!(!shown.reconciliation.write_blocked);
+
+    let retry = broker
         .run_coordinated_operation(request(session.id, &["branch", "after-nonzero"]))
-        .unwrap_err();
-    assert_eq!(blocked.to_string(), recovery);
-    assert!(matches!(
-        blocked,
-        BrokerOpError::CoordinatedOperationBlocked { operation_id, .. }
-            if operation_id == report.operation.id
-    ));
+        .unwrap();
+    assert!(retry.ok());
 }
 
 #[test]
