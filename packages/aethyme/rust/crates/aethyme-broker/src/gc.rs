@@ -318,30 +318,9 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), BrokerOpError> {
         path: parent.to_path_buf(),
         source,
     })?;
-    let temporary = parent.join(format!(
-        ".{}.tmp-{}-{}",
-        path.file_name().unwrap_or_default().to_string_lossy(),
-        std::process::id(),
-        now_ms()
-    ));
-    let result = (|| {
-        let mut file = std::fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temporary)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        }
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        std::fs::rename(&temporary, path)?;
-        Ok::<_, std::io::Error>(())
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&temporary);
-    }
+    let result = crate::atomic_file::with_synced_temporary(path, bytes, |temporary| {
+        std::fs::rename(temporary, path)
+    });
     result.map_err(|source| crate::BrokerError::Io {
         path: path.to_path_buf(),
         source,

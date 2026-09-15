@@ -5047,6 +5047,14 @@ fn run_reclaim(parsed: Parsed) -> Result<(), UsageError> {
     let gib = |bytes: u64| format!("{:.1} GiB", bytes as f64 / (1024.0 * 1024.0 * 1024.0));
     match action {
         "plan" => {
+            if let Err(error) =
+                crate::reclaim::save_snapshot(&root, &plan.digest, &plan.candidates)
+            {
+                eprintln!(
+                    "Warning: cannot save reclaim plan review snapshot; continuing with the \
+                     digest-bound plan: {error}"
+                );
+            }
             if parsed.json {
                 out!("{}", serde_json::to_string_pretty(&plan)?);
             } else {
@@ -5082,12 +5090,37 @@ fn run_reclaim(parsed: Parsed) -> Result<(), UsageError> {
             let confirm = parsed.confirm.as_deref().ok_or_else(|| {
                 UsageError::Message("reclaim apply requires --confirm <sha256>".into())
             })?;
-            // Re-derived from a fresh scan, so a plan whose candidates moved is
-            // refused rather than applied to a different set than was reviewed.
+            // Re-derived from a fresh scan, so a plan whose decision set moved
+            // is refused rather than applied to a different set than was reviewed.
             if confirm != plan.digest {
+                let (changes, snapshot_error) = match crate::reclaim::load_snapshot(&root, confirm)
+                {
+                    Ok(Some((_, reviewed))) => (
+                        crate::reclaim::decision_changes(
+                            &reviewed,
+                            &crate::reclaim::decisions(&plan.candidates),
+                        ),
+                        None,
+                    ),
+                    Ok(None) => (Vec::new(), None),
+                    Err(error) => (Vec::new(), Some(error.to_string())),
+                };
+                let detail = if changes.is_empty() {
+                    match snapshot_error {
+                        Some(error) => format!(
+                            "the saved review could not be read ({error}); no decision diff can be established"
+                        ),
+                        None => {
+                            "the saved review is unavailable; no decision diff can be established"
+                                .into()
+                        }
+                    }
+                } else {
+                    format!("changes since review: {}", capped_join(&changes, 8))
+                };
                 return Err(UsageError::Message(format!(
-                    "confirmation does not match the current plan; re-run `aethyme broker reclaim plan` and review it again (current {})",
-                    plan.digest
+                    "confirmation does not match the current plan; re-run `aethyme broker reclaim plan` and review it again (reviewed {}, current {}); {}",
+                    confirm, plan.digest, detail
                 )));
             }
             let outcome = crate::apply_reclaim(&plan);

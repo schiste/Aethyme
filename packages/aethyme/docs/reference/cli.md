@@ -1000,6 +1000,19 @@ symlinked, unsafe-path, pending, unproven, or inspection-failed candidates remai
 untouched. `--force` is available only for one exact session and is rejected
 with `--all-cleaned`; there is no blanket discard authorization.
 
+`broker reclaim plan` inventories regenerable build directories inside this
+repository's broker worktree root and saves the reviewed decision set under a
+digest-keyed host-state filename. A snapshot write failure is reported as a
+warning and does not suppress the plan; the digest is still recomputed at apply
+time, so deletion safety does not depend on the diagnostic snapshot.
+`broker reclaim apply --confirm <sha256>` re-scans and removes only the exact
+reviewed paths that are still reclaimable. The digest binds the root and the
+sorted candidate paths plus their kept/reclaimable decisions; measured byte
+counts remain visible in the plan but are deliberately excluded, so a build
+that grows while an operator reviews the plan does not invalidate it. If a
+path is added, removed, or changes reclaimability, apply refuses and names the
+decision changes when the saved review is available.
+
 `broker gc` applies one declared retention policy across terminal events,
 gate results and their broker-owned logs, terminal merge-queue history,
 command metrics, closed represented worktrees, build caches inside retained
