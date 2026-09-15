@@ -11,10 +11,9 @@ use crate::broker::{
     WORKTREE_ROOT_MARKER, WorktreeRootMarker, directory_size_without_following_links,
 };
 use crate::{
-    Broker, BrokerOpError, GcApplyReport, GcArtifactCandidate, GcBlocker,
-    GcWorktreeBlockerSummary,
-    GcFileAction, GcFileCandidate, GcHealth, GcOrphanCandidate, GcPlan, GcRowCandidate,
-    GcWorktreeCandidate, GitRepo, OperationStatus, RetentionPolicy, load_retention_policy,
+    Broker, BrokerOpError, GcApplyReport, GcArtifactCandidate, GcBlocker, GcFileAction,
+    GcFileCandidate, GcHealth, GcOrphanCandidate, GcPlan, GcRowCandidate, GcWorktreeCandidate,
+    GcWorktreeBlockerSummary, GitRepo, OperationStatus, RetentionPolicy, load_retention_policy,
     load_retention_policy_report,
 };
 

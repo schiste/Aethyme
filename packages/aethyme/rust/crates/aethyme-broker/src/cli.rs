@@ -5117,21 +5117,28 @@ fn run_reclaim(parsed: Parsed) -> Result<(), UsageError> {
             // Re-derived from a fresh scan, so a plan whose decision set moved
             // is refused rather than applied to a different set than was reviewed.
             if confirm != plan.digest {
-                let changes = crate::reclaim::load_snapshot(&root, confirm)
-                    .map_err(|error| {
-                        UsageError::Message(format!(
-                            "cannot inspect the saved reclaim plan review: {error}"
-                        ))
-                    })?
-                    .map(|(_, reviewed)| {
+                let (changes, snapshot_error) = match crate::reclaim::load_snapshot(&root, confirm)
+                {
+                    Ok(Some((_, reviewed))) => (
                         crate::reclaim::decision_changes(
                             &reviewed,
                             &crate::reclaim::decisions(&plan.candidates),
-                        )
-                    })
-                    .unwrap_or_default();
+                        ),
+                        None,
+                    ),
+                    Ok(None) => (Vec::new(), None),
+                    Err(error) => (Vec::new(), Some(error.to_string())),
+                };
                 let detail = if changes.is_empty() {
-                    "the saved review is unavailable; no decision diff can be established".into()
+                    match snapshot_error {
+                        Some(error) => format!(
+                            "the saved review could not be read ({error}); no decision diff can be established"
+                        ),
+                        None => {
+                            "the saved review is unavailable; no decision diff can be established"
+                                .into()
+                        }
+                    }
                 } else {
                     format!("changes since review: {}", capped_join(&changes, 8))
                 };
