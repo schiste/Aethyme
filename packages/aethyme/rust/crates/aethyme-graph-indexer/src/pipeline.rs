@@ -18,11 +18,13 @@ use rayon::prelude::*;
 
 use aethyme_graph_schema::NodeKind;
 use aethyme_graph_storage::{
-    Fragment, FragmentBuildError, FragmentWriteError, IndexShardWriteError, SymbolRecord,
+    CoverageArtifactError, CoverageFileStatus, ExclusionReason, Fragment, FragmentBuildError,
+    FragmentWriteError, IndexShardWriteError, SymbolRecord, write_coverage_artifacts,
     write_fragment, write_index_shard,
 };
 
 use crate::context::IndexerContext;
+use crate::coverage::{FileCoverageObservation, IndexCoverage, assemble, observe_file};
 use crate::filesystem::{FilesystemIndexerError, IndexedFile, WalkOptions, walk_source_tree};
 use crate::language::{LanguageIndexError, LanguageIndexResult, LanguageRegistry};
 use crate::php::PhpIndexer;
@@ -179,46 +181,92 @@ pub fn index_repo_to_disk_with(
     let indexing_started = Instant::now();
     // Build every fragment in memory first so parsing/indexing and serialization
     // have distinct wall-clock boundaries instead of an ambiguous combined time.
-    let per_file: Vec<(BTreeMap<NodeKind, usize>, BuiltFragment, u64)> = walk
+    let per_file: Vec<(
+        BTreeMap<NodeKind, usize>,
+        BuiltFragment,
+        u64,
+        FileCoverageObservation,
+    )> = walk
         .files
         .par_iter()
         .map(
-            |indexed| -> Result<(BTreeMap<NodeKind, usize>, BuiltFragment, u64), IndexRepoError> {
+            |indexed| -> Result<
+                (
+                    BTreeMap<NodeKind, usize>,
+                    BuiltFragment,
+                    u64,
+                    FileCoverageObservation,
+                ),
+                IndexRepoError,
+            > {
                 let language_indexer = registry.get(&indexed.language);
                 let needs_content =
                     language_indexer.is_some() || surface_flow::should_scan(indexed);
+                let mut read_error = None;
                 let content = if needs_content {
                     let abs = ctx.repo_root().join(&*indexed.source_path);
-                    Some(
-                        std::fs::read_to_string(&abs).map_err(|e| IndexRepoError::ReadSource {
-                            source_path: indexed.source_path.clone(),
-                            message: e.to_string(),
-                        })?,
-                    )
+                    match std::fs::read_to_string(&abs) {
+                        Ok(content) => Some(content),
+                        Err(error) => {
+                            read_error = Some(error.to_string());
+                            None
+                        }
+                    }
                 } else {
                     None
                 };
 
-                let mut combined = LanguageIndexResult::default();
-                if let Some(indexer) = language_indexer {
-                    let content = content
-                        .as_deref()
-                        .expect("language-indexed files are read above");
-                    let output = indexer
-                        .index_file(ctx, indexed, content)
-                        .map_err(IndexRepoError::Language)?;
-                    combined.additional_nodes.extend(output.additional_nodes);
-                    combined.additional_edges.extend(output.additional_edges);
-                }
-                if surface_flow::should_scan(indexed) {
-                    let content = content
-                        .as_deref()
-                        .expect("surface-flow-scanned files are read above");
-                    let output = surface_flow::index_file(ctx, indexed, content)
-                        .map_err(IndexRepoError::Language)?;
-                    combined.additional_nodes.extend(output.additional_nodes);
-                    combined.additional_edges.extend(output.additional_edges);
+                let is_code_file = matches!(&indexed.top_node, aethyme_graph_schema::Node::File(_));
+                let mut status = if !is_code_file {
+                    CoverageFileStatus::NonCode
+                } else if language_indexer.is_some() {
+                    CoverageFileStatus::Parsed
+                } else {
+                    CoverageFileStatus::Unsupported
                 };
+                let mut parser = language_indexer.map(|indexer| indexer.parser());
+                let mut exclusion_reason = if is_code_file && language_indexer.is_none() {
+                    Some(ExclusionReason::ParserUnavailable)
+                } else {
+                    None
+                };
+                if read_error.is_some() {
+                    if is_code_file && language_indexer.is_some() {
+                        status = CoverageFileStatus::Partial;
+                    }
+                    exclusion_reason = Some(ExclusionReason::ReadError);
+                }
+                let mut combined = LanguageIndexResult::default();
+                if let (Some(indexer), Some(content)) = (language_indexer, content.as_deref()) {
+                    match indexer.index_file(ctx, indexed, content) {
+                        Ok(output) => {
+                            combined.additional_nodes.extend(output.additional_nodes);
+                            combined.additional_edges.extend(output.additional_edges);
+                        }
+                        Err(error) => {
+                            status = CoverageFileStatus::Partial;
+                            exclusion_reason = Some(language_error_reason(&error));
+                        }
+                    }
+                }
+                if surface_flow::should_scan(indexed)
+                    && let Some(content) = content.as_deref()
+                {
+                    match surface_flow::index_file(ctx, indexed, content) {
+                        Ok(output) => {
+                            combined.additional_nodes.extend(output.additional_nodes);
+                            combined.additional_edges.extend(output.additional_edges);
+                        }
+                        Err(error) => {
+                            if status == CoverageFileStatus::Parsed {
+                                status = CoverageFileStatus::Partial;
+                            }
+                            if exclusion_reason.is_none() {
+                                exclusion_reason = Some(language_error_reason(&error));
+                            }
+                        }
+                    }
+                }
                 let lang_output = if combined.additional_nodes.is_empty()
                     && combined.additional_edges.is_empty()
                 {
@@ -234,7 +282,15 @@ pub fn index_repo_to_disk_with(
                     *counts.entry(node.kind()).or_default() += 1;
                 }
                 let source_bytes = content.as_ref().map_or(0, |content| content.len() as u64);
-                Ok((counts, built, source_bytes))
+                let observation = observe_file(
+                    indexed,
+                    &built,
+                    content.as_deref(),
+                    parser.take(),
+                    status,
+                    exclusion_reason,
+                );
+                Ok((counts, built, source_bytes, observation))
             },
         )
         .collect::<Result<Vec<_>, _>>()?;
@@ -242,15 +298,17 @@ pub fn index_repo_to_disk_with(
 
     let mut counts_by_kind: BTreeMap<NodeKind, usize> = BTreeMap::new();
     let mut built_fragments: Vec<BuiltFragment> = Vec::with_capacity(per_file.len());
+    let mut observations = Vec::with_capacity(per_file.len());
     let mut source_bytes_read = 0_u64;
     let mut total_edges = 0_usize;
-    for (counts, built, source_bytes) in per_file {
+    for (counts, built, source_bytes, observation) in per_file {
         for (kind, count) in counts {
             *counts_by_kind.entry(kind).or_default() += count;
         }
         source_bytes_read += source_bytes;
         total_edges += built.fragment.edge_count();
         built_fragments.push(built);
+        observations.push(observation);
     }
 
     let serialization_started = Instant::now();
@@ -277,10 +335,20 @@ pub fn index_repo_to_disk_with(
         .collect::<Result<Vec<_>, _>>()?;
     // Canonical sort by path for deterministic summary output.
     shards_written.sort();
+    let coverage = assemble(ctx, &walk, &observations, &built_fragments);
+    let coverage_paths = if ctx.source_revision().is_some() {
+        let (coverage_path, units_path) =
+            write_coverage_artifacts(ctx.repo_root(), &coverage.report, &coverage.units)
+                .map_err(IndexRepoError::CoverageWrite)?;
+        vec![coverage_path, units_path]
+    } else {
+        Vec::new()
+    };
     let fragment_serialization_elapsed_us = serialization_started.elapsed().as_micros();
     let fragment_bytes_written = fragments_written
         .iter()
         .chain(shards_written.iter())
+        .chain(coverage_paths.iter())
         .filter_map(|path| std::fs::metadata(path).ok().map(|metadata| metadata.len()))
         .sum();
     let total_nodes = counts_by_kind.values().sum();
@@ -293,6 +361,7 @@ pub fn index_repo_to_disk_with(
         counts_by_kind,
         total_nodes,
         total_edges,
+        coverage,
         observability: IndexRepoObservability {
             source_discovery_elapsed_us,
             source_indexing_elapsed_us,
@@ -321,6 +390,7 @@ pub struct IndexRepoSummary {
     pub counts_by_kind: BTreeMap<NodeKind, usize>,
     pub total_nodes: usize,
     pub total_edges: usize,
+    pub coverage: IndexCoverage,
     pub observability: IndexRepoObservability,
 }
 
@@ -345,6 +415,7 @@ pub enum IndexRepoError {
     Build(BuildFragmentError),
     FragmentWrite(FragmentWriteError),
     IndexShardWrite(IndexShardWriteError),
+    CoverageWrite(CoverageArtifactError),
     /// Reading a source file off disk failed (e.g., file disappeared
     /// between the filesystem walk and the language-indexer read).
     ReadSource {
@@ -364,6 +435,7 @@ impl std::fmt::Display for IndexRepoError {
             Self::Build(e) => write!(f, "index_repo: {e}"),
             Self::FragmentWrite(e) => write!(f, "index_repo: {e}"),
             Self::IndexShardWrite(e) => write!(f, "index_repo: {e}"),
+            Self::CoverageWrite(e) => write!(f, "index_repo: {e}"),
             Self::ReadSource {
                 source_path,
                 message,
@@ -374,3 +446,10 @@ impl std::fmt::Display for IndexRepoError {
 }
 
 impl std::error::Error for IndexRepoError {}
+
+fn language_error_reason(error: &LanguageIndexError) -> ExclusionReason {
+    match error {
+        LanguageIndexError::Parse { .. } => ExclusionReason::ParseError,
+        LanguageIndexError::NodeConstruction { .. } => ExclusionReason::NodeConstructionError,
+    }
+}

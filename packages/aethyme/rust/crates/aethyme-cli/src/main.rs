@@ -463,7 +463,7 @@ fn print_top_level_help() {
     eprintln!("  update check|plan|execute  explicit paired-binary updates; never background");
     eprintln!("  upgrade plan|apply|recover review, apply, or recover repository migrations");
     eprintln!(
-        "  graph status|materialize|refresh  inspect, materialize, or refresh graph artifacts"
+        "  graph status|units|materialize|refresh  inspect, page, materialize, or refresh graph artifacts"
     );
     eprintln!();
     eprintln!("Setup:");

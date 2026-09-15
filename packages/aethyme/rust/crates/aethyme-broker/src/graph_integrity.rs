@@ -11,8 +11,8 @@ use aethyme_graph_indexer::{IndexerContext, WalkOptions, index_repo_to_disk, lin
 #[cfg(test)]
 use aethyme_graph_storage::GraphAuthority;
 use aethyme_graph_storage::{
-    GRAPH_CONFIG_RELPATH, GraphIntegrityPolicy, bootstrap_repo, read_engine_version,
-    write_graph_authority_manifest,
+    GRAPH_CONFIG_RELPATH, GraphIntegrityPolicy, bootstrap_repo, committed_source_tree_digest,
+    read_coverage, read_engine_version, write_graph_authority_manifest,
 };
 
 pub(crate) fn load_graph_policy_at_commit(
@@ -147,6 +147,33 @@ pub(crate) fn verify_disposable_checkout(
         };
     }
 
+    let head_revision = match checkout.head_commit() {
+        Ok(revision) => revision,
+        Err(error) => {
+            return graph_error(
+                tree_hash,
+                policy_digest,
+                Some(pinned_version),
+                format!("cannot resolve the exact verification revision: {error}"),
+            );
+        }
+    };
+    let source_revision = read_coverage(checkout.root())
+        .ok()
+        .and_then(|coverage| coverage.source_revision)
+        .unwrap_or_else(|| head_revision.clone());
+    let source_tree_digest = match committed_source_tree_digest(checkout.root(), &head_revision) {
+        Ok(digest) => digest,
+        Err(error) => {
+            return graph_error(
+                tree_hash,
+                policy_digest,
+                Some(pinned_version),
+                format!("cannot resolve the exact source tree: {error}"),
+            );
+        }
+    };
+
     let graph_dir = checkout.root().join(".aethyme/graph");
     if let Err(error) = std::fs::remove_dir_all(&graph_dir)
         && error.kind() != std::io::ErrorKind::NotFound
@@ -171,7 +198,10 @@ pub(crate) fn verify_disposable_checkout(
         .as_deref()
         .expect("committed fragment policy validates repository identity");
     let context =
-        match IndexerContext::new(repository, checkout.root().to_path_buf(), running_version) {
+        match IndexerContext::new(repository, checkout.root().to_path_buf(), running_version)
+            .and_then(|context| context.with_source_revision(&source_revision))
+            .and_then(|context| context.with_source_tree_digest(&source_tree_digest))
+        {
             Ok(context) => context,
             Err(error) => {
                 return graph_error(
@@ -342,6 +372,18 @@ mod tests {
         );
     }
 
+    fn indexed_context(root: &Path) -> IndexerContext {
+        let checkout = crate::GitRepo::discover(root).unwrap();
+        let source_revision = checkout.head_commit().unwrap();
+        let source_tree_digest = committed_source_tree_digest(root, &source_revision).unwrap();
+        IndexerContext::new("fixture", root.to_path_buf(), env!("CARGO_PKG_VERSION"))
+            .unwrap()
+            .with_source_revision(&source_revision)
+            .unwrap()
+            .with_source_tree_digest(&source_tree_digest)
+            .unwrap()
+    }
+
     fn graph_repo() -> tempfile::TempDir {
         let repo = tempfile::tempdir().unwrap();
         git(repo.path(), &["init", "-b", "main"]);
@@ -360,12 +402,7 @@ mod tests {
         bootstrap_repo(repo.path(), env!("CARGO_PKG_VERSION")).unwrap();
         git(repo.path(), &["add", "."]);
         git(repo.path(), &["commit", "-m", "fixture source"]);
-        let context = IndexerContext::new(
-            "fixture",
-            repo.path().to_path_buf(),
-            env!("CARGO_PKG_VERSION"),
-        )
-        .unwrap();
+        let context = indexed_context(repo.path());
         index_repo_to_disk(&context, &WalkOptions::default()).unwrap();
         link_repo(&context).unwrap();
         write_graph_authority_manifest(repo.path(), "HEAD", "fixture", env!("CARGO_PKG_VERSION"))
@@ -525,18 +562,15 @@ mod tests {
             vec![
                 ".aethyme/graph/_index/src.lib.ndjson",
                 ".aethyme/graph/_index/src.renamed.ndjson",
+                ".aethyme/graph/coverage.json",
                 ".aethyme/graph/manifest.json",
                 ".aethyme/graph/src/lib.rs.bin",
-                ".aethyme/graph/src/renamed.rs.bin"
+                ".aethyme/graph/src/renamed.rs.bin",
+                ".aethyme/graph/units.ndjson"
             ]
         );
 
-        let context = IndexerContext::new(
-            "fixture",
-            repo.path().to_path_buf(),
-            env!("CARGO_PKG_VERSION"),
-        )
-        .unwrap();
+        let context = indexed_context(repo.path());
         std::fs::remove_dir_all(repo.path().join(".aethyme/graph")).unwrap();
         bootstrap_repo(repo.path(), env!("CARGO_PKG_VERSION")).unwrap();
         index_repo_to_disk(&context, &WalkOptions::default()).unwrap();
@@ -550,7 +584,7 @@ mod tests {
     }
 
     #[test]
-    fn binary_only_and_empty_changes_leave_fresh_fragments_valid() {
+    fn binary_only_changes_are_visible_in_coverage_artifacts() {
         let repo = graph_repo();
         let checkout = crate::GitRepo::discover(repo.path()).unwrap();
         let policy = GraphIntegrityPolicy::load(repo.path()).unwrap();
@@ -559,8 +593,14 @@ mod tests {
 
         std::fs::write(repo.path().join("asset.bin"), [0_u8, 159, 146, 150]).unwrap();
         let binary_only = verify_disposable_checkout(&checkout, &policy);
-        assert_eq!(binary_only.status, GraphIntegrityStatus::Passed);
-        assert!(binary_only.changed_paths.is_empty());
+        assert_eq!(binary_only.status, GraphIntegrityStatus::Stale);
+        assert_eq!(
+            binary_only.changed_paths,
+            vec![
+                ".aethyme/graph/coverage.json",
+                ".aethyme/graph/manifest.json"
+            ]
+        );
         assert_ne!(binary_only.tree_hash, unchanged.tree_hash);
         assert_eq!(binary_only.policy_digest, unchanged.policy_digest);
     }
