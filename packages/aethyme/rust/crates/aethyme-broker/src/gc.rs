@@ -11,7 +11,8 @@ use crate::broker::{
     WORKTREE_ROOT_MARKER, WorktreeRootMarker, directory_size_without_following_links,
 };
 use crate::{
-    Broker, BrokerOpError, GcApplyReport, GcArtifactCandidate, GcBlocker, GcBlockerSummary,
+    Broker, BrokerOpError, GcApplyReport, GcArtifactCandidate, GcBlocker,
+    GcWorktreeBlockerSummary,
     GcFileAction, GcFileCandidate, GcHealth, GcOrphanCandidate, GcPlan, GcRowCandidate,
     GcWorktreeCandidate, GitRepo, OperationStatus, RetentionPolicy, load_retention_policy,
     load_retention_policy_report,
@@ -319,30 +320,9 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), BrokerOpError> {
         path: parent.to_path_buf(),
         source,
     })?;
-    let temporary = parent.join(format!(
-        ".{}.tmp-{}-{}",
-        path.file_name().unwrap_or_default().to_string_lossy(),
-        std::process::id(),
-        now_ms()
-    ));
-    let result = (|| {
-        let mut file = std::fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temporary)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        }
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        std::fs::rename(&temporary, path)?;
-        Ok::<_, std::io::Error>(())
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&temporary);
-    }
+    let result = crate::atomic_file::with_synced_temporary(path, bytes, |temporary| {
+        std::fs::rename(temporary, path)
+    });
     result.map_err(|source| crate::BrokerError::Io {
         path: path.to_path_buf(),
         source,
@@ -929,7 +909,7 @@ impl Broker {
             (&left.kind, left.id, &left.reason).cmp(&(&right.kind, right.id, &right.reason))
         });
         blockers.dedup();
-        let mut blocker_summary = blocked_worktree_bytes
+        let mut worktree_blocker_summary = blocked_worktree_bytes
             .into_iter()
             .filter_map(|((kind, id), retained_bytes)| {
                 let blocker = blockers
@@ -947,13 +927,13 @@ impl Broker {
                 },
             )
             .into_iter()
-            .map(|(kind, (count, retained_bytes))| GcBlockerSummary {
+            .map(|(kind, (count, retained_bytes))| GcWorktreeBlockerSummary {
                 kind,
                 count,
                 retained_bytes,
             })
             .collect::<Vec<_>>();
-        blocker_summary.sort_by(|left, right| {
+        worktree_blocker_summary.sort_by(|left, right| {
             right
                 .retained_bytes
                 .cmp(&left.retained_bytes)
@@ -1055,7 +1035,7 @@ impl Broker {
             artifacts,
             orphans,
             blockers,
-            blocker_summary,
+            worktree_blocker_summary,
             estimated_reclaimable_bytes,
             estimated_retained_bytes,
             estimated_blocked_bytes,
