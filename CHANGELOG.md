@@ -6,6 +6,8 @@ artifacts and their exact source revision are recorded in each signed
 
 ## [Unreleased]
 
+## [0.7.19] - 2026-09-16
+
 ### Added
 
 - Sessions now reach a terminal state on their own. A session with no evidence
