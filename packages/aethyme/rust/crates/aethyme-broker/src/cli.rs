@@ -175,6 +175,9 @@ Usage:
   aethyme broker resources plan <request.json> [--json]
       Read-only host-wide availability estimate for a typed resource bundle.
       Never reserves a port, namespace, capacity slot, or exclusive key.
+  aethyme broker resources explain <request.json> [--json]
+      Read-only diagnosis joining each blocked resource to its exact lease,
+      holder process, liveness, and wait/reconcile guidance.
   aethyme broker resources acquire <request.json> [--wait <duration>] [--grant-out <path>] [--json]
       Atomically reserve the full bundle. --wait bounds contention retries.
       --grant-out atomically creates a mode-0600 private grant and keeps the
@@ -942,7 +945,10 @@ fn command_records_metric(args: &[String]) -> bool {
         ),
         Some("leases") => !matches!(args.get(1).map(String::as_str), Some("plan" | "export")),
         Some("console") => args.get(1).map(String::as_str) == Some("run"),
-        Some("resources") => !matches!(args.get(1).map(String::as_str), Some("plan" | "list")),
+        Some("resources") => !matches!(
+            args.get(1).map(String::as_str),
+            Some("plan" | "explain" | "list")
+        ),
         Some("events") => args.get(1).map(String::as_str) == Some("prune"),
         Some("gates") => match args.get(1).map(String::as_str) {
             Some("validate" | "manifest" | "scope" | "affected" | "semantic") => false,
@@ -8247,6 +8253,55 @@ fn render_host_lease(lease: &crate::HostResourceLease) {
     }
 }
 
+fn render_host_resource_explanation(explanation: &crate::HostResourceExplanation) {
+    out!(
+        "Request {} — {}",
+        explanation.request_id,
+        if explanation.available {
+            "available"
+        } else {
+            "blocked"
+        }
+    );
+    out!(
+        "  waitable: {} ({})",
+        explanation.wait.waitable,
+        explanation.wait.reason
+    );
+    out!("  action: {}", explanation.wait.action);
+    for blocker in &explanation.blockers {
+        let conflict = &blocker.conflict;
+        out!(
+            "  blocker {} [{}] — {}",
+            conflict.resource_key,
+            conflict.kind,
+            conflict.reason
+        );
+        if let Some(bindable) = blocker.os_bindable {
+            out!("    OS port available in requested range: {bindable}");
+        }
+        if blocker.leases.is_empty() {
+            out!("    broker leases: none");
+        } else {
+            for holder in &blocker.holders {
+                out!(
+                    "    lease {} generation {} run {} pid {} ({})",
+                    holder.lease_id,
+                    holder.generation,
+                    holder.run_id,
+                    holder
+                        .holder_pid
+                        .map_or_else(|| "-".into(), |pid| pid.to_string()),
+                    holder
+                        .process_alive
+                        .map_or("unknown", |alive| { if alive { "alive" } else { "gone" } })
+                );
+            }
+        }
+        out!("    recovery: {}", blocker.recovery);
+    }
+}
+
 fn render_submission_plan(plan: &crate::SubmissionPlan, checkout: &crate::GitRepo) {
     out!(
         "Submitting session {} — HEAD {} onto integration {}",
@@ -8801,11 +8856,12 @@ fn run_resources(parsed: Parsed) -> Result<(), UsageError> {
         .map(String::as_str)
         .ok_or_else(|| {
             UsageError::Message(
-                "resources requires plan, acquire, run, renew, release, list, or reconcile".into(),
-            )
+            "resources requires plan, explain, acquire, run, renew, release, list, or reconcile"
+                .into(),
+        )
         })?;
     match action {
-        "plan" | "acquire" => {
+        "plan" | "explain" | "acquire" => {
             let path = parsed.positional.get(1).map(PathBuf::from).ok_or_else(|| {
                 UsageError::Message(format!("resources {action} requires <request.json>"))
             })?;
@@ -8840,6 +8896,14 @@ fn run_resources(parsed: Parsed) -> Result<(), UsageError> {
                             conflict.reason
                         );
                     }
+                }
+            } else if action == "explain" {
+                let coordinator = crate::HostResourceCoordinator::open_read_only_default()?;
+                let explanation = coordinator.explain(&request)?;
+                if parsed.json {
+                    out!("{}", serde_json::to_string_pretty(&explanation)?);
+                } else {
+                    render_host_resource_explanation(&explanation);
                 }
             } else {
                 let mut coordinator = crate::HostResourceCoordinator::open_default()?;
@@ -9075,7 +9139,7 @@ fn run_resources(parsed: Parsed) -> Result<(), UsageError> {
         }
         other => {
             return Err(UsageError::Message(format!(
-                "unknown resources action {other:?}; expected plan, acquire, run, renew, release, list, or reconcile"
+                "unknown resources action {other:?}; expected plan, explain, acquire, run, renew, release, list, or reconcile"
             )));
         }
     }
