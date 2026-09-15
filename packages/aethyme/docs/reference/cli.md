@@ -31,6 +31,12 @@ manifest signature verification, migration, and rollback.
 
 `aethyme` and its required `aethyme-engine-cli` sibling are native Rust
 binaries; no interpreter, virtualenv, or pip step is involved.
+When Aethyme is run from its source checkout, session start, adopt, and
+start-agent also compare the installed broker build with the checkout's
+correctness sources. A stale installed build emits a non-blocking stderr
+warning; it does not silently block the lifecycle command. Run
+`aethyme broker doctor --fix-version` from the source checkout to install and
+verify the router/engine pair from the current revision.
 **`python -m src.cli` no longer exists** — the Python
 package was deleted on 2026-08-01 (python-retirement Phase 6) with no
 shim, and the old spelling fails with `No module named src`. Every
