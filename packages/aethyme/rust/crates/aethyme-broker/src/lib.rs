@@ -58,6 +58,7 @@ mod leases;
 pub mod main_reconcile;
 mod measurement;
 mod merge;
+mod operation_stats;
 mod operations;
 pub mod plugin_cli;
 mod pr;
@@ -230,6 +231,11 @@ pub use merge::{
     ACTION_REQUIRED_RELPATH, PromoteConfig, SubmissionCommitOwnership, SubmissionCommitProvenance,
     SubmissionConflict, SubmissionGateVerification, SubmissionGateVerificationStatus,
     SubmissionIntegrationState, SubmissionPlan, SubmitOutcome,
+};
+pub use operation_stats::{
+    DEFAULT_OPERATION_STATS_LIMIT, HooksOutsideLockStats, MAX_OPERATION_STATS_LIMIT,
+    OPERATION_STATS_SCHEMA_VERSION, OperationKindStats, OperationQueueDepthStats, OperationStats,
+    OperationTimingDistribution, RefDeterminationStats, UnrelatedContentionStats,
 };
 pub use operations::{
     CoordinatedCommand, CoordinatedOperationReport, OperationReconcileReport,
