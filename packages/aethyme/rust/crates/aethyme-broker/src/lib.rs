@@ -92,7 +92,8 @@ mod reclaim_order;
 pub use reclaim::{
     ReclaimCandidate, ReclaimOutcome, ReclaimPlan, apply as apply_reclaim,
     classify as classify_reclaim, directory_bytes, is_artefact_directory,
-    is_within as reclaim_is_within, reclaimable_bytes, scan as scan_reclaim,
+    is_artefact_directory_with_extras, is_within as reclaim_is_within, reclaimable_bytes,
+    scan as scan_reclaim, scan_with_extra_directories as scan_reclaim_with_extra_directories,
 };
 pub mod representation;
 pub use representation::{
@@ -114,6 +115,7 @@ mod schema;
 mod session_abandonment;
 mod ship;
 mod store;
+mod storage;
 mod types;
 mod update;
 mod update_cache;
@@ -190,7 +192,7 @@ pub use gates::{
     gate_scope_manifest_with_graph, load_gates, load_gates_at_commit, parse_gates, plan_pre_push,
     select_gates, verify_gate_scope_manifest,
 };
-pub use gc::GC_PLAN_SCHEMA_VERSION;
+pub use gc::{GC_PLAN_SCHEMA_VERSION, UNCLASSIFIED_ARTIFACT_REPORT_THRESHOLD_BYTES};
 pub use git::{GitError, GitRepo, MergeSimulation, RemoteDefaultBranch};
 pub use github_target::{
     GithubApiTargetEvidence, GithubTargetError, ResolvedGithubTarget, resolve_github_target,
@@ -345,12 +347,13 @@ pub use resources::{
     default_host_resource_db_path, resource_environment_key, validate_host_resource_requirements,
 };
 pub use retention::{
-    BROKER_CONFIG_RELPATH, GcApplyReport, GcArtifactCandidate, GcBlocker,
+    BROKER_CONFIG_RELPATH, GcApplyReport, GcArtifactCandidate, GcBlocker, GcBlockerSummary,
+    GcCheckpointPinRelease, GcDeclinedArtifact, GcFileAction, GcFileCandidate, GcHealth,
+    GcOrphanCandidate, GcPlan,
+    GcPublicationExposureExpiry, GcRowCandidate, GcRowKind, GcWorktreeCandidate,
     GcWorktreeBlockerSummary,
-    GcFileAction, GcFileCandidate, GcHealth, GcOrphanCandidate, GcPlan, GcRowCandidate,
-    GcRowKind, GcWorktreeCandidate, RETENTION_POLICY_SCHEMA_VERSION, RetentionConfigError,
-    RetentionConfigWarning, RetentionPolicy, RetentionPolicyLoadReport, load_retention_policy,
-    load_retention_policy_report,
+    RETENTION_POLICY_SCHEMA_VERSION, RetentionConfigError, RetentionConfigWarning, RetentionPolicy,
+    RetentionPolicyLoadReport, load_retention_policy, load_retention_policy_report,
 };
 pub use review::{
     REVIEW_POLICY_SCHEMA_VERSION, ReviewEvidenceAdapter, ReviewLifecycle,
@@ -395,6 +398,13 @@ pub use ship::{
     ShipReviewEvidence,
 };
 pub use store::BrokerStore;
+pub use storage::{
+    STORAGE_PLAN_SCHEMA_VERSION, STORAGE_RECONCILIATION_SCHEMA_VERSION, StorageApplyFailure,
+    StorageApplyReport, StorageAppliedItem, StorageCandidate, StorageCandidateKind,
+    StorageDirectoryKind, StorageEntry, StorageError, StorageFilesystemKind, StorageMarkerStatus,
+    StoragePlan, StorageReconciliation, StorageRoot, StorageSource, StorageSummary,
+    storage_apply, storage_plan,
+};
 pub use types::{
     Advisory, AdvisoryAction, AdvisoryAudience, AdvisoryDeliveryMetric, AdvisoryDeliverySummary,
     AdvisoryDeliverySurface, AdvisoryEvidence, AdvisoryList, AdvisoryProducer,

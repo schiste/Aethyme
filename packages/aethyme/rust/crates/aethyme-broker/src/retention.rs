@@ -19,16 +19,42 @@ const RETENTION_POLICY_FIELDS: &[&str] = &[
     "terminal_merge_queue_days",
     "command_metrics_days",
     "closed_worktrees_days",
+    "publication_exposure_days",
     "retained_bytes_budget",
     "artifact_reclaim_days",
     "orphan_worktree_roots_days",
     "session_abandoned_after_hours",
     "artifact_sweep_budget_ms",
     "artifact_sweep_interval_hours",
+    "artefact_directories",
     "startup_budget_ms",
     "routine_size_budget_ms",
     "size_record_ttl_hours",
 ];
+
+/// Directory names that are repository source or control roots rather than
+/// regenerable build output. Configured artefact names use a deliberately
+/// broad non-empty-directory witness, so allowing these names would let a
+/// typo turn normal repository content into a deletion candidate.
+///
+/// Two groups, and the second carries the larger loss. Source and tooling roots
+/// (`src`, `lib`, `tests`, `docs`) are tracked, so removing one costs a
+/// checkout. Data roots (`data`, `fixtures`, `logs`, `coverage`) are usually
+/// ignored, and being ignored is exactly what makes them grow large enough to
+/// tempt an operator into listing them -- and unrecoverable once removed. That
+/// is the case the built-in catalog's fixed list was written to refuse:
+/// "large and ignored" also matches a downloaded dataset or a local database
+/// someone cannot rebuild.
+const PROTECTED_ARTEFACT_DIRECTORY_NAMES: &[&str] = &[
+    ".aethyme", ".git", ".github", ".gitlab", ".idea", ".vscode", "coverage", "data", "doc",
+    "docs", "example", "examples", "fixtures", "include", "lib", "logs", "src", "test", "tests",
+];
+
+pub(crate) fn is_safe_artefact_directory_name(name: &str) -> bool {
+    !PROTECTED_ARTEFACT_DIRECTORY_NAMES
+        .iter()
+        .any(|protected| name.eq_ignore_ascii_case(protected))
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -38,6 +64,9 @@ pub struct RetentionPolicy {
     pub gate_results_days: u32,
     pub terminal_merge_queue_days: u32,
     pub command_metrics_days: u32,
+    /// Days an unverified promoted publication may remain outstanding before
+    /// it becomes an explicit terminal expiry rather than an eternal blocker.
+    pub publication_exposure_days: u32,
     /// Soft repository storage budget. `0` disables budget warnings.
     pub retained_bytes_budget: u64,
     /// Idle days before a closed session's unproven worktree is eligible for
@@ -64,6 +93,10 @@ pub struct RetentionPolicy {
     pub artifact_sweep_budget_ms: u64,
     /// Minimum spacing between autonomous artifact sweeps.
     pub artifact_sweep_interval_hours: u32,
+    /// Additional single-component directory names that may be treated as
+    /// regenerable artifacts. This is additive to the built-in catalog; an
+    /// operator cannot use configuration to weaken a built-in witness.
+    pub artefact_directories: Vec<String>,
     pub startup_budget_ms: u64,
     /// Wall-clock budget a *routine* check -- `broker status`, `doctor` --
     /// may spend measuring one directory it has never sized. `0` disables
@@ -90,12 +123,14 @@ impl Default for RetentionPolicy {
             terminal_merge_queue_days: 180,
             command_metrics_days: 30,
             closed_worktrees_days: 7,
+            publication_exposure_days: 30,
             retained_bytes_budget: 1_073_741_824,
             artifact_reclaim_days: 0,
             orphan_worktree_roots_days: 1,
             session_abandoned_after_hours: 72,
             artifact_sweep_budget_ms: 5_000,
             artifact_sweep_interval_hours: 24,
+            artefact_directories: Vec::new(),
             startup_budget_ms: 25,
             routine_size_budget_ms: 200,
             size_record_ttl_hours: 24,
@@ -117,6 +152,7 @@ impl RetentionPolicy {
             ("terminal_merge_queue_days", self.terminal_merge_queue_days),
             ("command_metrics_days", self.command_metrics_days),
             ("closed_worktrees_days", self.closed_worktrees_days),
+            ("publication_exposure_days", self.publication_exposure_days),
         ] {
             if value == 0 || value > 36_500 {
                 return Err(RetentionConfigError::InvalidValue {
@@ -173,6 +209,22 @@ impl RetentionPolicy {
                 value: self.artifact_sweep_interval_hours.to_string(),
                 constraint: "must be between 1 and 8760 hours",
             });
+        }
+        for directory in &self.artefact_directories {
+            let mut components = Path::new(directory).components();
+            let valid = !directory.is_empty()
+                && !directory.contains('/')
+                && !directory.contains('\\')
+                && !directory.contains('\0')
+                && matches!(components.next(), Some(std::path::Component::Normal(_)))
+                && components.next().is_none();
+            if !valid || !is_safe_artefact_directory_name(directory) {
+                return Err(RetentionConfigError::InvalidValue {
+                    field: "artefact_directories",
+                    value: directory.clone(),
+                    constraint: "each entry must be one non-empty safe directory name without path separators or reserved source/control names",
+                });
+            }
         }
         // A routine check may spend at most a quarter second measuring. Any
         // larger and the split this bounds -- routine check against expensive
@@ -408,6 +460,20 @@ pub struct GcArtifactCandidate {
     pub idle_days: u32,
 }
 
+/// A large git-ignored directory that was deliberately not classified as
+/// regenerable artifact output. This is evidence for an operator, never a GC
+/// candidate: the broker does not infer that an arbitrary ignored directory is
+/// safe to delete.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct GcDeclinedArtifact {
+    pub session_id: i64,
+    pub worktree_path: String,
+    /// Path of the ignored directory relative to the worktree root.
+    pub relative_dir: String,
+    pub estimated_bytes: u64,
+    pub reason: String,
+}
+
 /// A host worktree root whose owning repository no longer exists.
 ///
 /// Worktree storage is host-scoped but ownership records are repository-local,
@@ -428,6 +494,56 @@ pub struct GcBlocker {
     pub kind: String,
     pub id: Option<i64>,
     pub reason: String,
+}
+
+/// A closed session's accepted queue checkpoint that still has a GC pin.
+///
+/// Releasing this record changes only broker metadata. The accepted session
+/// head, integration commit, and tree remain available for cleanup provenance,
+/// and no committed worktree or branch is touched.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct GcCheckpointPinRelease {
+    pub session_id: i64,
+    pub queue_entry_id: i64,
+    pub recorded_at: i64,
+    pub estimated_bytes: u64,
+    pub reason: String,
+}
+
+/// An outstanding publication exposure past its stated retention age. The
+/// plan names the exact row; only an explicit `gc apply` may expire it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct GcPublicationExposureExpiry {
+    pub exposure_id: i64,
+    pub queue_entry_id: i64,
+    pub created_at: i64,
+    pub age_days: u32,
+    pub reason: String,
+}
+
+/// An aggregate view of the protections in a GC plan.
+///
+/// The individual blocker list remains the authoritative explanation for each
+/// row. This companion view makes retained disk pressure and ageing actionable
+/// by grouping it by the rule that held it, with the largest group first.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct GcBlockerSummary {
+    pub kind: String,
+    pub count: usize,
+    pub retained_bytes: u64,
+    /// The row or session identifier of the oldest member, when the blocker
+    /// kind has one. A null value means the kind only has path-level or
+    /// otherwise unaddressable findings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oldest_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oldest_recorded_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oldest_age_days: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub age_policy_days: Option<u32>,
+    #[serde(default)]
+    pub age_exceeded: bool,
 }
 
 /// A byte-backed aggregation of the worktree blockers in a GC plan.
@@ -458,11 +574,27 @@ pub struct GcPlan {
     pub artifacts: Vec<GcArtifactCandidate>,
     pub orphans: Vec<GcOrphanCandidate>,
     pub blockers: Vec<GcBlocker>,
+    /// Closed-session checkpoint pins that a reviewed `gc apply` may release.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checkpoint_pin_releases: Vec<GcCheckpointPinRelease>,
+    /// Publication exposures past policy age that a reviewed `gc apply` may
+    /// move to the terminal `expired` state.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub publication_exposure_expiries: Vec<GcPublicationExposureExpiry>,
+    /// Protection counts and byte estimates grouped by blocker kind. This is
+    /// reporting only and intentionally excluded from the authorization
+    /// digest, like the other measured byte totals.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocker_summary: Vec<GcBlockerSummary>,
     /// Retained worktree bytes grouped by the blocker that holds them. This
     /// is reporting only and intentionally excluded from the authorization
     /// digest, like the other measured byte totals.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub worktree_blocker_summary: Vec<GcWorktreeBlockerSummary>,
+    /// Large ignored directories outside the safe artifact catalog. These
+    /// are reporting-only and excluded from the authorization digest.
+    #[serde(default)]
+    pub declined_artifacts: Vec<GcDeclinedArtifact>,
     pub estimated_reclaimable_bytes: u64,
     /// Every byte held by retained worktrees, whether or not this plan acts on
     /// it. Reporting only: excluded from the digest so measured sizes never
@@ -471,6 +603,11 @@ pub struct GcPlan {
     /// Bytes this plan deliberately leaves in place because a retention or
     /// provenance gate blocked them.
     pub estimated_blocked_bytes: u64,
+    /// Bytes in [`GcPlan::declined_artifacts`]. Kept separate from
+    /// `estimated_reclaimable_bytes` so evidence can never be mistaken for a
+    /// deletion authorization.
+    #[serde(default)]
+    pub estimated_declined_artifact_bytes: u64,
     /// Directories under a broker worktree root that no session row claims
     /// (#176). Reporting only, and excluded from the digest for the same
     /// reason the byte totals are: this plan does not act on these, so a
@@ -521,6 +658,8 @@ pub struct GcApplyReport {
     pub sessions_cleaned: Vec<i64>,
     pub artifacts_reclaimed: Vec<String>,
     pub orphans_removed: Vec<String>,
+    pub checkpoint_pins_released: Vec<i64>,
+    pub publication_exposures_expired: Vec<i64>,
     pub reclaimed_bytes: u64,
     pub failures: Vec<String>,
     pub recovery_action: Option<String>,
@@ -589,6 +728,8 @@ impl GcPlan {
             artifacts: &'a [GcArtifactCandidate],
             orphans: &'a [GcOrphanCandidate],
             blockers: &'a [GcBlocker],
+            checkpoint_pin_releases: &'a [GcCheckpointPinRelease],
+            publication_exposure_expiries: &'a [GcPublicationExposureExpiry],
         }
         let bytes = serde_json::to_vec(&Authorization {
             schema_version: self.schema_version,
@@ -599,6 +740,8 @@ impl GcPlan {
             artifacts: &self.artifacts,
             orphans: &self.orphans,
             blockers: &self.blockers,
+            checkpoint_pin_releases: &self.checkpoint_pin_releases,
+            publication_exposure_expiries: &self.publication_exposure_expiries,
         })?;
         self.digest = format!("{:x}", Sha256::digest(bytes));
         Ok(())
@@ -623,6 +766,7 @@ mod tests {
         assert_eq!(policy.routine_size_budget_ms, 200);
         assert_eq!(policy.size_record_ttl_hours, 24);
         assert_eq!(policy.retained_bytes_budget, 1_073_741_824);
+        assert!(policy.artefact_directories.is_empty());
     }
 
     #[test]
@@ -645,6 +789,88 @@ mod tests {
             policy.startup_budget_ms,
             RetentionPolicy::default().startup_budget_ms
         );
+    }
+
+    #[test]
+    fn configured_artifact_directories_are_additive_and_path_scoped() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir(repo.path().join(".aethyme")).unwrap();
+        std::fs::write(
+            repo.path().join(BROKER_CONFIG_RELPATH),
+            "[retention]\nartefact_directories = [\".pnpm-store\", \"cache\"]\n",
+        )
+        .unwrap();
+
+        let policy = load_retention_policy(repo.path()).unwrap();
+        assert_eq!(
+            policy.artefact_directories,
+            vec![".pnpm-store".to_string(), "cache".to_string()]
+        );
+
+        for directory in ["", ".", "..", "nested/cache", "/tmp", "foo\\bar"] {
+            let mut policy = RetentionPolicy::default();
+            policy.artefact_directories = vec![directory.into()];
+            assert!(
+                matches!(
+                    policy.validate(),
+                    Err(RetentionConfigError::InvalidValue {
+                        field: "artefact_directories",
+                        ..
+                    })
+                ),
+                "{directory:?} should not escape one directory component"
+            );
+        }
+
+        for directory in [
+            ".aethyme", ".git", "SRC", "lib", "tests", "docs", "examples",
+        ] {
+            let mut policy = RetentionPolicy::default();
+            policy.artefact_directories = vec![directory.into()];
+            assert!(
+                matches!(
+                    policy.validate(),
+                    Err(RetentionConfigError::InvalidValue {
+                        field: "artefact_directories",
+                        ..
+                    })
+                ),
+                "{directory:?} should remain outside the configurable artifact catalog"
+            );
+        }
+    }
+
+    /// The built-in catalog and the protected list describe the same
+    /// directories from opposite sides, and nothing else keeps them agreeing.
+    /// A built-in artefact that is also protected would make the two contradict
+    /// each other; an unrecoverable data root that is not protected is exactly
+    /// the loss the fixed catalog was written to prevent.
+    #[test]
+    fn protected_names_cover_unrecoverable_roots_without_contradicting_the_catalog() {
+        for name in ["target", "node_modules", ".venv", "build", "dist"] {
+            assert!(
+                crate::is_artefact_directory(name),
+                "{name} must stay in the built-in artefact catalog"
+            );
+            assert!(
+                is_safe_artefact_directory_name(name),
+                "{name} is a built-in artefact and must not also be protected"
+            );
+        }
+
+        // Ignored, large, and not rebuildable from the repository -- the
+        // combination that makes an operator want to list them and makes the
+        // removal permanent.
+        for name in ["data", "fixtures", "logs", "coverage"] {
+            assert!(
+                !crate::is_artefact_directory(name),
+                "{name} must not be a built-in artefact"
+            );
+            assert!(
+                !is_safe_artefact_directory_name(name),
+                "{name} must stay outside the configurable artefact catalog"
+            );
+        }
     }
 
     #[test]

@@ -223,6 +223,42 @@ fn reclaim_confirmation_binds_decisions_not_sizes_and_explains_changes() {
 }
 
 #[test]
+fn reclaim_confirmation_keeps_digest_mismatch_primary_when_snapshot_is_unreadable() {
+    let (repo, container) = fixture("");
+    let root_output = run(repo.path(), container.path(), &["worktree-root", "--json"]);
+    let worktree_root =
+        serde_json::from_slice::<serde_json::Value>(&root_output.stdout).unwrap()["preferred_root"]
+            .as_str()
+            .map(PathBuf::from)
+            .unwrap();
+
+    let plan = reclaim_plan_json(repo.path(), container.path());
+    let digest = plan["digest"].as_str().unwrap().to_string();
+    let snapshot = worktree_root.join(format!(".aethyme-reclaim-plan-{digest}.json"));
+    std::fs::write(&snapshot, b"not a reclaim snapshot\n").unwrap();
+
+    let added = worktree_root.join("session/build");
+    std::fs::create_dir_all(&added).unwrap();
+    std::fs::write(added.join("artifact"), "new\n").unwrap();
+
+    let refused = run(
+        repo.path(),
+        container.path(),
+        &["reclaim", "apply", "--confirm", &digest],
+    );
+    assert!(!refused.status.success());
+    let message = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        message.contains("confirmation does not match the current plan"),
+        "{message}"
+    );
+    assert!(
+        message.contains("saved review could not be read"),
+        "{message}"
+    );
+}
+
+#[test]
 fn a_reappearing_repository_revokes_an_authorized_orphan_removal() {
     let (repo, container) =
         fixture("[retention]\norphan_worktree_roots_days = 0\nartifact_sweep_budget_ms = 0\n");
@@ -302,6 +338,131 @@ fn enable_sweep(repo: &Path) {
         "[retention]\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 5000\n",
     )
     .unwrap();
+}
+
+#[test]
+fn gc_plan_reports_large_ignored_directories_without_authorizing_them() {
+    let (repo, container) =
+        fixture("[retention]\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 0\n");
+    let (_id, worktree) = blocked_session_with_build_cache(repo.path(), container.path());
+    std::fs::write(repo.path().join(".git/info/exclude"), "ignored-cache/\n").unwrap();
+    let declined = worktree.join("ignored-cache");
+    std::fs::create_dir_all(&declined).unwrap();
+    std::fs::write(
+        declined.join("dataset.bin"),
+        vec![0_u8; aethyme_broker::UNCLASSIFIED_ARTIFACT_REPORT_THRESHOLD_BYTES as usize + 1],
+    )
+    .unwrap();
+
+    let plan = plan_json(repo.path(), container.path());
+    let reported = plan["declined_artifacts"].as_array().unwrap();
+    assert_eq!(
+        reported.len(),
+        1,
+        "expected one declined directory: {reported:?}"
+    );
+    assert_eq!(reported[0]["relative_dir"], "ignored-cache");
+    let declined_bytes = reported[0]["estimated_bytes"].as_u64().unwrap();
+    assert!(declined_bytes > aethyme_broker::UNCLASSIFIED_ARTIFACT_REPORT_THRESHOLD_BYTES);
+    assert_eq!(plan["estimated_declined_artifact_bytes"], declined_bytes);
+    assert!(plan["artifacts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|artifact| artifact["relative_dir"] != "ignored-cache"));
+
+    let reclaimable_from_candidates = plan["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["estimated_bytes"].as_u64().unwrap())
+        .chain(plan["files"].as_array().unwrap().iter().map(|file| {
+            file["bytes_before"]
+                .as_u64()
+                .unwrap()
+                .saturating_sub(file["bytes_after"].as_u64().unwrap())
+        }))
+        .chain(
+            plan["worktrees"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|worktree| worktree["estimated_bytes"].as_u64().unwrap()),
+        )
+        .chain(
+            plan["artifacts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|artifact| artifact["estimated_bytes"].as_u64().unwrap()),
+        )
+        .chain(
+            plan["orphans"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|orphan| orphan["estimated_bytes"].as_u64().unwrap()),
+        )
+        .sum::<u64>();
+    assert_eq!(
+        plan["estimated_reclaimable_bytes"],
+        reclaimable_from_candidates
+    );
+    assert!(declined.exists(), "reporting must not remove opaque output");
+}
+
+#[test]
+fn configured_artifact_directories_are_reclaimable_in_gc_and_reclaim() {
+    let (repo, container) = fixture(
+        "[retention]\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 0\nartefact_directories = [\".pnpm-store\"]\n",
+    );
+    let (_id, worktree) = blocked_session_with_build_cache(repo.path(), container.path());
+    std::fs::write(repo.path().join(".git/info/exclude"), ".pnpm-store/\n").unwrap();
+    let store = worktree.join(".pnpm-store");
+    std::fs::create_dir_all(&store).unwrap();
+    std::fs::write(store.join("index"), b"package-index").unwrap();
+
+    let plan = plan_json(repo.path(), container.path());
+    assert!(
+        plan["artifacts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|artifact| artifact["relative_dir"] == ".pnpm-store"),
+        "configured cache should extend the built-in catalog: {}",
+        serde_json::to_string_pretty(&plan).unwrap()
+    );
+    assert!(plan["declined_artifacts"].as_array().unwrap().is_empty());
+
+    let reclaim_plan = reclaim_plan_json(repo.path(), container.path());
+    assert!(
+        reclaim_plan["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|candidate| candidate["path"]
+                .as_str()
+                .unwrap()
+                .ends_with("/.pnpm-store")),
+        "legacy reclaim should use the same configured catalog: {reclaim_plan}"
+    );
+
+    let digest = plan["digest"].as_str().unwrap();
+    let output = run(
+        repo.path(),
+        container.path(),
+        &["gc", "apply", "--confirm", digest],
+    );
+    assert!(
+        output.status.success(),
+        "gc apply: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !store.exists(),
+        "configured cache should be removed after review"
+    );
+    assert!(worktree.join("work.txt").exists());
 }
 
 #[test]
@@ -470,7 +631,7 @@ fn build_caches_are_reclaimable_even_when_the_worktree_itself_is_blocked() {
             .all(|worktree| worktree["session_id"].as_i64().unwrap().to_string() != id),
         "a session with unaccepted commits must not be scheduled for removal"
     );
-    let retained_summary = plan["worktree_blocker_summary"]
+    let retained_summary = plan["blocker_summary"]
         .as_array()
         .unwrap()
         .iter()
@@ -481,6 +642,14 @@ fn build_caches_are_reclaimable_even_when_the_worktree_itself_is_blocked() {
         retained_summary["retained_bytes"].as_u64().unwrap() > 0,
         "age blocker should account for the retained worktree bytes: {retained_summary}"
     );
+    let worktree_summary = plan["worktree_blocker_summary"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|summary| summary["kind"] == "retention_age")
+        .expect("worktree-specific summary should include the age blocker");
+    assert_eq!(worktree_summary["count"], 1);
+    assert!(worktree_summary["retained_bytes"].as_u64().unwrap() > 0);
 
     let digest = plan["digest"].as_str().unwrap();
     let output = run(

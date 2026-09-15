@@ -1,6 +1,6 @@
 # CLI Reference
 
-Last Updated: 2026-09-05
+Last Updated: 2026-09-14
 
 ## Install
 
@@ -31,6 +31,12 @@ manifest signature verification, migration, and rollback.
 
 `aethyme` and its required `aethyme-engine-cli` sibling are native Rust
 binaries; no interpreter, virtualenv, or pip step is involved.
+When Aethyme is run from its source checkout, session start, adopt, and
+start-agent also compare the installed broker build with the checkout's
+correctness sources. A stale installed build emits a non-blocking stderr
+warning; it does not silently block the lifecycle command. Run
+`aethyme broker doctor --fix-version` from the source checkout to install and
+verify the router/engine pair from the current revision.
 **`python -m src.cli` no longer exists** — the Python
 package was deleted on 2026-08-01 (python-retirement Phase 6) with no
 shim, and the old spelling fails with `No module named src`. Every
@@ -103,6 +109,7 @@ product surface.
 - `aethyme broker leases ...`
 - `aethyme broker pr check`
 - `aethyme broker cleanup`
+- `aethyme broker storage ...`
 - `aethyme graph ...`
 - `aethyme facts ...`
 - `aethyme task ...`
@@ -536,6 +543,9 @@ continues to expose the complete local `log_path` without embedding log data.
 - `aethyme broker main reconcile apply --session <id> --confirm <sha256> [--resolution-file <path>] [--json]`
 - `aethyme broker gc plan [--json]`
 - `aethyme broker gc apply --confirm <sha256> [--json]`
+- `aethyme broker storage [--json]`
+- `aethyme broker storage plan [--json]`
+- `aethyme broker storage apply --confirm <sha256> [--json]`
 - `aethyme broker handoff (--session <id> | --worktree <path>) [--json]`
 - `aethyme broker report capture --kind <bug|improvement> --title <text> [--session <id>] [--include-task] [--stdout | --output <filename>] [--json]`
 - `aethyme broker report list [--json]`
@@ -1027,12 +1037,14 @@ gate_results_days = 30
 terminal_merge_queue_days = 180
 command_metrics_days = 30
 closed_worktrees_days = 7
+publication_exposure_days = 30
 retained_bytes_budget = 1073741824
 artifact_reclaim_days = 0
 orphan_worktree_roots_days = 1
 session_abandoned_after_hours = 72
 artifact_sweep_budget_ms = 5000
 artifact_sweep_interval_hours = 24
+artefact_directories = [] # e.g. [".pnpm-store"]; additive to built-ins
 startup_budget_ms = 25
 routine_size_budget_ms = 200
 size_record_ttl_hours = 24
@@ -1044,6 +1056,16 @@ applying the known settings; this keeps a newer config from disabling all
 reclamation. A schema version newer than the binary remains an explicit
 `UnsupportedSchema` error. `broker status` and `broker gates doctor` surface
 ignored or invalid retention keys with the remediation to edit this file.
+
+`artefact_directories` is an additive list of single directory names. It can
+extend the built-in artifact catalog (`target` and `node_modules`) for a
+repository-specific cache such as `.pnpm-store`; it cannot remove or weaken a
+built-in witness. Configured names must also avoid repository source and control
+roots such as `.git`, `.aethyme`, `src`, `lib`,
+`tests`, and `docs`; invalid names fail retention-policy validation.
+Configured names still have to be git-ignored and live inside the owning session
+worktree before GC can reclaim them. The legacy `broker reclaim` plan uses
+the same additive list.
 
 `retained_bytes_budget` is a soft, non-blocking budget used by status, doctor,
 and finish warnings; `0` disables only those warnings. It never authorizes
@@ -1072,24 +1094,42 @@ unpromoted commits, and unproven provenance still block removal exactly as
 before. Set it to `0` to restore the previous behaviour, where a session held
 its worktree, its branch, and its leases until a human intervened.
 
+When a session closes, its accepted-checkpoint pin is released in the same
+terminal transaction. The accepted session head, integration commit, tree, and
+queue row remain stored as cleanup provenance; releasing the pin changes broker
+metadata only. Pins left behind by older databases are named in a reviewed GC
+plan and are not released implicitly.
+
 Run `aethyme broker gc plan` first. Its text and stable JSON enumerate every
 eligible database row, runtime file, represented worktree and exact branch ref,
-build cache, orphaned root, estimated bytes, protected finding, and the SHA-256
+build cache, orphaned root, estimated bytes, protected finding, stale
+checkpoint-pin release, publication-expiry candidate, and the SHA-256
 authorization digest. A worktree whose cleanup proof says its contribution is
 represented is eligible here regardless of age, exactly as it is for
 `cleanup --all-cleaned`. Without that proof, `closed_worktrees_days` remains
 the first protection; once it is past, the plan retains the more specific
 unproven-contribution blocker. GC never ages out live sessions, outstanding or
 acknowledged advisories, unpublished exposures, unresolved coordinated
-operations, accepted checkpoints, or unproven contributions.
+operations, accepted checkpoints, or unproven contributions. An old publication
+exposure remains a blocker until the
+reviewed apply marks that exact row `expired`; expiry records that publication
+could no longer be verified and is not a claim that it was published.
 
 The plan also reports `estimated_retained_bytes` and `estimated_blocked_bytes`
 alongside `estimated_reclaimable_bytes`, so it states total disk pressure rather
 than only the bytes this plan will act on. The two reporting totals are excluded
 from the authorization digest: a measured size change must never invalidate a
-plan an operator already confirmed. `worktree_blocker_summary` groups retained
-worktree bytes by blocker kind, largest first, so a large protected backlog is
-visible before the individual findings.
+plan an operator already confirmed. `blocker_summary` groups every protection
+kind with its count, estimated bytes, oldest member, and age-policy flag,
+largest first, so a large or over-age protected backlog is visible before the
+individual findings. Where a protection has an addressable row or session, the
+oldest member's identifier is included too. `gc apply` releases only named
+broker pins and expires only named exposure rows; neither action deletes
+committed work or asserts publication verification.
+The more focused
+`worktree_blocker_summary` also groups retained worktree bytes by blocker kind,
+largest first, so disk pressure is visible independently of the full
+protection summary.
 
 ### The retained-bytes budget
 
@@ -1211,8 +1251,9 @@ digest for the same reason the byte totals are. The broker did not create these
 directories and cannot reason about what is inside them, so naming them for a
 human is the most it should do.
 
-Directories whose name begins with `.` are the broker's own shared state — the
-per-root Cargo home, the root marker — and are never reported. A session
+Directories whose name begins with `.` in the unclaimed reconciliation list
+are the broker's own shared state — the per-root Cargo home, the root marker —
+and are never reported there. A session
 worktree name is derived from the task slug, which contains only `[a-z0-9-]`,
 so the two sets cannot overlap.
 
@@ -1228,6 +1269,13 @@ source directory that merely shares the name is never removed. Git must also
 confirm the exact repository-relative directory is ignored; tracked content is
 never reclaimed even when its name and witness resemble a cache. The scan is
 depth-bounded, skips git metadata, and never follows symlinks.
+
+The full `gc plan` also reports any git-ignored directory larger than 4 KiB
+that is outside this catalog as `declined_artifacts`. These entries are
+evidence for an operator only: their byte total is shown separately from
+`estimated_reclaimable_bytes`, and `gc apply` never removes them. This keeps
+large caches such as an unconfigured `.pnpm-store` visible without turning a
+heuristic into a deletion rule.
 
 By default, build caches from sessions idle for `artifact_reclaim_days` are
 reclaimed automatically on broker startup, without per-run confirmation.
@@ -1256,6 +1304,35 @@ stops binding the moment the owning repository reappears. Repositories under the
 system temporary directory are never anchored in the implicit platform host-state
 directory for this reason, though an explicitly configured
 `AETHYME_HOST_STATE_DIR` or `AETHYME_WORKTREE_ROOT` is always honoured.
+
+`broker storage` is the host-wide inventory for that boundary. It enumerates
+every direct entry below the host worktree container, including roots whose
+owner is missing, and reconciles each usable root's on-disk directories with
+Git's worktree registrations and the owning repository's live and closed
+session ledger. The JSON projection is versioned and identifies paths missing
+from one or more of those sources, unreadable or unmarked roots, Git metadata,
+session IDs, and bounded byte estimates. Existing repository-local `gc` and
+`reclaim` commands remain the policy unit for an owner that still exists; when
+an owner has been deleted, the invoking repository's orphan grace setting is
+used and is reported in the plan.
+
+The inventory and `storage plan` are read-only. A directory that is absent from
+both Git registrations and the session ledger is reported as a possible stray,
+but it is not eligible unless the owning root has valid marker evidence. A
+valid marker whose owner is gone becomes an orphan candidate only after the
+reported grace period. Unmarked roots, non-directory entries, unreadable
+ledgers, and any ownership disagreement remain blockers. Apply only the exact
+reviewed digest:
+
+```bash
+aethyme broker storage apply --confirm <sha256>
+```
+
+Apply rechecks the root marker, owner checkout, direct containment, Git
+registrations, and session ledger immediately before each removal. A changed
+plan refuses before touching anything; a later race retains the affected path
+and reports the exact recovery command. The root ownership marker is kept
+until the final removal step so an interrupted deletion remains identifiable.
 
 Apply only the reviewed plan:
 
