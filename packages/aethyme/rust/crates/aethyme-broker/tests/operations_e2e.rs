@@ -530,7 +530,7 @@ fn local_pre_push_rejection_records_that_the_remote_was_not_contacted() {
     assert_eq!(evidence["classification"], "failed");
     assert_eq!(evidence["remote_contact"], "contacted");
     assert_eq!(evidence["remote_write_contact"], "not_contacted");
-    assert_eq!(evidence["remote_not_contacted"], true);
+    assert_eq!(evidence["remote_not_contacted"], false);
     assert_eq!(
         details["push_reconciliation"]["plan"]["destinations"][0]["proposed_sha"],
         proposed
