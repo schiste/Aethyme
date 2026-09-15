@@ -191,7 +191,16 @@ fn start_refuses_ambiguous_or_missing_default_refs() {
 #[test]
 fn start_refuses_a_pull_request_review_before_creating_a_session() {
     let tmp = fixture();
-    let output = run(tmp.path(), &["start", "--task", "review PR #42"]);
+    let output = run(
+        tmp.path(),
+        &[
+            "start",
+            "--task",
+            "review workspace",
+            "--pull-request",
+            "42",
+        ],
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
 
     assert!(!output.status.success());
@@ -205,6 +214,17 @@ fn start_refuses_a_pull_request_review_before_creating_a_session() {
             .unwrap()
             .is_empty()
     );
+}
+
+#[test]
+fn start_does_not_inspect_free_form_task_text_for_pull_request_reviews() {
+    let tmp = fixture();
+    let output = run(
+        tmp.path(),
+        &["start", "--task", "fix the review gate so PR 754 passes"],
+    );
+
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
 }
 
 #[test]

@@ -703,9 +703,11 @@ The adapter verifies `git rev-parse HEAD` against the handoff's full head SHA
 after both reuse and fresh checkout, immediately before it opens the reviewer
 tab. A failed proof abandons that review request for a later tick; it never
 starts an agent in an unlabelled revision. Do not create a review session with
-`aethyme broker start --task "review PR #42"`: ordinary starts are anchored to
-the integration tip and the broker refuses that task. Use this routed adapter,
-or create a detached PR-head checkout yourself and verify its exact head first.
+`aethyme broker start --task "review workspace" --pull-request 42`: ordinary
+starts are anchored to the integration tip and the explicit pull-request target
+is refused. Use this routed adapter, or create a detached PR-head checkout
+yourself and verify its exact head first. Task text remains free-form and is not
+used as a review classifier.
 
 ### Which agent performs it
 

@@ -130,13 +130,13 @@ Usage:
       Resolve retained ambiguity explicitly. Assignment requires --session;
       unsupported or repository-mismatched events can only be ignored. The
       reason is stored as a SHA-256 digest, never as text.
-  aethyme broker start --task <text> [--path <repo-path>]... [--agent <name-and-email>] [--json]
+  aethyme broker start --task <text> [--pull-request <number>] [--path <repo-path>]... [--agent <name-and-email>] [--json]
       Create a broker-managed worktree + branch and register a session,
       atomically claiming every reviewed --path, but do not spawn a process.
       Prefer this over adopting the main
       checkout for agent work; it isolates the git index and worktree.
       --agent as in adopt (see above).
-  aethyme broker start-agent --task <text> --cmd <command>
+  aethyme broker start-agent --task <text> --cmd <command> [--pull-request <number>]
                              [--agent <identity>] [--json]
       Create a worktree + branch and spawn <command> in it (sh -c),
       logging to .aethyme/logs/.
@@ -1222,6 +1222,20 @@ mod tests {
     }
 
     #[test]
+    fn parse_accepts_explicit_pull_request_review_target() {
+        let parsed = super::parse(&args(&[
+            "start",
+            "--task",
+            "review workspace",
+            "--pull-request",
+            "42",
+        ]))
+        .unwrap_or_else(|_| panic!("explicit pull-request target should parse"));
+
+        assert_eq!(parsed.pull_request, Some(42));
+    }
+
+    #[test]
     fn parse_accepts_read_only_exact_gate_scope_evaluation() {
         let parsed = match super::parse(&args(&[
             "gates",
@@ -1796,6 +1810,9 @@ struct Parsed {
     cmd: Option<String>,
     target: Option<String>,
     repository: Option<String>,
+    /// Explicit review target. Unlike `--pr`, this is only meaningful on
+    /// `start` and `start-agent`, where it refuses an integration-tip lane.
+    pull_request: Option<i64>,
     scope: Option<String>,
     effect: Option<String>,
     outcome: Option<String>,
@@ -1890,6 +1907,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         cmd: None,
         target: None,
         repository: None,
+        pull_request: None,
         scope: None,
         effect: None,
         outcome: None,
@@ -2336,6 +2354,20 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
                 parsed.pr_number = Some(value.parse().map_err(|_| {
                     UsageError::Message("--pr must be an integer PR number".into())
                 })?);
+            }
+            "--pull-request" => {
+                let value = iter.next().ok_or(UsageError::Message(
+                    "--pull-request requires a positive integer".into(),
+                ))?;
+                let number = value.parse::<i64>().map_err(|_| {
+                    UsageError::Message("--pull-request must be a positive integer".into())
+                })?;
+                if number <= 0 {
+                    return Err(UsageError::Message(
+                        "--pull-request must be a positive integer".into(),
+                    ));
+                }
+                parsed.pull_request = Some(number);
             }
             "--session" => {
                 let value = iter
@@ -8698,6 +8730,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
             }
         }
         "start" => {
+            Broker::reject_integration_based_review_task(parsed.pull_request)?;
             let task = parsed
                 .task
                 .ok_or(UsageError::Message("start requires --task".into()))?;
@@ -8752,6 +8785,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
             }
         }
         "start-agent" => {
+            Broker::reject_integration_based_review_task(parsed.pull_request)?;
             let task = parsed
                 .task
                 .ok_or(UsageError::Message("start-agent requires --task".into()))?;
