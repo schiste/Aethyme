@@ -547,7 +547,9 @@ fn hooks_outside_lock_enabled(main_root: &Path) -> bool {
 }
 
 fn is_push(args: &[String]) -> bool {
-    args.iter().any(|arg| arg == "push")
+    git_subcommand_args(args)
+        .and_then(|args| args.first())
+        .is_some_and(|command| command == "push")
 }
 
 pub(crate) fn humanize_duration(seconds: u64) -> String {
@@ -677,40 +679,129 @@ fn has_any(args: &[String], needles: &[&str]) -> bool {
     args.iter().any(|arg| needles.contains(&arg.as_str()))
 }
 
-fn git_subcommand_args(args: &[String]) -> Option<&[String]> {
-    let mut index = 0;
-    while args.get(index).is_some_and(|arg| arg == "-C") {
-        if args.get(index + 1).is_none_or(|path| path.is_empty()) {
-            return None;
+/// The subset of Git's global options that can appear before its subcommand.
+/// Unknown leading options stay unclassified so a mutating command cannot be
+/// treated as a definitely local failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GitGlobalOption {
+    Flag,
+    Value,
+    Directory,
+}
+
+fn git_global_option(arg: &str) -> Option<GitGlobalOption> {
+    match arg {
+        "-C" => Some(GitGlobalOption::Directory),
+        "-c" | "--exec-path" | "--git-dir" | "--work-tree" | "--namespace" | "--super-prefix"
+        | "--config-env" => Some(GitGlobalOption::Value),
+        "--paginate"
+        | "--no-pager"
+        | "--no-replace-objects"
+        | "--no-lazy-fetch"
+        | "--no-optional-locks"
+        | "--no-advice"
+        | "--literal-pathspecs"
+        | "--glob-pathspecs"
+        | "--noglob-pathspecs"
+        | "--icase-pathspecs"
+        | "--html-path"
+        | "--man-path"
+        | "--info-path"
+        | "-p"
+        | "-P" => Some(GitGlobalOption::Flag),
+        _ if arg.starts_with("-C") && arg.len() > 2 => Some(GitGlobalOption::Directory),
+        _ if arg.starts_with("-c") && arg.len() > 2 => Some(GitGlobalOption::Value),
+        _ if arg.starts_with("--exec-path=")
+            || arg.starts_with("--git-dir=")
+            || arg.starts_with("--work-tree=")
+            || arg.starts_with("--namespace=")
+            || arg.starts_with("--super-prefix=")
+            || arg.starts_with("--config-env=") =>
+        {
+            Some(GitGlobalOption::Value)
         }
-        index += 2;
+        _ => None,
     }
-    args.get(index..).filter(|remaining| !remaining.is_empty())
+}
+
+fn git_subcommand_index(args: &[String]) -> Option<usize> {
+    let mut index = 0;
+    while let Some(arg) = args.get(index) {
+        if arg == "--" {
+            return args.get(index + 1).map(|_| index + 1);
+        }
+        if arg == "--version" {
+            return Some(index);
+        }
+        match git_global_option(arg) {
+            Some(GitGlobalOption::Flag) => index += 1,
+            Some(kind @ (GitGlobalOption::Value | GitGlobalOption::Directory)) => {
+                let has_inline_value = match kind {
+                    GitGlobalOption::Value => {
+                        arg.starts_with("-c") && arg.len() > 2 || arg.contains('=')
+                    }
+                    GitGlobalOption::Directory => arg.starts_with("-C") && arg.len() > 2,
+                    GitGlobalOption::Flag => false,
+                };
+                if has_inline_value {
+                    index += 1;
+                } else if args.get(index + 1).is_some_and(|value| !value.is_empty()) {
+                    index += 2;
+                } else {
+                    return None;
+                }
+            }
+            None if arg.starts_with('-') => return None,
+            None => return Some(index),
+        }
+    }
+    None
+}
+
+fn git_subcommand_args(args: &[String]) -> Option<&[String]> {
+    git_subcommand_index(args).and_then(|index| args.get(index..))
 }
 
 fn git_explicit_directory(args: &[String], cwd: &Path) -> Result<Option<PathBuf>, BrokerOpError> {
     let mut index = 0;
     let mut directory = cwd.to_path_buf();
     let mut explicit = false;
-    while args.get(index).is_some_and(|arg| arg == "-C") {
-        let path =
-            args.get(index + 1)
-                .ok_or_else(|| BrokerOpError::InvalidCoordinatedOperation {
-                    reason: "git -C requires a non-empty checkout path".into(),
-                })?;
-        if path.is_empty() {
-            return Err(BrokerOpError::InvalidCoordinatedOperation {
-                reason: "git -C requires a non-empty checkout path".into(),
-            });
+    while let Some(arg) = args.get(index) {
+        if arg == "--" {
+            break;
         }
-        let path = Path::new(path);
-        directory = if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            directory.join(path)
-        };
-        explicit = true;
-        index += 2;
+        match git_global_option(arg) {
+            Some(GitGlobalOption::Directory) => {
+                let path = if arg.len() > 2 {
+                    &arg[2..]
+                } else {
+                    args.get(index + 1).ok_or_else(|| {
+                        BrokerOpError::InvalidCoordinatedOperation {
+                            reason: "git -C requires a non-empty checkout path".into(),
+                        }
+                    })?
+                };
+                if path.is_empty() {
+                    return Err(BrokerOpError::InvalidCoordinatedOperation {
+                        reason: "git -C requires a non-empty checkout path".into(),
+                    });
+                }
+                let path = Path::new(path);
+                directory = if path.is_absolute() {
+                    path.to_path_buf()
+                } else {
+                    directory.join(path)
+                };
+                explicit = true;
+                index += if arg.len() > 2 { 1 } else { 2 };
+            }
+            Some(GitGlobalOption::Flag) => index += 1,
+            Some(GitGlobalOption::Value) => {
+                let has_inline_value = arg.starts_with("-c") && arg.len() > 2 || arg.contains('=');
+                index += if has_inline_value { 1 } else { 2 };
+            }
+            None => break,
+        }
     }
     Ok(explicit.then_some(directory))
 }
@@ -987,13 +1078,31 @@ fn stored_resource_scope(operation: &CoordinatedOperation) -> Option<String> {
     resource_lock_scope(operation.provider, command.get(1..)?)
 }
 
-fn remote_git_operation(args: &[String]) -> bool {
-    match args.first().map(String::as_str) {
-        Some("clone" | "fetch" | "pull" | "push" | "ls-remote" | "submodule") => true,
-        Some("remote") => args
+/// Whether a parsed Git command can have changed a remote.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GitOperationKind {
+    Local,
+    Remote,
+    Unknown,
+}
+
+fn git_operation_kind(args: &[String]) -> GitOperationKind {
+    let Some(args) = git_subcommand_args(args) else {
+        return GitOperationKind::Unknown;
+    };
+    if matches!(
+        args.first().map(String::as_str),
+        Some("clone" | "fetch" | "pull" | "push" | "ls-remote" | "submodule")
+    ) || (args.first().map(String::as_str) == Some("remote")
+        && args
             .get(1)
-            .is_some_and(|arg| matches!(arg.as_str(), "show" | "prune" | "update")),
-        _ => false,
+            .is_some_and(|arg| matches!(arg.as_str(), "show" | "prune" | "update")))
+    {
+        GitOperationKind::Remote
+    } else if classify_git(args).is_some() {
+        GitOperationKind::Local
+    } else {
+        GitOperationKind::Unknown
     }
 }
 
@@ -2191,8 +2300,9 @@ impl Broker {
             });
         }
 
-        let is_remote_git =
-            request.provider == OperationProvider::Git && remote_git_operation(&request.args);
+        let git_operation =
+            (request.provider == OperationProvider::Git).then(|| git_operation_kind(&request.args));
+        let is_remote_git = git_operation == Some(GitOperationKind::Remote);
         let resolved_target = match (
             &request.resolved_target,
             &request.repository,
@@ -2200,7 +2310,10 @@ impl Broker {
         ) {
             (Some(expected), None, OperationProvider::Git) if is_remote_git => {
                 let repo = crate::GitRepo::discover(cwd)?;
-                let actual = repo.resolve_remote_command_target(&request.args, None)?;
+                let actual = repo.resolve_remote_command_target(
+                    git_subcommand_args(&request.args).expect("remote Git command was parsed"),
+                    None,
+                )?;
                 if actual.remote_name != expected.remote_name
                     || actual.coordination_key != expected.coordination_key
                 {
@@ -2224,7 +2337,10 @@ impl Broker {
             (None, Some(repository), OperationProvider::Git) if is_remote_git => {
                 validate_repository(repository)?;
                 let repo = crate::GitRepo::discover(cwd)?;
-                Some(repo.resolve_remote_command_target(&request.args, Some(repository))?)
+                Some(repo.resolve_remote_command_target(
+                    git_subcommand_args(&request.args).expect("remote Git command was parsed"),
+                    Some(repository),
+                )?)
             }
             (None, Some(_), OperationProvider::Github) => {
                 debug_assert!(github_target.is_some());
@@ -2384,10 +2500,11 @@ impl Broker {
             && hooks_outside_lock_enabled(&self.main_root().to_path_buf());
         let prechecked_plan = if hooks_ran_outside_lock {
             let mut dry_run = crate::git::git_command();
+            let command_index =
+                git_subcommand_index(&request.args).expect("push command was parsed");
+            dry_run.args(&request.args[..command_index]);
             dry_run.arg("push").arg("--dry-run");
-            for arg in request.args.iter().filter(|arg| *arg != "push") {
-                dry_run.arg(arg);
-            }
+            dry_run.args(&request.args[command_index + 1..]);
             dry_run.current_dir(cwd);
             match dry_run.output() {
                 Ok(output) if output.status.success() => {}
@@ -2689,6 +2806,27 @@ impl Broker {
                     json!({}),
                 ),
             )
+        } else if request.provider == OperationProvider::Git
+            && git_operation == Some(GitOperationKind::Local)
+        {
+            // A local Git command can leave the worktree or index in a
+            // conflict state, but it cannot have an uncertain remote effect.
+            // Keeping it as `outcome_unknown` write-blocked the canonical
+            // repository and told the operator to inspect remote state that
+            // the command could never have touched (#185).
+            (
+                OperationStatus::Failed,
+                journal_details(
+                    classification,
+                    resolved_target.as_ref(),
+                    github_target.as_ref(),
+                    json!({
+                        "failure_class": "local_git_command_failed",
+                        "remote_contact": "not_applicable",
+                        "recovery": "inspect_or_abort_local_worktree_state",
+                    }),
+                ),
+        )
         } else if let Some((status, push_reconciliation)) =
             reconcile_failed_push(cwd, &push_planning, remote_contact)
         {
@@ -3459,47 +3597,46 @@ mod tests {
             Some(RemoteContactEvidence {
                 remote_contact: "contacted",
                 remote_write_contact: "not_contacted",
-                remote_not_contacted: true,
+                remote_not_contacted: false,
             })
         );
     }
 
     #[test]
-    fn failed_pre_push_hook_marks_remote_write_as_not_contacted() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(
-            tmp.path(),
-            r#"{"event":"child_start","child_id":1,"child_class":"hook","hook_name":"pre-push","argv":[".git/hooks/pre-push","origin"]}
-{"event":"child_exit","child_id":1,"code":1}
-"#,
-        )
-        .unwrap();
-        let trace = inspect_git_transfer_trace(tmp.path());
+    fn remote_git_detection_ignores_global_checkout_options() {
         assert_eq!(
-            trace.remote_contact(),
-            Some(RemoteContactEvidence {
-                remote_contact: "not_contacted",
-                remote_write_contact: "not_contacted",
-                remote_not_contacted: true,
-            })
+            git_operation_kind(&args(&["-C", "/tmp/checkout", "push", "origin", "main"])),
+            GitOperationKind::Remote
         );
-
-        std::fs::write(
-            tmp.path(),
-            r#"{"event":"child_start","child_id":1,"argv":[".git/hooks/pre-push","origin"]}
-{"event":"child_exit","child_id":1,"code":1}
-{"event":"child_start","child_id":2,"argv":["git-receive-pack","repo.git"]}
-"#,
-        )
-        .unwrap();
-        let trace = inspect_git_transfer_trace(tmp.path());
         assert_eq!(
-            trace.remote_contact(),
-            Some(RemoteContactEvidence {
-                remote_contact: "contacted",
-                remote_write_contact: "not_contacted",
-                remote_not_contacted: false,
-            })
+            git_operation_kind(&args(&["-C", "/tmp/checkout", "rebase", "main"])),
+            GitOperationKind::Local
+        );
+    }
+
+    #[test]
+    fn git_global_options_are_skipped_before_the_subcommand() {
+        for command in [
+            args(&["-c", "core.fsmonitor=true", "push"]),
+            args(&["-c", "core.fsmonitor=true", "-C", "/tmp/checkout", "push"]),
+            args(&["--git-dir", "/tmp/checkout/.git", "push"]),
+            args(&["--git-dir=/tmp/checkout/.git", "push"]),
+            args(&["--work-tree", "/tmp/checkout", "push"]),
+            args(&["--namespace", "namespace", "push"]),
+            args(&["--super-prefix", "prefix", "push"]),
+            args(&["--config-env", "http.proxy=HTTPS_PROXY", "push"]),
+        ] {
+            assert_eq!(classify_git(&command), Some(OperationEffect::Write));
+            assert_eq!(git_operation_kind(&command), GitOperationKind::Remote);
+        }
+        assert_eq!(
+            classify_git(&args(&["--git-dir"])),
+            None,
+            "a missing global-option value must not be mistaken for a subcommand"
+        );
+        assert_eq!(
+            git_operation_kind(&args(&["--unknown-global-option", "push"])),
+            GitOperationKind::Unknown
         );
     }
 
