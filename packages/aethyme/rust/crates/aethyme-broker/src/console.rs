@@ -25,10 +25,9 @@
 //! takes another port, while deliberately bypassing only the repository-wide
 //! singleton key.
 
-use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
+use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -659,23 +658,9 @@ pub fn write_console_marker(marker: &ConsoleRuntimeMarker) -> io::Result<PathBuf
         ));
     }
 
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let temporary = directory.join(format!(".{}.{}.tmp", marker.file_name(), nonce));
-    let result = (|| {
-        let mut file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temporary)?;
-        crate::host_state::protect_host_state_path(&temporary, false)?;
-        file.write_all(&encoded_file)?;
-        file.sync_all()?;
-        drop(file);
-        match fs::hard_link(&temporary, &path) {
+    crate::atomic_file::with_synced_temporary(&path, &encoded_file, |temporary| {
+        match fs::hard_link(temporary, &path) {
             Ok(()) => {
-                let _ = fs::remove_file(&temporary);
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                 let metadata = fs::symlink_metadata(&path)?;
@@ -689,7 +674,6 @@ pub fn write_console_marker(marker: &ConsoleRuntimeMarker) -> io::Result<PathBuf
                     ));
                 }
                 if fs::read(&path)? == encoded_file {
-                    let _ = fs::remove_file(&temporary);
                 } else {
                     return Err(io::Error::new(
                         io::ErrorKind::AlreadyExists,
@@ -699,13 +683,8 @@ pub fn write_console_marker(marker: &ConsoleRuntimeMarker) -> io::Result<PathBuf
             }
             Err(error) => return Err(error),
         }
-        crate::host_state::protect_host_state_path(&path, false)?;
         Ok(path.clone())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
-    result
+    })
 }
 
 /// Remove a marker after its supervised process and lease have shut down.
