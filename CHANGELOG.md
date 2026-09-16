@@ -6,6 +6,17 @@ artifacts and their exact source revision are recorded in each signed
 
 ## [Unreleased]
 
+## [0.7.20] - 2026-09-16
+
+### Fixed
+
+- Release validation now parses tagged version banners that include build
+  metadata, keeping the release contract aligned with the production binary
+  output.
+
+This is a maintenance release with no runtime or broker-schema changes from
+v0.7.19.
+
 ## [0.7.19] - 2026-09-16
 
 ### Added
