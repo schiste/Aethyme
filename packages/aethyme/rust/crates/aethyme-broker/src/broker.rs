@@ -5800,6 +5800,15 @@ impl Broker {
         let checkout = GitRepo::discover(&worktree_path)?;
         let head = checkout.head_commit()?;
         let (branch, branch_ref, branch_tip) = self.default_branch_tip()?;
+        // Landed work reaches the remote first, and the ship lane deliberately
+        // leaves the local default branch where it was -- every publication
+        // prints "Local main unchanged". Searching only the local ref therefore
+        // excludes exactly the commits a squash-merged session is looking for:
+        // on this machine that search examined zero commits while twenty-three
+        // sat on the remote-tracking ref (#222).
+        let (branch_ref, branch_tip) = self
+            .remote_tracking_default_branch(&branch, &branch_tip)
+            .unwrap_or((branch_ref, branch_tip));
 
         let base = session.diff_base.clone().ok_or_else(|| {
             BrokerOpError::RepresentationUnavailable {
@@ -5949,6 +5958,71 @@ impl Broker {
         )
         .ok()?;
         Some(commit)
+    }
+
+    /// A remote-tracking ref that still holds this commit, verified against the
+    /// remote right now.
+    ///
+    /// Reachability from a pushed ref is the durability property cleanup
+    /// actually needs: it holds whatever the merge strategy did, where ancestry
+    /// against the default branch stops holding the moment a squash rewrites
+    /// the SHA.
+    ///
+    /// The freshness guard is what makes it safe to act on. A remote-tracking
+    /// ref left behind by a branch someone deleted would otherwise prove
+    /// durability for commits the remote no longer has -- on the one path that
+    /// authorizes removing a directory. So the ref must still match what the
+    /// remote reports, and not knowing -- offline, slow, unreadable -- is
+    /// unproven rather than absent. Offline, this evidence simply never fires
+    /// and behaviour is exactly what it was.
+    fn remote_durability_evidence(&self, session_head: &str) -> Option<(String, String)> {
+        const FRESHNESS_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+        let repo = self.repo_handle();
+        for remote_ref in repo.remote_refs_containing(session_head) {
+            let Some(rest) = remote_ref.strip_prefix("refs/remotes/") else {
+                continue;
+            };
+            let Some((remote, branch)) = rest.split_once('/') else {
+                continue;
+            };
+            // `origin/HEAD` is a symbolic alias, not a branch the remote lists.
+            if branch == "HEAD" {
+                continue;
+            }
+            let Some(tracked) = repo.resolve_ref(&remote_ref) else {
+                continue;
+            };
+            let Some(live) = repo.remote_branch_head(remote, branch, FRESHNESS_BUDGET) else {
+                continue;
+            };
+            if live == tracked {
+                return Some((remote_ref, tracked));
+            }
+        }
+        None
+    }
+
+    /// The remote-tracking default branch, when it is strictly ahead of the
+    /// local one.
+    ///
+    /// Returns `None` when the ref is missing, unreadable, or not a descendant
+    /// of the local tip. "Not a descendant" is the case that matters: a local
+    /// branch carrying commits the remote has not seen is not a superset, and
+    /// silently searching the remote instead would drop them from the search
+    /// space rather than add to it.
+    fn remote_tracking_default_branch(
+        &self,
+        branch: &str,
+        local_tip: &str,
+    ) -> Option<(String, String)> {
+        let remote_ref = format!("refs/remotes/origin/{branch}");
+        let remote_tip = self.repo_handle().resolve_ref(&remote_ref)?;
+        if remote_tip == local_tip {
+            return None;
+        }
+        self.repo_handle()
+            .is_ancestor(local_tip, &remote_tip)
+            .then_some((remote_ref, remote_tip))
     }
 
     pub(crate) fn default_branch_tip(&self) -> Result<(String, String, String), BrokerOpError> {
@@ -7252,6 +7326,22 @@ impl Broker {
         let Some(evidence) =
             self.recorded_representation_evidence(session, session_head, delivery_targets)?
         else {
+            // Last resort, and the one that survives any merge strategy: the
+            // commits exist on a remote, so this directory is not where the
+            // work lives.
+            if let Some((remote_ref, tracked)) = self.remote_durability_evidence(session_head) {
+                provenance.representation = CleanupRepresentation::Represented;
+                provenance.pending_commit_count = 0;
+                provenance.represented_on = Some(tracked.clone());
+                return Ok((
+                    provenance,
+                    format!(
+                        "session head {} is reachable from {}, verified current against the remote",
+                        short_commit(session_head),
+                        remote_ref
+                    ),
+                ));
+            }
             return Ok((provenance, reason));
         };
         provenance.representation = CleanupRepresentation::Represented;

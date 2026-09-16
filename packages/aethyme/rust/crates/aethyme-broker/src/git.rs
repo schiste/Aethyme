@@ -1172,6 +1172,83 @@ impl GitRepo {
 
     /// True when `ancestor` is reachable from `descendant`
     /// (`git merge-base --is-ancestor`).
+    /// Remote-tracking refs from which `commit` is reachable.
+    ///
+    /// Reachability from a pushed ref is what makes a worktree disposable: the
+    /// commits survive somewhere that is not this directory. It holds whatever
+    /// the merge strategy did, which ancestry against the default branch does
+    /// not once a squash has rewritten the SHA (#222).
+    pub fn remote_refs_containing(&self, commit: &str) -> Vec<String> {
+        run_git(
+            &self.root,
+            &[
+                "for-each-ref",
+                "--contains",
+                commit,
+                "--format=%(refname)",
+                "refs/remotes/",
+            ],
+        )
+        .map(|output| {
+            output
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+    }
+
+    /// What the remote says a branch points at right now, within a bounded wait.
+    ///
+    /// `None` means "do not know" -- offline, slow, unreadable -- never "absent".
+    /// This is consulted on a path that authorizes deletion, so every caller
+    /// must treat not-knowing as unproven. Bounding the wait matters for the
+    /// same reason it did in the admission lane: `Command::output` has no
+    /// deadline, and a wedged remote would hang a local cleanup (#219).
+    pub fn remote_branch_head(
+        &self,
+        remote: &str,
+        branch: &str,
+        budget: std::time::Duration,
+    ) -> Option<String> {
+        let mut command = Command::new(&git_program().program);
+        command
+            .arg("-C")
+            .arg(&self.root)
+            .args(["ls-remote", "--heads", remote, &format!("refs/heads/{branch}")])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut child = command.spawn().ok()?;
+        let deadline = std::time::Instant::now() + budget;
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) if status.success() => {
+                    let output = child.wait_with_output().ok()?;
+                    let text = String::from_utf8_lossy(&output.stdout);
+                    return text
+                        .lines()
+                        .next()
+                        .and_then(|line| line.split_whitespace().next())
+                        .map(str::to_string);
+                }
+                Ok(Some(_)) => return None,
+                Ok(None) => {}
+                Err(_) => {
+                    let _ = child.kill();
+                    return None;
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+    }
+
     pub fn is_ancestor(&self, ancestor: &str, descendant: &str) -> bool {
         git_command()
             .args(["merge-base", "--is-ancestor", ancestor, descendant])
