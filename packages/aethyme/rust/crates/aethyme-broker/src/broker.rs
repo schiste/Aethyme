@@ -1059,6 +1059,10 @@ pub struct StatusView {
     pub integration_branch: String,
     pub integration_head: String,
     pub main_head: String,
+    /// Ref the integration lead is counted against, named so the number
+    /// is never read against the wrong baseline.
+    pub publication_baseline_ref: String,
+    pub publication_baseline_head: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub upstream_ref: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -5361,14 +5365,18 @@ impl Broker {
             } else {
                 (0, 0)
             };
+        // Against the published branch, not the checkout: the number answers
+        // "what would publishing add to the default branch", which is the only
+        // reading anyone acts on.
+        let (baseline_ref, baseline_head) = self.publication_baseline()?;
         let (integration_relation, integration_ahead_main_commits) =
-            if integration_head == main_head {
+            if integration_head == baseline_head {
                 (StatusIntegrationRelation::CurrentWithMain, 0)
-            } else if self.repo.is_ancestor(&main_head, &integration_head) {
+            } else if self.repo.is_ancestor(&baseline_head, &integration_head) {
                 (
                     StatusIntegrationRelation::AheadOfMain,
                     self.repo
-                        .commit_count_between(&main_head, &integration_head)?,
+                        .commit_count_between(&baseline_head, &integration_head)?,
                 )
             } else {
                 (StatusIntegrationRelation::DivergedFromMain, 0)
@@ -5440,7 +5448,10 @@ impl Broker {
                     session_id: None,
                     queue_entry_id: None,
                     evidence: vec![
-                        format!("local main: {}", short_commit(&main_head)),
+                        format!(
+                            "{baseline_ref}: {}",
+                            short_commit(&baseline_head)
+                        ),
                         format!("{upstream}: {}", short_commit(upstream_head.as_deref().unwrap_or(""))),
                     ],
                     commands: if integration_contains_upstream {
@@ -5754,6 +5765,8 @@ impl Broker {
             .collect::<Vec<_>>();
 
         Ok(StatusView {
+            publication_baseline_ref: baseline_ref,
+            publication_baseline_head: baseline_head,
             summary,
             advice,
             outstanding_advisories: self.store.advisories(false)?,
@@ -6023,6 +6036,37 @@ impl Broker {
         self.repo_handle()
             .is_ancestor(local_tip, &remote_tip)
             .then_some((remote_ref, remote_tip))
+    }
+
+    /// The commit publication actually targets, and a label naming it.
+    ///
+    /// `head_commit()` is whatever branch happens to be checked out, which is
+    /// the default branch only by coincidence. Counting integration's lead
+    /// against it reported "ahead of main by 382 commits" on a checkout sitting
+    /// on an eleven-day-old feature branch, while the lead over the published
+    /// branch was one commit -- and an agent refused to publish on that number.
+    ///
+    /// Preference order is what-is-published first: the remote-tracking default
+    /// branch, then the local default branch, then the checkout. The last two
+    /// keep a repository without a fetched remote working exactly as before,
+    /// and the label says which one answered so the number is never read
+    /// against the wrong baseline again.
+    fn publication_baseline(&self) -> Result<(String, String), BrokerOpError> {
+        let branch = self
+            .repo
+            .symbolic_ref("refs/remotes/origin/HEAD")
+            .and_then(|head_ref| head_ref.rsplit('/').next().map(str::to_string));
+        if let Some(branch) = branch.as_deref() {
+            let remote_ref = format!("refs/remotes/origin/{branch}");
+            if let Some(commit) = self.repo.resolve_ref(&remote_ref) {
+                return Ok((remote_ref, commit));
+            }
+            let local_ref = format!("refs/heads/{branch}");
+            if let Some(commit) = self.repo.resolve_ref(&local_ref) {
+                return Ok((local_ref, commit));
+            }
+        }
+        Ok(("HEAD".to_string(), self.repo.head_commit()?))
     }
 
     pub(crate) fn default_branch_tip(&self) -> Result<(String, String, String), BrokerOpError> {

@@ -11669,7 +11669,18 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     status.integration_branch,
                     &status.integration_head[..12.min(status.integration_head.len())]
                 );
-                out!("Local main:  {}", short_commit(&status.main_head));
+                // Name the ref the lead is counted against. Calling the
+                // checkout "main" reported a 382-commit lead over an
+                // eleven-day-old feature branch that happened to be checked
+                // out, and an agent refused to publish on that number.
+                out!(
+                    "Baseline:    {} @ {}",
+                    status.publication_baseline_ref,
+                    short_commit(&status.publication_baseline_head)
+                );
+                if status.main_head != status.publication_baseline_head {
+                    out!("Checkout:    {}", short_commit(&status.main_head));
+                }
                 if let (Some(upstream_ref), Some(upstream_head)) =
                     (&status.upstream_ref, &status.upstream_head)
                 {
