@@ -6,6 +6,28 @@ artifacts and their exact source revision are recorded in each signed
 
 ## [Unreleased]
 
+## [0.7.21] - 2026-09-16
+
+### Fixed
+
+- Cleanup can release a session whose branch was squash-merged. The recorded
+  representation search now prefers the remote-tracking default branch, which
+  the ship lane never moves, and reachability from a remote ref is accepted as
+  durability under a freshness check that treats not knowing as unproven.
+- A worktree detached from its session branch is released when both the
+  worktree head and the branch tip are proven durable, instead of being refused
+  without asking whether either is lost.
+- The autonomous artifact sweep records how far it got, so an interrupted pass
+  advances the next one instead of re-scanning the head of the session list.
+- Storage exhaustion during a gate is classified as resource contention rather
+  than a test failure, so a full disk no longer records a conclusive verdict
+  that the tree-hash cache replays on every resubmission.
+- `--queue-timeout` and `--no-wait` bound the whole Git admission, including the
+  preparation that contacts the network, and exhaustion reports a distinct
+  admission timeout instead of naming a lock holder that never existed.
+- `broker status` counts the integration lead against the published default
+  branch rather than the checked-out branch, and names the reference it used.
+
 ## [0.7.20] - 2026-09-16
 
 ### Fixed
