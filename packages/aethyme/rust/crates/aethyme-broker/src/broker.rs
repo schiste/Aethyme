@@ -7696,15 +7696,40 @@ impl Broker {
                 unreachable!("entries without a worktree or a branch return None above")
             };
         if worktree_present
-            && provenance.is_some()
-            && branch_tip.as_deref()
-                != provenance
-                    .as_ref()
-                    .map(|provenance| provenance.session_head.as_str())
+            && let Some(worktree_head) = provenance
+                .as_ref()
+                .map(|provenance| provenance.session_head.as_str())
+            && branch_tip.as_deref() != Some(worktree_head)
         {
-            disposition = CleanupDisposition::UnprovenProvenance;
-            reason =
-                "session branch ref is missing or does not match the retained worktree HEAD".into();
+            // A detached worktree sitting somewhere other than its branch is
+            // two commits to account for, not one, and the provenance above
+            // only spoke for the branch. Removing the directory would drop
+            // whatever the worktree is detached on.
+            //
+            // Unless both are durable. Then nothing is dropped, and refusing
+            // only keeps a directory whose entire content exists on a remote.
+            // Both must prove it: proving one and guessing the other is how a
+            // detached head gets discarded quietly.
+            let worktree_durable = self.remote_durability_evidence(worktree_head);
+            let branch_durable = match branch_tip.as_deref() {
+                // No branch left to lose, so the worktree head answers alone.
+                None => Some(("(no branch ref)".to_string(), String::new())),
+                Some(tip) => self.remote_durability_evidence(tip),
+            };
+            match (worktree_durable, branch_durable) {
+                (Some((worktree_ref, _)), Some(_)) => {
+                    disposition = CleanupDisposition::Eligible;
+                    reason = format!(
+                        "worktree is detached on {}, which diverges from the session branch; both are reachable from remote refs and verified current, so neither is lost ({worktree_ref})",
+                        short_commit(worktree_head)
+                    );
+                }
+                _ => {
+                    disposition = CleanupDisposition::UnprovenProvenance;
+                    reason = "session branch ref is missing or does not match the retained                               worktree HEAD"
+                        .into();
+                }
+            }
         }
         let session_head = provenance
             .as_ref()
