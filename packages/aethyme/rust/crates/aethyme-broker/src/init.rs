@@ -515,6 +515,7 @@ pub const CONFIG_SCHEMA_VERSION: i64 = 1;
 /// FAIL — configs written for a newer schema must keep working here.
 const CONFIG_KNOWN_KEYS: &[(&str, &[&str])] = &[
     ("promote", &["mode", "branch"]),
+    ("delivery", &["default"]),
     ("leases", &["ignore", "routing"]),
     ("graph", &["authority", "repository"]),
 ];
@@ -982,6 +983,7 @@ const CONFIG_TEMPLATE: &str = "\
 #   schema            optional; the config schema version (currently 1)
 #   [promote] mode    \"auto\" | \"manual\"
 #   [promote] branch  integration branch name
+#   [delivery] default \"pull_request\" | \"local_main_merge\"
 #   [leases]  ignore  paths never leased (trailing / = directory prefix)
 #   [leases.routing] category = [\"path/\", \"exact/file\"]
 # Unknown keys are ignored at runtime; `aethyme certify` warns on them.
@@ -993,6 +995,13 @@ schema = 1
 # branch immediately. \"manual\" holds them for `aethyme broker promote`.
 mode = \"auto\"
 # branch = \"aethyme/integration\"
+
+# Delivery route for a promoted prefix. The policy is read from the target
+# default branch before a ship plan is made; an explicit pull request is the
+# safer choice when refs diverge. Leave this section absent to preserve the
+# legacy direct-ship behavior in existing repositories.
+# [delivery]
+# default = \"pull_request\"
 
 # [leases]
 # ignore = [\"generated/\"]   # entries ending in / are directory prefixes

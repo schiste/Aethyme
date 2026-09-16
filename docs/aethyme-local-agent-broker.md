@@ -87,6 +87,19 @@ contracts, so any future delivery surface is a client, not a rewrite.
   human promote step makes the human the bottleneck). Gates passing
   promotes immediately; `[promote] mode = "manual"` restores the explicit
   `broker promote` step.
+- **Delivery is explicit and target-aware.** `broker ship plan` reads an
+  optional `[delivery] default = "pull_request" | "local_main_merge"` from
+  the exact remote default-branch commit, never from the pending integration
+  tip. A plan reports the selected route, policy source, compared SHAs,
+  divergence reasons, and a SHA-256 digest. `broker ship execute` must bind
+  configured or overridden routes to that digest. A clean, unchanged local
+  main may use the coordinated non-force publication path; a pull-request
+  route pushes a deterministic branch and verifies the exact GitHub PR head,
+  base, and checks, then stops. An open PR is a proposal, so exposures and
+  publication advisories remain unresolved until the exact commit is verified
+  on the target default branch. Repositories without `[delivery]` retain the
+  legacy route when state is unambiguous, while divergence produces an
+  explicit pull-request recommendation.
 
 ## Current state (be precise about this)
 

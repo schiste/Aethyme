@@ -7,7 +7,8 @@ use std::os::unix::fs::PermissionsExt;
 use aethyme_broker::{
     AdvisoryEvidence, AdvisoryResolutionState, AdvisorySeverity, Broker, BrokerOpError,
     EntryExposureResolutionKind, EntryExposureState, IntegrationDeliveryState, NewAdvisory,
-    OperationIdentityProvenance, OperationStatus, ShipFreshnessResult,
+    OperationIdentityProvenance, OperationStatus, RepositoryDeliveryMode,
+    RepositoryDeliveryModeSource, ShipFreshnessResult,
 };
 
 const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
@@ -122,6 +123,128 @@ impl Fixture {
         self.remote_main()
     }
 
+    fn set_delivery_policy(&self, mode: &str) -> String {
+        std::fs::create_dir_all(self.repo.join(".aethyme")).unwrap();
+        std::fs::write(
+            self.repo.join(".aethyme/config.toml"),
+            format!("[delivery]\ndefault = \"{mode}\"\n"),
+        )
+        .unwrap();
+        git(&self.repo, &["add", "-f", ".aethyme/config.toml"]);
+        git(&self.repo, &["commit", "-qm", "configure delivery"]);
+        git(&self.repo, &["push", "-q", "origin", "main"]);
+        git_output(&self.repo, &["rev-parse", "HEAD"])
+    }
+
+    #[cfg(unix)]
+    fn configure_github_delivery_provider(&self) -> (PathBuf, PathBuf) {
+        git(
+            &self.repo,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "git@github.com:acme/project.git",
+            ],
+        );
+        let fake_bin = self._tmp.path().join("fake-bin");
+        std::fs::create_dir_all(&fake_bin).unwrap();
+        let ssh = fake_bin.join("ssh");
+        std::fs::write(
+            &ssh,
+            r#"#!/bin/sh
+case "$*" in
+  *git-upload-pack*) exec git-upload-pack "$AETHYME_TEST_GIT_REMOTE" ;;
+  *git-receive-pack*) exec git-receive-pack "$AETHYME_TEST_GIT_REMOTE" ;;
+esac
+exit 64
+"#,
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&ssh).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&ssh, permissions).unwrap();
+        git(
+            &self.repo,
+            &["config", "core.sshCommand", ssh.to_str().unwrap()],
+        );
+
+        let state = self._tmp.path().join("fake-pr-state");
+        let gh = fake_bin.join("gh");
+        std::fs::write(
+            &gh,
+            r#"#!/bin/sh
+state="$AETHYME_FAKE_PR_STATE"
+render_pr() {
+  branch=$(sed -n '1p' "$state")
+  head=$(git -C "$AETHYME_TEST_REPO" rev-parse "refs/heads/$branch") || exit 1
+  base=$(git -C "$AETHYME_TEST_REPO" rev-parse refs/remotes/origin/main) || exit 1
+  printf '{"number":7,"url":"https://github.com/acme/project/pull/7","state":"OPEN","isDraft":false,"mergedAt":null,"headRefName":"%s","headRefOid":"%s","headRepository":{"nameWithOwner":"acme/project"},"baseRefName":"main","baseRefOid":"%s","statusCheckRollup":[]}' "$branch" "$head" "$base"
+}
+if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
+  if [ ! -f "$state" ]; then
+    printf '[]\n'
+  else
+    printf '['
+    render_pr
+    printf ']\n'
+  fi
+  exit 0
+fi
+if [ "$1" = "pr" ] && [ "$2" = "create" ]; then
+  shift 2
+  branch=""
+  while [ "$#" -gt 0 ]; do
+    if [ "$1" = "--head" ]; then
+      branch="$2"
+      shift 2
+    else
+      shift
+    fi
+  done
+  printf '%s\n' "$branch" > "$state"
+  printf 'https://github.com/acme/project/pull/7\n'
+  exit 0
+fi
+if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+  render_pr
+  printf '\n'
+  exit 0
+fi
+exit 64
+"#,
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&gh).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&gh, permissions).unwrap();
+        (fake_bin, state)
+    }
+
+    #[cfg(unix)]
+    fn run_delivery_cli(
+        &self,
+        args: &[&str],
+        fake_bin: &Path,
+        state: &Path,
+    ) -> std::process::Output {
+        let path = format!(
+            "{}:{}",
+            fake_bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        Command::new(CLI)
+            .args(args)
+            .current_dir(&self.repo)
+            .env("PATH", path)
+            .env("AETHYME_HOST_STATE_DIR", self.host_operations.parent().unwrap())
+            .env("AETHYME_TEST_GIT_REMOTE", &self.remote)
+            .env("AETHYME_TEST_REPO", &self.repo)
+            .env("AETHYME_FAKE_PR_STATE", state)
+            .output()
+            .unwrap()
+    }
+
     #[cfg(unix)]
     fn install_hook(&self, name: &str, script: &str) -> PathBuf {
         let path = self.remote.join("hooks").join(name);
@@ -176,6 +299,13 @@ fn ship_plan_reports_exact_tip_and_does_not_mutate_refs() {
     );
     assert_eq!(plan.target.remote_name, "origin");
     assert!(plan.target.caller_assertion.is_none());
+    assert_eq!(plan.delivery.mode, RepositoryDeliveryMode::LocalMainMerge);
+    assert_eq!(
+        plan.delivery.source,
+        RepositoryDeliveryModeSource::LegacyDefault
+    );
+    assert!(plan.delivery.divergence_reasons.is_empty());
+    assert_eq!(plan.plan_digest.len(), 64);
     assert_eq!(
         plan.proposed_push.refspec,
         format!("{}:refs/heads/main", plan.publication_sha)
@@ -197,6 +327,267 @@ fn ship_plan_reports_exact_tip_and_does_not_mutate_refs() {
         EntryExposureState::Outstanding,
         "read-only ship planning must not resolve publication exposure"
     );
+}
+
+#[test]
+fn ship_plan_accepts_an_explicit_delivery_override_and_binds_its_digest() {
+    let fixture = Fixture::new();
+    let (entry_id, _, _) = fixture.promoted_entry();
+    let refs_before = fixture.refs();
+    let mut broker = fixture.broker();
+
+    let plan = broker
+        .ship_plan_with_delivery(entry_id, Some(RepositoryDeliveryMode::PullRequest))
+        .unwrap();
+
+    assert_eq!(plan.delivery.mode, RepositoryDeliveryMode::PullRequest);
+    assert_eq!(
+        plan.delivery.source,
+        RepositoryDeliveryModeSource::CliOverride
+    );
+    assert!(!plan.delivery.requires_explicit_selection);
+    assert_eq!(plan.plan_digest.len(), 64);
+    assert_eq!(
+        plan.proposed_push.destination_ref,
+        format!(
+            "refs/heads/aethyme/delivery/q{}-{}",
+            entry_id,
+            &plan.publication_sha[..12]
+        )
+    );
+    assert_eq!(
+        fixture.refs(),
+        refs_before,
+        "an explicit delivery plan must remain read-only"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn pull_request_delivery_pushes_and_reuses_one_exact_provider_pr() {
+    let fixture = Fixture::new();
+    let (entry_id, _, integration) = fixture.promoted_entry();
+    let (fake_bin, state) = fixture.configure_github_delivery_provider();
+    let entry = entry_id.to_string();
+    let planned = fixture.run_delivery_cli(
+        &[
+            "ship",
+            "plan",
+            "--entry",
+            &entry,
+            "--delivery",
+            "pull_request",
+            "--json",
+        ],
+        &fake_bin,
+        &state,
+    );
+    assert!(
+        planned.status.success(),
+        "{}",
+        String::from_utf8_lossy(&planned.stderr)
+    );
+    let plan: serde_json::Value = serde_json::from_slice(&planned.stdout).unwrap();
+    assert_eq!(plan["target"]["normalized_host"], "github.com");
+    assert_eq!(plan["delivery"]["mode"], "pull_request");
+    assert_eq!(plan["delivery"]["source"], "cli_override");
+    let plan_digest = plan["plan_digest"].as_str().unwrap().to_string();
+    let remote_before = fixture.remote_main();
+    let execute = fixture.run_delivery_cli(
+        &[
+            "ship",
+            "execute",
+            "--entry",
+            &entry,
+            "--confirm",
+            &integration,
+            "--delivery",
+            "pull_request",
+            "--plan",
+            &plan_digest,
+            "--json",
+        ],
+        &fake_bin,
+        &state,
+    );
+    assert!(
+        execute.status.success(),
+        "stderr: {}\nstdout: {}",
+        String::from_utf8_lossy(&execute.stderr),
+        String::from_utf8_lossy(&execute.stdout)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&execute.stdout).unwrap();
+    let report = &report["PullRequest"];
+    assert_eq!(report["delivery_state"], "pull_request_open");
+    assert_eq!(report["pull_request"]["number"], 7);
+    assert_eq!(report["pull_request"]["head_sha"], integration);
+    assert!(report["resolved_exposures"].as_array().unwrap().is_empty());
+    assert_eq!(fixture.remote_main(), remote_before);
+    let branch = report["branch"].as_str().unwrap().to_string();
+    let remote_branch_ref = format!("refs/heads/{branch}");
+    assert_eq!(
+        git_output(&fixture.remote, &["rev-parse", &remote_branch_ref]),
+        integration
+    );
+
+    let retry = fixture.run_delivery_cli(
+        &[
+            "ship",
+            "execute",
+            "--entry",
+            &entry,
+            "--confirm",
+            &integration,
+            "--delivery",
+            "pull_request",
+            "--plan",
+            &plan_digest,
+            "--json",
+        ],
+        &fake_bin,
+        &state,
+    );
+    assert!(
+        retry.status.success(),
+        "{}",
+        String::from_utf8_lossy(&retry.stderr)
+    );
+    let operations = fixture.run_delivery_cli(
+        &["operations", "list", "--json"],
+        &fake_bin,
+        &state,
+    );
+    assert!(operations.status.success());
+    let operations = String::from_utf8(operations.stdout).unwrap();
+    assert_eq!(
+        operations.matches("delivery:pr-create:").count(),
+        1,
+        "retry must reuse the existing provider PR"
+    );
+}
+
+#[test]
+fn ship_plan_reads_the_delivery_policy_from_the_remote_default_commit() {
+    let fixture = Fixture::new();
+    let policy_commit = fixture.set_delivery_policy("pull_request");
+    let (entry_id, _, _) = fixture.promoted_entry();
+    let mut broker = fixture.broker();
+
+    let plan = broker.ship_plan(entry_id).unwrap();
+
+    assert_eq!(plan.delivery.mode, RepositoryDeliveryMode::PullRequest);
+    assert_eq!(
+        plan.delivery.source,
+        RepositoryDeliveryModeSource::TrustedConfig
+    );
+    assert_eq!(
+        plan.delivery.trusted_config_commit, policy_commit,
+        "the policy must be bound to the observed remote default commit"
+    );
+    assert_eq!(
+        plan.delivery
+            .trusted_config_digest
+            .as_ref()
+            .map(String::len),
+        Some(64)
+    );
+    assert_eq!(plan.plan_digest.len(), 64);
+    assert!(matches!(
+        broker.ship_plan_with_delivery(entry_id, Some(RepositoryDeliveryMode::LocalMainMerge)),
+        Err(BrokerOpError::ShipDeliveryOverrideUnsafe { .. })
+    ));
+}
+
+#[test]
+fn local_main_delivery_preserves_then_merges_and_publishes_the_reviewed_sha() {
+    let fixture = Fixture::new();
+    let _ = fixture.set_delivery_policy("local_main_merge");
+    let (entry_id, _, integration) = fixture.promoted_entry();
+    let mut broker = fixture.broker();
+    let plan = broker.ship_plan(entry_id).unwrap();
+
+    let report = broker
+        .ship_execute_delivery(
+            entry_id,
+            &integration,
+            None,
+            Some(&plan.plan_digest),
+            false,
+            false,
+            None,
+        )
+        .unwrap();
+    let aethyme_broker::DeliveryExecutionReport::LocalMainMerge {
+        ship,
+        preservation_operation,
+        merge_operation,
+        plan_digest,
+    } = report
+    else {
+        panic!("configured local delivery should use the local-main route");
+    };
+    assert_eq!(plan_digest, plan.plan_digest);
+    assert!(preservation_operation.is_some());
+    assert!(merge_operation.is_some());
+    assert_eq!(ship.published_sha, integration);
+    assert_eq!(fixture.remote_main(), integration);
+    assert_eq!(
+        git_output(&fixture.repo, &["rev-parse", "refs/heads/main"]),
+        integration
+    );
+    assert!(!ship.resolved_exposures.is_empty());
+}
+
+#[test]
+fn ship_plan_recommends_explicit_pull_request_delivery_for_a_dirty_main_checkout() {
+    let fixture = Fixture::new();
+    let (entry_id, _, integration) = fixture.promoted_entry();
+    std::fs::write(fixture.repo.join("operator-note.txt"), "keep me\n").unwrap();
+    let mut broker = fixture.broker();
+
+    let plan = broker.ship_plan(entry_id).unwrap();
+    assert_eq!(
+        plan.delivery.source,
+        RepositoryDeliveryModeSource::DivergenceRecommendation
+    );
+    assert_eq!(plan.delivery.mode, RepositoryDeliveryMode::PullRequest);
+    assert_eq!(
+        plan.delivery.recommended_mode,
+        Some(RepositoryDeliveryMode::PullRequest)
+    );
+    assert!(plan.delivery.requires_explicit_selection);
+    assert!(plan
+        .delivery
+        .divergence_reasons
+        .iter()
+        .any(|reason| reason.starts_with("working_tree_not_clean")));
+
+    let error = broker
+        .ship_execute_delivery(entry_id, &integration, None, None, false, false, None)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        BrokerOpError::ShipDeliveryRequiresExplicitSelection { .. }
+    ));
+    assert!(broker.store().coordinated_operations().unwrap().is_empty());
+}
+
+#[test]
+fn ship_plan_rejects_an_invalid_trusted_delivery_policy() {
+    let fixture = Fixture::new();
+    let _ = fixture.set_delivery_policy("not-a-route");
+    let (entry_id, _, _) = fixture.promoted_entry();
+    let mut broker = fixture.broker();
+
+    let error = broker.ship_plan(entry_id).unwrap_err();
+    assert!(matches!(
+        error,
+        BrokerOpError::ShipPlanUnavailable {
+            what: "trusted delivery policy",
+            ..
+        }
+    ));
+    assert!(error.to_string().contains("not-a-route"));
 }
 
 #[test]

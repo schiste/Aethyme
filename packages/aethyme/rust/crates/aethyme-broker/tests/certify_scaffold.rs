@@ -375,7 +375,7 @@ fn config_schema_key_is_accepted_and_unknown_keys_warn_never_fail() {
     // The declared schema (and the full known surface) certifies clean.
     std::fs::write(
         &config,
-        "schema = 1\n[promote]\nmode = \"manual\"\nbranch = \"b\"\n[leases]\nignore = [\"x/\"]\n",
+        "schema = 1\n[promote]\nmode = \"manual\"\nbranch = \"b\"\n[delivery]\ndefault = \"pull_request\"\n[leases]\nignore = [\"x/\"]\n",
     )
     .unwrap();
     let check = certify_config();
