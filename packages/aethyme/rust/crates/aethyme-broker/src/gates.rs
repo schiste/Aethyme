@@ -1844,6 +1844,17 @@ fn is_timeout_error(exit_code: i32, log_path: &Path) -> bool {
 }
 
 fn is_resource_contention_error(command: &str, log_path: &Path) -> bool {
+    // Storage exhaustion is never a verdict on the diff, and it does not depend
+    // on which command hit it or where in the tree it surfaced. Checking it
+    // before the cargo split is the whole point: a cargo gate whose *test* ran
+    // out of space -- not its build -- leaves no `target/` context, so the
+    // cargo branch below returned false and the run fell through to
+    // `TestFailure`. That records a conclusive `Fail`, which the tree-hash
+    // cache then replays on every resubmission of the same tree, so a full disk
+    // condemns the very change that would free it (#222).
+    if log_contains_any(log_path, &["no space left on device"]) {
+        return true;
+    }
     if !command_mentions_cargo(command) {
         return log_contains_any(
             log_path,
@@ -2388,6 +2399,61 @@ mod tests {
     /// tuple was never the bug -- `Error` / `Environment` was already correct.
     /// What an operator got was a verdict with a cause that existed for one
     /// stack frame and was then discarded.
+    /// A full disk is not a verdict on the diff, and a cargo gate is where it
+    /// is most likely to be mistaken for one.
+    ///
+    /// The regression this pins: the log of a `cargo test` run whose *test*
+    /// exhausted the volume carries no `target/` context, so the cargo-specific
+    /// branch of the contention check ignored it and the run was classified
+    /// `Fail` / `TestFailure`. A conclusive `Fail` is cached against the tree
+    /// hash and replayed, so the tree stayed condemned until the row was
+    /// deleted by hand.
+    #[test]
+    fn a_full_disk_is_contention_whatever_ran_into_it() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // The shape observed in the field: a test, not the build, hit the wall.
+        let test_log = tmp.path().join("test.log");
+        std::fs::write(
+            &test_log,
+            "running 6 tests\nredb: I/O error: No space left on device (os error 28)\n",
+        )
+        .unwrap();
+        let (status, class, _) = classify_gate_result(
+            "cargo test --workspace",
+            &test_log,
+            Ok(GateCommandOutcome {
+                timed_out: false,
+                exit_code: Some(101),
+                resource_error: None,
+                first_output_ms: None,
+                output_bytes: 0,
+            }),
+        );
+        assert_eq!(status, GateStatus::Error, "a full disk is not a verdict");
+        assert_eq!(class, Some(GateFailureClass::ResourceContention));
+        // An Error is never replayed as a cached verdict, which is what keeps
+        // the tree from staying condemned.
+        assert_eq!(cached_failure_class(status), None);
+
+        // Still a test failure when the log says nothing about storage.
+        let clean_log = tmp.path().join("clean.log");
+        std::fs::write(&clean_log, "assertion failed: left == right\n").unwrap();
+        let (status, class, _) = classify_gate_result(
+            "cargo test --workspace",
+            &clean_log,
+            Ok(GateCommandOutcome {
+                timed_out: false,
+                exit_code: Some(101),
+                resource_error: None,
+                first_output_ms: None,
+                output_bytes: 0,
+            }),
+        );
+        assert_eq!(status, GateStatus::Fail);
+        assert_eq!(class, Some(GateFailureClass::TestFailure));
+    }
+
     #[test]
     fn a_gate_that_could_not_start_says_why_in_its_log() {
         let tmp = tempfile::tempdir().unwrap();
