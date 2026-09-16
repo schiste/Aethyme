@@ -37,6 +37,150 @@ pub enum QueueWait {
     Seconds(u64),
 }
 
+/// How long `--no-wait` admission may spend preparing before it gives up.
+///
+/// `--no-wait` says "refuse rather than queue", not "do no work": remote
+/// resolution and a pre-push dry run still have to run, and against a healthy
+/// remote they take seconds. A budget keeps "promptly" meaningful without
+/// turning a slow network into a refusal on every call.
+const NO_WAIT_ADMISSION_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How often a bounded child is checked for completion.
+const ADMISSION_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// The wall-clock bound on everything an admission does before it holds the
+/// repository lane.
+///
+/// `--queue-timeout` reads as a bound on the command returning, and that is how
+/// callers use it. It bounded only the `flock`, while the preparation in front
+/// of that lock -- remote resolution, a pre-push dry run that contacts the
+/// network -- carried no deadline at all. A wedged remote therefore hung both
+/// `--queue-timeout 60` and `--no-wait` (#219).
+///
+/// The budget is shared, not per-stage: whatever preparation spends is taken
+/// out of what the lock may wait. Otherwise a 60 second request could still
+/// park for 120.
+#[derive(Debug, Clone, Copy)]
+struct AdmissionDeadline {
+    at: Option<std::time::Instant>,
+    budget: Option<std::time::Duration>,
+}
+
+impl AdmissionDeadline {
+    fn start(queue_wait: QueueWait) -> Self {
+        let budget = match queue_wait {
+            // Waiting forever is a deliberate choice; honour it rather than
+            // inventing a bound the caller did not ask for.
+            QueueWait::Forever => None,
+            QueueWait::Refuse => Some(NO_WAIT_ADMISSION_BUDGET),
+            QueueWait::Seconds(seconds) => Some(std::time::Duration::from_secs(seconds)),
+        };
+        Self {
+            at: budget.map(|budget| std::time::Instant::now() + budget),
+            budget,
+        }
+    }
+
+    fn budget_label(&self) -> String {
+        self.budget
+            .map(|budget| humanize_duration(budget.as_secs()))
+            .unwrap_or_else(|| "unbounded".into())
+    }
+
+    fn remaining(&self) -> Option<std::time::Duration> {
+        self.at
+            .map(|at| at.saturating_duration_since(std::time::Instant::now()))
+    }
+
+    fn expired(&self) -> bool {
+        self.remaining().is_some_and(|left| left.is_zero())
+    }
+
+    /// Refuse before starting a stage whose budget is already gone. `stage`
+    /// completes "while ...", so it reads as the thing that was being done.
+    fn check(&self, repository: &str, stage: &str) -> Result<(), BrokerOpError> {
+        if self.expired() {
+            return Err(BrokerOpError::AdmissionTimedOut {
+                repository: repository.into(),
+                stage: stage.into(),
+                budget: self.budget_label(),
+            });
+        }
+        Ok(())
+    }
+
+    /// What the lock may still wait for, after preparation took its share.
+    ///
+    /// A caller who asked to refuse still refuses; a caller who asked to wait
+    /// forever still waits. Only a bounded request is narrowed.
+    fn remaining_queue_wait(&self, queue_wait: QueueWait) -> QueueWait {
+        match queue_wait {
+            QueueWait::Forever | QueueWait::Refuse => queue_wait,
+            QueueWait::Seconds(_) => match self.remaining() {
+                // Zero would read as "wait none" and silently become a refusal
+                // with the wrong error; the caller checks expiry before this.
+                Some(left) => QueueWait::Seconds(left.as_secs().max(1)),
+                None => queue_wait,
+            },
+        }
+    }
+}
+
+/// Run a child to completion, or kill it when the admission budget is gone.
+///
+/// `Command::output` waits without a deadline, which is exactly how a wedged
+/// remote turned a bounded request into an unbounded one. Output is small and
+/// fully drained after exit, so polling `try_wait` cannot deadlock on a full
+/// pipe here; a chattier command would need concurrent draining.
+fn output_within(
+    mut command: Command,
+    deadline: AdmissionDeadline,
+    repository: &str,
+    stage: &str,
+) -> Result<std::process::Output, BrokerOpError> {
+    deadline.check(repository, stage)?;
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|source| BrokerOpError::OperationIo {
+            path: PathBuf::from("git"),
+            source,
+        })?;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                return child
+                    .wait_with_output()
+                    .map_err(|source| BrokerOpError::OperationIo {
+                        path: PathBuf::from("git"),
+                        source,
+                    });
+            }
+            Ok(None) => {}
+            Err(source) => {
+                let _ = child.kill();
+                return Err(BrokerOpError::OperationIo {
+                    path: PathBuf::from("git"),
+                    source,
+                });
+            }
+        }
+        if deadline.expired() {
+            // Killing is the point: leaving it behind would keep contacting the
+            // remote after the caller was told nothing happened.
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(BrokerOpError::AdmissionTimedOut {
+                repository: repository.into(),
+                stage: stage.into(),
+                budget: deadline.budget_label(),
+            });
+        }
+        std::thread::sleep(ADMISSION_POLL_INTERVAL);
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CoordinatedCommand {
     pub session_id: i64,
@@ -2380,6 +2524,9 @@ impl Broker {
         P: FnOnce() -> Result<(), String>,
         F: FnOnce(&[u8], i64) -> Result<Option<serde_json::Value>, String>,
     {
+        // Starts before any preparation, so what preparation spends is taken
+        // out of what the lock may wait (#219).
+        let admission = AdmissionDeadline::start(queue_wait);
         if request.args.is_empty() {
             return Err(BrokerOpError::InvalidCoordinatedOperation {
                 reason: format!(
@@ -2645,7 +2792,7 @@ impl Broker {
             dry_run.arg("push").arg("--dry-run");
             dry_run.args(&request.args[command_index + 1..]);
             dry_run.current_dir(cwd);
-            match dry_run.output() {
+            match output_within(dry_run, admission, &repository, "running the pre-push dry run") {
                 Ok(output) if output.status.success() => {}
                 Ok(output) => {
                     // Failing here is the point: nothing is queued, and no other
@@ -2658,12 +2805,9 @@ impl Broker {
                         ),
                     });
                 }
-                Err(source) => {
+                Err(error) => {
                     self.resolve_unstarted_operation(queued_operation_id, "pre_push_unavailable");
-                    return Err(BrokerOpError::OperationIo {
-                        path: cwd.to_path_buf(),
-                        source,
-                    });
+                    return Err(error);
                 }
             }
             Some(plan_exact_push(
@@ -2680,11 +2824,15 @@ impl Broker {
             None
         } else {
             let main_root = self.main_root().to_path_buf();
+            if let Err(error) = admission.check(&repository, "preparing the operation") {
+                self.resolve_unstarted_operation(queued_operation_id, "admission_timed_out");
+                return Err(error);
+            }
             match RepositoryWriteLock::acquire(
                 &main_root,
                 &lock_key,
                 || describe_lock_holder(self.store(), &repository),
-                queue_wait,
+                admission.remaining_queue_wait(queue_wait),
             ) {
                 Ok(lock) => Some(lock),
                 Err(error) => {
@@ -3717,6 +3865,75 @@ mod tests {
             Some(OperationEffect::Destructive)
         );
         assert_eq!(classify_gh(&args(&["extension", "exec", "x"])), None);
+    }
+
+    /// `--no-wait` must still bound its own preparation. Without a budget it
+    /// inherits the unbounded wait it exists to avoid (#219).
+    #[test]
+    fn no_wait_admission_is_bounded_and_forever_is_not() {
+        assert!(AdmissionDeadline::start(QueueWait::Refuse).at.is_some());
+        assert!(AdmissionDeadline::start(QueueWait::Seconds(60)).at.is_some());
+        assert!(AdmissionDeadline::start(QueueWait::Forever).at.is_none());
+        assert_eq!(
+            AdmissionDeadline::start(QueueWait::Forever).budget_label(),
+            "unbounded"
+        );
+    }
+
+    /// The budget is shared between preparation and the lock, so a bounded
+    /// request cannot spend its timeout twice.
+    #[test]
+    fn the_lock_only_gets_what_preparation_left() {
+        let admission = AdmissionDeadline::start(QueueWait::Seconds(60));
+        match admission.remaining_queue_wait(QueueWait::Seconds(60)) {
+            QueueWait::Seconds(left) => assert!(left <= 60, "{left}"),
+            other => panic!("expected a narrowed bound, got {other:?}"),
+        }
+
+        // A caller who asked to refuse still refuses; one who asked to wait
+        // forever still waits.
+        assert_eq!(
+            admission.remaining_queue_wait(QueueWait::Refuse),
+            QueueWait::Refuse
+        );
+        assert_eq!(
+            AdmissionDeadline::start(QueueWait::Forever).remaining_queue_wait(QueueWait::Forever),
+            QueueWait::Forever
+        );
+    }
+
+    /// The defect itself: preparation that outruns the budget must be killed
+    /// and reported, not waited on. A wedged remote is what this stands in for.
+    #[test]
+    fn preparation_that_outruns_the_budget_is_killed_and_reported() {
+        let mut sleeper = Command::new("sleep");
+        sleeper.arg("30");
+        let started = std::time::Instant::now();
+        let error = output_within(
+            sleeper,
+            AdmissionDeadline::start(QueueWait::Seconds(1)),
+            "owner/repo",
+            "running the pre-push dry run",
+        )
+        .expect_err("a child outliving the budget must not be waited on");
+
+        match error {
+            BrokerOpError::AdmissionTimedOut {
+                repository,
+                stage,
+                budget,
+            } => {
+                assert_eq!(repository, "owner/repo");
+                assert_eq!(stage, "running the pre-push dry run");
+                assert_eq!(budget, humanize_duration(1));
+            }
+            other => panic!("expected AdmissionTimedOut, got {other:?}"),
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "returned after {:?}, so the child was waited on rather than killed",
+            started.elapsed()
+        );
     }
 
     #[test]

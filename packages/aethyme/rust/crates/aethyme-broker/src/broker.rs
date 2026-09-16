@@ -79,6 +79,20 @@ pub enum BrokerOpError {
         holder: String,
         waited: String,
     },
+    /// Admission spent its whole budget before it held the repository lane.
+    ///
+    /// Distinct from [`BrokerOpError::CoordinatedLockBusy`] on purpose: that one
+    /// names a holder the caller can go look at, this one says the caller's own
+    /// preparation ran out of time. Conflating them would send an operator
+    /// hunting for a lock holder that never existed (#219).
+    #[error(
+        "admission for {repository} exceeded its {budget} budget while {stage}; nothing was queued and nothing ran -- retry, or allow more time with --queue-timeout"
+    )]
+    AdmissionTimedOut {
+        repository: String,
+        stage: String,
+        budget: String,
+    },
 
     #[error(transparent)]
     Git(#[from] GitError),
