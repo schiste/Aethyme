@@ -44,6 +44,30 @@ pub const UNCLASSIFIED_ARTIFACT_REPORT_THRESHOLD_BYTES: u64 = 4 * 1024;
 
 /// `meta` key holding the last autonomous artifact sweep time.
 const ARTIFACT_SWEEP_STAMP_KEY: &str = "gc.artifact_sweep.last_run_ms";
+/// Session id the last unfinished sweep stopped after.
+///
+/// Without it an interrupted pass restarts at the lowest session id, so a
+/// budget smaller than one full scan services the head of the list forever and
+/// never reaches the backlog behind it. The cadence stamp records *when* a pass
+/// ran; this records *how far* it got (#222).
+const ARTIFACT_SWEEP_CURSOR_KEY: &str = "gc.artifact_sweep.cursor_session_id";
+
+/// Visit order for one sweep pass: everything after the cursor, then the head
+/// of the list.
+///
+/// The wrap matters as much as the resume. Without it a pass starting near the
+/// end of the list would report itself complete after a handful of sessions,
+/// clear the cursor, and send the next pass back to the top -- so the middle of
+/// the list would never be reached. With it, one uninterrupted pass is a full
+/// lap whatever the cursor was.
+fn sweep_order<T: Clone>(items: &[T], cursor: i64, id: impl Fn(&T) -> i64) -> Vec<T> {
+    items
+        .iter()
+        .filter(|item| id(item) > cursor)
+        .chain(items.iter().filter(|item| id(item) <= cursor))
+        .cloned()
+        .collect()
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ArtifactWitness {
@@ -1426,7 +1450,10 @@ impl Broker {
     /// at the deadline mid-directory and leaves the tree still classified as
     /// the build cache it is. An unfinished pass withholds the cadence stamp,
     /// so the next broker open resumes instead of waiting out the interval,
-    /// and a backlog that cannot fit in one budget still drains.
+    /// and records the session it stopped after so the next
+    /// pass continues from there. Resuming without that cursor re-scans the
+    /// head of the list every time, which is why a backlog larger than one
+    /// budget used to sit untouched behind it (#222).
     fn sweep_artifacts_autonomously(
         &mut self,
         policy: &RetentionPolicy,
@@ -1459,7 +1486,15 @@ impl Broker {
         let mut removed = Vec::new();
         let mut eligible_worktree_seen = false;
         let mut scan_completed = true;
-        for session in self.store().cleaned_sessions()? {
+        let cursor = self
+            .store()
+            .meta_get(ARTIFACT_SWEEP_CURSOR_KEY)?
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+        let mut last_visited = cursor;
+        let all = self.store().cleaned_sessions()?;
+        for session in sweep_order(&all, cursor, |session| session.id) {
+            last_visited = session.id;
             if live.contains(&session.id) {
                 continue;
             }
@@ -1523,6 +1558,15 @@ impl Broker {
         if eligible_worktree_seen && scan_completed {
             self.store()
                 .meta_set(ARTIFACT_SWEEP_STAMP_KEY, &now.to_string())?;
+        }
+        // A finished lap starts the next one from the top; an interrupted pass
+        // remembers where it stopped so the next one advances instead of
+        // re-walking what it already cleared.
+        if scan_completed {
+            self.store().meta_set(ARTIFACT_SWEEP_CURSOR_KEY, "0")?;
+        } else {
+            self.store()
+                .meta_set(ARTIFACT_SWEEP_CURSOR_KEY, &last_visited.to_string())?;
         }
         if !removed.is_empty() {
             let payload = serde_json::json!({
@@ -2014,6 +2058,26 @@ mod tests {
         );
         assert!(parsed.remaining_checkpoint_pin_releases.is_empty());
         assert!(parsed.remaining_publication_exposure_expiries.is_empty());
+    }
+
+    /// One interrupted pass must advance the next one, and one uninterrupted
+    /// pass must still be a full lap whatever the cursor was.
+    #[test]
+    fn a_sweep_resumes_after_the_cursor_and_still_wraps_to_the_head() {
+        let sessions = [1_i64, 2, 3, 4, 5];
+
+        // A fresh cursor visits everything in order.
+        assert_eq!(sweep_order(&sessions, 0, |id| *id), vec![1, 2, 3, 4, 5]);
+
+        // After stopping at 3, the next pass starts at 4 -- and still covers
+        // 1..=3 afterwards, so nothing is starved.
+        assert_eq!(sweep_order(&sessions, 3, |id| *id), vec![4, 5, 1, 2, 3]);
+
+        // A cursor past the end degenerates to a normal full lap rather than
+        // an empty pass.
+        assert_eq!(sweep_order(&sessions, 99, |id| *id), vec![1, 2, 3, 4, 5]);
+
+        assert!(sweep_order(&[] as &[i64], 7, |id| *id).is_empty());
     }
 
     fn dir(root: &Path, relative: &str) -> PathBuf {
