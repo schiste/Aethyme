@@ -536,6 +536,68 @@ fn local_main_delivery_preserves_then_merges_and_publishes_the_reviewed_sha() {
         integration
     );
     assert!(!ship.resolved_exposures.is_empty());
+
+    let retry_plan = broker.ship_plan(entry_id).unwrap();
+    let retry = broker
+        .ship_execute_delivery(
+            entry_id,
+            &integration,
+            None,
+            Some(&retry_plan.plan_digest),
+            false,
+            false,
+            None,
+        )
+        .unwrap();
+    let aethyme_broker::DeliveryExecutionReport::LocalMainMerge {
+        preservation_operation,
+        merge_operation,
+        ..
+    } = retry
+    else {
+        panic!("configured local retry should remain on the local-main route");
+    };
+    assert!(preservation_operation.is_none());
+    assert!(merge_operation.is_none());
+}
+
+#[test]
+fn configured_local_main_delivery_refuses_unrepresented_main_commits_before_writes() {
+    let fixture = Fixture::new();
+    let _ = fixture.set_delivery_policy("local_main_merge");
+    let (entry_id, _, integration) = fixture.promoted_entry();
+    std::fs::write(fixture.repo.join("local-only.txt"), "do not discard\n").unwrap();
+    git(&fixture.repo, &["add", "local-only.txt"]);
+    git(&fixture.repo, &["commit", "-qm", "local-only work"]);
+    let local_only = git_output(&fixture.repo, &["rev-parse", "HEAD"]);
+    let remote_before = fixture.remote_main();
+    let mut broker = fixture.broker();
+    let plan = broker.ship_plan(entry_id).unwrap();
+
+    assert!(!plan.local_main_sync_safe);
+    assert_eq!(
+        plan.local_main_sync_assessment.local_commits_not_in_integration,
+        vec![local_only.clone()]
+    );
+    let error = broker
+        .ship_execute_delivery(
+            entry_id,
+            &integration,
+            None,
+            Some(&plan.plan_digest),
+            false,
+            false,
+            None,
+        )
+        .unwrap_err();
+    assert!(matches!(error, BrokerOpError::ShipLocalMainUnsafe { .. }));
+    assert!(error.to_string().contains("not represented by integration"));
+    assert!(broker.store().coordinated_operations().unwrap().is_empty());
+    assert_eq!(fixture.remote_main(), remote_before);
+    assert_eq!(
+        git_output(&fixture.repo, &["rev-parse", "refs/heads/main"]),
+        local_only
+    );
 }
 
 #[test]

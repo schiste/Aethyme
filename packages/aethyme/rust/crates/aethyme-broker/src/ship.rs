@@ -1168,6 +1168,25 @@ impl Broker {
                     });
                 }
 
+                // A configured or explicitly selected local-main route must
+                // honor the complete read-only assessment from the plan. In
+                // particular, a local tip with commits absent from
+                // integration is not an authorized fast-forward source even
+                // if a later re-check happens to look clean.
+                if !plan.local_main_sync_safe {
+                    let default_branch = plan
+                        .local_default_branch_ref
+                        .strip_prefix("refs/heads/")
+                        .unwrap_or(&plan.local_default_branch_ref);
+                    return Err(BrokerOpError::ShipLocalMainUnsafe {
+                        reason: local_main_sync_refusal(
+                            &plan.local_main_sync_assessment,
+                            default_branch,
+                            &plan,
+                        ),
+                    });
+                }
+
                 let preservation_operation =
                     preserve_local_main_before_delivery(self, &plan, confirm)?;
                 let merge_operation = merge_local_main_before_delivery(self, &plan, confirm)?;
@@ -1558,6 +1577,40 @@ fn preserve_local_main_before_delivery(
             ),
         });
     }
+
+    let main_root = broker.main_root_path();
+    let repo = GitRepo::discover(&main_root).map_err(BrokerOpError::Git)?;
+    let default_branch = plan
+        .local_default_branch_ref
+        .strip_prefix("refs/heads/")
+        .unwrap_or(&plan.local_default_branch_ref)
+        .to_string();
+    let assessment = assess_local_main_sync_repo(
+        &repo,
+        &default_branch,
+        &plan.local_default_branch_ref,
+        &plan.local_default_branch_sha,
+        confirm,
+    )
+    .map_err(|reason| BrokerOpError::ShipLocalMainUnsafe { reason })?;
+    if repo.current_branch().map_err(BrokerOpError::Git)? == default_branch
+        && repo.head_commit().map_err(BrokerOpError::Git)? == confirm
+        && repo
+            .resolve_ref(&plan.local_default_branch_ref)
+            .is_some_and(|sha| sha == confirm)
+        && assessment.tracked_dirty_paths.is_empty()
+    {
+        // A retry may be planned after a previous attempt completed the local
+        // merge but before publishing. The reviewed source is already the
+        // local tip, so there is no older main state left to preserve.
+        return Ok(None);
+    }
+    if !assessment.safe {
+        return Err(BrokerOpError::ShipLocalMainUnsafe {
+            reason: local_main_sync_refusal(&assessment, &default_branch, plan),
+        });
+    }
+
     let preservation_ref = delivery_preservation_ref(plan);
     if let Some(actual) = broker.repo_handle().resolve_ref(&preservation_ref) {
         if actual == plan.local_default_branch_sha {
@@ -1575,26 +1628,6 @@ fn preserve_local_main_before_delivery(
     let expected_head = plan.local_default_branch_sha.clone();
     let expected_source = confirm.to_string();
     let preflight_plan = plan.clone();
-    let main_root = broker.main_root_path();
-    let repo = GitRepo::discover(&main_root).map_err(BrokerOpError::Git)?;
-    let default_branch = plan
-        .local_default_branch_ref
-        .strip_prefix("refs/heads/")
-        .unwrap_or(&plan.local_default_branch_ref)
-        .to_string();
-    let assessment = assess_local_main_sync_repo(
-        &repo,
-        &default_branch,
-        &plan.local_default_branch_ref,
-        &plan.local_default_branch_sha,
-        confirm,
-    )
-    .map_err(|reason| BrokerOpError::ShipLocalMainUnsafe { reason })?;
-    if !assessment.safe {
-        return Err(BrokerOpError::ShipLocalMainUnsafe {
-            reason: local_main_sync_refusal(&assessment, &default_branch, plan),
-        });
-    }
     let preflight_root = main_root.clone();
     let preservation_for_preflight = preservation_ref.clone();
     let preservation_branch = preservation_ref
@@ -2870,6 +2903,14 @@ fn local_main_sync_refusal(
             "local {} moved since planning, so the reviewed synchronization no longer \
              applies; review a new plan with `aethyme broker ship plan --entry {}`",
             plan.local_default_branch_ref, plan.queue_entry.id,
+        );
+    }
+    if !assessment.local_commits_not_in_integration.is_empty() {
+        return format!(
+            "local {} contains commits not represented by integration: {}. Review them with \
+             `aethyme broker main reconcile plan` before retrying delivery",
+            plan.local_default_branch_ref,
+            assessment.local_commits_not_in_integration.join(", "),
         );
     }
     if !assessment.fast_forward {
