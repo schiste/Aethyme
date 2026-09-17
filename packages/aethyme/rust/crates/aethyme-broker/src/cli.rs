@@ -477,13 +477,14 @@ Usage:
       Manual-mode only: advance the local integration branch to a verified
       entry's merge commit; other in-flight entries are re-simulated.
       Promotion stays local; publish through `broker ship plan --entry <id>`.
-  aethyme broker ship plan --entry <id> [--json]
-      Read-only publication plan through an exact promoted entry: resolve the
-      selected prefix SHA, included and excluded later entries, current
-      integration tip, remote freshness, proposed push, and local-main safety.
-  aethyme broker ship execute --entry <id> --confirm <full-publication-sha> [--sync-main] [--break-glass --reason <authorization>] [--json]
-      Fetch and revalidate the planned remote base, publish the exact confirmed
-      promoted prefix with a non-force push, then verify the remote default ref.
+  aethyme broker ship plan --entry <id> [--delivery <local_main_merge|pull_request>] [--json]
+      Read-only delivery plan through an exact promoted entry: resolve the
+      trusted delivery policy, divergence recommendation, publication prefix,
+      remote freshness, proposed route, and local-main safety.
+  aethyme broker ship execute --entry <id> --confirm <full-publication-sha> [--delivery <local_main_merge|pull_request>] [--plan <sha256>] [--sync-main] [--break-glass --reason <authorization>] [--json]
+      Revalidate and execute the reviewed delivery route. Local-main delivery
+      uses a clean fast-forward merge; pull-request delivery pushes a
+      deterministic branch and opens or verifies one exact GitHub PR.
       --sync-main additionally fast-forwards an unchanged primary checkout.
       A committed review-gated policy requires live exact-review evidence.
       Break-glass is available only when that committed policy opts in; the
@@ -1053,6 +1054,7 @@ mod tests {
             current_branch_matches: true,
             local_head_unchanged: true,
             fast_forward,
+            local_commits_not_in_integration: Vec::new(),
             tracked_dirty_paths: dirty.iter().map(|p| (*p).into()).collect(),
             untracked_paths: Vec::new(),
             conflicting_untracked_paths: Vec::new(),
@@ -1413,6 +1415,28 @@ mod tests {
         assert!(!super::command_records_metric(&args(&[
             "ship", "plan", "--entry", "42"
         ])));
+    }
+
+    #[test]
+    fn parse_accepts_delivery_route_and_plan_digest() {
+        let digest = "a".repeat(64);
+        let parsed = match super::parse(&args(&[
+            "ship",
+            "execute",
+            "--entry",
+            "42",
+            "--confirm",
+            &"b".repeat(40),
+            "--delivery",
+            "pull_request",
+            "--plan",
+            &digest,
+        ])) {
+            Ok(parsed) => parsed,
+            Err(_) => panic!("delivery route should parse"),
+        };
+        assert_eq!(parsed.delivery_mode.as_deref(), Some("pull_request"));
+        assert_eq!(parsed.delivery_plan.as_deref(), Some(digest.as_str()));
     }
 
     #[test]
@@ -1878,6 +1902,8 @@ struct Parsed {
     message: Option<String>,
     entry: Option<i64>,
     confirm: Option<String>,
+    delivery_mode: Option<String>,
+    delivery_plan: Option<String>,
     operation: Option<i64>,
     before: Option<i64>,
     limit: Option<u32>,
@@ -1978,6 +2004,8 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         message: None,
         entry: None,
         confirm: None,
+        delivery_mode: None,
+        delivery_plan: None,
         operation: None,
         before: None,
         limit: None,
@@ -2511,6 +2539,22 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
                 parsed.confirm = Some(
                     iter.next()
                         .ok_or(UsageError::Message("--confirm requires a value".into()))?
+                        .clone(),
+                )
+            }
+            "--delivery" => {
+                parsed.delivery_mode = Some(
+                    iter.next()
+                        .ok_or(UsageError::Message("--delivery requires a value".into()))?
+                        .clone(),
+                )
+            }
+            "--plan" | "--plan-digest" => {
+                parsed.delivery_plan = Some(
+                    iter.next()
+                        .ok_or(UsageError::Message(
+                            "--plan requires a SHA-256 digest".into(),
+                        ))?
                         .clone(),
                 )
             }
@@ -4439,6 +4483,39 @@ fn render_ship_plan(report: &crate::ShipPlan, json: bool, detail: bool) -> Resul
         report.target.display_slug,
         report.target.normalized_host
     );
+    out!(
+        "Delivery: {} (source {})",
+        report.delivery.mode.as_str(),
+        report.delivery.source.as_str()
+    );
+    if let Some(configured) = report.delivery.configured_mode {
+        out!("Configured delivery: {}", configured.as_str());
+    } else {
+        out!("Configured delivery: none (legacy default is local_main_merge)");
+    }
+    if let Some(recommended) = report.delivery.recommended_mode {
+        out!("Recommended delivery: {}", recommended.as_str());
+    }
+    if report.delivery.divergence_reasons.is_empty() {
+        out!("Delivery divergence: none");
+    } else {
+        out!(
+            "Delivery divergence: {}",
+            report.delivery.divergence_reasons.join(", ")
+        );
+    }
+    out!("Delivery selection: {}", report.delivery.reason);
+    out!(
+        "Trusted delivery config: {} @ {} (digest {})",
+        report.delivery.trusted_config_ref,
+        report.delivery.trusted_config_commit,
+        report
+            .delivery
+            .trusted_config_digest
+            .as_deref()
+            .unwrap_or("absent")
+    );
+    out!("Delivery plan digest: {}", report.plan_digest);
     out!("Freshness: {:?}", report.freshness.result);
     out!("Proposed push: {}", report.proposed_push.command.join(" "));
     out!(
@@ -4500,11 +4577,33 @@ fn render_ship_plan(report: &crate::ShipPlan, json: bool, detail: bool) -> Resul
             assessment.untracked_paths.join(", ")
         );
     }
-    out!(
-        "Confirm with: aethyme broker ship execute --entry {} --confirm {}",
-        report.queue_entry.id,
-        report.publication_sha
-    );
+    if report.delivery.requires_explicit_selection {
+        out!(
+            "Re-plan with an explicit route: aethyme broker ship plan --entry {} --delivery <local_main_merge|pull_request>",
+            report.queue_entry.id,
+        );
+    } else if report.delivery.source == crate::RepositoryDeliveryModeSource::LegacyDefault {
+        out!(
+            "Confirm with: aethyme broker ship execute --entry {} --confirm {}",
+            report.queue_entry.id,
+            report.publication_sha
+        );
+    } else if report.delivery.source == crate::RepositoryDeliveryModeSource::CliOverride {
+        out!(
+            "Confirm with: aethyme broker ship execute --entry {} --confirm {} --delivery {} --plan {}",
+            report.queue_entry.id,
+            report.publication_sha,
+            report.delivery.mode.as_str(),
+            report.plan_digest
+        );
+    } else {
+        out!(
+            "Confirm with: aethyme broker ship execute --entry {} --confirm {} --plan {}",
+            report.queue_entry.id,
+            report.publication_sha,
+            report.plan_digest
+        );
+    }
     Ok(())
 }
 
@@ -4545,6 +4644,111 @@ fn render_ship_execution(
     } else if let Some(command) = &report.local_main_sync.follow_up_command {
         out!("Local main unchanged. To synchronize it explicitly:");
         out!("  {command}");
+    }
+    Ok(())
+}
+
+fn render_delivery_execution(
+    report: &crate::DeliveryExecutionReport,
+    json: bool,
+) -> Result<(), UsageError> {
+    // Keep the wire shape of the established no-policy command stable. The
+    // new wrapper is only needed when delivery has an explicit policy or
+    // route-specific operations to report.
+    if let crate::DeliveryExecutionReport::LocalMainMerge {
+        ship,
+        preservation_operation: None,
+        merge_operation: None,
+        ..
+    } = report
+    {
+        return render_ship_execution(ship, json);
+    }
+    if json {
+        out!("{}", serde_json::to_string_pretty(report)?);
+        return Ok(());
+    }
+
+    match report {
+        crate::DeliveryExecutionReport::LocalMainMerge {
+            ship,
+            preservation_operation,
+            merge_operation,
+            plan_digest,
+        } => {
+            out!("Delivery mode: local_main_merge");
+            out!("Delivery plan digest: {plan_digest}");
+            if let Some(operation) = preservation_operation {
+                out!("Preservation ref operation: {}", operation.id);
+            }
+            if let Some(operation) = merge_operation {
+                out!("Local-main merge operation: {}", operation.id);
+            }
+            render_ship_execution(ship, false)?;
+        }
+        crate::DeliveryExecutionReport::PullRequest(report) => {
+            out!("Delivery mode: pull_request");
+            out!("Delivery branch: {}", report.branch);
+            out!("Proposed SHA: {}", report.proposed_sha);
+            out!(
+                "Pull request #{}: {} ({})",
+                report.pull_request.number,
+                report.pull_request.url,
+                report.pull_request.state
+            );
+            out!(
+                "Base: {} @ {}",
+                report.pull_request.base_branch,
+                report.pull_request.base_sha
+            );
+            let checks = &report.pull_request.checks;
+            out!(
+                "Checks: {} total, {} pending, {} failed, {} passed, {} unknown",
+                checks.total,
+                checks.pending,
+                checks.failed,
+                checks.passed,
+                checks.unknown
+            );
+            out!("Delivery state: {}", report.delivery_state.as_str());
+            out!(
+                "Operations: fetch {}, push {}, verify {}",
+                report.fetch_operation.id,
+                report.push_operation.id,
+                report.verify_operation.id
+            );
+            if let Some(operation) = &report.target_verification_operation {
+                out!("Target-branch verification operation: {}", operation.id);
+            }
+            if let Some(sha) = &report.target_remote_sha {
+                out!("Observed target branch SHA: {sha}");
+            }
+            if let Some(operation) = &report.branch_operation {
+                out!("Branch operation: {}", operation.id);
+            }
+            if let Some(operation) = &report.create_operation {
+                out!("Pull-request create operation: {}", operation.id);
+            }
+            out!(
+                "Publication exposures resolved: {}",
+                report.resolved_exposures.len()
+            );
+            out!(
+                "Publication advisories resolved: {}",
+                report.resolved_advisories.len()
+            );
+            if report.delivery_state == crate::DeliveryExecutionState::Published {
+                out!("Exact delivery head is verified on the target default branch.");
+            } else if report.delivery_state == crate::DeliveryExecutionState::PullRequestMerged {
+                out!(
+                    "The pull request merge is confirmed, but the exact delivery head is not yet verified on the target default branch."
+                );
+            } else {
+                out!(
+                    "Next: merge and verify this pull request on the target default branch before resolving publication exposures."
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -5721,6 +5925,15 @@ fn parse_delivery_policy(value: Option<&str>) -> Result<crate::DeliveryPolicy, U
             "unknown delivery policy {value:?}; expected notify, resume, or review-and-push"
         ))),
     }
+}
+
+fn parse_repository_delivery_mode(
+    value: Option<&str>,
+) -> Result<Option<crate::RepositoryDeliveryMode>, UsageError> {
+    value
+        .map(crate::RepositoryDeliveryMode::parse)
+        .transpose()
+        .map_err(UsageError::Message)
 }
 
 fn parse_pull_request_event_kinds(
@@ -11532,8 +11745,9 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     let entry = parsed.entry.ok_or(UsageError::Message(
                         "ship plan requires --entry <id>".into(),
                     ))?;
+                    let delivery = parse_repository_delivery_mode(parsed.delivery_mode.as_deref())?;
                     let mut broker = open_broker(parsed.read_only_snapshot)?;
-                    let report = broker.ship_plan(entry)?;
+                    let report = broker.ship_plan_with_delivery(entry, delivery)?;
                     render_ship_plan(&report, parsed.json, parsed.detail)?;
                 }
                 "execute" => {
@@ -11541,17 +11755,36 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                         "ship execute requires --entry <id>".into(),
                     ))?;
                     let confirm = parsed.confirm.as_deref().ok_or(UsageError::Message(
-                        "ship execute requires --confirm <full-integration-sha>".into(),
+                        "ship execute requires --confirm <full-publication-sha>".into(),
                     ))?;
+                    let delivery = parse_repository_delivery_mode(parsed.delivery_mode.as_deref())?;
                     let mut broker = open_broker(parsed.read_only_snapshot)?;
-                    let report = broker.ship_execute_with_policy(
+                    // Preserve the established command contract for callers
+                    // that do not opt into delivery routing. A configured
+                    // repository policy still refuses this compatibility path
+                    // inside `ship_execute_with_policy`; an unconfigured
+                    // repository keeps its historical direct-ship behavior.
+                    if delivery.is_none() && parsed.delivery_plan.is_none() {
+                        let report = broker.ship_execute_with_policy(
+                            entry,
+                            confirm,
+                            parsed.sync_main,
+                            parsed.break_glass,
+                            parsed.reason.as_deref(),
+                        )?;
+                        render_ship_execution(&report, parsed.json)?;
+                        return Ok(());
+                    }
+                    let report = broker.ship_execute_delivery(
                         entry,
                         confirm,
+                        delivery,
+                        parsed.delivery_plan.as_deref(),
                         parsed.sync_main,
                         parsed.break_glass,
                         parsed.reason.as_deref(),
                     )?;
-                    render_ship_execution(&report, parsed.json)?;
+                    render_delivery_execution(&report, parsed.json)?;
                 }
                 other => {
                     return Err(UsageError::Message(format!(

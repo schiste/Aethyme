@@ -399,10 +399,13 @@ pub use session_abandonment::{
     decide as decide_abandonment, survey as survey_abandonment,
 };
 pub use ship::{
-    PUBLICATION_POLICY_SCHEMA_VERSION, ShipExecutionReport, ShipFreshness, ShipFreshnessResult,
-    ShipLocalMainSync, ShipPlan, ShipPublicationAssessment, ShipPublicationAuthorization,
-    ShipPublicationAuthorizationKind, ShipPublicationMode, ShipPublicationPolicy, ShipPush,
-    ShipReviewEvidence,
+    DeliveryCheck, DeliveryChecksSummary, DeliveryExecutionReport, DeliveryExecutionState,
+    DeliveryPullRequest, PUBLICATION_POLICY_SCHEMA_VERSION, PullRequestDeliveryReport,
+    REPOSITORY_DELIVERY_POLICY_SCHEMA_VERSION, RepositoryDeliveryConfig, RepositoryDeliveryMode,
+    RepositoryDeliveryModeSource, RepositoryDeliverySelection, ShipExecutionReport, ShipFreshness,
+    ShipFreshnessResult, ShipLocalMainSync, ShipPlan, ShipPublicationAssessment,
+    ShipPublicationAuthorization, ShipPublicationAuthorizationKind, ShipPublicationMode,
+    ShipPublicationPolicy, ShipPush, ShipReviewEvidence,
 };
 pub use store::BrokerStore;
 pub use storage::{

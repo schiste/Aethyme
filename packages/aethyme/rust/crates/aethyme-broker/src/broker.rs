@@ -93,6 +93,20 @@ pub enum BrokerOpError {
         stage: String,
         budget: String,
     },
+    /// A coordinated child was already running when its bounded operation
+    /// budget expired. Remote writes are stored as `outcome_unknown` and use
+    /// the durable recovery error below; this variant is for read-only and
+    /// local commands whose timeout cannot have changed remote state.
+    #[error(
+        "coordinated {provider} operation {operation_id} for {repository} exceeded its {budget} budget while {stage}; inspect the recorded operation before retrying"
+    )]
+    CoordinatedOperationTimedOut {
+        provider: &'static str,
+        operation_id: i64,
+        repository: String,
+        stage: String,
+        budget: String,
+    },
 
     #[error(transparent)]
     Git(#[from] GitError),
@@ -378,6 +392,40 @@ pub enum BrokerOpError {
     ShipPlanUnavailable { what: &'static str, reason: String },
     #[error("ship publication policy refused: {reason}. Next: {remediation}")]
     ShipPublicationPolicy { reason: String, remediation: String },
+    #[error(
+        "ship delivery override {requested} would weaken the trusted repository delivery policy {configured}"
+    )]
+    ShipDeliveryOverrideUnsafe {
+        configured: &'static str,
+        requested: &'static str,
+    },
+    #[error(
+        "ship delivery was recommended as {recommendation} because the repository is divergent ({reasons}); select it explicitly with --delivery and re-run the reviewed plan"
+    )]
+    ShipDeliveryRequiresExplicitSelection {
+        recommendation: &'static str,
+        reasons: String,
+    },
+    #[error("ship delivery requires a full SHA-256 plan digest from `ship plan`")]
+    ShipDeliveryPlanDigestRequired,
+    #[error("ship delivery plan confirmation must be a full 64-character SHA-256 digest")]
+    ShipDeliveryPlanDigestNotSha256,
+    #[error(
+        "the reviewed ship delivery plan no longer matches current state; expected plan digest {expected}, received {actual}; rebuild and review the plan"
+    )]
+    ShipDeliveryPlanDigestMismatch { expected: String, actual: String },
+    #[error("ship delivery is unavailable: {reason}")]
+    ShipDeliveryUnavailable { reason: String },
+    #[error(
+        "delivery branch {branch} already exists at {actual}, but the reviewed source is {expected}; refusing to overwrite it"
+    )]
+    ShipDeliveryBranchConflict {
+        branch: String,
+        expected: String,
+        actual: String,
+    },
+    #[error("delivery pull request does not match the reviewed head/base: {reason}")]
+    ShipDeliveryPullRequestMismatch { reason: String },
     #[error("ship confirmation must be the full 40-character integration SHA")]
     ShipConfirmationNotFullSha,
     /// Ship keeps both SHAs, unlike its siblings: they are inspectable with
