@@ -1134,6 +1134,7 @@ impl BrokerStore {
         &mut self,
         entry_id: i64,
         integration_commit: &str,
+        integration_ref: &str,
         promoted_paths: &[String],
         details_json: &str,
     ) -> Result<(), BrokerError> {
@@ -1173,6 +1174,15 @@ impl BrokerStore {
              ) VALUES (?1, ?2, ?3, ?4, 'outstanding')",
             params![entry_id, integration_commit, paths_json, now],
         )?;
+        Self::record_promotion_representation(
+            &tx,
+            session_id,
+            &session_head,
+            integration_commit,
+            integration_ref,
+            &paths,
+            now,
+        )?;
         update_accepted_checkpoint(
             &tx,
             session_id,
@@ -1207,6 +1217,8 @@ impl BrokerStore {
         entry_id: i64,
         integration_commit: &str,
         integration_tree: &str,
+        integration_ref: &str,
+        promoted_paths: &[String],
         details_json: &str,
     ) -> Result<(), BrokerError> {
         let now = now_ms();
@@ -1229,6 +1241,15 @@ impl BrokerStore {
              WHERE id = ?1",
             params![entry_id, integration_tree, details_json, now],
         )?;
+        Self::record_promotion_representation(
+            &tx,
+            session_id,
+            &session_head,
+            integration_commit,
+            integration_ref,
+            promoted_paths,
+            now,
+        )?;
         update_accepted_checkpoint(
             &tx,
             session_id,
@@ -1246,6 +1267,56 @@ impl BrokerStore {
             Some(details_json),
         )?;
         tx.commit()?;
+        Ok(())
+    }
+
+    /// Record the exact rewritten landing produced by broker promotion.
+    ///
+    /// Promotion changes the commit identity even though the merged tree is
+    /// the verified session contribution. The representation ledger preserves
+    /// that relationship for cleanup, where ancestry alone cannot prove a
+    /// single-parent rewrite landed.
+    fn record_promotion_representation(
+        tx: &Transaction<'_>,
+        session_id: i64,
+        session_head: &str,
+        integration_commit: &str,
+        integration_ref: &str,
+        promoted_paths: &[String],
+        now: i64,
+    ) -> Result<(), BrokerError> {
+        let mut paths = promoted_paths.to_vec();
+        paths.sort();
+        paths.dedup();
+        let paths_json =
+            serde_json::to_string(&paths).expect("serializing representation paths cannot fail");
+        let evidence = format!(
+            "broker promotion landed session head {session_head} as {integration_commit} on {integration_ref}"
+        );
+        tx.execute(
+            "INSERT INTO session_representations (
+                 session_id, session_head, representing_commit, representing_ref,
+                 discovery, pr_number, paths_json, evidence, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8)
+             ON CONFLICT(session_id, session_head) DO UPDATE SET
+                 representing_commit = excluded.representing_commit,
+                 representing_ref = excluded.representing_ref,
+                 discovery = excluded.discovery,
+                 pr_number = excluded.pr_number,
+                 paths_json = excluded.paths_json,
+                 evidence = excluded.evidence,
+                 created_at = excluded.created_at",
+            params![
+                session_id,
+                session_head,
+                integration_commit,
+                integration_ref,
+                RepresentationDiscovery::MergeTime.as_str(),
+                paths_json,
+                evidence,
+                now,
+            ],
+        )?;
         Ok(())
     }
 

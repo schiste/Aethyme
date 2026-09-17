@@ -7,7 +7,8 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use aethyme_broker::{
-    AdoptMode, Broker, CheckpointRefusalCode, EntryExposureState, FinishStatus, GitRepo,
+    AdoptMode, Broker, CheckpointRefusalCode, CleanupDisposition, EntryExposureState,
+    FinishOptions, FinishStatus, GitRepo,
     GraphIntegrityStatus, IntegrationDeliveryState, IntegrationReconcileClassification,
     IntegrationReconcileOptions, MergeStatus, NewSession, RepairAction, RepairSource,
     SessionOrigin, StatusAdviceSeverity, SubmissionCommitOwnership,
@@ -1305,16 +1306,43 @@ fn repeated_reuse_after_rebase_preserves_owned_work_and_finish_truth() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());
     let mut broker = Broker::open(tmp.path()).unwrap();
-    let worktree = agent_worktree(tmp.path(), "reuse-after-rebase");
-
     let first = broker
-        .adopt(&worktree, Some("land the product change"))
+        .start_worktree("land the product change", None)
         .unwrap();
+    let worktree = Path::new(&first.worktree_path).to_path_buf();
     commit_edit(&worktree, "src/a.py", "a = 2\n");
-    assert!(broker.submit(first.id).unwrap().promoted);
+    let session_head = resolve(&worktree, "HEAD");
+    let outcome = broker.submit(first.id).unwrap();
+    assert!(outcome.promoted);
+    let promotion = promoted_merge_commit(&outcome.entry);
+    assert_ne!(promotion, session_head);
     assert_eq!(
-        broker.finish(first.id).unwrap().status,
+        resolve(tmp.path(), &format!("{promotion}^{{tree}}")),
+        resolve(&worktree, "HEAD^{tree}"),
+        "promotion rewrites the commit identity but preserves the verified tree"
+    );
+    assert_eq!(
+        broker
+            .finish_with_options(first.id, FinishOptions { keep_worktree: true })
+            .unwrap()
+            .status,
         FinishStatus::Closed
+    );
+    let cleanup = broker.cleanup_plan().unwrap();
+    let candidate = cleanup
+        .worktrees
+        .iter()
+        .find(|candidate| candidate.session_id == first.id)
+        .expect("promoted session must remain in the cleanup plan");
+    assert_eq!(candidate.disposition, CleanupDisposition::Eligible);
+    let representation = broker
+        .store()
+        .session_representation(first.id, &session_head)
+        .unwrap()
+        .expect("promotion must record landing provenance");
+    assert_eq!(
+        representation.representing_commit.as_deref(),
+        Some(promotion.as_str())
     );
 
     std::fs::create_dir_all(worktree.join("docs")).unwrap();
@@ -2349,7 +2377,7 @@ fn broker_open_checkpoints_a_promotion_interrupted_after_the_ref_move() {
 
     let mut recovered = Broker::open(tmp.path()).unwrap();
     let persisted = recovered.store().session(session.id).unwrap();
-    assert_eq!(persisted.accepted_session_head, Some(submitted_head));
+    assert_eq!(persisted.accepted_session_head, Some(submitted_head.clone()));
     assert_eq!(
         persisted.accepted_integration_commit.as_deref(),
         Some(merge_commit)
@@ -2372,6 +2400,15 @@ fn broker_open_checkpoints_a_promotion_interrupted_after_the_ref_move() {
         .unwrap();
     assert_eq!(recovered_exposure.promotion_sha, merge_commit);
     assert_eq!(recovered_exposure.paths, vec!["src/a.py"]);
+    let recovered_representation = recovered
+        .store()
+        .session_representation(session.id, &submitted_head)
+        .unwrap()
+        .expect("recovered promotion must record landing provenance");
+    assert_eq!(
+        recovered_representation.representing_commit.as_deref(),
+        Some(merge_commit)
+    );
 
     commit_edit(&worktree, "src/b.py", "b = 2\n");
     let follow_up = recovered.submit(session.id).unwrap();
