@@ -15,9 +15,20 @@ use crate::types::{
     MergeStatus, OperationEffect, OperationProvider, Session,
 };
 use std::path::Path;
+use std::time::Duration;
 
 pub const PUBLICATION_POLICY_SCHEMA_VERSION: u32 = 1;
 pub const REPOSITORY_DELIVERY_POLICY_SCHEMA_VERSION: u32 = 1;
+
+/// Each remote delivery operation gets one shared admission-and-child budget.
+/// The coordinator kills a child that outlives this budget and records remote
+/// writes as `outcome_unknown`, so a wedged network cannot hold the repository
+/// lane indefinitely or invite a blind retry.
+const DELIVERY_OPERATION_BUDGET: Duration = Duration::from_secs(30);
+
+fn delivery_operation_wait() -> crate::QueueWait {
+    crate::QueueWait::Seconds(DELIVERY_OPERATION_BUDGET.as_secs())
+}
 
 /// The repository-level route used for delivering a promoted prefix.
 ///
@@ -342,6 +353,9 @@ pub struct ShipLocalMainSync {
 #[serde(rename_all = "snake_case")]
 pub enum DeliveryExecutionState {
     Published,
+    /// The provider confirmed the PR merge, but the target branch has not
+    /// yet been independently verified to contain the reviewed delivery tip.
+    PullRequestMerged,
     PullRequestOpen,
     PullRequestChecksPending,
     PullRequestChecksFailed,
@@ -353,6 +367,7 @@ impl DeliveryExecutionState {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Published => "published",
+            Self::PullRequestMerged => "pull_request_merged",
             Self::PullRequestOpen => "pull_request_open",
             Self::PullRequestChecksPending => "pull_request_checks_pending",
             Self::PullRequestChecksFailed => "pull_request_checks_failed",
@@ -423,6 +438,16 @@ pub struct PullRequestDeliveryReport {
     pub push_operation: CoordinatedOperation,
     pub create_operation: Option<CoordinatedOperation>,
     pub verify_operation: CoordinatedOperation,
+    /// Present when a merged PR caused an additional target-branch fetch.
+    /// Opening or inspecting an open PR does not verify publication.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_verification_operation: Option<CoordinatedOperation>,
+    /// The target branch tip observed by the merged-PR verification, when a
+    /// merged PR has been observed. It is intentionally separate from the PR
+    /// base SHA: the latter is provider metadata, while this is the remote
+    /// ref evidence used to decide whether publication is complete.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_remote_sha: Option<String>,
     pub pull_request: DeliveryPullRequest,
     /// Deliberately empty: opening a PR is not publication and must not resolve
     /// entry exposures or publication advisories.
@@ -614,7 +639,7 @@ impl Broker {
             })?;
         let publication_policy = publication_assessment(
             self,
-            &publication_sha,
+            &remote_default.sha,
             &included_entries,
             &queue,
             &target.coordination_key,
@@ -839,7 +864,14 @@ impl Broker {
                 actual: confirm.into(),
             });
         }
-        self.ship_execute_from_plan(plan, confirm, sync_main, break_glass, break_glass_reason)
+        self.ship_execute_from_plan(
+            plan,
+            confirm,
+            sync_main,
+            break_glass,
+            break_glass_reason,
+            crate::QueueWait::Forever,
+        )
     }
 
     fn ship_execute_from_plan(
@@ -849,6 +881,7 @@ impl Broker {
         sync_main: bool,
         break_glass: bool,
         break_glass_reason: Option<&str>,
+        operation_wait: crate::QueueWait,
     ) -> Result<ShipExecutionReport, BrokerOpError> {
         let publication_authorization =
             authorize_publication(self, &plan, break_glass, break_glass_reason)?;
@@ -864,7 +897,7 @@ impl Broker {
         let main_root = self.main_root().to_path_buf();
         let tracking_ref = tracking_ref(&plan);
 
-        let fetch = self.run_coordinated_operation_at(
+        let fetch = self.run_coordinated_operation_at_with_wait(
             CoordinatedCommand {
                 session_id: plan.originating_session.id,
                 provider: OperationProvider::Git,
@@ -886,6 +919,7 @@ impl Broker {
                 ],
             },
             &main_root,
+            operation_wait,
         )?;
         if !fetch.ok() {
             return Err(ship_operation_failure("fetch", &fetch));
@@ -933,7 +967,7 @@ impl Broker {
             });
         }
 
-        let push = self.run_coordinated_operation_at(
+        let push = self.run_coordinated_operation_at_with_wait(
             CoordinatedCommand {
                 session_id: plan.originating_session.id,
                 provider: OperationProvider::Git,
@@ -954,12 +988,13 @@ impl Broker {
                 ],
             },
             &main_root,
+            operation_wait,
         )?;
         if !push.ok() {
             return Err(ship_operation_failure("push", &push));
         }
 
-        let verify = self.run_coordinated_operation_at(
+        let verify = self.run_coordinated_operation_at_with_wait(
             CoordinatedCommand {
                 session_id: plan.originating_session.id,
                 provider: OperationProvider::Git,
@@ -976,6 +1011,7 @@ impl Broker {
                 ],
             },
             &main_root,
+            operation_wait,
         )?;
         if !verify.ok() {
             return Err(ship_operation_failure("verification", &verify));
@@ -1018,7 +1054,7 @@ impl Broker {
                     reason,
                 }
             })?;
-            let sync = self.run_coordinated_operation_at(
+            let sync = self.run_coordinated_operation_at_with_wait(
                 CoordinatedCommand {
                     session_id: plan.originating_session.id,
                     provider: OperationProvider::Git,
@@ -1034,6 +1070,7 @@ impl Broker {
                     args: vec!["merge".into(), "--ff-only".into(), confirm.into()],
                 },
                 &main_root,
+                operation_wait,
             )?;
             if !sync.ok() {
                 return Err(ship_operation_failure("local-main synchronization", &sync));
@@ -1199,6 +1236,7 @@ impl Broker {
                     false,
                     break_glass,
                     break_glass_reason,
+                    delivery_operation_wait(),
                 )?;
                 // The merge above is the delivery mode's local-main
                 // synchronization. Keep the legacy nested report truthful;
@@ -1844,7 +1882,7 @@ fn execute_pull_request_delivery(
     let repository = plan.target.display_slug.clone();
     let main_root = broker.main_root_path();
     let tracking = tracking_ref(&plan);
-    let fetch = broker.run_coordinated_operation_at(
+    let fetch = broker.run_coordinated_operation_at_with_wait(
         CoordinatedCommand {
             session_id: plan.originating_session.id,
             provider: OperationProvider::Git,
@@ -1866,6 +1904,7 @@ fn execute_pull_request_delivery(
             ],
         },
         &main_root,
+        delivery_operation_wait(),
     )?;
     if !fetch.ok() {
         return Err(ship_operation_failure("delivery base fetch", &fetch));
@@ -1896,7 +1935,7 @@ fn execute_pull_request_delivery(
         }
         Some(_) => None,
         None => {
-            let create = broker.run_coordinated_operation_at(
+            let create = broker.run_coordinated_operation_at_with_wait(
                 CoordinatedCommand {
                     session_id: plan.originating_session.id,
                     provider: OperationProvider::Git,
@@ -1916,6 +1955,7 @@ fn execute_pull_request_delivery(
                     ],
                 },
                 &main_root,
+                delivery_operation_wait(),
             )?;
             if !create.ok() {
                 return Err(ship_operation_failure("delivery branch creation", &create));
@@ -1946,7 +1986,7 @@ fn execute_pull_request_delivery(
     // Pushing the exact same SHA on a retry is safe and lets Git provide the
     // idempotent "Everything up-to-date" result. No force or lease-expanding
     // refspec is ever constructed here.
-    let push = broker.run_coordinated_operation_at(
+    let push = broker.run_coordinated_operation_at_with_wait(
         CoordinatedCommand {
             session_id: plan.originating_session.id,
             provider: OperationProvider::Git,
@@ -1966,6 +2006,7 @@ fn execute_pull_request_delivery(
             ],
         },
         &main_root,
+        delivery_operation_wait(),
     )?;
     if !push.ok() {
         return Err(ship_operation_failure("delivery branch push", &push));
@@ -2000,7 +2041,7 @@ fn execute_pull_request_delivery(
 
     if pull_request.is_none() {
         let base_branch = branch_name_from_ref(&plan.remote_default_branch_ref);
-        let create = broker.run_coordinated_operation_at(
+        let create = broker.run_coordinated_operation_at_with_wait(
             CoordinatedCommand {
                 session_id: plan.originating_session.id,
                 provider: OperationProvider::Github,
@@ -2030,6 +2071,7 @@ fn execute_pull_request_delivery(
                 ],
             },
             &main_root,
+            delivery_operation_wait(),
         )?;
         if !create.ok() {
             return Err(ship_operation_failure("pull-request creation", &create));
@@ -2094,16 +2136,29 @@ fn execute_pull_request_delivery(
         &repository,
     )?;
     if pull_request.state != "OPEN" {
-        if pull_request.merged_at.is_some()
-            && broker
-                .repo_handle()
-                .is_ancestor(&pull_request.head_sha, &plan.remote_default_branch_sha)
-        {
-            let (resolved_exposures, resolved_advisories) =
-                resolve_verified_publication(broker, &plan, &plan.remote_default_branch_sha)?;
+        if pull_request.merged_at.is_some() {
+            let target_verification =
+                verify_delivery_target(broker, &plan, &pull_request.head_sha, &main_root)?;
+            let (delivery_state, resolved_exposures, resolved_advisories) = if target_verification
+                .contains_head
+            {
+                let (resolved_exposures, resolved_advisories) =
+                    resolve_verified_publication(broker, &plan, &target_verification.target_sha)?;
+                (
+                    DeliveryExecutionState::Published,
+                    resolved_exposures,
+                    resolved_advisories,
+                )
+            } else {
+                (
+                    DeliveryExecutionState::PullRequestMerged,
+                    Vec::new(),
+                    Vec::new(),
+                )
+            };
             return Ok(PullRequestDeliveryReport {
                 plan,
-                delivery_state: DeliveryExecutionState::Published,
+                delivery_state,
                 branch,
                 proposed_sha: pull_request.head_sha.clone(),
                 remote_base_sha: pull_request.base_sha.clone(),
@@ -2112,6 +2167,8 @@ fn execute_pull_request_delivery(
                 push_operation: push.operation,
                 create_operation,
                 verify_operation: verify.operation,
+                target_verification_operation: Some(target_verification.operation),
+                target_remote_sha: Some(target_verification.target_sha),
                 pull_request,
                 resolved_exposures,
                 resolved_advisories,
@@ -2137,6 +2194,8 @@ fn execute_pull_request_delivery(
         push_operation: push.operation,
         create_operation,
         verify_operation: verify.operation,
+        target_verification_operation: None,
+        target_remote_sha: None,
         pull_request,
         resolved_exposures: Vec::new(),
         resolved_advisories: Vec::new(),
@@ -2170,7 +2229,7 @@ fn delivery_github_read(
     args: Vec<String>,
     cwd: &Path,
 ) -> Result<CoordinatedOperationReport, BrokerOpError> {
-    let report = broker.run_coordinated_operation_at(
+    let report = broker.run_coordinated_operation_at_with_wait(
         CoordinatedCommand {
             session_id,
             provider: OperationProvider::Github,
@@ -2183,6 +2242,7 @@ fn delivery_github_read(
             args,
         },
         cwd,
+        delivery_operation_wait(),
     )?;
     if !report.ok() {
         return Err(ship_operation_failure(
@@ -2191,6 +2251,78 @@ fn delivery_github_read(
         ));
     }
     Ok(report)
+}
+
+#[derive(Debug)]
+struct DeliveryTargetVerification {
+    operation: CoordinatedOperation,
+    target_sha: String,
+    contains_head: bool,
+}
+
+/// Re-fetch the target after the provider reports a merge. A merged PR is
+/// provider evidence only; publication is reached only when the exact
+/// reviewed delivery head is also reachable from the target ref observed by
+/// Git. A successful fetch with a different target tip is still useful
+/// evidence, so callers can report the distinct merged-but-not-published
+/// state without resolving queue exposures.
+fn verify_delivery_target(
+    broker: &mut Broker,
+    plan: &ShipPlan,
+    head_sha: &str,
+    cwd: &Path,
+) -> Result<DeliveryTargetVerification, BrokerOpError> {
+    let tracking = tracking_ref(plan);
+    let fetch = broker.run_coordinated_operation_at_with_wait(
+        CoordinatedCommand {
+            session_id: plan.originating_session.id,
+            provider: OperationProvider::Git,
+            repository: None,
+            resolved_target: Some(plan.target.clone()),
+            scope: Some(format!(
+                "delivery:target-verify:{}",
+                plan.remote_default_branch_ref
+            )),
+            // Fetch updates the local tracking ref, so leave the effect
+            // inferred rather than downgrading the coordinator's write
+            // classification. No remote ref is mutated, but an interrupted
+            // fetch leaves local evidence uncertain, so recovery stays
+            // conservative.
+            declared_effect: None,
+            destructive_confirmed: false,
+            authorization_reason: Some(format!(
+                "refresh target branch evidence after provider merge for queue entry {}",
+                plan.queue_entry.id
+            )),
+            args: vec![
+                "fetch".into(),
+                "--no-tags".into(),
+                "--force".into(),
+                plan.target.remote_name.clone(),
+                format!("{}:{tracking}", plan.remote_default_branch_ref),
+            ],
+        },
+        cwd,
+        delivery_operation_wait(),
+    )?;
+    if !fetch.ok() {
+        return Err(ship_operation_failure(
+            "delivery target verification",
+            &fetch,
+        ));
+    }
+    let target_sha = broker.repo_handle().resolve_ref(&tracking).ok_or_else(|| {
+        BrokerOpError::ShipPlanUnavailable {
+            what: "verified delivery target",
+            reason: format!("{tracking} does not resolve after target verification fetch"),
+        }
+    })?;
+    let contains_head = broker.repo_handle().is_ancestor(head_sha, &target_sha);
+    Ok(DeliveryTargetVerification {
+        operation: fetch.operation,
+        target_sha,
+        contains_head,
+    })
 }
 
 fn find_delivery_pull_request(
@@ -2486,17 +2618,17 @@ fn delivery_check_state(check: &DeliveryCheck) -> DeliveryCheckState {
 
 fn publication_assessment(
     broker: &mut Broker,
-    publication_sha: &str,
+    policy_source_commit: &str,
     included_entries: &[ShipPromotedEntry],
     queue: &[MergeQueueEntry],
     target_repository: &str,
     target_branch: &str,
 ) -> Result<ShipPublicationAssessment, BrokerOpError> {
-    let policy = publication_policy_at(broker, publication_sha)?;
+    let policy = publication_policy_at(broker, policy_source_commit)?;
     if policy.mode == ShipPublicationMode::Direct {
         return Ok(ShipPublicationAssessment {
             policy,
-            source_commit: publication_sha.into(),
+            source_commit: policy_source_commit.into(),
             satisfied: true,
             evidence: Vec::new(),
             remediation: None,
@@ -2591,7 +2723,7 @@ fn publication_assessment(
     });
     Ok(ShipPublicationAssessment {
         policy,
-        source_commit: publication_sha.into(),
+        source_commit: policy_source_commit.into(),
         satisfied,
         evidence,
         remediation,
@@ -2600,11 +2732,23 @@ fn publication_assessment(
 
 fn publication_policy_at(
     broker: &Broker,
-    source_commit: &str,
+    policy_source_commit: &str,
 ) -> Result<ShipPublicationPolicy, BrokerOpError> {
+    if broker
+        .repo_handle()
+        .resolve_ref(policy_source_commit)
+        .is_none()
+    {
+        return Err(BrokerOpError::ShipPlanUnavailable {
+            what: "trusted publication policy",
+            reason: format!(
+                "the remote default SHA {policy_source_commit} is not available locally; fetch it before planning publication"
+            ),
+        });
+    }
     let Some(text) = broker
         .repo_handle()
-        .file_at_commit(source_commit, ".aethyme/config.toml")?
+        .file_at_commit(policy_source_commit, ".aethyme/config.toml")?
     else {
         return Ok(ShipPublicationPolicy::default());
     };

@@ -4717,6 +4717,12 @@ fn render_delivery_execution(
                 report.push_operation.id,
                 report.verify_operation.id
             );
+            if let Some(operation) = &report.target_verification_operation {
+                out!("Target-branch verification operation: {}", operation.id);
+            }
+            if let Some(sha) = &report.target_remote_sha {
+                out!("Observed target branch SHA: {sha}");
+            }
             if let Some(operation) = &report.branch_operation {
                 out!("Branch operation: {}", operation.id);
             }
@@ -4733,6 +4739,10 @@ fn render_delivery_execution(
             );
             if report.delivery_state == crate::DeliveryExecutionState::Published {
                 out!("Exact delivery head is verified on the target default branch.");
+            } else if report.delivery_state == crate::DeliveryExecutionState::PullRequestMerged {
+                out!(
+                    "The pull request merge is confirmed, but the exact delivery head is not yet verified on the target default branch."
+                );
             } else {
                 out!(
                     "Next: merge and verify this pull request on the target default branch before resolving publication exposures."

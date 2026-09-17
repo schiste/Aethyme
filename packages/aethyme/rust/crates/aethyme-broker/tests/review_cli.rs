@@ -452,7 +452,14 @@ fn review_gated_ship_requires_every_entry_and_revalidates_live_evidence() {
     );
     let plan: serde_json::Value = serde_json::from_slice(&planned.stdout).unwrap();
     assert_eq!(plan["publication_policy"]["satisfied"], true);
-    assert_eq!(plan["publication_policy"]["source_commit"], publication_sha);
+    let trusted_policy_commit = fixture.remote_main();
+    assert_eq!(
+        plan["publication_policy"]["source_commit"], trusted_policy_commit
+    );
+    assert_ne!(
+        plan["publication_policy"]["source_commit"], publication_sha,
+        "publication policy provenance must be the remote target, not the candidate"
+    );
     assert_eq!(
         plan["publication_policy"]["evidence"][0]["queue_entry_id"],
         entry_id

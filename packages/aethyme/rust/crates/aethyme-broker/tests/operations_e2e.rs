@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 use aethyme_broker::{
     Broker, BrokerOpError, CoordinatedCommand, GitRepo, NewCoordinatedOperation, OperationEffect,
     OperationIdentityProvenance, OperationProvider, OperationReconciliationState, OperationStatus,
+    QueueWait,
 };
 
 fn git(cwd: &Path, args: &[&str]) {
@@ -762,6 +763,87 @@ fn missing_post_push_evidence_keeps_an_exact_push_unknown() {
         shown.reconciliation.evidence.as_ref().unwrap()["evidence"]["reason"],
         "post_push_remote_evidence_unavailable"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn bounded_remote_write_timeout_is_journaled_unknown_and_blocks_retry() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut fixture = push_fixture(tmp.path(), "push-timeout");
+    commit_push_fixture(&fixture, "timeout\n");
+    let receive_pack = tmp.path().join("sleeping-receive-pack");
+    write_executable(&receive_pack, "#!/bin/sh\nsleep 5\n");
+    git(
+        &fixture.worktree,
+        &[
+            "config",
+            "remote.origin.receivepack",
+            receive_pack.to_str().unwrap(),
+        ],
+    );
+
+    let started = Instant::now();
+    let error = fixture
+        .broker
+        .run_coordinated_operation_with_wait(
+            exact_push_request(
+                fixture.session_id,
+                &fixture.worktree,
+                &["HEAD:refs/heads/main"],
+            ),
+            QueueWait::Seconds(1),
+        )
+        .unwrap_err();
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "bounded remote operation returned too late: {:?}",
+        started.elapsed()
+    );
+    let operation_id = match &error {
+        BrokerOpError::CoordinatedOperationBlocked { operation_id, .. } => *operation_id,
+        other => panic!("expected durable timeout recovery, got {other:?}"),
+    };
+    let operation = fixture
+        .broker
+        .store()
+        .coordinated_operation(operation_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(operation.status, OperationStatus::OutcomeUnknown);
+    let details: serde_json::Value =
+        serde_json::from_str(operation.details_json.as_deref().unwrap()).unwrap();
+    assert_eq!(details["failure_class"], "coordinated_operation_timeout");
+    assert_eq!(details["remote_outcome"], "unknown");
+}
+
+#[test]
+fn bounded_local_write_timeout_is_failed_without_remote_recovery() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let worktree = add_worktree(tmp.path(), "local-timeout");
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let session = broker.adopt(&worktree, None).unwrap();
+    let mut command = request(session.id, &["-c", "alias.pause=!sleep 5", "pause"]);
+    command.declared_effect = Some(OperationEffect::Write);
+    command.scope = Some("test:local-timeout".into());
+
+    let error = broker
+        .run_coordinated_operation_with_wait(command, QueueWait::Seconds(1))
+        .unwrap_err();
+    let operation_id = match &error {
+        BrokerOpError::CoordinatedOperationTimedOut { operation_id, .. } => *operation_id,
+        other => panic!("expected local timeout, got {other:?}"),
+    };
+    let operation = broker
+        .store()
+        .coordinated_operation(operation_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(operation.status, OperationStatus::Failed);
+    let details: serde_json::Value =
+        serde_json::from_str(operation.details_json.as_deref().unwrap()).unwrap();
+    assert_eq!(details["failure_class"], "coordinated_operation_timeout");
+    assert_eq!(details["remote_outcome"], "not_applicable");
 }
 
 #[cfg(unix)]

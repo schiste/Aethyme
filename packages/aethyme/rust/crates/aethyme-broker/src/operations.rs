@@ -138,7 +138,6 @@ fn output_within(
     repository: &str,
     stage: &str,
 ) -> Result<std::process::Output, BrokerOpError> {
-    deadline.check(repository, stage)?;
     let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -148,6 +147,17 @@ fn output_within(
             source,
         })?;
     loop {
+        if deadline.expired() {
+            // Killing is the point: leaving it behind would keep contacting the
+            // remote after the caller was told nothing happened.
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(BrokerOpError::AdmissionTimedOut {
+                repository: repository.into(),
+                stage: stage.into(),
+                budget: deadline.budget_label(),
+            });
+        }
         match child.try_wait() {
             Ok(Some(_)) => {
                 return child
@@ -165,17 +175,6 @@ fn output_within(
                     source,
                 });
             }
-        }
-        if deadline.expired() {
-            // Killing is the point: leaving it behind would keep contacting the
-            // remote after the caller was told nothing happened.
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(BrokerOpError::AdmissionTimedOut {
-                repository: repository.into(),
-                stage: stage.into(),
-                budget: deadline.budget_label(),
-            });
         }
         std::thread::sleep(ADMISSION_POLL_INTERVAL);
     }
@@ -2007,28 +2006,33 @@ fn plan_github_create(args: &[String], cwd: &Path) -> CreatePlanning {
 }
 
 /// One page of `gh <collection> list`, newest first.
-fn github_list(
+fn github_list_within(
     collection: &str,
     repository: &str,
     fields: &[&str],
     limit: usize,
     cwd: &Path,
-) -> Option<Vec<serde_json::Value>> {
+    deadline: AdmissionDeadline,
+    stage: &str,
+) -> Result<Option<Vec<serde_json::Value>>, BrokerOpError> {
     let limit = limit.to_string();
     let fields = fields.join(",");
-    let output = provider_command(OperationProvider::Github)
+    let mut command = provider_command(OperationProvider::Github);
+    command
         .args([
             collection, "list", "--repo", repository, "--state", "all", "--limit", &limit,
             "--json", &fields,
         ])
-        .current_dir(cwd)
-        .output()
-        .ok()?;
+        .current_dir(cwd);
+    let output = output_within(command, deadline, repository, stage)?;
     if !output.status.success() {
-        return None;
+        return Ok(None);
     }
-    let parsed: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
-    parsed.as_array().cloned()
+    let parsed: serde_json::Value = match serde_json::from_slice(&output.stdout) {
+        Ok(parsed) => parsed,
+        Err(_) => return Ok(None),
+    };
+    Ok(parsed.as_array().cloned())
 }
 
 /// Record the number the repository stands at before a create runs.
@@ -2036,11 +2040,25 @@ fn github_list(
 /// Costs one listing, and only for a create whose result could be recognised
 /// at all. Taking it afterwards would be worthless: the whole question is
 /// which numbers are new.
-fn observe_create_watermark(planning: &mut CreatePlanning, repository: &str, cwd: &Path) {
+fn observe_create_watermark(
+    planning: &mut CreatePlanning,
+    repository: &str,
+    cwd: &Path,
+    deadline: AdmissionDeadline,
+) -> Result<(), BrokerOpError> {
     let CreatePlanning::Planned(plan) = planning else {
-        return;
+        return Ok(());
     };
-    plan.watermark = github_list(&plan.collection, repository, &["number"], 1, cwd).map(|listed| {
+    plan.watermark = github_list_within(
+        &plan.collection,
+        repository,
+        &["number"],
+        1,
+        cwd,
+        deadline,
+        "observing GitHub create watermark",
+    )?
+    .map(|listed| {
         // A repository with nothing in the collection yet has no number, and 0
         // is below every number GitHub assigns.
         listed
@@ -2048,6 +2066,7 @@ fn observe_create_watermark(planning: &mut CreatePlanning, repository: &str, cwd
             .and_then(|entry| entry["number"].as_i64())
             .unwrap_or(0)
     });
+    Ok(())
 }
 
 /// The URL `gh` prints for a resource it just created in this repository.
@@ -2088,20 +2107,39 @@ fn created_resource_url(stdout: &str, repository: &str) -> Option<String> {
 /// Every path that cannot see far enough records a named reason and stays
 /// unknown rather than guessing, because it is a wrong "failed" that makes a
 /// blind retry look safe (#184).
+#[cfg(test)]
 fn reconcile_failed_github_create(
     cwd: &Path,
     repository: &str,
     planning: &CreatePlanning,
     stdout: &[u8],
 ) -> Option<(OperationStatus, serde_json::Value)> {
+    reconcile_failed_github_create_with_deadline(
+        cwd,
+        repository,
+        planning,
+        stdout,
+        AdmissionDeadline::start(QueueWait::Forever),
+    )
+    .ok()
+    .flatten()
+}
+
+fn reconcile_failed_github_create_with_deadline(
+    cwd: &Path,
+    repository: &str,
+    planning: &CreatePlanning,
+    stdout: &[u8],
+    deadline: AdmissionDeadline,
+) -> Result<Option<(OperationStatus, serde_json::Value)>, BrokerOpError> {
     let CreatePlanning::Planned(plan) = planning else {
-        return planning.journal_value().map(|mut value| {
+        return Ok(planning.journal_value().map(|mut value| {
             value["evidence"] = json!({
                 "classification": "unknown",
                 "reason": "create_plan_unavailable",
             });
             (OperationStatus::OutcomeUnknown, value)
-        });
+        }));
     };
     let mut value = planning.journal_value().expect("planned create");
     if let Some(created) = created_resource_url(&String::from_utf8_lossy(stdout), repository) {
@@ -2110,31 +2148,34 @@ fn reconcile_failed_github_create(
             "source": "command_output",
             "created": created,
         });
-        return Some((OperationStatus::Succeeded, value));
+        return Ok(Some((OperationStatus::Succeeded, value)));
     }
     let Some(watermark) = plan.watermark else {
         value["evidence"] = json!({
             "classification": "unknown",
             "reason": "pre_create_number_watermark_unavailable",
         });
-        return Some((OperationStatus::OutcomeUnknown, value));
+        return Ok(Some((OperationStatus::OutcomeUnknown, value)));
     };
-    let Some(listed) = github_list(
+    let Some(listed) = github_list_within(
         &plan.collection,
         repository,
         &["number", "url", plan.identity_field.as_str()],
         CREATE_OBSERVATION_LIMIT,
         cwd,
-    ) else {
+        deadline,
+        "observing GitHub create after failure",
+    )?
+    else {
         value["evidence"] = json!({
             "classification": "unknown",
             "reason": "post_create_repository_evidence_unavailable",
         });
-        return Some((OperationStatus::OutcomeUnknown, value));
+        return Ok(Some((OperationStatus::OutcomeUnknown, value)));
     };
     let (status, evidence) = classify_create_observation(plan, watermark, &listed);
     value["evidence"] = evidence;
-    Some((status, value))
+    Ok(Some((status, value)))
 }
 
 /// Read a listing of the collection, newest first, for the planned create.
@@ -2500,10 +2541,26 @@ impl Broker {
         request: CoordinatedCommand,
         cwd: &Path,
     ) -> Result<CoordinatedOperationReport, BrokerOpError> {
+        self.run_coordinated_operation_at_with_wait(request, cwd, QueueWait::Forever)
+    }
+
+    /// As [`Self::run_coordinated_operation_at`], but bound the complete
+    /// operation admission and child process to the caller's wait budget.
+    ///
+    /// The original helper intentionally keeps the compatibility API's
+    /// unbounded behavior. Delivery callers use this form because a remote
+    /// fetch, push, or provider query must not leave the broker holding a
+    /// repository lane forever when the network stops responding.
+    pub(crate) fn run_coordinated_operation_at_with_wait(
+        &mut self,
+        request: CoordinatedCommand,
+        cwd: &Path,
+        queue_wait: QueueWait,
+    ) -> Result<CoordinatedOperationReport, BrokerOpError> {
         self.run_coordinated_operation_at_with_hooks(
             request,
             cwd,
-            QueueWait::Forever,
+            queue_wait,
             || Ok(()),
             |_, _| Ok(None),
         )
@@ -2926,7 +2983,12 @@ impl Broker {
                 CreatePlanning::NotApplicable
             };
         if let Some(target) = &github_target {
-            observe_create_watermark(&mut create_planning, &target.display_slug, cwd);
+            if let Err(error) =
+                observe_create_watermark(&mut create_planning, &target.display_slug, cwd, admission)
+            {
+                self.resolve_unstarted_operation(queued_operation_id, "create_observation_failed");
+                return Err(error);
+            }
         }
 
         // The hook verified specific commits. If any local ref moved while this
@@ -2941,6 +3003,15 @@ impl Broker {
                          the hook no longer describes what would be pushed; re-run the command"
                     .into(),
             });
+        }
+
+        // A bounded request may spend its entire budget in revalidation or
+        // push planning. It has not started the provider command in this
+        // case, so leave the prepared journal row failed rather than claiming
+        // that a remote write has an unknown outcome.
+        if let Err(error) = admission.check(&repository, "preparing the operation") {
+            self.resolve_unstarted_operation(queued_operation_id, "admission_timed_out");
+            return Err(error);
         }
 
         if let Some(host_operation_id) = host_guard
@@ -3010,9 +3081,74 @@ impl Broker {
                     .display_slug,
             );
         }
-        let output = match command.output() {
+        let output = match output_within(
+            command,
+            admission,
+            &repository,
+            "executing coordinated operation",
+        ) {
             Ok(output) => output,
-            Err(source) => {
+            Err(BrokerOpError::AdmissionTimedOut {
+                repository,
+                stage,
+                budget,
+            }) => {
+                let status = if is_remote_write {
+                    OperationStatus::OutcomeUnknown
+                } else {
+                    OperationStatus::Failed
+                };
+                let mut details = journal_details(
+                    classification,
+                    resolved_target.as_ref(),
+                    github_target.as_ref(),
+                    with_push_planning(
+                        json!({
+                            "failure_class": "coordinated_operation_timeout",
+                            "stage": stage,
+                            "budget": budget,
+                            "remote_outcome": if is_remote_write {
+                                "unknown"
+                            } else {
+                                "not_applicable"
+                            },
+                        }),
+                        &push_planning,
+                    ),
+                );
+                add_coordination_timing(
+                    &mut details,
+                    &lock_key,
+                    lock_wait_started_at,
+                    lock.as_ref(),
+                    hooks_ran_outside_lock,
+                    ref_determination,
+                );
+                let operation = self.store().transition_coordinated_operation(
+                    operation.id,
+                    status,
+                    None,
+                    Some(&details.to_string()),
+                )?;
+                if let Some(guard) = &mut host_guard {
+                    guard.finish(operation.status)?;
+                }
+                if status == OperationStatus::OutcomeUnknown {
+                    return Err(BrokerOpError::CoordinatedOperationBlocked {
+                        repository,
+                        operation_id: operation.id,
+                        recovery: UnknownOutcomeRecovery::from_operation(&operation),
+                    });
+                }
+                return Err(BrokerOpError::CoordinatedOperationTimedOut {
+                    provider: request.provider.as_str(),
+                    operation_id: operation.id,
+                    repository,
+                    stage,
+                    budget,
+                });
+            }
+            Err(BrokerOpError::OperationIo { source, .. }) => {
                 let mut details = journal_details(
                     classification,
                     resolved_target.as_ref(),
@@ -3050,6 +3186,7 @@ impl Broker {
                     source,
                 });
             }
+            Err(error) => return Err(error),
         };
         let remote_contact = git_trace
             .as_ref()
@@ -3135,16 +3272,18 @@ impl Broker {
                     json!({ "push_reconciliation": push_reconciliation }),
                 ),
             )
-        } else if let Some((status, create_reconciliation)) =
-            github_target.as_ref().and_then(|target| {
-                reconcile_failed_github_create(
-                    cwd,
-                    &target.display_slug,
-                    &create_planning,
-                    &output.stdout,
-                )
-            })
-        {
+        } else if let Some((status, create_reconciliation)) = match github_target.as_ref() {
+            Some(target) => reconcile_failed_github_create_with_deadline(
+                cwd,
+                &target.display_slug,
+                &create_planning,
+                &output.stdout,
+                admission,
+            )
+            .ok()
+            .flatten(),
+            None => None,
+        } {
             (
                 status,
                 journal_details(

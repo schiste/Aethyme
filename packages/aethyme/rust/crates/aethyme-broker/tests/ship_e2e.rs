@@ -8,7 +8,7 @@ use aethyme_broker::{
     AdvisoryEvidence, AdvisoryResolutionState, AdvisorySeverity, Broker, BrokerOpError,
     EntryExposureResolutionKind, EntryExposureState, IntegrationDeliveryState, NewAdvisory,
     OperationIdentityProvenance, OperationStatus, RepositoryDeliveryMode,
-    RepositoryDeliveryModeSource, ShipFreshnessResult,
+    RepositoryDeliveryModeSource, ShipFreshnessResult, ShipPublicationMode,
 };
 
 const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
@@ -105,6 +105,49 @@ impl Fixture {
         git_output(&self.remote, &["rev-parse", "refs/heads/main"])
     }
 
+    #[cfg(unix)]
+    fn refresh_remote_main(&self) {
+        git(
+            &self.repo,
+            &[
+                "fetch",
+                "-q",
+                self.remote.to_str().unwrap(),
+                "refs/heads/main:refs/remotes/origin/main",
+            ],
+        );
+    }
+
+    #[cfg(unix)]
+    fn mark_fake_pr_merged(&self, state: &Path, branch: &str) {
+        std::fs::write(state, format!("{branch}\nMERGED\n")).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn merge_delivery_branch_into_remote_main(&self, branch: &str) {
+        let merged = self._tmp.path().join("merge-delivery");
+        git(
+            self._tmp.path(),
+            &[
+                "clone",
+                "-q",
+                self.remote.to_str().unwrap(),
+                merged.to_str().unwrap(),
+            ],
+        );
+        git(
+            &merged,
+            &[
+                "merge",
+                "--no-ff",
+                "-qm",
+                "merge delivery",
+                &format!("origin/{branch}"),
+            ],
+        );
+        git(&merged, &["push", "-q", "origin", "main"]);
+    }
+
     fn advance_remote(&self) -> String {
         let outsider = self._tmp.path().join("outsider");
         git(
@@ -132,6 +175,19 @@ impl Fixture {
         .unwrap();
         git(&self.repo, &["add", "-f", ".aethyme/config.toml"]);
         git(&self.repo, &["commit", "-qm", "configure delivery"]);
+        git(&self.repo, &["push", "-q", "origin", "main"]);
+        git_output(&self.repo, &["rev-parse", "HEAD"])
+    }
+
+    fn set_publication_policy(&self, mode: &str) -> String {
+        std::fs::create_dir_all(self.repo.join(".aethyme")).unwrap();
+        std::fs::write(
+            self.repo.join(".aethyme/config.toml"),
+            format!("[publication]\nmode = \"{mode}\"\nallow_break_glass = false\n"),
+        )
+        .unwrap();
+        git(&self.repo, &["add", "-f", ".aethyme/config.toml"]);
+        git(&self.repo, &["commit", "-qm", "configure publication"]);
         git(&self.repo, &["push", "-q", "origin", "main"]);
         git_output(&self.repo, &["rev-parse", "HEAD"])
     }
@@ -177,9 +233,15 @@ exit 64
 state="$AETHYME_FAKE_PR_STATE"
 render_pr() {
   branch=$(sed -n '1p' "$state")
+  pr_state=$(sed -n '2p' "$state")
+  if [ -z "$pr_state" ]; then pr_state=OPEN; fi
+  merged_at=null
+  if [ "$pr_state" = "MERGED" ]; then
+    merged_at='"2026-09-17T00:00:00Z"'
+  fi
   head=$(git -C "$AETHYME_TEST_REPO" rev-parse "refs/heads/$branch") || exit 1
   base=$(git -C "$AETHYME_TEST_REPO" rev-parse refs/remotes/origin/main) || exit 1
-  printf '{"number":7,"url":"https://github.com/acme/project/pull/7","state":"OPEN","isDraft":false,"mergedAt":null,"headRefName":"%s","headRefOid":"%s","headRepository":{"nameWithOwner":"acme/project"},"baseRefName":"main","baseRefOid":"%s","statusCheckRollup":[]}' "$branch" "$head" "$base"
+  printf '{"number":7,"url":"https://github.com/acme/project/pull/7","state":"%s","isDraft":false,"mergedAt":%s,"headRefName":"%s","headRefOid":"%s","headRepository":{"nameWithOwner":"acme/project"},"baseRefName":"main","baseRefOid":"%s","statusCheckRollup":[]}' "$pr_state" "$merged_at" "$branch" "$head" "$base"
 }
 if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
   if [ ! -f "$state" ]; then
@@ -466,6 +528,136 @@ fn pull_request_delivery_pushes_and_reuses_one_exact_provider_pr() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn pull_request_delivery_distinguishes_merged_from_target_verified_publication() {
+    let fixture = Fixture::new();
+    let (entry_id, _, integration) = fixture.promoted_entry();
+    let (fake_bin, state) = fixture.configure_github_delivery_provider();
+    let entry = entry_id.to_string();
+    let planned = fixture.run_delivery_cli(
+        &[
+            "ship",
+            "plan",
+            "--entry",
+            &entry,
+            "--delivery",
+            "pull_request",
+            "--json",
+        ],
+        &fake_bin,
+        &state,
+    );
+    assert!(planned.status.success());
+    let plan: serde_json::Value = serde_json::from_slice(&planned.stdout).unwrap();
+    let plan_digest = plan["plan_digest"].as_str().unwrap().to_string();
+
+    let execute = fixture.run_delivery_cli(
+        &[
+            "ship",
+            "execute",
+            "--entry",
+            &entry,
+            "--confirm",
+            &integration,
+            "--delivery",
+            "pull_request",
+            "--plan",
+            &plan_digest,
+            "--json",
+        ],
+        &fake_bin,
+        &state,
+    );
+    assert!(execute.status.success());
+    let open: serde_json::Value = serde_json::from_slice(&execute.stdout).unwrap();
+    let open = &open["PullRequest"];
+    let branch = open["branch"].as_str().unwrap().to_string();
+
+    // The provider can confirm a merge before the target ref is visible to a
+    // fresh Git fetch. The broker must report that intermediate state and keep
+    // publication exposures outstanding.
+    fixture.mark_fake_pr_merged(&state, &branch);
+    let merged = fixture.run_delivery_cli(
+        &[
+            "ship",
+            "execute",
+            "--entry",
+            &entry,
+            "--confirm",
+            &integration,
+            "--delivery",
+            "pull_request",
+            "--plan",
+            &plan_digest,
+            "--json",
+        ],
+        &fake_bin,
+        &state,
+    );
+    assert!(merged.status.success());
+    let merged: serde_json::Value = serde_json::from_slice(&merged.stdout).unwrap();
+    let merged = &merged["PullRequest"];
+    assert_eq!(merged["delivery_state"], "pull_request_merged");
+    assert!(merged["target_verification_operation"].is_object());
+    assert!(merged["target_remote_sha"].is_string());
+    assert!(merged["resolved_exposures"].as_array().unwrap().is_empty());
+
+    fixture.merge_delivery_branch_into_remote_main(&branch);
+    // Planning intentionally remains read-only and fails closed when the
+    // newly observed remote policy commit is not present locally. Refresh the
+    // local object database before asking it to build the next plan.
+    fixture.refresh_remote_main();
+    let replanned = fixture.run_delivery_cli(
+        &[
+            "ship",
+            "plan",
+            "--entry",
+            &entry,
+            "--delivery",
+            "pull_request",
+            "--json",
+        ],
+        &fake_bin,
+        &state,
+    );
+    assert!(replanned.status.success());
+    let replanned: serde_json::Value = serde_json::from_slice(&replanned.stdout).unwrap();
+    let replanned_digest = replanned["plan_digest"].as_str().unwrap();
+    let published = fixture.run_delivery_cli(
+        &[
+            "ship",
+            "execute",
+            "--entry",
+            &entry,
+            "--confirm",
+            &integration,
+            "--delivery",
+            "pull_request",
+            "--plan",
+            replanned_digest,
+            "--json",
+        ],
+        &fake_bin,
+        &state,
+    );
+    assert!(published.status.success());
+    let published: serde_json::Value = serde_json::from_slice(&published.stdout).unwrap();
+    let published = &published["PullRequest"];
+    assert_eq!(published["delivery_state"], "published");
+    assert!(
+        !published["resolved_exposures"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        published["target_remote_sha"],
+        fixture.remote_main(),
+        "publication must record the verified target tip"
+    );
+}
+
 #[test]
 fn ship_plan_reads_the_delivery_policy_from_the_remote_default_commit() {
     let fixture = Fixture::new();
@@ -496,6 +688,42 @@ fn ship_plan_reads_the_delivery_policy_from_the_remote_default_commit() {
         broker.ship_plan_with_delivery(entry_id, Some(RepositoryDeliveryMode::LocalMainMerge)),
         Err(BrokerOpError::ShipDeliveryOverrideUnsafe { .. })
     ));
+}
+
+#[test]
+fn ship_plan_reads_publication_policy_from_the_remote_default_commit() {
+    let fixture = Fixture::new();
+    let trusted_policy_commit = fixture.set_publication_policy("review_gated");
+    let mut broker = fixture.broker();
+    let session = broker.start_worktree("candidate publication policy", None).unwrap();
+    let worktree = PathBuf::from(&session.worktree_path);
+    std::fs::write(worktree.join("feature.txt"), "candidate\n").unwrap();
+    std::fs::write(
+        worktree.join(".aethyme/config.toml"),
+        "[publication]\nmode = \"direct\"\nallow_break_glass = false\n",
+    )
+    .unwrap();
+    git(&worktree, &["add", "feature.txt"]);
+    git(&worktree, &["add", "-f", ".aethyme/config.toml"]);
+    git(&worktree, &["commit", "-qm", "candidate publication policy"]);
+    let outcome = broker.submit(session.id).unwrap();
+    assert!(outcome.promoted);
+
+    let plan = broker.ship_plan(outcome.entry.id).unwrap();
+    assert_eq!(
+        plan.publication_policy.policy.mode,
+        ShipPublicationMode::ReviewGated
+    );
+    assert_eq!(
+        plan.publication_policy.source_commit,
+        trusted_policy_commit
+    );
+    assert_ne!(
+        plan.publication_policy.source_commit,
+        plan.publication_sha,
+        "a candidate must not be able to self-authorize direct publication"
+    );
+    assert!(!plan.publication_policy.satisfied);
 }
 
 #[test]
@@ -1267,13 +1495,22 @@ fn ship_execute_rejects_a_remote_that_moved_since_the_planned_base() {
 
     let error = broker.ship_execute(entry_id, &integration).unwrap_err();
     assert!(matches!(
-        error,
-        BrokerOpError::ShipRemoteMoved { actual, .. } if actual == advanced
+        &error,
+        BrokerOpError::ShipPlanUnavailable {
+            what: "trusted publication policy",
+            ..
+        }
     ));
+    assert!(
+        error.to_string().contains(&advanced),
+        "the refusal should identify the unavailable trusted remote commit: {error}"
+    );
     assert_eq!(fixture.remote_main(), advanced);
     let operations = broker.store().coordinated_operations().unwrap();
-    assert_eq!(operations.len(), 1);
-    assert_eq!(operations[0].status, OperationStatus::Succeeded);
+    assert!(
+        operations.is_empty(),
+        "publication must not start while the trusted policy commit is unavailable"
+    );
     let exposure = broker
         .store()
         .entry_path_exposure(entry_id)

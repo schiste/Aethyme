@@ -93,6 +93,20 @@ pub enum BrokerOpError {
         stage: String,
         budget: String,
     },
+    /// A coordinated child was already running when its bounded operation
+    /// budget expired. Remote writes are stored as `outcome_unknown` and use
+    /// the durable recovery error below; this variant is for read-only and
+    /// local commands whose timeout cannot have changed remote state.
+    #[error(
+        "coordinated {provider} operation {operation_id} for {repository} exceeded its {budget} budget while {stage}; inspect the recorded operation before retrying"
+    )]
+    CoordinatedOperationTimedOut {
+        provider: &'static str,
+        operation_id: i64,
+        repository: String,
+        stage: String,
+        budget: String,
+    },
 
     #[error(transparent)]
     Git(#[from] GitError),
