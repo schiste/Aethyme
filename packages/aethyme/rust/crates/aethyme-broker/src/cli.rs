@@ -193,6 +193,9 @@ Usage:
       read from the file rather than command arguments or broker telemetry.
   aethyme broker resources list [--all] [--json]
       Read-only inventory. Ownership tokens are never included.
+  aethyme broker resources reap [--json]
+      Reclaim capacity from quarantined leases whose holder process is gone;
+      named allocations remain quarantined for cleanup review.
   aethyme broker resources reconcile <lease-id> --confirm <generation> [--json]
       Release an expired, quarantined allocation after reviewing host cleanup.
       The generation confirmation fences stale cleanup commands.
@@ -9456,6 +9459,31 @@ fn run_resources(parsed: Parsed) -> Result<(), UsageError> {
                 }
             }
         }
+        "reap" => {
+            let mut coordinator = crate::HostResourceCoordinator::open_default()?;
+            let report = coordinator.reap_dead_holders()?;
+            if parsed.json {
+                out!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                out!(
+                    "Reaped {} dead holder(s): {} capacity unit(s) reclaimed, {} lease(s) released, {} lease(s) retained for cleanup.",
+                    report.dead_holders_seen,
+                    report.reclaimed_capacity_units,
+                    report.released_leases,
+                    report.retained_quarantined_leases,
+                );
+                for lease in &report.leases {
+                    out!(
+                        "  lease {} generation {} pid {} — reclaimed {} capacity unit(s), {}",
+                        lease.lease_id,
+                        lease.generation,
+                        lease.holder_pid,
+                        lease.capacity_units,
+                        lease.state.as_str(),
+                    );
+                }
+            }
+        }
         "reconcile" => {
             let mut coordinator = crate::HostResourceCoordinator::open_default()?;
             let lease_id = parsed
@@ -9481,7 +9509,7 @@ fn run_resources(parsed: Parsed) -> Result<(), UsageError> {
         }
         other => {
             return Err(UsageError::Message(format!(
-                "unknown resources action {other:?}; expected plan, explain, acquire, run, renew, release, list, or reconcile"
+                "unknown resources action {other:?}; expected plan, explain, acquire, run, renew, release, list, reap, or reconcile"
             )));
         }
     }

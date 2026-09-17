@@ -349,8 +349,9 @@ pub use resources::{
     HOST_RESOURCE_REQUEST_SCHEMA_VERSION, HOST_RESOURCE_SCHEMA_VERSION, HostLeaseState,
     HostResourceAllocation, HostResourceConflict, HostResourceCoordinator, HostResourceError,
     HostResourceBlocker, HostResourceExplanation, HostResourceGrant, HostResourceHolder,
-    HostResourceKind, HostResourceLease, HostResourcePlan, HostResourceRequest,
-    HostResourceRequirement, HostResourceRunError, HostResourceRunReport, HostResourceWaitAdvice,
+    HostResourceKind, HostResourceLease, HostResourcePlan, HostResourceReapLease,
+    HostResourceReapReport, HostResourceRequest, HostResourceRequirement, HostResourceRunError,
+    HostResourceRunReport, HostResourceWaitAdvice,
     default_host_resource_db_path, resource_environment_key, validate_host_resource_requirements,
 };
 pub use retention::{
