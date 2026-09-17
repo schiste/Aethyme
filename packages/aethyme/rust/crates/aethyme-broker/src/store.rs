@@ -2977,6 +2977,23 @@ impl BrokerStore {
             .ok_or(BrokerError::CoordinatedOperationNotFound(id))
     }
 
+    /// Attach durable queue-wait evidence while an operation is still
+    /// prepared. The status guard makes a late diagnostic harmless if the
+    /// operation acquired the lock between the observation and this update.
+    pub fn annotate_prepared_operation(
+        &mut self,
+        id: i64,
+        details_json: &str,
+    ) -> Result<(), BrokerError> {
+        self.conn.execute(
+            "UPDATE coordinated_operations
+             SET details_json = ?2, updated_at = ?3
+             WHERE id = ?1 AND status = 'prepared'",
+            params![id, details_json, now_ms()],
+        )?;
+        Ok(())
+    }
+
     pub fn coordinated_operation(
         &self,
         id: i64,

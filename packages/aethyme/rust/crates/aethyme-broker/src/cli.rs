@@ -619,6 +619,44 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+fn coordination_wait_summary(operation: &crate::CoordinatedOperation) -> Option<String> {
+    if operation.status != crate::OperationStatus::Prepared {
+        return None;
+    }
+    let details = operation
+        .details_json
+        .as_deref()
+        .and_then(|details| serde_json::from_str::<serde_json::Value>(details).ok())?;
+    let wait = details.get("coordination_wait")?;
+    let holder = wait.get("holder")?;
+    let holder_name = match (
+        holder.get("operation_id").and_then(serde_json::Value::as_i64),
+        holder.get("session_id").and_then(serde_json::Value::as_i64),
+    ) {
+        (Some(operation_id), Some(session_id)) => {
+            format!("operation {operation_id} (session {session_id})")
+        }
+        (Some(operation_id), None) => format!("operation {operation_id}"),
+        _ => wait
+            .get("holder_description")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("an unrecorded holder")
+            .to_string(),
+    };
+    let waiting_started_at = wait
+        .get("waiting_started_at")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(operation.created_at);
+    let waited_seconds = now_ms()
+        .saturating_sub(waiting_started_at)
+        .max(0) as u64
+        / 1_000;
+    Some(format!(
+        "waiting for {holder_name} for {}",
+        crate::operations::humanize_duration(waited_seconds)
+    ))
+}
+
 /// Entry point for the router. Returns a process exit code.
 /// `--agent` when given, else `AETHYME_AGENT`. Resolved in the agent's own
 /// process, because promotion can run from a different one (issue rescue: a
@@ -5998,6 +6036,9 @@ fn render_operation_show(report: &crate::OperationShowReport) {
     out!("Scope:          {}", operation.scope);
     out!("Effect:         {}", operation.effect.as_str());
     out!("Status:         {}", operation.status.as_str());
+    if let Some(waiting) = coordination_wait_summary(operation) {
+        out!("Queue wait:     {waiting}");
+    }
     out!("Identity:       {}", operation.identity_provenance.as_str());
     out!("Command:        {}", operation.command_json);
     out!(
@@ -10570,20 +10611,24 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                         out!("No coordinated operations recorded.");
                     } else {
                         out!(
-                            "{:<5} {:<8} {:<21} {:<22} SCOPE",
+                            "{:<5} {:<8} {:<21} {:<22} SCOPE / WAIT",
                             "ID",
                             "TOOL",
                             "STATUS",
                             "REPOSITORY"
                         );
                         for operation in page.operations {
+                            let waiting = coordination_wait_summary(&operation)
+                                .map(|summary| format!("  {summary}"))
+                                .unwrap_or_default();
                             out!(
-                                "{:<5} {:<8} {:<21} {:<22} {}",
+                                "{:<5} {:<8} {:<21} {:<22} {}{}",
                                 operation.id,
                                 operation.provider.as_str(),
                                 operation.status.as_str(),
                                 operation.repository,
                                 operation.scope,
+                                waiting,
                             );
                         }
                         if let Some(before_id) = page.next_before_id {

@@ -555,7 +555,7 @@ impl RepositoryWriteLock {
     fn acquire(
         main_root: &Path,
         repository: &str,
-        mut describe_holder: impl FnMut() -> String,
+        mut describe_holder: impl FnMut() -> Result<String, BrokerOpError>,
         queue_wait: QueueWait,
     ) -> Result<Self, BrokerOpError> {
         let dir = main_root.join(".aethyme/locks/operations");
@@ -595,16 +595,17 @@ impl RepositoryWriteLock {
         if queue_wait == QueueWait::Refuse {
             return Err(BrokerOpError::CoordinatedLockBusy {
                 repository: repository.into(),
-                holder: describe_holder(),
+                holder: describe_holder()?,
                 waited: "not waited for".into(),
             });
         }
         // A coordinated operation that simply pauses is indistinguishable from one
         // that died. Saying what holds the lock, and for how long, is what makes
         // the difference visible to the caller (issue #138).
+        let holder = describe_holder()?;
         eprintln!(
             "[coordination] waiting for the {repository} write lock: {}",
-            describe_holder()
+            holder
         );
         let waited = std::time::Instant::now();
         match queue_wait {
@@ -637,7 +638,7 @@ impl RepositoryWriteLock {
                     if std::time::Instant::now() >= deadline {
                         return Err(BrokerOpError::CoordinatedLockBusy {
                             repository: repository.into(),
-                            holder: describe_holder(),
+                            holder: describe_holder()?,
                             waited: humanize_duration(waited.elapsed().as_secs()),
                         });
                     }
@@ -817,14 +818,22 @@ fn add_coordination_timing(
     );
 }
 
-/// The holder is whichever operation on this repository is recorded as running.
-/// An operation that has not registered yet is reported as such rather than as
-/// "no holder", because the lock is demonstrably held by someone.
-fn describe_lock_holder(store: &mut crate::BrokerStore, repository: &str) -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0);
+#[derive(Debug, Clone)]
+struct LockHolderInfo {
+    description: String,
+    operation_id: Option<i64>,
+    session_id: Option<i64>,
+    pid: Option<i64>,
+    scope: Option<String>,
+    started_at: Option<i64>,
+}
+
+/// The holder is whichever operation on this repository is recorded as
+/// running. An operation that has not registered yet is reported as such
+/// rather than as "no holder", because the lock is demonstrably held by
+/// someone.
+fn lock_holder_info(store: &mut crate::BrokerStore, repository: &str) -> LockHolderInfo {
+    let now = unix_now_ms();
     let running = store
         .unresolved_coordinated_operations(repository)
         .ok()
@@ -834,16 +843,55 @@ fn describe_lock_holder(store: &mut crate::BrokerStore, repository: &str) -> Str
                 .find(|operation| operation.status == OperationStatus::Running)
         });
     match running {
-        Some(operation) => format!(
-            "operation {} (session {}, {} {}) has held it for {}",
-            operation.id,
-            operation.session_id,
-            operation.provider.as_str(),
-            operation.scope,
-            humanize_duration(now.saturating_sub(operation.created_at).max(0) as u64 / 1_000)
-        ),
-        None => "held by an operation that has not recorded itself yet".into(),
+        Some(operation) => LockHolderInfo {
+            description: format!(
+                "operation {} (session {}, {} {}) has held it for {}",
+                operation.id,
+                operation.session_id,
+                operation.provider.as_str(),
+                operation.scope,
+                humanize_duration(now.saturating_sub(operation.created_at).max(0) as u64 / 1_000)
+            ),
+            operation_id: Some(operation.id),
+            session_id: Some(operation.session_id),
+            pid: Some(operation.pid),
+            scope: Some(operation.scope),
+            started_at: Some(operation.created_at),
+        },
+        None => LockHolderInfo {
+            description: "held by an operation that has not recorded itself yet".into(),
+            operation_id: None,
+            session_id: None,
+            pid: None,
+            scope: None,
+            started_at: None,
+        },
     }
+}
+
+fn coordination_wait_details(
+    holder: &LockHolderInfo,
+    enqueued_at: i64,
+    waiting_started_at: i64,
+) -> String {
+    json!({
+        "coordination_wait": {
+            "schema_version": 1,
+            "reason": "repository_write_lock",
+            "holder_description": holder.description.as_str(),
+            "holder": {
+                "operation_id": holder.operation_id,
+                "session_id": holder.session_id,
+                "pid": holder.pid,
+                "scope": holder.scope.as_deref(),
+                "started_at": holder.started_at,
+            },
+            "enqueued_at": enqueued_at,
+            "waiting_started_at": waiting_started_at,
+            "waited_ms": unix_now_ms().saturating_sub(waiting_started_at).max(0),
+        }
+    })
+    .to_string()
 }
 
 impl Drop for RepositoryWriteLock {
@@ -2536,6 +2584,35 @@ impl Broker {
         );
     }
 
+    /// Reap prepared write rows whose client process is gone. This runs from
+    /// broker open so a dead client is resolved by an independent invocation,
+    /// not only when another write happens to reach the same lock.
+    pub(crate) fn reap_abandoned_prepared_operations(&mut self) -> Result<usize, BrokerOpError> {
+        let pending = self.store().pending_coordinated_operations()?;
+        let mut reaped = 0;
+        for operation in pending {
+            if operation.status != OperationStatus::Prepared || !process_is_gone(operation.pid) {
+                continue;
+            }
+            let mut details = operation
+                .details_json
+                .as_deref()
+                .and_then(|details| serde_json::from_str::<serde_json::Value>(details).ok())
+                .filter(serde_json::Value::is_object)
+                .unwrap_or_else(|| json!({}));
+            details["reason"] = json!("abandoned_before_start");
+            details["reaped_by"] = json!("broker_open");
+            self.store().transition_coordinated_operation(
+                operation.id,
+                OperationStatus::Failed,
+                None,
+                Some(&details.to_string()),
+            )?;
+            reaped += 1;
+        }
+        Ok(reaped)
+    }
+
     pub(crate) fn run_coordinated_operation_at(
         &mut self,
         request: CoordinatedCommand,
@@ -2863,7 +2940,12 @@ impl Broker {
                     });
                 }
                 Err(error) => {
-                    self.resolve_unstarted_operation(queued_operation_id, "pre_push_unavailable");
+                    let reason = if matches!(&error, BrokerOpError::AdmissionTimedOut { .. }) {
+                        "admission_timed_out"
+                    } else {
+                        "pre_push_unavailable"
+                    };
+                    self.resolve_unstarted_operation(queued_operation_id, reason);
                     return Err(error);
                 }
             }
@@ -2877,6 +2959,8 @@ impl Broker {
         };
 
         let lock_wait_started_at = (effect != OperationEffect::Read).then(unix_now_ms);
+        let waiting_started_at = lock_wait_started_at.unwrap_or_else(unix_now_ms);
+        let enqueued_at = operation.created_at;
         let lock = if effect == OperationEffect::Read {
             None
         } else {
@@ -2888,7 +2972,14 @@ impl Broker {
             match RepositoryWriteLock::acquire(
                 &main_root,
                 &lock_key,
-                || describe_lock_holder(self.store(), &repository),
+                || {
+                    let holder = lock_holder_info(self.store(), &repository);
+                    let details =
+                        coordination_wait_details(&holder, enqueued_at, waiting_started_at);
+                    self.store()
+                        .annotate_prepared_operation(queued_operation_id, &details)?;
+                    Ok(holder.description)
+                },
                 admission.remaining_queue_wait(queue_wait),
             ) {
                 Ok(lock) => Some(lock),
@@ -3824,7 +3915,7 @@ mod tests {
             .transition_coordinated_operation(created.id, OperationStatus::Running, None, None)
             .unwrap();
 
-        let described = describe_lock_holder(&mut store, "owner/repo");
+        let described = lock_holder_info(&mut store, "owner/repo").description;
         assert!(
             described.contains(&format!("operation {}", created.id))
                 && described.contains("session 37")
@@ -3833,7 +3924,7 @@ mod tests {
         );
 
         // A repository with nothing running must not claim a phantom holder.
-        let other = describe_lock_holder(&mut store, "owner/elsewhere");
+        let other = lock_holder_info(&mut store, "owner/elsewhere").description;
         assert!(
             other.contains("has not recorded itself"),
             "an unregistered holder must be reported as such: {other}"

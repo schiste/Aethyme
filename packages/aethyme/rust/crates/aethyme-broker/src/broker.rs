@@ -2183,6 +2183,7 @@ impl Broker {
             worktree_root_override: None,
         };
         broker.backfill_live_repository_contracts()?;
+        broker.reap_abandoned_prepared_operations()?;
         broker.recover_interrupted_promotion()?;
         broker.recover_prepared_reconciliation()?;
         broker.backfill_promoted_path_exposures()?;
