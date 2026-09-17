@@ -200,7 +200,7 @@ pub use github_target::{
 };
 pub use graph_impact::{
     GRAPH_IMPACT_MAX_DEPTH, GRAPH_IMPACT_MAX_NODES, GRAPH_IMPACT_RESULT_LIMIT, GraphImpactChain,
-    GraphImpactLookup, GraphImpactProvider, GraphImpactQuery, GraphImpactStatus,
+    GraphImpactLookup, GraphImpactMode, GraphImpactProvider, GraphImpactQuery, GraphImpactStatus,
     GraphStoreImpactProvider,
 };
 pub use graph_integrity::{GraphIntegrityOutcome, GraphIntegrityRejection, GraphIntegrityStatus};

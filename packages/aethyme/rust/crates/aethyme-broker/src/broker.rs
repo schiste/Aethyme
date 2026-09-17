@@ -18,8 +18,8 @@ use crate::PromoteConfig;
 use crate::error::BrokerError;
 use crate::git::{GitError, GitRepo};
 use crate::graph_impact::{
-    GRAPH_IMPACT_MAX_DEPTH, GRAPH_IMPACT_MAX_NODES, GRAPH_IMPACT_RESULT_LIMIT, GraphImpactProvider,
-    GraphImpactQuery, GraphImpactStatus, GraphStoreImpactProvider,
+    GRAPH_IMPACT_MAX_DEPTH, GRAPH_IMPACT_MAX_NODES, GRAPH_IMPACT_RESULT_LIMIT, GraphImpactMode,
+    GraphImpactProvider, GraphImpactQuery, GraphImpactStatus, GraphStoreImpactProvider,
 };
 use crate::session_abandonment::{
     AbandonmentVerdict, SessionActivity, decide as decide_abandonment,
@@ -2042,6 +2042,7 @@ pub struct SemanticGateSuggestionChain {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct SemanticGateSource {
     pub provider: String,
+    pub mode: GraphImpactMode,
     pub status: GraphImpactStatus,
     pub reason: String,
     pub graph_store_path: String,
@@ -4738,6 +4739,7 @@ impl Broker {
             .lookup(&GraphImpactQuery {
                 repo_root: &self.main_root,
                 changed_files: &changed,
+                mode: GraphImpactMode::Calls,
                 max_results: GRAPH_IMPACT_RESULT_LIMIT,
                 max_depth: GRAPH_IMPACT_MAX_DEPTH,
                 max_nodes: GRAPH_IMPACT_MAX_NODES,
@@ -4768,7 +4770,7 @@ impl Broker {
                     SemanticGateSelection {
                         gate,
                         triggered_by,
-                        reason: "incoming Calls frontier".into(),
+                        reason: format!("incoming {} frontier", lookup.mode.label()),
                         chain,
                     }
                 })
@@ -4778,6 +4780,7 @@ impl Broker {
         };
         let semantic = SemanticGateSource {
             provider: self.graph_impact_provider.name().into(),
+            mode: lookup.mode,
             status: lookup.status,
             reason: lookup.explanation,
             graph_store_path: ".aethyme/graph_store.redb".into(),
