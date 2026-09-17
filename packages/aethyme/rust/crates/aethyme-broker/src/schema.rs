@@ -16,7 +16,7 @@ use rusqlite::Connection;
 use crate::error::BrokerError;
 
 /// Current database schema version (== `MIGRATIONS.len()`).
-pub const SCHEMA_VERSION: i64 = 39;
+pub const SCHEMA_VERSION: i64 = 40;
 
 /// Version stamped on every event row written by this binary.
 pub const EVENTS_SCHEMA_VERSION: i64 = 1;
@@ -1118,6 +1118,61 @@ CREATE INDEX review_requests_by_repository_state
 /// publication exposures can reach a terminal expiry state. The exposure
 /// rebuild is intentional so the CHECK constraints remain authoritative for
 /// databases created before expiry existed.
+// `failure_class` arrived in V2 as an ADD COLUMN carrying its own CHECK, and
+// SQLite cannot alter a CHECK in place, so admitting `build_failure` means
+// rebuilding the table. The copy is a straight column-for-column move: no row
+// is reclassified, because nothing recorded before this point distinguished a
+// broken build from a failing assertion.
+const MIGRATION_V40: &str = "
+DROP INDEX IF EXISTS gate_results_by_gate_tree;
+DROP INDEX IF EXISTS gate_results_by_gate_tree_definition;
+DROP INDEX IF EXISTS gate_results_by_retention_age;
+ALTER TABLE gate_results RENAME TO gate_results_v39;
+
+CREATE TABLE gate_results (
+    id              INTEGER PRIMARY KEY,
+    gate_name       TEXT NOT NULL,
+    tree_hash       TEXT NOT NULL,
+    status          TEXT NOT NULL CHECK (status IN ('pass', 'fail', 'cancelled', 'error')),
+    exit_code       INTEGER,
+    duration_ms     INTEGER,
+    log_path        TEXT,
+    session_id      INTEGER REFERENCES sessions (id),
+    created_at      INTEGER NOT NULL,
+    failure_class   TEXT CHECK (failure_class IS NULL OR failure_class IN (
+                        'test_failure',
+                        'build_failure',
+                        'environment',
+                        'resource_contention',
+                        'timeout',
+                        'cached_prior_fail',
+                        'unknown'
+                    )),
+    definition_hash TEXT NOT NULL DEFAULT '',
+    wait_duration_ms INTEGER,
+    first_output_ms INTEGER,
+    output_bytes    INTEGER
+);
+
+INSERT INTO gate_results (
+    id, gate_name, tree_hash, status, exit_code, duration_ms, log_path,
+    session_id, created_at, failure_class, definition_hash, wait_duration_ms,
+    first_output_ms, output_bytes
+)
+SELECT
+    id, gate_name, tree_hash, status, exit_code, duration_ms, log_path,
+    session_id, created_at, failure_class, definition_hash, wait_duration_ms,
+    first_output_ms, output_bytes
+FROM gate_results_v39;
+
+DROP TABLE gate_results_v39;
+
+CREATE INDEX gate_results_by_gate_tree ON gate_results (gate_name, tree_hash, id);
+CREATE INDEX gate_results_by_gate_tree_definition
+    ON gate_results (gate_name, tree_hash, definition_hash, id);
+CREATE INDEX gate_results_by_retention_age ON gate_results (created_at, id);
+";
+
 const MIGRATION_V39: &str = "
 CREATE TABLE gc_checkpoint_pin_releases (
     session_id     INTEGER NOT NULL REFERENCES sessions (id),
@@ -1201,6 +1256,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_V37,
     MIGRATION_V38,
     MIGRATION_V39,
+    MIGRATION_V40,
 ];
 
 pub(crate) fn current_version(conn: &Connection) -> Result<i64, BrokerError> {
@@ -1268,6 +1324,105 @@ pub fn migrate(conn: &Connection) -> Result<(), BrokerError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn v40_preserves_gate_results_and_accepts_build_failure() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON").unwrap();
+        conn.execute_batch("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            .unwrap();
+        for (index, sql) in MIGRATIONS.iter().take(39).enumerate() {
+            conn.execute_batch(sql).unwrap();
+            conn.execute(
+                "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)
+                 ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                [(index + 1).to_string()],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO gate_results (
+                 id, gate_name, tree_hash, status, exit_code, duration_ms,
+                 log_path, session_id, created_at, failure_class,
+                 definition_hash, wait_duration_ms, first_output_ms, output_bytes
+             ) VALUES (
+                 7, 'cargo-test', 'e833c8c3', 'fail', 101, 24281,
+                 '/logs/cargo-test.log', NULL, 1700, 'test_failure',
+                 'definition', 76, NULL, 1185
+             )",
+            [],
+        )
+        .unwrap();
+        assert!(
+            conn.execute(
+                "UPDATE gate_results SET failure_class = 'build_failure' WHERE id = 7",
+                [],
+            )
+            .is_err(),
+            "the old CHECK is what forces the rebuild"
+        );
+
+        conn.execute_batch(MIGRATIONS[39]).unwrap();
+
+        let row: (String, String, i64, String, i64) = conn
+            .query_row(
+                "SELECT gate_name, status, exit_code, failure_class, output_bytes
+                 FROM gate_results WHERE id = 7",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            row,
+            (
+                "cargo-test".to_string(),
+                "fail".to_string(),
+                101,
+                "test_failure".to_string(),
+                1185
+            ),
+            "the copy must carry every column and reclassify nothing"
+        );
+
+        let indexes: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master
+                 WHERE type = 'index' AND tbl_name = 'gate_results' AND name IN (
+                     'gate_results_by_gate_tree',
+                     'gate_results_by_gate_tree_definition',
+                     'gate_results_by_retention_age'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            indexes, 3,
+            "the rebuild must restore every index it dropped"
+        );
+
+        conn.execute(
+            "UPDATE gate_results SET failure_class = 'build_failure' WHERE id = 7",
+            [],
+        )
+        .unwrap();
+        assert!(
+            conn.execute(
+                "UPDATE gate_results SET failure_class = 'not_a_class' WHERE id = 7",
+                [],
+            )
+            .is_err(),
+            "widening the CHECK must not stop it rejecting unknown values"
+        );
+    }
 
     #[test]
     fn v30_preserves_advisories_and_accepts_explicit_suppression() {

@@ -88,6 +88,7 @@ text_enum!(GateStatus, "gate_results.status", {
 
 text_enum!(GateFailureClass, "gate_results.failure_class", {
     TestFailure => "test_failure",
+    BuildFailure => "build_failure",
     Environment => "environment",
     ResourceContention => "resource_contention",
     Timeout => "timeout",

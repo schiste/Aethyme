@@ -74,6 +74,20 @@ impl DeliveryStatus {
     }
 }
 
+/// How many times one delivery may be attempted before the broker gives up.
+///
+/// `Retry` is a judgement about *this* tick -- the target is busy, or briefly
+/// absent -- and nothing in it bounds the next one. An adapter that keeps
+/// deferring therefore keeps the row alive forever: a tab that never comes
+/// back was retried thousands of times before this cap existed, holding a
+/// delivery slot and a poll budget for a message that could not land.
+///
+/// The backoff in `claim_next_delivery` grows 15s, 30s, 60s, 120s, 240s and
+/// then holds at 300s, so this bound spends a little over an hour of wall
+/// clock before dead-lettering. That is far longer than an agent restarting
+/// between ticks, and far shorter than forever.
+pub const MAX_DELIVERY_ATTEMPTS: i64 = 20;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeliveryCompletion {

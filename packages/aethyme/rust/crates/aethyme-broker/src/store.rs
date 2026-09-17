@@ -18,7 +18,7 @@ use sha2::{Digest, Sha256};
 
 use crate::delivery::{
     DELIVERY_OUTBOX_SCHEMA_VERSION, DeliveryCompletion, DeliveryOutboxItem, DeliveryPolicy,
-    DeliveryStatus, DeliverySubscription,
+    DeliveryStatus, DeliverySubscription, MAX_DELIVERY_ATTEMPTS,
 };
 use crate::error::BrokerError;
 use crate::external_events::{
@@ -4842,6 +4842,14 @@ impl BrokerStore {
         }
         let (status, delivered_at) = match completion {
             DeliveryCompletion::Delivered => (DeliveryStatus::Delivered, Some(now)),
+            // The claim already counted this attempt, so an exhausted row is
+            // dead-lettered here rather than handed back to the adapter that
+            // has just failed to place it `MAX_DELIVERY_ATTEMPTS` times. The
+            // caller's `Retry` stays advisory: only the broker can see how
+            // long the row has been asking, so only the broker can stop it.
+            DeliveryCompletion::Retry if current.attempt_count >= MAX_DELIVERY_ATTEMPTS => {
+                (DeliveryStatus::Failed, None)
+            }
             DeliveryCompletion::Retry => (DeliveryStatus::Pending, None),
             DeliveryCompletion::Failed => (DeliveryStatus::Failed, None),
         };
