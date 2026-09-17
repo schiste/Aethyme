@@ -172,6 +172,106 @@ fn explain_joins_capacity_contention_to_the_live_holder_without_a_token() {
     assert!(!String::from_utf8_lossy(&explained.stdout).contains("ownership_token"));
 }
 
+#[cfg(unix)]
+#[test]
+fn reap_reclaims_dead_capacity_and_explain_names_the_quarantined_holder() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = temp.path().join("state");
+    let first_request = temp.path().join("first.json");
+    let second_request = temp.path().join("second.json");
+    let mut child = Command::new("true").spawn().unwrap();
+    let dead_pid = child.id();
+    child.wait().unwrap();
+    let request = |id: &str, holder_pid: u32| {
+        serde_json::json!({
+            "schema_version": 1,
+            "request_id": id,
+            "repository": "owner/repo",
+            "worktree_fingerprint": id,
+            "run_id": id,
+            "ttl_seconds": 60,
+            "holder_pid": holder_pid,
+            "resources": [{
+                "key": "prepush_slot",
+                "kind": "capacity",
+                "pool": "prepush",
+                "units": 1,
+                "limit": 3
+            }, {
+                "key": "worktree",
+                "kind": "exclusive_key",
+                "name": "shared-worktree"
+            }]
+        })
+    };
+    std::fs::write(
+        &first_request,
+        serde_json::to_vec_pretty(&request("first", dead_pid)).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        &second_request,
+        serde_json::to_vec_pretty(&request("second", std::process::id())).unwrap(),
+    )
+    .unwrap();
+
+    let acquired = run(
+        temp.path(),
+        &state,
+        &[
+            "resources",
+            "acquire",
+            first_request.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    assert!(
+        acquired.status.success(),
+        "{}",
+        String::from_utf8_lossy(&acquired.stderr)
+    );
+    let grant: serde_json::Value = serde_json::from_slice(&acquired.stdout).unwrap();
+    let lease_id = grant["lease"]["lease_id"].as_str().unwrap();
+    let generation = grant["lease"]["generation"].as_u64().unwrap();
+
+    let reaped = run(temp.path(), &state, &["resources", "reap", "--json"]);
+    assert!(
+        reaped.status.success(),
+        "{}",
+        String::from_utf8_lossy(&reaped.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&reaped.stdout).unwrap();
+    assert_eq!(report["dead_holders_seen"], 1);
+    assert_eq!(report["reclaimed_capacity_units"], 1);
+    assert_eq!(report["retained_quarantined_leases"], 1);
+    assert_eq!(report["leases"][0]["lease_id"], lease_id);
+    assert_eq!(report["leases"][0]["state"], "quarantined");
+
+    let explained = run(
+        temp.path(),
+        &state,
+        &["resources", "explain", second_request.to_str().unwrap()],
+    );
+    assert!(
+        explained.status.success(),
+        "{}",
+        String::from_utf8_lossy(&explained.stderr)
+    );
+    let rendered = String::from_utf8_lossy(&explained.stdout);
+    assert!(rendered.contains("blocked"), "{rendered}");
+    assert!(rendered.contains(lease_id), "{rendered}");
+    assert!(
+        rendered.contains(&format!("holder PID {dead_pid}")),
+        "{rendered}"
+    );
+    assert!(rendered.contains("process is gone"), "{rendered}");
+    assert!(
+        rendered.contains(&format!("--confirm {generation}")),
+        "{rendered}"
+    );
+    assert!(rendered.contains("waitable: false"), "{rendered}");
+}
+
 #[test]
 fn supervised_run_preserves_child_status_and_quarantines_failed_cleanup() {
     let temp = tempfile::tempdir().unwrap();

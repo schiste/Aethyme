@@ -466,6 +466,7 @@ until an explicit fetch makes ancestry verification possible.
 - `aethyme broker resources renew <grant.json> --ttl <seconds> [--json]`
 - `aethyme broker resources release <grant.json> [--json]`
 - `aethyme broker resources list [--all] [--json]`
+- `aethyme broker resources reap [--json]`
 - `aethyme broker resources reconcile <lease-id> --confirm <generation> [--json]`
 - `aethyme broker console [status|list] [--json]`
 - `aethyme broker console plan [--allow-parallel] [--json]`
