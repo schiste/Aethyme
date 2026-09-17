@@ -536,10 +536,17 @@ impl Broker {
                     "commit": base,
                     "reason": "retry claimed an unrecorded promotion this session produced",
                 });
+                let promotion_parent = self.repo_handle().first_parent(&base)?;
+                let promoted_paths = self
+                    .repo_handle()
+                    .changed_between(&promotion_parent, &base)?;
+                let integration_ref = PromoteConfig::load(&self.main_root_path()).branch;
                 self.store().record_recovered_promotion(
                     entry.id,
                     &base,
                     &simulation.tree,
+                    &integration_ref,
+                    &promoted_paths,
                     &recovered.to_string(),
                 )?;
                 clear_action_required(Path::new(&session.worktree_path));
@@ -1154,6 +1161,7 @@ impl Broker {
             self.store().record_merge_promotion(
                 entry.id,
                 &integration_head,
+                &config.branch,
                 &promoted_paths,
                 &crate::events::merge_promoted_payload(&config.branch, &integration_head),
             )?;
@@ -1250,6 +1258,7 @@ impl Broker {
         self.store().record_merge_promotion(
             entry_id,
             &merge_commit,
+            &branch,
             &promoted_paths,
             &crate::events::merge_promoted_payload(&branch, &merge_commit),
         )?;

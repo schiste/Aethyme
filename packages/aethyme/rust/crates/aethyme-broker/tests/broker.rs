@@ -634,6 +634,15 @@ fn cleanup_distinguishes_pending_commits_from_missing_acceptance_provenance() {
             [unproven.id],
         )
         .unwrap();
+    // Promotion now records the rewritten landing in the representation
+    // ledger. Remove that evidence as well so this fixture still models a
+    // session with genuinely missing acceptance provenance.
+    connection
+        .execute(
+            "DELETE FROM session_representations WHERE session_id = ?1",
+            [unproven.id],
+        )
+        .unwrap();
     drop(connection);
 
     let broker = Broker::open(tmp.path()).unwrap();

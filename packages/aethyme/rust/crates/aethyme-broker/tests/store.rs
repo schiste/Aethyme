@@ -707,6 +707,7 @@ fn promotion_atomically_advances_the_contribution_checkpoint() {
         .record_merge_promotion(
             entry.id,
             "integration-commit-1",
+            "aethyme/integration",
             &["src/lib.rs".into()],
             "{\"commit\":\"integration-commit-1\"}",
         )
@@ -728,6 +729,17 @@ fn promotion_atomically_advances_the_contribution_checkpoint() {
     );
     assert_eq!(accepted.accepted_queue_entry_id, Some(entry.id));
     assert!(accepted.accepted_at.is_some());
+    let representation = store
+        .session_representation(session.id, "session-head-1")
+        .unwrap()
+        .expect("promotion must record landing provenance");
+    assert_eq!(
+        representation.representing_commit.as_deref(),
+        Some("integration-commit-1")
+    );
+    assert_eq!(representation.representing_ref, "aethyme/integration");
+    assert_eq!(representation.discovery.as_str(), "merge_time");
+    assert!(representation.evidence.contains("broker promotion"));
     assert_eq!(
         store.merge_queue().unwrap()[0].status,
         MergeStatus::Promoted
