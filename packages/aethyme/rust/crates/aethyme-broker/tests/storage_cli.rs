@@ -197,6 +197,29 @@ fn storage_plan_reconciles_disk_git_and_session_ledger_without_writing() {
     );
 }
 
+/// Make an artifact directory look settled.
+///
+/// The primary lane refuses anything still changing, because a primary
+/// checkout has no session whose close would prove a build had finished. A
+/// fixture built milliseconds ago is indistinguishable from a live build, so
+/// it has to be aged before it can stand in for an abandoned one.
+fn settle(path: &std::path::Path) {
+    for entry in std::fs::read_dir(path).unwrap().flatten() {
+        let status = Command::new("touch")
+            .args(["-t", "202001010000"])
+            .arg(entry.path())
+            .status()
+            .unwrap();
+        assert!(status.success(), "touch failed for {:?}", entry.path());
+    }
+    let status = Command::new("touch")
+        .args(["-t", "202001010000"])
+        .arg(path)
+        .status()
+        .unwrap();
+    assert!(status.success(), "touch failed for {path:?}");
+}
+
 #[test]
 fn storage_plan_reports_primary_artifacts_and_never_candidates_tracked_output() {
     let (repo, container) = fixture();
@@ -209,6 +232,19 @@ fn storage_plan_reports_primary_artifacts_and_never_candidates_tracked_output() 
     std::fs::write(repo.path().join("dist/tracked.js"), "tracked\n").unwrap();
     git(repo.path(), &["add", "-f", "dist/tracked.js"]);
     git(repo.path(), &["commit", "-qm", "add tracked dist output"]);
+
+    // A build that is running leaves the checkout clean, because `target/` is
+    // git-ignored. Candidacy therefore also requires the tree to have stopped
+    // moving, so prove the live case first and only then age the fixture.
+    let busy = json(run(repo.path(), container.path(), &["storage", "--json"]));
+    assert_eq!(
+        busy["summary"]["primary_candidate_count"], 0,
+        "an artifact still being written to must never be a candidate"
+    );
+
+    settle(&repo.path().join("target"));
+    settle(&repo.path().join("build"));
+    settle(&repo.path().join("dist"));
 
     let plan = json(run(repo.path(), container.path(), &["storage", "--json"]));
     assert_eq!(plan["summary"]["primary_checkout_count"], 1);

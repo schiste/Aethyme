@@ -14,7 +14,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
@@ -701,8 +701,16 @@ fn inspect_primary_checkouts(
         .map(|path| inspect_primary_checkout(&path, size))
         .collect::<Vec<_>>();
     checkouts.sort_by(|left, right| left.path.cmp(&right.path));
+    // Reporting spans every enrolled checkout on the host; deleting does not.
+    // `storage apply` is confirmed by one digest produced from wherever the
+    // operator happened to run `plan`, and nothing in that confirmation names
+    // another repository. A sibling checkout therefore stays visible in the
+    // inventory -- which is what makes the disk legible -- while only the
+    // invoking checkout can lose bytes to it.
+    let invoking = normalise(invoking_main_root);
     let mut candidates = checkouts
         .iter()
+        .filter(|checkout| normalise(&checkout.path) == invoking)
         .flat_map(|checkout| {
             checkout
                 .artifacts
@@ -720,6 +728,48 @@ fn inspect_primary_checkouts(
         .collect::<Vec<_>>();
     candidates.sort_by(|left, right| left.path.cmp(&right.path));
     (checkouts, candidates)
+}
+
+/// How long an artifact directory must have been still before the primary
+/// lane will consider deleting it.
+///
+/// Long enough to span a link step or a slow test binary, short enough that a
+/// checkout nobody is working in becomes reclaimable within one coffee break.
+const PRIMARY_ARTIFACT_IDLE_MS: u64 = 30 * 60 * 1_000;
+
+/// Whether `dir` or any of its immediate entries changed inside `window_ms`.
+///
+/// Only the top level is read. A deep walk of a multi-gigabyte `target/` is
+/// precisely the cost this lane exists to reclaim, and a live build touches the
+/// top level often enough -- profile directories, lock files, fingerprint
+/// stamps -- for one level to answer the question being asked.
+///
+/// Every unreadable case answers "recently modified". The caller uses this to
+/// decide whether deleting is safe, so not knowing must never read as safe.
+fn directory_modified_within(dir: &Path, window_ms: u64) -> bool {
+    let cutoff = match SystemTime::now().checked_sub(Duration::from_millis(window_ms)) {
+        Some(cutoff) => cutoff,
+        None => return true,
+    };
+    let recent = |metadata: &std::fs::Metadata| {
+        metadata
+            .modified()
+            .map(|modified| modified > cutoff)
+            .unwrap_or(true)
+    };
+    if std::fs::symlink_metadata(dir)
+        .as_ref()
+        .map(recent)
+        .unwrap_or(true)
+    {
+        return true;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return true;
+    };
+    entries
+        .flatten()
+        .any(|entry| entry.metadata().as_ref().map(recent).unwrap_or(true))
 }
 
 fn is_enrolled_primary_checkout(path: &Path) -> bool {
@@ -811,13 +861,24 @@ fn inspect_primary_checkout(path: &Path, size: bool) -> StoragePrimaryCheckout {
                             true
                         }
                     };
-                    let reclaimable = clean && ignored && !tracked;
+                    // A session worktree can be proven idle because the broker
+                    // owns its lifecycle. A primary checkout has no session and
+                    // no close event, so the only honest evidence that nothing
+                    // is building is that the tree itself has stopped moving. A
+                    // running `cargo build` writes into `target/` continuously
+                    // while leaving the checkout `clean`, because `target/` is
+                    // git-ignored -- so cleanliness alone would license deleting
+                    // a build out from under itself.
+                    let busy = directory_modified_within(&path, PRIMARY_ARTIFACT_IDLE_MS);
+                    let reclaimable = clean && ignored && !tracked && !busy;
                     let reason = if !clean {
                         "enrolled primary checkout is dirty; the whole checkout is refused".into()
                     } else if tracked {
                         "directory contains tracked files and is never a candidate".into()
                     } else if !ignored {
                         "directory is not ignored by Git and is never a candidate".into()
+                    } else if busy {
+                        "artifact changed recently; a build may be running against it".into()
                     } else {
                         "regenerable Git-ignored artifact in a clean enrolled primary checkout"
                             .into()
@@ -1503,6 +1564,41 @@ fn is_sha256(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A primary checkout has no session and no close event, so the only
+    /// evidence that nothing is building is that the tree stopped moving.
+    /// `target/` is git-ignored, so a running build leaves the checkout clean
+    /// and every other condition satisfied.
+    #[test]
+    fn an_artifact_that_is_still_changing_is_not_a_candidate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("target");
+        std::fs::create_dir_all(target.join("debug")).unwrap();
+
+        assert!(
+            directory_modified_within(&target, PRIMARY_ARTIFACT_IDLE_MS),
+            "a directory just written to must read as busy"
+        );
+
+        // Nothing readable must ever read as idle: not knowing is not safety.
+        assert!(directory_modified_within(
+            &tmp.path().join("absent"),
+            PRIMARY_ARTIFACT_IDLE_MS
+        ));
+    }
+
+    /// A zero-length window is the boundary the guard turns on: with no window
+    /// at all, a tree that is not being written to answers "idle".
+    #[test]
+    fn a_settled_artifact_answers_idle_once_its_window_closes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        assert!(
+            !directory_modified_within(&target, 0),
+            "a tree nobody is writing to must become reclaimable"
+        );
+    }
 
     #[test]
     fn decision_digest_ignores_measured_bytes() {

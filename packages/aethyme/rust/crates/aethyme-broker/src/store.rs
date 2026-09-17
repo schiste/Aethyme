@@ -1293,6 +1293,13 @@ impl BrokerStore {
         let evidence = format!(
             "broker promotion landed session head {session_head} as {integration_commit} on {integration_ref}"
         );
+        // A promotion records the local integration landing, which carries no
+        // pull request. A row already naming a PR merge is the stronger claim:
+        // the integration commit is not an ancestor of the default branch, so
+        // overwriting one with the other turns a session that demonstrably
+        // landed upstream into unproven provenance and blocks its cleanup. The
+        // guard is on the UPDATE rather than the INSERT because the first
+        // writer may legitimately be either lane.
         tx.execute(
             "INSERT INTO session_representations (
                  session_id, session_head, representing_commit, representing_ref,
@@ -1305,7 +1312,8 @@ impl BrokerStore {
                  pr_number = excluded.pr_number,
                  paths_json = excluded.paths_json,
                  evidence = excluded.evidence,
-                 created_at = excluded.created_at",
+                 created_at = excluded.created_at
+             WHERE session_representations.pr_number IS NULL",
             params![
                 session_id,
                 session_head,

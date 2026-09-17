@@ -1519,6 +1519,10 @@ fn run_selections(
                         gate.name, message
                     ));
                     drop(owner_locks);
+                    // An error here is still a failure whose log a later run on
+                    // the same tree would overwrite, so it moves aside exactly
+                    // as a failing run's log does.
+                    let log_path = preserve_failed_gate_log(&log_path, GateStatus::Error);
                     store.record_gate_result(&NewGateResult {
                         gate_name: gate.name.clone(),
                         tree_hash: tree.clone(),
@@ -1574,6 +1578,7 @@ fn run_selections(
                 progress.report(&format!("gate {} environment error: {message}", gate.name));
                 let _ = resource_runtime.as_mut().map(GateResourceRuntime::release);
                 drop(owner_locks);
+                let log_path = preserve_failed_gate_log(&log_path, GateStatus::Error);
                 store.record_gate_result(&NewGateResult {
                     gate_name: gate.name.clone(),
                     tree_hash: tree.clone(),
