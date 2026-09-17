@@ -10,7 +10,7 @@ use std::sync::Mutex;
 use aethyme_broker::{
     AdvisoryEvidence, AdvisorySeverity, Broker, CachePolicy, GRAPH_IMPACT_MAX_DEPTH,
     GRAPH_IMPACT_MAX_NODES, GRAPH_IMPACT_RESULT_LIMIT, GateFailureClass, GateProgressSink,
-    GateStatus, GitRepo, GraphImpactLookup, GraphImpactProvider, GraphImpactQuery,
+    GateStatus, GitRepo, GraphImpactLookup, GraphImpactMode, GraphImpactProvider, GraphImpactQuery,
     GraphImpactStatus, NewAdvisory,
 };
 use aethyme_graph_indexer::{IndexerContext, WalkOptions, index_repo_to_disk, link_repo};
@@ -32,6 +32,7 @@ impl GraphImpactProvider for FixedGraphImpactProvider {
         assert_eq!(query.max_results, GRAPH_IMPACT_RESULT_LIMIT);
         assert_eq!(query.max_depth, GRAPH_IMPACT_MAX_DEPTH);
         assert_eq!(query.max_nodes, GRAPH_IMPACT_MAX_NODES);
+        assert_eq!(query.mode, GraphImpactMode::Calls);
         assert!(!query.changed_files.is_empty());
         self.lookup.clone()
     }
@@ -279,6 +280,7 @@ triggers = ["docs/**"]
     assert_eq!(report.path_selected_gates[1].reason, "path trigger");
     assert!(report.semantic_suggested_gates.is_empty());
     assert_eq!(report.semantic.provider, "caller_frontier");
+    assert_eq!(report.semantic.mode, GraphImpactMode::Calls);
     assert_eq!(report.semantic.status, GraphImpactStatus::GraphMissing);
     assert!(report.semantic.reason.contains("graph_store.redb"));
     assert!(report.semantic.impacted_paths.is_empty());
