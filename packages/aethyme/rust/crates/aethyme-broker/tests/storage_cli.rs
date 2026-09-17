@@ -43,6 +43,22 @@ fn fixture() -> (tempfile::TempDir, tempfile::TempDir) {
     (repo, container)
 }
 
+fn enroll(repo: &Path) {
+    std::fs::write(
+        repo.join(".aethyme/config.toml"),
+        "[promote]\nmode = \"auto\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join(".gitignore"),
+        "/.aethyme/\n/target/\n/build/\n/dist/\n/node_modules/\n/.venv/\n",
+    )
+    .unwrap();
+    git(repo, &["add", ".gitignore"]);
+    git(repo, &["add", "-f", ".aethyme/config.toml"]);
+    git(repo, &["commit", "-qm", "enroll fixture"]);
+}
+
 fn run(repo: &Path, container: &Path, args: &[&str]) -> Output {
     Command::new(CLI)
         .args(args)
@@ -121,7 +137,7 @@ fn storage_plan_reconciles_disk_git_and_session_ledger_without_writing() {
         db_before,
         "storage plan must not mutate the owner ledger"
     );
-    assert_eq!(plan["schema_version"], 1);
+    assert_eq!(plan["schema_version"], 2);
     assert_eq!(plan["summary"]["root_count"], 3);
     assert_eq!(plan["summary"]["owner_present_count"], 1);
     assert_eq!(plan["summary"]["owner_missing_count"], 1);
@@ -179,6 +195,103 @@ fn storage_plan_reconciles_disk_git_and_session_ledger_without_writing() {
             .iter()
             .all(|candidate| candidate["path"] != unmarked_root.to_str().unwrap())
     );
+}
+
+#[test]
+fn storage_plan_reports_primary_artifacts_and_never_candidates_tracked_output() {
+    let (repo, container) = fixture();
+    enroll(repo.path());
+    std::fs::create_dir_all(repo.path().join("target")).unwrap();
+    std::fs::write(repo.path().join("target/output"), "target\n").unwrap();
+    std::fs::create_dir_all(repo.path().join("build")).unwrap();
+    std::fs::write(repo.path().join("build/output"), "build\n").unwrap();
+    std::fs::create_dir_all(repo.path().join("dist")).unwrap();
+    std::fs::write(repo.path().join("dist/tracked.js"), "tracked\n").unwrap();
+    git(repo.path(), &["add", "-f", "dist/tracked.js"]);
+    git(repo.path(), &["commit", "-qm", "add tracked dist output"]);
+
+    let plan = json(run(repo.path(), container.path(), &["storage", "--json"]));
+    assert_eq!(plan["summary"]["primary_checkout_count"], 1);
+    assert_eq!(plan["summary"]["primary_artifact_count"], 3);
+    assert_eq!(plan["summary"]["primary_candidate_count"], 2);
+    let checkout = &plan["primary_checkouts"][0];
+    assert_eq!(checkout["clean"], true);
+    let dist = checkout["artifacts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|artifact| artifact["name"] == "dist")
+        .unwrap();
+    assert_eq!(dist["tracked"], true);
+    assert_eq!(dist["reclaimable"], false);
+    assert!(dist["reason"].as_str().unwrap().contains("tracked"));
+    assert!(
+        plan["primary_candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|candidate| candidate["name"] != "dist")
+    );
+
+    let digest = plan["digest"].as_str().unwrap();
+    let applied = json(run(
+        repo.path(),
+        container.path(),
+        &["storage", "apply", "--confirm", digest, "--json"],
+    ));
+    assert_eq!(applied["complete"], true);
+    assert_eq!(applied["applied"].as_array().unwrap().len(), 2);
+    assert!(!repo.path().join("target").exists());
+    assert!(!repo.path().join("build").exists());
+    assert!(repo.path().join("dist/tracked.js").exists());
+}
+
+#[test]
+fn storage_plan_refuses_a_dirty_primary_checkout_as_a_whole() {
+    let (repo, container) = fixture();
+    enroll(repo.path());
+    std::fs::create_dir_all(repo.path().join("target")).unwrap();
+    std::fs::write(repo.path().join("target/output"), "target\n").unwrap();
+    std::fs::write(repo.path().join("notes.txt"), "human work\n").unwrap();
+
+    let plan = json(run(
+        repo.path(),
+        container.path(),
+        &["storage", "plan", "--json"],
+    ));
+    let checkout = &plan["primary_checkouts"][0];
+    assert_eq!(checkout["clean"], false);
+    assert!(
+        checkout["dirty_paths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|path| path == "notes.txt")
+    );
+    assert!(
+        checkout["blockers"][0]
+            .as_str()
+            .unwrap()
+            .contains("whole checkout")
+    );
+    let target = checkout["artifacts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|artifact| artifact["name"] == "target")
+        .unwrap();
+    assert_eq!(target["reclaimable"], false);
+    assert_eq!(plan["primary_candidates"].as_array().unwrap().len(), 0);
+
+    let digest = plan["digest"].as_str().unwrap();
+    let applied = json(run(
+        repo.path(),
+        container.path(),
+        &["storage", "apply", "--confirm", digest, "--json"],
+    ));
+    assert_eq!(applied["complete"], true);
+    assert!(applied["applied"].as_array().unwrap().is_empty());
+    assert!(repo.path().join("target/output").exists());
 }
 
 #[test]

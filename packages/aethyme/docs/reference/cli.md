@@ -1339,6 +1339,15 @@ session IDs, and bounded byte estimates. Existing repository-local `gc` and
 an owner has been deleted, the invoking repository's orphan grace setting is
 used and is reported in the plan.
 
+The same plan also reports regenerable top-level artifact directories in every
+enrolled primary checkout it can discover. The primary-checkout section is
+separate from host worktree-root reconciliation: it lists each checkout's
+cleanliness, recognized artifacts, and blockers. Only the built-in or
+configured artifact names that Git explicitly ignores and that contain no
+tracked files become primary-artifact candidates. A dirty primary checkout is
+refused as a whole, so its artifacts remain evidence only; a directory named
+`dist` or `build` is never enough to authorize removal of tracked content.
+
 The inventory and `storage plan` are read-only. A directory that is absent from
 both Git registrations and the session ledger is reported as a possible stray,
 but it is not eligible unless the owning root has valid marker evidence. A

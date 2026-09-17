@@ -412,7 +412,8 @@ pub use storage::{
     STORAGE_PLAN_SCHEMA_VERSION, STORAGE_RECONCILIATION_SCHEMA_VERSION, StorageApplyFailure,
     StorageApplyReport, StorageAppliedItem, StorageCandidate, StorageCandidateKind,
     StorageDirectoryKind, StorageEntry, StorageError, StorageFilesystemKind, StorageMarkerStatus,
-    StoragePlan, StorageReconciliation, StorageRoot, StorageSource, StorageSummary,
+    StoragePlan, StoragePrimaryArtifact, StoragePrimaryCandidate, StoragePrimaryCheckout,
+    StorageReconciliation, StorageRoot, StorageSource, StorageSummary,
     storage_apply, storage_plan,
 };
 pub use types::{

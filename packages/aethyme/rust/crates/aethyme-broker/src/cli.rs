@@ -3509,13 +3509,20 @@ fn render_capped<T>(items: &[T], cap: usize, detail: bool, mut render: impl FnMu
 
 fn render_storage_plan(plan: &crate::StoragePlan, detail: bool) {
     out!(
-        "Host storage plan {}: {} root(s), {} on-disk directory entries, {} candidate(s), {} reclaimable",
+        "Host storage plan {}: {} root(s), {} on-disk directory entries, {} host candidate(s), {} reclaimable; {} enrolled primary checkout(s), {} artifact(s), {} artifact candidate(s), {} reclaimable",
         plan.digest,
         plan.summary.root_count,
         plan.summary.on_disk_directory_count,
         plan.summary.candidate_count,
         plan.summary
             .reclaimable_bytes
+            .map(human_bytes)
+            .unwrap_or_else(|| "unknown bytes".into()),
+        plan.summary.primary_checkout_count,
+        plan.summary.primary_artifact_count,
+        plan.summary.primary_candidate_count,
+        plan.summary
+            .primary_reclaimable_bytes
             .map(human_bytes)
             .unwrap_or_else(|| "unknown bytes".into()),
     );
@@ -3559,6 +3566,36 @@ fn render_storage_plan(plan: &crate::StoragePlan, detail: bool) {
             }
         }
     }
+    for checkout in &plan.primary_checkouts {
+        out!(
+            "  primary checkout: {} ({}, {} artifact(s))",
+            checkout.path.display(),
+            if checkout.clean {
+                "clean"
+            } else {
+                "refused: dirty"
+            },
+            checkout.artifacts.len(),
+        );
+        for blocker in &checkout.blockers {
+            out!("    blocker: {blocker}");
+        }
+        if detail {
+            for artifact in &checkout.artifacts {
+                out!(
+                    "    artifact: {} ({}, ignored {}, tracked {}) — {}",
+                    artifact.path.display(),
+                    artifact
+                        .estimated_bytes
+                        .map(human_bytes)
+                        .unwrap_or_else(|| "unknown bytes".into()),
+                    artifact.ignored,
+                    artifact.tracked,
+                    artifact.reason,
+                );
+            }
+        }
+    }
     render_capped(&plan.candidates, GC_LIST_CAP, detail, |candidate| {
         out!(
             "  candidate: {:?} {} ({}) — {}",
@@ -3571,7 +3608,19 @@ fn render_storage_plan(plan: &crate::StoragePlan, detail: bool) {
             candidate.reason,
         );
     });
-    if plan.candidates.is_empty() {
+    render_capped(&plan.primary_candidates, GC_LIST_CAP, detail, |candidate| {
+        out!(
+            "  primary candidate: {:?} {} ({}) — {}",
+            crate::StorageCandidateKind::PrimaryArtifact,
+            candidate.path.display(),
+            candidate
+                .estimated_bytes
+                .map(human_bytes)
+                .unwrap_or_else(|| "unknown bytes".into()),
+            candidate.reason,
+        );
+    });
+    if plan.candidates.is_empty() && plan.primary_candidates.is_empty() {
         out!("  apply: nothing eligible");
     } else {
         out!(
