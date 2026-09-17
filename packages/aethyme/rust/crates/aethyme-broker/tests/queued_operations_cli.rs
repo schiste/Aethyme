@@ -194,10 +194,49 @@ fn an_operation_waiting_for_the_lock_is_visible_as_prepared() {
             .map(|o| format!("{}={}", o["id"], o["status"]))
             .collect::<Vec<_>>()
             .join(" ");
+        let holder_id = operations.iter().find_map(|operation| {
+            (operation["status"] == "running"
+                && operation["authorization_reason"] == "hold the lock for the test")
+            .then(|| operation["id"].as_i64())
+            .flatten()
+        });
         if operations.iter().any(|operation| {
             operation["status"] == "prepared"
                 && operation["authorization_reason"] == "queue behind the holder"
         }) {
+            let waiting = operations
+                .iter()
+                .find(|operation| {
+                    operation["status"] == "prepared"
+                        && operation["authorization_reason"] == "queue behind the holder"
+                })
+                .expect("the waiting operation was found above");
+            let details: serde_json::Value = serde_json::from_str(
+                waiting["details_json"]
+                    .as_str()
+                    .expect("waiting operation carries details"),
+            )
+            .unwrap();
+            assert_eq!(details["coordination_wait"]["reason"], "repository_write_lock");
+            assert_eq!(
+                details["coordination_wait"]["holder"]["operation_id"],
+                holder_id.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null)
+            );
+            assert!(details["coordination_wait"]["enqueued_at"].as_i64().is_some());
+            assert!(details["coordination_wait"]["waiting_started_at"].as_i64().is_some());
+            assert!(details["coordination_wait"]["waited_ms"].as_i64().is_some());
+
+            let human = run(repo.path(), state.path(), None, &["operations", "list"]);
+            let human = String::from_utf8_lossy(&human.stdout);
+            let holder_id = holder_id.expect("the holder must be visible beside the waiter");
+            assert!(
+                human.contains(&format!("waiting for operation {holder_id}")),
+                "operations list must name the holder: {human}"
+            );
+            assert!(
+                human.contains("for "),
+                "operations list must include the time in queue: {human}"
+            );
             saw_queued = true;
             break;
         }

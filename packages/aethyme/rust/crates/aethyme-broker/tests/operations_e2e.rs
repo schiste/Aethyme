@@ -948,6 +948,47 @@ fn crashed_write_blocks_until_operator_reconciliation() {
 }
 
 #[test]
+fn opening_the_broker_reaps_a_dead_prepared_operation_without_another_write() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let worktree = add_worktree(tmp.path(), "prepared-reap");
+    let operation_id;
+    {
+        let mut broker = Broker::open(tmp.path()).unwrap();
+        let session = broker.adopt(&worktree, None).unwrap();
+        let repository = format!("local:{}", broker.main_root().display());
+        operation_id = broker
+            .store()
+            .create_coordinated_operation(&NewCoordinatedOperation {
+                session_id: session.id,
+                provider: OperationProvider::Git,
+                repository,
+                scope: "repository".into(),
+                effect: OperationEffect::Write,
+                authorization_reason: Some("simulated abandoned admission".into()),
+                command_json: r#"["git","branch","never-started"]"#.into(),
+                pid: 999_999,
+                host_operation_id: None,
+                identity_provenance: OperationIdentityProvenance::LocalRepository,
+            })
+            .unwrap()
+            .id;
+    }
+
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let operation = broker
+        .store()
+        .coordinated_operation(operation_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(operation.status, OperationStatus::Failed);
+    let details: serde_json::Value =
+        serde_json::from_str(operation.details_json.as_deref().unwrap()).unwrap();
+    assert_eq!(details["reason"], "abandoned_before_start");
+    assert_eq!(details["reaped_by"], "broker_open");
+}
+
+#[test]
 fn local_git_conflict_is_failed_without_remote_recovery_or_write_block() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());
@@ -1071,6 +1112,59 @@ fn an_opted_in_pre_push_refusal_stops_before_the_lock() {
         rendered.contains("gate refused"),
         "the hook's own output must survive: {rendered}"
     );
+}
+
+/// The complete queue timeout includes preparation before the repository lock.
+/// A slow opted-in pre-push hook must settle its prepared journal row instead
+/// of waiting forever before the lock is even attempted (#219).
+#[cfg(unix)]
+#[test]
+fn a_slow_pre_lock_hook_exhausts_the_queue_timeout_and_settles_the_row() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut fixture = push_fixture(tmp.path(), "hooks-timeout");
+    let repo = fixture.broker.main_root().to_path_buf();
+    enable_hooks_outside_lock(&repo);
+    write_executable(
+        &repo.join(".git/hooks/pre-push"),
+        "#!/bin/sh\nsleep 5\nexit 0\n",
+    );
+    commit_push_fixture(&fixture, "pre-lock timeout\n");
+
+    let started = Instant::now();
+    let error = fixture
+        .broker
+        .run_coordinated_operation_with_wait(
+            exact_push_request(
+                fixture.session_id,
+                &fixture.worktree,
+                &["HEAD:refs/heads/main"],
+            ),
+            QueueWait::Seconds(1),
+        )
+        .unwrap_err();
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "pre-lock timeout returned too late: {:?}",
+        started.elapsed()
+    );
+    match error {
+        BrokerOpError::AdmissionTimedOut { stage, .. } => {
+            assert_eq!(stage, "running the pre-push dry run");
+        }
+        other => panic!("expected pre-lock admission timeout, got {other:?}"),
+    }
+    let operation = fixture
+        .broker
+        .store()
+        .coordinated_operations()
+        .unwrap()
+        .into_iter()
+        .last()
+        .expect("the timed-out admission must leave a journal row");
+    assert_eq!(operation.status, OperationStatus::Failed);
+    let details: serde_json::Value =
+        serde_json::from_str(operation.details_json.as_deref().unwrap()).unwrap();
+    assert_eq!(details["reason"], "admission_timed_out");
 }
 
 /// The opted-in path must still push successfully, and must not run the hook a
