@@ -16,16 +16,41 @@ use aethyme_engine::store::redb::graph_store::{
 
 /// Maximum number of provider-ranked impact paths admitted to one report.
 pub const GRAPH_IMPACT_RESULT_LIMIT: usize = 64;
-/// Maximum incoming `Calls` hops from a changed callable.
+/// Maximum incoming relationship hops from a changed graph node.
 pub const GRAPH_IMPACT_MAX_DEPTH: usize = 2;
-/// Maximum distinct callable nodes admitted to the caller traversal.
+/// Maximum distinct graph nodes admitted to the bounded traversal.
 pub const GRAPH_IMPACT_MAX_NODES: usize = 128;
+
+/// Relationship used to derive a bounded graph-impact frontier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GraphImpactMode {
+    Calls,
+    Imports,
+}
+
+impl GraphImpactMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Calls => "calls",
+            Self::Imports => "imports",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Calls => "Calls",
+            Self::Imports => "Imports",
+        }
+    }
+}
 
 /// Inputs available to an advisory graph-impact provider.
 #[derive(Debug, Clone, Copy)]
 pub struct GraphImpactQuery<'a> {
     pub repo_root: &'a Path,
     pub changed_files: &'a [String],
+    pub mode: GraphImpactMode,
     pub max_results: usize,
     pub max_depth: usize,
     pub max_nodes: usize,
@@ -63,6 +88,9 @@ impl GraphImpactStatus {
 /// Provider output before the broker derives advisory gate suggestions.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct GraphImpactLookup {
+    /// Relationship that actually served this lookup, including degraded
+    /// outcomes so callers can explain which mode was requested.
+    pub mode: GraphImpactMode,
     pub status: GraphImpactStatus,
     pub impacted_paths: Vec<String>,
     pub chains: Vec<GraphImpactChain>,
@@ -78,6 +106,7 @@ impl GraphImpactLookup {
         explanation: impl Into<String>,
     ) -> Self {
         Self {
+            mode: GraphImpactMode::Calls,
             status: GraphImpactStatus::Ready,
             impacted_paths,
             chains: Vec::new(),
@@ -98,6 +127,7 @@ impl GraphImpactLookup {
             .map(|chain| chain.caller_file.clone())
             .collect();
         Self {
+            mode: GraphImpactMode::Calls,
             status: GraphImpactStatus::Ready,
             impacted_paths,
             chains,
@@ -121,6 +151,7 @@ impl GraphImpactLookup {
 
     fn degraded(status: GraphImpactStatus, explanation: impl Into<String>) -> Self {
         Self {
+            mode: GraphImpactMode::Calls,
             status,
             impacted_paths: Vec::new(),
             chains: Vec::new(),
@@ -128,6 +159,14 @@ impl GraphImpactLookup {
             truncated: false,
             explanation: explanation.into(),
         }
+    }
+
+    /// Record the relationship mode requested by the caller. The basic
+    /// constructors retain their historical Calls default for custom test
+    /// providers and other API users that return a synthetic lookup.
+    pub fn with_mode(mut self, mode: GraphImpactMode) -> Self {
+        self.mode = mode;
+        self
     }
 
     /// Enforce the broker-side result contract even when a provider returns
@@ -172,7 +211,7 @@ pub trait GraphImpactProvider: Send + Sync {
     fn lookup(&self, query: &GraphImpactQuery<'_>) -> GraphImpactLookup;
 }
 
-/// Read-only redb provider for bounded incoming caller frontiers.
+/// Read-only redb provider for bounded incoming graph frontiers.
 #[derive(Debug, Default)]
 pub struct GraphStoreImpactProvider;
 
@@ -187,7 +226,8 @@ impl GraphImpactProvider for GraphStoreImpactProvider {
         if !store_path.is_file() {
             return GraphImpactLookup::graph_missing(
                 "no .aethyme/graph_store.redb found; semantic suggestions are unavailable",
-            );
+            )
+            .with_mode(query.mode);
         }
 
         let store_modified = match modified(&store_path) {
@@ -195,7 +235,8 @@ impl GraphImpactProvider for GraphStoreImpactProvider {
             Err(error) => {
                 return GraphImpactLookup::provider_error(format!(
                     "could not inspect .aethyme/graph_store.redb freshness: {error}"
-                ));
+                ))
+                .with_mode(query.mode);
             }
         };
         let newest_fragment = match newest_modified(&fragments_path) {
@@ -203,28 +244,37 @@ impl GraphImpactProvider for GraphStoreImpactProvider {
             Err(error) => {
                 return GraphImpactLookup::provider_error(format!(
                     "could not inspect .aethyme/graph fragments: {error}"
-                ));
+                ))
+                .with_mode(query.mode);
             }
         };
         if newest_fragment.is_some_and(|fragment| fragment > store_modified) {
             return GraphImpactLookup::graph_stale(
                 ".aethyme/graph contains fragments newer than graph_store.redb; rebuild the graph before using semantic suggestions",
-            );
+            )
+            .with_mode(query.mode);
         }
 
         let store = match GraphStore::open_read_only(query.repo_root) {
             Ok(store) => store,
             Err(error) => {
                 return GraphImpactLookup::provider_error(format!(
-                    "could not open graph_store.redb for caller lookup: {error}"
-                ));
+                    "could not open graph_store.redb for impact lookup: {error}"
+                ))
+                .with_mode(query.mode);
             }
         };
-        match caller_frontier(&store, query) {
+        let lookup = match query.mode {
+            GraphImpactMode::Calls => caller_frontier(&store, query),
+            GraphImpactMode::Imports => import_frontier(&store, query),
+        };
+        match lookup {
             Ok(lookup) => lookup,
-            Err(error) => {
-                GraphImpactLookup::provider_error(format!("caller frontier lookup failed: {error}"))
-            }
+            Err(error) => GraphImpactLookup::provider_error(format!(
+                "{} frontier lookup failed: {error}",
+                query.mode.as_str()
+            ))
+            .with_mode(query.mode),
         }
     }
 }
@@ -315,12 +365,98 @@ fn caller_frontier(
         query.max_depth,
         query.max_nodes
     );
-    Ok(GraphImpactLookup::ready_with_chains(
-        chains,
-        visited.len(),
-        truncated,
-        explanation,
-    ))
+    Ok(
+        GraphImpactLookup::ready_with_chains(chains, visited.len(), truncated, explanation)
+            .with_mode(GraphImpactMode::Calls),
+    )
+}
+
+fn import_frontier(
+    store: &ReadOnlyGraphStore,
+    query: &GraphImpactQuery<'_>,
+) -> Result<GraphImpactLookup, GraphStoreError> {
+    let mut changed_files = query.changed_files.to_vec();
+    changed_files.sort();
+    changed_files.dedup();
+    let changed_set = changed_files.iter().cloned().collect::<BTreeSet<_>>();
+
+    let mut queue = VecDeque::new();
+    let mut visited = BTreeSet::new();
+    let mut truncated = false;
+    for changed_file in &changed_files {
+        if visited.len() == query.max_nodes {
+            truncated = true;
+            break;
+        }
+        let Some(file) = store.resolve_file_path(changed_file)? else {
+            continue;
+        };
+        if visited.insert(file.id.clone()) {
+            queue.push_back(FrontierNode {
+                changed_file: changed_file.clone(),
+                node_id: file.id,
+                depth: 0,
+            });
+        }
+    }
+    let seed_count = visited.len();
+
+    let mut chains = Vec::new();
+    let mut importer_files = HashSet::new();
+    'walk: while let Some(current) = queue.pop_front() {
+        let importers = file_importers(store, &current.node_id)?;
+        if current.depth >= query.max_depth {
+            if importers
+                .iter()
+                .any(|(importer_id, _)| !visited.contains(importer_id))
+            {
+                truncated = true;
+            }
+            continue;
+        }
+
+        for (importer_id, importer_file) in importers {
+            if visited.contains(&importer_id) {
+                continue;
+            }
+            if visited.len() == query.max_nodes {
+                truncated = true;
+                break 'walk;
+            }
+            visited.insert(importer_id.clone());
+            let depth = current.depth + 1;
+            queue.push_back(FrontierNode {
+                changed_file: current.changed_file.clone(),
+                node_id: importer_id,
+                depth,
+            });
+
+            if changed_set.contains(&importer_file) || !importer_files.insert(importer_file.clone())
+            {
+                continue;
+            }
+            if chains.len() == query.max_results {
+                truncated = true;
+                break 'walk;
+            }
+            chains.push(GraphImpactChain {
+                changed_file: current.changed_file.clone(),
+                caller_file: importer_file,
+                depth,
+            });
+        }
+    }
+
+    let explanation = format!(
+        "walked incoming Imports edges from {seed_count} changed-file file(s); returned {} importer file(s) with depth <= {} and nodes <= {}",
+        chains.len(),
+        query.max_depth,
+        query.max_nodes
+    );
+    Ok(
+        GraphImpactLookup::ready_with_chains(chains, visited.len(), truncated, explanation)
+            .with_mode(GraphImpactMode::Imports),
+    )
 }
 
 fn callable_callers(
@@ -353,6 +489,41 @@ fn callable_callers(
     }
     callers.dedup();
     Ok(callers)
+}
+
+fn file_importers(
+    store: &ReadOnlyGraphStore,
+    node_id: &str,
+) -> Result<Vec<(String, String)>, GraphStoreError> {
+    let mut adjacency = store.neighbors(
+        node_id,
+        NeighborDirection::Incoming,
+        Some(EdgeKind::Imports),
+    )?;
+    adjacency.sort_by(|left, right| {
+        left.other
+            .as_str()
+            .cmp(right.other.as_str())
+            .then_with(|| left.source.as_str().cmp(right.source.as_str()))
+            .then_with(|| left.confidence.cmp(&right.confidence))
+    });
+
+    let mut importers = Vec::new();
+    for edge in adjacency {
+        let importer_id = edge.other.as_str();
+        let Some(display) = store.node_display(importer_id)? else {
+            continue;
+        };
+        if display.kind != StoredNodeKind::File {
+            continue;
+        }
+        let Some(path) = display.path else {
+            continue;
+        };
+        importers.push((importer_id.to_string(), path));
+    }
+    importers.dedup();
+    Ok(importers)
 }
 
 fn modified(path: &Path) -> std::io::Result<SystemTime> {
@@ -396,6 +567,7 @@ mod tests {
         GraphImpactQuery {
             repo_root: root,
             changed_files: &[],
+            mode: GraphImpactMode::Calls,
             max_results: GRAPH_IMPACT_RESULT_LIMIT,
             max_depth: GRAPH_IMPACT_MAX_DEPTH,
             max_nodes: GRAPH_IMPACT_MAX_NODES,
@@ -573,6 +745,7 @@ mod tests {
         let query = GraphImpactQuery {
             repo_root: root.path(),
             changed_files: &changed_files,
+            mode: GraphImpactMode::Calls,
             max_results: GRAPH_IMPACT_RESULT_LIMIT,
             max_depth: 2,
             max_nodes: GRAPH_IMPACT_MAX_NODES,
@@ -582,6 +755,7 @@ mod tests {
         let second = provider.lookup(&query);
 
         assert_eq!(first, second, "caller ordering must be deterministic");
+        assert_eq!(first.mode, GraphImpactMode::Calls);
         assert_eq!(first.status, GraphImpactStatus::Ready);
         assert_eq!(
             first.impacted_paths,
@@ -624,5 +798,118 @@ mod tests {
         assert_eq!(node_limited.impacted_paths, vec!["src/adapter.rs"]);
         assert_eq!(node_limited.visited_nodes, 2);
         assert!(node_limited.truncated);
+    }
+
+    #[test]
+    fn warm_graph_compares_calls_and_imports_frontiers_and_reports_mode() {
+        use aethyme_engine::model::edge::Edge;
+        use aethyme_engine::model::file::{FileNode, FileRole};
+        use aethyme_engine::store::redb::graph_store::{insert_edge, insert_file};
+
+        fn file(path: &str) -> FileNode {
+            FileNode::new(
+                "Repo",
+                path,
+                Some("rust".into()),
+                FileRole::Source,
+                10,
+                100,
+                false,
+                None,
+            )
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let store = GraphStore::open(root.path()).unwrap();
+        let changed_file = file("src/core.rs");
+        let adapter_file = file("src/adapter.rs");
+        let caller_file = file("src/service.rs");
+        let outer_file = file("src/api.rs");
+        let beyond_file = file("src/bin.rs");
+        let mut session = store.begin_index().unwrap();
+        for file in [
+            &changed_file,
+            &adapter_file,
+            &caller_file,
+            &outer_file,
+            &beyond_file,
+        ] {
+            insert_file(&mut session, file).unwrap();
+        }
+        for (from, to) in [
+            (adapter_file.id.as_str(), changed_file.id.as_str()),
+            (caller_file.id.as_str(), changed_file.id.as_str()),
+            (outer_file.id.as_str(), caller_file.id.as_str()),
+            (beyond_file.id.as_str(), outer_file.id.as_str()),
+        ] {
+            insert_edge(
+                &mut session,
+                &Edge::new(from, to, EdgeKind::Imports, 1000, "test"),
+            )
+            .unwrap();
+        }
+        session.commit().unwrap();
+        drop(store);
+
+        let changed_files = vec![changed_file.path.clone()];
+        let provider = GraphStoreImpactProvider;
+        let calls = provider.lookup(&GraphImpactQuery {
+            repo_root: root.path(),
+            changed_files: &changed_files,
+            mode: GraphImpactMode::Calls,
+            max_results: GRAPH_IMPACT_RESULT_LIMIT,
+            max_depth: 2,
+            max_nodes: GRAPH_IMPACT_MAX_NODES,
+        });
+        let imports = provider.lookup(&GraphImpactQuery {
+            mode: GraphImpactMode::Imports,
+            ..GraphImpactQuery {
+                repo_root: root.path(),
+                changed_files: &changed_files,
+                mode: GraphImpactMode::Calls,
+                max_results: GRAPH_IMPACT_RESULT_LIMIT,
+                max_depth: 2,
+                max_nodes: GRAPH_IMPACT_MAX_NODES,
+            }
+        });
+
+        assert_eq!(calls.status, GraphImpactStatus::Ready);
+        assert_eq!(calls.mode, GraphImpactMode::Calls);
+        assert!(calls.impacted_paths.is_empty());
+        assert_eq!(imports.status, GraphImpactStatus::Ready);
+        assert_eq!(imports.mode, GraphImpactMode::Imports);
+        assert_eq!(
+            imports.impacted_paths,
+            vec![
+                "src/adapter.rs".to_string(),
+                "src/service.rs".to_string(),
+                "src/api.rs".to_string()
+            ]
+        );
+        assert_eq!(
+            imports.chains,
+            vec![
+                GraphImpactChain {
+                    changed_file: "src/core.rs".into(),
+                    caller_file: "src/adapter.rs".into(),
+                    depth: 1,
+                },
+                GraphImpactChain {
+                    changed_file: "src/core.rs".into(),
+                    caller_file: "src/service.rs".into(),
+                    depth: 1,
+                },
+                GraphImpactChain {
+                    changed_file: "src/core.rs".into(),
+                    caller_file: "src/api.rs".into(),
+                    depth: 2,
+                },
+            ]
+        );
+        assert!(
+            imports.truncated,
+            "the depth-three importer must mark truncation"
+        );
+        assert!(imports.explanation.contains("incoming Imports edges"));
     }
 }
