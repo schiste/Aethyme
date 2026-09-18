@@ -3,19 +3,23 @@ name: Aethyme Gates
 # Convergence lane: gates.toml is the single definition of "verified" —
 # this workflow runs the exact gates, via the exact runner, that the
 # broker runs before promoting a session (`aethyme broker gates run
-# --all`). The pre-existing test workflows stay in place until this lane
-# has proven equivalent; deleting them is a separate, later decision.
+# --all`). Certify merged trees here; OSS CI runs the full Rust workspace
+# on pull requests. Keep the binary-driven subset available manually.
 #
 # No untrusted event data (`github.event.*`) is interpolated into any
 # `run:` block here — every step is a fixed command.
 
 on:
-  pull_request:
   push:
     branches: ["main", "master"]
+  workflow_dispatch:
 
 permissions:
   contents: read
+
+concurrency:
+  group: aethyme-gates-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   gates:
@@ -44,7 +48,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Build aethyme binary
-        run: cargo build --release --manifest-path packages/aethyme/rust/Cargo.toml --bin aethyme
+        run: cargo build --locked --release --manifest-path packages/aethyme/rust/Cargo.toml --bin aethyme
 
       - name: Run all gates
         run: packages/aethyme/rust/target/release/aethyme broker gates run --all

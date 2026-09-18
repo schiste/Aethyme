@@ -5,22 +5,15 @@ name: Aethyme Local Tests
 # now Rust integration tests in `aethyme-cli/tests/` and
 # `aethyme-testkit/tests/`, so this lane installs no Python.
 #
-# It stays separate from `oss-ci.yml:rust-tests` for one reason: the
-# suites shell out to the built binaries, and a lane scoped to
-# `packages/aethyme/**` gives that path its own signal on the PRs that
-# touch it. The PRODUCT path carries no Python and is proven by the
-# `product-path-no-python` job in oss-ci.yml.
+# Manual diagnostic lane: these suites already run in the full workspace
+# on PRs (OSS CI) and main (Aethyme Gates). The distinct no-Python product
+# proof remains automatic in oss-ci.yml.
 
 on:
-  pull_request:
-    paths:
-      - "packages/aethyme/**"
-      - ".github/workflows/aethyme-local-tests.yml"
-  push:
-    branches: ["main", "master"]
-    paths:
-      - "packages/aethyme/**"
-      - ".github/workflows/aethyme-local-tests.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   binary-driven-tests:
@@ -41,10 +34,10 @@ jobs:
       # them on demand. Building them up front keeps the cost visible as a
       # build step instead of hiding it inside the first test.
       - name: Build the binaries the suites drive
-        run: cargo build --quiet --bin aethyme --bin aethyme-engine-cli --bin aethyme-graph-index
+        run: cargo build --locked --quiet --bin aethyme --bin aethyme-engine-cli --bin aethyme-graph-index
 
       # `-p aethyme-cli -p aethyme-testkit` is the ported pytest surface:
       # the CLI suites and the repo-hygiene suites. The rest of the
-      # workspace is covered by oss-ci.yml:rust-tests.
+      # workspace is covered automatically by OSS CI and Aethyme Gates.
       - name: Run the binary-driven suites
-        run: cargo test -p aethyme-cli -p aethyme-testkit
+        run: cargo test --locked -p aethyme-cli -p aethyme-testkit

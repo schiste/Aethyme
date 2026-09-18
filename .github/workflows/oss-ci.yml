@@ -8,6 +8,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: oss-ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   # ── Product path ────────────────────────────────────────────────────────
   # The exit criterion of the python-retirement (plan Phase 6): a user who
@@ -134,6 +138,8 @@ jobs:
   # own Python by design and its own gate.
   rust-tests:
     name: Rust workspace tests
+    # Main receives the same full workspace coverage through Aethyme Gates.
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -146,4 +152,4 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Run Rust tests
-        run: cargo test --workspace
+        run: cargo test --locked --workspace

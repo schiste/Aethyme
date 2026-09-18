@@ -124,10 +124,10 @@ max_bytes = 12884901888
 #
 # COUPLING: this gate names the suites that read `.github/` from
 # `repo_root()`. A new test that reads a workflow file must be added here,
-# or it is unguarded on the workflow-only path. Both suites also run under
+# or it is unguarded on the workflow-only path. These suites also run under
 # `cargo-test`, so nothing here is lost when Rust changes.
 name = "workflow-contract"
-command = 'export CHAU7_CTO_OPTIM_ACTIVE=1 CARGO_INCREMENTAL=0 CARGO_PROFILE_TEST_DEBUG=1 CARGO_TARGET_DIR="$AETHYME_GATE_CACHE_DIR" && cargo test --quiet --manifest-path packages/aethyme/rust/Cargo.toml -p aethyme-testkit --test release_contract && cargo test --quiet --manifest-path packages/aethyme/rust/Cargo.toml -p aethyme-cli --test repository_deploy_cli'
+command = 'export CHAU7_CTO_OPTIM_ACTIVE=1 CARGO_INCREMENTAL=0 CARGO_PROFILE_TEST_DEBUG=1 CARGO_TARGET_DIR="$AETHYME_GATE_CACHE_DIR" && cargo test --locked --quiet --manifest-path packages/aethyme/rust/Cargo.toml -p aethyme-testkit --test release_contract --test ci_validation && cargo test --locked --quiet --manifest-path packages/aethyme/rust/Cargo.toml -p aethyme-cli --test repository_deploy_cli'
 cost = 1
 timeout_seconds = 600
 resource_wait_seconds = 900
