@@ -532,7 +532,13 @@ pub fn render_quality_report(report: &QualityReport) -> String {
             QualityGateStatus::Skipped | QualityGateStatus::Cancelled
         )
     });
-    let banner = if redacted.status == QualityReportStatus::Complete
+    // A green banner has to stand for evidence, and a report that ran no gates
+    // has none. `gates: []` with everything zero validates and reached the
+    // COMPLETE arm, so an empty route published a check mark for a revision
+    // where nothing was measured.
+    let banner = if redacted.status == QualityReportStatus::Complete && redacted.totals.gates == 0 {
+        "⚠️ NO GATE EVIDENCE — nothing was measured for this revision"
+    } else if redacted.status == QualityReportStatus::Complete
         && redacted.totals.failed == 0
         && !has_incomplete_gate
     {
@@ -735,6 +741,7 @@ fn is_hex(value: &str) -> bool {
 
 fn redact_publication_text(value: &str) -> String {
     let mut redacted = value.to_string();
+    let mut earliest: Option<usize> = None;
     for marker in [
         "ghp_",
         "github_pat_",
@@ -750,10 +757,17 @@ fn redact_publication_text(value: &str) -> String {
         "api_key=",
     ] {
         if let Some(index) = redacted.find(marker) {
-            redacted.truncate(index);
-            redacted.push_str("[redacted]");
-            break;
+            earliest = Some(earliest.map_or(index, |seen: usize| seen.min(index)));
         }
+    }
+    // The cut must be at the earliest marker in the *text*, not at whichever
+    // marker happens to come first in this list. Breaking on the first list hit
+    // truncated after anything that appeared before it: `PASSWORD=hunter2
+    // TOKEN=ghp_x` matched `ghp_` first and published the password verbatim
+    // into a public comment.
+    if let Some(index) = earliest {
+        redacted.truncate(index);
+        redacted.push_str("[redacted]");
     }
     if [
         "/Users/",
@@ -792,6 +806,25 @@ fn sha256(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// Redaction must cut at the earliest secret in the text, not at whichever
+    /// marker is listed first. Ordering the cut by the marker list published
+    /// everything that appeared before the matched one.
+    #[test]
+    fn redaction_cuts_at_the_first_secret_in_the_text() {
+        let redacted = redact_publication_text("make ci PASSWORD=hunter2 TOKEN=ghp_abc");
+        assert!(
+            !redacted.contains("hunter2"),
+            "a secret before the matched marker was published: {redacted}"
+        );
+        assert!(redacted.starts_with("make ci "));
+        assert!(redacted.ends_with("[redacted]"));
+
+        // And in the other order, so the test cannot pass by luck of the list.
+        let redacted = redact_publication_text("run TOKEN=ghp_abc PASSWORD=hunter2");
+        assert!(!redacted.contains("ghp_abc"), "got {redacted}");
+        assert!(!redacted.contains("hunter2"), "got {redacted}");
+    }
     use super::*;
 
     fn report() -> QualityReport {
