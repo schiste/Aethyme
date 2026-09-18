@@ -18,6 +18,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
+use crate::broker::directory_size_without_following_links;
+
 use crate::broker::{WORKTREE_ROOT_MARKER, WORKTREE_ROOT_SCHEMA_VERSION, WorktreeRootMarker};
 use crate::gc::{TreeRemoval, remove_condemned_tree};
 use crate::reclaim::is_artefact_directory_with_extras;
@@ -93,6 +95,7 @@ pub enum StorageCandidateKind {
     OrphanRoot,
     StrayDirectory,
     PrimaryArtifact,
+    PreparationEntry,
 }
 
 impl StorageCandidateKind {
@@ -101,6 +104,7 @@ impl StorageCandidateKind {
             Self::OrphanRoot => "orphan_root",
             Self::StrayDirectory => "stray_directory",
             Self::PrimaryArtifact => "primary_artifact",
+            Self::PreparationEntry => "preparation_entry",
         }
     }
 }
@@ -198,6 +202,12 @@ pub struct StorageSummary {
     pub primary_checkout_count: usize,
     pub primary_artifact_count: usize,
     pub primary_candidate_count: usize,
+    #[serde(default)]
+    pub preparation_entry_count: usize,
+    #[serde(default)]
+    pub preparation_candidate_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preparation_reclaimable_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub estimated_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -205,6 +215,34 @@ pub struct StorageSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub primary_reclaimable_bytes: Option<u64>,
     pub sized: bool,
+}
+
+/// One entry in the shared preparation cache.
+///
+/// The cache sits beside the worktree container rather than inside it, which
+/// is why every other lane here has been blind to it: `storage_container`
+/// resolves to `<host>/worktrees`, and these live under
+/// `<host>/preparation-cache/<repository>/<key>`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StoragePreparationEntry {
+    pub path: PathBuf,
+    pub repository: String,
+    pub key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub estimated_bytes: Option<u64>,
+    pub reclaimable: bool,
+    pub reason: String,
+}
+
+/// One preparation-cache entry the plan offers to remove.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StoragePreparationCandidate {
+    pub path: PathBuf,
+    pub repository: String,
+    pub key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub estimated_bytes: Option<u64>,
+    pub reason: String,
 }
 
 /// One enrolled primary checkout included in the host storage inventory.
@@ -262,6 +300,10 @@ pub struct StoragePlan {
     pub candidates: Vec<StorageCandidate>,
     pub primary_checkouts: Vec<StoragePrimaryCheckout>,
     pub primary_candidates: Vec<StoragePrimaryCandidate>,
+    #[serde(default)]
+    pub preparation_entries: Vec<StoragePreparationEntry>,
+    #[serde(default)]
+    pub preparation_candidates: Vec<StoragePreparationCandidate>,
     pub summary: StorageSummary,
     pub warnings: Vec<String>,
 }
@@ -369,6 +411,25 @@ pub fn storage_apply(
             }),
         }
     }
+    let live_roots = plan
+        .primary_checkouts
+        .iter()
+        .map(|checkout| checkout.path.clone())
+        .collect::<Vec<_>>();
+    for candidate in &plan.preparation_candidates {
+        match apply_preparation_candidate(candidate, &live_roots) {
+            Ok(reclaimed_bytes) => applied.push(StorageAppliedItem {
+                kind: StorageCandidateKind::PreparationEntry,
+                path: candidate.path.clone(),
+                reclaimed_bytes,
+            }),
+            Err(reason) => failures.push(StorageApplyFailure {
+                kind: StorageCandidateKind::PreparationEntry,
+                path: candidate.path.clone(),
+                reason,
+            }),
+        }
+    }
     for candidate in &plan.primary_candidates {
         match apply_primary_candidate(candidate) {
             Ok(reclaimed_bytes) => applied.push(StorageAppliedItem {
@@ -454,6 +515,42 @@ fn build_plan(
     });
     let (primary_checkouts, primary_candidates) =
         inspect_primary_checkouts(main_root, &roots, size);
+
+    // The cache is a sibling of the worktree container, so it is reached from
+    // the container rather than rediscovered. Live roots are every enrolled
+    // checkout in the inventory plus the one being invoked from.
+    let mut live_roots = primary_checkouts
+        .iter()
+        .map(|checkout| checkout.path.clone())
+        .collect::<Vec<_>>();
+    if !live_roots
+        .iter()
+        .any(|root| normalise(root) == normalise(main_root))
+    {
+        live_roots.push(normalise(main_root));
+    }
+    // Session worktrees are what actually run `broker prepare`, so they are
+    // the population that keeps a shared key alive. Omitting them would let
+    // the cache be emptied underneath the sessions still using it -- a
+    // primary checkout is often the one place that never asks for it.
+    for root in &roots {
+        let Ok(children) = std::fs::read_dir(&root.path) else {
+            continue;
+        };
+        for child in children.flatten() {
+            let path = child.path();
+            if is_real_directory(&path) {
+                live_roots.push(normalise(&path));
+            }
+        }
+    }
+    live_roots.sort();
+    live_roots.dedup();
+    let (preparation_entries, preparation_candidates) = match preparation_cache_root(&storage_root)
+    {
+        Some(cache_root) => inspect_preparation_cache(&cache_root, &live_roots, size),
+        None => (Vec::new(), Vec::new()),
+    };
     let digest = decision_digest(
         &storage_root,
         orphan_worktree_roots_days,
@@ -465,6 +562,8 @@ fn build_plan(
         &candidates,
         &primary_checkouts,
         &primary_candidates,
+        &preparation_entries,
+        &preparation_candidates,
         size,
     );
     Ok(StoragePlan {
@@ -477,6 +576,8 @@ fn build_plan(
         candidates,
         primary_checkouts,
         primary_candidates,
+        preparation_entries,
+        preparation_candidates,
         summary,
         warnings,
     })
@@ -772,6 +873,119 @@ fn directory_modified_within(dir: &Path, window_ms: u64) -> bool {
         .any(|entry| entry.metadata().as_ref().map(recent).unwrap_or(true))
 }
 
+/// Inventory the shared preparation cache, and decide which entries are dead.
+///
+/// An entry is named after the key its repository computed: a content hash of
+/// the declared inputs, the config and the platform. So the live set is not a
+/// guess -- it is exactly the keys the checkouts on this host would recompute
+/// now. Anything else is a key nobody will ask for again, because the inputs
+/// that produced it have changed.
+///
+/// `live_roots` are the checkouts entitled to keep an entry alive. A checkout
+/// that declares no shared step contributes no key and keeps nothing, which is
+/// correct: it never populated the cache either.
+fn inspect_preparation_cache(
+    cache_root: &Path,
+    live_roots: &[PathBuf],
+    size: bool,
+) -> (
+    Vec<StoragePreparationEntry>,
+    Vec<StoragePreparationCandidate>,
+) {
+    let mut live_keys = BTreeSet::new();
+    for root in live_roots {
+        if let Some(key) = crate::preparation::current_cache_key(root) {
+            live_keys.insert(key);
+        }
+    }
+
+    let mut entries = Vec::new();
+    let Ok(repositories) = std::fs::read_dir(cache_root) else {
+        return (entries, Vec::new());
+    };
+    for repository in repositories.flatten() {
+        let repository_path = repository.path();
+        if !is_real_directory(&repository_path) {
+            continue;
+        }
+        let repository_name = repository.file_name().to_string_lossy().into_owned();
+        let Ok(keys) = std::fs::read_dir(&repository_path) else {
+            continue;
+        };
+        for key_entry in keys.flatten() {
+            let path = key_entry.path();
+            if !is_real_directory(&path) {
+                continue;
+            }
+            let key = key_entry.file_name().to_string_lossy().into_owned();
+            let live = live_keys.contains(&key);
+            // Measuring is the expensive half, so a live entry is counted but
+            // never walked: its size cannot change the decision.
+            let estimated_bytes = if size && !live {
+                Some(directory_size_without_following_links(&path).unwrap_or(0))
+            } else {
+                None
+            };
+            let reason = if live {
+                "a checkout on this host still computes this key".into()
+            } else {
+                "no checkout on this host computes this key; its inputs have changed".into()
+            };
+            entries.push(StoragePreparationEntry {
+                path,
+                repository: repository_name.clone(),
+                key,
+                estimated_bytes,
+                reclaimable: !live,
+                reason,
+            });
+        }
+    }
+    entries.sort_by(|left, right| left.path.cmp(&right.path));
+    let candidates = entries
+        .iter()
+        .filter(|entry| entry.reclaimable)
+        .map(|entry| StoragePreparationCandidate {
+            path: entry.path.clone(),
+            repository: entry.repository.clone(),
+            key: entry.key.clone(),
+            estimated_bytes: entry.estimated_bytes,
+            reason: entry.reason.clone(),
+        })
+        .collect::<Vec<_>>();
+    (entries, candidates)
+}
+
+/// Remove one dead cache entry, re-deciding at the moment of removal.
+///
+/// The plan may be minutes old and a checkout may have changed its lockfile
+/// since, so the key is re-tested against the live set rather than trusted
+/// from the digest that authorised the run.
+fn apply_preparation_candidate(
+    candidate: &StoragePreparationCandidate,
+    live_roots: &[PathBuf],
+) -> Result<u64, String> {
+    for root in live_roots {
+        if crate::preparation::current_cache_key(root).as_deref() == Some(candidate.key.as_str()) {
+            return Err("a checkout now computes this key again; it is no longer dead".into());
+        }
+    }
+    if !is_real_directory(&candidate.path) {
+        return Err("cache entry is no longer a directory".into());
+    }
+    let bytes = directory_size_without_following_links(&candidate.path).unwrap_or(0);
+    std::fs::remove_dir_all(&candidate.path)
+        .map_err(|error| format!("cannot remove cache entry: {error}"))?;
+    Ok(bytes)
+}
+
+/// Where the shared preparation cache lives, beside the worktree container.
+fn preparation_cache_root(storage_root: &Path) -> Option<PathBuf> {
+    storage_root
+        .parent()
+        .map(|base| base.join("preparation-cache"))
+}
+
 fn is_enrolled_primary_checkout(path: &Path) -> bool {
     path.join(".aethyme/config.toml").is_file()
 }
@@ -1034,6 +1248,8 @@ fn summarise(
     candidates: &[StorageCandidate],
     primary_checkouts: &[StoragePrimaryCheckout],
     primary_candidates: &[StoragePrimaryCandidate],
+    preparation_entries: &[StoragePreparationEntry],
+    preparation_candidates: &[StoragePreparationCandidate],
     size: bool,
 ) -> StorageSummary {
     let owner_present_count = roots
@@ -1076,6 +1292,14 @@ fn summarise(
             .map(|checkout| checkout.artifacts.len())
             .sum(),
         primary_candidate_count: primary_candidates.len(),
+        preparation_entry_count: preparation_entries.len(),
+        preparation_candidate_count: preparation_candidates.len(),
+        preparation_reclaimable_bytes: size.then(|| {
+            preparation_candidates
+                .iter()
+                .filter_map(|candidate| candidate.estimated_bytes)
+                .sum()
+        }),
         estimated_bytes,
         reclaimable_bytes,
         primary_reclaimable_bytes,
@@ -1162,6 +1386,9 @@ fn apply_candidate(candidate: &StorageCandidate, storage_root: &Path) -> Result<
         StorageCandidateKind::PrimaryArtifact => {
             return Err("primary artifacts use the primary-checkout apply lane".into());
         }
+        StorageCandidateKind::PreparationEntry => {
+            return Err("preparation cache entries use the preparation apply lane".into());
+        }
     };
     if !is_direct_child(&normalise(&candidate.root_path), storage_root) {
         return Err("reviewed root is outside the host storage container".into());
@@ -1217,6 +1444,9 @@ fn apply_candidate(candidate: &StorageCandidate, storage_root: &Path) -> Result<
         }
         StorageCandidateKind::PrimaryArtifact => {
             unreachable!("primary artifacts are rejected before host-root matching")
+        }
+        StorageCandidateKind::PreparationEntry => {
+            Err("preparation cache entries use the preparation apply lane".into())
         }
     }
 }
@@ -1564,6 +1794,108 @@ fn is_sha256(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The live set is the keys checkouts would recompute, so an entry is dead
+    /// exactly when no checkout names it -- not when it looks old.
+    #[test]
+    fn a_cache_entry_no_checkout_names_is_the_reclaimable_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("preparation-cache");
+        let repo_dir = cache.join("repository-a");
+        std::fs::create_dir_all(repo_dir.join("aaaaaaaaaaaa")).unwrap();
+        std::fs::create_dir_all(repo_dir.join("bbbbbbbbbbbb")).unwrap();
+        std::fs::write(repo_dir.join("bbbbbbbbbbbb/blob"), "cached\n").unwrap();
+
+        // No live root declares preparation, so nothing keeps a key alive.
+        let (entries, candidates) = inspect_preparation_cache(&cache, &[], false);
+        assert_eq!(entries.len(), 2, "both entries must be inventoried");
+        assert_eq!(candidates.len(), 2, "with no live key, both are dead");
+        assert!(
+            entries.iter().all(|entry| entry.reclaimable),
+            "an entry nobody names cannot be live"
+        );
+        assert!(
+            candidates
+                .iter()
+                .all(|c| c.reason.contains("inputs have changed")),
+            "the reason must say why it is dead, not merely that it is"
+        );
+    }
+
+    /// A checkout that still computes a key keeps its entry, and only that
+    /// entry. This is the half that makes the rule safe rather than merely
+    /// aggressive: session worktrees are what run `broker prepare`, so if they
+    /// did not count as live the cache could be emptied underneath them.
+    #[test]
+    fn an_entry_a_live_checkout_still_names_is_kept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("checkout");
+        std::fs::create_dir_all(repo.join(".aethyme")).unwrap();
+        std::fs::write(repo.join("lock.txt"), "deps\n").unwrap();
+        std::fs::write(
+            repo.join(".aethyme/prepare.toml"),
+            "schema_version = 1\n\n             [[steps]]\n             name = \"deps\"\n             command = [\"sh\", \"-c\", \"true\"]\n             inputs = [\"lock.txt\"]\n             outputs = [\"out/\"]\n             cache = \"repository_shared\"\n             required_for_hooks = false\n",
+        )
+        .unwrap();
+
+        let key = crate::preparation::current_cache_key(&repo)
+            .expect("a checkout declaring a shared step computes a key");
+
+        let cache = tmp.path().join("preparation-cache/repository-a");
+        std::fs::create_dir_all(cache.join(&key)).unwrap();
+        std::fs::create_dir_all(cache.join("deadbeefdead")).unwrap();
+
+        let (entries, candidates) = inspect_preparation_cache(
+            &tmp.path().join("preparation-cache"),
+            &[repo.clone()],
+            false,
+        );
+        assert_eq!(entries.len(), 2);
+        assert_eq!(candidates.len(), 1, "only the unnamed key is dead");
+        assert_eq!(candidates[0].key, "deadbeefdead");
+        let kept = entries.iter().find(|e| e.key == key).unwrap();
+        assert!(
+            !kept.reclaimable,
+            "the key a checkout computes must survive"
+        );
+        assert!(kept.reason.contains("still computes"));
+    }
+
+    /// Reporting spans the cache; removal re-decides at the moment it acts.
+    #[test]
+    fn removal_refuses_an_entry_that_became_live_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let entry = tmp
+            .path()
+            .join("preparation-cache/repository-a/ccccccccccc1");
+        std::fs::create_dir_all(&entry).unwrap();
+        let candidate = StoragePreparationCandidate {
+            path: entry.clone(),
+            repository: "repository-a".into(),
+            key: "ccccccccccc1".into(),
+            estimated_bytes: None,
+            reason: "dead".into(),
+        };
+
+        // A root that cannot produce a key leaves the entry dead, so it goes.
+        let removed = apply_preparation_candidate(&candidate, &[tmp.path().to_path_buf()]);
+        assert!(removed.is_ok(), "a dead entry is removable: {removed:?}");
+        assert!(!entry.exists(), "the entry must actually be gone");
+
+        // Removing what is already gone is a refusal, not a silent success.
+        assert!(apply_preparation_candidate(&candidate, &[]).is_err());
+    }
+
+    /// The cache is a sibling of the worktree container, which is the whole
+    /// reason it was invisible to this lane.
+    #[test]
+    fn the_cache_is_found_beside_the_worktree_container() {
+        let root = Path::new("/host/state/worktrees");
+        assert_eq!(
+            preparation_cache_root(root),
+            Some(PathBuf::from("/host/state/preparation-cache"))
+        );
+    }
 
     /// A primary checkout has no session and no close event, so the only
     /// evidence that nothing is building is that the tree stopped moving.

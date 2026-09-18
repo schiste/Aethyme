@@ -646,7 +646,7 @@ fn validate_relative_path(path: &str) -> Result<(), PreparationError> {
     Ok(())
 }
 
-fn preparation_digest(
+pub(crate) fn preparation_digest(
     root: &Path,
     config: &PreparationConfig,
     session_id: i64,
@@ -880,6 +880,30 @@ fn preparation_resource_request(
             },
         }],
     })
+}
+
+/// The shared-cache key this checkout would ask for right now, if it declares
+/// a shared step at all.
+///
+/// This is what makes evicting the shared cache a decision rather than a
+/// guess. The key is a content hash of the declared inputs, the config and the
+/// platform, so an entry is live exactly when some current checkout would
+/// recompute its name -- a question with an answer, unlike "has this been
+/// touched recently".
+///
+/// `session_id` reaches the digest only through error messages, so any value
+/// produces the same key; zero is passed because no session is asking.
+pub(crate) fn current_cache_key(root: &Path) -> Option<String> {
+    let config = load_config(root).ok().flatten()?;
+    if !config
+        .steps
+        .iter()
+        .any(|step| step.cache == PreparationCachePolicy::RepositoryShared)
+    {
+        return None;
+    }
+    let digest = preparation_digest(root, &config, 0).ok()?;
+    Some(digest[..12.min(digest.len())].to_string())
 }
 
 fn preparation_cache_dir(broker: &Broker, digest: &str) -> Result<PathBuf, PreparationError> {
