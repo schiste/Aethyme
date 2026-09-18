@@ -2746,12 +2746,11 @@ impl Broker {
                 &planned_paths,
             )?
         } else {
-            self.store
-                .register_session_with_context_and_leases(
-                    &new_session,
-                    &context,
-                    &planned_paths,
-                )?
+            self.store.register_session_with_context_and_leases(
+                &new_session,
+                &context,
+                &planned_paths,
+            )?
         };
         self.store
             .set_session_foreign_files(session.id, &foreign_files)?;
@@ -3012,10 +3011,11 @@ impl Broker {
             log_path: None,
             agent_identity: agent_identity.map(str::to_string),
         };
-        let session = match self
-            .store
-            .register_session_with_context_and_leases(&new_session, &context, &planned_paths)
-        {
+        let session = match self.store.register_session_with_context_and_leases(
+            &new_session,
+            &context,
+            &planned_paths,
+        ) {
             Ok(session) => session,
             Err(error) => {
                 let worktree_path = worktree.root().to_path_buf();
@@ -6375,8 +6375,15 @@ impl Broker {
         if stalled.is_empty() {
             return None;
         }
+        // A quiet holder and a dead one are different claims, and only the
+        // second justifies Blocked. The evidence line already prints the pid,
+        // so the answer is available rather than inferred: a stale heartbeat
+        // whose process is still alive is a slow operation, and saying it "may
+        // have died" is what makes an operator re-issue work that is running.
         let heartbeat_stale = stalled.iter().any(|operation| {
             crate::operations::operation_liveness_view(operation).state == "heartbeat_stale"
+                && operation.pid > 0
+                && crate::operations::process_is_gone(operation.pid)
         });
         let subject = if stalled.len() == 1 {
             format!("operation {}", stalled[0].id)
@@ -6414,10 +6421,7 @@ impl Broker {
                 })
                 .collect(),
             commands: if stalled.len() == 1 {
-                vec![format!(
-                    "aethyme broker operations show {}",
-                    stalled[0].id
-                )]
+                vec![format!("aethyme broker operations show {}", stalled[0].id)]
             } else {
                 vec!["aethyme broker operations list".into()]
             },

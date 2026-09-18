@@ -55,6 +55,10 @@ const ADMISSION_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_m
 /// progress. Each complete line is either a human-readable message or a JSON
 /// object containing `message` and optional `phase` fields.
 pub(crate) const BROKER_OPERATION_PROGRESS_ENV: &str = "AETHYME_BROKER_PROGRESS_FILE";
+/// Liveness payload shape this build understands. A payload claiming a newer
+/// version is reported as unknown rather than interpreted with these keys.
+const OPERATION_LIVENESS_SCHEMA_VERSION: i64 = 1;
+
 const OPERATION_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 const OPERATION_STALL_AFTER: Duration = Duration::from_secs(60);
 
@@ -78,9 +82,7 @@ pub struct OperationLivenessView {
 /// Make the persisted liveness contract useful to status, operations list,
 /// and blocked-call diagnostics without teaching each surface how to parse the
 /// journal's free-form details JSON.
-pub(crate) fn operation_liveness_view(
-    operation: &CoordinatedOperation,
-) -> OperationLivenessView {
+pub(crate) fn operation_liveness_view(operation: &CoordinatedOperation) -> OperationLivenessView {
     let liveness = operation
         .details_json
         .as_deref()
@@ -97,13 +99,27 @@ pub(crate) fn operation_liveness_view(
     let now = unix_now_ms();
     let heartbeat_age_ms = heartbeat_at.map(|at| now.saturating_sub(at).max(0));
     let progress_age_ms = progress_at.map(|at| now.saturating_sub(at).max(0));
+    // A payload this build cannot read says nothing about the holder, so it
+    // must not be allowed to say the holder died. `schema_version` is written
+    // by every writer; a newer one, or a missing timestamp, means "cannot
+    // tell" -- and only a timestamp that is genuinely old means stale.
+    // Absent means "written before the field existed", which this build reads
+    // correctly; only a version from the future is genuinely unreadable. The
+    // guard is against a later shape being misread with these keys, not
+    // against the shape that predates the guard.
+    let payload_readable = liveness
+        .as_ref()
+        .and_then(|value| value.get("schema_version"))
+        .and_then(serde_json::Value::as_i64)
+        .is_none_or(|version| version <= OPERATION_LIVENESS_SCHEMA_VERSION);
+    let heartbeat_unreadable = !payload_readable || heartbeat_age_ms.is_none();
     let heartbeat_stale = heartbeat_age_ms
-        .is_none_or(|age| age >= (OPERATION_HEARTBEAT_INTERVAL.as_millis() as i64 * 3));
-    let progress_stale = progress_age_ms
-        .is_none_or(|age| age >= OPERATION_STALL_AFTER.as_millis() as i64);
+        .is_some_and(|age| age >= (OPERATION_HEARTBEAT_INTERVAL.as_millis() as i64 * 3));
+    let progress_stale =
+        progress_age_ms.is_none_or(|age| age >= OPERATION_STALL_AFTER.as_millis() as i64);
     let state = if operation.status != OperationStatus::Running {
         "not_running"
-    } else if liveness.is_none() {
+    } else if liveness.is_none() || heartbeat_unreadable {
         "unknown"
     } else if heartbeat_stale {
         "heartbeat_stale"
@@ -205,6 +221,7 @@ impl OperationHeartbeat {
         let thread = thread::Builder::new()
             .name(format!("aethyme-operation-heartbeat-{operation_id}"))
             .spawn(move || {
+                let mut write_failures: u32 = 0;
                 loop {
                     match stop_rx.recv_timeout(OPERATION_HEARTBEAT_INTERVAL) {
                         Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -224,7 +241,8 @@ impl OperationHeartbeat {
                         continue;
                     };
                     let liveness = json!({
-                        "schema_version": 1,
+                        "schema_version": OPERATION_LIVENESS_SCHEMA_VERSION,
+                        "write_failures": write_failures,
                         "phase": snapshot.phase,
                         "progress": snapshot.progress,
                         "heartbeat_at": now,
@@ -233,8 +251,24 @@ impl OperationHeartbeat {
                         "heartbeat_interval_ms": OPERATION_HEARTBEAT_INTERVAL.as_millis(),
                         "stall_after_ms": OPERATION_STALL_AFTER.as_millis(),
                     });
-                    if let Ok(mut store) = crate::BrokerStore::open(&thread_db_path) {
-                        let _ = store.update_coordinated_operation_liveness(operation_id, &liveness);
+                    // Persisting can fail for reasons that say nothing about
+                    // this operation -- a sibling worktree's binary moved the
+                    // schema, or SQLite stayed busy past its timeout. Those
+                    // must not accumulate into "the holder died", so the count
+                    // of consecutive failures rides along and a reader treats a
+                    // gap it can explain as unknown rather than stale.
+                    let persisted = crate::BrokerStore::open(&thread_db_path)
+                        .ok()
+                        .and_then(|mut store| {
+                            store
+                                .update_coordinated_operation_liveness(operation_id, &liveness)
+                                .ok()
+                        })
+                        .is_some();
+                    if persisted {
+                        write_failures = 0;
+                    } else {
+                        write_failures = write_failures.saturating_add(1);
                     }
                 }
             })
@@ -320,9 +354,13 @@ fn consume_progress_file(
     if complete_end <= *consumed {
         return;
     }
-    let Ok(text) = std::str::from_utf8(&bytes[*consumed..complete_end]) else {
-        return;
-    };
+    // Returning here without advancing `consumed` would re-read the same
+    // bytes on every tick and never get past them, freezing progress for the
+    // rest of the run while valid lines keep arriving behind the bad one. A
+    // gate echoing a non-UTF-8 path is enough to trigger it, so the undecodable
+    // bytes are replaced rather than allowed to stop the stream.
+    let text = String::from_utf8_lossy(&bytes[*consumed..complete_end]);
+    let text = text.as_ref();
     for line in text.lines() {
         let value = serde_json::from_str::<serde_json::Value>(line).ok();
         let message = value
@@ -459,14 +497,20 @@ fn output_within(
             path: PathBuf::from("git"),
             source,
         })?;
-    let stdout = child.stdout.take().ok_or_else(|| BrokerOpError::OperationIo {
-        path: PathBuf::from("git"),
-        source: std::io::Error::new(std::io::ErrorKind::Other, "child stdout was not piped"),
-    })?;
-    let stderr = child.stderr.take().ok_or_else(|| BrokerOpError::OperationIo {
-        path: PathBuf::from("git"),
-        source: std::io::Error::new(std::io::ErrorKind::Other, "child stderr was not piped"),
-    })?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| BrokerOpError::OperationIo {
+            path: PathBuf::from("git"),
+            source: std::io::Error::new(std::io::ErrorKind::Other, "child stdout was not piped"),
+        })?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| BrokerOpError::OperationIo {
+            path: PathBuf::from("git"),
+            source: std::io::Error::new(std::io::ErrorKind::Other, "child stderr was not piped"),
+        })?;
     let stdout_state = heartbeat.map(|heartbeat| Arc::clone(&heartbeat.state));
     let stderr_state = heartbeat.map(|heartbeat| Arc::clone(&heartbeat.state));
     let stdout_reader = spawn_output_reader(stdout, stdout_state, "provider stdout");
@@ -1051,7 +1095,7 @@ impl RepositoryWriteLock {
 /// disturbing it. Conservative about PID reuse -- a recycled PID reads as alive,
 /// which forgoes a cleanup rather than resolving a live operation out from under
 /// the process still running it.
-fn process_is_gone(pid: i64) -> bool {
+pub(crate) fn process_is_gone(pid: i64) -> bool {
     let Ok(pid) = libc::pid_t::try_from(pid) else {
         return false;
     };
@@ -3594,9 +3638,8 @@ impl Broker {
                 stage,
                 budget,
             }) => {
-                let operation_liveness = operation_heartbeat
-                    .as_mut()
-                    .map(OperationHeartbeat::finish);
+                let operation_liveness =
+                    operation_heartbeat.as_mut().map(OperationHeartbeat::finish);
                 let status = if is_remote_write {
                     OperationStatus::OutcomeUnknown
                 } else {
@@ -3656,9 +3699,8 @@ impl Broker {
                 });
             }
             Err(BrokerOpError::OperationIo { source, .. }) => {
-                let operation_liveness = operation_heartbeat
-                    .as_mut()
-                    .map(OperationHeartbeat::finish);
+                let operation_liveness =
+                    operation_heartbeat.as_mut().map(OperationHeartbeat::finish);
                 let mut details = journal_details(
                     classification,
                     resolved_target.as_ref(),
@@ -3687,9 +3729,7 @@ impl Broker {
                     operation.id,
                     OperationStatus::Failed,
                     None,
-                    Some(
-                        &details.to_string(),
-                    ),
+                    Some(&details.to_string()),
                 )?;
                 if let Some(guard) = &mut host_guard {
                     guard.finish(operation.status)?;
@@ -3700,15 +3740,17 @@ impl Broker {
                 });
             }
             Err(error) => {
-                let _ = operation_heartbeat
-                    .as_mut()
-                    .map(OperationHeartbeat::finish);
+                let _ = operation_heartbeat.as_mut().map(OperationHeartbeat::finish);
                 return Err(error);
             }
         };
-        let operation_liveness = operation_heartbeat
-            .as_mut()
-            .map(OperationHeartbeat::finish);
+        // The heartbeat deliberately outlives the child. Everything below --
+        // `on_success`, and the push and GitHub reconciles -- runs while the
+        // row is still `running`, and one of those reconciles is an unbounded
+        // `git ls-remote`. Stopping the heartbeat here left a healthy
+        // operation looking `heartbeat_stale` after 30s, so every blocked
+        // caller was told the holder may have died: the #138 failure this
+        // machinery exists to prevent, restated more confidently.
         let remote_contact = git_trace
             .as_ref()
             .map(|trace| inspect_git_transfer_trace(trace.path()))
@@ -3837,7 +3879,10 @@ impl Broker {
                 ),
             )
         };
-        if let Some(liveness) = operation_liveness {
+        // The row leaves `running` on the next statement, after which liveness
+        // is no longer consulted, so this is the first moment the heartbeat is
+        // redundant rather than load-bearing.
+        if let Some(liveness) = operation_heartbeat.as_mut().map(OperationHeartbeat::finish) {
             add_operation_liveness(&mut details, liveness);
         }
         add_coordination_timing(
@@ -4224,14 +4269,27 @@ mod tests {
         assert_eq!(scope(&["pr", "create", "--title", "x"]), None);
         assert_eq!(scope(&["issue", "create"]), None);
         assert_eq!(
-            scope(&["api", "repos/o/r/branches/main/protection", "--method", "PUT"]),
+            scope(&[
+                "api",
+                "repos/o/r/branches/main/protection",
+                "--method",
+                "PUT"
+            ]),
             None
         );
         // A URL or branch selector, not a number.
-        assert_eq!(scope(&["pr", "comment", "https://github.com/o/r/pull/7"]), None);
+        assert_eq!(
+            scope(&["pr", "comment", "https://github.com/o/r/pull/7"]),
+            None
+        );
         // Deeper than the collection endpoint: a reaction, not the thread.
         assert_eq!(
-            scope(&["api", "repos/o/r/issues/comments/99/reactions", "--method", "POST"]),
+            scope(&[
+                "api",
+                "repos/o/r/issues/comments/99/reactions",
+                "--method",
+                "POST"
+            ]),
             None
         );
         // A different provider never narrows.
@@ -4312,7 +4370,11 @@ mod tests {
         assert_eq!(humanize_duration(1_688), "28m 8s");
     }
 
-    fn liveness_operation(status: OperationStatus, heartbeat_age_ms: i64, progress_age_ms: i64) -> CoordinatedOperation {
+    fn liveness_operation(
+        status: OperationStatus,
+        heartbeat_age_ms: i64,
+        progress_age_ms: i64,
+    ) -> CoordinatedOperation {
         let now = unix_now_ms();
         CoordinatedOperation {
             id: 1,
@@ -4348,30 +4410,18 @@ mod tests {
     #[test]
     fn operation_liveness_distinguishes_active_progress_and_dead_heartbeat() {
         assert_eq!(
-            operation_liveness_view(&liveness_operation(
-                OperationStatus::Running,
-                5_000,
-                5_000,
-            ))
-            .state,
+            operation_liveness_view(&liveness_operation(OperationStatus::Running, 5_000, 5_000,))
+                .state,
             "active"
         );
         assert_eq!(
-            operation_liveness_view(&liveness_operation(
-                OperationStatus::Running,
-                5_000,
-                61_000,
-            ))
-            .state,
+            operation_liveness_view(&liveness_operation(OperationStatus::Running, 5_000, 61_000,))
+                .state,
             "progress_stale"
         );
         assert_eq!(
-            operation_liveness_view(&liveness_operation(
-                OperationStatus::Running,
-                31_000,
-                5_000,
-            ))
-            .state,
+            operation_liveness_view(&liveness_operation(OperationStatus::Running, 31_000, 5_000,))
+                .state,
             "heartbeat_stale"
         );
     }
@@ -4623,7 +4673,11 @@ mod tests {
     #[test]
     fn no_wait_admission_is_bounded_and_forever_is_not() {
         assert!(AdmissionDeadline::start(QueueWait::Refuse).at.is_some());
-        assert!(AdmissionDeadline::start(QueueWait::Seconds(60)).at.is_some());
+        assert!(
+            AdmissionDeadline::start(QueueWait::Seconds(60))
+                .at
+                .is_some()
+        );
         assert!(AdmissionDeadline::start(QueueWait::Forever).at.is_none());
         assert_eq!(
             AdmissionDeadline::start(QueueWait::Forever).budget_label(),
