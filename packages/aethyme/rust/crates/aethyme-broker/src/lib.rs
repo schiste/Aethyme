@@ -199,9 +199,13 @@ pub use github_target::{
     GithubApiTargetEvidence, GithubTargetError, ResolvedGithubTarget, resolve_github_target,
 };
 pub use graph_impact::{
+    GRAPH_IMPACT_CONTRACT_SCHEMA_VERSION, GRAPH_IMPACT_DEFAULT_BUDGET, GRAPH_IMPACT_MAX_BUDGET,
     GRAPH_IMPACT_MAX_DEPTH, GRAPH_IMPACT_MAX_NODES, GRAPH_IMPACT_RESULT_LIMIT, GraphImpactChain,
-    GraphImpactLookup, GraphImpactMode, GraphImpactProvider, GraphImpactQuery, GraphImpactStatus,
-    GraphStoreImpactProvider,
+    GraphImpactConfidence, GraphImpactContractError, GraphImpactContractStatus, GraphImpactCoverage,
+    GraphImpactLimits, GraphImpactLookup, GraphImpactMode, GraphImpactProvider, GraphImpactQuery,
+    GraphImpactReport, GraphImpactRepository, GraphImpactRequestSummary, GraphImpactRiskHints,
+    GraphImpactSet, GraphImpactStatus, GraphImpactProvenance, GraphStoreImpactProvider,
+    diff_digest, parse_diff_text, revision_bound_impact_report,
 };
 pub use graph_integrity::{GraphIntegrityOutcome, GraphIntegrityRejection, GraphIntegrityStatus};
 pub use homebrew::render_homebrew_formula;
