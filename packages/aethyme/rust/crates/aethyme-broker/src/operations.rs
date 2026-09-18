@@ -9,10 +9,13 @@
 use std::collections::BTreeSet;
 use std::fmt;
 use std::fs::{File, OpenOptions};
+use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Instant;
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use serde_json::json;
 
@@ -47,6 +50,316 @@ const NO_WAIT_ADMISSION_BUDGET: std::time::Duration = std::time::Duration::from_
 
 /// How often a bounded child is checked for completion.
 const ADMISSION_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Environment contract for wrapped commands that can report meaningful
+/// progress. Each complete line is either a human-readable message or a JSON
+/// object containing `message` and optional `phase` fields.
+pub(crate) const BROKER_OPERATION_PROGRESS_ENV: &str = "AETHYME_BROKER_PROGRESS_FILE";
+const OPERATION_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+const OPERATION_STALL_AFTER: Duration = Duration::from_secs(60);
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct OperationLivenessView {
+    pub state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub progress: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub heartbeat_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub progress_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub heartbeat_age_seconds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub progress_age_seconds: Option<u64>,
+}
+
+/// Make the persisted liveness contract useful to status, operations list,
+/// and blocked-call diagnostics without teaching each surface how to parse the
+/// journal's free-form details JSON.
+pub(crate) fn operation_liveness_view(
+    operation: &CoordinatedOperation,
+) -> OperationLivenessView {
+    let liveness = operation
+        .details_json
+        .as_deref()
+        .and_then(|details| serde_json::from_str::<serde_json::Value>(details).ok())
+        .and_then(|details| details.get("operation_liveness").cloned());
+    let heartbeat_at = liveness
+        .as_ref()
+        .and_then(|value| value.get("heartbeat_at"))
+        .and_then(serde_json::Value::as_i64);
+    let progress_at = liveness
+        .as_ref()
+        .and_then(|value| value.get("progress_at"))
+        .and_then(serde_json::Value::as_i64);
+    let now = unix_now_ms();
+    let heartbeat_age_ms = heartbeat_at.map(|at| now.saturating_sub(at).max(0));
+    let progress_age_ms = progress_at.map(|at| now.saturating_sub(at).max(0));
+    let heartbeat_stale = heartbeat_age_ms
+        .is_none_or(|age| age >= (OPERATION_HEARTBEAT_INTERVAL.as_millis() as i64 * 3));
+    let progress_stale = progress_age_ms
+        .is_none_or(|age| age >= OPERATION_STALL_AFTER.as_millis() as i64);
+    let state = if operation.status != OperationStatus::Running {
+        "not_running"
+    } else if liveness.is_none() {
+        "unknown"
+    } else if heartbeat_stale {
+        "heartbeat_stale"
+    } else if progress_stale {
+        "progress_stale"
+    } else {
+        "active"
+    };
+    OperationLivenessView {
+        state: state.into(),
+        phase: liveness
+            .as_ref()
+            .and_then(|value| value.get("phase"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        progress: liveness
+            .as_ref()
+            .and_then(|value| value.get("progress"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        heartbeat_at,
+        progress_at,
+        heartbeat_age_seconds: heartbeat_age_ms.map(|age| age as u64 / 1_000),
+        progress_age_seconds: progress_age_ms.map(|age| age as u64 / 1_000),
+    }
+}
+
+pub(crate) fn operation_liveness_summary(operation: &CoordinatedOperation) -> String {
+    let view = operation_liveness_view(operation);
+    operation_liveness_view_summary(&view)
+}
+
+pub(crate) fn operation_liveness_view_summary(view: &OperationLivenessView) -> String {
+    if view.state == "not_running" {
+        return view.state.clone();
+    }
+    let heartbeat = view
+        .heartbeat_age_seconds
+        .map(humanize_duration)
+        .unwrap_or_else(|| "unknown".into());
+    let progress = view
+        .progress_age_seconds
+        .map(humanize_duration)
+        .unwrap_or_else(|| "unknown".into());
+    let phase = view.phase.as_deref().unwrap_or("unknown phase");
+    let message = view.progress.as_deref().unwrap_or("no progress message");
+    format!(
+        "{}; phase {phase}; heartbeat {heartbeat} ago; progress {progress} ago ({message})",
+        view.state
+    )
+}
+
+/// Best-effort line protocol for wrapped commands. A downstream hook can
+/// report progress without linking to the broker or opening its database.
+pub(crate) fn emit_operation_progress(message: &str) {
+    let Some(path) = std::env::var_os(BROKER_OPERATION_PROGRESS_ENV) else {
+        return;
+    };
+    append_progress_event(Path::new(&path), message, None);
+}
+
+#[derive(Debug, Clone)]
+struct OperationHeartbeatState {
+    phase: String,
+    progress: String,
+    last_progress_at: i64,
+    output_bytes: u64,
+}
+
+struct OperationHeartbeat {
+    progress_file: tempfile::NamedTempFile,
+    stop: Option<mpsc::Sender<()>>,
+    thread: Option<JoinHandle<()>>,
+    state: Arc<Mutex<OperationHeartbeatState>>,
+    consumed: Arc<Mutex<usize>>,
+}
+
+impl OperationHeartbeat {
+    fn start(db_path: &Path, operation_id: i64, phase: &str) -> Option<Self> {
+        let run_dir = db_path.parent()?.join("run/operations");
+        std::fs::create_dir_all(&run_dir).ok()?;
+        let progress_file = tempfile::Builder::new()
+            .prefix(&format!("operation-{operation_id}-"))
+            .suffix(".progress")
+            .tempfile_in(run_dir)
+            .ok()?;
+        let progress_path = progress_file.path().to_path_buf();
+        let state = Arc::new(Mutex::new(OperationHeartbeatState {
+            phase: phase.into(),
+            progress: "provider command started".into(),
+            last_progress_at: unix_now_ms(),
+            output_bytes: 0,
+        }));
+        let consumed = Arc::new(Mutex::new(0usize));
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let thread_state = Arc::clone(&state);
+        let thread_consumed = Arc::clone(&consumed);
+        let thread_db_path = db_path.to_path_buf();
+        let thread = thread::Builder::new()
+            .name(format!("aethyme-operation-heartbeat-{operation_id}"))
+            .spawn(move || {
+                loop {
+                    match stop_rx.recv_timeout(OPERATION_HEARTBEAT_INTERVAL) {
+                        Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            if let Ok(mut consumed) = thread_consumed.lock() {
+                                consume_progress_file(&progress_path, &mut consumed, &thread_state);
+                            }
+                            break;
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    }
+                    if let Ok(mut consumed) = thread_consumed.lock() {
+                        consume_progress_file(&progress_path, &mut consumed, &thread_state);
+                    }
+                    let now = unix_now_ms();
+                    let snapshot = thread_state.lock().ok().map(|state| state.clone());
+                    let Some(snapshot) = snapshot else {
+                        continue;
+                    };
+                    let liveness = json!({
+                        "schema_version": 1,
+                        "phase": snapshot.phase,
+                        "progress": snapshot.progress,
+                        "heartbeat_at": now,
+                        "progress_at": snapshot.last_progress_at,
+                        "output_bytes": snapshot.output_bytes,
+                        "heartbeat_interval_ms": OPERATION_HEARTBEAT_INTERVAL.as_millis(),
+                        "stall_after_ms": OPERATION_STALL_AFTER.as_millis(),
+                    });
+                    if let Ok(mut store) = crate::BrokerStore::open(&thread_db_path) {
+                        let _ = store.update_coordinated_operation_liveness(operation_id, &liveness);
+                    }
+                }
+            })
+            .ok()?;
+        let heartbeat = Self {
+            progress_file,
+            stop: Some(stop_tx),
+            thread: Some(thread),
+            state,
+            consumed,
+        };
+        append_progress_event(heartbeat.progress_file.path(), phase, Some(phase));
+        Some(heartbeat)
+    }
+
+    fn path(&self) -> &Path {
+        self.progress_file.path()
+    }
+
+    fn liveness(&self, heartbeat_at: i64) -> serde_json::Value {
+        let state = self
+            .state
+            .lock()
+            .ok()
+            .map(|state| state.clone())
+            .unwrap_or_else(|| OperationHeartbeatState {
+                phase: "unknown".into(),
+                progress: "heartbeat state unavailable".into(),
+                last_progress_at: heartbeat_at,
+                output_bytes: 0,
+            });
+        json!({
+            "schema_version": 1,
+            "phase": state.phase,
+            "progress": state.progress,
+            "heartbeat_at": heartbeat_at,
+            "progress_at": state.last_progress_at,
+            "output_bytes": state.output_bytes,
+            "heartbeat_interval_ms": OPERATION_HEARTBEAT_INTERVAL.as_millis(),
+            "stall_after_ms": OPERATION_STALL_AFTER.as_millis(),
+        })
+    }
+
+    fn finish(&mut self) -> serde_json::Value {
+        if let Ok(mut consumed) = self.consumed.lock() {
+            consume_progress_file(self.progress_file.path(), &mut consumed, &self.state);
+        }
+        self.stop();
+        self.liveness(unix_now_ms())
+    }
+
+    fn stop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for OperationHeartbeat {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+fn consume_progress_file(
+    path: &Path,
+    consumed: &mut usize,
+    state: &Arc<Mutex<OperationHeartbeatState>>,
+) {
+    let Ok(bytes) = std::fs::read(path) else {
+        return;
+    };
+    if bytes.len() < *consumed {
+        *consumed = 0;
+    }
+    let Some(last_newline) = bytes.iter().rposition(|byte| *byte == b'\n') else {
+        return;
+    };
+    let complete_end = last_newline + 1;
+    if complete_end <= *consumed {
+        return;
+    }
+    let Ok(text) = std::str::from_utf8(&bytes[*consumed..complete_end]) else {
+        return;
+    };
+    for line in text.lines() {
+        let value = serde_json::from_str::<serde_json::Value>(line).ok();
+        let message = value
+            .as_ref()
+            .and_then(|value| value.get("message"))
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| (!line.trim().is_empty()).then_some(line.trim()));
+        let Some(message) = message else {
+            continue;
+        };
+        if let Ok(mut state) = state.lock() {
+            state.progress = message.to_owned();
+            state.last_progress_at = unix_now_ms();
+            if let Some(phase) = value
+                .as_ref()
+                .and_then(|value| value.get("phase"))
+                .and_then(serde_json::Value::as_str)
+            {
+                state.phase = phase.to_owned();
+            }
+        }
+    }
+    *consumed = complete_end;
+}
+
+fn append_progress_event(path: &Path, message: &str, phase: Option<&str>) {
+    let event = json!({
+        "schema_version": 1,
+        "message": message,
+        "phase": phase,
+        "ts": unix_now_ms(),
+    });
+    let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) else {
+        return;
+    };
+    let _ = writeln!(file, "{event}");
+}
 
 /// The wall-clock bound on everything an admission does before it holds the
 /// repository lane.
@@ -128,15 +441,15 @@ impl AdmissionDeadline {
 
 /// Run a child to completion, or kill it when the admission budget is gone.
 ///
-/// `Command::output` waits without a deadline, which is exactly how a wedged
-/// remote turned a bounded request into an unbounded one. Output is small and
-/// fully drained after exit, so polling `try_wait` cannot deadlock on a full
-/// pipe here; a chattier command would need concurrent draining.
+/// The output readers run concurrently with the child. Apart from avoiding a
+/// pipe-capacity deadlock, that gives the operation heartbeat a meaningful
+/// progress signal while a provider is still working.
 fn output_within(
     mut command: Command,
     deadline: AdmissionDeadline,
     repository: &str,
     stage: &str,
+    heartbeat: Option<&OperationHeartbeat>,
 ) -> Result<std::process::Output, BrokerOpError> {
     let mut child = command
         .stdout(Stdio::piped())
@@ -146,12 +459,32 @@ fn output_within(
             path: PathBuf::from("git"),
             source,
         })?;
-    loop {
+    let stdout = child.stdout.take().ok_or_else(|| BrokerOpError::OperationIo {
+        path: PathBuf::from("git"),
+        source: std::io::Error::new(std::io::ErrorKind::Other, "child stdout was not piped"),
+    })?;
+    let stderr = child.stderr.take().ok_or_else(|| BrokerOpError::OperationIo {
+        path: PathBuf::from("git"),
+        source: std::io::Error::new(std::io::ErrorKind::Other, "child stderr was not piped"),
+    })?;
+    let stdout_state = heartbeat.map(|heartbeat| Arc::clone(&heartbeat.state));
+    let stderr_state = heartbeat.map(|heartbeat| Arc::clone(&heartbeat.state));
+    let stdout_reader = spawn_output_reader(stdout, stdout_state, "provider stdout");
+    let stderr_reader = spawn_output_reader(stderr, stderr_state, "provider stderr");
+
+    let status = loop {
         if deadline.expired() {
             // Killing is the point: leaving it behind would keep contacting the
             // remote after the caller was told nothing happened.
             let _ = child.kill();
             let _ = child.wait();
+            // A provider may have grandchildren that inherited the pipes.
+            // Joining here would make a bounded operation wait for those
+            // grandchildren even after the provider itself was killed. Drop
+            // the handles and let those readers end when their inherited
+            // descriptors close.
+            drop(stdout_reader);
+            drop(stderr_reader);
             return Err(BrokerOpError::AdmissionTimedOut {
                 repository: repository.into(),
                 stage: stage.into(),
@@ -159,17 +492,13 @@ fn output_within(
             });
         }
         match child.try_wait() {
-            Ok(Some(_)) => {
-                return child
-                    .wait_with_output()
-                    .map_err(|source| BrokerOpError::OperationIo {
-                        path: PathBuf::from("git"),
-                        source,
-                    });
-            }
+            Ok(Some(status)) => break status,
             Ok(None) => {}
             Err(source) => {
                 let _ = child.kill();
+                let _ = child.wait();
+                drop(stdout_reader);
+                drop(stderr_reader);
                 return Err(BrokerOpError::OperationIo {
                     path: PathBuf::from("git"),
                     source,
@@ -177,6 +506,58 @@ fn output_within(
             }
         }
         std::thread::sleep(ADMISSION_POLL_INTERVAL);
+    };
+    let stdout = join_output_reader(stdout_reader)?;
+    let stderr = join_output_reader(stderr_reader)?;
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+fn spawn_output_reader<R>(
+    mut reader: R,
+    state: Option<Arc<Mutex<OperationHeartbeatState>>>,
+    stream: &'static str,
+) -> JoinHandle<std::io::Result<Vec<u8>>>
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut output = Vec::new();
+        let mut buffer = [0u8; 8 * 1024];
+        loop {
+            let read = reader.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            output.extend_from_slice(&buffer[..read]);
+            if let Some(state) = &state
+                && let Ok(mut state) = state.lock()
+            {
+                state.progress = format!("{stream} output received");
+                state.last_progress_at = unix_now_ms();
+                state.output_bytes = state.output_bytes.saturating_add(read as u64);
+            }
+        }
+        Ok(output)
+    })
+}
+
+fn join_output_reader(
+    reader: JoinHandle<std::io::Result<Vec<u8>>>,
+) -> Result<Vec<u8>, BrokerOpError> {
+    match reader.join() {
+        Ok(Ok(output)) => Ok(output),
+        Ok(Err(source)) => Err(BrokerOpError::OperationIo {
+            path: PathBuf::from("git"),
+            source,
+        }),
+        Err(_) => Err(BrokerOpError::OperationIo {
+            path: PathBuf::from("git"),
+            source: std::io::Error::new(std::io::ErrorKind::Other, "child output reader panicked"),
+        }),
     }
 }
 
@@ -555,6 +936,7 @@ impl RepositoryWriteLock {
     fn acquire(
         main_root: &Path,
         repository: &str,
+        operation_id: i64,
         mut describe_holder: impl FnMut() -> Result<String, BrokerOpError>,
         queue_wait: QueueWait,
     ) -> Result<Self, BrokerOpError> {
@@ -597,6 +979,7 @@ impl RepositoryWriteLock {
                 repository: repository.into(),
                 holder: describe_holder()?,
                 waited: "not waited for".into(),
+                operation_id,
             });
         }
         // A coordinated operation that simply pauses is indistinguishable from one
@@ -640,6 +1023,7 @@ impl RepositoryWriteLock {
                             repository: repository.into(),
                             holder: describe_holder()?,
                             waited: humanize_duration(waited.elapsed().as_secs()),
+                            operation_id,
                         });
                     }
                     std::thread::sleep(std::time::Duration::from_millis(100));
@@ -845,12 +1229,13 @@ fn lock_holder_info(store: &mut crate::BrokerStore, repository: &str) -> LockHol
     match running {
         Some(operation) => LockHolderInfo {
             description: format!(
-                "operation {} (session {}, {} {}) has held it for {}",
+                "operation {} (session {}, {} {}) has held it for {}; {}",
                 operation.id,
                 operation.session_id,
                 operation.provider.as_str(),
                 operation.scope,
-                humanize_duration(now.saturating_sub(operation.created_at).max(0) as u64 / 1_000)
+                humanize_duration(now.saturating_sub(operation.created_at).max(0) as u64 / 1_000),
+                operation_liveness_summary(&operation),
             ),
             operation_id: Some(operation.id),
             session_id: Some(operation.session_id),
@@ -1463,6 +1848,12 @@ fn journal_details(
     details
 }
 
+fn add_operation_liveness(details: &mut serde_json::Value, liveness: serde_json::Value) {
+    if let Some(details) = details.as_object_mut() {
+        details.insert("operation_liveness".into(), liveness);
+    }
+}
+
 fn with_push_planning(mut extra: serde_json::Value, planning: &PushPlanning) -> serde_json::Value {
     if let (Some(extra), Some(push)) = (extra.as_object_mut(), planning.journal_value()) {
         extra.insert("push_reconciliation".into(), push);
@@ -2072,7 +2463,7 @@ fn github_list_within(
             "--json", &fields,
         ])
         .current_dir(cwd);
-    let output = output_within(command, deadline, repository, stage)?;
+    let output = output_within(command, deadline, repository, stage, None)?;
     if !output.status.success() {
         return Ok(None);
     }
@@ -2880,6 +3271,7 @@ impl Broker {
                 return Err(BrokerOpError::DuplicatePendingOperation {
                     operation_id: pending.id,
                     status: pending.status.as_str(),
+                    liveness: operation_liveness_summary(&pending),
                 });
             }
         }
@@ -2926,7 +3318,13 @@ impl Broker {
             dry_run.arg("push").arg("--dry-run");
             dry_run.args(&request.args[command_index + 1..]);
             dry_run.current_dir(cwd);
-            match output_within(dry_run, admission, &repository, "running the pre-push dry run") {
+            match output_within(
+                dry_run,
+                admission,
+                &repository,
+                "running the pre-push dry run",
+                None,
+            ) {
                 Ok(output) if output.status.success() => {}
                 Ok(output) => {
                     // Failing here is the point: nothing is queued, and no other
@@ -2972,6 +3370,7 @@ impl Broker {
             match RepositoryWriteLock::acquire(
                 &main_root,
                 &lock_key,
+                queued_operation_id,
                 || {
                     let holder = lock_holder_info(self.store(), &repository);
                     let details =
@@ -3115,19 +3514,26 @@ impl Broker {
         if let Some(guard) = &mut host_guard {
             guard.mark_running()?;
         }
+        let operation_db_path = crate::broker_db_path(self.main_root());
+        let mut operation_heartbeat = OperationHeartbeat::start(
+            &operation_db_path,
+            operation.id,
+            "executing coordinated operation",
+        );
+        let mut running_details = journal_details(
+            classification,
+            resolved_target.as_ref(),
+            github_target.as_ref(),
+            with_push_planning(json!({}), &push_planning),
+        );
+        if let Some(heartbeat) = operation_heartbeat.as_ref() {
+            add_operation_liveness(&mut running_details, heartbeat.liveness(unix_now_ms()));
+        }
         self.store().transition_coordinated_operation(
             operation.id,
             OperationStatus::Running,
             None,
-            Some(
-                &journal_details(
-                    classification,
-                    resolved_target.as_ref(),
-                    github_target.as_ref(),
-                    with_push_planning(json!({}), &push_planning),
-                )
-                .to_string(),
-            ),
+            Some(&running_details.to_string()),
         )?;
 
         // This is the spawn that performs the remote mutation, so the binary
@@ -3163,6 +3569,9 @@ impl Broker {
             .stderr(Stdio::piped())
             .env("AETHYME_BROKER_SESSION_ID", request.session_id.to_string())
             .env("AETHYME_BROKER_OPERATION_ID", operation.id.to_string());
+        if let Some(heartbeat) = operation_heartbeat.as_ref() {
+            command.env(BROKER_OPERATION_PROGRESS_ENV, heartbeat.path());
+        }
         if request.provider == OperationProvider::Github {
             command.env(
                 "GH_REPO",
@@ -3177,6 +3586,7 @@ impl Broker {
             admission,
             &repository,
             "executing coordinated operation",
+            operation_heartbeat.as_ref(),
         ) {
             Ok(output) => output,
             Err(BrokerOpError::AdmissionTimedOut {
@@ -3184,6 +3594,9 @@ impl Broker {
                 stage,
                 budget,
             }) => {
+                let operation_liveness = operation_heartbeat
+                    .as_mut()
+                    .map(OperationHeartbeat::finish);
                 let status = if is_remote_write {
                     OperationStatus::OutcomeUnknown
                 } else {
@@ -3207,6 +3620,9 @@ impl Broker {
                         &push_planning,
                     ),
                 );
+                if let Some(liveness) = operation_liveness {
+                    add_operation_liveness(&mut details, liveness);
+                }
                 add_coordination_timing(
                     &mut details,
                     &lock_key,
@@ -3240,6 +3656,9 @@ impl Broker {
                 });
             }
             Err(BrokerOpError::OperationIo { source, .. }) => {
+                let operation_liveness = operation_heartbeat
+                    .as_mut()
+                    .map(OperationHeartbeat::finish);
                 let mut details = journal_details(
                     classification,
                     resolved_target.as_ref(),
@@ -3253,6 +3672,9 @@ impl Broker {
                         &push_planning,
                     ),
                 );
+                if let Some(liveness) = operation_liveness {
+                    add_operation_liveness(&mut details, liveness);
+                }
                 add_coordination_timing(
                     &mut details,
                     &lock_key,
@@ -3277,8 +3699,16 @@ impl Broker {
                     source,
                 });
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                let _ = operation_heartbeat
+                    .as_mut()
+                    .map(OperationHeartbeat::finish);
+                return Err(error);
+            }
         };
+        let operation_liveness = operation_heartbeat
+            .as_mut()
+            .map(OperationHeartbeat::finish);
         let remote_contact = git_trace
             .as_ref()
             .map(|trace| inspect_git_transfer_trace(trace.path()))
@@ -3407,6 +3837,9 @@ impl Broker {
                 ),
             )
         };
+        if let Some(liveness) = operation_liveness {
+            add_operation_liveness(&mut details, liveness);
+        }
         add_coordination_timing(
             &mut details,
             &lock_key,
@@ -3879,6 +4312,94 @@ mod tests {
         assert_eq!(humanize_duration(1_688), "28m 8s");
     }
 
+    fn liveness_operation(status: OperationStatus, heartbeat_age_ms: i64, progress_age_ms: i64) -> CoordinatedOperation {
+        let now = unix_now_ms();
+        CoordinatedOperation {
+            id: 1,
+            session_id: 2,
+            provider: OperationProvider::Git,
+            repository: "owner/repo".into(),
+            scope: "repository".into(),
+            effect: OperationEffect::Write,
+            status,
+            authorization_reason: Some("test".into()),
+            command_json: "[\"git\",\"push\"]".into(),
+            pid: 3,
+            exit_code: None,
+            details_json: Some(
+                json!({
+                    "operation_liveness": {
+                        "phase": "quality",
+                        "progress": "gate 3 of 7",
+                        "heartbeat_at": now - heartbeat_age_ms,
+                        "progress_at": now - progress_age_ms,
+                    }
+                })
+                .to_string(),
+            ),
+            created_at: now,
+            updated_at: now,
+            finished_at: None,
+            host_operation_id: None,
+            identity_provenance: OperationIdentityProvenance::VerifiedCanonical,
+        }
+    }
+
+    #[test]
+    fn operation_liveness_distinguishes_active_progress_and_dead_heartbeat() {
+        assert_eq!(
+            operation_liveness_view(&liveness_operation(
+                OperationStatus::Running,
+                5_000,
+                5_000,
+            ))
+            .state,
+            "active"
+        );
+        assert_eq!(
+            operation_liveness_view(&liveness_operation(
+                OperationStatus::Running,
+                5_000,
+                61_000,
+            ))
+            .state,
+            "progress_stale"
+        );
+        assert_eq!(
+            operation_liveness_view(&liveness_operation(
+                OperationStatus::Running,
+                31_000,
+                5_000,
+            ))
+            .state,
+            "heartbeat_stale"
+        );
+    }
+
+    #[test]
+    fn progress_file_accepts_json_and_plain_text_events() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        append_progress_event(file.path(), "gate 2 of 7", Some("quality"));
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(file.path())
+            .unwrap()
+            .write_all(b"gate 3 of 7\n")
+            .unwrap();
+        let state = Arc::new(Mutex::new(OperationHeartbeatState {
+            phase: "starting".into(),
+            progress: "none".into(),
+            last_progress_at: 0,
+            output_bytes: 0,
+        }));
+        let mut consumed = 0;
+        consume_progress_file(file.path(), &mut consumed, &state);
+        let state = state.lock().unwrap();
+        assert_eq!(state.phase, "quality");
+        assert_eq!(state.progress, "gate 3 of 7");
+        assert!(state.last_progress_at > 0);
+    }
+
     /// Issue #138: a blocked caller saw nothing at all, so a long hold was
     /// indistinguishable from a dead command and got re-issued.
     #[test]
@@ -4144,6 +4665,7 @@ mod tests {
             AdmissionDeadline::start(QueueWait::Seconds(1)),
             "owner/repo",
             "running the pre-push dry run",
+            None,
         )
         .expect_err("a child outliving the budget must not be waited on");
 

@@ -6201,6 +6201,12 @@ fn render_operation_show(report: &crate::OperationShowReport) {
     out!("Scope:          {}", operation.scope);
     out!("Effect:         {}", operation.effect.as_str());
     out!("Status:         {}", operation.status.as_str());
+    if operation.status == crate::OperationStatus::Running {
+        out!(
+            "Liveness:       {}",
+            crate::operations::operation_liveness_summary(operation)
+        );
+    }
     if let Some(waiting) = coordination_wait_summary(operation) {
         out!("Queue wait:     {waiting}");
     }
@@ -10829,6 +10835,14 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                             let waiting = coordination_wait_summary(&operation)
                                 .map(|summary| format!("  {summary}"))
                                 .unwrap_or_default();
+                            let liveness = (operation.status == crate::OperationStatus::Running)
+                                .then(|| {
+                                    format!(
+                                        "  liveness: {}",
+                                        crate::operations::operation_liveness_summary(&operation)
+                                    )
+                                })
+                                .unwrap_or_default();
                             out!(
                                 "{:<5} {:<8} {:<21} {:<22} {}{}",
                                 operation.id,
@@ -10836,7 +10850,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                                 operation.status.as_str(),
                                 operation.repository,
                                 operation.scope,
-                                waiting,
+                                format!("{waiting}{liveness}"),
                             );
                         }
                         if let Some(before_id) = page.next_before_id {
@@ -12261,14 +12275,15 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                             }
                         };
                         out!(
-                            "  op {:<6} sess {:<4} {:<7} {:<28} {:<9} {:>8}  {}",
+                            "  op {:<6} sess {:<4} {:<7} {:<28} {:<9} {:>8}  {} :: {}",
                             operation.id,
                             operation.session_id,
                             operation.provider,
                             operation.repository,
                             operation.status,
                             crate::operations::humanize_duration(operation.elapsed_seconds),
-                            role
+                            role,
+                            crate::operations::operation_liveness_view_summary(&operation.liveness)
                         );
                     }
                     if status.coordinated_operations.len() > 10 {

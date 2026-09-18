@@ -810,6 +810,7 @@ struct StderrGateProgressSink;
 impl GateProgressSink for StderrGateProgressSink {
     fn report(&self, line: &str) {
         eprintln!("{line}");
+        crate::operations::emit_operation_progress(line);
     }
 }
 

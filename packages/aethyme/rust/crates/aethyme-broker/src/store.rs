@@ -3173,6 +3173,37 @@ impl BrokerStore {
         Ok(())
     }
 
+    /// Refresh the liveness portion of a running operation without replacing
+    /// the rest of its journal. Heartbeats are deliberately best-effort and
+    /// guarded by the running status: a late heartbeat must never resurrect
+    /// or overwrite the terminal outcome recorded by the operation owner.
+    pub fn update_coordinated_operation_liveness(
+        &mut self,
+        id: i64,
+        liveness: &serde_json::Value,
+    ) -> Result<(), BrokerError> {
+        let Some(operation) = self.coordinated_operation(id)? else {
+            return Ok(());
+        };
+        if operation.status != OperationStatus::Running {
+            return Ok(());
+        }
+        let mut details = operation
+            .details_json
+            .as_deref()
+            .and_then(|details| serde_json::from_str::<serde_json::Value>(details).ok())
+            .filter(serde_json::Value::is_object)
+            .unwrap_or_else(|| serde_json::json!({}));
+        details["operation_liveness"] = liveness.clone();
+        self.conn.execute(
+            "UPDATE coordinated_operations
+             SET details_json = ?2, updated_at = ?3
+             WHERE id = ?1 AND status = 'running'",
+            params![id, details.to_string(), now_ms()],
+        )?;
+        Ok(())
+    }
+
     pub fn coordinated_operation(
         &self,
         id: i64,
