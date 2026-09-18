@@ -120,6 +120,33 @@ fn start_cli_returns_deterministic_planned_leases_and_status_exposes_them() {
 }
 
 #[test]
+fn start_cli_records_chau7_session_context_for_status_and_json() {
+    let tmp = fixture();
+    let started = stdout(&run(
+        tmp.path(),
+        &[
+            "start",
+            "--task",
+            "review workspace",
+            "--repo-name",
+            "Aethyme",
+            "--tab-name",
+            "Fix auth",
+            "--ai-provider",
+            "claude",
+            "--json",
+        ],
+    ));
+    let report: serde_json::Value = serde_json::from_str(&started).unwrap();
+    assert_eq!(report["repository_name"], "Aethyme");
+    assert_eq!(report["tab_name"], "Fix auth");
+    assert_eq!(report["ai_provider"], "claude");
+
+    let status = stdout(&run(tmp.path(), &["status"]));
+    assert!(status.contains("Aethyme / Fix auth / claude"), "{status}");
+}
+
+#[test]
 fn start_selects_integration_or_default_branch_without_using_checkout_head() {
     for checkout in ["main", "feature", "detached"] {
         let tmp = fixture();

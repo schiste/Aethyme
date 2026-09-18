@@ -126,3 +126,8 @@ notify or resume it, return its per-item result, and complete the fenced claim.
 If the tab no longer exists, the adapter must return the explicit
 `target_unavailable` fallback and must not silently start an unrelated agent.
 Aethyme's JSON contract and prompt are identical for Chau7 and a dummy adapter.
+When the Chau7 adapter has a live tab snapshot, `deliveries dispatch` and
+`deliveries resolve-tab` also record its optional repository name, tab name, and
+AI provider on the matched broker session. The values make `broker status` and
+lease refusals actionable without making the tab id part of broker ownership or
+delivery authorization.

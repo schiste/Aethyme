@@ -66,7 +66,7 @@ Usage:
       Inspect exact-HEAD gate quality without changing enforced selection.
       --probe explicitly runs all or one selected gate in a disposable
       detached worktree with ephemeral cache evidence and mutation capture.
-  aethyme broker adopt [<path>] [--task <text>] [--path <repo-path>]... [--agent <name-and-email>] [--reuse [--sync-integration]|--replace-stale] [--json]
+  aethyme broker adopt [<path>] [--task <text>] [--path <repo-path>]... [--agent <name-and-email>] [--repo-name <name>] [--tab-name <name>] [--ai-provider <provider>] [--reuse [--sync-integration]|--replace-stale] [--json]
       Register an existing worktree (attach-first). Defaults to the
       current directory. If the worktree already has a session:
       --reuse points it at a follow-up task with a fresh baseline and
@@ -132,13 +132,13 @@ Usage:
       Resolve retained ambiguity explicitly. Assignment requires --session;
       unsupported or repository-mismatched events can only be ignored. The
       reason is stored as a SHA-256 digest, never as text.
-  aethyme broker start --task <text> [--pull-request <number>] [--path <repo-path>]... [--agent <name-and-email>] [--json]
+  aethyme broker start --task <text> [--pull-request <number>] [--path <repo-path>]... [--agent <name-and-email>] [--repo-name <name>] [--tab-name <name>] [--ai-provider <provider>] [--json]
       Create a broker-managed worktree + branch and register a session,
       atomically claiming every reviewed --path, but do not spawn a process.
       Prefer this over adopting the main
       checkout for agent work; it isolates the git index and worktree.
       --agent as in adopt (see above).
-  aethyme broker start-agent --task <text> --cmd <command> [--pull-request <number>] [--agent <identity>] [--json]
+  aethyme broker start-agent --task <text> --cmd <command> [--pull-request <number>] [--agent <identity>] [--repo-name <name>] [--tab-name <name>] [--ai-provider <provider>] [--json]
       Create a worktree + branch and spawn <command> in it (sh -c),
       logging to .aethyme/logs/.
   aethyme broker prepare status --session <id> [--json]
@@ -668,6 +668,39 @@ fn session_agent_identity(explicit: Option<&str>) -> Option<String> {
     explicit
         .map(str::to_string)
         .or_else(|| crate::attribution::agent_from_env().map(|identity| identity.render()))
+}
+
+fn session_context_value(explicit: Option<&String>, environment: &[&str]) -> Option<String> {
+    explicit.cloned().or_else(|| {
+        environment
+            .iter()
+            .find_map(|name| std::env::var(name).ok())
+    })
+}
+
+fn session_context(parsed: &Parsed) -> crate::SessionContext {
+    crate::SessionContext::new(
+        session_context_value(
+            parsed.repo_name.as_ref(),
+            &[
+                "AETHYME_SESSION_REPO_NAME",
+                "AETHYME_CHAU7_REPO_NAME",
+                "AETHYME_REPO_NAME",
+            ],
+        ),
+        session_context_value(
+            parsed.tab_name.as_ref(),
+            &["AETHYME_SESSION_TAB_NAME", "AETHYME_CHAU7_TAB_NAME"],
+        ),
+        session_context_value(
+            parsed.ai_provider.as_ref(),
+            &[
+                "AETHYME_SESSION_AI_PROVIDER",
+                "AETHYME_CHAU7_AI_PROVIDER",
+                "AETHYME_AI_PROVIDER",
+            ],
+        ),
+    )
 }
 
 pub fn run(args: &[String]) -> u8 {
@@ -1320,6 +1353,36 @@ mod tests {
     }
 
     #[test]
+    fn parse_accepts_chau7_session_identity_flags() {
+        let parsed = super::parse(&args(&[
+            "start-agent",
+            "--task",
+            "review workspace",
+            "--cmd",
+            "claude --continue",
+            "--repo-name",
+            "Aethyme",
+            "--tab-name",
+            "Fix auth",
+            "--ai-provider",
+            "claude",
+        ]))
+        .unwrap_or_else(|_| panic!("Chau7 session identity flags should parse"));
+
+        assert_eq!(parsed.repo_name.as_deref(), Some("Aethyme"));
+        assert_eq!(parsed.tab_name.as_deref(), Some("Fix auth"));
+        assert_eq!(parsed.ai_provider.as_deref(), Some("claude"));
+        assert_eq!(
+            super::session_context(&parsed),
+            crate::SessionContext::new(
+                Some("Aethyme".into()),
+                Some("Fix auth".into()),
+                Some("claude".into())
+            )
+        );
+    }
+
+    #[test]
     fn parse_accepts_read_only_exact_gate_scope_evaluation() {
         let parsed = match super::parse(&args(&[
             "gates",
@@ -1936,6 +1999,9 @@ struct Parsed {
     outcome: Option<String>,
     reason: Option<String>,
     agent: Option<String>,
+    repo_name: Option<String>,
+    tab_name: Option<String>,
+    ai_provider: Option<String>,
     pr_number: Option<i64>,
     session: Option<i64>,
     to_session: Option<i64>,
@@ -2038,6 +2104,9 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         outcome: None,
         reason: None,
         agent: None,
+        repo_name: None,
+        tab_name: None,
+        ai_provider: None,
         pr_number: None,
         session: None,
         to_session: None,
@@ -2413,6 +2482,27 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
                         .clone(),
                 )
             }
+            "--repo-name" => {
+                parsed.repo_name = Some(
+                    iter.next()
+                        .ok_or(UsageError::Message("--repo-name requires a value".into()))?
+                        .clone(),
+                )
+            }
+            "--tab-name" => {
+                parsed.tab_name = Some(
+                    iter.next()
+                        .ok_or(UsageError::Message("--tab-name requires a value".into()))?
+                        .clone(),
+                )
+            }
+            "--ai-provider" => {
+                parsed.ai_provider = Some(
+                    iter.next()
+                        .ok_or(UsageError::Message("--ai-provider requires a value".into()))?
+                        .clone(),
+                )
+            }
             "--scope" => {
                 parsed.scope = Some(
                     iter.next()
@@ -2749,6 +2839,10 @@ fn render_lease_plan(report: &crate::LeasePlan, json: bool) -> Result<(), UsageE
         );
         for (label, overlaps) in [("owned", &path.owned), ("conflict", &path.conflicts)] {
             for overlap in overlaps {
+                let owner = match &overlap.owner_context {
+                    Some(context) => format!("{} [{}]", overlap.owner_status.as_str(), context),
+                    None => overlap.owner_status.as_str().to_string(),
+                };
                 out!(
                     "  {label:<8} {:<9} session {:<4} {:<9} {} (expires {}; owner {} at {})",
                     match overlap.relation {
@@ -2762,7 +2856,7 @@ fn render_lease_plan(report: &crate::LeasePlan, json: bool) -> Result<(), UsageE
                         .expires_at
                         .map(|expiry| expiry.to_string())
                         .unwrap_or_else(|| "never".to_string()),
-                    overlap.owner_status.as_str(),
+                    owner,
                     overlap.owner_worktree,
                 );
                 if label == "conflict" {
@@ -5777,6 +5871,18 @@ fn run_deliveries(parsed: Parsed) -> Result<(), UsageError> {
                 &session.branch,
                 &envelope.prompt,
             );
+            let resolved_tab_id = match &action {
+                crate::Chau7DispatchAction::Send { tab_id, .. }
+                | crate::Chau7DispatchAction::Defer { tab_id, .. } => Some(tab_id.as_str()),
+                crate::Chau7DispatchAction::Abandon { .. } => None,
+            };
+            if let Some(tab) = resolved_tab_id
+                .and_then(|tab_id| tabs.iter().find(|tab| tab.tab_id == tab_id))
+            {
+                broker
+                    .store()
+                    .update_session_context(session.id, &tab.session_context())?;
+            }
             // Deferral and abandonment are terminal for this claim, so the
             // broker completes them. A send stays open: only the caller knows
             // whether the transport actually landed.
@@ -5858,6 +5964,13 @@ fn run_deliveries(parsed: Parsed) -> Result<(), UsageError> {
             })?;
             let outcome =
                 crate::resolve_session_tab(&tabs, &session.worktree_path, &session.branch);
+            if let Ok(resolution) = &outcome
+                && let Some(tab) = tabs.iter().find(|tab| tab.tab_id == resolution.tab_id)
+            {
+                broker
+                    .store()
+                    .update_session_context(session.id, &tab.session_context())?;
+            }
             if parsed.json {
                 let body = match &outcome {
                     Ok(resolution) => serde_json::json!({"resolved": resolution}),
@@ -9628,6 +9741,14 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
             "--path is valid only with broker start or broker adopt".into(),
         ));
     }
+    if (parsed.repo_name.is_some() || parsed.tab_name.is_some() || parsed.ai_provider.is_some())
+        && !matches!(subcommand.as_str(), "start" | "start-agent" | "adopt")
+    {
+        return Err(UsageError::Message(
+            "session identity flags are valid only with broker start, broker start-agent, or broker adopt"
+                .into(),
+        ));
+    }
     if parsed.required_mode.is_some() && subcommand != "readiness" {
         return Err(UsageError::Message(
             "--require is valid only with broker readiness".into(),
@@ -9724,7 +9845,8 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
             }
             warn_stale_broker_binary(&broker);
             let agent_identity = session_agent_identity(parsed.agent.as_deref());
-            let report = broker.adopt_with_options(
+            let context = session_context(&parsed);
+            let report = broker.adopt_with_options_and_context(
                 &path,
                 parsed.task.as_deref(),
                 crate::AdoptOptions {
@@ -9733,6 +9855,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     planned_paths: parsed.planned_paths,
                 },
                 agent_identity.as_deref(),
+                context,
             )?;
             for renamed in &report.renamed_targets {
                 out!(
@@ -9846,16 +9969,18 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
         }
         "start" => {
             Broker::reject_integration_based_review_task(parsed.pull_request)?;
+            let context = session_context(&parsed);
             let task = parsed
                 .task
                 .ok_or(UsageError::Message("start requires --task".into()))?;
             let mut broker = open_broker(parsed.read_only_snapshot)?;
             warn_stale_broker_binary(&broker);
             let agent_identity = session_agent_identity(parsed.agent.as_deref());
-            let report = broker.start_worktree_with_planned_paths(
+            let report = broker.start_worktree_with_planned_paths_and_context(
                 &task,
                 &parsed.planned_paths,
                 agent_identity.as_deref(),
+                context,
             )?;
             let session = &report.session;
             if parsed.json {
@@ -9902,6 +10027,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
         }
         "start-agent" => {
             Broker::reject_integration_based_review_task(parsed.pull_request)?;
+            let context = session_context(&parsed);
             let task = parsed
                 .task
                 .ok_or(UsageError::Message("start-agent requires --task".into()))?;
@@ -9911,7 +10037,12 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
             let mut broker = open_broker(parsed.read_only_snapshot)?;
             warn_stale_broker_binary(&broker);
             let agent_identity = session_agent_identity(parsed.agent.as_deref());
-            let report = broker.start_agent_report(&task, &cmd, agent_identity.as_deref())?;
+            let report = broker.start_agent_report_with_context(
+                &task,
+                &cmd,
+                agent_identity.as_deref(),
+                context,
+            )?;
             let session = &report.session;
             if parsed.json {
                 out!("{}", serde_json::to_string_pretty(&report)?);
@@ -12150,18 +12281,24 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     out!("No live sessions.");
                 } else {
                     out!(
-                        "{:<4} {:<8} {:<8} {:<24} TASK",
+                        "{:<4} {:<8} {:<8} {:<30} {:<24} TASK",
                         "ID",
                         "STATUS",
                         "ORIGIN",
+                        "REPO / TAB / PROVIDER",
                         "BRANCH"
                     );
                     for view in &status.agents {
+                        let context = view
+                            .session
+                            .context_label()
+                            .unwrap_or_else(|| "-".into());
                         out!(
-                            "{:<4} {:<8} {:<8} {:<24} {}",
+                            "{:<4} {:<8} {:<8} {:<30} {:<24} {}",
                             view.session.id,
                             view.derived_status.as_str(),
                             view.session.origin.as_str(),
+                            context,
                             view.session.branch,
                             view.session.task.as_deref().unwrap_or("-"),
                         );

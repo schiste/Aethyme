@@ -43,7 +43,7 @@ use crate::types::{
     MergeQueueEntry, MergeStatus, NewAdvisory, NewCoordinatedOperation, NewGateResult,
     NewPrWatchState, NewSession, OperationEffect, OperationHistoryPage, OperationHistoryQuery,
     OperationIdentityProvenance, OperationProvider, OperationStatus, PrWatchState, Session,
-    SessionCleanupState, SessionNote, SessionOrigin, SessionStatus,
+    SessionCleanupState, SessionContext, SessionNote, SessionOrigin, SessionStatus,
 };
 use crate::types::{NewSessionRepresentation, RepresentationDiscovery, SessionRepresentation};
 
@@ -331,12 +331,26 @@ impl BrokerStore {
         new: &NewSession,
         planned_paths: &[String],
     ) -> Result<Session, BrokerError> {
+        self.register_session_with_context_and_leases(
+            new,
+            &SessionContext::default(),
+            planned_paths,
+        )
+    }
+
+    pub fn register_session_with_context_and_leases(
+        &mut self,
+        new: &NewSession,
+        context: &SessionContext,
+        planned_paths: &[String],
+    ) -> Result<Session, BrokerError> {
         let now = now_ms();
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         validate_planned_lease_conflicts(&tx, None, planned_paths, now)?;
-        let id = insert_session(&tx, new, now)?;
+        let id = insert_session(&tx, new, context, now)?;
+        insert_session_context_event(&tx, id, context, now)?;
         insert_planned_explicit_leases(&tx, id, planned_paths, now)?;
         tx.commit()?;
         self.session(id)
@@ -395,6 +409,25 @@ impl BrokerStore {
         agent_identity: Option<&str>,
         planned_paths: &[String],
     ) -> Result<Session, BrokerError> {
+        self.reuse_session_with_context_and_leases(
+            id,
+            task,
+            diff_base,
+            agent_identity,
+            &SessionContext::default(),
+            planned_paths,
+        )
+    }
+
+    pub fn reuse_session_with_context_and_leases(
+        &mut self,
+        id: i64,
+        task: Option<&str>,
+        diff_base: Option<&str>,
+        agent_identity: Option<&str>,
+        context: &SessionContext,
+        planned_paths: &[String],
+    ) -> Result<Session, BrokerError> {
         let now = now_ms();
         let tx = self
             .conn
@@ -403,9 +436,21 @@ impl BrokerStore {
         let changed = tx.execute(
             "UPDATE sessions SET task = COALESCE(?2, task), diff_base = COALESCE(?3, diff_base),
                                  agent_identity = COALESCE(?4, agent_identity),
-                                 status = 'active', last_activity_at = ?5, updated_at = ?5
+                                 repository_name = COALESCE(?5, repository_name),
+                                 tab_name = COALESCE(?6, tab_name),
+                                 ai_provider = COALESCE(?7, ai_provider),
+                                 status = 'active', last_activity_at = ?8, updated_at = ?8
              WHERE id = ?1 AND status != 'cleaned'",
-            params![id, task, diff_base, agent_identity, now],
+            params![
+                id,
+                task,
+                diff_base,
+                agent_identity,
+                context.repository_name,
+                context.tab_name,
+                context.ai_provider,
+                now,
+            ],
         )?;
         if changed == 0 {
             return Err(BrokerError::SessionNotFound(id));
@@ -417,6 +462,7 @@ impl BrokerStore {
             Some(id),
             Some(&crate::events::session_reused_payload(task, diff_base)),
         )?;
+        insert_session_context_event(&tx, id, context, now)?;
         insert_planned_explicit_leases(&tx, id, planned_paths, now)?;
         tx.commit()?;
         self.session(id)
@@ -430,6 +476,21 @@ impl BrokerStore {
         &mut self,
         replaced_id: i64,
         new: &NewSession,
+        planned_paths: &[String],
+    ) -> Result<Session, BrokerError> {
+        self.replace_session_with_context_and_leases(
+            replaced_id,
+            new,
+            &SessionContext::default(),
+            planned_paths,
+        )
+    }
+
+    pub fn replace_session_with_context_and_leases(
+        &mut self,
+        replaced_id: i64,
+        new: &NewSession,
+        context: &SessionContext,
         planned_paths: &[String],
     ) -> Result<Session, BrokerError> {
         let now = now_ms();
@@ -454,8 +515,47 @@ impl BrokerStore {
             [replaced_id],
         )?;
         insert_event(&tx, now, "session.cleaned", Some(replaced_id), None)?;
-        let id = insert_session(&tx, new, now)?;
+        let id = insert_session(&tx, new, context, now)?;
+        insert_session_context_event(&tx, id, context, now)?;
         insert_planned_explicit_leases(&tx, id, planned_paths, now)?;
+        tx.commit()?;
+        self.session(id)
+    }
+
+    /// Record host-facing session identity without changing ownership or
+    /// liveness. Values supplied by a later Chau7 snapshot replace stale
+    /// values; omitted values preserve what registration already knew.
+    pub fn update_session_context(
+        &mut self,
+        id: i64,
+        context: &SessionContext,
+    ) -> Result<Session, BrokerError> {
+        if context.is_empty() {
+            return self.session(id);
+        }
+        let now = now_ms();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = tx.execute(
+            "UPDATE sessions
+             SET repository_name = COALESCE(?2, repository_name),
+                 tab_name = COALESCE(?3, tab_name),
+                 ai_provider = COALESCE(?4, ai_provider),
+                 updated_at = ?5
+             WHERE id = ?1",
+            params![
+                id,
+                context.repository_name,
+                context.tab_name,
+                context.ai_provider,
+                now,
+            ],
+        )?;
+        if changed == 0 {
+            return Err(BrokerError::SessionNotFound(id));
+        }
+        insert_session_context_event(&tx, id, context, now)?;
         tx.commit()?;
         self.session(id)
     }
@@ -5484,18 +5584,24 @@ impl BrokerStore {
 
 // ── row mapping helpers ──────────────────────────────────────────────
 
-fn insert_session(tx: &Transaction<'_>, new: &NewSession, now: i64) -> Result<i64, BrokerError> {
+fn insert_session(
+    tx: &Transaction<'_>,
+    new: &NewSession,
+    context: &SessionContext,
+    now: i64,
+) -> Result<i64, BrokerError> {
     let contract = new.repository_contract.as_ref();
     let inserted = tx.execute(
         "INSERT INTO sessions (worktree_path, branch, origin, status, task, diff_base,
                                adoption_base, adopted_head, repository_schema,
                                deployment_state_digest, aethyme_version,
                                gate_definition_digest, repository_contract_backfilled,
-                               pid, command, log_path, agent_identity, created_at,
+                               pid, command, log_path, agent_identity, repository_name,
+                               tab_name, ai_provider, created_at,
                                updated_at, last_activity_at)
          VALUES (?1, ?2, ?3, 'active', ?4, ?5, COALESCE(?6, ?5),
                  COALESCE(?7, ?6, ?5), ?8, ?9, ?10, ?11, ?12, ?13,
-                 ?14, ?15, ?16, ?17, ?17, ?17)",
+                 ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?20, ?20)",
         params![
             new.worktree_path,
             new.branch,
@@ -5513,6 +5619,9 @@ fn insert_session(tx: &Transaction<'_>, new: &NewSession, now: i64) -> Result<i6
             new.command,
             new.log_path,
             new.agent_identity,
+            context.repository_name,
+            context.tab_name,
+            context.ai_provider,
             now,
         ],
     );
@@ -5540,6 +5649,25 @@ fn insert_session(tx: &Transaction<'_>, new: &NewSession, now: i64) -> Result<i6
         )),
     )?;
     Ok(id)
+}
+
+fn insert_session_context_event(
+    tx: &Transaction<'_>,
+    session_id: i64,
+    context: &SessionContext,
+    now: i64,
+) -> Result<(), BrokerError> {
+    if context.is_empty() {
+        return Ok(());
+    }
+    insert_event(
+        tx,
+        now,
+        crate::events::SESSION_CONTEXT_UPDATED,
+        Some(session_id),
+        Some(&crate::events::session_context_updated_payload(context)),
+    )?;
+    Ok(())
 }
 
 fn validate_planned_lease_conflicts(
@@ -5678,7 +5806,7 @@ const SESSION_SELECT: &str = "SELECT id, worktree_path, branch, origin, status, 
      accepted_at, repository_schema, deployment_state_digest, aethyme_version, \
      gate_definition_digest, repository_contract_backfilled, pid, command, log_path, \
      exit_code, created_at, updated_at, last_activity_at, cleanup_state, closed_at, \
-     cleanup_completed_at, agent_identity \
+     cleanup_completed_at, agent_identity, repository_name, tab_name, ai_provider \
      FROM sessions";
 
 const LEASE_SELECT: &str =
@@ -5776,6 +5904,9 @@ fn session_from_row(row: &rusqlite::Row<'_>) -> RowResult<Session> {
             closed_at: row.get(27)?,
             cleanup_completed_at: row.get(28)?,
             agent_identity: row.get(29)?,
+            repository_name: row.get(30)?,
+            tab_name: row.get(31)?,
+            ai_provider: row.get(32)?,
             task: row.get(5)?,
             diff_base: row.get(6)?,
             adoption_base: row.get(7)?,

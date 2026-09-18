@@ -16,7 +16,7 @@ use rusqlite::Connection;
 use crate::error::BrokerError;
 
 /// Current database schema version (== `MIGRATIONS.len()`).
-pub const SCHEMA_VERSION: i64 = 40;
+pub const SCHEMA_VERSION: i64 = 41;
 
 /// Version stamped on every event row written by this binary.
 pub const EVENTS_SCHEMA_VERSION: i64 = 1;
@@ -1216,6 +1216,12 @@ DROP TABLE entry_path_exposures_v38;
 CREATE INDEX entry_path_exposures_by_state
     ON entry_path_exposures (state, id);
 ";
+
+const MIGRATION_V41: &str = "
+ALTER TABLE sessions ADD COLUMN repository_name TEXT;
+ALTER TABLE sessions ADD COLUMN tab_name TEXT;
+ALTER TABLE sessions ADD COLUMN ai_provider TEXT;
+";
 const MIGRATIONS: &[&str] = &[
     MIGRATION_V1,
     MIGRATION_V2,
@@ -1257,6 +1263,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_V38,
     MIGRATION_V39,
     MIGRATION_V40,
+    MIGRATION_V41,
 ];
 
 pub(crate) fn current_version(conn: &Connection) -> Result<i64, BrokerError> {
@@ -1422,6 +1429,55 @@ mod tests {
             .is_err(),
             "widening the CHECK must not stop it rejecting unknown values"
         );
+    }
+
+    #[test]
+    fn v41_adds_session_context_columns_without_changing_existing_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON").unwrap();
+        conn.execute_batch("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            .unwrap();
+        for (index, sql) in MIGRATIONS.iter().take(40).enumerate() {
+            conn.execute_batch(sql).unwrap();
+            conn.execute(
+                "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)
+                 ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                [(index + 1).to_string()],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO sessions (
+                worktree_path, branch, origin, status, task, diff_base,
+                created_at, updated_at, last_activity_at
+             ) VALUES ('/repo/worktree', 'agent/legacy', 'adopted', 'active',
+                       'legacy task', 'base', 1, 1, 1)",
+            [],
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        let columns = conn
+            .prepare("PRAGMA table_info(sessions)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        for expected in ["repository_name", "tab_name", "ai_provider"] {
+            assert!(columns.iter().any(|column| column == expected), "{expected}");
+        }
+        let context: (Option<String>, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT repository_name, tab_name, ai_provider
+                 FROM sessions WHERE branch = 'agent/legacy'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(context, (None, None, None));
+        assert_eq!(current_version(&conn).unwrap(), SCHEMA_VERSION);
     }
 
     #[test]

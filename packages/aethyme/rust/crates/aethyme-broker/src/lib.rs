@@ -428,7 +428,7 @@ pub use types::{
     NewCoordinatedOperation, NewGateResult, NewPrWatchState, NewSession, OperationEffect,
     OperationHistoryPage, OperationHistoryQuery, OperationIdentityProvenance, OperationProvider,
     OperationStatus, PrWatchState, Session, SessionCleanupState, SessionNote, SessionNoteList,
-    SessionOrigin, SessionStatus,
+    SessionContext, SessionOrigin, SessionStatus,
 };
 pub use update::{
     INSTALL_RECEIPT_FILENAME, INSTALL_RECEIPT_SCHEMA_VERSION, InstallReceipt, InstallationMethod,

@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::process::{Command, Output};
 
-use aethyme_broker::{Broker, LeaseRoutingExportOptions};
+use aethyme_broker::{Broker, LeaseRoutingExportOptions, SessionContext};
 
 const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
 
@@ -70,6 +70,17 @@ fn lease_plan_cli_renders_structured_and_text_results_without_mutation() {
     let owner = broker.adopt(&owner_worktree, None).unwrap();
     broker
         .store()
+        .update_session_context(
+            owner.id,
+            &SessionContext::new(
+                Some("Aethyme".into()),
+                Some("Fix auth".into()),
+                Some("claude".into()),
+            ),
+        )
+        .unwrap();
+    broker
+        .store()
         .claim_lease(planner.id, "src/owned.rs", None)
         .unwrap();
     let directory = broker
@@ -118,6 +129,10 @@ fn lease_plan_cli_renders_structured_and_text_results_without_mutation() {
     assert_eq!(report["paths"][0]["conflicts"][0]["kind"], "implicit");
     assert_eq!(report["paths"][0]["conflicts"][0]["owner_status"], "active");
     assert_eq!(
+        report["paths"][0]["conflicts"][0]["owner_context"],
+        "Aethyme / Fix auth / claude"
+    );
+    assert_eq!(
         report["paths"][0]["conflicts"][0]["owner_worktree"],
         owner.worktree_path
     );
@@ -154,7 +169,7 @@ fn lease_plan_cli_renders_structured_and_text_results_without_mutation() {
     assert!(text.contains("exact"), "{text}");
     assert!(text.contains("directory"), "{text}");
     assert!(text.contains("expires never"), "{text}");
-    assert!(text.contains("owner active at"), "{text}");
+    assert!(text.contains("owner active [Aethyme / Fix auth / claude] at"), "{text}");
     assert!(text.contains("next: aethyme broker adopt"), "{text}");
     assert!(
         text.contains(&format!("expires {}", directory.expires_at.unwrap())),

@@ -399,6 +399,42 @@ pub struct NewSession {
     pub agent_identity: Option<String>,
 }
 
+/// Optional identity supplied by a host integration such as Chau7.
+///
+/// These values are deliberately separate from the session's Git identity:
+/// they help a human find the process that owns a lease, but never decide
+/// ownership or routing on their own.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionContext {
+    pub repository_name: Option<String>,
+    pub tab_name: Option<String>,
+    pub ai_provider: Option<String>,
+}
+
+impl SessionContext {
+    pub fn new(
+        repository_name: Option<String>,
+        tab_name: Option<String>,
+        ai_provider: Option<String>,
+    ) -> Self {
+        Self {
+            repository_name: normalize_context_value(repository_name),
+            tab_name: normalize_context_value(tab_name),
+            ai_provider: normalize_context_value(ai_provider),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.repository_name.is_none() && self.tab_name.is_none() && self.ai_provider.is_none()
+    }
+}
+
+fn normalize_context_value(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Session {
     pub id: i64,
@@ -431,10 +467,39 @@ pub struct Session {
     pub exit_code: Option<i64>,
     /// See [`NewSession::agent_identity`].
     pub agent_identity: Option<String>,
+    /// Human-facing repository name supplied by the broker or its host.
+    pub repository_name: Option<String>,
+    /// Human-facing Chau7 tab name, when the session is associated with one.
+    pub tab_name: Option<String>,
+    /// AI provider reported by the host integration, when known.
+    pub ai_provider: Option<String>,
     /// Unix epoch milliseconds.
     pub created_at: i64,
     pub updated_at: i64,
     pub last_activity_at: i64,
+}
+
+impl Session {
+    pub fn context(&self) -> SessionContext {
+        SessionContext {
+            repository_name: self.repository_name.clone(),
+            tab_name: self.tab_name.clone(),
+            ai_provider: self.ai_provider.clone(),
+        }
+    }
+
+    /// Compact identity for human-facing blocker/status output.
+    pub fn context_label(&self) -> Option<String> {
+        let parts = [
+            self.repository_name.as_deref(),
+            self.tab_name.as_deref(),
+            self.ai_provider.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        (!parts.is_empty()).then(|| parts.join(" / "))
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize)]

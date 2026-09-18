@@ -1404,6 +1404,9 @@ mod tests {
             updated_at: 500,
             last_activity_at: 490,
             agent_identity: None,
+            repository_name: None,
+            tab_name: None,
+            ai_provider: None,
         }
     }
 

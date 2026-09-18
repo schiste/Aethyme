@@ -17,6 +17,7 @@ use serde_json::json;
 // ── kind constants ───────────────────────────────────────────────────
 pub const SESSION_REGISTERED: &str = "session.registered";
 pub const SESSION_REUSED: &str = "session.reused";
+pub const SESSION_CONTEXT_UPDATED: &str = "session.context_updated";
 pub const SESSION_FINISHED: &str = "session.finished";
 pub const SESSION_FINISH_CLEANUP_STARTED: &str = "session.finish_cleanup_started";
 pub const SESSION_CHECKPOINT_REANCHORED: &str = "session.checkpoint_reanchored";
@@ -54,6 +55,15 @@ pub fn session_registered_payload(origin: &str, branch: &str, worktree_path: &st
 
 pub fn session_reused_payload(task: Option<&str>, diff_base: Option<&str>) -> String {
     json!({ "task": task, "diff_base": diff_base }).to_string()
+}
+
+pub fn session_context_updated_payload(context: &crate::SessionContext) -> String {
+    json!({
+        "repository_name": context.repository_name,
+        "tab_name": context.tab_name,
+        "ai_provider": context.ai_provider,
+    })
+    .to_string()
 }
 
 pub fn session_finish_cleanup_started_payload(

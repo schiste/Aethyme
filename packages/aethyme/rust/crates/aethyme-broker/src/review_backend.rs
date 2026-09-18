@@ -680,8 +680,10 @@ mod tests {
     fn tab(id: &str, cwd: &str) -> Chau7Tab {
         Chau7Tab {
             tab_id: id.into(),
+            tab_name: Some(format!("tab {id}")),
             cwd: Some(cwd.into()),
             repo_root: Some(cwd.into()),
+            repo_name: Some("Aethyme".into()),
             git_branch: None,
             ai_provider: Some("claude".into()),
             status: Some("idle".into()),

@@ -341,13 +341,13 @@ stashing multi-worktree changes.
 - `aethyme broker readiness recover [--repo <path>] --plan <plan-sha256> [--json]`
 - `aethyme broker status [--json]`
 - `aethyme broker worktree-root [--json]`
-- `aethyme broker start --task "..." [--pull-request <number>] [--path <repo-path>]... [--agent "<Name> <email>"] [--json]`
-- `aethyme broker start-agent --task "..." --cmd <command> [--pull-request <number>] [--agent "<Name> <email>"] [--json]`
+- `aethyme broker start --task "..." [--pull-request <number>] [--path <repo-path>]... [--agent "<Name> <email>"] [--repo-name <name>] [--tab-name <name>] [--ai-provider <provider>] [--json]`
+- `aethyme broker start-agent --task "..." --cmd <command> [--pull-request <number>] [--agent "<Name> <email>"] [--repo-name <name>] [--tab-name <name>] [--ai-provider <provider>] [--json]`
 - Supplying `--pull-request` explicitly refuses the integration-tip lane:
   pull-request reviews must use the routed review adapter, which provisions and
   verifies the exact pull-request head. Ordinary task text is not inspected for
   review-looking phrases.
-- `aethyme broker adopt [<path>] --task "..." [--path <repo-path>]... [--agent "<Name> <email>"] [--reuse [--sync-integration]] [--json]`
+- `aethyme broker adopt [<path>] --task "..." [--path <repo-path>]... [--agent "<Name> <email>"] [--repo-name <name>] [--tab-name <name>] [--ai-provider <provider>] [--reuse [--sync-integration]] [--json]`
 - `aethyme broker prepare status --session <id> [--json]`
 - `aethyme broker prepare --session <id> [--offline] [--wait <duration>] [--json]`
 - `aethyme broker exec --session <id> -- <command> [--json]`
@@ -739,6 +739,17 @@ Plain `broker adopt --reuse` preserves a live session's recorded ownership
 baseline. Reuse may update its task and activity, but cannot absorb pending
 commits into a new baseline. Close the completed session before adopting a new
 identity when a genuinely fresh ownership boundary is required.
+
+Session registration also accepts optional human-facing context for host
+integrations: `--repo-name`, `--tab-name`, and `--ai-provider`. The equivalent
+environment fallbacks are `AETHYME_SESSION_REPO_NAME`,
+`AETHYME_SESSION_TAB_NAME`, and `AETHYME_SESSION_AI_PROVIDER` (with
+`AETHYME_CHAU7_*` aliases). When host context includes a tab or provider but
+omits the repository name, the broker infers the repository basename. Chau7
+delivery commands enrich an existing session from the live tab snapshot, so
+`broker status`, lease refusals, and lease plans can identify a blocker as well
+as report its liveness. These fields are descriptive only: they never grant
+ownership or change lease routing.
 
 Closed sessions remain available to diagnostic reads, including `status`,
 `handoff`, and `review show`. They cannot claim leases or run review mutations.

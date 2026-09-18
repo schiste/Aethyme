@@ -306,6 +306,9 @@ without parsing `summary`.
 | `worktree_path` | no | Absolute worktree path. |
 | `branch` | no | Current/session branch. |
 | `diff_base` | no | Session baseline commit. |
+| `repository_name` | no | Human-facing repository name, when supplied by the broker or host. |
+| `tab_name` | no | Human-facing Chau7 tab name, when a host snapshot identifies one. |
+| `ai_provider` | no | AI provider reported by the host, when known. |
 | `head` | no | Current worktree `HEAD`. |
 | `dirty` | no | Whether uncommitted work exists. |
 | `dirty_paths` | no | Bounded repo-relative dirty path list. |
@@ -932,6 +935,11 @@ Required adapter properties:
 - bounded output identical in meaning to stdout compact rendering;
 - no hidden expansion of full logs unless explicitly requested by the user or
   agent.
+
+When a Chau7 tab snapshot is available, the broker may persist its repository
+name, tab name, and AI provider on the owning session. This context is exposed
+as an operator-facing label beside lease blockers and does not include the
+opaque tab id or alter delivery authorization.
 
 Delivery correlation candidates, in preferred order:
 

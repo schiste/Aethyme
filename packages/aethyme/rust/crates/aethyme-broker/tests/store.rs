@@ -6,7 +6,7 @@ use aethyme_broker::{
     AdvisoryAction, AdvisoryDeliverySurface, AdvisoryEvidence, AdvisoryResolutionState,
     AdvisorySeverity, BrokerError, BrokerStore, EntryExposureState, GateDef, GateFailureClass,
     GateStatus, LeaseKind, MergeStatus, NewAdvisory, NewGateResult, NewPrWatchState, NewSession,
-    RepositoryContract, SessionOrigin, SessionStatus,
+    RepositoryContract, SessionContext, SessionOrigin, SessionStatus,
 };
 
 fn open_temp() -> (tempfile::TempDir, BrokerStore) {
@@ -48,6 +48,60 @@ fn opens_in_repo_at_documented_path_and_reopens() {
     drop(store);
     // Reopen: migration is idempotent.
     BrokerStore::open_in_repo(tmp.path()).unwrap();
+}
+
+#[test]
+fn session_context_round_trips_and_can_be_enriched_from_chau7() {
+    let (_tmp, mut store) = open_temp();
+    let session = store
+        .register_session_with_context_and_leases(
+            &NewSession {
+                worktree_path: "/repo/.aethyme/worktrees/chau7-auth".into(),
+                branch: "agent/chau7-auth".into(),
+                origin: SessionOrigin::Adopted,
+                task: Some("Fix auth bug".into()),
+                diff_base: Some("abc123".into()),
+                adoption_base: None,
+                adopted_head: None,
+                repository_contract: None,
+                pid: None,
+                command: Some("chau7".into()),
+                log_path: None,
+                agent_identity: Some("Chau7 <chau7@example.invalid>".into()),
+            },
+            &SessionContext::new(
+                Some(" Aethyme ".into()),
+                Some("Fix auth".into()),
+                Some("claude".into()),
+            ),
+            &[],
+        )
+        .unwrap();
+
+    assert_eq!(session.repository_name.as_deref(), Some("Aethyme"));
+    assert_eq!(session.tab_name.as_deref(), Some("Fix auth"));
+    assert_eq!(session.ai_provider.as_deref(), Some("claude"));
+    assert_eq!(session.context_label().as_deref(), Some("Aethyme / Fix auth / claude"));
+    assert_eq!(session.status, SessionStatus::Active);
+    let last_activity_at = session.last_activity_at;
+
+    let enriched = store
+        .update_session_context(
+            session.id,
+            &SessionContext::new(None, Some("Fix auth (renamed)".into()), Some("codex".into())),
+        )
+        .unwrap();
+    assert_eq!(enriched.repository_name.as_deref(), Some("Aethyme"));
+    assert_eq!(enriched.tab_name.as_deref(), Some("Fix auth (renamed)"));
+    assert_eq!(enriched.ai_provider.as_deref(), Some("codex"));
+    assert_eq!(enriched.status, SessionStatus::Active);
+    assert_eq!(enriched.last_activity_at, last_activity_at);
+
+    let context_events = store
+        .events_after_filtered(0, i64::MAX, Some("session.context_updated"))
+        .unwrap();
+    assert_eq!(context_events.len(), 2);
+    assert!(context_events.iter().all(|event| event.session_id == Some(session.id)));
 }
 
 /// #163: telemetry must never be the write that creates broker state.

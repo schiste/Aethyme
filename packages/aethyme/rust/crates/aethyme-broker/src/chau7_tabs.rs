@@ -10,25 +10,59 @@
 //! is not, and with several agents on one branch that is a live risk rather
 //! than a theoretical one (#150).
 
+use std::path::Path;
+
 use serde::{Deserialize, Serialize};
+
+use crate::SessionContext;
 
 /// One tab as Chau7 reports it. Extra fields in the payload are ignored, so a
 /// Chau7 upgrade that adds fields does not break resolution.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Chau7Tab {
     pub tab_id: String,
+    #[serde(default, alias = "title", alias = "name", alias = "tab_title")]
+    pub tab_name: Option<String>,
     #[serde(default)]
     pub cwd: Option<String>,
     #[serde(default)]
     pub repo_root: Option<String>,
+    #[serde(
+        default,
+        alias = "repo",
+        alias = "repository_name",
+        alias = "repository"
+    )]
+    pub repo_name: Option<String>,
     #[serde(default)]
     pub git_branch: Option<String>,
     #[serde(default)]
+    #[serde(alias = "provider")]
     pub ai_provider: Option<String>,
     #[serde(default)]
     pub status: Option<String>,
     #[serde(default)]
     pub is_mcp_controlled: Option<bool>,
+}
+
+impl Chau7Tab {
+    pub fn session_context(&self) -> SessionContext {
+        SessionContext::new(
+            self.repo_name
+                .clone()
+                .filter(|name| !name.trim().is_empty())
+                .or_else(|| {
+                    self.repo_root.as_deref().and_then(|root| {
+                        Path::new(root)
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .map(str::to_string)
+                    })
+                }),
+            self.tab_name.clone(),
+            self.ai_provider.clone(),
+        )
+    }
 }
 
 /// Whether a resolved tab can take a message right now.
@@ -185,8 +219,10 @@ mod tests {
     fn tab(id: &str, cwd: &str, branch: &str, status: &str) -> Chau7Tab {
         Chau7Tab {
             tab_id: id.into(),
+            tab_name: Some(format!("tab {id}")),
             cwd: Some(cwd.into()),
             repo_root: Some(cwd.into()),
+            repo_name: Some("Aethyme".into()),
             git_branch: Some(branch.into()),
             ai_provider: Some("claude".into()),
             status: Some(status.into()),
@@ -294,6 +330,38 @@ mod tests {
         let parsed: Chau7Tab = serde_json::from_str(payload).unwrap();
         assert_eq!(parsed.tab_id, "tab_7");
     }
+
+    #[test]
+    fn tab_identity_aliases_are_available_to_session_context() {
+        let payload = r#"{"tab_id":"tab_7","title":"Fix auth","repo":"Aethyme",
+                          "ai_provider":"claude","status":"idle"}"#;
+        let parsed: Chau7Tab = serde_json::from_str(payload).unwrap();
+        assert_eq!(parsed.tab_name.as_deref(), Some("Fix auth"));
+        assert_eq!(parsed.repo_name.as_deref(), Some("Aethyme"));
+        assert_eq!(
+            parsed.session_context(),
+            SessionContext::new(
+                Some("Aethyme".into()),
+                Some("Fix auth".into()),
+                Some("claude".into())
+            )
+        );
+    }
+
+    #[test]
+    fn a_tab_repo_root_fills_in_a_missing_repository_name() {
+        let payload = r#"{"tab_id":"tab_7","repo_root":"/workspaces/Aethyme",
+                          "title":"Fix auth","provider":"codex"}"#;
+        let parsed: Chau7Tab = serde_json::from_str(payload).unwrap();
+        assert_eq!(
+            parsed.session_context(),
+            SessionContext::new(
+                Some("Aethyme".into()),
+                Some("Fix auth".into()),
+                Some("codex".into())
+            )
+        );
+    }
 }
 
 /// What an adapter should do with a claimed delivery.
@@ -362,8 +430,10 @@ mod dispatch_tests {
     fn tab(id: &str, cwd: &str, branch: &str, status: &str) -> Chau7Tab {
         Chau7Tab {
             tab_id: id.into(),
+            tab_name: Some(format!("tab {id}")),
             cwd: Some(cwd.into()),
             repo_root: Some(cwd.into()),
+            repo_name: Some("Aethyme".into()),
             git_branch: Some(branch.into()),
             ai_provider: Some("claude".into()),
             status: Some(status.into()),

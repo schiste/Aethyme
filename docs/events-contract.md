@@ -83,6 +83,7 @@ One JSON object per line:
 |---|---|---|---|
 | `session.registered` | the session | `origin` (adopted\|spawned), `branch`, `worktree_path` | adopt / start-agent |
 | `session.reused` | the session | `task`, `diff_base` (both nullable) | `adopt --reuse` pointed an existing session at a follow-up task (added 2026-07-14) |
+| `session.context_updated` | the session | `repository_name`, `tab_name`, `ai_provider` (all nullable) | registration or a host snapshot recorded human-facing Chau7/session context |
 | `session.active` / `.idle` / `.stale` | the session | — | liveness transition persisted (once per transition) |
 | `session.exited` | the session | `exit_code` (when known) | spawned PID died, or explicit transition |
 | `session.cleaned` | the session | — | `cleanup` removed the worktree, `close` marked the session finished (state only), or `adopt --replace-stale` retired the previous session |

@@ -27,8 +27,8 @@ use crate::session_abandonment::{
 use crate::store::BrokerStore;
 use crate::types::{
     Advisory, AdvisoryList, GateStatus, LeaseKind, MergeQueueEntry, MergeStatus, NewAdvisory,
-    NewSession, Session, SessionNote, SessionNoteList, SessionOrigin, SessionRepresentation,
-    SessionStatus,
+    NewSession, Session, SessionContext, SessionNote, SessionNoteList, SessionOrigin,
+    SessionRepresentation, SessionStatus,
 };
 use crate::version::{VersionDriftReport, VersionDriftStatus};
 use crate::worktree_reconcile::WorktreeReconciliation;
@@ -1242,10 +1242,19 @@ fn describe_lease_blockers(blockers: &[LeaseBlocker]) -> String {
         .iter()
         .take(4)
         .map(|blocker| {
+            let holder = match (
+                blocker.holder_context.as_deref(),
+                blocker.holder_status.as_deref(),
+            ) {
+                (Some(context), Some(status)) => format!("{context}; {status}"),
+                (Some(context), None) => context.to_string(),
+                (None, Some(status)) => status.to_string(),
+                (None, None) => "status unknown".to_string(),
+            };
             format!(
                 "session {} ({}) holds {} [{}]",
                 blocker.session_id,
-                blocker.holder_status.as_deref().unwrap_or("status unknown"),
+                holder,
                 blocker.path,
                 blocker.kind.as_str()
             )
@@ -1266,6 +1275,9 @@ pub struct LeaseBlocker {
     /// exactly as hard as one held by a session actively editing the file, and
     /// the refusal is only actionable if the reader can tell them apart.
     pub holder_status: Option<String>,
+    /// Repository, Chau7 tab, and AI provider when the holder supplied them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub holder_context: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -1296,6 +1308,9 @@ pub struct LeasePlanOverlap {
     pub owner_activity_at: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub owner_pid_alive: Option<bool>,
+    /// Repository, Chau7 tab, and AI provider when the owner supplied them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_context: Option<String>,
     pub safe_next_actions: Vec<String>,
 }
 
@@ -2197,6 +2212,19 @@ impl Broker {
         &self.main_root
     }
 
+    fn session_context(&self, mut context: SessionContext) -> SessionContext {
+        if context.repository_name.is_none()
+            && (context.tab_name.is_some() || context.ai_provider.is_some())
+        {
+            context.repository_name = self
+                .main_root
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_string);
+        }
+        context
+    }
+
     /// Override the per-user host-operation database.
     ///
     /// Production callers should use the platform default. This hook lets
@@ -2578,6 +2606,24 @@ impl Broker {
         options: AdoptOptions,
         agent_identity: Option<&str>,
     ) -> Result<AdoptReport, BrokerOpError> {
+        self.adopt_with_options_and_context(
+            worktree,
+            task,
+            options,
+            agent_identity,
+            SessionContext::default(),
+        )
+    }
+
+    pub fn adopt_with_options_and_context(
+        &mut self,
+        worktree: &Path,
+        task: Option<&str>,
+        options: AdoptOptions,
+        agent_identity: Option<&str>,
+        context: SessionContext,
+    ) -> Result<AdoptReport, BrokerOpError> {
+        let context = self.session_context(context);
         if options.sync_integration && options.mode != AdoptMode::Reuse {
             return Err(BrokerOpError::ReuseSyncRequiresReuse);
         }
@@ -2627,11 +2673,12 @@ impl Broker {
                     let refreshed_base = integration_sync
                         .as_ref()
                         .map(|sync| sync.after_head.as_str());
-                    let session = self.store.reuse_session_with_leases(
+                    let session = self.store.reuse_session_with_context_and_leases(
                         existing.id,
                         task,
                         refreshed_base,
                         agent_identity,
+                        &context,
                         &planned_paths,
                     )?;
                     self.store
@@ -2684,14 +2731,19 @@ impl Broker {
             agent_identity: agent_identity.map(str::to_string),
         };
         let session = if let Some(replaced_session_id) = replaced_session_id {
-            self.store.replace_session_with_leases(
+            self.store.replace_session_with_context_and_leases(
                 replaced_session_id,
                 &new_session,
+                &context,
                 &planned_paths,
             )?
         } else {
             self.store
-                .register_session_with_leases(&new_session, &planned_paths)?
+                .register_session_with_context_and_leases(
+                    &new_session,
+                    &context,
+                    &planned_paths,
+                )?
         };
         self.store
             .set_session_foreign_files(session.id, &foreign_files)?;
@@ -2916,6 +2968,22 @@ impl Broker {
         paths: &[String],
         agent_identity: Option<&str>,
     ) -> Result<StartReport, BrokerOpError> {
+        self.start_worktree_with_planned_paths_and_context(
+            task,
+            paths,
+            agent_identity,
+            SessionContext::default(),
+        )
+    }
+
+    pub fn start_worktree_with_planned_paths_and_context(
+        &mut self,
+        task: &str,
+        paths: &[String],
+        agent_identity: Option<&str>,
+        context: SessionContext,
+    ) -> Result<StartReport, BrokerOpError> {
+        let context = self.session_context(context);
         let planned_paths = normalize_planned_paths(paths)?;
         self.ensure_planned_paths_available(&planned_paths, None)?;
         let (_slug, branch, start_base, worktree, worktree_placement) =
@@ -2938,7 +3006,7 @@ impl Broker {
         };
         let session = match self
             .store
-            .register_session_with_leases(&new_session, &planned_paths)
+            .register_session_with_context_and_leases(&new_session, &context, &planned_paths)
         {
             Ok(session) => session,
             Err(error) => {
@@ -2981,6 +3049,22 @@ impl Broker {
         command: &str,
         agent_identity: Option<&str>,
     ) -> Result<StartAgentReport, BrokerOpError> {
+        self.start_agent_report_with_context(
+            task,
+            command,
+            agent_identity,
+            SessionContext::default(),
+        )
+    }
+
+    pub fn start_agent_report_with_context(
+        &mut self,
+        task: &str,
+        command: &str,
+        agent_identity: Option<&str>,
+        context: SessionContext,
+    ) -> Result<StartAgentReport, BrokerOpError> {
+        let context = self.session_context(context);
         let (slug, branch, start_base, worktree, worktree_placement) =
             self.create_session_worktree(task)?;
         let base = start_base.commit.clone();
@@ -3014,20 +3098,24 @@ impl Broker {
                 source,
             })?;
 
-        let session = self.store.register_session(&NewSession {
-            worktree_path: worktree.root().to_string_lossy().into_owned(),
-            branch,
-            origin: SessionOrigin::Spawned,
-            task: Some(task.to_string()),
-            adoption_base: Some(base.clone()),
-            adopted_head: Some(base.clone()),
-            diff_base: Some(base),
-            repository_contract: Some(repository_contract),
-            pid: Some(child.id() as i64),
-            command: Some(command.to_string()),
-            log_path: Some(log_path.to_string_lossy().into_owned()),
-            agent_identity: agent_identity.map(str::to_string),
-        })?;
+        let session = self.store.register_session_with_context_and_leases(
+            &NewSession {
+                worktree_path: worktree.root().to_string_lossy().into_owned(),
+                branch,
+                origin: SessionOrigin::Spawned,
+                task: Some(task.to_string()),
+                adoption_base: Some(base.clone()),
+                adopted_head: Some(base.clone()),
+                diff_base: Some(base),
+                repository_contract: Some(repository_contract),
+                pid: Some(child.id() as i64),
+                command: Some(command.to_string()),
+                log_path: Some(log_path.to_string_lossy().into_owned()),
+                agent_identity: agent_identity.map(str::to_string),
+            },
+            &context,
+            &[],
+        )?;
         self.store.set_session_foreign_files(session.id, &[])?;
         Ok(StartAgentReport {
             session,
@@ -3772,6 +3860,7 @@ impl Broker {
                     owner_worktree: owner.session.worktree_path.clone(),
                     owner_activity_at: owner.activity_at,
                     owner_pid_alive: owner.pid_alive,
+                    owner_context: owner.session.context_label(),
                     safe_next_actions: if owned_by_requester {
                         Vec::new()
                     } else {
@@ -3921,6 +4010,7 @@ impl Broker {
                     path: blocker.path.clone(),
                     kind: blocker.kind,
                     holder_status: self.lease_holder_status(blocker.session_id),
+                    holder_context: self.lease_holder_context(blocker.session_id),
                 });
             }
 
@@ -3984,6 +4074,7 @@ impl Broker {
             .map(|lease| LeaseBlocker {
                 session_id: lease.session_id,
                 holder_status: self.lease_holder_status(lease.session_id),
+                holder_context: self.lease_holder_context(lease.session_id),
                 path: lease.path,
                 kind: lease.kind,
             })
@@ -7248,6 +7339,13 @@ impl Broker {
             .map(|session| session.status.as_str().to_string())
     }
 
+    fn lease_holder_context(&self, session_id: i64) -> Option<String> {
+        self.store_ref()
+            .session(session_id)
+            .ok()
+            .and_then(|session| session.context_label())
+    }
+
     pub(crate) fn is_broker_owned_worktree(&self, session: &Session, path: &Path) -> bool {
         if session.origin != SessionOrigin::Spawned || path == self.main_root.as_path() {
             return false;
@@ -9793,6 +9891,9 @@ mod tests {
             log_path: None,
             exit_code: None,
             agent_identity: None,
+            repository_name: None,
+            tab_name: None,
+            ai_provider: None,
             created_at: 0,
             updated_at: 0,
             last_activity_at: 0,

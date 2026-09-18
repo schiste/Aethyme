@@ -51,6 +51,7 @@ const V1_KINDS: &[&str] = &[
     "session.active",
     "session.cleaned",
     "session.closed",
+    "session.context_updated",
     "session.exited",
     "session.finish_cleanup_started",
     "session.finished",
@@ -115,6 +116,7 @@ fn v1_kind_catalog_is_frozen() {
     let mut actual: Vec<String> = vec![
         events::SESSION_REGISTERED.into(),
         events::SESSION_REUSED.into(),
+        events::SESSION_CONTEXT_UPDATED.into(),
         events::SESSION_FINISHED.into(),
         events::SESSION_FINISH_CLEANUP_STARTED.into(),
         events::LEASE_CLAIMED.into(),
@@ -186,6 +188,15 @@ fn v1_constructor_payload_field_names_are_frozen() {
         &events::session_reused_payload(Some("t"), Some("d")),
         &["diff_base", "task"],
         "session.reused",
+    );
+    assert_keys(
+        &events::session_context_updated_payload(&aethyme_broker::SessionContext::new(
+            Some("Aethyme".into()),
+            Some("Fix auth".into()),
+            Some("claude".into()),
+        )),
+        &["ai_provider", "repository_name", "tab_name"],
+        "session.context_updated",
     );
     assert_keys(
         &events::session_exit_payload(0),

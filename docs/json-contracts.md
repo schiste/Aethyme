@@ -64,7 +64,9 @@ not evidence. `unknown` is an ordinary value, not a defect.
 
 `Session` fields: `id`, `worktree_path`, `branch`, `origin`, `status`,
 `task`, `diff_base`, `pid`, `command`, `log_path`, `exit_code`,
-`created_at`, `updated_at`, `last_activity_at`. Display `derived_status`
+`created_at`, `updated_at`, `last_activity_at`, `repository_name`, `tab_name`,
+`ai_provider`. The last three are nullable, human-facing host context fields;
+they do not participate in ownership or liveness. Display `derived_status`
 (liveness-adjusted), not raw `status`.
 
 `MergeQueueEntry` fields: `id`, `session_id`, `head_commit`,
