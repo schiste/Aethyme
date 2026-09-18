@@ -192,6 +192,11 @@ fn successful_operation_is_durably_journaled_with_events() {
             .as_i64()
             .is_some_and(|value| value >= 0)
     );
+    let liveness = &details["operation_liveness"];
+    assert_eq!(liveness["schema_version"], 1);
+    assert_eq!(liveness["phase"], "executing coordinated operation");
+    assert!(liveness["heartbeat_at"].as_i64().is_some());
+    assert!(liveness["progress_at"].as_i64().is_some());
 
     let events = broker.store().events_after(0, i64::MAX).unwrap();
     let kinds: Vec<&str> = events.iter().map(|event| event.kind.as_str()).collect();
@@ -1267,9 +1272,23 @@ fn status_names_the_holder_and_who_is_parked_behind_it() {
         .store()
         .create_coordinated_operation(&new_operation("repository", r#"["git","push"]"#))
         .unwrap();
+    let liveness = serde_json::json!({
+        "operation_liveness": {
+            "schema_version": 1,
+            "phase": "quality",
+            "progress": "gate 3 of 7",
+            "heartbeat_at": holder.created_at,
+            "progress_at": holder.created_at - 61_000,
+        }
+    });
     broker
         .store()
-        .transition_coordinated_operation(holder.id, OperationStatus::Running, None, None)
+        .transition_coordinated_operation(
+            holder.id,
+            OperationStatus::Running,
+            None,
+            Some(&liveness.to_string()),
+        )
         .unwrap();
     let parked = broker
         .store()
@@ -1309,6 +1328,11 @@ fn status_names_the_holder_and_who_is_parked_behind_it() {
         47 * 60,
         "the hold duration is the number that makes a wedge judgeable"
     );
+    assert_eq!(held.liveness.state, "progress_stale");
+    assert!(status
+        .advice
+        .iter()
+        .any(|advice| advice.id == "coordination.operation-stalled"));
 }
 
 /// A local Git command and a remote one describe the same repository, so they
