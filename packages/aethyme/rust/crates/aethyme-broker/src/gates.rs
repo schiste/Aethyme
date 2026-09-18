@@ -2031,6 +2031,11 @@ fn run_gate_command(
         let _ = log.write_all(crate::git::subprocess_path_note().as_bytes());
     }
     let log_err = log.try_clone()?;
+    // This is exported, so it reaches every descendant of the gate and not
+    // only the binary the gate names: anything spawned beneath it, at any
+    // depth and for any repository, resolves here. That is the intent for a
+    // gate, but a test fixture that spawns `aethyme` must scrub it or it will
+    // silently inherit this database instead of its own.
     // Gates execute binaries built from the tree under test.  Those binaries
     // may contain a broker-storage migration that is not present on any
     // reviewed branch yet.  Never let such a child discover the operator's

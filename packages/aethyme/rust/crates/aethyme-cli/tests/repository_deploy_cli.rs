@@ -34,6 +34,11 @@ fn command(repo: &std::path::Path) -> Command {
     let mut command = Command::new(aethyme_bin());
     command
         .env_remove("AETHYME_ROOT")
+        // Gates export a disposable database to every child they spawn, and
+        // that includes this test process. A fixture that inherited it would
+        // resolve to the gate's database instead of the one its own layout
+        // implies, and then assert about a checkout it never deployed to.
+        .env_remove("AETHYME_BROKER_DB")
         .env("XDG_CONFIG_HOME", repo.join("empty-config"));
     command
 }
