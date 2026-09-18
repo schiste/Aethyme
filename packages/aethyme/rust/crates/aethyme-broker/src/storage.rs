@@ -7,10 +7,11 @@
 //! belonging to another clone. This module joins those three observations at
 //! the host boundary.
 //!
-//! The inventory is read-only. Reclamation is a separate, digest-confirmed
-//! operation and rechecks the ownership evidence immediately before every
-//! removal. An unreadable or unmarked root is reported, but is never treated
-//! as disposable.
+//! The inventory does not mutate broker ownership state. It may spend the
+//! configured routine measurement budget refreshing the shared size cache.
+//! Reclamation is a separate, digest-confirmed operation and rechecks the
+//! ownership evidence immediately before every removal. An unreadable or
+//! unmarked root is reported, but is never treated as disposable.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -356,19 +357,26 @@ struct OwnerSources {
 
 /// Build the host inventory for the repository containing `path_inside_repo`.
 /// This function performs no broker-store creation, migration, lease refresh,
-/// or filesystem writes.
+/// or ownership-changing filesystem writes. It may persist one bounded size
+/// measurement when the routine policy permits it.
 pub fn storage_plan(path_inside_repo: &Path) -> Result<StoragePlan, StorageError> {
     let checkout = GitRepo::discover(path_inside_repo)?;
     let main_root = checkout.main_root()?;
     let storage_root = storage_container(&main_root)?;
     let (policy, warnings) = host_policy(&main_root);
-    build_plan(
+    let mut records = crate::measurement::load_size_records(&main_root);
+    let plan = build_plan(
         &main_root,
         &storage_root,
         policy.orphan_worktree_roots_days,
-        warnings,
-        true,
-    )
+        warnings.clone(),
+        crate::SizeScan::Recorded,
+        &mut records,
+    )?;
+    if warnings.is_empty() {
+        warm_one_storage_size_record(&main_root, &plan, &policy, &mut records);
+    }
+    Ok(plan)
 }
 
 /// Apply exactly one reviewed host storage plan. The digest is checked against
@@ -384,13 +392,19 @@ pub fn storage_apply(
     let main_root = checkout.main_root()?;
     let storage_root = storage_container(&main_root)?;
     let (policy, warnings) = host_policy(&main_root);
+    let mut records = crate::measurement::load_size_records(&main_root);
     let plan = build_plan(
         &main_root,
         &storage_root,
         policy.orphan_worktree_roots_days,
         warnings,
-        true,
+        crate::SizeScan::Measure,
+        &mut records,
     )?;
+    // The apply revalidation has already paid for a complete walk. Keep those
+    // observations so the next routine plan can report them without paying
+    // for the same trees again.
+    let _ = crate::measurement::save_size_records(&main_root, &records);
     if !plan.digest.eq_ignore_ascii_case(confirm) {
         return Err(StorageError::ConfirmationMismatch);
     }
@@ -464,7 +478,8 @@ fn build_plan(
     storage_root: &Path,
     orphan_worktree_roots_days: u32,
     warnings: Vec<String>,
-    size: bool,
+    scan: crate::SizeScan,
+    records: &mut crate::measurement::SizeRecords,
 ) -> Result<StoragePlan, StorageError> {
     let storage_root = normalise(&absolute_path(main_root, storage_root));
     let evaluated_at = now_ms();
@@ -504,7 +519,13 @@ fn build_plan(
     let mut roots = Vec::with_capacity(paths.len());
     let mut candidates = Vec::new();
     for path in paths {
-        let root = inspect_root(&path, evaluated_at, orphan_worktree_roots_days, size);
+        let root = inspect_root(
+            &path,
+            evaluated_at,
+            orphan_worktree_roots_days,
+            scan,
+            records,
+        );
         candidates.extend(candidates_for_root(&root, orphan_worktree_roots_days));
         roots.push(root);
     }
@@ -514,7 +535,7 @@ fn build_plan(
             .then_with(|| left.kind.as_str().cmp(right.kind.as_str()))
     });
     let (primary_checkouts, primary_candidates) =
-        inspect_primary_checkouts(main_root, &roots, size);
+        inspect_primary_checkouts(main_root, &roots, scan, records);
 
     // The cache is a sibling of the worktree container, so it is reached from
     // the container rather than rediscovered. Live roots are every enrolled
@@ -548,7 +569,7 @@ fn build_plan(
     live_roots.dedup();
     let (preparation_entries, preparation_candidates) = match preparation_cache_root(&storage_root)
     {
-        Some(cache_root) => inspect_preparation_cache(&cache_root, &live_roots, size),
+        Some(cache_root) => inspect_preparation_cache(&cache_root, &live_roots, scan, records),
         None => (Vec::new(), Vec::new()),
     };
     let digest = decision_digest(
@@ -564,7 +585,6 @@ fn build_plan(
         &primary_candidates,
         &preparation_entries,
         &preparation_candidates,
-        size,
     );
     Ok(StoragePlan {
         schema_version: STORAGE_PLAN_SCHEMA_VERSION,
@@ -587,7 +607,8 @@ fn inspect_root(
     raw_path: &Path,
     evaluated_at: i64,
     orphan_worktree_roots_days: u32,
-    size: bool,
+    scan: crate::SizeScan,
+    records: &mut crate::measurement::SizeRecords,
 ) -> StorageRoot {
     let filesystem_kind = filesystem_kind(raw_path);
     let path = if filesystem_kind == StorageFilesystemKind::Directory {
@@ -596,6 +617,7 @@ fn inspect_root(
         absolute_path(Path::new("/"), raw_path)
     };
     if filesystem_kind != StorageFilesystemKind::Directory {
+        let estimated_bytes = observed_size(raw_path, scan, records);
         return StorageRoot {
             path,
             filesystem_kind,
@@ -610,8 +632,8 @@ fn inspect_root(
             on_disk_directory_count: 0,
             git_registered_count: 0,
             ledger_claimed_count: 0,
-            estimated_bytes: size.then(|| file_size(raw_path)),
-            sized: size,
+            sized: estimated_bytes.is_some(),
+            estimated_bytes,
             reconciliation: empty_reconciliation(),
             blockers: vec!["entry is not a real directory and is never swept".into()],
         };
@@ -663,11 +685,7 @@ fn inspect_root(
                     continue;
                 }
                 let child = normalise(&child);
-                let estimated_bytes = if size {
-                    crate::broker::directory_size_without_following_links(&child).ok()
-                } else {
-                    None
-                };
+                let estimated_bytes = observed_size(&child, scan, records);
                 disk.insert(
                     child.clone(),
                     DiskObservation {
@@ -727,13 +745,8 @@ fn inspect_root(
             .map_or(0, |sources| sources.ledger_claimed.len()),
         entries,
     };
-    let estimated_bytes = if size {
-        crate::broker::directory_size_without_following_links(&path).ok()
-    } else {
-        None
-    };
-    let sized = size
-        && estimated_bytes.is_some()
+    let estimated_bytes = observed_size(&path, scan, records);
+    let sized = estimated_bytes.is_some()
         && reconciliation
             .entries
             .iter()
@@ -779,7 +792,8 @@ fn inspect_root(
 fn inspect_primary_checkouts(
     invoking_main_root: &Path,
     roots: &[StorageRoot],
-    size: bool,
+    scan: crate::SizeScan,
+    records: &mut crate::measurement::SizeRecords,
 ) -> (Vec<StoragePrimaryCheckout>, Vec<StoragePrimaryCandidate>) {
     let mut paths = BTreeSet::new();
     if is_enrolled_primary_checkout(invoking_main_root) {
@@ -799,7 +813,7 @@ fn inspect_primary_checkouts(
 
     let mut checkouts = paths
         .into_iter()
-        .map(|path| inspect_primary_checkout(&path, size))
+        .map(|path| inspect_primary_checkout(&path, scan, records))
         .collect::<Vec<_>>();
     checkouts.sort_by(|left, right| left.path.cmp(&right.path));
     // Reporting spans every enrolled checkout on the host; deleting does not.
@@ -887,7 +901,8 @@ fn directory_modified_within(dir: &Path, window_ms: u64) -> bool {
 fn inspect_preparation_cache(
     cache_root: &Path,
     live_roots: &[PathBuf],
-    size: bool,
+    scan: crate::SizeScan,
+    records: &mut crate::measurement::SizeRecords,
 ) -> (
     Vec<StoragePreparationEntry>,
     Vec<StoragePreparationCandidate>,
@@ -921,8 +936,8 @@ fn inspect_preparation_cache(
             let live = live_keys.contains(&key);
             // Measuring is the expensive half, so a live entry is counted but
             // never walked: its size cannot change the decision.
-            let estimated_bytes = if size && !live {
-                Some(directory_size_without_following_links(&path).unwrap_or(0))
+            let estimated_bytes = if !live {
+                observed_size(&path, scan, records)
             } else {
                 None
             };
@@ -990,7 +1005,11 @@ fn is_enrolled_primary_checkout(path: &Path) -> bool {
     path.join(".aethyme/config.toml").is_file()
 }
 
-fn inspect_primary_checkout(path: &Path, size: bool) -> StoragePrimaryCheckout {
+fn inspect_primary_checkout(
+    path: &Path,
+    scan: crate::SizeScan,
+    records: &mut crate::measurement::SizeRecords,
+) -> StoragePrimaryCheckout {
     let path = normalise(path);
     let mut blockers = Vec::new();
     let repo = match GitRepo::discover(&path) {
@@ -1097,18 +1116,14 @@ fn inspect_primary_checkout(path: &Path, size: bool) -> StoragePrimaryCheckout {
                         "regenerable Git-ignored artifact in a clean enrolled primary checkout"
                             .into()
                     };
+                    let estimated_bytes = observed_size(&path, scan, records);
                     artifacts.push(StoragePrimaryArtifact {
                         path,
                         name,
                         ignored,
                         tracked,
                         reclaimable,
-                        estimated_bytes: size
-                            .then(|| {
-                                crate::broker::directory_size_without_following_links(&raw_path)
-                                    .ok()
-                            })
-                            .flatten(),
+                        estimated_bytes,
                         reason,
                     });
                 }
@@ -1243,6 +1258,75 @@ fn candidates_for_root(
         .collect()
 }
 
+/// Observe one path through the selected sizing policy.
+///
+/// The recorded path never touches the directory contents. A full storage
+/// apply may still request a fresh walk, but the ordinary plan is deliberately
+/// assembled from the shared measurement cache so a cheap inventory cannot
+/// turn into a recursive scan of every checkout on the host.
+fn observed_size(
+    path: &Path,
+    scan: crate::SizeScan,
+    records: &mut crate::measurement::SizeRecords,
+) -> Option<u64> {
+    let key = path.to_string_lossy();
+    if scan.measures() {
+        let bytes = crate::broker::directory_size_without_following_links(path).ok()?;
+        records.record(&key, bytes, now_ms());
+        Some(bytes)
+    } else {
+        records.get(&key).map(|record| record.bytes)
+    }
+}
+
+/// Spend one routine measurement budget on the oldest or never-measured
+/// direct storage entry. A failed or timed-out walk records nothing, leaving
+/// the corresponding estimate explicitly unknown for the next plan.
+fn warm_one_storage_size_record(
+    main_root: &Path,
+    plan: &StoragePlan,
+    policy: &crate::RetentionPolicy,
+    records: &mut crate::measurement::SizeRecords,
+) {
+    let paths = storage_size_paths(plan);
+    let Some(path) = records.next_to_measure(
+        &paths,
+        now_ms(),
+        i64::from(policy.size_record_ttl_hours).saturating_mul(3_600_000),
+    ) else {
+        return;
+    };
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_millis(policy.routine_size_budget_ms);
+    let Some(bytes) = crate::broker::directory_size_bounded(Path::new(&path), deadline) else {
+        return;
+    };
+    records.record(&path, bytes, now_ms());
+    let _ = crate::measurement::save_size_records(main_root, records);
+}
+
+fn storage_size_paths(plan: &StoragePlan) -> Vec<String> {
+    let mut paths = BTreeSet::new();
+    for root in &plan.roots {
+        for entry in &root.reconciliation.entries {
+            if entry.on_disk {
+                paths.insert(entry.path.to_string_lossy().into_owned());
+            }
+        }
+    }
+    for checkout in &plan.primary_checkouts {
+        for artifact in &checkout.artifacts {
+            paths.insert(artifact.path.to_string_lossy().into_owned());
+        }
+    }
+    for entry in &plan.preparation_entries {
+        if entry.reclaimable {
+            paths.insert(entry.path.to_string_lossy().into_owned());
+        }
+    }
+    paths.into_iter().collect()
+}
+
 fn summarise(
     roots: &[StorageRoot],
     candidates: &[StorageCandidate],
@@ -1250,7 +1334,6 @@ fn summarise(
     primary_candidates: &[StoragePrimaryCandidate],
     preparation_entries: &[StoragePreparationEntry],
     preparation_candidates: &[StoragePreparationCandidate],
-    size: bool,
 ) -> StorageSummary {
     let owner_present_count = roots
         .iter()
@@ -1261,16 +1344,12 @@ fn summarise(
         .filter(|root| root.owner_exists == Some(false))
         .count();
     let on_disk_directory_count = roots.iter().map(|root| root.on_disk_directory_count).sum();
-    let estimated_bytes = sized_sum(roots.iter().map(|root| root.estimated_bytes), size);
-    let reclaimable_bytes = sized_sum(
-        candidates.iter().map(|candidate| candidate.estimated_bytes),
-        size,
-    );
+    let estimated_bytes = sized_sum(roots.iter().map(|root| root.estimated_bytes));
+    let reclaimable_bytes = sized_sum(candidates.iter().map(|candidate| candidate.estimated_bytes));
     let primary_reclaimable_bytes = sized_sum(
         primary_candidates
             .iter()
             .map(|candidate| candidate.estimated_bytes),
-        size,
     );
     StorageSummary {
         root_count: roots.len(),
@@ -1294,23 +1373,19 @@ fn summarise(
         primary_candidate_count: primary_candidates.len(),
         preparation_entry_count: preparation_entries.len(),
         preparation_candidate_count: preparation_candidates.len(),
-        preparation_reclaimable_bytes: size.then(|| {
+        preparation_reclaimable_bytes: sized_sum(
             preparation_candidates
                 .iter()
-                .filter_map(|candidate| candidate.estimated_bytes)
-                .sum()
-        }),
+                .map(|candidate| candidate.estimated_bytes),
+        ),
         estimated_bytes,
         reclaimable_bytes,
         primary_reclaimable_bytes,
-        sized: size && roots.iter().all(|root| root.sized),
+        sized: roots.iter().all(|root| root.sized),
     }
 }
 
-fn sized_sum(values: impl Iterator<Item = Option<u64>>, size: bool) -> Option<u64> {
-    if !size {
-        return None;
-    }
+fn sized_sum(values: impl Iterator<Item = Option<u64>>) -> Option<u64> {
     let mut total = 0_u64;
     for value in values {
         total = total.saturating_add(value?);
@@ -1719,12 +1794,6 @@ fn filesystem_kind(path: &Path) -> StorageFilesystemKind {
     }
 }
 
-fn file_size(path: &Path) -> u64 {
-    std::fs::symlink_metadata(path)
-        .map(|metadata| metadata.len())
-        .unwrap_or(0)
-}
-
 fn has_git_marker(path: &Path) -> bool {
     std::fs::symlink_metadata(path.join(".git")).is_ok()
 }
@@ -1807,7 +1876,9 @@ mod tests {
         std::fs::write(repo_dir.join("bbbbbbbbbbbb/blob"), "cached\n").unwrap();
 
         // No live root declares preparation, so nothing keeps a key alive.
-        let (entries, candidates) = inspect_preparation_cache(&cache, &[], false);
+        let mut records = crate::measurement::SizeRecords::default();
+        let (entries, candidates) =
+            inspect_preparation_cache(&cache, &[], crate::SizeScan::Recorded, &mut records);
         assert_eq!(entries.len(), 2, "both entries must be inventoried");
         assert_eq!(candidates.len(), 2, "with no live key, both are dead");
         assert!(
@@ -1845,10 +1916,12 @@ mod tests {
         std::fs::create_dir_all(cache.join(&key)).unwrap();
         std::fs::create_dir_all(cache.join("deadbeefdead")).unwrap();
 
+        let mut records = crate::measurement::SizeRecords::default();
         let (entries, candidates) = inspect_preparation_cache(
             &tmp.path().join("preparation-cache"),
             &[repo.clone()],
-            false,
+            crate::SizeScan::Recorded,
+            &mut records,
         );
         assert_eq!(entries.len(), 2);
         assert_eq!(candidates.len(), 1, "only the unnamed key is dead");
@@ -1958,6 +2031,35 @@ mod tests {
         assert!(is_sha256(&"a".repeat(64)));
         assert!(!is_sha256("a"));
         assert!(!is_sha256(&"g".repeat(64)));
+    }
+
+    #[test]
+    fn recorded_size_uses_the_cache_and_leaves_missing_paths_unknown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("target");
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("output"), "small").unwrap();
+
+        let mut records = crate::measurement::SizeRecords::default();
+        assert_eq!(
+            observed_size(&path, crate::SizeScan::Recorded, &mut records),
+            None
+        );
+
+        let key = path.to_string_lossy().into_owned();
+        records.record(&key, 5, 123);
+        std::fs::write(path.join("output"), vec![b'x'; 4096]).unwrap();
+        assert_eq!(
+            observed_size(&path, crate::SizeScan::Recorded, &mut records),
+            Some(5),
+            "recorded mode must not refresh a directory by walking it"
+        );
+    }
+
+    #[test]
+    fn incomplete_storage_totals_remain_unknown() {
+        assert_eq!(sized_sum([Some(1), Some(2)].into_iter()), Some(3));
+        assert_eq!(sized_sum([Some(1), None].into_iter()), None);
     }
 
     #[test]
