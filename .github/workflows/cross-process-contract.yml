@@ -55,6 +55,10 @@ jobs:
         # cwd must stay at the repository root.
         env:
           BASE_REF: ${{ github.base_ref }}
+          # The checker is built from the PR tree. Keep any broker access by
+          # its startup path or dependencies away from a runner's repository
+          # state; an unreviewed schema migration must be disposable (#232).
+          AETHYME_BROKER_DB: ${{ runner.temp }}/aethyme-broker-contract-check.db
         run: |
           cargo run --quiet \
             --manifest-path packages/aethyme/rust/Cargo.toml \

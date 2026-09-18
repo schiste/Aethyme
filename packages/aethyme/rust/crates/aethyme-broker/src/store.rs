@@ -6478,7 +6478,13 @@ mod snapshot_tests {
             .unwrap();
         drop(source);
 
-        let snapshot = BrokerStore::open_snapshot_in_repo(repo.path()).unwrap();
+        // `open_snapshot_in_repo` resolves through `broker_db_path`, which
+        // returns `AETHYME_BROKER_DB` verbatim and ignores the repository it
+        // was handed. Under a gate that variable is set, so every in-repo
+        // resolution in this binary collapses onto one database and sibling
+        // tests' sessions appear here. This test is about an exact file, which
+        // is what `open_snapshot_at` exists to open.
+        let snapshot = BrokerStore::open_snapshot_at(&database).unwrap();
         assert!(snapshot.live_sessions().unwrap().is_empty());
         assert_eq!(
             schema::current_version(&snapshot.conn).unwrap(),
