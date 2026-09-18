@@ -354,6 +354,60 @@ fn certify_names_a_path_git_shim_that_decorates_known_empty_output() {
 }
 
 #[test]
+fn certification_accepts_real_review_policy_and_rejects_runtime_invalid_policy() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    init::scaffold(tmp.path()).unwrap();
+    let config = tmp.path().join(".aethyme/config.toml");
+    let real_config = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../../../.aethyme/config.toml"),
+    )
+    .unwrap();
+    std::fs::write(&config, &real_config).unwrap();
+    let before = snapshot(tmp.path());
+    let report = init::certify(tmp.path()).unwrap();
+    let check = report
+        .checks
+        .iter()
+        .find(|c| c.id == "certify.config")
+        .unwrap();
+    assert_eq!(check.status, CheckStatus::Pass, "{}", check.detail);
+    assert_eq!(
+        before,
+        snapshot(tmp.path()),
+        "certification must remain read-only"
+    );
+
+    for section in ["trigger", "routing", "reporting", "projection"] {
+        std::fs::write(
+            &config,
+            format!("[review.{section}]\nschema_version = 999999\n"),
+        )
+        .unwrap();
+        let report = init::certify(tmp.path()).unwrap();
+        assert_eq!(
+            status_of(&report, "certify.config"),
+            CheckStatus::Fail,
+            "{section}"
+        );
+    }
+    std::fs::write(&config, "review = 'not a table'\n").unwrap();
+    assert_eq!(
+        status_of(&init::certify(tmp.path()).unwrap(), "certify.config"),
+        CheckStatus::Fail
+    );
+    std::fs::write(&config, "[review.future]\nenabled = true\n").unwrap();
+    let report = init::certify(tmp.path()).unwrap();
+    let check = report
+        .checks
+        .iter()
+        .find(|c| c.id == "certify.config")
+        .unwrap();
+    assert_eq!(check.status, CheckStatus::Warn);
+    assert!(check.detail.contains("review.future"));
+}
+
+#[test]
 fn config_schema_key_is_accepted_and_unknown_keys_warn_never_fail() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());

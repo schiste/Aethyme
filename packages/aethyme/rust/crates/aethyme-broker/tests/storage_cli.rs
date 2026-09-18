@@ -390,6 +390,49 @@ fn storage_apply_refuses_a_plan_when_a_new_stray_appears() {
 }
 
 #[test]
+fn storage_apply_binds_preparation_candidates_to_confirmation() {
+    let (repo, host) = fixture();
+    let container = host.path().join("worktrees");
+    std::fs::create_dir_all(&container).unwrap();
+    let empty = json(run(repo.path(), &container, &["storage", "plan", "--json"]));
+    let entry = host.path().join("preparation-cache/repository/new-key");
+    std::fs::create_dir_all(&entry).unwrap();
+    std::fs::write(entry.join("payload"), "must survive stale approval").unwrap();
+    let populated = json(run(repo.path(), &container, &["storage", "plan", "--json"]));
+    assert_ne!(empty["digest"], populated["digest"]);
+    assert_eq!(populated["summary"]["preparation_candidate_count"], 1);
+
+    let refused = run(
+        repo.path(),
+        &container,
+        &[
+            "storage",
+            "apply",
+            "--confirm",
+            empty["digest"].as_str().unwrap(),
+            "--json",
+        ],
+    );
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("no longer matches current state"));
+    assert!(entry.join("payload").is_file());
+
+    let applied = json(run(
+        repo.path(),
+        &container,
+        &[
+            "storage",
+            "apply",
+            "--confirm",
+            populated["digest"].as_str().unwrap(),
+            "--json",
+        ],
+    ));
+    assert_eq!(applied["complete"], true);
+    assert!(!entry.exists());
+}
+
+#[test]
 fn storage_plan_does_not_follow_a_root_symlink_or_remove_it() {
     let (repo, container) = fixture();
     let target = container.path().join("outside");

@@ -144,6 +144,128 @@ fn release_installer_delegates_pair_activation_to_the_native_transaction() {
 }
 
 #[test]
+#[cfg(unix)]
+fn installer_authenticates_archive_before_running_payload() {
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::PermissionsExt;
+
+    fn script(path: &Path, text: &str) {
+        std::fs::write(path, text).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path();
+    let bin = root.join("bin");
+    let payload = root.join("payload");
+    std::fs::create_dir(&bin).unwrap();
+    std::fs::create_dir(&payload).unwrap();
+    script(
+        &bin.join("uname"),
+        "#!/bin/sh\ncase $1 in -s) echo Linux;; -m) echo x86_64;; esac\n",
+    );
+    script(
+        &bin.join("curl"),
+        r#"#!/bin/sh
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --output) destination="$2"; shift 2;;
+        --*) shift;;
+        *) url="$1"; shift;;
+    esac
+done
+cp "$INSTALL_FIXTURE/${url##*/}" "$destination"
+"#,
+    );
+    // Stub signature verification to isolate the artifact-binding contract;
+    // this is not a test of Cosign's cryptographic implementation.
+    script(&bin.join("cosign"), "#!/bin/sh\nexit \"$SIGNATURE_EXIT\"\n");
+    for name in ["aethyme", "aethyme-engine-cli"] {
+        script(
+            &payload.join(name),
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$EXECUTED_PAYLOAD\"\necho aethyme 0.0.1\n",
+        );
+    }
+    let archive = "aethyme-v0.0.1-x86_64-unknown-linux-gnu.tar.gz";
+    assert!(
+        Command::new("tar")
+            .args(["-czf"])
+            .arg(root.join(archive))
+            .arg("-C")
+            .arg(&payload)
+            .args(["aethyme", "aethyme-engine-cli"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let actual = format!(
+        "{:x}",
+        Sha256::digest(std::fs::read(root.join(archive)).unwrap())
+    );
+    // A matching unsigned checksum must not override the manifest digest.
+    std::fs::write(
+        root.join(format!("{archive}.sha256")),
+        format!("{actual}  {archive}\n"),
+    )
+    .unwrap();
+    std::fs::write(root.join("release-manifest.sigstore.json"), "{}").unwrap();
+    let installer = aethyme_testkit::paths::repo_root().join("install.sh");
+    let installer_digest = format!("{:x}", Sha256::digest(std::fs::read(&installer).unwrap()));
+    for case in [
+        "valid",
+        "mismatch",
+        "duplicate",
+        "missing",
+        "bad-signature",
+        "bad-installer",
+    ] {
+        let artifact = serde_json::json!({
+            "archive": archive, "target": "x86_64-unknown-linux-gnu",
+            "sha256": if case == "mismatch" { "0".repeat(64) } else { actual.clone() }
+        });
+        let artifacts = match case {
+            "duplicate" => vec![artifact.clone(), artifact],
+            "missing" => vec![],
+            _ => vec![artifact],
+        };
+        let manifest = serde_json::json!({
+            "version": "0.0.1", "release_channel": "stable", "artifacts": artifacts,
+            "installer": { "sha256": if case == "bad-installer" { "0".repeat(64) } else { installer_digest.clone() } }
+        });
+        // Compact JSON deliberately exercises real parsing, not line matching.
+        std::fs::write(root.join("release-manifest.json"), manifest.to_string()).unwrap();
+        let executed = root.join(format!("executed-{case}"));
+        let output = Command::new("sh")
+            .arg(&installer)
+            .arg("--verify-signature")
+            .env(
+                "PATH",
+                format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+            )
+            .env("AETHYME_RELEASE_BASE_URL", "https://fixture.invalid")
+            .env("AETHYME_INSTALL_DIR", root.join("installed"))
+            .env("INSTALL_FIXTURE", root)
+            .env("EXECUTED_PAYLOAD", &executed)
+            .env(
+                "SIGNATURE_EXIT",
+                if case == "bad-signature" { "1" } else { "0" },
+            )
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.success(),
+            case == "valid",
+            "{case}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            executed.exists(),
+            case == "valid",
+            "payload execution in {case}"
+        );
+    }
+}
+
+#[test]
 fn release_notes_publish_migration_compatibility_rollback_and_known_issues() {
     let root = aethyme_testkit::paths::repo_root();
     let workflow = std::fs::read_to_string(root.join(".github/workflows/release.yml")).unwrap();

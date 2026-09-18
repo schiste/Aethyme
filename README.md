@@ -96,7 +96,9 @@ Future stable updates use the familiar `brew update` then
 installation trusts only `schiste/tap/aethyme`, while trusting the entire tap
 would extend that boundary to every formula and command it may contain.
 
-On a supported system without Homebrew, use the signed-manifest installer:
+On a supported system without Homebrew, the installer requires `curl`, `jq`,
+`tar`, and a SHA-256 utility. The convenience invocation verifies archive
+checksums against the downloaded manifest, **not its signature**:
 
 ```bash
 curl -fsSL https://github.com/schiste/Aethyme/releases/latest/download/install.sh | sh
@@ -108,6 +110,11 @@ The installer discovers the stable channel through its release manifest,
 verifies the selected archive checksum and contents, and installs both required
 binaries through one atomic version link under `~/.local/bin` by default. Pass
 `--version` or `--install-dir` after `sh -s --` to pin a release or destination.
+For authenticated release artifacts, install Cosign 3, download and review
+`install.sh`, then run `sh install.sh --verify-signature`. This verifies the
+manifest signature and installer hash, and binds the archive to the signed
+manifest before extracting or executing either binary. Do not pipe this mode
+into `sh`: verification requires the reviewed installer file.
 Installer-managed users can later review and confirm an update explicitly:
 
 ```bash

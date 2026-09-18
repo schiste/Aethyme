@@ -94,6 +94,20 @@ key = "rust-workspace-v3"
 max_bytes = 12884901888
 
 [[gate]]
+# Shell/jq-only changes must exercise the trust/privacy contracts they change,
+# without selecting the full workspace suite. This does not remove any gate.
+name = "script-contract"
+command = 'export CHAU7_CTO_OPTIM_ACTIVE=1 CARGO_INCREMENTAL=0 CARGO_PROFILE_TEST_DEBUG=1 CARGO_TARGET_DIR="$AETHYME_GATE_CACHE_DIR" && cargo test --locked --quiet --manifest-path packages/aethyme/rust/Cargo.toml -p aethyme-testkit --test release_contract installer_ && cargo test --locked --quiet --manifest-path packages/aethyme/rust/Cargo.toml -p aethyme-testkit --test pilot_report'
+cost = 1
+timeout_seconds = 300
+resource_wait_seconds = 900
+triggers = ["install.sh", "scripts/pilot-*.jq", "packages/aethyme/rust/crates/aethyme-testkit/tests/release_contract.rs", "packages/aethyme/rust/crates/aethyme-testkit/tests/pilot_report.rs"]
+
+[gate.managed_cache]
+key = "rust-workspace-v3"
+max_bytes = 12884901888
+
+[[gate]]
 # 2026-09-13: `.github/workflows/**` matched no trigger, so an entry that
 # touched only a workflow file selected no Rust gate and auto-promoted
 # without the suites that assert over that very file — the third instance

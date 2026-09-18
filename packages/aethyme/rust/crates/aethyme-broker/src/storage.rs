@@ -411,12 +411,8 @@ pub fn storage_apply(
             }),
         }
     }
-    let live_roots = plan
-        .primary_checkouts
-        .iter()
-        .map(|checkout| checkout.path.clone())
-        .collect::<Vec<_>>();
     for candidate in &plan.preparation_candidates {
+        let live_roots = preparation_live_roots(&main_root, &plan.primary_checkouts, &plan.roots);
         match apply_preparation_candidate(candidate, &live_roots) {
             Ok(reclaimed_bytes) => applied.push(StorageAppliedItem {
                 kind: StorageCandidateKind::PreparationEntry,
@@ -519,33 +515,7 @@ fn build_plan(
     // The cache is a sibling of the worktree container, so it is reached from
     // the container rather than rediscovered. Live roots are every enrolled
     // checkout in the inventory plus the one being invoked from.
-    let mut live_roots = primary_checkouts
-        .iter()
-        .map(|checkout| checkout.path.clone())
-        .collect::<Vec<_>>();
-    if !live_roots
-        .iter()
-        .any(|root| normalise(root) == normalise(main_root))
-    {
-        live_roots.push(normalise(main_root));
-    }
-    // Session worktrees are what actually run `broker prepare`, so they are
-    // the population that keeps a shared key alive. Omitting them would let
-    // the cache be emptied underneath the sessions still using it -- a
-    // primary checkout is often the one place that never asks for it.
-    for root in &roots {
-        let Ok(children) = std::fs::read_dir(&root.path) else {
-            continue;
-        };
-        for child in children.flatten() {
-            let path = child.path();
-            if is_real_directory(&path) {
-                live_roots.push(normalise(&path));
-            }
-        }
-    }
-    live_roots.sort();
-    live_roots.dedup();
+    let live_roots = preparation_live_roots(main_root, &primary_checkouts, &roots);
     let (preparation_entries, preparation_candidates) = match preparation_cache_root(&storage_root)
     {
         Some(cache_root) => inspect_preparation_cache(&cache_root, &live_roots, size),
@@ -556,6 +526,7 @@ fn build_plan(
         orphan_worktree_roots_days,
         &candidates,
         &primary_candidates,
+        &preparation_candidates,
     );
     let summary = summarise(
         &roots,
@@ -884,6 +855,32 @@ fn directory_modified_within(dir: &Path, window_ms: u64) -> bool {
 /// `live_roots` are the checkouts entitled to keep an entry alive. A checkout
 /// that declares no shared step contributes no key and keeps nothing, which is
 /// correct: it never populated the cache either.
+fn preparation_live_roots(
+    main_root: &Path,
+    primary_checkouts: &[StoragePrimaryCheckout],
+    roots: &[StorageRoot],
+) -> Vec<PathBuf> {
+    let mut live_roots = primary_checkouts
+        .iter()
+        .map(|checkout| normalise(&checkout.path))
+        .collect::<Vec<_>>();
+    live_roots.push(normalise(main_root));
+    // Use the same population for inventory and immediate deletion checks.
+    // Session worktrees, not just primary checkouts, consume shared entries.
+    for root in roots {
+        if let Ok(children) = std::fs::read_dir(&root.path) {
+            for child in children.flatten() {
+                if is_real_directory(&child.path()) {
+                    live_roots.push(normalise(&child.path()));
+                }
+            }
+        }
+    }
+    live_roots.sort();
+    live_roots.dedup();
+    live_roots
+}
+
 fn inspect_preparation_cache(
     cache_root: &Path,
     live_roots: &[PathBuf],
@@ -893,9 +890,14 @@ fn inspect_preparation_cache(
     Vec<StoragePreparationCandidate>,
 ) {
     let mut live_keys = BTreeSet::new();
+    let mut liveness_unknown = false;
     for root in live_roots {
-        if let Some(key) = crate::preparation::current_cache_key(root) {
-            live_keys.insert(key);
+        match crate::preparation::current_cache_key(root) {
+            Ok(Some(key)) => {
+                live_keys.insert(key);
+            }
+            Ok(None) => {}
+            Err(_) => liveness_unknown = true,
         }
     }
 
@@ -918,7 +920,7 @@ fn inspect_preparation_cache(
                 continue;
             }
             let key = key_entry.file_name().to_string_lossy().into_owned();
-            let live = live_keys.contains(&key);
+            let live = liveness_unknown || live_keys.contains(&key);
             // Measuring is the expensive half, so a live entry is counted but
             // never walked: its size cannot change the decision.
             let estimated_bytes = if size && !live {
@@ -926,7 +928,10 @@ fn inspect_preparation_cache(
             } else {
                 None
             };
-            let reason = if live {
+            let reason = if liveness_unknown {
+                "checkout preparation liveness could not be verified; retaining cache entries"
+                    .into()
+            } else if live {
                 "a checkout on this host still computes this key".into()
             } else {
                 "no checkout on this host computes this key; its inputs have changed".into()
@@ -966,7 +971,9 @@ fn apply_preparation_candidate(
     live_roots: &[PathBuf],
 ) -> Result<u64, String> {
     for root in live_roots {
-        if crate::preparation::current_cache_key(root).as_deref() == Some(candidate.key.as_str()) {
+        let key = crate::preparation::current_cache_key(root)
+            .map_err(|error| format!("cannot verify preparation liveness: {error}"))?;
+        if key.as_deref() == Some(candidate.key.as_str()) {
             return Err("a checkout now computes this key again; it is no longer dead".into());
         }
     }
@@ -1640,6 +1647,7 @@ fn decision_digest(
     orphan_worktree_roots_days: u32,
     candidates: &[StorageCandidate],
     primary_candidates: &[StoragePrimaryCandidate],
+    preparation_candidates: &[StoragePreparationCandidate],
 ) -> String {
     #[derive(serde::Serialize)]
     struct DecisionCandidate<'a> {
@@ -1657,6 +1665,13 @@ fn decision_digest(
         orphan_worktree_roots_days: u32,
         candidates: Vec<DecisionCandidate<'a>>,
         primary_candidates: Vec<DecisionPrimaryCandidate<'a>>,
+        preparation_candidates: Vec<DecisionPreparationCandidate<'a>>,
+    }
+    #[derive(serde::Serialize)]
+    struct DecisionPreparationCandidate<'a> {
+        path: &'a Path,
+        repository: &'a str,
+        key: &'a str,
     }
     #[derive(serde::Serialize)]
     struct DecisionPrimaryCandidate<'a> {
@@ -1678,6 +1693,14 @@ fn decision_digest(
                 repository_root: &candidate.repository_root,
                 git_marker: candidate.git_marker,
                 marker_sha256: &candidate.marker_sha256,
+            })
+            .collect(),
+        preparation_candidates: preparation_candidates
+            .iter()
+            .map(|candidate| DecisionPreparationCandidate {
+                path: &candidate.path,
+                repository: &candidate.repository,
+                key: &candidate.key,
             })
             .collect(),
         primary_candidates: primary_candidates
@@ -1839,6 +1862,7 @@ mod tests {
         .unwrap();
 
         let key = crate::preparation::current_cache_key(&repo)
+            .unwrap()
             .expect("a checkout declaring a shared step computes a key");
 
         let cache = tmp.path().join("preparation-cache/repository-a");
@@ -1859,6 +1883,16 @@ mod tests {
             "the key a checkout computes must survive"
         );
         assert!(kept.reason.contains("still computes"));
+        let live_candidate = StoragePreparationCandidate {
+            path: cache.join(&key),
+            repository: "repository-a".into(),
+            key,
+            estimated_bytes: None,
+            reason: "previously dead".into(),
+        };
+        let roots = preparation_live_roots(&repo, &[], &[]);
+        assert!(apply_preparation_candidate(&live_candidate, &roots).is_err());
+        assert!(live_candidate.path.is_dir());
     }
 
     /// Reporting spans the cache; removal re-decides at the moment it acts.
@@ -1888,6 +1922,31 @@ mod tests {
 
     /// The cache is a sibling of the worktree container, which is the whole
     /// reason it was invisible to this lane.
+    #[test]
+    fn unknown_preparation_liveness_never_authorizes_deletion() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("checkout");
+        std::fs::create_dir_all(repo.join(".aethyme")).unwrap();
+        std::fs::write(repo.join(".aethyme/prepare.toml"), "invalid = [").unwrap();
+        let cache = tmp.path().join("preparation-cache");
+        let path = cache.join("repository/key");
+        std::fs::create_dir_all(&path).unwrap();
+        let candidate = StoragePreparationCandidate {
+            path: path.clone(),
+            repository: "repository".into(),
+            key: "key".into(),
+            estimated_bytes: None,
+            reason: "previously unused".into(),
+        };
+        let (entries, candidates) = inspect_preparation_cache(&cache, &[repo.clone()], false);
+        assert_eq!(entries.len(), 1);
+        assert!(!entries[0].reclaimable);
+        assert!(entries[0].reason.contains("could not be verified"));
+        assert!(candidates.is_empty());
+        assert!(apply_preparation_candidate(&candidate, &[repo]).is_err());
+        assert!(path.is_dir());
+    }
+
     #[test]
     fn the_cache_is_found_beside_the_worktree_container() {
         let root = Path::new("/host/state/worktrees");
@@ -1948,9 +2007,38 @@ mod tests {
         let mut changed = candidate.clone();
         changed.estimated_bytes = Some(100);
         assert_eq!(
-            decision_digest(Path::new("/storage"), 1, &[candidate], &[]),
-            decision_digest(Path::new("/storage"), 1, &[changed], &[])
+            decision_digest(Path::new("/storage"), 1, &[candidate], &[], &[]),
+            decision_digest(Path::new("/storage"), 1, &[changed], &[], &[])
         );
+    }
+
+    #[test]
+    fn decision_digest_binds_preparation_identity_not_measurements() {
+        let candidate = StoragePreparationCandidate {
+            path: PathBuf::from("/cache/repository/key"),
+            repository: "repository".into(),
+            key: "key".into(),
+            estimated_bytes: Some(1),
+            reason: "unused".into(),
+        };
+        let digest = |candidates: &[StoragePreparationCandidate]| {
+            decision_digest(Path::new("/storage"), 1, &[], &[], candidates)
+        };
+        let approved = digest(&[candidate.clone()]);
+        assert_ne!(approved, digest(&[]));
+        let mut measured = candidate.clone();
+        measured.estimated_bytes = Some(999);
+        measured.reason = "updated explanation".into();
+        assert_eq!(approved, digest(&[measured]));
+        for field in 0..3 {
+            let mut changed = candidate.clone();
+            match field {
+                0 => changed.path = PathBuf::from("/cache/repository/other"),
+                1 => changed.repository = "other".into(),
+                _ => changed.key = "other".into(),
+            }
+            assert_ne!(approved, digest(&[changed]));
+        }
     }
 
     #[test]

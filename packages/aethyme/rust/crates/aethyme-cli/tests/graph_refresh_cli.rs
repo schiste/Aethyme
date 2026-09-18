@@ -552,7 +552,7 @@ fn materialize_refuses_exact_head_drift_without_cloning_or_indexing() {
 
 #[test]
 fn explore_returns_structured_degradation_when_the_opt_in_store_is_missing() {
-    let (_temporary, repo) = fixture();
+    let (temporary, repo) = fixture();
     let response: Value = serde_json::from_str(&success(run(
         &repo,
         &[
@@ -569,8 +569,40 @@ fn explore_returns_structured_degradation_when_the_opt_in_store_is_missing() {
     .unwrap();
     assert_eq!(response["status"], "degraded");
     assert_eq!(response["safe_to_use_as_answer"], false);
-    assert_eq!(response["safe_to_use_as_navigation"], false);
+    assert_eq!(response["safe_to_use_as_navigation"], true);
     assert_eq!(response["answer"], serde_json::json!([]));
+    assert!(
+        response["navigation_hints"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|hint| hint["path"] == "app.py" && hint["evidence"]["graph_available"] == false)
+    );
+    assert!(!repo.join(".aethyme/graph_store.redb").exists());
+    let saved = temporary.path().join("explore.json");
+    fs::write(&saved, serde_json::to_vec(&response).unwrap()).unwrap();
+    let verified: Value = serde_json::from_str(&success(run(
+        &repo,
+        &[
+            "verify-targets",
+            "--repo",
+            ".",
+            "--from",
+            saved.to_str().unwrap(),
+            "--max-targets",
+            "2",
+            "--max-lines",
+            "20",
+        ],
+    )))
+    .unwrap();
+    assert!(
+        verified["targets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|target| target["path"] == "app.py")
+    );
     assert_eq!(
         response["degraded_reasons"],
         serde_json::json!(["graph_store_missing"])

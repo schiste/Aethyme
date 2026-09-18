@@ -518,6 +518,7 @@ const CONFIG_KNOWN_KEYS: &[(&str, &[&str])] = &[
     ("delivery", &["default"]),
     ("leases", &["ignore", "routing"]),
     ("graph", &["authority", "repository"]),
+    ("review", &["trigger", "routing", "reporting", "projection"]),
 ];
 
 fn check_enrollment_visibility(repo: &crate::GitRepo, checkout_root: &Path) -> Vec<Check> {
@@ -616,6 +617,36 @@ fn check_config_valid(main_root: &Path) -> Check {
             };
         }
     };
+    // Certify with the runtime policy loaders, not a second approximation of
+    // their schema. In particular, supported review tables are not "ignored".
+    if value.get("review").is_some_and(|review| !review.is_table()) {
+        return Check {
+            id: "certify.config",
+            status: CheckStatus::Fail,
+            detail: "config.toml invalid: review must be a table".into(),
+        };
+    }
+    let review_checks = [
+        crate::review_trigger::ReviewTriggerPolicy::load(main_root)
+            .map(|_| ())
+            .map_err(|error| error.to_string()),
+        crate::review_backend::ReviewRoutingPolicy::load(main_root)
+            .map(|_| ())
+            .map_err(|error| error.to_string()),
+        crate::review_report::ReviewReportingPolicy::load(main_root)
+            .map(|_| ())
+            .map_err(|error| error.to_string()),
+        crate::pr_projection::PrProjectionPolicy::load(main_root)
+            .map(|_| ())
+            .map_err(|error| error.to_string()),
+    ];
+    if let Some(error) = review_checks.into_iter().find_map(Result::err) {
+        return Check {
+            id: "certify.config",
+            status: CheckStatus::Fail,
+            detail: format!("config.toml invalid: {error}"),
+        };
+    }
     let unknown = unknown_config_keys(&value);
     if !unknown.is_empty() {
         return Check {

@@ -52,6 +52,36 @@ fn tracked_files(root: &Path) -> Vec<String> {
 /// object, and the entry auto-promotes. Found 2026-09-13, one day after the
 /// same shape was found for `.github/workflows/**`.
 #[test]
+fn installer_and_pilot_scripts_select_their_narrow_contract_gate() {
+    let gates = load_gates(&repo_root()).unwrap();
+    for path in [
+        "install.sh",
+        "scripts/pilot-report.jq",
+        "scripts/pilot-compare.jq",
+    ] {
+        let selected = select_gates(&gates, &[path.to_string()]);
+        let contract = selected
+            .iter()
+            .find(|selection| selection.gate.name == "script-contract")
+            .unwrap_or_else(|| panic!("{path} has no script contract coverage"));
+        assert_eq!(contract.gate.cost, 1);
+        assert!(
+            contract
+                .gate
+                .command
+                .contains("--test release_contract installer_")
+        );
+        assert!(contract.gate.command.contains("--test pilot_report"));
+        assert!(
+            !selected
+                .iter()
+                .any(|selection| selection.gate.name == "cargo-test"),
+            "script-only changes should not need the full workspace suite"
+        );
+    }
+}
+
+#[test]
 fn gate_policy_changes_select_a_triggered_gate() {
     let root = repo_root();
     let gates = load_gates(&root).expect("the shipped gates.toml parses");
@@ -83,7 +113,11 @@ fn every_trigger_glob_matches_a_tracked_file() {
     let root = repo_root();
     let gates = load_gates(&root).expect("the shipped gates.toml parses");
     let tracked = tracked_files(&root);
-    assert!(!tracked.is_empty(), "no tracked files under {}", root.display());
+    assert!(
+        !tracked.is_empty(),
+        "no tracked files under {}",
+        root.display()
+    );
 
     let mut dead = Vec::new();
     for gate in &gates {

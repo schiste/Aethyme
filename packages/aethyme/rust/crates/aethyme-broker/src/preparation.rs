@@ -893,17 +893,19 @@ fn preparation_resource_request(
 ///
 /// `session_id` reaches the digest only through error messages, so any value
 /// produces the same key; zero is passed because no session is asking.
-pub(crate) fn current_cache_key(root: &Path) -> Option<String> {
-    let config = load_config(root).ok().flatten()?;
+pub(crate) fn current_cache_key(root: &Path) -> Result<Option<String>, PreparationError> {
+    let Some(config) = load_config(root)? else {
+        return Ok(None);
+    };
     if !config
         .steps
         .iter()
         .any(|step| step.cache == PreparationCachePolicy::RepositoryShared)
     {
-        return None;
+        return Ok(None);
     }
-    let digest = preparation_digest(root, &config, 0).ok()?;
-    Some(digest[..12.min(digest.len())].to_string())
+    let digest = preparation_digest(root, &config, 0)?;
+    Ok(Some(digest[..12.min(digest.len())].to_string()))
 }
 
 fn preparation_cache_dir(broker: &Broker, digest: &str) -> Result<PathBuf, PreparationError> {

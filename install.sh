@@ -42,6 +42,11 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 
+command -v jq >/dev/null 2>&1 || {
+    printf 'install: jq is required to parse the release manifest safely\n' >&2
+    exit 1
+}
+
 case "$requested_version" in
     *[!0-9.]*|.*|*.)
         printf 'install: invalid version %s\n' "$requested_version" >&2
@@ -82,8 +87,8 @@ fi
 manifest="$temp_root/release-manifest.json"
 download "$repository_url/$release_path/release-manifest.json" "$manifest"
 
-version="$(sed -n 's/^[[:space:]]*"version": "\([^"]*\)"[,]\{0,1\}$/\1/p' "$manifest")"
-channel="$(sed -n 's/^[[:space:]]*"release_channel": "\([^"]*\)"[,]\{0,1\}$/\1/p' "$manifest")"
+version="$(jq -er '.version | select(type == "string")' "$manifest")"
+channel="$(jq -er '.release_channel | select(type == "string")' "$manifest")"
 case "$version" in
     ''|*[!0-9.]*|.*|*.)
         printf 'install: release manifest has an invalid version\n' >&2
@@ -115,43 +120,39 @@ if [ "$verify_signature" = true ]; then
         printf 'install: signature verification requires running a reviewed installer file\n' >&2
         exit 1
     }
-    installer_digest="$(awk '
-        /"installer"[[:space:]]*:/ { in_installer = 1 }
-        in_installer && /"sha256"[[:space:]]*:/ {
-            value = $0
-            sub(/^.*"sha256"[[:space:]]*:[[:space:]]*"/, "", value)
-            sub(/".*$/, "", value)
-            print value
-            exit
-        }
-    ' "$manifest")"
+    installer_digest="$(jq -er '.installer.sha256 | select(type == "string")' "$manifest")"
     [ "$(sha256_file "$0")" = "$installer_digest" ] || {
         printf 'install: reviewed installer does not match the signed manifest\n' >&2
         exit 1
     }
+else
+    printf 'install: signature verification is disabled; checksums alone do not authenticate a release\n' >&2
 fi
 
 archive="aethyme-v${version}-${target}.tar.gz"
-grep -F "\"archive\": \"${archive}\"" "$manifest" >/dev/null || {
-    printf 'install: release manifest does not support %s\n' "$target" >&2
+expected="$(jq -er --arg archive "$archive" --arg target "$target" '
+    [.artifacts[] | select(.archive == $archive and .target == $target)]
+    | if length == 1 then .[0].sha256 else error("artifact must be unique") end
+    | select(type == "string")
+' "$manifest")" || {
+    printf 'install: release manifest has no unique artifact for %s\n' "$target" >&2
     exit 1
 }
 
 exact_release_path="releases/download/v${version}"
 archive_path="$temp_root/$archive"
-checksum_path="$temp_root/$archive.sha256"
 download "$repository_url/$exact_release_path/$archive" "$archive_path"
-download "$repository_url/$exact_release_path/$archive.sha256" "$checksum_path"
 
-expected="$(awk -v archive="$archive" '$2 == archive { print $1 }' "$checksum_path")"
+# The manifest is the trust root, including in signature-verification mode.
+# Never substitute a separately downloaded, unauthenticated checksum asset.
 case "$expected" in
     ''|*[!0-9a-f]*)
-        printf 'install: invalid checksum asset for %s\n' "$archive" >&2
+        printf 'install: invalid manifest checksum for %s\n' "$archive" >&2
         exit 1
         ;;
 esac
 [ "${#expected}" -eq 64 ] || {
-    printf 'install: invalid checksum asset for %s\n' "$archive" >&2
+    printf 'install: invalid manifest checksum for %s\n' "$archive" >&2
     exit 1
 }
 actual="$(sha256_file "$archive_path")"

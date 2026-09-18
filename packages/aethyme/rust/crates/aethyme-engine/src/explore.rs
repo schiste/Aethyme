@@ -31,6 +31,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
+mod source_fallback;
+
 use crate::graph::navigation::{task_anchors_view_redb, task_next_view_redb, task_scope_view_redb};
 use crate::graph::search::{SearchHit, symbol_search_redb};
 use crate::model::edge::EdgeKind;
@@ -958,6 +960,8 @@ pub fn graph_unavailable_response(
     status: &'static str,
     reason: String,
 ) -> ExploreResponse {
+    let fallback = source_fallback::inspect(repo, request);
+    let hint_count = fallback.hints.len();
     let policy = aethyme_graph_storage::GraphIntegrityPolicy::load(repo);
     let next_action = match policy {
         Ok(policy) if policy.enforces_committed_fragments() => {
@@ -981,13 +985,13 @@ pub fn graph_unavailable_response(
             parameters: serde_json::json!({}),
         },
         answer: Vec::new(),
-        navigation_hints: Vec::new(),
+        navigation_hints: fallback.hints,
         excluded: Vec::new(),
         ambiguous: Vec::new(),
-        subsystems: Vec::new(),
+        subsystems: fallback.subsystems,
         evidence: Evidence {
             answer_count: 0,
-            navigation_hint_count: 0,
+            navigation_hint_count: hint_count,
             excluded_count: 0,
         },
         confidence: Confidence {
@@ -997,22 +1001,22 @@ pub fn graph_unavailable_response(
             analyzed_summary: serde_json::json!({"graph_available": false}),
         },
         safe_to_use_as_answer: false,
-        safe_to_use_as_navigation: false,
+        safe_to_use_as_navigation: hint_count > 0,
         trust_policy: TrustPolicy {
             safe_to_use_as_answer: false,
-            safe_to_use_as_navigation: false,
-            evidence_level: "none".into(),
+            safe_to_use_as_navigation: hint_count > 0,
+            evidence_level: if hint_count > 0 { "source_navigation" } else { "none" }.into(),
             authoritative_answer_count: 0,
-            navigation_hint_count: 0,
+            navigation_hint_count: hint_count,
             degraded: true,
             trust_policy: "verify_before_use",
-            reason: "The optional graph query artifact is unavailable; no repository location was inferred."
+            reason: "The graph is unavailable. Bounded tracked-source hints are navigation only, not caller or impact evidence."
                 .into(),
         },
         degraded_reasons: vec![format!("graph_store_{status}")],
         verification_steps: vec![serde_json::json!({
             "kind": "manual_source_inspection",
-            "reason": "Explore returned no graph-backed targets"
+            "reason": "Verify bounded source hints; no graph-backed semantic claims are available"
         })],
         next_actions: vec![next_action.into()],
         available_specialized_intents: vec![
@@ -1020,13 +1024,20 @@ pub fn graph_unavailable_response(
             "usage_boundary_query",
         ],
         output_chars_estimate: 0,
-        truncated: false,
+        truncated: fallback.truncated,
         output_adapters: None,
         resolved_parameters: None,
         observability: Some(serde_json::json!({
             "readiness": {
                 "status": "degraded",
                 "reason": "optional_graph_unavailable"
+            },
+            "source_fallback": {
+                "tracked_only": true,
+                "scanned_files": fallback.scanned_files,
+                "max_files": 128,
+                "max_bytes_per_file": 8192,
+                "complete": false
             },
             "graph_store": {
                 "status": status,
