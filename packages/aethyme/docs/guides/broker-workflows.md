@@ -35,6 +35,39 @@ These commands coordinate local repository state. Submission promotes only to
 the local `aethyme/integration` branch. Use the separate
 `broker ship plan`/`broker ship execute` lane when publication is authorized.
 
+## Inspect a Running Coordinated Operation
+
+Every provider command that has acquired the repository write lane records a
+small liveness payload in its operation journal. The payload contains the
+current phase, the last progress message, the last heartbeat, and bytes read
+from provider stdout/stderr. `broker status` exposes the derived state beside
+each unresolved operation; `operations show <id>` and `operations list` expose
+the same signal for an operator investigating a hold.
+
+The states answer different questions:
+
+- `active`: the broker process is heartbeating and meaningful progress was
+  observed within the stall window;
+- `progress_stale`: the broker is alive, but neither provider output nor an
+  explicit progress event has arrived for the stall window;
+- `heartbeat_stale`: the broker itself stopped renewing the operation, so the
+  holder may have died and should be inspected before retrying;
+- `unknown`: an older running row predates the liveness payload and needs
+  manual inspection.
+
+Wrapped commands can report a phase or message without opening the broker
+database. If `AETHYME_BROKER_PROGRESS_FILE` is set, append one complete
+newline-delimited JSON object at a time:
+
+```json
+{"schema_version":1,"phase":"quality","message":"gate 3 of 7 complete","ts":0}
+```
+
+Plain text lines are accepted too. The broker reads the file while the
+operation runs, and the file is temporary and removed when the command ends.
+Stale-progress status is advisory evidence, not an automatic kill or retry:
+inspect the operation and its provider before reconciling or re-running it.
+
 ## Prepare Each Worktree Explicitly
 
 If a repository commits `.aethyme/prepare.toml`, every new or adopted session

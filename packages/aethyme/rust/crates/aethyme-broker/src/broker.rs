@@ -66,18 +66,22 @@ pub enum BrokerOpError {
     /// second one would fire it against state the first already changed.
     #[error(
         "session already has an identical {status} coordinated operation {operation_id} pending; \
-         wait for it to finish or reconcile it rather than queueing a duplicate"
+         current liveness: {liveness}; wait for it to finish or reconcile it rather than queueing a duplicate"
     )]
     DuplicatePendingOperation {
         operation_id: i64,
         status: &'static str,
+        liveness: String,
     },
     /// The caller bounded its patience and the lock did not free in time.
-    #[error("repository {repository} write lock is busy ({waited}): {holder}")]
+    #[error(
+        "repository {repository} write lock is busy ({waited}; caller operation {operation_id} did not start): {holder}"
+    )]
     CoordinatedLockBusy {
         repository: String,
         holder: String,
         waited: String,
+        operation_id: i64,
     },
     /// Admission spent its whole budget before it held the repository lane.
     ///
@@ -1081,6 +1085,10 @@ pub struct PendingOperationView {
     /// The operation this one is parked behind, when it is not the holder.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub blocked_by: Option<i64>,
+    /// Freshness and last meaningful progress for a running holder. Keeping
+    /// this beside the role lets a status reader distinguish work from a
+    /// live process that has stopped making progress.
+    pub liveness: crate::operations::OperationLivenessView,
 }
 
 /// Everything `broker status` renders, in one serializable shape.
@@ -2738,12 +2746,11 @@ impl Broker {
                 &planned_paths,
             )?
         } else {
-            self.store
-                .register_session_with_context_and_leases(
-                    &new_session,
-                    &context,
-                    &planned_paths,
-                )?
+            self.store.register_session_with_context_and_leases(
+                &new_session,
+                &context,
+                &planned_paths,
+            )?
         };
         self.store
             .set_session_foreign_files(session.id, &foreign_files)?;
@@ -3004,10 +3011,11 @@ impl Broker {
             log_path: None,
             agent_identity: agent_identity.map(str::to_string),
         };
-        let session = match self
-            .store
-            .register_session_with_context_and_leases(&new_session, &context, &planned_paths)
-        {
+        let session = match self.store.register_session_with_context_and_leases(
+            &new_session,
+            &context,
+            &planned_paths,
+        ) {
             Ok(session) => session,
             Err(error) => {
                 let worktree_path = worktree.root().to_path_buf();
@@ -5903,9 +5911,13 @@ impl Broker {
                         / 1_000,
                     holding_lock,
                     blocked_by: if holding_lock { None } else { holder },
+                    liveness: crate::operations::operation_liveness_view(operation),
                 }
             })
             .collect::<Vec<_>>();
+        if let Some(stalled) = self.stalled_coordinated_operation_advice(&pending_rows) {
+            advice.push(stalled);
+        }
 
         Ok(StatusView {
             publication_baseline_ref: baseline_ref,
@@ -6347,6 +6359,73 @@ impl Broker {
         }
 
         advice
+    }
+
+    fn stalled_coordinated_operation_advice(
+        &self,
+        operations: &[crate::types::CoordinatedOperation],
+    ) -> Option<StatusAdvice> {
+        let stalled = operations
+            .iter()
+            .filter(|operation| {
+                let state = crate::operations::operation_liveness_view(operation).state;
+                state == "progress_stale" || state == "heartbeat_stale"
+            })
+            .collect::<Vec<_>>();
+        if stalled.is_empty() {
+            return None;
+        }
+        // A quiet holder and a dead one are different claims, and only the
+        // second justifies Blocked. The evidence line already prints the pid,
+        // so the answer is available rather than inferred: a stale heartbeat
+        // whose process is still alive is a slow operation, and saying it "may
+        // have died" is what makes an operator re-issue work that is running.
+        let heartbeat_stale = stalled.iter().any(|operation| {
+            crate::operations::operation_liveness_view(operation).state == "heartbeat_stale"
+                && operation.pid > 0
+                && crate::operations::process_is_gone(operation.pid)
+        });
+        let subject = if stalled.len() == 1 {
+            format!("operation {}", stalled[0].id)
+        } else {
+            format!("{} coordinated operations", stalled.len())
+        };
+        Some(StatusAdvice {
+            id: "coordination.operation-stalled",
+            severity: if heartbeat_stale {
+                StatusAdviceSeverity::Blocked
+            } else {
+                StatusAdviceSeverity::Warning
+            },
+            reason: "running coordinated operation has stale progress or heartbeat",
+            summary: format!(
+                "{subject} has stopped reporting {}",
+                if heartbeat_stale {
+                    "a live heartbeat"
+                } else {
+                    "meaningful progress"
+                }
+            ),
+            session_id: (stalled.len() == 1).then_some(stalled[0].session_id),
+            queue_entry_id: None,
+            evidence: stalled
+                .iter()
+                .map(|operation| {
+                    format!(
+                        "operation {} (session {}, pid {}): {}",
+                        operation.id,
+                        operation.session_id,
+                        operation.pid,
+                        crate::operations::operation_liveness_summary(operation)
+                    )
+                })
+                .collect(),
+            commands: if stalled.len() == 1 {
+                vec![format!("aethyme broker operations show {}", stalled[0].id)]
+            } else {
+                vec!["aethyme broker operations list".into()]
+            },
+        })
     }
 
     // ── doctor (operational health) ───────────────────────────────────
