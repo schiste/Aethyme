@@ -6,6 +6,52 @@ artifacts and their exact source revision are recorded in each signed
 
 ## [Unreleased]
 
+## [0.7.22] - 2026-09-18
+
+### Changed
+
+- The broker database moves from schema 39 to 40, rebuilding `gate_results` so
+  it can record a build failure separately from a test failure. The migration
+  runs when the first v0.7.22 binary opens a database, and older binaries then
+  refuse that database. See the upgrade guide before installing alongside live
+  sessions.
+
+### Added
+
+- `aethyme explore` and the semantic gate report can answer from an Imports
+  graph-impact mode, traversing bounded incoming Imports edges where Calls has
+  no answer.
+- `aethyme broker storage` inventories enrolled primary checkouts, reporting
+  recognised regenerable artifacts, Git cleanliness, and tracked-file
+  protection separately from host storage roots.
+- Gate failures are classified as `build_failure` when the command never
+  compiled, distinguishing a broken build from a failing assertion. Detection
+  is cargo-scoped and sits behind the resource and environment checks, so a
+  build stopped by a full disk is still recorded as contention.
+
+### Fixed
+
+- A delivery whose target never returns is dead-lettered after a bounded number
+  of attempts instead of being deferred forever. Deferral still absorbs a
+  target that is briefly away.
+- A failing gate log is kept under a unique name instead of being overwritten
+  by a later run on the same tree, so a failure followed by a pass on unchanged
+  source leaves both records. This now covers the host-resource and
+  managed-cache failure paths as well.
+- `aethyme broker storage apply` requires a primary checkout's build directory
+  to have stopped changing before removing it. A running build leaves the
+  checkout clean, because build output is Git-ignored, so cleanliness alone
+  could license deleting a build out from under itself.
+- `aethyme broker storage` reports every enrolled checkout on the host but only
+  removes artifacts from the checkout it was invoked in; a confirmation digest
+  speaks for one repository.
+- Promotion no longer overwrites a session representation that already records
+  a pull request merge, which had downgraded a session that landed on the
+  default branch to unproven provenance and blocked its cleanup.
+- Prepared admissions record structured wait evidence and are reaped
+  independently when the holding client process is gone.
+- Dead quarantined resource holders are diagnosed and their capacity reclaimed.
+
 ## [0.7.21] - 2026-09-16
 
 ### Fixed
