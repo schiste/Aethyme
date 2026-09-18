@@ -2032,6 +2032,16 @@ fn run_gate_command(
         let _ = log.write_all(crate::git::subprocess_path_note().as_bytes());
     }
     let log_err = log.try_clone()?;
+    // Gates execute binaries built from the tree under test.  Those binaries
+    // may contain a broker-storage migration that is not present on any
+    // reviewed branch yet.  Never let such a child discover the operator's
+    // repository database through the normal worktree resolution (#232).
+    // Keep the database in a unique temporary directory so the isolation is
+    // both per gate and automatically reclaimed when the child exits.
+    let isolated_broker_db = tempfile::Builder::new()
+        .prefix("broker-db-")
+        .tempdir_in(context.run_dir)?;
+    let isolated_broker_db_path = isolated_broker_db.path().join("broker.db");
     let mut process = std::process::Command::new("sh");
     process
         .arg("-c")
@@ -2039,6 +2049,7 @@ fn run_gate_command(
         .current_dir(context.cwd)
         .env("AETHYME_GATE_WORKER_ID", context.worker_id)
         .env("AETHYME_TEST_DB_SUFFIX", context.worker_id)
+        .env(crate::BROKER_DB_ENV, &isolated_broker_db_path)
         .env("AETHYME_GATE_OWNER_PATHS", context.owner_paths.join(":"))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::from(log))
