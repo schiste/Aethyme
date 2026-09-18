@@ -443,6 +443,29 @@ fn gate_cli_reports_tree_provenance_for_executed_and_cached_results() {
 }
 
 #[test]
+fn gate_children_receive_a_disposable_broker_database() {
+    let tmp = fixture();
+    std::fs::write(
+        tmp.path().join(".aethyme/gates.toml"),
+        r#"[[gate]]
+name = "db-isolation"
+command = "printf '%s' \"$AETHYME_BROKER_DB\" > gate-broker-db-path.txt"
+"#,
+    )
+    .unwrap();
+
+    stdout(run(tmp.path(), &["gates", "run", "--all", "--no-cache"]));
+
+    let configured_path =
+        std::fs::read_to_string(tmp.path().join("gate-broker-db-path.txt")).unwrap();
+    assert_ne!(
+        std::path::Path::new(configured_path.trim()),
+        tmp.path().join(".aethyme/broker.db")
+    );
+    assert!(configured_path.contains(".aethyme/run/gates/broker-db-"));
+}
+
+#[test]
 fn gate_validate_reads_the_invoking_worktree_snapshot() {
     let tmp = fixture();
     let worktree = tmp.path().join(".aethyme/worktrees/validate");

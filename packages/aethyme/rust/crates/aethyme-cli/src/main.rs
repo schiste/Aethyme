@@ -50,6 +50,13 @@ impl<'a> ParsedCommand<'a> {
     fn parse(args: &'a [String]) -> Option<Self> {
         let (name, tail) = args.split_first()?;
         let (compatibility_capability, invocation_surface) = match name.as_str() {
+            // Contract checking only reads the Git diff and the consumers
+            // registry.  It must not perform the repository compatibility
+            // preflight, because that preflight is allowed to inspect broker
+            // state and this gate runs an unpromoted tree-built binary.
+            "broker" if tail.first().map(String::as_str) == Some("check-contract") => {
+                (None, None)
+            }
             "broker" => (
                 Some(broker_command_capability(tail)),
                 Some(broker_invocation_surface(tail)),
@@ -842,6 +849,12 @@ mod compatibility_command_tests {
             Some(CommandCapability::NewSession)
         );
         assert_eq!(capability(&["explore"]), None);
+    }
+
+    #[test]
+    fn contract_check_skips_repository_compatibility_preflight() {
+        assert_eq!(capability(&["broker", "check-contract"]), None);
+        assert_eq!(surface(&["broker", "check-contract"]), None);
     }
 
     #[test]
