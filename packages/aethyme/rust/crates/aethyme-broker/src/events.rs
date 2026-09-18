@@ -23,6 +23,8 @@ pub const SESSION_FINISH_CLEANUP_STARTED: &str = "session.finish_cleanup_started
 pub const SESSION_CHECKPOINT_REANCHORED: &str = "session.checkpoint_reanchored";
 pub const REVIEW_LIFECYCLE_REASSIGNED: &str = "review.lifecycle_reassigned";
 pub const REVIEW_LIFECYCLE_ABANDONED: &str = "review.lifecycle_abandoned";
+pub const QUALITY_REPORT_PUBLISHED: &str = "quality_report.published";
+pub const QUALITY_REPORT_PUBLICATION_FAILED: &str = "quality_report.publication_failed";
 pub const BROKER_COMMAND_FAILED: &str = "broker.command.failed";
 pub const BROKER_GC_APPLIED: &str = "broker.gc.applied";
 pub const BROKER_PROMOTION_RECORD_RESTORED: &str = "broker.promotion-record.restored";
@@ -124,6 +126,27 @@ pub fn review_lifecycle_abandoned_payload(
         "repository": repository,
         "pr_number": pr_number,
         "reason_digest": reason_digest,
+    })
+    .to_string()
+}
+
+pub fn quality_report_publication_payload(
+    report: &crate::QualityReport,
+    outcome: &str,
+    operation_id: Option<i64>,
+    external_id: Option<&str>,
+) -> String {
+    json!({
+        "schema_version": report.schema_version,
+        "repository": report.repository,
+        "pull_request": report.pull_request,
+        "revision": report.revision,
+        "base_revision": report.base_revision,
+        "report_digest": report.provenance.report_digest,
+        "status": report.status.as_str(),
+        "outcome": outcome,
+        "operation_id": operation_id,
+        "external_id": external_id,
     })
     .to_string()
 }

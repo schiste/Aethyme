@@ -31,6 +31,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use crate::quality_report::QualityReport;
 use crate::review_trigger::{ClassificationConflict, CommitClassification, ReviewType};
 
 /// Current shape of the `[review.projection]` table.
@@ -135,6 +136,10 @@ pub struct ReviewProjection {
     pub classification: CommitClassification,
     #[serde(default)]
     pub conflicts: Vec<ClassificationConflict>,
+    /// Optional advisory evidence rendered inside this same owned comment.
+    /// The quality report never creates a second provider comment.
+    #[serde(default)]
+    pub quality_report: Option<QualityReport>,
 }
 
 // ---------------------------------------------------------------------------
@@ -562,7 +567,14 @@ pub fn project(
     let mut actions = Vec::new();
 
     if policy.comment {
-        let body = render_comment(projection);
+        let rendered = render_comment(projection);
+        let body = match (&projection.quality_report, &facts.owned_comment) {
+            (Some(report), _) => crate::merge_quality_report_section(Some(&rendered), report),
+            (None, Some(existing)) => {
+                crate::preserve_quality_report_section(&rendered, &existing.body)
+            }
+            (None, None) => rendered,
+        };
         match &facts.owned_comment {
             // Byte-identical is the common case and must not produce a write:
             // an edit posts a "edited" event that people receive as activity.
@@ -704,6 +716,11 @@ pub fn render_comment(projection: &ReviewProjection) -> String {
         );
     }
 
+    if let Some(report) = &projection.quality_report {
+        let _ = writeln!(out);
+        out.push_str(&crate::render_quality_report(report));
+    }
+
     out
 }
 
@@ -734,6 +751,7 @@ mod tests {
                 "feat: x\n\nArea: backend\nSurface: auth\nRisk: high\n",
             ),
             conflicts: Vec::new(),
+            quality_report: None,
         }
     }
 
@@ -804,6 +822,30 @@ mod tests {
             actions[0],
             PrProjectionAction::UpdateComment { comment_id: 7, .. }
         ));
+    }
+
+    #[test]
+    fn a_review_refresh_preserves_the_quality_section_in_the_same_comment() {
+        let quality = format!(
+            "{}\nold quality\n{}\n",
+            crate::QUALITY_REPORT_SECTION_MARKER,
+            crate::QUALITY_REPORT_SECTION_END_MARKER
+        );
+        let mut observed = facts();
+        observed.owned_comment = Some(OwnedComment {
+            id: 7,
+            body: format!("{COMMENT_MARKER}\nold review\n\n{quality}"),
+        });
+        let actions = project(&policy(), &projection(), &observed);
+        let PrProjectionAction::UpdateComment { body, .. } = &actions[0] else {
+            panic!("the review projection should update its owned comment");
+        };
+        assert!(body.contains("old quality"));
+        assert_eq!(body.matches(COMMENT_MARKER).count(), 1);
+        assert_eq!(
+            body.matches(crate::QUALITY_REPORT_SECTION_MARKER).count(),
+            1
+        );
     }
 
     #[test]
