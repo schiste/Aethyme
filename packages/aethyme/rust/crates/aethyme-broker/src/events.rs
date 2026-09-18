@@ -39,6 +39,7 @@ pub const GUARD_UNTRACKED_ARTIFACT: &str = "guard.untracked_artifact";
 pub const GATE_CACHED: &str = "gate.cached";
 pub const GATE_CACHE_BYPASSED: &str = "gate.cache_bypassed";
 pub const GRAPH_INTEGRITY_CHECKED: &str = "graph.integrity_checked";
+pub const GRAPH_IMPACT_EVALUATED: &str = "graph.impact_evaluated";
 // merge.<status> kinds derive from MergeStatus::as_str.
 pub const MERGE_INTEGRATION_BRANCH_CREATED: &str = "merge.integration_branch_created";
 pub const MERGE_INTEGRATION_REFRESHED: &str = "merge.integration_refreshed";
@@ -90,6 +91,23 @@ pub fn session_checkpoint_reanchored_payload(
         "session_head": session_head,
         "plan_digest": plan_digest,
         "preservation_ref": preservation_ref,
+    })
+    .to_string()
+}
+
+pub fn graph_impact_evaluated_payload(report: &crate::GraphImpactReport) -> String {
+    json!({
+        "schema_version": report.schema_version,
+        "revision": report.repository.revision,
+        "changed_files": report.request.changed_files,
+        "diff_digest": report.request.diff_digest,
+        "mode": report.request.mode.as_str(),
+        "status": report.status.as_str(),
+        "confidence": report.confidence.as_str(),
+        "graph_revision": report.provenance.graph_revision,
+        "engine_version": report.provenance.engine_version,
+        "request_digest": report.provenance.request_digest,
+        "result_digest": report.provenance.result_digest,
     })
     .to_string()
 }
