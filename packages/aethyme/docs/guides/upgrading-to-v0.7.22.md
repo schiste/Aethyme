@@ -1,5 +1,7 @@
 # Upgrading to Aethyme v0.7.22
 
+Last Updated: 2026-09-18
+
 v0.7.22 is the first release since v0.7.19 that migrates the broker database.
 Read [Compatibility](#compatibility) before installing it on a machine with
 live sessions: the migration is one-way and older binaries cannot open a
