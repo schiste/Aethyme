@@ -10,14 +10,18 @@ artifacts and their exact source revision are recorded in each signed
 
 ### Changed
 
-- The broker database moves from schema 39 to 40, rebuilding `gate_results` so
-  it can record a build failure separately from a test failure. The migration
-  runs when the first v0.7.22 binary opens a database, and older binaries then
-  refuse that database. See the upgrade guide before installing alongside live
-  sessions.
+- The broker database moves from schema 39 to 41. Migration 40 rebuilds
+  `gate_results` so it can record a build failure separately from a test
+  failure; migration 41 adds nullable `repository_name`, `tab_name` and
+  `ai_provider` columns to `sessions`. Both run when the first v0.7.22 binary
+  opens a database, and older binaries then refuse that database. See the
+  upgrade guide before installing alongside live sessions.
 
 ### Added
 
+- Broker sessions record the repository, tab and AI provider they belong to, so
+  a session can be identified by where it is running rather than only by its
+  worktree path.
 - `aethyme explore` and the semantic gate report can answer from an Imports
   graph-impact mode, traversing bounded incoming Imports edges where Calls has
   no answer.

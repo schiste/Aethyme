@@ -37,6 +37,12 @@ tracked-file protection for enrolled primary checkouts. Removal is deliberately
 narrower than reporting: only the checkout you invoke it in can lose bytes, and
 only once its build directories have stopped changing.
 
+### Broker sessions carry their Chau7 context
+
+A session records the repository, tab and AI provider it belongs to, so a
+session can be identified by where it is running rather than only by its
+worktree path. This is the change behind migration 41.
+
 ### Bounded Imports graph-impact mode
 
 `explore` and the semantic gate report can traverse bounded incoming Imports
@@ -44,15 +50,20 @@ edges, answering where a Calls traversal has nothing to say.
 
 ## Compatibility
 
-- **The broker database moves from schema 39 to 40.** `gate_results` is rebuilt
-  to admit the new `build_failure` class. Every row and index is carried over.
+- **The broker database moves from schema 39 to 41**, applying two migrations:
+  - **40** rebuilds `gate_results` to admit the new `build_failure` class.
+    Every row and index is carried over.
+  - **41** adds `repository_name`, `tab_name` and `ai_provider` to `sessions`.
+    All three are nullable and existing rows are left untouched.
 - **The migration runs on first open.** The first v0.7.22 binary to touch a
   broker database migrates it, and that binary may be a gate's build rather
   than an installed one.
 - **v0.7.21 binaries then refuse that database** with
-  `broker db schema version 40 is newer than this binary supports (39)`. Plugin
+  `broker db schema version 41 is newer than this binary supports (39)`. Plugin
   hooks fail the same way, and a hook that swallows the exit code goes quiet
-  rather than erroring.
+  rather than erroring. A binary built between the two migrations reports the
+  intermediate number; the remedy is the same, which is to install the pair
+  from this release rather than to touch the database.
 - The engine protocol remains version 1.
 - Repository layout and `.aethyme/` configuration are unchanged from v0.7.21.
 
@@ -99,7 +110,7 @@ aethyme broker status
 aethyme certify
 ```
 
-`broker status` returning normally means the database is on schema 40 and the
+`broker status` returning normally means the database is on schema 41 and the
 installed binary speaks it. To see that gate history survived the rebuild:
 
 ```bash
