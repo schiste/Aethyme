@@ -304,6 +304,30 @@ pub struct HostResourceRunReport {
     pub final_lease_state: HostLeaseState,
 }
 
+/// Public, non-secret evidence from an independent dead-holder sweep.
+///
+/// Capacity is safe to reclaim once the owning process is provably gone. Named
+/// allocations remain quarantined because they may still have residue that
+/// requires an operator's cleanup review.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct HostResourceReapReport {
+    pub schema_version: u32,
+    pub dead_holders_seen: u32,
+    pub reclaimed_capacity_units: u32,
+    pub released_leases: u32,
+    pub retained_quarantined_leases: u32,
+    pub leases: Vec<HostResourceReapLease>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct HostResourceReapLease {
+    pub lease_id: String,
+    pub generation: u64,
+    pub holder_pid: u32,
+    pub capacity_units: u32,
+    pub state: HostLeaseState,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum HostResourceRunError {
     #[error(transparent)]
@@ -458,7 +482,7 @@ impl HostResourceCoordinator {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        quarantine_reclaimable(&tx, now)?;
+        let _ = quarantine_reclaimable(&tx, now)?;
         if let Some((existing_digest, state, token)) = tx.query_row(
             "SELECT request_digest,state,ownership_token FROM resource_leases WHERE request_id=?1",
             [&request.request_id],
@@ -572,7 +596,7 @@ impl HostResourceCoordinator {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        quarantine_reclaimable(&tx, now)?;
+        let _ = quarantine_reclaimable(&tx, now)?;
         verify_ownership(&tx, lease_id, generation, token, true)?;
         let expires = now.saturating_add((ttl_seconds as i64).saturating_mul(1_000));
         tx.execute(
@@ -595,7 +619,7 @@ impl HostResourceCoordinator {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        quarantine_reclaimable(&tx, now)?;
+        let _ = quarantine_reclaimable(&tx, now)?;
         verify_ownership(&tx, lease_id, generation, token, false)?;
         tx.execute("UPDATE resource_leases SET state='released',released_at=?2,updated_at=?2 WHERE lease_id=?1 AND state!='released'", params![lease_id,now])?;
         let lease = load_lease(&tx, "lease_id", lease_id)?
@@ -627,6 +651,20 @@ impl HostResourceCoordinator {
             .ok_or_else(|| HostResourceError::LeaseNotFound(lease_id.into()))?;
         tx.commit()?;
         Ok(lease)
+    }
+
+    /// Reclaim capacity held by quarantined leases whose holder process is
+    /// provably gone. This is an explicit independent trigger: a scheduler or
+    /// operator can run it without waiting for another acquisition to arrive.
+    /// Named allocations stay quarantined until exact cleanup is reviewed.
+    pub fn reap_dead_holders(&mut self) -> Result<HostResourceReapReport, HostResourceError> {
+        let now = now_ms();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let report = quarantine_reclaimable(&tx, now)?;
+        tx.commit()?;
+        Ok(report)
     }
 
     /// Run an existing command under a complete host-resource lifecycle.
@@ -809,7 +847,7 @@ impl HostResourceCoordinator {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        quarantine_reclaimable(&tx, now)?;
+        let _ = quarantine_reclaimable(&tx, now)?;
         let (actual, state): (i64, String) = tx
             .query_row(
                 "SELECT generation,state FROM resource_leases WHERE lease_id=?1",
@@ -1199,10 +1237,12 @@ fn request_digest(request: &HostResourceRequest) -> Result<String, HostResourceE
 
 struct Occupied {
     lease_id: String,
+    generation: u64,
     kind: String,
     value: String,
     units: Option<u32>,
     limit: Option<u32>,
+    holder_pid: Option<i64>,
     /// A named resource stays reserved after its holder dies, so the waiter needs
     /// to be told that waiting cannot resolve it.
     holder_gone: bool,
@@ -1223,31 +1263,27 @@ struct Occupied {
 /// still running keeps its units, because it is still consuming the CPU and memory
 /// the pool exists to bound.
 fn load_occupied(conn: &Connection) -> Result<Vec<Occupied>, HostResourceError> {
-    let mut stmt=conn.prepare("SELECT a.lease_id,a.kind,a.value,a.units,a.capacity_limit,l.holder_pid FROM resource_allocations a JOIN resource_leases l ON l.lease_id=a.lease_id WHERE l.state IN ('active','quarantined') ORDER BY l.generation,a.resource_key")?;
+    let mut stmt=conn.prepare("SELECT a.lease_id,l.generation,a.kind,a.value,a.units,a.capacity_limit,l.holder_pid FROM resource_allocations a JOIN resource_leases l ON l.lease_id=a.lease_id WHERE l.state IN ('active','quarantined') ORDER BY l.generation,a.resource_key")?;
     let rows = stmt
         .query_map([], |row| {
-            Ok((
-                Occupied {
-                    lease_id: row.get(0)?,
-                    kind: row.get(1)?,
-                    value: row.get(2)?,
-                    units: row.get::<_, Option<i64>>(3)?.map(|v| v as u32),
-                    limit: row.get::<_, Option<i64>>(4)?.map(|v| v as u32),
-                    holder_gone: row
-                        .get::<_, Option<i64>>(5)?
-                        .is_some_and(holder_process_is_gone),
-                },
-                row.get::<_, Option<i64>>(5)?,
-            ))
+            let holder_pid = row.get::<_, Option<i64>>(6)?;
+            Ok(Occupied {
+                lease_id: row.get(0)?,
+                generation: row.get::<_, i64>(1)? as u64,
+                kind: row.get(2)?,
+                value: row.get(3)?,
+                units: row.get::<_, Option<i64>>(4)?.map(|v| v as u32),
+                limit: row.get::<_, Option<i64>>(5)?.map(|v| v as u32),
+                holder_pid,
+                holder_gone: holder_pid.is_some_and(holder_process_is_gone),
+            })
         })?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(rows
         .into_iter()
-        .filter(|(occupied, holder_pid)| {
-            occupied.kind != "capacity"
-                || !holder_pid.is_some_and(|pid| holder_process_is_gone(pid))
+        .filter(|occupied| {
+            occupied.kind != "capacity" || !occupied.holder_pid.is_some_and(holder_process_is_gone)
         })
-        .map(|(occupied, _)| occupied)
         .collect())
 }
 
@@ -1338,10 +1374,15 @@ fn plan_allocations(
                     .find(|o| o.kind == "exclusive_key" && o.value == *name)
                 {
                     let reason = if owner.holder_gone {
+                        let holder = owner.holder_pid.map_or_else(
+                            || "holder PID unknown".into(),
+                            |pid| format!("holder PID {pid}"),
+                        );
                         format!(
-                            "exclusive key is held by lease {} whose holder process is gone; \
-                             waiting cannot release it, reconcile that lease to confirm cleanup",
-                            owner.lease_id
+                            "exclusive key is held by lease {} ({holder}) whose holder process is gone; \
+                             waiting cannot release it, review cleanup and run `aethyme broker \
+                             resources reconcile {} --confirm {}`",
+                            owner.lease_id, owner.lease_id, owner.generation
                         )
                     } else {
                         format!("exclusive key is held by lease {}", owner.lease_id)
@@ -1475,9 +1516,13 @@ fn blocker_recovery(conflict: &HostResourceConflict, leases: &[HostResourceLease
             .holder_pid
             .is_some_and(|pid| holder_process_is_gone(i64::from(pid)))
     }) {
+        let holder = lease.holder_pid.map_or_else(
+            || "holder PID unknown".into(),
+            |pid| format!("holder PID {pid}"),
+        );
         return format!(
-            "holder process is gone; review cleanup, then run `aethyme broker resources reconcile {} --confirm {}` after the lease is quarantined",
-            lease.lease_id, lease.generation
+            "holder process for lease {} ({holder}) is gone; review cleanup, then run `aethyme broker resources reconcile {} --confirm {}`",
+            lease.lease_id, lease.lease_id, lease.generation
         );
     }
     "ordinary contention; wait for the holder to release the lease and retry the same request"
@@ -1502,17 +1547,23 @@ fn wait_advice(blockers: &[HostResourceBlocker]) -> HostResourceWaitAdvice {
             action: "align the requested pool limit with the existing lease; waiting cannot change policy".into(),
         };
     }
-    if blockers.iter().any(|blocker| {
-        blocker
-            .holders
-            .iter()
-            .any(|holder| holder.process_alive == Some(false))
-    }) {
+    if let Some(holder) = blockers
+        .iter()
+        .flat_map(|blocker| &blocker.holders)
+        .find(|holder| holder.process_alive == Some(false))
+    {
         return HostResourceWaitAdvice {
             waitable: false,
             reason: "orphaned_holder".into(),
-            action: "review cleanup and reconcile the exact quarantined lease before retrying"
-                .into(),
+            action: format!(
+                "review cleanup for lease {} (holder PID {}), then run `aethyme broker resources reconcile {} --confirm {}`",
+                holder.lease_id,
+                holder
+                    .holder_pid
+                    .map_or_else(|| "unknown".into(), |pid| pid.to_string()),
+                holder.lease_id,
+                holder.generation
+            ),
         };
     }
     HostResourceWaitAdvice {
@@ -1604,12 +1655,98 @@ fn quarantine_dead_holders(conn: &Connection, now: i64) -> Result<(), HostResour
     Ok(())
 }
 
-/// Every write path reclaims both kinds of unusable lease before reading
-/// occupancy, so a stalled pool frees itself at the next attempt rather than
-/// requiring an operator to notice.
-fn quarantine_reclaimable(conn: &Connection, now: i64) -> Result<(), HostResourceError> {
+/// Every write path quarantines stale holders and reclaims their unusable
+/// capacity before reading occupancy, so a stalled pool frees itself at the
+/// next attempt rather than requiring an operator to notice.
+fn quarantine_reclaimable(
+    conn: &Connection,
+    now: i64,
+) -> Result<HostResourceReapReport, HostResourceError> {
     quarantine_expired(conn, now)?;
-    quarantine_dead_holders(conn, now)
+    quarantine_dead_holders(conn, now)?;
+    reclaim_dead_capacity(conn, now)
+}
+
+/// Reclaim only the allocation that becomes meaningless with the holder's
+/// process: a capacity unit. Namespaces, ports, and exclusive keys remain on
+/// the quarantined lease because they can correspond to residue on the host.
+fn reclaim_dead_capacity(
+    conn: &Connection,
+    now: i64,
+) -> Result<HostResourceReapReport, HostResourceError> {
+    let candidates = {
+        let mut stmt = conn.prepare(
+            "SELECT lease_id,generation,holder_pid FROM resource_leases \
+             WHERE state='quarantined' AND holder_pid IS NOT NULL ORDER BY generation",
+        )?;
+        stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)? as u64,
+                row.get::<_, i64>(2)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?
+    };
+    let mut report = HostResourceReapReport {
+        schema_version: HOST_RESOURCE_SCHEMA_VERSION,
+        dead_holders_seen: 0,
+        reclaimed_capacity_units: 0,
+        released_leases: 0,
+        retained_quarantined_leases: 0,
+        leases: Vec::new(),
+    };
+    for (lease_id, generation, holder_pid) in candidates {
+        if !holder_process_is_gone(holder_pid) {
+            continue;
+        }
+        report.dead_holders_seen += 1;
+        let capacity_units = conn.query_row(
+            "SELECT COALESCE(SUM(units), 0) FROM resource_allocations \
+             WHERE lease_id=?1 AND kind='capacity'",
+            [&lease_id],
+            |row| row.get::<_, i64>(0),
+        )? as u32;
+        if capacity_units == 0 {
+            continue;
+        }
+        conn.execute(
+            "DELETE FROM resource_allocations WHERE lease_id=?1 AND kind='capacity'",
+            [&lease_id],
+        )?;
+        let remaining_allocations: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM resource_allocations WHERE lease_id=?1",
+            [&lease_id],
+            |row| row.get(0),
+        )?;
+        let state = if remaining_allocations == 0 {
+            conn.execute(
+                "UPDATE resource_leases SET state='released',released_at=?2,updated_at=?2 \
+                 WHERE lease_id=?1 AND state='quarantined'",
+                params![lease_id, now],
+            )?;
+            report.released_leases += 1;
+            HostLeaseState::Released
+        } else {
+            conn.execute(
+                "UPDATE resource_leases SET updated_at=?2 WHERE lease_id=?1 AND state='quarantined'",
+                params![lease_id, now],
+            )?;
+            report.retained_quarantined_leases += 1;
+            HostLeaseState::Quarantined
+        };
+        report.reclaimed_capacity_units = report
+            .reclaimed_capacity_units
+            .saturating_add(capacity_units);
+        report.leases.push(HostResourceReapLease {
+            lease_id,
+            generation,
+            holder_pid: holder_pid as u32,
+            capacity_units,
+            state,
+        });
+    }
+    Ok(report)
 }
 
 fn verify_ownership(
@@ -1859,6 +1996,30 @@ mod tests {
         )
     }
 
+    fn slot_and_worktree(id: &str, holder_pid: u32) -> HostResourceRequest {
+        let mut request = req(
+            id,
+            vec![
+                HostResourceRequirement {
+                    key: "prepush_slot".into(),
+                    resource: HostResourceKind::Capacity {
+                        pool: "prepush".into(),
+                        units: 1,
+                        limit: 3,
+                    },
+                },
+                HostResourceRequirement {
+                    key: "worktree".into(),
+                    resource: HostResourceKind::ExclusiveKey {
+                        name: "shared-worktree".into(),
+                    },
+                },
+            ],
+        );
+        request.holder_pid = Some(holder_pid);
+        request
+    }
+
     /// Issue #139: a holder that died without releasing pinned a whole-pool lease
     /// until its TTL, stalling every gate on the machine.
     #[test]
@@ -1897,6 +2058,62 @@ mod tests {
             message.contains("holder process is gone") && message.contains("reconcile"),
             "conflict must explain that waiting cannot resolve it: {message}"
         );
+    }
+
+    #[test]
+    fn independent_reaper_reclaims_dead_capacity_but_keeps_named_lease_diagnosable() {
+        let t = tempfile::tempdir().unwrap();
+        let mut c = HostResourceCoordinator::open(&t.path().join("h.db")).unwrap();
+        let holder_pid = reaped_pid();
+        let leaked = slot_and_worktree("leaked", holder_pid);
+        let grant = c.acquire(&leaked).unwrap();
+        c.quarantine(
+            &grant.lease.lease_id,
+            grant.lease.generation,
+            &grant.ownership_token,
+        )
+        .unwrap();
+
+        let report = c.reap_dead_holders().unwrap();
+        assert_eq!(report.dead_holders_seen, 1);
+        assert_eq!(report.reclaimed_capacity_units, 1);
+        assert_eq!(report.released_leases, 0);
+        assert_eq!(report.retained_quarantined_leases, 1);
+        assert_eq!(report.leases[0].holder_pid, holder_pid);
+        assert_eq!(report.leases[0].state, HostLeaseState::Quarantined);
+
+        let retained = c
+            .list(false)
+            .unwrap()
+            .into_iter()
+            .find(|lease| lease.lease_id == grant.lease.lease_id)
+            .unwrap();
+        assert_eq!(retained.state, HostLeaseState::Quarantined);
+        assert_eq!(retained.allocations.len(), 1);
+        assert_eq!(retained.allocations[0].kind, "exclusive_key");
+
+        let explanation = c
+            .explain(&slot_and_worktree("next", std::process::id()))
+            .unwrap();
+        assert_eq!(explanation.proposed.len(), 1);
+        assert_eq!(explanation.blockers.len(), 1);
+        let blocker = &explanation.blockers[0];
+        assert!(blocker.conflict.reason.contains(&grant.lease.lease_id));
+        assert!(
+            blocker
+                .conflict
+                .reason
+                .contains(&format!("holder PID {holder_pid}"))
+        );
+        assert!(blocker.conflict.reason.contains("process is gone"));
+        assert!(
+            blocker
+                .conflict
+                .reason
+                .contains(&format!("--confirm {}", grant.lease.generation))
+        );
+        assert!(!explanation.wait.waitable);
+        assert!(explanation.wait.action.contains(&grant.lease.lease_id));
     }
 
     /// The reclaim must not be so eager that it revokes a lease from a running

@@ -193,6 +193,9 @@ Usage:
       read from the file rather than command arguments or broker telemetry.
   aethyme broker resources list [--all] [--json]
       Read-only inventory. Ownership tokens are never included.
+  aethyme broker resources reap [--json]
+      Reclaim capacity from quarantined leases whose holder process is gone;
+      named allocations remain quarantined for cleanup review.
   aethyme broker resources reconcile <lease-id> --confirm <generation> [--json]
       Release an expired, quarantined allocation after reviewing host cleanup.
       The generation confirmation fences stale cleanup commands.
@@ -617,6 +620,44 @@ fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+fn coordination_wait_summary(operation: &crate::CoordinatedOperation) -> Option<String> {
+    if operation.status != crate::OperationStatus::Prepared {
+        return None;
+    }
+    let details = operation
+        .details_json
+        .as_deref()
+        .and_then(|details| serde_json::from_str::<serde_json::Value>(details).ok())?;
+    let wait = details.get("coordination_wait")?;
+    let holder = wait.get("holder")?;
+    let holder_name = match (
+        holder.get("operation_id").and_then(serde_json::Value::as_i64),
+        holder.get("session_id").and_then(serde_json::Value::as_i64),
+    ) {
+        (Some(operation_id), Some(session_id)) => {
+            format!("operation {operation_id} (session {session_id})")
+        }
+        (Some(operation_id), None) => format!("operation {operation_id}"),
+        _ => wait
+            .get("holder_description")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("an unrecorded holder")
+            .to_string(),
+    };
+    let waiting_started_at = wait
+        .get("waiting_started_at")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(operation.created_at);
+    let waited_seconds = now_ms()
+        .saturating_sub(waiting_started_at)
+        .max(0) as u64
+        / 1_000;
+    Some(format!(
+        "waiting for {holder_name} for {}",
+        crate::operations::humanize_duration(waited_seconds)
+    ))
 }
 
 /// Entry point for the router. Returns a process exit code.
@@ -3471,13 +3512,20 @@ fn render_capped<T>(items: &[T], cap: usize, detail: bool, mut render: impl FnMu
 
 fn render_storage_plan(plan: &crate::StoragePlan, detail: bool) {
     out!(
-        "Host storage plan {}: {} root(s), {} on-disk directory entries, {} candidate(s), {} reclaimable",
+        "Host storage plan {}: {} root(s), {} on-disk directory entries, {} host candidate(s), {} reclaimable; {} enrolled primary checkout(s), {} artifact(s), {} artifact candidate(s), {} reclaimable",
         plan.digest,
         plan.summary.root_count,
         plan.summary.on_disk_directory_count,
         plan.summary.candidate_count,
         plan.summary
             .reclaimable_bytes
+            .map(human_bytes)
+            .unwrap_or_else(|| "unknown bytes".into()),
+        plan.summary.primary_checkout_count,
+        plan.summary.primary_artifact_count,
+        plan.summary.primary_candidate_count,
+        plan.summary
+            .primary_reclaimable_bytes
             .map(human_bytes)
             .unwrap_or_else(|| "unknown bytes".into()),
     );
@@ -3521,6 +3569,36 @@ fn render_storage_plan(plan: &crate::StoragePlan, detail: bool) {
             }
         }
     }
+    for checkout in &plan.primary_checkouts {
+        out!(
+            "  primary checkout: {} ({}, {} artifact(s))",
+            checkout.path.display(),
+            if checkout.clean {
+                "clean"
+            } else {
+                "refused: dirty"
+            },
+            checkout.artifacts.len(),
+        );
+        for blocker in &checkout.blockers {
+            out!("    blocker: {blocker}");
+        }
+        if detail {
+            for artifact in &checkout.artifacts {
+                out!(
+                    "    artifact: {} ({}, ignored {}, tracked {}) — {}",
+                    artifact.path.display(),
+                    artifact
+                        .estimated_bytes
+                        .map(human_bytes)
+                        .unwrap_or_else(|| "unknown bytes".into()),
+                    artifact.ignored,
+                    artifact.tracked,
+                    artifact.reason,
+                );
+            }
+        }
+    }
     render_capped(&plan.candidates, GC_LIST_CAP, detail, |candidate| {
         out!(
             "  candidate: {:?} {} ({}) — {}",
@@ -3533,7 +3611,19 @@ fn render_storage_plan(plan: &crate::StoragePlan, detail: bool) {
             candidate.reason,
         );
     });
-    if plan.candidates.is_empty() {
+    render_capped(&plan.primary_candidates, GC_LIST_CAP, detail, |candidate| {
+        out!(
+            "  primary candidate: {:?} {} ({}) — {}",
+            crate::StorageCandidateKind::PrimaryArtifact,
+            candidate.path.display(),
+            candidate
+                .estimated_bytes
+                .map(human_bytes)
+                .unwrap_or_else(|| "unknown bytes".into()),
+            candidate.reason,
+        );
+    });
+    if plan.candidates.is_empty() && plan.primary_candidates.is_empty() {
         out!("  apply: nothing eligible");
     } else {
         out!(
@@ -5998,6 +6088,9 @@ fn render_operation_show(report: &crate::OperationShowReport) {
     out!("Scope:          {}", operation.scope);
     out!("Effect:         {}", operation.effect.as_str());
     out!("Status:         {}", operation.status.as_str());
+    if let Some(waiting) = coordination_wait_summary(operation) {
+        out!("Queue wait:     {waiting}");
+    }
     out!("Identity:       {}", operation.identity_provenance.as_str());
     out!("Command:        {}", operation.command_json);
     out!(
@@ -9456,6 +9549,31 @@ fn run_resources(parsed: Parsed) -> Result<(), UsageError> {
                 }
             }
         }
+        "reap" => {
+            let mut coordinator = crate::HostResourceCoordinator::open_default()?;
+            let report = coordinator.reap_dead_holders()?;
+            if parsed.json {
+                out!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                out!(
+                    "Reaped {} dead holder(s): {} capacity unit(s) reclaimed, {} lease(s) released, {} lease(s) retained for cleanup.",
+                    report.dead_holders_seen,
+                    report.reclaimed_capacity_units,
+                    report.released_leases,
+                    report.retained_quarantined_leases,
+                );
+                for lease in &report.leases {
+                    out!(
+                        "  lease {} generation {} pid {} — reclaimed {} capacity unit(s), {}",
+                        lease.lease_id,
+                        lease.generation,
+                        lease.holder_pid,
+                        lease.capacity_units,
+                        lease.state.as_str(),
+                    );
+                }
+            }
+        }
         "reconcile" => {
             let mut coordinator = crate::HostResourceCoordinator::open_default()?;
             let lease_id = parsed
@@ -9481,7 +9599,7 @@ fn run_resources(parsed: Parsed) -> Result<(), UsageError> {
         }
         other => {
             return Err(UsageError::Message(format!(
-                "unknown resources action {other:?}; expected plan, explain, acquire, run, renew, release, list, or reconcile"
+                "unknown resources action {other:?}; expected plan, explain, acquire, run, renew, release, list, reap, or reconcile"
             )));
         }
     }
@@ -10570,20 +10688,24 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                         out!("No coordinated operations recorded.");
                     } else {
                         out!(
-                            "{:<5} {:<8} {:<21} {:<22} SCOPE",
+                            "{:<5} {:<8} {:<21} {:<22} SCOPE / WAIT",
                             "ID",
                             "TOOL",
                             "STATUS",
                             "REPOSITORY"
                         );
                         for operation in page.operations {
+                            let waiting = coordination_wait_summary(&operation)
+                                .map(|summary| format!("  {summary}"))
+                                .unwrap_or_default();
                             out!(
-                                "{:<5} {:<8} {:<21} {:<22} {}",
+                                "{:<5} {:<8} {:<21} {:<22} {}{}",
                                 operation.id,
                                 operation.provider.as_str(),
                                 operation.status.as_str(),
                                 operation.repository,
                                 operation.scope,
+                                waiting,
                             );
                         }
                         if let Some(before_id) = page.next_before_id {

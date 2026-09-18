@@ -88,6 +88,7 @@ text_enum!(GateStatus, "gate_results.status", {
 
 text_enum!(GateFailureClass, "gate_results.failure_class", {
     TestFailure => "test_failure",
+    BuildFailure => "build_failure",
     Environment => "environment",
     ResourceContention => "resource_contention",
     Timeout => "timeout",
@@ -555,8 +556,9 @@ pub struct Event {
 ///
 /// Both values are computed, never asserted. The distinction is recorded
 /// because it says how much the answer cost and how direct the evidence was:
-/// `merge_time` was observed at the moment the provider merged, `history_walk`
-/// was reconstructed afterwards by finding the commit that carried the content.
+/// `merge_time` was observed at the moment a provider merge or broker
+/// promotion landed, while `history_walk` was reconstructed afterwards by
+/// finding the commit that carried the content.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RepresentationDiscovery {

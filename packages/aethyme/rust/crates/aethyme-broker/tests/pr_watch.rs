@@ -502,3 +502,93 @@ fn a_retried_delivery_yields_to_the_next_one_instead_of_starving_it() {
         "after its backoff the earlier delivery regains its place in id order"
     );
 }
+
+/// A target that never comes back must stop being asked.
+///
+/// `Retry` is only ever a judgement about the current tick, so an adapter that
+/// keeps deferring keeps the row alive indefinitely. Observed live: four
+/// deliveries addressed to a Chau7 tab that had been gone for nine days reached
+/// 2,569-2,622 attempts each, re-queuing every five minutes for a message that
+/// could never land. The deferral still has to survive an agent restarting
+/// between ticks, so this asserts the row retries several times first and only
+/// then dead-letters.
+#[test]
+fn a_delivery_that_is_always_deferred_is_eventually_dead_lettered() {
+    let (_root, mut broker, session_id) = broker_fixture();
+    // One snapshot is consumed opening the watch, the second by the poll that
+    // produces the batch this delivery carries.
+    let provider = FakeProvider(Mutex::new(VecDeque::from([
+        snapshot("open", 'a', &["C1"]),
+        snapshot("open", 'b', &["C1", "C2"]),
+    ])));
+
+    let watch = broker
+        .start_pull_request_watch(
+            session_id,
+            "Owner/Repo",
+            7,
+            vec![PullRequestActivityKind::Comment],
+            60,
+            &provider,
+            1_000,
+        )
+        .unwrap();
+    broker
+        .subscribe_pull_request_delivery(
+            watch.id,
+            "test-adapter",
+            "recipient-1",
+            DeliveryPolicy::Notify,
+            2_000,
+        )
+        .unwrap();
+    broker
+        .poll_pull_request_watch(watch.id, &provider, 61_000)
+        .unwrap();
+
+    let mut now = 130_000;
+    let mut attempts = 0;
+    let outcome = loop {
+        let claimed = broker
+            .claim_next_delivery("test-adapter", "worker-1", 120, now)
+            .unwrap()
+            .delivery
+            .expect("an unfinished delivery stays claimable");
+        attempts += 1;
+        assert!(
+            attempts <= 64,
+            "the deferral loop is unbounded; it reached {attempts} attempts"
+        );
+        let item = broker
+            .complete_delivery(
+                claimed.item.id,
+                "worker-1",
+                claimed.item.generation,
+                DeliveryCompletion::Retry,
+                Some("tab_not_ready"),
+                now + 100,
+            )
+            .unwrap();
+        if item.status != DeliveryStatus::Pending {
+            break item;
+        }
+        // The row was completed at `now + 100`, and the backoff ceiling is
+        // 300s from that, so the next claim has to clear `now + 300_100`.
+        now += 301_000;
+    };
+
+    assert_eq!(
+        outcome.status,
+        DeliveryStatus::Failed,
+        "an exhausted delivery must dead-letter rather than retry forever"
+    );
+    assert!(
+        attempts > 2,
+        "deferral must still absorb a target that is briefly away; it gave up after {attempts}"
+    );
+    assert_eq!(
+        outcome.last_error_code.as_deref(),
+        Some("tab_not_ready"),
+        "the dead-lettered row must keep the reason it kept failing"
+    );
+}

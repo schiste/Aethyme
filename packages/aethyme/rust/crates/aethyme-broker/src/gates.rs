@@ -1519,6 +1519,10 @@ fn run_selections(
                         gate.name, message
                     ));
                     drop(owner_locks);
+                    // An error here is still a failure whose log a later run on
+                    // the same tree would overwrite, so it moves aside exactly
+                    // as a failing run's log does.
+                    let log_path = preserve_failed_gate_log(&log_path, GateStatus::Error);
                     store.record_gate_result(&NewGateResult {
                         gate_name: gate.name.clone(),
                         tree_hash: tree.clone(),
@@ -1574,6 +1578,7 @@ fn run_selections(
                 progress.report(&format!("gate {} environment error: {message}", gate.name));
                 let _ = resource_runtime.as_mut().map(GateResourceRuntime::release);
                 drop(owner_locks);
+                let log_path = preserve_failed_gate_log(&log_path, GateStatus::Error);
                 store.record_gate_result(&NewGateResult {
                     gate_name: gate.name.clone(),
                     tree_hash: tree.clone(),
@@ -1671,6 +1676,12 @@ fn run_selections(
             .map(|outcome| outcome.output_bytes as i64);
         let (gate_status, failure_class, exit_code) =
             classify_gate_result(&gate.command, &log_path, status);
+        // Classification reads the log in place, so the rename waits until
+        // after it. A failing log then moves aside: the generic name is keyed
+        // on (gate, tree, worker), so a re-run against an unchanged tree lands
+        // on the identical path and would erase the failure it just
+        // contradicted.
+        let log_path = preserve_failed_gate_log(&log_path, gate_status);
         progress.report(&format!(
             "gate {} {} in {}s (tree {})",
             gate.name,
@@ -1778,6 +1789,15 @@ fn classify_gate_result(
         }) if is_environment_error(code, log_path) => (
             GateStatus::Error,
             Some(GateFailureClass::Environment),
+            Some(code as i64),
+        ),
+        Ok(GateCommandOutcome {
+            exit_code: Some(code),
+            resource_error: None,
+            ..
+        }) if is_build_failure(command, log_path) => (
+            GateStatus::Fail,
+            Some(GateFailureClass::BuildFailure),
             Some(code as i64),
         ),
         Ok(GateCommandOutcome {
@@ -1919,6 +1939,27 @@ fn log_contains_any(log_path: &Path, patterns: &[&str]) -> bool {
     };
     let lower = log.to_ascii_lowercase();
     patterns.iter().any(|pattern| lower.contains(pattern))
+}
+
+/// Whether the gate failed before it could run anything.
+///
+/// A broken build and a failing assertion are both the diff's fault, but they
+/// are different repairs: one fixes a symbol, the other fixes behaviour.
+/// Filing both as `TestFailure` hid that -- a stale test import of a renamed
+/// symbol was recorded as a test failure, and the only tell was in the
+/// numbers: exit 101 after 24s, against the ~400s a run that reaches the tests
+/// takes.
+///
+/// This stays behind the resource and environment checks on purpose. A build
+/// that dies because the disk is full is a host problem, and classifying it
+/// here would let the tree-hash cache condemn the very change that frees the
+/// space.
+///
+/// Scoped to cargo, whose "could not compile" line is unambiguous and is
+/// emitted only when compilation itself failed. Other gates have no portable
+/// equivalent, so they keep their existing classification rather than guess.
+fn is_build_failure(command: &str, log_path: &Path) -> bool {
+    command_mentions_cargo(command) && log_contains_any(log_path, &["could not compile"])
 }
 
 fn command_mentions_cargo(command: &str) -> bool {
@@ -2200,6 +2241,30 @@ fn write_gate_diagnostic(path: &Path, message: &str) -> Result<(), std::io::Erro
     file.write_all(message.as_bytes())
 }
 
+/// Give a failing gate log a name no later run can reuse.
+///
+/// Gate logs are named after `(gate, tree, worker)`, which is stable across
+/// re-runs of the same tree -- exactly the case where both logs matter. A fail
+/// followed by a pass on an unchanged tree is the signature of a flake, and
+/// letting the pass overwrite the fail leaves no evidence it ever happened.
+/// Passing runs keep the generic name so the directory stays bounded.
+///
+/// A rename that cannot happen is not worth failing a gate over, so the
+/// original path is returned and the result still points at a real file.
+fn preserve_failed_gate_log(log_path: &Path, status: GateStatus) -> PathBuf {
+    if status == GateStatus::Pass {
+        return log_path.to_path_buf();
+    }
+    let Some(stem) = log_path.file_stem().and_then(|stem| stem.to_str()) else {
+        return log_path.to_path_buf();
+    };
+    let preserved = log_path.with_file_name(format!("{stem}.fail-{}.log", epoch_ms()));
+    match std::fs::rename(log_path, &preserved) {
+        Ok(()) => preserved,
+        Err(_) => log_path.to_path_buf(),
+    }
+}
+
 fn epoch_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2210,6 +2275,45 @@ fn epoch_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failing_gate_log_survives_a_later_pass_on_the_same_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shared = tmp.path().join("cargo-test-8b88ffbe-s509-cargo-test.log");
+
+        // The failing run writes the shared name, then moves it aside.
+        std::fs::write(&shared, "assertion failed: the evidence that matters\n").unwrap();
+        let preserved = preserve_failed_gate_log(&shared, GateStatus::Fail);
+        assert_ne!(
+            preserved, shared,
+            "a failing log must not keep the shared name"
+        );
+        assert!(
+            !shared.exists(),
+            "the shared name must be free for the next run"
+        );
+
+        // The re-run on the unchanged tree lands on the identical shared path.
+        std::fs::write(&shared, "test result: ok. 701 passed\n").unwrap();
+        let passing = preserve_failed_gate_log(&shared, GateStatus::Pass);
+
+        assert_eq!(passing, shared, "a passing log keeps the shared name");
+        assert_eq!(
+            std::fs::read_to_string(&preserved).unwrap(),
+            "assertion failed: the evidence that matters\n",
+            "the pass overwrote the failure it contradicted"
+        );
+    }
+
+    #[test]
+    fn preserving_a_missing_log_reports_the_original_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let absent = tmp.path().join("cargo-test-deadbeef-s1-cargo-test.log");
+
+        // A gate can fail before anything is written. The result still has to
+        // name a path rather than lose the row to a rename error.
+        assert_eq!(preserve_failed_gate_log(&absent, GateStatus::Fail), absent);
+    }
 
     fn write_config(dir: &Path, body: &str) {
         std::fs::create_dir_all(dir.join(".aethyme")).unwrap();
@@ -2390,6 +2494,59 @@ mod tests {
 
         assert_eq!(source, RepositoryKeySource::MainCheckoutPath);
         assert!(!key.is_empty());
+    }
+
+    /// A broken build is not a failing test.
+    ///
+    /// The regression this pins: a test importing a symbol that had been
+    /// renamed never compiled, so no assertion ever ran, yet the result was
+    /// filed `Fail` / `TestFailure` -- indistinguishable in the record from a
+    /// genuine behavioural failure. The repairs are different, and only the
+    /// timing hinted at which one it was.
+    #[test]
+    fn a_build_that_never_compiled_is_not_a_test_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let build_log = tmp.path().join("build.log");
+        std::fs::write(
+            &build_log,
+            "error[E0432]: unresolved import `aethyme_broker::GraphImpactMode`\n             error: could not compile `aethyme-broker` (test \"gates_e2e\") due to 1 previous error\n",
+        )
+        .unwrap();
+        let (status, class, _) = classify_gate_result(
+            "cargo test --workspace",
+            &build_log,
+            Ok(GateCommandOutcome {
+                timed_out: false,
+                exit_code: Some(101),
+                resource_error: None,
+                first_output_ms: None,
+                output_bytes: 0,
+            }),
+        );
+        assert_eq!(status, GateStatus::Fail, "the diff is still at fault");
+        assert_eq!(class, Some(GateFailureClass::BuildFailure));
+
+        // A run that reached the tests and failed one keeps its old class.
+        let test_log = tmp.path().join("test.log");
+        std::fs::write(
+            &test_log,
+            "running 1 test\ntest result: FAILED. 0 passed; 1 failed\n",
+        )
+        .unwrap();
+        let (status, class, _) = classify_gate_result(
+            "cargo test --workspace",
+            &test_log,
+            Ok(GateCommandOutcome {
+                timed_out: false,
+                exit_code: Some(101),
+                resource_error: None,
+                first_output_ms: None,
+                output_bytes: 0,
+            }),
+        );
+        assert_eq!(status, GateStatus::Fail);
+        assert_eq!(class, Some(GateFailureClass::TestFailure));
     }
 
     /// #168: the spawn error was the only account of why the gate produced no

@@ -254,6 +254,7 @@ aethyme broker resources acquire request.json --wait 30m \
   --grant-out "$private_runtime/grant.json" --json
 aethyme broker resources list --json
 aethyme broker resources list --all --json
+aethyme broker resources reap --json
 aethyme broker resources reconcile <lease-id> --confirm <generation>
 ```
 
@@ -265,6 +266,14 @@ non-retryable `capacity_policy_mismatch` code. `--grant-out` refuses overwrite,
 publishes atomically with mode 0600 on Unix, and omits the ownership token from
 stdout. Inventory and gate reports never contain that token, file contents,
 diffs, or absolute worktree paths.
+
+`reap` is an independent dead-holder sweep. It quarantines active leases whose
+holder PID is provably gone, releases their capacity allocations immediately,
+and reports the reclaimed units. Named allocations such as namespaces, ports,
+and exclusive keys remain quarantined until an operator reviews cleanup and
+uses the exact generation-fenced `reconcile` command. This split prevents a dead
+process from silently shrinking shared capacity without treating a possibly
+dirty named resource as safe to reuse.
 
 A minimal low-level request is:
 

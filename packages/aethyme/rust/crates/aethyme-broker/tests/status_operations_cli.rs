@@ -88,7 +88,12 @@ fn status_shows_a_wedged_operation_and_what_is_parked_behind_it() {
         .unwrap();
     broker
         .store()
-        .create_coordinated_operation(&make("issues/1/comments", r#"["gh","api"]"#))
+        .create_coordinated_operation(&NewCoordinatedOperation {
+            // Keep the parked row alive long enough for the status command
+            // to observe it; broker-open reaps genuinely abandoned clients.
+            pid: std::process::id() as i64,
+            ..make("issues/1/comments", r#"["gh","api"]"#)
+        })
         .unwrap();
     drop(broker);
 

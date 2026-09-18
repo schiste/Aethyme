@@ -18,7 +18,7 @@ use sha2::{Digest, Sha256};
 
 use crate::delivery::{
     DELIVERY_OUTBOX_SCHEMA_VERSION, DeliveryCompletion, DeliveryOutboxItem, DeliveryPolicy,
-    DeliveryStatus, DeliverySubscription,
+    DeliveryStatus, DeliverySubscription, MAX_DELIVERY_ATTEMPTS,
 };
 use crate::error::BrokerError;
 use crate::external_events::{
@@ -1134,6 +1134,7 @@ impl BrokerStore {
         &mut self,
         entry_id: i64,
         integration_commit: &str,
+        integration_ref: &str,
         promoted_paths: &[String],
         details_json: &str,
     ) -> Result<(), BrokerError> {
@@ -1173,6 +1174,15 @@ impl BrokerStore {
              ) VALUES (?1, ?2, ?3, ?4, 'outstanding')",
             params![entry_id, integration_commit, paths_json, now],
         )?;
+        Self::record_promotion_representation(
+            &tx,
+            session_id,
+            &session_head,
+            integration_commit,
+            integration_ref,
+            &paths,
+            now,
+        )?;
         update_accepted_checkpoint(
             &tx,
             session_id,
@@ -1207,6 +1217,8 @@ impl BrokerStore {
         entry_id: i64,
         integration_commit: &str,
         integration_tree: &str,
+        integration_ref: &str,
+        promoted_paths: &[String],
         details_json: &str,
     ) -> Result<(), BrokerError> {
         let now = now_ms();
@@ -1229,6 +1241,15 @@ impl BrokerStore {
              WHERE id = ?1",
             params![entry_id, integration_tree, details_json, now],
         )?;
+        Self::record_promotion_representation(
+            &tx,
+            session_id,
+            &session_head,
+            integration_commit,
+            integration_ref,
+            promoted_paths,
+            now,
+        )?;
         update_accepted_checkpoint(
             &tx,
             session_id,
@@ -1246,6 +1267,64 @@ impl BrokerStore {
             Some(details_json),
         )?;
         tx.commit()?;
+        Ok(())
+    }
+
+    /// Record the exact rewritten landing produced by broker promotion.
+    ///
+    /// Promotion changes the commit identity even though the merged tree is
+    /// the verified session contribution. The representation ledger preserves
+    /// that relationship for cleanup, where ancestry alone cannot prove a
+    /// single-parent rewrite landed.
+    fn record_promotion_representation(
+        tx: &Transaction<'_>,
+        session_id: i64,
+        session_head: &str,
+        integration_commit: &str,
+        integration_ref: &str,
+        promoted_paths: &[String],
+        now: i64,
+    ) -> Result<(), BrokerError> {
+        let mut paths = promoted_paths.to_vec();
+        paths.sort();
+        paths.dedup();
+        let paths_json =
+            serde_json::to_string(&paths).expect("serializing representation paths cannot fail");
+        let evidence = format!(
+            "broker promotion landed session head {session_head} as {integration_commit} on {integration_ref}"
+        );
+        // A promotion records the local integration landing, which carries no
+        // pull request. A row already naming a PR merge is the stronger claim:
+        // the integration commit is not an ancestor of the default branch, so
+        // overwriting one with the other turns a session that demonstrably
+        // landed upstream into unproven provenance and blocks its cleanup. The
+        // guard is on the UPDATE rather than the INSERT because the first
+        // writer may legitimately be either lane.
+        tx.execute(
+            "INSERT INTO session_representations (
+                 session_id, session_head, representing_commit, representing_ref,
+                 discovery, pr_number, paths_json, evidence, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8)
+             ON CONFLICT(session_id, session_head) DO UPDATE SET
+                 representing_commit = excluded.representing_commit,
+                 representing_ref = excluded.representing_ref,
+                 discovery = excluded.discovery,
+                 pr_number = excluded.pr_number,
+                 paths_json = excluded.paths_json,
+                 evidence = excluded.evidence,
+                 created_at = excluded.created_at
+             WHERE session_representations.pr_number IS NULL",
+            params![
+                session_id,
+                session_head,
+                integration_commit,
+                integration_ref,
+                RepresentationDiscovery::MergeTime.as_str(),
+                paths_json,
+                evidence,
+                now,
+            ],
+        )?;
         Ok(())
     }
 
@@ -2975,6 +3054,23 @@ impl BrokerStore {
         tx.commit()?;
         self.coordinated_operation(id)?
             .ok_or(BrokerError::CoordinatedOperationNotFound(id))
+    }
+
+    /// Attach durable queue-wait evidence while an operation is still
+    /// prepared. The status guard makes a late diagnostic harmless if the
+    /// operation acquired the lock between the observation and this update.
+    pub fn annotate_prepared_operation(
+        &mut self,
+        id: i64,
+        details_json: &str,
+    ) -> Result<(), BrokerError> {
+        self.conn.execute(
+            "UPDATE coordinated_operations
+             SET details_json = ?2, updated_at = ?3
+             WHERE id = ?1 AND status = 'prepared'",
+            params![id, details_json, now_ms()],
+        )?;
+        Ok(())
     }
 
     pub fn coordinated_operation(
@@ -4754,6 +4850,14 @@ impl BrokerStore {
         }
         let (status, delivered_at) = match completion {
             DeliveryCompletion::Delivered => (DeliveryStatus::Delivered, Some(now)),
+            // The claim already counted this attempt, so an exhausted row is
+            // dead-lettered here rather than handed back to the adapter that
+            // has just failed to place it `MAX_DELIVERY_ATTEMPTS` times. The
+            // caller's `Retry` stays advisory: only the broker can see how
+            // long the row has been asking, so only the broker can stop it.
+            DeliveryCompletion::Retry if current.attempt_count >= MAX_DELIVERY_ATTEMPTS => {
+                (DeliveryStatus::Failed, None)
+            }
             DeliveryCompletion::Retry => (DeliveryStatus::Pending, None),
             DeliveryCompletion::Failed => (DeliveryStatus::Failed, None),
         };

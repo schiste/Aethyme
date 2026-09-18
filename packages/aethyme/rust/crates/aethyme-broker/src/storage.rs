@@ -14,15 +14,16 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
 use crate::broker::{WORKTREE_ROOT_MARKER, WORKTREE_ROOT_SCHEMA_VERSION, WorktreeRootMarker};
 use crate::gc::{TreeRemoval, remove_condemned_tree};
+use crate::reclaim::is_artefact_directory_with_extras;
 use crate::{BrokerStore, GitRepo};
 
-pub const STORAGE_PLAN_SCHEMA_VERSION: u32 = 1;
+pub const STORAGE_PLAN_SCHEMA_VERSION: u32 = 2;
 pub const STORAGE_RECONCILIATION_SCHEMA_VERSION: u32 = 1;
 
 const DAY_MS: i64 = 86_400_000;
@@ -91,6 +92,7 @@ pub enum StorageSource {
 pub enum StorageCandidateKind {
     OrphanRoot,
     StrayDirectory,
+    PrimaryArtifact,
 }
 
 impl StorageCandidateKind {
@@ -98,6 +100,7 @@ impl StorageCandidateKind {
         match self {
             Self::OrphanRoot => "orphan_root",
             Self::StrayDirectory => "stray_directory",
+            Self::PrimaryArtifact => "primary_artifact",
         }
     }
 }
@@ -192,11 +195,56 @@ pub struct StorageSummary {
     pub orphan_root_count: usize,
     pub stray_directory_count: usize,
     pub candidate_count: usize,
+    pub primary_checkout_count: usize,
+    pub primary_artifact_count: usize,
+    pub primary_candidate_count: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub estimated_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reclaimable_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub primary_reclaimable_bytes: Option<u64>,
     pub sized: bool,
+}
+
+/// One enrolled primary checkout included in the host storage inventory.
+///
+/// A dirty checkout is reported as a whole-checkout blocker. Its recognized
+/// artifacts remain visible for accounting, but none of them enters the
+/// reviewed deletion candidate set.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StoragePrimaryCheckout {
+    pub path: PathBuf,
+    pub repository_key: String,
+    pub clean: bool,
+    pub dirty_paths: Vec<String>,
+    pub artifacts: Vec<StoragePrimaryArtifact>,
+    pub blockers: Vec<String>,
+}
+
+/// One recognized regenerable directory beneath an enrolled primary checkout.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StoragePrimaryArtifact {
+    pub path: PathBuf,
+    pub name: String,
+    pub ignored: bool,
+    pub tracked: bool,
+    pub reclaimable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub estimated_bytes: Option<u64>,
+    pub reason: String,
+}
+
+/// A primary-checkout artifact authorized by the reviewed storage plan.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StoragePrimaryCandidate {
+    pub path: PathBuf,
+    pub checkout_path: PathBuf,
+    pub repository_key: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub estimated_bytes: Option<u64>,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -212,6 +260,8 @@ pub struct StoragePlan {
     pub digest: String,
     pub roots: Vec<StorageRoot>,
     pub candidates: Vec<StorageCandidate>,
+    pub primary_checkouts: Vec<StoragePrimaryCheckout>,
+    pub primary_candidates: Vec<StoragePrimaryCandidate>,
     pub summary: StorageSummary,
     pub warnings: Vec<String>,
 }
@@ -319,6 +369,20 @@ pub fn storage_apply(
             }),
         }
     }
+    for candidate in &plan.primary_candidates {
+        match apply_primary_candidate(candidate) {
+            Ok(reclaimed_bytes) => applied.push(StorageAppliedItem {
+                kind: StorageCandidateKind::PrimaryArtifact,
+                path: candidate.path.clone(),
+                reclaimed_bytes,
+            }),
+            Err(reason) => failures.push(StorageApplyFailure {
+                kind: StorageCandidateKind::PrimaryArtifact,
+                path: candidate.path.clone(),
+                reason,
+            }),
+        }
+    }
     let reclaimed_bytes = applied.iter().fold(0_u64, |total, item| {
         total.saturating_add(item.reclaimed_bytes)
     });
@@ -388,8 +452,21 @@ fn build_plan(
             .cmp(&right.path)
             .then_with(|| left.kind.as_str().cmp(right.kind.as_str()))
     });
-    let digest = decision_digest(&storage_root, orphan_worktree_roots_days, &candidates);
-    let summary = summarise(&roots, &candidates, size);
+    let (primary_checkouts, primary_candidates) =
+        inspect_primary_checkouts(main_root, &roots, size);
+    let digest = decision_digest(
+        &storage_root,
+        orphan_worktree_roots_days,
+        &candidates,
+        &primary_candidates,
+    );
+    let summary = summarise(
+        &roots,
+        &candidates,
+        &primary_checkouts,
+        &primary_candidates,
+        size,
+    );
     Ok(StoragePlan {
         schema_version: STORAGE_PLAN_SCHEMA_VERSION,
         evaluated_at,
@@ -398,6 +475,8 @@ fn build_plan(
         digest,
         roots,
         candidates,
+        primary_checkouts,
+        primary_candidates,
         summary,
         warnings,
     })
@@ -596,6 +675,256 @@ fn inspect_root(
     }
 }
 
+fn inspect_primary_checkouts(
+    invoking_main_root: &Path,
+    roots: &[StorageRoot],
+    size: bool,
+) -> (Vec<StoragePrimaryCheckout>, Vec<StoragePrimaryCandidate>) {
+    let mut paths = BTreeSet::new();
+    if is_enrolled_primary_checkout(invoking_main_root) {
+        paths.insert(normalise(invoking_main_root));
+    }
+    for root in roots {
+        if root.marker_status == StorageMarkerStatus::Valid
+            && root.owner_exists == Some(true)
+            && root
+                .repository_root
+                .as_deref()
+                .is_some_and(is_enrolled_primary_checkout)
+        {
+            paths.insert(normalise(root.repository_root.as_deref().unwrap()));
+        }
+    }
+
+    let mut checkouts = paths
+        .into_iter()
+        .map(|path| inspect_primary_checkout(&path, size))
+        .collect::<Vec<_>>();
+    checkouts.sort_by(|left, right| left.path.cmp(&right.path));
+    // Reporting spans every enrolled checkout on the host; deleting does not.
+    // `storage apply` is confirmed by one digest produced from wherever the
+    // operator happened to run `plan`, and nothing in that confirmation names
+    // another repository. A sibling checkout therefore stays visible in the
+    // inventory -- which is what makes the disk legible -- while only the
+    // invoking checkout can lose bytes to it.
+    let invoking = normalise(invoking_main_root);
+    let mut candidates = checkouts
+        .iter()
+        .filter(|checkout| normalise(&checkout.path) == invoking)
+        .flat_map(|checkout| {
+            checkout
+                .artifacts
+                .iter()
+                .filter(|artifact| artifact.reclaimable)
+                .map(|artifact| StoragePrimaryCandidate {
+                    path: artifact.path.clone(),
+                    checkout_path: checkout.path.clone(),
+                    repository_key: checkout.repository_key.clone(),
+                    name: artifact.name.clone(),
+                    estimated_bytes: artifact.estimated_bytes,
+                    reason: artifact.reason.clone(),
+                })
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| left.path.cmp(&right.path));
+    (checkouts, candidates)
+}
+
+/// How long an artifact directory must have been still before the primary
+/// lane will consider deleting it.
+///
+/// Long enough to span a link step or a slow test binary, short enough that a
+/// checkout nobody is working in becomes reclaimable within one coffee break.
+const PRIMARY_ARTIFACT_IDLE_MS: u64 = 30 * 60 * 1_000;
+
+/// Whether `dir` or any of its immediate entries changed inside `window_ms`.
+///
+/// Only the top level is read. A deep walk of a multi-gigabyte `target/` is
+/// precisely the cost this lane exists to reclaim, and a live build touches the
+/// top level often enough -- profile directories, lock files, fingerprint
+/// stamps -- for one level to answer the question being asked.
+///
+/// Every unreadable case answers "recently modified". The caller uses this to
+/// decide whether deleting is safe, so not knowing must never read as safe.
+fn directory_modified_within(dir: &Path, window_ms: u64) -> bool {
+    let cutoff = match SystemTime::now().checked_sub(Duration::from_millis(window_ms)) {
+        Some(cutoff) => cutoff,
+        None => return true,
+    };
+    let recent = |metadata: &std::fs::Metadata| {
+        metadata
+            .modified()
+            .map(|modified| modified > cutoff)
+            .unwrap_or(true)
+    };
+    if std::fs::symlink_metadata(dir)
+        .as_ref()
+        .map(recent)
+        .unwrap_or(true)
+    {
+        return true;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return true;
+    };
+    entries
+        .flatten()
+        .any(|entry| entry.metadata().as_ref().map(recent).unwrap_or(true))
+}
+
+fn is_enrolled_primary_checkout(path: &Path) -> bool {
+    path.join(".aethyme/config.toml").is_file()
+}
+
+fn inspect_primary_checkout(path: &Path, size: bool) -> StoragePrimaryCheckout {
+    let path = normalise(path);
+    let mut blockers = Vec::new();
+    let repo = match GitRepo::discover(&path) {
+        Ok(repo) => Some(repo),
+        Err(error) => {
+            blockers.push(format!("cannot inspect enrolled primary checkout: {error}"));
+            None
+        }
+    };
+    let repository_key = primary_repository_key(&path, repo.as_ref());
+    let mut dirty_paths = Vec::new();
+    let mut clean = false;
+    let mut usable = false;
+    let mut extras = Vec::new();
+
+    if let Some(repo) = repo.as_ref() {
+        match repo.main_root() {
+            Ok(main_root) if normalise(&main_root) == path => usable = true,
+            Ok(main_root) => blockers.push(format!(
+                "enrollment path resolves to Git main checkout {}, not {}",
+                main_root.display(),
+                path.display()
+            )),
+            Err(error) => blockers.push(format!("cannot resolve primary checkout root: {error}")),
+        }
+        match repo.dirty_paths() {
+            Ok(paths) => {
+                dirty_paths = paths;
+                clean = dirty_paths.is_empty();
+                if !clean {
+                    blockers.push(format!(
+                        "checkout has uncommitted changes; refusing the whole checkout and no primary artifact is eligible ({} path(s))",
+                        dirty_paths.len()
+                    ));
+                }
+            }
+            Err(error) => blockers.push(format!("cannot inspect checkout dirtiness: {error}")),
+        }
+        match crate::load_retention_policy(&path) {
+            Ok(policy) => extras = policy.artefact_directories,
+            Err(error) => blockers.push(format!(
+                "cannot load this checkout's retention policy; configured artifact names are ignored: {error}"
+            )),
+        }
+    }
+
+    let mut artifacts = Vec::new();
+    if usable {
+        let Some(repo) = repo.as_ref() else {
+            unreachable!("a usable primary checkout has a Git repository");
+        };
+        match std::fs::read_dir(&path) {
+            Ok(entries) => {
+                for entry in entries {
+                    let entry = match entry {
+                        Ok(entry) => entry,
+                        Err(error) => {
+                            blockers
+                                .push(format!("cannot enumerate primary checkout entry: {error}"));
+                            continue;
+                        }
+                    };
+                    let raw_path = entry.path();
+                    if !is_real_directory(&raw_path) {
+                        continue;
+                    }
+                    let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                        continue;
+                    };
+                    if !is_artefact_directory_with_extras(&name, &extras) {
+                        continue;
+                    }
+                    let path = normalise(&raw_path);
+                    let ignored = repo.path_is_ignored(&name);
+                    let tracked = match repo.is_tracked(&name) {
+                        Ok(tracked) => tracked,
+                        Err(error) => {
+                            blockers.push(format!(
+                                "cannot determine whether primary artifact {} is tracked: {error}",
+                                path.display()
+                            ));
+                            true
+                        }
+                    };
+                    // A session worktree can be proven idle because the broker
+                    // owns its lifecycle. A primary checkout has no session and
+                    // no close event, so the only honest evidence that nothing
+                    // is building is that the tree itself has stopped moving. A
+                    // running `cargo build` writes into `target/` continuously
+                    // while leaving the checkout `clean`, because `target/` is
+                    // git-ignored -- so cleanliness alone would license deleting
+                    // a build out from under itself.
+                    let busy = directory_modified_within(&path, PRIMARY_ARTIFACT_IDLE_MS);
+                    let reclaimable = clean && ignored && !tracked && !busy;
+                    let reason = if !clean {
+                        "enrolled primary checkout is dirty; the whole checkout is refused".into()
+                    } else if tracked {
+                        "directory contains tracked files and is never a candidate".into()
+                    } else if !ignored {
+                        "directory is not ignored by Git and is never a candidate".into()
+                    } else if busy {
+                        "artifact changed recently; a build may be running against it".into()
+                    } else {
+                        "regenerable Git-ignored artifact in a clean enrolled primary checkout"
+                            .into()
+                    };
+                    artifacts.push(StoragePrimaryArtifact {
+                        path,
+                        name,
+                        ignored,
+                        tracked,
+                        reclaimable,
+                        estimated_bytes: size
+                            .then(|| {
+                                crate::broker::directory_size_without_following_links(&raw_path)
+                                    .ok()
+                            })
+                            .flatten(),
+                        reason,
+                    });
+                }
+            }
+            Err(error) => blockers.push(format!(
+                "cannot enumerate enrolled primary checkout: {error}"
+            )),
+        }
+    }
+    artifacts.sort_by(|left, right| left.path.cmp(&right.path));
+    StoragePrimaryCheckout {
+        path,
+        repository_key,
+        clean,
+        dirty_paths,
+        artifacts,
+        blockers,
+    }
+}
+
+fn primary_repository_key(path: &Path, repo: Option<&GitRepo>) -> String {
+    let Some(repo) = repo else {
+        return path.to_string_lossy().into_owned();
+    };
+    let Ok(common) = repo.git_common_dir() else {
+        return path.to_string_lossy().into_owned();
+    };
+    crate::host_state::repository_key(path, Some(&common))
+}
+
 #[derive(Debug, Default)]
 struct EntryBuilder {
     on_disk: bool,
@@ -700,7 +1029,13 @@ fn candidates_for_root(
         .collect()
 }
 
-fn summarise(roots: &[StorageRoot], candidates: &[StorageCandidate], size: bool) -> StorageSummary {
+fn summarise(
+    roots: &[StorageRoot],
+    candidates: &[StorageCandidate],
+    primary_checkouts: &[StoragePrimaryCheckout],
+    primary_candidates: &[StoragePrimaryCandidate],
+    size: bool,
+) -> StorageSummary {
     let owner_present_count = roots
         .iter()
         .filter(|root| root.owner_exists == Some(true))
@@ -713,6 +1048,12 @@ fn summarise(roots: &[StorageRoot], candidates: &[StorageCandidate], size: bool)
     let estimated_bytes = sized_sum(roots.iter().map(|root| root.estimated_bytes), size);
     let reclaimable_bytes = sized_sum(
         candidates.iter().map(|candidate| candidate.estimated_bytes),
+        size,
+    );
+    let primary_reclaimable_bytes = sized_sum(
+        primary_candidates
+            .iter()
+            .map(|candidate| candidate.estimated_bytes),
         size,
     );
     StorageSummary {
@@ -729,8 +1070,15 @@ fn summarise(roots: &[StorageRoot], candidates: &[StorageCandidate], size: bool)
             .filter(|candidate| candidate.kind == StorageCandidateKind::StrayDirectory)
             .count(),
         candidate_count: candidates.len(),
+        primary_checkout_count: primary_checkouts.len(),
+        primary_artifact_count: primary_checkouts
+            .iter()
+            .map(|checkout| checkout.artifacts.len())
+            .sum(),
+        primary_candidate_count: primary_candidates.len(),
         estimated_bytes,
         reclaimable_bytes,
+        primary_reclaimable_bytes,
         sized: size && roots.iter().all(|root| root.sized),
     }
 }
@@ -811,6 +1159,9 @@ fn apply_candidate(candidate: &StorageCandidate, storage_root: &Path) -> Result<
     let current_marker_root = match candidate.kind {
         StorageCandidateKind::OrphanRoot => candidate.path.as_path(),
         StorageCandidateKind::StrayDirectory => candidate.root_path.as_path(),
+        StorageCandidateKind::PrimaryArtifact => {
+            return Err("primary artifacts use the primary-checkout apply lane".into());
+        }
     };
     if !is_direct_child(&normalise(&candidate.root_path), storage_root) {
         return Err("reviewed root is outside the host storage container".into());
@@ -864,7 +1215,58 @@ fn apply_candidate(candidate: &StorageCandidate, storage_root: &Path) -> Result<
             }
             remove_candidate_tree(&candidate.path, None)
         }
+        StorageCandidateKind::PrimaryArtifact => {
+            unreachable!("primary artifacts are rejected before host-root matching")
+        }
     }
+}
+
+fn apply_primary_candidate(candidate: &StoragePrimaryCandidate) -> Result<u64, String> {
+    if !is_enrolled_primary_checkout(&candidate.checkout_path) {
+        return Err("primary checkout is no longer enrolled".into());
+    }
+    let repo = GitRepo::discover(&candidate.checkout_path)
+        .map_err(|error| format!("cannot inspect primary checkout: {error}"))?;
+    let main_root = repo
+        .main_root()
+        .map_err(|error| format!("cannot resolve primary checkout root: {error}"))?;
+    if normalise(&main_root) != normalise(&candidate.checkout_path) {
+        return Err("primary checkout no longer resolves to its reviewed Git main root".into());
+    }
+    let dirty_paths = repo
+        .dirty_paths()
+        .map_err(|error| format!("cannot inspect primary checkout dirtiness: {error}"))?;
+    if !dirty_paths.is_empty() {
+        return Err(format!(
+            "primary checkout is dirty; refusing the whole checkout ({} path(s))",
+            dirty_paths.len()
+        ));
+    }
+    let name = candidate.name.strip_prefix("./").unwrap_or(&candidate.name);
+    if name.is_empty() {
+        return Err("primary artifact name is empty".into());
+    }
+    let current_policy = crate::load_retention_policy(&candidate.checkout_path)
+        .map_err(|error| format!("cannot load primary checkout retention policy: {error}"))?;
+    if !is_artefact_directory_with_extras(name, &current_policy.artefact_directories) {
+        return Err("primary artifact is no longer in the configured regenerable catalog".into());
+    }
+    if !repo.path_is_ignored(name) {
+        return Err("primary artifact is no longer ignored by Git".into());
+    }
+    if repo
+        .is_tracked(name)
+        .map_err(|error| format!("cannot determine whether primary artifact is tracked: {error}"))?
+    {
+        return Err("primary artifact contains tracked files".into());
+    }
+    if !is_direct_child(
+        &normalise(&candidate.path),
+        &normalise(&candidate.checkout_path),
+    ) {
+        return Err("primary artifact is not a direct child of its reviewed checkout".into());
+    }
+    remove_candidate_tree(&candidate.path, None)
 }
 
 fn remove_candidate_tree(path: &Path, witness: Option<&str>) -> Result<u64, String> {
@@ -1007,6 +1409,7 @@ fn decision_digest(
     storage_root: &Path,
     orphan_worktree_roots_days: u32,
     candidates: &[StorageCandidate],
+    primary_candidates: &[StoragePrimaryCandidate],
 ) -> String {
     #[derive(serde::Serialize)]
     struct DecisionCandidate<'a> {
@@ -1023,6 +1426,14 @@ fn decision_digest(
         storage_root: &'a Path,
         orphan_worktree_roots_days: u32,
         candidates: Vec<DecisionCandidate<'a>>,
+        primary_candidates: Vec<DecisionPrimaryCandidate<'a>>,
+    }
+    #[derive(serde::Serialize)]
+    struct DecisionPrimaryCandidate<'a> {
+        path: &'a Path,
+        checkout_path: &'a Path,
+        repository_key: &'a str,
+        name: &'a str,
     }
     let bytes = serde_json::to_vec(&Decision {
         storage_root,
@@ -1037,6 +1448,15 @@ fn decision_digest(
                 repository_root: &candidate.repository_root,
                 git_marker: candidate.git_marker,
                 marker_sha256: &candidate.marker_sha256,
+            })
+            .collect(),
+        primary_candidates: primary_candidates
+            .iter()
+            .map(|candidate| DecisionPrimaryCandidate {
+                path: &candidate.path,
+                checkout_path: &candidate.checkout_path,
+                repository_key: &candidate.repository_key,
+                name: &candidate.name,
             })
             .collect(),
     })
@@ -1145,6 +1565,41 @@ fn is_sha256(value: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// A primary checkout has no session and no close event, so the only
+    /// evidence that nothing is building is that the tree stopped moving.
+    /// `target/` is git-ignored, so a running build leaves the checkout clean
+    /// and every other condition satisfied.
+    #[test]
+    fn an_artifact_that_is_still_changing_is_not_a_candidate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("target");
+        std::fs::create_dir_all(target.join("debug")).unwrap();
+
+        assert!(
+            directory_modified_within(&target, PRIMARY_ARTIFACT_IDLE_MS),
+            "a directory just written to must read as busy"
+        );
+
+        // Nothing readable must ever read as idle: not knowing is not safety.
+        assert!(directory_modified_within(
+            &tmp.path().join("absent"),
+            PRIMARY_ARTIFACT_IDLE_MS
+        ));
+    }
+
+    /// A zero-length window is the boundary the guard turns on: with no window
+    /// at all, a tree that is not being written to answers "idle".
+    #[test]
+    fn a_settled_artifact_answers_idle_once_its_window_closes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        assert!(
+            !directory_modified_within(&target, 0),
+            "a tree nobody is writing to must become reclaimable"
+        );
+    }
+
     #[test]
     fn decision_digest_ignores_measured_bytes() {
         let candidate = StorageCandidate {
@@ -1161,8 +1616,8 @@ mod tests {
         let mut changed = candidate.clone();
         changed.estimated_bytes = Some(100);
         assert_eq!(
-            decision_digest(Path::new("/storage"), 1, &[candidate]),
-            decision_digest(Path::new("/storage"), 1, &[changed])
+            decision_digest(Path::new("/storage"), 1, &[candidate], &[]),
+            decision_digest(Path::new("/storage"), 1, &[changed], &[])
         );
     }
 
