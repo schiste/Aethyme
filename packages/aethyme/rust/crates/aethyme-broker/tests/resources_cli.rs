@@ -247,6 +247,17 @@ fn reap_reclaims_dead_capacity_and_explain_names_the_quarantined_holder() {
     assert_eq!(report["leases"][0]["lease_id"], lease_id);
     assert_eq!(report["leases"][0]["state"], "quarantined");
 
+    let repeated = run(temp.path(), &state, &["resources", "reap", "--json"]);
+    assert!(
+        repeated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&repeated.stderr)
+    );
+    let repeated_report: serde_json::Value = serde_json::from_slice(&repeated.stdout).unwrap();
+    assert_eq!(repeated_report["dead_holders_seen"], 0);
+    assert_eq!(repeated_report["reclaimed_capacity_units"], 0);
+    assert!(repeated_report["leases"].as_array().unwrap().is_empty());
+
     let explained = run(
         temp.path(),
         &state,

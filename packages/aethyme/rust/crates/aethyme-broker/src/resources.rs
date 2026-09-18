@@ -50,6 +50,11 @@ CREATE TABLE IF NOT EXISTS resource_allocations (
 CREATE INDEX IF NOT EXISTS resource_leases_by_state ON resource_leases(state, expires_at);
 CREATE INDEX IF NOT EXISTS resource_allocations_by_value
  ON resource_allocations(kind, value, lease_id);
+CREATE TABLE IF NOT EXISTS resource_reap_observations (
+ lease_id TEXT PRIMARY KEY REFERENCES resource_leases(lease_id),
+ generation INTEGER NOT NULL,
+ reaped_at INTEGER NOT NULL
+);
 "#;
 
 #[derive(Debug, thiserror::Error)]
@@ -1677,7 +1682,12 @@ fn reclaim_dead_capacity(
     let candidates = {
         let mut stmt = conn.prepare(
             "SELECT lease_id,generation,holder_pid FROM resource_leases \
-             WHERE state='quarantined' AND holder_pid IS NOT NULL ORDER BY generation",
+             WHERE state='quarantined' AND holder_pid IS NOT NULL \
+             AND NOT EXISTS (\
+                 SELECT 1 FROM resource_reap_observations r \
+                 WHERE r.lease_id=resource_leases.lease_id\
+             ) \
+             ORDER BY generation",
         )?;
         stmt.query_map([], |row| {
             Ok((
@@ -1700,6 +1710,14 @@ fn reclaim_dead_capacity(
         if !holder_process_is_gone(holder_pid) {
             continue;
         }
+        let observed = conn.execute(
+            "INSERT INTO resource_reap_observations(lease_id,generation,reaped_at) \
+             VALUES (?1,?2,?3) ON CONFLICT(lease_id) DO NOTHING",
+            params![lease_id, generation as i64, now],
+        )?;
+        if observed == 0 {
+            continue;
+        }
         report.dead_holders_seen += 1;
         let capacity_units = conn.query_row(
             "SELECT COALESCE(SUM(units), 0) FROM resource_allocations \
@@ -1707,13 +1725,12 @@ fn reclaim_dead_capacity(
             [&lease_id],
             |row| row.get::<_, i64>(0),
         )? as u32;
-        if capacity_units == 0 {
-            continue;
+        if capacity_units > 0 {
+            conn.execute(
+                "DELETE FROM resource_allocations WHERE lease_id=?1 AND kind='capacity'",
+                [&lease_id],
+            )?;
         }
-        conn.execute(
-            "DELETE FROM resource_allocations WHERE lease_id=?1 AND kind='capacity'",
-            [&lease_id],
-        )?;
         let remaining_allocations: i64 = conn.query_row(
             "SELECT COUNT(*) FROM resource_allocations WHERE lease_id=?1",
             [&lease_id],
@@ -2082,6 +2099,13 @@ mod tests {
         assert_eq!(report.leases[0].holder_pid, holder_pid);
         assert_eq!(report.leases[0].state, HostLeaseState::Quarantined);
 
+        let second = c.reap_dead_holders().unwrap();
+        assert_eq!(second.dead_holders_seen, 0);
+        assert_eq!(second.reclaimed_capacity_units, 0);
+        assert_eq!(second.released_leases, 0);
+        assert_eq!(second.retained_quarantined_leases, 0);
+        assert!(second.leases.is_empty());
+
         let retained = c
             .list(false)
             .unwrap()
@@ -2114,6 +2138,38 @@ mod tests {
         );
         assert!(!explanation.wait.waitable);
         assert!(explanation.wait.action.contains(&grant.lease.lease_id));
+    }
+
+    #[test]
+    fn independent_reaper_reports_named_only_dead_holder_once() {
+        let t = tempfile::tempdir().unwrap();
+        let mut c = HostResourceCoordinator::open(&t.path().join("h.db")).unwrap();
+        let holder_pid = reaped_pid();
+        let mut request = req("named-only", vec![exclusive("shared")]);
+        request.holder_pid = Some(holder_pid);
+        let grant = c.acquire(&request).unwrap();
+        c.quarantine(
+            &grant.lease.lease_id,
+            grant.lease.generation,
+            &grant.ownership_token,
+        )
+        .unwrap();
+
+        let report = c.reap_dead_holders().unwrap();
+        assert_eq!(report.dead_holders_seen, 1);
+        assert_eq!(report.reclaimed_capacity_units, 0);
+        assert_eq!(report.released_leases, 0);
+        assert_eq!(report.retained_quarantined_leases, 1);
+        assert_eq!(report.leases.len(), 1);
+        assert_eq!(report.leases[0].lease_id, grant.lease.lease_id);
+        assert_eq!(report.leases[0].generation, grant.lease.generation);
+        assert_eq!(report.leases[0].holder_pid, holder_pid);
+        assert_eq!(report.leases[0].capacity_units, 0);
+        assert_eq!(report.leases[0].state, HostLeaseState::Quarantined);
+
+        let second = c.reap_dead_holders().unwrap();
+        assert_eq!(second.dead_holders_seen, 0);
+        assert!(second.leases.is_empty());
     }
 
     /// The reclaim must not be so eager that it revokes a lease from a running
