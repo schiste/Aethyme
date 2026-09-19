@@ -557,6 +557,25 @@ later default-policy run for the same tree. Submit threads the same policy into
 its merged-tree gates, so use the flag there when the landing decision requires
 fresh evidence.
 
+### Gate database isolation
+
+Gate children receive a disposable broker database bound to the canonical
+primary repository under test. Commands from its linked worktrees use the same
+temporary database, so a binary with unreviewed migrations cannot accidentally
+upgrade the operator's live database. Independent fixture repositories retain
+their own databases instead of sharing sessions, leases, and counters.
+
+Nested gates retain the ancestor repository bindings. An explicit
+`AETHYME_BROKER_DB` pointing to a different file still takes precedence. The
+runner also exports internal scope metadata alongside the legacy override;
+older binaries and invalid or unresolvable scope metadata retain the temporary
+override rather than falling back to live state. Invalid inherited metadata
+refuses a nested gate launch.
+
+This prevents accidental database discovery for repositories under validation;
+it is not a filesystem sandbox. Commands deliberately targeting other real
+repositories or overriding the environment still require their usual authority.
+
 ## Review Gate Quality Separately From Readiness
 
 Syntax validity is necessary but does not prove that a gate is safe or useful

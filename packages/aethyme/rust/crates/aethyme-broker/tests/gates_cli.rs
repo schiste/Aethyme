@@ -463,6 +463,195 @@ command = "printf '%s' \"$AETHYME_BROKER_DB\" > gate-broker-db-path.txt"
         tmp.path().join(".aethyme/broker.db")
     );
     assert!(configured_path.contains(".aethyme/run/gates/broker-db-"));
+    assert!(!Path::new(configured_path.trim()).parent().unwrap().exists());
+}
+
+fn shell_path(path: &Path) -> String {
+    format!("'{}'", path.to_str().unwrap().replace('\'', "'\\''"))
+}
+
+fn write_gate(repo: &Path, command: &str) {
+    std::fs::write(
+        repo.join(".aethyme/gates.toml"),
+        format!(
+            "[[gate]]\nname = 'db-scope'\ncommand = {}\n",
+            serde_json::to_string(command).unwrap()
+        ),
+    )
+    .unwrap();
+}
+
+fn adopted_json(path: &Path) -> serde_json::Value {
+    serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+}
+
+#[test]
+fn gate_refuses_invalid_inherited_database_scope_before_running_the_command() {
+    let repo = fixture();
+    write_gate(repo.path(), "touch must-not-run");
+    let output = Command::new(CLI)
+        .args(["gates", "run", "--all", "--no-cache", "--json"])
+        .current_dir(repo.path())
+        .env("AETHYME_GATE_BROKER_DATABASES", "invalid json")
+        .env_remove(aethyme_broker::BROKER_DB_ENV)
+        .output()
+        .unwrap();
+    assert!(!repo.path().join("must-not-run").exists());
+    assert!(!output.status.success());
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result[0]["status"], "error");
+    assert_eq!(result[0]["failure_class"], "environment");
+    let diagnostics = std::fs::read_to_string(result[0]["log_path"].as_str().unwrap()).unwrap();
+    assert!(
+        diagnostics.contains("invalid inherited gate database scope"),
+        "{diagnostics}"
+    );
+}
+
+#[test]
+fn failed_gate_also_reclaims_its_temporary_database() {
+    let repo = fixture();
+    write_gate(
+        repo.path(),
+        "printf '%s' \"$AETHYME_BROKER_DB\" > failed-db-path.txt; exit 1",
+    );
+    let output = run(
+        repo.path(),
+        &["gates", "run", "--all", "--no-cache", "--json"],
+    );
+    assert!(!output.status.success());
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result[0]["status"], "fail", "{result}");
+    let db = std::fs::read_to_string(repo.path().join("failed-db-path.txt")).unwrap();
+    assert!(!db.is_empty());
+    assert!(!Path::new(&db).parent().unwrap().exists());
+}
+
+#[test]
+fn gate_scope_separates_fixtures_and_protects_the_linked_primary() {
+    let primary = fixture();
+    let first = fixture();
+    let second = fixture();
+    stdout(run(
+        primary.path(),
+        &["adopt", "--task", "live operator", "--json"],
+    ));
+    let linked = primary.path().join(".aethyme/worktrees/linked");
+    std::fs::create_dir_all(linked.parent().unwrap()).unwrap();
+    git(
+        primary.path(),
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "agent/linked",
+            linked.to_str().unwrap(),
+        ],
+    );
+
+    let mut commands = Vec::new();
+    for (repo, name) in [
+        (linked.as_path(), "protected"),
+        (first.path(), "first"),
+        (second.path(), "second"),
+    ] {
+        commands.push(format!(
+            "(cd {} && {} adopt --task {} --json) > {}",
+            shell_path(repo),
+            shell_path(Path::new(CLI)),
+            name,
+            shell_path(&primary.path().join(format!("{name}.json")))
+        ));
+    }
+    write_gate(primary.path(), &commands.join(" && "));
+    let result: serde_json::Value = serde_json::from_str(&stdout(run(
+        primary.path(),
+        &["gates", "run", "--all", "--no-cache", "--json"],
+    )))
+    .unwrap();
+    assert_eq!(result[0]["status"], "pass", "{result}");
+    for name in ["protected", "first", "second"] {
+        let adopted = adopted_json(&primary.path().join(format!("{name}.json")));
+        assert_eq!(adopted["id"], 1, "{name}: {adopted}");
+        assert_eq!(adopted["task"], name);
+    }
+    let live = aethyme_broker::Broker::open(primary.path())
+        .unwrap()
+        .store()
+        .live_sessions()
+        .unwrap();
+    assert_eq!(live.len(), 1);
+    assert_eq!(live[0].task.as_deref(), Some("live operator"));
+    for repo in [first.path(), second.path()] {
+        assert!(repo.join(aethyme_broker::BROKER_DB_RELPATH).is_file());
+        assert_eq!(
+            aethyme_broker::Broker::open(repo)
+                .unwrap()
+                .store()
+                .live_sessions()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+}
+
+#[test]
+fn nested_gate_retains_ancestor_database_isolation() {
+    let outer = fixture();
+    let inner = fixture();
+    stdout(run(
+        outer.path(),
+        &["adopt", "--task", "live operator", "--json"],
+    ));
+    let commands: Vec<_> = [(outer.path(), "outer-child"), (inner.path(), "inner-child")]
+        .into_iter()
+        .map(|(repo, name)| {
+            format!(
+                "(cd {} && {} adopt --task {} --json) > {}",
+                shell_path(repo),
+                shell_path(Path::new(CLI)),
+                name,
+                shell_path(&outer.path().join(format!("{name}.json")))
+            )
+        })
+        .collect();
+    write_gate(inner.path(), &commands.join(" && "));
+    write_gate(
+        outer.path(),
+        &format!(
+            "cd {} && {} gates run --all --no-cache",
+            shell_path(inner.path()),
+            shell_path(Path::new(CLI))
+        ),
+    );
+    let result: serde_json::Value = serde_json::from_str(&stdout(run(
+        outer.path(),
+        &["gates", "run", "--all", "--no-cache", "--json"],
+    )))
+    .unwrap();
+    assert_eq!(result[0]["status"], "pass", "{result}");
+    for name in ["outer-child", "inner-child"] {
+        let adopted = adopted_json(&outer.path().join(format!("{name}.json")));
+        assert_eq!(adopted["id"], 1, "{name}: {adopted}");
+        assert_eq!(adopted["task"], name);
+    }
+    let live = aethyme_broker::Broker::open(outer.path())
+        .unwrap()
+        .store()
+        .live_sessions()
+        .unwrap();
+    assert_eq!(live.len(), 1);
+    assert_eq!(live[0].task.as_deref(), Some("live operator"));
+    assert!(
+        aethyme_broker::Broker::open(inner.path())
+            .unwrap()
+            .store()
+            .live_sessions()
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
