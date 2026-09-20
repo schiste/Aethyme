@@ -19,7 +19,8 @@ use crate::error::BrokerError;
 use crate::git::{GitError, GitRepo};
 use crate::graph_impact::{
     GRAPH_IMPACT_MAX_DEPTH, GRAPH_IMPACT_MAX_NODES, GRAPH_IMPACT_RESULT_LIMIT, GraphImpactMode,
-    GraphImpactProvider, GraphImpactQuery, GraphImpactStatus, GraphStoreImpactProvider,
+    GraphImpactProvider, GraphImpactQuery, GraphImpactReport, GraphImpactStatus,
+    GraphStoreImpactProvider, revision_bound_impact_report,
 };
 use crate::session_abandonment::{
     AbandonmentVerdict, SessionActivity, decide as decide_abandonment,
@@ -124,6 +125,8 @@ pub enum BrokerOpError {
     PullRequestWatch(#[from] crate::PullRequestWatchError),
     #[error(transparent)]
     Delivery(#[from] crate::DeliveryError),
+    #[error("graph impact request invalid: {reason}")]
+    GraphImpactInvalid { reason: String },
     #[error(transparent)]
     Preparation(#[from] crate::PreparationError),
     #[error(transparent)]
@@ -4912,6 +4915,43 @@ impl Broker {
             semantic,
             next_action,
         })
+    }
+
+    /// Evaluate the read-only graph-impact contract for an exact revision and
+    /// diff. This is intentionally independent from gate selection: callers
+    /// receive provenance and conservative status, while repository-owned
+    /// gate policy remains the only authority for mandatory checks.
+    pub fn graph_impact_report(
+        &mut self,
+        revision: &str,
+        changed_files: Vec<String>,
+        mode: GraphImpactMode,
+        budget: usize,
+    ) -> Result<GraphImpactReport, BrokerOpError> {
+        let resolved_revision =
+            self.repo
+                .resolve_ref(revision)
+                .ok_or_else(|| BrokerOpError::GraphImpactInvalid {
+                    reason: format!("revision {revision:?} does not resolve in this repository"),
+                })?;
+        let report = revision_bound_impact_report(
+            &self.main_root,
+            revision,
+            &resolved_revision,
+            &changed_files,
+            mode,
+            budget,
+            self.graph_impact_provider.as_ref(),
+        )
+        .map_err(|error| BrokerOpError::GraphImpactInvalid {
+            reason: error.to_string(),
+        })?;
+        self.store().append_event(
+            crate::events::GRAPH_IMPACT_EVALUATED,
+            None,
+            Some(&crate::events::graph_impact_evaluated_payload(&report)),
+        )?;
+        Ok(report)
     }
 
     /// Run the affected gates for a session's worktree: cheap-first,

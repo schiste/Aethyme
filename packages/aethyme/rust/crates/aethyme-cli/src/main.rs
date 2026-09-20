@@ -288,6 +288,9 @@ fn main() -> ExitCode {
         // Native since python-retirement Phase 1 (the Python `query`
         // group is deleted). Errors keep Click's `Error: {msg}` shape
         // and exit 1 so scripted consumers see the same surface.
+        "graph" if args.get(1).map(String::as_str) == Some("impact") => {
+            run_graph_impact(&args[2..])
+        }
         "graph" if graph_refresh::handles(&args[1..]) => {
             ExitCode::from(graph_refresh::run(&args[1..]))
         }
@@ -436,6 +439,136 @@ fn print_version() {
     );
 }
 
+fn run_graph_impact(args: &[String]) -> ExitCode {
+    match run_graph_impact_inner(args) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(message) => {
+            eprintln!("Error: {message}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn run_graph_impact_inner(args: &[String]) -> Result<(), String> {
+    let option = |name: &str| -> Result<String, String> {
+        let Some(index) = args.iter().position(|argument| argument == name) else {
+            return Err(format!("graph impact requires {name} <value>"));
+        };
+        args.get(index + 1)
+            .filter(|value| !value.starts_with('-'))
+            .cloned()
+            .ok_or_else(|| format!("graph impact requires {name} <value>"))
+    };
+    let repo = PathBuf::from(option("--repo")?);
+    if !repo.is_dir() {
+        return Err(format!(
+            "graph impact repository is not a directory: {}",
+            repo.display()
+        ));
+    }
+    let revision = option("--revision")?;
+    let diff_input = option("--diff")?;
+    let diff_text = if Path::new(&diff_input).is_file() {
+        std::fs::read_to_string(&diff_input)
+            .map_err(|error| format!("cannot read graph impact diff {diff_input:?}: {error}"))?
+    } else {
+        diff_input
+    };
+    let changed_files = aethyme_broker::parse_diff_text(&diff_text)
+        .map_err(|error| format!("invalid graph impact diff: {error}"))?;
+    let mode = if let Some(index) = args.iter().position(|argument| argument == "--mode") {
+        let value = args
+            .get(index + 1)
+            .ok_or_else(|| "--mode requires calls or imports".to_string())?;
+        aethyme_broker::GraphImpactMode::parse(value)
+            .ok_or_else(|| "--mode must be calls or imports".to_string())?
+    } else {
+        aethyme_broker::GraphImpactMode::Calls
+    };
+    let budget = if let Some(index) = args.iter().position(|argument| argument == "--budget") {
+        args.get(index + 1)
+            .ok_or_else(|| "--budget requires a positive integer".to_string())?
+            .parse::<usize>()
+            .map_err(|_| "--budget must be a positive integer".to_string())?
+    } else {
+        aethyme_broker::GRAPH_IMPACT_DEFAULT_BUDGET
+    };
+    let json = args.iter().any(|argument| argument == "--json");
+    let mut broker = aethyme_broker::Broker::open(&repo)
+        .map_err(|error| format!("cannot open broker for {}: {error}", repo.display()))?;
+    let report = broker
+        .graph_impact_report(&revision, changed_files, mode, budget)
+        .map_err(|error| error.to_string())?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).map_err(|error| error.to_string())?
+        );
+    } else {
+        println!(
+            "Graph impact: {} ({}, confidence {}) at {}",
+            report.status.as_str(),
+            report.request.mode.as_str(),
+            report.confidence.as_str(),
+            &report.repository.revision[..12.min(report.repository.revision.len())]
+        );
+        println!(
+            "Coverage: {} file(s) parsed, {} excluded, {} unsupported; languages={}",
+            report.coverage.parsed_files,
+            report.coverage.excluded_files,
+            report.coverage.unsupported_files,
+            if report.coverage.languages.is_empty() {
+                "-".into()
+            } else {
+                report.coverage.languages.join(",")
+            }
+        );
+        println!(
+            "Impact: {} direct, {} transitive, {} {}",
+            report.impact.direct.len(),
+            report.impact.transitive.len(),
+            if mode == aethyme_broker::GraphImpactMode::Calls {
+                report.impact.callers.len()
+            } else {
+                report.impact.importers.len()
+            },
+            mode.label().to_ascii_lowercase()
+        );
+        if !report.impact.tests.is_empty() {
+            println!("Tests: {}", report.impact.tests.join(", "));
+        }
+        if !report.impact.configs.is_empty() {
+            println!("Configs: {}", report.impact.configs.join(", "));
+        }
+        if !report.impact.manifests.is_empty() {
+            println!("Manifests: {}", report.impact.manifests.join(", "));
+        }
+        println!(
+            "Risk hints: security={}, runtime={}, workspace={}, global_config={}",
+            report.risk_hints.security_surface,
+            report.risk_hints.runtime_surface,
+            report.risk_hints.workspace_surface,
+            report.risk_hints.global_config_surface
+        );
+        println!(
+            "Limits: budget={}, nodes={}, depth={}, results={}, truncated={}",
+            report.limits.budget,
+            report.limits.max_nodes,
+            report.limits.max_depth,
+            report.limits.max_results,
+            report.limits.truncated
+        );
+        for explanation in &report.explanations {
+            println!("Reason: {explanation}");
+        }
+        println!(
+            "Provenance: request={}, result={}",
+            report.provenance.request_digest, report.provenance.result_digest
+        );
+    }
+    Ok(())
+}
+
 fn print_top_level_help() {
     eprintln!("aethyme — repository navigation, task localization, agent brokering");
     eprintln!();
@@ -472,6 +605,9 @@ fn print_top_level_help() {
     eprintln!("  upgrade plan|apply|recover review, apply, or recover repository migrations");
     eprintln!(
         "  graph status|units|materialize|refresh  inspect, page, materialize, or refresh graph artifacts"
+    );
+    eprintln!(
+        "  graph impact --repo <path> --revision <ref> --diff <path-or-json> [--mode calls|imports] [--budget <n>] [--json]"
     );
     eprintln!();
     eprintln!("Setup:");
