@@ -1,0 +1,4 @@
+{"module":"packages.aethyme.rust.crates.aethyme-engine.src.model.risk","symbol":"RiskArea","kind":"enum","node_id":"enum:schiste/Aethyme:snpzi43x7hb5yz3ny55yp73uhe","file":"packages/aethyme/rust/crates/aethyme-engine/src/model/risk.rs"}
+{"module":"packages.aethyme.rust.crates.aethyme-engine.src.model.risk","symbol":"RiskFlag","kind":"struct","node_id":"struct:schiste/Aethyme:mkd447xizollnptzr3z3z7qsbe","file":"packages/aethyme/rust/crates/aethyme-engine/src/model/risk.rs"}
+{"module":"packages.aethyme.rust.crates.aethyme-engine.src.model.risk","symbol":"RiskLevel","kind":"enum","node_id":"enum:schiste/Aethyme:houacowwx5qfyxh6p3a4vkuqle","file":"packages/aethyme/rust/crates/aethyme-engine/src/model/risk.rs"}
+{"module":"packages.aethyme.rust.crates.aethyme-engine.src.model.risk","symbol":"new","kind":"function","node_id":"function:schiste/Aethyme:75gcmvvkyix7gxaa4duh7n7kpy","file":"packages/aethyme/rust/crates/aethyme-engine/src/model/risk.rs"}

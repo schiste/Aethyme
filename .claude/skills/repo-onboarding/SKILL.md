@@ -63,6 +63,7 @@ description: Use when starting work in an unfamiliar repository, when the task a
 - `.github` (automation; automation and CI configuration; high confidence)
 - `docs` (docs; documentation area; high confidence)
 - `packages` (workspace; workspace-style package container; high confidence)
+- `scripts` (tooling; developer tooling or scripts; high confidence)
 
 ## Aethyme Recipes
 
@@ -81,7 +82,7 @@ description: Use when starting work in an unfamiliar repository, when the task a
 
 ## Freshness
 
-- Source digest: `a5a24a64b47ffa1e3b995c96f0ede12b4667a6f7e82662f3c56aa6f4a6fa09de`
-- Tracked source files: `629`
+- Source digest: `b0a62abdd47131e5ddbcb30ff3a13610c3c006c74d36b2d74eaa7f03df3182ef`
+- Tracked source files: `639`
 - Overrides applied: `False`
 - Sections generated: `repo, workspaces, primary_workspace, commands, areas, entrypoints, caution_zones, generated_paths, dangerous_paths, navigation_recipes, summon, freshness`

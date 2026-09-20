@@ -262,3 +262,7 @@ means = "optional: naming, style, preference. Say so rather than padding a revie
 enabled = true
 label_prefix = "aethyme/"
 reserved = ["skip-review"]
+
+[graph]
+authority = "committed_fragments"
+repository = "schiste/Aethyme"

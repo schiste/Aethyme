@@ -1,0 +1,2 @@
+{"module":"packages.aethyme.docs.architecture.api-contract","symbol":"env:- bearerAuth","kind":"credential_operation","node_id":"credential_operation:schiste/Aethyme:gavemalncsnqnbmt6xhjo5jlhe","file":"packages/aethyme/docs/architecture/api-contract.yaml"}
+{"module":"packages.aethyme.docs.architecture.api-contract","symbol":"env:bearerAuth","kind":"credential_operation","node_id":"credential_operation:schiste/Aethyme:kvb6ftzqi6fx4lnuoxvzg7vfqy","file":"packages/aethyme/docs/architecture/api-contract.yaml"}

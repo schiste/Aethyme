@@ -1,0 +1,2 @@
+{"module":"packages.aethyme.rust.crates.aethyme-broker.src.bin.broker-cli-shim","symbol":"ExitCode","kind":"unresolved_symbol","node_id":"unresolved_symbol:schiste/Aethyme:ocyov6j2i7lbfwxsnilc3oaesi","file":"packages/aethyme/rust/crates/aethyme-broker/src/bin/broker-cli-shim.rs"}
+{"module":"packages.aethyme.rust.crates.aethyme-broker.src.bin.broker-cli-shim","symbol":"main","kind":"function","node_id":"function:schiste/Aethyme:5krmgjgvakoqclgoc5h5upkkqu","file":"packages/aethyme/rust/crates/aethyme-broker/src/bin/broker-cli-shim.rs"}

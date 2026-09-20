@@ -1,0 +1,202 @@
+{
+  "schema_version": 1,
+  "available": true,
+  "source_revision": "15cfa8820110270a3ede27444738569425ef1679",
+  "indexed_revision": "15cfa8820110270a3ede27444738569425ef1679",
+  "source_tree_sha256": "ea7897328afcdef1d43c3c7f3ccaebfe30cb7a361f58b4cc7eda00426738da0a",
+  "indexed_tree_sha256": "ea7897328afcdef1d43c3c7f3ccaebfe30cb7a361f58b4cc7eda00426738da0a",
+  "engine_version": "0.7.23",
+  "coverage_mode": "partial",
+  "safe_to_use": false,
+  "gaps": [
+    "excluded_files",
+    "unsupported_languages"
+  ],
+  "files": {
+    "discovered": 655,
+    "eligible": 631,
+    "parsed": 414,
+    "partial": 0,
+    "unsupported": 10,
+    "non_code": 207,
+    "excluded": 24
+  },
+  "bytes": {
+    "discovered": 16029022,
+    "eligible": 11071442,
+    "parsed": 9365447,
+    "partial": 0,
+    "unsupported": 61634,
+    "non_code": 1644361,
+    "excluded": 4957580,
+    "source_read": 9476508
+  },
+  "by_language": {
+    "json": {
+      "files": 16,
+      "bytes": 56725,
+      "parsed": 0,
+      "partial": 0,
+      "unsupported": 0,
+      "non_code": 16,
+      "excluded": 0
+    },
+    "makefile": {
+      "files": 1,
+      "bytes": 1915,
+      "parsed": 0,
+      "partial": 0,
+      "unsupported": 1,
+      "non_code": 0,
+      "excluded": 0
+    },
+    "markdown": {
+      "files": 169,
+      "bytes": 1541512,
+      "parsed": 0,
+      "partial": 0,
+      "unsupported": 0,
+      "non_code": 169,
+      "excluded": 0
+    },
+    "python": {
+      "files": 18,
+      "bytes": 238449,
+      "parsed": 18,
+      "partial": 0,
+      "unsupported": 0,
+      "non_code": 0,
+      "excluded": 0
+    },
+    "ruby": {
+      "files": 1,
+      "bytes": 1266,
+      "parsed": 0,
+      "partial": 0,
+      "unsupported": 1,
+      "non_code": 0,
+      "excluded": 0
+    },
+    "rust": {
+      "files": 396,
+      "bytes": 9126998,
+      "parsed": 396,
+      "partial": 0,
+      "unsupported": 0,
+      "non_code": 0,
+      "excluded": 0
+    },
+    "shell": {
+      "files": 8,
+      "bytes": 58453,
+      "parsed": 0,
+      "partial": 0,
+      "unsupported": 8,
+      "non_code": 0,
+      "excluded": 0
+    },
+    "toml": {
+      "files": 13,
+      "bytes": 21689,
+      "parsed": 0,
+      "partial": 0,
+      "unsupported": 0,
+      "non_code": 13,
+      "excluded": 0
+    },
+    "yaml": {
+      "files": 9,
+      "bytes": 24435,
+      "parsed": 0,
+      "partial": 0,
+      "unsupported": 0,
+      "non_code": 9,
+      "excluded": 0
+    }
+  },
+  "by_parser": {
+    "none": {
+      "files": 207,
+      "bytes": 1644361,
+      "parsed": 0,
+      "partial": 0,
+      "unsupported": 0,
+      "non_code": 207,
+      "excluded": 0
+    },
+    "ra_ap_syntax": {
+      "files": 396,
+      "bytes": 9126998,
+      "parsed": 396,
+      "partial": 0,
+      "unsupported": 0,
+      "non_code": 0,
+      "excluded": 0
+    },
+    "ruff_python_parser": {
+      "files": 18,
+      "bytes": 238449,
+      "parsed": 18,
+      "partial": 0,
+      "unsupported": 0,
+      "non_code": 0,
+      "excluded": 0
+    },
+    "unavailable": {
+      "files": 10,
+      "bytes": 61634,
+      "parsed": 0,
+      "partial": 0,
+      "unsupported": 10,
+      "non_code": 0,
+      "excluded": 0
+    }
+  },
+  "exclusion_reasons": {
+    "unrecognized_extension": 24,
+    "parser_unavailable": 10
+  },
+  "node_counts_by_kind": {
+    "behavior_test_surface": 153,
+    "class": 12,
+    "credential_operation": 19,
+    "enum": 346,
+    "file": 424,
+    "function": 6467,
+    "global_variable": 723,
+    "method": 58,
+    "middleware_installation": 1,
+    "non_code_file": 207,
+    "proxy_surface": 40,
+    "struct": 918,
+    "trait": 11,
+    "type_alias": 5,
+    "unresolved_symbol": 5894
+  },
+  "node_counts_by_category": {
+    "callable": 6525,
+    "container": 631,
+    "partial_knowledge": 5894,
+    "sub_symbol": 723,
+    "surface_flow_node": 213,
+    "type_defining": 1292
+  },
+  "edge_counts_by_kind": {
+    "calls": 1172,
+    "contains": 8482,
+    "defines": 58,
+    "forwards_to": 40,
+    "imports": 4722,
+    "installs_middleware": 1,
+    "issues_credential": 2,
+    "tested_by": 153,
+    "uses_credential": 17,
+    "validates_credential": 153
+  },
+  "edge_counts_by_category": {
+    "behavioral": 1172,
+    "structural": 13262,
+    "surface_flow_edge": 366
+  },
+  "unit_count": 9104
+}
