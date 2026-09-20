@@ -6,6 +6,34 @@ artifacts and their exact source revision are recorded in each signed
 
 ## [Unreleased]
 
+## [0.7.23] - 2026-09-19
+
+### Fixed
+
+- Bind preparation-cache deletion to reviewed plans and preserve caches when
+  liveness is uncertain.
+- Isolate gate databases from shared operator state, and isolate deployment
+  test fixtures from the enclosing gate's database override.
+- Verify installer archive digests against the release manifest and reject
+  ambiguous artifacts. Manifest parsing now requires jq.
+- Validate readiness review configuration through the runtime policy loaders.
+- Keep operation liveness honest about unknown state and retain heartbeats
+  through reconciliation.
+
+### Added
+
+- Bounded source-navigation hints when the optional graph is unavailable.
+- Persistent coordinated-operation heartbeats and progress diagnostics.
+- Shared preparation-cache inventory and reclaim.
+- Privacy-safe pilot cost snapshots, comparisons, and operational recovery
+  and external-pilot guides.
+
+### Changed
+
+- Run workspace tests on PRs, combined gates on main, and the duplicate
+  binary-only workflow manually. Add narrow script and workflow contracts.
+- Retain broker schema 41; no database migration from v0.7.22.
+
 ## [0.7.22] - 2026-09-18
 
 ### Changed

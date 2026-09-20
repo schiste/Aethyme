@@ -6509,7 +6509,9 @@ mod snapshot_tests {
             .unwrap();
         drop(source);
 
-        let snapshot = BrokerStore::open_snapshot_in_repo(repo.path()).unwrap();
+        // The legacy fixture owns this database; an outer gate's
+        // AETHYME_BROKER_DB override must not redirect the snapshot.
+        let snapshot = BrokerStore::open_snapshot_at(&database).unwrap();
         assert!(snapshot.live_sessions().unwrap().is_empty());
         assert_eq!(
             schema::current_version(&snapshot.conn).unwrap(),

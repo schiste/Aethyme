@@ -34,8 +34,24 @@ fn command(repo: &std::path::Path) -> Command {
     let mut command = Command::new(aethyme_bin());
     command
         .env_remove("AETHYME_ROOT")
+        // The outer gate isolates its own database. These commands operate on
+        // disposable fixture repos and must exercise their normal DB layout,
+        // not share the gate's database across otherwise independent tests.
+        .env_remove("AETHYME_BROKER_DB")
         .env("XDG_CONFIG_HOME", repo.join("empty-config"));
     command
+}
+
+#[test]
+fn fixture_commands_remove_the_outer_gate_database_override() {
+    let temp = tmp_dir();
+    let command = command(temp.path());
+    assert!(
+        command.get_envs().any(|(key, value)| {
+            key == std::ffi::OsStr::new("AETHYME_BROKER_DB") && value.is_none()
+        }),
+        "fixture subprocesses must explicitly remove an inherited broker DB override"
+    );
 }
 
 fn commit_all(repo: &std::path::Path, message: &str) {
