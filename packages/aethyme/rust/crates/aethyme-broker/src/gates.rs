@@ -2041,7 +2041,12 @@ fn run_gate_command(
     let isolated_broker_db = tempfile::Builder::new()
         .prefix("broker-db-")
         .tempdir_in(context.run_dir)?;
-    let isolated_broker_db_path = isolated_broker_db.path().join("broker.db");
+    let isolated_broker_db_path = isolated_broker_db.path().canonicalize()?.join("broker.db");
+    let isolated_broker_scope = crate::gate_database::for_child(
+        context.cwd,
+        &isolated_broker_db_path,
+        std::env::var_os(crate::gate_database::SCOPE_ENV).as_deref(),
+    )?;
     let mut process = std::process::Command::new("sh");
     process
         .arg("-c")
@@ -2050,6 +2055,7 @@ fn run_gate_command(
         .env("AETHYME_GATE_WORKER_ID", context.worker_id)
         .env("AETHYME_TEST_DB_SUFFIX", context.worker_id)
         .env(crate::BROKER_DB_ENV, &isolated_broker_db_path)
+        .env(crate::gate_database::SCOPE_ENV, isolated_broker_scope)
         .env("AETHYME_GATE_OWNER_PATHS", context.owner_paths.join(":"))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::from(log))

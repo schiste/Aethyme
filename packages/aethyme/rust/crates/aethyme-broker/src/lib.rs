@@ -39,6 +39,7 @@ mod error;
 pub mod events;
 mod exposures;
 mod external_events;
+mod gate_database;
 mod gate_doctor;
 mod gates;
 mod gc;
@@ -472,8 +473,15 @@ pub const BROKER_DB_ENV: &str = "AETHYME_BROKER_DB";
 /// process working directory. Deliberate: an env var that silently rewrote the
 /// path it was given would be one more place a caller cannot predict what it
 /// opened, which is the whole complaint behind #163.
+/// Gate runners additionally bind their override to canonical repository roots;
+/// independent fixture repositories then retain their own storage. An explicit
+/// different override still wins, and older children retain the legacy pin.
 pub fn broker_db_path(repo_root: &std::path::Path) -> std::path::PathBuf {
-    broker_db_path_with(repo_root, std::env::var_os(BROKER_DB_ENV))
+    gate_database::resolve(
+        repo_root,
+        std::env::var_os(BROKER_DB_ENV).as_deref(),
+        std::env::var_os(gate_database::SCOPE_ENV).as_deref(),
+    )
 }
 
 /// The resolution itself, with the environment passed in.
@@ -481,16 +489,12 @@ pub fn broker_db_path(repo_root: &std::path::Path) -> std::path::PathBuf {
 /// Split out so it is testable: mutating a process-wide environment variable
 /// from a test races every other test in the binary, and a resolution rule
 /// this load-bearing should not go untested for that reason.
+#[cfg(test)]
 fn broker_db_path_with(
     repo_root: &std::path::Path,
     override_value: Option<std::ffi::OsString>,
 ) -> std::path::PathBuf {
-    match override_value {
-        Some(path) if !path.is_empty() => std::path::PathBuf::from(path),
-        // An empty value is the shell's way of saying "unset" (`VAR= cmd`), and
-        // the empty path is not a database anyone meant to name.
-        _ => repo_root.join(BROKER_DB_RELPATH),
-    }
+    gate_database::resolve(repo_root, override_value.as_deref(), None)
 }
 
 #[cfg(test)]
