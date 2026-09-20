@@ -2011,7 +2011,13 @@ mod tests {
             estimated_bytes: None,
             reason: "previously unused".into(),
         };
-        let (entries, candidates) = inspect_preparation_cache(&cache, &[repo.clone()], false);
+        let mut records = crate::measurement::SizeRecords::default();
+        let (entries, candidates) = inspect_preparation_cache(
+            &cache,
+            &[repo.clone()],
+            crate::SizeScan::Recorded,
+            &mut records,
+        );
         assert_eq!(entries.len(), 1);
         assert!(!entries[0].reclaimable);
         assert!(entries[0].reason.contains("could not be verified"));
