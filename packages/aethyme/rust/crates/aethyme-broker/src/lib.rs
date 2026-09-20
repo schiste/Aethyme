@@ -73,6 +73,7 @@ mod pr_projection;
 mod pr_watch;
 mod preparation;
 mod promotion_record;
+mod quality_report;
 mod quick_test;
 mod readiness;
 mod recommendations;
@@ -89,6 +90,17 @@ pub use chau7_tabs::{
     dispatch_action, resolve_session_tab, workspace_tab_ids,
 };
 pub use pr_link::{creates_pull_request, pull_request_number_from_output};
+pub use quality_report::{
+    QUALITY_REPORT_COMMENT_MARKER, QUALITY_REPORT_MAX_BODY_BYTES, QUALITY_REPORT_MAX_GATES,
+    QUALITY_REPORT_MAX_INPUT_BYTES, QUALITY_REPORT_SCHEMA_VERSION,
+    QUALITY_REPORT_SECTION_END_MARKER, QUALITY_REPORT_SECTION_MARKER, QualityGateCache,
+    QualityGateEvidence, QualityGateStatus, QualityReport, QualityReportComment,
+    QualityReportError, QualityReportProvenance, QualityReportPublicationAction,
+    QualityReportPublicationFacts, QualityReportPublicationPlan, QualityReportPublicationReceipt,
+    QualityReportPublisher, QualityReportRoute, QualityReportScope, QualityReportSource,
+    QualityReportStatus, QualityReportTotals, merge_quality_report_section, plan_quality_report,
+    preserve_quality_report_section, publish_quality_report, render_quality_report,
+};
 mod reclaim;
 mod reclaim_order;
 pub use reclaim::{

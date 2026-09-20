@@ -120,6 +120,12 @@ Usage:
       required fields. Successful issue URL/number metadata is journaled and
       recorded locally; ambiguous outcomes require explicit reconciliation and
       are never retried automatically.
+  aethyme broker quality-report plan <path> --repo <owner/name> --pr <number> [--json]
+  aethyme broker quality-report publish <path> --repo <owner/name> --pr <number> --session <id> [--json]
+      Validate and idempotently publish a revision-bound, redacted quality
+      report as the broker-owned neutral/advisory PR summary. Publication is
+      opt-in and uses the coordinated GitHub operation lane; it never changes
+      gate selection or CI certification.
   aethyme broker external-events ingest <normalized.json> [--json]
       Ingest one adapter-verified, digest-bound normalized event. The strict
       schema rejects provider payload fields and stores only allowlisted
@@ -996,6 +1002,7 @@ fn command_records_metric(args: &[String]) -> bool {
         Some("advisories") => matches!(args.get(1).map(String::as_str), Some("ack" | "suppress")),
         Some("exposures") => args.get(1).map(String::as_str) == Some("apply"),
         Some("report") => args.get(1).map(String::as_str) == Some("file"),
+        Some("quality-report") => args.get(1).map(String::as_str) != Some("plan"),
         Some("external-events") => matches!(
             args.get(1).map(String::as_str),
             Some("ingest" | "reconcile")
@@ -6514,6 +6521,7 @@ fn run_review_plan(parsed: Parsed) -> Result<(), UsageError> {
         reviews,
         classification: classification.clone(),
         conflicts: Vec::new(),
+        quality_report: None,
     };
     let projection_actions = crate::project(
         &projection_policy,
@@ -7138,6 +7146,7 @@ fn run_review_run(parsed: Parsed) -> Result<serde_json::Value, UsageError> {
             reviews,
             classification: classification.clone(),
             conflicts: Vec::new(),
+            quality_report: None,
         },
         &pr_facts,
     );
@@ -8420,6 +8429,239 @@ fn external_event_positional_id(parsed: &Parsed, action: &str) -> Result<i64, Us
     parsed.positional[1]
         .parse()
         .map_err(|_| UsageError::Message("external event id must be an integer".into()))
+}
+
+fn run_quality_report(parsed: Parsed) -> Result<(), UsageError> {
+    let action = parsed
+        .positional
+        .first()
+        .map(String::as_str)
+        .ok_or_else(|| {
+            UsageError::Message(
+                "quality-report requires plan or publish followed by a report path".into(),
+            )
+        })?;
+    let path = parsed.positional.get(1).ok_or_else(|| {
+        UsageError::Message("quality-report requires exactly one report path".into())
+    })?;
+    if parsed.positional.len() != 2 {
+        return Err(UsageError::Message(
+            "quality-report accepts exactly one report path".into(),
+        ));
+    }
+    let repository = parsed
+        .repository
+        .clone()
+        .ok_or_else(|| UsageError::Message("quality-report requires --repo <owner/name>".into()))?;
+    let pull_request = parsed
+        .pr_number
+        .ok_or_else(|| UsageError::Message("quality-report requires --pr <number>".into()))?;
+    let mut broker = open_broker(parsed.read_only_snapshot)?;
+    let projection_policy =
+        crate::PrProjectionPolicy::load(broker.main_root()).map_err(to_usage)?;
+    if !projection_policy.enabled || !projection_policy.comment {
+        return Err(UsageError::Message(
+            "quality-report publication is opt-in: enable [review.projection] with comment = true"
+                .into(),
+        ));
+    }
+    let report = crate::QualityReport::from_path(Path::new(path))
+        .map_err(|error| UsageError::Message(error.to_string()))?;
+    let facts = read_quality_report_facts(&repository, pull_request)?;
+    let plan = crate::plan_quality_report(&report, &facts)
+        .map_err(|error| UsageError::Message(error.to_string()))?;
+
+    if action == "plan" {
+        if parsed.json {
+            out!("{}", serde_json::to_string_pretty(&plan)?);
+        } else {
+            render_quality_report_plan(&plan, pull_request);
+        }
+        return Ok(());
+    }
+    if action != "publish" {
+        return Err(UsageError::Message(format!(
+            "unknown quality-report action {action:?}; expected plan or publish"
+        )));
+    }
+
+    let Some(publication) = plan.action.as_ref() else {
+        broker.store().append_event(
+            crate::events::QUALITY_REPORT_PUBLISHED,
+            parsed.session,
+            Some(&crate::events::quality_report_publication_payload(
+                &report, "noop", None, None,
+            )),
+        )?;
+        if parsed.json {
+            out!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "plan": plan,
+                    "outcome": "noop",
+                }))?
+            );
+        } else {
+            out!("Quality report already matches the owned pull-request summary.");
+            out!("{}", plan.explanation);
+        }
+        return Ok(());
+    };
+    let session_id = parsed.session.ok_or_else(|| {
+        UsageError::Message("quality-report publish requires --session <id>".into())
+    })?;
+    let operation = match broker.run_coordinated_operation(crate::CoordinatedCommand {
+        session_id,
+        provider: crate::OperationProvider::Github,
+        repository: Some(repository.clone()),
+        resolved_target: None,
+        scope: Some(format!("pr/{pull_request}/quality-report")),
+        declared_effect: Some(crate::OperationEffect::Write),
+        destructive_confirmed: false,
+        authorization_reason: Some(publication.reason(pull_request, &plan.report_digest)),
+        args: publication.gh_args(pull_request),
+    }) {
+        Ok(operation) => operation,
+        Err(error) => {
+            broker.store().append_event(
+                crate::events::QUALITY_REPORT_PUBLICATION_FAILED,
+                Some(session_id),
+                Some(&crate::events::quality_report_publication_payload(
+                    &report, "failed", None, None,
+                )),
+            )?;
+            return Err(UsageError::Message(error.to_string()));
+        }
+    };
+    let external_id = extract_quality_report_external_id(&operation.stdout);
+    let succeeded = operation.command_success;
+    let event_kind = if succeeded {
+        crate::events::QUALITY_REPORT_PUBLISHED
+    } else {
+        crate::events::QUALITY_REPORT_PUBLICATION_FAILED
+    };
+    broker.store().append_event(
+        event_kind,
+        Some(session_id),
+        Some(&crate::events::quality_report_publication_payload(
+            &report,
+            if succeeded { "published" } else { "failed" },
+            Some(operation.operation.id),
+            external_id.as_deref(),
+        )),
+    )?;
+    if parsed.json {
+        out!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "plan": plan,
+                "operation_id": operation.operation.id,
+                "success": succeeded,
+                "external_id": external_id,
+            }))?
+        );
+    } else {
+        out!(
+            "Quality report {} (operation {}).",
+            if succeeded { "published" } else { "failed" },
+            operation.operation.id
+        );
+        out!("{}", plan.explanation);
+        if let Some(external_id) = external_id {
+            out!("External reference: {external_id}");
+        }
+    }
+    if !succeeded {
+        return Err(UsageError::Message(
+            "quality-report publication failed; inspect the coordinated operation and retry only after reviewing it".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn read_quality_report_facts(
+    repository: &str,
+    pull_request: i64,
+) -> Result<crate::QualityReportPublicationFacts, UsageError> {
+    if pull_request <= 0 {
+        return Err(UsageError::Message("--pr must be positive".into()));
+    }
+    let output = std::process::Command::new("gh")
+        .args([
+            "pr",
+            "view",
+            &pull_request.to_string(),
+            "--repo",
+            repository,
+            "--json",
+            "number,headRefOid,baseRefOid,comments",
+        ])
+        .output()
+        .map_err(|error| UsageError::Message(format!("cannot run gh pr view: {error}")))?;
+    if !output.status.success() {
+        return Err(UsageError::Message(format!(
+            "gh could not read {repository}#{pull_request}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|error| UsageError::Message(format!("gh returned invalid PR JSON: {error}")))?;
+    let number = value["number"]
+        .as_i64()
+        .ok_or_else(|| UsageError::Message("gh PR JSON omitted number".into()))?;
+    if number != pull_request {
+        return Err(UsageError::Message(format!(
+            "gh returned PR #{number} while #{pull_request} was requested"
+        )));
+    }
+    let head_revision = value["headRefOid"]
+        .as_str()
+        .ok_or_else(|| UsageError::Message("gh PR JSON omitted headRefOid".into()))?;
+    let base_revision = value["baseRefOid"]
+        .as_str()
+        .ok_or_else(|| UsageError::Message("gh PR JSON omitted baseRefOid".into()))?;
+    let comments = value["comments"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let owned_comment =
+        owned_comment_from_view(repository, pull_request, comments)?.map(|comment| {
+            crate::QualityReportComment {
+                id: comment.id,
+                body: comment.body,
+            }
+        });
+    Ok(crate::QualityReportPublicationFacts {
+        repository: repository.into(),
+        pull_request: number,
+        head_revision: head_revision.into(),
+        base_revision: base_revision.into(),
+        owned_comment,
+    })
+}
+
+fn render_quality_report_plan(plan: &crate::QualityReportPublicationPlan, pull_request: i64) {
+    out!(
+        "Quality report for PR #{pull_request}: {}",
+        plan.status.as_str()
+    );
+    out!("Digest: {}", plan.report_digest);
+    out!("{}", plan.explanation);
+    match &plan.action {
+        Some(action) => out!("Planned GitHub action: {:?}", action),
+        None => out!("Planned GitHub action: none (idempotent no-op)"),
+    }
+}
+
+fn extract_quality_report_external_id(stdout: &str) -> Option<String> {
+    stdout
+        .split_whitespace()
+        .find(|token| token.contains("#issuecomment-") || token.contains("/pull/"))
+        .map(|token| {
+            token
+                .trim_matches(|character: char| ",.!)]}".contains(character))
+                .to_string()
+        })
 }
 
 fn run_report(parsed: Parsed) -> Result<(), UsageError> {
@@ -10065,6 +10307,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
             }
         }
         "report" => run_report(parsed)?,
+        "quality-report" => run_quality_report(parsed)?,
         "external-events" => run_external_events(parsed)?,
         "reclaim" => run_reclaim(parsed)?,
         "deliveries" => run_deliveries(parsed)?,
