@@ -379,6 +379,47 @@ fn read_diff(repo_root: &Path, base: &str) -> Result<Vec<String>, String> {
 /// did none of those things. A guard that can only be satisfied by
 /// mislabelling corrupts the signal it exists to give, so it counts both
 /// sides now.
+/// Whether `body` mentions `symbol` as a symbol rather than as a fragment of a
+/// longer name.
+///
+/// A plain substring test reports a removal whenever a tracked name appears
+/// anywhere inside another identifier: deleting `changed_paths: Vec::new()`
+/// was reported as removing the tracked `paths`, which left the author with no
+/// truthful contract label to declare (#263). Identifier characters on either
+/// side mean this is a different name, so the occurrence says nothing about
+/// the tracked one.
+///
+/// Deliberately still matches inside comments and string literals. Command
+/// names reach their dispatch as string literals, so skipping those would turn
+/// a genuine removal into silence -- the failure this check exists to prevent.
+fn mentions_symbol(body: &str, symbol: &str) -> bool {
+    if symbol.is_empty() {
+        return false;
+    }
+    let bytes = body.as_bytes();
+    let mut from = 0;
+    while let Some(offset) = body[from..].find(symbol) {
+        let start = from + offset;
+        let end = start + symbol.len();
+        let before_joins = start
+            .checked_sub(1)
+            .is_some_and(|index| is_symbol_byte(bytes[index]));
+        let after_joins = bytes.get(end).copied().is_some_and(is_symbol_byte);
+        if !before_joins && !after_joins {
+            return true;
+        }
+        from = start + 1;
+    }
+    false
+}
+
+/// Bytes that can continue an identifier, and so join a match to its
+/// neighbour. `-` counts because tracked names are CLI spellings such as
+/// `check-contract`, where a hyphen is part of the name rather than a break.
+fn is_symbol_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-'
+}
+
 pub fn find_touched_symbols(
     diff_lines: &[String],
     tracked: &BTreeSet<String>,
@@ -393,7 +434,7 @@ pub fn find_touched_symbols(
         }
         if let Some(body) = line.strip_prefix('-') {
             for symbol in tracked {
-                if body.contains(symbol.as_str()) {
+                if mentions_symbol(body, symbol) {
                     removed
                         .entry(symbol.clone())
                         .or_default()
@@ -402,7 +443,7 @@ pub fn find_touched_symbols(
             }
         } else if let Some(body) = line.strip_prefix('+') {
             for symbol in tracked {
-                if body.contains(symbol.as_str()) {
+                if mentions_symbol(body, symbol) {
                     *added.entry(symbol.clone()).or_default() += 1;
                 }
             }
@@ -678,6 +719,53 @@ mod tests {
 
     fn diff_of(lines: &[&str]) -> Vec<String> {
         lines.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// A tracked name inside a longer identifier is a different name.
+    ///
+    /// Deleting `changed_paths: Vec::new()` was reported as removing the
+    /// tracked `paths`, and once reported there is no truthful label left:
+    /// `none` is refused, and every other label asserts a retirement that did
+    /// not happen (#263).
+    #[test]
+    fn a_tracked_name_inside_a_longer_identifier_is_not_a_removal() {
+        let tracked = BTreeSet::from(["paths".to_string(), "graph".to_string()]);
+        let diff = vec![
+            "-            changed_paths: Vec::new(),".to_string(),
+            "-    let graphs = load();".to_string(),
+            "-    call_graph_builder();".to_string(),
+        ];
+        assert!(
+            find_touched_symbols(&diff, &tracked).is_empty(),
+            "changed_paths, graphs and call_graph_builder are other names"
+        );
+    }
+
+    /// The narrowing must not cost the detection the check exists for.
+    ///
+    /// Command names reach their dispatch as string literals, so a removal
+    /// inside quotes is exactly the case worth catching.
+    #[test]
+    fn a_standalone_tracked_name_is_still_a_removal_even_in_a_string() {
+        let tracked = BTreeSet::from(["paths".to_string(), "graph".to_string()]);
+        let diff = vec![
+            "-        \"graph\" => run_graph(tail),".to_string(),
+            "-    let paths = collect();".to_string(),
+        ];
+        let findings = find_touched_symbols(&diff, &tracked);
+        assert_eq!(findings.len(), 2, "both removals must still be reported");
+        assert!(findings.contains_key("graph"));
+        assert!(findings.contains_key("paths"));
+    }
+
+    /// Hyphens belong to CLI spellings, so they join rather than separate.
+    #[test]
+    fn a_hyphenated_name_does_not_match_a_longer_hyphenated_one() {
+        let tracked = BTreeSet::from(["check-contract".to_string()]);
+        let removed_longer = vec!["-    run(\"check-contract-plan\");".to_string()];
+        assert!(find_touched_symbols(&removed_longer, &tracked).is_empty());
+        let removed_exact = vec!["-    run(\"check-contract\");".to_string()];
+        assert_eq!(find_touched_symbols(&removed_exact, &tracked).len(), 1);
     }
 
     #[test]
