@@ -1323,10 +1323,19 @@ fn build_reconciliation_plan(
             upstream_head,
         )?);
     }
+    // Terminal statuses are skipped whether or not their commit still exists.
+    // An entry that never landed has nothing to line up against upstream, and
+    // nothing keeps its commit alive once git collects it -- so reading its
+    // parents aborts the whole pass on `bad object` (#268). A *pending* entry
+    // with a missing commit is a different matter and is deliberately left to
+    // fail loudly: that state should not occur, and silence would hide it.
     for entry in queue.iter().filter(|entry| {
         !matches!(
             entry.status,
-            MergeStatus::Promoted | MergeStatus::ExternallyLanded | MergeStatus::Superseded
+            MergeStatus::Promoted
+                | MergeStatus::ExternallyLanded
+                | MergeStatus::Superseded
+                | MergeStatus::Rejected
         )
     }) {
         commits.push(reconcile_commit(
