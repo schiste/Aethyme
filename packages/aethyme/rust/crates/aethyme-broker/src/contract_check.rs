@@ -207,14 +207,30 @@ pub fn run(args: &[String]) -> u8 {
             );
             0
         }
-        Some(Decision::None) => {
-            eprintln!(
-                "ERROR: PR contract is **none**, but the diff removes tracked \
-                 cross-process symbols. Either pick a different contract label \
-                 (introduce / soft-retire / hard-delete) or restore the symbols."
-            );
-            1
-        }
+        Some(Decision::None) => match parse_contract_justification(&pr_body) {
+            Some(reason) => {
+                // The finding stays printed above; this records why the author
+                // says it is spurious, so a reviewer sees both.
+                println!(
+                    "Contract decision in PR body: **none**, justified — treating \
+                     as deliberate.\n  justification: {reason}"
+                );
+                0
+            }
+            None => {
+                eprintln!(
+                    "ERROR: PR contract is **none**, but the diff removes tracked \
+                     cross-process symbols. Either pick a different contract label \
+                     (introduce / soft-retire / hard-delete), restore the symbols, \
+                     or state why the match is spurious on a line beginning \
+                     `Contract justification:` (at least {MIN_JUSTIFICATION_CHARS} \
+                     characters). The matcher reads diff text, so it cannot tell a \
+                     name leaving a comment or a string from an entry point leaving \
+                     the product."
+                );
+                1
+            }
+        },
         None => {
             eprintln!(
                 "ERROR: PR body does not declare a contract decision \
@@ -498,6 +514,38 @@ impl Decision {
 /// If neither appears, the contract is undeclared. When several are
 /// declared (mistake or indecision), the most-restrictive wins so a
 /// co-checked `none` cannot fool the check.
+/// Shortest justification that says anything. Long enough to exclude "n/a"
+/// and "see above", short enough not to demand an essay.
+const MIN_JUSTIFICATION_CHARS: usize = 24;
+
+/// A stated reason why a reported removal is not an interface change.
+///
+/// The matcher is a heuristic over diff text: it can see that a tracked name
+/// left a removed line, but not whether an entry point left the product. When
+/// it is wrong there is otherwise no truthful label -- `none` is refused, and
+/// every other label asserts a retirement that did not happen -- so the author
+/// is left choosing between mislabelling, rewording code to move a substring,
+/// and bypassing the gate. This is the fourth option: say why, on the record.
+///
+/// It is deliberately not a silencer. The finding is still printed, the
+/// justification is printed beside it, and both land in the run log where a
+/// reviewer can disagree.
+pub fn parse_contract_justification(pr_body: &str) -> Option<String> {
+    pr_body.lines().find_map(|line| {
+        let rest = line
+            .trim()
+            .trim_start_matches(['-', '*', '#', ' '])
+            .strip_prefix("Contract justification:")
+            .or_else(|| {
+                line.trim()
+                    .trim_start_matches(['-', '*', '#', ' '])
+                    .strip_prefix("contract justification:")
+            })?;
+        let reason = rest.trim();
+        (reason.chars().count() >= MIN_JUSTIFICATION_CHARS).then(|| reason.to_string())
+    })
+}
+
 pub fn parse_contract_decision(pr_body: &str) -> Option<Decision> {
     let mut matches: Vec<Decision> = Vec::new();
     matches.extend(checkbox_decisions(pr_body));
@@ -830,6 +878,38 @@ mod tests {
         .map(|s| s.to_string())
         .collect();
         assert!(find_touched_symbols(&diff, &tracked).is_empty());
+    }
+
+    /// A justification has to say something. Token reasons would make the
+    /// escape hatch a rubber stamp, which is worse than not having one.
+    #[test]
+    fn a_token_justification_is_not_a_justification() {
+        for weak in ["n/a", "see above", "spurious", "  ", "false positive"] {
+            assert_eq!(
+                parse_contract_justification(&format!("Contract justification: {weak}")),
+                None,
+                "{weak:?} should not count as a stated reason"
+            );
+        }
+    }
+
+    /// A real reason is accepted, and is returned verbatim so it can be
+    /// printed beside the finding rather than replacing it.
+    #[test]
+    fn a_stated_reason_is_accepted_and_preserved() {
+        let body = "## Contract decision\n\n- [x] **none**\n\n                    Contract justification: the name appears only inside a deleted \
+                    error-message string; no entry point changes.\n";
+        let reason = parse_contract_justification(body).expect("a real reason is accepted");
+        assert!(reason.starts_with("the name appears only inside"));
+        assert!(reason.ends_with("no entry point changes."));
+    }
+
+    /// The marker must be a line of its own, not a phrase in prose, so that
+    /// discussing the mechanism in a PR body does not silently satisfy it.
+    #[test]
+    fn prose_mentioning_the_marker_does_not_justify() {
+        let body = "We considered whether a Contract justification: line would help here.";
+        assert_eq!(parse_contract_justification(body), None);
     }
 
     #[test]
