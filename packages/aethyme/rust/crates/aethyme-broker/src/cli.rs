@@ -6364,6 +6364,17 @@ fn render_coordinated_operation(
             report.operation.repository,
             report.classification,
         );
+        // What the push actually sent. The planner resolved this before the
+        // command ran; printing it is what makes a refspec that resolved to an
+        // unintended commit visible at the point of the push rather than later
+        // from CI metadata (#269).
+        for pushed in &report.pushed_refs {
+            out!(
+                "  pushed {} -> {}",
+                &pushed.proposed_sha[..pushed.proposed_sha.len().min(12)],
+                pushed.destination_ref,
+            );
+        }
         // A create that exited non-zero has already been reconciled against the
         // repository by now, so the operator reads the answer here rather than
         // going to look for the issue by hand (#184).
@@ -10671,6 +10682,33 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                 (false, None) => crate::QueueWait::Forever,
             };
             let mut broker = open_broker(parsed.read_only_snapshot)?;
+            // `HEAD` is per-worktree state, and the coordinated command runs
+            // inside the *session* worktree rather than wherever the operator
+            // stood. Resolving it there publishes that session's commit under
+            // the branch name typed here, and the push reports success (#269).
+            // The check lives at this layer because "the caller's directory" is
+            // a property of this invocation, not of the broker: an in-process
+            // caller has no meaningful cwd, and asking the process for one
+            // would make library behaviour depend on ambient state.
+            if request.provider == crate::OperationProvider::Git {
+                let symbolic = crate::worktree_relative_push_sources(&request.args);
+                if !symbolic.is_empty()
+                    && let Ok(record) = broker.store().session(request.session_id)
+                    && let Ok(caller) = std::env::current_dir()
+                    && !crate::is_within(&caller, std::path::Path::new(&record.worktree_path))
+                {
+                    return Err(UsageError::Message(format!(
+                        "refusing a worktree-relative push source from outside the session \
+                         worktree: {}\n  caller cwd:         {}\n  session {} worktree: {}\n\
+                         `HEAD` resolves in the session worktree, not where you are. Push an \
+                         explicit commit (`git rev-parse HEAD`) or run from the session worktree.",
+                        symbolic.join(", "),
+                        caller.display(),
+                        record.id,
+                        record.worktree_path,
+                    )));
+                }
+            }
             let report = broker.run_coordinated_operation_with_wait(request, queue_wait)?;
             render_coordinated_operation(&report, parsed.json)?;
             // After the coordinated operation returned, so the repository
