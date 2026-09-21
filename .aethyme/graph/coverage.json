@@ -3,8 +3,8 @@
   "available": true,
   "source_revision": "15cfa8820110270a3ede27444738569425ef1679",
   "indexed_revision": "15cfa8820110270a3ede27444738569425ef1679",
-  "source_tree_sha256": "945816a5eca5422b33abb3c3dbf0f930b902335ca30f67cc974b73f8fa4b81d0",
-  "indexed_tree_sha256": "945816a5eca5422b33abb3c3dbf0f930b902335ca30f67cc974b73f8fa4b81d0",
+  "source_tree_sha256": "a1225315a3ee692bed72367831758128245b9ae7645eacf09412d1873133da5f",
+  "indexed_tree_sha256": "a1225315a3ee692bed72367831758128245b9ae7645eacf09412d1873133da5f",
   "engine_version": "0.7.23",
   "coverage_mode": "partial",
   "safe_to_use": false,
@@ -13,21 +13,21 @@
     "unsupported_languages"
   ],
   "files": {
-    "discovered": 655,
-    "eligible": 631,
+    "discovered": 656,
+    "eligible": 632,
     "parsed": 414,
     "partial": 0,
     "unsupported": 10,
-    "non_code": 207,
+    "non_code": 208,
     "excluded": 24
   },
   "bytes": {
-    "discovered": 16037776,
-    "eligible": 11080196,
+    "discovered": 16035334,
+    "eligible": 11077754,
     "parsed": 9374201,
     "partial": 0,
     "unsupported": 61634,
-    "non_code": 1644361,
+    "non_code": 1641919,
     "excluded": 4957580,
     "source_read": 9485262
   },
@@ -51,12 +51,12 @@
       "excluded": 0
     },
     "markdown": {
-      "files": 169,
-      "bytes": 1541512,
+      "files": 170,
+      "bytes": 1539070,
       "parsed": 0,
       "partial": 0,
       "unsupported": 0,
-      "non_code": 169,
+      "non_code": 170,
       "excluded": 0
     },
     "python": {
@@ -116,12 +116,12 @@
   },
   "by_parser": {
     "none": {
-      "files": 207,
-      "bytes": 1644361,
+      "files": 208,
+      "bytes": 1641919,
       "parsed": 0,
       "partial": 0,
       "unsupported": 0,
-      "non_code": 207,
+      "non_code": 208,
       "excluded": 0
     },
     "ra_ap_syntax": {
@@ -166,7 +166,7 @@
     "global_variable": 724,
     "method": 58,
     "middleware_installation": 1,
-    "non_code_file": 207,
+    "non_code_file": 208,
     "proxy_surface": 40,
     "struct": 918,
     "trait": 11,
@@ -175,7 +175,7 @@
   },
   "node_counts_by_category": {
     "callable": 6530,
-    "container": 631,
+    "container": 632,
     "partial_knowledge": 5894,
     "sub_symbol": 724,
     "surface_flow_node": 213,
