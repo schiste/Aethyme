@@ -41,6 +41,57 @@ pub fn available_bytes(path: &std::path::Path) -> Option<u64> {
     }
 }
 
+/// How hard the autonomous sweep should work right now.
+///
+/// Derived from the same fact the gate refuses on, so the two cannot disagree
+/// about whether the disk is in trouble. A fixed budget spends the same five
+/// seconds a day whether the volume is at 40% or about to refuse every gate,
+/// which is the state that actually needs the work done.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SweepUrgency {
+    /// Free space is above the threshold a gate needs; keep the light touch.
+    Routine,
+    /// Free space is already below what a gate requires to start. Reclaiming
+    /// is now the thing standing between this machine and refused work.
+    Pressured,
+}
+
+impl SweepUrgency {
+    /// Budget multiplier. Under pressure a minute of deletion is cheap next to
+    /// a gate that will not run at all.
+    pub fn budget_scale(self) -> u64 {
+        match self {
+            Self::Routine => 1,
+            Self::Pressured => 12,
+        }
+    }
+
+    /// Interval divisor. Hourly under pressure, daily otherwise.
+    pub fn interval_divisor(self) -> i64 {
+        match self {
+            Self::Routine => 1,
+            Self::Pressured => 24,
+        }
+    }
+}
+
+/// Classify current headroom for `path`.
+///
+/// Unknown headroom stays `Routine` for the same reason `refusal` fails open:
+/// a failed `statvfs` is not evidence of a full disk, and reacting to it would
+/// make an unreadable filesystem look like an emergency.
+pub fn sweep_urgency(available: Option<u64>, required: u64) -> SweepUrgency {
+    match available {
+        Some(available) if available < required => SweepUrgency::Pressured,
+        _ => SweepUrgency::Routine,
+    }
+}
+
+/// Render bytes for operator-facing messages.
+pub(crate) fn format_gibibytes(bytes: u64) -> String {
+    gibibytes(bytes)
+}
+
 fn gibibytes(bytes: u64) -> String {
     format!("{:.1} GiB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
 }
@@ -77,6 +128,50 @@ pub fn refusal(available: Option<u64>, required: u64) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The sweep must react to the same fact the gate refuses on, or the two
+    /// disagree about whether the disk is in trouble.
+    #[test]
+    fn pressure_tracks_the_threshold_a_gate_refuses_at() {
+        let required = DEFAULT_GATE_HEADROOM_BYTES;
+        assert_eq!(
+            sweep_urgency(Some(required - 1), required),
+            SweepUrgency::Pressured
+        );
+        assert_eq!(
+            sweep_urgency(Some(required), required),
+            SweepUrgency::Routine,
+            "exactly enough headroom is not pressure"
+        );
+        // Same input that makes `refusal` fire must make the sweep hurry.
+        assert!(refusal(Some(required - 1), required).is_some());
+    }
+
+    /// Unknown headroom is not an emergency. A failed statvfs would otherwise
+    /// put every machine into the aggressive cadence permanently.
+    #[test]
+    fn unknown_headroom_stays_routine() {
+        assert_eq!(
+            sweep_urgency(None, DEFAULT_GATE_HEADROOM_BYTES),
+            SweepUrgency::Routine
+        );
+        assert!(refusal(None, DEFAULT_GATE_HEADROOM_BYTES).is_none());
+    }
+
+    /// Pressure has to actually change the work done, not just the label.
+    #[test]
+    fn pressure_widens_the_budget_and_shortens_the_interval() {
+        let routine = SweepUrgency::Routine;
+        let pressured = SweepUrgency::Pressured;
+        assert_eq!(routine.budget_scale(), 1);
+        assert_eq!(routine.interval_divisor(), 1);
+        assert!(pressured.budget_scale() > routine.budget_scale());
+        assert!(pressured.interval_divisor() > routine.interval_divisor());
+
+        // 5s/24h routine becomes a minute, hourly.
+        assert_eq!(5_000_u64 * pressured.budget_scale(), 60_000);
+        assert_eq!(24_i64 * 3_600_000 / pressured.interval_divisor(), 3_600_000);
+    }
     use super::*;
 
     #[test]

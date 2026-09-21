@@ -29,6 +29,9 @@ pub const BROKER_COMMAND_FAILED: &str = "broker.command.failed";
 pub const BROKER_GC_APPLIED: &str = "broker.gc.applied";
 pub const BROKER_PROMOTION_RECORD_RESTORED: &str = "broker.promotion-record.restored";
 pub const BROKER_GC_ARTIFACTS_SWEPT: &str = "broker.gc.artifacts-swept";
+
+/// Dead shared preparation-cache entries reclaimed without an operator.
+pub const BROKER_GC_PREPARATION_SWEPT: &str = "broker.gc.preparation-swept";
 pub const BROKER_COMMAND_SUCCEEDED: &str = "broker.command.succeeded";
 // session.<status> transition kinds are derived from SessionStatus::as_str
 // (active/idle/stale/exited/cleaned) by the store.

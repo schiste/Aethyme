@@ -13,10 +13,9 @@ use crate::broker::{
 use crate::retention::is_safe_artefact_directory_name;
 use crate::{
     Broker, BrokerOpError, GcApplyReport, GcArtifactCandidate, GcBlocker, GcBlockerSummary,
-    GcCheckpointPinRelease, GcDeclinedArtifact,
-    GcFileAction, GcFileCandidate, GcHealth, GcOrphanCandidate, GcPlan, GcRowCandidate,
-    GcPublicationExposureExpiry, GcWorktreeBlockerSummary, GcWorktreeCandidate, GitRepo,
-    OperationStatus, RetentionPolicy,
+    GcCheckpointPinRelease, GcDeclinedArtifact, GcFileAction, GcFileCandidate, GcHealth,
+    GcOrphanCandidate, GcPlan, GcPublicationExposureExpiry, GcRowCandidate,
+    GcWorktreeBlockerSummary, GcWorktreeCandidate, GitRepo, OperationStatus, RetentionPolicy,
     load_retention_policy, load_retention_policy_report,
 };
 
@@ -904,9 +903,10 @@ impl Broker {
         }
         for session in sessions.values() {
             if let Some(queue_entry_id) = session.accepted_queue_entry_id {
-                if checkpoint_pin_releases.iter().any(|pin| {
-                    pin.session_id == session.id && pin.queue_entry_id == queue_entry_id
-                }) {
+                if checkpoint_pin_releases
+                    .iter()
+                    .any(|pin| pin.session_id == session.id && pin.queue_entry_id == queue_entry_id)
+                {
                     continue;
                 }
                 blockers.push(GcBlocker {
@@ -1463,7 +1463,17 @@ impl Broker {
         }
         let main_root = self.main_root().to_path_buf();
         let now = now_ms();
-        let interval_ms = i64::from(policy.artifact_sweep_interval_hours) * 3_600_000;
+        // React to the fact the gate refuses on, rather than sweeping at one
+        // fixed rate whether the volume is comfortable or already out of room.
+        let urgency = crate::disk_headroom::sweep_urgency(
+            crate::available_bytes(&main_root),
+            crate::disk_headroom::DEFAULT_GATE_HEADROOM_BYTES,
+        );
+        let budget_ms = policy
+            .artifact_sweep_budget_ms
+            .saturating_mul(urgency.budget_scale());
+        let interval_ms = (i64::from(policy.artifact_sweep_interval_hours) * 3_600_000)
+            / urgency.interval_divisor().max(1);
         if let Some(last) = self
             .store()
             .meta_get(ARTIFACT_SWEEP_STAMP_KEY)?
@@ -1482,7 +1492,29 @@ impl Broker {
             .into_iter()
             .map(|session| session.id)
             .collect::<Vec<_>>();
-        let deadline = Instant::now() + Duration::from_millis(policy.artifact_sweep_budget_ms);
+        let deadline = Instant::now() + Duration::from_millis(budget_ms);
+        // The shared preparation cache is content-addressed: an entry no
+        // checkout computes is unreadable forever, so it needs no operator
+        // review. It was reachable only from the manual lane, which is why a
+        // hand reclaim of 13.3 GB returned as 15 GB within three days.
+        let (cache_entries, cache_bytes) = crate::storage::sweep_preparation_cache(
+            &main_root,
+            policy.orphan_worktree_roots_days,
+            deadline,
+        );
+        if cache_entries > 0 {
+            let payload = serde_json::json!({
+                "entries": cache_entries,
+                "bytes": cache_bytes,
+                "urgency": format!("{urgency:?}"),
+            })
+            .to_string();
+            self.store().append_event(
+                crate::events::BROKER_GC_PREPARATION_SWEPT,
+                None,
+                Some(&payload),
+            )?;
+        }
         let mut removed = Vec::new();
         let mut eligible_worktree_seen = false;
         let mut scan_completed = true;
