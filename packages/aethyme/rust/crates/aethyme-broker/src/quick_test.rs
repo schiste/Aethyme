@@ -86,8 +86,8 @@ pub enum QuickTestError {
     Git { args: String, stderr: String },
     #[error("aethyme init did not certify the temporary repo")]
     InitNotCertified,
-    #[error("broker submit did not promote the smoke commit")]
-    SubmitNotPromoted,
+    #[error("broker submit did not promote the smoke commit: {reason}")]
+    SubmitNotPromoted { reason: String },
     #[error("broker gated quick test did not run the fixture gate")]
     GateNotRun,
     #[error("broker gated quick test fixture gate did not pass")]
@@ -203,7 +203,9 @@ pub fn run_broker_quick_test_with_options(
 
     let outcome = broker.submit(session.id)?;
     if !outcome.promoted || !outcome.conflicts.is_empty() {
-        return Err(QuickTestError::SubmitNotPromoted);
+        return Err(QuickTestError::SubmitNotPromoted {
+            reason: describe_unpromoted(&outcome.conflicts, &outcome.gate_outcomes),
+        });
     }
     if options.with_gate {
         let gate = find_gate_outcome(&outcome.gate_outcomes).ok_or(QuickTestError::GateNotRun)?;
@@ -341,6 +343,46 @@ cache = false
         ),
     )?;
     Ok(())
+}
+
+/// Why a submission did not promote, in the terms a caller needs.
+///
+/// A gate that refuses *before spawning* -- disk headroom under
+/// `DEFAULT_GATE_HEADROOM_BYTES`, a resource lease it could not take -- records
+/// `error` with a failure class and never runs the command. Reported as a bare
+/// "did not promote", that is indistinguishable from a gate that ran and failed
+/// the change, so a full disk reads as a broken diff (#270). The evidence is
+/// already on the outcome; this states it.
+fn describe_unpromoted(conflicts: &[String], gates: &[GateRunOutcome]) -> String {
+    let mut parts = Vec::new();
+    if !conflicts.is_empty() {
+        parts.push(format!("conflicts: {}", conflicts.join(", ")));
+    }
+    for gate in gates {
+        if gate.status != GateStatus::Pass {
+            let class = gate
+                .failure_class
+                .map(|class| format!(" [{}]", class.as_str()))
+                .unwrap_or_default();
+            let log = gate
+                .log_path
+                .as_deref()
+                .map(|path| format!(" log={path}"))
+                .unwrap_or_default();
+            parts.push(format!(
+                "gate {} {}{}{}",
+                gate.gate,
+                gate.status.as_str(),
+                class,
+                log
+            ));
+        }
+    }
+    if parts.is_empty() {
+        "no conflict or gate evidence was recorded".to_string()
+    } else {
+        parts.join("; ")
+    }
 }
 
 fn find_gate_outcome(outcomes: &[GateRunOutcome]) -> Option<&GateRunOutcome> {
@@ -502,5 +544,77 @@ mod tests {
                 .iter()
                 .any(|step| step.name == "broker-submit-failing-gate")
         );
+    }
+}
+
+#[cfg(test)]
+mod not_promoted_tests {
+    use super::*;
+
+    fn gate(name: &str, status: GateStatus, class: Option<GateFailureClass>) -> GateRunOutcome {
+        GateRunOutcome {
+            gate: name.to_string(),
+            tree_hash: "t".into(),
+            definition_hash: "d".into(),
+            resource_lease: None,
+            managed_cache: None,
+            status,
+            failure_class: class,
+            cached: false,
+            exit_code: None,
+            duration_ms: None,
+            wait_duration_ms: None,
+            first_output_ms: None,
+            output_bytes: None,
+            log_path: Some("/logs/gate.log".into()),
+        }
+    }
+
+    /// The case that cost the diagnosis: a gate refused before spawning because
+    /// the disk was under the headroom the gates enforce. Reported as a bare
+    /// "did not promote", that is indistinguishable from a gate that ran and
+    /// failed the change (#270).
+    #[test]
+    fn a_gate_that_refused_to_start_is_named_with_its_class() {
+        let reason = describe_unpromoted(
+            &[],
+            &[gate(
+                "cargo-test",
+                GateStatus::Error,
+                Some(GateFailureClass::ResourceContention),
+            )],
+        );
+        assert!(reason.contains("cargo-test"), "{reason}");
+        assert!(reason.contains("error"), "{reason}");
+        assert!(
+            reason.contains("resource_contention"),
+            "the class is what distinguishes a starved machine from a bad diff: {reason}"
+        );
+        assert!(reason.contains("/logs/gate.log"), "{reason}");
+    }
+
+    #[test]
+    fn conflicts_are_reported_and_passing_gates_are_not_noise() {
+        let reason = describe_unpromoted(
+            &["src/a.rs".to_string()],
+            &[
+                gate("fast", GateStatus::Pass, None),
+                gate("slow", GateStatus::Fail, Some(GateFailureClass::TestFailure)),
+            ],
+        );
+        assert!(reason.contains("conflicts: src/a.rs"), "{reason}");
+        assert!(reason.contains("slow"), "{reason}");
+        assert!(
+            !reason.contains("fast"),
+            "a gate that passed is not a reason for refusal: {reason}"
+        );
+    }
+
+    /// Never silently empty: an unexplained refusal must still say that the
+    /// evidence was missing, rather than printing nothing after the colon.
+    #[test]
+    fn an_outcome_with_no_evidence_still_says_so() {
+        let reason = describe_unpromoted(&[], &[]);
+        assert!(reason.contains("no conflict or gate evidence"), "{reason}");
     }
 }
