@@ -636,6 +636,10 @@ pub struct CoordinatedOperationReport {
     pub stderr: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub post_merge_cleanup: Option<PostMergeCleanupReport>,
+    /// Exactly what a successful push sent. Empty for anything that was not a
+    /// plannable push.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pushed_refs: Vec<PushedRef>,
     /// Set when a successful merge was observed to carry this session's work
     /// onto the default branch, so the session can finish without resubmitting.
     pub representing_commit: Option<String>,
@@ -730,6 +734,17 @@ struct ExactPushDestination {
 struct ExactPushPlan {
     remote: String,
     destinations: Vec<ExactPushDestination>,
+}
+
+/// What a successful push actually sent, per destination.
+///
+/// The planner already resolves this to answer "did the push send what the
+/// dry run inspected"; reporting it closes the gap that let a `HEAD:` refspec
+/// publish an unintended commit under a success line that named neither (#269).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct PushedRef {
+    pub destination_ref: String,
+    pub proposed_sha: String,
 }
 
 #[derive(Debug, Clone)]
@@ -1903,6 +1918,47 @@ fn with_push_planning(mut extra: serde_json::Value, planning: &PushPlanning) -> 
         extra.insert("push_reconciliation".into(), push);
     }
     extra
+}
+
+/// Push sources that mean something different in each worktree.
+///
+/// Refs under `refs/` are shared by every worktree of a repository, so
+/// `main:refs/heads/x` resolves identically wherever the command runs. `HEAD`
+/// does not -- it is per-worktree state. `broker git` executes inside the
+/// *session* worktree rather than the caller's, so a `HEAD:` refspec sent from
+/// somewhere else silently publishes the session's commit under the caller's
+/// chosen branch name, and the push reports success (#269).
+pub(crate) fn worktree_relative_push_sources(args: &[String]) -> Vec<String> {
+    let Some(args) = git_subcommand_args(args) else {
+        return Vec::new();
+    };
+    if args.first().map(String::as_str) != Some("push") {
+        return Vec::new();
+    }
+    args.iter()
+        .skip(1)
+        .filter(|argument| !argument.starts_with('-'))
+        .filter(|argument| {
+            let refspec = argument.strip_prefix('+').unwrap_or(argument);
+            let source = refspec.split(':').next().unwrap_or(refspec);
+            let base = source
+                .split(|character| character == '~' || character == '^')
+                .next()
+                .unwrap_or(source);
+            base == "HEAD" || base == "@" || base.starts_with("@{")
+        })
+        .cloned()
+        .collect()
+}
+
+/// Whether `candidate` is the session worktree or lives inside it.
+///
+/// Compared after canonicalization so a symlinked temporary directory -- the
+/// normal shape of a scratch checkout on macOS -- is not mistaken for a
+/// different tree.
+pub(crate) fn is_within(candidate: &Path, root: &Path) -> bool {
+    let canonical = |path: &Path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    canonical(candidate).starts_with(canonical(root))
 }
 
 fn plan_exact_push(
@@ -3918,6 +3974,21 @@ impl Broker {
             post_merge_cleanup: None,
             representing_commit: None,
             created_pull_request: created_pull_request_number,
+            pushed_refs: if output.status.success() {
+                match &push_planning {
+                    PushPlanning::Planned(plan) => plan
+                        .destinations
+                        .iter()
+                        .map(|destination| PushedRef {
+                            destination_ref: destination.destination_ref.clone(),
+                            proposed_sha: destination.proposed_sha.clone(),
+                        })
+                        .collect(),
+                    _ => Vec::new(),
+                }
+            } else {
+                Vec::new()
+            },
         })
     }
 
@@ -4539,6 +4610,58 @@ mod tests {
         let repo = crate::GitRepo::discover(tmp.path()).unwrap();
         let target = repo.resolve_remote_target("origin", None).unwrap();
         (tmp, target)
+    }
+
+    #[test]
+    fn only_head_relative_push_sources_are_worktree_relative() {
+        let argv = |items: &[&str]| items.iter().map(|item| item.to_string()).collect::<Vec<_>>();
+
+        // `HEAD` and its relatives mean something different in each worktree.
+        for source in ["HEAD:refs/heads/x", "HEAD", "+HEAD:refs/heads/x", "HEAD~1:refs/heads/x", "@", "@{u}"] {
+            let args = argv(&["push", "origin", source]);
+            assert_eq!(
+                worktree_relative_push_sources(&args),
+                vec![source.to_string()],
+                "{source} should be recognised as worktree-relative"
+            );
+        }
+
+        // Refs under `refs/` are shared by every worktree, so a branch name
+        // resolves identically wherever the command runs. Refusing these would
+        // block safe pushes without catching anything.
+        for source in ["main:refs/heads/x", "refs/heads/main:refs/heads/x", "deadbeef:refs/heads/x"] {
+            let args = argv(&["push", "origin", source]);
+            assert!(
+                worktree_relative_push_sources(&args).is_empty(),
+                "{source} is shared across worktrees and must be allowed"
+            );
+        }
+
+        // Options are not refspecs.
+        let args = argv(&["push", "--force-with-lease=refs/heads/x:abc", "origin", "abc:refs/heads/x"]);
+        assert!(worktree_relative_push_sources(&args).is_empty());
+
+        // Anything that is not a push is none of this function's business.
+        let args = argv(&["log", "HEAD"]);
+        assert!(worktree_relative_push_sources(&args).is_empty());
+    }
+
+    #[test]
+    fn containment_survives_a_symlinked_temporary_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("worktree");
+        std::fs::create_dir_all(root.join("nested/deeper")).unwrap();
+
+        assert!(is_within(&root, &root), "a worktree contains itself");
+        assert!(is_within(&root.join("nested/deeper"), &root));
+        assert!(
+            !is_within(tmp.path(), &root),
+            "the parent is not inside the worktree"
+        );
+
+        let sibling = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(&sibling).unwrap();
+        assert!(!is_within(&sibling, &root), "a sibling checkout is outside");
     }
 
     fn planned_destinations(

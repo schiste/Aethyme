@@ -256,6 +256,10 @@ pub use operation_stats::{
 };
 pub use operations::{
     CoordinatedCommand, CoordinatedOperationReport, OperationReconcileReport,
+    PushedRef,
+};
+pub(crate) use operations::{is_within, worktree_relative_push_sources};
+pub use operations::{
     OperationReconciliation, OperationReconciliationRecovery, OperationReconciliationState,
     OperationShowReport, PostMergeCleanupReport, PostMergeCleanupState, QueueWait,
     UnknownOutcomeRecovery, classify_gh, classify_git,

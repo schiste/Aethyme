@@ -1621,3 +1621,36 @@ fn a_ref_scoped_block_is_invisible_to_a_comment_write_on_its_own_thread() {
         other => panic!("two writes to one comment thread must still serialise: {other:?}"),
     }
 }
+
+/// A successful push states what it sent. The planner already resolved this to
+/// answer "did the push send what the dry run inspected"; reporting it is what
+/// makes a refspec that resolved to an unintended commit visible at the push
+/// rather than later from CI metadata (#269).
+#[test]
+fn a_successful_push_reports_the_commit_it_sent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fixture = push_fixture(tmp.path(), "reports-what-it-sent");
+    let head = commit_push_fixture(&fixture, "reported\n");
+    let mut fixture = fixture;
+
+    let report = fixture
+        .broker
+        .run_coordinated_operation(exact_push_request(
+            fixture.session_id,
+            &fixture.worktree,
+            &["HEAD:refs/heads/reported"],
+        ))
+        .unwrap();
+
+    assert!(report.ok(), "{report:#?}");
+    assert_eq!(
+        report.pushed_refs.len(),
+        1,
+        "one refspec should yield one reported destination: {report:#?}"
+    );
+    assert_eq!(report.pushed_refs[0].proposed_sha, head);
+    assert_eq!(
+        report.pushed_refs[0].destination_ref,
+        "refs/heads/reported"
+    );
+}
