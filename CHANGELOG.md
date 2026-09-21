@@ -6,6 +6,27 @@ artifacts and their exact source revision are recorded in each signed
 
 ## [Unreleased]
 
+## [0.7.24] - 2026-09-21
+
+### Changed
+
+- The autonomous artifact sweep now reclaims the shared preparation cache. It
+  previously ran on its daily cadence and reclaimed nothing, because the cache
+  was reachable only from `aethyme broker storage`, a command an operator had
+  to type. An entry is removed only when no checkout on the host would compute
+  its key, which is the same rule the manual lane applies.
+- The sweep's effort now follows free space. Below the headroom a gate
+  requires to start, its budget widens and its interval shortens to an hour;
+  above it, the previous light touch is unchanged. Unknown free space is
+  treated as routine rather than urgent.
+- `aethyme broker status` reports host free space beside retained bytes, and
+  says that the retained-bytes budget is per repository while the volume is
+  shared.
+
+### Added
+
+- Graph enrollment, refresh, and the committed Aethyme graph artifacts.
+
 ## [0.7.23] - 2026-09-19
 
 ### Fixed
