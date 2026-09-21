@@ -92,7 +92,7 @@
         "member_count": 10,
         "ci_mentions": 12,
         "executable_entrypoints": 1,
-        "source_files": 391
+        "source_files": 396
       }
     },
     {
@@ -114,7 +114,7 @@
         },
         {
           "kind": "ci_usage",
-          "detail": "workspace root mentioned 21 time(s) in CI",
+          "detail": "workspace root mentioned 18 time(s) in CI",
           "confidence": "medium"
         }
       ],
@@ -124,9 +124,9 @@
         "root_manifest": false,
         "declares_workspace": false,
         "member_count": 0,
-        "ci_mentions": 21,
+        "ci_mentions": 18,
         "executable_entrypoints": 1,
-        "source_files": 393
+        "source_files": 398
       }
     },
     {
@@ -243,7 +243,7 @@
       "member_count": 10,
       "ci_mentions": 12,
       "executable_entrypoints": 1,
-      "source_files": 391
+      "source_files": 396
     }
   },
   "commands": [
@@ -301,6 +301,12 @@
       "path": "packages",
       "role": "workspace",
       "reason": "workspace-style package container",
+      "confidence": "high"
+    },
+    {
+      "path": "scripts",
+      "role": "tooling",
+      "reason": "developer tooling or scripts",
       "confidence": "high"
     }
   ],
@@ -452,9 +458,9 @@
     ]
   },
   "freshness": {
-    "source_digest": "a5a24a64b47ffa1e3b995c96f0ede12b4667a6f7e82662f3c56aa6f4a6fa09de",
+    "source_digest": "b0a62abdd47131e5ddbcb30ff3a13610c3c006c74d36b2d74eaa7f03df3182ef",
     "source_commit": null,
-    "source_file_count": 629,
+    "source_file_count": 639,
     "generator": "deterministic"
   },
   "telemetry": {
@@ -475,7 +481,7 @@
     "counts": {
       "workspaces": 3,
       "commands": 4,
-      "areas": 3,
+      "areas": 4,
       "entrypoints": 7,
       "caution_zones": 0,
       "generated_paths": 1,

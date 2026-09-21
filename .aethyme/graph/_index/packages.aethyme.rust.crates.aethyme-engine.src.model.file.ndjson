@@ -1,0 +1,3 @@
+{"module":"packages.aethyme.rust.crates.aethyme-engine.src.model.file","symbol":"FileNode","kind":"struct","node_id":"struct:schiste/Aethyme:td3pslngl5ixc25if7n2euioye","file":"packages/aethyme/rust/crates/aethyme-engine/src/model/file.rs"}
+{"module":"packages.aethyme.rust.crates.aethyme-engine.src.model.file","symbol":"FileRole","kind":"enum","node_id":"enum:schiste/Aethyme:ffhe3dcxrsqybspvfi2geyehoa","file":"packages/aethyme/rust/crates/aethyme-engine/src/model/file.rs"}
+{"module":"packages.aethyme.rust.crates.aethyme-engine.src.model.file","symbol":"new","kind":"function","node_id":"function:schiste/Aethyme:3quf7vvsg2qiyebdkkyqpzytma","file":"packages/aethyme/rust/crates/aethyme-engine/src/model/file.rs"}

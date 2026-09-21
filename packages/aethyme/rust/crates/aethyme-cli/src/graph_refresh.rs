@@ -19,8 +19,8 @@ use aethyme_graph_storage::{
     GRAPH_CONFIG_RELPATH, GRAPH_COVERAGE_RELPATH, GRAPH_MANIFEST_RELPATH, GRAPH_UNITS_RELPATH,
     GraphAuthorityManifest, GraphCoverage, GraphEntityCounts, GraphIntegrityPolicy,
     GraphLifecycleObservability, GraphStoreArtifactCache, GraphStoreCacheKey, GraphUnit,
-    committed_source_tree_digest, decode_units, graph_fragment_set_digest, read_coverage,
-    read_engine_version, write_graph_authority_manifest,
+    bootstrap_repo, committed_source_tree_digest, decode_units, graph_fragment_set_digest,
+    read_coverage, read_engine_version, write_graph_authority_manifest,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -1424,6 +1424,7 @@ fn regenerate_fragments(
     {
         return Err(format!("reset disposable graph output: {error}"));
     }
+    bootstrap_repo(repo, version).map_err(|error| format!("bootstrap graph output: {error}"))?;
     let context = IndexerContext::new(repository, repo.to_path_buf(), version)
         .and_then(|context| context.with_source_revision(&source_revision))
         .and_then(|context| context.with_source_tree_digest(&source_tree_digest))
@@ -2397,6 +2398,7 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aethyme_graph_storage::GITATTRIBUTES_CONTENT;
 
     #[test]
     fn batched_blob_reads_do_not_deadlock_when_both_pipes_exceed_capacity() {
@@ -2425,5 +2427,54 @@ mod tests {
         let blobs = git_blob_batch(temporary.path(), vec![oid.as_str(); 4_096]).unwrap();
         assert_eq!(blobs.len(), 4_096);
         assert!(blobs.iter().all(|blob| blob.len() == 2_048));
+    }
+
+    #[test]
+    fn regeneration_bootstraps_graph_gitattributes() {
+        let temporary = tempfile::tempdir().unwrap();
+        git(temporary.path(), &["init", "-q"]).unwrap();
+        git(
+            temporary.path(),
+            &["config", "user.name", "Graph Refresh Test"],
+        )
+        .unwrap();
+        git(
+            temporary.path(),
+            &["config", "user.email", "graph-refresh@example.test"],
+        )
+        .unwrap();
+        std::fs::create_dir_all(temporary.path().join(".aethyme")).unwrap();
+        std::fs::write(
+            temporary.path().join(".aethyme/config.toml"),
+            "[graph]\nauthority = 'committed_fragments'\nrepository = 'fixture'\n",
+        )
+        .unwrap();
+        bootstrap_repo(temporary.path(), env!("CARGO_PKG_VERSION")).unwrap();
+        std::fs::create_dir_all(temporary.path().join("src")).unwrap();
+        std::fs::write(
+            temporary.path().join("src/lib.rs"),
+            "pub fn answer() -> u8 { 42 }\n",
+        )
+        .unwrap();
+        git(temporary.path(), &["add", "."]).unwrap();
+        git(temporary.path(), &["commit", "-qm", "fixture source"]).unwrap();
+
+        let mut work = GraphLifecycleWork::default();
+        let mut performance = GraphLifecycleObservability::default();
+        regenerate_fragments(
+            temporary.path(),
+            "fixture",
+            env!("CARGO_PKG_VERSION"),
+            &mut work,
+            &mut performance,
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(temporary.path().join(".aethyme/graph/.gitattributes"))
+                .unwrap(),
+            GITATTRIBUTES_CONTENT
+        );
+        assert!(temporary.path().join(GRAPH_MANIFEST_RELPATH).is_file());
     }
 }

@@ -5728,6 +5728,28 @@ impl Broker {
                         cleanup_retention.estimated_retained_bytes,
                         cleanup_retention.estimated_reclaimable_bytes
                     ),
+                    // The budget above is per repository; the disk is not.
+                    // Every enrolled repository can sit inside its own budget
+                    // while the shared volume is full, so the number that
+                    // decides whether work can run belongs next to it.
+                    {
+                        let available = crate::available_bytes(self.main_root());
+                        let required = crate::disk_headroom::DEFAULT_GATE_HEADROOM_BYTES;
+                        match available {
+                            Some(available) if available < required => format!(
+                                "host free space: {} of {} a gate needs to start \
+                                 -- sweeps widen and run hourly until it clears",
+                                crate::disk_headroom::format_gibibytes(available),
+                                crate::disk_headroom::format_gibibytes(required)
+                            ),
+                            Some(available) => format!(
+                                "host free space: {} (this budget is per repository; \
+                                 the volume is shared)",
+                                crate::disk_headroom::format_gibibytes(available)
+                            ),
+                            None => "host free space: unknown".to_string(),
+                        }
+                    },
                     format!(
                         "blocked/budget bytes: {}/{}{}",
                         cleanup_retention.estimated_blocked_bytes,

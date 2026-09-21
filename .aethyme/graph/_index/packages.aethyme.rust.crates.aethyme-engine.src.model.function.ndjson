@@ -1,0 +1,3 @@
+{"module":"packages.aethyme.rust.crates.aethyme-engine.src.model.function","symbol":"FunctionNode","kind":"struct","node_id":"struct:schiste/Aethyme:ratnw2ghyyj677zw5ztpk2o3bu","file":"packages/aethyme/rust/crates/aethyme-engine/src/model/function.rs"}
+{"module":"packages.aethyme.rust.crates.aethyme-engine.src.model.function","symbol":"InternedStr","kind":"unresolved_symbol","node_id":"unresolved_symbol:schiste/Aethyme:gvdb5hblil2mim555oiyokbu4q","file":"packages/aethyme/rust/crates/aethyme-engine/src/model/function.rs"}
+{"module":"packages.aethyme.rust.crates.aethyme-engine.src.model.function","symbol":"new","kind":"function","node_id":"function:schiste/Aethyme:ksdmo37esufstjiec6n3rrvooq","file":"packages/aethyme/rust/crates/aethyme-engine/src/model/function.rs"}

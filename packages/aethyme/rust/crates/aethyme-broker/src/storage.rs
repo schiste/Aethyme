@@ -869,6 +869,58 @@ fn directory_modified_within(dir: &Path, window_ms: u64) -> bool {
 /// `live_roots` are the checkouts entitled to keep an entry alive. A checkout
 /// that declares no shared step contributes no key and keeps nothing, which is
 /// correct: it never populated the cache either.
+/// Reclaim dead preparation-cache entries without an operator present.
+///
+/// The manual lane exists so a human can review before deleting. That review
+/// is the right default for worktrees, which hold work; it is the wrong
+/// default for a content-addressed cache, whose entries are named after the
+/// inputs that produced them. An entry no checkout computes will never be read
+/// again no matter how long it is kept, so waiting for someone to type a
+/// command only trades disk for nothing. Measured here: 13.3 GB reclaimed by
+/// hand came back as 15 GB in three days, because nothing reclaimed it.
+///
+/// Bounded by `deadline` and safe to interrupt -- entries are independent, so
+/// a partial sweep is simply a smaller sweep. Returns entries removed and
+/// bytes reclaimed.
+pub(crate) fn sweep_preparation_cache(
+    main_root: &Path,
+    orphan_worktree_roots_days: u32,
+    deadline: std::time::Instant,
+) -> (usize, u64) {
+    let Ok(storage_root) = storage_container(main_root) else {
+        return (0, 0);
+    };
+    let mut records = crate::measurement::SizeRecords::default();
+    // Recorded sizing: the budget should be spent reclaiming, and an entry's
+    // size does not change whether it is dead.
+    let Ok(plan) = build_plan(
+        main_root,
+        &storage_root,
+        orphan_worktree_roots_days,
+        Vec::new(),
+        crate::SizeScan::Recorded,
+        &mut records,
+    ) else {
+        return (0, 0);
+    };
+    // The same population the manual lane uses. It must span every enrolled
+    // checkout, not just this repository: the cache is shared, and a live
+    // entry belonging to a sibling repository would otherwise look dead here.
+    let live_roots = preparation_live_roots(main_root, &plan.primary_checkouts, &plan.roots);
+    let mut removed = 0_usize;
+    let mut bytes = 0_u64;
+    for candidate in &plan.preparation_candidates {
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        if let Ok(reclaimed) = apply_preparation_candidate(candidate, &live_roots) {
+            removed += 1;
+            bytes = bytes.saturating_add(reclaimed);
+        }
+    }
+    (removed, bytes)
+}
+
 fn preparation_live_roots(
     main_root: &Path,
     primary_checkouts: &[StoragePrimaryCheckout],

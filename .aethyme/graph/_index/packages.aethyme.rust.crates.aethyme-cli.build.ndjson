@@ -1,0 +1,4 @@
+{"module":"packages.aethyme.rust.crates.aethyme-cli.build","symbol":"Command","kind":"unresolved_symbol","node_id":"unresolved_symbol:schiste/Aethyme:nvy4takbc6twlkuyscbkwjtfl4","file":"packages/aethyme/rust/crates/aethyme-cli/build.rs"}
+{"module":"packages.aethyme.rust.crates.aethyme-cli.build","symbol":"build_date","kind":"function","node_id":"function:schiste/Aethyme:ieucyti4mstbgwejg26fg4ybou","file":"packages/aethyme/rust/crates/aethyme-cli/build.rs"}
+{"module":"packages.aethyme.rust.crates.aethyme-cli.build","symbol":"git_output","kind":"function","node_id":"function:schiste/Aethyme:k3ave7usjq34iyq5yjmoq36gzy","file":"packages/aethyme/rust/crates/aethyme-cli/build.rs"}
+{"module":"packages.aethyme.rust.crates.aethyme-cli.build","symbol":"main","kind":"function","node_id":"function:schiste/Aethyme:ryjwg6xcohown5tp6oc2o5f4f4","file":"packages/aethyme/rust/crates/aethyme-cli/build.rs"}
