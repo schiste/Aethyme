@@ -12081,6 +12081,20 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                          finish safely with `aethyme broker finish --session {}`.",
                         outcome.entry.session_id,
                     );
+                } else if crate::PromoteConfig::load(broker.main_root()).mode
+                    == crate::PromoteMode::VerifyOnly
+                {
+                    // Telling an operator to promote in a repository that has
+                    // opted out contradicts the line printed directly above it,
+                    // and names a command whose whole point is that it is not
+                    // wanted here (#290 phase 2.2).
+                    out!(
+                        "What now: entry {} is verified and nothing moved, which is what this \
+                         repository is configured for. Ship the work its usual way, or finish \
+                         with `aethyme broker finish --session {}`.",
+                        outcome.entry.id,
+                        outcome.entry.session_id,
+                    );
                 } else {
                     out!(
                         "What now: entry {} is verified but not promoted (manual mode). \
