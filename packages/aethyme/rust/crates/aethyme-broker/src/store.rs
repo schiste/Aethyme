@@ -981,8 +981,10 @@ impl BrokerStore {
 
     /// Declared scopes for every session that is still live.
     ///
-    /// Scoped to live sessions for the same reason leases are: a closed
-    /// session's declaration is history, not a claim on anything.
+    /// Scoped to live sessions by the same allow-list `active_leases` uses.
+    /// A finished session's declaration is history, not a claim on anything,
+    /// and an allow-list keeps a status added later out until someone decides
+    /// it belongs -- a deny-list would silently admit it.
     pub fn active_session_scopes(&self) -> Result<Vec<crate::SessionScope>, BrokerError> {
         let mut stmt = self.conn.prepare(
             "SELECT s.id, s.session_id, s.kind, s.value, s.operation, s.source,
@@ -990,7 +992,7 @@ impl BrokerStore {
                FROM session_scopes s
                JOIN sessions ON sessions.id = s.session_id
               WHERE s.released_at IS NULL
-                AND sessions.status NOT IN ('closed', 'abandoned')
+                AND sessions.status IN ('active', 'idle', 'stale')
               ORDER BY s.kind, s.value, s.session_id",
         )?;
         let rows = stmt
