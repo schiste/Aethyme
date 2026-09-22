@@ -253,11 +253,7 @@ pub use main_reconcile::{
     MainReconcileDisposition, MainReconcilePlan, MainReconcileResolution,
     MainReconcileResolutionDocument, MainReconcileResolutionTemplate,
 };
-pub use merge::{
-    ACTION_REQUIRED_RELPATH, PromoteConfig, SubmissionCommitOwnership, SubmissionCommitProvenance,
-    SubmissionConflict, SubmissionGateVerification, SubmissionGateVerificationStatus,
-    SubmissionIntegrationState, SubmissionPlan, SubmitOutcome,
-};
+pub use merge::{ACTION_REQUIRED_RELPATH, PromoteConfig, PromoteMode, PromotionIntent, SubmissionCommitOwnership, SubmissionCommitProvenance, SubmissionConflict, SubmissionGateVerification, SubmissionGateVerificationStatus, SubmissionIntegrationState, SubmissionPlan, SubmitOutcome};
 pub use operation_stats::{
     DEFAULT_OPERATION_STATS_LIMIT, HooksOutsideLockStats, MAX_OPERATION_STATS_LIMIT,
     OPERATION_STATS_SCHEMA_VERSION, OperationKindStats, OperationQueueDepthStats, OperationStats,

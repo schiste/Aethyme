@@ -821,10 +821,46 @@ fn committed_corrupt_fragments_are_repaired_from_committed_source() {
 fn active_sessions_block_shared_fragment_writes() {
     let (_temporary, repo) = fixture();
     let mut broker = aethyme_broker::Broker::open(&repo).unwrap();
-    let session = broker.adopt(&repo, Some("hold graph policy")).unwrap();
+
+    // The session that owns the checkout being refreshed is the one *asking*
+    // for the refresh, so it is not concurrency. Counting it made the blocker
+    // unsatisfiable for a solo agent: the only way to clear it was closing your
+    // own session, and that close moves the ownership baseline and drops the
+    // session's pending commits (#294). This previously adopted `repo` itself,
+    // which was the cheapest way to obtain an active session rather than a
+    // statement that the owner must block.
+    let owner = broker.adopt(&repo, Some("owns this checkout")).unwrap();
+    let planned = plan(&repo);
+    assert!(
+        planned["active_sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|session| session["session_id"] != owner.id),
+        "the session owning this checkout must not block its own refresh"
+    );
+
+    // The invariant this test is named for: a session working *elsewhere* is
+    // invisible from here, so its concurrency is exactly what must block.
+    let elsewhere = repo.join("other-worktree");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            elsewhere.to_str().unwrap(),
+            "-b",
+            "other",
+        ],
+    );
+    let other = broker
+        .adopt(&elsewhere, Some("a different checkout"))
+        .unwrap();
+
     let planned = plan(&repo);
     assert_eq!(planned["safe_to_execute"], false);
-    assert_eq!(planned["active_sessions"][0]["session_id"], session.id);
+    assert_eq!(planned["active_sessions"][0]["session_id"], other.id);
     assert!(
         planned["blockers"]
             .as_array()

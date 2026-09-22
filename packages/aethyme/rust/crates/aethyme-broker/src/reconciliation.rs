@@ -473,10 +473,32 @@ impl Broker {
             && !entries.is_empty()
             && unrecorded_commits.is_empty()
             && landed_entry_count == entries.len();
+        // Nothing recorded and nothing unrecorded: integration holds no work of
+        // its own, so there is no landing evidence that could be missing. The
+        // `!entries.is_empty()` in `stale_only` made this case fall through to
+        // "some promoted entries lack conclusive upstream landing evidence",
+        // which names an empty set and refuses the one state that is provably
+        // safe -- integration a strict ancestor of upstream (#290 phase 3.1).
+        // A repository that does not promote is in this state after every
+        // merge, so the refusal was permanent there.
+        let carries_nothing_of_its_own = described_chain_is_complete
+            && entries.is_empty()
+            && unrecorded_commits.is_empty()
+            && self
+                .repo_handle()
+                .is_ancestor(integration_head, upstream_head);
         let local_main = self.repo_handle().head_commit()?;
-        let automatic_cleanup_safe =
-            stale_only && self.repo_handle().is_ancestor(&local_main, upstream_head);
-        let explanation = if stale_only {
+        let automatic_cleanup_safe = (stale_only || carries_nothing_of_its_own)
+            && self.repo_handle().is_ancestor(&local_main, upstream_head);
+        let explanation = if carries_nothing_of_its_own {
+            if automatic_cleanup_safe {
+                "integration holds nothing upstream lacks; it can be fast-forwarded without review"
+                    .into()
+            } else {
+                "integration holds nothing of its own, but local main is not an ancestor of upstream; automatic cleanup is refused"
+                    .into()
+            }
+        } else if stale_only {
             if automatic_cleanup_safe {
                 format!(
                     "all {landed_entry_count} promoted entries have conclusive upstream landing evidence; the recorded integration layer is stale and can be cleaned automatically"
@@ -577,7 +599,23 @@ impl Broker {
                         | IntegrationReconcileClassification::SupersededUpstream
                 )
             });
-        if !conclusively_landed {
+        // The empty-entry case is not ambiguity, it is the simplest safe
+        // outcome: nothing was promoted, upstream moved, and integration is a
+        // strict ancestor of it. Requiring a non-empty plan refused exactly
+        // that, so after every pull-request merge in a repository that does not
+        // promote, integration fell further behind and every new session
+        // inherited the gap (#290 phase 3.1).
+        //
+        // `is_ancestor` is the whole safety argument: integration holds nothing
+        // upstream lacks, so advancing it discards no work and rewrites no
+        // history. Anything else still defers to the reviewed manual path.
+        let fast_forward_only = dry_run.safe
+            && dry_run.new_integration == upstream_head
+            && dry_run.entries.is_empty()
+            && self
+                .repo_handle()
+                .is_ancestor(&old_integration, &upstream_head);
+        if !conclusively_landed && !fast_forward_only {
             return Ok(AutomaticIntegrationCleanupReport {
                 state: AutomaticIntegrationCleanupState::Deferred,
                 upstream_ref: upstream_ref.to_string(),
@@ -592,11 +630,12 @@ impl Broker {
             });
         }
 
-        let cleaned_queue_entry_ids = dry_run
+        let cleaned_queue_entry_ids: Vec<i64> = dry_run
             .entries
             .iter()
             .map(|entry| entry.queue_entry_id)
             .collect();
+        let advanced_by_fast_forward = fast_forward_only && !conclusively_landed;
         let applied = self.reconcile_integration(IntegrationReconcileOptions {
             upstream: upstream_ref.to_string(),
             apply: true,
@@ -626,7 +665,11 @@ impl Broker {
             new_integration: applied.new_integration,
             cleaned_queue_entry_ids,
             assessment: Some(assessment),
-            explanation: "all recorded integration promotions were proven upstream and cleaned transactionally"
+            explanation: if advanced_by_fast_forward {
+                "integration held nothing upstream lacked and was fast-forwarded onto it"
+            } else {
+                "all recorded integration promotions were proven upstream and cleaned transactionally"
+            }
                 .into(),
             next_action: None,
         })

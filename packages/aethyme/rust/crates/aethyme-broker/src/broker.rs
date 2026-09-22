@@ -723,6 +723,8 @@ pub(crate) struct WorktreeRootMarker {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionStartBaseEvidence {
+    /// The operator named the base with `--base <ref>`, so no inference ran.
+    ExplicitBase,
     IntegrationTip,
     RemoteDefaultBranch,
     ConventionalMain,
@@ -732,6 +734,7 @@ pub enum SessionStartBaseEvidence {
 impl SessionStartBaseEvidence {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::ExplicitBase => "explicit --base",
             Self::IntegrationTip => "integration tip",
             Self::RemoteDefaultBranch => "remote default branch",
             Self::ConventionalMain => "conventional main branch",
@@ -754,6 +757,17 @@ pub struct SessionStartBase {
     /// it would have carried into its pull request. `None` when there is no
     /// fetched default branch to compare against.
     pub behind_default_commits: Option<u64>,
+    /// Commits the chosen base carries that the fetched default branch does
+    /// not.
+    ///
+    /// Unlike `behind_default_commits` this is the *expected* state -- it is
+    /// what promoted-but-unpublished work looks like. It still needs naming,
+    /// because a branch cut here inherits every one of these commits and a
+    /// pull request opened from it presents them as its own. #283 reports a
+    /// 2-commit change whose pull request carried 5 commits from four
+    /// sessions, and a 4-file change whose pull request carried 29 files.
+    /// The `Start base:` line reads identically whether this is 0 or 20.
+    pub ahead_default_commits: Option<u64>,
     /// The ref the comparison used, so the number can be checked.
     pub default_ref: Option<String>,
 }
@@ -2987,6 +3001,7 @@ impl Broker {
             paths,
             agent_identity,
             SessionContext::default(),
+            None,
         )
     }
 
@@ -2996,12 +3011,13 @@ impl Broker {
         paths: &[String],
         agent_identity: Option<&str>,
         context: SessionContext,
+        explicit_base: Option<&str>,
     ) -> Result<StartReport, BrokerOpError> {
         let context = self.session_context(context);
         let planned_paths = normalize_planned_paths(paths)?;
         self.ensure_planned_paths_available(&planned_paths, None)?;
         let (_slug, branch, start_base, worktree, worktree_placement) =
-            self.create_session_worktree(task)?;
+            self.create_session_worktree(task, explicit_base)?;
         let base = start_base.commit.clone();
         let repository_contract = self.capture_repository_contract(worktree.root(), false)?;
         let new_session = NewSession {
@@ -3069,6 +3085,7 @@ impl Broker {
             command,
             agent_identity,
             SessionContext::default(),
+            None,
         )
     }
 
@@ -3078,10 +3095,11 @@ impl Broker {
         command: &str,
         agent_identity: Option<&str>,
         context: SessionContext,
+        explicit_base: Option<&str>,
     ) -> Result<StartAgentReport, BrokerOpError> {
         let context = self.session_context(context);
         let (slug, branch, start_base, worktree, worktree_placement) =
-            self.create_session_worktree(task)?;
+            self.create_session_worktree(task, explicit_base)?;
         let base = start_base.commit.clone();
         let repository_contract = self.capture_repository_contract(worktree.root(), false)?;
 
@@ -3142,13 +3160,14 @@ impl Broker {
     fn create_session_worktree(
         &mut self,
         task: &str,
+        explicit_base: Option<&str>,
     ) -> Result<(String, String, SessionStartBase, GitRepo, WorktreePlacement), BrokerOpError> {
         let placement = self.prepare_broker_worktree_root()?;
         let slug = self.next_worktree_slug(task, &placement.root);
         let worktree_path = placement.root.join(&slug);
         self.refuse_nested_worktree_path(&worktree_path)?;
         let branch = format!("agent/{slug}");
-        let start_base = self.select_session_start_base()?;
+        let start_base = self.select_session_start_base(explicit_base)?;
         let worktree = self
             .repo
             .worktree_add(&worktree_path, &branch, &start_base.commit)?;
@@ -3416,24 +3435,55 @@ impl Broker {
     }
 
     /// Compare a chosen start base against the fetched default branch.
-    fn start_base_drift(&self, commit: &str) -> (Option<u64>, Option<String>) {
+    fn start_base_drift(&self, commit: &str) -> (Option<u64>, Option<u64>, Option<String>) {
         let Some((upstream_ref, upstream_head)) = self.repo.tracking_upstream() else {
-            return (None, None);
+            return (None, None, None);
         };
         let behind = self.repo.commit_count_between(commit, &upstream_head).ok();
-        (behind, Some(upstream_ref))
+        let ahead = self.repo.commit_count_between(&upstream_head, commit).ok();
+        (behind, ahead, Some(upstream_ref))
     }
 
-    fn select_session_start_base(&self) -> Result<SessionStartBase, BrokerOpError> {
+    /// Choose the commit a new session's branch is cut from.
+    ///
+    /// An explicit `--base` skips inference entirely: the operator named the
+    /// ref, so guessing on their behalf would be worse than failing. It is
+    /// still measured against the default branch, because naming a base does
+    /// not make its inherited commits stop landing in a pull request (#290).
+    fn select_session_start_base(
+        &self,
+        explicit: Option<&str>,
+    ) -> Result<SessionStartBase, BrokerOpError> {
+        if let Some(reference) = explicit {
+            let Some(commit) = self.repo.resolve_ref(reference) else {
+                return Err(BrokerOpError::StartBaseUnavailable {
+                    reason: format!(
+                        "--base {reference} does not resolve to a commit in this repository"
+                    ),
+                });
+            };
+            let (behind_default_commits, ahead_default_commits, default_ref) =
+                self.start_base_drift(&commit);
+            return Ok(SessionStartBase {
+                ref_name: reference.to_string(),
+                commit,
+                evidence: SessionStartBaseEvidence::ExplicitBase,
+                behind_default_commits,
+                ahead_default_commits,
+                default_ref,
+            });
+        }
         let integration_branch = PromoteConfig::load(&self.main_root).branch;
         let integration_ref = format!("refs/heads/{integration_branch}");
         if let Some(commit) = self.repo.resolve_ref(&integration_ref) {
-            let (behind_default_commits, default_ref) = self.start_base_drift(&commit);
+            let (behind_default_commits, ahead_default_commits, default_ref) =
+                self.start_base_drift(&commit);
             return Ok(SessionStartBase {
                 ref_name: integration_ref,
                 commit,
                 evidence: SessionStartBaseEvidence::IntegrationTip,
                 behind_default_commits,
+                ahead_default_commits,
                 default_ref,
             });
         }
@@ -3447,6 +3497,7 @@ impl Broker {
                         commit,
                         evidence: SessionStartBaseEvidence::RemoteDefaultBranch,
                         behind_default_commits: None,
+                        ahead_default_commits: None,
                         default_ref: None,
                     });
                 }
@@ -3461,6 +3512,7 @@ impl Broker {
                 commit,
                 evidence: SessionStartBaseEvidence::ConventionalMain,
                         behind_default_commits: None,
+                        ahead_default_commits: None,
                         default_ref: None,
             }),
             (None, Some(commit)) => Ok(SessionStartBase {
@@ -3468,6 +3520,7 @@ impl Broker {
                 commit,
                 evidence: SessionStartBaseEvidence::ConventionalMaster,
                         behind_default_commits: None,
+                        ahead_default_commits: None,
                         default_ref: None,
             }),
             (Some(_), Some(_)) => Err(BrokerOpError::StartBaseUnavailable {
@@ -5760,23 +5813,39 @@ impl Broker {
             let stale_only = integration_reconciliation
                 .as_ref()
                 .filter(|assessment| assessment.stale_only);
+            // Integration strictly behind upstream is not ambiguity: it holds
+            // nothing upstream lacks, so advancing it discards no work and
+            // rewrites no history. Reporting that as `blocked` alongside
+            // genuine divergence taught operators to reach for a reviewed
+            // reconciliation when a fast-forward was the whole answer, and to
+            // wait for the block rather than keeping the ref current (#290
+            // phase 3.2). Divergence still blocks.
+            let fast_forward_available = !integration_contains_upstream
+                && upstream_head
+                    .as_deref()
+                    .is_some_and(|upstream| self.repo.is_ancestor(&integration_head, upstream));
             advice.insert(
                 0,
                 StatusAdvice {
                     id: if stale_only.is_some() {
                         "integration.stale-promotions"
+                    } else if fast_forward_available {
+                        "integration.fast-forward-available"
                     } else {
                         "integration.upstream-main-ahead"
                     },
-                    severity: if integration_contains_upstream {
-                        StatusAdviceSeverity::Notice
-                    } else if stale_only.is_some() {
+                    severity: if integration_contains_upstream
+                        || stale_only.is_some()
+                        || fast_forward_available
+                    {
                         StatusAdviceSeverity::Notice
                     } else {
                         StatusAdviceSeverity::Blocked
                     },
                     reason: if stale_only.is_some() {
                         "all recorded integration promotions have conclusive upstream landing evidence"
+                    } else if fast_forward_available {
+                        "integration holds nothing upstream lacks, so it can be advanced without review"
                     } else {
                         "configured upstream moved outside broker-managed integration"
                     },
@@ -5786,6 +5855,16 @@ impl Broker {
                         )
                     } else if let Some(assessment) = stale_only {
                         assessment.explanation.clone()
+                    } else if fast_forward_available {
+                        // Keeps the external-movement signal verbatim: what
+                        // changes is the severity and the named repair, not
+                        // whether the operator is told main moved outside the
+                        // broker.
+                        format!(
+                            "external main movement detected: integration is behind {upstream} \
+                             and carries nothing of its own, so it can be fast-forwarded without \
+                             review; do it so new sessions stop inheriting the gap"
+                        )
                     } else {
                         format!(
                             "external main movement detected: integration does not contain {upstream}; unresolved or unrecorded work requires reviewed reconciliation"
@@ -7487,6 +7566,13 @@ impl Broker {
         if let Some(entry) = latest_for_head {
             match entry.status {
                 MergeStatus::Promoted | MergeStatus::ExternallyLanded => {}
+                // A repository that never promotes leaves every entry
+                // `Verified`, so demanding a promotion before finish would
+                // block every session in it permanently (#290 phase 2.2).
+                MergeStatus::Verified
+                    if !crate::PromoteConfig::load(&self.main_root_path())
+                        .mode
+                        .promotes_at_all() => {}
                 MergeStatus::Verified => {
                     report.warnings.push(format!(
                         "queue entry {} is verified but not promoted; promote it before finish",

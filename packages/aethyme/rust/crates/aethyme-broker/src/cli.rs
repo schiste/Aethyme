@@ -138,7 +138,7 @@ Usage:
       Resolve retained ambiguity explicitly. Assignment requires --session;
       unsupported or repository-mismatched events can only be ignored. The
       reason is stored as a SHA-256 digest, never as text.
-  aethyme broker start --task <text> [--pull-request <number>] [--path <repo-path>]... [--agent <name-and-email>] [--repo-name <name>] [--tab-name <name>] [--ai-provider <provider>] [--json]
+  aethyme broker start --task <text> [--base <ref>] [--pull-request <number>] [--path <repo-path>]... [--agent <name-and-email>] [--repo-name <name>] [--tab-name <name>] [--ai-provider <provider>] [--json]
       Create a broker-managed worktree + branch and register a session,
       atomically claiming every reviewed --path, but do not spawn a process.
       Prefer this over adopting the main
@@ -446,7 +446,7 @@ Usage:
   aethyme broker review abandon --session <id> --reason <text> [--json]
       Explicitly retire a stuck lifecycle without deleting its audit history,
       freeing the PR for fresh registration. Only the reason digest is stored.
-  aethyme broker submit --session <id> [--no-cache] [--json]
+  aethyme broker submit --session <id> [--no-cache] [--verify-only] [--json]
       Submit the session's head commit: simulate the merge onto the local
       integration branch, run affected gates on the merged tree, and
       promote when verified (default; set [promote] mode = 'manual' to
@@ -1991,6 +1991,8 @@ impl<E: std::fmt::Display> From<E> for UsageError {
 #[derive(Clone)]
 struct Parsed {
     read_only_snapshot: bool,
+    /// `submit --verify-only`: run verification and promote nothing.
+    verify_only: bool,
     /// `status --summary`: skip the per-session lease refresh (#182).
     summary: bool,
     positional: Vec<String>,
@@ -2100,6 +2102,7 @@ struct Parsed {
 fn parse(args: &[String]) -> Result<Parsed, UsageError> {
     let mut parsed = Parsed {
         read_only_snapshot: false,
+        verify_only: false,
         summary: false,
         positional: Vec::new(),
         task: None,
@@ -2264,6 +2267,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
             "--sync-main" => parsed.sync_main = true,
             "--sync-integration" => parsed.sync_integration = true,
             "--no-cache" => parsed.no_cache = true,
+            "--verify-only" => parsed.verify_only = true,
             "--probe" => parsed.probe = true,
             "--only" => {
                 parsed.only = Some(
@@ -2899,6 +2903,58 @@ fn render_planned_explicit_leases(leases: &[crate::Lease]) {
     out!("Planned explicit leases:");
     for lease in leases {
         out!("  {}", lease.path);
+    }
+}
+
+/// The base a session's branch was cut from, and what that base carries
+/// relative to the default branch in both directions.
+///
+/// Shared by `start` and `start-agent` because both select a base and both open
+/// pull requests from it. `start-agent` is the detached case, where nobody is
+/// watching the terminal -- which is exactly why it cannot be the one surface
+/// that stays silent about an inherited gap (#290).
+fn render_start_base(base: &crate::SessionStartBase) {
+    out!(
+        "Start base: {} at {} ({})",
+        base.ref_name,
+        short_commit(&base.commit),
+        base.evidence.as_str()
+    );
+    let default_ref = || base.default_ref.as_deref().unwrap_or("the default branch");
+    // Integration is normally ahead of the default branch. Behind means it
+    // stopped following, and every session cut from it inherits the gap —
+    // silently, because the line above looks identical either way.
+    if let Some(behind) = base.behind_default_commits
+        && behind > 0
+    {
+        out!(
+            "warning: this base is {behind} commit(s) behind {}; a branch cut \
+             from it carries that gap into its pull request",
+            default_ref()
+        );
+        out!(
+            "         inspect with `aethyme broker integration status`, or start \
+             from the default branch if integration is not the base you want."
+        );
+    }
+    // Ahead is the designed state: integration carries promoted work the default
+    // branch has not published. It is also the state that puts other sessions'
+    // commits into this session's pull request, and nothing printed above
+    // separates 0 from 20.
+    //
+    // Deliberately a note rather than a warning. In a repository that promotes
+    // this is true at almost every start, and a warning that always fires stops
+    // being read. Escalating it belongs with the merge-path detection in #290
+    // phase 1.2, which can tell whether pull requests are how work ships here;
+    // until then the count is the signal.
+    if let Some(ahead) = base.ahead_default_commits
+        && ahead > 0
+    {
+        out!(
+            "note: this base is {ahead} commit(s) ahead of {}; a pull request \
+             opened from this branch carries them alongside your own work",
+            default_ref()
+        );
     }
 }
 
@@ -10020,6 +10076,34 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                 .into(),
         ));
     }
+    // `--base` names the commit a new session's branch is cut from (#290 phase
+    // 1.1), and `gates scope` uses it as a diff endpoint. Everywhere else it
+    // used to be parsed and silently dropped, which reported a choice that was
+    // never made -- the same shape as the `adopt --claim` drop in #285.
+    //
+    // `adopt` is called out separately because it is the plausible mistake:
+    // adopting registers an existing worktree whose branch already has a
+    // history, so there is no base to choose and silently ignoring the flag
+    // would be the worst of the three options.
+    if parsed.base.is_some() && subcommand == "adopt" {
+        return Err(UsageError::Message(
+            "--base does not apply to broker adopt: adopting registers an existing worktree, \
+             whose branch already has its own history. Use broker start --base <ref> to cut a \
+             new branch from a chosen base."
+                .into(),
+        ));
+    }
+    if parsed.base.is_some() && !matches!(subcommand.as_str(), "gates" | "start" | "start-agent") {
+        return Err(UsageError::Message(
+            "--base is valid only with broker start, broker start-agent, or broker gates scope"
+                .into(),
+        ));
+    }
+    if parsed.verify_only && subcommand != "submit" {
+        return Err(UsageError::Message(
+            "--verify-only is valid only with broker submit".into(),
+        ));
+    }
     if parsed.required_mode.is_some() && subcommand != "readiness" {
         return Err(UsageError::Message(
             "--require is valid only with broker readiness".into(),
@@ -10259,6 +10343,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                 &parsed.planned_paths,
                 agent_identity.as_deref(),
                 context,
+                parsed.base.as_deref(),
             )?;
             let session = &report.session;
             if parsed.json {
@@ -10277,33 +10362,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     &parsed.declared_scopes,
                     false,
                 )?;
-                out!(
-                    "Start base: {} at {} ({})",
-                    report.start_base.ref_name,
-                    short_commit(&report.start_base.commit),
-                    report.start_base.evidence.as_str()
-                );
-                // Integration is normally ahead of the default branch. Behind
-                // means it stopped following, and every session cut from it
-                // inherits the gap — silently, because the line above looks
-                // identical either way.
-                if let Some(behind) = report.start_base.behind_default_commits
-                    && behind > 0
-                {
-                    out!(
-                        "warning: this base is {behind} commit(s) behind {}; a branch cut \
-                         from it carries that gap into its pull request",
-                        report
-                            .start_base
-                            .default_ref
-                            .as_deref()
-                            .unwrap_or("the default branch")
-                    );
-                    out!(
-                        "         inspect with `aethyme broker integration status`, or start \
-                         from the default branch if integration is not the base you want."
-                    );
-                }
+                render_start_base(&report.start_base);
                 render_worktree_placement(&report.worktree_placement);
                 render_planned_explicit_leases(&report.planned_explicit_leases);
                 render_preparation_status(&report.preparation, false)?;
@@ -10327,6 +10386,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                 &cmd,
                 agent_identity.as_deref(),
                 context,
+                parsed.base.as_deref(),
             )?;
             let session = &report.session;
             if parsed.json {
@@ -10340,6 +10400,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     session.branch,
                     session.log_path.as_deref().unwrap_or("-"),
                 );
+                render_start_base(&report.start_base);
                 render_worktree_placement(&report.worktree_placement);
             }
         }
@@ -11256,6 +11317,11 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     "gates requires an action: draft, validate, doctor, manifest, scope, affected, semantic, run, or pre-push"
                         .into(),
                 ))?;
+            if parsed.base.is_some() && action != "scope" {
+                return Err(UsageError::Message(
+                    "--base is valid only with broker gates scope".into(),
+                ));
+            }
             if parsed.probe && action != "doctor" {
                 return Err(UsageError::Message(
                     "--probe is valid only with broker gates doctor".into(),
@@ -11816,12 +11882,17 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     );
                 }
             }
-            let outcome = broker.submit_with_policy(
+            let outcome = broker.submit_with_intent(
                 session,
                 if parsed.no_cache {
                     crate::CachePolicy::Bypass
                 } else {
                     crate::CachePolicy::Use
+                },
+                if parsed.verify_only {
+                    crate::PromotionIntent::VerifyOnly
+                } else {
+                    crate::PromotionIntent::Configured
                 },
             )?;
             if parsed.json {
@@ -11938,6 +12009,12 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                             ""
                         }
                     );
+                    // A verified entry that did not move is the normal outcome
+                    // where promotion is off, and reads as a silent failure
+                    // without the reason (#290 phase 2.2).
+                    if let Some(reason) = &outcome.promotion_suppressed {
+                        out!("  {reason}");
+                    }
                 }
                 if outcome.no_changes {
                     // "Nothing pending" is the right summary only when nothing was

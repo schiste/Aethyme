@@ -1567,10 +1567,32 @@ fn broker_preconditions(
     let status = broker
         .status_snapshot(now_ms())
         .map_err(|error| error.to_string())?;
+    // The refresh runs *inside* one session's worktree, and that session is the
+    // one asking for it. Counting it as a concurrent writer makes the blocker
+    // self-inflicted: a solo agent can never satisfy it without closing its own
+    // session first, and that close moves the ownership baseline and silently
+    // costs the session its pending commits (#294). Measured twice in one
+    // evening with exactly one live session on the host -- its own.
+    //
+    // Excluding only *this* checkout's session is safe because the hazard the
+    // blocker guards, an edit landing while fragments are generated, is already
+    // covered for this worktree by the overlapping-dirty-paths check above,
+    // which reads the same tree this refresh regenerates from. Every other
+    // session stays blocking: their edits are invisible from here, so their
+    // concurrency is exactly what this check is for.
+    let requesting_worktree = std::fs::canonicalize(repo).ok();
+    let is_requesting_session = |worktree_path: &str| match requesting_worktree.as_ref() {
+        // Without a resolvable path, fail closed and keep the session blocking.
+        None => false,
+        Some(requesting) => std::fs::canonicalize(worktree_path)
+            .map(|path| path == *requesting)
+            .unwrap_or(false),
+    };
     let mut sessions = status
         .agents
         .into_iter()
         .filter(|agent| !agent.derived_status.is_closed())
+        .filter(|agent| !is_requesting_session(&agent.session.worktree_path))
         .map(|agent| GraphSessionPrecondition {
             session_id: agent.session.id,
             status: agent.derived_status,
@@ -2427,6 +2449,68 @@ mod tests {
         let blobs = git_blob_batch(temporary.path(), vec![oid.as_str(); 4_096]).unwrap();
         assert_eq!(blobs.len(), 4_096);
         assert!(blobs.iter().all(|blob| blob.len() == 2_048));
+    }
+
+    /// The refresh runs inside a session's worktree, so counting that session as
+    /// a concurrent writer makes the blocker unsatisfiable for a solo agent: the
+    /// only way to clear it is closing your own session, which moves the
+    /// ownership baseline and costs the session its pending commits (#294).
+    /// Other sessions must keep blocking -- their edits are invisible from here.
+    #[test]
+    fn refresh_liveness_ignores_the_session_that_owns_this_checkout() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        git(root, &["init", "-q"]).unwrap();
+        git(root, &["config", "user.name", "Graph Refresh Test"]).unwrap();
+        git(root, &["config", "user.email", "graph-refresh@example.test"]).unwrap();
+        std::fs::create_dir_all(root.join(".aethyme")).unwrap();
+        std::fs::write(
+            root.join(".aethyme/config.toml"),
+            "[graph]\nauthority = 'committed_fragments'\nrepository = 'fixture'\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("README.md"), "fixture\n").unwrap();
+        git(root, &["add", "."]).unwrap();
+        git(root, &["commit", "-qm", "fixture"]).unwrap();
+
+        let mut broker = Broker::open(root).unwrap();
+        let mine = broker.adopt(root, Some("owns this checkout")).unwrap();
+
+        // A planned path is required for the lease scan; its value is irrelevant
+        // here because the assertion is about which sessions are reported.
+        let planned = BTreeSet::from([".aethyme/graph/manifest.json".to_string()]);
+
+        let (sessions, _) = broker_preconditions(root, &planned).unwrap();
+        assert!(
+            !sessions.iter().any(|s| s.session_id == mine.id),
+            "the session owning this checkout must not block its own refresh, got {sessions:?}"
+        );
+
+        // A session on a different worktree is exactly what the check is for.
+        let elsewhere = root.join("other-worktree");
+        git(
+            root,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                elsewhere.to_str().unwrap(),
+                "-b",
+                "other",
+            ],
+        )
+        .unwrap();
+        let other = broker.adopt(&elsewhere, Some("a different checkout")).unwrap();
+
+        let (sessions, _) = broker_preconditions(root, &planned).unwrap();
+        assert!(
+            !sessions.iter().any(|s| s.session_id == mine.id),
+            "the owning session must still be excluded, got {sessions:?}"
+        );
+        assert!(
+            sessions.iter().any(|s| s.session_id == other.id),
+            "a session on another worktree must still block, got {sessions:?}"
+        );
     }
 
     #[test]
