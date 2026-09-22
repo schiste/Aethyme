@@ -3,8 +3,8 @@
   "available": true,
   "source_revision": "15cfa8820110270a3ede27444738569425ef1679",
   "indexed_revision": "15cfa8820110270a3ede27444738569425ef1679",
-  "source_tree_sha256": "b7313b5485970161ece6a5990c897c6c2ebcbbd6dd0b49372fd1cd77d6bff20b",
-  "indexed_tree_sha256": "b7313b5485970161ece6a5990c897c6c2ebcbbd6dd0b49372fd1cd77d6bff20b",
+  "source_tree_sha256": "c4f438d85f6d47f3e4213b402ae9f9bf3fa83ab06acad3fabc75007140f6b701",
+  "indexed_tree_sha256": "c4f438d85f6d47f3e4213b402ae9f9bf3fa83ab06acad3fabc75007140f6b701",
   "engine_version": "0.7.25",
   "coverage_mode": "partial",
   "safe_to_use": false,
@@ -22,12 +22,12 @@
     "excluded": 24
   },
   "bytes": {
-    "discovered": 16140398,
-    "eligible": 11182818,
+    "discovered": 16143002,
+    "eligible": 11185422,
     "parsed": 9469570,
     "partial": 0,
     "unsupported": 61634,
-    "non_code": 1651614,
+    "non_code": 1654218,
     "excluded": 4957580,
     "source_read": 9580631
   },
@@ -52,7 +52,7 @@
     },
     "markdown": {
       "files": 171,
-      "bytes": 1548765,
+      "bytes": 1551369,
       "parsed": 0,
       "partial": 0,
       "unsupported": 0,
@@ -117,7 +117,7 @@
   "by_parser": {
     "none": {
       "files": 209,
-      "bytes": 1651614,
+      "bytes": 1654218,
       "parsed": 0,
       "partial": 0,
       "unsupported": 0,
