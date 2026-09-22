@@ -754,6 +754,17 @@ pub struct SessionStartBase {
     /// it would have carried into its pull request. `None` when there is no
     /// fetched default branch to compare against.
     pub behind_default_commits: Option<u64>,
+    /// Commits the chosen base carries that the fetched default branch does
+    /// not.
+    ///
+    /// Unlike `behind_default_commits` this is the *expected* state -- it is
+    /// what promoted-but-unpublished work looks like. It still needs naming,
+    /// because a branch cut here inherits every one of these commits and a
+    /// pull request opened from it presents them as its own. #283 reports a
+    /// 2-commit change whose pull request carried 5 commits from four
+    /// sessions, and a 4-file change whose pull request carried 29 files.
+    /// The `Start base:` line reads identically whether this is 0 or 20.
+    pub ahead_default_commits: Option<u64>,
     /// The ref the comparison used, so the number can be checked.
     pub default_ref: Option<String>,
 }
@@ -3416,24 +3427,27 @@ impl Broker {
     }
 
     /// Compare a chosen start base against the fetched default branch.
-    fn start_base_drift(&self, commit: &str) -> (Option<u64>, Option<String>) {
+    fn start_base_drift(&self, commit: &str) -> (Option<u64>, Option<u64>, Option<String>) {
         let Some((upstream_ref, upstream_head)) = self.repo.tracking_upstream() else {
-            return (None, None);
+            return (None, None, None);
         };
         let behind = self.repo.commit_count_between(commit, &upstream_head).ok();
-        (behind, Some(upstream_ref))
+        let ahead = self.repo.commit_count_between(&upstream_head, commit).ok();
+        (behind, ahead, Some(upstream_ref))
     }
 
     fn select_session_start_base(&self) -> Result<SessionStartBase, BrokerOpError> {
         let integration_branch = PromoteConfig::load(&self.main_root).branch;
         let integration_ref = format!("refs/heads/{integration_branch}");
         if let Some(commit) = self.repo.resolve_ref(&integration_ref) {
-            let (behind_default_commits, default_ref) = self.start_base_drift(&commit);
+            let (behind_default_commits, ahead_default_commits, default_ref) =
+                self.start_base_drift(&commit);
             return Ok(SessionStartBase {
                 ref_name: integration_ref,
                 commit,
                 evidence: SessionStartBaseEvidence::IntegrationTip,
                 behind_default_commits,
+                ahead_default_commits,
                 default_ref,
             });
         }
@@ -3447,6 +3461,7 @@ impl Broker {
                         commit,
                         evidence: SessionStartBaseEvidence::RemoteDefaultBranch,
                         behind_default_commits: None,
+                        ahead_default_commits: None,
                         default_ref: None,
                     });
                 }
@@ -3461,6 +3476,7 @@ impl Broker {
                 commit,
                 evidence: SessionStartBaseEvidence::ConventionalMain,
                         behind_default_commits: None,
+                        ahead_default_commits: None,
                         default_ref: None,
             }),
             (None, Some(commit)) => Ok(SessionStartBase {
@@ -3468,6 +3484,7 @@ impl Broker {
                 commit,
                 evidence: SessionStartBaseEvidence::ConventionalMaster,
                         behind_default_commits: None,
+                        ahead_default_commits: None,
                         default_ref: None,
             }),
             (Some(_), Some(_)) => Err(BrokerOpError::StartBaseUnavailable {

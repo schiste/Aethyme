@@ -2902,6 +2902,58 @@ fn render_planned_explicit_leases(leases: &[crate::Lease]) {
     }
 }
 
+/// The base a session's branch was cut from, and what that base carries
+/// relative to the default branch in both directions.
+///
+/// Shared by `start` and `start-agent` because both select a base and both open
+/// pull requests from it. `start-agent` is the detached case, where nobody is
+/// watching the terminal -- which is exactly why it cannot be the one surface
+/// that stays silent about an inherited gap (#290).
+fn render_start_base(base: &crate::SessionStartBase) {
+    out!(
+        "Start base: {} at {} ({})",
+        base.ref_name,
+        short_commit(&base.commit),
+        base.evidence.as_str()
+    );
+    let default_ref = || base.default_ref.as_deref().unwrap_or("the default branch");
+    // Integration is normally ahead of the default branch. Behind means it
+    // stopped following, and every session cut from it inherits the gap —
+    // silently, because the line above looks identical either way.
+    if let Some(behind) = base.behind_default_commits
+        && behind > 0
+    {
+        out!(
+            "warning: this base is {behind} commit(s) behind {}; a branch cut \
+             from it carries that gap into its pull request",
+            default_ref()
+        );
+        out!(
+            "         inspect with `aethyme broker integration status`, or start \
+             from the default branch if integration is not the base you want."
+        );
+    }
+    // Ahead is the designed state: integration carries promoted work the default
+    // branch has not published. It is also the state that puts other sessions'
+    // commits into this session's pull request, and nothing printed above
+    // separates 0 from 20.
+    //
+    // Deliberately a note rather than a warning. In a repository that promotes
+    // this is true at almost every start, and a warning that always fires stops
+    // being read. Escalating it belongs with the merge-path detection in #290
+    // phase 1.2, which can tell whether pull requests are how work ships here;
+    // until then the count is the signal.
+    if let Some(ahead) = base.ahead_default_commits
+        && ahead > 0
+    {
+        out!(
+            "note: this base is {ahead} commit(s) ahead of {}; a pull request \
+             opened from this branch carries them alongside your own work",
+            default_ref()
+        );
+    }
+}
+
 fn render_worktree_placement(placement: &crate::WorktreePlacement) {
     let boundary = if placement.outside_repository {
         "outside the repository"
@@ -10020,6 +10072,16 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                 .into(),
         ));
     }
+    // `--base` is read only by `gates scope`. Accepted anywhere else it was
+    // silently dropped, so `broker start --base main` exited zero having ignored
+    // the flag entirely (#290 phase 0.2) -- the same shape as the `adopt --claim`
+    // drop in #285. A flag the parser accepts must be honored or refused;
+    // honoring `--base` at `start` is #290 phase 1.1.
+    if parsed.base.is_some() && subcommand != "gates" {
+        return Err(UsageError::Message(
+            "--base is valid only with broker gates scope".into(),
+        ));
+    }
     if parsed.required_mode.is_some() && subcommand != "readiness" {
         return Err(UsageError::Message(
             "--require is valid only with broker readiness".into(),
@@ -10277,33 +10339,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     &parsed.declared_scopes,
                     false,
                 )?;
-                out!(
-                    "Start base: {} at {} ({})",
-                    report.start_base.ref_name,
-                    short_commit(&report.start_base.commit),
-                    report.start_base.evidence.as_str()
-                );
-                // Integration is normally ahead of the default branch. Behind
-                // means it stopped following, and every session cut from it
-                // inherits the gap — silently, because the line above looks
-                // identical either way.
-                if let Some(behind) = report.start_base.behind_default_commits
-                    && behind > 0
-                {
-                    out!(
-                        "warning: this base is {behind} commit(s) behind {}; a branch cut \
-                         from it carries that gap into its pull request",
-                        report
-                            .start_base
-                            .default_ref
-                            .as_deref()
-                            .unwrap_or("the default branch")
-                    );
-                    out!(
-                        "         inspect with `aethyme broker integration status`, or start \
-                         from the default branch if integration is not the base you want."
-                    );
-                }
+                render_start_base(&report.start_base);
                 render_worktree_placement(&report.worktree_placement);
                 render_planned_explicit_leases(&report.planned_explicit_leases);
                 render_preparation_status(&report.preparation, false)?;
@@ -10340,6 +10376,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     session.branch,
                     session.log_path.as_deref().unwrap_or("-"),
                 );
+                render_start_base(&report.start_base);
                 render_worktree_placement(&report.worktree_placement);
             }
         }
@@ -11256,6 +11293,11 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     "gates requires an action: draft, validate, doctor, manifest, scope, affected, semantic, run, or pre-push"
                         .into(),
                 ))?;
+            if parsed.base.is_some() && action != "scope" {
+                return Err(UsageError::Message(
+                    "--base is valid only with broker gates scope".into(),
+                ));
+            }
             if parsed.probe && action != "doctor" {
                 return Err(UsageError::Message(
                     "--probe is valid only with broker gates doctor".into(),

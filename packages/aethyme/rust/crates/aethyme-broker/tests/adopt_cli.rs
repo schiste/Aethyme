@@ -191,6 +191,143 @@ fn start_selects_integration_or_default_branch_without_using_checkout_head() {
     assert_eq!(value["start_base"]["evidence"], "integration_tip");
 }
 
+/// Point `main` at a tracking upstream without needing a real remote, so
+/// `@{upstream}` resolves and the start base can be compared against it.
+fn track_origin_main(repo: &Path, commit: &str) {
+    git(repo, &["update-ref", "refs/remotes/origin/main", commit]);
+    git(repo, &["config", "remote.origin.url", "."]);
+    git(
+        repo,
+        &[
+            "config",
+            "remote.origin.fetch",
+            "+refs/heads/*:refs/remotes/origin/*",
+        ],
+    );
+    git(repo, &["config", "branch.main.remote", "origin"]);
+    git(repo, &["config", "branch.main.merge", "refs/heads/main"]);
+}
+
+/// Put `aethyme/integration` `commits` ahead of `main`, the state a repository
+/// is in whenever work has been promoted but not yet published.
+fn integration_ahead_of_main(repo: &Path, commits: usize) -> String {
+    git(repo, &["switch", "-qc", "promoted"]);
+    for n in 0..commits {
+        std::fs::write(repo.join(format!("promoted{n}.txt")), "promoted\n").unwrap();
+        git(repo, &["add", "."]);
+        git(repo, &["commit", "-qm", &format!("promoted work {n}")]);
+    }
+    let integration = git_output(repo, &["rev-parse", "HEAD"]);
+    git(
+        repo,
+        &["update-ref", "refs/heads/aethyme/integration", &integration],
+    );
+    git(repo, &["switch", "-q", "main"]);
+    integration
+}
+
+/// A branch cut from integration inherits everything integration carries that
+/// the default branch does not, and opening a pull request from it presents
+/// those commits as the session's own (#283, #290). Being *ahead* is the
+/// normal state, so it is the one that was never reported.
+#[test]
+fn start_reports_the_commits_its_base_carries_ahead_of_the_default_branch() {
+    let tmp = fixture();
+    let main = git_output(tmp.path(), &["rev-parse", "HEAD"]);
+    track_origin_main(tmp.path(), &main);
+    integration_ahead_of_main(tmp.path(), 2);
+
+    let started = stdout(&run(
+        tmp.path(),
+        &["start", "--task", "ahead of default", "--json"],
+    ));
+    let value: serde_json::Value = serde_json::from_str(&started).unwrap();
+    assert_eq!(value["start_base"]["evidence"], "integration_tip");
+    assert_eq!(value["start_base"]["ahead_default_commits"], 2);
+    assert_eq!(value["start_base"]["behind_default_commits"], 0);
+
+    let human = fixture();
+    let main = git_output(human.path(), &["rev-parse", "HEAD"]);
+    track_origin_main(human.path(), &main);
+    integration_ahead_of_main(human.path(), 2);
+    let rendered = stdout(&run(human.path(), &["start", "--task", "ahead of default"]));
+    assert!(
+        rendered.contains("note: this base is 2 commit(s) ahead of"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("carries them alongside your own work"),
+        "{rendered}"
+    );
+}
+
+/// A base level with the default branch inherits nothing, so the note would be
+/// noise. Guards the threshold in the other direction.
+#[test]
+fn start_is_silent_when_its_base_carries_nothing_extra() {
+    let tmp = fixture();
+    let main = git_output(tmp.path(), &["rev-parse", "HEAD"]);
+    track_origin_main(tmp.path(), &main);
+    git(
+        tmp.path(),
+        &["update-ref", "refs/heads/aethyme/integration", &main],
+    );
+
+    let rendered = stdout(&run(tmp.path(), &["start", "--task", "level with default"]));
+    assert!(!rendered.contains("commit(s) ahead of"), "{rendered}");
+    assert!(!rendered.contains("commit(s) behind"), "{rendered}");
+}
+
+/// `start-agent` selects a base exactly as `start` does and reported nothing
+/// about it, which is the worse half of the gap: a detached agent has no one
+/// reading its terminal, and it opens pull requests from that base (#290).
+#[test]
+fn start_agent_reports_its_base_and_what_it_carries() {
+    let tmp = fixture();
+    let main = git_output(tmp.path(), &["rev-parse", "HEAD"]);
+    track_origin_main(tmp.path(), &main);
+    integration_ahead_of_main(tmp.path(), 3);
+
+    let rendered = stdout(&run(
+        tmp.path(),
+        &["start-agent", "--task", "detached", "--cmd", "true"],
+    ));
+    assert!(rendered.contains("Start base: refs/heads/aethyme/integration"), "{rendered}");
+    assert!(
+        rendered.contains("note: this base is 3 commit(s) ahead of"),
+        "{rendered}"
+    );
+}
+
+/// `--base` is parsed for every subcommand but read only by `gates scope`.
+/// Accepting it at `start` and ignoring it reports a base choice that was never
+/// made (#290 phase 0.2); refusing is correct until phase 1.1 honors it.
+#[test]
+fn start_refuses_a_base_flag_it_cannot_honor() {
+    let tmp = fixture();
+    let output = run(
+        tmp.path(),
+        &["start", "--task", "explicit base", "--base", "main"],
+    );
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("--base is valid only with broker gates scope"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // The same drop one level down: only `scope` reads it.
+    let output = run(tmp.path(), &["gates", "draft", "--base", "main"]);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("--base is valid only with broker gates scope"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[test]
 fn start_refuses_ambiguous_or_missing_default_refs() {
     let ambiguous = fixture();
