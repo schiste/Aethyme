@@ -93,6 +93,42 @@ fn verify_only_repositories_verify_and_promote_nothing() {
     );
 }
 
+/// The reason and the next action must agree. The first cut of `verify-only`
+/// printed "promotion is off for this repository" and then, on the very next
+/// line, "verified but not promoted (manual mode). Promote with `aethyme
+/// broker promote`" -- naming the one command the mode exists to avoid,
+/// directly under a sentence saying it would not happen.
+#[test]
+fn the_next_action_does_not_contradict_the_suppression_reason() {
+    let (tmp, mut broker) = fixture(Some("verify-only"));
+    let session = commit_work(&mut broker, "agreement");
+    let outcome = broker.submit(session).unwrap();
+    assert!(
+        outcome
+            .promotion_suppressed
+            .as_deref()
+            .is_some_and(|r| r.contains("promotion is off"))
+    );
+
+    let rendered = String::from_utf8_lossy(
+        &std::process::Command::new(env!("CARGO_BIN_EXE_broker-cli-shim"))
+            .args(["submit", "--session", &session.to_string()])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .into_owned();
+    assert!(
+        !rendered.contains("manual mode"),
+        "a verify-only repository must not be told it is in manual mode: {rendered}"
+    );
+    assert!(
+        !rendered.contains("broker promote --entry"),
+        "a verify-only repository must not be told to promote: {rendered}"
+    );
+}
+
 /// `finish` must not demand a promotion the repository has opted out of, or
 /// every session in it would be unfinishable.
 #[test]

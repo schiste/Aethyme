@@ -28,6 +28,7 @@ page before reaching for lower-level graph, eval, or architecture references.
 - [`architecture/eval-mining-notes.md`](architecture/eval-mining-notes.md)
 - [`guides/testing.md`](guides/testing.md)
 - [`guides/troubleshooting.md`](guides/troubleshooting.md)
+- [`guides/worktree-cleanup.md`](guides/worktree-cleanup.md)
 
 ## First Local Proof
 

@@ -3,8 +3,8 @@
   "available": true,
   "source_revision": "15cfa8820110270a3ede27444738569425ef1679",
   "indexed_revision": "15cfa8820110270a3ede27444738569425ef1679",
-  "source_tree_sha256": "31cbc6ddba48c9a32e9fc0d12ac32321436785a585deac33555751df705f655f",
-  "indexed_tree_sha256": "31cbc6ddba48c9a32e9fc0d12ac32321436785a585deac33555751df705f655f",
+  "source_tree_sha256": "d5ee717e10b79964c98a613243286883b6194f818f067ad390d5ee8084aa0d99",
+  "indexed_tree_sha256": "d5ee717e10b79964c98a613243286883b6194f818f067ad390d5ee8084aa0d99",
   "engine_version": "0.7.25",
   "coverage_mode": "partial",
   "safe_to_use": false,
@@ -13,23 +13,23 @@
     "unsupported_languages"
   ],
   "files": {
-    "discovered": 662,
-    "eligible": 638,
+    "discovered": 663,
+    "eligible": 639,
     "parsed": 419,
     "partial": 0,
     "unsupported": 10,
-    "non_code": 209,
+    "non_code": 210,
     "excluded": 24
   },
   "bytes": {
-    "discovered": 16176310,
-    "eligible": 11218730,
-    "parsed": 9502878,
+    "discovered": 16184811,
+    "eligible": 11227231,
+    "parsed": 9505091,
     "partial": 0,
     "unsupported": 61634,
-    "non_code": 1654218,
+    "non_code": 1660506,
     "excluded": 4957580,
-    "source_read": 9613939
+    "source_read": 9616152
   },
   "by_language": {
     "json": {
@@ -51,12 +51,12 @@
       "excluded": 0
     },
     "markdown": {
-      "files": 171,
-      "bytes": 1551369,
+      "files": 172,
+      "bytes": 1557657,
       "parsed": 0,
       "partial": 0,
       "unsupported": 0,
-      "non_code": 171,
+      "non_code": 172,
       "excluded": 0
     },
     "python": {
@@ -79,7 +79,7 @@
     },
     "rust": {
       "files": 401,
-      "bytes": 9264429,
+      "bytes": 9266642,
       "parsed": 401,
       "partial": 0,
       "unsupported": 0,
@@ -116,17 +116,17 @@
   },
   "by_parser": {
     "none": {
-      "files": 209,
-      "bytes": 1654218,
+      "files": 210,
+      "bytes": 1660506,
       "parsed": 0,
       "partial": 0,
       "unsupported": 0,
-      "non_code": 209,
+      "non_code": 210,
       "excluded": 0
     },
     "ra_ap_syntax": {
       "files": 401,
-      "bytes": 9264429,
+      "bytes": 9266642,
       "parsed": 401,
       "partial": 0,
       "unsupported": 0,
@@ -162,11 +162,11 @@
     "credential_operation": 19,
     "enum": 351,
     "file": 429,
-    "function": 6540,
+    "function": 6541,
     "global_variable": 727,
     "method": 58,
     "middleware_installation": 1,
-    "non_code_file": 209,
+    "non_code_file": 210,
     "proxy_surface": 40,
     "struct": 924,
     "trait": 11,
@@ -174,8 +174,8 @@
     "unresolved_symbol": 5934
   },
   "node_counts_by_category": {
-    "callable": 6598,
-    "container": 638,
+    "callable": 6599,
+    "container": 639,
     "partial_knowledge": 5934,
     "sub_symbol": 727,
     "surface_flow_node": 216,
@@ -183,7 +183,7 @@
   },
   "edge_counts_by_kind": {
     "calls": 1172,
-    "contains": 8570,
+    "contains": 8571,
     "defines": 58,
     "forwards_to": 40,
     "imports": 4762,
@@ -195,8 +195,8 @@
   },
   "edge_counts_by_category": {
     "behavioral": 1172,
-    "structural": 13390,
+    "structural": 13391,
     "surface_flow_edge": 372
   },
-  "unit_count": 9200
+  "unit_count": 9201
 }
