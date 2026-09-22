@@ -6,6 +6,59 @@ artifacts and their exact source revision are recorded in each signed
 
 ## [Unreleased]
 
+## [0.7.25] - 2026-09-22
+
+### Added
+
+- Sessions can declare the targets they will work on, and collisions between
+  live sessions are reported before any edit exists. `broker start` and
+  `broker adopt` take a repeatable `--claim kind:value[=operation]`, targets are
+  also derived from the session task where the repository has graph state, and
+  `broker status --json` carries `scope_overlaps` beside the existing path
+  `overlaps`. Severity is decided by the pair of intents rather than by the
+  shared target, so two sessions extending one interface stays quiet while a
+  rewrite underneath an extension does not. A target named without an operation
+  records as `unknown` and reports at medium rather than being assumed safe.
+  A session's declared targets stop pairing once it finishes, by the same
+  liveness rule leases apply.
+- A `none` cross-process contract decision is accepted when the pull request
+  body carries a `Contract justification:` line of at least 24 characters. The
+  finding is still printed, with the justification beside it.
+
+### Fixed
+
+- Tracked cross-process symbols match on word boundaries instead of as
+  substrings, so a tracked name inside a longer identifier is no longer read as
+  a removal.
+- `broker git` refuses a `HEAD`-family push source when the caller is outside
+  the session worktree. Coordinated commands run in the session worktree, so
+  such a refspec resolved there rather than where the operator stood and
+  published an unintended commit while reporting success. Every successful push
+  now also states what it sent.
+- A submission that does not promote reports why, naming the gate, its failure
+  class and its log. A gate that refused before spawning previously reached the
+  caller as a bare "did not promote", indistinguishable from a gate that ran and
+  failed the change.
+- `broker integration reconcile` skips terminal queue entries whose commit is no
+  longer reachable. A never-merged entry loses its commit to `git gc`
+  eventually, which is its expected end state; reading its parents aborted the
+  whole pass and deferred post-merge cleanup after every merge. A pending entry
+  with a missing commit still fails loudly.
+- Graph verification no longer refuses on the recorded engine version. The
+  comparison was against whichever binary happened to be installed, and a
+  version string cannot distinguish two builds; the tree comparison still
+  detects a genuinely different verifying binary.
+- `aethyme --version` reports the commit it was built from. The build scripts
+  watched `.git/HEAD`, which does not change when a branch advances, so a pull,
+  fast-forward or local commit produced a binary carrying stale provenance.
+
+### Changed
+
+- Broker database schema 41 to 42, adding `session_scopes`. Migrations are
+  append-only and there is no downgrade: an older binary refuses a migrated
+  database rather than guessing, so the CLI and engine pair must be installed
+  together.
+
 ## [0.7.24] - 2026-09-21
 
 ### Changed
