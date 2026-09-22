@@ -2093,6 +2093,7 @@ struct Parsed {
     offline: bool,
     required_mode: Option<String>,
     planned_paths: Vec<String>,
+    declared_scopes: Vec<String>,
     exec_command: Vec<String>,
 }
 
@@ -2194,6 +2195,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         offline: false,
         required_mode: None,
         planned_paths: Vec::new(),
+        declared_scopes: Vec::new(),
         exec_command: Vec::new(),
     };
     let mut iter = args.iter();
@@ -2309,6 +2311,16 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
                 iter.next()
                     .ok_or(UsageError::Message(
                         "--path requires a repository-relative path".into(),
+                    ))?
+                    .clone(),
+            ),
+            // Repeatable: a session may name several targets up front.
+            // `--scope` is already the coordinated-operation resource, so the
+            // session's own targets are claimed, parallel to `leases claim`.
+            "--claim" => parsed.declared_scopes.push(
+                iter.next()
+                    .ok_or(UsageError::Message(
+                        "--claim requires kind:value[=operation], e.g. symbol:Name=replace".into(),
                     ))?
                     .clone(),
             ),
@@ -10156,7 +10168,14 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                 if std::path::Path::new(&session.worktree_path) == broker.main_root() {
                     out!(
                         "note: main-checkout session — verification is advisory here \
-                         (commits land on main before gates run); use a worktree \
+                         (commits land on main before gates run);
+                    capture_declared_scopes(
+                        &mut broker,
+                        session.id,
+                        parsed.task.as_deref(),
+                        &parsed.declared_scopes,
+                        false,
+                    )?; use a worktree \
                          session for enforced verification."
                     );
                 }
@@ -10251,6 +10270,13 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     session.worktree_path,
                     session.branch
                 );
+                capture_declared_scopes(
+                    &mut broker,
+                    session.id,
+                    Some(task.as_str()),
+                    &parsed.declared_scopes,
+                    false,
+                )?;
                 out!(
                     "Start base: {} at {} ({})",
                     report.start_base.ref_name,
@@ -13403,4 +13429,62 @@ fn surface_command_advisories(subcommand: &str, parsed: &Parsed) {
             session_id, note.id
         );
     }
+}
+
+/// Record what a new session says it will work on, and say what happened.
+///
+/// Parsed here so a malformed `--claim` fails before the session exists rather
+/// than leaving one half-described. Reported in the same breath because a
+/// silent capture would make "no collisions" and "nothing recorded"
+/// indistinguishable.
+fn capture_declared_scopes(
+    broker: &mut crate::Broker,
+    session_id: i64,
+    task: Option<&str>,
+    declared: &[String],
+    quiet: bool,
+) -> Result<(), UsageError> {
+    let mut parsed = Vec::with_capacity(declared.len());
+    for text in declared {
+        let (kind, value, operation) =
+            crate::parse_scope_argument(text).map_err(UsageError::Message)?;
+        parsed.push((kind, value, operation));
+    }
+    let report = broker.capture_session_scopes(session_id, &parsed, task)?;
+    if quiet {
+        return Ok(());
+    }
+    if report.declared > 0 || report.derived > 0 {
+        out!(
+            "Scope: {} declared, {} derived from the task",
+            report.declared,
+            report.derived
+        );
+        let overlaps = broker.scope_overlaps_snapshot()?;
+        let mine: Vec<_> = overlaps
+            .iter()
+            .filter(|overlap| overlap.session_a == session_id || overlap.session_b == session_id)
+            .collect();
+        for overlap in &mine {
+            let other = if overlap.session_a == session_id {
+                overlap.session_b
+            } else {
+                overlap.session_a
+            };
+            out!(
+                "  {} with session {}: {}",
+                overlap.severity.as_str(),
+                other,
+                overlap.explanation
+            );
+            out!("    {}", overlap.suggestion);
+        }
+        if mine.is_empty() {
+            out!("  no other live session names these targets");
+        }
+    } else if let Some(reason) = &report.degraded {
+        // Never let an empty scope set read as a clean bill of health.
+        out!("Scope: none recorded — {reason}");
+    }
+    Ok(())
 }

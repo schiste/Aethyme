@@ -74,6 +74,28 @@ text_enum!(SessionCleanupState, "sessions.cleanup_state", {
     Cleaned => "cleaned",
 });
 
+text_enum!(ScopeKind, "session_scopes.kind", {
+    Symbol => "symbol",
+});
+
+// Unknown: derived from task text, where the intent cannot be inferred.
+// Extend:  adds behaviour without changing what existing callers see.
+// Replace: rewrites the target, so existing callers must be migrated.
+// Remove:  takes the target away.
+text_enum!(ScopeOperation, "session_scopes.operation", {
+    Unknown => "unknown",
+    Extend => "extend",
+    Replace => "replace",
+    Remove => "remove",
+});
+
+// Declared: stated by the operator or agent.
+// Derived:  inferred from the session task against the graph.
+text_enum!(ScopeSource, "session_scopes.source", {
+    Declared => "declared",
+    Derived => "derived",
+});
+
 text_enum!(LeaseKind, "leases.kind", {
     Implicit => "implicit",
     Explicit => "explicit",
@@ -500,6 +522,25 @@ impl Session {
         .collect::<Vec<_>>();
         (!parts.is_empty()).then(|| parts.join(" / "))
     }
+}
+
+/// A target a session says it will work on, recorded before the edits exist.
+///
+/// Leases answer "which paths has this session already touched", recomputed
+/// from the diff, so they only describe work that has happened. A scope is the
+/// forward-looking counterpart: two sessions can rewrite the same interface
+/// from different files and collide with no overlapping path until both land.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SessionScope {
+    pub id: i64,
+    pub session_id: i64,
+    pub kind: ScopeKind,
+    /// The target itself, e.g. a symbol name.
+    pub value: String,
+    pub operation: ScopeOperation,
+    pub source: ScopeSource,
+    pub created_at: i64,
+    pub released_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]

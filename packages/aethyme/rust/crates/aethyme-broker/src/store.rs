@@ -937,6 +937,82 @@ impl BrokerStore {
     /// Live leases across all live sessions: unreleased, unexpired, and
     /// belonging to a session that is not cleaned/exited. Overlap detection
     /// (Phase 3) is computed over this set.
+    /// Record the targets a session says it will work on.
+    ///
+    /// Idempotent per (session, kind, value): re-recording a target keeps the
+    /// first row and upgrades its operation when the new one is stated, so a
+    /// derived `unknown` never overwrites an operator's declaration.
+    pub fn record_session_scopes(
+        &mut self,
+        session_id: i64,
+        scopes: &[(crate::ScopeKind, String, crate::ScopeOperation, crate::ScopeSource)],
+    ) -> Result<usize, BrokerError> {
+        let now = now_ms();
+        let tx = self.conn.transaction()?;
+        let mut written = 0usize;
+        for (kind, value, operation, source) in scopes {
+            written += tx.execute(
+                "INSERT INTO session_scopes
+                     (session_id, kind, value, operation, source, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT (session_id, kind, value) DO UPDATE SET
+                     operation = CASE
+                         WHEN excluded.operation = 'unknown' THEN session_scopes.operation
+                         ELSE excluded.operation
+                     END,
+                     source = CASE
+                         WHEN excluded.operation = 'unknown' THEN session_scopes.source
+                         ELSE excluded.source
+                     END,
+                     released_at = NULL",
+                rusqlite::params![
+                    session_id,
+                    kind.as_str(),
+                    value,
+                    operation.as_str(),
+                    source.as_str(),
+                    now
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(written)
+    }
+
+    /// Declared scopes for every session that is still live.
+    ///
+    /// Scoped to live sessions for the same reason leases are: a closed
+    /// session's declaration is history, not a claim on anything.
+    pub fn active_session_scopes(&self) -> Result<Vec<crate::SessionScope>, BrokerError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT s.id, s.session_id, s.kind, s.value, s.operation, s.source,
+                    s.created_at, s.released_at
+               FROM session_scopes s
+               JOIN sessions ON sessions.id = s.session_id
+              WHERE s.released_at IS NULL
+                AND sessions.status NOT IN ('closed', 'abandoned')
+              ORDER BY s.kind, s.value, s.session_id",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(crate::SessionScope {
+                    id: row.get(0)?,
+                    session_id: row.get(1)?,
+                    kind: crate::ScopeKind::parse(&row.get::<_, String>(2)?)
+                        .unwrap_or(crate::ScopeKind::Symbol),
+                    value: row.get(3)?,
+                    operation: crate::ScopeOperation::parse(&row.get::<_, String>(4)?)
+                        .unwrap_or(crate::ScopeOperation::Unknown),
+                    source: crate::ScopeSource::parse(&row.get::<_, String>(5)?)
+                        .unwrap_or(crate::ScopeSource::Derived),
+                    created_at: row.get(6)?,
+                    released_at: row.get(7)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     pub fn active_leases(&self) -> Result<Vec<Lease>, BrokerError> {
         self.active_leases_at(now_ms())
     }

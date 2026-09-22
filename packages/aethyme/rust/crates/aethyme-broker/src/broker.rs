@@ -1108,6 +1108,10 @@ pub struct StatusView {
     pub agents: Vec<AgentView>,
     pub leases: Vec<crate::Lease>,
     pub overlaps: Vec<crate::leases::Overlap>,
+    /// Collisions between what live sessions say they will work on, which a
+    /// path comparison cannot see until both sides have already edited.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scope_overlaps: Vec<crate::ScopeOverlap>,
     pub promoted_conflicts: Vec<PromotedConflict>,
     /// Unresolved coordinated write operations, across every repository.
     /// Separate from `queue`, which is the merge queue.
@@ -3726,6 +3730,82 @@ impl Broker {
         Ok(crate::detect_overlaps(&self.store.active_leases()?))
     }
 
+    /// Collisions between what live sessions say they will work on.
+    ///
+    /// Read-only and independent of leases: a scope exists before any edit, so
+    /// this reports pairs that no diff has revealed yet.
+    pub fn scope_overlaps_snapshot(&self) -> Result<Vec<crate::ScopeOverlap>, BrokerOpError> {
+        Ok(crate::detect_scope_overlaps(
+            &self.store.active_session_scopes()?,
+        ))
+    }
+
+    /// Record what a session says it will work on.
+    ///
+    /// `declared` is what the operator stated; anything the task text implies
+    /// is derived from the graph and recorded separately, so a reader can tell
+    /// an assertion from an inference. Derivation is best-effort by design:
+    /// graph state is repository opt-in, and a session must still start on a
+    /// repository that has none. When it is unavailable the reason is returned
+    /// rather than swallowed, so the caller can say why nothing was derived.
+    pub fn capture_session_scopes(
+        &mut self,
+        session_id: i64,
+        declared: &[(crate::ScopeKind, String, crate::ScopeOperation)],
+        task: Option<&str>,
+    ) -> Result<ScopeCaptureReport, BrokerOpError> {
+        let mut rows: Vec<(
+            crate::ScopeKind,
+            String,
+            crate::ScopeOperation,
+            crate::ScopeSource,
+        )> = declared
+            .iter()
+            .map(|(kind, value, operation)| {
+                (
+                    *kind,
+                    value.clone(),
+                    *operation,
+                    crate::ScopeSource::Declared,
+                )
+            })
+            .collect();
+        let declared_count = rows.len();
+
+        let (derived, degraded) = match task {
+            Some(text) if !text.trim().is_empty() => {
+                derive_scopes_from_task(self.main_root(), text)
+            }
+            _ => (Vec::new(), Some("session has no task text".to_string())),
+        };
+        let already: std::collections::HashSet<String> =
+            rows.iter().map(|(_, value, _, _)| value.clone()).collect();
+        let derived_count = derived
+            .iter()
+            .filter(|value| !already.contains(*value))
+            .count();
+        for value in derived {
+            if already.contains(&value) {
+                continue;
+            }
+            rows.push((
+                crate::ScopeKind::Symbol,
+                value,
+                crate::ScopeOperation::Unknown,
+                crate::ScopeSource::Derived,
+            ));
+        }
+
+        if !rows.is_empty() {
+            self.store.record_session_scopes(session_id, &rows)?;
+        }
+        Ok(ScopeCaptureReport {
+            declared: declared_count,
+            derived: derived_count,
+            degraded,
+        })
+    }
+
     // ── leases (Phase 3) ──────────────────────────────────────────────
 
     /// Recompute every live session's implicit leases from its diff
@@ -5530,6 +5610,10 @@ impl Broker {
         now_ms: i64,
     ) -> Result<StatusView, BrokerOpError> {
         let promoted_conflicts = self.promoted_conflicts()?;
+        // Declared intent, not yet visible in any diff. Read from the same
+        // snapshot as the leases above so both halves of "who else is working
+        // on this" describe one moment.
+        let scope_overlaps = crate::detect_scope_overlaps(&self.store.active_session_scopes()?);
         let queue = self.store.current_merge_queue()?;
         let terminal_counts = self.store.terminal_merge_queue_counts()?;
         let mut latest_live_queue = Vec::new();
@@ -5992,6 +6076,7 @@ impl Broker {
             agents,
             leases: self.store.active_leases()?,
             overlaps,
+            scope_overlaps,
             promoted_conflicts,
             coordinated_operations,
             queue,
@@ -10053,5 +10138,55 @@ mod tests {
             created_at: 0,
             updated_at: 0,
         }
+    }
+}
+
+/// What a session recorded about its own scope, and why more was not derived.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ScopeCaptureReport {
+    pub declared: usize,
+    pub derived: usize,
+    /// Present when nothing could be derived. Stated rather than implied, so
+    /// "no scopes" is never mistaken for "no collisions possible".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub degraded: Option<String>,
+}
+
+/// Symbols a task is likely to touch, according to committed graph state.
+///
+/// Mirrors the degradation the impact reader already uses: the store is
+/// repository opt-in, so its absence is an ordinary condition to report, not a
+/// failure to raise.
+fn derive_scopes_from_task(repo_root: &Path, task: &str) -> (Vec<String>, Option<String>) {
+    use aethyme_engine::graph::navigation::task_scope_view_redb;
+    use aethyme_engine::model::task::TaskInput;
+    use aethyme_engine::store::redb::graph_store::GraphStore;
+
+    let store_path = repo_root.join(".aethyme/graph_store.redb");
+    if !store_path.is_file() {
+        return (
+            Vec::new(),
+            Some(
+                "graph store is absent, so no scope could be derived from the task; \
+                 declare scopes explicitly to compare intent across sessions"
+                    .to_string(),
+            ),
+        );
+    }
+    let store = match GraphStore::open_read_only(repo_root) {
+        Ok(store) => store,
+        Err(error) => {
+            return (
+                Vec::new(),
+                Some(format!("graph store could not be opened: {error}")),
+            );
+        }
+    };
+    match task_scope_view_redb(&store, &TaskInput::from_task_text(task)) {
+        Ok(view) => (view.in_scope_symbols, None),
+        Err(error) => (
+            Vec::new(),
+            Some(format!("task scope could not be resolved: {error}")),
+        ),
     }
 }
