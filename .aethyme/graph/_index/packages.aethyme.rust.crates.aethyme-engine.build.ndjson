@@ -1,4 +1,5 @@
 {"module":"packages.aethyme.rust.crates.aethyme-engine.build","symbol":"Command","kind":"unresolved_symbol","node_id":"unresolved_symbol:schiste/Aethyme:aiin74jwjv6dncmvivzvsypp5e","file":"packages/aethyme/rust/crates/aethyme-engine/build.rs"}
 {"module":"packages.aethyme.rust.crates.aethyme-engine.build","symbol":"build_date","kind":"function","node_id":"function:schiste/Aethyme:4fidqss2cxmobvk23tus7mq324","file":"packages/aethyme/rust/crates/aethyme-engine/build.rs"}
+{"module":"packages.aethyme.rust.crates.aethyme-engine.build","symbol":"emit_source_identity_reruns","kind":"function","node_id":"function:schiste/Aethyme:xhbmnr3bejefwjup5cruccdjlq","file":"packages/aethyme/rust/crates/aethyme-engine/build.rs"}
 {"module":"packages.aethyme.rust.crates.aethyme-engine.build","symbol":"git_output","kind":"function","node_id":"function:schiste/Aethyme:kpokjecporwakwlr2xyyzcut2u","file":"packages/aethyme/rust/crates/aethyme-engine/build.rs"}
 {"module":"packages.aethyme.rust.crates.aethyme-engine.build","symbol":"main","kind":"function","node_id":"function:schiste/Aethyme:pmn464c4ncfny3fldwg53tj3am","file":"packages/aethyme/rust/crates/aethyme-engine/build.rs"}

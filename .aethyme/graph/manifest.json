@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "repository": "schiste/Aethyme",
-  "engine_version": "0.7.23",
-  "source_tree_sha256": "a1225315a3ee692bed72367831758128245b9ae7645eacf09412d1873133da5f",
-  "fragment_set_sha256": "fadb7f64b7c89dec4d90465c87a5bb1f0062ad925c151ab01d2d9198427eaf6c"
+  "engine_version": "0.7.25",
+  "source_tree_sha256": "51f0a9cc4164593d7bc963e48a12193e773142b0f6f83d72bd4b4ebfd5652a3d",
+  "fragment_set_sha256": "3466e8504337aa859376844507b279776b0dda6d16e77a48f70663dde58a4f1b"
 }
