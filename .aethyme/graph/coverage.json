@@ -3,8 +3,8 @@
   "available": true,
   "source_revision": "15cfa8820110270a3ede27444738569425ef1679",
   "indexed_revision": "15cfa8820110270a3ede27444738569425ef1679",
-  "source_tree_sha256": "c4f438d85f6d47f3e4213b402ae9f9bf3fa83ab06acad3fabc75007140f6b701",
-  "indexed_tree_sha256": "c4f438d85f6d47f3e4213b402ae9f9bf3fa83ab06acad3fabc75007140f6b701",
+  "source_tree_sha256": "bd1af25a9fadd9e20a20cf441044909b3e0ccfcec953a5f3d9601a36608e36af",
+  "indexed_tree_sha256": "bd1af25a9fadd9e20a20cf441044909b3e0ccfcec953a5f3d9601a36608e36af",
   "engine_version": "0.7.25",
   "coverage_mode": "partial",
   "safe_to_use": false,
@@ -22,14 +22,14 @@
     "excluded": 24
   },
   "bytes": {
-    "discovered": 16143002,
-    "eligible": 11185422,
-    "parsed": 9469570,
+    "discovered": 16148429,
+    "eligible": 11190849,
+    "parsed": 9474997,
     "partial": 0,
     "unsupported": 61634,
     "non_code": 1654218,
     "excluded": 4957580,
-    "source_read": 9580631
+    "source_read": 9586058
   },
   "by_language": {
     "json": {
@@ -79,7 +79,7 @@
     },
     "rust": {
       "files": 399,
-      "bytes": 9231121,
+      "bytes": 9236548,
       "parsed": 399,
       "partial": 0,
       "unsupported": 0,
@@ -126,7 +126,7 @@
     },
     "ra_ap_syntax": {
       "files": 399,
-      "bytes": 9231121,
+      "bytes": 9236548,
       "parsed": 399,
       "partial": 0,
       "unsupported": 0,
