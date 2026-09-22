@@ -446,7 +446,7 @@ Usage:
   aethyme broker review abandon --session <id> --reason <text> [--json]
       Explicitly retire a stuck lifecycle without deleting its audit history,
       freeing the PR for fresh registration. Only the reason digest is stored.
-  aethyme broker submit --session <id> [--no-cache] [--json]
+  aethyme broker submit --session <id> [--no-cache] [--verify-only] [--json]
       Submit the session's head commit: simulate the merge onto the local
       integration branch, run affected gates on the merged tree, and
       promote when verified (default; set [promote] mode = 'manual' to
@@ -1991,6 +1991,8 @@ impl<E: std::fmt::Display> From<E> for UsageError {
 #[derive(Clone)]
 struct Parsed {
     read_only_snapshot: bool,
+    /// `submit --verify-only`: run verification and promote nothing.
+    verify_only: bool,
     /// `status --summary`: skip the per-session lease refresh (#182).
     summary: bool,
     positional: Vec<String>,
@@ -2100,6 +2102,7 @@ struct Parsed {
 fn parse(args: &[String]) -> Result<Parsed, UsageError> {
     let mut parsed = Parsed {
         read_only_snapshot: false,
+        verify_only: false,
         summary: false,
         positional: Vec::new(),
         task: None,
@@ -2264,6 +2267,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
             "--sync-main" => parsed.sync_main = true,
             "--sync-integration" => parsed.sync_integration = true,
             "--no-cache" => parsed.no_cache = true,
+            "--verify-only" => parsed.verify_only = true,
             "--probe" => parsed.probe = true,
             "--only" => {
                 parsed.only = Some(
@@ -10095,6 +10099,11 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                 .into(),
         ));
     }
+    if parsed.verify_only && subcommand != "submit" {
+        return Err(UsageError::Message(
+            "--verify-only is valid only with broker submit".into(),
+        ));
+    }
     if parsed.required_mode.is_some() && subcommand != "readiness" {
         return Err(UsageError::Message(
             "--require is valid only with broker readiness".into(),
@@ -11873,12 +11882,17 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     );
                 }
             }
-            let outcome = broker.submit_with_policy(
+            let outcome = broker.submit_with_intent(
                 session,
                 if parsed.no_cache {
                     crate::CachePolicy::Bypass
                 } else {
                     crate::CachePolicy::Use
+                },
+                if parsed.verify_only {
+                    crate::PromotionIntent::VerifyOnly
+                } else {
+                    crate::PromotionIntent::Configured
                 },
             )?;
             if parsed.json {
@@ -11995,6 +12009,12 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                             ""
                         }
                     );
+                    // A verified entry that did not move is the normal outcome
+                    // where promotion is off, and reads as a silent failure
+                    // without the reason (#290 phase 2.2).
+                    if let Some(reason) = &outcome.promotion_suppressed {
+                        out!("  {reason}");
+                    }
                 }
                 if outcome.no_changes {
                     // "Nothing pending" is the right summary only when nothing was

@@ -5813,23 +5813,39 @@ impl Broker {
             let stale_only = integration_reconciliation
                 .as_ref()
                 .filter(|assessment| assessment.stale_only);
+            // Integration strictly behind upstream is not ambiguity: it holds
+            // nothing upstream lacks, so advancing it discards no work and
+            // rewrites no history. Reporting that as `blocked` alongside
+            // genuine divergence taught operators to reach for a reviewed
+            // reconciliation when a fast-forward was the whole answer, and to
+            // wait for the block rather than keeping the ref current (#290
+            // phase 3.2). Divergence still blocks.
+            let fast_forward_available = !integration_contains_upstream
+                && upstream_head
+                    .as_deref()
+                    .is_some_and(|upstream| self.repo.is_ancestor(&integration_head, upstream));
             advice.insert(
                 0,
                 StatusAdvice {
                     id: if stale_only.is_some() {
                         "integration.stale-promotions"
+                    } else if fast_forward_available {
+                        "integration.fast-forward-available"
                     } else {
                         "integration.upstream-main-ahead"
                     },
-                    severity: if integration_contains_upstream {
-                        StatusAdviceSeverity::Notice
-                    } else if stale_only.is_some() {
+                    severity: if integration_contains_upstream
+                        || stale_only.is_some()
+                        || fast_forward_available
+                    {
                         StatusAdviceSeverity::Notice
                     } else {
                         StatusAdviceSeverity::Blocked
                     },
                     reason: if stale_only.is_some() {
                         "all recorded integration promotions have conclusive upstream landing evidence"
+                    } else if fast_forward_available {
+                        "integration holds nothing upstream lacks, so it can be advanced without review"
                     } else {
                         "configured upstream moved outside broker-managed integration"
                     },
@@ -5839,6 +5855,16 @@ impl Broker {
                         )
                     } else if let Some(assessment) = stale_only {
                         assessment.explanation.clone()
+                    } else if fast_forward_available {
+                        // Keeps the external-movement signal verbatim: what
+                        // changes is the severity and the named repair, not
+                        // whether the operator is told main moved outside the
+                        // broker.
+                        format!(
+                            "external main movement detected: integration is behind {upstream} \
+                             and carries nothing of its own, so it can be fast-forwarded without \
+                             review; do it so new sessions stop inheriting the gap"
+                        )
                     } else {
                         format!(
                             "external main movement detected: integration does not contain {upstream}; unresolved or unrecorded work requires reviewed reconciliation"
@@ -7540,6 +7566,13 @@ impl Broker {
         if let Some(entry) = latest_for_head {
             match entry.status {
                 MergeStatus::Promoted | MergeStatus::ExternallyLanded => {}
+                // A repository that never promotes leaves every entry
+                // `Verified`, so demanding a promotion before finish would
+                // block every session in it permanently (#290 phase 2.2).
+                MergeStatus::Verified
+                    if !crate::PromoteConfig::load(&self.main_root_path())
+                        .mode
+                        .promotes_at_all() => {}
                 MergeStatus::Verified => {
                     report.warnings.push(format!(
                         "queue entry {} is verified but not promoted; promote it before finish",

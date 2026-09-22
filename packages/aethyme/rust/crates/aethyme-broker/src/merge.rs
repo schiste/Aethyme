@@ -29,18 +29,69 @@ use crate::types::{AdvisoryEvidence, AdvisorySeverity, MergeQueueEntry, MergeSta
 pub const DEFAULT_INTEGRATION_BRANCH: &str = "aethyme/integration";
 pub const ACTION_REQUIRED_RELPATH: &str = ".aethyme/broker-action-required.md";
 
+/// What a repository does with work that passes verification.
+///
+/// `VerifyOnly` exists because promotion is not universal. Where a repository
+/// ships through pull requests, the integration branch is simultaneously the
+/// default base for every session and a destination nothing reads, so it
+/// accumulates drift that leaks into new sessions while contributing nothing
+/// (#290). Such a repository still wants what `submit` is good at -- cross
+/// session conflict detection before a pull request exists, and affected gates
+/// rather than a full batch -- without a second copy of the work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PromoteMode {
+    /// Verified work moves to the integration branch immediately.
+    Auto,
+    /// Verified work waits for an explicit `broker promote`.
+    Manual,
+    /// Nothing is ever promoted. `submit` verifies and reports; the integration
+    /// branch is never moved.
+    VerifyOnly,
+}
+
+impl PromoteMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Manual => "manual",
+            Self::VerifyOnly => "verify-only",
+        }
+    }
+
+    /// Whether any queue entry in this repository can still be promoted.
+    /// `finish` and the pending-layer accounting use this to avoid demanding a
+    /// promotion the repository has opted out of.
+    pub fn promotes_at_all(self) -> bool {
+        !matches!(self, Self::VerifyOnly)
+    }
+}
+
+/// Whether a single `submit` invocation is allowed to promote.
+///
+/// Separate from [`PromoteMode`] because the repository's policy and one
+/// operator's intent are different facts: `--verify-only` narrows a promoting
+/// repository for one run, and never widens one that has opted out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromotionIntent {
+    /// Follow whatever the repository configured.
+    Configured,
+    /// Verify and report; promote nothing, whatever the repository configured.
+    VerifyOnly,
+}
+
 /// `[promote]` section of `.aethyme/config.toml`.
 #[derive(Debug, Clone)]
 pub struct PromoteConfig {
     pub branch: String,
-    pub auto: bool,
+    pub mode: PromoteMode,
 }
 
 impl PromoteConfig {
     pub fn load(main_root: &Path) -> Self {
         let mut config = Self {
             branch: DEFAULT_INTEGRATION_BRANCH.to_string(),
-            auto: true,
+            mode: PromoteMode::Auto,
         };
         let Ok(text) = std::fs::read_to_string(main_root.join(".aethyme/config.toml")) else {
             return config;
@@ -53,7 +104,15 @@ impl PromoteConfig {
                 config.branch = branch.to_string();
             }
             if let Some(mode) = promote.get("mode").and_then(|v| v.as_str()) {
-                config.auto = mode != "manual";
+                // Unknown values keep the historical default rather than
+                // failing the load: a typo in this key must not make the
+                // broker unusable, and the mode is reported wherever it
+                // matters so a wrong value is visible.
+                config.mode = match mode {
+                    "manual" => PromoteMode::Manual,
+                    "verify-only" | "none" | "off" => PromoteMode::VerifyOnly,
+                    _ => PromoteMode::Auto,
+                };
             }
         }
         config
@@ -106,6 +165,9 @@ pub struct SubmitOutcome {
     /// Queue status describes promotion eligibility; this field describes
     /// whether gates actually supplied verification evidence.
     pub gate_verification: SubmissionGateVerification,
+    /// Why a verified submission was not promoted, when it was not. `None`
+    /// when it was promoted, or when it did not pass.
+    pub promotion_suppressed: Option<String>,
     /// True when every pending session-owned commit is already represented
     /// by integration or produces no tree change. No gate or promotion runs
     /// for this outcome.
@@ -324,11 +386,30 @@ impl Broker {
         self.submit_with_policy(session_id, crate::gates::CachePolicy::Use)
     }
 
+    /// Submit, declaring whether this invocation may promote at all.
+    pub fn submit_with_intent(
+        &mut self,
+        session_id: i64,
+        cache_policy: crate::gates::CachePolicy,
+        intent: PromotionIntent,
+    ) -> Result<SubmitOutcome, BrokerOpError> {
+        self.submit_inner(session_id, cache_policy, intent)
+    }
+
     /// Submit with an explicit policy for merged-tree gate cache lookup.
     pub fn submit_with_policy(
         &mut self,
         session_id: i64,
         cache_policy: crate::gates::CachePolicy,
+    ) -> Result<SubmitOutcome, BrokerOpError> {
+        self.submit_inner(session_id, cache_policy, PromotionIntent::Configured)
+    }
+
+    fn submit_inner(
+        &mut self,
+        session_id: i64,
+        cache_policy: crate::gates::CachePolicy,
+        intent: PromotionIntent,
     ) -> Result<SubmitOutcome, BrokerOpError> {
         let session = self.store().session(session_id)?;
         let checkout = GitRepo::discover(Path::new(&session.worktree_path))?;
@@ -388,7 +469,7 @@ impl Broker {
             self.store()
                 .set_merge_status(stale_id, MergeStatus::Superseded, None, None)?;
         }
-        self.simulate_and_gate_with_policy(entry.id, cache_policy)
+        self.simulate_and_gate_with_policy(entry.id, cache_policy, intent)
     }
 
     /// Whether `commit` is a promotion this session produced that no promoted
@@ -429,13 +510,18 @@ impl Broker {
     /// CURRENT integration head. Rebinds the entry's base if the branch
     /// moved since submission.
     pub fn simulate_and_gate(&mut self, entry_id: i64) -> Result<SubmitOutcome, BrokerOpError> {
-        self.simulate_and_gate_with_policy(entry_id, crate::gates::CachePolicy::Use)
+        self.simulate_and_gate_with_policy(
+            entry_id,
+            crate::gates::CachePolicy::Use,
+            PromotionIntent::Configured,
+        )
     }
 
     fn simulate_and_gate_with_policy(
         &mut self,
         entry_id: i64,
         cache_policy: crate::gates::CachePolicy,
+        intent: PromotionIntent,
     ) -> Result<SubmitOutcome, BrokerOpError> {
         // #42: remember where the integration branch stood BEFORE the
         // follows-main refresh. Gate selection must diff against this —
@@ -508,6 +594,7 @@ impl Broker {
                 gate_verification: SubmissionGateVerification::not_run(),
                 no_changes: false,
                 promoted: false,
+                promotion_suppressed: None,
             });
         }
 
@@ -560,6 +647,7 @@ impl Broker {
                     gate_verification: SubmissionGateVerification::not_run(),
                     no_changes: true,
                     promoted: true,
+                    promotion_suppressed: None,
                 });
             }
             self.store().record_content_empty_supersession(
@@ -579,6 +667,7 @@ impl Broker {
                 gate_verification: SubmissionGateVerification::not_run(),
                 no_changes: true,
                 promoted: false,
+                promotion_suppressed: None,
             });
         }
 
@@ -732,10 +821,36 @@ impl Broker {
             )?;
         }
 
+        let configured = PromoteConfig::load(&self.main_root_path()).mode;
+        let effective = match intent {
+            PromotionIntent::Configured => configured,
+            PromotionIntent::VerifyOnly => PromoteMode::VerifyOnly,
+        };
         let mut promoted = false;
-        if all_pass && PromoteConfig::load(&self.main_root_path()).auto {
-            self.promote(entry.id)?;
-            promoted = true;
+        let mut promotion_suppressed = None;
+        if all_pass {
+            match effective {
+                PromoteMode::Auto => {
+                    self.promote(entry.id)?;
+                    promoted = true;
+                }
+                PromoteMode::Manual => {
+                    promotion_suppressed = Some(format!(
+                        "verified; promotion is manual for this repository — \
+                         run `aethyme broker promote --entry {}`",
+                        entry.id
+                    ));
+                }
+                PromoteMode::VerifyOnly => {
+                    promotion_suppressed = Some(match intent {
+                        PromotionIntent::VerifyOnly =>
+                            "verified; --verify-only, so nothing was promoted".to_string(),
+                        PromotionIntent::Configured =>
+                            "verified; promotion is off for this repository, so the work was \
+                             checked and nothing was moved".to_string(),
+                    });
+                }
+            }
         }
         if promoted {
             clear_action_required(Path::new(&session.worktree_path));
@@ -751,6 +866,7 @@ impl Broker {
             gate_verification,
             no_changes: false,
             promoted,
+            promotion_suppressed,
         })
     }
 

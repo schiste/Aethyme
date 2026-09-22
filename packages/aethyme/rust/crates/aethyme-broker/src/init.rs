@@ -1012,7 +1012,7 @@ const CONFIG_TEMPLATE: &str = "\
 #
 # Known sections/keys (schema 1):
 #   schema            optional; the config schema version (currently 1)
-#   [promote] mode    \"auto\" | \"manual\"
+#   [promote] mode    \"auto\" | \"manual\" | \"verify-only\"
 #   [promote] branch  integration branch name
 #   [delivery] default \"pull_request\" | \"local_main_merge\"
 #   [leases]  ignore  paths never leased (trailing / = directory prefix)
@@ -1024,6 +1024,10 @@ schema = 1
 [promote]
 # \"auto\" (default): verified submissions promote to the local integration
 # branch immediately. \"manual\" holds them for `aethyme broker promote`.
+# \"verify-only\" verifies and promotes nothing -- for a repository that ships
+# through pull requests, where a second copy of the work on an integration
+# branch costs drift and contributes nothing. An unrecognised value falls back
+# to \"auto\"; `aethyme certify` warns on unknown keys but not unknown values.
 mode = \"auto\"
 # branch = \"aethyme/integration\"
 

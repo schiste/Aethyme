@@ -3416,9 +3416,16 @@ fn status_warns_on_the_first_external_main_movement() {
         Some(expected_upstream.as_str())
     );
     assert_eq!(status.main_behind_upstream_commits, 1);
+    // The external-movement signal is unchanged; its severity is not. With
+    // integration holding nothing upstream lacks, the repair is a fast-forward
+    // that discards no work, and reporting that as `Blocked` alongside genuine
+    // divergence sent operators to a reviewed reconciliation for a state that
+    // needs none -- and taught them to wait for a block rather than keep the
+    // ref current (#290 phase 3.2). Divergence still blocks; see
+    // `divergence_is_still_refused` in tests/integration_drift.rs.
     assert!(status.advice.iter().any(|advice| {
-        advice.id == "integration.upstream-main-ahead"
-            && advice.severity == StatusAdviceSeverity::Blocked
+        advice.id == "integration.fast-forward-available"
+            && advice.severity == StatusAdviceSeverity::Notice
             && advice.summary.contains("external main movement detected")
             && advice.commands
                 == vec!["aethyme broker integration reconcile --upstream origin/main --dry-run"]
