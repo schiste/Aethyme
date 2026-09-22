@@ -138,7 +138,7 @@ Usage:
       Resolve retained ambiguity explicitly. Assignment requires --session;
       unsupported or repository-mismatched events can only be ignored. The
       reason is stored as a SHA-256 digest, never as text.
-  aethyme broker start --task <text> [--pull-request <number>] [--path <repo-path>]... [--agent <name-and-email>] [--repo-name <name>] [--tab-name <name>] [--ai-provider <provider>] [--json]
+  aethyme broker start --task <text> [--base <ref>] [--pull-request <number>] [--path <repo-path>]... [--agent <name-and-email>] [--repo-name <name>] [--tab-name <name>] [--ai-provider <provider>] [--json]
       Create a broker-managed worktree + branch and register a session,
       atomically claiming every reviewed --path, but do not spawn a process.
       Prefer this over adopting the main
@@ -10072,14 +10072,27 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                 .into(),
         ));
     }
-    // `--base` is read only by `gates scope`. Accepted anywhere else it was
-    // silently dropped, so `broker start --base main` exited zero having ignored
-    // the flag entirely (#290 phase 0.2) -- the same shape as the `adopt --claim`
-    // drop in #285. A flag the parser accepts must be honored or refused;
-    // honoring `--base` at `start` is #290 phase 1.1.
-    if parsed.base.is_some() && subcommand != "gates" {
+    // `--base` names the commit a new session's branch is cut from (#290 phase
+    // 1.1), and `gates scope` uses it as a diff endpoint. Everywhere else it
+    // used to be parsed and silently dropped, which reported a choice that was
+    // never made -- the same shape as the `adopt --claim` drop in #285.
+    //
+    // `adopt` is called out separately because it is the plausible mistake:
+    // adopting registers an existing worktree whose branch already has a
+    // history, so there is no base to choose and silently ignoring the flag
+    // would be the worst of the three options.
+    if parsed.base.is_some() && subcommand == "adopt" {
         return Err(UsageError::Message(
-            "--base is valid only with broker gates scope".into(),
+            "--base does not apply to broker adopt: adopting registers an existing worktree, \
+             whose branch already has its own history. Use broker start --base <ref> to cut a \
+             new branch from a chosen base."
+                .into(),
+        ));
+    }
+    if parsed.base.is_some() && !matches!(subcommand.as_str(), "gates" | "start" | "start-agent") {
+        return Err(UsageError::Message(
+            "--base is valid only with broker start, broker start-agent, or broker gates scope"
+                .into(),
         ));
     }
     if parsed.required_mode.is_some() && subcommand != "readiness" {
@@ -10321,6 +10334,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                 &parsed.planned_paths,
                 agent_identity.as_deref(),
                 context,
+                parsed.base.as_deref(),
             )?;
             let session = &report.session;
             if parsed.json {
@@ -10363,6 +10377,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                 &cmd,
                 agent_identity.as_deref(),
                 context,
+                parsed.base.as_deref(),
             )?;
             let session = &report.session;
             if parsed.json {

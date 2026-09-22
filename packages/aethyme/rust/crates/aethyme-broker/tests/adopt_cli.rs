@@ -299,16 +299,86 @@ fn start_agent_reports_its_base_and_what_it_carries() {
     );
 }
 
-/// `--base` is parsed for every subcommand but read only by `gates scope`.
-/// Accepting it at `start` and ignoring it reports a base choice that was never
-/// made (#290 phase 0.2); refusing is correct until phase 1.1 honors it.
+/// #290 phase 1.1: an explicit base is honored, recorded as its own evidence so
+/// the choice is auditable, and still measured against the default branch --
+/// naming a base does not stop its inherited commits landing in a pull request.
 #[test]
-fn start_refuses_a_base_flag_it_cannot_honor() {
+fn start_cuts_from_an_explicit_base_when_one_is_given() {
+    let tmp = fixture();
+    let main = git_output(tmp.path(), &["rev-parse", "HEAD"]);
+    track_origin_main(tmp.path(), &main);
+    let integration = integration_ahead_of_main(tmp.path(), 2);
+
+    // Without --base the integration tip wins, and carries 2 inherited commits.
+    let default_base = stdout(&run(tmp.path(), &["start", "--task", "implicit", "--json"]));
+    let value: serde_json::Value = serde_json::from_str(&default_base).unwrap();
+    assert_eq!(value["start_base"]["commit"], integration);
+    assert_eq!(value["start_base"]["ahead_default_commits"], 2);
+
+    // Naming the default branch cuts from it instead, inheriting nothing.
+    let chosen = fixture();
+    let main = git_output(chosen.path(), &["rev-parse", "HEAD"]);
+    track_origin_main(chosen.path(), &main);
+    integration_ahead_of_main(chosen.path(), 2);
+    let explicit = stdout(&run(
+        chosen.path(),
+        &[
+            "start",
+            "--task",
+            "explicit",
+            "--base",
+            "refs/heads/main",
+            "--json",
+        ],
+    ));
+    let value: serde_json::Value = serde_json::from_str(&explicit).unwrap();
+    assert_eq!(value["start_base"]["ref_name"], "refs/heads/main");
+    assert_eq!(value["start_base"]["commit"], main);
+    assert_eq!(value["start_base"]["evidence"], "explicit_base");
+    assert_eq!(value["start_base"]["ahead_default_commits"], 0);
+}
+
+/// A base that does not resolve is refused rather than silently falling back to
+/// inference, which would report a base the operator did not choose.
+#[test]
+fn start_refuses_a_base_that_does_not_resolve() {
     let tmp = fixture();
     let output = run(
         tmp.path(),
-        &["start", "--task", "explicit base", "--base", "main"],
+        &["start", "--task", "bad base", "--base", "refs/heads/nope"],
     );
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("does not resolve to a commit"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// `adopt` registers an existing worktree, so there is no base to choose. The
+/// refusal says so rather than giving the generic "valid only with" list.
+#[test]
+fn adopt_refuses_a_base_and_explains_why() {
+    let tmp = fixture();
+    let output = run(tmp.path(), &["adopt", "--task", "x", "--base", "main"]);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("does not apply to broker adopt"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// `--base` is parsed for every subcommand, and only some can act on it.
+/// Accepting it where it is ignored reports a base choice that was never made
+/// (#290 phase 0.2). `start` and `start-agent` now honor it (phase 1.1); every
+/// other subcommand must refuse rather than drop it.
+#[test]
+fn subcommands_that_cannot_honor_a_base_refuse_it() {
+    let tmp = fixture();
+
+    // Only `scope` reads it within `gates`.
+    let output = run(tmp.path(), &["gates", "draft", "--base", "main"]);
     assert!(!output.status.success());
     assert!(
         String::from_utf8_lossy(&output.stderr)
@@ -317,12 +387,11 @@ fn start_refuses_a_base_flag_it_cannot_honor() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    // The same drop one level down: only `scope` reads it.
-    let output = run(tmp.path(), &["gates", "draft", "--base", "main"]);
+    // And a subcommand with no notion of a base at all.
+    let output = run(tmp.path(), &["status", "--base", "main"]);
     assert!(!output.status.success());
     assert!(
-        String::from_utf8_lossy(&output.stderr)
-            .contains("--base is valid only with broker gates scope"),
+        String::from_utf8_lossy(&output.stderr).contains("--base is valid only with"),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );

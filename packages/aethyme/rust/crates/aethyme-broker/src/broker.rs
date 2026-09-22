@@ -723,6 +723,8 @@ pub(crate) struct WorktreeRootMarker {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionStartBaseEvidence {
+    /// The operator named the base with `--base <ref>`, so no inference ran.
+    ExplicitBase,
     IntegrationTip,
     RemoteDefaultBranch,
     ConventionalMain,
@@ -732,6 +734,7 @@ pub enum SessionStartBaseEvidence {
 impl SessionStartBaseEvidence {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::ExplicitBase => "explicit --base",
             Self::IntegrationTip => "integration tip",
             Self::RemoteDefaultBranch => "remote default branch",
             Self::ConventionalMain => "conventional main branch",
@@ -2998,6 +3001,7 @@ impl Broker {
             paths,
             agent_identity,
             SessionContext::default(),
+            None,
         )
     }
 
@@ -3007,12 +3011,13 @@ impl Broker {
         paths: &[String],
         agent_identity: Option<&str>,
         context: SessionContext,
+        explicit_base: Option<&str>,
     ) -> Result<StartReport, BrokerOpError> {
         let context = self.session_context(context);
         let planned_paths = normalize_planned_paths(paths)?;
         self.ensure_planned_paths_available(&planned_paths, None)?;
         let (_slug, branch, start_base, worktree, worktree_placement) =
-            self.create_session_worktree(task)?;
+            self.create_session_worktree(task, explicit_base)?;
         let base = start_base.commit.clone();
         let repository_contract = self.capture_repository_contract(worktree.root(), false)?;
         let new_session = NewSession {
@@ -3080,6 +3085,7 @@ impl Broker {
             command,
             agent_identity,
             SessionContext::default(),
+            None,
         )
     }
 
@@ -3089,10 +3095,11 @@ impl Broker {
         command: &str,
         agent_identity: Option<&str>,
         context: SessionContext,
+        explicit_base: Option<&str>,
     ) -> Result<StartAgentReport, BrokerOpError> {
         let context = self.session_context(context);
         let (slug, branch, start_base, worktree, worktree_placement) =
-            self.create_session_worktree(task)?;
+            self.create_session_worktree(task, explicit_base)?;
         let base = start_base.commit.clone();
         let repository_contract = self.capture_repository_contract(worktree.root(), false)?;
 
@@ -3153,13 +3160,14 @@ impl Broker {
     fn create_session_worktree(
         &mut self,
         task: &str,
+        explicit_base: Option<&str>,
     ) -> Result<(String, String, SessionStartBase, GitRepo, WorktreePlacement), BrokerOpError> {
         let placement = self.prepare_broker_worktree_root()?;
         let slug = self.next_worktree_slug(task, &placement.root);
         let worktree_path = placement.root.join(&slug);
         self.refuse_nested_worktree_path(&worktree_path)?;
         let branch = format!("agent/{slug}");
-        let start_base = self.select_session_start_base()?;
+        let start_base = self.select_session_start_base(explicit_base)?;
         let worktree = self
             .repo
             .worktree_add(&worktree_path, &branch, &start_base.commit)?;
@@ -3436,7 +3444,35 @@ impl Broker {
         (behind, ahead, Some(upstream_ref))
     }
 
-    fn select_session_start_base(&self) -> Result<SessionStartBase, BrokerOpError> {
+    /// Choose the commit a new session's branch is cut from.
+    ///
+    /// An explicit `--base` skips inference entirely: the operator named the
+    /// ref, so guessing on their behalf would be worse than failing. It is
+    /// still measured against the default branch, because naming a base does
+    /// not make its inherited commits stop landing in a pull request (#290).
+    fn select_session_start_base(
+        &self,
+        explicit: Option<&str>,
+    ) -> Result<SessionStartBase, BrokerOpError> {
+        if let Some(reference) = explicit {
+            let Some(commit) = self.repo.resolve_ref(reference) else {
+                return Err(BrokerOpError::StartBaseUnavailable {
+                    reason: format!(
+                        "--base {reference} does not resolve to a commit in this repository"
+                    ),
+                });
+            };
+            let (behind_default_commits, ahead_default_commits, default_ref) =
+                self.start_base_drift(&commit);
+            return Ok(SessionStartBase {
+                ref_name: reference.to_string(),
+                commit,
+                evidence: SessionStartBaseEvidence::ExplicitBase,
+                behind_default_commits,
+                ahead_default_commits,
+                default_ref,
+            });
+        }
         let integration_branch = PromoteConfig::load(&self.main_root).branch;
         let integration_ref = format!("refs/heads/{integration_branch}");
         if let Some(commit) = self.repo.resolve_ref(&integration_ref) {
