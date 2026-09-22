@@ -3,9 +3,9 @@
   "available": true,
   "source_revision": "15cfa8820110270a3ede27444738569425ef1679",
   "indexed_revision": "15cfa8820110270a3ede27444738569425ef1679",
-  "source_tree_sha256": "a1225315a3ee692bed72367831758128245b9ae7645eacf09412d1873133da5f",
-  "indexed_tree_sha256": "a1225315a3ee692bed72367831758128245b9ae7645eacf09412d1873133da5f",
-  "engine_version": "0.7.23",
+  "source_tree_sha256": "51f0a9cc4164593d7bc963e48a12193e773142b0f6f83d72bd4b4ebfd5652a3d",
+  "indexed_tree_sha256": "51f0a9cc4164593d7bc963e48a12193e773142b0f6f83d72bd4b4ebfd5652a3d",
+  "engine_version": "0.7.25",
   "coverage_mode": "partial",
   "safe_to_use": false,
   "gaps": [
@@ -13,23 +13,23 @@
     "unsupported_languages"
   ],
   "files": {
-    "discovered": 656,
-    "eligible": 632,
-    "parsed": 414,
+    "discovered": 660,
+    "eligible": 636,
+    "parsed": 417,
     "partial": 0,
     "unsupported": 10,
-    "non_code": 208,
+    "non_code": 209,
     "excluded": 24
   },
   "bytes": {
-    "discovered": 16035334,
-    "eligible": 11077754,
-    "parsed": 9374201,
+    "discovered": 16132240,
+    "eligible": 11174660,
+    "parsed": 9461412,
     "partial": 0,
     "unsupported": 61634,
-    "non_code": 1641919,
+    "non_code": 1651614,
     "excluded": 4957580,
-    "source_read": 9485262
+    "source_read": 9572473
   },
   "by_language": {
     "json": {
@@ -51,12 +51,12 @@
       "excluded": 0
     },
     "markdown": {
-      "files": 170,
-      "bytes": 1539070,
+      "files": 171,
+      "bytes": 1548765,
       "parsed": 0,
       "partial": 0,
       "unsupported": 0,
-      "non_code": 170,
+      "non_code": 171,
       "excluded": 0
     },
     "python": {
@@ -78,9 +78,9 @@
       "excluded": 0
     },
     "rust": {
-      "files": 396,
-      "bytes": 9135752,
-      "parsed": 396,
+      "files": 399,
+      "bytes": 9222963,
+      "parsed": 399,
       "partial": 0,
       "unsupported": 0,
       "non_code": 0,
@@ -116,18 +116,18 @@
   },
   "by_parser": {
     "none": {
-      "files": 208,
-      "bytes": 1641919,
+      "files": 209,
+      "bytes": 1651614,
       "parsed": 0,
       "partial": 0,
       "unsupported": 0,
-      "non_code": 208,
+      "non_code": 209,
       "excluded": 0
     },
     "ra_ap_syntax": {
-      "files": 396,
-      "bytes": 9135752,
-      "parsed": 396,
+      "files": 399,
+      "bytes": 9222963,
+      "parsed": 399,
       "partial": 0,
       "unsupported": 0,
       "non_code": 0,
@@ -157,46 +157,46 @@
     "parser_unavailable": 10
   },
   "node_counts_by_kind": {
-    "behavior_test_surface": 153,
+    "behavior_test_surface": 154,
     "class": 12,
     "credential_operation": 19,
-    "enum": 347,
-    "file": 424,
-    "function": 6472,
-    "global_variable": 724,
+    "enum": 349,
+    "file": 427,
+    "function": 6515,
+    "global_variable": 727,
     "method": 58,
     "middleware_installation": 1,
-    "non_code_file": 208,
+    "non_code_file": 209,
     "proxy_surface": 40,
-    "struct": 918,
+    "struct": 924,
     "trait": 11,
     "type_alias": 5,
-    "unresolved_symbol": 5894
+    "unresolved_symbol": 5921
   },
   "node_counts_by_category": {
-    "callable": 6530,
-    "container": 632,
-    "partial_knowledge": 5894,
-    "sub_symbol": 724,
-    "surface_flow_node": 213,
-    "type_defining": 1293
+    "callable": 6573,
+    "container": 636,
+    "partial_knowledge": 5921,
+    "sub_symbol": 727,
+    "surface_flow_node": 214,
+    "type_defining": 1301
   },
   "edge_counts_by_kind": {
     "calls": 1172,
-    "contains": 8489,
+    "contains": 8543,
     "defines": 58,
     "forwards_to": 40,
-    "imports": 4722,
+    "imports": 4749,
     "installs_middleware": 1,
     "issues_credential": 2,
-    "tested_by": 153,
+    "tested_by": 154,
     "uses_credential": 17,
-    "validates_credential": 153
+    "validates_credential": 154
   },
   "edge_counts_by_category": {
     "behavioral": 1172,
-    "structural": 13269,
-    "surface_flow_edge": 366
+    "structural": 13350,
+    "surface_flow_edge": 368
   },
-  "unit_count": 9111
+  "unit_count": 9169
 }

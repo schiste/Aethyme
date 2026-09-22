@@ -68,6 +68,36 @@ fn production_crates_and_binaries_share_the_release_version() {
     }
 }
 
+/// A version bump must carry the committed graph engine pin with it.
+///
+/// `graph_integrity` compares `.aethyme/engine-version` against the verifier's
+/// own `CARGO_PKG_VERSION` and returns `Incompatible` when they differ, so a
+/// release that moves the workspace version and leaves the pin behind makes
+/// every subsequent `broker submit` refuse. The refusal names
+/// `aethyme graph refresh plan`, and that command deliberately will not help:
+/// it never rewrites the pin, because the pin records which engine authored
+/// the fragments and rewriting it would let a mismatched engine claim
+/// authorship silently.
+///
+/// So the pin can only move as a deliberate act of the release, and nothing
+/// enforced that until this test. v0.7.24 shipped with the pin left at 0.7.23
+/// and blocked graph verification for the whole repository.
+#[test]
+fn the_graph_engine_pin_moves_with_the_release_version() {
+    let pin_path = aethyme_testkit::paths::repo_root().join(".aethyme/engine-version");
+    let pinned = std::fs::read_to_string(&pin_path)
+        .unwrap_or_else(|error| panic!("cannot read {}: {error}", pin_path.display()));
+    assert_eq!(
+        pinned.trim(),
+        product_version(),
+        "committed .aethyme/engine-version is {} but the workspace is {}; bump the pin and \
+         regenerate the committed graph fragments in the same commit as the version, or \
+         graph integrity refuses every submission and `graph refresh` will not fix it",
+        pinned.trim(),
+        product_version()
+    );
+}
+
 #[test]
 fn release_workflow_smokes_the_installed_archive_contract() {
     let workflow = std::fs::read_to_string(
