@@ -7627,14 +7627,41 @@ impl Broker {
         }
 
         if report.unsubmitted_commits > 0 {
-            report.warnings.push(format!(
-                "HEAD has {} committed {} not yet represented in promoted integration; submit before finish",
-                report.unsubmitted_commits,
-                plural_word(report.unsubmitted_commits as usize, "change", "changes")
-            ));
-            report
-                .next_commands
-                .push(format!("aethyme broker submit --session {session_id}"));
+            // The guard is right either way -- these commits exist nowhere but
+            // this branch, and closing a session holding the only copy is what
+            // #222 exists to prevent. What differs is the remedy.
+            //
+            // Where the repository does not promote, `submit` has already run
+            // and can never satisfy this: it verifies and moves nothing by
+            // design (#290 phase 2.2). Naming it anyway sends the operator
+            // round a loop with no exit, which is the shape of the engine-pin
+            // refusal in #254. The reachable path is to land the work and then
+            // prove it landed, and proving it needs `record`, not just `scan`.
+            let promotes = crate::PromoteConfig::load(&self.main_root)
+                .mode
+                .promotes_at_all();
+            if promotes {
+                report.warnings.push(format!(
+                    "HEAD has {} committed {} not yet represented in promoted integration; submit before finish",
+                    report.unsubmitted_commits,
+                    plural_word(report.unsubmitted_commits as usize, "change", "changes")
+                ));
+                report
+                    .next_commands
+                    .push(format!("aethyme broker submit --session {session_id}"));
+            } else {
+                report.warnings.push(format!(
+                    "HEAD has {} committed {} not represented on any delivery target. This \
+                     repository does not promote, so submitting again cannot change that — land \
+                     the work, then prove it landed",
+                    report.unsubmitted_commits,
+                    plural_word(report.unsubmitted_commits as usize, "change", "changes")
+                ));
+            }
+            // `scan` only: it is read-only, and its output names `record` with
+            // the real digest. Listing `record` here would mean printing a
+            // placeholder the operator cannot run -- the same unreachable
+            // remedy this block exists to remove.
             report.next_commands.push(format!(
                 "aethyme broker representation scan --session {session_id}"
             ));

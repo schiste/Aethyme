@@ -148,6 +148,62 @@ fn finish_does_not_demand_promotion_a_repository_opted_out_of() {
     );
 }
 
+/// `finish` refuses correctly when work exists nowhere else, but the remedy it
+/// names has to be reachable. In a repository that does not promote, `submit`
+/// has already run and can never satisfy the check -- naming it sends the
+/// operator round a loop with no exit, which is the engine-pin shape from #254.
+#[test]
+fn finish_names_a_reachable_remedy_where_promotion_is_off() {
+    let (_tmp, mut broker) = fixture(Some("verify-only"));
+    let session = commit_work(&mut broker, "unlanded");
+    assert!(!broker.submit(session).unwrap().promoted);
+
+    let report = broker.finish(session).unwrap();
+
+    // The guard still holds: this work is on no delivery target.
+    let warning = report
+        .warnings
+        .iter()
+        .find(|w| w.contains("not represented on any delivery target"))
+        .unwrap_or_else(|| panic!("expected the representation refusal: {:?}", report.warnings));
+    assert!(
+        warning.contains("does not promote"),
+        "the refusal must say why submitting again cannot help: {warning}"
+    );
+
+    let commands = report.next_commands.join("\n");
+    assert!(
+        !commands.contains("broker submit"),
+        "submit cannot satisfy this check here and must not be suggested: {commands}"
+    );
+    assert!(
+        commands.contains("representation scan"),
+        "the reachable path starts with a scan: {commands}"
+    );
+    // `record` is deliberately absent: it needs a digest the scan produces, so
+    // naming it here could only be a placeholder.
+    assert!(
+        !commands.contains("<sha256>"),
+        "a suggested command must be runnable as printed: {commands}"
+    );
+}
+
+/// A promoting repository is unchanged: submit is the right next step there.
+#[test]
+fn finish_still_tells_a_promoting_repository_to_submit() {
+    let (_tmp, mut broker) = fixture(Some("manual"));
+    let session = commit_work(&mut broker, "held");
+    assert!(!broker.submit(session).unwrap().promoted);
+
+    let report = broker.finish(session).unwrap();
+    let commands = report.next_commands.join("\n");
+    assert!(
+        commands.contains("broker promote") || commands.contains("broker submit"),
+        "a promoting repository keeps its promotion remedy: {commands} / {:?}",
+        report.warnings
+    );
+}
+
 /// `--verify-only` narrows one run of a promoting repository, and the reason
 /// distinguishes the flag from the repository policy.
 #[test]
