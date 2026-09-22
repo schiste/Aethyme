@@ -13262,6 +13262,15 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                 }
             }
         }
+        "worktrees" => {
+            let mut broker = open_broker(parsed.read_only_snapshot)?;
+            let report = broker.worktree_report()?;
+            if parsed.json {
+                out!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                render_worktree_report(&report);
+            }
+        }
         "storage" => {
             let action = parsed.positional.first().map(String::as_str);
             if parsed.positional.len() > 1 {
@@ -13487,4 +13496,59 @@ fn capture_declared_scopes(
         out!("Scope: none recorded — {reason}");
     }
     Ok(())
+}
+
+/// Print the worktree report: what holds work that exists nowhere else, first.
+///
+/// The summary leads with bytes that cannot be reclaimed by any policy, because
+/// that is the number a reader acts on -- every other figure in a storage
+/// report is already answerable by `broker storage`.
+fn render_worktree_report(report: &crate::WorktreeReport) {
+    if report.rows.is_empty() {
+        out!("No worktrees on this host.");
+        return;
+    }
+    out!(
+        "{} worktree(s), {}. {} hold work that exists nowhere else ({}).",
+        report.rows.len(),
+        human_bytes(report.total_bytes),
+        report.unique_work_count,
+        human_bytes(report.unique_work_bytes),
+    );
+    if report.unique_work_count > 0 {
+        out!("No cleanup can reclaim those; each needs a push-or-discard decision.");
+    }
+    out!();
+    for row in &report.rows {
+        let state = match &row.work {
+            crate::WorkState::Uncommitted { files } => {
+                format!("uncommitted ({files} file(s))")
+            }
+            crate::WorkState::Unpushed { commits } => {
+                format!("unpushed ({commits} commit(s))")
+            }
+            crate::WorkState::Recoverable => "recoverable".to_string(),
+            crate::WorkState::NotACheckout => "not a checkout".to_string(),
+        };
+        let idle = row
+            .idle_days
+            .map(|days| format!("{days}d idle"))
+            .unwrap_or_else(|| "-".to_string());
+        out!(
+            "  {:<22} {:>9}  {:<26} {:<10} {}{}",
+            truncate(&row.repository, 22),
+            human_bytes(row.bytes),
+            state,
+            idle,
+            row.branch.as_deref().unwrap_or("-"),
+            if row.live { "  [live session]" } else { "" },
+        );
+    }
+}
+
+fn truncate(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        return text.to_string();
+    }
+    text.chars().take(width.saturating_sub(1)).collect::<String>() + "…"
 }

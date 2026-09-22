@@ -57,6 +57,7 @@ mod issue_form;
 mod lease_export;
 mod leases;
 mod scopes;
+mod worktree_report;
 pub mod main_reconcile;
 mod measurement;
 mod merge;
@@ -240,6 +241,9 @@ pub use lease_export::{
     LeaseRoutingExportOptions, LeaseRoutingItem, MAX_LEASE_ROUTING_EXPORT_LIMIT,
 };
 pub use leases::{LeaseIgnoreRules, Overlap, detect_overlaps};
+pub use worktree_report::{
+    WorkState, WorktreeReport, WorktreeRow, build as build_worktree_report,
+};
 pub use scopes::{
     ScopeConflictSeverity, ScopeOverlap, classify as classify_scope_pair, detect_scope_overlaps,
     parse_scope_argument,
