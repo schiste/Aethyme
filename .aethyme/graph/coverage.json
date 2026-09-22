@@ -3,8 +3,8 @@
   "available": true,
   "source_revision": "15cfa8820110270a3ede27444738569425ef1679",
   "indexed_revision": "15cfa8820110270a3ede27444738569425ef1679",
-  "source_tree_sha256": "341014f2190fe3a3339ad7a424ae70bb813fd1185a7a0730032b286bde821f7d",
-  "indexed_tree_sha256": "341014f2190fe3a3339ad7a424ae70bb813fd1185a7a0730032b286bde821f7d",
+  "source_tree_sha256": "d5ee717e10b79964c98a613243286883b6194f818f067ad390d5ee8084aa0d99",
+  "indexed_tree_sha256": "d5ee717e10b79964c98a613243286883b6194f818f067ad390d5ee8084aa0d99",
   "engine_version": "0.7.25",
   "coverage_mode": "partial",
   "safe_to_use": false,
@@ -22,14 +22,14 @@
     "excluded": 24
   },
   "bytes": {
-    "discovered": 16182598,
-    "eligible": 11225018,
-    "parsed": 9502878,
+    "discovered": 16184811,
+    "eligible": 11227231,
+    "parsed": 9505091,
     "partial": 0,
     "unsupported": 61634,
     "non_code": 1660506,
     "excluded": 4957580,
-    "source_read": 9613939
+    "source_read": 9616152
   },
   "by_language": {
     "json": {
@@ -79,7 +79,7 @@
     },
     "rust": {
       "files": 401,
-      "bytes": 9264429,
+      "bytes": 9266642,
       "parsed": 401,
       "partial": 0,
       "unsupported": 0,
@@ -126,7 +126,7 @@
     },
     "ra_ap_syntax": {
       "files": 401,
-      "bytes": 9264429,
+      "bytes": 9266642,
       "parsed": 401,
       "partial": 0,
       "unsupported": 0,
@@ -162,7 +162,7 @@
     "credential_operation": 19,
     "enum": 351,
     "file": 429,
-    "function": 6540,
+    "function": 6541,
     "global_variable": 727,
     "method": 58,
     "middleware_installation": 1,
@@ -174,7 +174,7 @@
     "unresolved_symbol": 5934
   },
   "node_counts_by_category": {
-    "callable": 6598,
+    "callable": 6599,
     "container": 639,
     "partial_knowledge": 5934,
     "sub_symbol": 727,
@@ -183,7 +183,7 @@
   },
   "edge_counts_by_kind": {
     "calls": 1172,
-    "contains": 8570,
+    "contains": 8571,
     "defines": 58,
     "forwards_to": 40,
     "imports": 4762,
@@ -195,8 +195,8 @@
   },
   "edge_counts_by_category": {
     "behavioral": 1172,
-    "structural": 13390,
+    "structural": 13391,
     "surface_flow_edge": 372
   },
-  "unit_count": 9200
+  "unit_count": 9201
 }
