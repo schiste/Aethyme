@@ -3724,6 +3724,77 @@ impl Broker {
         Ok(views)
     }
 
+    /// What every worktree on this host holds, and whether removing it would
+    /// lose anything. Read-only.
+    ///
+    /// A directory is a worktree when it carries its own `.git` entry, not when
+    /// it sits at a particular depth. The host mixes layouts: most roots hold
+    /// one directory per session, but some roots *are* a checkout. Keying on
+    /// depth descends into those and reports each of their source directories
+    /// as a worktree, every one inheriting the parent's git state.
+    pub fn worktree_report(&mut self) -> Result<crate::WorktreeReport, BrokerOpError> {
+        fn is_checkout(path: &std::path::Path) -> bool {
+            path.join(".git").exists()
+        }
+
+        let plan = self.worktree_root_plan()?;
+        // Keyed by path: `preferred_root` normally sits inside `root_container`,
+        // so both walks reach the same checkouts and a plain vector reports each
+        // of this repository's worktrees twice.
+        let mut worktrees: std::collections::BTreeMap<std::path::PathBuf, String> =
+            std::collections::BTreeMap::new();
+        let mut roots = Vec::new();
+        if let Some(container) = plan.root_container.as_ref() {
+            roots.push(container.clone());
+        }
+        if let Some(root) = plan.preferred_root.as_ref()
+            && !roots.contains(root)
+        {
+            roots.push(root.clone());
+        }
+        for root in roots {
+            let Ok(entries) = std::fs::read_dir(&root) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                if !entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+                    continue;
+                }
+                let path = entry.path();
+                let label = entry.file_name().to_string_lossy().into_owned();
+                if is_checkout(&path) {
+                    // A root that is itself a checkout.
+                    worktrees.entry(path).or_insert(label);
+                    continue;
+                }
+                let Ok(children) = std::fs::read_dir(&path) else {
+                    continue;
+                };
+                for child in children.flatten() {
+                    if !child.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+                        continue;
+                    }
+                    let child_path = child.path();
+                    // Shared caches sit beside worktrees under the same root.
+                    if is_checkout(&child_path) {
+                        worktrees.entry(child_path).or_insert_with(|| label.clone());
+                    }
+                }
+            }
+        }
+        let live = self
+            .store
+            .live_sessions()?
+            .into_iter()
+            .map(|session| std::path::PathBuf::from(session.worktree_path))
+            .collect();
+        let worktrees: Vec<(String, std::path::PathBuf)> = worktrees
+            .into_iter()
+            .map(|(path, label)| (label, path))
+            .collect();
+        Ok(crate::build_worktree_report(&worktrees, &live))
+    }
+
     /// Return overlaps from the persisted lease snapshot without recomputing
     /// implicit leases, extending expiries, or emitting overlap events.
     pub fn lease_overlaps_snapshot(&self) -> Result<Vec<crate::Overlap>, BrokerOpError> {

@@ -1954,6 +1954,23 @@ impl GitRepo {
         Ok(!self.dirty_paths()?.is_empty())
     }
 
+    /// Commits reachable from HEAD that no remote-tracking ref contains.
+    ///
+    /// Zero means every commit here exists somewhere else, so the checkout can
+    /// be removed without losing history. Non-zero is the count of commits that
+    /// would go with it.
+    pub fn commits_not_on_any_remote(&self) -> Result<usize, GitError> {
+        let count = run_git(&self.root, &["rev-list", "--count", "HEAD", "--not", "--remotes"])?;
+        Ok(count.trim().parse().unwrap_or(0))
+    }
+
+    /// Unix seconds of HEAD's commit time, for reporting how long a checkout
+    /// has sat untouched.
+    pub fn head_committed_at(&self) -> Result<i64, GitError> {
+        let text = run_git(&self.root, &["log", "-1", "--format=%ct", "HEAD"])?;
+        Ok(text.trim().parse().unwrap_or(0))
+    }
+
     /// Commits on HEAD that are not reachable from `base` — cleanup
     /// refuses to remove a worktree whose work was never merged.
     pub fn unmerged_commit_count(&self, base: &str) -> Result<u64, GitError> {
