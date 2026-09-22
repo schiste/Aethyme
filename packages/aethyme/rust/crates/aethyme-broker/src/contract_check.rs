@@ -207,14 +207,30 @@ pub fn run(args: &[String]) -> u8 {
             );
             0
         }
-        Some(Decision::None) => {
-            eprintln!(
-                "ERROR: PR contract is **none**, but the diff removes tracked \
-                 cross-process symbols. Either pick a different contract label \
-                 (introduce / soft-retire / hard-delete) or restore the symbols."
-            );
-            1
-        }
+        Some(Decision::None) => match parse_contract_justification(&pr_body) {
+            Some(reason) => {
+                // The finding stays printed above; this records why the author
+                // says it is spurious, so a reviewer sees both.
+                println!(
+                    "Contract decision in PR body: **none**, justified — treating \
+                     as deliberate.\n  justification: {reason}"
+                );
+                0
+            }
+            None => {
+                eprintln!(
+                    "ERROR: PR contract is **none**, but the diff removes tracked \
+                     cross-process symbols. Either pick a different contract label \
+                     (introduce / soft-retire / hard-delete), restore the symbols, \
+                     or state why the match is spurious on a line beginning \
+                     `Contract justification:` (at least {MIN_JUSTIFICATION_CHARS} \
+                     characters). The matcher reads diff text, so it cannot tell a \
+                     name leaving a comment or a string from an entry point leaving \
+                     the product."
+                );
+                1
+            }
+        },
         None => {
             eprintln!(
                 "ERROR: PR body does not declare a contract decision \
@@ -379,6 +395,47 @@ fn read_diff(repo_root: &Path, base: &str) -> Result<Vec<String>, String> {
 /// did none of those things. A guard that can only be satisfied by
 /// mislabelling corrupts the signal it exists to give, so it counts both
 /// sides now.
+/// Whether `body` mentions `symbol` as a symbol rather than as a fragment of a
+/// longer name.
+///
+/// A plain substring test reports a removal whenever a tracked name appears
+/// anywhere inside another identifier: deleting `changed_paths: Vec::new()`
+/// was reported as removing the tracked `paths`, which left the author with no
+/// truthful contract label to declare (#263). Identifier characters on either
+/// side mean this is a different name, so the occurrence says nothing about
+/// the tracked one.
+///
+/// Deliberately still matches inside comments and string literals. Command
+/// names reach their dispatch as string literals, so skipping those would turn
+/// a genuine removal into silence -- the failure this check exists to prevent.
+fn mentions_symbol(body: &str, symbol: &str) -> bool {
+    if symbol.is_empty() {
+        return false;
+    }
+    let bytes = body.as_bytes();
+    let mut from = 0;
+    while let Some(offset) = body[from..].find(symbol) {
+        let start = from + offset;
+        let end = start + symbol.len();
+        let before_joins = start
+            .checked_sub(1)
+            .is_some_and(|index| is_symbol_byte(bytes[index]));
+        let after_joins = bytes.get(end).copied().is_some_and(is_symbol_byte);
+        if !before_joins && !after_joins {
+            return true;
+        }
+        from = start + 1;
+    }
+    false
+}
+
+/// Bytes that can continue an identifier, and so join a match to its
+/// neighbour. `-` counts because tracked names are CLI spellings such as
+/// `check-contract`, where a hyphen is part of the name rather than a break.
+fn is_symbol_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-'
+}
+
 pub fn find_touched_symbols(
     diff_lines: &[String],
     tracked: &BTreeSet<String>,
@@ -393,7 +450,7 @@ pub fn find_touched_symbols(
         }
         if let Some(body) = line.strip_prefix('-') {
             for symbol in tracked {
-                if body.contains(symbol.as_str()) {
+                if mentions_symbol(body, symbol) {
                     removed
                         .entry(symbol.clone())
                         .or_default()
@@ -402,7 +459,7 @@ pub fn find_touched_symbols(
             }
         } else if let Some(body) = line.strip_prefix('+') {
             for symbol in tracked {
-                if body.contains(symbol.as_str()) {
+                if mentions_symbol(body, symbol) {
                     *added.entry(symbol.clone()).or_default() += 1;
                 }
             }
@@ -457,6 +514,38 @@ impl Decision {
 /// If neither appears, the contract is undeclared. When several are
 /// declared (mistake or indecision), the most-restrictive wins so a
 /// co-checked `none` cannot fool the check.
+/// Shortest justification that says anything. Long enough to exclude "n/a"
+/// and "see above", short enough not to demand an essay.
+const MIN_JUSTIFICATION_CHARS: usize = 24;
+
+/// A stated reason why a reported removal is not an interface change.
+///
+/// The matcher is a heuristic over diff text: it can see that a tracked name
+/// left a removed line, but not whether an entry point left the product. When
+/// it is wrong there is otherwise no truthful label -- `none` is refused, and
+/// every other label asserts a retirement that did not happen -- so the author
+/// is left choosing between mislabelling, rewording code to move a substring,
+/// and bypassing the gate. This is the fourth option: say why, on the record.
+///
+/// It is deliberately not a silencer. The finding is still printed, the
+/// justification is printed beside it, and both land in the run log where a
+/// reviewer can disagree.
+pub fn parse_contract_justification(pr_body: &str) -> Option<String> {
+    pr_body.lines().find_map(|line| {
+        let rest = line
+            .trim()
+            .trim_start_matches(['-', '*', '#', ' '])
+            .strip_prefix("Contract justification:")
+            .or_else(|| {
+                line.trim()
+                    .trim_start_matches(['-', '*', '#', ' '])
+                    .strip_prefix("contract justification:")
+            })?;
+        let reason = rest.trim();
+        (reason.chars().count() >= MIN_JUSTIFICATION_CHARS).then(|| reason.to_string())
+    })
+}
+
 pub fn parse_contract_decision(pr_body: &str) -> Option<Decision> {
     let mut matches: Vec<Decision> = Vec::new();
     matches.extend(checkbox_decisions(pr_body));
@@ -680,6 +769,53 @@ mod tests {
         lines.iter().map(|s| s.to_string()).collect()
     }
 
+    /// A tracked name inside a longer identifier is a different name.
+    ///
+    /// Deleting `changed_paths: Vec::new()` was reported as removing the
+    /// tracked `paths`, and once reported there is no truthful label left:
+    /// `none` is refused, and every other label asserts a retirement that did
+    /// not happen (#263).
+    #[test]
+    fn a_tracked_name_inside_a_longer_identifier_is_not_a_removal() {
+        let tracked = BTreeSet::from(["paths".to_string(), "graph".to_string()]);
+        let diff = vec![
+            "-            changed_paths: Vec::new(),".to_string(),
+            "-    let graphs = load();".to_string(),
+            "-    call_graph_builder();".to_string(),
+        ];
+        assert!(
+            find_touched_symbols(&diff, &tracked).is_empty(),
+            "changed_paths, graphs and call_graph_builder are other names"
+        );
+    }
+
+    /// The narrowing must not cost the detection the check exists for.
+    ///
+    /// Command names reach their dispatch as string literals, so a removal
+    /// inside quotes is exactly the case worth catching.
+    #[test]
+    fn a_standalone_tracked_name_is_still_a_removal_even_in_a_string() {
+        let tracked = BTreeSet::from(["paths".to_string(), "graph".to_string()]);
+        let diff = vec![
+            "-        \"graph\" => run_graph(tail),".to_string(),
+            "-    let paths = collect();".to_string(),
+        ];
+        let findings = find_touched_symbols(&diff, &tracked);
+        assert_eq!(findings.len(), 2, "both removals must still be reported");
+        assert!(findings.contains_key("graph"));
+        assert!(findings.contains_key("paths"));
+    }
+
+    /// Hyphens belong to CLI spellings, so they join rather than separate.
+    #[test]
+    fn a_hyphenated_name_does_not_match_a_longer_hyphenated_one() {
+        let tracked = BTreeSet::from(["check-contract".to_string()]);
+        let removed_longer = vec!["-    run(\"check-contract-plan\");".to_string()];
+        assert!(find_touched_symbols(&removed_longer, &tracked).is_empty());
+        let removed_exact = vec!["-    run(\"check-contract\");".to_string()];
+        assert_eq!(find_touched_symbols(&removed_exact, &tracked).len(), 1);
+    }
+
     #[test]
     fn find_touched_symbols_only_flags_removals() {
         // Added lines mentioning a tracked symbol are usually new
@@ -742,6 +878,38 @@ mod tests {
         .map(|s| s.to_string())
         .collect();
         assert!(find_touched_symbols(&diff, &tracked).is_empty());
+    }
+
+    /// A justification has to say something. Token reasons would make the
+    /// escape hatch a rubber stamp, which is worse than not having one.
+    #[test]
+    fn a_token_justification_is_not_a_justification() {
+        for weak in ["n/a", "see above", "spurious", "  ", "false positive"] {
+            assert_eq!(
+                parse_contract_justification(&format!("Contract justification: {weak}")),
+                None,
+                "{weak:?} should not count as a stated reason"
+            );
+        }
+    }
+
+    /// A real reason is accepted, and is returned verbatim so it can be
+    /// printed beside the finding rather than replacing it.
+    #[test]
+    fn a_stated_reason_is_accepted_and_preserved() {
+        let body = "## Contract decision\n\n- [x] **none**\n\n                    Contract justification: the name appears only inside a deleted \
+                    error-message string; no entry point changes.\n";
+        let reason = parse_contract_justification(body).expect("a real reason is accepted");
+        assert!(reason.starts_with("the name appears only inside"));
+        assert!(reason.ends_with("no entry point changes."));
+    }
+
+    /// The marker must be a line of its own, not a phrase in prose, so that
+    /// discussing the mechanism in a PR body does not silently satisfy it.
+    #[test]
+    fn prose_mentioning_the_marker_does_not_justify() {
+        let body = "We considered whether a Contract justification: line would help here.";
+        assert_eq!(parse_contract_justification(body), None);
     }
 
     #[test]

@@ -56,6 +56,8 @@ pub mod install_health;
 mod issue_form;
 mod lease_export;
 mod leases;
+mod scopes;
+mod worktree_report;
 pub mod main_reconcile;
 mod measurement;
 mod merge;
@@ -239,6 +241,13 @@ pub use lease_export::{
     LeaseRoutingExportOptions, LeaseRoutingItem, MAX_LEASE_ROUTING_EXPORT_LIMIT,
 };
 pub use leases::{LeaseIgnoreRules, Overlap, detect_overlaps};
+pub use worktree_report::{
+    WorkState, WorktreeReport, WorktreeRow, build as build_worktree_report,
+};
+pub use scopes::{
+    ScopeConflictSeverity, ScopeOverlap, classify as classify_scope_pair, detect_scope_overlaps,
+    parse_scope_argument,
+};
 pub use main_reconcile::{
     MAIN_RECONCILE_SCHEMA_VERSION, MainReconcileApplyReport, MainReconcileCommit,
     MainReconcileDisposition, MainReconcilePlan, MainReconcileResolution,
@@ -256,6 +265,10 @@ pub use operation_stats::{
 };
 pub use operations::{
     CoordinatedCommand, CoordinatedOperationReport, OperationReconcileReport,
+    PushedRef,
+};
+pub(crate) use operations::{is_within, worktree_relative_push_sources};
+pub use operations::{
     OperationReconciliation, OperationReconciliationRecovery, OperationReconciliationState,
     OperationShowReport, PostMergeCleanupReport, PostMergeCleanupState, QueueWait,
     UnknownOutcomeRecovery, classify_gh, classify_git,
@@ -435,6 +448,7 @@ pub use storage::{
     storage_apply, storage_plan,
 };
 pub use types::{
+    ScopeKind, ScopeOperation, ScopeSource, SessionScope,
     Advisory, AdvisoryAction, AdvisoryAudience, AdvisoryDeliveryMetric, AdvisoryDeliverySummary,
     AdvisoryDeliverySurface, AdvisoryEvidence, AdvisoryList, AdvisoryProducer,
     AdvisoryResolutionState, AdvisorySeverity, CoordinatedOperation,

@@ -2093,6 +2093,7 @@ struct Parsed {
     offline: bool,
     required_mode: Option<String>,
     planned_paths: Vec<String>,
+    declared_scopes: Vec<String>,
     exec_command: Vec<String>,
 }
 
@@ -2194,6 +2195,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         offline: false,
         required_mode: None,
         planned_paths: Vec::new(),
+        declared_scopes: Vec::new(),
         exec_command: Vec::new(),
     };
     let mut iter = args.iter();
@@ -2309,6 +2311,16 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
                 iter.next()
                     .ok_or(UsageError::Message(
                         "--path requires a repository-relative path".into(),
+                    ))?
+                    .clone(),
+            ),
+            // Repeatable: a session may name several targets up front.
+            // `--scope` is already the coordinated-operation resource, so the
+            // session's own targets are claimed, parallel to `leases claim`.
+            "--claim" => parsed.declared_scopes.push(
+                iter.next()
+                    .ok_or(UsageError::Message(
+                        "--claim requires kind:value[=operation], e.g. symbol:Name=replace".into(),
                     ))?
                     .clone(),
             ),
@@ -6364,6 +6376,17 @@ fn render_coordinated_operation(
             report.operation.repository,
             report.classification,
         );
+        // What the push actually sent. The planner resolved this before the
+        // command ran; printing it is what makes a refspec that resolved to an
+        // unintended commit visible at the point of the push rather than later
+        // from CI metadata (#269).
+        for pushed in &report.pushed_refs {
+            out!(
+                "  pushed {} -> {}",
+                &pushed.proposed_sha[..pushed.proposed_sha.len().min(12)],
+                pushed.destination_ref,
+            );
+        }
         // A create that exited non-zero has already been reconciled against the
         // repository by now, so the operator reads the answer here rather than
         // going to look for the issue by hand (#184).
@@ -10145,7 +10168,14 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                 if std::path::Path::new(&session.worktree_path) == broker.main_root() {
                     out!(
                         "note: main-checkout session — verification is advisory here \
-                         (commits land on main before gates run); use a worktree \
+                         (commits land on main before gates run);
+                    capture_declared_scopes(
+                        &mut broker,
+                        session.id,
+                        parsed.task.as_deref(),
+                        &parsed.declared_scopes,
+                        false,
+                    )?; use a worktree \
                          session for enforced verification."
                     );
                 }
@@ -10240,6 +10270,13 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     session.worktree_path,
                     session.branch
                 );
+                capture_declared_scopes(
+                    &mut broker,
+                    session.id,
+                    Some(task.as_str()),
+                    &parsed.declared_scopes,
+                    false,
+                )?;
                 out!(
                     "Start base: {} at {} ({})",
                     report.start_base.ref_name,
@@ -10671,6 +10708,33 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                 (false, None) => crate::QueueWait::Forever,
             };
             let mut broker = open_broker(parsed.read_only_snapshot)?;
+            // `HEAD` is per-worktree state, and the coordinated command runs
+            // inside the *session* worktree rather than wherever the operator
+            // stood. Resolving it there publishes that session's commit under
+            // the branch name typed here, and the push reports success (#269).
+            // The check lives at this layer because "the caller's directory" is
+            // a property of this invocation, not of the broker: an in-process
+            // caller has no meaningful cwd, and asking the process for one
+            // would make library behaviour depend on ambient state.
+            if request.provider == crate::OperationProvider::Git {
+                let symbolic = crate::worktree_relative_push_sources(&request.args);
+                if !symbolic.is_empty()
+                    && let Ok(record) = broker.store().session(request.session_id)
+                    && let Ok(caller) = std::env::current_dir()
+                    && !crate::is_within(&caller, std::path::Path::new(&record.worktree_path))
+                {
+                    return Err(UsageError::Message(format!(
+                        "refusing a worktree-relative push source from outside the session \
+                         worktree: {}\n  caller cwd:         {}\n  session {} worktree: {}\n\
+                         `HEAD` resolves in the session worktree, not where you are. Push an \
+                         explicit commit (`git rev-parse HEAD`) or run from the session worktree.",
+                        symbolic.join(", "),
+                        caller.display(),
+                        record.id,
+                        record.worktree_path,
+                    )));
+                }
+            }
             let report = broker.run_coordinated_operation_with_wait(request, queue_wait)?;
             render_coordinated_operation(&report, parsed.json)?;
             // After the coordinated operation returned, so the repository
@@ -13198,6 +13262,15 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                 }
             }
         }
+        "worktrees" => {
+            let mut broker = open_broker(parsed.read_only_snapshot)?;
+            let report = broker.worktree_report()?;
+            if parsed.json {
+                out!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                render_worktree_report(&report);
+            }
+        }
         "storage" => {
             let action = parsed.positional.first().map(String::as_str);
             if parsed.positional.len() > 1 {
@@ -13365,4 +13438,117 @@ fn surface_command_advisories(subcommand: &str, parsed: &Parsed) {
             session_id, note.id
         );
     }
+}
+
+/// Record what a new session says it will work on, and say what happened.
+///
+/// Parsed here so a malformed `--claim` fails before the session exists rather
+/// than leaving one half-described. Reported in the same breath because a
+/// silent capture would make "no collisions" and "nothing recorded"
+/// indistinguishable.
+fn capture_declared_scopes(
+    broker: &mut crate::Broker,
+    session_id: i64,
+    task: Option<&str>,
+    declared: &[String],
+    quiet: bool,
+) -> Result<(), UsageError> {
+    let mut parsed = Vec::with_capacity(declared.len());
+    for text in declared {
+        let (kind, value, operation) =
+            crate::parse_scope_argument(text).map_err(UsageError::Message)?;
+        parsed.push((kind, value, operation));
+    }
+    let report = broker.capture_session_scopes(session_id, &parsed, task)?;
+    if quiet {
+        return Ok(());
+    }
+    if report.declared > 0 || report.derived > 0 {
+        out!(
+            "Scope: {} declared, {} derived from the task",
+            report.declared,
+            report.derived
+        );
+        let overlaps = broker.scope_overlaps_snapshot()?;
+        let mine: Vec<_> = overlaps
+            .iter()
+            .filter(|overlap| overlap.session_a == session_id || overlap.session_b == session_id)
+            .collect();
+        for overlap in &mine {
+            let other = if overlap.session_a == session_id {
+                overlap.session_b
+            } else {
+                overlap.session_a
+            };
+            out!(
+                "  {} with session {}: {}",
+                overlap.severity.as_str(),
+                other,
+                overlap.explanation
+            );
+            out!("    {}", overlap.suggestion);
+        }
+        if mine.is_empty() {
+            out!("  no other live session names these targets");
+        }
+    } else if let Some(reason) = &report.degraded {
+        // Never let an empty scope set read as a clean bill of health.
+        out!("Scope: none recorded — {reason}");
+    }
+    Ok(())
+}
+
+/// Print the worktree report: what holds work that exists nowhere else, first.
+///
+/// The summary leads with bytes that cannot be reclaimed by any policy, because
+/// that is the number a reader acts on -- every other figure in a storage
+/// report is already answerable by `broker storage`.
+fn render_worktree_report(report: &crate::WorktreeReport) {
+    if report.rows.is_empty() {
+        out!("No worktrees on this host.");
+        return;
+    }
+    out!(
+        "{} worktree(s), {}. {} hold work that exists nowhere else ({}).",
+        report.rows.len(),
+        human_bytes(report.total_bytes),
+        report.unique_work_count,
+        human_bytes(report.unique_work_bytes),
+    );
+    if report.unique_work_count > 0 {
+        out!("No cleanup can reclaim those; each needs a push-or-discard decision.");
+    }
+    out!();
+    for row in &report.rows {
+        let state = match &row.work {
+            crate::WorkState::Uncommitted { files } => {
+                format!("uncommitted ({files} file(s))")
+            }
+            crate::WorkState::Unpushed { commits } => {
+                format!("unpushed ({commits} commit(s))")
+            }
+            crate::WorkState::Recoverable => "recoverable".to_string(),
+            crate::WorkState::NotACheckout => "not a checkout".to_string(),
+        };
+        let idle = row
+            .idle_days
+            .map(|days| format!("{days}d idle"))
+            .unwrap_or_else(|| "-".to_string());
+        out!(
+            "  {:<22} {:>9}  {:<26} {:<10} {}{}",
+            truncate(&row.repository, 22),
+            human_bytes(row.bytes),
+            state,
+            idle,
+            row.branch.as_deref().unwrap_or("-"),
+            if row.live { "  [live session]" } else { "" },
+        );
+    }
+}
+
+fn truncate(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        return text.to_string();
+    }
+    text.chars().take(width.saturating_sub(1)).collect::<String>() + "…"
 }

@@ -3664,3 +3664,91 @@ fn status_advice_warns_about_dirty_worktree_wip() {
         "{advice:?}"
     );
 }
+
+/// A queue entry that never landed loses its commit to `git gc` eventually --
+/// that is the expected end state, not corruption. Reconcile used to read its
+/// parents anyway and abort the entire pass on `fatal: bad object`, so one
+/// stale row from weeks earlier deferred cleanup after every merge (#268).
+#[test]
+fn a_rejected_entry_whose_commit_was_collected_does_not_abort_reconcile() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let mut broker = Broker::open(tmp.path()).unwrap();
+
+    let wt = agent_worktree(tmp.path(), "reconcile-collected");
+    let session = broker.adopt(&wt, Some("land real work")).unwrap();
+    commit_edit(&wt, "src/a.py", "a = 2\n");
+    assert!(broker.submit(session.id).unwrap().promoted);
+    sh(
+        tmp.path(),
+        &["update-ref", "refs/remotes/origin/main", "main"],
+    );
+
+    // A rejected entry whose commit the object store no longer has.
+    let collected = "21fc2cb8cf20ede101430cc8e5b80a5f7e0a5824";
+    let db = rusqlite::Connection::open(tmp.path().join(".aethyme/broker.db")).unwrap();
+    db.execute(
+        "INSERT INTO merge_queue
+            (session_id, head_commit, base_commit, status, created_at, updated_at)
+         VALUES (?1, ?2, ?2, 'rejected', 1, 1)",
+        rusqlite::params![session.id, collected],
+    )
+    .unwrap();
+    drop(db);
+
+    let report = broker
+        .reconcile_integration(IntegrationReconcileOptions {
+            upstream: "origin/main".into(),
+            apply: false,
+            resolution_file: None,
+            confirm: None,
+        })
+        .expect("a collected rejected commit must not abort reconcile");
+
+    assert!(
+        !format!("{report:?}").contains(collected),
+        "the terminal entry must be skipped, not reported: {report:#?}"
+    );
+}
+
+/// The counterpart to the above: skipping is scoped to *terminal* statuses. A
+/// commit missing from an entry that is still pending is an anomaly that should
+/// not occur, so it keeps failing loudly rather than being silently dropped.
+#[test]
+fn a_pending_entry_whose_commit_is_missing_still_fails_loudly() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let mut broker = Broker::open(tmp.path()).unwrap();
+
+    let wt = agent_worktree(tmp.path(), "reconcile-pending-missing");
+    let session = broker.adopt(&wt, Some("land real work")).unwrap();
+    commit_edit(&wt, "src/a.py", "a = 2\n");
+    assert!(broker.submit(session.id).unwrap().promoted);
+    sh(
+        tmp.path(),
+        &["update-ref", "refs/remotes/origin/main", "main"],
+    );
+
+    let missing = "21fc2cb8cf20ede101430cc8e5b80a5f7e0a5824";
+    let db = rusqlite::Connection::open(tmp.path().join(".aethyme/broker.db")).unwrap();
+    db.execute(
+        "INSERT INTO merge_queue
+            (session_id, head_commit, base_commit, status, created_at, updated_at)
+         VALUES (?1, ?2, ?2, 'verified', 1, 1)",
+        rusqlite::params![session.id, missing],
+    )
+    .unwrap();
+    drop(db);
+
+    let outcome = broker.reconcile_integration(IntegrationReconcileOptions {
+        upstream: "origin/main".into(),
+        apply: false,
+        resolution_file: None,
+        confirm: None,
+    });
+
+    assert!(
+        outcome.is_err(),
+        "a pending entry with no commit must not be skipped silently: {outcome:#?}"
+    );
+}

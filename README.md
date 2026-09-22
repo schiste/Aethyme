@@ -1,88 +1,36 @@
 # Aethyme
 
-**Flight control for AI coding agents.** Aethyme is a local-first broker that
-lets many concurrent AI agents (Claude Code, Codex, Aider, plain shell
-scripts — any vendor) work on the same repository without colliding: each
-agent flies in its own git worktree, files a task, and requests clearance to
-land. The broker simulates the merge, runs your repo's checks on the merged
-tree, and promotes verified work onto a local integration branch — or hands
-the agent precise rebase instructions when it conflicts.
+> Local-first coordination and repository intelligence for AI coding agents.
 
-No cloud, no daemon, no dashboard: a single Rust binary coordinating through
-SQLite in `.aethyme/`, on macOS and Linux.
+Aethyme is a Rust-native CLI for running concurrent agent work safely in one
+repository. It gives each task an isolated worktree, tracks ownership and
+leases, runs repository-owned gates against the merged tree, and promotes
+verified work to a local integration branch. Its engine adds bounded,
+observable repository navigation when an agent needs context.
 
-## The flight-control model
+There is no hosted control plane to operate. Repository policy and broker state
+live in `.aethyme/`; the optional graph store is derived locally.
 
-| Airport | Aethyme | What it does |
+## The product in three surfaces
+
+| Surface | What it provides | Start with |
 | --- | --- | --- |
-| **The tower** | the broker (`aethyme broker ...`) | Tracks every active session (worktree + branch + task), warns when two agents edit the same files, serializes landings on the integration branch. |
-| **Clearance to land** | `submit` → simulate → gates → promote | A submission is merge-simulated against the integration branch *before* anything runs. Conflicts are rejected in milliseconds with written recovery steps; clean merges get your checks run on the merged tree — the only place semantic conflicts are detectable — then promote. |
-| **Regulations** | `.aethyme/gates.toml` | Quality rules are repo policy, not broker policy. You declare gates (command, cost tier, path triggers); the broker selects the affected ones, runs cheap-first, caches by tree hash, and cancels obsolete runs. A repo with no gates is a valid conflict-only deployment. |
-| **Certification** | `aethyme init` / `aethyme certify` | `certify` is a read-only inspection (git version, repo state, config validity, gitignore contract, database integrity) you can run in CI or cron. `init` runs certify, then scaffolds only what's missing, then drafts gates from your manifests. Idempotent: a second run changes nothing and says so. |
-| **Preflight smoke** | `aethyme broker quick-test` | Creates a disposable repo, runs init → adopt → commit → submit, verifies promotion, then removes the repo. Use it after install/init to prove the local broker loop before starting real work. |
-| **Verification loop** | `aethyme broker verify-loop` | Operator E2E: snapshots the integration head, runs quick-test, runs doctor, runs broker source tests when invoked inside the Aethyme checkout, and fails if integration moved before the result could prove the current tip. Alias: `aethyme broker e2e`. |
-| **Charts** | the graph engine | A deterministic Rust repo-intelligence engine (indexing, graph navigation, impact frontiers, task-context packs). Its bounded incoming-caller frontier also supplies optional hints to `broker gates semantic`; those suggestions never expand enforced gates. |
-| **The flight recorder** | `aethyme broker events` | Every mutation appends to a versioned event log ([`docs/events-contract.md`](docs/events-contract.md)) — the integration contract for any future surface (TUI, editor plugin). |
+| **Coordinate** | Sessions, worktrees, leases, gates, merge simulation, integration, handoffs, and guarded Git/GitHub operations. | `aethyme broker start --task "..."` |
+| **Explore** | Deterministic repository orientation, bounded evidence, task context, graph queries, and verification targets. | `aethyme explore --repo . --request "..."` |
+| **Improve** | Readiness checks, repository-quality inspection, scorecards, and controlled autofixes. | `aethyme readiness` |
 
-Two design commitments underneath all of it:
+The broker is the public front door. Explore and the lower-level graph and task
+commands are supporting repository intelligence for agents and operators.
 
-- **Worktree-first.** The normal path is `broker start --task`, which creates
-  an isolated worktree + branch and registers the session. `broker adopt`
-  remains the attach path for an existing dedicated worktree. Agents from
-  different vendors coordinate because sessions are vendor-agnostic
-  worktrees, not because of per-vendor adapters.
-- **API-first.** The broker core is a typed Rust library; the CLI is a thin
-  client and every command has a `--json` form. `broker submit` promotes to a
-  *local* integration branch only; explicitly authorized remote changes use
-  the durable `broker git` / `broker gh` coordinators instead of bypassing the
-  broker.
+## Quick start
 
-For the current public product map, including the three canonical user
-journeys, command tiers, confidence commands, JSON stability, and the next
-broker directions for repo cleanliness and token budgets, see
-[`docs/product-surface.md`](docs/product-surface.md).
-For the safe follow-up paths after a first submission—including session reuse,
-fresh gate evidence, lease preflight, and durable finish handoffs—see
-[`packages/aethyme/docs/guides/broker-workflows.md`](packages/aethyme/docs/guides/broker-workflows.md).
+### 1. Install the Rust binaries
 
-## Current state — honest version
+Supported release targets are Apple Silicon macOS, Intel macOS, and x86-64
+Linux. A release contains the paired `aethyme` router and
+`aethyme-engine-cli` engine binary.
 
-**v0 (MVP) is built and proven in dogfood.** Sessions, diff-derived leases
-with overlap warnings, explicit write leases, guarded command execution, the
-affected gate runner with tree-hash caching, merge simulation, auto-promotion,
-conflict hand-back
-(`.aethyme/broker-action-required.md`), the append-only event log, managed
-git hooks, `init`/`certify`, and cost/benefit `metrics` all work today.
-Aethyme's own development runs through the broker — multi-agent batches on
-this very repository, including a live-caught semantic conflict (two
-sessions whose changes merged cleanly but broke together; the gate on the
-merged tree caught it). Friction and cost accounting are logged in
-[`docs/dogfood-friction.md`](docs/dogfood-friction.md).
-
-**V1 is active.** The dogfood week and issue #33 closed on 2026-07-17 after
-the broker passed its MVP exit checklist under real multi-agent load. Known edges:
-design ceiling of 15 concurrent sessions (stress-tested at 20), macOS/Linux
-only, implicit overlap warnings are advisory while explicit leases block, and
-graph-aware gate hints are exposed only through the read-only
-`broker gates semantic` report. The deterministic graph engine remains a
-separate supporting service; changed-path triggers still exclusively control
-`gates run` and submit-time verification.
-
-**Removed.** Earlier cloud/SaaS work was deleted in 2026-07; no cloud
-execution, auth, or team sync is part of the product. Direction doc:
-[`docs/aethyme-local-agent-broker.md`](docs/aethyme-local-agent-broker.md).
-
-## Quickstart: install -> deploy -> quick-test -> start -> submit
-
-Prerequisites: git ≥ 2.38 and any repository to try it on. Prebuilt releases
-support Apple Silicon macOS, Intel macOS, and x86-64 Linux. Building from
-source additionally needs a Rust toolchain and about 2 GB of free RAM for the
-one-time compile.
-
-First-time flow: install -> `aethyme deploy` -> `aethyme broker quick-test` ->
-`aethyme broker start --task "..."` -> `aethyme broker submit --session <id>`.
-
-**1. Install the latest stable binary pair with Homebrew:**
+With Homebrew:
 
 ```bash
 brew install schiste/tap/aethyme
@@ -90,15 +38,7 @@ aethyme --version
 aethyme-engine-cli --version
 ```
 
-Homebrew installs both executables from one checksummed platform archive.
-Future stable updates use the familiar `brew update` then
-`brew upgrade aethyme` flow. This is a third-party tap: direct formula
-installation trusts only `schiste/tap/aethyme`, while trusting the entire tap
-would extend that boundary to every formula and command it may contain.
-
-On a supported system without Homebrew, the installer requires `curl`, `jq`,
-`tar`, and a SHA-256 utility. The convenience invocation verifies archive
-checksums against the downloaded manifest, **not its signature**:
+Without Homebrew, use the checksum-verified installer:
 
 ```bash
 curl -fsSL https://github.com/schiste/Aethyme/releases/latest/download/install.sh | sh
@@ -106,235 +46,181 @@ aethyme --version
 aethyme-engine-cli --version
 ```
 
-The installer discovers the stable channel through its release manifest,
-verifies the selected archive checksum and contents, and installs both required
-binaries through one atomic version link under `~/.local/bin` by default. Pass
-`--version` or `--install-dir` after `sh -s --` to pin a release or destination.
-For authenticated release artifacts, install Cosign 3, download and review
-`install.sh`, then run `sh install.sh --verify-signature`. This verifies the
-manifest signature and installer hash, and binds the archive to the signed
-manifest before extracting or executing either binary. Do not pipe this mode
-into `sh`: verification requires the reviewed installer file.
-Installer-managed users can later review and confirm an update explicitly:
+For signature-authenticated installation, download and review `install.sh`,
+then run it with `--verify-signature` and Cosign 3. Installer users can review
+updates explicitly with `aethyme update check`, `aethyme update plan`, and
+`aethyme update execute --confirm <manifest-sha256>`.
+
+Contributors can install from this checkout instead:
 
 ```bash
-aethyme update check
-aethyme update plan --channel stable
-aethyme update execute --confirm <manifest-sha256>
+cargo install --locked --path packages/aethyme/rust/crates/aethyme-cli
+cargo install --locked --path packages/aethyme/rust/crates/aethyme-engine
 ```
 
-After either Homebrew or installer updates the binary pair, review embedded
-repository migrations separately in every enrolled repository:
+### 2. Enroll a repository
 
-```bash
-cd /path/to/your-repo
-aethyme upgrade plan
-aethyme upgrade apply --confirm <plan-sha256> # only when the plan requires it
-# after an interrupted apply only:
-aethyme upgrade recover --plan <plan-sha256>
-```
-
-The binary updater never scans for repositories or rewrites them implicitly.
-Repository application is journaled, writes the schema marker last, and uses
-explicit rollback recovery rather than treating an in-progress marker as
-permission to retry.
-See the [repository upgrade contract](packages/aethyme/docs/guides/repository-upgrades.md)
-for canonical, local-only, interruption, and rollback behavior.
-
-Aethyme never updates silently in the background. Cargo installation is retained for
-contributors and unsupported targets, not as the primary quickstart. See the
-[v0.2.2 upgrade and rollback guide](packages/aethyme/docs/guides/upgrading-to-v0.2.2.md)
-for signature verification, source installation, migrations, and rollback.
-
-**2. Enroll each target repository:**
+Aethyme is installed once per machine and deployed separately into each
+repository. For a reviewed, shared enrollment, plan against the exact remote
+default branch and authorize the printed digest:
 
 ```bash
 cd /path/to/your-repo
 aethyme deploy plan --repo . --diff
 aethyme deploy execute --repo . --confirm <plan-sha256>
+aethyme deploy verify --repo .
 ```
 
-This is the reviewed, atomic first-enrollment path. `plan` reads the remote
-default branch into a disposable checkout and binds the exact generated files,
-dirty-path and session preconditions, local and integration refs, hook state,
-and preservation refs into a SHA-256. `execute` preserves the pre-enrollment
-refs first, creates an isolated broker session, commits and verifies the exact
-reviewed outputs, publishes the promoted commit, verifies the remote, and only
-fast-forwards a clean local default branch. An interrupted execution resumes
-from its private journal; it never guesses that a push failed or succeeded.
+The plan is read-only. Execution applies only the reviewed policy, broker
+configuration, gates, generated agent guidance, and hooks; it publishes through
+the broker and refuses if the reviewed repository state has changed.
 
-The globally installed binaries provide the executable; the committed
-repository policy makes every agent in this repository use it. Re-check the
-committed state locally and in CI with `aethyme deploy verify --repo .`.
+For an intentionally offline/manual enrollment, use the non-publishing path:
 
-(On a repo with a `Cargo.toml`, `go.mod`, `package.json` scripts, or a
-`pyproject.toml` mentioning pytest/ruff, phase 3 drafts a `gates.toml` for
-you to review.) For an intentionally offline/manual enrollment,
-`aethyme deploy --repo .` still prepares and verifies the files without
-publishing them; the operator then owns the Git review and publication steps.
-The reviewed canonical write set still includes the generated `AGENTS.md` and
-`CLAUDE.md` policy surfaces alongside `.aethyme/` and the agent skills.
+```bash
+aethyme deploy --repo .
+aethyme deploy verify --repo .
+```
 
-The deploy command prints the exact tracked-policy/runtime-state boundary.
-See the [repository deployment contract](packages/aethyme/docs/guides/repository-deployment.md)
-for clone behavior, ignored artifacts, and CI enforcement.
-
-For a private trial before team-wide enrollment, commit only the inert bridge:
+To keep the full policy clone-local, first commit the inert bridge and then
+activate local-only deployment:
 
 ```bash
 aethyme deploy bridge --repo .
 git add AGENTS.md CLAUDE.md
 git commit -m "docs: add optional local Aethyme bridge"
-```
-
-Then each developer may opt in independently:
-
-```bash
 aethyme deploy --local-only --repo .
 aethyme deploy verify --local-only --repo .
 ```
 
-Without `.aethyme/local/enabled`, the bridge tells agents to continue normally
-without probing for Aethyme, installing it, or mentioning its absence. Local
-activation writes only clone-ignored policy and runtime files, leaving the
-working tree clean and other clones inactive.
+Graph support is opt-in and canonical. Enable it with
+`aethyme deploy --repo . --with-graph`, commit the enrollment, then follow the
+[graph refresh guide](packages/aethyme/docs/guides/graph-refresh.md). Ordinary
+and local-only deployment remain graph-free.
 
-**3. Run the disposable broker smoke** — this creates and removes a temporary
-repo; it does not touch your target repo:
+Prove the local broker loop before starting real work:
 
 ```bash
 aethyme broker quick-test
+aethyme broker verify-loop
 ```
 
-```text
-broker quick test passed
-pass     create-temp-repo     /tmp/aethyme-broker-quick-test-...
-pass     git-bootstrap        initial commit on main
-pass     aethyme-init         scaffold committed
-pass     broker-adopt         session 1
-pass     smoke-commit         committed one broker-owned change
-pass     broker-submit        entry 1 promoted
-temporary repo removed: yes
-integration head: 69d395da1c7c
-```
+`quick-test` uses a disposable repository. `verify-loop` also reports which
+integration tip was tested and detects movement during the check.
 
-**4. Start a broker-managed session** — this creates an isolated worktree and
-branch for the task:
+### 3. Coordinate a task
 
 ```bash
-aethyme broker start --task "Add a farewell function"
+aethyme broker status
+aethyme broker start --task "Describe the task"
+# Change into the worktree printed by `broker start`.
+aethyme broker leases claim path/to/area --session <id>
+# Edit, test, and commit in that worktree.
+aethyme broker submit --session <id>
+aethyme broker finish --session <id>
 ```
 
-```text
-Started session 1 — worktree /Users/me/Library/Application Support/Aethyme/worktrees/demo-app-a10b2c3d4e5f6789/add-a-farewell-function on branch agent/add-a-farewell-function
-Worktree root: /Users/me/Library/Application Support/Aethyme/worktrees/demo-app-a10b2c3d4e5f6789 (host state, outside the repository)
-Next: cd /Users/me/Library/Application Support/Aethyme/worktrees/demo-app-a10b2c3d4e5f6789/add-a-farewell-function
-```
+Use `aethyme broker adopt --task "..."` for an existing dedicated worktree.
+Run broad commands through `aethyme broker exec --session <id> -- ...`; use
+`aethyme broker git` and `aethyme broker gh` for coordinated Git or GitHub
+mutations. Only committed work can be submitted.
 
-Broker-managed worktrees live in private per-user host state by default, not
-beneath the repository, so repository-wide scanners cannot descend into a
-nested checkout. Inspect the resolved location without creating it with
-`aethyme broker worktree-root --json`. `AETHYME_WORKTREE_ROOT` can select an
-external base; an explicit override that resolves inside this repository or
-another linked worktree is refused.
+`broker submit` simulates the merge, selects the affected repository gates,
+and promotes a verified result to the local `aethyme/integration` branch. It
+does not publish a remote branch. Use the reviewed `broker ship plan` /
+`broker ship execute` lane, or your normal review flow, when publication is
+authorized.
 
-`broker adopt --task "..."` is still available when you have already created
-a dedicated worktree yourself.
+## Explore a repository
 
-**5. Do the work and commit it.** Only committed work integrates:
+`aethyme explore` is the bounded navigation path for agents. It runs through
+the Rust engine, starts the paired local engine daemon when needed, and
+returns candidate files, evidence, verification steps, confidence, and
+observability. If the optional graph is unavailable, it returns a degraded
+result that must be verified before it is treated as an answer.
+
+For the full agent-oriented loop, keep one saved `answer-json` result and feed
+that same file to both readers:
 
 ```bash
-aethyme broker leases claim src/app.py --session 1
-# ...edit src/app.py, or run broad tools through:
-# aethyme broker exec --session 1 -- <command>
-git add src/app.py
-git commit -m "feat: add farewell function"
+AETHYME_JSON="$(mktemp -t aethyme-explore.XXXXXX.json)"
+aethyme explore \
+  --repo "$PWD" \
+  --request "Find the files responsible for this behavior" \
+  --format answer-json \
+  --show-observability \
+  --depth 0 > "$AETHYME_JSON"
+aethyme explore-summary --from "$AETHYME_JSON"
+aethyme verify-targets \
+  --repo "$PWD" \
+  --from "$AETHYME_JSON" \
+  --max-targets 2 \
+  --max-lines 80
 ```
 
-**6. Submit — simulate, gate, land:**
+Lower-level commands are available for focused work:
 
 ```bash
-aethyme broker submit --session 1
+aethyme graph callers /path/to/repo <target> --json-output
+aethyme task pack --repo /path/to/repo --task "Explain this area" --json-output
+aethyme intents --request "Find public functions with no outside callers" --format compact-json
 ```
 
-```text
-Submitting session 1 — HEAD 6613f5ccb1a0
-  6613f5c feat: add farewell function
-gate wall time: 0ms
-entry 1 → promoted (auto-promoted)
-What now: aethyme/integration is at 69d395da1c7c and contains this work. Your checkout and branches are untouched — keep working, or start a follow-up with `aethyme broker adopt --reuse --task "..."`, or finish safely with `aethyme broker finish --session 1`.
-```
+## Architecture
 
-**7. What now?** Your promoted work is on the local `aethyme/integration`
-branch (`git log aethyme/integration`); merge or push it through your normal
-review flow whenever you choose. `aethyme broker status` shows the whole
-picture:
+The shipped product lives in the Rust workspace at
+[`packages/aethyme/rust`](packages/aethyme/rust):
 
-```text
-Integration: aethyme/integration @ 69d395da1c7c
+| Component | Responsibility |
+| --- | --- |
+| `aethyme` / `aethyme-cli` | The single native command entrypoint and router. |
+| `aethyme-broker` | Sessions, external worktrees, leases, gates, merge queue, integration, events, reports, and publication coordination. |
+| `aethyme-engine` | Repository mapping, graph storage and traversal, Explore, and deterministic task-context packs. |
+| `aethyme-enhance` | Repository deployment, generated agent guidance, skills, hooks, and experience artifacts. |
+| `aethyme-quality` | Readiness, repository-quality analysis, scorecards, and controlled autofix behavior. |
+| `aethyme-engine-cli` | The paired local engine-daemon binary used by the router. |
 
-ID   STATUS   ORIGIN   BRANCH                   TASK
-1    active   adopted  main                     Add a farewell function
-
-QID  SID  QSTATUS     HEAD
-1    1    promoted    6613f5ccb1a0
-```
-
-From here: add a `gates.toml` so submissions are verified, not just
-conflict-checked; add the Broker Coordination protocol to your `AGENTS.md`
-so agents follow the loop unprompted (`aethyme certify` reports it as
-`certify.agents-protocol`); and run the full two-agent conflict scenario in
-[`docs/demo-script.md`](docs/demo-script.md) — worth five more minutes to
-see the tower actually direct traffic.
-
-## Repository layout
-
-- `packages/aethyme/rust`: the Rust workspace — `aethyme-engine` (graph
-  engine + the `aethyme` router binary), `aethyme-broker` (the broker
-  library and CLI), and the graph schema/storage/indexer crates.
-- `packages/aethyme`: the 100% Rust product package (broker, graph indexing,
-  search, task context, enhance, and quality tooling). See
-  [`packages/aethyme/README.md`](packages/aethyme/README.md) and
-  [`packages/aethyme/rust/README.md`](packages/aethyme/rust/README.md).
-- `docs`: project-level direction and contracts
-  ([`docs/aethyme-local-agent-broker.md`](docs/aethyme-local-agent-broker.md),
-  [`docs/events-contract.md`](docs/events-contract.md),
-  [`docs/demo-script.md`](docs/demo-script.md)).
-
-For graph-engine usage (indexing, `explore`, task-context packs) see the
-longer guide at
-[`packages/aethyme/docs/getting-started/quickstart.md`](packages/aethyme/docs/getting-started/quickstart.md).
+The shipped product path is 100% Rust: it needs no Python runtime, virtual
+environment, or pip installation. `packages/aethyme-eval` is a deliberately
+separate Python acceptance harness and does not belong to the product runtime.
+The old `python -m src.cli` path was removed and has no compatibility shim.
 
 ## Development
 
-```bash
-# Product: no Python anywhere.
-cargo install --path packages/aethyme/rust/crates/aethyme-cli
-cargo install --path packages/aethyme/rust/crates/aethyme-engine
+From the repository root:
 
-# Tests: no Python there either, since 2026-08-06.
-cd packages/aethyme/rust && cargo test --workspace
+```bash
+cargo build --manifest-path packages/aethyme/rust/Cargo.toml --workspace
+cargo test --manifest-path packages/aethyme/rust/Cargo.toml --workspace
+cargo fmt --manifest-path packages/aethyme/rust/Cargo.toml --all -- --check
+cargo clippy --manifest-path packages/aethyme/rust/Cargo.toml --workspace --all-targets
 ```
 
-> **`python -m src.cli` no longer exists.** The Python package was deleted
-> on 2026-08-01 (python-retirement Phase 6) and there is no shim: the old
-> spelling now fails with `No module named src`. Every command is native —
-> run `aethyme --help`. Installing the router is `cargo install`, with no
-> interpreter, virtualenv, or pip step on the product path.
+The workspace test command above is the product test story. It includes unit tests,
+implementation-blind CLI suites that drive the built binaries, and repository
+hygiene tests for docs, templates, and contracts. See the
+[testing guide](packages/aethyme/docs/guides/testing.md) for the suite layout.
 
-This repository dogfoods its own broker — see the Broker Coordination
-section in [`CLAUDE.md`](CLAUDE.md) / [`AGENTS.md`](AGENTS.md). Evaluation
-work follows the Cardinal Rules there: evals run only against Playground
-repositories, and the tool is never tuned to a score.
+When a binary update changes repository policy or embedded migrations, review
+the repository separately with `aethyme upgrade plan --repo . --diff`; binary
+updates and repository upgrades are intentionally independent.
 
-## Security and support
+## Documentation
 
-- Security policy: [`SECURITY.md`](SECURITY.md)
-- Support scope: [`SUPPORT.md`](SUPPORT.md)
-- Contribution guide: [`CONTRIBUTING.md`](CONTRIBUTING.md)
-- Governance: [`GOVERNANCE.md`](GOVERNANCE.md)
-- Code of conduct: [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md)
+- [Public product surface](docs/product-surface.md) — canonical user journeys and command tiers.
+- [Repository deployment contract](packages/aethyme/docs/guides/repository-deployment.md) — reviewed enrollment, local-only mode, and recovery.
+- [Broker workflows](packages/aethyme/docs/guides/broker-workflows.md) — preparation, leases, gate evidence, reuse, handoffs, and recovery.
+- [CLI reference](packages/aethyme/docs/reference/cli.md) — command and contract details.
+- [Graph refresh guide](packages/aethyme/docs/guides/graph-refresh.md) — opt-in committed graph artifacts and local materialization.
+- [Contributing](CONTRIBUTING.md) — development setup and contribution expectations.
+- [Changelog](CHANGELOG.md) — user-visible release history.
 
-## License
+## Security, support, and license
 
-Apache License 2.0. See [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE).
+- [Security policy](SECURITY.md)
+- [Support](SUPPORT.md)
+- [Code of conduct](CODE_OF_CONDUCT.md)
+- [Governance](GOVERNANCE.md)
+
+Aethyme is licensed under the [Apache License 2.0](LICENSE). See [NOTICE](NOTICE)
+for attribution information.

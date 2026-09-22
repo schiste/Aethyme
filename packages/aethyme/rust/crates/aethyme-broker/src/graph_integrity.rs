@@ -132,20 +132,20 @@ pub(crate) fn verify_disposable_checkout(
             };
         }
     };
+    // The pin is no longer a gate. It was a fast path in front of the real
+    // check below -- regenerate the fragments and compare the resulting tree --
+    // and it answered a different question than the one it was asked.
+    // `CARGO_PKG_VERSION` collapses distinct builds onto one string, so a
+    // release `0.7.23` and a worktree build describing itself as `0.7.23` pass
+    // the pin while producing different bytes, and two builds that would emit
+    // identical fragments fail it whenever their versions differ. It refused on
+    // an identity that is neither recorded nor stable: the verifying binary is
+    // whichever `aethyme` happens to be installed, which on a multi-agent host
+    // any session replaces at will (#254).
+    //
+    // The regeneration below detects drift directly and needs no version to do
+    // it, so the pin is kept as provenance and not consulted for a verdict.
     let running_version = env!("CARGO_PKG_VERSION");
-    if pinned_version != running_version {
-        return GraphIntegrityOutcome {
-            status: GraphIntegrityStatus::Incompatible,
-            enforced: true,
-            tree_hash,
-            policy_digest,
-            engine_version: Some(pinned_version.clone()),
-            changed_paths: Vec::new(),
-            reason: format!(
-                "graph fragments are pinned to Aethyme {pinned_version}, but this verifier is {running_version}; run `aethyme graph refresh plan --repo .` with a compatible release"
-            ),
-        };
-    }
 
     let head_revision = match checkout.head_commit() {
         Ok(revision) => revision,
@@ -605,18 +605,26 @@ mod tests {
         assert_eq!(binary_only.policy_digest, unchanged.policy_digest);
     }
 
+    /// A pin that disagrees with the running version is not by itself a
+    /// verdict.
+    ///
+    /// It used to refuse outright, which meant a repository could be blocked by
+    /// which binary happened to be installed rather than by anything committed.
+    /// Fragments that still regenerate to the verification tree are current, so
+    /// the pin's disagreement must not override that evidence.
     #[test]
-    fn mismatched_engine_pin_refuses_without_rewriting_fragments() {
+    fn a_stale_engine_pin_alone_does_not_refuse() {
         let repo = graph_repo();
         std::fs::write(repo.path().join(".aethyme/engine-version"), "0.0.1\n").unwrap();
         git(repo.path(), &["add", ".aethyme/engine-version"]);
         git(repo.path(), &["commit", "-m", "old graph pin"]);
         let checkout = crate::GitRepo::discover(repo.path()).unwrap();
-        let before = checkout.working_tree_hash().unwrap();
         let policy = GraphIntegrityPolicy::load(repo.path()).unwrap();
         let outcome = verify_disposable_checkout(&checkout, &policy);
-        assert_eq!(outcome.status, GraphIntegrityStatus::Incompatible);
-        assert!(!outcome.allows_promotion());
-        assert_eq!(checkout.working_tree_hash().unwrap(), before);
+        assert_ne!(
+            outcome.status,
+            GraphIntegrityStatus::Incompatible,
+            "a version string must not decide this on its own"
+        );
     }
 }

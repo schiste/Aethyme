@@ -1783,3 +1783,63 @@ fn status_brief_still_records_liveness_transitions() {
         "the transition must be persisted, unlike status_snapshot"
     );
 }
+
+/// A finished session's declared targets must stop pairing with live ones.
+///
+/// The liveness filter is SQL, so the in-memory detector's tests cannot reach
+/// it: they are handed rows directly and never see a session change status. An
+/// earlier deny-list (`NOT IN ('closed', 'abandoned')`) admitted `cleaned` and
+/// `exited` — and named a status that does not exist — so closed sessions kept
+/// colliding forever, which would have made the signal progressively noisier
+/// until it was ignored.
+#[test]
+fn a_finished_session_stops_colliding_on_its_declared_targets() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let mut broker = Broker::open(tmp.path()).unwrap();
+
+    // Two real worktrees: one session per checkout, as the broker requires.
+    let first_tree = tmp.path().join(".aethyme/worktrees/rewriter");
+    let second_tree = tmp.path().join(".aethyme/worktrees/extender");
+    for (path, branch) in [(&first_tree, "agent/rewriter"), (&second_tree, "agent/extender")] {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        sh(
+            tmp.path(),
+            &["worktree", "add", "-q", "-b", branch, path.to_str().unwrap(), "main"],
+        );
+    }
+    let first = broker.adopt(&first_tree, Some("rewrite it")).unwrap();
+    let second = broker.adopt(&second_tree, Some("extend it")).unwrap();
+
+    for (session, operation) in [
+        (first.id, aethyme_broker::ScopeOperation::Replace),
+        (second.id, aethyme_broker::ScopeOperation::Extend),
+    ] {
+        broker
+            .capture_session_scopes(
+                session,
+                &[(
+                    aethyme_broker::ScopeKind::Symbol,
+                    "PaymentService".to_string(),
+                    operation,
+                )],
+                None,
+            )
+            .unwrap();
+    }
+
+    let live = broker.scope_overlaps_snapshot().unwrap();
+    assert_eq!(live.len(), 1, "two live sessions must collide: {live:?}");
+    assert_eq!(
+        live[0].severity,
+        aethyme_broker::ScopeConflictSeverity::High
+    );
+
+    broker.close(second.id).unwrap();
+
+    let after = broker.scope_overlaps_snapshot().unwrap();
+    assert!(
+        after.is_empty(),
+        "a finished session must not keep colliding: {after:?}"
+    );
+}

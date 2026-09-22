@@ -3,8 +3,8 @@
   "available": true,
   "source_revision": "15cfa8820110270a3ede27444738569425ef1679",
   "indexed_revision": "15cfa8820110270a3ede27444738569425ef1679",
-  "source_tree_sha256": "29fe55d2a154bd661c44dc9290da62ab410043a4dd6183c2a71aff1a7aed74cc",
-  "indexed_tree_sha256": "29fe55d2a154bd661c44dc9290da62ab410043a4dd6183c2a71aff1a7aed74cc",
+  "source_tree_sha256": "a1225315a3ee692bed72367831758128245b9ae7645eacf09412d1873133da5f",
+  "indexed_tree_sha256": "a1225315a3ee692bed72367831758128245b9ae7645eacf09412d1873133da5f",
   "engine_version": "0.7.23",
   "coverage_mode": "partial",
   "safe_to_use": false,
@@ -22,12 +22,12 @@
     "excluded": 24
   },
   "bytes": {
-    "discovered": 16043342,
-    "eligible": 11085762,
+    "discovered": 16035334,
+    "eligible": 11077754,
     "parsed": 9374201,
     "partial": 0,
     "unsupported": 61634,
-    "non_code": 1649927,
+    "non_code": 1641919,
     "excluded": 4957580,
     "source_read": 9485262
   },
@@ -52,7 +52,7 @@
     },
     "markdown": {
       "files": 170,
-      "bytes": 1547078,
+      "bytes": 1539070,
       "parsed": 0,
       "partial": 0,
       "unsupported": 0,
@@ -117,7 +117,7 @@
   "by_parser": {
     "none": {
       "files": 208,
-      "bytes": 1649927,
+      "bytes": 1641919,
       "parsed": 0,
       "partial": 0,
       "unsupported": 0,

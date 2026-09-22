@@ -16,7 +16,7 @@ use rusqlite::Connection;
 use crate::error::BrokerError;
 
 /// Current database schema version (== `MIGRATIONS.len()`).
-pub const SCHEMA_VERSION: i64 = 41;
+pub const SCHEMA_VERSION: i64 = 42;
 
 /// Version stamped on every event row written by this binary.
 pub const EVENTS_SCHEMA_VERSION: i64 = 1;
@@ -1222,6 +1222,24 @@ ALTER TABLE sessions ADD COLUMN repository_name TEXT;
 ALTER TABLE sessions ADD COLUMN tab_name TEXT;
 ALTER TABLE sessions ADD COLUMN ai_provider TEXT;
 ";
+const MIGRATION_V42: &str = "
+CREATE TABLE session_scopes (
+    id          INTEGER PRIMARY KEY,
+    session_id  INTEGER NOT NULL REFERENCES sessions (id),
+    kind        TEXT NOT NULL
+                CHECK (kind IN ('symbol')),
+    value       TEXT NOT NULL,
+    operation   TEXT NOT NULL DEFAULT 'unknown'
+                CHECK (operation IN ('unknown', 'extend', 'replace', 'remove')),
+    source      TEXT NOT NULL
+                CHECK (source IN ('declared', 'derived')),
+    created_at  INTEGER NOT NULL,
+    released_at INTEGER,
+    UNIQUE (session_id, kind, value)
+);
+CREATE INDEX session_scopes_by_target ON session_scopes (kind, value, released_at);
+CREATE INDEX session_scopes_by_session ON session_scopes (session_id, released_at);
+";
 const MIGRATIONS: &[&str] = &[
     MIGRATION_V1,
     MIGRATION_V2,
@@ -1264,6 +1282,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_V39,
     MIGRATION_V40,
     MIGRATION_V41,
+    MIGRATION_V42,
 ];
 
 pub(crate) fn current_version(conn: &Connection) -> Result<i64, BrokerError> {
@@ -1429,6 +1448,83 @@ mod tests {
             .is_err(),
             "widening the CHECK must not stop it rejecting unknown values"
         );
+    }
+
+    #[test]
+    fn v42_adds_session_scopes_without_disturbing_existing_sessions() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON").unwrap();
+        conn.execute_batch("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            .unwrap();
+        for (index, sql) in MIGRATIONS.iter().take(41).enumerate() {
+            conn.execute_batch(sql).unwrap();
+            conn.execute(
+                "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)
+                 ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                [(index + 1).to_string()],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO sessions (
+                worktree_path, branch, origin, status, task, diff_base,
+                created_at, updated_at, last_activity_at
+             ) VALUES ('/repo/worktree', 'agent/legacy', 'adopted', 'active',
+                       'legacy task', 'base', 1, 1, 1)",
+            [],
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        // The session that predates the migration is untouched.
+        let task: String = conn
+            .query_row("SELECT task FROM sessions WHERE id = 1", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(task, "legacy task");
+
+        // A target can be recorded against it.
+        conn.execute(
+            "INSERT INTO session_scopes
+                 (session_id, kind, value, operation, source, created_at)
+             VALUES (1, 'symbol', 'PaymentService', 'replace', 'declared', 1)",
+            [],
+        )
+        .unwrap();
+
+        // One row per (session, kind, value): re-recording a target updates it
+        // rather than accumulating duplicates that would pair with themselves.
+        conn.execute(
+            "INSERT INTO session_scopes
+                 (session_id, kind, value, operation, source, created_at)
+             VALUES (1, 'symbol', 'PaymentService', 'extend', 'derived', 2)
+             ON CONFLICT (session_id, kind, value) DO UPDATE SET
+                 operation = excluded.operation",
+            [],
+        )
+        .unwrap();
+        let rows: i64 = conn
+            .query_row("SELECT count(*) FROM session_scopes", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 1, "the target must not be recorded twice");
+
+        // The stored strings are the contract: an operation outside the
+        // vocabulary is refused rather than silently kept.
+        let refused = conn.execute(
+            "INSERT INTO session_scopes
+                 (session_id, kind, value, operation, source, created_at)
+             VALUES (1, 'symbol', 'Other', 'rewrite', 'declared', 3)",
+            [],
+        );
+        assert!(refused.is_err(), "unknown operation must be refused");
+
+        let refused_kind = conn.execute(
+            "INSERT INTO session_scopes
+                 (session_id, kind, value, operation, source, created_at)
+             VALUES (1, 'ledger', 'Other', 'extend', 'declared', 3)",
+            [],
+        );
+        assert!(refused_kind.is_err(), "unknown kind must be refused");
     }
 
     #[test]
