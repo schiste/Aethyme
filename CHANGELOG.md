@@ -6,6 +6,15 @@ artifacts and their exact source revision are recorded in each signed
 
 ## [Unreleased]
 
+### Changed
+
+- The broker database records `min_compatible_schema`. From this release on, an
+  older binary opens a newer database without migrating when every newer
+  migration was declared compatible (new tables, indexes, nullable or defaulted
+  columns), instead of refusing with "schema version N is newer than this
+  binary supports" (#293). Databases migrated before this marker existed are
+  still refused by older binaries.
+
 ## [0.8.1] - 2026-09-23
 
 Fixes two regressions from v0.8.0 seen in real use. No schema change (42);

@@ -4,8 +4,15 @@
 //! - `meta.schema_version` records the applied version; migrations run in
 //!   order inside one transaction per version.
 //! - Migrations are append-only: never edit an entry in [`MIGRATIONS`],
-//!   only add new ones. Opening a database newer than this binary knows
-//!   fails with [`BrokerError::SchemaTooNew`] rather than guessing.
+//!   only add new ones.
+//! - `meta.min_compatible_schema` records the oldest schema version whose
+//!   binaries may still read and write the database. A binary older than the
+//!   database opens it without migrating when its own [`SCHEMA_VERSION`] is at
+//!   least that value, and otherwise fails with [`BrokerError::SchemaTooNew`].
+//!   Raise [`MIN_COMPATIBLE_SCHEMA`] in the same change as a migration older
+//!   writers cannot tolerate: a renamed or dropped column, a new `NOT NULL`
+//!   column without a default, a changed constraint. New tables, indexes and
+//!   nullable or defaulted columns leave it unchanged.
 //! - The `events` table is append-only by contract: the store exposes no
 //!   update or delete for it, and each row carries its own
 //!   `schema_version` ([`EVENTS_SCHEMA_VERSION`]) so old rows stay
@@ -17,6 +24,29 @@ use crate::error::BrokerError;
 
 /// Current database schema version (== `MIGRATIONS.len()`).
 pub const SCHEMA_VERSION: i64 = 42;
+
+/// The oldest schema version whose binaries can safely use a database at
+/// [`SCHEMA_VERSION`]. Before this existed every newer database locked out
+/// every older binary, including for purely additive migrations (#293).
+pub const MIN_COMPATIBLE_SCHEMA: i64 = 42;
+
+/// Whether this binary may use a database at `found`, a version newer than
+/// its own, because every migration past [`SCHEMA_VERSION`] was declared
+/// compatible. A database without the marker predates it and is refused.
+pub fn newer_schema_is_compatible(conn: &Connection, found: i64) -> Result<bool, BrokerError> {
+    if found <= SCHEMA_VERSION {
+        return Ok(true);
+    }
+    let minimum: Option<i64> = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'min_compatible_schema'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+        .and_then(|value| value.parse().ok());
+    Ok(minimum.is_some_and(|minimum| SCHEMA_VERSION >= minimum))
+}
 
 /// Version stamped on every event row written by this binary.
 pub const EVENTS_SCHEMA_VERSION: i64 = 1;
@@ -1310,12 +1340,16 @@ pub fn migrate(conn: &Connection) -> Result<(), BrokerError> {
 
     let found = current_version(conn)?;
     if found > SCHEMA_VERSION {
+        if newer_schema_is_compatible(conn, found)? {
+            return Ok(());
+        }
         return Err(BrokerError::SchemaTooNew {
             found,
             supported: SCHEMA_VERSION,
         });
     }
     if found == SCHEMA_VERSION {
+        record_min_compatible_schema(conn)?;
         return Ok(());
     }
 
@@ -1344,12 +1378,92 @@ pub fn migrate(conn: &Connection) -> Result<(), BrokerError> {
             }
         }
     }
+    record_min_compatible_schema(conn)?;
+    Ok(())
+}
+
+/// Record [`MIN_COMPATIBLE_SCHEMA`], never lowering a value a newer binary
+/// already wrote: that binary knows about migrations this one does not.
+fn record_min_compatible_schema(conn: &Connection) -> Result<(), BrokerError> {
+    conn.execute(
+        "INSERT INTO meta (key, value) VALUES ('min_compatible_schema', ?1)
+         ON CONFLICT (key) DO UPDATE SET value = excluded.value
+         WHERE CAST(meta.value AS INTEGER) < CAST(excluded.value AS INTEGER)",
+        [MIN_COMPATIBLE_SCHEMA.to_string()],
+    )?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn migrated() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        conn
+    }
+
+    fn set_meta(conn: &Connection, key: &str, value: i64) {
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES (?1, ?2)
+             ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+            rusqlite::params![key, value.to_string()],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn migrate_records_the_min_compatible_schema() {
+        let conn = migrated();
+        let value: String = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'min_compatible_schema'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(value, MIN_COMPATIBLE_SCHEMA.to_string());
+    }
+
+    #[test]
+    fn an_older_binary_opens_a_newer_database_only_when_declared_compatible() {
+        // A newer binary applied an additive migration and kept the minimum.
+        let conn = migrated();
+        set_meta(&conn, "schema_version", SCHEMA_VERSION + 1);
+        assert!(migrate(&conn).is_ok(), "additive newer schema must open");
+        assert_eq!(current_version(&conn).unwrap(), SCHEMA_VERSION + 1);
+
+        // A newer binary declared a breaking migration.
+        set_meta(&conn, "min_compatible_schema", SCHEMA_VERSION + 1);
+        assert!(matches!(
+            migrate(&conn),
+            Err(BrokerError::SchemaTooNew { .. })
+        ));
+
+        // A newer database from before the marker existed is refused.
+        conn.execute("DELETE FROM meta WHERE key = 'min_compatible_schema'", [])
+            .unwrap();
+        assert!(matches!(
+            migrate(&conn),
+            Err(BrokerError::SchemaTooNew { .. })
+        ));
+    }
+
+    #[test]
+    fn the_min_compatible_marker_is_never_lowered() {
+        let conn = migrated();
+        set_meta(&conn, "min_compatible_schema", MIN_COMPATIBLE_SCHEMA + 5);
+        record_min_compatible_schema(&conn).unwrap();
+        let value: String = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'min_compatible_schema'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(value, (MIN_COMPATIBLE_SCHEMA + 5).to_string());
+    }
 
     #[test]
     fn v40_preserves_gate_results_and_accepts_build_failure() {
