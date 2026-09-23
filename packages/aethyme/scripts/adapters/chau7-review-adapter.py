@@ -16,10 +16,29 @@ Loop, per invocation:
                                                       checkout head into
                                                       the workspace
                                                           |
+                                                      fetch the diff into
+                                                      the outbox
+                                                          |
                                                       tab_create + tab_exec
+                                                      (credential-free env)
                                                           |
                                                       review state --state
                                                         running | abandoned
+
+and every teardown posts the reviewer's `review.md` through `broker gh` before
+it closes the tab.
+
+The reviewer holds no GitHub credentials (audit finding M5). It reads a diff
+somebody else wrote -- a fork's, when a repository opts in -- and text in that
+diff is input to an agent, so "do not push" in its prompt is not a control: an
+injected instruction can countermand it. The broker therefore hands every
+handoff a `sandbox`: an outbox beside the workspace, an empty `GH_CONFIG_DIR`,
+and an `env` prefix that unsets the token variables and `SSH_AUTH_SOCK` and
+stops git from finding a credential helper. This script, which runs as the
+operator anyway, fetches the pull request into the outbox before the spawn and
+posts the review file after the row settles. The prefix has to go on the
+command itself: a Chau7 tab starts from the operator's login shell and never
+sees this process's environment.
 
 Teardown comes first, and both halves of that matter. A reviewer's shell is
 interactive, so it never exits on its own; until 2026-09-12 nothing ever closed
@@ -71,6 +90,7 @@ import shlex
 import socket
 import subprocess
 import sys
+import shutil
 import tempfile
 from typing import Any
 
@@ -289,6 +309,78 @@ def require_workspace_head(workspace: str, expected: str) -> None:
         )
 
 
+def gh_read(args: list[str]) -> str:
+    """A read-only `gh` call, run directly: reads are not coordinated writes."""
+    result = subprocess.run(["gh", *args], capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        raise RuntimeError(f"gh {' '.join(args[:3])} failed: {result.stderr.strip()}")
+    return result.stdout
+
+def checked_outbox(sandbox: dict[str, Any], workspace: str) -> str:
+    """The outbox path, refused unless it is exactly the workspace's sibling.
+
+    This path is about to be deleted recursively, so it is checked against the
+    one shape the broker produces rather than trusted as given.
+    """
+    outbox = sandbox["outbox"]
+    if outbox != workspace.rstrip("/") + ".review":
+        raise RuntimeError(f"refusing unexpected review outbox {outbox!r} for {workspace}")
+    return outbox
+
+def prepare_outbox(sandbox: dict[str, Any], workspace: str, repository: str,
+                   pull_request: int) -> None:
+    """Fill a fresh outbox with what the reviewer reads, and nothing else.
+
+    Recreated on every spawn: a review file left by the previous head's
+    reviewer would otherwise be posted as this head's review.
+    """
+    outbox = checked_outbox(sandbox, workspace)
+    shutil.rmtree(outbox, ignore_errors=True)
+    os.makedirs(sandbox["gh_config_dir"])
+    diff = gh_read(["pr", "diff", str(pull_request), "--repo", repository])
+    with open(sandbox["diff_file"], "w", encoding="utf-8") as handle:
+        handle.write(diff)
+    metadata = gh_read([
+        "pr", "view", str(pull_request), "--repo", repository, "--json",
+        "number,title,body,url,author,baseRefName,baseRefOid,headRefName,headRefOid,"
+        "isCrossRepository,files",
+    ])
+    with open(sandbox["metadata_file"], "w", encoding="utf-8") as handle:
+        handle.write(metadata)
+
+def post_review(broker: str, cwd: str | None, session: str, repository: str,
+                teardown: dict[str, Any]) -> bool:
+    """Post the review the reviewer wrote, through the coordinated lane.
+
+    Returns False when the post failed, so the caller keeps the tab: the tab
+    is what makes the next tick plan this teardown -- and so this post --
+    again. A missing file is not a failure to retry; the reviewer wrote
+    nothing, and waiting will not change that.
+    """
+    sandbox = teardown["sandbox"]
+    body = sandbox["body_file"]
+    pull_request, review_type = teardown["pull_request"], teardown["review_type"]
+    if not os.path.isfile(body):
+        print(f"the {review_type} reviewer of #{pull_request} left no {body}", file=sys.stderr)
+        return True
+    post = (teardown["post_request_changes_args"]
+            if os.path.exists(sandbox["request_changes_marker"])
+            else teardown["post_comment_args"])
+    result = subprocess.run(
+        [broker, "broker", "gh", "--session", session, "--repo", repository,
+         "--reason", f"post the {review_type} review on {repository}#{pull_request}",
+         "--", *post, "--repo", repository],
+        capture_output=True, text=True, cwd=cwd, check=False,
+    )
+    if result.returncode != 0:
+        print(f"could not post the {review_type} review on #{pull_request}: "
+              f"{result.stderr.strip()}", file=sys.stderr)
+        return False
+    # Posted once. A teardown that is planned again -- the tab refused to
+    # close -- must not post the same review a second time.
+    os.replace(body, body + ".posted")
+    return True
+
 def prepare_workspace(
     broker: str, repo_path: str | None, session: str, repository: str,
     pull_request: int, head: str, workspace: str,
@@ -372,7 +464,10 @@ def main() -> int:
         for teardown in visited.get("chau7_teardown") or []:
             review_type, workspace = teardown["review_type"], teardown["workspace"]
             if args.dry_run:
-                print(f"[dry-run] would close {len(teardown['tab_ids'])} tab(s) in {workspace}")
+                print(f"[dry-run] would post {teardown['sandbox']['body_file']} and close "
+                      f"{len(teardown['tab_ids'])} tab(s) in {workspace}")
+                continue
+            if not post_review(args.broker, args.repo_path, args.session, args.repo, teardown):
                 continue
             for tab_id in teardown["tab_ids"]:
                 try:
@@ -400,13 +495,16 @@ def main() -> int:
             try:
                 prepare_workspace(args.broker, args.repo_path, args.session, args.repo,
                                   pull_request, head, workspace)
+                sandbox = handoff["sandbox"]
+                prepare_outbox(sandbox, workspace, args.repo, pull_request)
                 # Keep the proof at the transport boundary too: the workspace
                 # must still name the handoff's commit after preparation and
                 # immediately before the tab is opened.
                 require_workspace_head(workspace, head)
                 client.start_review(
                     workspace,
-                    f"{args.agent} {shlex.quote(handoff['prompt'])}",
+                    f"{shlex.join(sandbox['command_prefix'])} {args.agent} "
+                    f"{shlex.quote(handoff['prompt'])}",
                     f"{review_type} review #{pull_request}",
                 )
             except (Chau7Error, BrokerError, OSError, RuntimeError) as error:

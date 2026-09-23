@@ -469,15 +469,22 @@ fn this_repositorys_own_review_configuration_loads_and_routes_as_written() {
             "schiste/Aethyme",
             179,
             "abc123",
+            &routing.workspace(&root, 179, dimension),
             &reporting,
             routing.route_for(dimension).instructions.as_deref(),
         );
-        // A reviewer is a shell with credentials; posting with bare `gh` puts
-        // a shared-state write outside the operations journal.
+        // A reviewer reads a diff somebody else wrote, so it holds no GitHub
+        // credentials and posts nothing: it writes a file, and the broker
+        // posts that file through the coordinated lane (M5).
         assert!(
-            prompt.contains("aethyme broker gh"),
-            "the {dimension} reviewer is no longer told to post through the \
-             coordinated lane:\n{prompt}"
+            prompt.contains("coordinated `gh` lane") && prompt.contains("review.md"),
+            "the {dimension} reviewer is no longer told the broker posts its \
+             review file:\n{prompt}"
+        );
+        assert!(
+            !prompt.contains("gh pr review") && !prompt.contains("gh pr diff"),
+            "the {dimension} reviewer is told to use credentials it no longer \
+             holds:\n{prompt}"
         );
         // Without a ladder and an anchor, two reviewers of one pull request
         // produce two documents that cannot be read side by side -- which is

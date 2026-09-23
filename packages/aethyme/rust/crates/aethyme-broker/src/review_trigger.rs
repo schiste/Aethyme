@@ -411,6 +411,17 @@ pub struct ReviewTriggerPolicy {
     /// Schedule for a type with no entry in `schedule`.
     #[serde(default)]
     pub default_schedule: ReviewSchedule,
+    /// Review pull requests whose head lives in a different repository.
+    ///
+    /// Off by default. A fork's diff is written by someone with no standing in
+    /// this repository, and a Chau7 reviewer reads that diff from a checkout on
+    /// the operator's machine, as the operator. Text in the diff is therefore
+    /// input to an agent -- the classic prompt-injection shape -- and the only
+    /// defence that holds whatever the reviewer's sandbox turns out to allow is
+    /// not starting it. A repository that wants fork review says so here, and
+    /// every other rule, `from_fork` included, then applies unchanged.
+    #[serde(default)]
+    pub include_forks: bool,
 }
 
 fn default_trigger_schema_version() -> u32 {
@@ -425,9 +436,19 @@ impl Default for ReviewTriggerPolicy {
             rule: Vec::new(),
             schedule: BTreeMap::new(),
             default_schedule: ReviewSchedule::default(),
+            include_forks: false,
         }
     }
 }
+
+/// Why a fork's pull request was not reviewed, in the decision's own words.
+///
+/// Spelled out rather than left as an empty eligibility list: "no review
+/// needed" and "a review was needed and deliberately withheld" must not look
+/// the same to an operator reading the tick.
+pub const FORK_EXCLUDED_WHY: &str = "pull request is from a fork; fork pull requests are not \
+     reviewed unless `[review.trigger] include_forks = true`, because their diff is untrusted \
+     input to a reviewer running on this machine";
 
 /// Why a policy could not be used. Each names what an operator must change.
 #[derive(Debug, thiserror::Error)]
@@ -676,6 +697,12 @@ pub struct EligibleReview {
     pub review_type: ReviewType,
     /// Rule names, or `author declaration`, in the order they were found.
     pub because: Vec<String>,
+    /// Needed, and withheld by policy rather than by cost -- today only a fork
+    /// pull request under the default `include_forks = false`. [`schedule`]
+    /// turns it into a `Skip` carrying this reason, so the rules that matched
+    /// stay visible next to the reason nothing was spent on them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub excluded: Option<String>,
 }
 
 /// Review types this change needs, before anything about cost is considered.
@@ -709,11 +736,19 @@ pub fn eligible_types(policy: &ReviewTriggerPolicy, facts: &ChangeFacts) -> Vec<
             .or_default()
             .push("author declaration".to_string());
     }
+    // Applied after matching, not instead of it: the rules a fork's change
+    // matched are still reported, next to the reason none of them is spent.
+    // An author declaration is excluded too -- a fork's author writes its
+    // trailers, and escalating into a reviewer is exactly what must not be
+    // theirs to ask for.
+    let excluded =
+        (facts.from_fork && !policy.include_forks).then(|| FORK_EXCLUDED_WHY.to_string());
     found
         .into_iter()
         .map(|(review_type, because)| EligibleReview {
             review_type,
             because,
+            excluded: excluded.clone(),
         })
         .collect()
 }
@@ -845,6 +880,14 @@ pub fn schedule(
     eligible
         .iter()
         .map(|candidate| {
+            // First, so no spend, cap or debounce can reword it: a withheld
+            // review is settled for this change, not waiting on a clock.
+            if let Some(why) = &candidate.excluded {
+                return ReviewTriggerDecision::Skip {
+                    review_type: candidate.review_type.clone(),
+                    why: why.clone(),
+                };
+            }
             let schedule = policy.schedule_for(&candidate.review_type);
             let spent = spend
                 .get(&candidate.review_type)
@@ -1175,7 +1218,8 @@ mod tests {
         by_path.paths = vec!["src/auth/**".to_string()];
         let mut by_fork = rule("by-fork", &["security"]);
         by_fork.from_fork = Some(true);
-        let policy = enabled(vec![by_path, by_fork]);
+        let mut policy = enabled(vec![by_path, by_fork]);
+        policy.include_forks = true;
 
         let mut change = facts(&["src/auth/login.rs"]);
         change.from_fork = true;
@@ -1184,6 +1228,88 @@ mod tests {
         assert_eq!(
             found[0].because,
             vec!["by-path".to_string(), "by-fork".to_string()]
+        );
+    }
+
+    fn fork_change() -> ChangeFacts {
+        let mut change = facts(&["src/auth/login.rs"]);
+        change.from_fork = true;
+        change.classification.requested.insert("code".to_string());
+        change
+    }
+
+    /// M5: a fork's diff is untrusted input to an agent holding the operator's
+    /// machine. Matching rules and author declarations are both withheld, and
+    /// the decision says why rather than reading as "nothing needed".
+    #[test]
+    fn a_fork_pull_request_is_excluded_by_default_and_says_why() {
+        let mut by_path = rule("by-path", &["security"]);
+        by_path.paths = vec!["src/auth/**".to_string()];
+        let policy = enabled(vec![by_path]);
+
+        let found = eligible_types(&policy, &fork_change());
+        assert_eq!(found.len(), 2, "matching is still reported: {found:?}");
+        for eligible in &found {
+            assert_eq!(eligible.excluded.as_deref(), Some(FORK_EXCLUDED_WHY));
+        }
+        let decisions = decide(&policy, &fork_change(), &BTreeMap::new(), "h", None, 0);
+        assert_eq!(decisions.len(), 2);
+        for decision in &decisions {
+            match decision {
+                ReviewTriggerDecision::Skip { why, .. } => {
+                    assert!(why.contains("include_forks = true"), "{why}");
+                    assert!(why.contains("fork"), "{why}");
+                }
+                other => panic!("a fork must not be reviewed by default: {other:?}"),
+            }
+        }
+
+        // The same change from a branch in this repository is reviewed.
+        let mut local = fork_change();
+        local.from_fork = false;
+        assert!(
+            decide(&policy, &local, &BTreeMap::new(), "h", None, 0)
+                .iter()
+                .all(|decision| matches!(decision, ReviewTriggerDecision::Request { .. }))
+        );
+    }
+
+    #[test]
+    fn include_forks_reviews_a_fork_like_any_other_change() {
+        let mut by_path = rule("by-path", &["security"]);
+        by_path.paths = vec!["src/auth/**".to_string()];
+        let mut policy = enabled(vec![by_path]);
+        policy.include_forks = true;
+
+        let found = eligible_types(&policy, &fork_change());
+        assert!(found.iter().all(|eligible| eligible.excluded.is_none()));
+        let decisions = decide(&policy, &fork_change(), &BTreeMap::new(), "h", None, 0);
+        assert_eq!(decisions.len(), 2);
+        assert!(
+            decisions
+                .iter()
+                .all(|decision| matches!(decision, ReviewTriggerDecision::Request { .. })),
+            "{decisions:?}"
+        );
+    }
+
+    #[test]
+    fn include_forks_parses_from_the_trigger_table_and_defaults_off() {
+        let temp = tempfile::tempdir().unwrap();
+        write_config(temp.path(), "[review.trigger]\nenabled = true\n");
+        assert!(
+            !ReviewTriggerPolicy::load(temp.path())
+                .unwrap()
+                .include_forks
+        );
+        write_config(
+            temp.path(),
+            "[review.trigger]\nenabled = true\ninclude_forks = true\n",
+        );
+        assert!(
+            ReviewTriggerPolicy::load(temp.path())
+                .unwrap()
+                .include_forks
         );
     }
 
@@ -1258,6 +1384,7 @@ mod tests {
         vec![EligibleReview {
             review_type: review_type.to_string(),
             because: vec!["rule".to_string()],
+            excluded: None,
         }]
     }
 
@@ -1369,10 +1496,12 @@ mod tests {
             EligibleReview {
                 review_type: "code".to_string(),
                 because: vec!["rule".to_string()],
+                excluded: None,
             },
             EligibleReview {
                 review_type: "security".to_string(),
                 because: vec!["rule".to_string()],
+                excluded: None,
             },
         ];
         let mut spend = settled("code", "head1", Some("base1"));
@@ -1634,10 +1763,12 @@ mod tests {
             EligibleReview {
                 review_type: "code".to_string(),
                 because: vec!["r".to_string()],
+                excluded: None,
             },
             EligibleReview {
                 review_type: "security".to_string(),
                 because: vec!["r".to_string()],
+                excluded: None,
             },
         ];
         let mut spend = BTreeMap::new();

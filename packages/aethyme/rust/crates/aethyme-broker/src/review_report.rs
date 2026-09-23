@@ -69,9 +69,10 @@ pub struct ReviewReportingPolicy {
     pub request_changes_at: Option<String>,
     /// Post through `aethyme broker gh` rather than bare `gh`.
     ///
-    /// On by default: a reviewer is an agent doing work in a shared
-    /// repository, and posting a review is a GitHub mutation like any other.
-    /// "It is only a comment" is how writes end up outside the journal.
+    /// Accepted and no longer consulted by the Chau7 lane. A Chau7 reviewer
+    /// holds no GitHub credentials and posts nothing; it writes its review to
+    /// a file and the adapter posts it, always through `aethyme broker gh`. The
+    /// key stays so a repository that sets it keeps loading.
     #[serde(default = "default_true")]
     pub coordinated: bool,
     /// Require every finding to name `path:line`.
@@ -304,38 +305,29 @@ impl ReviewReportingPolicy {
         repository: &str,
         pull_request: i64,
         head: &str,
+        body_file: &str,
+        request_changes_marker: &str,
     ) -> String {
         let mut out = String::new();
-        out.push_str(
+        // The reviewer writes and the broker posts. A reviewer that posted its
+        // own review needed a GitHub login, and a login that can post a review
+        // can also push, comment anywhere, and read private repositories --
+        // all of it on the say-so of a diff somebody else wrote.
+        out.push_str(&format!(
             "## Reporting\n\n\
-             Post the result as a review on the pull request. That review is the record: a \
-             finding that lives only in this terminal is not tracked, and an unposted review \
-             cannot be told apart from one that never ran. Post even when you find nothing.\n\n",
-        );
-
-        if self.coordinated {
-            out.push_str(&format!(
-                "Posting is a coordinated write, and this workspace is a worktree with no \
-                 session of its own. Take one, post, close it:\n\n    \
-                 aethyme broker adopt --task \"{review_type} review of #{pull_request}\"\n    \
-                 aethyme broker gh --session <id> --repo {repository} \\\n        \
-                 --reason \"post the {review_type} review on #{pull_request}\" -- \\\n        \
-                 pr review {pull_request} --comment --body-file <file>\n    \
-                 aethyme broker close --session <id>\n\n\
-                 Running `gh` directly puts a shared-state write outside the operations \
-                 journal.\n\n"
-            ));
-        } else {
-            out.push_str(&format!(
-                "Post it with:\n\n    \
-                 gh pr review {pull_request} --repo {repository} --comment --body-file <file>\n\n"
-            ));
-        }
+             Write the result, as the body of a review, to `{body_file}`. That file is the \
+             record: once you close the row below, Aethyme posts it on pull request \
+             #{pull_request} in {repository} through its coordinated `gh` lane. A finding \
+             that lives only in this terminal is not tracked, and a review with no file \
+             cannot be told apart from one that never ran. Write it even when you find \
+             nothing. Do not post it yourself.\n\n",
+        ));
 
         let blocking = self.blocking_labels();
         if !blocking.is_empty() {
             out.push_str(&format!(
-                "Submit `--request-changes` instead of `--comment` when any finding is {}.\n\n",
+                "When any finding is {}, also create the empty file `{request_changes_marker}`; \
+                 the review is then submitted as requested changes instead of a comment.\n\n",
                 join_with_or(&blocking)
             ));
         }
@@ -393,7 +385,7 @@ impl ReviewReportingPolicy {
         // hung one are the same row.
         out.push_str(&format!(
             "\n## Finishing\n\n\
-             Close the row once the review is posted:\n\n    \
+             Close the row once the review is written:\n\n    \
              aethyme broker review state --repo {repository} --pr {pull_request} \\\n        \
              --type {review_type} --head {head} --state satisfied \\\n        \
              --completed-for-commit {head} --verdict pass \\\n        \
@@ -472,7 +464,7 @@ means = "annoys a maintainer"
         );
         let policy = ReviewReportingPolicy::load(temp.path()).unwrap();
         assert_eq!(policy.blocking_labels(), vec!["major"]);
-        let text = policy.instructions("security", "o/r", 7, "abc1234");
+        let text = policy.instructions("security", "o/r", 7, "abc1234", BODY, MARKER);
         assert!(text.contains("breaks a user"), "{text}");
         assert!(!text.contains("P0"), "the default ladder is gone: {text}");
         assert!(text.contains("At most 3 findings"), "{text}");
@@ -531,10 +523,14 @@ severity = []
         );
     }
 
+    const BODY: &str = "/w/pr-1/code.review/review.md";
+    const MARKER: &str = "/w/pr-1/code.review/request-changes";
+
     #[test]
     fn the_instructions_name_the_pull_request_the_repository_and_the_dimension() {
         let policy = ReviewReportingPolicy::default();
-        let text = policy.instructions("security", "schiste/Aethyme", 179, "e53b60a3");
+        let text =
+            policy.instructions("security", "schiste/Aethyme", 179, "e53b60a3", BODY, MARKER);
         assert!(text.contains("#179"), "{text}");
         assert!(text.contains("schiste/Aethyme"), "{text}");
         assert!(text.contains("## Security review"), "{text}");
@@ -542,27 +538,24 @@ severity = []
         assert!(text.contains("No security findings."), "{text}");
     }
 
+    /// M5: the reviewer holds no GitHub credentials, so it must never be told
+    /// to post -- whichever way `coordinated` is set. It writes a file, and the
+    /// adapter posts that file through `broker gh`.
     #[test]
-    fn coordinated_posting_takes_a_session_and_bare_posting_does_not() {
-        let coordinated =
-            ReviewReportingPolicy::default().instructions("code", "o/r", 1, "abc1234");
-        assert!(
-            coordinated.contains("aethyme broker adopt"),
-            "{coordinated}"
-        );
-        assert!(coordinated.contains("aethyme broker gh"), "{coordinated}");
-
-        let direct = ReviewReportingPolicy {
-            coordinated: false,
-            ..Default::default()
+    fn the_reviewer_writes_its_review_to_a_file_and_never_posts() {
+        for coordinated in [true, false] {
+            let text = ReviewReportingPolicy {
+                coordinated,
+                request_changes_at: Some("P1".into()),
+                ..Default::default()
+            }
+            .instructions("code", "o/r", 1, "abc1234", BODY, MARKER);
+            assert!(text.contains(BODY), "{text}");
+            assert!(text.contains(MARKER), "{text}");
+            assert!(!text.contains("gh pr review"), "{text}");
+            assert!(!text.contains("aethyme broker gh"), "{text}");
+            assert!(!text.contains("aethyme broker adopt"), "{text}");
         }
-        .instructions("code", "o/r", 1, "abc1234");
-        // The claim is about the posting lane, not about the word "broker":
-        // the ledger row belongs to the broker whatever posts the review, so
-        // the finishing step below stays either way.
-        assert!(!direct.contains("aethyme broker gh"), "{direct}");
-        assert!(!direct.contains("aethyme broker adopt"), "{direct}");
-        assert!(direct.contains("gh pr review 1 --repo o/r"), "{direct}");
     }
 
     /// The reviewer is the only thing that knows it is done, and that is true
@@ -576,7 +569,7 @@ severity = []
                 coordinated,
                 ..Default::default()
             }
-            .instructions("security", "schiste/Aethyme", 179, "e53b60a3");
+            .instructions("security", "schiste/Aethyme", 179, "e53b60a3", BODY, MARKER);
             assert!(
                 text.contains("aethyme broker review state --repo schiste/Aethyme --pr 179"),
                 "coordinated={coordinated}: {text}"
@@ -603,7 +596,7 @@ severity = []
             require_location: false,
             ..Default::default()
         }
-        .instructions("code", "o/r", 1, "abc1234");
+        .instructions("code", "o/r", 1, "abc1234", BODY, MARKER);
         assert!(!text.contains("path/to/file.rs"), "{text}");
         assert!(!text.contains("path:line"), "{text}");
     }
@@ -617,7 +610,7 @@ severity = []
         assert_eq!(policy.blocking_labels(), vec!["P0", "P1"]);
         assert!(
             policy
-                .instructions("code", "o/r", 1, "abc1234")
+                .instructions("code", "o/r", 1, "abc1234", BODY, MARKER)
                 .contains("any finding is P0 or P1")
         );
     }
