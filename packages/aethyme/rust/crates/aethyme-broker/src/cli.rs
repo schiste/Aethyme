@@ -349,6 +349,18 @@ Usage:
       arguments. Unknown hook names are rejected.
       (hooks pre-commit / hooks post-commit / hooks pre-push are internal entry
       points the installed shims call — not for direct use.)
+  aethyme broker trust [--repo <path>] [--json]
+      Show every gate and prepare command this repository defines, then
+      record their exact policy digest as trusted on this machine. Until a
+      policy is trusted, submit, gates run, the pre-commit hook and prepare
+      refuse (exit 3) before running any repository-defined command; a policy
+      change needs trusting again. Requires an interactive terminal on stdin,
+      so an agent cannot approve itself. Repositories that already had gate
+      history are trusted with their current policy automatically.
+      AETHYME_TRUST_NONINTERACTIVE_FOR_TESTS=1 is a test-only escape.
+  aethyme broker trust status [--repo <path>] [--json]
+      Read-only: the checkout's and integration tip's policy digests, whether
+      each is trusted, and the approved digests on record.
   aethyme broker pr check [--target <branch>] [--pr <number>] [--agent <name>] [--dispatch] [--cmd <command>] [--json]
   aethyme broker watch pr start --session <id> --repo <owner/name> --pr <number> [--events <comments,reviews,checks>] [--seconds <15..3600>] [--json]
   aethyme broker watch pr monitoring <activate|deactivate|status> --session <id> [--json]
@@ -828,6 +840,7 @@ const KNOWN_COMMAND_WORDS: &[&str] = &[
     "metrics",
     "doctor",
     "quick-test",
+    "trust",
     "verify-loop",
     "e2e",
     "finish",
@@ -1034,6 +1047,7 @@ fn command_records_metric(args: &[String]) -> bool {
             _ => true,
         },
         Some("doctor") => args.iter().any(|arg| arg == "--fix-version"),
+        Some("trust") => args.get(1).map(String::as_str) != Some("status"),
         _ => true,
     }
 }
@@ -13172,6 +13186,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
             )?;
             render_quick_test_report(&report, parsed.json)?;
         }
+        "trust" => run_trust_command(&parsed)?,
         "verify-loop" | "e2e" => {
             let mut broker = open_broker(parsed.read_only_snapshot)?;
             let cwd = std::env::current_dir()
@@ -13508,6 +13523,137 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
         }
     }
     Ok(())
+}
+
+/// `aethyme broker trust [status]`. Never opens (or creates) the broker
+/// database for the check itself: trust is host state.
+fn run_trust_command(parsed: &Parsed) -> Result<(), UsageError> {
+    use crate::broker::gate_trust;
+
+    let status_only = match parsed.positional.as_slice() {
+        [] => false,
+        [action] if action == "status" => true,
+        _ => {
+            return Err(UsageError::Message(
+                "trust accepts no arguments other than `status`".into(),
+            ));
+        }
+    };
+    let dir = match parsed.repository.as_deref() {
+        Some(path) => PathBuf::from(path),
+        None => std::env::current_dir()
+            .map_err(|err| UsageError::Message(format!("cannot resolve cwd: {err}")))?,
+    };
+    let status = gate_trust::status(&dir)?;
+    if status_only {
+        if parsed.json {
+            out!("{}", serde_json::to_string_pretty(&status)?);
+        } else {
+            render_trust_sources(&status.sources);
+            out!("record: {}", status.record_path);
+            match &status.next_action {
+                Some(next) => out!("not trusted; next: {next}"),
+                None => out!("trusted"),
+            }
+        }
+        return Ok(());
+    }
+    let pending = status
+        .sources
+        .iter()
+        .filter(|source| !source.trusted)
+        .cloned()
+        .collect::<Vec<_>>();
+    let escape = gate_trust::test_escape_enabled();
+    if !pending.is_empty() && !escape {
+        use std::io::IsTerminal as _;
+        if !std::io::stdin().is_terminal() {
+            return Err(UsageError::Exit {
+                message: format!(
+                    "refusing to trust without an interactive terminal: approving the \
+                     commands a repository runs is a human decision, and agents run without \
+                     a terminal. Run `{}` yourself in a terminal.",
+                    gate_trust::trust_command(Path::new(&status.repository))
+                ),
+                code: crate::exit_status::REFUSED,
+            });
+        }
+        eprintln!(
+            "Repository {} defines these commands. Aethyme runs them as you when an agent \
+             submits, runs gates, commits, or prepares a session:",
+            status.repository
+        );
+        for source in &pending {
+            eprintln!(
+                "\n{} policy sha256 {}:",
+                source.source, source.policy.policy_sha256
+            );
+            for command in &source.policy.commands {
+                eprintln!(
+                    "  [{}] {}: {}",
+                    command.source, command.name, command.command
+                );
+            }
+        }
+        eprint!("\nTrust these commands on this machine? [y/N] ");
+        let mut answer = String::new();
+        std::io::stdin()
+            .read_line(&mut answer)
+            .map_err(|err| UsageError::Message(format!("cannot read the answer: {err}")))?;
+        if !matches!(answer.trim(), "y" | "Y" | "yes" | "YES" | "Yes") {
+            return Err(UsageError::Exit {
+                message: "not trusted; nothing was recorded".into(),
+                code: crate::exit_status::REFUSED,
+            });
+        }
+    }
+    let source = if pending.is_empty() || !escape {
+        "interactive"
+    } else {
+        "test_escape"
+    };
+    let report = gate_trust::trust(&dir, source)?;
+    if parsed.json {
+        out!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        render_trust_sources(&report.sources);
+        if report.recorded.is_empty() {
+            out!("Nothing to record: every policy that runs commands was already trusted.");
+        } else {
+            out!(
+                "Trusted {} policy digest(s) for {}.",
+                report.recorded.len(),
+                report.repository
+            );
+        }
+    }
+    Ok(())
+}
+
+fn render_trust_sources(sources: &[crate::broker::gate_trust::PolicySource]) {
+    if sources.is_empty() {
+        out!("This repository defines no gate or prepare commands.");
+    }
+    for source in sources {
+        out!(
+            "{} policy {} ({}):",
+            source.source,
+            source.policy.policy_sha256,
+            if source.trusted {
+                "trusted"
+            } else {
+                "not trusted"
+            }
+        );
+        for command in &source.policy.commands {
+            out!(
+                "  [{}] {}: {}",
+                command.source,
+                command.name,
+                command.command
+            );
+        }
+    }
 }
 
 /// Every broker invocation associated with a live session surfaces its

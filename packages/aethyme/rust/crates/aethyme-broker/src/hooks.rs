@@ -73,6 +73,8 @@ pub enum HooksError {
          and re-run `aethyme broker hooks install`."
     )]
     HooksPathOverride { configured: String },
+    #[error("commit blocked by Aethyme pre-commit: {0}")]
+    GatePolicy(Box<crate::BrokerOpError>),
     #[error(
         "gate {gate} failed (exit {code}) — commit blocked. Fix and retry, or bypass once \
          with `git commit --no-verify`.{unprepared}"
@@ -139,6 +141,11 @@ pub enum HooksError {
 impl HooksError {
     /// Original non-zero gate exit code when this is a gate failure.
     pub fn exit_code(&self) -> Option<u8> {
+        if let Self::GatePolicy(error) = self
+            && matches!(**error, crate::BrokerOpError::GatePolicyUntrusted { .. })
+        {
+            return Some(crate::exit_status::REFUSED);
+        }
         let Self::GateFailed { code, .. } = self else {
             return None;
         };
@@ -700,13 +707,23 @@ pub fn run_pre_commit(cwd: &Path) -> Result<(), HooksError> {
         Err(GateConfigError::Missing(_)) => return Ok(()),
         other => other?,
     };
+    let prepare = crate::preparation::load_config(&main_root)
+        .map_err(|error| HooksError::GatePolicy(Box::new(error.into())))?;
+    let policy = crate::broker::gate_trust::GatePolicy::from_parts(&gates, prepare.as_ref());
     let cheap: Vec<_> = gates
         .into_iter()
         .filter(|gate| gate.cost <= PRE_COMMIT_MAX_COST)
         .collect();
     let staged = checkout.staged_files()?;
+    let selections = select_gates(&cheap, &staged);
+    if !selections.is_empty() {
+        // The hook runs the main checkout's gates through `sh -c`: the same
+        // repository-defined commands the broker refuses until trusted.
+        crate::broker::gate_trust::require_trusted_standalone(&main_root, &policy)
+            .map_err(|error| HooksError::GatePolicy(Box::new(error)))?;
+    }
     // load_gates sorts cheap-first, so selections run in cost order.
-    for selection in select_gates(&cheap, &staged) {
+    for selection in selections {
         let gate = selection.gate;
         let output = std::process::Command::new("sh")
             .arg("-c")

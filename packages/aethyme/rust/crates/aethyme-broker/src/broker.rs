@@ -34,6 +34,8 @@ use crate::types::{
 use crate::version::{VersionDriftReport, VersionDriftStatus};
 use crate::worktree_reconcile::WorktreeReconciliation;
 
+pub(crate) mod gate_trust;
+
 /// Idle/stale thresholds for activity-derived liveness (issue #9).
 /// Configurable via `.aethyme/config.toml` in a later phase; constants
 /// for now, chosen so an agent "thinking" for a few minutes stays active.
@@ -137,6 +139,20 @@ pub enum BrokerOpError {
     ReviewLifecycle { reason: String },
     #[error("no configured gate named {name:?}")]
     UnknownGate { name: String },
+    /// Repository-defined gate or prepare commands whose exact policy no human
+    /// on this machine has approved. Nothing was run.
+    #[error(
+        "refusing to run repository-defined commands: the gate policy of {repository} \
+         (sha256 {policy_sha256}) {state}. Gate and prepare commands come from the repository \
+         and run as you, so a human must review and approve them on this machine: \
+         {trust_command}"
+    )]
+    GatePolicyUntrusted {
+        repository: String,
+        policy_sha256: String,
+        state: &'static str,
+        trust_command: String,
+    },
     #[error("refusing to clean session {id}: {reason} (use --force to discard)")]
     DirtyWorktree { id: i64, reason: String },
     #[error("bulk cleanup confirmation must be a full SHA-256 digest")]
@@ -5419,13 +5435,41 @@ impl Broker {
 
     /// Load gates.toml and sync the definition snapshot so recorded
     /// results stay interpretable after config edits.
+    ///
+    /// Every caller runs the gates it loads, so this is also where the
+    /// checkout's policy must be trusted: nothing is synced or run otherwise.
     pub(crate) fn load_and_sync_gates_from(
         &mut self,
         config_root: &Path,
     ) -> Result<Vec<crate::gates::Gate>, BrokerOpError> {
         let gates = crate::gates::load_gates(config_root)?;
+        let prepare = crate::preparation::load_config(config_root)?;
+        let policy = gate_trust::GatePolicy::from_parts(&gates, prepare.as_ref());
+        self.require_trusted_policy(&policy, None)?;
         self.sync_gate_definitions(&gates)?;
         Ok(gates)
+    }
+
+    /// Refuse unless `policy` is trusted for this repository.
+    pub(crate) fn require_trusted_policy(
+        &mut self,
+        policy: &gate_trust::GatePolicy,
+        session_id: Option<i64>,
+    ) -> Result<(), BrokerOpError> {
+        let main_root = self.main_root.clone();
+        gate_trust::require_trusted(&main_root, policy, Some(&mut self.store), session_id)?;
+        Ok(())
+    }
+
+    /// Refuse unless the policy committed at `commit` -- the base a submission
+    /// lands on, whose gates judge it -- is trusted for this repository.
+    pub(crate) fn require_trusted_policy_at_commit(
+        &mut self,
+        commit: &str,
+        session_id: Option<i64>,
+    ) -> Result<(), BrokerOpError> {
+        let policy = gate_trust::policy_at_commit(&self.repo, commit)?;
+        self.require_trusted_policy(&policy, session_id)
     }
 
     /// Load gates.toml as committed at `commit` and sync its definitions.

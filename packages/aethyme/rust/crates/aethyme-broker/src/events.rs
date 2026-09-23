@@ -43,6 +43,11 @@ pub const GUARD_UNTRACKED_ARTIFACT: &str = "guard.untracked_artifact";
 // gate.<status> kinds derive from GateStatus::as_str (pass/fail/cancelled/error).
 pub const GATE_CACHED: &str = "gate.cached";
 pub const GATE_CACHE_BYPASSED: &str = "gate.cache_bypassed";
+/// A human approved a repository's gate/prepare policy with `broker trust`.
+pub const GATE_POLICY_TRUSTED: &str = "gate.policy_trusted";
+/// A repository with gate history was trusted with its current policy the
+/// first time the trust check saw it.
+pub const GATE_POLICY_TRUST_GRANDFATHERED: &str = "gate.policy_trust_grandfathered";
 pub const GRAPH_INTEGRITY_CHECKED: &str = "graph.integrity_checked";
 pub const GRAPH_IMPACT_EVALUATED: &str = "graph.impact_evaluated";
 // merge.<status> kinds derive from MergeStatus::as_str.
@@ -270,6 +275,10 @@ pub fn gate_cached_payload(
 
 pub fn gate_cache_bypassed_payload(gate: &str, tree: &str) -> String {
     json!({ "gate": gate, "tree": tree }).to_string()
+}
+
+pub fn gate_policy_trust_payload(policy_sha256: &str, source: &str) -> String {
+    json!({ "policy_sha256": policy_sha256, "source": source }).to_string()
 }
 
 pub fn merge_submitted_payload(head: &str) -> String {

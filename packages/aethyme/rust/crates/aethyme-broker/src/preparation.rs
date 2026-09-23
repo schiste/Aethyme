@@ -376,6 +376,15 @@ impl Broker {
                 next_action: "dependencies are already current".into(),
             });
         }
+        // Everything below runs the repository's own commands. The policy is
+        // this worktree's: its gates and the preparation just loaded.
+        let gates = match crate::gates::load_gates(&root) {
+            Ok(gates) => gates,
+            Err(crate::gates::GateConfigError::Missing(_)) => Vec::new(),
+            Err(error) => return Err(error.into()),
+        };
+        let policy = crate::broker::gate_trust::GatePolicy::from_parts(&gates, Some(&config));
+        self.require_trusted_policy(&policy, Some(session_id))?;
         if offline
             && let Some(step) = config
                 .steps
@@ -558,13 +567,19 @@ pub(crate) fn load_config(root: &Path) -> Result<Option<PreparationConfig>, Prep
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(source) => return Err(PreparationError::Io { path, source }),
     };
+    parse_config(&text).map(Some)
+}
+
+/// Parse and validate preparation configuration already read from an exact
+/// source, a checkout file or a committed blob alike.
+pub(crate) fn parse_config(text: &str) -> Result<PreparationConfig, PreparationError> {
     let config: PreparationConfig =
-        toml::from_str(&text).map_err(|error| PreparationError::InvalidConfig {
+        toml::from_str(text).map_err(|error| PreparationError::InvalidConfig {
             path: PREPARATION_CONFIG_RELPATH.into(),
             reason: error.to_string(),
         })?;
     validate_config(&config)?;
-    Ok(Some(config))
+    Ok(config)
 }
 
 fn validate_config(config: &PreparationConfig) -> Result<(), PreparationError> {

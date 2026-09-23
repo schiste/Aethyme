@@ -57,4 +57,10 @@ jobs:
         run: cargo build --locked --release --manifest-path packages/aethyme/rust/Cargo.toml --bin aethyme
 
       - name: Run all gates
+        env:
+          # A fresh runner has no gate-trust record and no gate history, so the
+          # broker would refuse this repository's own gates (P2.1). CI runs the
+          # gates this repository defines on its own main branch; that is the
+          # trust decision, made here explicitly.
+          AETHYME_TRUST_NONINTERACTIVE_FOR_TESTS: "1"
         run: packages/aethyme/rust/target/release/aethyme broker gates run --all
