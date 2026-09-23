@@ -78,6 +78,9 @@ decision rather than an omission.
 # ---------------------------------------------------------------------------
 [review.trigger]
 enabled = true
+# Fork pull requests are not reviewed unless this is true. See "Fork pull
+# requests" below before turning it on.
+include_forks = false
 
 # A rule fires when EVERY condition it names holds. A rule that names no
 # condition matches every change -- which is how you say "always".
@@ -97,6 +100,7 @@ paths = [
 ]
 
 # Conditions may also read what the author declared, and who the author is.
+# `from_fork = true` only ever matches with `include_forks = true` above.
 [[review.trigger.rule]]
 name = "untrusted-input"
 require = ["security"]
@@ -215,7 +219,7 @@ with no agent started and no bot mentioned.
 | `areas` | list | `Area:` values the author declared. |
 | `surfaces` | list | `Surface:` values the author declared. |
 | `min_risk` | string | Declared `Risk:` at or above this level. |
-| `from_fork` | bool | Only when the change comes from a fork. |
+| `from_fork` | bool | Only when the change comes from a fork. Forks are excluded outright unless `include_forks = true`; see below. |
 | `first_time_contributor` | bool | Only when the author has not landed here before. |
 | `authored_by_model` | bool | `true` only when a `Model:` trailer names one; `false` only when none does. |
 | `models` | list | Only when the declared `Model:` is one of these, compared case-insensitively. |
@@ -244,6 +248,26 @@ which no tick can report; remove it from `on` or the rule will never fire
 `min_risk` ranks `none` below `low`, `low` below `high` and `critical`. An
 unrecognised value ranks *above* `low`: a typo in a risk trailer escalates
 rather than silently downgrading.
+
+### Fork pull requests
+
+A pull request whose head lives in another repository (`isCrossRepository`) is
+**not reviewed by default**. Its diff is written by someone with no standing in
+this repository, and a Chau7 reviewer reads that diff on the operator's machine:
+any instruction hidden in it is input to an agent. The rules still match -- the
+eligible list shows which ones, each with an `excluded` reason -- but every
+resulting decision is a `skip` whose `why` says the pull request is from a fork
+and names the key, so a withheld review is not the same value as "no review
+needed". The pull request's Aethyme comment shows those dimensions as skipped.
+
+```toml
+[review.trigger]
+include_forks = true   # review forks under the same rules as everything else
+```
+
+With it set, forks are ordinary changes and `from_fork` rules apply. Author
+declarations (`Review:` trailers) are withheld along with everything else when
+it is not, since a fork's author writes those too.
 
 ## How the coder supplies classification
 
@@ -683,8 +707,9 @@ packages/aethyme/scripts/adapters/chau7-review-adapter.py \
 ```
 
 It takes a `tab_list` snapshot, runs `review tick` with it, and for each handoff
-checks the pull request's head out into the workspace, opens a Chau7 tab there,
-runs the reviewing agent with the prompt, and closes the row:
+checks the pull request's head out into the workspace, fills the handoff's
+outbox, opens a Chau7 tab there, runs the reviewing agent with the prompt, and
+closes the row:
 
 - started: `review state --state running`
 - could not start: `review state --state abandoned --note "<why>"`, which is the
@@ -698,6 +723,44 @@ is a shared-git mutation like any other. The workspace path *is* the identity of
 an in-flight review, which is why a workspace already sitting on the right
 commit is reused and one sitting on anything else is replaced: reviewing the
 wrong commit is worse than not reviewing.
+
+#### The reviewer holds no credentials
+
+A reviewer reads a diff somebody else wrote, so "do not push" in its prompt is
+an instruction the diff can countermand. The control is that it has nothing to
+push with. Every handoff carries a `sandbox`:
+
+- `outbox` -- `<workspace>.review/`, a sibling of the checkout so nothing
+  written there is an edit to the branch. The adapter recreates it per spawn
+  and writes `pr.diff` (`gh pr diff`) and `pr.json` (`gh pr view --json`) into
+  it with its own read-only `gh` calls.
+- `gh_config_dir` -- an empty directory inside the outbox.
+- `command_prefix` -- an `env` invocation the adapter puts in front of the
+  agent command. It unsets `GH_TOKEN`, `GITHUB_TOKEN`, `GH_ENTERPRISE_TOKEN`,
+  `GITHUB_ENTERPRISE_TOKEN` and `SSH_AUTH_SOCK`; points `GH_CONFIG_DIR` at the
+  empty directory so `gh` finds no login; sets `GIT_TERMINAL_PROMPT=0` and
+  `GIT_ASKPASS`/`SSH_ASKPASS=/usr/bin/false`; empties `credential.helper`
+  through `GIT_CONFIG_COUNT` so the keychain is never asked; and gives git an
+  `ssh` that ignores `~/.ssh/config` and key files. It goes on the command, not
+  the adapter's environment, because a Chau7 tab starts from the operator's
+  login shell.
+
+The reviewer writes its review to `review.md` in the outbox (and an empty
+`request-changes` file when a finding meets `request_changes_at`), then closes
+its row with `review state`, which needs no GitHub access. On the next tick the
+row has settled, the teardown is planned, and the adapter posts `review.md`
+with the teardown's `post_comment_args` or `post_request_changes_args` through
+`aethyme broker gh` before closing the tab. A failed post keeps the tab open so
+the next tick retries it; a posted file is renamed `review.md.posted`, so a
+repeated teardown never posts twice. `[review.reporting] coordinated` is no
+longer consulted: the adapter always posts through the coordinated lane.
+
+This is scoping, not a sandbox. The reviewer still runs as the operator's OS
+user, so an agent with unrestricted shell access could read a login from the
+keychain or from a plaintext `hosts.yml` itself. Run the agent under its own
+sandbox as well (Codex's `workspace-write`, Claude Code's permission modes);
+the environment above removes the credentials the reviewer would otherwise
+hold without asking for them.
 
 The adapter verifies `git rev-parse HEAD` against the handoff's full head SHA
 after both reuse and fresh checkout, immediately before it opens the reviewer
@@ -730,10 +793,11 @@ you would otherwise diagnose from an empty tab:
   approval prompt holds its concurrency slot until `stale_after_minutes`
   reclaims it, and the symptom is a review that never appears rather than one
   that failed.
-- `--sandbox workspace-write` with `network_access`. The reviewer must reach
-  `gh` to read the diff and the broker to post the result; its checkout is a
-  detached throwaway, so writes there cost nothing, and the rest of the
-  filesystem is not part of reviewing a pull request.
+- `--sandbox workspace-write` with `network_access`. The reviewer reads the
+  diff from its outbox and reaches the broker only to close its row; the
+  adapter posts the result. Its checkout is a detached throwaway, so writes
+  there cost nothing, and the rest of the filesystem is not part of reviewing a
+  pull request.
 - A PATH with the machine's `git` wrappers stripped. The broker resolves an
   honest `git` for itself (#176, #178); a reviewer typing `git diff` by hand has
   no such protection and would review bytes nobody wrote.
@@ -964,7 +1028,10 @@ problem is elsewhere.
   `schema_version` newer than the broker understands is an error, because
   silently reviewing nothing is the one failure mode this must not have.
 - It never merges, pushes, or edits a branch under review. The generated Chau7
-  prompt says so explicitly.
+  prompt says so explicitly, and the reviewer is started without the
+  credentials that would let it.
+- It never reviews a fork's pull request unless `include_forks = true`, and it
+  says so in the decision rather than reporting nothing.
 - It never starts a background poller. `review tick` is a bounded foreground
   pass; scheduling it is the operator's choice and the operator's cron.
 - It never guesses who wrote a change. `authored_by_model` reads a declared

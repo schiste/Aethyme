@@ -22,7 +22,7 @@
 use serde::Serialize;
 
 use crate::pr_projection::PrProjectionAction;
-use crate::review_backend::ReviewDispatchAction;
+use crate::review_backend::{ReviewDispatchAction, ReviewerSandbox};
 use crate::review_ledger::ReviewRequestState;
 
 /// One review's entry in the ledger, before anything is performed.
@@ -73,6 +73,10 @@ pub struct Chau7Handoff {
     pub pull_request: i64,
     pub workspace: String,
     pub prompt: String,
+    /// The adapter fills the outbox with the pull request's diff and metadata,
+    /// creates the empty `gh_config_dir`, and starts the agent behind
+    /// `command_prefix`. See [`ReviewerSandbox`].
+    pub sandbox: ReviewerSandbox,
 }
 
 /// One reviewer workspace whose review is over and whose tab is still open.
@@ -102,6 +106,14 @@ pub struct Chau7Teardown {
     pub tab_ids: Vec<String>,
     /// The state that settled the review, for an operator reading the tick.
     pub why: String,
+    /// Where the reviewer left its review. The reviewer holds no credentials,
+    /// so the adapter posts `sandbox.body_file` -- with the args below, through
+    /// `aethyme broker gh` -- before it closes the tab.
+    pub sandbox: ReviewerSandbox,
+    /// Post as a comment: the default.
+    pub post_comment_args: Vec<String>,
+    /// Post as requested changes: when `sandbox.request_changes_marker` exists.
+    pub post_request_changes_args: Vec<String>,
 }
 
 /// Everything one tick should do, in the order it should do it.
@@ -160,6 +172,7 @@ pub fn plan_execution(
                 pull_request,
                 workspace,
                 prompt,
+                sandbox,
             } => {
                 plan.ledger.push(LedgerWrite {
                     review_type: review_type.clone(),
@@ -172,6 +185,7 @@ pub fn plan_execution(
                     pull_request: *pull_request,
                     workspace: workspace.clone(),
                     prompt: prompt.clone(),
+                    sandbox: sandbox.as_ref().clone(),
                 });
             }
             ReviewDispatchAction::MentionOnPullRequest { review_type, .. } => {
@@ -229,6 +243,7 @@ mod tests {
             pull_request: 12,
             workspace: "/w/review".into(),
             prompt: "review it".into(),
+            sandbox: Box::new(ReviewerSandbox::for_workspace("/w/review")),
         }
     }
 

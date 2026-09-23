@@ -228,13 +228,10 @@ unless someone is looking for them.
 # Everything here reaches the reviewer verbatim inside the generated prompt.
 schema_version = 1
 
-# Post through `aethyme broker gh`, not bare `gh`. A reviewer is an agent
-# doing work in a shared repository, and a posted review is a GitHub mutation
-# like any other; "it is only a comment" is how writes end up outside the
-# operations journal. The generated prompt spells out `broker adopt` first,
-# because a routed reviewer has no session of its own -- the adapter's session
-# opened the workspace, and lending it out would attribute every reviewer's
-# writes to the sweeper.
+# No longer consulted by the Chau7 lane. A reviewer reads a diff somebody
+# else wrote, so it runs with no GitHub credentials and posts nothing: it
+# writes its review to a file beside its workspace, and the adapter posts that
+# file through `aethyme broker gh`. Kept so the table reads as it always has.
 coordinated = true
 
 # A finding the reader cannot locate is not actionable: the reviewer has the

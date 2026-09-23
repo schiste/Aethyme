@@ -415,6 +415,10 @@ pub enum ReviewDispatchAction {
         pull_request: i64,
         workspace: String,
         prompt: String,
+        /// How the adapter must start the reviewer: no credentials that can
+        /// write to GitHub or push, and an outbox for the pull request's data
+        /// and the review it writes. Boxed only for the enum's size.
+        sandbox: Box<ReviewerSandbox>,
     },
     /// Ask a bot for the review by mentioning it on the pull request.
     MentionOnPullRequest {
@@ -559,9 +563,11 @@ pub fn dispatch_review(
                     repository,
                     pull_request,
                     head,
+                    &workspace,
                     reporting,
                     route.instructions.as_deref(),
                 ),
+                sandbox: Box::new(ReviewerSandbox::for_workspace(&workspace)),
                 workspace,
             }
         }
@@ -624,9 +630,13 @@ pub fn finished_workspaces(
         if tab_ids.is_empty() {
             continue;
         }
+        let sandbox = ReviewerSandbox::for_workspace(&workspace);
         teardown.push(Chau7Teardown {
             review_type: (*review_type).to_string(),
             pull_request,
+            post_comment_args: sandbox.post_args(pull_request, false),
+            post_request_changes_args: sandbox.post_args(pull_request, true),
+            sandbox,
             workspace,
             tab_ids,
             why: format!("every {review_type} review of #{pull_request} has settled"),
@@ -635,13 +645,148 @@ pub fn finished_workspaces(
     teardown
 }
 
+// ---------------------------------------------------------------------------
+// The reviewer's sandbox
+// ---------------------------------------------------------------------------
+
+/// Credential-bearing variables a reviewer never inherits.
+///
+/// A reviewer reads a diff somebody else wrote -- a fork's, in the worst case --
+/// and anything in that diff is input to an agent. "Do not push" in the prompt
+/// is an instruction, and an injected instruction can countermand it. What an
+/// injected instruction cannot do is use a token the process does not have.
+pub const REVIEWER_SCRUBBED_ENV: &[&str] = &[
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "GH_ENTERPRISE_TOKEN",
+    "GITHUB_ENTERPRISE_TOKEN",
+    "SSH_AUTH_SOCK",
+];
+
+/// The pull request's diff, written by the adapter before the reviewer starts.
+pub const REVIEW_DIFF_FILE: &str = "pr.diff";
+/// `gh pr view --json` metadata, written by the adapter alongside the diff.
+pub const REVIEW_METADATA_FILE: &str = "pr.json";
+/// The review body the reviewer writes and the adapter posts.
+pub const REVIEW_BODY_FILE: &str = "review.md";
+/// Present when the reviewer wants the review posted as `--request-changes`.
+pub const REVIEW_REQUEST_CHANGES_MARKER: &str = "request-changes";
+/// The empty directory `GH_CONFIG_DIR` names, so `gh` finds no stored login.
+pub const REVIEW_GH_CONFIG_DIR: &str = "gh-config";
+
+/// How a Chau7 reviewer is started, and where its input and output live.
+///
+/// The reviewer used to fetch the diff with `gh pr diff` and post its own
+/// review, so it ran with the operator's GitHub login -- a login that can also
+/// push, comment on any repository, and read private ones. It now needs none of
+/// that: the adapter, which runs as the operator anyway, fetches the pull
+/// request into [`Self::outbox`] before the spawn and posts
+/// [`Self::body_file`] through `aethyme broker gh` after the row settles. The
+/// reviewer reads files and writes one.
+///
+/// The outbox is a sibling of the workspace rather than a directory inside it:
+/// the workspace is a checkout of the head under review, and a file written
+/// there is an edit to the branch as far as `git status` is concerned.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ReviewerSandbox {
+    pub outbox: String,
+    pub diff_file: String,
+    pub metadata_file: String,
+    pub body_file: String,
+    pub request_changes_marker: String,
+    /// Must exist and be empty when the reviewer starts; the adapter creates it.
+    pub gh_config_dir: String,
+    /// Unset in the reviewer's environment.
+    pub env_remove: Vec<String>,
+    /// Set in the reviewer's environment, in this order.
+    pub env_set: Vec<(String, String)>,
+    /// `env` argv applying both lists. The adapter prepends it to the agent
+    /// command, because a Chau7 tab starts from the operator's login shell and
+    /// does not inherit the adapter's environment -- scrubbing the adapter's
+    /// own would change nothing the reviewer sees.
+    pub command_prefix: Vec<String>,
+}
+
+impl ReviewerSandbox {
+    pub fn for_workspace(workspace: &str) -> Self {
+        let outbox = format!("{}.review", workspace.trim_end_matches('/'));
+        let file = |name: &str| format!("{outbox}/{name}");
+        let gh_config_dir = file(REVIEW_GH_CONFIG_DIR);
+        let env_remove: Vec<String> = REVIEWER_SCRUBBED_ENV
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect();
+        let env_set: Vec<(String, String)> = [
+            // `gh` reads its login from here; an empty directory is no login.
+            ("GH_CONFIG_DIR", gh_config_dir.as_str()),
+            // git may not ask a human, or a helper program, for a password.
+            ("GIT_TERMINAL_PROMPT", "0"),
+            ("GIT_ASKPASS", "/usr/bin/false"),
+            ("SSH_ASKPASS", "/usr/bin/false"),
+            // An empty `credential.helper` resets the helper list, so the
+            // keychain and `gh auth git-credential` are never consulted.
+            ("GIT_CONFIG_COUNT", "1"),
+            ("GIT_CONFIG_KEY_0", "credential.helper"),
+            ("GIT_CONFIG_VALUE_0", ""),
+            // With the agent socket gone, stop git's ssh falling back to key
+            // files on disk or to the user's ssh config.
+            (
+                "GIT_SSH_COMMAND",
+                "ssh -F /dev/null -o IdentitiesOnly=yes -o IdentityFile=/dev/null \
+                 -o BatchMode=yes",
+            ),
+        ]
+        .into_iter()
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .collect();
+        let mut command_prefix = vec!["env".to_string()];
+        for name in &env_remove {
+            command_prefix.push("-u".to_string());
+            command_prefix.push(name.clone());
+        }
+        for (name, value) in &env_set {
+            command_prefix.push(format!("{name}={value}"));
+        }
+        Self {
+            diff_file: file(REVIEW_DIFF_FILE),
+            metadata_file: file(REVIEW_METADATA_FILE),
+            body_file: file(REVIEW_BODY_FILE),
+            request_changes_marker: file(REVIEW_REQUEST_CHANGES_MARKER),
+            gh_config_dir,
+            env_remove,
+            env_set,
+            command_prefix,
+            outbox,
+        }
+    }
+
+    /// `gh` arguments that post [`Self::body_file`] as the review, for the
+    /// adapter to run through `aethyme broker gh`. The adapter adds `--repo`.
+    pub fn post_args(&self, pull_request: i64, request_changes: bool) -> Vec<String> {
+        vec![
+            "pr".into(),
+            "review".into(),
+            pull_request.to_string(),
+            if request_changes {
+                "--request-changes".into()
+            } else {
+                "--comment".into()
+            },
+            "--body-file".into(),
+            self.body_file.clone(),
+        ]
+    }
+}
+
 /// The prompt a spawned reviewer receives.
 ///
 /// Bounded on purpose. An agent told to "review this" reads the whole
-/// repository; an agent told which pull request, which dimension, and to report
-/// on the pull request reads the diff. The instruction not to push is not
-/// decoration -- a reviewer with a checkout can commit, and a review that
-/// edited the code under review is no longer a review.
+/// repository; an agent told which pull request, which dimension, and where
+/// the diff is reads the diff. The instruction not to push is not decoration
+/// -- a reviewer with a checkout can commit, and a review that edited the code
+/// under review is no longer a review -- but it is not the control either:
+/// [`ReviewerSandbox`] is, because a prompt can be countermanded by the diff
+/// it asks the reviewer to read.
 ///
 /// Three parts, in descending order of how much a repository may change them.
 /// The task is generated and fixed. The reporting half comes from
@@ -653,18 +798,32 @@ pub fn review_prompt(
     repository: &str,
     pull_request: i64,
     head: &str,
+    workspace: &str,
     reporting: &ReviewReportingPolicy,
     instructions: Option<&str>,
 ) -> String {
+    let sandbox = ReviewerSandbox::for_workspace(workspace);
     let mut prompt = format!(
         "Review pull request #{pull_request} in {repository} (head `{head}`) for \
          **{review_type}**.\n\n\
-         - Read the diff with `gh pr diff {pull_request}`; the checkout in this \
-           directory is at that head.\n\
+         - Read the diff from `{diff}` and the pull request's title, body and base \
+           from `{metadata}`; the checkout in this directory is at that head.\n\
          - Limit the review to {review_type}. Another reviewer covers the rest.\n\
-         - Do not commit, push, or edit the branch under review.\n\n"
+         - Do not commit, push, or edit the branch under review.\n\
+         - This session has no GitHub credentials, on purpose: `gh`, `git push` and \
+           `aethyme broker gh` will fail. Do not try to work around that; everything \
+           you need is in the files above, and the broker posts your review.\n\n",
+        diff = sandbox.diff_file,
+        metadata = sandbox.metadata_file,
     );
-    prompt.push_str(&reporting.instructions(review_type, repository, pull_request, head));
+    prompt.push_str(&reporting.instructions(
+        review_type,
+        repository,
+        pull_request,
+        head,
+        &sandbox.body_file,
+        &sandbox.request_changes_marker,
+    ));
     if let Some(extra) = instructions {
         prompt.push('\n');
         prompt.push_str(extra.trim_end());
@@ -767,6 +926,13 @@ mod tests {
             } => {
                 assert_eq!(workspace, "/repo/.aethyme/reviews/pr-42/security");
                 assert!(prompt.contains("#42") && prompt.contains("security"));
+                // The diff comes from the outbox, not from a `gh` the reviewer
+                // no longer has credentials for.
+                assert!(
+                    prompt.contains("/repo/.aethyme/reviews/pr-42/security.review/pr.diff"),
+                    "{prompt}"
+                );
+                assert!(!prompt.contains("gh pr diff"), "{prompt}");
                 // A reviewer with a checkout can commit, and a review that
                 // edited the branch is no longer a review.
                 assert!(prompt.contains("Do not commit"));
@@ -1076,6 +1242,99 @@ mod tests {
         assert_eq!(
             policy.workspace(Path::new("/repo"), 42, "security"),
             "/var/reviews/pr-42/security"
+        );
+    }
+
+    // -- sandbox (M5) ------------------------------------------------------
+
+    #[test]
+    fn a_spawn_carries_a_credential_free_sandbox_outside_the_checkout() {
+        let ReviewDispatchAction::SpawnChau7Review {
+            workspace, sandbox, ..
+        } = dispatch(&chau7_policy(), &[], &[])
+        else {
+            panic!("expected a spawn");
+        };
+        assert_eq!(*sandbox, ReviewerSandbox::for_workspace(&workspace));
+        assert!(!sandbox.outbox.starts_with(&format!("{workspace}/")));
+        assert!(sandbox.gh_config_dir.starts_with(&sandbox.outbox));
+        for name in REVIEWER_SCRUBBED_ENV {
+            assert!(sandbox.env_remove.iter().any(|removed| removed == name));
+            assert!(
+                sandbox
+                    .command_prefix
+                    .windows(2)
+                    .any(|pair| pair[0] == "-u" && pair[1] == *name),
+                "{name} is not unset by {:?}",
+                sandbox.command_prefix
+            );
+        }
+        let set: BTreeMap<&str, &str> = sandbox
+            .env_set
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect();
+        assert_eq!(set["GH_CONFIG_DIR"], sandbox.gh_config_dir);
+        assert_eq!(set["GIT_TERMINAL_PROMPT"], "0");
+        assert_eq!(set["GIT_ASKPASS"], "/usr/bin/false");
+        assert_eq!(set["GIT_CONFIG_KEY_0"], "credential.helper");
+        assert_eq!(set["GIT_CONFIG_VALUE_0"], "");
+    }
+
+    /// The prefix is what the tab actually runs, so run it: with every token
+    /// and the agent socket set in the parent, the child must see none of them
+    /// and must see `GH_CONFIG_DIR` pointing at the sandbox's empty directory.
+    #[cfg(unix)]
+    #[test]
+    fn the_reviewer_command_prefix_strips_credentials_from_a_real_child() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("pr-7/security");
+        let sandbox = ReviewerSandbox::for_workspace(workspace.to_str().unwrap());
+        std::fs::create_dir_all(&sandbox.gh_config_dir).unwrap();
+
+        let mut command = std::process::Command::new(&sandbox.command_prefix[0]);
+        command.args(&sandbox.command_prefix[1..]).arg("env");
+        for name in REVIEWER_SCRUBBED_ENV {
+            command.env(name, "secret-value");
+        }
+        command.env("GIT_ASKPASS", "/usr/local/bin/leaky-helper");
+        let output = command.output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let seen = String::from_utf8(output.stdout).unwrap();
+        let vars: BTreeMap<&str, &str> = seen
+            .lines()
+            .filter_map(|line| line.split_once('='))
+            .collect();
+
+        for name in REVIEWER_SCRUBBED_ENV {
+            assert!(!vars.contains_key(name), "{name} reached the reviewer");
+        }
+        assert!(!seen.contains("secret-value"), "{seen}");
+        assert_eq!(vars["GH_CONFIG_DIR"], sandbox.gh_config_dir);
+        assert_eq!(
+            std::fs::read_dir(vars["GH_CONFIG_DIR"]).unwrap().count(),
+            0,
+            "gh must find no stored login"
+        );
+        assert_eq!(vars["GIT_TERMINAL_PROMPT"], "0");
+        assert_eq!(vars["GIT_ASKPASS"], "/usr/bin/false");
+    }
+
+    #[test]
+    fn a_teardown_carries_the_post_the_adapter_makes_for_the_reviewer() {
+        let rows = [row(1, "security", "head1", ReviewRequestState::Satisfied)];
+        let tabs = [tab("t1", "/repo/.aethyme/reviews/pr-42/security")];
+        let teardown = reclaim(&rows, &tabs);
+        assert_eq!(teardown.len(), 1);
+        let body = "/repo/.aethyme/reviews/pr-42/security.review/review.md";
+        assert_eq!(teardown[0].sandbox.body_file, body);
+        assert_eq!(
+            teardown[0].post_comment_args,
+            ["pr", "review", "42", "--comment", "--body-file", body]
+        );
+        assert_eq!(
+            teardown[0].post_request_changes_args[3],
+            "--request-changes"
         );
     }
 
