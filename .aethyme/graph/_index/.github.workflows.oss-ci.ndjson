@@ -1,5 +1,0 @@
-{"module":".github.workflows.oss-ci","symbol":"$RUNNER_TEMP/product-repo","kind":"proxy_surface","node_id":"proxy_surface:schiste/Aethyme:doqym4v2w3doji7poyllqqb3sq","file":".github/workflows/oss-ci.yml"}
-{"module":".github.workflows.oss-ci","symbol":"$TARGET","kind":"proxy_surface","node_id":"proxy_surface:schiste/Aethyme:dkdu3uey2ikyflc7ddg7ornrp4","file":".github/workflows/oss-ci.yml"}
-{"module":".github.workflows.oss-ci","symbol":"$TARGET/src","kind":"proxy_surface","node_id":"proxy_surface:schiste/Aethyme:rxzupmlfss6ml7vuhazr6n5xpm","file":".github/workflows/oss-ci.yml"}
-{"module":".github.workflows.oss-ci","symbol":"FAIL: deployed policy embeds the target checkout","kind":"proxy_surface","node_id":"proxy_surface:schiste/Aethyme:e7yvhreumzhiodgsn4dflqd6hu","file":".github/workflows/oss-ci.yml"}
-{"module":".github.workflows.oss-ci","symbol":"proxy:aethyme verify-targets --repo . --from explore.json > /dev/null","kind":"proxy_surface","node_id":"proxy_surface:schiste/Aethyme:ytnkf2ko6wbcfebvbmpmnta434","file":".github/workflows/oss-ci.yml"}

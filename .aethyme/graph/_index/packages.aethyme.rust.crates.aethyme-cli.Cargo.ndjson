@@ -1,1 +1,0 @@
-{"module":"packages.aethyme.rust.crates.aethyme-cli.Cargo","symbol":"The aethyme router binary — single entrypoint for agents. Owns the app shell (native dispatch to engine/broker/enhance","kind":"proxy_surface","node_id":"proxy_surface:schiste/Aethyme:askmnnao4camkjepqfbp64tbze","file":"packages/aethyme/rust/crates/aethyme-cli/Cargo.toml"}

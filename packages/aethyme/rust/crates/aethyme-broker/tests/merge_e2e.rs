@@ -658,6 +658,49 @@ fn verification_commit_preserves_only_the_owned_contract_decision() {
     assert!(!message.contains("Private implementation rationale"));
 }
 
+// The contract gate runs against the promote commit. A justified `none` must
+// reach it, or no truthful label can pass once the matcher fires.
+#[test]
+fn verification_commit_carries_the_contract_justification() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let worktree = agent_worktree(tmp.path(), "contract-justification");
+    let session = broker
+        .adopt(&worktree, Some("remove generated data"))
+        .unwrap();
+    std::fs::write(worktree.join("src/a.py"), "a = data\n").unwrap();
+    sh(&worktree, &["add", "src/a.py"]);
+    sh(
+        &worktree,
+        &[
+            "commit",
+            "-qm",
+            "chore: drop generated data",
+            "-m",
+            "Private implementation rationale.\n\nContract decision: none\n\n\
+             Contract justification: only generated data leaves the tree",
+        ],
+    );
+
+    let outcome = broker.submit(session.id).unwrap();
+    assert!(outcome.promoted);
+    let promoted = promoted_merge_commit(&outcome.entry);
+    let message = Command::new("git")
+        .args(["show", "-s", "--format=%B", &promoted])
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert!(message.status.success());
+    let message = String::from_utf8_lossy(&message.stdout);
+    assert!(message.contains("Contract decision: none"));
+    assert!(
+        message.contains("Contract justification: only generated data leaves the tree"),
+        "{message}"
+    );
+    assert!(!message.contains("Private implementation rationale"));
+}
+
 #[test]
 fn repeated_submission_uses_the_last_accepted_session_head_as_its_checkpoint() {
     let tmp = tempfile::tempdir().unwrap();

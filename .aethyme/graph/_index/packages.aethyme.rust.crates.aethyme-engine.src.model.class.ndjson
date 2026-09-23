@@ -1,3 +1,0 @@
-{"module":"packages.aethyme.rust.crates.aethyme-engine.src.model.class","symbol":"ClassNode","kind":"struct","node_id":"struct:schiste/Aethyme:z5lx6rqiwh2xm7zfavdbs5wdsm","file":"packages/aethyme/rust/crates/aethyme-engine/src/model/class.rs"}
-{"module":"packages.aethyme.rust.crates.aethyme-engine.src.model.class","symbol":"InternedStr","kind":"unresolved_symbol","node_id":"unresolved_symbol:schiste/Aethyme:nrq7qqyd7eycf6n2yhlocm67za","file":"packages/aethyme/rust/crates/aethyme-engine/src/model/class.rs"}
-{"module":"packages.aethyme.rust.crates.aethyme-engine.src.model.class","symbol":"new","kind":"function","node_id":"function:schiste/Aethyme:rmhoenqf7lutwbhozinwnr7aim","file":"packages/aethyme/rust/crates/aethyme-engine/src/model/class.rs"}
