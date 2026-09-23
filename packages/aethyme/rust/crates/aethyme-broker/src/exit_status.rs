@@ -108,7 +108,8 @@ pub fn for_broker_error(error: &BrokerOpError) -> u8 {
         | E::SessionExistsForWorktree { .. }
         | E::ReuseSyncRequiresReuse
         | E::ReuseSyncDirty { .. }
-        | E::ReuseSyncNotFastForward { .. } => REFUSED,
+        | E::ReuseSyncNotFastForward { .. }
+        | E::GatePolicyUntrusted { .. } => REFUSED,
         _ => FAILED,
     }
 }

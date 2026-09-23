@@ -1,0 +1,11 @@
+# Cargo reads this for every command run at or below the repository root,
+# including `cargo test --manifest-path packages/aethyme/rust/Cargo.toml` from
+# the root and CI's `working-directory: packages/aethyme/rust`.
+
+[env]
+# Test-only: the broker's test suites create hundreds of temporary
+# repositories whose gates.toml they wrote themselves. This lets their gates
+# run without a trust record in host state. Tests that exercise trust itself
+# remove it from the child environment. Never set it outside tests; see
+# `aethyme broker trust`.
+AETHYME_TRUST_NONINTERACTIVE_FOR_TESTS = "1"

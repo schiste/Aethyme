@@ -555,6 +555,8 @@ continues to expose the complete local `log_path` without embedding log data.
 - `aethyme broker hooks install [--json]`
 - `aethyme broker hooks uninstall [--json]`
 - `aethyme broker hooks status [--json]`
+- `aethyme broker trust [--repo <path>] [--json]`
+- `aethyme broker trust status [--repo <path>] [--json]`
 - `aethyme broker leases plan <paths...> [--session <id>] [--json]`
 - `aethyme broker leases export (--session <id> | --entry <id>) [--limit <n>] [--json]`
 - `aethyme broker submit --session <id> [--no-cache] [--json]`
@@ -585,6 +587,34 @@ continues to expose the complete local `log_path` without embedding log data.
 - `aethyme broker quick-test [--with-gate] [--json]`
 - `aethyme broker verify-loop [--json]`
 - `aethyme broker pr check [--target <branch>] [--pr <number>] [--agent <name>] [--dispatch] [--cmd <command>] [--json]`
+
+`broker trust` approves the commands a repository defines. `.aethyme/gates.toml`
+and `.aethyme/prepare.toml` travel with a clone, and the broker runs their
+commands as you, so nothing they declare runs until a human on this machine has
+trusted the exact policy. Until then `submit`, `gates run` (session, `--all`,
+`--only` and `pre-push`), `gates doctor --probe`, `prepare` and the installed
+pre-commit hook refuse with exit 3 before running any repository-defined
+command, naming `aethyme broker trust --repo <path>`. `trust` prints every gate
+and prepare command of the checkout and, when it differs, of the integration
+tip, asks for confirmation, and records SHA-256 digests of those policies in
+host state (`<host-state>/gate-trust/<repository-key>.json`, shared by every
+worktree of the clone). The gate digest reuses each gate's `definition_hash`,
+so changing a command, trigger, resource or cache setting changes the policy.
+A policy change needs trusting again; because submissions are judged by the
+base's policy, that is the moment a gates change lands. Earlier approvals stay
+valid (the last 16 are kept), so a session on the previous policy keeps
+working.
+
+`trust` refuses (exit 3) when stdin is not a terminal: agents run without one
+and must not approve their own commands. `trust status` is read-only and
+reports each source's digest and whether it is trusted. A repository whose
+broker database already holds gate history is trusted with its current
+policies the first time the check sees it, and a
+`gate.policy_trust_grandfathered` event records that; existing repositories
+need no action. `AETHYME_TRUST_NONINTERACTIVE_FOR_TESTS=1` is a test-only
+escape: `trust` records without a terminal or prompt, and an untrusted policy
+runs without being recorded. This repository's `.cargo/config.toml` sets it for
+`cargo test`; never set it elsewhere.
 
 `quick-test` is the disposable install smoke. `verify-loop` is the stronger
 operator E2E: it reports the integration commit tested and flags movement during

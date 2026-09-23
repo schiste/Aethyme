@@ -125,7 +125,7 @@ pub fn run_broker_quick_test_with_options(
         });
     }
 
-    let temp_repo = TempRepo::create()?;
+    let mut temp_repo = TempRepo::create()?;
     let mut steps = Vec::new();
     steps.push(step(
         "create-temp-repo",
@@ -170,6 +170,17 @@ pub fn run_broker_quick_test_with_options(
             "pass",
             format!("installed {FIXTURE_GATE_NAME}"),
         ));
+    }
+
+    // The quick test wrote this repository's policy itself, so it approves
+    // it itself; the record goes with the repository at the end.
+    let policy = crate::broker::gate_trust::policy_at_root(temp_repo.path())?;
+    if policy.runs_commands() {
+        temp_repo.trust_record = Some(crate::broker::gate_trust::record_trust(
+            temp_repo.path(),
+            &[&policy.policy_sha256],
+            "quick_test",
+        )?);
     }
 
     let mut broker = Broker::open(temp_repo.path())?;
@@ -426,6 +437,8 @@ fn git(cwd: &Path, args: &[&str]) -> Result<String, QuickTestError> {
 struct TempRepo {
     path: PathBuf,
     remove_on_drop: bool,
+    /// Host-state trust record for the fixture policy, removed with the repo.
+    trust_record: Option<PathBuf>,
 }
 
 impl TempRepo {
@@ -443,6 +456,7 @@ impl TempRepo {
                     return Ok(Self {
                         path,
                         remove_on_drop: true,
+                        trust_record: None,
                     });
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -468,6 +482,9 @@ impl TempRepo {
 
 impl Drop for TempRepo {
     fn drop(&mut self) {
+        if let Some(record) = self.trust_record.take() {
+            crate::broker::gate_trust::forget_record(&record);
+        }
         if self.remove_on_drop {
             let _ = std::fs::remove_dir_all(&self.path);
         }

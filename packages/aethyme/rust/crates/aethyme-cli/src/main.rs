@@ -111,6 +111,10 @@ fn broker_command_capability(args: &[String]) -> repository_upgrade::CommandCapa
             CommandCapability::RecoveryWrite
         }
         (Some("storage"), Some("apply")) => CommandCapability::RecoveryWrite,
+        // Trust writes only host state, and it is how a refused repository
+        // recovers, so compatibility policy must not stand in its way.
+        (Some("trust"), Some("status")) => CommandCapability::DiagnosticRead,
+        (Some("trust"), _) => CommandCapability::RecoveryWrite,
         (Some("checkpoint"), Some("apply")) => CommandCapability::RecoveryWrite,
         (Some("report"), Some("file")) => CommandCapability::RecoveryWrite,
         (Some("quality-report"), Some("plan")) => CommandCapability::DiagnosticRead,

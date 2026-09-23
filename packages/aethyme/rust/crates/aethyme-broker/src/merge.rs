@@ -422,6 +422,9 @@ impl Broker {
             });
         }
         let (_branch, base) = self.integration_head()?;
+        // The base's gates judge this submission. Refuse an untrusted policy
+        // before any queue row exists, so the refusal leaves no residue.
+        self.require_trusted_policy_at_commit(&base, Some(session_id))?;
 
         // Provenance and replay planning are deterministic and ref-free. Run
         // them before creating a live queue row so a fail-closed ownership
@@ -545,6 +548,10 @@ impl Broker {
             .find(|e| e.id == entry_id)
             .ok_or(crate::BrokerError::SessionNotFound(entry_id))?;
         let session = self.store().session(entry.session_id)?;
+        // Re-simulation reaches here without submit (queue drain after another
+        // promotion), and the base may have moved onto a new policy. Checked
+        // before the entry changes state, so a refusal leaves it as it was.
+        self.require_trusted_policy_at_commit(&base, Some(entry.session_id))?;
         let mut submission_plan =
             self.build_submission_plan(&session, &entry.head_commit, &base)?;
 

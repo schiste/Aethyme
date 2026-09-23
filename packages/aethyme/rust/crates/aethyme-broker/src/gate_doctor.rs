@@ -578,6 +578,13 @@ pub fn probe_gate_quality(
         .collect::<Vec<_>>();
 
     let main_root = repo.main_root()?;
+    // A probe runs the committed gates for real, so it needs the same trust
+    // as any other run of repository-defined commands.
+    crate::broker::gate_trust::policy_at_commit(repo, &head)
+        .and_then(|policy| {
+            crate::broker::gate_trust::require_trusted_standalone(&main_root, &policy)
+        })
+        .map_err(|error| GateDoctorError::Probe(error.to_string()))?;
     let mut slot =
         crate::verification::ExactTreeVerificationSlot::acquire(&main_root, "gate-doctor-probe")
             .map_err(|error| GateDoctorError::Probe(error.to_string()))?;
