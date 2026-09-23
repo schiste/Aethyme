@@ -24,7 +24,6 @@ use super::{AnswerItem, ExploreError, SymbolBatchResults, ranking};
 pub(super) fn compute_callsite_files(
     store: &ReadOnlyGraphStore,
     symbol_matches: &SymbolBatchResults,
-    request: &str,
     max_symbols: usize,
     max_results: usize,
 ) -> Result<Vec<AnswerItem>, ExploreError> {
@@ -114,22 +113,9 @@ pub(super) fn compute_callsite_files(
             (path, syms, hits, production_hits, samples)
         })
         .collect();
-    let auth_focus = ranking::auth_token_focus_from_request(request);
     ranked.sort_by(|a, b| {
-        let a_symbols = a.1.iter().cloned().collect::<Vec<_>>();
-        let b_symbols = b.1.iter().cloned().collect::<Vec<_>>();
-        let a_surface = ranking::auth_token_surface_signals(&a.0, &a_symbols, request);
-        let b_surface = ranking::auth_token_surface_signals(&b.0, &b_symbols, request);
-        let auth_ordering = if auth_focus {
-            b_surface
-                .score
-                .cmp(&a_surface.score)
-                .then_with(|| b.3.cmp(&a.3))
-        } else {
-            std::cmp::Ordering::Equal
-        };
-        auth_ordering
-            .then_with(|| b.1.len().cmp(&a.1.len()))
+        b.1.len()
+            .cmp(&a.1.len())
             .then_with(|| b.2.cmp(&a.2))
             .then_with(|| a.0.cmp(&b.0))
     });
@@ -141,20 +127,11 @@ pub(super) fn compute_callsite_files(
             |(path, symbols, hit_count, production_hit_count, samples)| {
                 let symbol_count = symbols.len();
                 let multi = symbol_count >= 2;
-                let symbols_for_ranking = symbols.iter().cloned().collect::<Vec<_>>();
-                let signals =
-                    ranking::auth_token_surface_signals(&path, &symbols_for_ranking, request);
-                let surface_confidence_bonus = if signals.score >= 100 {
-                    0.03
-                } else if production_hit_count > 0 {
-                    0.02
-                } else {
-                    0.0
-                };
+                let production_confidence_bonus = if production_hit_count > 0 { 0.02 } else { 0.0 };
                 let confidence: f64 = if multi { 0.86 } else { 0.74 };
-                let confidence = (((confidence + surface_confidence_bonus).min(0.9_f64)) * 100.0)
-                    .round()
-                    / 100.0;
+                let confidence =
+                    (((confidence + production_confidence_bonus).min(0.9_f64)) * 100.0).round()
+                        / 100.0;
                 let reason = if multi {
                     "Multiple candidate symbols are called from this file; \
                  likely a usage entry point or dispatch hub."
@@ -163,25 +140,13 @@ pub(super) fn compute_callsite_files(
                  whether it's the primary caller or one of many."
                 };
                 let symbols_list: Vec<&String> = symbols.iter().collect();
-                let mut evidence = serde_json::json!({
+                let evidence = serde_json::json!({
                     "source": "redb.calls",
                     "symbols": symbols_list,
                     "hit_count": hit_count,
                     "production_hit_count": production_hit_count,
                     "samples": samples,
                 });
-                if signals.score != 0 {
-                    if let Some(obj) = evidence.as_object_mut() {
-                        obj.insert(
-                            "ranking_bonus".to_string(),
-                            serde_json::json!(signals.score),
-                        );
-                        obj.insert(
-                            "ranking_signals".to_string(),
-                            serde_json::json!(signals.labels),
-                        );
-                    }
-                }
                 AnswerItem {
                     kind: "call_site_file".into(),
                     target: path.clone(),

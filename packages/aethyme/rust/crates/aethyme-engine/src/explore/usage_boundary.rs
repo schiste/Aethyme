@@ -11,7 +11,7 @@
 
 use std::path::Path;
 
-use crate::graph::usage_boundary::analyze_usage_boundary_scope_first_redb_with_request;
+use crate::graph::usage_boundary::analyze_usage_boundary_scope_first_redb;
 use crate::model::analysis::{AnswerStatus, DeadCodeCandidate};
 use crate::store::redb::graph_store::GraphStore;
 
@@ -95,13 +95,12 @@ pub fn explore_usage_boundary(
         .canonicalize()
         .map_err(|error| ExploreError::EngineAnalyzer(format!("resolve repo: {error}")))?;
     let store = GraphStore::open_read_only(&canonical_repo).map_err(graph_store_explore_error)?;
-    let answer = analyze_usage_boundary_scope_first_redb_with_request(
+    let answer = analyze_usage_boundary_scope_first_redb(
         &canonical_repo,
         &store,
         &params.scope,
         &params.search_roots,
         params.include_methods,
-        Some(request),
         Some(params.budget_ms),
         params.max_evidence_per_symbol,
     )
@@ -462,7 +461,6 @@ fn usage_boundary_observability(
                 "degraded_ranking_reasons": degraded_reasons,
                 "top_signals_used": top_signals_used,
                 "top_signals_absent": top_signals_absent,
-                "subsystem_ambiguous": false,
             }),
         );
         obj.insert(

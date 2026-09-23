@@ -33,6 +33,24 @@ resolves to the sibling package, and `MONOREPO_ROOT` backs cardinal
 rule 1 — an eval target inside this checkout is Aethyme itself and is
 refused.
 
+## Contaminated results (2026-07-28 to 2026-09-23)
+
+From `75d70494` (2026-07-28, "fix(engine): rank auth token request
+surfaces") until its removal in the Phase 0 recovery work (2026-09-23),
+`aethyme-engine` contained ranking tuned to one playground app: its
+proxy and backend paths, its token modules, and a list of its decoys.
+That violates cardinal rule 2.
+
+- Treat every Aethyme-arm result on an auth or token task produced by
+  an engine built in that window as contaminated. Do not cite it or
+  compare against it.
+- Other tasks in the window ran through the same ranking code. Rerun
+  them before using them as evidence.
+- `baselines/haiku-2026-05.json` predates the window and stays valid.
+- `aethyme-testkit/tests/no_eval_tuning.rs` now fails the build if a
+  playground identifier appears in engine source. Add new playground
+  identifiers to its list when a playground is enrolled.
+
 ## Commands
 
 Generate a baseline from historical run JSONL:

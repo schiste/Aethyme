@@ -286,194 +286,6 @@ fn build_duplicate_anchor_redb_fixture() -> tempfile::TempDir {
     tmp
 }
 
-fn build_surface_flow_auth_redb_fixture() -> tempfile::TempDir {
-    let tmp = tempfile::tempdir().unwrap();
-    write(
-        tmp.path(),
-        "gcp-run-proxy/src/worker.mjs",
-        br#"
-export default {
-  async fetch(request, env) {
-    const incoming = request.headers.get("Authorization")
-    const headers = new Headers(request.headers)
-    if (incoming && incoming.startsWith("Bearer pk_")) {
-      headers.set("Authorization", incoming)
-    } else {
-      headers.set("Authorization", `Bearer ${env.PUBLIC_API_FALLBACK_PK}`)
-    }
-    return fetch(`${env.BACKEND_ORIGIN}/api/projects/`, {
-      method: request.method,
-      headers,
-    })
-  }
-}
-"#,
-    );
-    write(
-        tmp.path(),
-        "backend/settings.py",
-        br#"
-MIDDLEWARE = [
-    "django.middleware.security.SecurityMiddleware",
-    "backend.api_keys.middleware.PublishableKeyMiddleware",
-]
-
-REST_FRAMEWORK = {
-    "DEFAULT_AUTHENTICATION_CLASSES": [
-        "backend.api_keys.middleware.PublishableKeyAuthentication",
-    ],
-    "DEFAULT_PERMISSION_CLASSES": [
-        "rest_framework.permissions.IsAuthenticated",
-    ],
-}
-
-OIDC_CLIENT_ID = "oidc-decoy-client"
-"#,
-    );
-    write(
-        tmp.path(),
-        "backend/urls.py",
-        br#"
-from django.urls import path
-from backend.api_keys.views import project_view
-
-urlpatterns = [
-    path("api/projects/", project_view),
-]
-"#,
-    );
-    write(
-        tmp.path(),
-        "backend/api_keys/middleware.py",
-        br#"
-class PublishableKeyAuthentication:
-    def authenticate(self, request):
-        header = request.headers.get("Authorization", "")
-        if not header.startswith("Bearer pk_"):
-            return None
-        return validate_publishable_key(header.removeprefix("Bearer "))
-
-
-class PublishableKeyMiddleware:
-    def __call__(self, request):
-        request.publishable_key = validate_publishable_key(
-            request.headers.get("Authorization", "")
-        )
-        return self.get_response(request)
-
-
-def validate_publishable_key(raw_token):
-    if not raw_token.startswith("pk_"):
-        raise PermissionError("invalid publishable key")
-    return raw_token
-"#,
-    );
-    write(
-        tmp.path(),
-        "backend/api_keys/views.py",
-        br#"
-from rest_framework.decorators import api_view, permission_classes
-from backend.api_keys.middleware import validate_publishable_key
-
-
-def require_scope(scope):
-    def decorator(view):
-        view.required_scope = scope
-        return view
-    return decorator
-
-
-@api_view(["GET"])
-@permission_classes(["IsAuthenticated"])
-@require_scope("projects:read")
-def project_view(request):
-    key = validate_publishable_key(request.headers.get("Authorization", ""))
-    if "projects:read" not in key:
-        raise PermissionError("missing projects scope")
-    return {"ok": True}
-"#,
-    );
-    write(
-        tmp.path(),
-        "backend/accounts/oidc.py",
-        br#"
-def verify_oidc_id_token(id_token, provider):
-    if provider != "OIDC":
-        raise ValueError("wrong provider")
-    return {"sub": "user-1"}
-"#,
-    );
-    write(
-        tmp.path(),
-        "backend/audit/jws.py",
-        br#"
-def verify_audit_jws(audit_jws):
-    return audit_jws.split(".")
-"#,
-    );
-    write(
-        tmp.path(),
-        "backend/accounts/auth0_management.py",
-        br#"
-def get_auth0_management_token(client):
-    return client.oauth_token("auth0-management")
-"#,
-    );
-    write(
-        tmp.path(),
-        "backend/accounts/webhook_tokens.py",
-        br#"
-def verify_webhook_token(signature, payload, secret):
-    if not signature.startswith("whsec_"):
-        raise PermissionError("invalid webhook token signature")
-    return hmac_compare(signature, payload, secret)
-"#,
-    );
-    write(
-        tmp.path(),
-        "tests/test_proxy_worker.mjs",
-        br#"
-test("proxy preserves publishable key Authorization", async () => {
-  const request = new Request("https://edge.example.test/api/projects/", {
-    headers: { Authorization: "Bearer pk_projects_read" },
-  })
-  const response = await worker.fetch(request, { BACKEND_ORIGIN: "https://backend.test" })
-  expect(response.request.headers.get("Authorization")).toEqual("Bearer pk_projects_read")
-})
-"#,
-    );
-    write(
-        tmp.path(),
-        "backend/api_keys/tests/test_backend_auth.py",
-        br#"
-def test_publishable_key_middleware_validates_pk_prefix(rf):
-    request = rf.get("/api/projects/", HTTP_AUTHORIZATION="Bearer pk_projects_read")
-    assert validate_publishable_key("pk_projects_read") == "pk_projects_read"
-
-
-def test_project_route_requires_projects_read_scope(client):
-    response = client.get("/api/projects/", HTTP_AUTHORIZATION="Bearer pk_projects_read")
-    assert response.status_code == 200
-"#,
-    );
-
-    let root = tmp.path().canonicalize().unwrap();
-    bootstrap_repo(&root, "test-engine").expect("bootstrap graph layout");
-    let ctx = IndexerContext::new("SurfaceFlowAuthRepo", root, "test-engine").unwrap();
-    let summary = index_repo_to_disk(&ctx, &WalkOptions::default()).expect("write fragments");
-    assert_eq!(summary.total_files, 11);
-
-    let output = run_engine([
-        "index",
-        "--repo",
-        tmp.path().to_str().unwrap(),
-        "--from-fragments",
-    ]);
-    assert_success(&output);
-    assert!(tmp.path().join(".aethyme/graph_store.redb").is_file());
-    tmp
-}
-
 fn build_expand_redb_fixture() -> tempfile::TempDir {
     let tmp = tempfile::tempdir().unwrap();
     write(
@@ -1775,135 +1587,12 @@ fn redb_explore_observability_reports_store_freshness() {
 }
 
 #[test]
-fn redb_explore_auth_surface_fixture_ranks_proxy_backend_and_names_decoys() {
-    let tmp = build_surface_flow_auth_redb_fixture();
-
-    let (response, metrics) = aethyme_explore_cli_json_with_metrics(
-        tmp.path(),
-        "Trace token authentication behavior for publishable API keys",
-        "task_localization_query",
-        true,
-    );
-
-    assert_eq!(response["schema_version"], "aethyme-explore-v1");
-    assert_eq!(response["intent"], "task_localization_query");
-    assert_eq!(response["observability"]["graph_store"]["backend"], "redb");
-    assert_eq!(
-        response["observability"]["output_profile"], "agent_compact",
-        "--show-observability should default to compact agent observability"
-    );
-    assert!(
-        response.get("output_adapters").is_none(),
-        "compact agent observability should not emit verbose adapters"
-    );
-    assert!(
-        response.get("resolved_parameters").is_none(),
-        "compact agent observability should not emit resolved params"
-    );
-    assert!(
-        metrics.aethyme_explore_invoked,
-        "fixture should exercise router-level aethyme explore: {metrics:?}"
-    );
-    assert!(
-        !metrics.aethyme_path_leaked,
-        "fixture output leaked generated Aethyme paths: {metrics:?}"
-    );
-
-    let subsystems = response["subsystems"].as_array().expect("subsystems");
-    let roles = subsystems
-        .iter()
-        .map(|subsystem| subsystem["role"].as_str().expect("role"))
-        .collect::<Vec<_>>();
-    assert_eq!(
-        roles.iter().take(2).copied().collect::<Vec<_>>(),
-        vec!["ingress_proxy", "backend_validator"],
-        "proxy and backend validator should be the first verification lanes: {roles:?}"
-    );
-
-    let ingress_proxy = subsystems
-        .iter()
-        .find(|subsystem| subsystem["role"] == "ingress_proxy")
-        .expect("ingress/proxy subsystem");
-    let ingress_target_values = ingress_proxy["top_verification_targets"]
-        .as_array()
-        .expect("ingress targets");
-    let ingress_top = ingress_target_values
-        .first()
-        .map(serde_json::Value::to_string)
-        .unwrap_or_default();
-    let ingress_targets = ingress_target_values
-        .iter()
-        .map(serde_json::Value::to_string)
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(
-        ingress_top.contains("gcp-run-proxy"),
-        "ingress first verification target should point at the worker/proxy: top={ingress_top}, all={ingress_targets}"
-    );
-
-    let backend_validator = subsystems
-        .iter()
-        .find(|subsystem| subsystem["role"] == "backend_validator")
-        .expect("backend validator subsystem");
-    let backend_target_values = backend_validator["top_verification_targets"]
-        .as_array()
-        .expect("backend targets");
-    let backend_top = backend_target_values
-        .first()
-        .map(serde_json::Value::to_string)
-        .unwrap_or_default();
-    let backend_targets = backend_target_values
-        .iter()
-        .map(serde_json::Value::to_string)
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(
-        backend_top.contains("backend/api_keys"),
-        "backend first verification target should point at API-key validation code: top={backend_top}, all={backend_targets}"
-    );
-
-    let ambiguity = response["ambiguous"].to_string();
-    assert!(
-        ambiguity.contains("OIDC"),
-        "token ambiguity should explicitly name the OIDC decoy subsystem: {ambiguity}"
-    );
-    assert!(
-        ambiguity.contains("audit JWS"),
-        "token ambiguity should explicitly name the audit JWS decoy subsystem: {ambiguity}"
-    );
-    assert!(
-        ambiguity.contains("Auth0 management"),
-        "token ambiguity should explicitly name the Auth0 management decoy subsystem: {ambiguity}"
-    );
-    assert!(
-        ambiguity.contains("webhook tokens"),
-        "token ambiguity should explicitly name the webhook token decoy subsystem: {ambiguity}"
-    );
-
-    let verification_steps = response["verification_steps"]
-        .as_array()
-        .expect("verification steps")
-        .iter()
-        .filter_map(|step| step["step"].as_str())
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(
-        verification_steps.contains("There are multiple token systems"),
-        "verification should surface token subsystem ambiguity: {verification_steps}"
-    );
-    assert!(
-        verification_steps.contains("Verify proxy classification first, then backend validation"),
-        "verification should force proxy/backend verification order: {verification_steps}"
-    );
-}
-
-#[test]
 fn verify_targets_extracts_bounded_spans_from_explore_json() {
-    let tmp = build_surface_flow_auth_redb_fixture();
+    let tmp = build_task_redb_fixture();
 
     let (explore, _) = aethyme_explore_cli_json_with_metrics(
         tmp.path(),
-        "Trace token authentication behavior for publishable API keys",
+        "Find the load_token flow",
         "task_localization_query",
         true,
     );
@@ -1922,27 +1611,19 @@ fn verify_targets_extracts_bounded_spans_from_explore_json() {
 
     let targets = verified["targets"].as_array().expect("targets array");
     assert_eq!(targets.len(), 2, "expected exactly two bounded targets");
-    assert_eq!(targets[0]["status"], "verified_span");
-    assert_eq!(targets[1]["status"], "verified_span");
-    assert!(
-        targets[0]["path"]
-            .as_str()
-            .is_some_and(|path| path.contains("gcp-run-proxy")),
-        "first target should verify the ingress/proxy lane: {targets:?}"
-    );
-    assert!(
-        targets[1]["path"]
-            .as_str()
-            .is_some_and(|path| path.contains("backend/api_keys")),
-        "second target should verify the backend validator lane: {targets:?}"
-    );
-
-    let first_lines = targets[0]["lines"].to_string();
-    assert!(first_lines.contains("Authorization"));
-    assert!(first_lines.contains("Bearer"));
-    let second_lines = targets[1]["lines"].to_string();
-    assert!(second_lines.contains("validate_publishable_key"));
-    assert!(second_lines.contains("pk_"));
+    for target in targets {
+        assert_eq!(target["status"], "verified_span", "{targets:?}");
+        assert!(
+            target["path"]
+                .as_str()
+                .is_some_and(|path| path.starts_with("src/")),
+            "targets should verify source files named by explore: {targets:?}"
+        );
+        assert!(
+            target["lines"].to_string().contains("load_token"),
+            "verified span should contain the request symbol: {targets:?}"
+        );
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
