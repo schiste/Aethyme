@@ -110,11 +110,39 @@ pub fn for_broker_error(error: &BrokerOpError) -> u8 {
     }
 }
 
+/// Whether every failing gate failed because the host could not run it
+/// (low disk, lock or resource contention, environment) rather than because
+/// the code failed. An empty set is not: a graph-integrity rejection has no
+/// gate outcomes and did judge the tree.
+pub fn failures_are_environmental<'a>(classes: impl IntoIterator<Item = Option<&'a str>>) -> bool {
+    let mut any = false;
+    for class in classes {
+        any = true;
+        if !matches!(class, Some("resource_contention" | "environment")) {
+            return false;
+        }
+    }
+    any
+}
+
 /// The exit code for a finished submission. Only a conflict or a rejection
 /// is non-zero; a queued or verify-only outcome is the command succeeding.
-pub fn for_submission(status: MergeStatus) -> u8 {
+/// A rejection whose failing gates never ran for host reasons is ENVIRONMENT,
+/// not VERIFICATION_FAILED: the code was not judged, so "fix the code" is the
+/// wrong next step.
+pub fn for_submission(status: MergeStatus, gates: &[crate::gates::GateRunOutcome]) -> u8 {
     match status {
         MergeStatus::Conflict => REFUSED,
+        MergeStatus::Rejected
+            if failures_are_environmental(
+                gates
+                    .iter()
+                    .filter(|gate| gate.status != crate::GateStatus::Pass)
+                    .map(|gate| gate.failure_class.map(|class| class.as_str())),
+            ) =>
+        {
+            ENVIRONMENT
+        }
         MergeStatus::Rejected => VERIFICATION_FAILED,
         _ => SUCCESS,
     }
@@ -141,9 +169,30 @@ mod tests {
 
     #[test]
     fn a_submission_is_non_zero_only_when_it_did_not_pass() {
-        assert_eq!(for_submission(MergeStatus::Promoted), SUCCESS);
-        assert_eq!(for_submission(MergeStatus::Verified), SUCCESS);
-        assert_eq!(for_submission(MergeStatus::Conflict), REFUSED);
-        assert_eq!(for_submission(MergeStatus::Rejected), VERIFICATION_FAILED);
+        assert_eq!(for_submission(MergeStatus::Promoted, &[]), SUCCESS);
+        assert_eq!(for_submission(MergeStatus::Verified, &[]), SUCCESS);
+        assert_eq!(for_submission(MergeStatus::Conflict, &[]), REFUSED);
+        // A graph-integrity rejection has no gate outcomes and did judge the tree.
+        assert_eq!(
+            for_submission(MergeStatus::Rejected, &[]),
+            VERIFICATION_FAILED
+        );
+    }
+
+    #[test]
+    fn only_host_failures_count_as_environmental() {
+        assert!(failures_are_environmental([Some("resource_contention")]));
+        assert!(failures_are_environmental([
+            Some("environment"),
+            Some("resource_contention")
+        ]));
+        assert!(!failures_are_environmental([
+            Some("resource_contention"),
+            Some("test_failure")
+        ]));
+        assert!(!failures_are_environmental([None]));
+        assert!(!failures_are_environmental(
+            std::iter::empty::<Option<&str>>()
+        ));
     }
 }

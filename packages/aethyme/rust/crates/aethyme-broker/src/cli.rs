@@ -12093,9 +12093,19 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                              the broker cannot hold it back. Fix forward on main and resubmit."
                         );
                     }
+                    let code = crate::exit_status::for_submission(
+                        outcome.entry.status,
+                        &outcome.gate_outcomes,
+                    );
                     return Err(UsageError::Exit {
-                        message: "gates failed on the merged tree".into(),
-                        code: crate::exit_status::VERIFICATION_FAILED,
+                        message: if code == crate::exit_status::ENVIRONMENT {
+                            "gates could not run on this host (resource contention or \
+                             environment); the code was not judged. Free the resource and resubmit"
+                                .into()
+                        } else {
+                            "gates failed on the merged tree".into()
+                        },
+                        code,
                     });
                 }
                 // "What now?" — the next expected human action was
@@ -12137,7 +12147,8 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
             }
             // `--json` used to exit 0 for a rejected or conflicted entry, so a
             // caller reading only the exit code saw a failed gate as success.
-            let code = crate::exit_status::for_submission(outcome.entry.status);
+            let code =
+                crate::exit_status::for_submission(outcome.entry.status, &outcome.gate_outcomes);
             if code != crate::exit_status::SUCCESS {
                 return Err(UsageError::SilentExit(code));
             }
