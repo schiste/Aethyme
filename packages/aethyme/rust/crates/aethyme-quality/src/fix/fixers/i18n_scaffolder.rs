@@ -77,7 +77,7 @@ impl I18nScaffolder {
     /// Port of `_is_likely_code`.
     fn is_likely_code(&self, text: &str) -> bool {
         let len = pystr::char_len(text);
-        if len < 3 || len > 100 {
+        if !(3..=100).contains(&len) {
             return true;
         }
         if CODE_INDICATORS

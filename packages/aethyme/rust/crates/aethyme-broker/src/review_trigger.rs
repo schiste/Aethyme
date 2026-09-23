@@ -331,12 +331,14 @@ pub struct ReviewTriggerRule {
 /// the provider's exhausted quota could not serve (#172).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum ReviewFreshness {
     /// A review stays valid until the head SHA changes.
     ///
     /// The default, and the rule every dimension has followed since the router
     /// existed -- so a repository that does not write this key keeps exactly
     /// today's behaviour.
+    #[default]
     Head,
     /// The head SHA changing invalidates, and so does the base commit moving.
     ///
@@ -345,12 +347,6 @@ pub enum ReviewFreshness {
     /// on a busy trunk can be more re-reviews than the quota affords. That is
     /// the trade the operator is making, and why it is not the default.
     HeadAndBase,
-}
-
-impl Default for ReviewFreshness {
-    fn default() -> Self {
-        Self::Head
-    }
 }
 
 /// How much may be spent, and how often.

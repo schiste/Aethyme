@@ -14,6 +14,7 @@ pub struct ClassNode {
 }
 
 impl ClassNode {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         repo_name: &str,
         file_id: InternedStr,

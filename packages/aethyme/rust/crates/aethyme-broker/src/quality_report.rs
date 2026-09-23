@@ -633,7 +633,7 @@ pub fn merge_quality_report_section(
     report: &QualityReport,
 ) -> String {
     let rendered = render_quality_report(report);
-    let base = existing_comment.unwrap_or_else(|| {
+    let base = existing_comment.unwrap_or({
         // A report may arrive before the first review projection. Still create
         // the same single owned comment, so the next review sweep can edit it
         // in place rather than creating a second quality-only comment.

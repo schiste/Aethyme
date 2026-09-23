@@ -954,7 +954,7 @@ fn ship_execute_publishes_and_verifies_the_exact_confirmed_sha() {
         resolved_advisory.resolution_state,
         AdvisoryResolutionState::Resolved
     );
-    assert_eq!(resolved_advisory.resolved_at.is_some(), true);
+    assert!(resolved_advisory.resolved_at.is_some());
     assert!(
         resolved_advisory
             .resolution_evidence

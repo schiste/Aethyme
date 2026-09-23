@@ -346,7 +346,7 @@ fn replace_output_size(text: &str, size: usize, which: Occurrence) -> (Option<us
     };
     let value_start = i + marker.len();
     let value_end = text[value_start..]
-        .find(|c: char| c == ',' || c == '\n' || c == '}')
+        .find([',', '\n', '}'])
         .map(|off| value_start + off)
         .unwrap_or(text.len());
     let existing = text[value_start..value_end].trim().parse::<usize>().ok();

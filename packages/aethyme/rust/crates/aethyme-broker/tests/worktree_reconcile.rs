@@ -296,7 +296,7 @@ fn a_worktree_reached_by_another_spelling_is_still_owned() {
     );
     drop(through_link);
 
-    let mut through_real = Broker::open(&real).unwrap();
+    let through_real = Broker::open(&real).unwrap();
     let sweep = through_real.reconcile_worktree_directories(false).unwrap();
     assert_eq!(
         sweep.unclaimed_count, 0,

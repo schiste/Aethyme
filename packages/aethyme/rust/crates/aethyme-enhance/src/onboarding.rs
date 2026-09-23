@@ -2514,18 +2514,16 @@ fn navigation_recipes() -> Value {
             ("purpose", Value::str("Quick deterministic repo summary")),
             (
                 "command",
-                Value::str(format!(
-                    "aethyme repo inspect \"$PWD\" --mode brief --json-output"
-                )),
+                Value::str("aethyme repo inspect \"$PWD\" --mode brief --json-output".to_string()),
             ),
         ]),
         obj(vec![
             ("purpose", Value::str("Trace likely impact before editing")),
             (
                 "command",
-                Value::str(format!(
-                    "aethyme graph callers \"$PWD\" \"<symbol-or-file>\" --json-output"
-                )),
+                Value::str(
+                    "aethyme graph callers \"$PWD\" \"<symbol-or-file>\" --json-output".to_string(),
+                ),
             ),
         ]),
     ])
@@ -3506,9 +3504,7 @@ fn canonical_remote_repository_name(repo_path: &Path) -> Option<String> {
 
 fn repository_name_from_remote_url(url: &str) -> Option<String> {
     let without_query = url.split(['?', '#']).next()?.trim_end_matches(['/', '\\']);
-    let name = without_query
-        .rsplit(|character| matches!(character, '/' | ':' | '\\'))
-        .next()?;
+    let name = without_query.rsplit(['/', ':', '\\']).next()?;
     let name = name.strip_suffix(".git").unwrap_or(name);
     (!name.is_empty() && !matches!(name, "." | "..")).then(|| name.to_string())
 }

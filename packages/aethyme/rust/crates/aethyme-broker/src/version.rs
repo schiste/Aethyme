@@ -286,9 +286,7 @@ fn resolve_binary_commit(repo: &GitRepo, binary: &BinaryBuild) -> Option<String>
     {
         return Some(commit);
     }
-    let Some(describe) = binary.describe.as_deref() else {
-        return None;
-    };
+    let describe = binary.describe.as_deref()?;
     let commitish = commitish_from_describe(describe)?;
     repo.resolve_ref(&commitish)
 }

@@ -37,16 +37,14 @@ fn extract_cargo_deps(contents: &str, source: &str) -> Vec<ExternalDep> {
                 || trimmed == "[build-dependencies]";
             continue;
         }
-        if in_deps_section {
-            if let Some((key, _)) = trimmed.split_once('=') {
-                let name = key.trim();
-                if !name.is_empty() && !name.starts_with('#') {
-                    deps.push(ExternalDep {
-                        name: name.to_string(),
-                        dep_type: "cargo".to_string(),
-                        source_config: source.to_string(),
-                    });
-                }
+        if in_deps_section && let Some((key, _)) = trimmed.split_once('=') {
+            let name = key.trim();
+            if !name.is_empty() && !name.starts_with('#') {
+                deps.push(ExternalDep {
+                    name: name.to_string(),
+                    dep_type: "cargo".to_string(),
+                    source_config: source.to_string(),
+                });
             }
         }
     }

@@ -253,7 +253,7 @@ fn detect_direct_references(repos: &[WorkspaceRepo]) -> Vec<CrossRepoEdge> {
                 .next()
                 .unwrap_or(&file.path)
                 .rsplit('.')
-                .last()
+                .next_back()
                 .unwrap_or(&file.path);
             paths.insert(stem, file.id.as_str());
         }
@@ -278,21 +278,21 @@ fn detect_direct_references(repos: &[WorkspaceRepo]) -> Vec<CrossRepoEdge> {
                 if other_repo.name == repo.name {
                     continue;
                 }
-                if let Some(paths) = module_paths.get(other_repo.name.as_str()) {
-                    if let Some(target_id) = paths.get(last_segment) {
-                        edges.push(CrossRepoEdge {
-                            from_repo: repo.name.clone(),
-                            from_id: edge.from.to_string(),
-                            to_repo: other_repo.name.clone(),
-                            to_id: target_id.to_string(),
-                            kind: CrossEdgeKind::DirectReference,
-                            confidence: 500,
-                            evidence: format!(
-                                "unresolved import '{}' matches module in {}",
-                                import_name, other_repo.name
-                            ),
-                        });
-                    }
+                if let Some(paths) = module_paths.get(other_repo.name.as_str())
+                    && let Some(target_id) = paths.get(last_segment)
+                {
+                    edges.push(CrossRepoEdge {
+                        from_repo: repo.name.clone(),
+                        from_id: edge.from.to_string(),
+                        to_repo: other_repo.name.clone(),
+                        to_id: target_id.to_string(),
+                        kind: CrossEdgeKind::DirectReference,
+                        confidence: 500,
+                        evidence: format!(
+                            "unresolved import '{}' matches module in {}",
+                            import_name, other_repo.name
+                        ),
+                    });
                 }
             }
         }

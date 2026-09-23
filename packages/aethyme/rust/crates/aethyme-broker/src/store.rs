@@ -2521,6 +2521,7 @@ impl BrokerStore {
     /// request and starting the reviewer re-runs, sees `false`, and knows not
     /// to spawn a second one. Callers that treat a duplicate as an error would
     /// turn every crash into a stuck pull request.
+    #[allow(clippy::too_many_arguments)]
     pub fn record_review_request(
         &mut self,
         repository: &str,
@@ -2549,6 +2550,7 @@ impl BrokerStore {
     /// explicit/manual request. The router uses this method so the trigger it
     /// derived from the provider observation is persisted before any backend
     /// is invoked.
+    #[allow(clippy::too_many_arguments)]
     pub fn record_review_request_with_trigger(
         &mut self,
         repository: &str,
@@ -2959,6 +2961,7 @@ impl BrokerStore {
     /// Aethyme recorded, while the provider supplies the completion commit,
     /// verdict, and identity. That separation is what lets a late result be
     /// attached to the head it actually reviewed.
+    #[allow(clippy::too_many_arguments)]
     pub fn complete_review_request(
         &mut self,
         id: i64,
@@ -3020,6 +3023,7 @@ impl BrokerStore {
     /// a later request for that same head can reconcile into this row. Request
     /// fields remain null and the trigger is `unsolicited`; no provenance is
     /// invented to make the row look like a routed request.
+    #[allow(clippy::too_many_arguments)]
     pub fn record_unsolicited_review_completion(
         &mut self,
         repository: &str,
@@ -5824,15 +5828,17 @@ fn validate_planned_lease_conflicts(
                 path,
             )
             .join("\n  ");
-            return Err(BrokerError::PlannedLeaseConflict {
-                path: path.clone(),
-                blocker_session_id: blocker.session_id,
-                blocker_path: blocker.path.clone(),
-                blocker_kind: blocker.kind.as_str().to_string(),
-                blocker_status,
-                blocker_worktree,
-                remediation,
-            });
+            return Err(BrokerError::PlannedLeaseConflict(Box::new(
+                crate::error::PlannedLeaseConflict {
+                    path: path.clone(),
+                    blocker_session_id: blocker.session_id,
+                    blocker_path: blocker.path.clone(),
+                    blocker_kind: blocker.kind.as_str().to_string(),
+                    blocker_status,
+                    blocker_worktree,
+                    remediation,
+                },
+            )));
         }
     }
     Ok(())

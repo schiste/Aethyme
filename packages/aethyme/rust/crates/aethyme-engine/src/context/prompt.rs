@@ -83,10 +83,10 @@ fn build_overview_context(root: &Path, map: &RepositoryMap) -> String {
 
     // README excerpt — prefer root README.md over nested READMEs
     let readme_path = find_root_readme(map);
-    if let Some(path) = &readme_path {
-        if let Some(header) = read_file_header(root, path, 25) {
-            sections.push(format!("### README (`{path}`)\n```\n{header}\n```\n"));
-        }
+    if let Some(path) = &readme_path
+        && let Some(header) = read_file_header(root, path, 25)
+    {
+        sections.push(format!("### README (`{path}`)\n```\n{header}\n```\n"));
     }
 
     // Root-level entry points (source files at repo root)
@@ -159,7 +159,7 @@ fn build_overview_context(root: &Path, map: &RepositoryMap) -> String {
         })
         .filter(|(_, count)| *count > 0)
         .collect();
-    area_counts.sort_by(|a, b| b.1.cmp(&a.1));
+    area_counts.sort_by_key(|entry| std::cmp::Reverse(entry.1));
 
     if !area_counts.is_empty() {
         let mut section = String::from("### Structure (top directories by file count)\n");
@@ -313,7 +313,7 @@ fn build_area_context(root: &Path, map: &RepositoryMap, area_name: &str) -> Stri
         })
         .filter(|(_, c)| *c > 0)
         .collect();
-    subdirs.sort_by(|a, b| b.1.cmp(&a.1));
+    subdirs.sort_by_key(|entry| std::cmp::Reverse(entry.1));
 
     if !subdirs.is_empty() {
         let mut section = String::from("### Sub-directories\n");
@@ -468,7 +468,7 @@ fn build_testing_context(root: &Path, map: &RepositoryMap) -> String {
         })
         .filter(|(_, c)| *c > 0)
         .collect();
-    test_dirs.sort_by(|a, b| b.1.cmp(&a.1));
+    test_dirs.sort_by_key(|entry| std::cmp::Reverse(entry.1));
 
     if !test_dirs.is_empty() {
         let mut section = String::from("### Test Directories\n");
@@ -843,12 +843,11 @@ fn find_bootstrap_chain(root: &Path, map: &RepositoryMap, root_sources: &[&str])
 
                 // Does it reference a bootstrap-named file?
                 for pattern in BOOTSTRAP_NAMES {
-                    if trimmed.contains(pattern) {
-                        if let Some(file) = extract_import_path(trimmed) {
-                            if !chain.contains(&file) {
-                                chain.push(file);
-                            }
-                        }
+                    if trimmed.contains(pattern)
+                        && let Some(file) = extract_import_path(trimmed)
+                        && !chain.contains(&file)
+                    {
+                        chain.push(file);
                     }
                 }
             }
@@ -932,12 +931,12 @@ fn describe_manifest(root: &Path, path: &str) -> String {
         "composer.json" => {
             let desc = extract_json_field(&content, "description")
                 .unwrap_or_else(|| "PHP dependencies".to_string());
-            format!("{desc}")
+            desc.to_string()
         }
         "package.json" => {
             let desc = extract_json_field(&content, "description")
                 .unwrap_or_else(|| "JS/Node dependencies".to_string());
-            format!("{desc}")
+            desc.to_string()
         }
         "Cargo.toml" => "Rust project manifest".to_string(),
         "pyproject.toml" | "setup.py" | "setup.cfg" => "Python project manifest".to_string(),
@@ -983,7 +982,7 @@ fn top_sub_areas(map: &RepositoryMap, parent: &str, limit: usize) -> Vec<String>
         .filter(|(_, c)| *c >= 10)
         .collect();
 
-    subs.sort_by(|a, b| b.1.cmp(&a.1));
+    subs.sort_by_key(|entry| std::cmp::Reverse(entry.1));
     subs.into_iter()
         .take(limit)
         .map(|(name, count)| format!("{name} ({count})"))
@@ -1050,10 +1049,11 @@ fn suggest_starting_files(_root: &Path, map: &RepositoryMap) -> Vec<(String, Str
     for (pattern, reason) in STARTING_FILE_PATTERNS {
         for file in &map.files {
             let name = file.path.rsplit('/').next().unwrap_or(&file.path);
-            if name == *pattern && file.path.matches('/').count() <= 1 {
-                if !suggestions.iter().any(|(p, _)| p == &file.path) {
-                    suggestions.push((file.path.clone(), reason.to_string()));
-                }
+            if name == *pattern
+                && file.path.matches('/').count() <= 1
+                && !suggestions.iter().any(|(p, _)| p == &file.path)
+            {
+                suggestions.push((file.path.clone(), reason.to_string()));
             }
         }
     }
@@ -1061,14 +1061,13 @@ fn suggest_starting_files(_root: &Path, map: &RepositoryMap) -> Vec<(String, Str
     // Hooks / event / plugin system docs (any framework)
     for doc in &map.docs {
         let name_lower = doc.path.to_lowercase();
-        if name_lower.contains("hook")
+        if (name_lower.contains("hook")
             || name_lower.contains("event")
             || name_lower.contains("plugin")
-            || name_lower.contains("middleware")
+            || name_lower.contains("middleware"))
+            && !suggestions.iter().any(|(p, _)| p == &doc.path)
         {
-            if !suggestions.iter().any(|(p, _)| p == &doc.path) {
-                suggestions.push((doc.path.clone(), "extensibility documentation".to_string()));
-            }
+            suggestions.push((doc.path.clone(), "extensibility documentation".to_string()));
         }
     }
 

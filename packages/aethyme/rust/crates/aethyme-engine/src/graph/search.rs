@@ -305,13 +305,12 @@ pub(crate) fn score_symbol(
     let mut name_matched_tokens: Vec<String> = Vec::new();
     let name_lower = name.to_ascii_lowercase();
     for token in lowered_tokens {
-        if name_lower == *token
+        if (name_lower == *token
             || name_lower.contains(token.as_str())
-            || component_lowers.iter().any(|c| shares_stem(c, token))
+            || component_lowers.iter().any(|c| shares_stem(c, token)))
+            && !name_matched_tokens.contains(token)
         {
-            if !name_matched_tokens.contains(token) {
-                name_matched_tokens.push(token.clone());
-            }
+            name_matched_tokens.push(token.clone());
         }
     }
     let name_score = match name_matched_tokens.len() {
@@ -358,12 +357,11 @@ pub(crate) fn score_symbol(
         .next()
         .unwrap_or("")
         .to_ascii_lowercase();
-    let basename_bonus =
-        if !basename_lower.is_empty() && lowered_tokens.iter().any(|t| *t == basename_lower) {
-            BASENAME_EXACT_BONUS
-        } else {
-            0
-        };
+    let basename_bonus = if !basename_lower.is_empty() && lowered_tokens.contains(&basename_lower) {
+        BASENAME_EXACT_BONUS
+    } else {
+        0
+    };
 
     let total = name_score + path_score + area_score + basename_bonus;
     if total == 0 {

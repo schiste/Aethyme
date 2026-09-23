@@ -1597,10 +1597,10 @@ fn find_symbols_from<D: ReadableDatabase>(
         let Some(node) = get_node_in_txn(&txn, &id)? else {
             continue;
         };
-        if let Some(expected) = kind {
-            if node.kind() != expected {
-                continue;
-            }
+        if let Some(expected) = kind
+            && node.kind() != expected
+        {
+            continue;
         }
         if let Some(symbol) = symbol_lookup_from_node(node) {
             out.push(symbol);
@@ -1706,8 +1706,8 @@ fn score_symbol_candidate(
     let exact_variants = symbol_query_exact_variants(query);
     let index_variants = symbol_query_index_variants(query, tokens);
     let name_lower = symbol.name.to_ascii_lowercase();
-    signals.exact |= exact_variants.iter().any(|variant| symbol.name == *variant);
-    signals.case_insensitive |= index_variants.iter().any(|variant| name_lower == *variant);
+    signals.exact |= exact_variants.contains(&symbol.name);
+    signals.case_insensitive |= index_variants.contains(&name_lower);
 
     let component_lowers = split_symbol_components(symbol.name.as_str())
         .into_iter()
@@ -1729,10 +1729,10 @@ fn score_symbol_candidate(
         {
             signals.prefix = true;
         }
-        if name_lower == *token || name_lower.contains(token.as_str()) || component_match {
-            if !name_matched_tokens.contains(token) {
-                name_matched_tokens.push(token.clone());
-            }
+        if (name_lower == *token || name_lower.contains(token.as_str()) || component_match)
+            && !name_matched_tokens.contains(token)
+        {
+            name_matched_tokens.push(token.clone());
         }
     }
 
@@ -1765,7 +1765,7 @@ fn score_symbol_candidate(
     let area_score = area_matched as i32 * AREA_PER_TOKEN;
 
     let basename_lower = basename_without_extension(symbol.path.as_str());
-    if !basename_lower.is_empty() && tokens.iter().any(|token| *token == basename_lower) {
+    if !basename_lower.is_empty() && tokens.contains(&basename_lower) {
         signals.basename = true;
     }
     let basename_score = if signals.basename {
@@ -1784,20 +1784,20 @@ fn score_symbol_candidate(
 }
 
 fn symbol_candidate_allowed(symbol: &SymbolLookup, options: &SymbolMatchOptions) -> bool {
-    if let Some(kind) = options.kind {
-        if symbol.kind != kind {
-            return false;
-        }
+    if let Some(kind) = options.kind
+        && symbol.kind != kind
+    {
+        return false;
     }
-    if let Some(prefix) = &options.path_prefix {
-        if !symbol.path.starts_with(prefix) {
-            return false;
-        }
+    if let Some(prefix) = &options.path_prefix
+        && !symbol.path.starts_with(prefix)
+    {
+        return false;
     }
-    if let Some(area_id) = &options.area_id {
-        if symbol.area_id.as_deref() != Some(area_id.as_str()) {
-            return false;
-        }
+    if let Some(area_id) = &options.area_id
+        && symbol.area_id.as_deref() != Some(area_id.as_str())
+    {
+        return false;
     }
     true
 }
@@ -1852,11 +1852,11 @@ fn collect_symbol_ids_for_name_prefix<D: ReadableDatabase>(
     let end = prefix_end(prefix);
     let mut ids = BTreeSet::new();
     for entry in t.range(prefix..end.as_str())? {
-        let (key, mut values) = entry?;
+        let (key, values) = entry?;
         if !key.value().starts_with(prefix) {
             continue;
         }
-        while let Some(value) = values.next() {
+        for value in values {
             ids.insert(value?.value().to_string());
             if ids.len() >= limit {
                 return Ok(ids);
@@ -1899,11 +1899,11 @@ fn collect_symbol_ids_for_component_prefix<D: ReadableDatabase>(
     let end = prefix_end(prefix);
     let mut ids = BTreeSet::new();
     for entry in t.range(prefix..end.as_str())? {
-        let (key, mut values) = entry?;
+        let (key, values) = entry?;
         if !key.value().starts_with(prefix) {
             continue;
         }
-        while let Some(value) = values.next() {
+        for value in values {
             ids.insert(value?.value().to_string());
             if ids.len() >= limit {
                 return Ok(ids);
@@ -1946,11 +1946,11 @@ fn collect_symbol_ids_for_path_component_prefix<D: ReadableDatabase>(
     let end = prefix_end(prefix);
     let mut ids = BTreeSet::new();
     for entry in t.range(prefix..end.as_str())? {
-        let (key, mut values) = entry?;
+        let (key, values) = entry?;
         if !key.value().starts_with(prefix) {
             continue;
         }
-        while let Some(value) = values.next() {
+        for value in values {
             ids.insert(value?.value().to_string());
             if ids.len() >= limit {
                 return Ok(ids);
@@ -2361,11 +2361,11 @@ fn ids_under_path_limited_from<D: ReadableDatabase>(
     let end = prefix_end(prefix);
     let mut ids = BTreeSet::new();
     for entry in t.range(prefix..end.as_str())? {
-        let (key, mut values) = entry?;
+        let (key, values) = entry?;
         if !key.value().starts_with(prefix) {
             continue;
         }
-        while let Some(value) = values.next() {
+        for value in values {
             ids.insert(value?.value().to_string());
             if ids.len() >= limit {
                 return Ok(ids.into_iter().collect());
@@ -2649,10 +2649,10 @@ fn relation_items_from<D: ReadableDatabase>(
         let Some(node) = display_from_id_in_txn(&txn, edge.other.as_str())? else {
             continue;
         };
-        if let Some(expected) = kind_filter {
-            if node.kind != expected {
-                continue;
-            }
+        if let Some(expected) = kind_filter
+            && node.kind != expected
+        {
+            continue;
         }
         items.push(RedbRelationItem {
             relation: edge_kind_label(&edge.kind).to_string(),
@@ -3360,19 +3360,18 @@ fn middleware_chain_for_route_from<D: ReadableDatabase>(
             }
         }
 
-        if root.kind != StoredNodeKind::File {
-            if let Some(path) = &root.path {
-                if let Some(file) = resolve_file_path_from(db, path)? {
-                    for step in relation_steps_for_node_from(
-                        db,
-                        &file.id,
-                        &[NeighborDirection::Outgoing],
-                        &middleware_kinds,
-                        FLOW_CHAIN_STEP_LIMIT,
-                    )? {
-                        insert_chain_step(&mut steps, step);
-                    }
-                }
+        if root.kind != StoredNodeKind::File
+            && let Some(path) = &root.path
+            && let Some(file) = resolve_file_path_from(db, path)?
+        {
+            for step in relation_steps_for_node_from(
+                db,
+                &file.id,
+                &[NeighborDirection::Outgoing],
+                &middleware_kinds,
+                FLOW_CHAIN_STEP_LIMIT,
+            )? {
+                insert_chain_step(&mut steps, step);
             }
         }
     }
@@ -3451,10 +3450,10 @@ fn tests_for_surface_or_symbol_from<D: ReadableDatabase>(
     let mut tests = BTreeMap::new();
     for root in &roots {
         let mut seed_ids = vec![root.id.clone()];
-        if let Some(path) = &root.path {
-            if let Some(file) = resolve_file_path_from(db, path)? {
-                push_unique_string(&mut seed_ids, file.id);
-            }
+        if let Some(path) = &root.path
+            && let Some(file) = resolve_file_path_from(db, path)?
+        {
+            push_unique_string(&mut seed_ids, file.id);
         }
         for seed_id in seed_ids {
             for step in relation_steps_for_node_from(
@@ -3748,11 +3747,11 @@ fn risks_for_node_or_path_from<D: ReadableDatabase>(
     if !prefix.is_empty() {
         let end = prefix_end(prefix);
         for entry in t.range(prefix..end.as_str())? {
-            let (key, mut values) = entry?;
+            let (key, values) = entry?;
             if !key.value().starts_with(prefix) {
                 continue;
             }
-            while let Some(value) = values.next() {
+            for value in values {
                 let risk: RiskFlag = bincode::deserialize(value?.value())?;
                 if seen.insert((risk.scope.clone(), risk.reason.clone())) {
                     out.push(risk);
@@ -3811,8 +3810,8 @@ fn edge_count_from<D: ReadableDatabase>(db: &D) -> Result<u64, GraphStoreError> 
     let t = txn.open_multimap_table(EDGES_OUT)?;
     let mut count = 0;
     for entry in t.iter()? {
-        let (_, mut values) = entry?;
-        while let Some(value) = values.next() {
+        let (_, values) = entry?;
+        for value in values {
             value?;
             count += 1;
         }
@@ -3825,9 +3824,9 @@ fn all_edges_from<D: ReadableDatabase>(db: &D) -> Result<Vec<Edge>, GraphStoreEr
     let t = txn.open_multimap_table(EDGES_OUT)?;
     let mut edges = Vec::new();
     for entry in t.iter()? {
-        let (key, mut values) = entry?;
+        let (key, values) = entry?;
         let from = key.value().to_string();
-        while let Some(value) = values.next() {
+        for value in values {
             let row = value?;
             let rec: AdjacencyRecord = bincode::deserialize(row.value())?;
             edges.push(Edge::new(
@@ -3853,10 +3852,10 @@ fn list_areas_from<D: ReadableDatabase>(
     for entry in t.iter()? {
         let (_, value) = entry?;
         let area: AreaNode = bincode::deserialize(value.value())?;
-        if let Some(d) = depth {
-            if area_depth(&area) != d {
-                continue;
-            }
+        if let Some(d) = depth
+            && area_depth(&area) != d
+        {
+            continue;
         }
         out.push(area);
     }
@@ -3894,10 +3893,10 @@ fn overview_from<D: ReadableDatabase>(
         let mut seen = std::collections::BTreeSet::new();
         let mut paths = Vec::new();
         'outer: for kv in edges.iter()? {
-            let (key, mut values) = kv?;
+            let (key, values) = kv?;
             let src = key.value().to_string();
             let mut has_entrypoint = false;
-            while let Some(v) = values.next() {
+            for v in values {
                 let row = v?;
                 let rec: AdjacencyRecord = bincode::deserialize(row.value())?;
                 if matches!(rec.kind, EdgeKind::EntrypointFor) {
@@ -3926,8 +3925,8 @@ fn overview_from<D: ReadableDatabase>(
         let t = txn.open_multimap_table(RISK_FLAGS)?;
         let mut all = Vec::new();
         for kv in t.iter()? {
-            let (_, mut values) = kv?;
-            while let Some(v) = values.next() {
+            let (_, values) = kv?;
+            for v in values {
                 let row = v?;
                 let risk: RiskFlag = bincode::deserialize(row.value())?;
                 all.push(risk);
@@ -6825,7 +6824,7 @@ mod tests {
         let exact = readonly.symbols_matching("LoadToken").expect("exact");
         let function_exact = exact
             .iter()
-            .find(|candidate| candidate.symbol.id == fixture.function.id.to_string())
+            .find(|candidate| candidate.symbol.id == fixture.function.id)
             .expect("function exact candidate");
         assert!(function_exact.signals.exact);
         assert!(function_exact.signals.case_insensitive);
@@ -6834,22 +6833,22 @@ mod tests {
         let case_insensitive = readonly.symbols_matching("loadtoken").expect("case");
         let function_case = case_insensitive
             .iter()
-            .find(|candidate| candidate.symbol.id == fixture.function.id.to_string())
+            .find(|candidate| candidate.symbol.id == fixture.function.id)
             .expect("function case-insensitive candidate");
         assert!(!function_case.signals.exact);
         assert!(function_case.signals.case_insensitive);
 
         let prefix = readonly.symbols_matching("Load").expect("prefix");
         assert!(prefix.iter().any(|candidate| {
-            candidate.symbol.id == fixture.function.id.to_string() && candidate.signals.prefix
+            candidate.symbol.id == fixture.function.id && candidate.signals.prefix
         }));
 
         let component = readonly.symbols_matching("token").expect("component");
         assert!(component.iter().any(|candidate| {
-            candidate.symbol.id == fixture.function.id.to_string() && candidate.signals.component
+            candidate.symbol.id == fixture.function.id && candidate.signals.component
         }));
         assert!(component.iter().any(|candidate| {
-            candidate.symbol.id == fixture.class.id.to_string() && candidate.signals.component
+            candidate.symbol.id == fixture.class.id && candidate.signals.component
         }));
 
         let path = readonly
@@ -6862,17 +6861,17 @@ mod tests {
             )
             .expect("path");
         assert!(path.iter().any(|candidate| {
-            candidate.symbol.id == fixture.function.id.to_string() && candidate.signals.path
+            candidate.symbol.id == fixture.function.id && candidate.signals.path
         }));
 
         let area = readonly.symbols_matching("src").expect("area");
         assert!(area.iter().any(|candidate| {
-            candidate.symbol.id == fixture.function.id.to_string() && candidate.signals.area
+            candidate.symbol.id == fixture.function.id && candidate.signals.area
         }));
 
         let basename = readonly.symbols_matching("lib").expect("basename");
         assert!(basename.iter().any(|candidate| {
-            candidate.symbol.id == fixture.function.id.to_string()
+            candidate.symbol.id == fixture.function.id
                 && candidate.signals.path
                 && candidate.signals.basename
         }));
@@ -6920,7 +6919,7 @@ mod tests {
             .expect("stem symbol match");
         let hit = hits
             .iter()
-            .find(|candidate| candidate.symbol.id == function.id.to_string())
+            .find(|candidate| candidate.symbol.id == function.id)
             .expect("doViewUpdates should be recalled via the view/viewing stem");
         assert!(hit.signals.component);
         assert!(hit.rank > 0);
@@ -7083,7 +7082,7 @@ mod tests {
             .expect("anchors");
         let function_anchor = anchors
             .iter()
-            .find(|candidate| candidate.node.id == fixture.function.id.to_string())
+            .find(|candidate| candidate.node.id == fixture.function.id)
             .expect("function anchor");
         assert!(
             function_anchor
@@ -7114,7 +7113,7 @@ mod tests {
             .expect("entrypoints");
         let route = entrypoints
             .iter()
-            .find(|candidate| candidate.node.id == fixture.route.id.to_string())
+            .find(|candidate| candidate.node.id == fixture.route.id)
             .expect("route entrypoint");
         assert!(route.relation_kinds.contains(&EdgeKind::Exposes));
         assert!(entrypoints.len() <= FLOW_QUERY_LIMIT);
@@ -7130,7 +7129,7 @@ mod tests {
             src_path
                 .surfaces
                 .iter()
-                .any(|surface| surface.id == fixture.route.id.to_string())
+                .any(|surface| surface.id == fixture.route.id)
         );
         assert!(
             src_path
@@ -7144,7 +7143,7 @@ mod tests {
             .expect("credential flows");
         let credential_candidate = credential
             .iter()
-            .find(|candidate| candidate.node.id == fixture.credential.id.to_string())
+            .find(|candidate| candidate.node.id == fixture.credential.id)
             .expect("credential operation");
         assert!(
             credential_candidate
@@ -7179,21 +7178,21 @@ mod tests {
             middleware
                 .roots
                 .iter()
-                .any(|root| root.id == fixture.route.id.to_string())
+                .any(|root| root.id == fixture.route.id)
         );
         assert!(
             middleware
                 .steps
                 .iter()
                 .any(|step| step.edge_kind == EdgeKind::InstallsMiddleware
-                    && step.to.id == fixture.middleware.id.to_string())
+                    && step.to.id == fixture.middleware.id)
         );
         assert!(
             middleware
                 .steps
                 .iter()
                 .any(|step| step.edge_kind == EdgeKind::ValidatesCredential
-                    && step.to.id == fixture.credential.id.to_string())
+                    && step.to.id == fixture.credential.id)
         );
         assert!(middleware.steps.len() <= FLOW_CHAIN_STEP_LIMIT);
 
@@ -7201,18 +7200,16 @@ mod tests {
             .forwarding_chain_for_surface(fixture.route.id.as_str())
             .expect("forwarding chain");
         assert!(
-            forwarding
-                .steps
-                .iter()
-                .any(|step| step.edge_kind == EdgeKind::ForwardsTo
-                    && step.to.id == fixture.proxy.id.to_string())
+            forwarding.steps.iter().any(
+                |step| step.edge_kind == EdgeKind::ForwardsTo && step.to.id == fixture.proxy.id
+            )
         );
         assert!(
             forwarding
                 .steps
                 .iter()
                 .any(|step| step.edge_kind == EdgeKind::RewritesHeader
-                    && step.to.id == fixture.credential.id.to_string())
+                    && step.to.id == fixture.credential.id)
         );
 
         let tests = readonly

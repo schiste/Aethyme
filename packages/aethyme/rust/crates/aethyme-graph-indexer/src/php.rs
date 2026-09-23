@@ -647,10 +647,8 @@ fn emit_php_use_placeholders(
         let mut ccursor = clause.walk();
         for child in clause.named_children(&mut ccursor) {
             match child.kind() {
-                "name" | "qualified_name" => {
-                    if imported_path.is_none() {
-                        imported_path = Some(node_text(child, content).to_string());
-                    }
+                "name" | "qualified_name" if imported_path.is_none() => {
+                    imported_path = Some(node_text(child, content).to_string());
                 }
                 _ => {}
             }

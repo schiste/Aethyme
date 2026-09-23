@@ -158,7 +158,7 @@ fn top_areas(map: &RepositoryMap) -> Vec<String> {
         .filter(|(_, count)| *count > 0)
         .collect();
 
-    areas.sort_by(|a, b| b.1.cmp(&a.1));
+    areas.sort_by_key(|entry| std::cmp::Reverse(entry.1));
     areas
         .into_iter()
         .map(|(name, _)| name.to_string())
@@ -166,7 +166,7 @@ fn top_areas(map: &RepositoryMap) -> Vec<String> {
 }
 
 fn sanitize_snippet_id(name: &str) -> String {
-    name.replace('/', "-").replace(' ', "-").to_lowercase()
+    name.replace(['/', ' '], "-").to_lowercase()
 }
 
 /// Assigns single-letter keys a-z to snippets in order.

@@ -51,7 +51,7 @@ fn revision_bound_artifacts_are_content_free_and_exactly_digest_units() {
     assert_eq!(function.end.line, 3);
     assert_eq!(
         function.content_digest,
-        blake3::hash(source["# leading comment\n".len()..].as_bytes())
+        blake3::hash(&source.as_bytes()["# leading comment\n".len()..])
             .to_hex()
             .to_string()
     );

@@ -3488,19 +3488,19 @@ impl Broker {
             });
         }
 
-        if let Some(remote_head) = self.repo.symbolic_ref("refs/remotes/origin/HEAD") {
-            if let Some(branch_name) = remote_head.strip_prefix("refs/remotes/origin/") {
-                let local_ref = format!("refs/heads/{branch_name}");
-                if let Some(commit) = self.repo.resolve_ref(&local_ref) {
-                    return Ok(SessionStartBase {
-                        ref_name: local_ref,
-                        commit,
-                        evidence: SessionStartBaseEvidence::RemoteDefaultBranch,
-                        behind_default_commits: None,
-                        ahead_default_commits: None,
-                        default_ref: None,
-                    });
-                }
+        if let Some(remote_head) = self.repo.symbolic_ref("refs/remotes/origin/HEAD")
+            && let Some(branch_name) = remote_head.strip_prefix("refs/remotes/origin/")
+        {
+            let local_ref = format!("refs/heads/{branch_name}");
+            if let Some(commit) = self.repo.resolve_ref(&local_ref) {
+                return Ok(SessionStartBase {
+                    ref_name: local_ref,
+                    commit,
+                    evidence: SessionStartBaseEvidence::RemoteDefaultBranch,
+                    behind_default_commits: None,
+                    ahead_default_commits: None,
+                    default_ref: None,
+                });
             }
         }
 
@@ -4122,15 +4122,17 @@ impl Broker {
                 .conflicts
                 .first()
                 .expect("conflicting path has at least one blocker");
-            return Err(BrokerError::PlannedLeaseConflict {
-                path: path.path.clone(),
-                blocker_session_id: blocker.session_id,
-                blocker_path: blocker.path.clone(),
-                blocker_kind: blocker.kind.as_str().to_string(),
-                blocker_status: blocker.owner_status.as_str().to_string(),
-                blocker_worktree: blocker.owner_worktree.clone(),
-                remediation: blocker.safe_next_actions.join("\n  "),
-            }
+            return Err(BrokerError::PlannedLeaseConflict(Box::new(
+                crate::error::PlannedLeaseConflict {
+                    path: path.path.clone(),
+                    blocker_session_id: blocker.session_id,
+                    blocker_path: blocker.path.clone(),
+                    blocker_kind: blocker.kind.as_str().to_string(),
+                    blocker_status: blocker.owner_status.as_str().to_string(),
+                    blocker_worktree: blocker.owner_worktree.clone(),
+                    remediation: blocker.safe_next_actions.join("\n  "),
+                },
+            ))
             .into());
         }
         Ok(())
@@ -4978,8 +4980,7 @@ impl Broker {
             .store
             .merge_queue()?
             .into_iter()
-            .filter(|entry| entry.session_id == session_id)
-            .last();
+            .rfind(|entry| entry.session_id == session_id);
         if let Some(entry) = latest
             && entry.status == MergeStatus::Conflict
         {
@@ -9310,6 +9311,7 @@ fn integration_movement_advice(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn integration_next_action(
     branch: &str,
     integration_head: &str,
@@ -9353,18 +9355,18 @@ fn integration_next_action(
         };
     }
 
-    if upstream_head == Some(integration_head) {
-        if let Some(entry_id) = latest_delivery_entry_id {
-            return IntegrationNextAction {
-                state: IntegrationDeliveryState::Published,
-                summary: format!(
-                    "{branch} is published at {integration_head}; local main is not synchronized"
-                ),
-                commands: vec![format!(
-                    "aethyme broker ship execute --entry {entry_id} --confirm {integration_head} --sync-main"
-                )],
-            };
-        }
+    if upstream_head == Some(integration_head)
+        && let Some(entry_id) = latest_delivery_entry_id
+    {
+        return IntegrationNextAction {
+            state: IntegrationDeliveryState::Published,
+            summary: format!(
+                "{branch} is published at {integration_head}; local main is not synchronized"
+            ),
+            commands: vec![format!(
+                "aethyme broker ship execute --entry {entry_id} --confirm {integration_head} --sync-main"
+            )],
+        };
     }
 
     if !promoted_entries.is_empty() {

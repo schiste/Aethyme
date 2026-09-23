@@ -35,7 +35,7 @@ mod tests {
     #[test]
     fn compatibility_range_tracks_runtime_schema_and_protocol() {
         assert_eq!(BROKER_STORAGE_CURRENT_SCHEMA, crate::SCHEMA_VERSION);
-        assert!(BROKER_STORAGE_MINIMUM_SCHEMA <= BROKER_STORAGE_CURRENT_SCHEMA);
+        const { assert!(BROKER_STORAGE_MINIMUM_SCHEMA <= BROKER_STORAGE_CURRENT_SCHEMA) };
         assert_eq!(
             ENGINE_PROTOCOL_VERSION,
             aethyme_engine::daemon::ENGINE_PROTOCOL_VERSION

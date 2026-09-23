@@ -473,6 +473,7 @@ impl ReviewDispatchAction {
 /// a declared `on_refusal` edge when there is one. `None` is both "first
 /// attempt" and "the last one did not refuse", which route identically -- the
 /// edge exists to escape a refusal, so nothing else may take it.
+#[allow(clippy::too_many_arguments)]
 pub fn dispatch_review(
     policy: &ReviewRoutingPolicy,
     reporting: &ReviewReportingPolicy,

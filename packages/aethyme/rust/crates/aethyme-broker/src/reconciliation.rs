@@ -1124,8 +1124,8 @@ fn build_candidate_layer(
     let mut candidates = Vec::new();
     for entry in queue
         .iter()
+        .filter(|&entry| entry.status == MergeStatus::Promoted)
         .cloned()
-        .filter(|entry| entry.status == MergeStatus::Promoted)
     {
         let Some(merge_commit) = promoted_commit(&entry) else {
             continue;

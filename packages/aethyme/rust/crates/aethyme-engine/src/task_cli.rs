@@ -204,22 +204,22 @@ fn render_scope(payload: &Value) -> String {
         ("in_scope_areas", "In-scope areas:"),
         ("out_of_scope", "Out of scope:"),
     ] {
-        if let Some(items) = payload.get(key).and_then(Value::as_array) {
-            if !items.is_empty() {
-                out.push_str(heading);
-                out.push('\n');
-                for item in items {
-                    out.push_str(&value_reason_line(item));
-                }
+        if let Some(items) = payload.get(key).and_then(Value::as_array)
+            && !items.is_empty()
+        {
+            out.push_str(heading);
+            out.push('\n');
+            for item in items {
+                out.push_str(&value_reason_line(item));
             }
         }
     }
-    if let Some(risks) = payload.get("risks").and_then(Value::as_array) {
-        if !risks.is_empty() {
-            out.push_str("Risks:\n");
-            for item in risks {
-                out.push_str(&format!("- {}\n", item.as_str().unwrap_or_default()));
-            }
+    if let Some(risks) = payload.get("risks").and_then(Value::as_array)
+        && !risks.is_empty()
+    {
+        out.push_str("Risks:\n");
+        for item in risks {
+            out.push_str(&format!("- {}\n", item.as_str().unwrap_or_default()));
         }
     }
     emit_completeness_signals(payload, &mut out);
@@ -255,37 +255,37 @@ fn render_pack_summary(pack: &Value) -> String {
         "Task: {}",
         pack["task"]["raw"].as_str().unwrap_or_default()
     )];
-    if let Some(anchors) = pack.get("anchors").and_then(Value::as_array) {
-        if !anchors.is_empty() {
-            lines.push("Anchors:".to_string());
-            for anchor in anchors {
-                lines.push(format!(
-                    "- {} ({})",
-                    anchor["id"].as_str().unwrap_or_default(),
-                    anchor["reason"].as_str().unwrap_or_default(),
-                ));
-            }
+    if let Some(anchors) = pack.get("anchors").and_then(Value::as_array)
+        && !anchors.is_empty()
+    {
+        lines.push("Anchors:".to_string());
+        for anchor in anchors {
+            lines.push(format!(
+                "- {} ({})",
+                anchor["id"].as_str().unwrap_or_default(),
+                anchor["reason"].as_str().unwrap_or_default(),
+            ));
         }
     }
-    if let Some(navigation) = pack.get("navigation_order").and_then(Value::as_array) {
-        if !navigation.is_empty() {
-            lines.push("Navigation order:".to_string());
-            for item in navigation {
-                lines.push(format!("- {}", item.as_str().unwrap_or_default()));
-            }
+    if let Some(navigation) = pack.get("navigation_order").and_then(Value::as_array)
+        && !navigation.is_empty()
+    {
+        lines.push("Navigation order:".to_string());
+        for item in navigation {
+            lines.push(format!("- {}", item.as_str().unwrap_or_default()));
         }
     }
-    if let Some(risks) = pack.get("risk_flags").and_then(Value::as_array) {
-        if !risks.is_empty() {
-            lines.push("High-risk areas:".to_string());
-            for risk in risks {
-                lines.push(format!(
-                    "- {} ({}): {}",
-                    risk["scope"].as_str().unwrap_or_default(),
-                    risk["area"].as_str().unwrap_or_default(),
-                    risk["reason"].as_str().unwrap_or_default(),
-                ));
-            }
+    if let Some(risks) = pack.get("risk_flags").and_then(Value::as_array)
+        && !risks.is_empty()
+    {
+        lines.push("High-risk areas:".to_string());
+        for risk in risks {
+            lines.push(format!(
+                "- {} ({}): {}",
+                risk["scope"].as_str().unwrap_or_default(),
+                risk["area"].as_str().unwrap_or_default(),
+                risk["reason"].as_str().unwrap_or_default(),
+            ));
         }
     }
     if let Some(confidence) = pack.get("confidence").and_then(Value::as_object) {
@@ -441,13 +441,13 @@ fn render_explain_from_pack(pack: &Value) -> String {
             }
         }
     }
-    if let Some(navigation) = pack.get("navigation_order").and_then(Value::as_array) {
-        if !navigation.is_empty() {
-            lines.push(String::new());
-            lines.push("Navigation order:".to_string());
-            for item in navigation.iter().take(5) {
-                lines.push(format!("- {}", item.as_str().unwrap_or_default()));
-            }
+    if let Some(navigation) = pack.get("navigation_order").and_then(Value::as_array)
+        && !navigation.is_empty()
+    {
+        lines.push(String::new());
+        lines.push("Navigation order:".to_string());
+        for item in navigation.iter().take(5) {
+            lines.push(format!("- {}", item.as_str().unwrap_or_default()));
         }
     }
     lines.join("\n")

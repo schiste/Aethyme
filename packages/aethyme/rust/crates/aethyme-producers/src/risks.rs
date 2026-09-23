@@ -365,15 +365,15 @@ fn destructive_risks(fragments: &[Fragment]) -> Vec<RiskFlag> {
     for fragment in fragments {
         let mut names: Vec<&str> = Vec::new();
         for node in fragment.nodes() {
-            if let Node::Function(_) = node {
-                if let Some(name) = node.name() {
-                    let lower = name.to_ascii_lowercase();
-                    if DESTRUCTIVE_PATTERNS
-                        .iter()
-                        .any(|pattern| lower.contains(pattern))
-                    {
-                        names.push(name);
-                    }
+            if let Node::Function(_) = node
+                && let Some(name) = node.name()
+            {
+                let lower = name.to_ascii_lowercase();
+                if DESTRUCTIVE_PATTERNS
+                    .iter()
+                    .any(|pattern| lower.contains(pattern))
+                {
+                    names.push(name);
                 }
             }
         }

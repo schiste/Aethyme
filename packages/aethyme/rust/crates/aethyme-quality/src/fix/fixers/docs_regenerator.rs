@@ -190,28 +190,28 @@ impl DocsRegenerator {
         if suffix == ".py" {
             if let Some(caps) = self.py_docstring.captures(&content) {
                 let doc = crate::util::py_strip(caps.get(1).unwrap().as_str());
-                return Some(first_line_truncated(&doc));
+                return Some(first_line_truncated(doc));
             }
             if let Some(caps) = self.py_docstring_single.captures(&content) {
                 let doc = crate::util::py_strip(caps.get(1).unwrap().as_str());
-                return Some(first_line_truncated(&doc));
+                return Some(first_line_truncated(doc));
             }
         }
 
-        if [".js", ".ts", ".tsx", ".jsx"].contains(&suffix.as_str()) {
-            if let Some(caps) = self.js_docblock.captures(&content) {
-                let doc = crate::util::py_strip(caps.get(1).unwrap().as_str());
-                // Strip a leading `*` from each line, then take the
-                // first. `split('\n')` here, not splitlines.
-                let stripped: Vec<String> = doc
-                    .split('\n')
-                    .map(|line| {
-                        crate::util::py_strip(crate::util::py_strip(line).trim_start_matches('*'))
-                            .to_string()
-                    })
-                    .collect();
-                return Some(first_line_truncated(&stripped.join("\n")));
-            }
+        if [".js", ".ts", ".tsx", ".jsx"].contains(&suffix.as_str())
+            && let Some(caps) = self.js_docblock.captures(&content)
+        {
+            let doc = crate::util::py_strip(caps.get(1).unwrap().as_str());
+            // Strip a leading `*` from each line, then take the
+            // first. `split('\n')` here, not splitlines.
+            let stripped: Vec<String> = doc
+                .split('\n')
+                .map(|line| {
+                    crate::util::py_strip(crate::util::py_strip(line).trim_start_matches('*'))
+                        .to_string()
+                })
+                .collect();
+            return Some(first_line_truncated(&stripped.join("\n")));
         }
 
         None

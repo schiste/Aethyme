@@ -197,9 +197,12 @@ mod tests {
     /// Records every invocation and replies from a scripted table, so
     /// the assertions are about orchestration rather than formatter
     /// output.
+    /// One recorded runner invocation: argv, working directory, timeout.
+    type RecordedCall = (Vec<String>, Option<String>, Option<Duration>);
+
     #[derive(Default)]
     struct FakeRunner {
-        calls: Mutex<Vec<(Vec<String>, Option<String>, Option<Duration>)>>,
+        calls: Mutex<Vec<RecordedCall>>,
         available: Vec<&'static str>,
         replies: Mutex<Vec<RunOutcome>>,
         default_reply: Mutex<Option<RunOutcome>>,

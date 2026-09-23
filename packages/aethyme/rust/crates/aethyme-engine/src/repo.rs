@@ -150,10 +150,10 @@ fn walk_dir(
             if should_exclude_dir(file_name) {
                 continue;
             }
-            if let Ok(relative) = path.strip_prefix(root) {
-                if let Some(first) = relative.components().next() {
-                    top_level_dirs.insert(first.as_os_str().to_string_lossy().to_string());
-                }
+            if let Ok(relative) = path.strip_prefix(root)
+                && let Some(first) = relative.components().next()
+            {
+                top_level_dirs.insert(first.as_os_str().to_string_lossy().to_string());
             }
             walk_dir(root, &path, files, languages, top_level_dirs, readme_path)?;
             continue;

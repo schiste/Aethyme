@@ -206,8 +206,8 @@ fn emit_reports(args: &Args, report: &ScorecardReport) -> Option<u8> {
 
     if format == "json" || format == "both" {
         let json_output = format_json(report);
-        if args.output.is_some() && format == "json" {
-            let output_path = PathBuf::from(args.output.as_ref().unwrap());
+        if let Some(output) = args.output.as_ref().filter(|_| format == "json") {
+            let output_path = PathBuf::from(output);
             if let Err(e) = std::fs::write(&output_path, &json_output) {
                 eprintln!("Error during scan: {e}");
                 return Some(2);
@@ -231,8 +231,8 @@ fn emit_reports(args: &Args, report: &ScorecardReport) -> Option<u8> {
 
     if format == "md" || format == "both" {
         let md_output = format_markdown(report);
-        if args.output.is_some() && format == "md" {
-            let output_path = PathBuf::from(args.output.as_ref().unwrap());
+        if let Some(output) = args.output.as_ref().filter(|_| format == "md") {
+            let output_path = PathBuf::from(output);
             if let Err(e) = std::fs::write(&output_path, &md_output) {
                 eprintln!("Error during scan: {e}");
                 return Some(2);

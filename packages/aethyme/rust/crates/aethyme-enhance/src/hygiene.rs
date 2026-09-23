@@ -390,7 +390,7 @@ fn parse_sections(body_lines: &[&str]) -> Vec<(String, String)> {
         .collect()
 }
 
-fn parse_section_header<'a>(line: &'a str) -> Option<(&'static str, &'a str)> {
+fn parse_section_header(line: &str) -> Option<(&'static str, &str)> {
     known_sections().find_map(|section| {
         let remainder = line.strip_prefix(section)?.strip_prefix(':')?;
         if remainder.is_empty() {

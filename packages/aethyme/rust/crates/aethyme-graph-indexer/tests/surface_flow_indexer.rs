@@ -152,11 +152,7 @@ def test_token_route_requires_bearer(client):
             .count(),
         2
     );
-    assert!(
-        edge_kinds(tmp.path(), "backend/urls.py")
-            .iter()
-            .any(|kind| *kind == EdgeKind::Exposes)
-    );
+    assert!(edge_kinds(tmp.path(), "backend/urls.py").contains(&EdgeKind::Exposes));
 
     let settings_nodes = node_kinds(tmp.path(), "backend/settings.py");
     assert_eq!(
@@ -166,11 +162,7 @@ def test_token_route_requires_bearer(client):
             .count(),
         4
     );
-    assert!(
-        edge_kinds(tmp.path(), "backend/settings.py")
-            .iter()
-            .any(|kind| *kind == EdgeKind::InstallsMiddleware)
-    );
+    assert!(edge_kinds(tmp.path(), "backend/settings.py").contains(&EdgeKind::InstallsMiddleware));
 
     let worker_nodes = node_kinds(tmp.path(), "edge/worker.mjs");
     assert!(worker_nodes.contains(&NodeKind::WorkerSurface));

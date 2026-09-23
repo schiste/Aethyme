@@ -144,16 +144,15 @@ pub fn fetch_manifest_cached(
     // request for live answers only, not for old ones on a bad day.
     let cached = (ttl > 0).then(|| read_entry(url)).flatten();
 
-    if !refresh {
-        if let Some(entry) = &cached
-            && is_fresh(entry.fetched_at_unix_ms, now_unix_ms, ttl)
-        {
-            return Ok(ManifestFetch {
-                bytes: entry.body.clone().into_bytes(),
-                age_seconds: age_seconds(entry.fetched_at_unix_ms, now_unix_ms),
-                source: ManifestSource::Cache,
-            });
-        }
+    if !refresh
+        && let Some(entry) = &cached
+        && is_fresh(entry.fetched_at_unix_ms, now_unix_ms, ttl)
+    {
+        return Ok(ManifestFetch {
+            bytes: entry.body.clone().into_bytes(),
+            age_seconds: age_seconds(entry.fetched_at_unix_ms, now_unix_ms),
+            source: ManifestSource::Cache,
+        });
     }
 
     match fetch(url) {

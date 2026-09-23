@@ -407,7 +407,6 @@ fn git_ignored(repo: &Path, relative: &str) -> Result<bool, String> {
 mod tests {
     use super::*;
 
-    #[test]
     /// A local-only deployment's whole claim is that the clone is unchanged, so
     /// every file it writes has to be excluded. A target that is not is not a
     /// cosmetic gap: it appears as an untracked file in someone else's
@@ -441,6 +440,7 @@ mod tests {
         }
     }
 
+    #[test]
     fn bridge_is_inert_when_marker_is_absent() {
         assert!(BRIDGE_BLOCK.contains("If it does not exist, continue normally"));
         assert!(BRIDGE_BLOCK.contains("do not run Aethyme"));

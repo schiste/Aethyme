@@ -198,17 +198,16 @@ fn extract_python_django(
 
         if path.ends_with("urls.py")
             && (lower.contains("path(") || lower.contains("re_path(") || lower.contains("url("))
+            && let Some(pattern) = first_quoted_value(trimmed)
         {
-            if let Some(pattern) = first_quoted_value(trimmed) {
-                builder.push(
-                    NodeKind::RouteSurface,
-                    EdgeAttributes::Exposes,
-                    &format!("route:{pattern}"),
-                    "Django URL route",
-                    line_no,
-                    &[("framework", "django".to_string()), ("pattern", pattern)],
-                )?;
-            }
+            builder.push(
+                NodeKind::RouteSurface,
+                EdgeAttributes::Exposes,
+                &format!("route:{pattern}"),
+                "Django URL route",
+                line_no,
+                &[("framework", "django".to_string()), ("pattern", pattern)],
+            )?;
         }
 
         if lower.contains("middleware") && lower.contains('[') {
@@ -338,17 +337,17 @@ fn extract_js_ts(
             )?;
         }
 
-        if lower.contains(".use(") {
-            if let Some(name) = first_quoted_value(trimmed).or_else(|| callable_name(trimmed)) {
-                builder.push(
-                    NodeKind::MiddlewareInstallation,
-                    EdgeAttributes::InstallsMiddleware,
-                    &name,
-                    "JS/TS middleware installation",
-                    line_no,
-                    &[("framework", "javascript".to_string())],
-                )?;
-            }
+        if lower.contains(".use(")
+            && let Some(name) = first_quoted_value(trimmed).or_else(|| callable_name(trimmed))
+        {
+            builder.push(
+                NodeKind::MiddlewareInstallation,
+                EdgeAttributes::InstallsMiddleware,
+                &name,
+                "JS/TS middleware installation",
+                line_no,
+                &[("framework", "javascript".to_string())],
+            )?;
         }
 
         if lower.contains("fetch(")

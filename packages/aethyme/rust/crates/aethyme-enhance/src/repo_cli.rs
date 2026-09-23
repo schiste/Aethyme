@@ -409,7 +409,7 @@ fn run_validate_override(rest: &[String], result: impl Fn(&Path) -> Value, event
 fn run_validate_onboarding_overrides(rest: &[String]) -> u8 {
     run_validate_override(
         rest,
-        |repo| onboarding::validate_overrides(repo),
+        onboarding::validate_overrides,
         "repo.validate-onboarding-overrides",
     )
 }
@@ -417,7 +417,7 @@ fn run_validate_onboarding_overrides(rest: &[String]) -> u8 {
 fn run_validate_agents_overrides(rest: &[String]) -> u8 {
     run_validate_override(
         rest,
-        |repo| agents::validate_agents_overrides(repo),
+        agents::validate_agents_overrides,
         "repo.validate-agents-overrides",
     )
 }

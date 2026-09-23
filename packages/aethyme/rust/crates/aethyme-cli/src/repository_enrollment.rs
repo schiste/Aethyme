@@ -1101,6 +1101,7 @@ fn acquire_enrollment_lock(common_dir: &Path) -> Result<EnrollmentLock, String> 
     let path = directory.join("enrollment-publication.lock");
     let file = OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(&path)

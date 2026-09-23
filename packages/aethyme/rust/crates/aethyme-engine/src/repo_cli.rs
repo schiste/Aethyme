@@ -166,26 +166,26 @@ fn inspect(repo: &Path, rest: &[String]) -> Result<(), String> {
         ("entrypoints", "Entrypoints"),
         ("key_configs", "Key configs"),
     ] {
-        if let Some(items) = payload.get(key).and_then(Value::as_array) {
-            if !items.is_empty() {
-                println!("{label}: {}", join(&payload[key]));
-            }
+        if let Some(items) = payload.get(key).and_then(Value::as_array)
+            && !items.is_empty()
+        {
+            println!("{label}: {}", join(&payload[key]));
         }
     }
-    if let Some(signals) = payload.get("signals").and_then(Value::as_object) {
-        if !signals.is_empty() {
-            println!("Signals:");
-            for name in object_key_order(&raw, "signals") {
-                let Some(signal) = signals.get(&name) else {
-                    continue;
-                };
-                println!(
-                    "- {}: {} ({})",
-                    name.replace('_', " "),
-                    render_number(&signal["score"]),
-                    signal["level"].as_str().unwrap_or_default(),
-                );
-            }
+    if let Some(signals) = payload.get("signals").and_then(Value::as_object)
+        && !signals.is_empty()
+    {
+        println!("Signals:");
+        for name in object_key_order(&raw, "signals") {
+            let Some(signal) = signals.get(&name) else {
+                continue;
+            };
+            println!(
+                "- {}: {} ({})",
+                name.replace('_', " "),
+                render_number(&signal["score"]),
+                signal["level"].as_str().unwrap_or_default(),
+            );
         }
     }
     Ok(())

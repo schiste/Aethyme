@@ -475,6 +475,7 @@ fn json_string<'a>(value: &'a serde_json::Value, field: &str) -> Option<&'a str>
 }
 
 impl Broker {
+    #[allow(clippy::too_many_arguments)]
     pub fn start_pull_request_watch(
         &mut self,
         session_id: i64,

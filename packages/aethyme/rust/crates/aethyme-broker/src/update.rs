@@ -230,20 +230,19 @@ pub fn release_target_for(os: &str, arch: &str) -> Result<&'static str, UpdateEr
 
 pub fn detect_installation(executable: &Path) -> InstallationProvenance {
     let executable = fs::canonicalize(executable).unwrap_or_else(|_| executable.to_path_buf());
-    if let Some((receipt_path, receipt)) = find_receipt(&executable) {
-        if receipt.validate().is_ok()
-            && fs::canonicalize(&receipt.router_path).ok().as_ref() == Some(&executable)
-        {
-            return InstallationProvenance {
-                method: InstallationMethod::Installer,
-                router_path: receipt.router_path,
-                engine_path: Some(receipt.engine_path),
-                managed_root: Some(receipt.managed_root),
-                receipt_path: Some(receipt_path),
-                manager_command: None,
-                explanation: "installer receipt owns the paired binary layout".into(),
-            };
-        }
+    if let Some((receipt_path, receipt)) = find_receipt(&executable)
+        && receipt.validate().is_ok()
+        && fs::canonicalize(&receipt.router_path).ok().as_ref() == Some(&executable)
+    {
+        return InstallationProvenance {
+            method: InstallationMethod::Installer,
+            router_path: receipt.router_path,
+            engine_path: Some(receipt.engine_path),
+            managed_root: Some(receipt.managed_root),
+            receipt_path: Some(receipt_path),
+            manager_command: None,
+            explanation: "installer receipt owns the paired binary layout".into(),
+        };
     }
 
     let parent = executable.parent().unwrap_or(Path::new(""));
@@ -294,6 +293,7 @@ pub fn detect_installation(executable: &Path) -> InstallationProvenance {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn build_update_plan(
     manifest_bytes: &[u8],
     channel: UpdateChannel,
@@ -635,7 +635,7 @@ fn latest_preview_manifest_url() -> Result<String, String> {
 }
 
 fn preview_manifest_url_from_index(index: &[u8]) -> Result<String, String> {
-    let releases: serde_json::Value = serde_json::from_slice(&index)
+    let releases: serde_json::Value = serde_json::from_slice(index)
         .map_err(|error| format!("parse GitHub release index: {error}"))?;
     let releases = releases
         .as_array()
@@ -1128,10 +1128,10 @@ fn activate_payload(
 
     let relative_target = PathBuf::from("versions").join(&bundle_name);
     let old_target = fs::read_link(&receipt.current_link).ok();
-    if let Some(old) = &old_target {
-        if old != &relative_target {
-            atomic_symlink(old, &receipt.previous_link)?;
-        }
+    if let Some(old) = &old_target
+        && old != &relative_target
+    {
+        atomic_symlink(old, &receipt.previous_link)?;
     }
     atomic_symlink(&relative_target, &receipt.current_link)?;
     ensure_public_links(receipt)?;
@@ -1202,10 +1202,10 @@ fn verify_existing_bundle(payload: &Path, bundle: &Path) -> Result<(), String> {
 fn cleanup_old_bundles(receipt: &InstallReceipt) -> Result<(), String> {
     let mut keep = Vec::new();
     for link in [&receipt.current_link, &receipt.previous_link] {
-        if let Ok(target) = fs::read_link(link) {
-            if let Some(name) = target.file_name() {
-                keep.push(name.to_os_string());
-            }
+        if let Ok(target) = fs::read_link(link)
+            && let Some(name) = target.file_name()
+        {
+            keep.push(name.to_os_string());
         }
     }
     for entry in fs::read_dir(&receipt.versions_dir)
@@ -1315,7 +1315,7 @@ fn inspect_broker_schema_at(
     compatibility: &ReleaseCompatibility,
 ) -> Result<(), String> {
     let connection = rusqlite::Connection::open_with_flags(
-        &database,
+        database,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .map_err(|error| format!("inspect broker schema {}: {error}", database.display()))?;
@@ -1449,10 +1449,10 @@ fn is_cargo_bin_path(path: &Path) -> bool {
     let Some(parent) = path.parent() else {
         return false;
     };
-    if let Some(cargo_home) = std::env::var_os("CARGO_HOME") {
-        if parent == PathBuf::from(cargo_home).join("bin") {
-            return true;
-        }
+    if let Some(cargo_home) = std::env::var_os("CARGO_HOME")
+        && parent == PathBuf::from(cargo_home).join("bin")
+    {
+        return true;
     }
     std::env::var_os("HOME")
         .map(PathBuf::from)

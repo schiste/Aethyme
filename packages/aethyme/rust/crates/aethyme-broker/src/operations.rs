@@ -502,14 +502,14 @@ fn output_within(
         .take()
         .ok_or_else(|| BrokerOpError::OperationIo {
             path: PathBuf::from("git"),
-            source: std::io::Error::new(std::io::ErrorKind::Other, "child stdout was not piped"),
+            source: std::io::Error::other("child stdout was not piped"),
         })?;
     let stderr = child
         .stderr
         .take()
         .ok_or_else(|| BrokerOpError::OperationIo {
             path: PathBuf::from("git"),
-            source: std::io::Error::new(std::io::ErrorKind::Other, "child stderr was not piped"),
+            source: std::io::Error::other("child stderr was not piped"),
         })?;
     let stdout_state = heartbeat.map(|heartbeat| Arc::clone(&heartbeat.state));
     let stderr_state = heartbeat.map(|heartbeat| Arc::clone(&heartbeat.state));
@@ -600,7 +600,7 @@ fn join_output_reader(
         }),
         Err(_) => Err(BrokerOpError::OperationIo {
             path: PathBuf::from("git"),
-            source: std::io::Error::new(std::io::ErrorKind::Other, "child output reader panicked"),
+            source: std::io::Error::other("child output reader panicked"),
         }),
     }
 }
@@ -2090,10 +2090,7 @@ pub(crate) fn worktree_relative_push_sources(args: &[String]) -> Vec<String> {
         .filter(|argument| {
             let refspec = argument.strip_prefix('+').unwrap_or(argument);
             let source = refspec.split(':').next().unwrap_or(refspec);
-            let base = source
-                .split(|character| character == '~' || character == '^')
-                .next()
-                .unwrap_or(source);
+            let base = source.split(['~', '^']).next().unwrap_or(source);
             base == "HEAD" || base == "@" || base.starts_with("@{")
         })
         .cloned()
@@ -2399,7 +2396,7 @@ fn inspect_git_transfer_trace(path: &Path) -> GitTransferTrace {
                     .iter()
                     .any(|marker| command.contains(marker));
             }
-            Some("child_exit") => {
+            Some("child_exit")
                 if event
                     .get("child_id")
                     .and_then(serde_json::Value::as_u64)
@@ -2407,10 +2404,9 @@ fn inspect_git_transfer_trace(path: &Path) -> GitTransferTrace {
                     && event
                         .get("code")
                         .and_then(serde_json::Value::as_i64)
-                        .is_some_and(|code| code != 0)
-                {
-                    trace.pre_push_hook_failed = true;
-                }
+                        .is_some_and(|code| code != 0) =>
+            {
+                trace.pre_push_hook_failed = true;
             }
             _ => {}
         }
@@ -3499,14 +3495,14 @@ impl Broker {
         let hooks_ran_outside_lock = effect != OperationEffect::Read
             && request.provider == OperationProvider::Git
             && is_push(&request.args)
-            && hooks_outside_lock_enabled(&self.main_root().to_path_buf());
+            && hooks_outside_lock_enabled(self.main_root());
 
         // Two identical commands from one session cannot both be intended: the
         // second would fire against state the first already changed. Now that a
         // queued operation is recorded, refusing the duplicate is possible before
         // it is queued rather than after both have run (issue #138).
-        if effect != OperationEffect::Read {
-            if let Some(pending) = self
+        if effect != OperationEffect::Read
+            && let Some(pending) = self
                 .store()
                 .unresolved_coordinated_operations(&repository)?
                 .into_iter()
@@ -3519,13 +3515,12 @@ impl Broker {
                         )
                         && !process_is_gone(pending.pid)
                 })
-            {
-                return Err(BrokerOpError::DuplicatePendingOperation {
-                    operation_id: pending.id,
-                    status: pending.status.as_str(),
-                    liveness: operation_liveness_summary(&pending),
-                });
-            }
+        {
+            return Err(BrokerOpError::DuplicatePendingOperation {
+                operation_id: pending.id,
+                status: pending.status.as_str(),
+                liveness: operation_liveness_summary(&pending),
+            });
         }
 
         let operation = self
@@ -3551,7 +3546,7 @@ impl Broker {
         let queued_operation_id = operation.id;
 
         let ref_determination = measure_pr_merge_ref_determination(
-            &self.main_root().to_path_buf(),
+            self.main_root(),
             cwd,
             &request.args,
             github_target.as_ref(),
@@ -3724,13 +3719,12 @@ impl Broker {
             } else {
                 CreatePlanning::NotApplicable
             };
-        if let Some(target) = &github_target {
-            if let Err(error) =
+        if let Some(target) = &github_target
+            && let Err(error) =
                 observe_create_watermark(&mut create_planning, &target.display_slug, cwd, admission)
-            {
-                self.resolve_unstarted_operation(queued_operation_id, "create_observation_failed");
-                return Err(error);
-            }
+        {
+            self.resolve_unstarted_operation(queued_operation_id, "create_observation_failed");
+            return Err(error);
         }
 
         // The hook verified specific commits. If any local ref moved while this

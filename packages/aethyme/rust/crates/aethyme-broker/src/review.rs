@@ -16,41 +16,29 @@ pub const REVIEW_POLICY_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum ReviewProvider {
+    #[default]
     Github,
-}
-
-impl Default for ReviewProvider {
-    fn default() -> Self {
-        Self::Github
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum ReviewEvidenceAdapter {
+    #[default]
     GithubApproval,
     GithubCheckRun,
 }
 
-impl Default for ReviewEvidenceAdapter {
-    fn default() -> Self {
-        Self::GithubApproval
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum ValidationUnlockAdapter {
+    #[default]
     GithubLabel,
     GithubWorkflow,
     CloudBuildManualTrigger,
-}
-
-impl Default for ValidationUnlockAdapter {
-    fn default() -> Self {
-        Self::GithubLabel
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]

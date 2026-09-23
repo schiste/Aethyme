@@ -150,6 +150,7 @@ exit 64
         self.run_with_evidence(args, head, "main", "OPEN", draft, decision, None)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn run_with_evidence(
         &self,
         args: &[&str],

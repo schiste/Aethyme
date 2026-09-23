@@ -251,7 +251,7 @@ fn customized_policies_block_until_every_resolution_is_explicit() {
                         [[gate]]\n\
                         name = \"maintainer-check\"\n\
                         command = \"true\"\n";
-    fs::write(repo.join(".aethyme/gates.toml"), &custom_gates).unwrap();
+    fs::write(repo.join(".aethyme/gates.toml"), custom_gates).unwrap();
     commit_all(&repo, "customize repository policy");
 
     let blocked = json(&run(&repo, &["upgrade", "plan", "--json"]));

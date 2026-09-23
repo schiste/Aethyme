@@ -13,6 +13,7 @@ pub struct UnresolvedNode {
 }
 
 impl UnresolvedNode {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: InternedStr,
         name: InternedStr,

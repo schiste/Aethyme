@@ -189,12 +189,16 @@ impl RelativeLinksDetector {
                 if inspect_markdown && markdown_line_is_example(line, &mut fence) {
                     continue;
                 }
-                let destination_ranges = inspect_markdown
-                    .then(|| markdown_destination_ranges(line))
-                    .unwrap_or_default();
-                let code_ranges = inspect_markdown
-                    .then(|| inline_code_ranges(line))
-                    .unwrap_or_default();
+                let destination_ranges = if inspect_markdown {
+                    markdown_destination_ranges(line)
+                } else {
+                    Default::default()
+                };
+                let code_ranges = if inspect_markdown {
+                    inline_code_ranges(line)
+                } else {
+                    Default::default()
+                };
 
                 for (pattern, path_type) in patterns() {
                     for matched_path in pattern.find_iter(line) {

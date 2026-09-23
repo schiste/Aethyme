@@ -213,8 +213,13 @@ fn variants_are_alphabetical_within_each_category() {
             );
         }
 
-        for i in prefix_end..group_end {
-            let name = ALL_EDGE_KINDS[i].name();
+        for (i, kind) in ALL_EDGE_KINDS
+            .iter()
+            .enumerate()
+            .take(group_end)
+            .skip(prefix_end)
+        {
+            let name = kind.name();
             assert!(
                 !initial_set.contains(name),
                 "initial-set edge kind {name:?} appears after a tail-appended \
