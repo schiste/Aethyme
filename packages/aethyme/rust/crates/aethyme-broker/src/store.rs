@@ -148,6 +148,14 @@ impl BrokerStore {
         )?;
         conn.busy_timeout(std::time::Duration::from_millis(BUSY_TIMEOUT_MS))?;
         let found = schema::current_version(&conn)?;
+        if found > crate::SCHEMA_VERSION && schema::newer_schema_is_compatible(&conn, found)? {
+            conn.pragma_update(None, "query_only", true)?;
+            return Ok(Self {
+                conn,
+                path,
+                _snapshot_dir: None,
+            });
+        }
         if found > crate::SCHEMA_VERSION {
             return Err(BrokerError::SchemaTooNew {
                 found,
