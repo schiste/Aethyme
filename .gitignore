@@ -73,3 +73,6 @@ packages/aethyme/.claude/
 .aethyme/generated/experience-status.md
 .aethyme/generated/experience-telemetry.jsonl
 # aethyme-broker:end
+
+# TypeScript incremental build output
+*.tsbuildinfo

@@ -1,0 +1,19 @@
+# Recovery plan P1.5: weekly update PRs for GitHub Actions (pinned to commit
+# SHAs) and the Rust workspace lockfile.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+  - package-ecosystem: cargo
+    directory: /packages/aethyme/rust
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      cargo-patch:
+        update-types: ["patch"]
