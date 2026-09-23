@@ -1801,11 +1801,22 @@ fn a_finished_session_stops_colliding_on_its_declared_targets() {
     // Two real worktrees: one session per checkout, as the broker requires.
     let first_tree = tmp.path().join(".aethyme/worktrees/rewriter");
     let second_tree = tmp.path().join(".aethyme/worktrees/extender");
-    for (path, branch) in [(&first_tree, "agent/rewriter"), (&second_tree, "agent/extender")] {
+    for (path, branch) in [
+        (&first_tree, "agent/rewriter"),
+        (&second_tree, "agent/extender"),
+    ] {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         sh(
             tmp.path(),
-            &["worktree", "add", "-q", "-b", branch, path.to_str().unwrap(), "main"],
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                branch,
+                path.to_str().unwrap(),
+                "main",
+            ],
         );
     }
     let first = broker.adopt(&first_tree, Some("rewrite it")).unwrap();

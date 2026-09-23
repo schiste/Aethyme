@@ -88,7 +88,11 @@ fn reclaim_plan_warns_but_prints_when_snapshot_storage_is_unavailable() {
     std::fs::remove_file(&snapshot).unwrap();
     std::fs::create_dir(&snapshot).unwrap();
 
-    let output = run(repo.path(), container.path(), &["reclaim", "plan", "--json"]);
+    let output = run(
+        repo.path(),
+        container.path(),
+        &["reclaim", "plan", "--json"],
+    );
     assert!(
         output.status.success(),
         "reclaim plan should remain available: {}",
@@ -365,11 +369,13 @@ fn gc_plan_reports_large_ignored_directories_without_authorizing_them() {
     let declined_bytes = reported[0]["estimated_bytes"].as_u64().unwrap();
     assert!(declined_bytes > aethyme_broker::UNCLASSIFIED_ARTIFACT_REPORT_THRESHOLD_BYTES);
     assert_eq!(plan["estimated_declined_artifact_bytes"], declined_bytes);
-    assert!(plan["artifacts"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .all(|artifact| artifact["relative_dir"] != "ignored-cache"));
+    assert!(
+        plan["artifacts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|artifact| artifact["relative_dir"] != "ignored-cache")
+    );
 
     let reclaimable_from_candidates = plan["rows"]
         .as_array()
@@ -504,9 +510,8 @@ fn explicit_opt_out_preserves_closed_session_build_caches() {
 
 #[test]
 fn unknown_retention_fields_warn_without_disabling_gc_or_status() {
-    let (repo, container) = fixture(
-        "[retention]\nartifact_sweep_budget_ms = 0\nfuture_sweep_days = 14\n",
-    );
+    let (repo, container) =
+        fixture("[retention]\nartifact_sweep_budget_ms = 0\nfuture_sweep_days = 14\n");
 
     let plan = plan_json(repo.path(), container.path());
     assert_eq!(plan["policy"]["artifact_sweep_budget_ms"], 0);

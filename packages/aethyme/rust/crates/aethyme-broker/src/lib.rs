@@ -21,13 +21,13 @@
 //!   sessions, stress-tested at 20 (see `tests/stress.rs`).
 
 mod advisories;
-mod atomic_file;
-pub mod exit_status;
 pub mod agent_hook;
+mod atomic_file;
 pub mod attribution;
 mod broker;
 mod chau7_tabs;
 mod disk_headroom;
+pub mod exit_status;
 pub use disk_headroom::{
     DEFAULT_GATE_HEADROOM_BYTES, available_bytes, refusal as disk_headroom_refusal,
 };
@@ -57,8 +57,6 @@ pub mod install_health;
 mod issue_form;
 mod lease_export;
 mod leases;
-mod scopes;
-mod worktree_report;
 pub mod main_reconcile;
 mod measurement;
 mod merge;
@@ -68,6 +66,8 @@ pub mod plugin_cli;
 mod pr;
 mod pr_link;
 mod pr_monitoring;
+mod scopes;
+mod worktree_report;
 pub use pr_monitoring::{
     activate as activate_pr_monitoring, active_sessions as pr_monitoring_sessions,
     deactivate as deactivate_pr_monitoring, is_active as pr_monitoring_is_active,
@@ -131,8 +131,8 @@ mod review_trigger;
 mod schema;
 mod session_abandonment;
 mod ship;
-mod store;
 mod storage;
+mod store;
 mod types;
 mod update;
 mod update_cache;
@@ -159,13 +159,13 @@ pub use broker::{
     IntegrationStabilityReport, IntegrationStatusView, LeaseBlocker, LeaseClaimReport,
     LeaseOverlapRelation, LeasePathPlan, LeasePlan, LeasePlanOverlap, OwnershipAuditReport,
     PromotedConflict, PromotedIntegrationEntry, RepairAction, RepairGateSelection, RepairReport,
-    RepairSource, RepresentationScan, RetentionConfigStatus, SESSION_NOTE_MAX_BYTES, SemanticGateAdvice,
-    SemanticGateSelection, SemanticGateSource, SemanticGateSourceStatus,
+    RepairSource, RepresentationScan, RetentionConfigStatus, SESSION_NOTE_MAX_BYTES,
+    SemanticGateAdvice, SemanticGateSelection, SemanticGateSource, SemanticGateSourceStatus,
     SemanticGateSuggestionChain, SessionCheckpointApplyReport, SessionCheckpointRecoveryPlan,
     SessionHandoffReport, SessionStartBase, SessionStartBaseEvidence, StartAgentReport,
     StartReport, StatusAdvice, StatusAdviceSeverity, StatusBrief, StatusIntegrationRelation,
-    StatusSummary, StatusView, VersionRepairReport, VersionRepairStep, WORKTREE_ROOT_SCHEMA_VERSION,
-    WorktreePlacement, WorktreeRootPlan, WorktreeRootSource,
+    StatusSummary, StatusView, VersionRepairReport, VersionRepairStep,
+    WORKTREE_ROOT_SCHEMA_VERSION, WorktreePlacement, WorktreeRootPlan, WorktreeRootSource,
 };
 pub use console::{
     CONSOLE_EXCLUSIVE_KEY, CONSOLE_INTEGRATION_REF, CONSOLE_MARKER_DIGEST_ENV, CONSOLE_MARKER_ENV,
@@ -217,11 +217,12 @@ pub use github_target::{
 pub use graph_impact::{
     GRAPH_IMPACT_CONTRACT_SCHEMA_VERSION, GRAPH_IMPACT_DEFAULT_BUDGET, GRAPH_IMPACT_MAX_BUDGET,
     GRAPH_IMPACT_MAX_DEPTH, GRAPH_IMPACT_MAX_NODES, GRAPH_IMPACT_RESULT_LIMIT, GraphImpactChain,
-    GraphImpactConfidence, GraphImpactContractError, GraphImpactContractStatus, GraphImpactCoverage,
-    GraphImpactLimits, GraphImpactLookup, GraphImpactMode, GraphImpactProvider, GraphImpactQuery,
-    GraphImpactReport, GraphImpactRepository, GraphImpactRequestSummary, GraphImpactRiskHints,
-    GraphImpactSet, GraphImpactStatus, GraphImpactProvenance, GraphStoreImpactProvider,
-    diff_digest, parse_diff_text, revision_bound_impact_report,
+    GraphImpactConfidence, GraphImpactContractError, GraphImpactContractStatus,
+    GraphImpactCoverage, GraphImpactLimits, GraphImpactLookup, GraphImpactMode,
+    GraphImpactProvenance, GraphImpactProvider, GraphImpactQuery, GraphImpactReport,
+    GraphImpactRepository, GraphImpactRequestSummary, GraphImpactRiskHints, GraphImpactSet,
+    GraphImpactStatus, GraphStoreImpactProvider, diff_digest, parse_diff_text,
+    revision_bound_impact_report,
 };
 pub use graph_integrity::{GraphIntegrityOutcome, GraphIntegrityRejection, GraphIntegrityStatus};
 pub use homebrew::render_homebrew_formula;
@@ -242,34 +243,34 @@ pub use lease_export::{
     LeaseRoutingExportOptions, LeaseRoutingItem, MAX_LEASE_ROUTING_EXPORT_LIMIT,
 };
 pub use leases::{LeaseIgnoreRules, Overlap, detect_overlaps};
-pub use worktree_report::{
-    WorkState, WorktreeReport, WorktreeRow, build as build_worktree_report,
-};
-pub use scopes::{
-    ScopeConflictSeverity, ScopeOverlap, classify as classify_scope_pair, detect_scope_overlaps,
-    parse_scope_argument,
-};
 pub use main_reconcile::{
     MAIN_RECONCILE_SCHEMA_VERSION, MainReconcileApplyReport, MainReconcileCommit,
     MainReconcileDisposition, MainReconcilePlan, MainReconcileResolution,
     MainReconcileResolutionDocument, MainReconcileResolutionTemplate,
 };
-pub use merge::{ACTION_REQUIRED_RELPATH, PromoteConfig, PromoteMode, PromotionIntent, SubmissionCommitOwnership, SubmissionCommitProvenance, SubmissionConflict, SubmissionGateVerification, SubmissionGateVerificationStatus, SubmissionIntegrationState, SubmissionPlan, SubmitOutcome};
+pub use measurement::{
+    BudgetVerdict, MeasuredTotal, SizeRecord, SizeRecords, SizeScan, budget_verdict,
+};
+pub use merge::{
+    ACTION_REQUIRED_RELPATH, PromoteConfig, PromoteMode, PromotionIntent,
+    SubmissionCommitOwnership, SubmissionCommitProvenance, SubmissionConflict,
+    SubmissionGateVerification, SubmissionGateVerificationStatus, SubmissionIntegrationState,
+    SubmissionPlan, SubmitOutcome,
+};
 pub use operation_stats::{
     DEFAULT_OPERATION_STATS_LIMIT, HooksOutsideLockStats, MAX_OPERATION_STATS_LIMIT,
     OPERATION_STATS_SCHEMA_VERSION, OperationKindStats, OperationQueueDepthStats, OperationStats,
     OperationTimingDistribution, RefDeterminationStats, UnrelatedContentionStats,
 };
 pub use operations::{
-    CoordinatedCommand, CoordinatedOperationReport, OperationReconcileReport,
-    PushedRef,
+    CoordinatedCommand, CoordinatedOperationReport, OperationReconcileReport, PushedRef,
 };
-pub(crate) use operations::{is_within, worktree_relative_push_sources};
 pub use operations::{
     OperationReconciliation, OperationReconciliationRecovery, OperationReconciliationState,
     OperationShowReport, PostMergeCleanupReport, PostMergeCleanupState, QueueWait,
     UnknownOutcomeRecovery, classify_gh, classify_git,
 };
+pub(crate) use operations::{is_within, worktree_relative_push_sources};
 pub use pr::{
     PrActivityItem, PrCheckOptions, PrCheckReport, PrCheckRun, PrDecision, PrDecisionStatus,
     PrDispatchReport, PrDispatchStatus, PrError, PrMarker, PrSummary,
@@ -309,6 +310,10 @@ pub use readiness::{
     ReadinessEvidence, ReadinessFinding, ReadinessReport, ReadinessState, RepositoryOperatingMode,
     RepositoryReadinessMode, inspect_repository_readiness, render_readiness_json,
     render_readiness_text,
+};
+pub use reclaim_order::{
+    ReclaimOrder, ReclaimRanking, clears_budget, deficit_bytes, order_for as reclaim_order_for,
+    over_budget,
 };
 pub use recommendations::{
     MaintainerRecommendation, RECOMMENDATION_DURATION_MIN_SAMPLES,
@@ -365,30 +370,22 @@ pub use repository_contract::{
     RepositoryDeploymentMode, detect_repository_mode, repository_managed_paths,
     repository_state_digest,
 };
-pub use measurement::{
-    BudgetVerdict, MeasuredTotal, SizeRecord, SizeRecords, SizeScan, budget_verdict,
-};
-pub use reclaim_order::{
-    ReclaimOrder, ReclaimRanking, clears_budget, deficit_bytes,
-    order_for as reclaim_order_for, over_budget,
-};
 pub use resources::{
     HOST_RESOURCE_REQUEST_SCHEMA_VERSION, HOST_RESOURCE_SCHEMA_VERSION, HostLeaseState,
-    HostResourceAllocation, HostResourceConflict, HostResourceCoordinator, HostResourceError,
-    HostResourceBlocker, HostResourceExplanation, HostResourceGrant, HostResourceHolder,
+    HostResourceAllocation, HostResourceBlocker, HostResourceConflict, HostResourceCoordinator,
+    HostResourceError, HostResourceExplanation, HostResourceGrant, HostResourceHolder,
     HostResourceKind, HostResourceLease, HostResourcePlan, HostResourceReapLease,
     HostResourceReapReport, HostResourceRequest, HostResourceRequirement, HostResourceRunError,
-    HostResourceRunReport, HostResourceWaitAdvice,
-    default_host_resource_db_path, resource_environment_key, validate_host_resource_requirements,
+    HostResourceRunReport, HostResourceWaitAdvice, default_host_resource_db_path,
+    resource_environment_key, validate_host_resource_requirements,
 };
 pub use retention::{
     BROKER_CONFIG_RELPATH, GcApplyReport, GcArtifactCandidate, GcBlocker, GcBlockerSummary,
     GcCheckpointPinRelease, GcDeclinedArtifact, GcFileAction, GcFileCandidate, GcHealth,
-    GcOrphanCandidate, GcPlan,
-    GcPublicationExposureExpiry, GcRowCandidate, GcRowKind, GcWorktreeCandidate,
-    GcWorktreeBlockerSummary,
-    RETENTION_POLICY_SCHEMA_VERSION, RetentionConfigError, RetentionConfigWarning, RetentionPolicy,
-    RetentionPolicyLoadReport, load_retention_policy, load_retention_policy_report,
+    GcOrphanCandidate, GcPlan, GcPublicationExposureExpiry, GcRowCandidate, GcRowKind,
+    GcWorktreeBlockerSummary, GcWorktreeCandidate, RETENTION_POLICY_SCHEMA_VERSION,
+    RetentionConfigError, RetentionConfigWarning, RetentionPolicy, RetentionPolicyLoadReport,
+    load_retention_policy, load_retention_policy_report,
 };
 pub use review::{
     REVIEW_POLICY_SCHEMA_VERSION, ReviewEvidenceAdapter, ReviewLifecycle,
@@ -422,6 +419,10 @@ pub use review_trigger::{
     classification_conflicts, decide, eligible_types, parse_classification, schedule,
 };
 pub use schema::{EVENTS_SCHEMA_VERSION, SCHEMA_VERSION};
+pub use scopes::{
+    ScopeConflictSeverity, ScopeOverlap, classify as classify_scope_pair, detect_scope_overlaps,
+    parse_scope_argument,
+};
 pub use session_abandonment::{
     AbandonmentDecision, AbandonmentVerdict, SessionActivity, abandoned as abandoned_sessions,
     decide as decide_abandonment, survey as survey_abandonment,
@@ -435,17 +436,15 @@ pub use ship::{
     ShipPublicationAuthorization, ShipPublicationAuthorizationKind, ShipPublicationMode,
     ShipPublicationPolicy, ShipPush, ShipReviewEvidence,
 };
-pub use store::BrokerStore;
 pub use storage::{
-    STORAGE_PLAN_SCHEMA_VERSION, STORAGE_RECONCILIATION_SCHEMA_VERSION, StorageApplyFailure,
-    StorageApplyReport, StorageAppliedItem, StorageCandidate, StorageCandidateKind,
+    STORAGE_PLAN_SCHEMA_VERSION, STORAGE_RECONCILIATION_SCHEMA_VERSION, StorageAppliedItem,
+    StorageApplyFailure, StorageApplyReport, StorageCandidate, StorageCandidateKind,
     StorageDirectoryKind, StorageEntry, StorageError, StorageFilesystemKind, StorageMarkerStatus,
     StoragePlan, StoragePrimaryArtifact, StoragePrimaryCandidate, StoragePrimaryCheckout,
-    StorageReconciliation, StorageRoot, StorageSource, StorageSummary,
-    storage_apply, storage_plan,
+    StorageReconciliation, StorageRoot, StorageSource, StorageSummary, storage_apply, storage_plan,
 };
+pub use store::BrokerStore;
 pub use types::{
-    ScopeKind, ScopeOperation, ScopeSource, SessionScope,
     Advisory, AdvisoryAction, AdvisoryAudience, AdvisoryDeliveryMetric, AdvisoryDeliverySummary,
     AdvisoryDeliverySurface, AdvisoryEvidence, AdvisoryList, AdvisoryProducer,
     AdvisoryResolutionState, AdvisorySeverity, CoordinatedOperation,
@@ -455,8 +454,9 @@ pub use types::{
     MergeQueueHistoryPage, MergeQueueStatusCount, MergeStatus, NewAdvisory,
     NewCoordinatedOperation, NewGateResult, NewPrWatchState, NewSession, OperationEffect,
     OperationHistoryPage, OperationHistoryQuery, OperationIdentityProvenance, OperationProvider,
-    OperationStatus, PrWatchState, Session, SessionCleanupState, SessionNote, SessionNoteList,
-    SessionContext, SessionOrigin, SessionStatus,
+    OperationStatus, PrWatchState, ScopeKind, ScopeOperation, ScopeSource, Session,
+    SessionCleanupState, SessionContext, SessionNote, SessionNoteList, SessionOrigin, SessionScope,
+    SessionStatus,
 };
 pub use update::{
     INSTALL_RECEIPT_FILENAME, INSTALL_RECEIPT_SCHEMA_VERSION, InstallReceipt, InstallationMethod,
@@ -476,6 +476,7 @@ pub use worktree_reconcile::{
     WORKTREE_RECONCILIATION_SCHEMA_VERSION, WorktreeReconciliation,
     reconcile as reconcile_worktree_directories, summarise as summarise_worktree_reconciliation,
 };
+pub use worktree_report::{WorkState, WorktreeReport, WorktreeRow, build as build_worktree_report};
 
 /// Repo-relative location of the broker database.
 pub const BROKER_DB_RELPATH: &str = ".aethyme/broker.db";

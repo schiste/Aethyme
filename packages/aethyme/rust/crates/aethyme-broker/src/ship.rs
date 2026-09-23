@@ -1563,7 +1563,10 @@ fn validate_delivery_source(broker: &Broker, plan: &ShipPlan) -> Result<(), Brok
         .resolve_ref(&format!("refs/heads/{}", plan.integration_ref))
         .ok_or_else(|| BrokerOpError::ShipPlanUnavailable {
             what: "integration ref",
-            reason: format!("{} disappeared during delivery execution", plan.integration_ref),
+            reason: format!(
+                "{} disappeared during delivery execution",
+                plan.integration_ref
+            ),
         })?;
     if !broker
         .repo_handle()
@@ -3129,7 +3132,9 @@ mod tests {
     fn delivery_divergence_ignores_broker_runtime_artifacts_but_not_operator_files() {
         assert!(is_broker_runtime_path(".aethyme/broker-advisory.md"));
         assert!(is_broker_runtime_path(".aethyme/run/gates/1.log"));
-        assert!(is_broker_runtime_path(".aethyme/logs/command-metrics.jsonl"));
+        assert!(is_broker_runtime_path(
+            ".aethyme/logs/command-metrics.jsonl"
+        ));
         assert!(!is_broker_runtime_path(".aethyme/config.toml"));
         assert!(!is_broker_runtime_path("operator-note.txt"));
     }

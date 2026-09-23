@@ -12,7 +12,7 @@ use std::process::Command;
 
 use sha2::{Digest, Sha256};
 
-use crate::pyjson::{self, Value, py_bool};
+use crate::pyjson::{self, py_bool, Value};
 use crate::util::{py_splitlines, resolve_path};
 
 pub const ONBOARDING_JSON_PATH: &str = ".aethyme/generated/onboarding.json";
@@ -3846,11 +3846,9 @@ mod tests {
             artifact.get("repo").unwrap().get("name").unwrap().as_str(),
             Some("Canonical-Repository")
         );
-        assert!(
-            render_onboarding_skill(&artifact)
-                .unwrap()
-                .contains("# Repo Onboarding: Canonical-Repository\n")
-        );
+        assert!(render_onboarding_skill(&artifact)
+            .unwrap()
+            .contains("# Repo Onboarding: Canonical-Repository\n"));
 
         std::fs::remove_dir_all(&worktree).unwrap();
         std::fs::remove_dir_all(&repo).unwrap();
@@ -3997,10 +3995,8 @@ mod tests {
             Some("cargo")
         );
         assert!(value_strings(repo_facts.get("languages").unwrap()).contains(&"rust".into()));
-        assert!(
-            value_strings(repo_facts.get("manifests").unwrap())
-                .contains(&"products/tool/Cargo.toml".into())
-        );
+        assert!(value_strings(repo_facts.get("manifests").unwrap())
+            .contains(&"products/tool/Cargo.toml".into()));
         assert_eq!(
             artifact
                 .get("primary_workspace")
@@ -4146,20 +4142,16 @@ mod tests {
             Some("cargo")
         );
         let commands = artifact.get("commands").unwrap().as_array().unwrap();
-        assert!(
-            !commands.iter().any(|command| command
-                .get("command")
-                .unwrap()
-                .py_str()
-                .contains("pytest"))
-        );
-        assert!(
-            artifact
-                .get("primary_commands")
-                .unwrap()
-                .get("lint")
-                .is_none()
-        );
+        assert!(!commands.iter().any(|command| command
+            .get("command")
+            .unwrap()
+            .py_str()
+            .contains("pytest")));
+        assert!(artifact
+            .get("primary_commands")
+            .unwrap()
+            .get("lint")
+            .is_none());
         assert_eq!(
             artifact
                 .get("primary_entrypoints")

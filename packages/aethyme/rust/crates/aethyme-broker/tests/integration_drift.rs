@@ -42,7 +42,10 @@ fn fixture(ahead: usize) -> (tempfile::TempDir, Broker) {
     git(root, &["commit", "-qm", "init"]);
     let base = git(root, &["rev-parse", "HEAD"]);
 
-    git(root, &["update-ref", "refs/heads/aethyme/integration", &base]);
+    git(
+        root,
+        &["update-ref", "refs/heads/aethyme/integration", &base],
+    );
     // The upstream commits must NOT be on local `main`. `integration_head`
     // already fast-forwards integration onto the main checkout's HEAD when it
     // is an ancestor of it (#40), so advancing local main here would mask the
@@ -119,7 +122,11 @@ fn status_reports_a_clean_lag_as_a_notice_rather_than_a_block() {
         .expect("a clean lag must be reported");
 
     assert_eq!(advice.severity, StatusAdviceSeverity::Notice);
-    assert!(advice.summary.contains("fast-forward"), "{}", advice.summary);
+    assert!(
+        advice.summary.contains("fast-forward"),
+        "{}",
+        advice.summary
+    );
     assert!(
         !status
             .advice

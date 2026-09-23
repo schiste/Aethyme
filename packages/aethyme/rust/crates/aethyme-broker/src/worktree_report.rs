@@ -80,7 +80,9 @@ fn tree_bytes(root: &Path) -> u64 {
             continue;
         };
         for entry in entries.flatten() {
-            let Ok(kind) = entry.file_type() else { continue };
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
             if kind.is_symlink() {
                 continue;
             }
@@ -110,21 +112,32 @@ fn inspect(path: &Path) -> (Option<String>, Option<i64>, WorkState) {
             paths
                 .iter()
                 .filter(|path| {
-                    !["target/", "node_modules/", ".venv/", "dist/", "build/", ".DS_Store"]
-                        .iter()
-                        .any(|ignorable| path.contains(ignorable))
+                    ![
+                        "target/",
+                        "node_modules/",
+                        ".venv/",
+                        "dist/",
+                        "build/",
+                        ".DS_Store",
+                    ]
+                    .iter()
+                    .any(|ignorable| path.contains(ignorable))
                 })
                 .count()
         })
         .unwrap_or(0);
 
-    let idle_days = repo.head_committed_at().ok().filter(|at| *at > 0).map(|at| {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|elapsed| elapsed.as_secs() as i64)
-            .unwrap_or(at);
-        (now - at).max(0) / 86_400
-    });
+    let idle_days = repo
+        .head_committed_at()
+        .ok()
+        .filter(|at| *at > 0)
+        .map(|at| {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_secs() as i64)
+                .unwrap_or(at);
+            (now - at).max(0) / 86_400
+        });
 
     if dirty > 0 {
         return (branch, idle_days, WorkState::Uncommitted { files: dirty });
@@ -216,10 +229,7 @@ mod tests {
     fn a_commit_no_remote_holds_is_reported_as_unique_work() {
         let tmp = tempfile::tempdir().unwrap();
         let path = checkout(tmp.path(), "solo");
-        let report = build(
-            &[("repo".to_string(), path.clone())],
-            &BTreeSet::new(),
-        );
+        let report = build(&[("repo".to_string(), path.clone())], &BTreeSet::new());
         assert_eq!(report.rows.len(), 1);
         assert!(
             matches!(report.rows[0].work, WorkState::Unpushed { commits } if commits >= 1),

@@ -868,9 +868,7 @@ mod tests {
         // one -- reading it as a number is how a repository ends up with one
         // Aethyme comment per sweep.
         assert_eq!(
-            rest_comment_id(
-                "https://github.com/schiste/Aethyme/pull/179#issuecomment-5644766269"
-            ),
+            rest_comment_id("https://github.com/schiste/Aethyme/pull/179#issuecomment-5644766269"),
             Some(5_644_766_269)
         );
         assert_eq!(rest_comment_id("IC_kwDOQ07FcM8AAAABUHRMPQ"), None);

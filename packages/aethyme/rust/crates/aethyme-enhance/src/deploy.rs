@@ -10,8 +10,8 @@ use crate::agents::{
     render_broker_reference,
 };
 use crate::onboarding::{
-    ACT_STARTER_JSON_PATH, ONBOARDING_JSON_PATH, expected_onboarding_files, override_freshness,
-    recommendation_summary,
+    expected_onboarding_files, override_freshness, recommendation_summary, ACT_STARTER_JSON_PATH,
+    ONBOARDING_JSON_PATH,
 };
 use crate::pyjson::{self, Value};
 use crate::telemetry::{
@@ -870,16 +870,12 @@ mod tests {
             std::fs::read_to_string(repo.join("CLAUDE.md")).unwrap(),
             "maintainer claude policy\n"
         );
-        assert!(
-            actions.iter().all(|action| {
-                !matches!(action.relative_path.as_str(), "AGENTS.md" | "CLAUDE.md")
-            })
-        );
-        assert!(
-            !repo
-                .join(".aethyme/generated/experience-telemetry.jsonl")
-                .exists()
-        );
+        assert!(actions
+            .iter()
+            .all(|action| { !matches!(action.relative_path.as_str(), "AGENTS.md" | "CLAUDE.md") }));
+        assert!(!repo
+            .join(".aethyme/generated/experience-telemetry.jsonl")
+            .exists());
     }
 
     #[test]
@@ -921,11 +917,9 @@ mod tests {
         std::fs::write(repo.join("AGENTS.md"), "Hand-written policy.\n").unwrap();
         let actions = deploy(&repo, false).unwrap();
         // Migration action reported, override created.
-        assert!(
-            actions
-                .iter()
-                .any(|a| a.relative_path == AGENTS_OVERRIDE_PATH && a.action == "created")
-        );
+        assert!(actions
+            .iter()
+            .any(|a| a.relative_path == AGENTS_OVERRIDE_PATH && a.action == "created"));
         let override_text = std::fs::read_to_string(repo.join(AGENTS_OVERRIDE_PATH)).unwrap();
         assert_eq!(
             override_text,

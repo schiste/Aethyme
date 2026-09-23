@@ -4774,10 +4774,22 @@ mod tests {
 
     #[test]
     fn only_head_relative_push_sources_are_worktree_relative() {
-        let argv = |items: &[&str]| items.iter().map(|item| item.to_string()).collect::<Vec<_>>();
+        let argv = |items: &[&str]| {
+            items
+                .iter()
+                .map(|item| item.to_string())
+                .collect::<Vec<_>>()
+        };
 
         // `HEAD` and its relatives mean something different in each worktree.
-        for source in ["HEAD:refs/heads/x", "HEAD", "+HEAD:refs/heads/x", "HEAD~1:refs/heads/x", "@", "@{u}"] {
+        for source in [
+            "HEAD:refs/heads/x",
+            "HEAD",
+            "+HEAD:refs/heads/x",
+            "HEAD~1:refs/heads/x",
+            "@",
+            "@{u}",
+        ] {
             let args = argv(&["push", "origin", source]);
             assert_eq!(
                 worktree_relative_push_sources(&args),
@@ -4789,7 +4801,11 @@ mod tests {
         // Refs under `refs/` are shared by every worktree, so a branch name
         // resolves identically wherever the command runs. Refusing these would
         // block safe pushes without catching anything.
-        for source in ["main:refs/heads/x", "refs/heads/main:refs/heads/x", "deadbeef:refs/heads/x"] {
+        for source in [
+            "main:refs/heads/x",
+            "refs/heads/main:refs/heads/x",
+            "deadbeef:refs/heads/x",
+        ] {
             let args = argv(&["push", "origin", source]);
             assert!(
                 worktree_relative_push_sources(&args).is_empty(),
@@ -4798,7 +4814,12 @@ mod tests {
         }
 
         // Options are not refspecs.
-        let args = argv(&["push", "--force-with-lease=refs/heads/x:abc", "origin", "abc:refs/heads/x"]);
+        let args = argv(&[
+            "push",
+            "--force-with-lease=refs/heads/x:abc",
+            "origin",
+            "abc:refs/heads/x",
+        ]);
         assert!(worktree_relative_push_sources(&args).is_empty());
 
         // Anything that is not a push is none of this function's business.

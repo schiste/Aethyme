@@ -872,11 +872,14 @@ impl Broker {
                 }
                 PromoteMode::VerifyOnly => {
                     promotion_suppressed = Some(match intent {
-                        PromotionIntent::VerifyOnly =>
-                            "verified; --verify-only, so nothing was promoted".to_string(),
-                        PromotionIntent::Configured =>
+                        PromotionIntent::VerifyOnly => {
+                            "verified; --verify-only, so nothing was promoted".to_string()
+                        }
+                        PromotionIntent::Configured => {
                             "verified; promotion is off for this repository, so the work was \
-                             checked and nothing was moved".to_string(),
+                             checked and nothing was moved"
+                                .to_string()
+                        }
                     });
                 }
             }

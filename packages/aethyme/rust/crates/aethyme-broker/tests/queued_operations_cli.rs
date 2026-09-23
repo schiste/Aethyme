@@ -197,8 +197,8 @@ fn an_operation_waiting_for_the_lock_is_visible_as_prepared() {
         let holder_id = operations.iter().find_map(|operation| {
             (operation["status"] == "running"
                 && operation["authorization_reason"] == "hold the lock for the test")
-            .then(|| operation["id"].as_i64())
-            .flatten()
+                .then(|| operation["id"].as_i64())
+                .flatten()
         });
         if operations.iter().any(|operation| {
             operation["status"] == "prepared"
@@ -217,13 +217,26 @@ fn an_operation_waiting_for_the_lock_is_visible_as_prepared() {
                     .expect("waiting operation carries details"),
             )
             .unwrap();
-            assert_eq!(details["coordination_wait"]["reason"], "repository_write_lock");
+            assert_eq!(
+                details["coordination_wait"]["reason"],
+                "repository_write_lock"
+            );
             assert_eq!(
                 details["coordination_wait"]["holder"]["operation_id"],
-                holder_id.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null)
+                holder_id
+                    .map(serde_json::Value::from)
+                    .unwrap_or(serde_json::Value::Null)
             );
-            assert!(details["coordination_wait"]["enqueued_at"].as_i64().is_some());
-            assert!(details["coordination_wait"]["waiting_started_at"].as_i64().is_some());
+            assert!(
+                details["coordination_wait"]["enqueued_at"]
+                    .as_i64()
+                    .is_some()
+            );
+            assert!(
+                details["coordination_wait"]["waiting_started_at"]
+                    .as_i64()
+                    .is_some()
+            );
             assert!(details["coordination_wait"]["waited_ms"].as_i64().is_some());
 
             let human = run(repo.path(), state.path(), None, &["operations", "list"]);

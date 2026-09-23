@@ -3,13 +3,13 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::PLACEHOLDER;
 use crate::agents::render_agents_document;
-use crate::deploy::{SETTINGS_FILE, TARGETS, ensure_settings_hook};
+use crate::deploy::{ensure_settings_hook, SETTINGS_FILE, TARGETS};
 use crate::onboarding::{
-    ACT_CLAUDE_PATH, ACT_CODEX_PATH, ONBOARDING_CLAUDE_PATH, ONBOARDING_CODEX_PATH,
-    expected_onboarding_files,
+    expected_onboarding_files, ACT_CLAUDE_PATH, ACT_CODEX_PATH, ONBOARDING_CLAUDE_PATH,
+    ONBOARDING_CODEX_PATH,
 };
+use crate::PLACEHOLDER;
 
 pub const LOCAL_MARKER_PATH: &str = ".aethyme/local/enabled";
 pub const LOCAL_POLICY_PATH: &str = ".aethyme/local/AGENTS.md";

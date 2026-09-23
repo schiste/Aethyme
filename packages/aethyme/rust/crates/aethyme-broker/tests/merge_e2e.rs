@@ -8,10 +8,9 @@ use std::time::{Duration, Instant};
 
 use aethyme_broker::{
     AdoptMode, Broker, CheckpointRefusalCode, CleanupDisposition, EntryExposureState,
-    FinishOptions, FinishStatus, GitRepo,
-    GraphIntegrityStatus, IntegrationDeliveryState, IntegrationReconcileClassification,
-    IntegrationReconcileOptions, MergeStatus, NewSession, RepairAction, RepairSource,
-    SessionOrigin, StatusAdviceSeverity, SubmissionCommitOwnership,
+    FinishOptions, FinishStatus, GitRepo, GraphIntegrityStatus, IntegrationDeliveryState,
+    IntegrationReconcileClassification, IntegrationReconcileOptions, MergeStatus, NewSession,
+    RepairAction, RepairSource, SessionOrigin, StatusAdviceSeverity, SubmissionCommitOwnership,
     SubmissionGateVerificationStatus, SubmissionIntegrationState,
 };
 use aethyme_graph_indexer::{IndexerContext, WalkOptions, index_repo_to_disk, link_repo};
@@ -1366,7 +1365,12 @@ fn repeated_reuse_after_rebase_preserves_owned_work_and_finish_truth() {
     );
     assert_eq!(
         broker
-            .finish_with_options(first.id, FinishOptions { keep_worktree: true })
+            .finish_with_options(
+                first.id,
+                FinishOptions {
+                    keep_worktree: true
+                }
+            )
             .unwrap()
             .status,
         FinishStatus::Closed
@@ -2455,7 +2459,10 @@ fn broker_open_checkpoints_a_promotion_interrupted_after_the_ref_move() {
 
     let mut recovered = Broker::open(tmp.path()).unwrap();
     let persisted = recovered.store().session(session.id).unwrap();
-    assert_eq!(persisted.accepted_session_head, Some(submitted_head.clone()));
+    assert_eq!(
+        persisted.accepted_session_head,
+        Some(submitted_head.clone())
+    );
     assert_eq!(
         persisted.accepted_integration_commit.as_deref(),
         Some(merge_commit)

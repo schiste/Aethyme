@@ -639,7 +639,9 @@ fn coordination_wait_summary(operation: &crate::CoordinatedOperation) -> Option<
     let wait = details.get("coordination_wait")?;
     let holder = wait.get("holder")?;
     let holder_name = match (
-        holder.get("operation_id").and_then(serde_json::Value::as_i64),
+        holder
+            .get("operation_id")
+            .and_then(serde_json::Value::as_i64),
         holder.get("session_id").and_then(serde_json::Value::as_i64),
     ) {
         (Some(operation_id), Some(session_id)) => {
@@ -656,10 +658,7 @@ fn coordination_wait_summary(operation: &crate::CoordinatedOperation) -> Option<
         .get("waiting_started_at")
         .and_then(serde_json::Value::as_i64)
         .unwrap_or(operation.created_at);
-    let waited_seconds = now_ms()
-        .saturating_sub(waiting_started_at)
-        .max(0) as u64
-        / 1_000;
+    let waited_seconds = now_ms().saturating_sub(waiting_started_at).max(0) as u64 / 1_000;
     Some(format!(
         "waiting for {holder_name} for {}",
         crate::operations::humanize_duration(waited_seconds)
@@ -677,11 +676,9 @@ fn session_agent_identity(explicit: Option<&str>) -> Option<String> {
 }
 
 fn session_context_value(explicit: Option<&String>, environment: &[&str]) -> Option<String> {
-    explicit.cloned().or_else(|| {
-        environment
-            .iter()
-            .find_map(|name| std::env::var(name).ok())
-    })
+    explicit
+        .cloned()
+        .or_else(|| environment.iter().find_map(|name| std::env::var(name).ok()))
 }
 
 fn session_context(parsed: &Parsed) -> crate::SessionContext {
@@ -994,11 +991,7 @@ fn output_measurement_opted_in() -> bool {
 
 fn command_records_metric(args: &[String]) -> bool {
     match args.first().map(String::as_str) {
-        Some(
-            "certify" | "readiness" | "queue" | "metrics" | "handoff" | "worktree-root",
-        ) => {
-            false
-        }
+        Some("certify" | "readiness" | "queue" | "metrics" | "handoff" | "worktree-root") => false,
         Some("advisories") => matches!(args.get(1).map(String::as_str), Some("ack" | "suppress")),
         Some("exposures") => args.get(1).map(String::as_str) == Some("apply"),
         Some("report") => args.get(1).map(String::as_str) == Some("file"),
@@ -1027,10 +1020,7 @@ fn command_records_metric(args: &[String]) -> bool {
             };
             effect != Some(crate::OperationEffect::Read)
         }
-        Some("hooks") => !matches!(
-            args.get(1).map(String::as_str),
-            Some("status" | "snippet")
-        ),
+        Some("hooks") => !matches!(args.get(1).map(String::as_str), Some("status" | "snippet")),
         Some("leases") => !matches!(args.get(1).map(String::as_str), Some("plan" | "export")),
         Some("console") => args.get(1).map(String::as_str) == Some("run"),
         Some("resources") => !matches!(
@@ -5805,8 +5795,7 @@ fn run_reclaim(parsed: Parsed) -> Result<(), UsageError> {
     let gib = |bytes: u64| format!("{:.1} GiB", bytes as f64 / (1024.0 * 1024.0 * 1024.0));
     match action {
         "plan" => {
-            if let Err(error) =
-                crate::reclaim::save_snapshot(&root, &plan.digest, &plan.candidates)
+            if let Err(error) = crate::reclaim::save_snapshot(&root, &plan.digest, &plan.candidates)
             {
                 eprintln!(
                     "Warning: cannot save reclaim plan review snapshot; continuing with the \
@@ -5966,8 +5955,8 @@ fn run_deliveries(parsed: Parsed) -> Result<(), UsageError> {
                 | crate::Chau7DispatchAction::Defer { tab_id, .. } => Some(tab_id.as_str()),
                 crate::Chau7DispatchAction::Abandon { .. } => None,
             };
-            if let Some(tab) = resolved_tab_id
-                .and_then(|tab_id| tabs.iter().find(|tab| tab.tab_id == tab_id))
+            if let Some(tab) =
+                resolved_tab_id.and_then(|tab_id| tabs.iter().find(|tab| tab.tab_id == tab_id))
             {
                 broker
                     .store()
@@ -12750,10 +12739,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                         "BRANCH"
                     );
                     for view in &status.agents {
-                        let context = view
-                            .session
-                            .context_label()
-                            .unwrap_or_else(|| "-".into());
+                        let context = view.session.context_label().unwrap_or_else(|| "-".into());
                         out!(
                             "{:<4} {:<8} {:<8} {:<30} {:<24} {}",
                             view.session.id,
@@ -13689,5 +13675,8 @@ fn truncate(text: &str, width: usize) -> String {
     if text.chars().count() <= width {
         return text.to_string();
     }
-    text.chars().take(width.saturating_sub(1)).collect::<String>() + "…"
+    text.chars()
+        .take(width.saturating_sub(1))
+        .collect::<String>()
+        + "…"
 }

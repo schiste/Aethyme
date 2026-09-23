@@ -54,9 +54,7 @@ impl<'a> ParsedCommand<'a> {
             // registry.  It must not perform the repository compatibility
             // preflight, because that preflight is allowed to inspect broker
             // state and this gate runs an unpromoted tree-built binary.
-            "broker" if tail.first().map(String::as_str) == Some("check-contract") => {
-                (None, None)
-            }
+            "broker" if tail.first().map(String::as_str) == Some("check-contract") => (None, None),
             "broker" => (
                 Some(broker_command_capability(tail)),
                 Some(broker_invocation_surface(tail)),

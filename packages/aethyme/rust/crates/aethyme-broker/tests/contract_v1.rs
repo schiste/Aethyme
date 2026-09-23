@@ -508,7 +508,10 @@ fn merge_lifecycle_payload_field_names_are_frozen_on_the_wire() {
     std::fs::create_dir_all(gates.parent().unwrap()).unwrap();
     std::fs::write(&gates, policy).unwrap();
     sh(tmp.path(), &["add", "-A"]);
-    sh(tmp.path(), &["commit", "-qm", "base: gate that rejects b.py"]);
+    sh(
+        tmp.path(),
+        &["commit", "-qm", "base: gate that rejects b.py"],
+    );
     let mut broker = Broker::open(tmp.path()).unwrap();
 
     // Verified + promoted: session A lands a clean change through a
