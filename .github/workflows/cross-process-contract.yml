@@ -24,7 +24,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout PR (full history for diff)
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           # Need both branches to compute the diff. Default
           # actions/checkout fetches only the head — we need the
@@ -32,7 +32,9 @@ jobs:
           fetch-depth: 0
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
 
       - name: Capture PR body
         # Write the PR body to a file so the checker can parse the
