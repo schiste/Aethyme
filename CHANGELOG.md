@@ -6,12 +6,48 @@ artifacts and their exact source revision are recorded in each signed
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-09-23
+
+A correctness and integrity release from the 2026-09-23 audit. It changes
+exit codes and what a submission is judged by, hence the minor bump. The broker
+database schema is unchanged (42), so rollback is unrestricted.
+
 ### Changed
 
 - `aethyme broker` exit codes now name the outcome: 3 refused, 4 verification
   failed, 5 outcome unknown, 6 environment; 1 stays an unclassified failure.
   `broker submit --json` no longer exits 0 for rejected (4) or conflicted (3)
   entries. See "Exit codes" in `docs/reference/cli.md`.
+- `broker submit` reads `.aethyme/gates.toml` and the `[graph]` policy from the
+  integration base the change lands on, not from the submitted tree. A session
+  can no longer weaken or delete the gates that judge it; a policy change it
+  makes applies after it lands and emits `merge.policy_deferred`.
+- An unrecognized git/gh command can no longer be declared `--effect read`;
+  declare `write` or `destructive`. Inline `-c`/`--config-env` keys that run
+  programs or define aliases, and `--exec-path`, are refused for coordinated
+  git.
+- `+refspec` pushes, bundled short flags (`-fdx`, `-uf`, `-Df`), `git push -d`,
+  `update-ref -d`, forced `send-pack`, `reset --hard/--merge/--keep`, `clean
+  -f/-d/-x` and `gh api -XDELETE` now classify as destructive.
+- The pre-push hook verifies coordination in the operation journal. Exporting
+  `AETHYME_BROKER_OPERATION_ID` and `AETHYME_BROKER_SESSION_ID` no longer
+  unlocks a push to a protected branch.
+- Explore's auth ranking layer is removed. It was tuned to one evaluation
+  playground and broke the project's eval rule. Explore ranks auth questions
+  generically until a content search replaces it. Eval results from
+  2026-07-28 to 2026-09-23 are marked contaminated.
+
+### Fixed
+
+- `broker adopt` records declared and task-derived scope (#285), and
+  `broker start --json` records scope too. `--claim` is refused on
+  subcommands that cannot honor it instead of being silently discarded.
+- The promote commit carries `Contract justification:` alongside the contract
+  decision, so a justified `none` can pass the contract gate.
+
+### Repository
+
+- This repository no longer commits `.aethyme/graph` fragments.
 
 ## [0.7.25] - 2026-09-22
 
