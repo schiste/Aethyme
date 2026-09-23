@@ -24,6 +24,7 @@ mod advisories;
 pub mod agent_hook;
 mod atomic_file;
 pub mod attribution;
+mod blockers;
 mod bounded_output;
 mod broker;
 mod chau7_tabs;
@@ -148,6 +149,10 @@ pub use aethyme_graph_storage::{
     GRAPH_CONFIG_RELPATH, GraphAuthority, GraphIntegrityPolicy, GraphIntegrityPolicyError,
 };
 pub use attribution::{Attribution, Identity};
+pub use blockers::{
+    BLOCKER_CLEARED, Blocker, BlockerKind, BlockerRef, BlockerReport, BlockerScope,
+    BlockerSourceError, UnblockOutcome, UnblockRefusal, UnblockReport, UnblockRequest,
+};
 pub use broker::{
     AdoptIntegrationDrift, AdoptIntegrationRelation, AdoptIntegrationSync,
     AdoptIntegrationSyncOutcome, AdoptMode, AdoptOptions, AdoptOutcome, AdoptReport, AgentView,

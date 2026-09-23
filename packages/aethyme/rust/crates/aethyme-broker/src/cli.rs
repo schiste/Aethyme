@@ -256,6 +256,18 @@ Usage:
       Read bounded lock-hold, queue-wait, queue-depth, and known-unrelated
       contention measurements. Older operations without timing data are
       reported as unmeasured; this command never changes lock policy.
+  aethyme broker blockers [--json]
+      Read-only: every current blocker across broker.db, the host operation
+      and resource ledgers, gate pidfiles, and conflict notices, each with a
+      stable id (op:<n>, hostop:<hex>, resource:<id>, lease:<id>,
+      gatecache:<gate>@<tree>, pidfile:<session>-<gate>, action:<session>),
+      its cause, and the one command that clears it.
+  aethyme broker unblock <id> [--outcome <succeeded|failed>] [--reason <text>] [--confirm <generation>] [--json]
+      Clear one blocker through its store's recovery path. Outcome-unknown
+      operations need --outcome and --reason from an operator who inspected
+      the remote; cached failing gate verdicts need --reason; unclosed
+      resource leases need --confirm <generation>. Refusals exit 3 and name
+      the flag they need.
   aethyme broker advisories list [--all] [--json]
       List outstanding non-blocking advisories newest-first. --all includes
       acknowledged, suppressed, and resolved history. Deliberate inventory
@@ -785,6 +797,8 @@ const KNOWN_COMMAND_WORDS: &[&str] = &[
     "gh",
     "operations",
     "stats",
+    "blockers",
+    "unblock",
     "advisories",
     "exposures",
     "note",
@@ -1048,6 +1062,7 @@ fn command_records_metric(args: &[String]) -> bool {
         },
         Some("doctor") => args.iter().any(|arg| arg == "--fix-version"),
         Some("trust") => args.get(1).map(String::as_str) != Some("status"),
+        Some("blockers") => false,
         _ => true,
     }
 }
@@ -5209,6 +5224,89 @@ fn write_reconciliation_resolution_template(
         ))
     })?;
     Ok(())
+}
+
+const UNBLOCK_USAGE: &str = "usage: aethyme broker unblock <id> [--outcome <succeeded|failed>] [--reason <text>] [--confirm <generation>] [--json]";
+
+fn render_blockers(report: &crate::BlockerReport) {
+    if report.blockers.is_empty() {
+        out!("blockers: none");
+    }
+    for blocker in &report.blockers {
+        out!(
+            "blocker {} [{} {}{}]: {}",
+            blocker.id,
+            blocker.kind.as_str(),
+            match blocker.scope {
+                crate::BlockerScope::Repo => "repo",
+                crate::BlockerScope::Host => "host",
+            },
+            if blocker.safe_to_clear_automatically {
+                ", safe to clear"
+            } else {
+                ""
+            },
+            blocker.cause
+        );
+        out!("  clear: {}", blocker.clear);
+    }
+    for source in &report.unavailable {
+        out!(
+            "blockers: could not read {}: {} -- the list above is incomplete",
+            source.source,
+            source.error
+        );
+    }
+}
+
+fn run_unblock(parsed: Parsed) -> Result<(), UsageError> {
+    let [id] = parsed.positional.as_slice() else {
+        return Err(UsageError::Message(UNBLOCK_USAGE.into()));
+    };
+    crate::BlockerRef::parse(id)
+        .map_err(|reason| UsageError::Message(format!("{reason}\n{UNBLOCK_USAGE}")))?;
+    let outcome = match parsed.outcome.as_deref() {
+        None => None,
+        Some("succeeded") => Some(true),
+        Some("failed") => Some(false),
+        Some(_) => {
+            return Err(UsageError::Message(format!(
+                "--outcome must be succeeded or failed\n{UNBLOCK_USAGE}"
+            )));
+        }
+    };
+    let mut broker = open_broker(false)?;
+    let request = crate::UnblockRequest {
+        id: id.clone(),
+        outcome,
+        reason: parsed.reason.clone(),
+        confirm: parsed.confirm.clone(),
+    };
+    match broker.unblock(&request)? {
+        crate::UnblockOutcome::Cleared(report) => {
+            if parsed.json {
+                out!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                out!("unblocked {}: {}", report.id, report.action);
+            }
+            Ok(())
+        }
+        crate::UnblockOutcome::Refused(refusal) => {
+            if parsed.json {
+                out!("{}", serde_json::to_string_pretty(&refusal)?);
+                return Err(UsageError::SilentExit(crate::exit_status::REFUSED));
+            }
+            let flags = if refusal.required_flags.is_empty() {
+                String::new()
+            } else {
+                format!("; required: {}", refusal.required_flags.join(" "))
+            };
+            Err(UsageError::Exit {
+                message: format!("unblock {} refused: {}{flags}", refusal.id, refusal.reason),
+                code: crate::exit_status::REFUSED,
+            })
+        }
+    }
 }
 
 fn open_broker(read_only_snapshot: bool) -> Result<Broker, UsageError> {
@@ -13004,6 +13102,22 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                 }
             }
         }
+        "blockers" => {
+            if !parsed.positional.is_empty() {
+                return Err(UsageError::Message(
+                    "blockers does not accept positional arguments; usage: aethyme broker blockers [--json]"
+                        .into(),
+                ));
+            }
+            let broker = open_broker(parsed.read_only_snapshot)?;
+            let report = broker.blockers();
+            if parsed.json {
+                out!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                render_blockers(&report);
+            }
+        }
+        "unblock" => run_unblock(parsed)?,
         "doctor" => {
             let mut broker = open_broker(parsed.read_only_snapshot)?;
             let report = if parsed.fix_version {
@@ -13011,8 +13125,11 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
             } else {
                 broker.doctor()?
             };
+            let blocker_report = broker.blockers();
             if parsed.json {
-                out!("{}", serde_json::to_string_pretty(&report)?);
+                let mut value = serde_json::to_value(&report)?;
+                value["blockers"] = serde_json::to_value(&blocker_report.blockers)?;
+                out!("{}", serde_json::to_string_pretty(&value)?);
             } else {
                 out!("integrity: {}", report.integrity);
                 out!(
@@ -13122,6 +13239,11 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     for name in &report.orphaned_pidfiles {
                         out!("gate runs: orphaned pidfile removed: {name}");
                     }
+                }
+                if blocker_report.blockers.is_empty() && blocker_report.unavailable.is_empty() {
+                    out!("blockers: none");
+                } else {
+                    render_blockers(&blocker_report);
                 }
                 out!(
                     "retention: {} rows, {} files, {} worktrees, {} retained, {} reclaimable; {} protected findings",

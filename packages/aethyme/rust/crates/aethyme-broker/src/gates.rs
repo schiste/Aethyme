@@ -841,15 +841,15 @@ fn running_dir(main_root: &Path) -> PathBuf {
 
 /// What a gate pidfile says about the process group it names.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct GatePidRecord {
-    pgid: i32,
-    tree: String,
+pub(crate) struct GatePidRecord {
+    pub(crate) pgid: i32,
+    pub(crate) tree: String,
     /// The group leader. Gates are spawned as their own group, so this is
     /// `pgid`; absent from pidfiles written before it was recorded.
-    pid: Option<i32>,
+    pub(crate) pid: Option<i32>,
     /// The leader's start time, in [`process_start_time`] units. It is what
     /// tells the recorded process apart from a later one that reused its PID.
-    start: Option<u64>,
+    pub(crate) start: Option<u64>,
 }
 
 impl GatePidRecord {
@@ -864,7 +864,7 @@ impl GatePidRecord {
         )
     }
 
-    fn parse(content: &str) -> Option<Self> {
+    pub(crate) fn parse(content: &str) -> Option<Self> {
         let mut parts = content.split_whitespace();
         let pgid = parts.next()?.parse().ok()?;
         let tree = parts.next()?.to_string();

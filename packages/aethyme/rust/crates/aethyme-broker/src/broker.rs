@@ -1171,6 +1171,13 @@ pub struct StatusView {
     pub cleanup_retention: CleanupRetention,
     /// Reviews a provider refused and nothing has re-asked for since.
     pub review_refusals: Vec<ReviewRefusalView>,
+    /// Every current blocker across the broker's stores, each with the one
+    /// command that clears it (`aethyme broker blockers`).
+    pub blockers: Vec<crate::Blocker>,
+    /// Stores the blocker collection could not read, so an empty `blockers`
+    /// is never mistaken for a complete answer.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocker_sources_unavailable: Vec<crate::BlockerSourceError>,
 }
 
 /// How many refused reviews `broker status` carries.
@@ -6281,6 +6288,10 @@ impl Broker {
         if let Some(stalled) = self.stalled_coordinated_operation_advice(&pending_rows) {
             advice.push(stalled);
         }
+        let blocker_report = self.blockers();
+        if let Some(unblock) = crate::blockers::status_advice(&blocker_report.blockers) {
+            advice.push(unblock);
+        }
 
         Ok(StatusView {
             publication_baseline_ref: baseline_ref,
@@ -6312,6 +6323,8 @@ impl Broker {
             integration_reconciliation,
             cleanup_retention,
             review_refusals,
+            blockers: blocker_report.blockers,
+            blocker_sources_unavailable: blocker_report.unavailable,
         })
     }
 
