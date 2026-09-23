@@ -103,7 +103,7 @@ fn agents_document_includes_broker_protocol_only_when_configured() {
         "aethyme broker cleanup --all-cleaned --apply",
         "aethyme broker operations reconcile",
         "aethyme broker ship execute",
-        "--effect read|write|destructive --scope <resource>",
+        "--effect write|destructive --scope <resource>",
     ] {
         assert!(
             broker_reference.contains(moved),

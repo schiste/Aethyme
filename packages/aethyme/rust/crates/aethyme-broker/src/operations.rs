@@ -1417,16 +1417,103 @@ fn resolve_effect(
         }
         (Some(_), Some(declared)) => Ok((declared, "declared")),
         (Some(inferred), None) => Ok((inferred, "inferred")),
+        // An unrecognized command may be an alias for anything, including a
+        // push, so the caller cannot vouch that it only reads.
+        (None, Some(OperationEffect::Read)) => Err(BrokerOpError::InvalidCoordinatedOperation {
+            reason: "an unrecognized command cannot be declared --effect read; declare \
+                     --effect write or --effect destructive"
+                .into(),
+        }),
         (None, Some(declared)) => Ok((declared, "declared")),
         (None, None) => Err(BrokerOpError::InvalidCoordinatedOperation {
-            reason: "operation is ambiguous; declare --effect read|write|destructive and --scope"
-                .into(),
+            reason: "operation is ambiguous; declare --effect write|destructive and --scope".into(),
         }),
     }
 }
 
 fn has_any(args: &[String], needles: &[&str]) -> bool {
     args.iter().any(|arg| needles.contains(&arg.as_str()))
+}
+
+/// True when a bundled short-option argument such as `-fdx` or `-uf`
+/// includes `flag`. Matching `has_any` against `-f` alone misses bundles.
+fn has_short_flag(args: &[String], flag: char) -> bool {
+    args.iter().any(|arg| {
+        arg.strip_prefix('-').is_some_and(|flags| {
+            !flags.is_empty()
+                && !flags.starts_with('-')
+                && flags.chars().all(|ch| ch.is_ascii_alphabetic())
+                && flags.contains(flag)
+        })
+    })
+}
+
+/// Positional refspecs led by `+` force-update their destination.
+fn has_forced_refspec(args: &[String]) -> bool {
+    args.iter()
+        .skip(1)
+        .any(|arg| arg.starts_with('+') && arg.len() > 1)
+}
+
+/// Config keys that make Git run a program or reinterpret a command name.
+/// Set inline for a coordinated operation, they would run arbitrary code or
+/// disguise a push as an unrecognized command.
+const CODE_EXECUTING_CONFIG_PREFIXES: &[&str] = &["alias.", "includeif.", "filter.", "credential."];
+const CODE_EXECUTING_CONFIG_KEYS: &[&str] = &[
+    "core.hookspath",
+    "core.sshcommand",
+    "core.fsmonitor",
+    "core.pager",
+    "core.editor",
+    "core.askpass",
+    "sequence.editor",
+    "include.path",
+    "gpg.program",
+    "diff.external",
+    "uploadpack.packobjectshook",
+];
+
+fn config_key_executes_code(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    CODE_EXECUTING_CONFIG_PREFIXES
+        .iter()
+        .any(|prefix| key.starts_with(prefix))
+        || CODE_EXECUTING_CONFIG_KEYS.contains(&key.as_str())
+}
+
+/// Refuse global options that change what a coordinated Git command executes.
+pub(crate) fn refuse_code_executing_git_options(args: &[String]) -> Result<(), BrokerOpError> {
+    let refuse = |what: &str| {
+        Err(BrokerOpError::InvalidCoordinatedOperation {
+            reason: format!(
+                "{what} is refused for coordinated git: it can make git run another program \
+                 or treat a push as an unrecognized command"
+            ),
+        })
+    };
+    let end = git_subcommand_index(args).unwrap_or(args.len());
+    let mut index = 0;
+    while index < end {
+        let arg = args[index].as_str();
+        let (key, consumed) = if arg == "-c" || arg == "--config-env" {
+            (args.get(index + 1).map(String::as_str).unwrap_or(""), 2)
+        } else if let Some(inline) = arg.strip_prefix("--config-env=") {
+            (inline, 1)
+        } else if let Some(inline) = arg.strip_prefix("-c") {
+            (inline, 1)
+        } else if arg == "--exec-path" || arg.starts_with("--exec-path=") {
+            return refuse("--exec-path");
+        } else {
+            index += 1;
+            continue;
+        };
+        let key = key.split('=').next().unwrap_or("");
+        if config_key_executes_code(key) {
+            return refuse(&format!("config key `{key}`"));
+        }
+        index += consumed;
+    }
+    Ok(())
 }
 
 /// The subset of Git's global options that can appear before its subcommand.
@@ -1563,9 +1650,47 @@ pub fn classify_git(args: &[String]) -> Option<OperationEffect> {
         "status" | "diff" | "log" | "show" | "rev-parse" | "ls-files" | "ls-tree" | "cat-file"
         | "grep" | "blame" | "describe" | "shortlog" | "whatchanged" | "merge-base"
         | "name-rev" | "for-each-ref" | "check-ignore" | "count-objects" | "fsck" | "help"
-        | "ls-remote" | "version" | "--version" => Some(OperationEffect::Read),
+        | "ls-remote" | "version" | "--version" | "rev-list" | "show-ref" | "show-branch"
+        | "cherry" | "range-diff" | "var" | "check-attr" | "check-ref-format" | "verify-commit"
+        | "verify-tag" | "diff-tree" | "diff-index" | "diff-files" => Some(OperationEffect::Read),
+        "config" => {
+            let reads = has_any(
+                args,
+                &[
+                    "--get",
+                    "--get-all",
+                    "--get-regexp",
+                    "--get-urlmatch",
+                    "--list",
+                    "-l",
+                ],
+            ) || matches!(args.get(1).map(String::as_str), Some("get" | "list"));
+            Some(if reads {
+                OperationEffect::Read
+            } else {
+                OperationEffect::Write
+            })
+        }
+        "update-ref" => Some(
+            if has_short_flag(args, 'd') || has_any(args, &["--stdin"]) {
+                OperationEffect::Destructive
+            } else {
+                OperationEffect::Write
+            },
+        ),
+        "send-pack" => Some(
+            if has_any(args, &["--force", "--mirror"]) || has_forced_refspec(args) {
+                OperationEffect::Destructive
+            } else {
+                OperationEffect::Write
+            },
+        ),
         "branch" => {
-            if has_any(args, &["-d", "-D", "--delete"]) {
+            if has_any(args, &["--delete", "--force"])
+                || ['d', 'D', 'f', 'M', 'C']
+                    .into_iter()
+                    .any(|flag| has_short_flag(args, flag))
+            {
                 Some(OperationEffect::Destructive)
             } else if args.len() == 1
                 || has_any(
@@ -1573,6 +1698,13 @@ pub fn classify_git(args: &[String]) -> Option<OperationEffect> {
                     &[
                         "-l",
                         "--list",
+                        "-a",
+                        "--all",
+                        "-r",
+                        "--remotes",
+                        "-v",
+                        "-vv",
+                        "--verbose",
                         "--show-current",
                         "--contains",
                         "--no-contains",
@@ -1587,7 +1719,10 @@ pub fn classify_git(args: &[String]) -> Option<OperationEffect> {
             }
         }
         "tag" => {
-            if has_any(args, &["-d", "--delete"]) {
+            if has_any(args, &["--delete", "--force"])
+                || has_short_flag(args, 'd')
+                || has_short_flag(args, 'f')
+            {
                 Some(OperationEffect::Destructive)
             } else if args.len() == 1 || has_any(args, &["-l", "--list", "--contains"]) {
                 Some(OperationEffect::Read)
@@ -1614,21 +1749,30 @@ pub fn classify_git(args: &[String]) -> Option<OperationEffect> {
             let destructive = args.iter().any(|arg| {
                 matches!(
                     arg.as_str(),
-                    "-f" | "--force" | "--force-with-lease" | "--delete" | "--mirror" | "--prune"
+                    "--force" | "--force-with-lease" | "--delete" | "--mirror" | "--prune"
                 ) || arg.starts_with("--force-with-lease=")
                     || (arg.starts_with(':') && arg.len() > 1)
-            });
+            }) || has_short_flag(args, 'f')
+                || has_short_flag(args, 'd')
+                || has_forced_refspec(args);
             Some(if destructive {
                 OperationEffect::Destructive
             } else {
                 OperationEffect::Write
             })
         }
-        "reset" | "clean" | "reflog"
-            if has_any(args, &["delete", "expire", "--hard", "-f", "-d"]) =>
+        "reset" if has_any(args, &["--hard", "--merge", "--keep"]) => {
+            Some(OperationEffect::Destructive)
+        }
+        "clean"
+            if has_any(args, &["--force"])
+                || ['f', 'd', 'x', 'X']
+                    .into_iter()
+                    .any(|flag| has_short_flag(args, flag)) =>
         {
             Some(OperationEffect::Destructive)
         }
+        "reflog" if has_any(args, &["delete", "expire"]) => Some(OperationEffect::Destructive),
         "add" | "am" | "apply" | "checkout" | "cherry-pick" | "clone" | "commit" | "fetch"
         | "gc" | "init" | "merge" | "mv" | "notes" | "pull" | "rebase" | "replace" | "restore"
         | "revert" | "rm" | "stash" | "submodule" | "switch" | "worktree" | "reset" | "clean"
@@ -1642,6 +1786,11 @@ fn gh_method(args: &[String]) -> Option<&str> {
         .find(|pair| matches!(pair[0].as_str(), "-X" | "--method"))
         .map(|pair| pair[1].as_str())
         .or_else(|| args.iter().find_map(|arg| arg.strip_prefix("--method=")))
+        // `-XDELETE`: the method bundled into the flag, as curl also accepts.
+        .or_else(|| {
+            args.iter()
+                .find_map(|arg| arg.strip_prefix("-X").filter(|method| !method.is_empty()))
+        })
 }
 
 pub fn classify_gh(args: &[String]) -> Option<OperationEffect> {
@@ -1666,7 +1815,7 @@ pub fn classify_gh(args: &[String]) -> Option<OperationEffect> {
     ];
     let destructive_actions = ["delete", "remove", "archive"];
     match command {
-        "search" | "status" | "browse" => Some(OperationEffect::Read),
+        "search" | "status" | "browse" | "--version" | "version" => Some(OperationEffect::Read),
         "auth" => match action {
             Some("status" | "token") => Some(OperationEffect::Read),
             Some("login" | "logout" | "refresh" | "setup-git") => Some(OperationEffect::Write),
@@ -3160,6 +3309,9 @@ impl Broker {
                 ),
             });
         }
+        if request.provider == OperationProvider::Git {
+            refuse_code_executing_git_options(&request.args)?;
+        }
         if request.provider == OperationProvider::Git
             && let Some(directory) = git_explicit_directory(&request.args, cwd)?
         {
@@ -3667,8 +3819,16 @@ impl Broker {
             .stdin(Stdio::inherit())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .env("AETHYME_BROKER_SESSION_ID", request.session_id.to_string())
-            .env("AETHYME_BROKER_OPERATION_ID", operation.id.to_string());
+            // Inline config from the caller's environment would bypass the
+            // `-c` refusal above.
+            .env_remove("GIT_CONFIG_PARAMETERS")
+            .env_remove("GIT_CONFIG_COUNT")
+            .env("AETHYME_BROKER_SESSION_ID", request.session_id.to_string());
+        // The pre-push hook treats the operation id as coordination for
+        // protected branches, so a read never carries one.
+        if effect != OperationEffect::Read {
+            command.env("AETHYME_BROKER_OPERATION_ID", operation.id.to_string());
+        }
         if let Some(heartbeat) = operation_heartbeat.as_ref() {
             command.env(BROKER_OPERATION_PROGRESS_ENV, heartbeat.path());
         }
@@ -4789,6 +4949,78 @@ mod tests {
             Some(OperationEffect::Destructive)
         );
         assert_eq!(classify_gh(&args(&["extension", "exec", "x"])), None);
+    }
+
+    /// Every classification bypass found in the 2026-09-23 audit, one row
+    /// each. A row that stops holding reopens a way to hide a destructive or
+    /// remote write behind a milder label.
+    #[test]
+    fn classification_closes_the_audited_bypasses() {
+        use OperationEffect::{Destructive, Read, Write};
+        let git_rows: &[(&[&str], Option<OperationEffect>)] = &[
+            (&["push", "origin", "+main:main"], Some(Destructive)),
+            (&["push", "-uf", "origin", "main"], Some(Destructive)),
+            (&["push", "-d", "origin", "topic"], Some(Destructive)),
+            (&["push", "-u", "origin", "topic"], Some(Write)),
+            (&["clean", "-fdx"], Some(Destructive)),
+            (&["clean", "-xdf"], Some(Destructive)),
+            (&["branch", "-Df", "topic"], Some(Destructive)),
+            (&["branch", "-f", "topic", "HEAD~1"], Some(Destructive)),
+            (&["branch", "-vv"], Some(Read)),
+            (&["tag", "-fa", "v1", "-m", "release"], Some(Destructive)),
+            (&["reset", "--hard", "HEAD~1"], Some(Destructive)),
+            (&["reset", "HEAD~1"], Some(Write)),
+            (&["update-ref", "-d", "refs/heads/main"], Some(Destructive)),
+            (&["send-pack", "origin", "+main:main"], Some(Destructive)),
+            (&["rev-list", "--count", "HEAD"], Some(Read)),
+            (&["config", "--get", "user.name"], Some(Read)),
+            (&["config", "user.name", "x"], Some(Write)),
+        ];
+        for (row, expected) in git_rows {
+            assert_eq!(classify_git(&args(row)), *expected, "git {row:?}");
+        }
+        assert_eq!(
+            classify_gh(&args(&["api", "-XDELETE", "repos/o/r/git/refs/heads/x"])),
+            Some(Destructive)
+        );
+        assert_eq!(
+            classify_gh(&args(&["api", "-Xget", "repos/o/r"])),
+            Some(Read)
+        );
+    }
+
+    #[test]
+    fn an_unrecognized_command_cannot_be_declared_a_read() {
+        assert!(resolve_effect(None, Some(OperationEffect::Read)).is_err());
+        assert!(resolve_effect(None, Some(OperationEffect::Write)).is_ok());
+        assert!(resolve_effect(Some(OperationEffect::Read), Some(OperationEffect::Read)).is_ok());
+    }
+
+    #[test]
+    fn code_executing_git_config_is_refused_before_the_subcommand() {
+        for row in [
+            &["-c", "alias.p=push", "p", "origin", "HEAD:main"][..],
+            &["-calias.p=push", "p"][..],
+            &["-c", "Core.HooksPath=/tmp/h", "commit", "-m", "x"][..],
+            &["--config-env=core.sshCommand=SSH", "fetch"][..],
+            &["--exec-path=/tmp/x", "status"][..],
+        ] {
+            assert!(
+                refuse_code_executing_git_options(&args(row)).is_err(),
+                "{row:?} must be refused"
+            );
+        }
+        for row in [
+            &["-c", "user.name=x", "commit", "-m", "x"][..],
+            &["-C", "/tmp/repo", "status"][..],
+            // Subcommand options are not global config: `commit -c` reuses a message.
+            &["commit", "-c", "HEAD"][..],
+        ] {
+            assert!(
+                refuse_code_executing_git_options(&args(row)).is_ok(),
+                "{row:?} must be allowed"
+            );
+        }
     }
 
     /// `--no-wait` must still bound its own preparation. Without a budget it

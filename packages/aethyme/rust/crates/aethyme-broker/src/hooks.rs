@@ -759,9 +759,7 @@ pub fn run_pre_push(cwd: &Path, updates: &str) -> Result<(), HooksError> {
         return Ok(());
     }
 
-    let coordinated = std::env::var_os("AETHYME_BROKER_OPERATION_ID").is_some()
-        && std::env::var_os("AETHYME_BROKER_SESSION_ID").is_some();
-    if coordinated {
+    if push_is_a_running_coordinated_write(&main_root) {
         return Ok(());
     }
 
@@ -783,6 +781,35 @@ pub fn run_pre_push(cwd: &Path, updates: &str) -> Result<(), HooksError> {
     Err(HooksError::ProtectedPush {
         refs: protected_updates.join(", "),
     })
+}
+
+/// Whether this push runs inside a coordinated broker write.
+///
+/// The environment only names the operation; the journal is what vouches for
+/// it. Anyone can export the two variables, so the operation must exist,
+/// belong to the named session, be running, and not be a read.
+fn push_is_a_running_coordinated_write(main_root: &Path) -> bool {
+    let id = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.trim().parse::<i64>().ok())
+    };
+    let (Some(operation_id), Some(session_id)) = (
+        id("AETHYME_BROKER_OPERATION_ID"),
+        id("AETHYME_BROKER_SESSION_ID"),
+    ) else {
+        return false;
+    };
+    let Ok(store) = BrokerStore::open_in_repo(main_root) else {
+        return false;
+    };
+    matches!(
+        store.coordinated_operation(operation_id),
+        Ok(Some(operation))
+            if operation.session_id == session_id
+                && operation.status == crate::OperationStatus::Running
+                && operation.effect != crate::OperationEffect::Read
+    )
 }
 
 /// Fail closed at Git's write boundary when this machine has opted into
