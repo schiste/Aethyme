@@ -118,7 +118,7 @@ ra_ap_syntax = "=0.0.331"
 # (tree-sitter uses `links = "tree-sitter"`, which Cargo
 # enforces as one-version-per-build-graph). tree-sitter-php
 # 0.23.11 is compatible with tree-sitter 0.25.
-tree-sitter = "0.25"
+tree-sitter = "0.26"
 tree-sitter-php = "=0.23.11"
 
 # clap for the aethyme-graph-index CLI (Phase 4.1). v4 with
