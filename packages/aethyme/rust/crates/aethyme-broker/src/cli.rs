@@ -10099,6 +10099,13 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                 .into(),
         ));
     }
+    // Only start and adopt record declared scope; anywhere else `--claim`
+    // would exit zero and discard the claim, which reads as accepted.
+    if !parsed.declared_scopes.is_empty() && !matches!(subcommand.as_str(), "start" | "adopt") {
+        return Err(UsageError::Message(
+            "--claim is valid only with broker start or broker adopt".into(),
+        ));
+    }
     if parsed.verify_only && subcommand != "submit" {
         return Err(UsageError::Message(
             "--verify-only is valid only with broker submit".into(),
@@ -10227,6 +10234,15 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
             }
             let session = &report.session;
             if parsed.json {
+                // Scope is recorded in both output modes: `--json` is the form
+                // agents use, so skipping capture there drops it for most callers.
+                capture_declared_scopes(
+                    &mut broker,
+                    session.id,
+                    parsed.task.as_deref(),
+                    &parsed.declared_scopes,
+                    true,
+                )?;
                 out!("{}", serde_json::to_string_pretty(&report)?);
             } else {
                 match report.outcome {
@@ -10249,17 +10265,17 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                         session.branch
                     ),
                 }
+                capture_declared_scopes(
+                    &mut broker,
+                    session.id,
+                    parsed.task.as_deref(),
+                    &parsed.declared_scopes,
+                    false,
+                )?;
                 if std::path::Path::new(&session.worktree_path) == broker.main_root() {
                     out!(
                         "note: main-checkout session — verification is advisory here \
-                         (commits land on main before gates run);
-                    capture_declared_scopes(
-                        &mut broker,
-                        session.id,
-                        parsed.task.as_deref(),
-                        &parsed.declared_scopes,
-                        false,
-                    )?; use a worktree \
+                         (commits land on main before gates run); use a worktree \
                          session for enforced verification."
                     );
                 }
@@ -10347,6 +10363,13 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
             )?;
             let session = &report.session;
             if parsed.json {
+                capture_declared_scopes(
+                    &mut broker,
+                    session.id,
+                    Some(task.as_str()),
+                    &parsed.declared_scopes,
+                    true,
+                )?;
                 out!("{}", serde_json::to_string_pretty(&report)?);
             } else {
                 out!(
