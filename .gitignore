@@ -55,6 +55,10 @@ packages/aethyme/dhat-heap.json
 # is opened in directly grow their own runtime directory.
 packages/aethyme/.claude/
 
+# Graph fragments are generated on demand, not committed (decision D2).
+.aethyme/graph/
+.aethyme/graph_store.redb*
+
 # aethyme-broker:begin (managed block — do not edit inside)
 .aethyme/broker.db*
 .aethyme/logs/

@@ -1,4 +1,0 @@
-{"module":"packages.aethyme.rust.crates.aethyme-engine.src.model.edge","symbol":"Edge","kind":"struct","node_id":"struct:schiste/Aethyme:kpoxufrccbifripue2oi2wjooa","file":"packages/aethyme/rust/crates/aethyme-engine/src/model/edge.rs"}
-{"module":"packages.aethyme.rust.crates.aethyme-engine.src.model.edge","symbol":"EdgeKind","kind":"enum","node_id":"enum:schiste/Aethyme:y65hqax7it2wiaf2ks4yo5dbw4","file":"packages/aethyme/rust/crates/aethyme-engine/src/model/edge.rs"}
-{"module":"packages.aethyme.rust.crates.aethyme-engine.src.model.edge","symbol":"InternedStr","kind":"unresolved_symbol","node_id":"unresolved_symbol:schiste/Aethyme:en4sijjkeca7awc2tffx75xgfe","file":"packages/aethyme/rust/crates/aethyme-engine/src/model/edge.rs"}
-{"module":"packages.aethyme.rust.crates.aethyme-engine.src.model.edge","symbol":"new","kind":"function","node_id":"function:schiste/Aethyme:47fdqk2ms63frzzj6mhnzx6g4y","file":"packages/aethyme/rust/crates/aethyme-engine/src/model/edge.rs"}

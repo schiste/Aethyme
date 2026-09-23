@@ -283,5 +283,10 @@ label_prefix = "aethyme/"
 reserved = ["skip-review"]
 
 [graph]
-authority = "committed_fragments"
+# Fragments are no longer committed here (recovery plan decision D2,
+# 2026-09-23). Committed fragments failed 11 of 15 main gate runs as stale,
+# blocked every submit while another session was live, and fed a graph with
+# no call edges for this repository's own languages. Materialize locally with
+# `aethyme graph refresh` when you need the store; nothing in CI reads them.
+authority = "disabled"
 repository = "schiste/Aethyme"
