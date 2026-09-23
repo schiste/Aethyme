@@ -81,14 +81,21 @@ fn session_context_round_trips_and_can_be_enriched_from_chau7() {
     assert_eq!(session.repository_name.as_deref(), Some("Aethyme"));
     assert_eq!(session.tab_name.as_deref(), Some("Fix auth"));
     assert_eq!(session.ai_provider.as_deref(), Some("claude"));
-    assert_eq!(session.context_label().as_deref(), Some("Aethyme / Fix auth / claude"));
+    assert_eq!(
+        session.context_label().as_deref(),
+        Some("Aethyme / Fix auth / claude")
+    );
     assert_eq!(session.status, SessionStatus::Active);
     let last_activity_at = session.last_activity_at;
 
     let enriched = store
         .update_session_context(
             session.id,
-            &SessionContext::new(None, Some("Fix auth (renamed)".into()), Some("codex".into())),
+            &SessionContext::new(
+                None,
+                Some("Fix auth (renamed)".into()),
+                Some("codex".into()),
+            ),
         )
         .unwrap();
     assert_eq!(enriched.repository_name.as_deref(), Some("Aethyme"));
@@ -101,7 +108,11 @@ fn session_context_round_trips_and_can_be_enriched_from_chau7() {
         .events_after_filtered(0, i64::MAX, Some("session.context_updated"))
         .unwrap();
     assert_eq!(context_events.len(), 2);
-    assert!(context_events.iter().all(|event| event.session_id == Some(session.id)));
+    assert!(
+        context_events
+            .iter()
+            .all(|event| event.session_id == Some(session.id))
+    );
 }
 
 /// #163: telemetry must never be the write that creates broker state.

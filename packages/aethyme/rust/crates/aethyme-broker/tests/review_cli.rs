@@ -454,7 +454,8 @@ fn review_gated_ship_requires_every_entry_and_revalidates_live_evidence() {
     assert_eq!(plan["publication_policy"]["satisfied"], true);
     let trusted_policy_commit = fixture.remote_main();
     assert_eq!(
-        plan["publication_policy"]["source_commit"], trusted_policy_commit
+        plan["publication_policy"]["source_commit"],
+        trusted_policy_commit
     );
     assert_ne!(
         plan["publication_policy"]["source_commit"], publication_sha,
@@ -1487,21 +1488,25 @@ fn an_unmatched_completion_does_not_rewrite_the_latest_request() {
     );
 
     let store = aethyme_broker::BrokerStore::open_in_repo(fixture.root.path()).unwrap();
-    let rows = store
-        .review_requests_for_pr("acme/product", 42)
-        .unwrap();
+    let rows = store.review_requests_for_pr("acme/product", 42).unwrap();
     assert_eq!(rows.len(), 2);
     let requested = rows
         .iter()
         .find(|row| row.head_commit == WAIVE_HEAD)
         .unwrap();
-    assert_eq!(requested.state, aethyme_broker::ReviewRequestState::Requested);
+    assert_eq!(
+        requested.state,
+        aethyme_broker::ReviewRequestState::Requested
+    );
     let unsolicited = rows
         .iter()
         .find(|row| row.head_commit == COMPLETION_HEAD)
         .unwrap();
     assert_eq!(unsolicited.requested_for_commit, None);
-    assert_eq!(unsolicited.trigger, Some(aethyme_broker::ReviewTrigger::Unsolicited));
+    assert_eq!(
+        unsolicited.trigger,
+        Some(aethyme_broker::ReviewTrigger::Unsolicited)
+    );
 }
 
 /// The issue in one test: waiving the dimension that is stuck must leave every

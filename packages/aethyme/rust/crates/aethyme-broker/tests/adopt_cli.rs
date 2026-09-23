@@ -292,7 +292,10 @@ fn start_agent_reports_its_base_and_what_it_carries() {
         tmp.path(),
         &["start-agent", "--task", "detached", "--cmd", "true"],
     ));
-    assert!(rendered.contains("Start base: refs/heads/aethyme/integration"), "{rendered}");
+    assert!(
+        rendered.contains("Start base: refs/heads/aethyme/integration"),
+        "{rendered}"
+    );
     assert!(
         rendered.contains("note: this base is 3 commit(s) ahead of"),
         "{rendered}"
@@ -457,7 +460,11 @@ fn start_does_not_inspect_free_form_task_text_for_pull_request_reviews() {
         &["start", "--task", "fix the review gate so PR 754 passes"],
     );
 
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]

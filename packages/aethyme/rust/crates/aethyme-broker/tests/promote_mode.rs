@@ -86,7 +86,10 @@ fn verify_only_repositories_verify_and_promote_nothing() {
     assert!(reason.contains("promotion is off"), "{reason}");
 
     // The integration branch must not exist or must not have moved.
-    let integration = git(tmp.path(), &["rev-parse", "--verify", "-q", "aethyme/integration"]);
+    let integration = git(
+        tmp.path(),
+        &["rev-parse", "--verify", "-q", "aethyme/integration"],
+    );
     assert!(
         integration.is_empty() || integration == before,
         "integration moved to {integration} in a verify-only repository"

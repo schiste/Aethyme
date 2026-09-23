@@ -101,8 +101,7 @@ fn explain(value: &str, a: ScopeOperation, b: ScopeOperation) -> (String, String
         ),
         (Extend, Extend) => (
             format!("both sessions extend `{value}`"),
-            "usually fine; check the additions do not assume each other's absence"
-                .to_string(),
+            "usually fine; check the additions do not assume each other's absence".to_string(),
         ),
     }
 }

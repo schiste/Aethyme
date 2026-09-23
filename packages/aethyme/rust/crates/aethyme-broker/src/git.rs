@@ -1217,7 +1217,12 @@ impl GitRepo {
         command
             .arg("-C")
             .arg(&self.root)
-            .args(["ls-remote", "--heads", remote, &format!("refs/heads/{branch}")])
+            .args([
+                "ls-remote",
+                "--heads",
+                remote,
+                &format!("refs/heads/{branch}"),
+            ])
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
         let mut child = command.spawn().ok()?;
@@ -1960,7 +1965,10 @@ impl GitRepo {
     /// be removed without losing history. Non-zero is the count of commits that
     /// would go with it.
     pub fn commits_not_on_any_remote(&self) -> Result<usize, GitError> {
-        let count = run_git(&self.root, &["rev-list", "--count", "HEAD", "--not", "--remotes"])?;
+        let count = run_git(
+            &self.root,
+            &["rev-list", "--count", "HEAD", "--not", "--remotes"],
+        )?;
         Ok(count.trim().parse().unwrap_or(0))
     }
 

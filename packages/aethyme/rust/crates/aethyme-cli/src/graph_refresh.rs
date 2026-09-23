@@ -2462,7 +2462,11 @@ mod tests {
         let root = temporary.path();
         git(root, &["init", "-q"]).unwrap();
         git(root, &["config", "user.name", "Graph Refresh Test"]).unwrap();
-        git(root, &["config", "user.email", "graph-refresh@example.test"]).unwrap();
+        git(
+            root,
+            &["config", "user.email", "graph-refresh@example.test"],
+        )
+        .unwrap();
         std::fs::create_dir_all(root.join(".aethyme")).unwrap();
         std::fs::write(
             root.join(".aethyme/config.toml"),
@@ -2500,7 +2504,9 @@ mod tests {
             ],
         )
         .unwrap();
-        let other = broker.adopt(&elsewhere, Some("a different checkout")).unwrap();
+        let other = broker
+            .adopt(&elsewhere, Some("a different checkout"))
+            .unwrap();
 
         let (sessions, _) = broker_preconditions(root, &planned).unwrap();
         assert!(

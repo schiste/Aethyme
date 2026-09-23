@@ -1310,23 +1310,26 @@ fn gate_doctor_reports_invalid_retention_configuration() {
     )
     .unwrap();
 
-    let report: serde_json::Value = serde_json::from_str(&stdout(run(
-        repo.path(),
-        &["gates", "doctor", "--json"],
-    )))
-    .unwrap();
-    assert!(report["findings"].as_array().unwrap().iter().any(|finding| {
-        finding["id"] == "invalid_retention_config"
-            && finding["evidence"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|item| item.as_str().unwrap().contains("startup_budget_ms"))
-            && finding["remediation"]
-                .as_str()
-                .unwrap()
-                .contains("broker gc plan")
-    }));
+    let report: serde_json::Value =
+        serde_json::from_str(&stdout(run(repo.path(), &["gates", "doctor", "--json"]))).unwrap();
+    assert!(
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| {
+                finding["id"] == "invalid_retention_config"
+                    && finding["evidence"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|item| item.as_str().unwrap().contains("startup_budget_ms"))
+                    && finding["remediation"]
+                        .as_str()
+                        .unwrap()
+                        .contains("broker gc plan")
+            })
+    );
 }
 
 #[test]

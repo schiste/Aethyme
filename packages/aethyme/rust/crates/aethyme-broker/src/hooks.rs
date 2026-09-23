@@ -52,9 +52,7 @@ pub enum HooksError {
         path: PathBuf,
         source: std::io::Error,
     },
-    #[error(
-        "unknown hook {hook:?}; expected one of pre-commit, post-commit, or pre-push"
-    )]
+    #[error("unknown hook {hook:?}; expected one of pre-commit, post-commit, or pre-push")]
     InvalidHook { hook: String },
     #[error("failed to replay pre-commit gate {stream}: {source}")]
     ReplayOutput {
@@ -585,7 +583,8 @@ pub fn status(repo: &GitRepo) -> Result<Vec<HookReport>, HooksError> {
                 continue;
             }
             if contains_hook_invocation(&existing, hook) {
-                let stale = assigned_binary(&existing).is_some_and(|binary| !is_executable(&binary));
+                let stale =
+                    assigned_binary(&existing).is_some_and(|binary| !is_executable(&binary));
                 external = Some((candidate, stale));
                 break;
             }
@@ -1091,6 +1090,9 @@ mod tests {
         ));
         let text = "AETHYME='/missing/aethyme'\n    \"$AETHYME\" broker hooks pre-commit\n";
         assert!(contains_hook_invocation(text, "pre-commit"));
-        assert_eq!(assigned_binary(text), Some(PathBuf::from("/missing/aethyme")));
+        assert_eq!(
+            assigned_binary(text),
+            Some(PathBuf::from("/missing/aethyme"))
+        );
     }
 }

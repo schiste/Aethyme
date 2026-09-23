@@ -660,8 +660,7 @@ pub fn write_console_marker(marker: &ConsoleRuntimeMarker) -> io::Result<PathBuf
 
     crate::atomic_file::with_synced_temporary(&path, &encoded_file, |temporary| {
         match fs::hard_link(temporary, &path) {
-            Ok(()) => {
-            }
+            Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                 let metadata = fs::symlink_metadata(&path)?;
                 if metadata.file_type().is_symlink() || !metadata.is_file() {

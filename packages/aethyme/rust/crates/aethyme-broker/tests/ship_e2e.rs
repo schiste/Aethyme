@@ -299,7 +299,10 @@ exit 64
             .args(args)
             .current_dir(&self.repo)
             .env("PATH", path)
-            .env("AETHYME_HOST_STATE_DIR", self.host_operations.parent().unwrap())
+            .env(
+                "AETHYME_HOST_STATE_DIR",
+                self.host_operations.parent().unwrap(),
+            )
             .env("AETHYME_TEST_GIT_REMOTE", &self.remote)
             .env("AETHYME_TEST_REPO", &self.repo)
             .env("AETHYME_FAKE_PR_STATE", state)
@@ -514,11 +517,7 @@ fn pull_request_delivery_pushes_and_reuses_one_exact_provider_pr() {
         "{}",
         String::from_utf8_lossy(&retry.stderr)
     );
-    let operations = fixture.run_delivery_cli(
-        &["operations", "list", "--json"],
-        &fake_bin,
-        &state,
-    );
+    let operations = fixture.run_delivery_cli(&["operations", "list", "--json"], &fake_bin, &state);
     assert!(operations.status.success());
     let operations = String::from_utf8(operations.stdout).unwrap();
     assert_eq!(
@@ -695,7 +694,9 @@ fn ship_plan_reads_publication_policy_from_the_remote_default_commit() {
     let fixture = Fixture::new();
     let trusted_policy_commit = fixture.set_publication_policy("review_gated");
     let mut broker = fixture.broker();
-    let session = broker.start_worktree("candidate publication policy", None).unwrap();
+    let session = broker
+        .start_worktree("candidate publication policy", None)
+        .unwrap();
     let worktree = PathBuf::from(&session.worktree_path);
     std::fs::write(worktree.join("feature.txt"), "candidate\n").unwrap();
     std::fs::write(
@@ -705,7 +706,10 @@ fn ship_plan_reads_publication_policy_from_the_remote_default_commit() {
     .unwrap();
     git(&worktree, &["add", "feature.txt"]);
     git(&worktree, &["add", "-f", ".aethyme/config.toml"]);
-    git(&worktree, &["commit", "-qm", "candidate publication policy"]);
+    git(
+        &worktree,
+        &["commit", "-qm", "candidate publication policy"],
+    );
     let outcome = broker.submit(session.id).unwrap();
     assert!(outcome.promoted);
 
@@ -714,13 +718,9 @@ fn ship_plan_reads_publication_policy_from_the_remote_default_commit() {
         plan.publication_policy.policy.mode,
         ShipPublicationMode::ReviewGated
     );
-    assert_eq!(
-        plan.publication_policy.source_commit,
-        trusted_policy_commit
-    );
+    assert_eq!(plan.publication_policy.source_commit, trusted_policy_commit);
     assert_ne!(
-        plan.publication_policy.source_commit,
-        plan.publication_sha,
+        plan.publication_policy.source_commit, plan.publication_sha,
         "a candidate must not be able to self-authorize direct publication"
     );
     assert!(!plan.publication_policy.satisfied);
@@ -804,7 +804,8 @@ fn configured_local_main_delivery_refuses_unrepresented_main_commits_before_writ
 
     assert!(!plan.local_main_sync_safe);
     assert_eq!(
-        plan.local_main_sync_assessment.local_commits_not_in_integration,
+        plan.local_main_sync_assessment
+            .local_commits_not_in_integration,
         vec![local_only.clone()]
     );
     let error = broker
@@ -846,11 +847,12 @@ fn ship_plan_recommends_explicit_pull_request_delivery_for_a_dirty_main_checkout
         Some(RepositoryDeliveryMode::PullRequest)
     );
     assert!(plan.delivery.requires_explicit_selection);
-    assert!(plan
-        .delivery
-        .divergence_reasons
-        .iter()
-        .any(|reason| reason.starts_with("working_tree_not_clean")));
+    assert!(
+        plan.delivery
+            .divergence_reasons
+            .iter()
+            .any(|reason| reason.starts_with("working_tree_not_clean"))
+    );
 
     let error = broker
         .ship_execute_delivery(entry_id, &integration, None, None, false, false, None)

@@ -169,7 +169,10 @@ fn lease_plan_cli_renders_structured_and_text_results_without_mutation() {
     assert!(text.contains("exact"), "{text}");
     assert!(text.contains("directory"), "{text}");
     assert!(text.contains("expires never"), "{text}");
-    assert!(text.contains("owner active [Aethyme / Fix auth / claude] at"), "{text}");
+    assert!(
+        text.contains("owner active [Aethyme / Fix auth / claude] at"),
+        "{text}"
+    );
     assert!(text.contains("next: aethyme broker adopt"), "{text}");
     assert!(
         text.contains(&format!("expires {}", directory.expires_at.unwrap())),

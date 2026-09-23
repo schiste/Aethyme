@@ -263,9 +263,7 @@ pub enum RetentionConfigError {
     },
     #[error("broker.toml: {0}")]
     Parse(String),
-    #[error(
-        "unsupported retention policy schema {found}; this binary supports schema {supported}"
-    )]
+    #[error("unsupported retention policy schema {found}; this binary supports schema {supported}")]
     UnsupportedSchema { found: u32, supported: u32 },
     #[error("retention.{field}={value} is invalid: {constraint}")]
     InvalidValue {
@@ -908,9 +906,11 @@ mod tests {
         assert_eq!(report.policy.routine_size_budget_ms, 0);
         assert_eq!(report.warnings.len(), 1);
         assert_eq!(report.warnings[0].field, "retention.future_sweep_days");
-        assert!(report.warnings[0]
-            .message
-            .contains("known retention settings remain active"));
+        assert!(
+            report.warnings[0]
+                .message
+                .contains("known retention settings remain active")
+        );
         assert_eq!(load_retention_policy(repo.path()).unwrap(), report.policy);
     }
 
@@ -927,9 +927,11 @@ mod tests {
         let report = load_retention_policy_report(repo.path()).unwrap();
         assert_eq!(report.warnings.len(), 1);
         assert_eq!(report.warnings[0].field, "broker.future_broker_setting");
-        assert!(report.warnings[0]
-            .message
-            .contains("unknown broker configuration field"));
+        assert!(
+            report.warnings[0]
+                .message
+                .contains("unknown broker configuration field")
+        );
         assert!(!report.warnings[0].message.contains("retention schema 0"));
     }
 

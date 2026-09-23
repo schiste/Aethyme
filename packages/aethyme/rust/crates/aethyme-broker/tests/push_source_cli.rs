@@ -27,11 +27,17 @@ fn git(repo: &Path, args: &[&str]) -> String {
         "git {args:?}: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    String::from_utf8_lossy(&output.stdout).trim_end().to_string()
+    String::from_utf8_lossy(&output.stdout)
+        .trim_end()
+        .to_string()
 }
 
 fn run_from(cwd: &Path, args: &[&str]) -> Output {
-    Command::new(CLI).args(args).current_dir(cwd).output().unwrap()
+    Command::new(CLI)
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .unwrap()
 }
 
 fn merged(output: &Output) -> String {
@@ -43,7 +49,12 @@ fn merged(output: &Output) -> String {
 }
 
 /// Repository with a session worktree, plus a separate checkout to stand in.
-fn fixture() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+fn fixture() -> (
+    tempfile::TempDir,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    std::path::PathBuf,
+) {
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().join("repo");
     std::fs::create_dir_all(&repo).unwrap();
@@ -55,16 +66,42 @@ fn fixture() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf, std:
 
     // A bare remote, so a push is otherwise a legitimate command.
     let remote = tmp.path().join("remote.git");
-    git(tmp.path(), &["init", "-q", "--bare", remote.to_str().unwrap()]);
-    git(&repo, &["remote", "add", "origin", remote.to_str().unwrap()]);
+    git(
+        tmp.path(),
+        &["init", "-q", "--bare", remote.to_str().unwrap()],
+    );
+    git(
+        &repo,
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+    );
 
     let worktree = repo.join("session-worktree");
-    git(&repo, &["worktree", "add", "-q", worktree.to_str().unwrap(), "-b", "session"]);
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            worktree.to_str().unwrap(),
+            "-b",
+            "session",
+        ],
+    );
     // The caller stands in a *different* worktree of the same repository --
     // the exact shape of the 2026-09-21 incident, and the only shape the CLI
     // will even accept, since it resolves the repository from the cwd.
     let other = repo.join("other-worktree");
-    git(&repo, &["worktree", "add", "-q", other.to_str().unwrap(), "-b", "other"]);
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            other.to_str().unwrap(),
+            "-b",
+            "other",
+        ],
+    );
     (tmp, repo, worktree, other)
 }
 
@@ -79,7 +116,12 @@ fn adopt(worktree: &Path) -> String {
     let id = tokens
         .windows(2)
         .find(|pair| pair[0] == "session")
-        .and_then(|pair| pair[1].trim_matches(|c: char| !c.is_ascii_digit()).parse::<i64>().ok())
+        .and_then(|pair| {
+            pair[1]
+                .trim_matches(|c: char| !c.is_ascii_digit())
+                .parse::<i64>()
+                .ok()
+        })
         .unwrap_or_else(|| panic!("could not read a session id from: {text}"));
     id.to_string()
 }
@@ -91,8 +133,17 @@ fn a_head_push_from_outside_the_session_worktree_is_refused() {
 
     let output = run_from(
         &elsewhere,
-        &["git", "--session", &session, "--reason", "test", "--",
-          "push", "origin", "HEAD:refs/heads/somewhere"],
+        &[
+            "git",
+            "--session",
+            &session,
+            "--reason",
+            "test",
+            "--",
+            "push",
+            "origin",
+            "HEAD:refs/heads/somewhere",
+        ],
     );
     let text = merged(&output);
 
@@ -117,8 +168,17 @@ fn a_branch_named_push_source_is_not_refused_from_outside_the_worktree() {
 
     let output = run_from(
         &elsewhere,
-        &["git", "--session", &session, "--reason", "test", "--",
-          "push", "origin", "main:refs/heads/somewhere"],
+        &[
+            "git",
+            "--session",
+            &session,
+            "--reason",
+            "test",
+            "--",
+            "push",
+            "origin",
+            "main:refs/heads/somewhere",
+        ],
     );
 
     assert!(
@@ -142,8 +202,17 @@ fn a_head_push_from_inside_the_session_worktree_is_allowed() {
 
     let output = run_from(
         &worktree,
-        &["git", "--session", &session, "--reason", "test", "--",
-          "push", "origin", "HEAD:refs/heads/landed"],
+        &[
+            "git",
+            "--session",
+            &session,
+            "--reason",
+            "test",
+            "--",
+            "push",
+            "origin",
+            "HEAD:refs/heads/landed",
+        ],
     );
 
     assert!(

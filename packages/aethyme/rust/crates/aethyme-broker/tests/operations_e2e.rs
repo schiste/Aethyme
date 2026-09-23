@@ -1015,7 +1015,9 @@ fn local_git_conflict_is_failed_without_remote_recovery_or_write_block() {
     assert_eq!(details["remote_contact"], "not_applicable");
     assert_eq!(details["recovery"], "inspect_or_abort_local_worktree_state");
 
-    let shown = broker.show_coordinated_operation(report.operation.id).unwrap();
+    let shown = broker
+        .show_coordinated_operation(report.operation.id)
+        .unwrap();
     assert_eq!(
         shown.reconciliation.state,
         OperationReconciliationState::NotRequired
@@ -1333,10 +1335,12 @@ fn status_names_the_holder_and_who_is_parked_behind_it() {
         "the hold duration is the number that makes a wedge judgeable"
     );
     assert_eq!(held.liveness.state, "progress_stale");
-    assert!(status
-        .advice
-        .iter()
-        .any(|advice| advice.id == "coordination.operation-stalled"));
+    assert!(
+        status
+            .advice
+            .iter()
+            .any(|advice| advice.id == "coordination.operation-stalled")
+    );
 }
 
 /// A local Git command and a remote one describe the same repository, so they
@@ -1653,8 +1657,5 @@ fn a_successful_push_reports_the_commit_it_sent() {
         "one refspec should yield one reported destination: {report:#?}"
     );
     assert_eq!(report.pushed_refs[0].proposed_sha, head);
-    assert_eq!(
-        report.pushed_refs[0].destination_ref,
-        "refs/heads/reported"
-    );
+    assert_eq!(report.pushed_refs[0].destination_ref, "refs/heads/reported");
 }

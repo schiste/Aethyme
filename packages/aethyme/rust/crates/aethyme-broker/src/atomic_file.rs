@@ -17,11 +17,7 @@ use std::path::Path;
 /// return path, including write, sync, and publication errors; its random name
 /// also means an interrupted process cannot wedge a later writer by reusing a
 /// PID-and-clock filename.
-pub(crate) fn with_synced_temporary<T, F>(
-    target: &Path,
-    bytes: &[u8],
-    publish: F,
-) -> io::Result<T>
+pub(crate) fn with_synced_temporary<T, F>(target: &Path, bytes: &[u8], publish: F) -> io::Result<T>
 where
     F: FnOnce(&Path) -> io::Result<T>,
 {

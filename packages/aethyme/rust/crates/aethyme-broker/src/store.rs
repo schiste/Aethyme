@@ -945,7 +945,12 @@ impl BrokerStore {
     pub fn record_session_scopes(
         &mut self,
         session_id: i64,
-        scopes: &[(crate::ScopeKind, String, crate::ScopeOperation, crate::ScopeSource)],
+        scopes: &[(
+            crate::ScopeKind,
+            String,
+            crate::ScopeOperation,
+            crate::ScopeSource,
+        )],
     ) -> Result<usize, BrokerError> {
         let now = now_ms();
         let tx = self.conn.transaction()?;

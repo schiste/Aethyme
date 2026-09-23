@@ -1479,7 +1479,9 @@ mod tests {
 
         // The session that predates the migration is untouched.
         let task: String = conn
-            .query_row("SELECT task FROM sessions WHERE id = 1", [], |row| row.get(0))
+            .query_row("SELECT task FROM sessions WHERE id = 1", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_eq!(task, "legacy task");
 
@@ -1562,7 +1564,10 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         for expected in ["repository_name", "tab_name", "ai_provider"] {
-            assert!(columns.iter().any(|column| column == expected), "{expected}");
+            assert!(
+                columns.iter().any(|column| column == expected),
+                "{expected}"
+            );
         }
         let context: (Option<String>, Option<String>, Option<String>) = conn
             .query_row(

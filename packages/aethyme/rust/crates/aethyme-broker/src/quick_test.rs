@@ -410,7 +410,10 @@ fn short_commit(commit: &str) -> &str {
 }
 
 fn git(cwd: &Path, args: &[&str]) -> Result<String, QuickTestError> {
-    let output = crate::git::git_command().args(args).current_dir(cwd).output()?;
+    let output = crate::git::git_command()
+        .args(args)
+        .current_dir(cwd)
+        .output()?;
     if !output.status.success() {
         return Err(QuickTestError::Git {
             args: args.join(" "),
@@ -599,7 +602,11 @@ mod not_promoted_tests {
             &["src/a.rs".to_string()],
             &[
                 gate("fast", GateStatus::Pass, None),
-                gate("slow", GateStatus::Fail, Some(GateFailureClass::TestFailure)),
+                gate(
+                    "slow",
+                    GateStatus::Fail,
+                    Some(GateFailureClass::TestFailure),
+                ),
             ],
         );
         assert!(reason.contains("conflicts: src/a.rs"), "{reason}");
