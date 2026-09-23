@@ -49,6 +49,7 @@ pub const GRAPH_IMPACT_EVALUATED: &str = "graph.impact_evaluated";
 pub const MERGE_INTEGRATION_BRANCH_CREATED: &str = "merge.integration_branch_created";
 pub const MERGE_INTEGRATION_REFRESHED: &str = "merge.integration_refreshed";
 pub const MERGE_SUBMISSION_PLANNING_FAILED: &str = "merge.submission_planning_failed";
+pub const MERGE_POLICY_DEFERRED: &str = "merge.policy_deferred";
 // operation.<status> transition kinds derive from OperationStatus::as_str.
 
 // ── payload constructors ─────────────────────────────────────────────
@@ -174,6 +175,21 @@ pub fn quality_report_publication_payload(
 
 pub fn session_exit_payload(exit_code: i64) -> String {
     json!({ "exit_code": exit_code }).to_string()
+}
+
+/// A submission changed gate or graph policy; it was judged by the base
+/// policy, and its own change applies once it lands.
+pub fn merge_policy_deferred_payload(
+    base: &str,
+    gates_changed: bool,
+    graph_policy_changed: bool,
+) -> String {
+    json!({
+        "base": base,
+        "gates_changed": gates_changed,
+        "graph_policy_changed": graph_policy_changed,
+    })
+    .to_string()
 }
 
 pub fn graph_integrity_checked_payload(outcome: &crate::GraphIntegrityOutcome) -> String {

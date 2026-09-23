@@ -1719,20 +1719,21 @@ fn normalized_replay_refuses_missing_baseline_and_owned_merge_commits() {
 }
 
 #[test]
-fn failing_gate_on_merged_tree_rejects_and_auto_mode_promotes() {
+fn base_gate_policy_judges_a_submission_that_weakens_or_deletes_its_gates() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());
     let mut broker = Broker::open(tmp.path()).unwrap();
-    let wt = agent_worktree(tmp.path(), "x");
-    let session = broker.adopt(&wt, None).unwrap();
-    // Failing gate config is committed in the session worktree so the
-    // simulated merged tree, not the broker's main checkout, defines the
-    // verification policy.
+    // The failing gate is committed at the base: submission policy comes from
+    // the tree the change lands on, not from the session.
     std::fs::write(
-        wt.join(".aethyme/gates.toml"),
+        tmp.path().join(".aethyme/gates.toml"),
         "[[gate]]\nname = \"fail\"\ncommand = \"exit 7\"\ntriggers = [\"**/*.py\"]\n",
     )
     .unwrap();
+    sh(tmp.path(), &["add", "-A"]);
+    sh(tmp.path(), &["commit", "-qm", "base: failing gate"]);
+    let wt = agent_worktree(tmp.path(), "x");
+    let session = broker.adopt(&wt, None).unwrap();
     commit_edit(&wt, "src/a.py", "a = 3\n");
 
     let outcome = broker.submit(session.id).unwrap();
@@ -1775,15 +1776,47 @@ fn failing_gate_on_merged_tree_rejects_and_auto_mode_promotes() {
         "{advice:?}"
     );
 
-    // Flip to a passing gate: with the DEFAULT config (no config.toml),
-    // verified promotes immediately — auto is the default (2026-07-13).
+    // The session cannot pass by weakening its own gate: the base policy
+    // still judges it, and the attempted change is recorded.
     std::fs::write(
         wt.join(".aethyme/gates.toml"),
-        "[[gate]]\nname = \"ok\"\ncommand = \"true\"\ntriggers = [\"**/*.py\"]\n",
+        "[[gate]]\nname = \"fail\"\ncommand = \"true\"\ntriggers = [\"**/*.py\"]\n",
     )
     .unwrap();
     commit_edit(&wt, "src/a.py", "a = 4\n");
-    let outcome = broker.submit(session.id).unwrap();
+    let weakened = broker.submit(session.id).unwrap();
+    assert_eq!(weakened.entry.status, MergeStatus::Rejected);
+    let deferred = broker
+        .store()
+        .events_after_filtered(0, 50, Some("merge.policy_deferred"))
+        .unwrap();
+    let payload: serde_json::Value =
+        serde_json::from_str(deferred.last().unwrap().payload_json.as_deref().unwrap()).unwrap();
+    assert_eq!(payload["gates_changed"], true);
+    assert_eq!(payload["graph_policy_changed"], false);
+
+    // Deleting the gate config does not escape verification either.
+    std::fs::remove_file(wt.join(".aethyme/gates.toml")).unwrap();
+    commit_edit(&wt, "src/a.py", "a = 5\n");
+    let deleted = broker.submit(session.id).unwrap();
+    assert_eq!(deleted.entry.status, MergeStatus::Rejected);
+    assert!(!deleted.gate_outcomes.is_empty());
+
+    // Fixing the gate at the base flips it: with the DEFAULT config (no
+    // config.toml), verified promotes immediately — auto is the default.
+    std::fs::write(
+        tmp.path().join(".aethyme/gates.toml"),
+        "[[gate]]\nname = \"ok\"\ncommand = \"true\"\ntriggers = [\"**/*.py\"]\n",
+    )
+    .unwrap();
+    sh(tmp.path(), &["add", "-A"]);
+    sh(tmp.path(), &["commit", "-qm", "base: passing gate"]);
+    // A fresh session cut after the base fix promotes; the rejected session's
+    // history edits the gate file and would have to be rebased first.
+    let wt_fixed = agent_worktree(tmp.path(), "fixed");
+    let fixed = broker.adopt(&wt_fixed, None).unwrap();
+    commit_edit(&wt_fixed, "src/a.py", "a = 6\n");
+    let outcome = broker.submit(fixed.id).unwrap();
     assert_eq!(outcome.entry.status, MergeStatus::Promoted);
     assert!(outcome.promoted, "auto-promote is the default");
 }
@@ -1878,11 +1911,13 @@ fn repo_without_gates_is_a_pure_conflict_manager() {
     init_repo(tmp.path());
     let mut broker = Broker::open(tmp.path()).unwrap();
 
+    // Conflict-only mode is committed repository state at the base: a
+    // session removing gates.toml on its own would not escape its gates.
+    std::fs::remove_file(tmp.path().join(".aethyme/gates.toml")).unwrap();
+    sh(tmp.path(), &["add", "-A"]);
+    sh(tmp.path(), &["commit", "-qm", "base: conflict-only"]);
     let wt = agent_worktree(tmp.path(), "solo");
     let session = broker.adopt(&wt, None).unwrap();
-    // Remove the gate config in the submitted tree: conflict-only mode is
-    // committed repository state, not an untracked local checkout setting.
-    std::fs::remove_file(wt.join(".aethyme/gates.toml")).unwrap();
     commit_edit(&wt, "src/a.py", "a = 9\n");
 
     // Clean merge, zero gates configured -> promoted with no verification,

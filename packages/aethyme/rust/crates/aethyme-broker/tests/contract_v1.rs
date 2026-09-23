@@ -500,6 +500,15 @@ fn commit_edit(worktree: &Path, file: &str, content: &str) {
 fn merge_lifecycle_payload_field_names_are_frozen_on_the_wire() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());
+    // Gate policy is read from the base, so the gate that rejects session C
+    // is committed there up front, scoped to the file only C touches.
+    let gates = tmp.path().join(".aethyme/gates.toml");
+    let mut policy = std::fs::read_to_string(&gates).unwrap_or_default();
+    policy.push_str("\n[[gate]]\nname = \"no\"\ncommand = \"exit 7\"\ntriggers = [\"src/b.py\"]\n");
+    std::fs::create_dir_all(gates.parent().unwrap()).unwrap();
+    std::fs::write(&gates, policy).unwrap();
+    sh(tmp.path(), &["add", "-A"]);
+    sh(tmp.path(), &["commit", "-qm", "base: gate that rejects b.py"]);
     let mut broker = Broker::open(tmp.path()).unwrap();
 
     // Verified + promoted: session A lands a clean change through a
@@ -516,15 +525,9 @@ fn merge_lifecycle_payload_field_names_are_frozen_on_the_wire() {
     let out = broker.submit(b.id).unwrap();
     assert_eq!(out.entry.status, MergeStatus::Conflict);
 
-    // Rejected: session C's clean merge fails the gate policy carried by
-    // its submitted tree.
+    // Rejected: session C's clean merge fails the base gate on src/b.py.
     let wt_c = agent_worktree(tmp.path(), "c");
     let c = broker.adopt(&wt_c, Some("c")).unwrap();
-    std::fs::write(
-        wt_c.join(".aethyme/gates.toml"),
-        "[[gate]]\nname = \"no\"\ncommand = \"exit 7\"\ntriggers = [\"**/*.py\"]\n",
-    )
-    .unwrap();
     commit_edit(&wt_c, "src/b.py", "b = 2\n");
     let out = broker.submit(c.id).unwrap();
     assert_eq!(out.entry.status, MergeStatus::Rejected);

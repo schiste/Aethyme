@@ -727,7 +727,15 @@ impl Broker {
             "merge-sim",
         )?;
         let sim_worktree = verification_slot.materialize(self.repo_handle(), &merge_commit)?;
-        let graph_policy = crate::GraphIntegrityPolicy::load(sim_worktree.root())?;
+        // Verification policy comes from the base the change lands on, never
+        // from the merged tree: otherwise a session could weaken or delete the
+        // gates and graph policy that judge it. A policy change a session makes
+        // applies to the submissions after it lands.
+        let graph_policy =
+            crate::graph_integrity::load_graph_policy_at_commit(self.repo_handle(), &base)?;
+        let graph_policy_changed =
+            crate::graph_integrity::load_graph_policy_at_commit(self.repo_handle(), &merge_commit)
+                .map_or(true, |merged| merged != graph_policy);
         let graph_integrity =
             crate::graph_integrity::verify_disposable_checkout(&sim_worktree, &graph_policy);
         if graph_integrity.enforced {
@@ -742,16 +750,29 @@ impl Broker {
         // Conflict-only brokering is valid: a repo with no gates.toml gets
         // textual merge simulation and promotion on clean merges, with zero
         // verification — recorded explicitly so nobody mistakes it for a
-        // passing check run. A *malformed* gates.toml in the merged tree
-        // stays a hard error (broken intent, not absent intent).
-        let (gates, gate_configuration_present) =
-            match self.load_and_sync_gates_from(sim_worktree.root()) {
-                Ok(gates) => (gates, true),
-                Err(BrokerOpError::GateConfig(crate::gates::GateConfigError::Missing(_))) => {
-                    (Vec::new(), false)
-                }
-                Err(err) => return Err(err),
-            };
+        // passing check run. A *malformed* gates.toml at the base stays a
+        // hard error (broken intent, not absent intent).
+        let (gates, gate_configuration_present) = match self.load_and_sync_gates_at_commit(&base)? {
+            Some(gates) => (gates, true),
+            None => (Vec::new(), false),
+        };
+        let gate_policy_changed = self
+            .repo_handle()
+            .file_at_commit(&base, crate::gates::GATES_CONFIG_RELPATH)?
+            != self
+                .repo_handle()
+                .file_at_commit(&merge_commit, crate::gates::GATES_CONFIG_RELPATH)?;
+        if gate_policy_changed || graph_policy_changed {
+            self.store().append_event(
+                crate::events::MERGE_POLICY_DEFERRED,
+                Some(entry.session_id),
+                Some(&crate::events::merge_policy_deferred_payload(
+                    &base,
+                    gate_policy_changed,
+                    graph_policy_changed,
+                )),
+            )?;
+        }
         let configured_gates = gates.len();
         let main_root = self.main_root_path();
         let gate_outcomes = if graph_integrity.allows_promotion() {
