@@ -9,8 +9,39 @@ permissions:
   contents: read
 
 jobs:
+  # Recovery plan P1.2: a release is cut only from a commit that is on main and
+  # whose Aethyme Gates run passed. v0.7.25 was tagged one minute after main's
+  # gates failed; this job makes that impossible rather than a matter of care.
+  verify-green-main:
+    name: Tagged commit passed Aethyme Gates on main
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+
+      - name: Require a green gates run on the tagged commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if ! git merge-base --is-ancestor "$SHA" origin/main; then
+            echo "tagged commit $SHA is not on main" >&2
+            exit 1
+          fi
+          conclusions="$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/aethyme-gates.yml/runs?head_sha=$SHA&status=completed" \
+            --jq '[.workflow_runs[].conclusion] | join(" ")')"
+          case " $conclusions " in
+            *" success "*) echo "Aethyme Gates passed on $SHA" ;;
+            *) echo "Aethyme Gates has no passing run on $SHA (completed: ${conclusions:-none}); tag a commit whose gates passed" >&2
+               exit 1 ;;
+          esac
+
   build:
     name: Build (${{ matrix.target }})
+    needs: verify-green-main
     strategy:
       matrix:
         include:
@@ -26,14 +57,16 @@ jobs:
         working-directory: packages/aethyme/rust
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           # Full history + tags so build.rs embeds the tag in
           # `aethyme --version` via `git describe`.
           fetch-depth: 0
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
 
       - name: Verify release version contract
         env:
@@ -87,7 +120,7 @@ jobs:
           test -f "$graph_repo/.aethyme/graph_store.redb"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: aethyme-${{ matrix.target }}
           path: packages/aethyme/rust/aethyme-*-${{ matrix.target }}.tar.gz
@@ -103,12 +136,14 @@ jobs:
       id-token: write
     steps:
       - name: Checkout release source
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
 
       - name: Download artifacts
         env:
@@ -170,6 +205,6 @@ jobs:
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3
         with:
           files: dist/*
-          body_path: packages/aethyme/docs/guides/upgrading-to-v0.8.0.md
+          body_path: packages/aethyme/docs/guides/upgrading-to-${{ github.ref_name }}.md
           generate_release_notes: true
           prerelease: ${{ contains(github.ref_name, '-') }}
