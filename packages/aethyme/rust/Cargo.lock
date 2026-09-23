@@ -97,10 +97,10 @@ dependencies = [
  "aethyme-graph-storage",
  "blake3",
  "clap",
- "oxc_allocator",
+ "oxc_allocator 0.125.0",
  "oxc_ast",
  "oxc_parser",
- "oxc_span",
+ "oxc_span 0.150.0",
  "ra_ap_syntax",
  "rayon",
  "rustpython-ruff_python_ast",
@@ -274,7 +274,7 @@ dependencies = [
  "manyhow",
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -290,7 +290,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "quote-use",
- "syn",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -441,7 +441,7 @@ dependencies = [
  "heck",
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -474,6 +474,19 @@ dependencies = [
  "rustversion",
  "ryu",
  "static_assertions",
+]
+
+[[package]]
+name = "compact_str"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "79fcda08c33bb58b97008b2cdada6622500e949e060f5913361763121abd2416"
+dependencies = [
+ "castaway",
+ "cfg-if",
+ "itoa",
+ "static_assertions",
+ "zmij",
 ]
 
 [[package]]
@@ -570,7 +583,7 @@ checksum = "d08b3a0bcc0d079199cd476b2cae8435016ec11d1c0986c6901c5ac223041534"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -681,7 +694,7 @@ checksum = "f2b6d1e2f75c16bfbcd0f95d84f99858a6e2f885c2287d1f5c3a96e8444a34b4"
 dependencies = [
  "attribute-derive",
  "quote",
- "syn",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -690,7 +703,7 @@ version = "0.7.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "49cf31a6d70300cf81461098f7797571362387ef4bf85d32ac47eaa59b3a5a1a"
 dependencies = [
- "compact_str",
+ "compact_str 0.9.0",
  "get-size-derive2",
  "hashbrown 0.16.1",
  "ordermap",
@@ -830,7 +843,7 @@ dependencies = [
  "heck",
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -925,7 +938,7 @@ dependencies = [
  "manyhow-macros",
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -1090,7 +1103,7 @@ checksum = "b237422b014f8f8fff75bb9379e697d13f8d57551a22c88bebb39f073c1bf696"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -1101,7 +1114,19 @@ checksum = "fc35d43f3816c0ade3657e051959e0fbcef18bcb99fe9cde80df5b8ae4307d1d"
 dependencies = [
  "allocator-api2",
  "hashbrown 0.17.1",
- "oxc_data_structures",
+ "oxc_data_structures 0.125.0",
+ "rustc-hash 2.1.1",
+]
+
+[[package]]
+name = "oxc_allocator"
+version = "0.150.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8c5deaaa43f0813b6d4a18dcc5f41bea1996f193f0a55d0242831d7f29bfa16d"
+dependencies = [
+ "allocator-api2",
+ "hashbrown 0.17.1",
+ "oxc_data_structures 0.150.0",
  "rustc-hash 2.1.1",
 ]
 
@@ -1112,14 +1137,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dcd098e18245c41bb94b79bcd4bc1ae02b00cfb805fe6c345210f369d51359e7"
 dependencies = [
  "bitflags",
- "oxc_allocator",
- "oxc_ast_macros",
- "oxc_data_structures",
+ "oxc_allocator 0.125.0",
+ "oxc_ast_macros 0.125.0",
+ "oxc_data_structures 0.125.0",
  "oxc_diagnostics",
- "oxc_estree",
+ "oxc_estree 0.125.0",
  "oxc_regular_expression",
- "oxc_span",
- "oxc_str",
+ "oxc_span 0.125.0",
+ "oxc_str 0.125.0",
  "oxc_syntax",
 ]
 
@@ -1132,7 +1157,19 @@ dependencies = [
  "phf 0.13.1",
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.117",
+]
+
+[[package]]
+name = "oxc_ast_macros"
+version = "0.150.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c586b5760e383b5453db155be9f58ff6f68337e3e885ceef6817443dc6a10d17"
+dependencies = [
+ "phf 0.14.0",
+ "proc-macro2",
+ "quote",
+ "syn 3.0.6",
 ]
 
 [[package]]
@@ -1140,6 +1177,12 @@ name = "oxc_data_structures"
 version = "0.125.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "758fb6faa0d257b6f7b456509428dcea9ac545bad87a922fadc2b2476346fe24"
+
+[[package]]
+name = "oxc_data_structures"
+version = "0.150.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4c21f86e763fc44e3bac2d48f235c9b8156ea173a36d593c3083eebff2426450"
 
 [[package]]
 name = "oxc_diagnostics"
@@ -1161,10 +1204,10 @@ dependencies = [
  "cow-utils",
  "num-bigint",
  "num-traits",
- "oxc_allocator",
+ "oxc_allocator 0.125.0",
  "oxc_ast",
  "oxc_regular_expression",
- "oxc_span",
+ "oxc_span 0.125.0",
  "oxc_syntax",
 ]
 
@@ -1173,6 +1216,12 @@ name = "oxc_estree"
 version = "0.125.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d60d5a46e1c8a3551693d72afb77bad9a4bbabe764df1d3f19ec77244735ea92"
+
+[[package]]
+name = "oxc_estree"
+version = "0.150.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dcd53514d0e7ac8026261a79694680a1186649af0eb7ccbae60d7a7a755f9519"
 
 [[package]]
 name = "oxc_index"
@@ -1195,14 +1244,14 @@ dependencies = [
  "memchr",
  "num-bigint",
  "num-traits",
- "oxc_allocator",
+ "oxc_allocator 0.125.0",
  "oxc_ast",
- "oxc_data_structures",
+ "oxc_data_structures 0.125.0",
  "oxc_diagnostics",
  "oxc_ecmascript",
  "oxc_regular_expression",
- "oxc_span",
- "oxc_str",
+ "oxc_span 0.125.0",
+ "oxc_str 0.125.0",
  "oxc_syntax",
  "rustc-hash 2.1.1",
  "seq-macro",
@@ -1215,11 +1264,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "acdcbaf3009ca3acca6f9e43047839edfab2fc50a4685f47deedea7d8f6f5eea"
 dependencies = [
  "bitflags",
- "oxc_allocator",
- "oxc_ast_macros",
+ "oxc_allocator 0.125.0",
+ "oxc_ast_macros 0.125.0",
  "oxc_diagnostics",
- "oxc_span",
- "oxc_str",
+ "oxc_span 0.125.0",
+ "oxc_str 0.125.0",
  "phf 0.13.1",
  "rustc-hash 2.1.1",
  "unicode-id-start",
@@ -1231,12 +1280,25 @@ version = "0.125.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2d6563c4417d299d8d39221218b512ddfa4a05d1d3607091f72547e9b4f2f1e0"
 dependencies = [
- "compact_str",
+ "compact_str 0.9.0",
  "oxc-miette",
- "oxc_allocator",
- "oxc_ast_macros",
- "oxc_estree",
- "oxc_str",
+ "oxc_allocator 0.125.0",
+ "oxc_ast_macros 0.125.0",
+ "oxc_estree 0.125.0",
+ "oxc_str 0.125.0",
+]
+
+[[package]]
+name = "oxc_span"
+version = "0.150.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "674178f9b8af8135559b51fea7a416ea18efe6aa03ed5491f86f0c75f2336a43"
+dependencies = [
+ "compact_str 0.10.0",
+ "oxc_allocator 0.150.0",
+ "oxc_ast_macros 0.150.0",
+ "oxc_estree 0.150.0",
+ "oxc_str 0.150.0",
 ]
 
 [[package]]
@@ -1245,10 +1307,22 @@ version = "0.125.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6e67a133122ad525d7059bd8824d36acea375d198b11790f4cad5d406cdb23d"
 dependencies = [
- "compact_str",
+ "compact_str 0.9.0",
  "hashbrown 0.17.1",
- "oxc_allocator",
- "oxc_estree",
+ "oxc_allocator 0.125.0",
+ "oxc_estree 0.125.0",
+]
+
+[[package]]
+name = "oxc_str"
+version = "0.150.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5fab366ed74ea0f6a67d2b70b3acfd1725999a4a62645efa330121c392e5061e"
+dependencies = [
+ "compact_str 0.10.0",
+ "hashbrown 0.17.1",
+ "oxc_allocator 0.150.0",
+ "oxc_estree 0.150.0",
 ]
 
 [[package]]
@@ -1261,12 +1335,12 @@ dependencies = [
  "cow-utils",
  "dragonbox_ecma",
  "nonmax",
- "oxc_allocator",
- "oxc_ast_macros",
- "oxc_estree",
+ "oxc_allocator 0.125.0",
+ "oxc_ast_macros 0.125.0",
+ "oxc_estree 0.125.0",
  "oxc_index",
- "oxc_span",
- "oxc_str",
+ "oxc_span 0.125.0",
+ "oxc_str 0.125.0",
  "phf 0.13.1",
  "unicode-id-start",
 ]
@@ -1321,6 +1395,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "phf"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "010378780309880b08997fae13be7834dba947d36393bd372f2b1556deb2a2f6"
+dependencies = [
+ "phf_shared 0.14.0",
+ "serde",
+]
+
+[[package]]
 name = "phf_codegen"
 version = "0.11.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1360,7 +1444,7 @@ dependencies = [
  "phf_shared 0.13.1",
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -1377,6 +1461,15 @@ name = "phf_shared"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e57fef6bc5981e38c2ce2d63bfa546861309f875b8a75f092d1d54ae2d64f266"
+dependencies = [
+ "siphasher",
+]
+
+[[package]]
+name = "phf_shared"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c6fd9027e2d9319be6349febd1db4e8d02aa544921200c9b777720ac34a3aa89"
 dependencies = [
  "siphasher",
 ]
@@ -1409,7 +1502,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "479ca8adacdd7ce8f1fb39ce9ecccbfe93a3f1344b3d0d97f20bc0196208f62b"
 dependencies = [
  "proc-macro2",
- "syn",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -1460,7 +1553,7 @@ dependencies = [
  "proc-macro-utils",
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -1704,7 +1797,7 @@ checksum = "f021ff72cabf5e2cd6d8ec8813d376a8445a228dc610ab56c27bd9054cda70d4"
 dependencies = [
  "aho-corasick",
  "bitflags",
- "compact_str",
+ "compact_str 0.9.0",
  "get-size2",
  "is-macro",
  "memchr",
@@ -1723,7 +1816,7 @@ checksum = "01e6ee78bd9671fb5766664b2695fe1f2a92a961f4d9101646c570d8acdb1e0b"
 dependencies = [
  "bitflags",
  "bstr",
- "compact_str",
+ "compact_str 0.9.0",
  "get-size2",
  "memchr",
  "rustc-hash 2.1.1",
@@ -1833,7 +1926,7 @@ checksum = "d540f220d3187173da220f885ab66608367b6574e925011a9353e4badda91d79"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -1944,6 +2037,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "syn"
+version = "3.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8593e8e72159ed2257d083c7a454a85cbf854f37a0966d8d483aff8c8a3ebcee"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "unicode-ident",
+]
+
+[[package]]
 name = "tempfile"
 version = "3.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1990,7 +2094,7 @@ checksum = "ebc4ee7f67670e9b64d05fa4253e753e016c6c95ff35b89b7941d6b856dec1d5"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -2344,7 +2448,7 @@ dependencies = [
  "heck",
  "indexmap",
  "prettyplease",
- "syn",
+ "syn 2.0.117",
  "wasm-metadata",
  "wit-bindgen-core",
  "wit-component",
@@ -2360,7 +2464,7 @@ dependencies = [
  "prettyplease",
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.117",
  "wit-bindgen-core",
  "wit-bindgen-rust",
 ]
@@ -2419,7 +2523,7 @@ checksum = "7e6cc098ea4d3bd6246687de65af3f920c430e236bee1e3bf2e441463f08a02f"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.117",
 ]
 
 [[package]]

@@ -93,7 +93,7 @@ rayon = "1"
 oxc_parser = "=0.125"
 oxc_ast = "=0.125"
 oxc_allocator = "=0.125"
-oxc_span = "=0.125"
+oxc_span = "=0.150"
 
 # Rust parsing (Phase 3.6) via rust-analyzer's syntax crate.
 # ra_ap_syntax provides IDE-grade Rust parsing — the same engine
