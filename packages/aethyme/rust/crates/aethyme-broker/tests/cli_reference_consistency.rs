@@ -60,7 +60,7 @@ fn every_documented_broker_flag_appears_in_the_usage_text() {
     let reference = std::fs::read_to_string(root.join("packages/aethyme/docs/reference/cli.md"))
         .expect("cli reference");
     let usage_source = std::fs::read_to_string(
-        root.join("packages/aethyme/rust/crates/aethyme-broker/src/cli.rs"),
+        root.join("packages/aethyme/rust/crates/aethyme-broker/src/cli/mod.rs"),
     )
     .expect("cli source");
 
