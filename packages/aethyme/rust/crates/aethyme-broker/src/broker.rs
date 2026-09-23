@@ -5423,7 +5423,29 @@ impl Broker {
         config_root: &Path,
     ) -> Result<Vec<crate::gates::Gate>, BrokerOpError> {
         let gates = crate::gates::load_gates(config_root)?;
-        for gate in &gates {
+        self.sync_gate_definitions(&gates)?;
+        Ok(gates)
+    }
+
+    /// Load gates.toml as committed at `commit` and sync its definitions.
+    /// `None` means the commit has no gate configuration.
+    pub(crate) fn load_and_sync_gates_at_commit(
+        &mut self,
+        commit: &str,
+    ) -> Result<Option<Vec<crate::gates::Gate>>, BrokerOpError> {
+        let Some(text) = self
+            .repo_handle()
+            .file_at_commit(commit, crate::gates::GATES_CONFIG_RELPATH)?
+        else {
+            return Ok(None);
+        };
+        let gates = crate::gates::parse_gates(&text)?;
+        self.sync_gate_definitions(&gates)?;
+        Ok(Some(gates))
+    }
+
+    fn sync_gate_definitions(&mut self, gates: &[crate::gates::Gate]) -> Result<(), BrokerOpError> {
+        for gate in gates {
             self.store.upsert_gate(&crate::types::GateDef {
                 name: gate.name.clone(),
                 command: gate.command.clone(),
@@ -5441,7 +5463,7 @@ impl Broker {
                 updated_at: 0,
             })?;
         }
-        Ok(gates)
+        Ok(())
     }
 
     // ── status (Phase 6) ──────────────────────────────────────────────

@@ -98,6 +98,7 @@ One JSON object per line:
 | `merge.simulating` | the session | — | merge-tree simulation started |
 | `merge.conflict` | the session | `conflicts[]`, `conflict_details[]` (`path`, `originating_commit`, `ownership`, `integration_side_commits[]`, `remediation`, `commands[]`), `blocking_sessions[]`, `base` | normalized patch replay found textual conflicts (rejected pre-gate); blockers are limited to active leases overlapping surviving paths |
 | `merge.verified` | the session | `merge_commit`, `base`, `gates[]` | gates passed on the merged tree |
+| `merge.policy_deferred` | the session | `base`, `gates_changed`, `graph_policy_changed` | the submission changed `.aethyme/gates.toml` or the `[graph]` policy; it was judged by the base policy, and its change applies once it lands (added 2026-09-23) |
 | `merge.rejected` | the session | `merge_commit`, `base`, `gates[]` | a gate failed on the merged tree |
 | `merge.promoted` | the session | `branch`, `commit` | integration branch advanced |
 | `merge.externally_landed` | the session | `branch`, `commit`, `externally_landed`, `classification`, `upstream_ref`, `upstream_landing`, `operator_resolution` (nullable; operator, reason, resolution file, bound upstream commit, old integration) | reconciliation found equivalent or operator-attested superseding content in the named upstream ref |
