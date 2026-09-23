@@ -17,9 +17,13 @@ on:
 permissions:
   contents: read
 
+# One group per commit: every commit on main gets a completed verdict.
+# Cancelling superseded runs left merge commits (including a release commit on
+# 2026-09-23) with no verdict at all, and releases are tagged only on a commit
+# whose gates passed.
 concurrency:
-  group: aethyme-gates-${{ github.ref }}
-  cancel-in-progress: true
+  group: aethyme-gates-${{ github.sha }}
+  cancel-in-progress: false
 
 jobs:
   gates:
@@ -27,7 +31,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           # cross-process-contract falls back to HEAD~1 when the broker's
           # local integration ref is absent on a clean GitHub runner.
@@ -40,12 +44,14 @@ jobs:
       # provisions its own venv inside the tree under test; it needs an
       # interpreter on PATH and nothing else.
       - name: Set up Python (for the aethyme-eval gate only)
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.12"
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
 
       - name: Build aethyme binary
         run: cargo build --locked --release --manifest-path packages/aethyme/rust/Cargo.toml --bin aethyme
