@@ -31,6 +31,9 @@ pub fn for_broker_error(error: &BrokerOpError) -> u8 {
     use BrokerOpError as E;
     match error {
         E::CoordinatedOperationTimedOut { .. } => OUTCOME_UNKNOWN,
+        // A git killed at its deadline judged nothing: the host, a remote or
+        // a lock is wedged, so the next step is to look at the environment.
+        E::Git(crate::GitError::TimedOut { .. }) => ENVIRONMENT,
         E::GraphIntegrityRejected { .. }
         | E::NotVerified { .. }
         | E::ExposureVerificationFailed { .. }
@@ -165,6 +168,20 @@ mod tests {
         ];
         let unique: std::collections::BTreeSet<_> = codes.iter().collect();
         assert_eq!(unique.len(), codes.len());
+    }
+
+    #[test]
+    fn a_timed_out_git_is_an_environment_failure_and_other_git_errors_are_not() {
+        let timed_out = BrokerOpError::Git(crate::GitError::TimedOut {
+            args: "fetch origin".to_string(),
+            seconds: 600,
+        });
+        assert_eq!(for_broker_error(&timed_out), ENVIRONMENT);
+        let failed = BrokerOpError::Git(crate::GitError::Git {
+            args: "fetch origin".to_string(),
+            stderr: "fatal: bad".to_string(),
+        });
+        assert_eq!(for_broker_error(&failed), FAILED);
     }
 
     #[test]

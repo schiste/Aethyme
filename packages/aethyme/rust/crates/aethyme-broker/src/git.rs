@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 static NEXT_PRIVATE_INDEX_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -36,6 +37,37 @@ pub enum GitError {
     /// failed: the command would have succeeded and lied.
     #[error("refusing to judge this checkout: {detail}")]
     UntrustedOutput { detail: String },
+
+    /// git ran past its deadline and was killed (#219). Nothing about the
+    /// repository is known from it; the host, a remote or a lock is wedged.
+    #[error(
+        "git {args} did not finish within {seconds}s and was killed \
+         (set AETHYME_GIT_TIMEOUT_SECS to change the limit)"
+    )]
+    TimedOut { args: String, seconds: u64 },
+}
+
+/// Overrides [`DEFAULT_GIT_TIMEOUT`], in whole seconds.
+pub(crate) const GIT_TIMEOUT_ENV: &str = "AETHYME_GIT_TIMEOUT_SECS";
+
+/// How long one broker git invocation may run before it is killed. Generous
+/// on purpose: it exists to turn a hang into an error, not to police a slow
+/// but progressing fetch.
+const DEFAULT_GIT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
+/// The deadline for one git invocation, from the value of
+/// [`GIT_TIMEOUT_ENV`]. A missing, unparsable or zero value keeps the
+/// default: a zero budget would fail every call, which nobody means.
+fn git_timeout_from(value: Option<&str>) -> Duration {
+    value
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_GIT_TIMEOUT)
+}
+
+fn git_timeout() -> Duration {
+    git_timeout_from(std::env::var(GIT_TIMEOUT_ENV).ok().as_deref())
 }
 
 /// Extract paths from `git status --porcelain` output, validating each
@@ -765,10 +797,24 @@ fn run_git_inner(cwd: &Path, index_file: Option<&str>, args: &[&str]) -> Result<
     if let Some(index) = index_file {
         command.env("GIT_INDEX_FILE", index);
     }
-    let output = command.output().map_err(|source| GitError::Spawn {
-        args: args.join(" "),
-        source,
-    })?;
+    run_git_command(command, args, git_timeout())
+}
+
+/// Run a prepared git `command` within `budget`, killing it on expiry.
+fn run_git_command(
+    mut command: Command,
+    args: &[&str],
+    budget: Duration,
+) -> Result<String, GitError> {
+    let output = crate::bounded_output::output_within(&mut command, budget)
+        .map_err(|source| GitError::Spawn {
+            args: args.join(" "),
+            source,
+        })?
+        .ok_or_else(|| GitError::TimedOut {
+            args: args.join(" "),
+            seconds: budget.as_secs(),
+        })?;
     if !output.status.success() {
         return Err(GitError::Git {
             args: args.join(" "),
@@ -1214,44 +1260,21 @@ impl GitRepo {
         budget: std::time::Duration,
     ) -> Option<String> {
         let mut command = Command::new(&git_program().program);
-        command
-            .arg("-C")
-            .arg(&self.root)
-            .args([
-                "ls-remote",
-                "--heads",
-                remote,
-                &format!("refs/heads/{branch}"),
-            ])
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-        let mut child = command.spawn().ok()?;
-        let deadline = std::time::Instant::now() + budget;
-        loop {
-            match child.try_wait() {
-                Ok(Some(status)) if status.success() => {
-                    let output = child.wait_with_output().ok()?;
-                    let text = String::from_utf8_lossy(&output.stdout);
-                    return text
-                        .lines()
-                        .next()
-                        .and_then(|line| line.split_whitespace().next())
-                        .map(str::to_string);
-                }
-                Ok(Some(_)) => return None,
-                Ok(None) => {}
-                Err(_) => {
-                    let _ = child.kill();
-                    return None;
-                }
-            }
-            if std::time::Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(25));
+        command.arg("-C").arg(&self.root).args([
+            "ls-remote",
+            "--heads",
+            remote,
+            &format!("refs/heads/{branch}"),
+        ]);
+        let output = crate::bounded_output::output_within(&mut command, budget).ok()??;
+        if !output.status.success() {
+            return None;
         }
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().next())
+            .map(str::to_string)
     }
 
     pub fn is_ancestor(&self, ancestor: &str, descendant: &str) -> bool {
@@ -2626,5 +2649,45 @@ mod subprocess_path_tests {
         let note = subprocess_path_note();
         assert!(note.starts_with(SUBPROCESS_PATH_NOTE_PREFIX), "{note}");
         assert!(note.ends_with('\n'), "{note}");
+    }
+}
+
+/// #219: a git that never returns must become an error, not a hang.
+#[cfg(test)]
+mod timeout_tests {
+    use super::*;
+
+    #[test]
+    fn a_git_that_outlives_its_deadline_is_killed_and_reported_as_timed_out() {
+        // A stand-in for a wedged git: the runner does not care what the
+        // program is, only that it has not exited when the budget runs out.
+        let mut command = Command::new("sh");
+        command.args(["-c", "exec sleep 30"]);
+        let started = std::time::Instant::now();
+        let error = run_git_command(command, &["fetch", "origin"], Duration::from_millis(300))
+            .expect_err("a sleeping git must time out");
+        assert!(
+            matches!(&error, GitError::TimedOut { args, .. } if args == "fetch origin"),
+            "{error:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(error.to_string().contains(GIT_TIMEOUT_ENV), "{error}");
+    }
+
+    #[test]
+    fn a_git_that_finishes_in_time_returns_its_trimmed_output() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "printf ' M path\\n'"]);
+        let out = run_git_command(command, &["status"], Duration::from_secs(30)).unwrap();
+        assert_eq!(out, " M path");
+    }
+
+    #[test]
+    fn the_timeout_defaults_to_ten_minutes_and_honours_a_positive_override() {
+        assert_eq!(git_timeout_from(None), Duration::from_secs(600));
+        assert_eq!(git_timeout_from(Some("")), Duration::from_secs(600));
+        assert_eq!(git_timeout_from(Some("0")), Duration::from_secs(600));
+        assert_eq!(git_timeout_from(Some("soon")), Duration::from_secs(600));
+        assert_eq!(git_timeout_from(Some(" 45 ")), Duration::from_secs(45));
     }
 }

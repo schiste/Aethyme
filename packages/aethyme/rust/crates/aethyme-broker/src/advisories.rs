@@ -3,41 +3,21 @@
 //! The SQLite rows are authoritative. This file only serializes concurrent
 //! projectors and replaces the generated Markdown in one rename.
 
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 use std::io::{self, Write};
-use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::Advisory;
+use crate::file_lock::{ExclusiveFileLock, open_lock_file};
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(1);
 
-struct ProjectionLock {
-    file: File,
-}
-
-impl ProjectionLock {
-    fn acquire(main_root: &Path) -> io::Result<Self> {
-        let run_dir = main_root.join(".aethyme/run");
-        std::fs::create_dir_all(&run_dir)?;
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(run_dir.join("broker-advisory.lock"))?;
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(Self { file })
-    }
-}
-
-impl Drop for ProjectionLock {
-    fn drop(&mut self) {
-        let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
-    }
+/// Serialize concurrent projectors; blocks until the lock is free.
+fn acquire_projection_lock(main_root: &Path) -> io::Result<ExclusiveFileLock> {
+    let run_dir = main_root.join(".aethyme/run");
+    std::fs::create_dir_all(&run_dir)?;
+    ExclusiveFileLock::acquire(open_lock_file(&run_dir.join("broker-advisory.lock"))?)
 }
 
 fn quoted(value: &str) -> String {
@@ -158,7 +138,7 @@ pub(crate) fn project(
     load: impl FnOnce() -> Result<Vec<Advisory>, crate::BrokerError>,
 ) -> Result<PathBuf, crate::BrokerOpError> {
     let target = main_root.join(crate::BROKER_ADVISORY_RELPATH);
-    let _lock = ProjectionLock::acquire(main_root).map_err(|source| {
+    let _lock = acquire_projection_lock(main_root).map_err(|source| {
         crate::BrokerOpError::AdvisoryProjectionIo {
             path: target.clone(),
             source,

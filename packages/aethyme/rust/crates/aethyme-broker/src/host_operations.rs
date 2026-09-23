@@ -4,14 +4,13 @@
 //! deliberately smaller: it stores only a credential-free remote identity and
 //! enough state to stop another clone after an ambiguous outcome.
 
-use std::fs::{File, OpenOptions};
-use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 
+use crate::clock::epoch_ms as now_ms;
+use crate::file_lock::{ExclusiveFileLock, open_lock_file};
 use crate::{OperationEffect, OperationProvider, OperationStatus};
 
 const SCHEMA_VERSION: i64 = 1;
@@ -278,7 +277,7 @@ pub fn host_operation(
 }
 
 struct HostRemoteLock {
-    file: File,
+    _lock: ExclusiveFileLock,
 }
 
 impl HostRemoteLock {
@@ -287,24 +286,10 @@ impl HostRemoteLock {
         create_private_directory(&directory)?;
         let digest = format!("{:x}", Sha256::digest(remote_key.as_bytes()));
         let path = directory.join(format!("{digest}.lock"));
-        let file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(&path)
-            .map_err(|source| io_error(&path, source))?;
+        let file = open_lock_file(&path).map_err(|source| io_error(&path, source))?;
         protect(&path, false)?;
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-            return Err(io_error(&path, std::io::Error::last_os_error()));
-        }
-        Ok(Self { file })
-    }
-}
-
-impl Drop for HostRemoteLock {
-    fn drop(&mut self) {
-        let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+        let lock = ExclusiveFileLock::acquire(file).map_err(|source| io_error(&path, source))?;
+        Ok(Self { _lock: lock })
     }
 }
 
@@ -453,13 +438,6 @@ fn io_error(path: &Path, source: std::io::Error) -> HostOperationError {
         path: path.into(),
         source,
     }
-}
-
-fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64
 }
 
 #[cfg(test)]
