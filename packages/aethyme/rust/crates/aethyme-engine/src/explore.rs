@@ -35,13 +35,10 @@ mod source_fallback;
 
 use crate::graph::navigation::{task_anchors_view_redb, task_next_view_redb, task_scope_view_redb};
 use crate::graph::search::{SearchHit, symbol_search_redb};
-use crate::model::edge::EdgeKind;
 use crate::model::task::TaskInput;
-#[cfg(test)]
-use crate::store::redb::graph_store::SymbolMatchSignals;
 use crate::store::redb::graph_store::{
-    GraphStore, GraphStoreError, NodeDisplay, ReadOnlyGraphStore, StoredNodeKind,
-    SubsystemCandidate, SurfaceFlowCandidate, SurfacePathCandidate,
+    GraphStore, GraphStoreError, NodeDisplay, ReadOnlyGraphStore, SurfaceFlowCandidate,
+    SurfacePathCandidate,
 };
 
 const SURFACE_FLOW_COVERAGE_SCHEMA_VERSION: u8 = 1;
@@ -50,12 +47,6 @@ const SURFACE_FLOW_MAX_PATH_HINTS: usize = 8;
 const SURFACE_FLOW_MAX_SCANNED_PATHS: usize = 20_000;
 const AGENT_OUTPUT_MAX_ANSWER_ITEMS: usize = 4;
 const AGENT_OUTPUT_MAX_NAVIGATION_HINTS: usize = 0;
-const AGENT_OUTPUT_MAX_SUBSYSTEMS: usize = 3;
-const AGENT_OUTPUT_MAX_SUBSYSTEM_PATHS: usize = 2;
-const AGENT_OUTPUT_MAX_SUBSYSTEM_TARGETS: usize = 2;
-const AGENT_OUTPUT_MAX_SUBSYSTEM_SIGNALS: usize = 3;
-const AGENT_OUTPUT_MAX_TARGET_REASON_CHARS: usize = 140;
-const AGENT_OUTPUT_MAX_WARNINGS: usize = 3;
 const AGENT_OUTPUT_MAX_DEGRADED_REASONS: usize = 6;
 const AGENT_OUTPUT_MAX_NEXT_ACTIONS: usize = 3;
 const AGENT_OUTPUT_MAX_VERIFICATION_STEPS: usize = 2;
@@ -65,7 +56,6 @@ const AGENT_OUTPUT_MAX_MATCHED_TERMS: usize = 6;
 const AGENT_OUTPUT_MAX_MATCHED_QUERIES: usize = 4;
 const AGENT_OUTPUT_MAX_SYMBOLS: usize = 3;
 const AGENT_OUTPUT_MAX_LINE_REFS: usize = 2;
-const AGENT_OUTPUT_MAX_AMBIGUITY_ARRAY_ITEMS: usize = 4;
 const AGENT_OUTPUT_MAX_MISSING_SURFACES: usize = 8;
 const SURFACE_FLOW_IGNORED_DIRS: &[&str] = &[
     ".aethyme",
@@ -94,7 +84,6 @@ const BACKEND_PATTERNS: &[&str] = &[
     "services.",
 ];
 const EDGE_PROXY_PATTERNS: &[&str] = &[
-    "gcp-run-proxy/",
     "cloudflare",
     "edge/",
     "functions/_middleware",
@@ -1170,7 +1159,6 @@ pub fn explore_with_intent(
     let callsite_items = compute_callsite_files(
         &store,
         &symbol_matches,
-        request,
         params.max_callsite_symbols,
         params.max_callsite_results,
     )
@@ -1254,8 +1242,8 @@ fn surface_flow_evidence_redb(
     symbol_queries: &[String],
     text_terms: &[String],
 ) -> SurfaceFlowExploreEvidence {
-    let tokens = surface_flow_query_tokens(request, symbol_queries, text_terms);
-    if tokens.is_empty() || !should_query_surface_flow(request, &tokens) {
+    let tokens = surface_flow_query_tokens(symbol_queries, text_terms);
+    if tokens.is_empty() || !should_query_surface_flow(&tokens) {
         return SurfaceFlowExploreEvidence::default();
     }
 
@@ -1269,9 +1257,6 @@ fn surface_flow_evidence_redb(
     if let Ok(credential_flows) = store.credential_flow_candidates(&tokens) {
         evidence.credential_flows = credential_flows;
     }
-    if let Ok(subsystems) = store.subsystems_matching(&tokens) {
-        evidence.subsystems = subsystems;
-    }
     if let Ok(coverage) = store.coverage_for_task_class(request) {
         evidence.tests = coverage.tests;
         evidence.coverage_missing = coverage.missing;
@@ -1279,26 +1264,10 @@ fn surface_flow_evidence_redb(
     evidence
 }
 
-fn surface_flow_query_tokens(
-    request: &str,
-    symbol_queries: &[String],
-    text_terms: &[String],
-) -> Vec<String> {
+fn surface_flow_query_tokens(symbol_queries: &[String], text_terms: &[String]) -> Vec<String> {
     let mut tokens = Vec::new();
     for token in symbol_queries.iter().chain(text_terms.iter()) {
         push_unique_token(&mut tokens, token);
-    }
-    if ranking::auth_token_focus_from_request(request) {
-        for token in [
-            "auth",
-            "token",
-            "credential",
-            "middleware",
-            "route",
-            "proxy",
-        ] {
-            push_unique_token(&mut tokens, token);
-        }
     }
     tokens.truncate(16);
     tokens
@@ -1314,10 +1283,7 @@ fn push_unique_token(tokens: &mut Vec<String>, token: &str) {
     }
 }
 
-fn should_query_surface_flow(request: &str, tokens: &[String]) -> bool {
-    if ranking::auth_token_focus_from_request(request) {
-        return true;
-    }
+fn should_query_surface_flow(tokens: &[String]) -> bool {
     tokens.iter().any(|token| {
         contains_any_text(
             token,
@@ -1796,7 +1762,7 @@ fn indexed_frameworks_from_graph_paths(
     ) {
         frameworks.insert("cloudflare-workers");
     }
-    if contains_any_text(&match_text, &["gcp-run-proxy", "proxy_surface"]) {
+    if match_text.contains("proxy_surface") {
         frameworks.insert("edge-proxy");
     }
     if contains_any_text(&match_text, &["vercel.json", "vercel/"]) {
@@ -1899,7 +1865,6 @@ struct SurfaceFlowExploreEvidence {
     entrypoints: Vec<SurfaceFlowCandidate>,
     surface_paths: Vec<SurfacePathCandidate>,
     credential_flows: Vec<SurfaceFlowCandidate>,
-    subsystems: Vec<SubsystemCandidate>,
     tests: Vec<NodeDisplay>,
     coverage_missing: Vec<String>,
 }
@@ -2032,1205 +1997,6 @@ pub(crate) fn extract_symbol_queries(request: &str) -> Vec<String> {
 
 // ── response synthesis ──────────────────────────────────────────────────
 
-#[derive(Debug, Clone)]
-struct TokenSubsystemSummary {
-    id: &'static str,
-    label: &'static str,
-    score: i32,
-    paths: std::collections::BTreeSet<String>,
-    signals: std::collections::BTreeSet<&'static str>,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct TokenSubsystemMatch {
-    id: &'static str,
-    label: &'static str,
-    base_score: i32,
-    signal: &'static str,
-}
-
-fn token_subsystem_summaries(
-    request: &str,
-    item_groups: &[&[AnswerItem]],
-) -> Vec<TokenSubsystemSummary> {
-    if !ranking::auth_token_focus_from_request(request) {
-        return Vec::new();
-    }
-
-    let mut by_id: std::collections::BTreeMap<&'static str, TokenSubsystemSummary> =
-        std::collections::BTreeMap::new();
-    for group in item_groups {
-        for item in *group {
-            let text = token_subsystem_item_text(item);
-            for matched in token_subsystem_matches(&text) {
-                let entry = by_id
-                    .entry(matched.id)
-                    .or_insert_with(|| TokenSubsystemSummary {
-                        id: matched.id,
-                        label: matched.label,
-                        score: 0,
-                        paths: std::collections::BTreeSet::new(),
-                        signals: std::collections::BTreeSet::new(),
-                    });
-                entry.score = entry
-                    .score
-                    .max(matched.base_score + token_subsystem_item_score(item));
-                entry.signals.insert(matched.signal);
-                if let Some(path) = item.path.as_deref().filter(|path| !path.is_empty()) {
-                    entry.paths.insert(path.to_string());
-                } else if !item.target.is_empty() {
-                    entry.paths.insert(item.target.clone());
-                }
-            }
-        }
-    }
-
-    let mut summaries: Vec<TokenSubsystemSummary> =
-        by_id.into_iter().map(|(_, summary)| summary).collect();
-    summaries.sort_by(|left, right| {
-        right
-            .score
-            .cmp(&left.score)
-            .then_with(|| left.label.cmp(right.label))
-    });
-    summaries
-}
-
-fn token_subsystem_item_score(item: &AnswerItem) -> i32 {
-    let raw_bonus = item
-        .evidence
-        .get("ranking_bonus")
-        .and_then(|value| value.as_i64())
-        .unwrap_or(0);
-    let ranking_bonus = raw_bonus.max(-200).min(200) as i32;
-    let confidence = (item.confidence * 100.0).round() as i32;
-    let kind_bonus = match item.kind.as_str() {
-        "source_text_file" => 12,
-        "symbol_search_file" => 10,
-        "call_site_file" => 8,
-        _ => 0,
-    };
-    confidence + ranking_bonus + kind_bonus
-}
-
-fn token_subsystem_item_text(item: &AnswerItem) -> String {
-    let mut chunks = Vec::new();
-    chunks.push(item.kind.clone());
-    chunks.push(item.target.clone());
-    chunks.push(item.reason.clone());
-    if let Some(path) = item.path.as_deref() {
-        chunks.push(path.to_string());
-    }
-    collect_json_strings(&item.evidence, &mut chunks, 24);
-    chunks.join(" ").to_ascii_lowercase()
-}
-
-fn collect_json_strings(value: &serde_json::Value, output: &mut Vec<String>, limit: usize) {
-    if output.len() >= limit {
-        return;
-    }
-    match value {
-        serde_json::Value::String(text) => output.push(text.clone()),
-        serde_json::Value::Array(values) => {
-            for value in values {
-                collect_json_strings(value, output, limit);
-                if output.len() >= limit {
-                    break;
-                }
-            }
-        }
-        serde_json::Value::Object(values) => {
-            for value in values.values() {
-                collect_json_strings(value, output, limit);
-                if output.len() >= limit {
-                    break;
-                }
-            }
-        }
-        _ => {}
-    }
-}
-
-fn token_subsystem_matches(lower: &str) -> Vec<TokenSubsystemMatch> {
-    let mut matches = Vec::new();
-    if contains_any_text(
-        lower,
-        &["api keys", "api-key", "api_key", "api_keys", "apikey"],
-    ) {
-        matches.push(TokenSubsystemMatch {
-            id: "api_keys",
-            label: "API keys",
-            base_score: 120,
-            signal: "api_key_surface",
-        });
-    }
-    if contains_any_text(
-        lower,
-        &["oidc", "openid", "id token", "id_token", "idtoken"],
-    ) {
-        matches.push(TokenSubsystemMatch {
-            id: "oidc",
-            label: "OIDC",
-            base_score: 95,
-            signal: "oidc_surface",
-        });
-    }
-    if lower.contains("jws")
-        || lower.contains("audit_jws")
-        || (lower.contains("audit")
-            && contains_any_text(lower, &["jwt", "signature", "signing", "signed"]))
-    {
-        matches.push(TokenSubsystemMatch {
-            id: "audit_jws",
-            label: "audit JWS",
-            base_score: 90,
-            signal: "audit_jws_surface",
-        });
-    }
-    if lower.contains("auth0_management")
-        || (lower.contains("auth0") && lower.contains("management"))
-        || lower.contains("management_token")
-        || lower.contains("management token")
-    {
-        matches.push(TokenSubsystemMatch {
-            id: "auth0_management",
-            label: "Auth0 management",
-            base_score: 80,
-            signal: "auth0_management_surface",
-        });
-    }
-    if lower.contains("webhook")
-        && contains_any_text(lower, &["token", "secret", "signature", "hmac"])
-    {
-        matches.push(TokenSubsystemMatch {
-            id: "webhook_tokens",
-            label: "webhook tokens",
-            base_score: 75,
-            signal: "webhook_token_surface",
-        });
-    }
-    if lower.contains("profile_integrity")
-        || lower.contains("profile-integrity")
-        || (lower.contains("profile") && lower.contains("integrity"))
-    {
-        matches.push(TokenSubsystemMatch {
-            id: "profile_integrity",
-            label: "profile-integrity",
-            base_score: 70,
-            signal: "profile_integrity_surface",
-        });
-    }
-    if lower.contains("domain_verification")
-        || lower.contains("domain verification")
-        || lower.contains("domain-verification")
-        || (lower.contains("domain") && contains_any_text(lower, &["verify", "verification"]))
-    {
-        matches.push(TokenSubsystemMatch {
-            id: "domain_verification",
-            label: "domain verification",
-            base_score: 65,
-            signal: "domain_verification_surface",
-        });
-    }
-    matches
-}
-
-fn request_names_specific_token_subsystem(request: &str) -> bool {
-    let lower = request.to_ascii_lowercase();
-    !token_subsystem_matches(&lower).is_empty()
-}
-
-fn request_names_provider_or_secondary_token_subsystem(request: &str) -> bool {
-    let lower = request.to_ascii_lowercase();
-    token_subsystem_matches(&lower).iter().any(|matched| {
-        matches!(
-            matched.id,
-            "oidc"
-                | "audit_jws"
-                | "auth0_management"
-                | "webhook_tokens"
-                | "profile_integrity"
-                | "domain_verification"
-        )
-    })
-}
-
-fn token_subsystem_ambiguity_value(summaries: &[TokenSubsystemSummary]) -> serde_json::Value {
-    let subsystems: Vec<serde_json::Value> = summaries
-        .iter()
-        .enumerate()
-        .map(|(index, summary)| {
-            serde_json::json!({
-                "rank": index + 1,
-                "id": summary.id,
-                "label": summary.label,
-                "score": summary.score,
-                "paths": summary.paths.iter().take(4).cloned().collect::<Vec<_>>(),
-                "signals": summary.signals.iter().copied().collect::<Vec<_>>(),
-            })
-        })
-        .collect();
-    serde_json::json!({
-        "kind": "token_subsystem_ambiguity",
-        "status": "needs_verification",
-        "reason": "Multiple token/auth subsystems matched this request; verify the top 2 before committing to one subsystem.",
-        "verify_top_n": 2,
-        "subsystems": subsystems,
-    })
-}
-
-fn top_token_subsystem_labels(summaries: &[TokenSubsystemSummary], limit: usize) -> String {
-    summaries
-        .iter()
-        .take(limit)
-        .map(|summary| summary.label)
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-#[derive(Debug)]
-struct ExploreSubsystemBuilder {
-    id: &'static str,
-    label: &'static str,
-    role: &'static str,
-    priority: u8,
-    score: i32,
-    paths: std::collections::BTreeSet<String>,
-    targets: Vec<ExploreSubsystemTarget>,
-    target_keys: std::collections::BTreeSet<String>,
-    signals: std::collections::BTreeSet<String>,
-    warnings: std::collections::BTreeSet<String>,
-}
-
-impl ExploreSubsystemBuilder {
-    fn new(id: &'static str) -> Self {
-        let (label, role, priority) = explore_subsystem_identity(id);
-        Self {
-            id,
-            label,
-            role,
-            priority,
-            score: 0,
-            paths: std::collections::BTreeSet::new(),
-            targets: Vec::new(),
-            target_keys: std::collections::BTreeSet::new(),
-            signals: std::collections::BTreeSet::new(),
-            warnings: std::collections::BTreeSet::new(),
-        }
-    }
-
-    fn add_path(&mut self, path: impl Into<String>) {
-        let path = path.into();
-        if !path.trim().is_empty() {
-            self.paths.insert(path);
-        }
-    }
-
-    fn add_signal(&mut self, signal: impl Into<String>) {
-        let signal = signal.into();
-        if !signal.trim().is_empty() {
-            self.signals.insert(signal);
-        }
-    }
-
-    fn add_warning(&mut self, warning: impl Into<String>) {
-        let warning = warning.into();
-        if !warning.trim().is_empty() {
-            self.warnings.insert(warning);
-        }
-    }
-
-    fn add_target(&mut self, target: ExploreSubsystemTarget) {
-        let key = format!(
-            "{}\u{1f}{}\u{1f}{}",
-            target.kind,
-            target.target,
-            target.path.as_deref().unwrap_or("")
-        );
-        if !self.target_keys.insert(key) {
-            return;
-        }
-        self.targets.push(target);
-    }
-}
-
-fn explore_subsystem_identity(id: &'static str) -> (&'static str, &'static str, u8) {
-    match id {
-        "ingress_proxy" => ("ingress/proxy", "ingress_proxy", 0),
-        "backend_validator" => ("backend API-key validator", "backend_validator", 1),
-        "provider_oidc_audit" => (
-            "provider/OIDC/audit/webhook",
-            "provider_or_secondary_token",
-            2,
-        ),
-        _ => ("related subsystem", "related", 9),
-    }
-}
-
-fn subsystem_target_search_text(target: &ExploreSubsystemTarget) -> String {
-    format!(
-        "{} {} {} {}",
-        target.kind,
-        target.target,
-        target.path.as_deref().unwrap_or(""),
-        target.reason
-    )
-    .to_ascii_lowercase()
-}
-
-fn target_path_component_count(target: &ExploreSubsystemTarget) -> usize {
-    target
-        .path
-        .as_deref()
-        .unwrap_or(target.target.as_str())
-        .trim_matches('/')
-        .split('/')
-        .filter(|component| !component.is_empty())
-        .count()
-}
-
-fn broad_subsystem_path_penalty(target: &ExploreSubsystemTarget) -> i32 {
-    if target.kind != "subsystem_path" {
-        return 0;
-    }
-    let lower = target
-        .path
-        .as_deref()
-        .unwrap_or(target.target.as_str())
-        .to_ascii_lowercase();
-    if target_path_component_count(target) <= 1
-        || matches!(
-            lower.as_str(),
-            "api" | "backend" | "server" | "services" | "src"
-        )
-    {
-        -220
-    } else {
-        0
-    }
-}
-
-fn subsystem_target_priority(subsystem_id: &str, target: &ExploreSubsystemTarget) -> i32 {
-    let text = subsystem_target_search_text(target);
-    let mut priority = match target.kind.as_str() {
-        "entrypoint" => 320,
-        "credential_flow" => 300,
-        "surface_path" => 240,
-        "token_subsystem" => 160,
-        "behavior_test" => 80,
-        "subsystem_path" => 60,
-        _ => 100,
-    } + broad_subsystem_path_penalty(target);
-
-    match subsystem_id {
-        "ingress_proxy" => {
-            if text.contains("gcp-run-proxy") {
-                priority += 520;
-            }
-            if path_looks_ingress_proxy(&text) {
-                priority += 220;
-            }
-            if contains_any_text(
-                &text,
-                &[
-                    "forwards_to",
-                    "rewrites_header",
-                    "entrypoint_for",
-                    "exposes",
-                ],
-            ) {
-                priority += 140;
-            }
-            if target.kind == "behavior_test" {
-                priority -= 80;
-            }
-        }
-        "backend_validator" => {
-            if contains_any_text(&text, &["backend/api_keys", "backend.api_keys"]) {
-                priority += 520;
-            }
-            if contains_any_text(
-                &text,
-                &[
-                    "validates_credential",
-                    "authorizes",
-                    "publishablekey",
-                    "validate_publishable_key",
-                    "authenticate_api_key",
-                ],
-            ) {
-                priority += 180;
-            }
-            if target.kind == "behavior_test" {
-                priority -= 70;
-            }
-        }
-        "provider_oidc_audit" => {
-            if !token_subsystem_matches(&text).is_empty() {
-                priority += 160;
-            }
-            if contains_any_text(
-                &text,
-                &[
-                    "oidc",
-                    "audit_jws",
-                    "auth0_management",
-                    "webhook_token",
-                    "profile_integrity",
-                    "domain_verification",
-                ],
-            ) {
-                priority += 120;
-            }
-        }
-        _ => {}
-    }
-
-    priority
-}
-
-fn text_has_edge_proxy_evidence(text: &str) -> bool {
-    path_looks_ingress_proxy(text)
-        || contains_any_text(
-            text,
-            &[
-                "proxy_surface",
-                "worker_surface",
-                "forwards_to",
-                "rewrites_header",
-            ],
-        )
-}
-
-fn ingress_lane_lacks_edge_proxy_evidence(builder: &ExploreSubsystemBuilder) -> bool {
-    builder.id == "ingress_proxy"
-        && !builder
-            .paths
-            .iter()
-            .any(|path| text_has_edge_proxy_evidence(&path.to_ascii_lowercase()))
-        && !builder.signals.iter().any(|signal| {
-            matches!(
-                signal.as_str(),
-                "forwards_to" | "rewrites_header" | "proxy_surface" | "worker_surface"
-            )
-        })
-        && !builder
-            .targets
-            .iter()
-            .any(|target| text_has_edge_proxy_evidence(&subsystem_target_search_text(target)))
-}
-
-fn explore_subsystem_rankings(
-    request: &str,
-    token_subsystems: &[TokenSubsystemSummary],
-    surface_flow: &SurfaceFlowExploreEvidence,
-) -> Vec<ExploreSubsystem> {
-    let surface_focused = ranking::auth_token_focus_from_request(request)
-        || !surface_flow.entrypoints.is_empty()
-        || !surface_flow.surface_paths.is_empty()
-        || !surface_flow.credential_flows.is_empty();
-    if !surface_focused || request_names_provider_or_secondary_token_subsystem(request) {
-        return Vec::new();
-    }
-
-    let mut builders: std::collections::BTreeMap<&'static str, ExploreSubsystemBuilder> =
-        std::collections::BTreeMap::new();
-
-    for summary in token_subsystems {
-        let subsystem_id = match summary.id {
-            "api_keys" if !summary_paths_are_only_ingress_proxy(summary) => "backend_validator",
-            "api_keys" => continue,
-            "oidc"
-            | "audit_jws"
-            | "auth0_management"
-            | "webhook_tokens"
-            | "profile_integrity"
-            | "domain_verification" => "provider_oidc_audit",
-            _ => continue,
-        };
-        let builder = builders
-            .entry(subsystem_id)
-            .or_insert_with(|| ExploreSubsystemBuilder::new(subsystem_id));
-        builder.score += summary.score.max(1);
-        builder.add_signal(format!("token_subsystem:{}", summary.id));
-        for signal in &summary.signals {
-            builder.add_signal(*signal);
-        }
-        for path in &summary.paths {
-            builder.add_path(path.clone());
-        }
-        builder.add_target(ExploreSubsystemTarget {
-            kind: "token_subsystem".into(),
-            target: summary.label.to_string(),
-            path: summary.paths.iter().next().cloned(),
-            reason: format!(
-                "Matched token/auth subsystem signals: {}",
-                summary
-                    .signals
-                    .iter()
-                    .copied()
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-            confidence: confidence_from_subsystem_score(summary.score),
-        });
-    }
-
-    for candidate in &surface_flow.entrypoints {
-        add_surface_flow_candidate_subsystems(
-            &mut builders,
-            candidate,
-            "entrypoint",
-            190,
-            "Surface/Flow graph matched an ingress candidate for this task.",
-        );
-    }
-    for path in &surface_flow.surface_paths {
-        add_surface_path_subsystems(&mut builders, path);
-    }
-    for candidate in &surface_flow.credential_flows {
-        add_surface_flow_candidate_subsystems(
-            &mut builders,
-            candidate,
-            "credential_flow",
-            180,
-            "Surface/Flow graph matched credential issue/store/use/validation behavior.",
-        );
-    }
-    for subsystem in &surface_flow.subsystems {
-        add_redb_subsystem_candidate(&mut builders, subsystem);
-    }
-    for test in &surface_flow.tests {
-        add_behavior_test_target(&mut builders, test);
-    }
-    apply_surface_flow_missing_warnings(&mut builders, &surface_flow.coverage_missing);
-
-    let mut ranked: Vec<ExploreSubsystemBuilder> = builders.into_values().collect();
-    ranked.retain(|builder| !builder.paths.is_empty() || !builder.targets.is_empty());
-    ranked.sort_by(|left, right| {
-        left.priority
-            .cmp(&right.priority)
-            .then_with(|| right.score.cmp(&left.score))
-            .then_with(|| left.label.cmp(right.label))
-    });
-    ranked
-        .into_iter()
-        .enumerate()
-        .map(|(index, mut builder)| {
-            let subsystem_id = builder.id;
-            let route_only_ingress = ingress_lane_lacks_edge_proxy_evidence(&builder);
-            if route_only_ingress {
-                builder.add_warning(
-                    "No indexed edge/proxy surface matched this task; ingress evidence is backend route-only.",
-                );
-            }
-            builder.targets.sort_by(|left, right| {
-                subsystem_target_priority(subsystem_id, right)
-                    .cmp(&subsystem_target_priority(subsystem_id, left))
-                    .then_with(|| {
-                        right
-                            .confidence
-                            .partial_cmp(&left.confidence)
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    })
-                    .then_with(|| left.target.cmp(&right.target))
-                    .then_with(|| left.path.cmp(&right.path))
-            });
-            let top_verification_targets = builder.targets.into_iter().take(3).collect::<Vec<_>>();
-            let signals = builder.signals.iter().take(10).cloned().collect::<Vec<_>>();
-            let token_subsystems =
-                token_subsystem_labels_from_signals_targets(&signals, &top_verification_targets);
-            let mut confidence = confidence_from_subsystem_score(builder.score);
-            if route_only_ingress {
-                confidence = confidence.min(0.68);
-            }
-            ExploreSubsystem {
-                rank: index + 1,
-                id: builder.id.to_string(),
-                label: builder.label.to_string(),
-                role: builder.role.to_string(),
-                confidence,
-                paths: builder.paths.iter().take(6).cloned().collect(),
-                token_subsystems,
-                top_verification_targets,
-                signals,
-                missing_coverage_warnings: builder.warnings.iter().take(4).cloned().collect(),
-            }
-        })
-        .take(4)
-        .collect()
-}
-
-fn summary_paths_are_only_ingress_proxy(summary: &TokenSubsystemSummary) -> bool {
-    !summary.paths.is_empty()
-        && summary
-            .paths
-            .iter()
-            .all(|path| path_looks_ingress_proxy(path))
-}
-
-fn path_looks_ingress_proxy(path: &str) -> bool {
-    let lower = path.to_ascii_lowercase();
-    contains_any_text(
-        &lower,
-        &[
-            "gcp-run-proxy",
-            "proxy/",
-            "proxy.",
-            "worker.",
-            "workers/",
-            "edge/",
-            "gateway/",
-        ],
-    )
-}
-
-fn add_surface_flow_candidate_subsystems(
-    builders: &mut std::collections::BTreeMap<&'static str, ExploreSubsystemBuilder>,
-    candidate: &SurfaceFlowCandidate,
-    target_kind: &str,
-    base_score: i32,
-    reason: &str,
-) {
-    let text = surface_candidate_text(
-        candidate.node.kind,
-        candidate.node.id.as_str(),
-        candidate.node.display.as_str(),
-        candidate.node.name.as_str(),
-        candidate.node.path.as_deref(),
-        &candidate.relation_kinds,
-        &[],
-    );
-    for subsystem_id in
-        classify_surface_subsystems(candidate.node.kind, &text, &candidate.relation_kinds)
-    {
-        let builder = builders
-            .entry(subsystem_id)
-            .or_insert_with(|| ExploreSubsystemBuilder::new(subsystem_id));
-        builder.score += base_score + candidate.rank.max(0);
-        if let Some(path) = candidate.node.path.as_deref() {
-            builder.add_path(path);
-        }
-        for relation in &candidate.relation_kinds {
-            builder.add_signal(edge_kind_label_for_explore(relation));
-        }
-        for token in &candidate.matched_tokens {
-            builder.add_signal(format!("matched_token:{token}"));
-        }
-        for matched in token_subsystem_matches(&text) {
-            builder.add_signal(matched.signal);
-        }
-        builder.add_target(ExploreSubsystemTarget {
-            kind: target_kind.to_string(),
-            target: node_target_label(&candidate.node),
-            path: candidate.node.path.clone(),
-            reason: relation_reason(reason, &candidate.relation_kinds),
-            confidence: confidence_from_subsystem_score(base_score + candidate.rank.max(0)),
-        });
-    }
-}
-
-fn add_surface_path_subsystems(
-    builders: &mut std::collections::BTreeMap<&'static str, ExploreSubsystemBuilder>,
-    path: &SurfacePathCandidate,
-) {
-    let node_kind = path
-        .surfaces
-        .first()
-        .map(|node| node.kind)
-        .unwrap_or(StoredNodeKind::File);
-    let text = surface_candidate_text(
-        node_kind,
-        path.path.as_str(),
-        path.path.as_str(),
-        path.path.as_str(),
-        Some(path.path.as_str()),
-        &path.relation_kinds,
-        &[],
-    );
-    for subsystem_id in classify_surface_subsystems(node_kind, &text, &path.relation_kinds) {
-        let builder = builders
-            .entry(subsystem_id)
-            .or_insert_with(|| ExploreSubsystemBuilder::new(subsystem_id));
-        builder.score += 120 + path.rank.max(0);
-        builder.add_path(path.path.clone());
-        for relation in &path.relation_kinds {
-            builder.add_signal(edge_kind_label_for_explore(relation));
-        }
-        for token in &path.matched_tokens {
-            builder.add_signal(format!("matched_token:{token}"));
-        }
-        for matched in token_subsystem_matches(&text) {
-            builder.add_signal(matched.signal);
-        }
-        builder.add_target(ExploreSubsystemTarget {
-            kind: "surface_path".into(),
-            target: path.path.clone(),
-            path: Some(path.path.clone()),
-            reason: relation_reason(
-                "Surface/Flow graph matched behavior on this repo path.",
-                &path.relation_kinds,
-            ),
-            confidence: confidence_from_subsystem_score(120 + path.rank.max(0)),
-        });
-    }
-}
-
-fn add_redb_subsystem_candidate(
-    builders: &mut std::collections::BTreeMap<&'static str, ExploreSubsystemBuilder>,
-    subsystem: &SubsystemCandidate,
-) {
-    let text = format!(
-        "{} {} {}",
-        subsystem.id.as_deref().unwrap_or(""),
-        subsystem.path_prefix,
-        subsystem.matched_tokens.join(" ")
-    )
-    .to_ascii_lowercase();
-    let relation_kinds = Vec::new();
-    let mut matched = classify_surface_subsystems(StoredNodeKind::File, &text, &relation_kinds)
-        .into_iter()
-        .filter(|id| *id != "backend_validator")
-        .collect::<Vec<_>>();
-    for node in &subsystem.nodes {
-        let node_text = surface_candidate_text(
-            node.kind,
-            node.id.as_str(),
-            node.display.as_str(),
-            node.name.as_str(),
-            node.path.as_deref(),
-            &relation_kinds,
-            &[],
-        );
-        for id in classify_surface_subsystems(node.kind, &node_text, &relation_kinds) {
-            if !matched.contains(&id) {
-                matched.push(id);
-            }
-        }
-    }
-    for subsystem_id in matched {
-        let builder = builders
-            .entry(subsystem_id)
-            .or_insert_with(|| ExploreSubsystemBuilder::new(subsystem_id));
-        builder.score += 100 + subsystem.rank.max(0);
-        builder.add_path(subsystem.path_prefix.clone());
-        for token in &subsystem.matched_tokens {
-            builder.add_signal(format!("matched_token:{token}"));
-        }
-        builder.add_target(ExploreSubsystemTarget {
-            kind: "subsystem_path".into(),
-            target: subsystem.path_prefix.clone(),
-            path: Some(subsystem.path_prefix.clone()),
-            reason: "redb grouped matching Surface/Flow nodes under this path prefix.".into(),
-            confidence: confidence_from_subsystem_score(100 + subsystem.rank.max(0)),
-        });
-    }
-}
-
-fn add_behavior_test_target(
-    builders: &mut std::collections::BTreeMap<&'static str, ExploreSubsystemBuilder>,
-    node: &NodeDisplay,
-) {
-    let text = surface_candidate_text(
-        node.kind,
-        node.id.as_str(),
-        node.display.as_str(),
-        node.name.as_str(),
-        node.path.as_deref(),
-        &[],
-        &[],
-    );
-    let matched = classify_surface_subsystems(node.kind, &text, &[]);
-    for subsystem_id in matched {
-        let builder = builders
-            .entry(subsystem_id)
-            .or_insert_with(|| ExploreSubsystemBuilder::new(subsystem_id));
-        builder.score += 45;
-        if let Some(path) = node.path.as_deref() {
-            builder.add_path(path);
-        }
-        builder.add_signal("tested_by");
-        builder.add_target(ExploreSubsystemTarget {
-            kind: "behavior_test".into(),
-            target: node_target_label(node),
-            path: node.path.clone(),
-            reason: "Behavior test linked to a matching Surface/Flow candidate.".into(),
-            confidence: 0.62,
-        });
-    }
-}
-
-fn apply_surface_flow_missing_warnings(
-    builders: &mut std::collections::BTreeMap<&'static str, ExploreSubsystemBuilder>,
-    missing: &[String],
-) {
-    for item in missing {
-        match item.as_str() {
-            "entrypoints" => {
-                if let Some(builder) = builders.get_mut("ingress_proxy") {
-                    builder.add_warning(
-                        "No indexed ingress entrypoint matched this task; verify route/proxy discovery from source.",
-                    );
-                }
-            }
-            "surface_paths" => {
-                for builder in builders.values_mut() {
-                    builder.add_warning(
-                        "Surface path coverage is partial for this task class; treat subsystem ordering as provisional.",
-                    );
-                }
-            }
-            "credential_flows" => {
-                if let Some(builder) = builders.get_mut("backend_validator") {
-                    builder.add_warning(
-                        "No indexed credential-flow edge matched this task; verify credential issue/use/validation in source.",
-                    );
-                }
-            }
-            "behavior_tests" => {
-                for builder in builders.values_mut() {
-                    builder.add_warning(
-                        "No linked live behavior test was indexed for this task class.",
-                    );
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
-fn classify_surface_subsystems(
-    kind: StoredNodeKind,
-    lower_text: &str,
-    relation_kinds: &[EdgeKind],
-) -> Vec<&'static str> {
-    let mut out = Vec::new();
-    let provider_or_secondary = token_subsystem_matches(lower_text).iter().any(|matched| {
-        matches!(
-            matched.id,
-            "oidc"
-                | "audit_jws"
-                | "auth0_management"
-                | "webhook_tokens"
-                | "profile_integrity"
-                | "domain_verification"
-        )
-    }) || contains_any_text(
-        lower_text,
-        &["oauth", "provider", "management_token", "management token"],
-    );
-    let api_key = contains_any_text(
-        lower_text,
-        &["api keys", "api-key", "api_key", "api_keys", "apikey"],
-    );
-    let ingress_kind = matches!(
-        kind,
-        StoredNodeKind::RouteSurface
-            | StoredNodeKind::WorkerSurface
-            | StoredNodeKind::ProxySurface
-            | StoredNodeKind::WebhookSurface
-            | StoredNodeKind::CliSurface
-            | StoredNodeKind::JobSurface
-            | StoredNodeKind::QueueSurface
-    );
-    let ingress_relation = relation_kinds.iter().any(|kind| {
-        matches!(
-            kind,
-            EdgeKind::EntrypointFor
-                | EdgeKind::Exposes
-                | EdgeKind::ForwardsTo
-                | EdgeKind::RewritesHeader
-        )
-    });
-    if ingress_kind
-        || ingress_relation
-        || contains_any_text(
-            lower_text,
-            &[
-                "gcp-run-proxy",
-                "proxy/",
-                "proxy.",
-                "worker.",
-                "workers/",
-                "route_surface",
-                "webhook_surface",
-                "middleware.ts",
-                "middleware.js",
-            ],
-        )
-    {
-        out.push("ingress_proxy");
-    }
-
-    let credential_relation = relation_kinds.iter().any(|kind| {
-        matches!(
-            kind,
-            EdgeKind::Authorizes
-                | EdgeKind::IssuesCredential
-                | EdgeKind::StoresCredential
-                | EdgeKind::UsesCredential
-                | EdgeKind::ValidatesCredential
-        )
-    });
-    let backend_text = contains_any_text(lower_text, &["backend/", "backend.", "server/", "api/"]);
-    let backend_validation_text = api_key
-        || contains_any_text(
-            lower_text,
-            &[
-                "bearer",
-                "credential",
-                "pk_",
-                "authenticate",
-                "authentication",
-                "authorize",
-                "permission",
-                "validate",
-                "validator",
-            ],
-        );
-    let ingress_proxy_text = path_looks_ingress_proxy(lower_text);
-    let backend_implementation_text = contains_any_text(
-        lower_text,
-        &[
-            "backend/api_keys",
-            "backend.api_keys",
-            "/api_keys",
-            "api_keys/",
-        ],
-    );
-    let backend_candidate_kind = matches!(
-        kind,
-        StoredNodeKind::File
-            | StoredNodeKind::Function
-            | StoredNodeKind::Class
-            | StoredNodeKind::CredentialOperation
-            | StoredNodeKind::MiddlewareInstallation
-            | StoredNodeKind::RouteSurface
-    );
-    if !provider_or_secondary
-        && backend_text
-        && backend_validation_text
-        && (!ingress_proxy_text || backend_implementation_text)
-        && (api_key || credential_relation || backend_candidate_kind)
-    {
-        out.push("backend_validator");
-    }
-
-    if provider_or_secondary && !out.contains(&"provider_oidc_audit") {
-        out.push("provider_oidc_audit");
-    }
-    out
-}
-
-fn surface_candidate_text(
-    kind: StoredNodeKind,
-    id: &str,
-    display: &str,
-    name: &str,
-    path: Option<&str>,
-    relation_kinds: &[EdgeKind],
-    matched_tokens: &[String],
-) -> String {
-    let relation_labels = relation_kinds
-        .iter()
-        .map(edge_kind_label_for_explore)
-        .collect::<Vec<_>>()
-        .join(" ");
-    format!(
-        "{} {} {} {} {} {} {}",
-        stored_node_kind_label(kind),
-        id,
-        display,
-        name,
-        path.unwrap_or(""),
-        relation_labels,
-        matched_tokens.join(" ")
-    )
-    .to_ascii_lowercase()
-}
-
-fn relation_reason(base: &str, relation_kinds: &[EdgeKind]) -> String {
-    if relation_kinds.is_empty() {
-        return base.to_string();
-    }
-    format!(
-        "{} Relations: {}.",
-        base,
-        relation_kinds
-            .iter()
-            .map(edge_kind_label_for_explore)
-            .collect::<Vec<_>>()
-            .join(", ")
-    )
-}
-
-fn node_target_label(node: &NodeDisplay) -> String {
-    if !node.display.trim().is_empty() {
-        node.display.clone()
-    } else if !node.name.trim().is_empty() {
-        node.name.clone()
-    } else {
-        node.id.clone()
-    }
-}
-
-fn confidence_from_subsystem_score(score: i32) -> f64 {
-    let clamped = score.max(0).min(500) as f64;
-    ((0.48 + (clamped / 500.0) * 0.44) * 100.0).round() / 100.0
-}
-
-fn subsystem_crossing_hint(subsystems: &[ExploreSubsystem]) -> Option<String> {
-    let ingress = subsystems
-        .iter()
-        .find(|subsystem| subsystem.role == "ingress_proxy")
-        .and_then(|subsystem| {
-            preferred_matching_path(&subsystem.paths, &["gcp-run-proxy", "proxy"])
-        });
-    let backend = subsystems
-        .iter()
-        .find(|subsystem| subsystem.role == "backend_validator")
-        .and_then(|subsystem| {
-            preferred_matching_path(&subsystem.paths, &["backend/api_keys", "api_keys"])
-        });
-    match (ingress, backend) {
-        (Some(ingress), Some(backend)) => Some(format!(
-            "The likely inbound API-key path crosses {ingress} and {backend}. Verify proxy classification first, then backend validation."
-        )),
-        _ => None,
-    }
-}
-
-fn preferred_matching_path(paths: &[String], preferred_needles: &[&str]) -> Option<String> {
-    paths
-        .iter()
-        .find(|path| {
-            let lower = path.to_ascii_lowercase();
-            preferred_needles
-                .iter()
-                .any(|needle| lower.contains(needle))
-        })
-        .cloned()
-}
-
-fn subsystem_lane_ambiguity_value(subsystems: &[ExploreSubsystem]) -> serde_json::Value {
-    serde_json::json!({
-        "kind": "subsystem_lane_ambiguity",
-        "status": "needs_verification",
-        "reason": "Multiple subsystem lanes matched this request; verify the top lanes before committing to one implementation.",
-        "verify_top_n": 2,
-        "subsystems": subsystems
-            .iter()
-            .take(4)
-            .map(|subsystem| serde_json::json!({
-                "rank": subsystem.rank,
-                "id": subsystem.id,
-                "label": subsystem.label,
-                "role": subsystem.role,
-                "confidence": subsystem.confidence,
-                "paths": subsystem.paths,
-                "token_subsystems": subsystem.token_subsystems,
-                "signals": subsystem.signals,
-                "top_verification_targets": subsystem.top_verification_targets,
-                "missing_coverage_warnings": subsystem.missing_coverage_warnings,
-            }))
-            .collect::<Vec<_>>(),
-    })
-}
-
-fn token_subsystem_labels_from_signals_targets(
-    signals: &[String],
-    targets: &[ExploreSubsystemTarget],
-) -> Vec<&'static str> {
-    let mut labels = std::collections::BTreeSet::new();
-    for signal in signals {
-        match signal.as_str() {
-            "api_key_surface" | "token_subsystem:api_keys" => {
-                labels.insert("API keys");
-            }
-            "oidc_surface" | "token_subsystem:oidc" => {
-                labels.insert("OIDC");
-            }
-            "audit_jws_surface" | "token_subsystem:audit_jws" => {
-                labels.insert("audit JWS");
-            }
-            "auth0_management_surface" | "token_subsystem:auth0_management" => {
-                labels.insert("Auth0 management");
-            }
-            "webhook_token_surface" | "token_subsystem:webhook_tokens" => {
-                labels.insert("webhook tokens");
-            }
-            "profile_integrity_surface" | "token_subsystem:profile_integrity" => {
-                labels.insert("profile-integrity");
-            }
-            "domain_verification_surface" | "token_subsystem:domain_verification" => {
-                labels.insert("domain verification");
-            }
-            _ => {}
-        }
-    }
-    for target in targets {
-        let text = format!(
-            "{} {} {}",
-            target.target,
-            target.path.as_deref().unwrap_or(""),
-            target.reason
-        )
-        .to_ascii_lowercase();
-        for matched in token_subsystem_matches(&text) {
-            labels.insert(matched.label);
-        }
-    }
-    labels.into_iter().collect()
-}
-
-fn edge_kind_label_for_explore(kind: &EdgeKind) -> &'static str {
-    match kind {
-        EdgeKind::Contains => "contains",
-        EdgeKind::BelongsTo => "belongs_to",
-        EdgeKind::Defines => "defines",
-        EdgeKind::Imports => "imports",
-        EdgeKind::Calls => "calls",
-        EdgeKind::References => "references",
-        EdgeKind::Documents => "documents",
-        EdgeKind::Configures => "configures",
-        EdgeKind::EntrypointFor => "entrypoint_for",
-        EdgeKind::Authorizes => "authorizes",
-        EdgeKind::Exposes => "exposes",
-        EdgeKind::ForwardsTo => "forwards_to",
-        EdgeKind::InstallsMiddleware => "installs_middleware",
-        EdgeKind::IssuesCredential => "issues_credential",
-        EdgeKind::StoresCredential => "stores_credential",
-        EdgeKind::UsesCredential => "uses_credential",
-        EdgeKind::ValidatesCredential => "validates_credential",
-        EdgeKind::RewritesHeader => "rewrites_header",
-        EdgeKind::TestedBy => "tested_by",
-    }
-}
-
-fn stored_node_kind_label(kind: StoredNodeKind) -> &'static str {
-    match kind {
-        StoredNodeKind::Repository => "repository",
-        StoredNodeKind::Directory => "directory",
-        StoredNodeKind::File => "file",
-        StoredNodeKind::Area => "area",
-        StoredNodeKind::Function => "function",
-        StoredNodeKind::Class => "class",
-        StoredNodeKind::Doc => "doc",
-        StoredNodeKind::Config => "config",
-        StoredNodeKind::BehaviorTestSurface => "behavior_test_surface",
-        StoredNodeKind::CliSurface => "cli_surface",
-        StoredNodeKind::CredentialOperation => "credential_operation",
-        StoredNodeKind::JobSurface => "job_surface",
-        StoredNodeKind::MiddlewareInstallation => "middleware_installation",
-        StoredNodeKind::ProxySurface => "proxy_surface",
-        StoredNodeKind::QueueSurface => "queue_surface",
-        StoredNodeKind::RouteSurface => "route_surface",
-        StoredNodeKind::WebhookSurface => "webhook_surface",
-        StoredNodeKind::WorkerSurface => "worker_surface",
-        StoredNodeKind::Unresolved => "unresolved",
-    }
-}
-
 fn contains_any_text(haystack: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| haystack.contains(needle))
 }
@@ -3266,8 +2032,8 @@ fn build_response(
 }
 
 /// Translate the redb task-localize view into the answer-json
-/// envelope the agent contract expects, with optional Surface/Flow
-/// evidence projected into subsystem-ranked verification lanes.
+/// envelope the agent contract expects. Surface/Flow evidence feeds the
+/// observability and degraded-reason signals only; it does not rank answers.
 fn build_response_with_surface_flow(
     request: &str,
     intent: Intent,
@@ -3445,7 +2211,7 @@ fn build_response_with_surface_flow(
     // The reservation is conservative: only ≥2 slots, only when symbol
     // has multi-query hits. Single-query symbol matches stay weakly
     // ranked.
-    let symbol_items = build_symbol_file_items(symbol_matches, params.max_symbol_files, request);
+    let symbol_items = build_symbol_file_items(symbol_matches, params.max_symbol_files);
     let multi_query_symbol_count = symbol_items
         .iter()
         .filter(|item| {
@@ -3626,37 +2392,9 @@ fn build_response_with_surface_flow(
     // `max_answer_items` exactly.
     answers.truncate(params.max_answer_items);
 
-    let token_summary_groups: [&[AnswerItem]; 4] = [
-        answers.as_slice(),
-        symbol_items.as_slice(),
-        text_items,
-        callsite_items,
-    ];
-    let token_subsystems = token_subsystem_summaries(request, &token_summary_groups);
-    let mut subsystems = explore_subsystem_rankings(request, &token_subsystems, surface_flow);
-    let token_subsystem_ambiguous =
-        token_subsystems.len() >= 2 && !request_names_specific_token_subsystem(request);
-    let subsystem_lane_ambiguous = subsystems.len() >= 2
-        && ranking::auth_token_focus_from_request(request)
-        && !request_names_provider_or_secondary_token_subsystem(request);
-    let subsystem_ambiguous = token_subsystem_ambiguous || subsystem_lane_ambiguous;
-    let mut ambiguous = Vec::new();
-    if token_subsystem_ambiguous {
-        ambiguous.push(token_subsystem_ambiguity_value(&token_subsystems));
-    }
-    if subsystem_lane_ambiguous {
-        ambiguous.push(subsystem_lane_ambiguity_value(&subsystems));
-    }
-
     let mut output_budget = OutputBudgetReport::default();
     if agent_output_profile(params) {
-        apply_agent_output_budget(
-            &mut answers,
-            &mut nav_hints,
-            &mut ambiguous,
-            &mut subsystems,
-            &mut output_budget,
-        );
+        apply_agent_output_budget(&mut answers, &mut nav_hints, &mut output_budget);
     }
 
     let answer_count = answers.len();
@@ -3727,7 +2465,7 @@ fn build_response_with_surface_flow(
     let triple_corroborated: bool = !strong_callsite_files.is_empty()
         && (!cross_corroborated.is_empty() || !multi_query_symbol_files.is_empty());
 
-    let mut policy_kind = if answers.is_empty() && nav_hints.is_empty() {
+    let policy_kind = if answers.is_empty() && nav_hints.is_empty() {
         "failed"
     } else if !cross_corroborated.is_empty() || !multi_query_symbol_files.is_empty() {
         "answer_candidate"
@@ -3737,9 +2475,6 @@ fn build_response_with_surface_flow(
     } else {
         "needs_verification"
     };
-    if subsystem_ambiguous && policy_kind == "answer_candidate" {
-        policy_kind = "needs_verification";
-    }
     let evidence_level = if triple_corroborated {
         "graph+symbol+text+callsite"
     } else if !cross_corroborated.is_empty() {
@@ -3761,17 +2496,6 @@ fn build_response_with_surface_flow(
     };
     let safe_to_use_as_answer = matches!(policy_kind, "answer_candidate");
     let trust_reason = match policy_kind {
-        _ if subsystem_ambiguous => {
-            if let Some(hint) = subsystem_crossing_hint(&subsystems) {
-                format!("Multiple token/auth subsystems matched. {hint}")
-            } else {
-                format!(
-                    "Multiple token/auth subsystems matched ({}); verify the top 2 \
-                     before relying on one implementation.",
-                    top_token_subsystem_labels(&token_subsystems, 6)
-                )
-            }
-        }
         "answer_candidate" if !cross_corroborated.is_empty() => format!(
             "Symbol search and source-text both matched {} candidate file(s); \
              cross-corroborated evidence treated as authoritative.",
@@ -3814,7 +2538,6 @@ fn build_response_with_surface_flow(
         text_items,
         callsite_items,
         surface_flow,
-        subsystem_ambiguous,
         &observability,
     );
     trust_policy.degraded = !degraded_reasons.is_empty();
@@ -3830,20 +2553,6 @@ fn build_response_with_surface_flow(
             "Refine the request — graph navigation found no anchors.".into(),
             "Try a more specific keyword from the codebase domain.".into(),
         ]
-    } else if subsystem_ambiguous {
-        let mut actions = vec![
-            "There are multiple token systems; verify the top 2 subsystem lanes before committing to one implementation."
-                .into(),
-        ];
-        if let Some(hint) = subsystem_crossing_hint(&subsystems) {
-            actions.push(hint);
-        } else {
-            actions.push(
-                "Then read the top answer[] item and confirm it matches the intended inbound or provider-management path."
-                    .into(),
-            );
-        }
-        actions
     } else {
         vec![
             "Read the top answer[] item to verify it matches the task.".into(),
@@ -3857,27 +2566,13 @@ fn build_response_with_surface_flow(
     // into the response struct.
     let safe_to_use_as_answer = trust_policy.safe_to_use_as_answer;
     let safe_to_use_as_navigation = trust_policy.safe_to_use_as_navigation;
-    let mut verification_steps = build_verification_steps(
-        &answers,
-        &nav_hints,
-        &trust_policy,
-        text_items,
-        if subsystem_ambiguous {
-            token_subsystems.as_slice()
-        } else {
-            &[]
-        },
-        if subsystem_ambiguous {
-            subsystems.as_slice()
-        } else {
-            &[]
-        },
-    );
+    let mut verification_steps =
+        build_verification_steps(&answers, &nav_hints, &trust_policy, text_items);
 
     // Build output_adapters and resolved_parameters only when the
     // caller has asked for the explicit full profile. `--show-observability`
     // in compact/standard now emits a compact trust/coverage block instead
-    // of the full debug envelope; agents need safety, lanes, and warnings on
+    // of the full debug envelope; agents need safety, coverage, and warnings on
     // the first call, not adapters and long path-hint arrays.
     let full_profile = matches!(params.detail, Detail::Full);
 
@@ -3920,9 +2615,7 @@ fn build_response_with_surface_flow(
             &symbol_items,
             text_items,
             callsite_items,
-            &subsystems,
             surface_flow,
-            subsystem_ambiguous,
         ))
     } else if params.show_observability {
         Some(compact_explore_observability(
@@ -3935,9 +2628,7 @@ fn build_response_with_surface_flow(
             &symbol_items,
             text_items,
             callsite_items,
-            &subsystems,
             surface_flow,
-            subsystem_ambiguous,
         ))
     } else {
         None
@@ -4003,8 +2694,13 @@ fn build_response_with_surface_flow(
         answer: answers,
         navigation_hints: nav_hints,
         excluded: Vec::new(),
-        ambiguous,
-        subsystems,
+        // `ambiguous` and `subsystems` stay in the envelope because
+        // cross-process readers (`explore-summary`, `verify-targets`, the
+        // eval harness) read them. The task-localization path has no
+        // producer for either; the bounded source fallback fills
+        // `subsystems` when the graph is unavailable.
+        ambiguous: Vec::new(),
+        subsystems: Vec::new(),
         evidence: Evidence {
             answer_count,
             navigation_hint_count,
@@ -4048,9 +2744,7 @@ fn enrich_explore_observability(
     symbol_items: &[AnswerItem],
     text_items: &[AnswerItem],
     callsite_items: &[AnswerItem],
-    subsystems: &[ExploreSubsystem],
     surface_flow: &SurfaceFlowExploreEvidence,
-    subsystem_ambiguous: bool,
 ) -> serde_json::Value {
     let top_signals_used = explore_top_signals_used(
         answers,
@@ -4058,7 +2752,6 @@ fn enrich_explore_observability(
         symbol_items,
         text_items,
         callsite_items,
-        subsystems,
         surface_flow,
     );
     let top_signals_absent = explore_top_signals_absent(
@@ -4066,7 +2759,6 @@ fn enrich_explore_observability(
         symbol_items,
         text_items,
         callsite_items,
-        subsystems,
         surface_flow,
         &observability,
     );
@@ -4101,7 +2793,6 @@ fn enrich_explore_observability(
                 "degraded_ranking_reasons": degraded_reasons,
                 "top_signals_used": top_signals_used,
                 "top_signals_absent": top_signals_absent,
-                "subsystem_ambiguous": subsystem_ambiguous,
             }),
         );
         obj.insert(
@@ -4132,9 +2823,7 @@ fn compact_explore_observability(
     symbol_items: &[AnswerItem],
     text_items: &[AnswerItem],
     callsite_items: &[AnswerItem],
-    subsystems: &[ExploreSubsystem],
     surface_flow: &SurfaceFlowExploreEvidence,
-    subsystem_ambiguous: bool,
 ) -> serde_json::Value {
     let enriched = enrich_explore_observability(
         observability,
@@ -4146,9 +2835,7 @@ fn compact_explore_observability(
         symbol_items,
         text_items,
         callsite_items,
-        subsystems,
         surface_flow,
-        subsystem_ambiguous,
     );
     let mut compact = serde_json::Map::new();
     if let Some(value) = enriched.get("graph_store").cloned() {
@@ -4253,10 +2940,8 @@ fn compact_missing_expected_surfaces(value: &serde_json::Value) -> serde_json::V
 
 fn compact_ranking_explainability(value: &serde_json::Value) -> serde_json::Value {
     let mut compact = serde_json::Map::new();
-    for key in ["subsystem_ambiguous", "degraded_ranking_reasons"] {
-        if let Some(child) = value.get(key).cloned() {
-            compact.insert(key.to_string(), child);
-        }
+    if let Some(child) = value.get("degraded_ranking_reasons").cloned() {
+        compact.insert("degraded_ranking_reasons".to_string(), child);
     }
     if let Some(items) = value
         .get("top_signals_used")
@@ -4303,7 +2988,6 @@ fn explore_top_signals_used(
     symbol_items: &[AnswerItem],
     text_items: &[AnswerItem],
     callsite_items: &[AnswerItem],
-    subsystems: &[ExploreSubsystem],
     surface_flow: &SurfaceFlowExploreEvidence,
 ) -> Vec<serde_json::Value> {
     let mut counts = std::collections::BTreeMap::new();
@@ -4321,15 +3005,6 @@ fn explore_top_signals_used(
         .chain(callsite_items.iter())
     {
         collect_answer_item_signals(item, &mut counts);
-    }
-    if !subsystems.is_empty() {
-        add_signal_count(&mut counts, "subsystem_lane_ranking");
-    }
-    for subsystem in subsystems {
-        add_signal_count(&mut counts, format!("subsystem:{}", subsystem.role));
-        for signal in &subsystem.signals {
-            add_signal_count(&mut counts, format!("subsystem_signal:{signal}"));
-        }
     }
     if !surface_flow.entrypoints.is_empty() {
         add_signal_count(&mut counts, "surface_flow_entrypoints");
@@ -4427,7 +3102,6 @@ fn explore_top_signals_absent(
     symbol_items: &[AnswerItem],
     text_items: &[AnswerItem],
     callsite_items: &[AnswerItem],
-    subsystems: &[ExploreSubsystem],
     surface_flow: &SurfaceFlowExploreEvidence,
     observability: &serde_json::Value,
 ) -> Vec<serde_json::Value> {
@@ -4490,39 +3164,6 @@ fn explore_top_signals_absent(
             "No caller/callee expansion evidence was emitted for the ranked symbols.",
         );
     }
-    let auth_focus = ranking::auth_token_focus_from_request(request);
-    if auth_focus && surface_flow.entrypoints.is_empty() {
-        push_absent_signal(
-            &mut absent,
-            &mut seen,
-            "surface_flow_entrypoints",
-            "No indexed route/proxy/worker entrypoint candidate matched this auth or token task.",
-        );
-    }
-    if auth_focus && surface_flow.credential_flows.is_empty() {
-        push_absent_signal(
-            &mut absent,
-            &mut seen,
-            "surface_flow_credential_flows",
-            "No persisted credential issue/store/use/validation edge matched this task.",
-        );
-    }
-    if auth_focus && surface_flow.tests.is_empty() {
-        push_absent_signal(
-            &mut absent,
-            &mut seen,
-            "linked_behavior_tests",
-            "No indexed integration or behavior test was linked to the matching surface.",
-        );
-    }
-    if auth_focus && subsystems.len() < 2 {
-        push_absent_signal(
-            &mut absent,
-            &mut seen,
-            "multi_lane_subsystem_ranking",
-            "Explore did not have enough Surface/Flow evidence to rank competing subsystem lanes.",
-        );
-    }
     absent.into_iter().take(14).collect()
 }
 
@@ -4535,7 +3176,6 @@ fn explore_degraded_ranking_reasons(
     text_items: &[AnswerItem],
     callsite_items: &[AnswerItem],
     surface_flow: &SurfaceFlowExploreEvidence,
-    subsystem_ambiguous: bool,
     observability: &serde_json::Value,
 ) -> Vec<String> {
     let mut reasons = Vec::new();
@@ -4546,9 +3186,6 @@ fn explore_degraded_ranking_reasons(
             &mut reasons,
             "navigation_only_without_authoritative_evidence",
         );
-    }
-    if subsystem_ambiguous {
-        push_unique_reason(&mut reasons, "ambiguous_token_or_surface_subsystems");
     }
     if !trust_policy.safe_to_use_as_answer
         && !has_symbol_text_corroboration(symbol_items, text_items)
@@ -4563,14 +3200,6 @@ fn explore_degraded_ranking_reasons(
     }
     if !trust_policy.safe_to_use_as_answer && callsite_items.is_empty() {
         push_unique_reason(&mut reasons, "missing_callsite_evidence");
-    }
-    if ranking::auth_token_focus_from_request(request) {
-        if surface_flow.entrypoints.is_empty() {
-            push_unique_reason(&mut reasons, "missing_ingress_surface_flow_candidates");
-        }
-        if surface_flow.credential_flows.is_empty() {
-            push_unique_reason(&mut reasons, "missing_credential_flow_edges");
-        }
     }
     if !surface_flow.coverage_missing.is_empty() {
         push_unique_reason(&mut reasons, "surface_flow_task_coverage_missing");
@@ -4639,8 +3268,7 @@ fn surface_flow_relevant_for_request(
     request: &str,
     surface_flow: &SurfaceFlowExploreEvidence,
 ) -> bool {
-    ranking::auth_token_focus_from_request(request)
-        || !surface_flow.entrypoints.is_empty()
+    !surface_flow.entrypoints.is_empty()
         || !surface_flow.surface_paths.is_empty()
         || !surface_flow.credential_flows.is_empty()
         || contains_any_text(
@@ -4784,48 +3412,13 @@ fn cap_vec<T>(items: &mut Vec<T>, max: usize, report: &mut OutputBudgetReport) {
 fn apply_agent_output_budget(
     answers: &mut Vec<AnswerItem>,
     nav_hints: &mut Vec<AnswerItem>,
-    ambiguous: &mut [serde_json::Value],
-    subsystems: &mut Vec<ExploreSubsystem>,
     report: &mut OutputBudgetReport,
 ) {
     cap_vec(answers, AGENT_OUTPUT_MAX_ANSWER_ITEMS, report);
     cap_vec(nav_hints, AGENT_OUTPUT_MAX_NAVIGATION_HINTS, report);
-    cap_vec(subsystems, AGENT_OUTPUT_MAX_SUBSYSTEMS, report);
 
     for item in answers.iter_mut().chain(nav_hints.iter_mut()) {
         budget_answer_item(item, report);
-    }
-    for value in ambiguous {
-        budget_ambiguity_value(value, report);
-    }
-    for subsystem in subsystems {
-        cap_vec(
-            &mut subsystem.paths,
-            AGENT_OUTPUT_MAX_SUBSYSTEM_PATHS,
-            report,
-        );
-        cap_vec(
-            &mut subsystem.top_verification_targets,
-            AGENT_OUTPUT_MAX_SUBSYSTEM_TARGETS,
-            report,
-        );
-        for target in &mut subsystem.top_verification_targets {
-            shorten_string(
-                &mut target.reason,
-                AGENT_OUTPUT_MAX_TARGET_REASON_CHARS,
-                report,
-            );
-        }
-        cap_vec(
-            &mut subsystem.signals,
-            AGENT_OUTPUT_MAX_SUBSYSTEM_SIGNALS,
-            report,
-        );
-        cap_vec(
-            &mut subsystem.missing_coverage_warnings,
-            AGENT_OUTPUT_MAX_WARNINGS,
-            report,
-        );
     }
 }
 
@@ -4846,15 +3439,6 @@ fn apply_agent_tail_budget(
 
 fn budget_answer_item(item: &mut AnswerItem, report: &mut OutputBudgetReport) {
     budget_evidence_value(&mut item.evidence, None, report);
-}
-
-fn shorten_string(value: &mut String, max_chars: usize, report: &mut OutputBudgetReport) {
-    if value.chars().count() <= max_chars {
-        return;
-    }
-    let shortened = value.chars().take(max_chars).collect::<String>();
-    *value = format!("{shortened}...");
-    report.truncated = true;
 }
 
 fn budget_evidence_value(
@@ -4883,63 +3467,6 @@ fn budget_evidence_value(
             }
         }
         _ => {}
-    }
-}
-
-fn budget_ambiguity_value(value: &mut serde_json::Value, report: &mut OutputBudgetReport) {
-    let Some(obj) = value.as_object_mut() else {
-        return;
-    };
-    let Some(subsystems) = obj
-        .get_mut("subsystems")
-        .and_then(|value| value.as_array_mut())
-    else {
-        return;
-    };
-    cap_vec(subsystems, AGENT_OUTPUT_MAX_AMBIGUITY_ARRAY_ITEMS, report);
-    for subsystem in subsystems {
-        let Some(subsystem_obj) = subsystem.as_object_mut() else {
-            continue;
-        };
-        let keep: std::collections::BTreeSet<&str> = [
-            "id",
-            "label",
-            "rank",
-            "role",
-            "score",
-            "confidence",
-            "token_subsystems",
-            "missing_coverage_warnings",
-        ]
-        .into_iter()
-        .collect();
-        let keys_to_remove = subsystem_obj
-            .keys()
-            .filter(|key| !keep.contains(key.as_str()))
-            .cloned()
-            .collect::<Vec<_>>();
-        if !keys_to_remove.is_empty() {
-            report.truncated = true;
-        }
-        for key in keys_to_remove {
-            subsystem_obj.remove(&key);
-        }
-        if let Some(token_subsystems) = subsystem_obj
-            .get_mut("token_subsystems")
-            .and_then(|value| value.as_array_mut())
-        {
-            cap_vec(
-                token_subsystems,
-                AGENT_OUTPUT_MAX_AMBIGUITY_ARRAY_ITEMS,
-                report,
-            );
-        }
-        if let Some(warnings) = subsystem_obj
-            .get_mut("missing_coverage_warnings")
-            .and_then(|value| value.as_array_mut())
-        {
-            cap_vec(warnings, AGENT_OUTPUT_MAX_WARNINGS, report);
-        }
     }
 }
 
@@ -5040,56 +3567,18 @@ fn merge_symbol_search_evidence(existing: &mut AnswerItem, symbol_item: &AnswerI
 /// specific line ref or symbol gives the agent a concrete thing to do.
 ///
 /// Step priority (we emit at most 4):
-///   1. If token/auth ambiguity exists → verify the top 2 subsystems
-///   2. If text evidence with line_refs → read the cited line(s)
-///   3. If symbol evidence → grep callers/dispatch sites of the symbol
-///   4. If failed/no answers → suggest broadening the request or increasing
+///   1. If text evidence with line_refs → read the cited line(s)
+///   2. If symbol evidence → grep callers/dispatch sites of the symbol
+///   3. If failed/no answers → suggest broadening the request or increasing
 ///      native detail for richer evidence
-///   5. Generic "open top answer and confirm" as a final fallback
+///   4. Generic "open top answer and confirm" as a final fallback
 fn build_verification_steps(
     answers: &[AnswerItem],
     nav_hints: &[AnswerItem],
     trust_policy: &TrustPolicy,
     text_items: &[AnswerItem],
-    token_subsystems: &[TokenSubsystemSummary],
-    subsystems: &[ExploreSubsystem],
 ) -> Vec<serde_json::Value> {
     let mut steps: Vec<serde_json::Value> = Vec::new();
-
-    if token_subsystems.len() >= 2 || subsystems.len() >= 2 {
-        let label_list = if !subsystems.is_empty() {
-            subsystems
-                .iter()
-                .take(4)
-                .map(|subsystem| subsystem.label.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        } else {
-            top_token_subsystem_labels(token_subsystems, 6)
-        };
-        steps.push(serde_json::json!({
-            "step": format!(
-                "There are multiple token systems: Aethyme found multiple \
-                 subsystem lanes ({}). Verify the top 2 before committing \
-                 to one subsystem.",
-                label_list
-            ),
-            "rationale": "Broad token requests can match API keys, OIDC, audit \
-                          JWS, provider-management, profile-integrity, and \
-                          domain-verification code. Checking the top two \
-                          prevents anchoring on the first plausible token hit.",
-        }));
-    }
-
-    if let Some(hint) = subsystem_crossing_hint(subsystems) {
-        steps.push(serde_json::json!({
-            "step": hint,
-            "rationale": "Inbound credential behavior often crosses an edge/proxy \
-                          layer before backend validation. Verifying the boundary \
-                          order prevents confusing provider-token helpers with \
-                          request authentication.",
-        }));
-    }
 
     // Step 1: cite a specific line ref the agent can read.
     if let Some(top_text) = text_items.first() {
@@ -5204,18 +3693,13 @@ fn build_verification_steps(
 ///
 /// These are the same numbers Python uses; preserving them keeps the
 /// trust-policy heuristics consistent across implementations.
-fn build_symbol_file_items(
-    symbol_matches: &SymbolBatchResults,
-    cap: usize,
-    request: &str,
-) -> Vec<AnswerItem> {
+fn build_symbol_file_items(symbol_matches: &SymbolBatchResults, cap: usize) -> Vec<AnswerItem> {
     use std::collections::BTreeMap;
     use std::collections::BTreeSet;
 
     #[derive(Default)]
     struct PerFile {
         queries: BTreeSet<String>,
-        symbol_names: BTreeSet<String>,
         symbols: Vec<serde_json::Value>,
         score: i64,
     }
@@ -5233,7 +3717,6 @@ fn build_symbol_file_items(
             }
             let entry = by_file.entry(hit.file.clone()).or_default();
             entry.queries.insert(query.clone());
-            entry.symbol_names.insert(hit.name.clone());
             entry.symbols.push(serde_json::json!({
                 "name": hit.name,
                 "kind": hit.kind,
@@ -5246,26 +3729,11 @@ fn build_symbol_file_items(
 
     let mut ranked: Vec<(String, PerFile)> = by_file.into_iter().collect();
     ranked.sort_by(|(la, a), (lb, b)| {
-        // Auth/token requests get one extra generic surface signal:
-        // inbound request-path and credential issue/auth surfaces outrank
-        // incidental token helpers. Non-auth requests return score 0 here,
-        // preserving the historical query/score/path ordering.
-        let a_surface = ranking::auth_token_surface_signals(
-            la,
-            &a.symbol_names.iter().cloned().collect::<Vec<_>>(),
-            request,
-        );
-        let b_surface = ranking::auth_token_surface_signals(
-            lb,
-            &b.symbol_names.iter().cloned().collect::<Vec<_>>(),
-            request,
-        );
-        // Primary: auth surface score when relevant. Secondary: more
-        // distinct queries. Tertiary: total score. Final: stable path order.
-        b_surface
-            .score
-            .cmp(&a_surface.score)
-            .then_with(|| b.queries.len().cmp(&a.queries.len()))
+        // Primary: more distinct queries. Secondary: total score. Final:
+        // stable path order.
+        b.queries
+            .len()
+            .cmp(&a.queries.len())
             .then_with(|| b.score.cmp(&a.score))
             .then_with(|| la.cmp(lb))
     });
@@ -5274,45 +3742,19 @@ fn build_symbol_file_items(
     for (file_path, summary) in ranked.into_iter().take(cap) {
         let matched_queries: Vec<String> = summary.queries.iter().cloned().collect();
         let multi = matched_queries.len() > 1;
-        let signals = ranking::auth_token_surface_signals(
-            &file_path,
-            &summary.symbol_names.iter().cloned().collect::<Vec<_>>(),
-            request,
-        );
-        let surface_confidence_bonus = if signals.score >= 120 {
-            0.04
-        } else if signals.score >= 70 {
-            0.02
-        } else {
-            0.0
-        };
         let confidence: f64 = if multi { 0.88 } else { 0.76 };
-        let confidence =
-            (((confidence + surface_confidence_bonus).min(0.92_f64)) * 100.0).round() / 100.0;
         let reason = if multi {
             "Multiple request terms matched symbols in this file."
         } else {
             "A request term matched a symbol in this file."
         };
         let symbols_preview: Vec<serde_json::Value> = summary.symbols.into_iter().take(5).collect();
-        let mut evidence = serde_json::json!({
+        let evidence = serde_json::json!({
             "source": "query-symbol",
             "matched_queries": matched_queries,
             "symbols": symbols_preview,
             "combined_score": summary.score,
         });
-        if signals.score != 0 {
-            if let Some(obj) = evidence.as_object_mut() {
-                obj.insert(
-                    "ranking_bonus".to_string(),
-                    serde_json::json!(signals.score),
-                );
-                obj.insert(
-                    "ranking_signals".to_string(),
-                    serde_json::json!(signals.labels),
-                );
-            }
-        }
         items.push(AnswerItem {
             kind: "symbol_search_file".into(),
             target: file_path.clone(),
@@ -5886,498 +4328,48 @@ mod tests {
     }
 
     #[test]
-    fn build_response_auth_token_ranking_prefers_credential_boundary_over_incidental_token_view() {
-        let mut by_query = std::collections::BTreeMap::new();
-        by_query.insert(
-            "token".to_string(),
-            vec![
-                SymbolHit {
-                    name: "_issue_profile_integrity_token".into(),
-                    kind: "function".into(),
-                    file: "backend/accounts/platform_users_views.py".into(),
-                    line: 18,
-                    score: 900,
-                },
-                SymbolHit {
-                    name: "generate_api_key".into(),
-                    kind: "function".into(),
-                    file: "backend/api_keys/models.py".into(),
-                    line: 12,
-                    score: 40,
-                },
-            ],
-        );
-        by_query.insert(
-            "authenticate".to_string(),
-            vec![
-                SymbolHit {
-                    name: "authenticate_api_key".into(),
-                    kind: "function".into(),
-                    file: "backend/api_keys/models.py".into(),
-                    line: 36,
-                    score: 40,
-                },
-                SymbolHit {
-                    name: "authenticate_profile_token".into(),
-                    kind: "function".into(),
-                    file: "backend/accounts/platform_users_views.py".into(),
-                    line: 42,
-                    score: 40,
-                },
-            ],
-        );
-        let symbols = SymbolBatchResults {
-            query_order: vec!["token".to_string(), "authenticate".to_string()],
-            by_query,
-        };
-
-        let response = build_response(
-            "trace token issuing and authentication behavior",
-            Intent::TaskLocalization,
-            IntentSource::Default,
-            &sample_view(),
-            &symbols,
-            &[],
-            &[],
-            &[],
-            &ExploreParams::default(),
-            test_observability(),
-        );
-
-        let first_symbol_file = response
-            .answer
-            .iter()
-            .find(|item| item.kind == "symbol_search_file")
-            .expect("symbol evidence should be included in answer[]");
-        assert_eq!(
-            first_symbol_file.path.as_deref(),
-            Some("backend/api_keys/models.py"),
-            "credential boundary should outrank incidental high-scoring token view"
-        );
-        let signals = first_symbol_file
-            .evidence
-            .get("ranking_signals")
-            .and_then(|value| value.as_array())
-            .cloned()
-            .unwrap_or_default();
-        assert!(
-            signals
-                .iter()
-                .any(|signal| signal.as_str() == Some("issue_auth_credential_pair")),
-            "expected credential-pair ranking evidence, got {signals:?}"
-        );
-    }
-
-    #[test]
-    fn build_response_auth_token_ambiguity_lists_ranked_subsystems_and_verifies_top_two() {
-        let mut by_query = std::collections::BTreeMap::new();
-        by_query.insert(
-            "token".to_string(),
-            vec![
-                SymbolHit {
-                    name: "generate_api_key".into(),
-                    kind: "function".into(),
-                    file: "backend/api_keys/models.py".into(),
-                    line: 12,
-                    score: 40,
-                },
-                SymbolHit {
-                    name: "verify_oidc_token".into(),
-                    kind: "function".into(),
-                    file: "backend/accounts/oidc_validator.py".into(),
-                    line: 28,
-                    score: 80,
-                },
-                SymbolHit {
-                    name: "verify_audit_jws".into(),
-                    kind: "function".into(),
-                    file: "backend/audit/jws.py".into(),
-                    line: 32,
-                    score: 70,
-                },
-                SymbolHit {
-                    name: "get_management_token".into(),
-                    kind: "function".into(),
-                    file: "backend/accounts/auth0_management.py".into(),
-                    line: 17,
-                    score: 900,
-                },
-                SymbolHit {
-                    name: "verify_webhook_token_signature".into(),
-                    kind: "function".into(),
-                    file: "backend/accounts/webhook_tokens.py".into(),
-                    line: 44,
-                    score: 780,
-                },
-                SymbolHit {
-                    name: "_issue_profile_integrity_token".into(),
-                    kind: "function".into(),
-                    file: "backend/accounts/platform_users_views.py".into(),
-                    line: 18,
-                    score: 850,
-                },
-                SymbolHit {
-                    name: "issue_domain_verification_token".into(),
-                    kind: "function".into(),
-                    file: "backend/domains/domain_verification.py".into(),
-                    line: 22,
-                    score: 60,
-                },
-            ],
-        );
-        by_query.insert(
-            "authenticate".to_string(),
-            vec![SymbolHit {
-                name: "authenticate_api_key".into(),
-                kind: "function".into(),
-                file: "backend/api_keys/models.py".into(),
-                line: 36,
-                score: 40,
-            }],
-        );
-        let symbols = SymbolBatchResults {
-            query_order: vec!["token".to_string(), "authenticate".to_string()],
-            by_query,
-        };
-
-        let response = build_response(
-            "trace token issuing and authentication behavior",
-            Intent::TaskLocalization,
-            IntentSource::Default,
-            &sample_view(),
-            &symbols,
-            &[],
-            &[],
-            &[],
-            &ExploreParams::default(),
-            test_observability(),
-        );
-
-        assert!(
-            !response.safe_to_use_as_answer,
-            "broad token subsystem ambiguity should require verification"
-        );
-        assert_eq!(response.trust_policy.trust_policy, "needs_verification");
-
-        let ambiguity = response
-            .ambiguous
-            .iter()
-            .find(|item| {
-                item.get("kind").and_then(|value| value.as_str())
-                    == Some("token_subsystem_ambiguity")
-            })
-            .expect("broad token request should emit subsystem ambiguity");
-        assert_eq!(
-            ambiguity
-                .get("verify_top_n")
-                .and_then(|value| value.as_u64()),
-            Some(2)
-        );
-        let subsystems = ambiguity
-            .get("subsystems")
-            .and_then(|value| value.as_array())
-            .expect("subsystems should be an array");
-        let labels: Vec<&str> = subsystems
-            .iter()
-            .filter_map(|item| item.get("label").and_then(|value| value.as_str()))
-            .collect();
-        for expected in [
-            "API keys",
-            "OIDC",
-            "audit JWS",
-            "Auth0 management",
-            "webhook tokens",
-            "profile-integrity",
-            "domain verification",
-        ] {
-            assert!(
-                labels.contains(&expected),
-                "expected subsystem {expected:?} in {labels:?}"
-            );
-        }
-        assert_eq!(
-            labels.first().copied(),
-            Some("API keys"),
-            "inbound credential boundary should rank ahead of provider helpers"
-        );
-        let first_step = response
-            .verification_steps
-            .first()
-            .and_then(|value| value.get("step"))
-            .and_then(|value| value.as_str())
-            .unwrap_or("");
-        assert!(
-            first_step.contains("top 2"),
-            "first verification step should ask for top-2 subsystem verification: {first_step}"
-        );
-        assert!(
-            !response.subsystems.is_empty(),
-            "broad token ambiguity should emit top-level subsystem lanes"
-        );
-        assert_eq!(
-            response.subsystems[0].role, "backend_validator",
-            "without ingress/proxy graph evidence, API-key validation should be the first subsystem lane"
-        );
-    }
-
-    #[test]
-    fn build_response_auth_token_subsystems_include_proxy_backend_and_provider_lanes() {
-        let mut by_query = std::collections::BTreeMap::new();
-        by_query.insert(
-            "token".to_string(),
-            vec![
-                SymbolHit {
-                    name: "generate_api_key".into(),
-                    kind: "function".into(),
-                    file: "backend/api_keys/models.py".into(),
-                    line: 12,
-                    score: 40,
-                },
-                SymbolHit {
-                    name: "verify_oidc_token".into(),
-                    kind: "function".into(),
-                    file: "backend/accounts/oidc_validator.py".into(),
-                    line: 28,
-                    score: 80,
-                },
-            ],
-        );
-        by_query.insert(
-            "authenticate".to_string(),
-            vec![SymbolHit {
-                name: "authenticate_api_key".into(),
-                kind: "function".into(),
-                file: "backend/api_keys/models.py".into(),
-                line: 36,
-                score: 40,
-            }],
-        );
-        let symbols = SymbolBatchResults {
-            query_order: vec!["token".to_string(), "authenticate".to_string()],
-            by_query,
-        };
-        let proxy = NodeDisplay {
-            id: "surface:proxy:gcp-run-proxy:token".into(),
-            kind: StoredNodeKind::ProxySurface,
-            display: "gcp-run-proxy token ingress".into(),
-            name: "gcp-run-proxy".into(),
-            path: Some("gcp-run-proxy/src/index.ts".into()),
-            language: Some("typescript".into()),
-            area_id: None,
-        };
-        let backend = NodeDisplay {
-            id: "surface:credential:backend/api_keys/models.py:api-key".into(),
-            kind: StoredNodeKind::CredentialOperation,
-            display: "backend API-key validation".into(),
-            name: "authenticate_api_key".into(),
-            path: Some("backend/api_keys/models.py".into()),
-            language: Some("python".into()),
-            area_id: None,
-        };
-        let surface_flow = SurfaceFlowExploreEvidence {
-            entrypoints: vec![SurfaceFlowCandidate {
-                node: proxy,
-                signals: SymbolMatchSignals::default(),
-                matched_tokens: vec!["token".into(), "auth".into()],
-                relation_kinds: vec![EdgeKind::ForwardsTo, EdgeKind::RewritesHeader],
-                rank: 260,
-            }],
-            surface_paths: vec![SurfacePathCandidate {
-                path: "backend/api_keys/models.py".into(),
-                surfaces: vec![backend.clone()],
-                matched_tokens: vec!["token".into(), "credential".into()],
-                relation_kinds: vec![EdgeKind::ValidatesCredential, EdgeKind::Authorizes],
-                rank: 240,
-            }],
-            credential_flows: vec![SurfaceFlowCandidate {
-                node: backend,
-                signals: SymbolMatchSignals::default(),
-                matched_tokens: vec!["token".into(), "credential".into()],
-                relation_kinds: vec![
-                    EdgeKind::IssuesCredential,
-                    EdgeKind::UsesCredential,
-                    EdgeKind::ValidatesCredential,
-                ],
-                rank: 240,
-            }],
-            coverage_missing: vec!["behavior_tests".into()],
-            ..SurfaceFlowExploreEvidence::default()
-        };
-
-        let response = build_response_with_surface_flow(
-            "trace API key token issuing and authentication behavior",
-            Intent::TaskLocalization,
-            IntentSource::Default,
-            &sample_view(),
-            &symbols,
-            &[],
-            &[],
-            &[],
-            &surface_flow,
-            &ExploreParams::default(),
-            test_observability(),
-        );
-
-        let roles: Vec<&str> = response
-            .subsystems
-            .iter()
-            .map(|subsystem| subsystem.role.as_str())
-            .collect();
-        assert_eq!(
-            roles.iter().take(3).copied().collect::<Vec<_>>(),
-            vec![
-                "ingress_proxy",
-                "backend_validator",
-                "provider_or_secondary_token"
-            ]
-        );
-        let all_paths = response
-            .subsystems
-            .iter()
-            .flat_map(|subsystem| subsystem.paths.iter())
-            .cloned()
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(
-            all_paths.contains("gcp-run-proxy"),
-            "proxy lane should point at gcp-run-proxy evidence: {all_paths}"
-        );
-        assert!(
-            all_paths.contains("backend/api_keys"),
-            "backend validator lane should point at API-key evidence: {all_paths}"
-        );
-        let steps = response
-            .verification_steps
-            .iter()
-            .filter_map(|step| step.get("step").and_then(|value| value.as_str()))
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(
-            steps.contains("Verify proxy classification first, then backend validation"),
-            "verification should name the proxy-first order: {steps}"
-        );
-        assert!(
-            response.subsystems.iter().any(|subsystem| subsystem
-                .missing_coverage_warnings
-                .iter()
-                .any(|warning| warning.contains("No linked live behavior test"))),
-            "subsystems should surface missing live-test coverage warnings"
-        );
-    }
-
-    #[test]
-    fn build_response_specific_token_subsystem_request_stays_decisive() {
-        let mut by_query = std::collections::BTreeMap::new();
-        by_query.insert(
-            "token".to_string(),
-            vec![
-                SymbolHit {
-                    name: "get_management_token".into(),
-                    kind: "function".into(),
-                    file: "backend/accounts/auth0_management.py".into(),
-                    line: 17,
-                    score: 900,
-                },
-                SymbolHit {
-                    name: "generate_api_key".into(),
-                    kind: "function".into(),
-                    file: "backend/api_keys/models.py".into(),
-                    line: 12,
-                    score: 40,
-                },
-            ],
-        );
-        by_query.insert(
-            "management".to_string(),
-            vec![SymbolHit {
-                name: "get_management_token".into(),
-                kind: "function".into(),
-                file: "backend/accounts/auth0_management.py".into(),
-                line: 17,
-                score: 900,
-            }],
-        );
-        let symbols = SymbolBatchResults {
-            query_order: vec!["token".to_string(), "management".to_string()],
-            by_query,
-        };
-
-        let response = build_response(
-            "trace Auth0 management token behavior",
-            Intent::TaskLocalization,
-            IntentSource::Default,
-            &sample_view(),
-            &symbols,
-            &[],
-            &[],
-            &[],
-            &ExploreParams::default(),
-            test_observability(),
-        );
-
-        assert!(
-            response.ambiguous.is_empty(),
-            "a request that names the subsystem should not be downgraded by broad-token ambiguity"
-        );
-        assert!(
-            response.subsystems.is_empty(),
-            "provider-specific token requests should not emit competing subsystem lanes"
-        );
-        assert!(response.safe_to_use_as_answer);
-        let first_symbol_file = response
-            .answer
-            .iter()
-            .find(|item| item.kind == "symbol_search_file")
-            .expect("symbol evidence should be present");
-        assert_eq!(
-            first_symbol_file.path.as_deref(),
-            Some("backend/accounts/auth0_management.py")
-        );
-    }
-
-    #[test]
     fn build_response_verification_prefers_symbol_evidence_merged_into_top_text_answer() {
         let text_match = AnswerItem {
             kind: "source_text_file".into(),
-            target: "backend/accounts/auth0_management.py".into(),
-            path: Some("backend/accounts/auth0_management.py".into()),
+            target: "billing/vendor_sync.py".into(),
+            path: Some("billing/vendor_sync.py".into()),
             status: "candidate".into(),
             confidence: 0.87,
             reason: "text evidence".into(),
             role: "candidate".into(),
             evidence: serde_json::json!({
                 "source": "source-text-search",
-                "matched_terms": ["auth0", "management", "token"],
-                "line_refs": [{"line": 114, "text": "management token", "matched_terms": ["auth0", "management", "token"]}],
+                "matched_terms": ["vendor", "sync", "ledger"],
+                "line_refs": [{"line": 114, "text": "vendor sync ledger", "matched_terms": ["vendor", "sync", "ledger"]}],
             }),
         };
         let mut by_query = std::collections::BTreeMap::new();
         by_query.insert(
-            "Auth0".to_string(),
+            "Vendor".to_string(),
             vec![
                 SymbolHit {
-                    name: "get_management_token".into(),
+                    name: "get_vendor_ledger".into(),
                     kind: "function".into(),
-                    file: "backend/accounts/auth0_management.py".into(),
+                    file: "billing/vendor_sync.py".into(),
                     line: 83,
                     score: 160,
                 },
                 SymbolHit {
-                    name: "record_auth0_idp_assets".into(),
+                    name: "record_vendor_assets".into(),
                     kind: "function".into(),
-                    file: "backend/accounts/idp_assets.py".into(),
+                    file: "billing/vendor_assets.py".into(),
                     line: 56,
                     score: 100,
                 },
             ],
         );
         let symbols = SymbolBatchResults {
-            query_order: vec!["Auth0".to_string()],
+            query_order: vec!["Vendor".to_string()],
             by_query,
         };
 
         let response = build_response(
-            "Trace Auth0 management token behavior.",
+            "Trace vendor sync ledger behavior.",
             Intent::TaskLocalization,
             IntentSource::Default,
             &sample_view(),
@@ -6393,10 +4385,7 @@ mod tests {
             .answer
             .first()
             .expect("expected text answer to survive");
-        assert_eq!(
-            top.path.as_deref(),
-            Some("backend/accounts/auth0_management.py")
-        );
+        assert_eq!(top.path.as_deref(), Some("billing/vendor_sync.py"));
         assert!(
             top.evidence.get("also_symbol_search").is_some(),
             "same-path symbol evidence should merge into the top text answer"
@@ -6408,7 +4397,7 @@ mod tests {
             .find(|step| step.contains("callers of the symbol"))
             .unwrap_or("");
         assert!(
-            symbol_step.contains("backend/accounts/auth0_management.py"),
+            symbol_step.contains("billing/vendor_sync.py"),
             "symbol verification should follow the merged top answer, got {symbol_step}"
         );
     }
@@ -6770,27 +4759,27 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         write_test_file(
             tmp.path(),
-            "backend/api_keys/middleware.py",
-            "class APIKeyAuthenticationMiddleware: pass\n",
+            "backend/keys/middleware.py",
+            "class KeyCheckMiddleware: pass\n",
         );
         write_test_file(
             tmp.path(),
-            "gcp-run-proxy/src/worker.mjs",
+            "edge-proxy/src/worker.mjs",
             "export default { fetch(request) { return fetch(request) } }\n",
         );
         write_test_file(
             tmp.path(),
-            ".aethyme/graph/_index/backend.api_keys.middleware.ndjson",
-            r#"{"module":"backend.api_keys.middleware","symbol":"APIKeyAuthenticationMiddleware","kind":"class","node_id":"class:demo:abc","file":"backend/api_keys/middleware.py"}"#,
+            ".aethyme/graph/_index/backend.keys.middleware.ndjson",
+            r#"{"module":"backend.keys.middleware","symbol":"KeyCheckMiddleware","kind":"class","node_id":"class:demo:abc","file":"backend/keys/middleware.py"}"#,
         );
         write_test_file(
             tmp.path(),
-            ".aethyme/graph/backend/api_keys/middleware.py.bin",
+            ".aethyme/graph/backend/keys/middleware.py.bin",
             "middleware_installation validates_credential\n",
         );
         write_test_file(
             tmp.path(),
-            ".aethyme/graph/backend/api_keys/urls.py.bin",
+            ".aethyme/graph/backend/keys/urls.py.bin",
             "route_surface exposes\n",
         );
         write_test_file(tmp.path(), ".aethyme/graph_store.redb", "placeholder");
@@ -6902,7 +4891,7 @@ mod tests {
         );
         write_test_file(
             tmp.path(),
-            "gcp-run-proxy/src/worker.mjs",
+            "edge-proxy/src/worker.mjs",
             "export default { fetch(request) { return fetch(request) } }\n",
         );
         write_test_file(
@@ -6917,12 +4906,12 @@ mod tests {
         );
         write_test_file(
             tmp.path(),
-            ".aethyme/graph/gcp-run-proxy/FOLDER.gcp-run-proxy.md.bin",
+            ".aethyme/graph/edge-proxy/FOLDER.edge-proxy.md.bin",
             "folder summary",
         );
         write_test_file(
             tmp.path(),
-            ".aethyme/graph/gcp-run-proxy/package.json.bin",
+            ".aethyme/graph/edge-proxy/package.json.bin",
             "{\"scripts\":{\"deploy\":\"wrangler deploy\"}}\n",
         );
 
@@ -6953,7 +4942,7 @@ mod tests {
         assert!(unindexed.iter().any(|value| {
             value
                 .as_str()
-                .is_some_and(|path| path.starts_with("gcp-run-proxy/"))
+                .is_some_and(|path| path.starts_with("edge-proxy/"))
         }));
         let languages = observability
             .get("indexed_languages")

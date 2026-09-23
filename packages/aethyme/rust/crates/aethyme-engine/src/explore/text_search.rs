@@ -17,7 +17,7 @@
 use std::ffi::OsStr;
 use std::path::Path;
 
-use super::{AnswerItem, extract_symbol_queries, ranking};
+use super::{AnswerItem, extract_symbol_queries};
 
 const RIPGREP_BIN: &str = "rg";
 const SOURCE_TEXT_FILE_SIZE_CAP_BYTES: u64 = 750_000;
@@ -143,22 +143,16 @@ fn source_text_files_with_ripgrep(
     }
 
     let mut ranked: Vec<TextHit> = hits_by_file.into_values().collect();
-    // Sort by composite score: (request surface desc, suffix_class_rank desc,
-    // distinct_terms desc, hit_count desc, path asc). suffix_class_rank
-    // pushes executable source ahead of locale data / changelogs so the
-    // agent doesn't see a wall of i18n JSON files when their query terms
-    // happen to be common words.
-    // The request surface term is zero outside broad auth/token requests;
-    // those keep the historical ordering exactly.
+    // Sort by composite score: (suffix_class_rank desc, distinct_terms
+    // desc, hit_count desc, path asc). suffix_class_rank pushes executable
+    // source ahead of locale data / changelogs so the agent doesn't see a
+    // wall of i18n JSON files when their query terms happen to be common
+    // words.
     // Mirrors the Python helper's role-aware penalty without porting the
     // full heuristic (deferred to session 4+).
     ranked.sort_by(|a, b| {
-        let a_surface = auth_surface_for_text_hit(a, terms);
-        let b_surface = auth_surface_for_text_hit(b, terms);
-        b_surface
-            .score
-            .cmp(&a_surface.score)
-            .then_with(|| suffix_class_rank(&b.path).cmp(&suffix_class_rank(&a.path)))
+        suffix_class_rank(&b.path)
+            .cmp(&suffix_class_rank(&a.path))
             .then_with(|| b.matched_terms.len().cmp(&a.matched_terms.len()))
             .then_with(|| b.hit_count.cmp(&a.hit_count))
             .then_with(|| a.path.cmp(&b.path))
@@ -168,7 +162,6 @@ fn source_text_files_with_ripgrep(
         .into_iter()
         .take(max_files)
         .map(|hit| {
-            let signals = auth_surface_for_text_hit(&hit, terms);
             let matched_count = hit.matched_terms.len();
             let confidence: f64 = if matched_count >= 3 {
                 0.84
@@ -177,15 +170,6 @@ fn source_text_files_with_ripgrep(
             } else {
                 0.70
             };
-            let surface_confidence_bonus = if signals.score >= 120 {
-                0.03
-            } else if signals.score >= 70 {
-                0.02
-            } else {
-                0.0
-            };
-            let confidence =
-                (((confidence + surface_confidence_bonus).min(0.88_f64)) * 100.0).round() / 100.0;
             let reason = if matched_count >= 2 {
                 "Source text matched multiple request terms in executable code; \
                  line refs are evidence, not filename-only hints."
@@ -213,24 +197,12 @@ fn source_text_files_with_ripgrep(
                     })
                 })
                 .collect();
-            let mut evidence = serde_json::json!({
+            let evidence = serde_json::json!({
                 "source": "source-text-search",
                 "matched_terms": hit.matched_terms.iter().collect::<Vec<_>>(),
                 "hit_count": hit.hit_count,
                 "line_refs": line_refs_json,
             });
-            if signals.score != 0 {
-                if let Some(obj) = evidence.as_object_mut() {
-                    obj.insert(
-                        "ranking_bonus".to_string(),
-                        serde_json::json!(signals.score),
-                    );
-                    obj.insert(
-                        "ranking_signals".to_string(),
-                        serde_json::json!(signals.labels),
-                    );
-                }
-            }
             AnswerItem {
                 kind: "source_text_file".into(),
                 target: hit.path.clone(),
@@ -271,14 +243,6 @@ fn native_text_hits(repo: &Path, terms: &[String]) -> std::collections::BTreeMap
     }
 
     hits_by_file
-}
-
-fn auth_surface_for_text_hit(hit: &TextHit, request_terms: &[String]) -> ranking::SurfaceSignals {
-    let hit_terms = hit.matched_terms.iter().cloned().collect::<Vec<_>>();
-    if !ranking::auth_token_focus_from_terms(&hit_terms) {
-        return ranking::SurfaceSignals::default();
-    }
-    ranking::auth_token_surface_signals_for_terms(&hit.path, &hit_terms, request_terms)
 }
 
 /// Coarse file-class ranking for source-text matches. Higher is better.
@@ -440,7 +404,7 @@ mod tests {
     //! Regression tests for `suffix_class_rank` — moved here from
     //! explore.rs alongside the function in the 2026-05-08 split.
 
-    use super::{source_text_files, source_text_files_with_ripgrep, suffix_class_rank};
+    use super::{source_text_files_with_ripgrep, suffix_class_rank};
     use std::fs;
     use std::path::PathBuf;
 
@@ -474,67 +438,6 @@ mod tests {
         assert!(config > data);
         assert!(data >= lockfile);
         assert!(lockfile > locale);
-    }
-
-    #[test]
-    fn source_text_files_prefers_auth_request_surface_over_incidental_token_helper() {
-        let repo = temp_repo("aethyme-source-text-auth-ranking");
-        fs::create_dir_all(repo.join("backend/api_keys")).unwrap();
-        fs::create_dir_all(repo.join("backend/accounts")).unwrap();
-        fs::create_dir_all(repo.join("scripts/ci")).unwrap();
-        fs::write(
-            repo.join("backend/api_keys/middleware.py"),
-            "def authenticate_api_key_middleware(request):\n    token = request.headers.get('authorization')\n",
-        )
-        .unwrap();
-        fs::write(
-            repo.join("backend/accounts/auth0_management.py"),
-            "def get_management_token():\n    token = fetch_token()\n    return token\n",
-        )
-        .unwrap();
-        fs::write(
-            repo.join("scripts/ci/validate-api-routes.mjs"),
-            "export function validateRoutes() {\n  return 'API Route Validation Script';\n}\n",
-        )
-        .unwrap();
-
-        let terms = vec![
-            "token".to_string(),
-            "authenticate".to_string(),
-            "api_key".to_string(),
-            "validation".to_string(),
-        ];
-        let items = source_text_files(&repo, &terms, 3, 2);
-        let _ = fs::remove_dir_all(&repo);
-
-        assert!(
-            items.len() >= 2,
-            "expected both source files to be matched, got {items:?}"
-        );
-        assert_eq!(
-            items[0].path.as_deref(),
-            Some("backend/api_keys/middleware.py")
-        );
-        let signals = items[0]
-            .evidence
-            .get("ranking_signals")
-            .and_then(|value| value.as_array())
-            .cloned()
-            .unwrap_or_default();
-        assert!(
-            signals
-                .iter()
-                .any(|signal| signal.as_str() == Some("middleware_request_path")),
-            "expected middleware_request_path ranking evidence, got {signals:?}"
-        );
-        let validation_script = items
-            .iter()
-            .find(|item| item.path.as_deref() == Some("scripts/ci/validate-api-routes.mjs"))
-            .expect("validation script should still be returned as ordinary text evidence");
-        assert!(
-            validation_script.evidence.get("ranking_signals").is_none(),
-            "validation-only API script should not receive auth/token ranking evidence"
-        );
     }
 
     #[test]

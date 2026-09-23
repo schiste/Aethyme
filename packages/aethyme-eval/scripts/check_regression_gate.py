@@ -166,7 +166,9 @@ def main() -> int:
             require_determinism=not args.allow_missing_determinism,
             require_coverage_report=not args.allow_missing_coverage_report,
             require_event_sequence=not args.allow_missing_event_sequence,
-            require_auth_surface_lanes=not args.allow_missing_auth_surface_lanes,
+            # Retired 2026-09-23: the engine no longer emits auth lanes (they were
+            # tuned to one playground app; Cardinal Rule 2). Flag kept as a no-op.
+            require_auth_surface_lanes=False,
         )
         print(json.dumps(report, indent=2, sort_keys=True))
         return 0 if report["passed"] else 1
@@ -205,7 +207,7 @@ def main() -> int:
         require_determinism=not args.allow_missing_determinism,
         require_coverage_report=not args.allow_missing_coverage_report,
         require_event_sequence=not args.allow_missing_event_sequence,
-        require_auth_surface_lanes=not args.allow_missing_auth_surface_lanes,
+        require_auth_surface_lanes=False,  # retired 2026-09-23, see above
     )
     print(json.dumps(report, indent=2, sort_keys=True))
     return 0 if report["passed"] else 1
@@ -552,7 +554,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--allow-missing-auth-surface-lanes",
         action="store_true",
-        help="Allow auth/token tasks that omit Surface/Flow subsystem lanes.",
+        help="No-op since 2026-09-23: auth lanes were removed from the engine and are no longer required.",
     )
     return parser.parse_args()
 
