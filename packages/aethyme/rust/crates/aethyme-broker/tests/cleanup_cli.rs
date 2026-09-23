@@ -164,6 +164,32 @@ fn bulk_cleanup_rejects_force_and_session_mixups() {
     }
 }
 
+/// `--dry-run`, `--confirm` and `--detail` belong to `--all-cleaned`. Given to
+/// a single-session cleanup they were dropped, so `cleanup <id> --dry-run`
+/// cleaned for real; they are now a usage error that changes nothing.
+#[test]
+fn single_session_cleanup_refuses_sweep_only_flags() {
+    let tmp = tempfile::tempdir().unwrap();
+    git(tmp.path(), &["init", "-q", "-b", "main"]);
+    std::fs::write(tmp.path().join("README.md"), "fixture\n").unwrap();
+    git(tmp.path(), &["add", "-A"]);
+    git(tmp.path(), &["commit", "-qm", "init"]);
+
+    for (args, flag) in [
+        (vec!["cleanup", "12", "--dry-run"], "--dry-run"),
+        (vec!["cleanup", "12", "--confirm", "abc"], "--confirm"),
+        (vec!["cleanup", "12", "--detail"], "--detail"),
+    ] {
+        let output = run(tmp.path(), &args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(&format!("cleanup <session-id> does not take {flag}")),
+            "{args:?}: {stderr}"
+        );
+    }
+}
+
 #[test]
 fn bulk_cleanup_confirmation_binds_the_exact_reviewed_branch_tip() {
     let tmp = tempfile::tempdir().unwrap();

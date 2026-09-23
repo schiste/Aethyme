@@ -1995,6 +1995,279 @@ mod tests {
             "fetched upstream matches local main"
         );
     }
+
+    fn strings(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    /// `(subcommand, positionals, flags)` -> the refusal, if any.
+    fn refusal(subcommand: &str, positional: &[&str], flags: &[&str]) -> Option<String> {
+        super::flag_refusal(subcommand, &strings(positional), &strings(flags))
+    }
+
+    /// The #285 bug class: a flag valid for some subcommand but not the one
+    /// given is refused, naming the flag, the subcommand and where it applies.
+    #[test]
+    fn a_flag_valid_elsewhere_is_refused_with_where_it_applies() {
+        let cases: &[(&str, &[&str], &[&str], &str)] = &[
+            (
+                "submit",
+                &[],
+                &["--session", "--claim"],
+                "`--claim` is not valid for `broker submit`; it applies to: start, adopt",
+            ),
+            (
+                "status",
+                &[],
+                &["--verify-only"],
+                "`--verify-only` is not valid for `broker status`; it applies to: submit",
+            ),
+            (
+                "gates",
+                &["draft"],
+                &["--base"],
+                "`--base` is not valid for `broker gates draft`; it applies to: start, start-agent, review plan, review run, review tick, gates scope",
+            ),
+            (
+                "gates",
+                &["run"],
+                &["--probe"],
+                "`--probe` is not valid for `broker gates run`; it applies to: gates doctor",
+            ),
+            (
+                "leases",
+                &["plan", "src/lib.rs"],
+                &["--ttl"],
+                "`--ttl` is not valid for `broker leases plan`; it applies to: resources renew, resources release, leases claim",
+            ),
+            (
+                "status",
+                &[],
+                &["--", "echo"],
+                "`--` (the command separator) is not valid for `broker status`",
+            ),
+            (
+                "finish",
+                &[],
+                &["--session", "--require"],
+                "`--require` is not valid for `broker finish`; it applies to: readiness",
+            ),
+        ];
+        for (subcommand, positional, flags, expected) in cases {
+            let message = refusal(subcommand, positional, flags)
+                .unwrap_or_else(|| panic!("{subcommand} {positional:?} {flags:?} must refuse"));
+            assert!(
+                message.starts_with(expected),
+                "{subcommand} {positional:?} {flags:?}: {message}"
+            );
+        }
+    }
+
+    /// `adopt --base` keeps the explanation of why no base can apply.
+    #[test]
+    fn adopt_base_refusal_keeps_its_explanation() {
+        let message = refusal("adopt", &[], &["--base"]).expect("adopt --base refuses");
+        assert!(
+            message.contains("`--base` is not valid for `broker adopt`"),
+            "{message}"
+        );
+        assert!(message.contains("already has its own history"), "{message}");
+        assert!(message.contains("start --base <ref>"), "{message}");
+    }
+
+    #[test]
+    fn flags_the_subcommand_reads_are_accepted() {
+        let cases: &[(&str, &[&str], &[&str])] = &[
+            (
+                "start",
+                &[],
+                &["--task", "--base", "--claim", "--path", "--json"],
+            ),
+            (
+                "adopt",
+                &["/tmp/x"],
+                &["--task", "--claim", "--reuse", "--sync-integration"],
+            ),
+            (
+                "submit",
+                &[],
+                &["--session", "--verify-only", "--no-cache", "--json"],
+            ),
+            ("status", &[], &["--summary", "--json"]),
+            ("gates", &["scope"], &["--base", "--head"]),
+            ("gates", &["doctor"], &["--probe", "--only"]),
+            ("leases", &["claim", "src/"], &["--session", "--ttl"]),
+            ("watch", &["pr", "start"], &["--session", "--repo", "--pr"]),
+            ("main", &["reconcile", "apply"], &["--session", "--confirm"]),
+            ("exec", &[], &["--session", "--"]),
+            ("cleanup", &["12"], &["--force"]),
+            ("readiness", &[], &["--require"]),
+            // An unknown action is held to the union; its handler names it.
+            ("gates", &["nonsense"], &["--probe"]),
+            // An unknown subcommand is the dispatcher's to report.
+            ("no-such-subcommand", &[], &["--claim"]),
+        ];
+        for (subcommand, positional, flags) in cases {
+            assert_eq!(
+                refusal(subcommand, positional, flags),
+                None,
+                "{subcommand} {positional:?} {flags:?}"
+            );
+        }
+    }
+
+    /// Validation reaches the process as a usage error, exit 2.
+    #[test]
+    fn a_refused_flag_is_a_usage_error() {
+        let parsed = super::parse(&strings(&["--session", "4", "--claim", "symbol:A"]))
+            .unwrap_or_else(|_| panic!("parses"));
+        match super::validate_flags("submit", &parsed) {
+            Err(UsageError::Exit { code, message }) => {
+                assert_eq!(code, crate::exit_status::USAGE);
+                assert!(message.contains("`--claim`"), "{message}");
+            }
+            _ => panic!("submit --claim must be a usage error"),
+        }
+    }
+
+    /// Every flag the table names must be one the parser knows; a typo here
+    /// would otherwise make a flag unusable everywhere.
+    #[test]
+    fn every_table_flag_is_a_parsed_flag() {
+        for (path, flags) in super::FLAG_RULES {
+            for flag in *flags {
+                if *flag == "--" {
+                    continue;
+                }
+                let result = super::parse(&strings(&[flag, "1"]));
+                if let Err(UsageError::Message(message)) = &result {
+                    assert!(
+                        !message.starts_with("unknown flag"),
+                        "{path}: {flag} is not a parsed flag"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The `(path words, flags)` each `aethyme broker ...` line of a help text
+    /// documents, with `a|b` actions and an optional `[a|b]` action expanded.
+    fn documented_invocations(text: &str) -> Vec<(Vec<String>, Vec<String>)> {
+        // Handled outside this parser: `check-contract` dispatches before it,
+        // and the readiness repair verbs belong to the top-level router.
+        const ELSEWHERE: &[&str] = &[
+            "check-contract",
+            "readiness plan",
+            "readiness apply",
+            "readiness recover",
+        ];
+        let mut invocations = Vec::new();
+        for line in text.lines() {
+            let Some(rest) = line.trim_start().strip_prefix("aethyme broker ") else {
+                continue;
+            };
+            if ELSEWHERE.iter().any(|prefix| rest.starts_with(prefix)) {
+                continue;
+            }
+            let tokens: Vec<&str> = rest.split_whitespace().collect();
+            let mut paths: Vec<Vec<String>> = vec![Vec::new()];
+            for token in &tokens {
+                let optional = token.starts_with('[') && token.ends_with(']');
+                let bare = token.trim_start_matches('[').trim_end_matches(']');
+                let words: Vec<&str> = bare.split('|').collect();
+                let is_action = !words.is_empty()
+                    && words.iter().all(|word| {
+                        !word.is_empty()
+                            && word.chars().all(|c| c.is_ascii_lowercase() || c == '-')
+                            && !word.starts_with('-')
+                    });
+                if !is_action || (token.starts_with('[') && !optional) {
+                    break;
+                }
+                let mut next = Vec::new();
+                for path in &paths {
+                    if optional {
+                        next.push(path.clone());
+                    }
+                    for word in &words {
+                        let mut extended = path.clone();
+                        extended.push((*word).to_string());
+                        next.push(extended);
+                    }
+                }
+                paths = next;
+                if optional {
+                    break;
+                }
+            }
+            if paths.iter().all(Vec::is_empty) {
+                continue;
+            }
+            let mut flags = Vec::new();
+            for token in &tokens {
+                let trimmed = token.trim_matches(|c| matches!(c, '[' | ']' | '(' | ')' | '`'));
+                if trimmed == "--" {
+                    flags.push("--".to_string());
+                }
+                for part in trimmed.split('|') {
+                    let part = part.trim_matches(|c| matches!(c, '[' | ']' | '(' | ')' | '`'));
+                    if part.len() > 2
+                        && part.starts_with("--")
+                        && part[2..]
+                            .chars()
+                            .all(|c| c.is_ascii_lowercase() || c == '-')
+                    {
+                        flags.push(part.to_string());
+                    }
+                }
+            }
+            for path in paths {
+                invocations.push((path, flags.clone()));
+            }
+        }
+        invocations
+    }
+
+    /// Every flag `USAGE` documents for a subcommand passes validation, so the
+    /// table cannot drift from the help text without this failing.
+    #[test]
+    fn every_usage_example_passes_flag_validation() {
+        let invocations = documented_invocations(super::USAGE);
+        assert!(invocations.len() > 100, "found {}", invocations.len());
+        for (path, flags) in invocations {
+            assert_eq!(
+                super::flag_refusal(&path[0], &path[1..], &flags),
+                None,
+                "USAGE documents `broker {}` with {flags:?}",
+                path.join(" ")
+            );
+        }
+    }
+
+    /// The same for the reference manual.
+    #[test]
+    fn every_cli_reference_example_passes_flag_validation() {
+        let text = include_str!("../../../../docs/reference/cli.md");
+        let lines: String = text
+            .lines()
+            .filter_map(|line| {
+                line.find("`aethyme broker ")
+                    .map(|start| &line[start + 1..])
+                    .and_then(|rest| rest.split('`').next())
+            })
+            .map(|line| format!("{line}\n"))
+            .collect();
+        let invocations = documented_invocations(&lines);
+        assert!(invocations.len() > 50, "found {}", invocations.len());
+        for (path, flags) in invocations {
+            assert_eq!(
+                super::flag_refusal(&path[0], &path[1..], &flags),
+                None,
+                "cli.md documents `broker {}` with {flags:?}",
+                path.join(" ")
+            );
+        }
+    }
 }
 
 enum UsageError {
@@ -2136,6 +2409,10 @@ struct Parsed {
     planned_paths: Vec<String>,
     declared_scopes: Vec<String>,
     exec_command: Vec<String>,
+    /// Every flag spelled on the command line, in order, as written (`--` for
+    /// the command separator). `validate_flags` checks these against the
+    /// subcommand's entry in `FLAG_RULES`.
+    given_flags: Vec<String>,
 }
 
 fn parse(args: &[String]) -> Result<Parsed, UsageError> {
@@ -2239,9 +2516,13 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         planned_paths: Vec::new(),
         declared_scopes: Vec::new(),
         exec_command: Vec::new(),
+        given_flags: Vec::new(),
     };
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
+        if arg.starts_with('-') {
+            parsed.given_flags.push(arg.clone());
+        }
         match arg.as_str() {
             "--" => {
                 parsed.exec_command = iter.cloned().collect();
@@ -2775,6 +3056,501 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         }
     }
     Ok(parsed)
+}
+
+/// Flags every subcommand accepts. `-h`/`--help` never reach validation: the
+/// parser turns them into help before a subcommand can see them.
+const GLOBAL_FLAGS: &[&str] = &["--json"];
+
+/// Which flags each subcommand reads, keyed by its command path.
+///
+/// The parser fills one shared `Parsed` for every subcommand, so a flag that is
+/// valid somewhere parses everywhere. Without this table a flag given to a
+/// subcommand that never reads it was silently dropped -- `adopt --claim` in
+/// #285 -- which reports a choice the broker never made. Each entry lists the
+/// flags its handler actually reads (including flags it reads only to refuse
+/// with a sharper message), so nothing that works is refused.
+///
+/// A path of more than one word is an action (`gates scope`, `watch pr start`)
+/// and applies when the positional arguments begin with those words. A
+/// one-word path applies when no action entry matches: to the bare command, and
+/// to a command whose positional is a value rather than an action
+/// (`cleanup <id>`). A command with action entries and no matching one (an
+/// unknown action) is held to the union of its entries, and its handler names
+/// the bad action.
+///
+/// Keep in step with `USAGE`: `every_usage_example_passes_flag_validation`
+/// fails when a documented flag is missing here.
+const FLAG_RULES: &[(&str, &[&str])] = &[
+    ("readiness", &["--require"]),
+    ("worktree-root", &[]),
+    (
+        "start",
+        &[
+            "--task",
+            "--base",
+            "--pull-request",
+            "--path",
+            "--claim",
+            "--agent",
+            "--repo-name",
+            "--tab-name",
+            "--ai-provider",
+        ],
+    ),
+    (
+        "start-agent",
+        &[
+            "--task",
+            "--cmd",
+            "--base",
+            "--pull-request",
+            "--agent",
+            "--repo-name",
+            "--tab-name",
+            "--ai-provider",
+        ],
+    ),
+    (
+        "adopt",
+        &[
+            "--task",
+            "--path",
+            "--claim",
+            "--agent",
+            "--repo-name",
+            "--tab-name",
+            "--ai-provider",
+            "--reuse",
+            "--sync-integration",
+            "--replace-stale",
+        ],
+    ),
+    (
+        "report capture",
+        &[
+            "--kind",
+            "--title",
+            "--session",
+            "--include-task",
+            "--stdout",
+            "--output",
+        ],
+    ),
+    ("report list", &[]),
+    ("report show", &[]),
+    ("report render", &["--form", "--output"]),
+    ("report file", &["--repo", "--confirm"]),
+    ("quality-report", &["--repo", "--pr", "--session"]),
+    ("external-events ingest", &[]),
+    ("external-events list", &["--all"]),
+    ("external-events show", &[]),
+    (
+        "external-events reconcile",
+        &["--outcome", "--reason", "--session"],
+    ),
+    ("reclaim", &[]),
+    ("reclaim plan", &[]),
+    ("reclaim apply", &["--confirm"]),
+    (
+        "deliveries subscribe",
+        &["--watch", "--adapter", "--target", "--policy"],
+    ),
+    ("deliveries list", &["--adapter", "--all"]),
+    ("deliveries claim", &["--adapter", "--worker", "--seconds"]),
+    ("deliveries resolve-tab", &["--session", "--tabs-file"]),
+    (
+        "deliveries dispatch",
+        &["--adapter", "--worker", "--tabs-file", "--seconds"],
+    ),
+    (
+        "deliveries complete",
+        &[
+            "--id",
+            "--worker",
+            "--generation",
+            "--outcome",
+            "--error-code",
+        ],
+    ),
+    ("review plan", &["--base", "--pr", "--repo"]),
+    (
+        "review run",
+        &[
+            "--session",
+            "--repo",
+            "--pr",
+            "--base",
+            "--tabs-file",
+            "--from-provider",
+            "--dry-run",
+        ],
+    ),
+    (
+        "review tick",
+        &[
+            "--session",
+            "--repo",
+            "--pr",
+            "--base",
+            "--limit",
+            "--tabs-file",
+            "--from-provider",
+            "--dry-run",
+        ],
+    ),
+    ("review ledger", &["--repo", "--pr"]),
+    (
+        "review state",
+        &[
+            "--repo",
+            "--pr",
+            "--type",
+            "--state",
+            "--head",
+            "--note",
+            "--completed-for-commit",
+            "--verdict",
+            "--reviewer-provider",
+            "--reviewer-model",
+        ],
+    ),
+    (
+        "review waive",
+        &["--repo", "--pr", "--type", "--head", "--reason", "--agent"],
+    ),
+    ("review register", &["--session", "--repo", "--pr"]),
+    ("review show", &["--session"]),
+    ("review request", &["--session"]),
+    ("review unlock", &["--session"]),
+    (
+        "review reassign",
+        &["--session", "--to-session", "--reason"],
+    ),
+    ("review abandon", &["--session", "--reason"]),
+    ("prepare", &["--session", "--offline", "--wait"]),
+    // `status` reads `--offline` and `--wait` only to refuse them by name.
+    ("prepare status", &["--session", "--offline", "--wait"]),
+    ("console", &[]),
+    ("console status", &[]),
+    ("console list", &[]),
+    ("console plan", &["--allow-parallel"]),
+    (
+        "console run",
+        &["--wait", "--allow-parallel", "--cleanup-command", "--"],
+    ),
+    ("resources plan", &["--wait", "--grant-out"]),
+    ("resources explain", &["--wait", "--grant-out"]),
+    ("resources acquire", &["--wait", "--grant-out"]),
+    ("resources run", &["--wait", "--cleanup-command", "--"]),
+    ("resources renew", &["--ttl"]),
+    ("resources release", &["--ttl"]),
+    ("resources list", &["--all"]),
+    ("resources reap", &[]),
+    ("resources reconcile", &["--confirm"]),
+    ("agents", &[]),
+    ("leases", &[]),
+    ("leases claim", &["--session", "--ttl"]),
+    ("leases plan", &["--session"]),
+    ("leases export", &["--session", "--entry", "--limit"]),
+    ("leases release", &["--session"]),
+    ("exec", &["--session", "--"]),
+    (
+        "git",
+        &[
+            "--session",
+            "--repo",
+            "--scope",
+            "--effect",
+            "--reason",
+            "--destructive",
+            "--no-wait",
+            "--queue-timeout",
+            "--",
+        ],
+    ),
+    (
+        "gh",
+        &[
+            "--session",
+            "--repo",
+            "--scope",
+            "--effect",
+            "--reason",
+            "--destructive",
+            "--no-wait",
+            "--queue-timeout",
+            "--",
+        ],
+    ),
+    (
+        "operations",
+        &[
+            "--limit",
+            "--before",
+            "--session",
+            "--status",
+            "--repo",
+            "--provider",
+        ],
+    ),
+    (
+        "operations list",
+        &[
+            "--limit",
+            "--before",
+            "--session",
+            "--status",
+            "--repo",
+            "--provider",
+        ],
+    ),
+    ("operations show", &[]),
+    ("operations stats", &["--repo", "--limit"]),
+    (
+        "operations reconcile",
+        &["--operation", "--outcome", "--reason"],
+    ),
+    ("blockers", &[]),
+    ("unblock", &["--outcome", "--reason", "--confirm"]),
+    ("advisories list", &["--all"]),
+    ("advisories show", &[]),
+    ("advisories ack", &[]),
+    ("advisories suppress", &[]),
+    ("advisories metrics", &[]),
+    ("exposures plan", &[]),
+    ("exposures apply", &["--session", "--confirm"]),
+    ("note send", &["--session", "--to-session", "--message"]),
+    ("note list", &["--session"]),
+    ("note ack", &["--session", "--id"]),
+    ("gates draft", &[]),
+    ("gates validate", &[]),
+    (
+        "gates doctor",
+        &["--probe", "--only", "--session", "--all", "--no-cache"],
+    ),
+    ("gates manifest", &["--head"]),
+    ("gates scope", &["--base", "--head"]),
+    ("gates affected", &["--session"]),
+    ("gates semantic", &["--session"]),
+    ("gates run", &["--session", "--all", "--only", "--no-cache"]),
+    ("gates pre-push", &["--session", "--all", "--no-cache"]),
+    ("hooks install", &[]),
+    ("hooks uninstall", &[]),
+    ("hooks status", &[]),
+    ("hooks snippet", &[]),
+    ("hooks pre-commit", &[]),
+    ("hooks post-commit", &[]),
+    ("hooks pre-push", &[]),
+    ("trust", &["--repo"]),
+    ("trust status", &["--repo"]),
+    (
+        "pr check",
+        &["--target", "--pr", "--agent", "--dispatch", "--cmd"],
+    ),
+    ("watch pr monitoring", &["--session"]),
+    (
+        "watch pr start",
+        &["--session", "--repo", "--pr", "--events", "--seconds"],
+    ),
+    ("watch pr list", &["--all"]),
+    ("watch pr show", &["--id"]),
+    ("watch pr poll", &["--id"]),
+    ("watch pr pause", &["--id"]),
+    ("watch pr resume", &["--id"]),
+    ("watch pr stop", &["--id"]),
+    ("watch pr tick", &["--limit"]),
+    ("watch pr batches", &["--id", "--all"]),
+    ("watch pr ack", &["--id", "--outcome", "--reason"]),
+    ("submit", &["--session", "--no-cache", "--verify-only"]),
+    ("repair", &["--session"]),
+    ("checkpoint plan", &["--session"]),
+    ("checkpoint apply", &["--session", "--confirm"]),
+    // Bare `queue` reads `--limit` and `--before` only to refuse them by name.
+    ("queue", &["--active", "--limit", "--before"]),
+    ("queue history", &["--limit", "--before"]),
+    ("promote", &["--entry"]),
+    ("ship plan", &["--entry", "--delivery", "--detail"]),
+    (
+        "ship execute",
+        &[
+            "--entry",
+            "--confirm",
+            "--delivery",
+            "--plan",
+            "--plan-digest",
+            "--sync-main",
+            "--break-glass",
+            "--reason",
+        ],
+    ),
+    ("integration status", &[]),
+    ("integration wait-stable", &["--seconds"]),
+    (
+        "integration reconcile",
+        &[
+            "--upstream",
+            "--resolution-file",
+            "--write-resolution-template",
+            "--dry-run",
+            "--apply",
+            "--confirm",
+        ],
+    ),
+    ("status", &["--summary"]),
+    ("events", &["--since", "--kind", "--follow"]),
+    ("events prune", &["--keep-days"]),
+    ("metrics", &[]),
+    ("doctor", &["--fix-version"]),
+    ("quick-test", &["--chau7", "--with-gate"]),
+    ("verify-loop", &[]),
+    ("e2e", &[]),
+    ("init", &[]),
+    ("certify", &[]),
+    ("scaffold", &[]),
+    ("handoff", &["--session", "--worktree"]),
+    ("finish", &["--session", "--keep-worktree"]),
+    ("close", &["--session"]),
+    (
+        "cleanup",
+        &[
+            "--force",
+            "--all-cleaned",
+            "--apply",
+            "--confirm",
+            "--dry-run",
+            "--detail",
+        ],
+    ),
+    (
+        "main reconcile plan",
+        &[
+            "--detail",
+            "--resolution-file",
+            "--write-resolution-template",
+        ],
+    ),
+    (
+        "main reconcile apply",
+        &["--session", "--confirm", "--resolution-file"],
+    ),
+    ("representation scan", &["--session"]),
+    ("representation status", &["--session"]),
+    ("representation record", &["--session", "--confirm"]),
+    ("promotion-record plan", &[]),
+    ("promotion-record apply", &["--confirm"]),
+    // `plan` reads `--confirm` only to refuse it by name.
+    ("gc plan", &["--detail", "--confirm"]),
+    ("gc apply", &["--confirm"]),
+    ("worktrees", &[]),
+    ("storage", &["--detail", "--confirm"]),
+    ("storage plan", &["--detail", "--confirm"]),
+    ("storage apply", &["--confirm"]),
+];
+
+/// Extra guidance for a refusal whose plausible cause the generic list does not
+/// explain, keyed by the one-word subcommand and the flag.
+const FLAG_REFUSAL_HINTS: &[(&str, &str, &str)] = &[(
+    "adopt",
+    "--base",
+    "--base does not apply to broker adopt: adopting registers an existing worktree, whose branch already has its own \
+     history. Use broker start --base <ref> to cut a new branch from a chosen base.",
+)];
+
+/// The `FLAG_RULES` entry that governs `subcommand` with these positionals, as
+/// its path and flags. `None` for a subcommand the table does not know, which
+/// the dispatcher then reports as unknown.
+fn flag_rule(subcommand: &str, positional: &[String]) -> Option<(String, Vec<&'static str>)> {
+    let entries: Vec<(Vec<&str>, &'static [&'static str])> = FLAG_RULES
+        .iter()
+        .filter_map(|(path, flags)| {
+            let words: Vec<&str> = path.split(' ').collect();
+            (words[0] == subcommand).then_some((words, *flags))
+        })
+        .collect();
+    if entries.is_empty() {
+        return None;
+    }
+    let action_match = entries
+        .iter()
+        .filter(|(words, _)| {
+            words.len() > 1
+                && words.len() - 1 <= positional.len()
+                && words[1..]
+                    .iter()
+                    .zip(positional)
+                    .all(|(word, given)| word == given)
+        })
+        .max_by_key(|(words, _)| words.len());
+    if let Some((words, flags)) = action_match {
+        return Some((words.join(" "), flags.to_vec()));
+    }
+    let has_actions = entries.iter().any(|(words, _)| words.len() > 1);
+    if let Some((_, flags)) = entries.iter().find(|(words, _)| words.len() == 1)
+        && (positional.is_empty() || !has_actions)
+    {
+        return Some((subcommand.to_string(), flags.to_vec()));
+    }
+    let mut union: Vec<&'static str> = Vec::new();
+    for (_, flags) in &entries {
+        for flag in *flags {
+            if !union.contains(flag) {
+                union.push(flag);
+            }
+        }
+    }
+    Some((subcommand.to_string(), union))
+}
+
+/// The command paths at which `flag` is valid, in table order.
+fn flag_valid_at(flag: &str) -> Vec<&'static str> {
+    FLAG_RULES
+        .iter()
+        .filter(|(_, flags)| flags.contains(&flag))
+        .map(|(path, _)| *path)
+        .collect()
+}
+
+/// Why `flags` cannot be given to `subcommand` with these positionals, or
+/// `None` when every flag is one it reads.
+fn flag_refusal(subcommand: &str, positional: &[String], flags: &[String]) -> Option<String> {
+    let (path, allowed) = flag_rule(subcommand, positional)?;
+    let flag = flags
+        .iter()
+        .find(|flag| !GLOBAL_FLAGS.contains(&flag.as_str()) && !allowed.contains(&flag.as_str()))?;
+    let flag_label = if flag == "--" {
+        "`--` (the command separator)".to_string()
+    } else {
+        format!("`{flag}`")
+    };
+    let valid_at = flag_valid_at(flag);
+    let mut message = if valid_at.is_empty() {
+        format!("{flag_label} is not valid for `broker {path}`")
+    } else {
+        format!(
+            "{flag_label} is not valid for `broker {path}`; it applies to: {}",
+            valid_at.join(", ")
+        )
+    };
+    if let Some((_, _, hint)) = FLAG_REFUSAL_HINTS
+        .iter()
+        .find(|(command, hinted, _)| *command == subcommand && hinted == flag)
+    {
+        message.push_str(". ");
+        message.push_str(hint);
+    }
+    Some(message)
+}
+
+/// Refuse any flag the subcommand does not read, as a usage error.
+fn validate_flags(subcommand: &str, parsed: &Parsed) -> Result<(), UsageError> {
+    match flag_refusal(subcommand, &parsed.positional, &parsed.given_flags) {
+        Some(message) => Err(UsageError::Exit {
+            message,
+            code: crate::exit_status::USAGE,
+        }),
+        None => Ok(()),
+    }
 }
 
 fn aethyme_gates_load(main_root: &std::path::Path) -> Result<Vec<crate::Gate>, UsageError> {
@@ -10184,59 +10960,9 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
         }
     })?;
     parsed.read_only_snapshot = mode == CompatibilityMode::ReadOnlySnapshot;
-    if !parsed.planned_paths.is_empty() && !matches!(subcommand.as_str(), "start" | "adopt") {
-        return Err(UsageError::Message(
-            "--path is valid only with broker start or broker adopt".into(),
-        ));
-    }
-    if (parsed.repo_name.is_some() || parsed.tab_name.is_some() || parsed.ai_provider.is_some())
-        && !matches!(subcommand.as_str(), "start" | "start-agent" | "adopt")
-    {
-        return Err(UsageError::Message(
-            "session identity flags are valid only with broker start, broker start-agent, or broker adopt"
-                .into(),
-        ));
-    }
-    // `--base` names the commit a new session's branch is cut from (#290 phase
-    // 1.1), and `gates scope` uses it as a diff endpoint. Everywhere else it
-    // used to be parsed and silently dropped, which reported a choice that was
-    // never made -- the same shape as the `adopt --claim` drop in #285.
-    //
-    // `adopt` is called out separately because it is the plausible mistake:
-    // adopting registers an existing worktree whose branch already has a
-    // history, so there is no base to choose and silently ignoring the flag
-    // would be the worst of the three options.
-    if parsed.base.is_some() && subcommand == "adopt" {
-        return Err(UsageError::Message(
-            "--base does not apply to broker adopt: adopting registers an existing worktree, \
-             whose branch already has its own history. Use broker start --base <ref> to cut a \
-             new branch from a chosen base."
-                .into(),
-        ));
-    }
-    if parsed.base.is_some() && !matches!(subcommand.as_str(), "gates" | "start" | "start-agent") {
-        return Err(UsageError::Message(
-            "--base is valid only with broker start, broker start-agent, or broker gates scope"
-                .into(),
-        ));
-    }
-    // Only start and adopt record declared scope; anywhere else `--claim`
-    // would exit zero and discard the claim, which reads as accepted.
-    if !parsed.declared_scopes.is_empty() && !matches!(subcommand.as_str(), "start" | "adopt") {
-        return Err(UsageError::Message(
-            "--claim is valid only with broker start or broker adopt".into(),
-        ));
-    }
-    if parsed.verify_only && subcommand != "submit" {
-        return Err(UsageError::Message(
-            "--verify-only is valid only with broker submit".into(),
-        ));
-    }
-    if parsed.required_mode.is_some() && subcommand != "readiness" {
-        return Err(UsageError::Message(
-            "--require is valid only with broker readiness".into(),
-        ));
-    }
+    // One declarative check replaces the per-flag guards that grew after #285:
+    // a flag the subcommand never reads is refused rather than dropped.
+    validate_flags(subcommand, &parsed)?;
     surface_command_advisories(subcommand, &parsed);
 
     match subcommand.as_str() {
@@ -11461,16 +12187,6 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     "gates requires an action: draft, validate, doctor, manifest, scope, affected, semantic, run, or pre-push"
                         .into(),
                 ))?;
-            if parsed.base.is_some() && action != "scope" {
-                return Err(UsageError::Message(
-                    "--base is valid only with broker gates scope".into(),
-                ));
-            }
-            if parsed.probe && action != "doctor" {
-                return Err(UsageError::Message(
-                    "--probe is valid only with broker gates doctor".into(),
-                ));
-            }
             match action {
                 "draft" => {
                     let cwd = std::env::current_dir()
@@ -13625,6 +14341,23 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                         "cleanup <session-id> does not take --apply; use the exact command after finish reports cleanup safe"
                             .into(),
                     ));
+                }
+                // The table admits these for `--all-cleaned`; for one session they
+                // would be dropped, and `--dry-run` would then clean for real.
+                if let Some(flag) = [
+                    ("--dry-run", parsed.dry_run),
+                    ("--confirm", parsed.confirm.is_some()),
+                    ("--detail", parsed.detail),
+                ]
+                .into_iter()
+                .find_map(|(flag, given)| given.then_some(flag))
+                {
+                    return Err(UsageError::Exit {
+                        message: format!(
+                            "cleanup <session-id> does not take {flag}; it applies to cleanup --all-cleaned"
+                        ),
+                        code: crate::exit_status::USAGE,
+                    });
                 }
                 let id: i64 = parsed
                     .positional
