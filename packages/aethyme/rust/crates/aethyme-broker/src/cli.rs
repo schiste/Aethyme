@@ -949,7 +949,10 @@ fn record_command_outcome(args: &[String], exit: u8) {
     } else {
         crate::events::BROKER_COMMAND_FAILED
     };
-    let _ = store.append_event(kind, session_id, Some(&payload));
+    crate::warn_unrecorded(
+        "record the command outcome event",
+        store.append_event(kind, session_id, Some(&payload)),
+    );
 }
 
 /// Record one command's cost. `output_bytes` counts stdout emitted through
@@ -979,6 +982,8 @@ fn record_command_metric(args: &[String], exit: u8, duration_ms: i64) {
     let Ok(main_root) = repo.main_root() else {
         return;
     };
+    // Opt-in latency telemetry, not broker state: a command must never fail
+    // or grow stderr noise because its own timing line could not be written.
     let dir = main_root.join(".aethyme/logs");
     let _ = std::fs::create_dir_all(&dir);
     let ts = std::time::SystemTime::now()
@@ -13824,7 +13829,10 @@ fn surface_command_advisories(subcommand: &str, parsed: &Parsed) {
         return;
     };
     if !parsed.read_only_snapshot {
-        let _ = store.record_advisories_shown(&advisories, crate::AdvisoryDeliverySurface::Command);
+        crate::warn_unrecorded(
+            "record advisory delivery",
+            store.record_advisories_shown(&advisories, crate::AdvisoryDeliverySurface::Command),
+        );
     }
     for line in crate::advisories::session_notice_lines(&advisories) {
         eprintln!("{line}");

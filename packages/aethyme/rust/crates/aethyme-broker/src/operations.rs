@@ -3302,11 +3302,14 @@ impl Broker {
     /// real failure, and the liveness-aware sweep is the backstop.
     fn resolve_unstarted_operation(&mut self, id: i64, reason: &str) {
         let details = json!({ "reason": reason }).to_string();
-        let _ = self.store().transition_coordinated_operation(
-            id,
-            OperationStatus::Failed,
-            None,
-            Some(&details),
+        crate::warn_unrecorded(
+            "mark an unstarted coordinated operation failed",
+            self.store().transition_coordinated_operation(
+                id,
+                OperationStatus::Failed,
+                None,
+                Some(&details),
+            ),
         );
     }
 

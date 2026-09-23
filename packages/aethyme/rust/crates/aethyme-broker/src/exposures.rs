@@ -264,7 +264,10 @@ impl Broker {
                 &advisory_entry_ids.into_iter().collect::<Vec<_>>(),
                 &evidence,
             )?;
-        let _ = self.refresh_advisory_projection();
+        crate::warn_unrecorded(
+            "refresh the advisory projection",
+            self.refresh_advisory_projection(),
+        );
         Ok(ExposureReconciliationApplyReport {
             plan,
             verification_operation: verification.operation,

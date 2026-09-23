@@ -503,6 +503,20 @@ pub const BROKER_DB_RELPATH: &str = ".aethyme/broker.db";
 /// binary ever runs in -- resolution is exactly what it was.
 pub const BROKER_DB_ENV: &str = "AETHYME_BROKER_DB";
 
+/// Report a state write that failed where stopping would be worse than going on.
+///
+/// For writes that follow an effect that already happened (a promotion, a
+/// committed transaction), or that run on a path already returning the real
+/// error. Propagating there would report failure for work that succeeded, or
+/// hide the original error; dropping the result would lose the fact that broker
+/// state is now incomplete. stderr is the broker's channel for non-fatal
+/// diagnostics, and `warning:` is the prefix the CLI already uses for them.
+pub(crate) fn warn_unrecorded<T, E: std::fmt::Display>(what: &str, result: Result<T, E>) {
+    if let Err(error) = result {
+        eprintln!("warning: aethyme could not {what}: {error}");
+    }
+}
+
 /// Where a repository's broker database lives, honouring [`BROKER_DB_ENV`].
 ///
 /// The override is used verbatim, so a relative value resolves against the
