@@ -17,7 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
@@ -57,7 +57,7 @@ jobs:
         working-directory: packages/aethyme/rust
     steps:
       - name: Checkout
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # Full history + tags so build.rs embeds the tag in
           # `aethyme --version` via `git describe`.
@@ -136,7 +136,7 @@ jobs:
       id-token: write
     steps:
       - name: Checkout release source
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
@@ -202,7 +202,7 @@ jobs:
       - name: Create or update release
         # Third-party action with a write-scoped token: pinned to a full
         # commit SHA rather than a movable tag.
-        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
           files: dist/*
           body_path: packages/aethyme/docs/guides/upgrading-to-${{ github.ref_name }}.md
