@@ -217,6 +217,25 @@ For task-oriented examples that connect session reuse, gate cache policy,
 lease planning, and durable finish handoffs, see the
 [broker follow-up workflows guide](../guides/broker-workflows.md).
 
+### Exit codes
+
+`aethyme broker` exit codes name the outcome, so an agent can branch on
+the code without parsing output. They apply with or without `--json`.
+
+| Code | Meaning | What to do |
+| --- | --- | --- |
+| 0 | Success, including a verified submission that promotion did not move | Continue |
+| 1 | Unclassified failure | Read the error message |
+| 2 | Usage error | Fix the command line; see `--help` |
+| 3 | Refused: a policy, lease, confirmation or state precondition blocked the request, or a submission conflicted. Nothing changed. | Fix the precondition, then retry |
+| 4 | Verification failed: a gate or graph-integrity check did not pass | Fix the code; the gate output names the failure |
+| 5 | Outcome unknown: a remote write may or may not have happened | Inspect external state, then `broker operations reconcile`. Never retry blindly. |
+| 6 | Environment: a missing tool, path or remote base, or host I/O failure | Fix the host, then retry |
+
+Before 2026-09-23, `submit --json` exited 0 for rejected and conflicted
+entries, and every refusal exited 1. Some subcommands keep their own
+documented codes, for example `check-contract` and the `exec` guard.
+
 `broker worktree-root` is a strictly read-only placement plan. It reports the
 canonical checkout identity, the preferred private host-state root, whether
 that root is outside the repository, and the legacy fallback. Normal starts

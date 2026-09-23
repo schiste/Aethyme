@@ -1980,9 +1980,24 @@ enum UsageError {
     SilentExit(u8),
 }
 
-impl<E: std::fmt::Display> From<E> for UsageError {
+impl<E: std::fmt::Display + 'static> From<E> for UsageError {
     fn from(err: E) -> Self {
-        UsageError::Message(err.to_string())
+        // `?` funnels every error through here, so this is the one place a
+        // typed broker error can keep its class as an exit code.
+        let code = (&err as &dyn std::any::Any)
+            .downcast_ref::<crate::BrokerOpError>()
+            .map_or(
+                crate::exit_status::FAILED,
+                crate::exit_status::for_broker_error,
+            );
+        if code == crate::exit_status::FAILED {
+            UsageError::Message(err.to_string())
+        } else {
+            UsageError::Exit {
+                message: err.to_string(),
+                code,
+            }
+        }
     }
 }
 
@@ -10872,7 +10887,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                 if let Some(recovery) = report.unknown_outcome_recovery() {
                     return Err(UsageError::Exit {
                         message: recovery.to_string(),
-                        code: 1,
+                        code: crate::exit_status::OUTCOME_UNKNOWN,
                     });
                 }
                 return Err(UsageError::Message(format!(
@@ -11944,7 +11959,10 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                     "Quick start: git fetch . {base} && git rebase {base}   (then resubmit)",
                     base = outcome.entry.base_commit
                 );
-                return Err(UsageError::Message("submission conflicted".into()));
+                return Err(UsageError::Exit {
+                    message: "submission conflicted".into(),
+                    code: crate::exit_status::REFUSED,
+                });
             } else {
                 if let Some(graph) = &outcome.graph_integrity
                     && graph.enforced
@@ -11989,7 +12007,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                 match outcome.gate_verification.status {
                     crate::SubmissionGateVerificationStatus::NotRun => {}
                     crate::SubmissionGateVerificationStatus::NoConfiguration => out!(
-                        "verification: conflict-only — no .aethyme/gates.toml exists in the submitted tree; 0 gates selected"
+                        "verification: conflict-only — the base has no .aethyme/gates.toml; 0 gates selected"
                     ),
                     crate::SubmissionGateVerificationStatus::NoGatesTriggered => out!(
                         "verification: no gate matched this diff ({} configured, 0 selected); review triggers with `aethyme broker gates affected --session {}`",
@@ -12086,9 +12104,10 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                              the broker cannot hold it back. Fix forward on main and resubmit."
                         );
                     }
-                    return Err(UsageError::Message(
-                        "gates failed on the merged tree".into(),
-                    ));
+                    return Err(UsageError::Exit {
+                        message: "gates failed on the merged tree".into(),
+                        code: crate::exit_status::VERIFICATION_FAILED,
+                    });
                 }
                 // "What now?" — the next expected human action was
                 // implicit (dogfood feedback 2026-07-14).
@@ -12126,6 +12145,12 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                         outcome.entry.id,
                     );
                 }
+            }
+            // `--json` used to exit 0 for a rejected or conflicted entry, so a
+            // caller reading only the exit code saw a failed gate as success.
+            let code = crate::exit_status::for_submission(outcome.entry.status);
+            if code != crate::exit_status::SUCCESS {
+                return Err(UsageError::SilentExit(code));
             }
         }
         "repair" => {

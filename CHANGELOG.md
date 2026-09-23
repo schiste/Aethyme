@@ -6,6 +6,13 @@ artifacts and their exact source revision are recorded in each signed
 
 ## [Unreleased]
 
+### Changed
+
+- `aethyme broker` exit codes now name the outcome: 3 refused, 4 verification
+  failed, 5 outcome unknown, 6 environment; 1 stays an unclassified failure.
+  `broker submit --json` no longer exits 0 for rejected (4) or conflicted (3)
+  entries. See "Exit codes" in `docs/reference/cli.md`.
+
 ## [0.7.25] - 2026-09-22
 
 ### Added
