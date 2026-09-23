@@ -92,7 +92,7 @@ rayon = "1"
 # rustc bump.
 oxc_parser = "=0.125"
 oxc_ast = "=0.125"
-oxc_allocator = "=0.125"
+oxc_allocator = "=0.150"
 oxc_span = "=0.125"
 
 # Rust parsing (Phase 3.6) via rust-analyzer's syntax crate.
