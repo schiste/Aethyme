@@ -7625,10 +7625,23 @@ impl Broker {
                     return Ok(report);
                 }
                 MergeStatus::Rejected => {
-                    report.warnings.push(format!(
-                        "latest submit qid {} was rejected; commit a fix and resubmit before finish",
-                        entry.id
-                    ));
+                    let environmental = crate::exit_status::failures_are_environmental(
+                        gate_failures(entry.details_json.as_deref())
+                            .iter()
+                            .map(|failure| failure.failure_class.as_deref()),
+                    );
+                    report.warnings.push(if environmental {
+                        format!(
+                            "latest submit qid {} could not run its gates on this host (low disk, \
+                             locks or environment); free the resource and resubmit before finish",
+                            entry.id
+                        )
+                    } else {
+                        format!(
+                            "latest submit qid {} was rejected; commit a fix and resubmit before finish",
+                            entry.id
+                        )
+                    });
                     report
                         .next_commands
                         .push(format!("aethyme broker submit --session {session_id}"));
@@ -8820,7 +8833,21 @@ fn rejected_submit_advice(agent: &AgentView, entry: &MergeQueueEntry) -> StatusA
         .iter()
         .map(|failure| failure.name.clone())
         .collect();
-    let summary = if gate_names.is_empty() {
+    let environmental = crate::exit_status::failures_are_environmental(
+        failures
+            .iter()
+            .map(|failure| failure.failure_class.as_deref()),
+    );
+    let summary = if environmental {
+        format!(
+            "session {} latest submit qid {} was not verified: {} could not run on this host \
+             (low disk, locks or environment), so the code was not judged; free the resource, \
+             then resubmit without changing code",
+            agent.session.id,
+            entry.id,
+            gate_names.join(", ")
+        )
+    } else if gate_names.is_empty() {
         format!(
             "session {} latest submit qid {} was rejected; inspect the gate details, commit a fix, then resubmit",
             agent.session.id, entry.id

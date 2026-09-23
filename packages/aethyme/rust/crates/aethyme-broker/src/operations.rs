@@ -1420,8 +1420,9 @@ fn resolve_effect(
         // An unrecognized command may be an alias for anything, including a
         // push, so the caller cannot vouch that it only reads.
         (None, Some(OperationEffect::Read)) => Err(BrokerOpError::InvalidCoordinatedOperation {
-            reason: "an unrecognized command cannot be declared --effect read; declare \
-                     --effect write or --effect destructive"
+            reason: "unrecognized command: check the command name first (a typo, or a \
+                     repeated `git`/`gh`); only if it is intentional, declare --effect write \
+                     or --effect destructive, because it cannot be declared --effect read"
                 .into(),
         }),
         (None, Some(declared)) => Ok((declared, "declared")),
@@ -1479,6 +1480,32 @@ fn config_key_executes_code(key: &str) -> bool {
         .iter()
         .any(|prefix| key.starts_with(prefix))
         || CODE_EXECUTING_CONFIG_KEYS.contains(&key.as_str())
+}
+
+/// `broker git -- git push` runs `git git push`. Refuse it plainly: otherwise
+/// the command reads as an unrecognized subcommand, the caller raises its
+/// declared effect to get past that, and the failed write then blocks the
+/// repository as an unknown outcome (seen twice on 2026-09-23).
+pub(crate) fn refuse_repeated_program_name(
+    provider: OperationProvider,
+    args: &[String],
+) -> Result<(), BrokerOpError> {
+    let (program, first) = match provider {
+        OperationProvider::Git => (
+            "git",
+            git_subcommand_index(args).and_then(|index| args.get(index)),
+        ),
+        OperationProvider::Github => ("gh", args.first()),
+    };
+    if first.is_some_and(|arg| arg == program) {
+        return Err(BrokerOpError::InvalidCoordinatedOperation {
+            reason: format!(
+                "the broker already runs `{program}`; drop the leading `{program}` after `--` \
+                 (write `broker {program} ... -- <args>`, not `-- {program} <args>`)"
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// Refuse global options that change what a coordinated Git command executes.
@@ -3305,6 +3332,7 @@ impl Broker {
                 ),
             });
         }
+        refuse_repeated_program_name(request.provider, &request.args)?;
         if request.provider == OperationProvider::Git {
             refuse_code_executing_git_options(&request.args)?;
         }
@@ -5001,6 +5029,36 @@ mod tests {
         assert_eq!(
             classify_gh(&args(&["api", "-Xget", "repos/o/r"])),
             Some(Read)
+        );
+    }
+
+    #[test]
+    fn a_repeated_program_name_is_refused_before_classification() {
+        assert!(
+            refuse_repeated_program_name(OperationProvider::Git, &args(&["git", "add", "x"]))
+                .is_err()
+        );
+        assert!(
+            refuse_repeated_program_name(
+                OperationProvider::Git,
+                &args(&["-C", "/tmp/r", "git", "status"])
+            )
+            .is_err()
+        );
+        assert!(
+            refuse_repeated_program_name(OperationProvider::Github, &args(&["gh", "pr", "merge"]))
+                .is_err()
+        );
+        assert!(
+            refuse_repeated_program_name(
+                OperationProvider::Git,
+                &args(&["push", "origin", "main"])
+            )
+            .is_ok()
+        );
+        assert!(
+            refuse_repeated_program_name(OperationProvider::Github, &args(&["pr", "view", "1"]))
+                .is_ok()
         );
     }
 

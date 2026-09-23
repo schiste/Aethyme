@@ -6,6 +6,23 @@ artifacts and their exact source revision are recorded in each signed
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-09-23
+
+Fixes two regressions from v0.8.0 seen in real use. No schema change (42);
+rollback to 0.8.0 is unrestricted.
+
+### Fixed
+
+- `broker git -- git ...` and `broker gh -- gh ...` are refused plainly, naming
+  the fix (drop the repeated program name). In v0.8.0 the unrecognized-command
+  refusal told the caller to declare `--effect write`; the failed write then
+  left an unknown outcome that write-blocked the whole repository. The
+  unrecognized-command refusal now says to check the command name first.
+- A submission whose failing gates could not run on the host (low disk, locks,
+  a missing tool: `resource_contention` or `environment`) exits 6 instead of 4,
+  prints that the code was not judged, and status/finish advice says to free
+  the resource and resubmit without changing code.
+
 ## [0.8.0] - 2026-09-23
 
 A correctness and integrity release from the 2026-09-23 audit. It changes

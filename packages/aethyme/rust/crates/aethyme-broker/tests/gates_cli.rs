@@ -1501,3 +1501,75 @@ fn exit_codes_name_the_outcome_an_agent_acts_on() {
         String::from_utf8_lossy(&refused.stderr)
     );
 }
+
+// v0.8.1: a gate that could not run on the host (here a missing tool, exit
+// 127, classed `environment`; low disk is classed `resource_contention`) did
+// not judge the code. It exits 6, not 4, and status must not say "commit a
+// fix". A repeated `git` after `--` is refused plainly instead of steering the
+// caller toward a stronger --effect.
+#[test]
+fn host_failures_exit_environment_and_a_repeated_git_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    git(tmp.path(), &["init", "-q", "-b", "main"]);
+    std::fs::create_dir_all(tmp.path().join(".aethyme")).unwrap();
+    std::fs::write(tmp.path().join("tracked.txt"), "base\n").unwrap();
+    std::fs::write(
+        tmp.path().join(".gitignore"),
+        ".aethyme/broker.db*\n.aethyme/logs/\n.aethyme/run/\n.aethyme/worktrees/\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join(".aethyme/gates.toml"),
+        "[[gate]]\nname = \"missing-tool\"\ncommand = \"exit 127\"\n",
+    )
+    .unwrap();
+    git(tmp.path(), &["add", "-A"]);
+    git(tmp.path(), &["commit", "-qm", "fixture"]);
+    let worktree = tmp.path().join(".aethyme/worktrees/host");
+    std::fs::create_dir_all(worktree.parent().unwrap()).unwrap();
+    git(
+        tmp.path(),
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "agent/host",
+            worktree.to_str().unwrap(),
+            "main",
+        ],
+    );
+    let adopted = stdout(run(
+        &worktree,
+        &["adopt", "--task", "host failure", "--json"],
+    ));
+    let adopted: serde_json::Value = serde_json::from_str(&adopted).unwrap();
+    let session = adopted["id"].as_i64().unwrap().to_string();
+    std::fs::write(worktree.join("tracked.txt"), "changed\n").unwrap();
+    git(&worktree, &["commit", "-qam", "change"]);
+
+    let submitted = run(&worktree, &["submit", "--session", &session, "--json"]);
+    assert_eq!(
+        submitted.status.code(),
+        Some(i32::from(aethyme_broker::exit_status::ENVIRONMENT)),
+        "{}",
+        String::from_utf8_lossy(&submitted.stderr)
+    );
+    let status = stdout(run(&worktree, &["status", "--json"]));
+    assert!(status.contains("the code was not judged"), "{status}");
+    assert!(!status.contains("commit a fix"), "{status}");
+
+    let repeated = run(
+        &worktree,
+        &["git", "--session", &session, "--", "git", "status"],
+    );
+    assert_eq!(
+        repeated.status.code(),
+        Some(i32::from(aethyme_broker::exit_status::REFUSED))
+    );
+    assert!(
+        String::from_utf8_lossy(&repeated.stderr).contains("drop the leading `git`"),
+        "{}",
+        String::from_utf8_lossy(&repeated.stderr)
+    );
+}
