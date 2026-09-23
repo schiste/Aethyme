@@ -51,9 +51,27 @@ part of the contract.
   "review_refusals": [
     { "repository", "pull_request", "review_type", "head_commit",
       "class", "text", "refused_at" }
-  ]
+  ],
+  "blockers": [
+    { "id", "kind", "scope", "cause", "session_id", "clear",
+      "safe_to_clear_automatically" }
+  ],
+  "blocker_sources_unavailable": [ { "source", "error" } ]
 }
 ```
+
+`blockers` (added 2026-09-23) is every current blocker across `broker.db`,
+the host operation and resource ledgers, gate pidfiles, and conflict notices,
+in one id namespace: `op:<n>`, `hostop:<32-hex>`, `resource:<lease-id>`,
+`lease:<id>`, `gatecache:<gate>@<tree>`, `pidfile:<session>-<gate>`,
+`action:<session>`. `kind` is `operation`, `host_operation`,
+`resource_lease`, `path_lease`, `gate_cache`, `pidfile` or
+`action_required`; `scope` is `repo` or `host`; `session_id` is omitted when
+no session owns the blocker. `clear` is the exact command that clears it,
+usually `aethyme broker unblock <id>` plus any flag an operator must supply.
+`blocker_sources_unavailable` is omitted when every store was read; when
+present, `blockers` is incomplete, never "nothing blocks". The same report is
+`aethyme broker blockers --json`.
 
 `review_refusals` lists reviews a provider declined and nothing has re-asked
 for since. `class` is `quota_exhausted`, `rate_limited`, `provider_error` or

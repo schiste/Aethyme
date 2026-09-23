@@ -109,6 +109,7 @@ One JSON object per line:
 | `operation.succeeded` / `.failed` | the session | same operation fields | the fixed `git` or `gh` subprocess exited and its definitive status was durably recorded (`failed` is used for reads or commands that never started) |
 | `operation.outcome_unknown` | the session | same operation fields | a previous writer released its process lock without recording an outcome, or a write exited non-zero after possibly applying partial effects; overlapping writes fail closed |
 | `operation.reconciled_succeeded` / `.reconciled_failed` | the session | same operation fields | an operator inspected external state and attested the crash-ambiguous outcome |
+| `broker.blocker.cleared` | — | `id`, `kind`, `reason` (nullable), `detail` (kind-specific: `gate_name`, `tree_hash`, `removed_gate_result_ids[]`, `operator_reason` for a gate verdict; `remote_key`, `outcome` for a host operation; `generation` for a resource lease; `gate_name`, `pid` for a pidfile) | `aethyme broker unblock <id>` cleared a blocker that no older recovery path records (added 2026-09-23). Operations reconciled through `op:<n>`, or a host operation a repository row journals, are recorded by the existing `operation.reconciled_*` kinds instead; path-lease releases by `lease.released`. |
 
 ## Operational commands
 
