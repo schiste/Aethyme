@@ -17,10 +17,9 @@
 //! placement is recorded rather than silently accepted, and `gate doctor`
 //! reports it.
 
-use std::fs::{File, OpenOptions};
-use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 
+use crate::file_lock::{ExclusiveFileLock, open_lock_file};
 use crate::{BrokerError, BrokerOpError, GitRepo};
 
 /// Where a slot was placed, and what it had to settle for.
@@ -142,7 +141,7 @@ fn resolve(path: &Path) -> PathBuf {
 pub(crate) struct ExactTreeVerificationSlot {
     repository_root: PathBuf,
     path: PathBuf,
-    _lock: File,
+    _lock: ExclusiveFileLock,
 }
 
 impl ExactTreeVerificationSlot {
@@ -157,26 +156,17 @@ impl ExactTreeVerificationSlot {
             source,
         })?;
         let lock_path = placement.directory.join("slot.lock");
-        let lock = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(&lock_path)
-            .map_err(|source| BrokerError::Io {
-                path: lock_path.clone(),
-                source,
-            })?;
+        let file = open_lock_file(&lock_path).map_err(|source| BrokerError::Io {
+            path: lock_path.clone(),
+            source,
+        })?;
         // Contention blocks rather than failing, so a lock error is a broken
         // lock and never a busy one. Answering it by moving to a different
         // directory would hand one slot to two processes, so it is fatal.
-        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
-            return Err(BrokerError::Io {
-                path: lock_path,
-                source: std::io::Error::last_os_error(),
-            }
-            .into());
-        }
+        let lock = ExclusiveFileLock::acquire(file).map_err(|source| BrokerError::Io {
+            path: lock_path,
+            source,
+        })?;
         Ok(Self {
             repository_root: main_root.to_path_buf(),
             path: placement.directory.join("slot"),

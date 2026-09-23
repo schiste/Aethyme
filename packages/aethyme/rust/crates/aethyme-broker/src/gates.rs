@@ -31,6 +31,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use sha2::{Digest, Sha256};
 
+use crate::clock::epoch_ms;
 use crate::git::GitRepo;
 use crate::store::BrokerStore;
 use crate::types::{GateFailureClass, GateStatus, NewGateResult};
@@ -831,9 +832,164 @@ fn heartbeat_interval() -> Duration {
 
 /// Directory holding pidfiles for in-flight gate runs, enabling
 /// cross-process cancellation without a daemon. One file per running
-/// gate: `<session>-<gate>.pid` containing `<pgid> <tree_hash>`.
+/// gate: `<session>-<gate>.pid` containing
+/// `<pgid> <tree_hash> <pid> <start_time>`. Readers need only the first two
+/// fields, so older pidfiles (`<pgid> <tree_hash>`) still parse.
 fn running_dir(main_root: &Path) -> PathBuf {
     main_root.join(".aethyme/run/gates")
+}
+
+/// What a gate pidfile says about the process group it names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GatePidRecord {
+    pgid: i32,
+    tree: String,
+    /// The group leader. Gates are spawned as their own group, so this is
+    /// `pgid`; absent from pidfiles written before it was recorded.
+    pid: Option<i32>,
+    /// The leader's start time, in [`process_start_time`] units. It is what
+    /// tells the recorded process apart from a later one that reused its PID.
+    start: Option<u64>,
+}
+
+impl GatePidRecord {
+    fn render(&self) -> String {
+        let field = |value: Option<String>| value.unwrap_or_else(|| "-".to_string());
+        format!(
+            "{} {} {} {}",
+            self.pgid,
+            self.tree,
+            field(self.pid.map(|pid| pid.to_string())),
+            field(self.start.map(|start| start.to_string())),
+        )
+    }
+
+    fn parse(content: &str) -> Option<Self> {
+        let mut parts = content.split_whitespace();
+        let pgid = parts.next()?.parse().ok()?;
+        let tree = parts.next()?.to_string();
+        let pid = parts.next().and_then(|pid| pid.parse().ok());
+        let start = parts.next().and_then(|start| start.parse().ok());
+        Some(Self {
+            pgid,
+            tree,
+            pid,
+            start,
+        })
+    }
+}
+
+/// Why a recorded gate process group must not be signalled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SignalRefusal {
+    /// 0 is the caller's own group and 1 is init's; a negative value is not
+    /// a group at all. None of them is a gate.
+    ReservedGroup(i32),
+    /// The pidfile predates start-time recording, so the PID's identity
+    /// cannot be proven.
+    UnrecordedStartTime,
+    /// No live process has the recorded PID.
+    ProcessGone,
+    /// The PID was reused by a different process.
+    StartTimeMismatch { recorded: u64, live: u64 },
+}
+
+/// The process group to signal for `record`, or why signalling it would be
+/// unsafe. `live_start` is the current start time of the recorded leader.
+///
+/// A crash leaves a pidfile behind, and the kernel reuses PIDs; signalling a
+/// stale pgid unchecked can terminate a stranger's process group.
+fn signal_target(record: &GatePidRecord, live_start: Option<u64>) -> Result<i32, SignalRefusal> {
+    if record.pgid <= 1 {
+        return Err(SignalRefusal::ReservedGroup(record.pgid));
+    }
+    let recorded = record.start.ok_or(SignalRefusal::UnrecordedStartTime)?;
+    let live = live_start.ok_or(SignalRefusal::ProcessGone)?;
+    if live != recorded {
+        return Err(SignalRefusal::StartTimeMismatch { recorded, live });
+    }
+    Ok(record.pgid)
+}
+
+/// When `pid` started, as an opaque value comparable only on this host:
+/// microseconds since the epoch on macOS, clock ticks since boot on Linux.
+/// `None` when the process does not exist or the platform cannot say.
+#[cfg(target_os = "macos")]
+fn process_start_time(pid: i32) -> Option<u64> {
+    if pid <= 0 {
+        return None;
+    }
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: `info` is a writable buffer of exactly `size` bytes, and
+    // proc_pidinfo writes at most `size` bytes into it.
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if written != size {
+        return None;
+    }
+    // SAFETY: the buffer was zero-initialized and then fully written, and
+    // proc_bsdinfo is plain integers and byte arrays, valid for any bits.
+    let info = unsafe { info.assume_init() };
+    Some(
+        info.pbi_start_tvsec
+            .saturating_mul(1_000_000)
+            .saturating_add(info.pbi_start_tvusec),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn process_start_time(pid: i32) -> Option<u64> {
+    if pid <= 0 {
+        return None;
+    }
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    linux_stat_start_time(&stat)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn process_start_time(_pid: i32) -> Option<u64> {
+    None
+}
+
+/// Field 22 (`starttime`) of a `/proc/<pid>/stat` line. The command name in
+/// field 2 is parenthesized and may itself contain spaces and parentheses, so
+/// fields are counted from the last `)`.
+#[cfg(any(target_os = "linux", test))]
+fn linux_stat_start_time(stat: &str) -> Option<u64> {
+    let rest = &stat[stat.rfind(')')? + 1..];
+    // `rest` begins at field 3, so field 22 is the 20th entry.
+    rest.split_whitespace().nth(19)?.parse().ok()
+}
+
+/// Write a gate pidfile in one rename, so a reader never sees a torn record.
+///
+/// Not fsynced, unlike [`crate::atomic_file::with_synced_temporary`]: a
+/// pidfile describes processes that do not survive a host crash, so
+/// durability buys nothing, and a full sync on the gate start path delays the
+/// moment a run becomes cancellable.
+fn write_gate_pidfile(path: &Path, record: &GatePidRecord) -> std::io::Result<()> {
+    use std::io::Write;
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("pidfile path has no parent: {}", path.display()),
+        )
+    })?;
+    std::fs::create_dir_all(parent)?;
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".gate-pid-")
+        .tempfile_in(parent)?;
+    temporary.write_all(record.render().as_bytes())?;
+    temporary.persist(path).map_err(|error| error.error)?;
+    Ok(())
 }
 
 /// Kill in-flight gate runs for `session_id` whose tree differs from
@@ -862,18 +1018,23 @@ pub fn cancel_obsolete_runs(
         let Ok(content) = std::fs::read_to_string(entry.path()) else {
             continue;
         };
-        let mut parts = content.split_whitespace();
-        let (Some(pgid), Some(tree)) = (parts.next(), parts.next()) else {
+        let Some(record) = GatePidRecord::parse(&content) else {
             continue;
         };
+        let tree = record.tree.as_str();
         if tree == current_tree {
             continue;
         }
         // Kill the whole process group (the runner spawns each gate in
         // its own group for exactly this purpose). killpg directly:
         // the external `kill` utility on Linux parses "-<pgid>" as an
-        // option and silently does nothing.
-        if let Ok(pgid) = pgid.parse::<i32>() {
+        // option and silently does nothing. Only a group whose leader is
+        // provably the recorded process is signalled; a refusal means the
+        // run is already gone (or unprovable), so it is still retired below.
+        let live_start = process_start_time(record.pid.unwrap_or(record.pgid));
+        if let Ok(pgid) = signal_target(&record, live_start) {
+            // SAFETY: killpg takes plain integers and has no memory-safety
+            // preconditions; signal_target proved the group is the gate's.
             unsafe {
                 libc::killpg(pgid, libc::SIGTERM);
             }
@@ -1044,7 +1205,7 @@ pub(crate) fn run_named(
 }
 
 struct GateOwnerLocks {
-    _files: Vec<std::fs::File>,
+    _locks: Vec<crate::file_lock::ExclusiveFileLock>,
 }
 
 impl GateOwnerLocks {
@@ -1054,8 +1215,6 @@ impl GateOwnerLocks {
         owner_paths: &[String],
         progress: &dyn GateProgressSink,
     ) -> Result<Self, std::io::Error> {
-        use std::os::fd::AsRawFd;
-
         std::fs::create_dir_all(owner_dir)?;
         let mut paths = gate_owner_lock_paths(owner_dir, gate_name, owner_paths);
         paths.sort();
@@ -1067,21 +1226,12 @@ impl GateOwnerLocks {
             ));
         }
 
-        let mut files = Vec::with_capacity(paths.len());
+        let mut locks = Vec::with_capacity(paths.len());
         for path in paths {
-            let file = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(&path)?;
-            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-            if rc != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            files.push(file);
+            let file = crate::file_lock::open_lock_file(&path)?;
+            locks.push(crate::file_lock::ExclusiveFileLock::acquire(file)?);
         }
-        Ok(Self { _files: files })
+        Ok(Self { _locks: locks })
     }
 }
 
@@ -2086,7 +2236,25 @@ fn run_gate_command(
             .join(format!("{sid}-{}.pid", context.gate_name))
     });
     if let Some(pidfile) = &pidfile {
-        let _ = std::fs::write(pidfile, format!("{} {}", child.id(), context.tree));
+        let pid = child.id() as i32;
+        let record = GatePidRecord {
+            pgid: pid,
+            tree: context.tree.to_string(),
+            pid: Some(pid),
+            start: process_start_time(pid),
+        };
+        if let Err(error) = write_gate_pidfile(pidfile, &record) {
+            // Without a pidfile the run cannot be cancelled from outside, so
+            // it must not run untracked. The child is unreaped, so its PID
+            // and group cannot have been reused.
+            // SAFETY: killpg takes plain integers and has no memory-safety
+            // preconditions.
+            unsafe {
+                libc::killpg(pid, libc::SIGKILL);
+            }
+            let _ = child.wait();
+            return Err(error);
+        }
     }
     let fatal_resource_error = std::sync::Arc::new(std::sync::Mutex::new(None));
     let first_output = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(-1));
@@ -2150,6 +2318,9 @@ fn run_gate_command(
                                         if let Ok(mut slot) = thread_error.lock() {
                                             *slot = Some(error.to_string());
                                         }
+                                        // SAFETY: killpg has no memory-safety
+                                        // preconditions; the leader is unreaped,
+                                        // so the group cannot have been reused.
                                         unsafe {
                                             libc::killpg(process_group, libc::SIGTERM);
                                         }
@@ -2184,6 +2355,8 @@ fn run_gate_command(
                         context.log_path,
                         &format!("aethyme gate timeout exceeded after {seconds}s\n"),
                     );
+                    // SAFETY: killpg has no memory-safety preconditions; the
+                    // leader is unreaped, so the group cannot have been reused.
                     unsafe {
                         libc::killpg(process_group, libc::SIGTERM);
                     }
@@ -2192,6 +2365,7 @@ fn run_gate_command(
                         match child.try_wait() {
                             Ok(Some(status)) => break Ok(status),
                             Ok(None) if Instant::now() >= grace_deadline => {
+                                // SAFETY: as for the SIGTERM above.
                                 unsafe {
                                     libc::killpg(process_group, libc::SIGKILL);
                                 }
@@ -2285,16 +2459,103 @@ fn preserve_failed_gate_log(log_path: &Path, status: GateStatus) -> PathBuf {
     }
 }
 
-fn epoch_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as i64)
-        .unwrap_or(0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pid_record(pgid: i32, start: Option<u64>) -> GatePidRecord {
+        GatePidRecord {
+            pgid,
+            tree: "tree".to_string(),
+            pid: Some(pgid),
+            start,
+        }
+    }
+
+    #[test]
+    fn the_callers_own_group_and_init_are_never_signalled() {
+        for pgid in [-1, 0, 1] {
+            assert_eq!(
+                signal_target(&pid_record(pgid, Some(7)), Some(7)),
+                Err(SignalRefusal::ReservedGroup(pgid))
+            );
+        }
+    }
+
+    #[test]
+    fn a_reused_pid_is_not_signalled() {
+        assert_eq!(
+            signal_target(&pid_record(4242, Some(100)), Some(200)),
+            Err(SignalRefusal::StartTimeMismatch {
+                recorded: 100,
+                live: 200
+            })
+        );
+        assert_eq!(
+            signal_target(&pid_record(4242, Some(100)), None),
+            Err(SignalRefusal::ProcessGone)
+        );
+    }
+
+    #[test]
+    fn a_pidfile_without_a_start_time_is_not_signalled() {
+        let legacy = GatePidRecord::parse("4242 abc123").unwrap();
+        assert_eq!(legacy.pid, None);
+        assert_eq!(legacy.start, None);
+        assert_eq!(
+            signal_target(&legacy, Some(100)),
+            Err(SignalRefusal::UnrecordedStartTime)
+        );
+    }
+
+    #[test]
+    fn the_recorded_process_is_signalled() {
+        assert_eq!(
+            signal_target(&pid_record(4242, Some(100)), Some(100)),
+            Ok(4242)
+        );
+    }
+
+    #[test]
+    fn a_pidfile_round_trips_and_stays_readable_by_two_field_readers() {
+        let record = pid_record(4242, Some(99));
+        let rendered = record.render();
+        assert_eq!(GatePidRecord::parse(&rendered), Some(record));
+        let mut legacy_reader = rendered.split_whitespace();
+        assert_eq!(legacy_reader.next(), Some("4242"));
+        assert_eq!(legacy_reader.next(), Some("tree"));
+        let unknown = pid_record(4242, None);
+        assert_eq!(GatePidRecord::parse(&unknown.render()), Some(unknown));
+    }
+
+    #[test]
+    fn the_live_start_time_identifies_this_process() {
+        let me = std::process::id() as i32;
+        let first = process_start_time(me).expect("this process has a start time");
+        assert_eq!(process_start_time(me), Some(first));
+        assert_eq!(process_start_time(0), None);
+    }
+
+    #[test]
+    fn linux_start_time_is_field_22_even_with_spaces_in_the_name() {
+        let stat = "123 (a (weird) name) S 1 123 123 0 -1 4194560 100 0 0 0 \
+                    5 6 0 0 20 0 1 0 987654 1000 10";
+        assert_eq!(linux_stat_start_time(stat), Some(987_654));
+        assert_eq!(linux_stat_start_time("garbage"), None);
+    }
+
+    #[test]
+    fn a_gate_pidfile_is_published_whole_and_leaves_no_temporary() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("7-lint.pid");
+        let record = pid_record(4242, Some(1));
+        write_gate_pidfile(&path, &record).unwrap();
+        assert_eq!(
+            GatePidRecord::parse(&std::fs::read_to_string(&path).unwrap()),
+            Some(record)
+        );
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
 
     #[test]
     fn a_failing_gate_log_survives_a_later_pass_on_the_same_tree() {

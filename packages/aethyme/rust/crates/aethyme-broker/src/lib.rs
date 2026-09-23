@@ -24,8 +24,10 @@ mod advisories;
 pub mod agent_hook;
 mod atomic_file;
 pub mod attribution;
+mod bounded_output;
 mod broker;
 mod chau7_tabs;
+mod clock;
 mod disk_headroom;
 pub mod exit_status;
 pub use disk_headroom::{
@@ -40,6 +42,7 @@ mod error;
 pub mod events;
 mod exposures;
 mod external_events;
+mod file_lock;
 mod gate_database;
 mod gate_doctor;
 mod gates;
