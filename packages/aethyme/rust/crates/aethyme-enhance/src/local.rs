@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::agents::render_agents_document;
-use crate::deploy::{ensure_settings_hook, SETTINGS_FILE, TARGETS};
+use crate::deploy::{ensure_no_symlink_in_path, ensure_settings_hook, SETTINGS_FILE, TARGETS};
 use crate::onboarding::{
     expected_onboarding_files, ACT_CLAUDE_PATH, ACT_CODEX_PATH, ONBOARDING_CLAUDE_PATH,
     ONBOARDING_CODEX_PATH,
@@ -103,6 +103,7 @@ pub fn install_bridge(repo: &Path) -> Result<Vec<LocalAction>, String> {
                 "created"
             };
             if existing != updated {
+                ensure_no_symlink_in_path(repo, &path)?;
                 write_file(&path, &updated)?;
             }
             Ok(LocalAction {
@@ -339,6 +340,7 @@ fn write_local_target(
     executable: bool,
 ) -> Result<LocalAction, String> {
     let path = repo.join(relative);
+    ensure_no_symlink_in_path(repo, &path)?;
     let existing = std::fs::read_to_string(&path).ok();
     let action = if existing.as_deref() == Some(content) {
         "unchanged"
@@ -377,7 +379,7 @@ fn is_executable(relative: &str) -> bool {
 
 fn ensure_executable(path: &Path) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
-    let mut permissions = std::fs::metadata(path)
+    let mut permissions = std::fs::symlink_metadata(path)
         .map_err(|error| format!("{}: {error}", path.display()))?
         .permissions();
     permissions.set_mode(permissions.mode() | 0o111);

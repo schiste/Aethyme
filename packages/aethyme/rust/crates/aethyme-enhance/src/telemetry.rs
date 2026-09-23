@@ -28,6 +28,7 @@
 
 use std::path::Path;
 
+use crate::deploy::ensure_no_symlink_in_path;
 use crate::onboarding::{
     override_freshness, validate_onboarding_schema, ACT_STARTER_JSON_PATH, ONBOARDING_JSON_PATH,
 };
@@ -61,6 +62,7 @@ fn py_yes_no(b: bool) -> &'static str {
 pub fn append_event(repo_path: &Path, event_type: &str, payload: Value) -> Result<(), String> {
     let repo_path = resolve_path(repo_path);
     let log_path = repo_path.join(TELEMETRY_LOG_PATH);
+    ensure_no_symlink_in_path(&repo_path, &log_path)?;
     if let Some(parent) = log_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
     }
@@ -577,11 +579,13 @@ pub fn write_status_artifacts(repo_path: &Path) -> Result<Value, String> {
     let repo_path = resolve_path(repo_path);
     let status = build_status_artifact(&repo_path)?;
     let status_json_path = repo_path.join(STATUS_JSON_PATH);
+    ensure_no_symlink_in_path(&repo_path, &status_json_path)?;
     if let Some(parent) = status_json_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
     }
     for artifact in render_status_artifacts(&repo_path)? {
         let path = repo_path.join(artifact.path);
+        ensure_no_symlink_in_path(&repo_path, &path)?;
         std::fs::write(&path, artifact.bytes).map_err(|e| format!("{}: {e}", path.display()))?;
     }
     Ok(status)

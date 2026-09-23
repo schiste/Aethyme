@@ -2998,13 +2998,39 @@ fn redacted_command(provider: OperationProvider, args: &[String]) -> Result<Stri
     ];
     let mut redacted = vec![provider_executable(provider).to_string()];
     let mut hide_next = false;
+    let mut pending: Option<fn(&str) -> String> = None;
     for arg in args {
         if hide_next {
             redacted.push("[REDACTED]".into());
             hide_next = false;
             continue;
         }
-        if sensitive_flags.contains(&arg.as_str()) {
+        if let Some(redact) = pending.take() {
+            redacted.push(redact(arg));
+            continue;
+        }
+        if provider == OperationProvider::Git && (arg == "-c" || arg == "--config-env") {
+            redacted.push(arg.clone());
+            pending = Some(redact_config_assignment);
+        } else if provider == OperationProvider::Git && arg.starts_with("--config-env=") {
+            let assignment = &arg["--config-env=".len()..];
+            redacted.push(format!(
+                "--config-env={}",
+                redact_config_assignment(assignment)
+            ));
+        } else if provider == OperationProvider::Git && arg.starts_with("-c") {
+            redacted.push(format!("-c{}", redact_config_assignment(&arg[2..])));
+        } else if provider == OperationProvider::Github && (arg == "-H" || arg == "--header") {
+            redacted.push(arg.clone());
+            pending = Some(redact_header);
+        } else if provider == OperationProvider::Github && arg.starts_with("--header=") {
+            redacted.push(format!(
+                "--header={}",
+                redact_header(&arg["--header=".len()..])
+            ));
+        } else if provider == OperationProvider::Github && arg.starts_with("-H") {
+            redacted.push(format!("-H{}", redact_header(&arg[2..])));
+        } else if sensitive_flags.contains(&arg.as_str()) {
             redacted.push(arg.clone());
             hide_next = true;
         } else if sensitive_flags
@@ -3020,6 +3046,43 @@ fn redacted_command(provider: OperationProvider, args: &[String]) -> Result<Stri
         }
     }
     Ok(serde_json::to_string(&redacted)?)
+}
+
+/// Redact the value of a Git `key=value` configuration assignment whose key
+/// can carry a credential: any `*extraheader` (`http.extraHeader`,
+/// `http.<url>.extraHeader`), or a key naming an authorization, token, or
+/// password. The key survives so the journal still shows which setting the
+/// command overrode.
+fn redact_config_assignment(assignment: &str) -> String {
+    let Some((key, _value)) = assignment.split_once('=') else {
+        return assignment.to_string();
+    };
+    let lowered = key.to_ascii_lowercase();
+    let sensitive = ["extraheader", "authorization", "token", "password"]
+        .iter()
+        .any(|needle| lowered.contains(needle));
+    if sensitive {
+        format!("{key}=[REDACTED]")
+    } else {
+        assignment.to_string()
+    }
+}
+
+/// Redact the value of a `gh api -H "Name: value"` header that can carry a
+/// credential: `Authorization`, `Proxy-Authorization`, or any header whose
+/// name contains `token`. The header name survives.
+fn redact_header(header: &str) -> String {
+    let Some((name, _value)) = header.split_once(':') else {
+        return header.to_string();
+    };
+    let lowered = name.trim().to_ascii_lowercase();
+    let sensitive =
+        lowered == "authorization" || lowered == "proxy-authorization" || lowered.contains("token");
+    if sensitive {
+        format!("{name}: [REDACTED]")
+    } else {
+        header.to_string()
+    }
 }
 
 fn is_github_pull_request_merge(args: &[String]) -> bool {
@@ -5256,6 +5319,133 @@ mod tests {
         .unwrap();
         assert!(value.contains("[REDACTED]"));
         assert!(!value.contains("super-secret"));
+    }
+
+    fn assert_redacted(provider: OperationProvider, argv: &[&str], kept: &[&str], secret: &str) {
+        let value = redacted_command(provider, &args(argv)).unwrap();
+        assert!(!value.contains(secret), "{value} leaks {secret}");
+        assert!(value.contains("[REDACTED]"), "{value}");
+        for fragment in kept {
+            assert!(value.contains(fragment), "{value} lost {fragment}");
+        }
+    }
+
+    #[test]
+    fn redaction_hides_git_extraheader_config_values() {
+        // Separated `-c key=value`, mixed-case key.
+        assert_redacted(
+            OperationProvider::Git,
+            &[
+                "-c",
+                "http.extraHeader=AUTHORIZATION: bearer s3cr3t",
+                "push",
+                "origin",
+                "main",
+            ],
+            &["\"-c\"", "http.extraHeader=[REDACTED]", "push", "origin"],
+            "s3cr3t",
+        );
+        // URL-scoped key.
+        assert_redacted(
+            OperationProvider::Git,
+            &[
+                "-c",
+                "http.https://github.com/.extraheader=Basic s3cr3t",
+                "fetch",
+            ],
+            &["http.https://github.com/.extraheader=[REDACTED]", "fetch"],
+            "s3cr3t",
+        );
+        // Joined `-ckey=value`.
+        assert_redacted(
+            OperationProvider::Git,
+            &["-chttp.extraheader=Authorization: token s3cr3t", "push"],
+            &["-chttp.extraheader=[REDACTED]"],
+            "s3cr3t",
+        );
+    }
+
+    #[test]
+    fn redaction_hides_credential_named_config_values() {
+        assert_redacted(
+            OperationProvider::Git,
+            &["-c", "credential.helper.token=s3cr3t", "push"],
+            &["credential.helper.token=[REDACTED]"],
+            "s3cr3t",
+        );
+        assert_redacted(
+            OperationProvider::Git,
+            &["-c", "remote.origin.password=s3cr3t", "push"],
+            &["remote.origin.password=[REDACTED]"],
+            "s3cr3t",
+        );
+        // `--config-env`, separated and joined.
+        assert_redacted(
+            OperationProvider::Git,
+            &["--config-env", "http.extraheader=S3CR3T_ENV", "push"],
+            &["\"--config-env\"", "http.extraheader=[REDACTED]"],
+            "S3CR3T_ENV",
+        );
+        assert_redacted(
+            OperationProvider::Git,
+            &["--config-env=http.authorization=S3CR3T_ENV", "push"],
+            &["--config-env=http.authorization=[REDACTED]"],
+            "S3CR3T_ENV",
+        );
+        // Harmless configuration stays readable.
+        let value = redacted_command(
+            OperationProvider::Git,
+            &args(&["-c", "core.quotepath=false", "push"]),
+        )
+        .unwrap();
+        assert!(value.contains("core.quotepath=false"), "{value}");
+    }
+
+    #[test]
+    fn redaction_hides_github_credential_header_values() {
+        // Separated `-H`.
+        assert_redacted(
+            OperationProvider::Github,
+            &["api", "-H", "Authorization: token s3cr3t", "repos/o/r"],
+            &["\"-H\"", "Authorization: [REDACTED]", "repos/o/r"],
+            "s3cr3t",
+        );
+        // Separated `--header`, Proxy-Authorization.
+        assert_redacted(
+            OperationProvider::Github,
+            &[
+                "api",
+                "--header",
+                "Proxy-Authorization: Basic s3cr3t",
+                "user",
+            ],
+            &["\"--header\"", "Proxy-Authorization: [REDACTED]"],
+            "s3cr3t",
+        );
+        // Joined `--header=` with a token-named header.
+        assert_redacted(
+            OperationProvider::Github,
+            &["api", "--header=X-Api-Token: s3cr3t", "user"],
+            &["--header=X-Api-Token: [REDACTED]"],
+            "s3cr3t",
+        );
+        // Joined `-H`.
+        assert_redacted(
+            OperationProvider::Github,
+            &["api", "-Hauthorization: bearer s3cr3t", "user"],
+            &["-Hauthorization: [REDACTED]"],
+            "s3cr3t",
+        );
+        // Non-credential headers stay readable.
+        let value = redacted_command(
+            OperationProvider::Github,
+            &args(&["api", "-H", "Accept: application/vnd.github+json", "user"]),
+        )
+        .unwrap();
+        assert!(
+            value.contains("Accept: application/vnd.github+json"),
+            "{value}"
+        );
     }
 
     #[test]
