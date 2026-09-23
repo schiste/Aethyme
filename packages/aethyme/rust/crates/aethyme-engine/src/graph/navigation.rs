@@ -751,15 +751,15 @@ fn redb_annotations(
 ) -> Result<Vec<String>, GraphStoreError> {
     let mut annotations = Vec::new();
 
-    if node.kind == StoredNodeKind::File {
-        if let Some(path) = node.path.as_deref() {
-            for risk in store.risk_for_node_or_path(&node.id)? {
-                if risk.scope == path {
-                    annotations.push(format!(
-                        "risk: {}",
-                        format!("{:?}", risk.area).to_ascii_lowercase()
-                    ));
-                }
+    if node.kind == StoredNodeKind::File
+        && let Some(path) = node.path.as_deref()
+    {
+        for risk in store.risk_for_node_or_path(&node.id)? {
+            if risk.scope == path {
+                annotations.push(format!(
+                    "risk: {}",
+                    format!("{:?}", risk.area).to_ascii_lowercase()
+                ));
             }
         }
     }
@@ -1105,10 +1105,10 @@ pub(crate) fn primary_area_names_redb(
             AnchorKind::Folder => {}
             AnchorKind::File => {
                 let file = anchor.file.as_deref().unwrap_or(&anchor.id);
-                if let Some(area) = file_area_name_redb_nav(store, file)? {
-                    if !areas.contains(&area) {
-                        areas.push(area);
-                    }
+                if let Some(area) = file_area_name_redb_nav(store, file)?
+                    && !areas.contains(&area)
+                {
+                    areas.push(area);
                 }
             }
             AnchorKind::Symbol => {
@@ -1116,12 +1116,11 @@ pub(crate) fn primary_area_names_redb(
                     Some(file) => Some(file),
                     None => file_for_redb_symbol(store, &anchor.id)?,
                 };
-                if let Some(file) = file {
-                    if let Some(area) = file_area_name_redb_nav(store, &file)? {
-                        if !areas.contains(&area) {
-                            areas.push(area);
-                        }
-                    }
+                if let Some(file) = file
+                    && let Some(area) = file_area_name_redb_nav(store, &file)?
+                    && !areas.contains(&area)
+                {
+                    areas.push(area);
                 }
             }
         }
@@ -2501,10 +2500,10 @@ fn direct_change_relations_redb(
 }
 
 fn change_display_for_relation_item(map: &RepositoryMap, item: GraphRelationItem) -> String {
-    if item.kind == "function" {
-        if let Some(function) = map.functions.iter().find(|function| function.id == item.id) {
-            return function.file_path.to_string();
-        }
+    if item.kind == "function"
+        && let Some(function) = map.functions.iter().find(|function| function.id == item.id)
+    {
+        return function.file_path.to_string();
     }
     item.display
 }
@@ -2513,12 +2512,11 @@ fn change_display_for_redb_relation_item(
     store: &ReadOnlyGraphStore,
     item: GraphRelationItem,
 ) -> Result<String, GraphStoreError> {
-    if item.kind == "function" {
-        if let Some(node) = store.node_display(&item.id)? {
-            if let Some(path) = node.path {
-                return Ok(path);
-            }
-        }
+    if item.kind == "function"
+        && let Some(node) = store.node_display(&item.id)?
+        && let Some(path) = node.path
+    {
+        return Ok(path);
     }
     Ok(item.display)
 }

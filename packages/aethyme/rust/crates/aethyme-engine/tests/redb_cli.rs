@@ -593,7 +593,9 @@ fn bytes_multimap_count(
     table
         .get(key)
         .expect("get values")
-        .map(|row| row.expect("row"))
+        .inspect(|row| {
+            row.as_ref().expect("row");
+        })
         .count()
 }
 
@@ -1645,7 +1647,7 @@ struct ExploreInvocationMetrics {
 }
 
 fn estimate_tokens_from_chars(chars: usize) -> usize {
-    (chars + 3) / 4
+    chars.div_ceil(4)
 }
 
 fn context_pack_budget_metrics(
@@ -1708,6 +1710,7 @@ fn context_pack_budget_metrics_track_stable_cost_signals() {
     assert!(leaked.aethyme_path_leaked);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn assert_metric_not_above(
     label: &str,
     actual: usize,

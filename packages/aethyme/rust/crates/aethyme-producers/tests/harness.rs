@@ -130,8 +130,8 @@ fn non_deterministic_producer_panics_harness() {
 // -- Belt-and-braces: harness must not silently swallow store types --
 
 /// Sanity check that `ProducerCtx::new` accepts a real store and
-/// that the trait's `Payload` bounds (`Serialize + DeserializeOwned
-/// + Clone + PartialEq`) compile for a non-trivial payload. If this
+/// that the trait's `Payload` bounds
+/// (`Serialize + DeserializeOwned + Clone + PartialEq`) compile for a non-trivial payload. If this
 /// fails to compile, the harness suite is broken in a way that
 /// affects every downstream producer crate.
 #[test]

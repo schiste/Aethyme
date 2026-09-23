@@ -236,7 +236,7 @@ pub fn check_pr_followup(
         PrDispatchReport {
             status: PrDispatchStatus::NotNeeded,
             session_id: None,
-            prompt_path: prompt_path.as_ref().map(path_string),
+            prompt_path: prompt_path.as_deref().map(path_string),
             command: None,
             message: decision.summary.clone(),
         }
@@ -285,7 +285,7 @@ pub fn check_pr_followup(
         checks,
         failing_checks,
         decision,
-        prompt_path: prompt_path.as_ref().map(path_string),
+        prompt_path: prompt_path.as_deref().map(path_string),
         dispatch,
         next_commands,
     })
@@ -848,7 +848,7 @@ fn i64_value(value: &Value, field: &str) -> Option<i64> {
     value.get(field).and_then(serde_json::Value::as_i64)
 }
 
-fn path_string(path: &PathBuf) -> String {
+fn path_string(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
@@ -889,7 +889,7 @@ mod tests {
             updated_at: Some("2026-07-31T11:00:00Z".into()),
         };
 
-        let first = activity_fingerprint(&[a.clone()], &[b.clone()], &[]);
+        let first = activity_fingerprint(std::slice::from_ref(&a), std::slice::from_ref(&b), &[]);
         let reordered = activity_fingerprint(&[], &[b, a], &[]);
         assert_eq!(first, reordered);
     }

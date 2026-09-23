@@ -602,6 +602,7 @@ fn path_event_recommendations(
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn gate_recommendation(
     kind: RecommendationKind,
     producer: AdvisoryProducer,

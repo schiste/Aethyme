@@ -150,15 +150,11 @@ pub struct RepositoryDeliverySelection {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum ShipPublicationMode {
+    #[default]
     Direct,
     ReviewGated,
-}
-
-impl Default for ShipPublicationMode {
-    fn default() -> Self {
-        Self::Direct
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -710,7 +706,7 @@ impl Broker {
         };
         let local_main_sync_assessment = assess_local_main_sync(
             self,
-            &default_branch,
+            default_branch,
             &local_default_branch_ref,
             &local_default_branch_sha,
             &publication_sha,
@@ -1144,6 +1140,7 @@ impl Broker {
     /// existing callers retain their publication semantics. Configured routes
     /// require the plan digest, and a divergence recommendation requires an
     /// explicit `pull_request` selection before any mutation.
+    #[allow(clippy::too_many_arguments)]
     pub fn ship_execute_delivery(
         &mut self,
         entry_id: i64,
@@ -2063,7 +2060,7 @@ fn execute_pull_request_delivery(
                     "--head".into(),
                     branch.clone(),
                     "--base".into(),
-                    base_branch.into(),
+                    base_branch,
                     "--title".into(),
                     format!("Deliver broker queue entry {}", plan.queue_entry.id),
                     "--body".into(),

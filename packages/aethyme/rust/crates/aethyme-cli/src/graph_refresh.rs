@@ -1260,7 +1260,7 @@ fn encode_unit_cursor(cursor: &UnitCursor) -> Result<String, String> {
 }
 
 fn decode_unit_cursor(encoded: &str) -> Result<UnitCursor, String> {
-    if encoded.is_empty() || encoded.len() > 16_384 || encoded.len() % 2 != 0 {
+    if encoded.is_empty() || encoded.len() > 16_384 || !encoded.len().is_multiple_of(2) {
         return Err("unit cursor is malformed".into());
     }
     let mut bytes = Vec::with_capacity(encoded.len() / 2);
@@ -1960,7 +1960,7 @@ fn materialize_verified_store(
     files: &BTreeMap<String, GraphFileBytes>,
 ) -> Result<GraphStoreMaterialization, String> {
     let started = std::time::Instant::now();
-    let bytes_read = graph_files_bytes(&files);
+    let bytes_read = graph_files_bytes(files);
     let manifest_bytes = files
         .get(GRAPH_MANIFEST_RELPATH)
         .ok_or_else(|| "graph authority manifest is missing during materialization".to_string())?;
@@ -2000,7 +2000,7 @@ fn materialize_verified_store(
         });
     }
 
-    let exact = ExactFragmentRepository::from_committed_files(&files)?;
+    let exact = ExactFragmentRepository::from_committed_files(files)?;
     let (mut map, _) = aethyme_engine::map::RepositoryMap::build_from_fragments(&exact.root)?;
     let counts = graph_counts(&map);
     map.snapshot.root = repo

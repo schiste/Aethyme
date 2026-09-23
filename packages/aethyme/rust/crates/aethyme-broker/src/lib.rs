@@ -525,6 +525,9 @@ fn broker_db_path_with(
     gate_database::resolve(repo_root, override_value.as_deref(), None)
 }
 
+/// Repo-relative generated projection of outstanding advisory rows.
+pub const BROKER_ADVISORY_RELPATH: &str = ".aethyme/broker-advisory.md";
+
 #[cfg(test)]
 mod broker_db_path_tests {
     use super::*;
@@ -558,6 +561,3 @@ mod broker_db_path_tests {
         );
     }
 }
-
-/// Repo-relative generated projection of outstanding advisory rows.
-pub const BROKER_ADVISORY_RELPATH: &str = ".aethyme/broker-advisory.md";

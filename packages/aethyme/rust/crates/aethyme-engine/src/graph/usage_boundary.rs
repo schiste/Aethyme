@@ -481,11 +481,11 @@ fn collect_redb_usage_seed_plan(
         if let StoredNode::Class(class) = node {
             class_by_id.insert(class.id.to_string(), class.clone());
         }
-        if let Some(path) = source_scan_path(node) {
-            if is_inside_boundary(&path, scope) {
-                internal_source_files.insert(path.clone());
-                source_files.insert(path);
-            }
+        if let Some(path) = source_scan_path(node)
+            && is_inside_boundary(&path, scope)
+        {
+            internal_source_files.insert(path.clone());
+            source_files.insert(path);
         }
     }
 
@@ -585,6 +585,7 @@ fn collect_redb_usage_seed_plan(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_adjacency_candidate_paths(
     store: &ReadOnlyGraphStore,
     seed_ids: &BTreeSet<String>,
@@ -649,6 +650,7 @@ fn is_usage_boundary_seed_edge(kind: &EdgeKind) -> bool {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_root_candidate_paths(
     repo: &Path,
     store: &ReadOnlyGraphStore,
@@ -695,13 +697,12 @@ fn add_candidate_path_from_node(
             source_files.insert(path);
         }
     }
-    if let Some(path) = docs_config_scan_path(node) {
-        if !is_inside_boundary(&path, scope)
-            && path_is_under_roots(&path, roots)
-            && !is_excluded_relative_path(&path)
-        {
-            docs_config_files.insert(path);
-        }
+    if let Some(path) = docs_config_scan_path(node)
+        && !is_inside_boundary(&path, scope)
+        && path_is_under_roots(&path, roots)
+        && !is_excluded_relative_path(&path)
+    {
+        docs_config_files.insert(path);
     }
 }
 
@@ -917,6 +918,7 @@ fn collect_files(
     Ok(files)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_files_inner(
     repo: &Path,
     root: &Path,
@@ -1041,11 +1043,7 @@ fn extract_php_symbols(
         let depth_before = brace_depth;
 
         if let Some((kind, name)) = php_type_declaration(trimmed) {
-            let class_depth = if trimmed.contains('{') {
-                depth_before + 1
-            } else {
-                depth_before + 1
-            };
+            let class_depth = depth_before + 1;
             current_class = Some((kind, name, class_depth));
         }
 
@@ -1108,6 +1106,7 @@ fn extract_php_symbols(
     symbols
 }
 
+#[allow(clippy::too_many_arguments)]
 fn scan_source_files(
     repo: &Path,
     boundary: &str,

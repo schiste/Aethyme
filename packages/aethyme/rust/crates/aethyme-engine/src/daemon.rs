@@ -144,12 +144,12 @@ pub fn start_detached(
 ) -> Result<StartOutcome, String> {
     let pidfile = pidfile_path_for(repo);
     if pidfile.exists() {
-        if let Ok(pid_str) = std::fs::read_to_string(&pidfile) {
-            if let Ok(pid) = pid_str.trim().parse::<i32>() {
-                let alive = unsafe { libc::kill(pid, 0) };
-                if alive == 0 {
-                    return Ok(StartOutcome::AlreadyRunning(pid));
-                }
+        if let Ok(pid_str) = std::fs::read_to_string(&pidfile)
+            && let Ok(pid) = pid_str.trim().parse::<i32>()
+        {
+            let alive = unsafe { libc::kill(pid, 0) };
+            if alive == 0 {
+                return Ok(StartOutcome::AlreadyRunning(pid));
             }
         }
         let _ = std::fs::remove_file(&pidfile);

@@ -381,10 +381,10 @@ fn read_file_contents(
 
     // Priority 1: anchor files
     for anchor in anchors {
-        if let Some(file) = &anchor.file {
-            if seen.insert(file.clone()) {
-                candidates.push((file.clone(), "anchor_target"));
-            }
+        if let Some(file) = &anchor.file
+            && seen.insert(file.clone())
+        {
+            candidates.push((file.clone(), "anchor_target"));
         }
         if anchor.kind == AnchorKind::File && seen.insert(anchor.id.clone()) {
             candidates.push((anchor.id.clone(), "anchor_target"));

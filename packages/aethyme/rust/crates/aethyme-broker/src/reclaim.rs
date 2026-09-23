@@ -561,7 +561,7 @@ pub fn scan_with_extra_directories(
         }
         collect(&base, &base, active, extras, &mut found, 0);
     }
-    found.sort_by(|a, b| b.bytes.cmp(&a.bytes));
+    found.sort_by_key(|candidate| std::cmp::Reverse(candidate.bytes));
     found
 }
 
@@ -678,7 +678,7 @@ mod scan_tests {
         let tmp = tempfile::tempdir().unwrap();
         let wt = tmp.path().join("live");
         write(&wt.join("target/x"), 16);
-        let found = scan(tmp.path(), &[wt.clone()]);
+        let found = scan(tmp.path(), std::slice::from_ref(&wt));
         assert_eq!(found.len(), 1);
         assert!(!found[0].reclaimable);
         assert_eq!(reclaimable_bytes(&found), 0);
@@ -734,7 +734,7 @@ mod scan_tests {
         write(&done.join("target/a"), 64);
         write(&live.join("target/b"), 64);
 
-        let candidates = scan(tmp.path(), &[live.clone()]);
+        let candidates = scan(tmp.path(), std::slice::from_ref(&live));
         let plan = ReclaimPlan {
             digest: "test".into(),
             root: tmp.path().to_path_buf(),

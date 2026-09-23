@@ -105,12 +105,12 @@ pub fn run_facts(args: &[String]) -> Result<(), String> {
                     ("internal_callers", "Internal callers:"),
                     ("external_callers", "External callers:"),
                 ] {
-                    if let Some(items) = payload.get(key).and_then(Value::as_array) {
-                        if !items.is_empty() {
-                            println!("{heading}");
-                            for item in items {
-                                println!("- {}", item.as_str().unwrap_or_default());
-                            }
+                    if let Some(items) = payload.get(key).and_then(Value::as_array)
+                        && !items.is_empty()
+                    {
+                        println!("{heading}");
+                        for item in items {
+                            println!("- {}", item.as_str().unwrap_or_default());
                         }
                     }
                 }

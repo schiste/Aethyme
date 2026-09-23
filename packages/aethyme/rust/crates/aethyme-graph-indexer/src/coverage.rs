@@ -69,7 +69,7 @@ pub(crate) fn observe_file(
                 line: line_count(content),
                 byte_offset: content.len() as u64,
             },
-            content_digest: digest(&content.as_bytes()[..]),
+            content_digest: digest(content.as_bytes()),
             graph_node_ref: indexed.top_node.id().as_str().to_string(),
             coverage_status: unit_status,
         });

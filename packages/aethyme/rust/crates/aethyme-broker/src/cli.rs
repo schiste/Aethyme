@@ -3911,33 +3911,33 @@ fn render_gc_plan(plan: &crate::GcPlan, detail: bool) {
     // Listed apart from the candidate sections above because it is not a
     // candidate list: `gc apply` will not touch any of these, and printing
     // them among things the digest authorizes would imply otherwise (#176).
-    if let Some(sweep) = &plan.reconciliation {
-        if sweep.unclaimed_count > 0 {
+    if let Some(sweep) = &plan.reconciliation
+        && sweep.unclaimed_count > 0
+    {
+        out!(
+            "  unclaimed by any session ({} of {} {} under {} broker worktree {}, {}): reported only, `gc apply` does not remove these",
+            sweep.unclaimed_count,
+            sweep.directory_count,
+            crate::broker::plural_word(sweep.directory_count, "directory", "directories"),
+            sweep.scanned_root_count,
+            crate::broker::plural_word(sweep.scanned_root_count, "root", "roots"),
+            if sweep.sized {
+                human_bytes(sweep.unclaimed_bytes)
+            } else {
+                "unsized".to_string()
+            },
+        );
+        render_capped(&sweep.unclaimed, GC_LIST_CAP, detail, |entry| {
             out!(
-                "  unclaimed by any session ({} of {} {} under {} broker worktree {}, {}): reported only, `gc apply` does not remove these",
-                sweep.unclaimed_count,
-                sweep.directory_count,
-                crate::broker::plural_word(sweep.directory_count, "directory", "directories"),
-                sweep.scanned_root_count,
-                crate::broker::plural_word(sweep.scanned_root_count, "root", "roots"),
-                if sweep.sized {
-                    human_bytes(sweep.unclaimed_bytes)
-                } else {
-                    "unsized".to_string()
-                },
+                "  unclaimed: {} ({}{})",
+                entry.path,
+                entry.kind,
+                entry
+                    .estimated_bytes
+                    .map(|bytes| format!(", {}", human_bytes(bytes)))
+                    .unwrap_or_default()
             );
-            render_capped(&sweep.unclaimed, GC_LIST_CAP, detail, |entry| {
-                out!(
-                    "  unclaimed: {} ({}{})",
-                    entry.path,
-                    entry.kind,
-                    entry
-                        .estimated_bytes
-                        .map(|bytes| format!(", {}", human_bytes(bytes)))
-                        .unwrap_or_default()
-                );
-            });
-        }
+        });
     }
     render_capped(&plan.rows, GC_LIST_CAP, detail, |row| {
         out!(
@@ -7589,6 +7589,7 @@ fn read_tab_snapshot(parsed: &Parsed) -> Result<Vec<crate::Chau7Tab>, UsageError
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_review_run_report(
     base: &str,
     head: &str,
@@ -9849,22 +9850,21 @@ fn run_resources(parsed: Parsed) -> Result<(), UsageError> {
             let path = PathBuf::from(argument);
             // A lease id here is a natural mistake, and reporting it as a missing
             // file sends the operator looking for the wrong thing (issue #139).
-            if !path.exists() {
-                if let Some(lease) = coordinator
+            if !path.exists()
+                && let Some(lease) = coordinator
                     .list(false)?
                     .into_iter()
                     .find(|lease| &lease.lease_id == argument)
-                {
-                    return Err(UsageError::Message(format!(
-                        "resources {action} takes the grant JSON written at acquire, not a lease \
+            {
+                return Err(UsageError::Message(format!(
+                    "resources {action} takes the grant JSON written at acquire, not a lease \
                          id; {argument} is a {} lease. The grant carries the ownership token that \
                          authorizes {action}, and a holder that died leaves none to reuse -- \
                          reclaim that lease instead: aethyme broker resources reconcile \
                          {argument} --confirm {}",
-                        lease.state.as_str(),
-                        lease.generation,
-                    )));
-                }
+                    lease.state.as_str(),
+                    lease.generation,
+                )));
             }
             let mut grant: crate::HostResourceGrant = read_resource_json(&path)?;
             grant.lease = if action == "renew" {
@@ -11230,14 +11230,14 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
                             let waiting = coordination_wait_summary(&operation)
                                 .map(|summary| format!("  {summary}"))
                                 .unwrap_or_default();
-                            let liveness = (operation.status == crate::OperationStatus::Running)
-                                .then(|| {
-                                    format!(
-                                        "  liveness: {}",
-                                        crate::operations::operation_liveness_summary(&operation)
-                                    )
-                                })
-                                .unwrap_or_default();
+                            let liveness = if operation.status == crate::OperationStatus::Running {
+                                format!(
+                                    "  liveness: {}",
+                                    crate::operations::operation_liveness_summary(&operation)
+                                )
+                            } else {
+                                String::new()
+                            };
                             out!(
                                 "{:<5} {:<8} {:<21} {:<22} {}{}",
                                 operation.id,

@@ -1129,19 +1129,19 @@ fn customization_paths(mode: RepositoryMode) -> Vec<&'static str> {
     }
 }
 
+/// Customizations found, the resolutions they need, and unresolved paths.
+type CustomizationAssessment = (
+    Vec<RepositoryCustomization>,
+    Vec<RepositoryResolution>,
+    Vec<String>,
+);
+
 fn assess_customizations(
     repo: &Path,
     mode: RepositoryMode,
     requested: &BTreeMap<String, RepositoryResolutionChoice>,
     blocked_paths: &BTreeSet<String>,
-) -> Result<
-    (
-        Vec<RepositoryCustomization>,
-        Vec<RepositoryResolution>,
-        Vec<String>,
-    ),
-    String,
-> {
+) -> Result<CustomizationAssessment, String> {
     let mut customizations = Vec::new();
     for relative in customization_paths(mode) {
         let classification = if blocked_paths.contains(relative) {
@@ -1617,12 +1617,12 @@ fn build_rollback_journal(
             }
             let replacement_path = (output.action != RepositoryTreeAction::Delete)
                 .then(|| {
-                    sibling_transaction_path(&output.path, &plan.plan_digest, index, "replacement")
+                    sibling_transaction_path(&output.path, plan.plan_digest, index, "replacement")
                 })
                 .transpose()?;
             let tombstone_path = (output.action == RepositoryTreeAction::Delete)
                 .then(|| {
-                    sibling_transaction_path(&output.path, &plan.plan_digest, index, "removed")
+                    sibling_transaction_path(&output.path, plan.plan_digest, index, "removed")
                 })
                 .transpose()?;
             for artifact in [&replacement_path, &tombstone_path].into_iter().flatten() {
@@ -1828,7 +1828,7 @@ pub(crate) fn execute_repository_transaction(
                 .into(),
         );
     }
-    let journal_path = journal_path(repo, &plan.plan_digest)?;
+    let journal_path = journal_path(repo, plan.plan_digest)?;
     write_rollback_journal(&journal_path, &journal)?;
     crash_if_requested("after_journal");
     let result: Result<(), String> = (|| {

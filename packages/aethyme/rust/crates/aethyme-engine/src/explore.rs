@@ -1120,10 +1120,7 @@ pub fn explore_with_intent(
     let symbol_matches = if symbol_queries.is_empty() {
         SymbolBatchResults::default()
     } else {
-        match symbol_batch_redb(&store, &symbol_queries, params.max_symbol_results) {
-            Ok(r) => r,
-            Err(_) => SymbolBatchResults::default(),
-        }
+        symbol_batch_redb(&store, &symbol_queries, params.max_symbol_results).unwrap_or_default()
     };
 
     // 3. Source-text evidence. Runs ripgrep client-side against the repo
@@ -1540,7 +1537,7 @@ fn collect_surface_flow_semantic_hits(
         return hits;
     }
     for relative in relative_paths {
-        let path = root.join(&relative);
+        let path = root.join(relative);
         let Some(bytes) = read_file_prefix(&path, SURFACE_FLOW_MAX_FRAGMENT_BYTES) else {
             continue;
         };
@@ -1959,11 +1956,7 @@ const STOP_WORDS: &[&str] = &[
 pub(crate) fn extract_symbol_queries(request: &str) -> Vec<String> {
     let normalized = request.replace('`', " ");
     let mut raw_terms: Vec<String> = Vec::new();
-    for token in normalized
-        .replace('/', " ")
-        .replace('-', " ")
-        .split_whitespace()
-    {
+    for token in normalized.replace(['/', '-'], " ").split_whitespace() {
         let term: String = token
             .chars()
             .filter(|c| c.is_alphanumeric() || *c == '_')
@@ -2004,6 +1997,7 @@ fn contains_any_text(haystack: &str, needles: &[&str]) -> bool {
 /// Translate the redb task-localize view into the answer-json
 /// envelope the agent contract expects.
 #[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 fn build_response(
     request: &str,
     intent: Intent,
@@ -2034,6 +2028,7 @@ fn build_response(
 /// Translate the redb task-localize view into the answer-json
 /// envelope the agent contract expects. Surface/Flow evidence feeds the
 /// observability and degraded-reason signals only; it does not rank answers.
+#[allow(clippy::too_many_arguments)]
 fn build_response_with_surface_flow(
     request: &str,
     intent: Intent,
@@ -2275,17 +2270,17 @@ fn build_response_with_surface_flow(
             // attach it to the existing item under `also_callsite_for`.
             // Bump confidence by a small amount (capped at 0.9) since
             // multiple corroborating sources increase trust.
-            if let Some(syms) = item.evidence.get("symbols").cloned() {
-                if let Some(obj) = existing.evidence.as_object_mut() {
-                    obj.insert("also_callsite_for".to_string(), syms);
-                    obj.insert(
-                        "callsite_hit_count".to_string(),
-                        item.evidence
-                            .get("hit_count")
-                            .cloned()
-                            .unwrap_or(serde_json::Value::Null),
-                    );
-                }
+            if let Some(syms) = item.evidence.get("symbols").cloned()
+                && let Some(obj) = existing.evidence.as_object_mut()
+            {
+                obj.insert("also_callsite_for".to_string(), syms);
+                obj.insert(
+                    "callsite_hit_count".to_string(),
+                    item.evidence
+                        .get("hit_count")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null),
+                );
             }
             existing.confidence = ((existing.confidence + 0.05).min(0.9) * 100.0).round() / 100.0;
             continue;
@@ -2734,6 +2729,7 @@ fn build_response_with_surface_flow(
     response_with_output_estimate(response)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn enrich_explore_observability(
     mut observability: serde_json::Value,
     request: &str,
@@ -2813,6 +2809,7 @@ fn enrich_explore_observability(
     observability
 }
 
+#[allow(clippy::too_many_arguments)]
 fn compact_explore_observability(
     observability: serde_json::Value,
     request: &str,
@@ -3167,6 +3164,7 @@ fn explore_top_signals_absent(
     absent.into_iter().take(14).collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn explore_degraded_ranking_reasons(
     request: &str,
     trust_policy: &TrustPolicy,
@@ -3483,13 +3481,12 @@ pub(super) fn response_with_output_estimate(mut response: ExploreResponse) -> Ex
 ///
 /// Filtering rules mirror Python at `cli.py:2088-2118`:
 ///   - candidate_files  → kinds {symbol_search_file, source_text_file,
-///                        call_site_file, filesystem_file, anchor,
-///                        in_scope_file} that have a `path`.
+///     call_site_file, filesystem_file, anchor, in_scope_file} that have
+///     a `path`.
 ///   - candidate_symbols → kinds {symbol_search, in_scope_symbol} OR
-///                        items whose evidence carries `anchor_kind ==
-///                        "symbol"`.
+///     items whose evidence carries `anchor_kind == "symbol"`.
 ///   - navigation_hints → empty when `detail == compact`; otherwise
-///                        echoes the response's nav_hints.
+///     echoes the response's nav_hints.
 fn build_output_adapters(
     answers: &[AnswerItem],
     nav_hints: &[AnswerItem],
@@ -3581,27 +3578,25 @@ fn build_verification_steps(
     let mut steps: Vec<serde_json::Value> = Vec::new();
 
     // Step 1: cite a specific line ref the agent can read.
-    if let Some(top_text) = text_items.first() {
-        if let Some(line_refs) = top_text
+    if let Some(top_text) = text_items.first()
+        && let Some(line_refs) = top_text
             .evidence
             .get("line_refs")
             .and_then(|v| v.as_array())
-        {
-            if let Some(first_ref) = line_refs.first() {
-                let line = first_ref.get("line").and_then(|v| v.as_u64()).unwrap_or(0);
-                let path = top_text.path.as_deref().unwrap_or("(unknown)");
-                steps.push(serde_json::json!({
-                    "step": format!(
-                        "Read {}:{} and confirm the matched terms appear in \
-                         executable code (not a comment or stringified \
-                         translation).",
-                        path, line
-                    ),
-                    "rationale": "Source-text evidence is line-level; verifying \
-                                  the line context takes one Read tool call.",
-                }));
-            }
-        }
+        && let Some(first_ref) = line_refs.first()
+    {
+        let line = first_ref.get("line").and_then(|v| v.as_u64()).unwrap_or(0);
+        let path = top_text.path.as_deref().unwrap_or("(unknown)");
+        steps.push(serde_json::json!({
+            "step": format!(
+                "Read {}:{} and confirm the matched terms appear in \
+                 executable code (not a comment or stringified \
+                 translation).",
+                path, line
+            ),
+            "rationale": "Source-text evidence is line-level; verifying \
+                          the line context takes one Read tool call.",
+        }));
     }
 
     // Step 2: when symbol-search anchored a file (different from text
@@ -3866,8 +3861,10 @@ mod disclosure_tests {
     fn depth_zero_strips_evidence() {
         // depth=0 is the discovery rung — cheap. Apply must zero
         // out line_refs and downstream knobs that crowd the budget.
-        let mut p = ExploreParams::default();
-        p.depth = Some(0);
+        let mut p = ExploreParams {
+            depth: Some(0),
+            ..ExploreParams::default()
+        };
         p.apply_disclosure_level();
         assert_eq!(p.max_answer_items, 15);
         assert_eq!(p.max_text_line_refs, 0);
@@ -3878,8 +3875,10 @@ mod disclosure_tests {
 
     #[test]
     fn depth_one_keeps_signature_line_only() {
-        let mut p = ExploreParams::default();
-        p.depth = Some(1);
+        let mut p = ExploreParams {
+            depth: Some(1),
+            ..ExploreParams::default()
+        };
         p.apply_disclosure_level();
         assert_eq!(p.max_answer_items, 8);
         // Exactly 1 line_ref to surface the signature line — the
@@ -3891,8 +3890,10 @@ mod disclosure_tests {
 
     #[test]
     fn depth_two_enables_snippets_and_callsites() {
-        let mut p = ExploreParams::default();
-        p.depth = Some(2);
+        let mut p = ExploreParams {
+            depth: Some(2),
+            ..ExploreParams::default()
+        };
         p.apply_disclosure_level();
         assert_eq!(p.max_answer_items, 3);
         assert!(p.max_text_line_refs > 0);
@@ -3901,8 +3902,10 @@ mod disclosure_tests {
 
     #[test]
     fn depth_three_pulls_full_content() {
-        let mut p = ExploreParams::default();
-        p.depth = Some(3);
+        let mut p = ExploreParams {
+            depth: Some(3),
+            ..ExploreParams::default()
+        };
         p.apply_disclosure_level();
         assert_eq!(p.max_answer_items, 1);
         // depth=3 has the call-graph flag — verify the table value.
@@ -3916,8 +3919,10 @@ mod disclosure_tests {
         // method itself is robust against bad inputs from future
         // embedded callers (PyO3, MCP). Clamps silently to the
         // top rung rather than panicking — defensive only.
-        let mut p = ExploreParams::default();
-        p.depth = Some(99);
+        let mut p = ExploreParams {
+            depth: Some(99),
+            ..ExploreParams::default()
+        };
         p.apply_disclosure_level();
         // Should land on the deepest rung's caps.
         assert_eq!(p.max_answer_items, 1);

@@ -315,8 +315,13 @@ fn variants_are_alphabetical_within_each_category() {
         // Anything past the prefix must NOT be an initial-set name
         // (an initial-set kind appearing after a tail-appended one
         // would mean someone inserted mid-block, not appended).
-        for i in prefix_end..group_end {
-            let name = ALL_NODE_KINDS[i].name();
+        for (i, kind) in ALL_NODE_KINDS
+            .iter()
+            .enumerate()
+            .take(group_end)
+            .skip(prefix_end)
+        {
+            let name = kind.name();
             assert!(
                 !initial_set.contains(name),
                 "initial-set kind {name:?} appears after a tail-appended \

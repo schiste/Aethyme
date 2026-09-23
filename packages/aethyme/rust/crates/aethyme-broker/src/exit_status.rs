@@ -54,9 +54,9 @@ pub fn for_broker_error(error: &BrokerOpError) -> u8 {
         | E::CoordinatedLockBusy { .. }
         | E::AdmissionTimedOut { .. }
         | E::DirtyWorktree { .. }
-        | E::CleanupConfirmationNotSha256 { .. }
+        | E::CleanupConfirmationNotSha256
         | E::CleanupConfirmationMismatch { .. }
-        | E::GcConfirmationNotSha256 { .. }
+        | E::GcConfirmationNotSha256
         | E::GcConfirmationMismatch { .. }
         | E::GcResumeConfirmationMismatch { .. }
         | E::PromotionRecordConfirmationMismatch { .. }
@@ -64,7 +64,7 @@ pub fn for_broker_error(error: &BrokerOpError) -> u8 {
         | E::UnsafeRepairPlan { .. }
         | E::RepairNotApplicable { .. }
         | E::UnsafeCheckpointRecovery { .. }
-        | E::CheckpointConfirmationNotSha256 { .. }
+        | E::CheckpointConfirmationNotSha256
         | E::CheckpointConfirmationMismatch { .. }
         | E::CheckpointPreservationRefConflict { .. }
         | E::InvalidReconciliationResolution { .. }
@@ -81,7 +81,7 @@ pub fn for_broker_error(error: &BrokerOpError) -> u8 {
         | E::UnsafeSubmissionPlan { .. }
         | E::UnsupportedSubmissionCommit { .. }
         | E::ExposurePlanUnsafe { .. }
-        | E::ExposureConfirmationNotSha256 { .. }
+        | E::ExposureConfirmationNotSha256
         | E::ExposureConfirmationMismatch { .. }
         | E::ExposureRemoteMoved { .. }
         | E::ShipEntryNotPromoted { .. }
@@ -89,21 +89,21 @@ pub fn for_broker_error(error: &BrokerOpError) -> u8 {
         | E::ShipPublicationPolicy { .. }
         | E::ShipDeliveryOverrideUnsafe { .. }
         | E::ShipDeliveryRequiresExplicitSelection { .. }
-        | E::ShipDeliveryPlanDigestRequired { .. }
-        | E::ShipDeliveryPlanDigestNotSha256 { .. }
+        | E::ShipDeliveryPlanDigestRequired
+        | E::ShipDeliveryPlanDigestNotSha256
         | E::ShipDeliveryPlanDigestMismatch { .. }
         | E::ShipDeliveryBranchConflict { .. }
         | E::ShipDeliveryPullRequestMismatch { .. }
-        | E::ShipConfirmationNotFullSha { .. }
+        | E::ShipConfirmationNotFullSha
         | E::ShipConfirmationMismatch { .. }
         | E::ReconciliationConfirmationRequired { .. }
-        | E::ReconciliationConfirmationNotSha256 { .. }
+        | E::ReconciliationConfirmationNotSha256
         | E::ReconciliationConfirmationMismatch { .. }
         | E::ShipRemoteMoved { .. }
         | E::ShipNonFastForward { .. }
         | E::ShipLocalMainUnsafe { .. }
         | E::SessionExistsForWorktree { .. }
-        | E::ReuseSyncRequiresReuse { .. }
+        | E::ReuseSyncRequiresReuse
         | E::ReuseSyncDirty { .. }
         | E::ReuseSyncNotFastForward { .. } => REFUSED,
         _ => FAILED,

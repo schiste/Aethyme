@@ -23,6 +23,7 @@ impl ProjectionLock {
         std::fs::create_dir_all(&run_dir)?;
         let file = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(run_dir.join("broker-advisory.lock"))?;

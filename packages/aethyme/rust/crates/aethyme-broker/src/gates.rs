@@ -548,6 +548,7 @@ pub fn evaluate_gate_scope_with_graph(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn gate_definition_hash(
     name: &str,
     command: &str,
@@ -1005,6 +1006,7 @@ pub(crate) fn run_all_with_progress(
 
 /// Run one explicitly selected gate. Unlike affected selection, an exact
 /// name is authoritative even when its path triggers do not match the diff.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_named(
     store: &mut BrokerStore,
     main_root: &Path,
@@ -1332,8 +1334,8 @@ fn prepare_managed_gate_cache_in(
     let Some(policy) = policy else {
         return Ok(None);
     };
-    std::fs::create_dir_all(&root)?;
-    crate::host_state::protect_host_state_path(&root, true)?;
+    std::fs::create_dir_all(root)?;
+    crate::host_state::protect_host_state_path(root, true)?;
     let repository_root = root.join("gates").join(repository);
     std::fs::create_dir_all(&repository_root)?;
     let directory = repository_root.join(&policy.key);

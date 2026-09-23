@@ -101,13 +101,8 @@ pub(super) fn compute_callsite_files(
         }
     }
 
-    let mut ranked: Vec<(
-        String,
-        std::collections::BTreeSet<String>,
-        usize,
-        usize,
-        Vec<serde_json::Value>,
-    )> = by_file
+    // (path, symbols, hits, production_hits, samples)
+    let mut ranked: Vec<_> = by_file
         .into_iter()
         .map(|(path, (syms, hits, production_hits, samples))| {
             (path, syms, hits, production_hits, samples)

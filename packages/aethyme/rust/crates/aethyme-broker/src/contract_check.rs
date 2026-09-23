@@ -596,12 +596,13 @@ fn checkbox_decisions(text: &str) -> Vec<Decision> {
             cursor += 1;
         }
         let label: String = chars[start..cursor].iter().collect();
-        if expect(&chars, &mut cursor, '*') && expect(&chars, &mut cursor, '*') {
-            if let Some(decision) = Decision::from_label(&label) {
-                out.push(decision);
-                index = cursor;
-                continue;
-            }
+        if expect(&chars, &mut cursor, '*')
+            && expect(&chars, &mut cursor, '*')
+            && let Some(decision) = Decision::from_label(&label)
+        {
+            out.push(decision);
+            index = cursor;
+            continue;
         }
         index += 1;
     }

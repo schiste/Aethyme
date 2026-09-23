@@ -678,9 +678,9 @@ fn validate_identifier(
 ) -> Result<(), ExternalEventError> {
     if value.is_empty()
         || value.len() > maximum
-        || !value.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || punctuation.iter().any(|allowed| *allowed == byte)
-        })
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || punctuation.contains(&byte))
     {
         return Err(ExternalEventError::InvalidField {
             field,

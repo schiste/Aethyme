@@ -564,10 +564,7 @@ fn render_repo_routing(repo: &Path) -> Result<String, String> {
     };
     let fast_test = match primary_commands.get("fast_test") {
         Some(v) if v.truthy() => Some(v.clone()),
-        _ => match act_commands.get("fast_test") {
-            Some(v) => Some(v.clone()),
-            None => None,
-        },
+        _ => act_commands.get("fast_test").cloned(),
     };
     let app_entrypoint = match primary_entrypoints.get("app") {
         Some(v) if v.truthy() => v.clone(),

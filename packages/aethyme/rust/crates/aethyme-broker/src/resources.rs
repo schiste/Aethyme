@@ -702,6 +702,7 @@ impl HostResourceCoordinator {
     /// supplemental environment values after acquisition has selected the
     /// actual allocations. This is the narrow hook consumers need when a
     /// child-facing value depends on the granted port or namespace.
+    #[allow(clippy::too_many_arguments)]
     pub fn run_supervised_with_environment<F, P>(
         &mut self,
         request: &HostResourceRequest,

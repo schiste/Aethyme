@@ -202,13 +202,12 @@ fn confirmed_execute_preserves_publishes_verifies_syncs_and_resumes() {
         .unwrap()
         .to_string();
     assert_eq!(git(&fixture.clone, &["rev-parse", "main"]), remote_main);
-    assert_eq!(
+    assert!(
         git(
             &fixture.clone,
             &["show", &format!("{remote_main}:.aethyme/repository.json")]
         )
-        .contains("schema_version"),
-        true
+        .contains("schema_version")
     );
     let preserved = report["preservation_refs"][0]["ref_name"].as_str().unwrap();
     assert_eq!(git(&fixture.clone, &["rev-parse", preserved]), original);

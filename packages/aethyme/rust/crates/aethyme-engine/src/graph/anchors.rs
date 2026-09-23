@@ -554,10 +554,10 @@ fn file_reference_anchors(map: &RepositoryMap, task: &TaskInput, limit: usize) -
         let cleaned = lowered.trim_end_matches(|c: char| {
             c.is_ascii_punctuation() && c != '.' && c != '/' && c != '-' && c != '_'
         });
-        if EXTENSIONS.iter().any(|ext| cleaned.ends_with(ext)) {
-            if !file_refs.contains(&cleaned.to_string()) {
-                file_refs.push(cleaned.to_string());
-            }
+        if EXTENSIONS.iter().any(|ext| cleaned.ends_with(ext))
+            && !file_refs.contains(&cleaned.to_string())
+        {
+            file_refs.push(cleaned.to_string());
         }
     }
 
@@ -597,21 +597,20 @@ fn file_reference_anchors(map: &RepositoryMap, task: &TaskInput, limit: usize) -
             ));
 
             // Also anchor on the file's parent area
-            if let Some(area_id) = &file.area_id {
-                if !seen_areas.contains(area_id) {
-                    if let Some(area) = map.areas.iter().find(|a| &a.id == area_id) {
-                        seen_areas.push(area_id.clone());
-                        anchors.push((
-                            score - 10, // slightly lower than the file itself
-                            Anchor::new(
-                                AnchorKind::Folder,
-                                &area.name,
-                                None::<String>,
-                                format!("area containing referenced file ({})", file_ref),
-                            ),
-                        ));
-                    }
-                }
+            if let Some(area_id) = &file.area_id
+                && !seen_areas.contains(area_id)
+                && let Some(area) = map.areas.iter().find(|a| &a.id == area_id)
+            {
+                seen_areas.push(area_id.clone());
+                anchors.push((
+                    score - 10, // slightly lower than the file itself
+                    Anchor::new(
+                        AnchorKind::Folder,
+                        &area.name,
+                        None::<String>,
+                        format!("area containing referenced file ({})", file_ref),
+                    ),
+                ));
             }
         }
     }
@@ -684,21 +683,20 @@ fn file_reference_anchors_redb(
                 ),
             ));
 
-            if let Some(area_id) = &file.area_id {
-                if !seen_areas.contains(area_id) {
-                    if let Some(area) = overview.areas.iter().find(|area| &area.id == area_id) {
-                        seen_areas.push(area_id.clone());
-                        anchors.push((
-                            score - 10,
-                            Anchor::new(
-                                AnchorKind::Folder,
-                                &area.name,
-                                None::<String>,
-                                format!("area containing referenced file ({})", file_ref),
-                            ),
-                        ));
-                    }
-                }
+            if let Some(area_id) = &file.area_id
+                && !seen_areas.contains(area_id)
+                && let Some(area) = overview.areas.iter().find(|area| &area.id == area_id)
+            {
+                seen_areas.push(area_id.clone());
+                anchors.push((
+                    score - 10,
+                    Anchor::new(
+                        AnchorKind::Folder,
+                        &area.name,
+                        None::<String>,
+                        format!("area containing referenced file ({})", file_ref),
+                    ),
+                ));
             }
         }
     }

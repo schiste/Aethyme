@@ -15,6 +15,7 @@ pub struct FunctionNode {
 }
 
 impl FunctionNode {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         repo_name: &str,
         file_id: InternedStr,

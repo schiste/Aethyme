@@ -25,6 +25,7 @@ pub struct FileNode {
 }
 
 impl FileNode {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         repo_name: &str,
         path: &str,

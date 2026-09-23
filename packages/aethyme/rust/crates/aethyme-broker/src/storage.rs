@@ -733,7 +733,7 @@ fn inspect_root(
     } else if owner_exists == Some(false) && age_days.is_none() {
         blockers.push("cannot determine orphan root age; no removal is authorized".into());
     } else if owner_exists == Some(false)
-        && !age_days.is_some_and(|age| age >= orphan_worktree_roots_days)
+        && age_days.is_none_or(|age| age < orphan_worktree_roots_days)
     {
         blockers.push(format!(
             "orphan root is younger than the {orphan_worktree_roots_days} day grace period"
@@ -1995,7 +1995,7 @@ mod tests {
         let mut records = crate::measurement::SizeRecords::default();
         let (entries, candidates) = inspect_preparation_cache(
             &tmp.path().join("preparation-cache"),
-            &[repo.clone()],
+            std::slice::from_ref(&repo),
             crate::SizeScan::Recorded,
             &mut records,
         );
@@ -2066,7 +2066,7 @@ mod tests {
         let mut records = crate::measurement::SizeRecords::default();
         let (entries, candidates) = inspect_preparation_cache(
             &cache,
-            &[repo.clone()],
+            std::slice::from_ref(&repo),
             crate::SizeScan::Recorded,
             &mut records,
         );
@@ -2155,7 +2155,7 @@ mod tests {
         let digest = |candidates: &[StoragePreparationCandidate]| {
             decision_digest(Path::new("/storage"), 1, &[], &[], candidates)
         };
-        let approved = digest(&[candidate.clone()]);
+        let approved = digest(std::slice::from_ref(&candidate));
         assert_ne!(approved, digest(&[]));
         let mut measured = candidate.clone();
         measured.estimated_bytes = Some(999);

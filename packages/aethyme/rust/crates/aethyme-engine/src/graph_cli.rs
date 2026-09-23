@@ -155,14 +155,14 @@ fn render_node(payload: &Value) -> String {
         out.push_str(&format!("Language: {language}"));
         out.push('\n');
     }
-    if let Some(annotations) = payload.get("annotations").and_then(Value::as_array) {
-        if !annotations.is_empty() {
-            out.push_str(&format!("Annotations:"));
+    if let Some(annotations) = payload.get("annotations").and_then(Value::as_array)
+        && !annotations.is_empty()
+    {
+        out.push_str("Annotations:");
+        out.push('\n');
+        for annotation in annotations {
+            out.push_str(&format!("- {}", annotation.as_str().unwrap_or_default()));
             out.push('\n');
-            for annotation in annotations {
-                out.push_str(&format!("- {}", annotation.as_str().unwrap_or_default()));
-                out.push('\n');
-            }
         }
     }
     emit_completeness_signals(payload, &mut out);
@@ -231,14 +231,14 @@ fn render_expand(payload: &Value) -> String {
             out.push('\n');
         }
     }
-    if let Some(risks) = payload.get("risks").and_then(Value::as_array) {
-        if !risks.is_empty() {
-            out.push_str(&format!("Risks:"));
+    if let Some(risks) = payload.get("risks").and_then(Value::as_array)
+        && !risks.is_empty()
+    {
+        out.push_str("Risks:");
+        out.push('\n');
+        for risk in risks {
+            out.push_str(&format!("- {}", risk.as_str().unwrap_or_default()));
             out.push('\n');
-            for risk in risks {
-                out.push_str(&format!("- {}", risk.as_str().unwrap_or_default()));
-                out.push('\n');
-            }
         }
     }
     emit_completeness_signals(payload, &mut out);
@@ -252,25 +252,25 @@ fn render_overview(payload: &Value, raw_json: &str) -> String {
         payload["repo"].as_str().unwrap_or_default()
     ));
     out.push('\n');
-    if let Some(signals) = payload.get("signals").and_then(Value::as_object) {
-        if !signals.is_empty() {
-            out.push_str(&format!("Signals:"));
+    if let Some(signals) = payload.get("signals").and_then(Value::as_object)
+        && !signals.is_empty()
+    {
+        out.push_str("Signals:");
+        out.push('\n');
+        // Python iterates dict insertion order = the engine's emission
+        // order; serde's map is sorted, so recover order from the raw
+        // JSON text.
+        for name in object_key_order(raw_json, "signals") {
+            let Some(signal) = signals.get(&name) else {
+                continue;
+            };
+            out.push_str(&format!(
+                "- {}: {} ({})",
+                name.replace('_', " "),
+                render_number(&signal["score"]),
+                signal["level"].as_str().unwrap_or_default(),
+            ));
             out.push('\n');
-            // Python iterates dict insertion order = the engine's emission
-            // order; serde's map is sorted, so recover order from the raw
-            // JSON text.
-            for name in object_key_order(raw_json, "signals") {
-                let Some(signal) = signals.get(&name) else {
-                    continue;
-                };
-                out.push_str(&format!(
-                    "- {}: {} ({})",
-                    name.replace('_', " "),
-                    render_number(&signal["score"]),
-                    signal["level"].as_str().unwrap_or_default(),
-                ));
-                out.push('\n');
-            }
         }
     }
     for label in [
@@ -307,11 +307,9 @@ pub(crate) fn emit_completeness_signals(payload: &Value, out: &mut String) {
             if truncated { "yes" } else { "no" }
         ));
         out.push('\n');
-        if truncated {
-            if let Some(reason) = opt_str(payload, "reason") {
-                out.push_str(&format!("Truncation reason: {reason}"));
-                out.push('\n');
-            }
+        if truncated && let Some(reason) = opt_str(payload, "reason") {
+            out.push_str(&format!("Truncation reason: {reason}"));
+            out.push('\n');
         }
     }
     match payload.get("confidence") {
@@ -334,19 +332,19 @@ pub(crate) fn emit_completeness_signals(payload: &Value, out: &mut String) {
         }
         _ => {}
     }
-    if let Some(caps) = payload.get("caps").and_then(Value::as_object) {
-        if !caps.is_empty() {
-            // Python: json.dumps(caps) — compact with ", "/": " separators,
-            // insertion order == sorted here is acceptable only if the
-            // engine emits caps sorted; caps objects are small fixed maps
-            // emitted in code order which is alphabetical today.
-            let rendered: Vec<String> = caps
-                .iter()
-                .map(|(k, v)| format!("\"{k}\": {}", render_number(v)))
-                .collect();
-            out.push_str(&format!("Caps: {{{}}}", rendered.join(", ")));
-            out.push('\n');
-        }
+    if let Some(caps) = payload.get("caps").and_then(Value::as_object)
+        && !caps.is_empty()
+    {
+        // Python: json.dumps(caps) — compact with ", "/": " separators,
+        // insertion order == sorted here is acceptable only if the
+        // engine emits caps sorted; caps objects are small fixed maps
+        // emitted in code order which is alphabetical today.
+        let rendered: Vec<String> = caps
+            .iter()
+            .map(|(k, v)| format!("\"{k}\": {}", render_number(v)))
+            .collect();
+        out.push_str(&format!("Caps: {{{}}}", rendered.join(", ")));
+        out.push('\n');
     }
 }
 

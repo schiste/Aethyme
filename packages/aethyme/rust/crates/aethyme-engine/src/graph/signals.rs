@@ -305,13 +305,13 @@ fn entrypoint_clarity(map: &RepositoryMap) -> SignalAssessment {
 
     let mut entrypoints_by_area = BTreeMap::<String, BTreeSet<String>>::new();
     for edge in &entrypoint_edges {
-        if let Some(config_path) = config_path(map, &edge.from) {
-            if let Some(area_id) = map.area_id_for_target(&edge.from) {
-                entrypoints_by_area
-                    .entry(area_id)
-                    .or_default()
-                    .insert(config_path);
-            }
+        if let Some(config_path) = config_path(map, &edge.from)
+            && let Some(area_id) = map.area_id_for_target(&edge.from)
+        {
+            entrypoints_by_area
+                .entry(area_id)
+                .or_default()
+                .insert(config_path);
         }
     }
     let ambiguous_areas = entrypoints_by_area
@@ -351,13 +351,13 @@ fn entrypoint_clarity_redb(ctx: &RedbSignalContext) -> SignalAssessment {
 
     let mut entrypoints_by_area = BTreeMap::<String, BTreeSet<String>>::new();
     for edge in &entrypoint_edges {
-        if let Some(config_path) = ctx.config_path(edge.from.as_str()) {
-            if let Some(area_id) = ctx.area_id_for_target(edge.from.as_str()) {
-                entrypoints_by_area
-                    .entry(area_id)
-                    .or_default()
-                    .insert(config_path);
-            }
+        if let Some(config_path) = ctx.config_path(edge.from.as_str())
+            && let Some(area_id) = ctx.area_id_for_target(edge.from.as_str())
+        {
+            entrypoints_by_area
+                .entry(area_id)
+                .or_default()
+                .insert(config_path);
         }
     }
     let ambiguous_areas = entrypoints_by_area

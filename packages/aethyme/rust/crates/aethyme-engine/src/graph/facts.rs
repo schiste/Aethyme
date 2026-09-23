@@ -61,14 +61,13 @@ pub fn function_usage_fact(
     // this is O(F × in_degree).
     for &edge_idx in map.edges_to(&fact.id) {
         let edge = &map.edges[edge_idx];
-        if matches!(edge.kind, EdgeKind::References | EdgeKind::Documents) {
-            if let Some((reference, reference_path)) = docs_config_reference_for_id(map, &edge.from)
-            {
-                if roots.is_empty() || roots.iter().any(|root| reference_path.starts_with(root)) {
-                    docs_config.insert(reference);
-                }
-                continue;
+        if matches!(edge.kind, EdgeKind::References | EdgeKind::Documents)
+            && let Some((reference, reference_path)) = docs_config_reference_for_id(map, &edge.from)
+        {
+            if roots.is_empty() || roots.iter().any(|root| reference_path.starts_with(root)) {
+                docs_config.insert(reference);
             }
+            continue;
         }
         if !matches!(edge.kind, EdgeKind::Calls | EdgeKind::References) {
             continue;
@@ -194,10 +193,10 @@ fn source_code_path_for_id(map: &RepositoryMap, value: &str) -> Option<String> {
     if let Some(class) = map.classes.iter().find(|class| class.id == value) {
         return Some(class.file_path.to_string());
     }
-    if let Some(file) = map.files.iter().find(|file| file.id == value) {
-        if matches!(file.role, FileRole::Source | FileRole::Test) {
-            return Some(file.path.clone());
-        }
+    if let Some(file) = map.files.iter().find(|file| file.id == value)
+        && matches!(file.role, FileRole::Source | FileRole::Test)
+    {
+        return Some(file.path.clone());
     }
     None
 }

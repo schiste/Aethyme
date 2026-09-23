@@ -264,7 +264,7 @@ fn retained_metric_bytes(bytes: &[u8], cutoff: i64) -> Vec<u8> {
         let timestamp = serde_json::from_slice::<serde_json::Value>(line)
             .ok()
             .and_then(|value| value.get("ts").and_then(serde_json::Value::as_i64));
-        if !timestamp.is_some_and(|timestamp| timestamp < cutoff) {
+        if timestamp.is_none_or(|timestamp| timestamp >= cutoff) {
             after.extend_from_slice(line);
         }
     }
@@ -620,10 +620,8 @@ fn drain_directory(
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => return Err(error),
         };
-        if is_directory {
-            if drain_directory(&path, None, deadline)? == TreeRemoval::Interrupted {
-                return Ok(TreeRemoval::Interrupted);
-            }
+        if is_directory && drain_directory(&path, None, deadline)? == TreeRemoval::Interrupted {
+            return Ok(TreeRemoval::Interrupted);
         }
         remove_entry(&path, is_directory)?;
         // Checked after the entry, never before: a pass that removes nothing
@@ -1142,16 +1140,16 @@ impl Broker {
             }
         }
         for ((kind, id), retained_bytes) in &blocked_worktree_bytes {
-            if let Some(session_id) = id {
-                if let Some(session) = sessions.get(session_id) {
-                    blocker_facts.insert(
-                        (kind.clone(), *id),
-                        (
-                            *retained_bytes,
-                            session.closed_at.unwrap_or(session.updated_at),
-                        ),
-                    );
-                }
+            if let Some(session_id) = id
+                && let Some(session) = sessions.get(session_id)
+            {
+                blocker_facts.insert(
+                    (kind.clone(), *id),
+                    (
+                        *retained_bytes,
+                        session.closed_at.unwrap_or(session.updated_at),
+                    ),
+                );
             }
         }
         let mut grouped = BTreeMap::<String, (usize, u64, Option<(i64, Option<i64>)>)>::new();

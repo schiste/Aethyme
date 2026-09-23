@@ -376,17 +376,16 @@ impl Broker {
                 next_action: "dependencies are already current".into(),
             });
         }
-        if offline {
-            if let Some(step) = config
+        if offline
+            && let Some(step) = config
                 .steps
                 .iter()
                 .find(|step| step.offline_command.is_none())
-            {
-                return Err(PreparationError::OfflineUnavailable {
-                    step: step.name.clone(),
-                }
-                .into());
+        {
+            return Err(PreparationError::OfflineUnavailable {
+                step: step.name.clone(),
             }
+            .into());
         }
 
         let shared = config

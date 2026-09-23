@@ -806,8 +806,10 @@ mod tests {
         );
 
         for directory in ["", ".", "..", "nested/cache", "/tmp", "foo\\bar"] {
-            let mut policy = RetentionPolicy::default();
-            policy.artefact_directories = vec![directory.into()];
+            let policy = RetentionPolicy {
+                artefact_directories: vec![directory.into()],
+                ..RetentionPolicy::default()
+            };
             assert!(
                 matches!(
                     policy.validate(),
@@ -823,8 +825,10 @@ mod tests {
         for directory in [
             ".aethyme", ".git", "SRC", "lib", "tests", "docs", "examples",
         ] {
-            let mut policy = RetentionPolicy::default();
-            policy.artefact_directories = vec![directory.into()];
+            let policy = RetentionPolicy {
+                artefact_directories: vec![directory.into()],
+                ..RetentionPolicy::default()
+            };
             assert!(
                 matches!(
                     policy.validate(),
