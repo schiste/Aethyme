@@ -1416,3 +1416,85 @@ name = "gate-doctor-cli-probe"
         1
     );
 }
+
+// P0.6: agents read the exit code. A rejected submit used to exit 0 under
+// `--json`, and every typed refusal was the same unclassified 1.
+#[test]
+fn exit_codes_name_the_outcome_an_agent_acts_on() {
+    let tmp = tempfile::tempdir().unwrap();
+    git(tmp.path(), &["init", "-q", "-b", "main"]);
+    std::fs::create_dir_all(tmp.path().join(".aethyme")).unwrap();
+    std::fs::write(tmp.path().join("tracked.txt"), "base\n").unwrap();
+    std::fs::write(
+        tmp.path().join(".gitignore"),
+        ".aethyme/broker.db*\n.aethyme/logs/\n.aethyme/run/\n.aethyme/worktrees/\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join(".aethyme/gates.toml"),
+        "[[gate]]\nname = \"always-fails\"\ncommand = \"exit 7\"\n",
+    )
+    .unwrap();
+    git(tmp.path(), &["add", "-A"]);
+    git(tmp.path(), &["commit", "-qm", "fixture"]);
+    let worktree = tmp.path().join(".aethyme/worktrees/codes");
+    std::fs::create_dir_all(worktree.parent().unwrap()).unwrap();
+    git(
+        tmp.path(),
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "agent/codes",
+            worktree.to_str().unwrap(),
+            "main",
+        ],
+    );
+    let adopted = stdout(run(&worktree, &["adopt", "--task", "exit codes", "--json"]));
+    let adopted: serde_json::Value = serde_json::from_str(&adopted).unwrap();
+    let session = adopted["id"].as_i64().unwrap().to_string();
+    std::fs::write(worktree.join("tracked.txt"), "changed\n").unwrap();
+    git(&worktree, &["commit", "-qam", "change"]);
+
+    let rejected = run(&worktree, &["submit", "--session", &session, "--json"]);
+    assert_eq!(
+        rejected.status.code(),
+        Some(i32::from(aethyme_broker::exit_status::VERIFICATION_FAILED)),
+        "{}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+    let outcome: serde_json::Value = serde_json::from_slice(&rejected.stdout).unwrap();
+    assert_eq!(outcome["entry"]["status"], "rejected");
+
+    let rejected_text = run(&worktree, &["submit", "--session", &session]);
+    assert_eq!(
+        rejected_text.status.code(),
+        Some(i32::from(aethyme_broker::exit_status::VERIFICATION_FAILED)),
+        "{}",
+        String::from_utf8_lossy(&rejected_text.stderr)
+    );
+
+    let refused = run(
+        &worktree,
+        &[
+            "git",
+            "--session",
+            &session,
+            "--effect",
+            "read",
+            "--scope",
+            "test:codes",
+            "--",
+            "push",
+            "origin",
+            "main",
+        ],
+    );
+    assert_eq!(
+        refused.status.code(),
+        Some(i32::from(aethyme_broker::exit_status::REFUSED)),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+}

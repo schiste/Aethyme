@@ -22,6 +22,7 @@
 
 mod advisories;
 mod atomic_file;
+pub mod exit_status;
 pub mod agent_hook;
 pub mod attribution;
 mod broker;

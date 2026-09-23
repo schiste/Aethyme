@@ -77,7 +77,8 @@ fn github_and_destructive_frontends_fail_before_execution_without_required_scope
     ])
     .cwd(tmp.path())
     .run();
-    missing_repo.expect_code(1);
+    // Refused before execution: exit 3, distinct from an unclassified failure (P0.6).
+    missing_repo.expect_code(3);
     missing_repo.assert_contains("broker gh requires --repo owner/name");
 
     let destructive = Invoke::new([
@@ -92,7 +93,7 @@ fn github_and_destructive_frontends_fail_before_execution_without_required_scope
     ])
     .cwd(tmp.path())
     .run();
-    destructive.expect_code(1);
+    destructive.expect_code(3);
     destructive.assert_contains("requires --destructive");
 
     let missing_reason = Invoke::new([
@@ -106,7 +107,7 @@ fn github_and_destructive_frontends_fail_before_execution_without_required_scope
     ])
     .cwd(tmp.path())
     .run();
-    missing_reason.expect_code(1);
+    missing_reason.expect_code(3);
     missing_reason.assert_contains("require --reason");
 
     Invoke::new([

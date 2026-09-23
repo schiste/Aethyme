@@ -423,7 +423,12 @@ fn failed_submit_is_captured_as_a_redacted_structured_command_failure() {
     assert_eq!(failure["command_surface"], "broker.submit");
     assert_eq!(failure["failure_class"], "submission_failed");
     assert_eq!(failure["session_id"], session.id);
-    assert_eq!(failure["exit_code"], 1);
+    // A submission refused before verification (no recorded baseline) is a
+    // refusal, not an unclassified failure.
+    assert_eq!(
+        failure["exit_code"],
+        u64::from(aethyme_broker::exit_status::REFUSED)
+    );
     let bytes = String::from_utf8_lossy(&report.stdout);
     assert!(!bytes.contains("TASK-TEXT-SECRET"));
     assert!(!bytes.contains("no recorded baseline"));
