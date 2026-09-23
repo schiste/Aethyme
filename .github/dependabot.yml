@@ -17,3 +17,9 @@ updates:
     groups:
       cargo-patch:
         update-types: ["patch"]
+    # Only patch releases arrive automatically. For 0.x crates a minor bump is
+    # breaking (oxc, tree-sitter), and some majors change on-disk formats
+    # (bincode backs the graph store), so those are upgraded deliberately.
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]

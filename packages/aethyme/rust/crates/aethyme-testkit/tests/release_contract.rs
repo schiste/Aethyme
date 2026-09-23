@@ -301,7 +301,11 @@ fn release_notes_publish_migration_compatibility_rollback_and_known_issues() {
     let workflow = std::fs::read_to_string(root.join(".github/workflows/release.yml")).unwrap();
     let version = product_version();
     let guide_path = format!("packages/aethyme/docs/guides/upgrading-to-v{version}.md");
-    assert!(workflow.contains(&format!("body_path: {guide_path}")));
+    // The release body is the guide named by the tag, so a release needs no
+    // workflow edit; the guide for the current version must still exist.
+    assert!(workflow.contains(
+        "body_path: packages/aethyme/docs/guides/upgrading-to-${{ github.ref_name }}.md"
+    ));
 
     let guide = std::fs::read_to_string(root.join(&guide_path)).unwrap();
     for heading in [
