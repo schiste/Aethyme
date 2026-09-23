@@ -630,3 +630,98 @@ fn adopt_warns_about_uncommitted_paths_it_did_not_create() {
         "the warning must say why it matters: {dirty_out}"
     );
 }
+
+fn overlaps(repo: &Path) -> Vec<aethyme_broker::ScopeOverlap> {
+    Broker::open(repo)
+        .unwrap()
+        .scope_overlaps_snapshot()
+        .unwrap()
+}
+
+// #285: adopt pasted its capture call inside a string literal, so it recorded
+// no scope and printed Rust source in its note. Start with `--json` skipped
+// capture too. Both paths must persist the claim where overlap detection sees it.
+#[test]
+fn adopt_records_declared_scope_that_collides_with_a_json_start() {
+    let tmp = fixture();
+    stdout(&run(
+        tmp.path(),
+        &[
+            "start",
+            "--task",
+            "first",
+            "--claim",
+            "symbol:PaymentService=replace",
+            "--json",
+        ],
+    ));
+    let adopted = stdout(&run(
+        tmp.path(),
+        &[
+            "adopt",
+            "--task",
+            "second",
+            "--claim",
+            "symbol:PaymentService=replace",
+        ],
+    ));
+    assert!(adopted.contains("Scope: 1 declared"), "{adopted}");
+    assert!(
+        !adopted.contains("&mut") && !adopted.contains(")?;"),
+        "adopt must print prose, not source: {adopted}"
+    );
+    assert_eq!(overlaps(tmp.path()).len(), 1, "{adopted}");
+}
+
+#[test]
+fn json_adopt_records_declared_scope_that_collides_with_a_start() {
+    let tmp = fixture();
+    stdout(&run(
+        tmp.path(),
+        &[
+            "start",
+            "--task",
+            "first",
+            "--claim",
+            "symbol:PaymentService=replace",
+        ],
+    ));
+    let adopted = stdout(&run(
+        tmp.path(),
+        &[
+            "adopt",
+            "--task",
+            "second",
+            "--claim",
+            "symbol:PaymentService=replace",
+            "--json",
+        ],
+    ));
+    serde_json::from_str::<serde_json::Value>(&adopted).expect("adopt --json stays pure JSON");
+    assert_eq!(overlaps(tmp.path()).len(), 1);
+}
+
+#[test]
+fn subcommands_that_cannot_honor_a_claim_refuse_it() {
+    let tmp = fixture();
+    for args in [
+        &[
+            "start-agent",
+            "--task",
+            "t",
+            "--cmd",
+            "true",
+            "--claim",
+            "symbol:A",
+        ][..],
+        &["submit", "--session", "1", "--claim", "symbol:A"][..],
+    ] {
+        let output = run(tmp.path(), args);
+        assert!(!output.status.success(), "{args:?} must refuse --claim");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("--claim is valid only with broker start or broker adopt"),
+            "{args:?}: {stderr}"
+        );
+    }
+}
