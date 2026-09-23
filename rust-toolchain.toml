@@ -1,0 +1,6 @@
+# Recovery plan P1.3/P1.4: one toolchain for local builds, gates and CI, so a
+# newer stable release cannot add clippy lints or change formatting unannounced.
+# Bump deliberately, in its own PR, fixing whatever the new version reports.
+[toolchain]
+channel = "1.96.0"
+components = ["rustfmt", "clippy"]
