@@ -489,10 +489,13 @@ pub(crate) fn trust(dir: &Path, source: &str) -> Result<GateTrustReport, BrokerO
         record_trust(&main_root, &refs, source)?;
         if let Ok(Some(mut store)) = BrokerStore::open_current_in_repo(&main_root) {
             for digest in &recorded {
-                let _ = store.append_event(
-                    crate::events::GATE_POLICY_TRUSTED,
-                    None,
-                    Some(&crate::events::gate_policy_trust_payload(digest, source)),
+                crate::warn_unrecorded(
+                    "record the gate policy trust event",
+                    store.append_event(
+                        crate::events::GATE_POLICY_TRUSTED,
+                        None,
+                        Some(&crate::events::gate_policy_trust_payload(digest, source)),
+                    ),
                 );
             }
         }

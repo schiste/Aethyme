@@ -1429,6 +1429,8 @@ impl Broker {
             }
             None => None,
         };
+        // The sweep only reclaims rebuildable caches, and this runs inside
+        // broker open: its failure must not stop every command.
         let _ = self.sweep_artifacts_autonomously(&policy);
         Ok(resumed)
     }

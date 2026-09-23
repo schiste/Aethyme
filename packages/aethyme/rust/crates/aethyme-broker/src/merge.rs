@@ -1458,11 +1458,14 @@ impl Broker {
                 continue;
             };
             if stale_session.status.is_closed() {
-                let _ = self.store().set_merge_status(
-                    stale_id,
-                    MergeStatus::Superseded,
-                    None,
-                    Some("{\"reason\":\"session cleaned before queue revalidation\"}"),
+                crate::warn_unrecorded(
+                    "mark a closed session's queue entry superseded",
+                    self.store().set_merge_status(
+                        stale_id,
+                        MergeStatus::Superseded,
+                        None,
+                        Some("{\"reason\":\"session cleaned before queue revalidation\"}"),
+                    ),
                 );
                 continue;
             }
@@ -1477,7 +1480,8 @@ impl Broker {
     /// explicit or implicit lease intersects the newly promoted paths.
     ///
     /// The integration ref and promotion row are already authoritative when
-    /// this runs. Every failure is therefore swallowed: notifications may be
+    /// this runs. Every failure is therefore reported as a warning, never
+    /// returned: notifications may be
     /// repaired or acknowledged, but they can never roll back or block a
     /// verified promotion and they never mutate another worktree.
     fn persist_promotion_lease_advisories(
@@ -1559,7 +1563,7 @@ impl Broker {
                 kind: "safe_next_action".into(),
                 summary: "aethyme broker status --json".into(),
             });
-            let _ = self.persist_advisory(NewAdvisory {
+            let persisted = self.persist_advisory(NewAdvisory {
                 identity: format!("promotion_lease_intersection:{integration_sha}:{session_id}"),
                 audience: crate::AdvisoryAudience::Session,
                 producer: crate::AdvisoryProducer::Coordination,
@@ -1570,6 +1574,7 @@ impl Broker {
                 paths,
                 evidence,
             });
+            crate::warn_unrecorded("persist a lease-intersection advisory", persisted);
         }
     }
 
@@ -1717,9 +1722,12 @@ fn write_action_required(
         blocking_note = blocking_note,
         session = entry.session_id,
     );
+    // The queue entry already records the conflict; this file is how the
+    // agent learns of it, so a failed write is reported rather than dropped.
     let path = worktree.join(ACTION_REQUIRED_RELPATH);
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let _ = std::fs::write(path, body);
+    let written = path
+        .parent()
+        .map_or(Ok(()), std::fs::create_dir_all)
+        .and_then(|()| std::fs::write(&path, body));
+    crate::warn_unrecorded(&format!("write {}", path.display()), written);
 }

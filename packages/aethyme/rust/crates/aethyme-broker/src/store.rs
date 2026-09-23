@@ -3569,7 +3569,7 @@ impl BrokerStore {
             .expect("serializing advisory evidence cannot fail");
         let now = now_ms();
         let tx = self.conn.transaction()?;
-        let inserted = tx.execute(
+        tx.execute(
             "INSERT OR IGNORE INTO advisories (
                  identity, audience, producer, session_id, severity,
                  queue_entry_id, integration_sha, paths_json, evidence_json,
@@ -3588,7 +3588,6 @@ impl BrokerStore {
                 now,
             ],
         )?;
-        let _ = inserted;
         tx.commit()?;
 
         let stored = self
@@ -4111,13 +4110,12 @@ impl BrokerStore {
 
         let now = now_ms();
         let tx = self.conn.transaction()?;
-        let updated = tx.execute(
+        tx.execute(
             "UPDATE advisories
              SET resolution_state = 'acknowledged', acknowledged_at = ?2
              WHERE id = ?1 AND resolution_state = 'outstanding'",
             params![id, now],
         )?;
-        let _ = updated;
         tx.execute(
             "UPDATE advisory_delivery_metrics
              SET acted_at = COALESCE(acted_at, ?2), action = 'acknowledged'

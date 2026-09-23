@@ -5284,7 +5284,7 @@ impl Broker {
             &self.main_root,
             session_id,
             &tree,
-        ))
+        )?)
     }
 
     /// Run every configured gate against the checkout containing `dir`,
@@ -8554,7 +8554,10 @@ impl Broker {
             // Only a pass that enumerated everything may prune: a routine
             // check sees whatever subset it asked about.
             records.retain_paths(&known);
-            let _ = crate::measurement::save_size_records(&self.main_root, &records);
+            crate::warn_unrecorded(
+                "save worktree size records",
+                crate::measurement::save_size_records(&self.main_root, &records),
+            );
             let bytes = serde_json::to_vec(&plan)?;
             plan.digest = format!("{:x}", Sha256::digest(bytes));
         }
@@ -8606,7 +8609,10 @@ impl Broker {
             return Ok(());
         };
         records.record(&path, bytes, now_ms());
-        let _ = crate::measurement::save_size_records(&self.main_root, &records);
+        crate::warn_unrecorded(
+            "save worktree size records",
+            crate::measurement::save_size_records(&self.main_root, &records),
+        );
         Ok(())
     }
 

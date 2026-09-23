@@ -487,7 +487,7 @@ impl HostResourceCoordinator {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let _ = quarantine_reclaimable(&tx, now)?;
+        quarantine_reclaimable(&tx, now)?;
         if let Some((existing_digest, state, token)) = tx.query_row(
             "SELECT request_digest,state,ownership_token FROM resource_leases WHERE request_id=?1",
             [&request.request_id],
@@ -601,7 +601,7 @@ impl HostResourceCoordinator {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let _ = quarantine_reclaimable(&tx, now)?;
+        quarantine_reclaimable(&tx, now)?;
         verify_ownership(&tx, lease_id, generation, token, true)?;
         let expires = now.saturating_add((ttl_seconds as i64).saturating_mul(1_000));
         tx.execute(
@@ -624,7 +624,7 @@ impl HostResourceCoordinator {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let _ = quarantine_reclaimable(&tx, now)?;
+        quarantine_reclaimable(&tx, now)?;
         verify_ownership(&tx, lease_id, generation, token, false)?;
         tx.execute("UPDATE resource_leases SET state='released',released_at=?2,updated_at=?2 WHERE lease_id=?1 AND state!='released'", params![lease_id,now])?;
         let lease = load_lease(&tx, "lease_id", lease_id)?
@@ -742,10 +742,13 @@ impl HostResourceCoordinator {
         let environment = match prepare_environment(&grant) {
             Ok(environment) => environment,
             Err(source) => {
-                let _ = self.quarantine(
-                    &grant.lease.lease_id,
-                    grant.lease.generation,
-                    &grant.ownership_token,
+                crate::warn_unrecorded(
+                    "quarantine the host resource lease",
+                    self.quarantine(
+                        &grant.lease.lease_id,
+                        grant.lease.generation,
+                        &grant.ownership_token,
+                    ),
                 );
                 return Err(HostResourceRunError::Environment(source));
             }
@@ -760,10 +763,13 @@ impl HostResourceCoordinator {
         let mut child = match child {
             Ok(child) => child,
             Err(error) => {
-                let _ = self.quarantine(
-                    &grant.lease.lease_id,
-                    grant.lease.generation,
-                    &grant.ownership_token,
+                crate::warn_unrecorded(
+                    "quarantine the host resource lease",
+                    self.quarantine(
+                        &grant.lease.lease_id,
+                        grant.lease.generation,
+                        &grant.ownership_token,
+                    ),
                 );
                 return Err(error);
             }
@@ -791,10 +797,13 @@ impl HostResourceCoordinator {
             let mut cleanup_child = match cleanup_child {
                 Ok(child) => child,
                 Err(error) => {
-                    let _ = self.quarantine(
-                        &grant.lease.lease_id,
-                        grant.lease.generation,
-                        &grant.ownership_token,
+                    crate::warn_unrecorded(
+                        "quarantine the host resource lease",
+                        self.quarantine(
+                            &grant.lease.lease_id,
+                            grant.lease.generation,
+                            &grant.ownership_token,
+                        ),
                     );
                     return Err(error);
                 }
@@ -853,7 +862,7 @@ impl HostResourceCoordinator {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let _ = quarantine_reclaimable(&tx, now)?;
+        quarantine_reclaimable(&tx, now)?;
         let (actual, state): (i64, String) = tx
             .query_row(
                 "SELECT generation,state FROM resource_leases WHERE lease_id=?1",

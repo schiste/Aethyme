@@ -244,6 +244,8 @@ pub fn claim_refresh_attempt(url: &str, now_unix_ms: i64) -> bool {
         let _ = std::fs::create_dir_all(directory);
         let _ = protect_host_state_path(directory, true);
     }
+    // A throttle marker that cannot be written only means the next call
+    // checks again; the check itself must not fail over it.
     let _ = std::fs::write(&path, now_unix_ms.to_string());
     true
 }

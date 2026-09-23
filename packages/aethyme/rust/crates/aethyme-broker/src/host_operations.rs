@@ -215,10 +215,13 @@ impl Drop for HostOperationGuard {
     fn drop(&mut self) {
         if !self.terminal && self.operation.status == OperationStatus::Prepared {
             let now = now_ms();
-            let _ = self.conn.execute(
-                "UPDATE host_operations SET status='failed', updated_at=?2, finished_at=?2
-                 WHERE operation_id=?1 AND status='prepared'",
-                params![self.operation.operation_id, now],
+            crate::warn_unrecorded(
+                "mark an abandoned host operation failed",
+                self.conn.execute(
+                    "UPDATE host_operations SET status='failed', updated_at=?2, finished_at=?2
+                     WHERE operation_id=?1 AND status='prepared'",
+                    params![self.operation.operation_id, now],
+                ),
             );
         }
     }

@@ -788,8 +788,17 @@ pub fn run_pre_push(cwd: &Path, updates: &str) -> Result<(), HooksError> {
             "reason_digest": format!("{:x}", Sha256::digest(reason.as_bytes())),
         })
         .to_string();
-        if let Ok(mut store) = BrokerStore::open_in_repo(&main_root) {
-            let _ = store.append_event("hook.pre_push.break_glass", None, Some(&payload));
+        // Break-glass exists for when the broker is broken, so an audit write
+        // that fails must not block the push; it must still be visible.
+        match BrokerStore::open_in_repo(&main_root) {
+            Ok(mut store) => crate::warn_unrecorded(
+                "record the break-glass push audit event",
+                store.append_event("hook.pre_push.break_glass", None, Some(&payload)),
+            ),
+            Err(error) => crate::warn_unrecorded::<(), _>(
+                "open the broker store to record the break-glass push audit event",
+                Err(error),
+            ),
         }
         return Ok(());
     }

@@ -995,15 +995,19 @@ fn write_gate_pidfile(path: &Path, record: &GatePidRecord) -> std::io::Result<()
 /// Kill in-flight gate runs for `session_id` whose tree differs from
 /// `current_tree` (issue #18): they test a superseded state. Records a
 /// `cancelled` result for each. Returns the cancelled gate names.
+///
+/// A result that cannot be recorded is an error, not a silent skip: the run
+/// was killed, and without the row nothing says why it has no outcome. The
+/// pidfile is removed only after the row lands, so a retry retires it again.
 pub fn cancel_obsolete_runs(
     store: &mut BrokerStore,
     main_root: &Path,
     session_id: i64,
     current_tree: &str,
-) -> Vec<String> {
+) -> Result<Vec<String>, crate::BrokerError> {
     let dir = running_dir(main_root);
     let Ok(entries) = std::fs::read_dir(&dir) else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let prefix = format!("{session_id}-");
     let mut cancelled = Vec::new();
@@ -1039,8 +1043,7 @@ pub fn cancel_obsolete_runs(
                 libc::killpg(pgid, libc::SIGTERM);
             }
         }
-        let _ = std::fs::remove_file(entry.path());
-        let _ = store.record_gate_result(&NewGateResult {
+        store.record_gate_result(&NewGateResult {
             gate_name: gate_name.to_string(),
             tree_hash: tree.to_string(),
             definition_hash: String::new(),
@@ -1053,10 +1056,13 @@ pub fn cancel_obsolete_runs(
             output_bytes: None,
             log_path: None,
             session_id: Some(session_id),
-        });
+        })?;
+        // The cancellation is recorded; a pidfile that survives is retired
+        // again by the next pass (its process is gone, so nothing is signalled).
+        let _ = std::fs::remove_file(entry.path());
         cancelled.push(gate_name.to_string());
     }
-    cancelled
+    Ok(cancelled)
 }
 
 /// Run the affected gates for a checkout, cheap-first, with tree-hash
@@ -1558,9 +1564,11 @@ fn run_selections(
 ) -> Result<Vec<GateRunOutcome>, crate::broker::BrokerOpError> {
     let tree = checkout.working_tree_hash()?;
     if let Some(session_id) = session_id {
-        cancel_obsolete_runs(store, main_root, session_id, &tree);
+        cancel_obsolete_runs(store, main_root, session_id, &tree)?;
     }
 
+    // A directory that cannot be created fails loudly where the first file
+    // inside it is opened (owner locks, pidfile, log), so nothing is lost here.
     let log_dir = main_root.join(".aethyme/logs/gates");
     let _ = std::fs::create_dir_all(&log_dir);
     let run_dir = running_dir(main_root);
@@ -1572,12 +1580,15 @@ fn run_selections(
         let gate = selection.gate;
         let worker_id = gate_worker_id(session_id, &gate.name);
         if cache_policy == CachePolicy::Bypass {
-            let _ = store.append_event(
-                crate::events::GATE_CACHE_BYPASSED,
-                session_id,
-                Some(&crate::events::gate_cache_bypassed_payload(
-                    &gate.name, &tree,
-                )),
+            crate::warn_unrecorded(
+                "record the gate cache bypass event",
+                store.append_event(
+                    crate::events::GATE_CACHE_BYPASSED,
+                    session_id,
+                    Some(&crate::events::gate_cache_bypassed_payload(
+                        &gate.name, &tree,
+                    )),
+                ),
             );
         }
         // Cache: conclusive result for this exact tree, any session. The
@@ -1598,16 +1609,19 @@ fn run_selections(
                 short_tree_hash(&tree),
                 saved_ms
             ));
-            let _ = store.append_event(
-                crate::events::GATE_CACHED,
-                session_id,
-                Some(&crate::events::gate_cached_payload(
-                    &gate.name,
-                    &tree,
-                    saved_ms,
-                    hit.status,
-                    cached_failure_class(hit.status),
-                )),
+            crate::warn_unrecorded(
+                "record the gate cache hit event",
+                store.append_event(
+                    crate::events::GATE_CACHED,
+                    session_id,
+                    Some(&crate::events::gate_cached_payload(
+                        &gate.name,
+                        &tree,
+                        saved_ms,
+                        hit.status,
+                        cached_failure_class(hit.status),
+                    )),
+                ),
             );
             let failed = hit.status == GateStatus::Fail;
             outcomes.push(GateRunOutcome {
@@ -1637,8 +1651,13 @@ fn run_selections(
             if let Some(session_id) = session_id
                 && let Ok(advisories) = store.outstanding_advisories_for_session(session_id)
             {
-                let _ = store
-                    .record_advisories_shown(&advisories, crate::AdvisoryDeliverySurface::PreGate);
+                crate::warn_unrecorded(
+                    "record advisory delivery",
+                    store.record_advisories_shown(
+                        &advisories,
+                        crate::AdvisoryDeliverySurface::PreGate,
+                    ),
+                );
                 for line in crate::advisories::session_notice_lines(&advisories) {
                     progress.report(&line);
                 }
@@ -1729,7 +1748,12 @@ fn run_selections(
                 let message = format!("managed cache preparation failed: {error}");
                 let _ = std::fs::write(&log_path, format!("aethyme {message}\n"));
                 progress.report(&format!("gate {} environment error: {message}", gate.name));
-                let _ = resource_runtime.as_mut().map(GateResourceRuntime::release);
+                if let Some(runtime) = resource_runtime.as_mut() {
+                    crate::warn_unrecorded(
+                        "release the gate's host resource lease",
+                        runtime.release(),
+                    );
+                }
                 drop(owner_locks);
                 let log_path = preserve_failed_gate_log(&log_path, GateStatus::Error);
                 store.record_gate_result(&NewGateResult {
@@ -2470,6 +2494,38 @@ mod tests {
             pid: Some(pgid),
             start,
         }
+    }
+
+    #[test]
+    fn a_cancellation_that_cannot_be_recorded_is_an_error_and_keeps_the_pidfile() {
+        let root = tempfile::tempdir().unwrap();
+        let database = root.path().join("broker.db");
+        let mut store = BrokerStore::open(&database).unwrap();
+        rusqlite::Connection::open(&database)
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER refuse_gate_results BEFORE INSERT ON gate_results
+                 BEGIN SELECT RAISE(ABORT, 'simulated gate result write failure'); END;",
+            )
+            .unwrap();
+        let pidfile = running_dir(root.path()).join("7-slow.pid");
+        std::fs::create_dir_all(pidfile.parent().unwrap()).unwrap();
+        // pgid 1 is never signalled, so no real process group is touched.
+        std::fs::write(&pidfile, pid_record(1, None).render()).unwrap();
+
+        let error = cancel_obsolete_runs(&mut store, root.path(), 7, "current tree")
+            .expect_err("a cancellation whose result was not recorded must not report success");
+
+        assert!(
+            error
+                .to_string()
+                .contains("simulated gate result write failure"),
+            "the store's error must surface: {error}"
+        );
+        assert!(
+            pidfile.exists(),
+            "the pidfile must survive so a later pass can record the cancellation"
+        );
     }
 
     #[test]

@@ -245,7 +245,10 @@ fn current_session(broker: &mut Broker, cwd: &std::path::Path) -> Option<Session
 fn touch(broker: &mut Broker, session: Option<&Session>) {
     if let Some(session) = session {
         let now = now_ms();
-        let _ = broker.store().touch_session_activity(session.id, now);
+        crate::warn_unrecorded(
+            "record session activity",
+            broker.store().touch_session_activity(session.id, now),
+        );
     }
 }
 
@@ -292,9 +295,12 @@ fn on_session_start(broker: &mut Broker, session: Option<&Session>) -> HookOutco
         if already_announced(broker, session.id, peer.id) {
             continue;
         }
-        let _ = broker
-            .store()
-            .record_session_note(session.id, peer.id, &joined);
+        crate::warn_unrecorded(
+            "record the arrival note for a peer session",
+            broker
+                .store()
+                .record_session_note(session.id, peer.id, &joined),
+        );
     }
 
     HookOutcome::Context(format!(
@@ -328,7 +334,12 @@ fn on_user_prompt_submit(broker: &mut Broker, session: Option<&Session>) -> Hook
     let mut lines = Vec::with_capacity(unread.len());
     for note in &unread {
         lines.push(note.message.clone());
-        let _ = broker.store().acknowledge_session_note(note.id);
+        // An unacknowledged note is delivered again next turn; say so rather
+        // than let the repeat look like a new event.
+        crate::warn_unrecorded(
+            "acknowledge a delivered session note",
+            broker.store().acknowledge_session_note(note.id),
+        );
     }
     HookOutcome::Context(lines.join("\n"))
 }

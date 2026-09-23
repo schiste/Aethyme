@@ -494,7 +494,10 @@ fn resolve_verified_publication(
             &contained_entry_ids,
             &resolution_evidence,
         )?;
-    let _ = broker.refresh_advisory_projection();
+    crate::warn_unrecorded(
+        "refresh the advisory projection",
+        broker.refresh_advisory_projection(),
+    );
     Ok((resolved_exposures, resolved_advisories))
 }
 
