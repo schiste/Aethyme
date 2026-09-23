@@ -131,9 +131,79 @@ fn is_executable(relative_path: &str) -> bool {
             .unwrap_or(false)
 }
 
-fn ensure_executable(path: &Path) -> Result<(), String> {
+/// Refuse to write through a symbolic link.
+///
+/// A repository can commit `.claude/skills` (or any deploy target, or any
+/// directory above one) as a symlink that points outside the checkout, for
+/// example into `$HOME`. Following it would let `enhance deploy` overwrite
+/// and chmod files the repository does not own. Every component between
+/// `repo` and `path` (inclusive) must therefore be a real file or directory,
+/// and the deepest existing ancestor must canonicalize under the canonical
+/// repository root. `repo` itself may be reached through a link.
+pub(crate) fn ensure_no_symlink_in_path(repo: &Path, path: &Path) -> Result<(), String> {
+    let relative = path.strip_prefix(repo).map_err(|_| {
+        format!(
+            "refusing to write {}: path is outside repository {}",
+            path.display(),
+            repo.display()
+        )
+    })?;
+    let canonical_repo = repo
+        .canonicalize()
+        .map_err(|e| format!("{}: {e}", repo.display()))?;
+    let mut current = repo.to_path_buf();
+    let mut deepest_existing = repo.to_path_buf();
+    for component in relative.components() {
+        match component {
+            std::path::Component::Normal(part) => current.push(part),
+            _ => {
+                return Err(format!(
+                    "refusing to write {}: path must be a plain repository-relative path",
+                    path.display()
+                ))
+            }
+        }
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(format!(
+                    "refusing to write through symlink {}: deploy targets and their parent directories must not be symbolic links",
+                    current.display()
+                ));
+            }
+            Ok(_) => deepest_existing = current.clone(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+            Err(e) => return Err(format!("{}: {e}", current.display())),
+        }
+    }
+    let canonical = deepest_existing
+        .canonicalize()
+        .map_err(|e| format!("{}: {e}", deepest_existing.display()))?;
+    if !canonical.starts_with(&canonical_repo) {
+        return Err(format!(
+            "refusing to write {}: {} resolves outside repository {}",
+            path.display(),
+            deepest_existing.display(),
+            canonical_repo.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Create the parent directories of a repository file after refusing any
+/// symlinked component on the way.
+fn create_parent_dirs(repo: &Path, path: &Path) -> Result<(), String> {
+    ensure_no_symlink_in_path(repo, path)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+    }
+    Ok(())
+}
+
+fn ensure_executable(repo: &Path, path: &Path) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
-    let metadata = std::fs::metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    ensure_no_symlink_in_path(repo, path)?;
+    let metadata =
+        std::fs::symlink_metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let mut permissions = metadata.permissions();
     permissions.set_mode(permissions.mode() | 0o111);
     std::fs::set_permissions(path, permissions).map_err(|e| format!("{}: {e}", path.display()))
@@ -143,7 +213,8 @@ fn read_text(path: &Path) -> Result<String, String> {
     std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))
 }
 
-fn write_text(path: &Path, content: &str) -> Result<(), String> {
+fn write_text(repo: &Path, path: &Path, content: &str) -> Result<(), String> {
+    ensure_no_symlink_in_path(repo, path)?;
     std::fs::write(path, content).map_err(|e| format!("{}: {e}", path.display()))
 }
 
@@ -199,11 +270,9 @@ fn deploy_inner(
             });
             continue;
         }
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
-        }
+        create_parent_dirs(repo, &dest)?;
         let existed = dest.exists();
-        write_text(&dest, &content)?;
+        write_text(repo, &dest, &content)?;
         actions.push(DeployAction {
             relative_path,
             action: if existed { "updated" } else { "created" },
@@ -222,7 +291,7 @@ fn deploy_inner(
         if dest.exists() && !force && read_text(&dest)? == content {
             // Still ensure the executable bit is right on shell scripts.
             if is_executable(relative_path) {
-                ensure_executable(&dest)?;
+                ensure_executable(repo, &dest)?;
             }
             actions.push(DeployAction {
                 relative_path: relative_path.to_string(),
@@ -230,13 +299,11 @@ fn deploy_inner(
             });
             continue;
         }
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
-        }
+        create_parent_dirs(repo, &dest)?;
         let existed = dest.exists();
-        write_text(&dest, &content)?;
+        write_text(repo, &dest, &content)?;
         if is_executable(relative_path) {
-            ensure_executable(&dest)?;
+            ensure_executable(repo, &dest)?;
         }
         actions.push(DeployAction {
             relative_path: relative_path.to_string(),
@@ -279,7 +346,7 @@ fn ensure_agents_document(repo: &Path, force: bool) -> Result<DeployAction, Stri
     let content = render_agents_document(Some(repo))?;
     let existed = dest.exists();
     if !existed {
-        write_text(&dest, &content)?;
+        write_text(repo, &dest, &content)?;
         return Ok(DeployAction {
             relative_path: "AGENTS.md".to_string(),
             action: "created",
@@ -292,7 +359,7 @@ fn ensure_agents_document(repo: &Path, force: bool) -> Result<DeployAction, Stri
             action: "unchanged",
         });
     }
-    write_text(&dest, &content)?;
+    write_text(repo, &dest, &content)?;
     Ok(DeployAction {
         relative_path: "AGENTS.md".to_string(),
         action: "updated",
@@ -356,11 +423,10 @@ fn migrate_legacy_agents_content(repo: &Path) -> Result<Option<DeployAction>, St
         }
     }
 
-    if let Some(parent) = override_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
-    }
+    create_parent_dirs(repo, &override_path)?;
     let existed = override_path.exists();
     write_text(
+        repo,
         &override_path,
         &format!("{}\n", pyjson::dumps_indent2(&clean_overrides)),
     )?;
@@ -407,6 +473,7 @@ fn drop_stale_generated_agents_override(repo: &Path) -> Result<Option<DeployActi
     );
     if clean_overrides.truthy() {
         write_text(
+            repo,
             &override_path,
             &format!("{}\n", pyjson::dumps_indent2(&clean_overrides)),
         )?;
@@ -454,9 +521,7 @@ fn session_start_hook_entry() -> Value {
 /// (merge-aware, idempotent).
 pub(crate) fn ensure_settings_hook(repo: &Path) -> Result<DeployAction, String> {
     let settings_path = repo.join(SETTINGS_FILE);
-    if let Some(parent) = settings_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
-    }
+    create_parent_dirs(repo, &settings_path)?;
 
     let mut existed = settings_path.exists();
     let mut settings = Value::object();
@@ -468,6 +533,7 @@ pub(crate) fn ensure_settings_hook(repo: &Path) -> Result<DeployAction, String> 
             // and start fresh, exactly like the Python flow.
             _ => {
                 let backup = settings_path.with_extension("json.bak");
+                ensure_no_symlink_in_path(repo, &backup)?;
                 std::fs::rename(&settings_path, &backup)
                     .map_err(|e| format!("{}: {e}", settings_path.display()))?;
                 existed = false;
@@ -503,6 +569,7 @@ pub(crate) fn ensure_settings_hook(repo: &Path) -> Result<DeployAction, String> 
     hooks.set("SessionStart", session_start);
     settings.set("hooks", hooks);
     write_text(
+        repo,
         &settings_path,
         &format!("{}\n", pyjson::dumps_indent2(&settings)),
     )?;
@@ -996,6 +1063,99 @@ mod tests {
             std::fs::read(repo.join(".codex/skills/aethyme/SKILL.md")).unwrap(),
             before_skill
         );
+        std::fs::remove_dir_all(&repo).unwrap();
+    }
+
+    fn outside_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "aethyme-enhance-outside-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn snapshot(dir: &Path) -> Vec<(PathBuf, Vec<u8>, u32)> {
+        use std::os::unix::fs::PermissionsExt;
+        let mut entries: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+                let bytes = std::fs::read(&path).unwrap_or_default();
+                (path, bytes, mode)
+            })
+            .collect();
+        entries.sort();
+        entries
+    }
+
+    #[test]
+    fn deploy_refuses_symlinked_target_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let repo = fixture_repo("symlink-file");
+        let outside = outside_dir("symlink-file");
+        let victim = outside.join("victim");
+        std::fs::write(&victim, "outside content\n").unwrap();
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::create_dir_all(repo.join(".claude/hooks")).unwrap();
+        let link = repo.join(".claude/hooks/aethyme-load-context.sh");
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+        let before = snapshot(&outside);
+
+        let error = deploy(&repo, true).unwrap_err();
+        assert!(
+            error.contains("refusing to write through symlink"),
+            "{error}"
+        );
+        assert!(error.contains("aethyme-load-context.sh"), "{error}");
+        assert_eq!(
+            snapshot(&outside),
+            before,
+            "no bytes or modes change outside"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "outside content\n"
+        );
+        std::fs::remove_dir_all(&repo).unwrap();
+        std::fs::remove_dir_all(&outside).unwrap();
+    }
+
+    #[test]
+    fn deploy_refuses_symlinked_parent_directory() {
+        let repo = fixture_repo("symlink-parent");
+        let outside = outside_dir("symlink-parent");
+        std::fs::create_dir_all(repo.join(".claude")).unwrap();
+        std::os::unix::fs::symlink(&outside, repo.join(".claude/skills")).unwrap();
+
+        let error = deploy(&repo, true).unwrap_err();
+        assert!(
+            error.contains("refusing to write through symlink"),
+            "{error}"
+        );
+        assert!(error.contains(".claude/skills"), "{error}");
+        assert!(
+            snapshot(&outside).is_empty(),
+            "nothing may be written through the linked directory"
+        );
+        std::fs::remove_dir_all(&repo).unwrap();
+        std::fs::remove_dir_all(&outside).unwrap();
+    }
+
+    #[test]
+    fn deploy_through_a_linked_repo_root_still_works() {
+        let repo = fixture_repo("linked-root");
+        let alias = std::env::temp_dir().join(format!(
+            "aethyme-enhance-deploy-linked-root-alias-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&alias);
+        std::os::unix::fs::symlink(&repo, &alias).unwrap();
+        deploy(&alias, true).unwrap();
+        assert!(repo.join(".claude/skills/aethyme/SKILL.md").is_file());
+        let _ = std::fs::remove_file(&alias);
         std::fs::remove_dir_all(&repo).unwrap();
     }
 }
