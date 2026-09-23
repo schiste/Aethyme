@@ -141,19 +141,25 @@ pub enum BrokerError {
     #[error("a session already exists for worktree {0}")]
     WorktreeAlreadyRegistered(String),
 
-    #[error(
-        "planned lease {path:?} overlaps {blocker_kind} lease {blocker_path:?} held by session {blocker_session_id} ({blocker_status}) at {blocker_worktree:?}\nSafe next actions:\n  {remediation}"
-    )]
-    PlannedLeaseConflict {
-        path: String,
-        blocker_session_id: i64,
-        blocker_path: String,
-        blocker_kind: String,
-        blocker_status: String,
-        blocker_worktree: String,
-        remediation: String,
-    },
+    #[error("{0}")]
+    PlannedLeaseConflict(Box<PlannedLeaseConflict>),
 
     #[error("invalid {field} value in broker db: {value:?}")]
     InvalidEnumValue { field: &'static str, value: String },
+}
+
+/// Detail for [`BrokerError::PlannedLeaseConflict`], boxed so the error enum
+/// stays small on every `Result` path.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "planned lease {path:?} overlaps {blocker_kind} lease {blocker_path:?} held by session {blocker_session_id} ({blocker_status}) at {blocker_worktree:?}\nSafe next actions:\n  {remediation}"
+)]
+pub struct PlannedLeaseConflict {
+    pub path: String,
+    pub blocker_session_id: i64,
+    pub blocker_path: String,
+    pub blocker_kind: String,
+    pub blocker_status: String,
+    pub blocker_worktree: String,
+    pub remediation: String,
 }

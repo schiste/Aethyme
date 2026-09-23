@@ -182,7 +182,7 @@ pub use delivery::{
     DELIVERY_OUTBOX_SCHEMA_VERSION, DeliveryClaimReport, DeliveryCompletion, DeliveryEnvelope,
     DeliveryError, DeliveryOutboxItem, DeliveryPolicy, DeliveryStatus, DeliverySubscription,
 };
-pub use error::BrokerError;
+pub use error::{BrokerError, PlannedLeaseConflict};
 pub use exposures::{
     AdvisoryReconciliationItem, EXPOSURE_RECONCILIATION_SCHEMA_VERSION,
     ExposureReconciliationApplyReport, ExposureReconciliationPlan, ExposureRemainingItem,

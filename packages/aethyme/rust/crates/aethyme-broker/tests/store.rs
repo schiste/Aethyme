@@ -251,7 +251,7 @@ fn session_registration_and_planned_leases_rollback_as_one_transaction() {
             &["docs/new.md".into(), "generated/policy.md".into()],
         )
         .unwrap_err();
-    assert!(matches!(error, BrokerError::PlannedLeaseConflict { .. }));
+    assert!(matches!(error, BrokerError::PlannedLeaseConflict(_)));
     assert!(
         store
             .session_for_worktree("/repo/.aethyme/worktrees/second")

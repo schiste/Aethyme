@@ -4122,15 +4122,17 @@ impl Broker {
                 .conflicts
                 .first()
                 .expect("conflicting path has at least one blocker");
-            return Err(BrokerError::PlannedLeaseConflict {
-                path: path.path.clone(),
-                blocker_session_id: blocker.session_id,
-                blocker_path: blocker.path.clone(),
-                blocker_kind: blocker.kind.as_str().to_string(),
-                blocker_status: blocker.owner_status.as_str().to_string(),
-                blocker_worktree: blocker.owner_worktree.clone(),
-                remediation: blocker.safe_next_actions.join("\n  "),
-            }
+            return Err(BrokerError::PlannedLeaseConflict(Box::new(
+                crate::error::PlannedLeaseConflict {
+                    path: path.path.clone(),
+                    blocker_session_id: blocker.session_id,
+                    blocker_path: blocker.path.clone(),
+                    blocker_kind: blocker.kind.as_str().to_string(),
+                    blocker_status: blocker.owner_status.as_str().to_string(),
+                    blocker_worktree: blocker.owner_worktree.clone(),
+                    remediation: blocker.safe_next_actions.join("\n  "),
+                },
+            ))
             .into());
         }
         Ok(())

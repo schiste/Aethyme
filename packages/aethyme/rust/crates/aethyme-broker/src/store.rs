@@ -5824,15 +5824,17 @@ fn validate_planned_lease_conflicts(
                 path,
             )
             .join("\n  ");
-            return Err(BrokerError::PlannedLeaseConflict {
-                path: path.clone(),
-                blocker_session_id: blocker.session_id,
-                blocker_path: blocker.path.clone(),
-                blocker_kind: blocker.kind.as_str().to_string(),
-                blocker_status,
-                blocker_worktree,
-                remediation,
-            });
+            return Err(BrokerError::PlannedLeaseConflict(Box::new(
+                crate::error::PlannedLeaseConflict {
+                    path: path.clone(),
+                    blocker_session_id: blocker.session_id,
+                    blocker_path: blocker.path.clone(),
+                    blocker_kind: blocker.kind.as_str().to_string(),
+                    blocker_status,
+                    blocker_worktree,
+                    remediation,
+                },
+            )));
         }
     }
     Ok(())
