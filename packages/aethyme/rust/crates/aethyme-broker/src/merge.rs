@@ -703,6 +703,14 @@ impl Broker {
         if let Some(decision) = crate::contract_check::parse_contract_decision(&pending_messages) {
             verification_message.push_str("\n\nContract decision: ");
             verification_message.push_str(decision.label());
+            // The contract gate reads this commit, not the session's. Dropping
+            // the justification made a justified `none` unpassable here.
+            if let Some(reason) =
+                crate::contract_check::parse_contract_justification(&pending_messages)
+            {
+                verification_message.push_str("\nContract justification: ");
+                verification_message.push_str(&reason);
+            }
         }
         let merge_commit = self.repo_handle().commit_tree(
             &simulation.tree,
