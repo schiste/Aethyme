@@ -300,11 +300,53 @@ fn pre_push_blocks_direct_default_branch_updates_and_journals_break_glass() {
     std::fs::write(tmp.path().join("feature.txt"), "two\n").unwrap();
     sh(tmp.path(), &["add", "feature.txt"]);
     sh(tmp.path(), &["commit", "-qm", "feature two"]);
-    let coordinated = Command::new("git")
+    // Exporting the variables is not coordination: the ids must name a
+    // running, non-read operation of that session in the broker journal.
+    let forged = Command::new("git")
         .args(["push", "origin", "HEAD:main"])
         .current_dir(tmp.path())
         .env("AETHYME_BROKER_SESSION_ID", "7")
         .env("AETHYME_BROKER_OPERATION_ID", "11")
+        .output()
+        .unwrap();
+    assert!(
+        !forged.status.success(),
+        "forged coordination ids must not unlock a protected push"
+    );
+
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let session = broker.adopt(tmp.path(), Some("coordinated push")).unwrap();
+    let repository = format!("local:{}", broker.main_root().display());
+    let operation = broker
+        .store()
+        .create_coordinated_operation(&aethyme_broker::NewCoordinatedOperation {
+            session_id: session.id,
+            provider: aethyme_broker::OperationProvider::Git,
+            repository,
+            scope: "repository".into(),
+            effect: aethyme_broker::OperationEffect::Write,
+            authorization_reason: Some("test coordinated push".into()),
+            command_json: r#"["git","push","origin","HEAD:main"]"#.into(),
+            pid: i64::from(std::process::id()),
+            host_operation_id: None,
+            identity_provenance: aethyme_broker::OperationIdentityProvenance::LocalRepository,
+        })
+        .unwrap();
+    broker
+        .store()
+        .transition_coordinated_operation(
+            operation.id,
+            aethyme_broker::OperationStatus::Running,
+            None,
+            None,
+        )
+        .unwrap();
+    drop(broker);
+    let coordinated = Command::new("git")
+        .args(["push", "origin", "HEAD:main"])
+        .current_dir(tmp.path())
+        .env("AETHYME_BROKER_SESSION_ID", session.id.to_string())
+        .env("AETHYME_BROKER_OPERATION_ID", operation.id.to_string())
         .output()
         .unwrap();
     assert!(

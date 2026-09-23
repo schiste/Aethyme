@@ -828,7 +828,10 @@ fn bounded_local_write_timeout_is_failed_without_remote_recovery() {
     let worktree = add_worktree(tmp.path(), "local-timeout");
     let mut broker = Broker::open(tmp.path()).unwrap();
     let session = broker.adopt(&worktree, None).unwrap();
-    let mut command = request(session.id, &["-c", "alias.pause=!sleep 5", "pause"]);
+    // Inline `-c alias.*` is refused for coordinated git, so the slow command
+    // is a repository alias instead.
+    git(tmp.path(), &["config", "alias.pause", "!sleep 5"]);
+    let mut command = request(session.id, &["pause"]);
     command.declared_effect = Some(OperationEffect::Write);
     command.scope = Some("test:local-timeout".into());
 
@@ -1034,6 +1037,7 @@ fn repository_write_lock_serializes_independent_process_clients() {
     let mut broker = Broker::open(tmp.path()).unwrap();
     let session_a = broker.adopt(&worktree_a, None).unwrap();
     let session_b = broker.adopt(&worktree_b, None).unwrap();
+    git(tmp.path(), &["config", "alias.pause", "!sleep 1"]);
 
     let root_a = tmp.path().to_path_buf();
     let root_b = root_a.clone();
@@ -1050,7 +1054,7 @@ fn repository_write_lock_serializes_independent_process_clients() {
                     declared_effect: Some(OperationEffect::Write),
                     destructive_confirmed: false,
                     authorization_reason: Some("concurrency regression".into()),
-                    args: vec!["-c".into(), "alias.pause=!sleep 1".into(), "pause".into()],
+                    args: vec!["pause".into()],
                 })
                 .unwrap()
         })

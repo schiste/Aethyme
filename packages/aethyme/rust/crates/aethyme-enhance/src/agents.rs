@@ -502,7 +502,7 @@ blocked.
    ```
 
    The broker classifies known commands and fails closed on ambiguity. Add
-   `--effect read|write|destructive --scope <resource>` before `--` for an
+   `--effect write|destructive --scope <resource>` before `--` for an
    unrecognized command. Destructive operations also require `--destructive`.
    Every coordinated write requires a concise `--reason` identifying the user
    request or documented workflow that authorized it.
