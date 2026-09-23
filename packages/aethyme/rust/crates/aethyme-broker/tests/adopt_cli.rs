@@ -385,7 +385,7 @@ fn subcommands_that_cannot_honor_a_base_refuse_it() {
     assert!(!output.status.success());
     assert!(
         String::from_utf8_lossy(&output.stderr)
-            .contains("--base is valid only with broker gates scope"),
+            .contains("`--base` is not valid for `broker gates draft`; it applies to:"),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
@@ -394,7 +394,8 @@ fn subcommands_that_cannot_honor_a_base_refuse_it() {
     let output = run(tmp.path(), &["status", "--base", "main"]);
     assert!(!output.status.success());
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("--base is valid only with"),
+        String::from_utf8_lossy(&output.stderr)
+            .contains("`--base` is not valid for `broker status`"),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
@@ -727,7 +728,8 @@ fn subcommands_that_cannot_honor_a_claim_refuse_it() {
         assert!(!output.status.success(), "{args:?} must refuse --claim");
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
-            stderr.contains("--claim is valid only with broker start or broker adopt"),
+            stderr.contains("`--claim` is not valid for")
+                && stderr.contains("it applies to: start, adopt"),
             "{args:?}: {stderr}"
         );
     }
