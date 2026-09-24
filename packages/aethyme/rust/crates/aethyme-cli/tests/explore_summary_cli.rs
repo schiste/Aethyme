@@ -307,9 +307,9 @@ fn graph_free_explore_output_feeds_both_readers() {
         serde_json::from_str(invoke_aethyme(["explore-summary", "--from", &saved_arg]).ok())
             .unwrap();
     assert_eq!(summary["observability"]["readiness"]["status"], "ready");
-    // The defining file dominates the docs page on term coverage and score,
-    // so the complete content search makes it answer-safe.
-    assert_eq!(summary["safe_to_use_as_answer"], true);
+    // Graph-free answer promotion is off until its precision is measured, so
+    // even a dominant defining file stays a navigation hint.
+    assert_eq!(summary["safe_to_use_as_answer"], false);
     assert_eq!(
         summary["trust_policy"]["evidence_level"],
         "source_navigation"
