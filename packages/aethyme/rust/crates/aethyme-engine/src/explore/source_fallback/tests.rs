@@ -515,3 +515,35 @@ fn the_span_is_the_definition_densest_in_request_terms() {
     assert_eq!(refs[0]["line"], 6, "{refs}");
     assert_eq!(refs[0]["symbol"], "invoice_retry_delay", "{refs}");
 }
+
+#[test]
+fn spans_prefer_the_innermost_covering_definition_and_add_a_second() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    git(root, &["init", "-q"]);
+    write(
+        root,
+        "shop/cart.py",
+        "class Cart:\n\
+         \x20   def add(self, item):\n\
+         \x20       self.items.append(item)\n\n\
+         \x20   def apply_discount(self, coupon):\n\
+         \x20       # discount coupon percentage\n\
+         \x20       return coupon.percentage\n\n\
+         \x20   def total(self):\n\
+         \x20       return sum(self.items)\n\n\
+         def coupon_expired(coupon):\n\
+         \x20   return coupon.expires < now()\n",
+    );
+    git(root, &["add", "--all"]);
+    let result = inspect_with(root, "discount coupon", &options());
+    let refs = result.hints[0].evidence["line_refs"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(refs[0]["symbol"], "apply_discount", "{refs:?}");
+    assert!(
+        refs.iter().any(|r| r["symbol"] == "coupon_expired"),
+        "{refs:?}"
+    );
+}

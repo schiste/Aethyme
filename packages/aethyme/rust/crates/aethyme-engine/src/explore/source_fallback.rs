@@ -849,79 +849,99 @@ fn document(file: &ScannedFile, query: &QueryTerms) -> Option<Document> {
 /// later definition bounds it.
 const PASSAGE_FALLBACK_LINES: u32 = 60;
 
-/// The definition whose body best matches the request. Each definition's
-/// line range is a passage scored by BM25 (k1 and b as for files) over the
-/// matched lines it holds, against the file's average definition length, so
-/// a short function dense in request terms beats the class around it. A
-/// one-line definition (found by keyword, without a parser) spans until the
-/// next definition, the end of its enclosing definition, or
-/// [`PASSAGE_FALLBACK_LINES`], whichever comes first.
-fn best_passage<'a>(file: &'a ScannedFile, idf: &[f64]) -> Option<(&'a Definition, u32, f64)> {
+/// Share of the best coverage within which a shorter passage is preferred.
+const PASSAGE_NEAR_BEST: f64 = 0.9;
+/// Passages reported per file.
+const MAX_PASSAGES: usize = 2;
+
+/// The definitions whose name and body cover the most of the request.
+///
+/// A passage's coverage is the idf weight of the distinct request terms on
+/// its matched lines, with terms its name matches counted twice (the name
+/// says what the passage is about). An enclosing class covers everything its
+/// methods do, so among passages within [`PASSAGE_NEAR_BEST`] of the best
+/// coverage the shortest wins: the innermost definition that still holds
+/// the request. The next passage is chosen the same way among those that do
+/// not overlap one already chosen. A one-line definition (found by keyword,
+/// without a parser) spans until the next definition, the end of its
+/// enclosing definition, or [`PASSAGE_FALLBACK_LINES`], whichever is first.
+fn best_passages<'a>(
+    file: &'a ScannedFile,
+    query: &QueryTerms,
+    idf: &[f64],
+) -> Vec<(&'a Definition, u32)> {
     let definitions = &file.definitions;
     if definitions.is_empty() || file.lines.is_empty() {
-        return None;
+        return Vec::new();
     }
-    let spans = definitions
-        .iter()
-        .enumerate()
-        .map(|(index, definition)| {
-            let start = definition.start_line;
-            if definition.end_line > start {
-                return (start, definition.end_line);
-            }
-            // Bounded by the innermost multi-line definition around it.
+    let mut candidates = Vec::new();
+    for (index, definition) in definitions.iter().enumerate() {
+        let start = definition.start_line;
+        let end = if definition.end_line > start {
+            definition.end_line
+        } else {
             let bound = definitions
                 .iter()
                 .filter(|outer| outer.start_line <= start && outer.end_line > start)
                 .map(|outer| outer.end_line)
                 .min()
                 .unwrap_or(start + PASSAGE_FALLBACK_LINES);
-            let next = definitions[index + 1..]
+            definitions[index + 1..]
                 .iter()
                 .map(|next| next.start_line)
                 .find(|&line| line > start)
-                .map_or(bound, |line| line - 1);
-            (start, next.min(bound))
-        })
-        .collect::<Vec<_>>();
-    let average = spans
-        .iter()
-        .map(|(start, end)| f64::from(end - start + 1))
-        .sum::<f64>()
-        / spans.len() as f64;
-    let mut best: Option<(&Definition, u32, f64)> = None;
-    for (definition, &(start, end)) in definitions.iter().zip(&spans) {
+                .map_or(bound, |line| line - 1)
+                .min(bound)
+        };
         let from = file.lines.partition_point(|line| line.line < start);
-        let mut tf = vec![0u32; idf.len()];
-        for line in file.lines[from..]
+        let body = file.lines[from..]
             .iter()
             .take_while(|line| line.line <= end)
-        {
-            for (bit, count) in tf.iter_mut().enumerate() {
-                *count += u32::from(line.mask & (1 << bit) != 0);
-            }
-        }
-        let length = f64::from(end - start + 1);
-        let norm = 1.0 - bm25f::PASSAGE_B + bm25f::PASSAGE_B * length / average.max(1.0);
-        let score = tf
+            .fold(0u32, |mask, line| mask | line.mask);
+        let parts = split_identifier(&definition.name);
+        let name = query
+            .terms
             .iter()
-            .zip(idf)
-            .filter(|(tf, _)| **tf > 0)
-            .map(|(tf, idf)| {
-                let tf = f64::from(*tf);
-                idf * tf * (bm25f::K1 + 1.0) / (tf + bm25f::K1 * norm)
-            })
-            .sum::<f64>();
-        // Ties go to the shorter passage: the innermost definition.
-        let better = best.is_none_or(|(current, current_end, current_score)| {
-            score > current_score
-                || (score == current_score && end - start < current_end - current.start_line)
-        });
-        if score > 0.0 && better {
-            best = Some((definition, end, score));
+            .enumerate()
+            .filter(|(_, term)| parts.iter().any(|part| part_matches(part, &term.stem)))
+            .fold(0u32, |mask, (bit, _)| mask | (1 << bit));
+        let coverage = mask_weight(body | name, idf) + mask_weight(name, idf);
+        if coverage > 0.0 {
+            candidates.push((definition, start, end, coverage));
         }
     }
-    best
+    let mut chosen: Vec<(&Definition, u32, u32)> = Vec::new();
+    while chosen.len() < MAX_PASSAGES {
+        let open = candidates
+            .iter()
+            .filter(|(_, start, end, _)| {
+                chosen
+                    .iter()
+                    .all(|(_, taken_start, taken_end)| end < taken_start || start > taken_end)
+            })
+            .collect::<Vec<_>>();
+        let Some(best) = open.iter().map(|candidate| candidate.3).reduce(f64::max) else {
+            break;
+        };
+        let pick = open
+            .iter()
+            .filter(|candidate| candidate.3 >= best * PASSAGE_NEAR_BEST)
+            .min_by(|a, b| {
+                (a.2 - a.1)
+                    .cmp(&(b.2 - b.1))
+                    .then_with(|| b.3.total_cmp(&a.3))
+                    .then_with(|| a.1.cmp(&b.1))
+            })
+            .copied();
+        let Some(&(definition, start, end, _)) = pick else {
+            break;
+        };
+        chosen.push((definition, start, end));
+    }
+    chosen
+        .into_iter()
+        .map(|(definition, _, end)| (definition, end))
+        .collect()
 }
 
 fn rank(query: &QueryTerms, files: &[ScannedFile]) -> Vec<(AnswerItem, HitSignal)> {
@@ -1005,23 +1025,30 @@ fn rank(query: &QueryTerms, files: &[ScannedFile]) -> Vec<(AnswerItem, HitSignal
                     (start..=end.max(start)).contains(&line)
                 })
             };
-            // The definition whose body is densest in request terms leads,
-            // then the densest window outside it, then the definition whose
-            // name best matches the request.
-            if let Some((definition, end, _)) = best_passage(file, idf) {
-                line_refs.push(serde_json::json!({
+            // The definition that best covers the request leads, then the
+            // densest window outside it, then the next-best definition, then
+            // the definition whose name best matches the request.
+            let passages = best_passages(file, query, idf);
+            let passage_ref = |(definition, end): &(&Definition, u32)| {
+                serde_json::json!({
                     "line": definition.start_line,
                     "end_line": end,
                     "kind": "definition",
                     "symbol": definition.name,
                     "symbol_kind": definition.kind,
-                }));
-            }
+                })
+            };
+            line_refs.extend(passages.first().map(passage_ref));
             if let Some((start, end, _, _)) = window
                 && !(covered(&line_refs, start) && covered(&line_refs, end))
             {
                 line_refs
                     .push(serde_json::json!({"line": start, "end_line": end, "kind": "match"}));
+            }
+            if let Some(second) = passages.get(1)
+                && !covered(&line_refs, second.0.start_line)
+            {
+                line_refs.push(passage_ref(second));
             }
             if let Some(symbol) = &symbol
                 && !covered(&line_refs, symbol.definition.start_line)

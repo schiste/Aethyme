@@ -63,8 +63,6 @@ pub(super) const FIELDS: [FieldParams; FIELD_COUNT] = [
 
 /// Term-frequency saturation.
 pub(super) const K1: f64 = 1.2;
-/// Length normalization for passages (definitions within one file).
-pub(super) const PASSAGE_B: f64 = 0.75;
 
 /// One file's term frequencies and field lengths.
 #[derive(Debug, Clone, Default)]
