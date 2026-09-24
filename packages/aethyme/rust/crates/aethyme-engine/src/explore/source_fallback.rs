@@ -36,6 +36,12 @@ const MAX_LINE_REFS: usize = 3;
 const BM25_K1: f64 = 1.2;
 const BM25_B: f64 = 0.75;
 
+/// Term coverage the top hit needs for the coverage rule of
+/// [`answer_safety`].
+const ANSWER_MIN_COVERAGE: f64 = 0.8;
+/// How far the top hit must out-score hit 2 for the coverage rule.
+const ANSWER_MIN_MARGIN: f64 = 1.5;
+
 pub const DEFAULT_SOURCE_SEARCH_HITS: usize = 8;
 pub const DEFAULT_SOURCE_SEARCH_BUDGET: Duration = Duration::from_millis(2_000);
 
@@ -94,6 +100,93 @@ pub(super) struct SourceFallback {
     pub budget_ms: u64,
     pub max_hits: usize,
     pub symbol_index: IndexStats,
+    /// Whether the top hit is strong enough to be used as an answer.
+    pub answer_safety: AnswerSafety,
+}
+
+/// Ranking facts [`answer_safety`] reads, one per ranked hit.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(super) struct HitSignal {
+    pub score: f64,
+    /// Share of the idf weight of the present request terms the hit matched.
+    pub coverage: f64,
+    /// Separator-free lowercase name of a definition the request named
+    /// exactly (`load_token` for a request mentioning `load token`).
+    pub exact_symbol: Option<String>,
+}
+
+/// The verdict of [`answer_safety`]: `rule` names the rule that held, or
+/// the first reason none did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct AnswerSafety {
+    pub safe: bool,
+    pub rule: &'static str,
+}
+
+impl Default for AnswerSafety {
+    fn default() -> Self {
+        AnswerSafety {
+            safe: false,
+            rule: "no_hits",
+        }
+    }
+}
+
+/// Decide whether the top content-search hit may be used as an answer.
+///
+/// Content search locates where the request's vocabulary is defined or
+/// concentrated; it never proves callers, dependencies or impact. The top
+/// hit is answer-safe only when the search listed and read every file within
+/// its budget and one of two rules holds:
+///
+/// - `exact_symbol_definition`: the top hit defines a symbol whose name the
+///   request spelled out (`load_token`, `loadToken` or `load token`), and no
+///   other ranked hit defines a symbol of the same name;
+/// - `dominant_term_coverage`: the top hit covers at least
+///   [`ANSWER_MIN_COVERAGE`] of the request's present term weight and scores
+///   at least [`ANSWER_MIN_MARGIN`] times hit 2 (or is the only hit).
+///
+/// `signals` is the full ranking, before truncation to the hit count.
+pub(super) fn answer_safety(signals: &[HitSignal], complete: bool) -> AnswerSafety {
+    let unsafe_because = |rule| AnswerSafety { safe: false, rule };
+    if !complete {
+        return unsafe_because("search_incomplete");
+    }
+    let Some(top) = signals.first() else {
+        return unsafe_because("no_hits");
+    };
+    if let Some(name) = &top.exact_symbol {
+        let duplicated = signals[1..]
+            .iter()
+            .any(|other| other.exact_symbol.as_ref() == Some(name));
+        if !duplicated {
+            return AnswerSafety {
+                safe: true,
+                rule: "exact_symbol_definition",
+            };
+        }
+    }
+    if top.coverage < ANSWER_MIN_COVERAGE {
+        return unsafe_because(if top.exact_symbol.is_some() {
+            "ambiguous_symbol_definition"
+        } else {
+            "low_term_coverage"
+        });
+    }
+    let clear_margin = signals
+        .get(1)
+        .is_none_or(|second| top.score >= second.score * ANSWER_MIN_MARGIN);
+    if !clear_margin {
+        return unsafe_because(if top.exact_symbol.is_some() {
+            "ambiguous_symbol_definition"
+        } else {
+            "no_clear_margin"
+        });
+    }
+    AnswerSafety {
+        safe: true,
+        rule: "dominant_term_coverage",
+    }
 }
 
 impl SourceFallback {
@@ -111,6 +204,10 @@ impl SourceFallback {
             "reason": self.incomplete_reason,
             "max_hits": self.max_hits,
             "terms": self.terms,
+            "answer_safety": {
+                "safe": self.answer_safety.safe,
+                "rule": self.answer_safety.rule,
+            },
             "symbol_index": {
                 "cached_files": self.symbol_index.cached_files,
                 "cache_hits": self.symbol_index.hits,
@@ -194,7 +291,8 @@ pub(super) fn inspect_with(
     result.complete = incomplete_reason.is_none();
     result.incomplete_reason = incomplete_reason;
 
-    let mut ranked = rank(&query, &files);
+    let (mut ranked, signals): (Vec<_>, Vec<_>) = rank(&query, &files).into_iter().unzip();
+    result.answer_safety = answer_safety(&signals, result.complete);
     result.truncated = !result.complete || ranked.len() > options.max_hits;
     ranked.truncate(options.max_hits);
     result.hints = ranked;
@@ -638,7 +736,7 @@ fn best_window(lines: &[MatchedLine], idf: &[f64]) -> Option<(u32, u32, u32, f64
     best
 }
 
-fn rank(query: &QueryTerms, files: &[ScannedFile]) -> Vec<AnswerItem> {
+fn rank(query: &QueryTerms, files: &[ScannedFile]) -> Vec<(AnswerItem, HitSignal)> {
     let path_masks = files
         .iter()
         .map(|file| path_term_mask(&file.path, query))
@@ -768,7 +866,15 @@ fn rank(query: &QueryTerms, files: &[ScannedFile]) -> Vec<AnswerItem> {
                 file.role.as_str()
             ));
             let confidence = ((0.25 + 0.45 * coverage) * 100.0).round() / 100.0;
-            AnswerItem {
+            let signal = HitSignal {
+                score,
+                coverage,
+                exact_symbol: symbol
+                    .as_ref()
+                    .filter(|symbol| symbol.exact)
+                    .map(|symbol| split_identifier(&symbol.definition.name).concat()),
+            };
+            let item = AnswerItem {
                 kind: "source_file".into(),
                 target: file.path.clone(),
                 path: Some(file.path.clone()),
@@ -790,294 +896,11 @@ fn rank(query: &QueryTerms, files: &[ScannedFile]) -> Vec<AnswerItem> {
                     })),
                     "line_refs": line_refs,
                 }),
-            }
+            };
+            (item, signal)
         })
         .collect()
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn git(repo: &Path, args: &[&str]) {
-        assert!(
-            Command::new("git")
-                .args(args)
-                .current_dir(repo)
-                .env_remove("GIT_DIR")
-                .env_remove("GIT_WORK_TREE")
-                .env_remove("GIT_INDEX_FILE")
-                .status()
-                .unwrap()
-                .success()
-        );
-    }
-
-    fn write(repo: &Path, path: &str, content: &str) {
-        let full = repo.join(path);
-        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
-        std::fs::write(full, content).unwrap();
-    }
-
-    fn options() -> SourceSearchOptions {
-        SourceSearchOptions {
-            symbol_cache: SymbolCache::Disabled,
-            ..SourceSearchOptions::default()
-        }
-    }
-
-    fn targets(result: &SourceFallback) -> Vec<&str> {
-        result
-            .hints
-            .iter()
-            .map(|hint| hint.target.as_str())
-            .collect()
-    }
-
-    /// A small repository with source, docs, a vendored copy, generated
-    /// output and tests that all mention the same behavior.
-    fn fixture() -> tempfile::TempDir {
-        let repo = tempfile::tempdir().unwrap();
-        let root = repo.path();
-        git(root, &["init", "-q"]);
-        write(
-            root,
-            "src/net/backoff.py",
-            "import random\n\n\
-             def compute_retry_delay(attempt, base=0.5):\n\
-             \x20   \"\"\"Exponential retry delay with jitter.\"\"\"\n\
-             \x20   delay = base * (2 ** attempt)\n\
-             \x20   return delay + random.random()\n",
-        );
-        write(
-            root,
-            "src/net/client.py",
-            "from .backoff import compute_retry_delay\n\n\
-             class Client:\n\
-             \x20   def send(self, request):\n\
-             \x20       return self.transport.send(request)\n",
-        );
-        write(
-            root,
-            "docs/design/retry-delay.md",
-            "# Retry delay design\n\nThe retry delay grows exponentially. Retry delay retry delay.\n\
-             Each retry doubles the delay; the retry delay has jitter.\n",
-        );
-        write(
-            root,
-            "vendor/httplib/retry.py",
-            "def compute_retry_delay(attempt):\n    # retry delay retry delay\n    return attempt\n",
-        );
-        write(
-            root,
-            "src/generated/api_pb2.py",
-            "# Generated by the protocol buffer compiler.  DO NOT EDIT!\n\
-             RETRY_DELAY = 1\nretry_delay_field = 2\n",
-        );
-        write(
-            root,
-            "tests/test_backoff.py",
-            "from src.net.backoff import compute_retry_delay\n\n\
-             def test_retry_delay_grows():\n    assert compute_retry_delay(2) > compute_retry_delay(1)\n",
-        );
-        write(
-            root,
-            "README.md",
-            "# Example\n\nA client with retry delay.\n",
-        );
-        git(root, &["add", "--all"]);
-        repo
-    }
-
-    #[test]
-    fn behavior_request_ranks_the_defining_source_first() {
-        let repo = fixture();
-        let result = inspect_with(repo.path(), "How is the retry delay computed?", &options());
-        assert!(result.complete, "{:?}", result.incomplete_reason);
-        let targets = targets(&result);
-        assert_eq!(targets[0], "src/net/backoff.py", "{targets:?}");
-        let first = &result.hints[0];
-        let line = first.evidence["line_refs"][0]["line"].as_u64().unwrap();
-        assert_eq!(line, 3, "{}", first.evidence);
-    }
-
-    #[test]
-    fn docs_vendored_generated_and_tests_rank_below_source() {
-        let repo = fixture();
-        let result = inspect_with(repo.path(), "retry delay", &options());
-        let targets = targets(&result);
-        let position = |path: &str| targets.iter().position(|target| *target == path);
-        let source = position("src/net/backoff.py").expect("source present");
-        for other in [
-            "docs/design/retry-delay.md",
-            "vendor/httplib/retry.py",
-            "src/generated/api_pb2.py",
-            "tests/test_backoff.py",
-        ] {
-            if let Some(other_position) = position(other) {
-                assert!(
-                    source < other_position,
-                    "{other} outranks source: {targets:?}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn symbol_definition_match_ranks_its_file_first() {
-        let repo = tempfile::tempdir().unwrap();
-        let root = repo.path();
-        git(root, &["init", "-q"]);
-        write(
-            root,
-            "app/session.ts",
-            "export class SessionStore {\n  refreshAccessToken(): void {}\n}\n",
-        );
-        // Mentions the words more often, but defines nothing by that name.
-        write(
-            root,
-            "app/notes.ts",
-            "// refresh the access token: refresh access token, token refresh\n\
-             const refreshCount = 1; // access token refresh token access\n",
-        );
-        git(root, &["add", "--all"]);
-        let result = inspect_with(root, "where is refreshAccessToken", &options());
-        assert_eq!(
-            targets(&result)[0],
-            "app/session.ts",
-            "{:#?}",
-            result
-                .hints
-                .iter()
-                .map(|hint| &hint.evidence)
-                .collect::<Vec<_>>()
-        );
-        let first = &result.hints[0];
-        assert_eq!(first.evidence["symbol_match"]["name"], "refreshAccessToken");
-        assert_eq!(first.evidence["symbol_match"]["exact"], true);
-        assert_eq!(first.evidence["line_refs"][0]["line"], 2);
-    }
-
-    #[test]
-    fn untracked_files_are_searched_but_ignored_hidden_and_symlinked_files_are_not() {
-        let repo = tempfile::tempdir().unwrap();
-        let root = repo.path();
-        git(root, &["init", "-q"]);
-        write(root, "storage.rs", "fn cleanup_cache() {}\n");
-        write(root, ".gitignore", "ignored.rs\n");
-        write(root, "ignored.rs", "fn cleanup_cache() {}\n");
-        write(root, ".env", "cleanup cache secret\n");
-        #[cfg(unix)]
-        std::os::unix::fs::symlink("/etc/passwd", root.join("cleanup.rs")).unwrap();
-        git(root, &["add", "storage.rs", ".gitignore"]);
-        write(root, "later.rs", "fn cleanup_cache_later() {}\n");
-        let result = inspect_with(root, "where is cleanup cache", &options());
-        let targets = targets(&result);
-        assert!(targets.contains(&"storage.rs"), "{targets:?}");
-        assert!(targets.contains(&"later.rs"), "{targets:?}");
-        for excluded in [".env", "ignored.rs", "cleanup.rs", ".gitignore"] {
-            assert!(
-                !targets.contains(&excluded),
-                "{excluded} leaked: {targets:?}"
-            );
-        }
-        for hint in &result.hints {
-            assert_eq!(hint.evidence["graph_available"], false);
-        }
-    }
-
-    #[test]
-    fn fallback_envelope_is_navigation_not_graph_evidence() {
-        let repo = fixture();
-        let envelope = super::super::graph_unavailable_response(
-            repo.path(),
-            "retry delay",
-            "task_localization_query",
-            "test",
-            "missing",
-            "fixture".into(),
-        );
-        assert!(!envelope.safe_to_use_as_answer);
-        assert!(envelope.safe_to_use_as_navigation);
-        assert!(envelope.answer.is_empty());
-        assert!(!repo.path().join(".aethyme").exists());
-        let observability = envelope.observability.as_ref().unwrap();
-        assert_eq!(observability["readiness"]["status"], "ready");
-        assert_eq!(observability["source_fallback"]["complete"], true);
-        assert!(observability["source_fallback"]["reason"].is_null());
-        let json = serde_json::to_value(&envelope).unwrap();
-        let targets = json["subsystems"][0]["top_verification_targets"]
-            .as_array()
-            .unwrap();
-        assert_eq!(targets[0]["path"], "src/net/backoff.py");
-    }
-
-    #[test]
-    fn missing_repository_has_no_claims() {
-        let repo = tempfile::tempdir().unwrap();
-        let result = inspect(&repo.path().join("missing"), "cleanup");
-        assert!(result.hints.is_empty());
-    }
-
-    #[test]
-    fn non_git_directories_are_walked() {
-        let repo = tempfile::tempdir().unwrap();
-        write(
-            repo.path(),
-            "lib/queue.rb",
-            "class JobQueue\n  def drain; end\nend\n",
-        );
-        write(repo.path(), ".hidden/queue.rb", "class JobQueue; end\n");
-        let result = inspect_with(repo.path(), "job queue drain", &options());
-        assert_eq!(result.listing, "filesystem");
-        assert_eq!(targets(&result), ["lib/queue.rb"]);
-    }
-
-    #[test]
-    fn exhausted_budget_is_reported_as_incomplete() {
-        let repo = fixture();
-        let result = inspect_with(
-            repo.path(),
-            "retry delay",
-            &SourceSearchOptions {
-                budget: Duration::ZERO,
-                ..options()
-            },
-        );
-        assert!(!result.complete);
-        assert_eq!(result.incomplete_reason, Some("time_budget_exhausted"));
-        assert!(result.truncated);
-        assert!(result.observability()["complete"] == false);
-    }
-
-    #[test]
-    fn hit_count_is_configurable_and_ranking_is_deterministic() {
-        let repo = tempfile::tempdir().unwrap();
-        let root = repo.path();
-        git(root, &["init", "-q"]);
-        for index in 0..40 {
-            write(
-                root,
-                &format!("src/cache_{index:02}.rs"),
-                &format!("fn cache_{index}() {{ /* cache */ }}\n"),
-            );
-        }
-        git(root, &["add", "--all"]);
-        let first = inspect_with(root, "cache", &options());
-        let second = inspect_with(root, "cache", &options());
-        assert!(first.complete);
-        assert_eq!(first.scanned_files, 40);
-        assert_eq!(first.hints.len(), DEFAULT_SOURCE_SEARCH_HITS);
-        assert!(first.truncated);
-        assert_eq!(targets(&first), targets(&second));
-        let three = inspect_with(
-            root,
-            "cache",
-            &SourceSearchOptions {
-                max_hits: 3,
-                ..options()
-            },
-        );
-        assert_eq!(three.hints.len(), 3);
-    }
-}
+mod tests;

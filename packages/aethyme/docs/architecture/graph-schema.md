@@ -549,7 +549,7 @@ Bridge decisions as of 2026-07-17:
 V2 correctness and performance gates:
 
 - Tiny read-API gates live in
-  `rust/crates/aethyme-engine/src/store/redb/graph_store.rs` and cover
+  `rust/crates/aethyme-engine/src/store/redb/graph_store/tests/reads.rs` and cover
   `get_node`, `get_nodes`, `node_display`, `area_for_node`, `find_symbols`,
   `symbols_matching`, `symbols_matching_with`, `nodes_under_path`,
   `functions_under_path`, `resolve_file_path`, `neighbors`, `children`,

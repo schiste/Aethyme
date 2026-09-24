@@ -307,7 +307,13 @@ fn graph_free_explore_output_feeds_both_readers() {
         serde_json::from_str(invoke_aethyme(["explore-summary", "--from", &saved_arg]).ok())
             .unwrap();
     assert_eq!(summary["observability"]["readiness"]["status"], "ready");
-    assert_eq!(summary["safe_to_use_as_answer"], false);
+    // The defining file dominates the docs page on term coverage and score,
+    // so the complete content search makes it answer-safe.
+    assert_eq!(summary["safe_to_use_as_answer"], true);
+    assert_eq!(
+        summary["trust_policy"]["evidence_level"],
+        "source_navigation"
+    );
     assert_eq!(
         summary["top_verification_targets"][0]["path"], "src/billing/invoice.py",
         "{summary}"
