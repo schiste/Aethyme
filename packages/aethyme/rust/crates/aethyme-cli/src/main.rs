@@ -630,9 +630,6 @@ Graph and analysis:
 
 Quality:
   quality inspect [--repo <path>] bounded optional repository-quality analysis
-  ai-ready [--repo <path>]    legacy quality scorecard alias (deprecated)
-  autofix <path> [--dry-run|--apply|--pr]
-                              safe automated fixes
 
 Deprecated spellings still work and print one warning line on stderr.
 ";

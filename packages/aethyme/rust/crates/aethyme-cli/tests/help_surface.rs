@@ -21,6 +21,10 @@ fn top_level_help_names_the_normal_broker_lifecycle() {
     ] {
         assert!(help.contains(command), "help omitted {command:?}\n{help}");
     }
+    // Still commands (each answers its own --help), but not front-door ones.
+    for hidden in ["ai-ready", "autofix"] {
+        assert!(!help.contains(hidden), "help lists {hidden:?}\n{help}");
+    }
 }
 
 #[test]
