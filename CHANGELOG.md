@@ -39,6 +39,8 @@ Phase 3 of the recovery plan: Explore works without a graph. No schema bump
 
 ## [0.8.2] - 2026-09-24
 
+**Breaking:** see [UPGRADING.md](UPGRADING.md#v082).
+
 Phase 2 of the recovery plan: broker hardening. No schema bump (42); rollback
 to 0.8.1 is unrestricted.
 
@@ -87,6 +89,8 @@ to 0.8.1 is unrestricted.
 
 ## [0.8.1] - 2026-09-23
 
+**Breaking:** see [UPGRADING.md](UPGRADING.md#v081).
+
 Fixes two regressions from v0.8.0 seen in real use. No schema change (42);
 rollback to 0.8.0 is unrestricted.
 
@@ -103,6 +107,8 @@ rollback to 0.8.0 is unrestricted.
   the resource and resubmit without changing code.
 
 ## [0.8.0] - 2026-09-23
+
+**Breaking:** see [UPGRADING.md](UPGRADING.md#v080).
 
 A correctness and integrity release from the 2026-09-23 audit. It changes
 exit codes and what a submission is judged by, hence the minor bump. The broker
@@ -146,6 +152,8 @@ database schema is unchanged (42), so rollback is unrestricted.
 - This repository no longer commits `.aethyme/graph` fragments.
 
 ## [0.7.25] - 2026-09-22
+
+**Breaking:** see [UPGRADING.md](UPGRADING.md#v0725).
 
 ### Added
 
@@ -221,6 +229,8 @@ database schema is unchanged (42), so rollback is unrestricted.
 
 ## [0.7.23] - 2026-09-19
 
+**Breaking:** see [UPGRADING.md](UPGRADING.md#v0723).
+
 ### Fixed
 
 - Bind preparation-cache deletion to reviewed plans and preserve caches when
@@ -248,6 +258,8 @@ database schema is unchanged (42), so rollback is unrestricted.
 - Retain broker schema 41; no database migration from v0.7.22.
 
 ## [0.7.22] - 2026-09-18
+
+**Breaking:** see [UPGRADING.md](UPGRADING.md#v0722).
 
 ### Changed
 
@@ -331,6 +343,8 @@ This is a maintenance release with no runtime or broker-schema changes from
 v0.7.19.
 
 ## [0.7.19] - 2026-09-16
+
+**Breaking:** see [UPGRADING.md](UPGRADING.md#v0719).
 
 ### Added
 
@@ -617,6 +631,8 @@ v0.7.19.
 
 ## [0.7.18] - 2026-09-12
 
+**Breaking:** see [UPGRADING.md](UPGRADING.md#v0718).
+
 ### Added
 
 - `scripts/adapters/codex-luna-review.sh` performs this repository's routed
@@ -830,6 +846,8 @@ v0.7.19.
 
 ## [0.7.16] - 2026-09-09
 
+**Breaking:** see [UPGRADING.md](UPGRADING.md#v0716).
+
 ### Added
 
 - A session whose work reached the default branch through a provider-side
@@ -898,8 +916,7 @@ v0.7.19.
 
 ### Upgrade notes
 
-Read [Upgrading to v0.7.14](packages/aethyme/docs/guides/upgrading-to-v0.7.14.md)
-before updating. Broker storage, repository deployment, engine protocol, graph
+Broker storage, repository deployment, engine protocol, graph
 cache schemas, and the generated agent policy are unchanged from v0.7.13.
 
 ## [0.7.13] - 2026-09-07
@@ -913,8 +930,7 @@ cache schemas, and the generated agent policy are unchanged from v0.7.13.
 
 ### Upgrade notes
 
-Read [Upgrading to v0.7.13](packages/aethyme/docs/guides/upgrading-to-v0.7.13.md)
-before updating. This release changes maintainer documentation only. Broker
+This release changes maintainer documentation only. Broker
 storage, repository deployment, engine protocol, graph cache schemas, and the
 generated agent policy are unchanged from v0.7.12.
 
@@ -940,8 +956,7 @@ generated agent policy are unchanged from v0.7.12.
 
 ### Upgrade notes
 
-Read [Upgrading to v0.7.12](packages/aethyme/docs/guides/upgrading-to-v0.7.12.md)
-before updating. Broker storage, repository deployment, engine protocol, and
+Broker storage, repository deployment, engine protocol, and
 graph cache schemas are unchanged from v0.7.11. The generated policy changes, so
 `aethyme enhance deploy` will rewrite `AGENTS.md` and `CLAUDE.md` in enrolled
 repositories.
@@ -975,8 +990,7 @@ repositories.
 
 ### Upgrade notes
 
-Read [Upgrading to v0.7.11](packages/aethyme/docs/guides/upgrading-to-v0.7.11.md)
-before updating. Broker storage, repository deployment, engine protocol, and
+Broker storage, repository deployment, engine protocol, and
 graph cache schemas are unchanged from v0.7.10.
 
 ## [0.7.10] - 2026-09-06
@@ -1017,11 +1031,12 @@ graph cache schemas are unchanged from v0.7.10.
 
 ### Upgrade notes
 
-Read [Upgrading to v0.7.10](packages/aethyme/docs/guides/upgrading-to-v0.7.10.md)
-before updating. Broker storage, repository deployment, engine protocol, and
+Broker storage, repository deployment, engine protocol, and
 graph cache schemas are unchanged from v0.7.9.
 
 ## [0.7.9] - 2026-09-06
+
+**Breaking:** see [UPGRADING.md](UPGRADING.md#v079).
 
 ### Added
 
@@ -1038,13 +1053,15 @@ graph cache schemas are unchanged from v0.7.9.
 
 ### Upgrade notes
 
-Read [Upgrading to v0.7.9](packages/aethyme/docs/guides/upgrading-to-v0.7.9.md)
+Read [UPGRADING.md](UPGRADING.md#v079)
 before updating. Broker storage moves from schema 30 to schema 31, and the
 migration is applied in place the first time a v0.7.9 binary opens the database.
 Earlier releases cannot read a migrated database, so upgrade every Aethyme
 installation that shares a repository together.
 
 ## [0.7.8] - 2026-09-06
+
+**Breaking:** see [UPGRADING.md](UPGRADING.md#v078).
 
 ### Added
 
@@ -1107,7 +1124,7 @@ installation that shares a repository together.
 
 ### Upgrade notes
 
-Read [Upgrading to v0.7.8](packages/aethyme/docs/guides/upgrading-to-v0.7.8.md)
+Read [UPGRADING.md](UPGRADING.md#v078)
 before updating. Broker storage moves from schema 28 to schema 30, and the
 migration is applied in place the first time a v0.7.8 binary opens the database.
 Earlier releases cannot read a migrated database, so upgrade every Aethyme
@@ -1124,8 +1141,7 @@ installation that shares a repository together.
 
 ### Upgrade notes
 
-Read [Upgrading to v0.7.7](packages/aethyme/docs/guides/upgrading-to-v0.7.7.md)
-before updating. Broker storage, repository deployment, engine protocol, and
+Broker storage, repository deployment, engine protocol, and
 graph cache schemas are unchanged from v0.7.6.
 
 ## [0.7.6] - 2026-09-04
@@ -1162,8 +1178,7 @@ graph cache schemas are unchanged from v0.7.6.
 
 ### Upgrade notes
 
-Read [Upgrading to v0.7.6](packages/aethyme/docs/guides/upgrading-to-v0.7.6.md)
-before updating. Broker storage, repository deployment, and engine protocol are
+Broker storage, repository deployment, and engine protocol are
 unchanged from v0.7.5. Graph support remains opt-in.
 
 ## [0.7.5] - 2026-09-04
@@ -1188,11 +1203,12 @@ unchanged from v0.7.5. Graph support remains opt-in.
 
 ### Upgrade notes
 
-Read [Upgrading to v0.7.5](packages/aethyme/docs/guides/upgrading-to-v0.7.5.md)
-before updating. Broker storage, repository deployment, and engine protocol are
+Broker storage, repository deployment, and engine protocol are
 unchanged from v0.7.4, and graph support stays off unless a repository enrolls.
 
 ## [0.7.4] - 2026-09-04
+
+**Breaking:** see [UPGRADING.md](UPGRADING.md#v074).
 
 ### Added
 
@@ -1238,7 +1254,7 @@ unchanged from v0.7.4, and graph support stays off unless a repository enrolls.
 
 ### Upgrade notes
 
-Read [Upgrading to v0.7.4](packages/aethyme/docs/guides/upgrading-to-v0.7.4.md)
+Read [UPGRADING.md](UPGRADING.md#v074)
 before updating. Broker storage, repository deployment, and engine protocol
 remain unchanged from v0.7.3. The GC plan schema moves from 1 to 2, so an
 outstanding `.aethyme/gc-journal.json` written by an earlier version is
@@ -1265,11 +1281,12 @@ refused; complete or remove it before upgrading.
 
 ### Upgrade notes
 
-Read [Upgrading to v0.7.3](packages/aethyme/docs/guides/upgrading-to-v0.7.3.md)
-before updating. Broker storage, repository deployment, and engine protocol
+Broker storage, repository deployment, and engine protocol
 remain unchanged from v0.7.2.
 
 ## [0.7.2] - 2026-09-02
+
+**Breaking:** see [UPGRADING.md](UPGRADING.md#v072).
 
 ### Added
 
@@ -1298,11 +1315,13 @@ remain unchanged from v0.7.2.
 
 ### Upgrade notes
 
-Read [Upgrading to v0.7.2](packages/aethyme/docs/guides/upgrading-to-v0.7.2.md)
+Read [UPGRADING.md](UPGRADING.md#v072)
 before updating. Broker storage migrates from schema 25 to 28; repository
 deployment and engine protocol remain unchanged.
 
 ## [0.7.1] - 2026-09-01
+
+**Breaking:** see [UPGRADING.md](UPGRADING.md#v071).
 
 ### Added
 
@@ -1332,7 +1351,7 @@ deployment and engine protocol remain unchanged.
 
 ### Upgrade notes
 
-Read [Upgrading to v0.7.1](packages/aethyme/docs/guides/upgrading-to-v0.7.1.md)
+Read [UPGRADING.md](UPGRADING.md#v071)
 before updating. Broker storage migrates from schema 24 to 25; repository
 deployment and engine protocol remain unchanged.
 
@@ -1365,8 +1384,7 @@ deployment and engine protocol remain unchanged.
 
 ### Upgrade notes
 
-Read [Upgrading to v0.7.0](packages/aethyme/docs/guides/upgrading-to-v0.7.0.md)
-before updating. Broker storage, repository deployment, and engine protocol
+Broker storage, repository deployment, and engine protocol
 schemas are unchanged from v0.6.0; no mandatory migration is required.
 
 ## [0.6.0] - 2026-09-01
@@ -1397,11 +1415,12 @@ schemas are unchanged from v0.6.0; no mandatory migration is required.
 
 ### Upgrade notes
 
-Read [Upgrading to v0.6.0](packages/aethyme/docs/guides/upgrading-to-v0.6.0.md)
-before updating. Broker storage, repository deployment, and engine protocol
+Broker storage, repository deployment, and engine protocol
 schemas are unchanged from v0.5.0; no migration is required.
 
 ## [0.5.0] - 2026-09-01
+
+**Breaking:** see [UPGRADING.md](UPGRADING.md#v050).
 
 ### Added
 
@@ -1438,7 +1457,7 @@ schemas are unchanged from v0.5.0; no migration is required.
 
 ### Upgrade notes
 
-Read [Upgrading to v0.5.0](packages/aethyme/docs/guides/upgrading-to-v0.5.0.md)
+Read [UPGRADING.md](UPGRADING.md#v050)
 before updating. Repository deployment stays at schema 1 and engine protocol
 stays at 1. Broker storage advances to schema 24 and migrates automatically;
 review the rollback limitation before first opening an existing broker database.
@@ -1464,7 +1483,6 @@ review the rollback limitation before first opening an existing broker database.
 
 ### Upgrade notes
 
-Read [Upgrading to v0.4.2](packages/aethyme/docs/guides/upgrading-to-v0.4.2.md).
 Broker storage, engine protocol, and repository deployment schemas are
 unchanged; no repository migration is required.
 
@@ -1481,7 +1499,6 @@ unchanged; no repository migration is required.
 
 ### Upgrade notes
 
-Read [Upgrading to v0.4.1](packages/aethyme/docs/guides/upgrading-to-v0.4.1.md).
 Binary protocols and repository schemas are unchanged from v0.4.0; no
 repository migration is required.
 
@@ -1518,12 +1535,13 @@ repository migration is required.
 
 ### Upgrade notes
 
-Read [Upgrading to v0.4.0](packages/aethyme/docs/guides/upgrading-to-v0.4.0.md)
-before updating. Broker storage remains schema 17, engine protocol remains 1,
+Broker storage remains schema 17, engine protocol remains 1,
 and repository deployment remains schema 1, so v0.3.0 repositories do not
 require a mandatory policy migration.
 
 ## [0.3.0] - 2026-08-27
+
+**Breaking:** see [UPGRADING.md](UPGRADING.md#v030).
 
 ### Added
 
@@ -1563,12 +1581,14 @@ require a mandatory policy migration.
 
 ### Upgrade notes
 
-Read [Upgrading to v0.3.0](packages/aethyme/docs/guides/upgrading-to-v0.3.0.md)
+Read [UPGRADING.md](UPGRADING.md#v030)
 before updating an enrolled repository. This release advances broker storage
 to schema 17. Repository deployment remains schema 1, but regenerated policy
 and onboarding should be reviewed per repository.
 
 ## [0.2.2] - 2026-08-24
+
+**Breaking:** see [UPGRADING.md](UPGRADING.md#v022).
 
 ### Added
 
@@ -1602,7 +1622,7 @@ and onboarding should be reviewed per repository.
 
 ### Upgrade notes
 
-Read [Upgrading to v0.2.2](packages/aethyme/docs/guides/upgrading-to-v0.2.2.md)
+Read [UPGRADING.md](UPGRADING.md#v022)
 before updating an enrolled repository. This release advances broker storage
 to schema 8 and introduces repository deployment schema 1.
 
@@ -1626,10 +1646,12 @@ to schema 8 and introduces repository deployment schema 1.
 
 ### Upgrade notes
 
-Read [Upgrading to v0.2.1](packages/aethyme/docs/guides/upgrading-to-v0.2.1.md)
-for compatibility, verification, rollback, and known-issue guidance.
+There is no broker storage or engine protocol migration from v0.2.0;
+rollback is unrestricted.
 
 ## [0.2.0] - 2026-08-24
+
+**Breaking:** see [UPGRADING.md](UPGRADING.md#v020).
 
 ### Added
 
@@ -1685,7 +1707,7 @@ for compatibility, verification, rollback, and known-issue guidance.
 
 ### Upgrade notes
 
-Read [Upgrading to v0.2.0](packages/aethyme/docs/guides/upgrading-to-v0.2.0.md)
+Read [UPGRADING.md](UPGRADING.md#v020)
 before upgrading an existing broker repository. It covers the paired-binary
 requirement, broker database backup/migration, graph-store regeneration,
 compatibility, rollback, and known issues.
