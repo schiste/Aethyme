@@ -310,11 +310,6 @@ fn ts_relative_import_path_preserved() {
 
 #[test]
 fn ts_imports_coexist_with_other_extractions() {
-    // Plain (non-exported) declarations — the v1 walker only
-    // matches top-level Function/Class statements, not the
-    // ExportNamedDeclaration wrappers around them. Imports use a
-    // separate Statement::ImportDeclaration arm so they aren't
-    // affected by the export-wrapping issue.
     let result = index_source(
         "src/x.ts",
         "import { X } from './x';\n\nfunction f() {}\n\nclass C {}\n",
@@ -323,4 +318,173 @@ fn ts_imports_coexist_with_other_extractions() {
     assert!(kinds.contains(&NodeKind::UnresolvedSymbol));
     assert!(kinds.contains(&NodeKind::Function));
     assert!(kinds.contains(&NodeKind::Class));
+}
+
+// ─── Export-wrapped declarations ────────────────────────────────────
+
+/// `(kind, name, start_line, end_line)` for every defined node,
+/// sorted, so a fixture's expectations read as a table.
+fn definitions(
+    result: &aethyme_graph_indexer::LanguageIndexResult,
+) -> Vec<(NodeKind, String, u32, u32)> {
+    let mut out: Vec<_> = result
+        .additional_nodes
+        .iter()
+        .filter(|n| n.kind() != NodeKind::UnresolvedSymbol)
+        .map(|n| {
+            let range = n.source_range().expect("definition has a source range");
+            (
+                n.kind(),
+                n.name().expect("definition has a name").to_string(),
+                range.start_line(),
+                range.end_line(),
+            )
+        })
+        .collect();
+    out.sort_by(|a, b| (a.2, &a.1).cmp(&(b.2, &b.1)));
+    out
+}
+
+/// Serialized nodes and edges, sorted, for byte-for-byte comparison
+/// of an exported source with its bare equivalent.
+fn serialized(result: &aethyme_graph_indexer::LanguageIndexResult) -> (Vec<String>, Vec<String>) {
+    let mut nodes: Vec<String> = result
+        .additional_nodes
+        .iter()
+        .map(|n| serde_json::to_string(n).unwrap())
+        .collect();
+    let mut edges: Vec<String> = result
+        .additional_edges
+        .iter()
+        .map(|e| serde_json::to_string(e).unwrap())
+        .collect();
+    nodes.sort();
+    edges.sort();
+    (nodes, edges)
+}
+
+const EXPORTED_TS: &str = "\
+export function f(a: number) {
+  return a;
+}
+export class C {
+  m() { return 1; }
+}
+export const x = 1, y = 2;
+export interface I {
+  a: string;
+}
+export type T = string;
+export enum E { A, B }
+export default function g() {
+  return 0;
+}
+";
+
+#[test]
+fn ts_export_wrapped_declarations_are_indexed_at_their_lines() {
+    let result = index_source("src/x.ts", EXPORTED_TS);
+    let expected = vec![
+        (NodeKind::Function, "f".to_string(), 1, 3),
+        (NodeKind::Class, "C".to_string(), 4, 6),
+        (NodeKind::Method, "m".to_string(), 5, 5),
+        (NodeKind::GlobalVariable, "x".to_string(), 7, 7),
+        (NodeKind::GlobalVariable, "y".to_string(), 7, 7),
+        (NodeKind::Interface, "I".to_string(), 8, 10),
+        (NodeKind::TypeAlias, "T".to_string(), 11, 11),
+        (NodeKind::Enum, "E".to_string(), 12, 12),
+        (NodeKind::Function, "g".to_string(), 13, 15),
+    ];
+    assert_eq!(definitions(&result), expected);
+}
+
+#[test]
+fn ts_export_wrapped_declarations_match_their_bare_forms() {
+    let bare = EXPORTED_TS
+        .replace("export default ", "")
+        .replace("export ", "");
+    assert_eq!(
+        serialized(&index_source("src/x.ts", EXPORTED_TS)),
+        serialized(&index_source("src/x.ts", &bare)),
+    );
+}
+
+#[test]
+fn ts_export_default_class_interface_and_named_expressions_are_indexed() {
+    let cases = [
+        (
+            "export default class D {\n  run() {}\n}\n",
+            vec![
+                (NodeKind::Class, "D".to_string(), 1, 3),
+                (NodeKind::Method, "run".to_string(), 2, 2),
+            ],
+        ),
+        (
+            "export default interface DI {\n  a: string;\n}\n",
+            vec![(NodeKind::Interface, "DI".to_string(), 1, 3)],
+        ),
+        (
+            "export default (function h() {\n  return 1;\n});\n",
+            vec![(NodeKind::Function, "h".to_string(), 1, 3)],
+        ),
+        (
+            "export default (class K {});\n",
+            vec![(NodeKind::Class, "K".to_string(), 1, 1)],
+        ),
+    ];
+    for (source, expected) in cases {
+        let result = index_source("src/x.ts", source);
+        assert_eq!(definitions(&result), expected, "source: {source}");
+    }
+}
+
+#[test]
+fn ts_anonymous_default_exports_and_re_exports_define_nothing() {
+    for source in [
+        "export default function () {}\n",
+        "export default class {}\n",
+        "export default 42;\n",
+        "const a = 1;\nexport { a };\n",
+        "export { b } from './b';\n",
+        "export * from './c';\n",
+        "export * as ns from './d';\n",
+    ] {
+        let result = index_source("src/x.ts", source);
+        let defined: Vec<_> = definitions(&result)
+            .into_iter()
+            .filter(|(_, name, _, _)| name != "a")
+            .collect();
+        assert!(defined.is_empty(), "source {source:?} defined {defined:?}");
+    }
+}
+
+#[test]
+fn js_export_wrapped_declarations_are_indexed_at_their_lines() {
+    let source = "\
+export function f() {
+  return 1;
+}
+export class C {
+  m() {}
+}
+export const x = 1;
+export let y;
+export default class D {
+}
+";
+    let result = index_source("src/x.js", source);
+    let expected = vec![
+        (NodeKind::Function, "f".to_string(), 1, 3),
+        (NodeKind::Class, "C".to_string(), 4, 6),
+        (NodeKind::Method, "m".to_string(), 5, 5),
+        (NodeKind::GlobalVariable, "x".to_string(), 7, 7),
+        (NodeKind::GlobalVariable, "y".to_string(), 8, 8),
+        (NodeKind::Class, "D".to_string(), 9, 10),
+    ];
+    assert_eq!(definitions(&result), expected);
+    let bare = source.replace("export default ", "").replace("export ", "");
+    assert_eq!(
+        serialized(&result),
+        serialized(&index_source("src/x.js", &bare)),
+    );
 }
