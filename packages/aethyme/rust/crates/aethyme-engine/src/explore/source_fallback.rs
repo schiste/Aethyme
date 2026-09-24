@@ -36,6 +36,12 @@ const MAX_LINE_REFS: usize = 3;
 const BM25_K1: f64 = 1.2;
 const BM25_B: f64 = 0.75;
 
+/// Term coverage the top hit needs for the coverage rule of
+/// [`answer_safety`].
+const ANSWER_MIN_COVERAGE: f64 = 0.8;
+/// How far the top hit must out-score hit 2 for the coverage rule.
+const ANSWER_MIN_MARGIN: f64 = 1.5;
+
 pub const DEFAULT_SOURCE_SEARCH_HITS: usize = 8;
 pub const DEFAULT_SOURCE_SEARCH_BUDGET: Duration = Duration::from_millis(2_000);
 
@@ -94,6 +100,93 @@ pub(super) struct SourceFallback {
     pub budget_ms: u64,
     pub max_hits: usize,
     pub symbol_index: IndexStats,
+    /// Whether the top hit is strong enough to be used as an answer.
+    pub answer_safety: AnswerSafety,
+}
+
+/// Ranking facts [`answer_safety`] reads, one per ranked hit.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(super) struct HitSignal {
+    pub score: f64,
+    /// Share of the idf weight of the present request terms the hit matched.
+    pub coverage: f64,
+    /// Separator-free lowercase name of a definition the request named
+    /// exactly (`load_token` for a request mentioning `load token`).
+    pub exact_symbol: Option<String>,
+}
+
+/// The verdict of [`answer_safety`]: `rule` names the rule that held, or
+/// the first reason none did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct AnswerSafety {
+    pub safe: bool,
+    pub rule: &'static str,
+}
+
+impl Default for AnswerSafety {
+    fn default() -> Self {
+        AnswerSafety {
+            safe: false,
+            rule: "no_hits",
+        }
+    }
+}
+
+/// Decide whether the top content-search hit may be used as an answer.
+///
+/// Content search locates where the request's vocabulary is defined or
+/// concentrated; it never proves callers, dependencies or impact. The top
+/// hit is answer-safe only when the search listed and read every file within
+/// its budget and one of two rules holds:
+///
+/// - `exact_symbol_definition`: the top hit defines a symbol whose name the
+///   request spelled out (`load_token`, `loadToken` or `load token`), and no
+///   other ranked hit defines a symbol of the same name;
+/// - `dominant_term_coverage`: the top hit covers at least
+///   [`ANSWER_MIN_COVERAGE`] of the request's present term weight and scores
+///   at least [`ANSWER_MIN_MARGIN`] times hit 2 (or is the only hit).
+///
+/// `signals` is the full ranking, before truncation to the hit count.
+pub(super) fn answer_safety(signals: &[HitSignal], complete: bool) -> AnswerSafety {
+    let unsafe_because = |rule| AnswerSafety { safe: false, rule };
+    if !complete {
+        return unsafe_because("search_incomplete");
+    }
+    let Some(top) = signals.first() else {
+        return unsafe_because("no_hits");
+    };
+    if let Some(name) = &top.exact_symbol {
+        let duplicated = signals[1..]
+            .iter()
+            .any(|other| other.exact_symbol.as_ref() == Some(name));
+        if !duplicated {
+            return AnswerSafety {
+                safe: true,
+                rule: "exact_symbol_definition",
+            };
+        }
+    }
+    if top.coverage < ANSWER_MIN_COVERAGE {
+        return unsafe_because(if top.exact_symbol.is_some() {
+            "ambiguous_symbol_definition"
+        } else {
+            "low_term_coverage"
+        });
+    }
+    let clear_margin = signals
+        .get(1)
+        .is_none_or(|second| top.score >= second.score * ANSWER_MIN_MARGIN);
+    if !clear_margin {
+        return unsafe_because(if top.exact_symbol.is_some() {
+            "ambiguous_symbol_definition"
+        } else {
+            "no_clear_margin"
+        });
+    }
+    AnswerSafety {
+        safe: true,
+        rule: "dominant_term_coverage",
+    }
 }
 
 impl SourceFallback {
@@ -111,6 +204,10 @@ impl SourceFallback {
             "reason": self.incomplete_reason,
             "max_hits": self.max_hits,
             "terms": self.terms,
+            "answer_safety": {
+                "safe": self.answer_safety.safe,
+                "rule": self.answer_safety.rule,
+            },
             "symbol_index": {
                 "cached_files": self.symbol_index.cached_files,
                 "cache_hits": self.symbol_index.hits,
@@ -194,7 +291,8 @@ pub(super) fn inspect_with(
     result.complete = incomplete_reason.is_none();
     result.incomplete_reason = incomplete_reason;
 
-    let mut ranked = rank(&query, &files);
+    let (mut ranked, signals): (Vec<_>, Vec<_>) = rank(&query, &files).into_iter().unzip();
+    result.answer_safety = answer_safety(&signals, result.complete);
     result.truncated = !result.complete || ranked.len() > options.max_hits;
     ranked.truncate(options.max_hits);
     result.hints = ranked;
@@ -638,7 +736,7 @@ fn best_window(lines: &[MatchedLine], idf: &[f64]) -> Option<(u32, u32, u32, f64
     best
 }
 
-fn rank(query: &QueryTerms, files: &[ScannedFile]) -> Vec<AnswerItem> {
+fn rank(query: &QueryTerms, files: &[ScannedFile]) -> Vec<(AnswerItem, HitSignal)> {
     let path_masks = files
         .iter()
         .map(|file| path_term_mask(&file.path, query))
@@ -768,7 +866,15 @@ fn rank(query: &QueryTerms, files: &[ScannedFile]) -> Vec<AnswerItem> {
                 file.role.as_str()
             ));
             let confidence = ((0.25 + 0.45 * coverage) * 100.0).round() / 100.0;
-            AnswerItem {
+            let signal = HitSignal {
+                score,
+                coverage,
+                exact_symbol: symbol
+                    .as_ref()
+                    .filter(|symbol| symbol.exact)
+                    .map(|symbol| split_identifier(&symbol.definition.name).concat()),
+            };
+            let item = AnswerItem {
                 kind: "source_file".into(),
                 target: file.path.clone(),
                 path: Some(file.path.clone()),
@@ -790,7 +896,8 @@ fn rank(query: &QueryTerms, files: &[ScannedFile]) -> Vec<AnswerItem> {
                     })),
                     "line_refs": line_refs,
                 }),
-            }
+            };
+            (item, signal)
         })
         .collect()
 }
@@ -987,7 +1094,7 @@ mod tests {
     }
 
     #[test]
-    fn fallback_envelope_is_navigation_not_graph_evidence() {
+    fn strong_fallback_envelope_answers_with_source_navigation_evidence() {
         let repo = fixture();
         let envelope = super::super::graph_unavailable_response(
             repo.path(),
@@ -997,19 +1104,185 @@ mod tests {
             "missing",
             "fixture".into(),
         );
-        assert!(!envelope.safe_to_use_as_answer);
+        assert!(envelope.safe_to_use_as_answer);
         assert!(envelope.safe_to_use_as_navigation);
-        assert!(envelope.answer.is_empty());
+        assert_eq!(envelope.answer.len(), 1);
+        let answer = &envelope.answer[0];
+        assert_eq!(answer.target, "src/net/backoff.py");
+        assert_eq!(answer.status, "content_evidence");
+        assert_eq!(answer.evidence["graph_available"], false);
+        assert!(answer.evidence["answer_rule"].is_string());
+        assert!(
+            envelope
+                .navigation_hints
+                .iter()
+                .all(|hint| hint.target != answer.target)
+        );
+        let policy = &envelope.trust_policy;
+        assert_eq!(policy.trust_policy, "answer_candidate");
+        assert_eq!(policy.evidence_level, "source_navigation");
+        assert!(policy.degraded);
+        assert!(
+            policy.reason.contains("not caller or impact evidence"),
+            "{}",
+            policy.reason
+        );
+        assert_eq!(envelope.status, "degraded");
         assert!(!repo.path().join(".aethyme").exists());
         let observability = envelope.observability.as_ref().unwrap();
         assert_eq!(observability["readiness"]["status"], "ready");
         assert_eq!(observability["source_fallback"]["complete"], true);
         assert!(observability["source_fallback"]["reason"].is_null());
+        assert_eq!(
+            observability["source_fallback"]["answer_safety"]["safe"],
+            true
+        );
         let json = serde_json::to_value(&envelope).unwrap();
         let targets = json["subsystems"][0]["top_verification_targets"]
             .as_array()
             .unwrap();
         assert_eq!(targets[0]["path"], "src/net/backoff.py");
+    }
+
+    #[test]
+    fn incomplete_fallback_envelope_is_navigation_only() {
+        let repo = fixture();
+        let envelope = super::super::graph_unavailable_response_with(
+            repo.path(),
+            "retry delay",
+            "task_localization_query",
+            "test",
+            "missing",
+            "fixture".into(),
+            &SourceSearchOptions {
+                budget: Duration::ZERO,
+                ..options()
+            },
+        );
+        assert!(!envelope.safe_to_use_as_answer);
+        assert!(envelope.answer.is_empty());
+        assert_eq!(envelope.trust_policy.trust_policy, "verify_before_use");
+        assert!(
+            envelope.trust_policy.reason.contains("search_incomplete"),
+            "{}",
+            envelope.trust_policy.reason
+        );
+    }
+
+    fn signal(score: f64, coverage: f64, exact_symbol: Option<&str>) -> HitSignal {
+        HitSignal {
+            score,
+            coverage,
+            exact_symbol: exact_symbol.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn exact_unique_symbol_definition_is_answer_safe() {
+        let signals = [
+            signal(4.0, 0.6, Some("loadtoken")),
+            signal(3.9, 1.0, None),
+            signal(1.0, 0.5, Some("storetoken")),
+        ];
+        assert_eq!(
+            answer_safety(&signals, true),
+            AnswerSafety {
+                safe: true,
+                rule: "exact_symbol_definition"
+            }
+        );
+    }
+
+    #[test]
+    fn dominant_coverage_with_clear_margin_is_answer_safe() {
+        let signals = [signal(6.0, 0.9, None), signal(3.0, 1.0, None)];
+        assert_eq!(answer_safety(&signals, true).rule, "dominant_term_coverage");
+        assert!(answer_safety(&signals, true).safe);
+        assert!(answer_safety(&signals[..1], true).safe, "sole hit");
+    }
+
+    #[test]
+    fn ambiguous_weak_or_incomplete_evidence_is_not_answer_safe() {
+        for (signals, complete, rule) in [
+            (vec![], true, "no_hits"),
+            (vec![], false, "search_incomplete"),
+            (
+                vec![signal(9.0, 1.0, Some("loadtoken"))],
+                false,
+                "search_incomplete",
+            ),
+            (
+                vec![signal(9.0, 1.0, None), signal(1.0, 0.2, None)],
+                false,
+                "search_incomplete",
+            ),
+            (
+                vec![
+                    signal(5.0, 1.0, Some("loadtoken")),
+                    signal(4.8, 1.0, Some("loadtoken")),
+                ],
+                true,
+                "ambiguous_symbol_definition",
+            ),
+            (
+                vec![signal(5.0, 1.0, None), signal(4.0, 1.0, None)],
+                true,
+                "no_clear_margin",
+            ),
+            (
+                vec![signal(9.0, 0.5, None), signal(1.0, 0.5, None)],
+                true,
+                "low_term_coverage",
+            ),
+        ] {
+            let verdict = answer_safety(&signals, complete);
+            assert_eq!(
+                verdict,
+                AnswerSafety { safe: false, rule },
+                "{signals:?} complete={complete}"
+            );
+        }
+    }
+
+    #[test]
+    fn duplicated_symbol_still_answers_on_dominant_coverage() {
+        let signals = [
+            signal(9.0, 1.0, Some("loadtoken")),
+            signal(2.0, 0.7, Some("loadtoken")),
+        ];
+        assert_eq!(answer_safety(&signals, true).rule, "dominant_term_coverage");
+    }
+
+    #[test]
+    fn search_reports_its_answer_safety_verdict() {
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path();
+        git(root, &["init", "-q"]);
+        write(
+            root,
+            "app/session.ts",
+            "export class SessionStore {\n  refreshAccessToken(): void {}\n}\n",
+        );
+        write(root, "app/notes.ts", "// access token notes\n");
+        git(root, &["add", "--all"]);
+        let result = inspect_with(root, "where is refreshAccessToken", &options());
+        assert_eq!(
+            result.answer_safety,
+            AnswerSafety {
+                safe: true,
+                rule: "exact_symbol_definition"
+            }
+        );
+        let incomplete = inspect_with(
+            root,
+            "where is refreshAccessToken",
+            &SourceSearchOptions {
+                budget: Duration::ZERO,
+                ..options()
+            },
+        );
+        assert!(!incomplete.answer_safety.safe);
+        assert_eq!(incomplete.observability()["answer_safety"]["safe"], false);
     }
 
     #[test]

@@ -137,11 +137,11 @@ fn explore(root: &Path, cache: &Path, request: &str) -> (serde_json::Value, Dura
     (serde_json::from_slice(&output.stdout).unwrap(), elapsed)
 }
 
+/// Ranked paths: the answer-safe top hit (if any), then navigation hints.
 fn hint_paths(response: &serde_json::Value) -> Vec<String> {
-    response["navigation_hints"]
-        .as_array()
-        .unwrap()
+    ["answer", "navigation_hints"]
         .iter()
+        .flat_map(|key| response[*key].as_array().unwrap())
         .map(|hint| hint["path"].as_str().unwrap().to_string())
         .collect()
 }
@@ -174,12 +174,19 @@ fn two_thousand_file_repo_is_searched_completely_within_budget_cold_and_warm() {
         assert_eq!(source["complete"], true, "{source}");
         assert!(source["reason"].is_null());
         assert_eq!(response["observability"]["readiness"]["status"], "ready");
-        assert_eq!(response["safe_to_use_as_answer"], false);
+        // The request names `retry_throttle_window`; vendored copies also
+        // defines it, so the exact-symbol rule is ambiguous, but the real
+        // definition dominates on term coverage and score margin.
+        assert_eq!(response["safe_to_use_as_answer"], true);
+        assert_eq!(
+            response["answer"][0]["evidence"]["answer_rule"],
+            "dominant_term_coverage"
+        );
         assert_eq!(response["truncated"], true, "more than 8 files match");
         let paths = hint_paths(response);
         assert_eq!(paths.len(), 8);
         assert_eq!(paths[0], "src/net/limits.py", "{paths:?}");
-        let first = &response["navigation_hints"][0]["evidence"];
+        let first = &response["answer"][0]["evidence"];
         assert_eq!(first["symbol_match"]["name"], "retry_throttle_window");
         assert_eq!(first["line_refs"][0]["line"], 10);
         for (rank, path) in paths.iter().enumerate() {

@@ -947,8 +947,10 @@ pub(super) fn graph_store_explore_error(error: GraphStoreError) -> ExploreError 
 
 /// Build the stable answer-json contract for a repository whose optional
 /// local graph store cannot currently answer. A bounded full-content source
-/// search supplies ranked navigation hints with line spans; it never
-/// supplies caller or impact evidence, so the answer stays unsafe.
+/// search supplies ranked navigation hints with line spans. When its top hit
+/// passes [`source_fallback::answer_safety`] that hit becomes the single
+/// `answer[]` item and `safe_to_use_as_answer` is true; it is still
+/// source-navigation evidence, never caller or impact evidence.
 pub fn graph_unavailable_response(
     repo: &Path,
     request: &str,
@@ -980,10 +982,33 @@ pub fn graph_unavailable_response_with(
     options: &SourceSearchOptions,
 ) -> ExploreResponse {
     let mut fallback = source_fallback::inspect_with(repo, request, options);
-    let hint_count = fallback.hints.len();
     let source_observability = fallback.observability();
-    let hints = std::mem::take(&mut fallback.hints);
+    let mut hints = std::mem::take(&mut fallback.hints);
     let subsystems = std::mem::take(&mut fallback.subsystems);
+    let safety = fallback.answer_safety;
+    let answer = if safety.safe && !hints.is_empty() {
+        let mut top = hints.remove(0);
+        top.status = "content_evidence".into();
+        top.evidence["answer_rule"] = serde_json::json!(safety.rule);
+        vec![top]
+    } else {
+        Vec::new()
+    };
+    let answer_count = answer.len();
+    let hint_count = hints.len();
+    let safe_to_use_as_answer = answer_count > 0;
+    let safe_to_use_as_navigation = answer_count + hint_count > 0;
+    let trust_reason = if safe_to_use_as_answer {
+        format!(
+            "The graph is unavailable. The top source-search hit passed the `{}` content-evidence rule over a complete search: it is source-navigation evidence for where the request is defined, not caller or impact evidence.",
+            safety.rule
+        )
+    } else {
+        format!(
+            "The graph is unavailable. Ranked source-search hints are navigation only (content-evidence rule: `{}`), not caller or impact evidence.",
+            safety.rule
+        )
+    };
     let policy = aethyme_graph_storage::GraphIntegrityPolicy::load(repo);
     let next_action = match policy {
         Ok(policy) if policy.enforces_committed_fragments() => {
@@ -1006,34 +1031,42 @@ pub fn graph_unavailable_response_with(
             raw: request.to_string(),
             parameters: serde_json::json!({}),
         },
-        answer: Vec::new(),
+        confidence: Confidence {
+            overall: answer.first().map(|item| item.confidence),
+            answer_summary: bucket_confidence(&answer),
+            excluded_summary: ConfidenceSummary::default(),
+            analyzed_summary: serde_json::json!({"graph_available": false}),
+        },
+        answer,
         navigation_hints: hints,
         excluded: Vec::new(),
         ambiguous: Vec::new(),
         subsystems,
         evidence: Evidence {
-            answer_count: 0,
+            answer_count,
             navigation_hint_count: hint_count,
             excluded_count: 0,
         },
-        confidence: Confidence {
-            overall: None,
-            answer_summary: ConfidenceSummary::default(),
-            excluded_summary: ConfidenceSummary::default(),
-            analyzed_summary: serde_json::json!({"graph_available": false}),
-        },
-        safe_to_use_as_answer: false,
-        safe_to_use_as_navigation: hint_count > 0,
+        safe_to_use_as_answer,
+        safe_to_use_as_navigation,
         trust_policy: TrustPolicy {
-            safe_to_use_as_answer: false,
-            safe_to_use_as_navigation: hint_count > 0,
-            evidence_level: if hint_count > 0 { "source_navigation" } else { "none" }.into(),
-            authoritative_answer_count: 0,
+            safe_to_use_as_answer,
+            safe_to_use_as_navigation,
+            evidence_level: if safe_to_use_as_navigation {
+                "source_navigation"
+            } else {
+                "none"
+            }
+            .into(),
+            authoritative_answer_count: answer_count,
             navigation_hint_count: hint_count,
             degraded: true,
-            trust_policy: "verify_before_use",
-            reason: "The graph is unavailable. Ranked source-search hints are navigation only, not caller or impact evidence."
-                .into(),
+            trust_policy: if safe_to_use_as_answer {
+                "answer_candidate"
+            } else {
+                "verify_before_use"
+            },
+            reason: trust_reason,
         },
         degraded_reasons: vec![format!("graph_store_{status}")],
         verification_steps: vec![serde_json::json!({
@@ -1041,10 +1074,7 @@ pub fn graph_unavailable_response_with(
             "reason": "Verify the ranked source spans; no graph-backed semantic claims are available"
         })],
         next_actions: vec![next_action.into()],
-        available_specialized_intents: vec![
-            "behavior_localization_query",
-            "usage_boundary_query",
-        ],
+        available_specialized_intents: vec!["behavior_localization_query", "usage_boundary_query"],
         output_chars_estimate: 0,
         truncated: fallback.truncated,
         output_adapters: None,

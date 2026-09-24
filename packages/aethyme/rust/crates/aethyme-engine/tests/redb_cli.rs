@@ -3270,7 +3270,16 @@ fn query_commands_fail_cleanly_and_do_not_create_store_when_missing() {
     assert!(explore.stderr.is_empty());
     let degraded: serde_json::Value = serde_json::from_slice(&explore.stdout).unwrap();
     assert_eq!(degraded["status"], "degraded");
-    assert_eq!(degraded["safe_to_use_as_answer"], false);
+    // Content search may make its top hit answer-safe, but the evidence
+    // stays source navigation: never graph-backed caller or impact claims.
+    assert_eq!(
+        degraded["trust_policy"]["evidence_level"],
+        "source_navigation"
+    );
+    assert_eq!(
+        degraded["safe_to_use_as_answer"],
+        !degraded["answer"].as_array().unwrap().is_empty()
+    );
     assert_eq!(
         degraded["degraded_reasons"],
         serde_json::json!(["graph_store_missing"])
