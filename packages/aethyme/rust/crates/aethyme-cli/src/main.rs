@@ -225,7 +225,10 @@ fn main() -> ExitCode {
     {
         return answer_help(route, &args);
     }
-    let args = resolve_spelling(args);
+    let args = match resolve_spelling(args) {
+        Ok(args) => args,
+        Err(code) => return code,
+    };
     let Some(command) = ParsedCommand::parse(&args) else {
         print_top_level_help(false);
         return ExitCode::from(2);
@@ -688,26 +691,34 @@ fn answer_help(route: help::HelpRoute, args: &[String]) -> ExitCode {
 
 /// Translate deprecated spellings to the ones this binary dispatches, and
 /// print the one-line warning for each (stderr only, so `--json` stays clean).
-fn resolve_spelling(args: Vec<String>) -> Vec<String> {
+///
+/// The broker line is resolved exactly once, here, to the command the broker
+/// will dispatch, so the compatibility preflight classifies that command. A
+/// line resolution refuses (a public verb under `advanced`) never runs.
+fn resolve_spelling(args: Vec<String>) -> Result<Vec<String>, ExitCode> {
     let warn = |old: &str, new: &str| {
         eprintln!("{}", aethyme_broker::cli::deprecation_warning(old, new));
     };
     match args[0].as_str() {
         "broker" => {
             let resolved = aethyme_broker::cli::resolve(&args[1..]);
+            if let Some(refusal) = &resolved.refusal {
+                eprintln!("Error: {refusal}");
+                return Err(ExitCode::from(2));
+            }
             if let Some(deprecation) = &resolved.deprecation {
                 eprintln!("{}", deprecation.warning());
             }
             if resolved.args.is_empty() {
-                return args;
+                return Ok(args);
             }
-            std::iter::once("broker".to_string())
+            Ok(std::iter::once("broker".to_string())
                 .chain(resolved.args)
-                .collect()
+                .collect())
         }
         "readiness" => {
             warn("aethyme readiness", "aethyme broker status readiness");
-            args
+            Ok(args)
         }
         "enhance" => {
             match args.get(1).map(String::as_str) {
@@ -715,9 +726,9 @@ fn resolve_spelling(args: Vec<String>) -> Vec<String> {
                 Some("verify") => warn("aethyme enhance verify", "aethyme deploy verify"),
                 _ => {}
             }
-            args
+            Ok(args)
         }
-        _ => args,
+        _ => Ok(args),
     }
 }
 

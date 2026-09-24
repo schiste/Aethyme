@@ -157,12 +157,13 @@ pub const ADVANCED_VERBS: &[(&str, &str)] = &[
     ),
 ];
 
-/// Internal entry points invoked by installed hook shims and CI. Their
-/// spelling is written into files outside this binary's control, so they
-/// never warn.
+/// Internal entry points invoked by installed hook shims, CI, and other
+/// binaries (`update` runs a staged binary's `broker quick-test`, which may be
+/// older or newer than this one). Their spelling lives outside this binary's
+/// control, so it is permanent: they never warn and are never removed.
 fn is_machine_entry_point(args: &[String]) -> bool {
     match args.first().map(String::as_str) {
-        Some("check-contract") => true,
+        Some("check-contract" | "quick-test") => true,
         Some("hooks") => matches!(
             args.get(1).map(String::as_str),
             Some("pre-commit" | "post-commit" | "pre-push")
@@ -192,6 +193,11 @@ pub struct Resolution {
     pub args: Vec<String>,
     /// Set when the caller used an old spelling.
     pub deprecation: Option<Deprecation>,
+    /// Set when the command line must not run at all: a public verb spelled
+    /// under `advanced`. Refusing it (rather than stripping `advanced`)
+    /// keeps resolution a single step, so the router's compatibility
+    /// classification and the broker's dispatch see the same command.
+    pub refusal: Option<String>,
 }
 
 fn words(prefix: &[&str], rest: &[String]) -> Vec<String> {
@@ -209,14 +215,28 @@ pub fn resolve(args: &[String]) -> Resolution {
         return Resolution {
             args: Vec::new(),
             deprecation: None,
+            refusal: None,
         };
     };
     if first == "advanced" {
         let internal = args[1..].to_vec();
+        if let Some(verb) = internal.first().map(String::as_str)
+            && (verb == "advanced" || PUBLIC_VERBS.iter().any(|(public, _)| *public == verb))
+        {
+            return Resolution {
+                args: internal.clone(),
+                deprecation: None,
+                refusal: Some(format!(
+                    "`{verb}` is not an advanced verb; use 'aethyme broker {}'",
+                    internal.join(" ")
+                )),
+            };
+        }
         let deprecation = old_spelling_replacement(&internal, true);
         return Resolution {
             args: internal,
             deprecation,
+            refusal: None,
         };
     }
     if PUBLIC_VERBS.iter().any(|(verb, _)| *verb == first) {
@@ -228,6 +248,7 @@ pub fn resolve(args: &[String]) -> Resolution {
             return Resolution {
                 args: words(internal, &args[2..]),
                 deprecation: None,
+                refusal: None,
             };
         }
         // `unblock` with nothing to clear lists what could be cleared.
@@ -235,16 +256,19 @@ pub fn resolve(args: &[String]) -> Resolution {
             return Resolution {
                 args: words(&["blockers"], &args[1..]),
                 deprecation: None,
+                refusal: None,
             };
         }
         return Resolution {
             args: args.to_vec(),
             deprecation: None,
+            refusal: None,
         };
     }
     Resolution {
         args: args.to_vec(),
         deprecation: old_spelling_replacement(args, false),
+        refusal: None,
     }
 }
 
@@ -522,6 +546,71 @@ mod tests {
     }
 
     #[test]
+    fn public_verbs_under_advanced_are_refused_not_stripped() {
+        for (line, public) in [
+            ("advanced status doctor --json", "status doctor --json"),
+            (
+                "advanced status readiness recover",
+                "status readiness recover",
+            ),
+            (
+                "advanced submit promote --entry 1",
+                "submit promote --entry 1",
+            ),
+            (
+                "advanced submit prepare --session 1",
+                "submit prepare --session 1",
+            ),
+            ("advanced gc reap", "gc reap"),
+            ("advanced unblock", "unblock"),
+            ("advanced advanced leases", "advanced leases"),
+        ] {
+            let resolved = resolve(&args(line));
+            let refusal = resolved
+                .refusal
+                .unwrap_or_else(|| panic!("{line} should be refused"));
+            assert!(
+                refusal.contains(&format!("use 'aethyme broker {public}'")),
+                "{line}: {refusal}"
+            );
+        }
+    }
+
+    /// The router resolves once and hands the result to the broker, which
+    /// resolves again: both must see the identical command, or the router's
+    /// compatibility classification describes a different command than the
+    /// one that runs.
+    #[test]
+    fn resolution_reaches_its_fixpoint_in_one_step() {
+        let mut corpus: Vec<String> = Vec::new();
+        for (verb, _) in PUBLIC_VERBS.iter().chain(ADVANCED_VERBS) {
+            corpus.push(format!("{verb} --json"));
+            corpus.push(format!("advanced {verb} --json"));
+            for (_, word, _) in MERGED_FORMS {
+                corpus.push(format!("{verb} {word} plan"));
+                corpus.push(format!("advanced {verb} {word} plan"));
+            }
+        }
+        for (_, _, internal) in MERGED_FORMS {
+            corpus.push(internal.join(" "));
+            corpus.push(format!("advanced {}", internal.join(" ")));
+        }
+        for extra in ["adopt --reuse", "start-agent", "blockers", "init", "e2e"] {
+            corpus.push(extra.to_string());
+            corpus.push(format!("advanced {extra}"));
+        }
+        for line in corpus {
+            let once = resolve(&args(&line));
+            if once.refusal.is_some() {
+                continue;
+            }
+            let twice = resolve(&once.args);
+            assert_eq!(twice.args, once.args, "{line}");
+            assert_eq!(twice.refusal, None, "{line}");
+        }
+    }
+
+    #[test]
     fn old_spellings_warn_with_the_new_spelling() {
         for (old, new) in [
             ("adopt --reuse --task t", "aethyme broker start --reuse"),
@@ -584,6 +673,7 @@ mod tests {
             "hooks pre-commit",
             "hooks post-commit",
             "hooks pre-push",
+            "quick-test",
             "check-contract --base main",
             "no-such-verb",
         ] {

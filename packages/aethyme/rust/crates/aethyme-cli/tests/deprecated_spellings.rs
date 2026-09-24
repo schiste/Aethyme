@@ -218,3 +218,66 @@ fn installed_hook_entry_points_never_warn() {
     let output = aethyme(&repo, &["broker", "hooks", "post-commit"]);
     assert!(warnings(&output).is_empty(), "{:?}", warnings(&output));
 }
+
+/// A public verb spelled under `advanced` used to be stripped twice: the
+/// router classified `advanced status doctor` as `status` (a diagnostic read)
+/// while the broker ran `doctor` (a shared mutation), so a repository on a
+/// newer schema refused `broker doctor` but let `advanced status doctor`
+/// through. Those spellings are now refused before the preflight, and each
+/// sub-form is gated exactly like the internal command it runs.
+#[test]
+fn public_verbs_under_advanced_cannot_bypass_the_compatibility_gate() {
+    let tmp = fixture();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir_all(repo.join(".aethyme")).unwrap();
+    std::fs::write(
+        repo.join(".aethyme/repository.json"),
+        "{\"schema_version\":999}\n",
+    )
+    .unwrap();
+
+    for line in [
+        "broker doctor --json",
+        "broker status doctor --json",
+        "broker promote --entry 1 --json",
+        "broker submit promote --entry 1 --json",
+    ] {
+        let args: Vec<&str> = line.split(' ').collect();
+        let output = aethyme(&repo, &args);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "`{line}` must be refused by the compatibility gate: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    for (line, public) in [
+        (
+            "broker advanced status doctor --json",
+            "status doctor --json",
+        ),
+        (
+            "broker advanced status readiness recover --plan x",
+            "status readiness recover --plan x",
+        ),
+        (
+            "broker advanced submit promote --entry 1 --json",
+            "submit promote --entry 1 --json",
+        ),
+        (
+            "broker advanced submit prepare --session 1",
+            "submit prepare --session 1",
+        ),
+    ] {
+        let args: Vec<&str> = line.split(' ').collect();
+        let output = aethyme(&repo, &args);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(2), "`{line}`: {stderr}");
+        assert!(
+            stderr.contains(&format!("use 'aethyme broker {public}'")),
+            "`{line}`: {stderr}"
+        );
+        assert!(output.stdout.is_empty(), "`{line}` printed on stdout");
+    }
+}

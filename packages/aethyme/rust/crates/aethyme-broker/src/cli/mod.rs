@@ -723,6 +723,10 @@ pub fn run_with_mode(args: &[String], mode: CompatibilityMode) -> u8 {
     // internal subcommand that implements them. The router prints the
     // deprecation warning; in-process callers pass internal spellings.
     let resolved = resolve(args);
+    if let Some(refusal) = &resolved.refusal {
+        eprintln!("Error: {refusal}");
+        return crate::exit_status::USAGE;
+    }
     if resolved.args.is_empty() {
         let text = if args.is_empty() {
             surface::public_help()
