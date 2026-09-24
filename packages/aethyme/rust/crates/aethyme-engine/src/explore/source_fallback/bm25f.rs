@@ -94,17 +94,23 @@ impl Document {
 #[derive(Debug, Clone)]
 pub(super) struct Corpus {
     pub idf: Vec<f64>,
-    /// Average length of each field over the documents where it is non-empty
-    /// (a file without definitions says nothing about how many a file that
-    /// has them usually holds).
+    /// Average length of each field over the searched files where it is
+    /// non-empty (a file without definitions says nothing about how many a
+    /// file that has them usually holds).
     pub avg_len: [f64; FIELD_COUNT],
 }
 
 impl Corpus {
-    /// Statistics over `documents`, the files that match some term, out of
-    /// `population` searched files (the rest hold no term).
-    pub fn new(documents: &[Document], terms: usize, population: usize) -> Self {
-        let n = population.max(documents.len()).max(1) as f64;
+    /// Statistics over `documents`, the files that match some term, and
+    /// `lengths`, the field lengths of every searched file (the rest hold no
+    /// term, but they are still part of the collection).
+    ///
+    /// Average lengths come from every searched file, not only the matching
+    /// ones: a large file mentions more terms, so it is overrepresented among
+    /// the matches, and averaging over them alone would raise the average
+    /// and let hub files escape length normalization.
+    pub fn new(documents: &[Document], terms: usize, lengths: &[[f64; FIELD_COUNT]]) -> Self {
+        let n = lengths.len().max(documents.len()).max(1) as f64;
         let idf = (0..terms)
             .map(|term| {
                 let df = documents.iter().filter(|doc| doc.contains(term)).count() as f64;
@@ -113,9 +119,9 @@ impl Corpus {
             .collect();
         let mut avg_len = [1.0; FIELD_COUNT];
         for (field, average) in avg_len.iter_mut().enumerate() {
-            let (sum, count) = documents
+            let (sum, count) = lengths
                 .iter()
-                .map(|doc| doc.len[field])
+                .map(|len| len[field])
                 .filter(|len| *len > 0.0)
                 .fold((0.0, 0usize), |(sum, count), len| (sum + len, count + 1));
             if count > 0 {
@@ -168,6 +174,10 @@ mod tests {
         document
     }
 
+    fn lengths(docs: &[Document]) -> Vec<[f64; FIELD_COUNT]> {
+        docs.iter().map(|doc| doc.len).collect()
+    }
+
     const CODE_ONLY: [f64; FIELD_COUNT] = [1.0, 1.0, 0.0, 100.0, 0.0];
 
     #[test]
@@ -183,7 +193,7 @@ mod tests {
             doc(2, &[(0, Field::Code, 1.0)], CODE_ONLY),
             doc(2, &[(0, Field::Code, 1.0)], CODE_ONLY),
         ];
-        let corpus = Corpus::new(&docs, 2, docs.len());
+        let corpus = Corpus::new(&docs, 2, &lengths(&docs));
         assert!(corpus.idf[1] > corpus.idf[0] * 2.0, "{:?}", corpus.idf);
         assert!(corpus.term_score(&docs[0], 1) > corpus.term_score(&docs[0], 0));
     }
@@ -203,7 +213,7 @@ mod tests {
         );
         let filler = (0..20).map(|_| doc(2, &[], [1.0, 1.0, 0.0, 200.0, 0.0]));
         let docs = [focused, hub].into_iter().chain(filler).collect::<Vec<_>>();
-        let corpus = Corpus::new(&docs, 2, docs.len());
+        let corpus = Corpus::new(&docs, 2, &lengths(&docs));
         assert!(
             corpus.score(&docs[0]) > corpus.score(&docs[1]),
             "focused {} hub {}",
@@ -222,7 +232,7 @@ mod tests {
             doc(1, &[], lens),
             doc(1, &[], lens),
         ];
-        let corpus = Corpus::new(&docs, 1, docs.len());
+        let corpus = Corpus::new(&docs, 1, &lengths(&docs));
         let code = corpus.score(&docs[0]);
         let name = corpus.score(&docs[1]);
         let symbol = corpus.score(&docs[2]);
@@ -237,10 +247,40 @@ mod tests {
             doc(1, &[(0, Field::Code, 100.0)], lens),
             doc(1, &[], lens),
         ];
-        let corpus = Corpus::new(&docs, 1, docs.len());
+        let corpus = Corpus::new(&docs, 1, &lengths(&docs));
         let once = corpus.score(&docs[0]);
         let many = corpus.score(&docs[1]);
         assert!(many > once);
         assert!(many < corpus.idf[0] * (K1 + 1.0), "bounded by idf*(k1+1)");
+    }
+
+    #[test]
+    fn average_length_counts_files_that_match_nothing() {
+        // The hub is the only long file among many short ones. Among the
+        // matching files alone it would set the average itself and escape
+        // length normalization; over the whole collection it is 20x the
+        // average and scores below the short file that is about the term.
+        let short = [1.0, 1.0, 0.0, 50.0, 0.0];
+        let hub_len = [1.0, 1.0, 0.0, 5_000.0, 0.0];
+        let focused = doc(1, &[(0, Field::Code, 2.0)], short);
+        let hub = doc(1, &[(0, Field::Code, 20.0)], hub_len);
+        let docs = vec![focused, hub];
+        let mut population = vec![short, hub_len];
+        population.extend(std::iter::repeat_n(short, 98));
+        let corpus = Corpus::new(&docs, 1, &population);
+        assert!(
+            corpus.avg_len[Field::Code as usize] < 110.0,
+            "{:?}",
+            corpus.avg_len
+        );
+        assert!(
+            corpus.score(&docs[0]) > corpus.score(&docs[1]),
+            "focused {} hub {}",
+            corpus.score(&docs[0]),
+            corpus.score(&docs[1])
+        );
+        // Averaged over the matches only, the hub would win.
+        let matches_only = Corpus::new(&docs, 1, &lengths(&docs));
+        assert!(matches_only.score(&docs[1]) > matches_only.score(&docs[0]));
     }
 }

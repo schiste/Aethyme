@@ -561,21 +561,25 @@ fn scan_file(
     // up with the original lines.
     let lowered = text.to_ascii_lowercase();
     // Most files hold no request term at all: one substring pass each
-    // settles that without per-line work. Such a file has no field lengths
-    // either; averages are taken over the files that match (see `rank`).
+    // settles that without per-line match work. Such a file still counts
+    // toward the collection's average field lengths (see `rank`), so its
+    // tokens are counted.
     if !query
         .terms
         .iter()
         .any(|term| may_contain(&lowered, &term.stem))
     {
+        for raw in text.split_inclusive('\n') {
+            let (line, comment) = searched_line(raw);
+            file.tokens[usize::from(comment)] += token_count(line);
+        }
         return Scan::Searched(Box::new(file));
     }
     // Line table: start offset, end of the searched prefix, comment flag.
     let mut table = Vec::new();
     let mut offset = 0;
     for raw in text.split_inclusive('\n') {
-        let line = truncate_at_char(raw.trim_end_matches(['\n', '\r']), MAX_LINE_BYTES);
-        let comment = is_comment_line(line);
+        let (line, comment) = searched_line(raw);
         file.tokens[usize::from(comment)] += token_count(line);
         table.push((offset, offset + line.len(), comment));
         offset += raw.len();
@@ -625,6 +629,13 @@ fn scan_file(
         file.definitions = index.definitions(path, Stamp::of(&metadata), &text);
     }
     Scan::Searched(Box::new(file))
+}
+
+/// The searched prefix of one raw line (without its line ending) and
+/// whether it is a comment line.
+fn searched_line(raw: &str) -> (&str, bool) {
+    let line = truncate_at_char(raw.trim_end_matches(['\n', '\r']), MAX_LINE_BYTES);
+    (line, is_comment_line(line))
 }
 
 fn truncate_at_char(line: &str, max: usize) -> &str {
@@ -810,10 +821,7 @@ fn document(file: &ScannedFile, query: &QueryTerms) -> Option<Document> {
         return None;
     }
     let mut doc = Document::new(query.terms.len() + query.compounds.len());
-    doc.len[Field::Name as usize] = name_parts.len() as f64;
-    doc.len[Field::Dir as usize] = dir_parts.len() as f64;
-    doc.len[Field::Code as usize] = f64::from(file.tokens[0]);
-    doc.len[Field::Comment as usize] = f64::from(file.tokens[1]);
+    doc.len = field_lengths(file);
     for (bit, term) in query.terms.iter().enumerate() {
         let hits = |parts: &[String]| {
             parts
@@ -828,7 +836,6 @@ fn document(file: &ScannedFile, query: &QueryTerms) -> Option<Document> {
     }
     for definition in &file.definitions {
         let parts = split_identifier(&definition.name);
-        doc.len[Field::Symbol as usize] += parts.len() as f64;
         if parts.len() >= 2 {
             let joined = parts.concat();
             if let Some(index) = query.compounds.iter().position(|c| *c == joined) {
@@ -843,6 +850,25 @@ fn document(file: &ScannedFile, query: &QueryTerms) -> Option<Document> {
         }
     }
     Some(doc)
+}
+
+/// The length of each BM25F field of one scanned file, whether or not it
+/// matches a term. Definitions are parsed only for matching files, so the
+/// symbol field is empty elsewhere and its average (taken over non-empty
+/// fields) stays over the files that have one.
+fn field_lengths(file: &ScannedFile) -> [f64; bm25f::FIELD_COUNT] {
+    let (name_parts, dir_parts) = path_parts(&file.path);
+    let mut len = [0.0; bm25f::FIELD_COUNT];
+    len[Field::Name as usize] = name_parts.len() as f64;
+    len[Field::Dir as usize] = dir_parts.len() as f64;
+    len[Field::Symbol as usize] = file
+        .definitions
+        .iter()
+        .map(|definition| split_identifier(&definition.name).len() as f64)
+        .sum();
+    len[Field::Code as usize] = f64::from(file.tokens[0]);
+    len[Field::Comment as usize] = f64::from(file.tokens[1]);
+    len
 }
 
 /// Lines a one-line (keyword-found) definition is taken to span when no
@@ -949,12 +975,13 @@ fn rank(query: &QueryTerms, files: &[ScannedFile]) -> Vec<(AnswerItem, HitSignal
         .par_iter()
         .filter_map(|file| Some((file, document(file, query)?)))
         .unzip();
-    // Field-length averages come from the files that match at least one
-    // term (the only ones ranked); idf uses every searched file.
+    // Field-length averages and idf come from every searched file, not
+    // only the ones that match a term (the only ones ranked).
+    let lengths = files.par_iter().map(field_lengths).collect::<Vec<_>>();
     let mut corpus = Corpus::new(
         &documents,
         query.terms.len() + query.compounds.len(),
-        files.len(),
+        &lengths,
     );
     // A phrase is rare by construction; it may count as much as matching
     // the request terms it is made of, never more.
