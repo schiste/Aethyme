@@ -1,9 +1,17 @@
 {
+  "Aetower": "~/Repositories/Aetower",
+  "Chau7": "~/Repositories/Chau7",
+  "Mockup": "~/Repositories/Mockup",
   "SP42": "~/Repositories/SP42",
   "XeenRemastered": "~/Repositories/XeenRemastered",
   "aedventure": "~/Repositories/aedventure",
+  "aegowlg": "~/Repositories/aegowlg",
   "aeptus-product-design": "~/Repositories/aeptus-product-design",
   "aerie": "~/Repositories/aerie",
   "blybot": "~/Repositories/blybot",
+  "citogenesis": "~/Repositories/citogenesis",
+  "map-generator": "~/Repositories/map-generator",
+  "safeskills": "~/Repositories/safeskills",
+  "toolhub-evolved": "~/Repositories/toolhub-evolved",
   "website": "~/Repositories/website"
 }
