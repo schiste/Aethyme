@@ -15,6 +15,11 @@
 //! - GlobalVariable (for each VariableDeclarator with a simple
 //!   identifier binding pattern at module scope)
 //!
+//! Each kind is extracted identically whether bare or wrapped in
+//! `export` / `export default` (same node, name and line span).
+//! Anonymous default exports have no name and are skipped.
+//! Specifier-only exports and re-exports define nothing.
+//!
 //! Extracted edges:
 //! - Contains (file → top-level symbol)
 //! - Defines (class → method)
@@ -28,9 +33,10 @@
 
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
-    BindingPattern, Class, ClassElement, Expression, Function as OxcFunction, ImportDeclaration,
-    ImportDeclarationSpecifier, ModuleExportName, Program, PropertyKey, Statement,
-    TSEnumDeclaration, TSInterfaceDeclaration, TSTypeAliasDeclaration,
+    BindingPattern, Class, ClassElement, Declaration, ExportDefaultDeclarationKind, Expression,
+    Function as OxcFunction, ImportDeclaration, ImportDeclarationSpecifier, ModuleExportName,
+    Program, PropertyKey, Statement, TSEnumDeclaration, TSInterfaceDeclaration,
+    TSTypeAliasDeclaration, VariableDeclaration,
 };
 use oxc_parser::Parser;
 use oxc_span::{SourceType as OxcSourceType, Span};
@@ -128,6 +134,26 @@ impl LanguageIndexer for TypeScriptIndexer {
     }
 }
 
+/// Where a top-level walk writes its nodes and edges.
+struct Sink<'s> {
+    repo: &'s str,
+    source_path: &'s str,
+    file_id: &'s NodeId,
+    line_index: &'s LineIndex,
+    nodes: &'s mut Vec<Node>,
+    edges: &'s mut Vec<Edge>,
+}
+
+impl Sink<'_> {
+    fn contains(&mut self, child: NodeId) {
+        self.edges.push(structural_edge(
+            EdgeAttributes::Contains,
+            self.file_id.clone(),
+            child,
+        ));
+    }
+}
+
 fn walk_top_level_statement(
     stmt: &Statement,
     repo: &str,
@@ -137,106 +163,143 @@ fn walk_top_level_statement(
     nodes: &mut Vec<Node>,
     edges: &mut Vec<Edge>,
 ) -> Result<(), LanguageIndexError> {
+    let mut sink = Sink {
+        repo,
+        source_path,
+        file_id,
+        line_index,
+        nodes,
+        edges,
+    };
     match stmt {
-        Statement::FunctionDeclaration(f) => {
-            if let Some(node) = build_function(repo, source_path, f, line_index, true)? {
-                let id = node.id().clone();
-                nodes.push(Node::Function(node));
-                edges.push(structural_edge(
-                    EdgeAttributes::Contains,
-                    file_id.clone(),
-                    id,
-                ));
+        Statement::FunctionDeclaration(f) => index_function(&mut sink, f),
+        Statement::ClassDeclaration(c) => index_class(&mut sink, c),
+        Statement::TSInterfaceDeclaration(i) => index_interface(&mut sink, i),
+        Statement::TSTypeAliasDeclaration(t) => index_type_alias(&mut sink, t),
+        Statement::TSEnumDeclaration(e) => index_enum(&mut sink, e),
+        Statement::VariableDeclaration(v) => index_variables(&mut sink, v),
+        Statement::ExportNamedDeclaration(export) => match &export.declaration {
+            Some(Declaration::FunctionDeclaration(f)) => index_function(&mut sink, f),
+            Some(Declaration::ClassDeclaration(c)) => index_class(&mut sink, c),
+            Some(Declaration::TSInterfaceDeclaration(i)) => index_interface(&mut sink, i),
+            Some(Declaration::TSTypeAliasDeclaration(t)) => index_type_alias(&mut sink, t),
+            Some(Declaration::TSEnumDeclaration(e)) => index_enum(&mut sink, e),
+            Some(Declaration::VariableDeclaration(v)) => index_variables(&mut sink, v),
+            _ => Ok(()),
+        },
+        Statement::ExportDefaultDeclaration(export) => match &export.declaration {
+            ExportDefaultDeclarationKind::FunctionDeclaration(f) => index_function(&mut sink, f),
+            ExportDefaultDeclarationKind::ClassDeclaration(c) => index_class(&mut sink, c),
+            ExportDefaultDeclarationKind::TSInterfaceDeclaration(i) => {
+                index_interface(&mut sink, i)
             }
-        }
-        Statement::ClassDeclaration(c) => {
-            if let Some(class) = build_class(repo, source_path, c, line_index)? {
-                let class_id = class.id().clone();
-                nodes.push(Node::Class(class));
-                edges.push(structural_edge(
-                    EdgeAttributes::Contains,
-                    file_id.clone(),
-                    class_id.clone(),
-                ));
-                for member in &c.body.body {
-                    if let ClassElement::MethodDefinition(m) = member {
-                        let name = property_key_name(&m.key);
-                        if let Some(name) = name {
-                            let method = build_method(
-                                repo,
-                                source_path,
-                                name,
-                                &m.value,
-                                m.r#static,
-                                class_id.clone(),
-                                line_index,
-                                m.span,
-                            )?;
-                            let id = method.id().clone();
-                            nodes.push(Node::Method(method));
-                            edges.push(structural_edge(
-                                EdgeAttributes::Defines,
-                                class_id.clone(),
-                                id,
-                            ));
-                        }
-                    }
-                }
-            }
-        }
-        Statement::TSInterfaceDeclaration(i) => {
-            let iface = build_interface(repo, source_path, i, line_index)?;
-            let id = iface.id().clone();
-            nodes.push(Node::Interface(iface));
-            edges.push(structural_edge(
-                EdgeAttributes::Contains,
-                file_id.clone(),
-                id,
-            ));
-        }
-        Statement::TSTypeAliasDeclaration(t) => {
-            let alias = build_type_alias(repo, source_path, t, line_index)?;
-            let id = alias.id().clone();
-            nodes.push(Node::TypeAlias(alias));
-            edges.push(structural_edge(
-                EdgeAttributes::Contains,
-                file_id.clone(),
-                id,
-            ));
-        }
-        Statement::TSEnumDeclaration(e) => {
-            let en = build_enum(repo, source_path, e, line_index)?;
-            let id = en.id().clone();
-            nodes.push(Node::Enum(en));
-            edges.push(structural_edge(
-                EdgeAttributes::Contains,
-                file_id.clone(),
-                id,
-            ));
-        }
-        Statement::VariableDeclaration(v) => {
-            for decl in &v.declarations {
-                if let BindingPattern::BindingIdentifier(id) = &decl.id {
-                    let global =
-                        build_global(repo, source_path, id.name.as_str(), decl.span, line_index)?;
-                    let global_id = global.id().clone();
-                    nodes.push(Node::GlobalVariable(global));
-                    edges.push(structural_edge(
-                        EdgeAttributes::Contains,
-                        file_id.clone(),
-                        global_id,
-                    ));
-                }
-            }
-        }
-        Statement::ImportDeclaration(imp) => {
-            emit_ts_import_placeholders(repo, source_path, file_id, imp, nodes, edges)?;
-        }
-        _ => {} // other statement kinds are ignored at top level in v1
+            other => match other.as_expression().map(Expression::without_parentheses) {
+                Some(Expression::FunctionExpression(f)) => index_function(&mut sink, f),
+                Some(Expression::ClassExpression(c)) => index_class(&mut sink, c),
+                _ => Ok(()),
+            },
+        },
+        Statement::ImportDeclaration(imp) => emit_ts_import_placeholders(
+            sink.repo,
+            sink.source_path,
+            sink.file_id,
+            imp,
+            sink.nodes,
+            sink.edges,
+        ),
+        _ => Ok(()), // other statement kinds are ignored at top level in v1
+    }
+}
+
+fn index_function(sink: &mut Sink<'_>, f: &OxcFunction) -> Result<(), LanguageIndexError> {
+    if let Some(node) = build_function(sink.repo, sink.source_path, f, sink.line_index, true)? {
+        let id = node.id().clone();
+        sink.nodes.push(Node::Function(node));
+        sink.contains(id);
     }
     Ok(())
 }
 
+fn index_class(sink: &mut Sink<'_>, c: &Class) -> Result<(), LanguageIndexError> {
+    let Some(class) = build_class(sink.repo, sink.source_path, c, sink.line_index)? else {
+        return Ok(());
+    };
+    let class_id = class.id().clone();
+    sink.nodes.push(Node::Class(class));
+    sink.contains(class_id.clone());
+    for member in &c.body.body {
+        if let ClassElement::MethodDefinition(m) = member
+            && let Some(name) = property_key_name(&m.key)
+        {
+            let method = build_method(
+                sink.repo,
+                sink.source_path,
+                name,
+                &m.value,
+                m.r#static,
+                class_id.clone(),
+                sink.line_index,
+                m.span,
+            )?;
+            let id = method.id().clone();
+            sink.nodes.push(Node::Method(method));
+            sink.edges.push(structural_edge(
+                EdgeAttributes::Defines,
+                class_id.clone(),
+                id,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn index_interface(
+    sink: &mut Sink<'_>,
+    i: &TSInterfaceDeclaration,
+) -> Result<(), LanguageIndexError> {
+    let iface = build_interface(sink.repo, sink.source_path, i, sink.line_index)?;
+    let id = iface.id().clone();
+    sink.nodes.push(Node::Interface(iface));
+    sink.contains(id);
+    Ok(())
+}
+
+fn index_type_alias(
+    sink: &mut Sink<'_>,
+    t: &TSTypeAliasDeclaration,
+) -> Result<(), LanguageIndexError> {
+    let alias = build_type_alias(sink.repo, sink.source_path, t, sink.line_index)?;
+    let id = alias.id().clone();
+    sink.nodes.push(Node::TypeAlias(alias));
+    sink.contains(id);
+    Ok(())
+}
+
+fn index_enum(sink: &mut Sink<'_>, e: &TSEnumDeclaration) -> Result<(), LanguageIndexError> {
+    let en = build_enum(sink.repo, sink.source_path, e, sink.line_index)?;
+    let id = en.id().clone();
+    sink.nodes.push(Node::Enum(en));
+    sink.contains(id);
+    Ok(())
+}
+
+fn index_variables(sink: &mut Sink<'_>, v: &VariableDeclaration) -> Result<(), LanguageIndexError> {
+    for decl in &v.declarations {
+        if let BindingPattern::BindingIdentifier(id) = &decl.id {
+            let global = build_global(
+                sink.repo,
+                sink.source_path,
+                id.name.as_str(),
+                decl.span,
+                sink.line_index,
+            )?;
+            let global_id = global.id().clone();
+            sink.nodes.push(Node::GlobalVariable(global));
+            sink.contains(global_id);
+        }
+    }
+    Ok(())
+}
 // ─── Builders ────────────────────────────────────────────────────────
 
 fn build_function(
@@ -247,8 +310,8 @@ fn build_function(
     is_top_level: bool,
 ) -> Result<Option<SchemaFunction>, LanguageIndexError> {
     // Anonymous functions (no id) at the top level are unusual but
-    // legal in TS (e.g. export default function() {}). Skip them in
-    // v1 — they don't have an addressable name.
+    // legal in TS (e.g. export default function() {}). Skip them —
+    // they don't have an addressable name.
     let Some(id) = &f.id else {
         return Ok(None);
     };
