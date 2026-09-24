@@ -1,4 +1,4 @@
-"""Navigation eval: Aethyme Explore vs two ripgrep baselines.
+"""Navigation eval: Aethyme Explore vs three ripgrep baselines.
 
 Used for both the development set (``devset/``) and any held-out set. For
 every question in a questions file this runs
@@ -11,13 +11,22 @@ every question in a questions file this runs
   hit (ties broken by total matching lines, then path);
 * ``bm25``: the same terms searched with ``rg -i --count-matches -F``, files
   ranked by Okapi BM25 (term-frequency saturation ``k1``, document-length
-  normalization ``b``, IDF over every file ``rg --files`` lists in the repo).
+  normalization ``b``, IDF over every file ``rg --files`` lists in the repo);
+* ``bm25plus`` (opt-in via ``--methods``): BM25 over suffix-stemmed terms,
+  restricted to code files, plus an IDF bonus when a term appears in the path.
 
 A question scores recall@k when any accepted answer path is among a method's
 first k distinct paths, and primary recall@k when the answer flagged
-``"primary": true`` is (a missing flag means true). MRR uses the first
-accepted path within the first ``MAX_RANK`` paths. Every proportion carries a
-95% Wilson interval; MRR carries a 95% percentile-bootstrap interval.
+``"primary": true`` is (a missing flag means true). Span recall@k also needs
+one of the method's returned line spans for that path to overlap an accepted
+line range. MRR uses the first hit within the first ``MAX_RANK`` paths. Every
+proportion carries a 95% Wilson interval; MRR carries a 95% percentile-bootstrap
+interval. ``--compare A.json B.json`` pairs two runs (McNemar exact test and a
+paired bootstrap) without running anything.
+
+Explore runs with a run-private symbol-index cache (``AETHYME_HOST_CACHE_DIR``
+pointed at a temp dir; see ``--host-cache``) so results do not depend on what
+other sessions left in the host cache.
 
 Repository roots come from, in order: ``--repo-root NAME=PATH``, a question's
 own ``repo_root``, a ``repos.json`` (``{"name": "path"}``) next to the
@@ -41,6 +50,7 @@ import shutil
 import statistics
 import subprocess
 import sys
+import tempfile
 import time
 from collections.abc import Callable, Iterable
 from pathlib import Path
@@ -54,7 +64,17 @@ EXPLORE_TIMEOUT_SECONDS = 300
 RG_TIMEOUT_SECONDS = 120
 TOP_KS = (1, 3, 5, 8)
 MAX_RANK = 25
-KEPT_PATHS = 10
+# Keep the whole scored list so results can be rescored offline (span overlap,
+# new answer sets) without rerunning every method.
+KEPT_PATHS = MAX_RANK
+# Baselines return files, not spans. For span-overlap scoring a baseline's
+# "span" is what an agent would see first: a +/-SNIPPET_RADIUS window around
+# the SNIPPET_LINES lines that match the most distinct query terms. Only the
+# first SPAN_TOP ranked files get spans (the rest cannot score span@k<=8).
+SPAN_TOP = 8
+SNIPPET_LINES = 3
+SNIPPET_RADIUS = 2
+WHOLE_FILE = (1, 1 << 31)
 Z95 = 1.959963984540054
 BOOTSTRAP_RESAMPLES = 2000
 BM25_K1 = 1.2
@@ -66,7 +86,9 @@ METHODS: dict[str, str] = {
     "explore": "Explore",
     "rg": "naive rg",
     "bm25": "BM25 rg",
+    "bm25plus": "BM25+ rg (stem, code-only, path bonus)",
 }
+DEFAULT_METHODS = ("explore", "rg", "bm25")
 
 STOPWORDS = frozenset(
     """
@@ -166,14 +188,44 @@ def _item_path(item: Any) -> str | None:
     return None
 
 
-def explore_paths(payload: dict[str, Any], repo: Path) -> list[str]:
-    """Ordered, deduplicated paths: answers, navigation hints, then targets."""
+def _item_spans(item: Any) -> list[list[int]]:
+    """Line ranges an Explore item points at: its own range plus evidence line_refs."""
+    if not isinstance(item, dict):
+        return []
+    spans: list[list[int]] = []
+
+    def add(start: Any, end: Any) -> None:
+        if isinstance(start, int) and start > 0:
+            spans.append([start, end if isinstance(end, int) and end >= start else start])
+
+    add(item.get("start_line", item.get("line")), item.get("end_line"))
+    location = item.get("location")
+    if isinstance(location, dict):
+        add(location.get("start_line", location.get("line")), location.get("end_line"))
+    evidence = item.get("evidence")
+    if isinstance(evidence, dict):
+        for ref in evidence.get("line_refs") or []:
+            if isinstance(ref, dict):
+                add(ref.get("line", ref.get("start_line")), ref.get("end_line"))
+    return spans
+
+
+def explore_paths(
+    payload: dict[str, Any], repo: Path, spans: dict[str, list[list[int]]] | None = None
+) -> list[str]:
+    """Ordered, deduplicated paths: answers, navigation hints, then targets.
+
+    When ``spans`` is given it is filled with every line range Explore attached
+    to each path, across all the items that named it.
+    """
     ordered: list[str] = []
 
     def push(item: Any) -> None:
         raw = _item_path(item)
         if raw:
             path = normalize_path(raw, repo)
+            if spans is not None:
+                spans.setdefault(path, []).extend(_item_spans(item))
             if path not in ordered:
                 ordered.append(path)
 
@@ -201,7 +253,9 @@ def answer_rule(observability: dict[str, Any]) -> dict[str, Any] | None:
     return {"safe": bool(safety.get("safe")), "rule": safety.get("rule")}
 
 
-def run_explore(aethyme: str, repo: Path, question: str) -> dict[str, Any]:
+def run_explore(
+    aethyme: str, repo: Path, question: str, env: dict[str, str] | None = None
+) -> dict[str, Any]:
     command = [
         aethyme,
         "explore",
@@ -223,6 +277,7 @@ def run_explore(aethyme: str, repo: Path, question: str) -> dict[str, Any]:
             text=True,
             timeout=EXPLORE_TIMEOUT_SECONDS,
             check=False,
+            env=env,
         )
     except subprocess.TimeoutExpired:
         return {
@@ -230,6 +285,7 @@ def run_explore(aethyme: str, repo: Path, question: str) -> dict[str, Any]:
             "exit_code": None,
             "error": "timeout",
             "paths": [],
+            "spans": {},
         }
     wall = round(time.monotonic() - started, 3)
     result: dict[str, Any] = {"wall_seconds": wall, "exit_code": completed.returncode}
@@ -241,27 +297,47 @@ def run_explore(aethyme: str, repo: Path, question: str) -> dict[str, Any]:
                 "error": "unparseable_output",
                 "stderr_tail": completed.stderr[-2000:],
                 "paths": [],
+                "spans": {},
             }
         )
         return result
     observability = payload.get("observability") or {}
     fallback = observability.get("source_fallback") or {}
+    spans: dict[str, list[list[int]]] = {}
+    paths = explore_paths(payload, repo, spans)
     result.update(
         {
             "status": payload.get("status"),
             "intent": payload.get("intent"),
             "degraded_reasons": payload.get("degraded_reasons"),
             "safe_to_use_as_answer": payload.get("safe_to_use_as_answer"),
+            "truncated": payload.get("truncated"),
+            "output_chars": len(completed.stdout),
             "readiness": observability.get("readiness") or {},
             "source_fallback": {
                 key: fallback.get(key)
-                for key in ("listed_files", "scanned_files", "complete", "reason", "terms")
+                for key in (
+                    "listed_files",
+                    "scanned_files",
+                    "complete",
+                    "reason",
+                    "terms",
+                    "elapsed_ms",
+                    "budget_ms",
+                    "symbol_index",
+                )
             }
             if fallback
             else None,
             "answer_safety": answer_rule(observability),
             "answer_count": len(payload.get("answer") or []),
-            "paths": explore_paths(payload, repo),
+            "answer_paths": [
+                normalize_path(p, repo)
+                for p in (_item_path(item) for item in payload.get("answer") or [])
+                if p
+            ],
+            "paths": paths,
+            "spans": {path: spans.get(path, []) for path in paths[:MAX_RANK]},
         }
     )
     return result
@@ -287,6 +363,47 @@ def _rg_counts(rg: str, repo: Path, term: str, flag: str) -> dict[str, int]:
     return counts
 
 
+def baseline_spans(
+    rg: str, repo: Path, terms: list[str], paths: list[str]
+) -> dict[str, list[list[int]]]:
+    """Snippet windows an agent would see first in each of the top baseline files.
+
+    One ``rg -n`` over the top ``SPAN_TOP`` files; per file, the ``SNIPPET_LINES``
+    lines matching the most distinct terms (earliest first on ties), each widened
+    by ``SNIPPET_RADIUS`` lines.
+    """
+    top = paths[:SPAN_TOP]
+    if not top or not terms:
+        return {}
+    command = [rg, "-n", "-i", "-F", "--no-heading", "--with-filename"]
+    for term in terms:
+        command += ["-e", term]
+    completed = subprocess.run(
+        command + ["--", *top],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        timeout=RG_TIMEOUT_SECONDS,
+        check=False,
+    )
+    density: dict[str, list[tuple[int, int]]] = {}
+    for line in completed.stdout.splitlines():
+        match = re.match(r"^(.*?):(\d+):(.*)$", line)
+        if not match:
+            continue
+        path = normalize_path(match.group(1), repo)
+        text = match.group(3).lower()
+        hits = sum(1 for term in terms if term in text)
+        density.setdefault(path, []).append((hits, int(match.group(2))))
+    spans: dict[str, list[list[int]]] = {}
+    for path, lines in density.items():
+        best = sorted(lines, key=lambda item: (-item[0], item[1]))[:SNIPPET_LINES]
+        spans[path] = [
+            [max(1, number - SNIPPET_RADIUS), number + SNIPPET_RADIUS] for _, number in best
+        ]
+    return spans
+
+
 def run_rg_baseline(rg: str, repo: Path, question: str) -> dict[str, Any]:
     terms = extract_terms(question)
     distinct_hits: dict[str, int] = {}
@@ -302,6 +419,14 @@ def run_rg_baseline(rg: str, repo: Path, question: str) -> dict[str, Any]:
         "wall_seconds": wall,
         "terms": terms,
         "paths": ranked[:MAX_RANK],
+        "spans": baseline_spans(rg, repo, terms, ranked),
+        "ties_at_top": sum(
+            1
+            for p in ranked[1:]
+            if ranked
+            and (distinct_hits[p], total_matches[p])
+            == (distinct_hits[ranked[0]], total_matches[ranked[0]])
+        ),
         "top_scores": [[p, distinct_hits[p], total_matches[p]] for p in ranked[:5]],
         "files_matched": len(ranked),
     }
@@ -359,6 +484,60 @@ def run_bm25_baseline(rg: str, repo: Path, question: str, corpus: Corpus) -> dic
         "wall_seconds": wall,
         "terms": terms,
         "paths": ranked[:MAX_RANK],
+        "spans": baseline_spans(rg, repo, terms, ranked),
+        "top_scores": [[p, round(scores[p], 3)] for p in ranked[:5]],
+        "files_matched": len(ranked),
+    }
+
+
+# The refinements an agent applies after one look at plain rg output: search
+# the word stem, skip prose/data/test files, and notice when a file's path
+# names the concept. Generic on purpose: no repo- or question-specific lists.
+NON_CODE_RE = re.compile(
+    r"(\.(md|mdx|markdown|rst|txt|adoc|html?|json|jsonl|csv|tsv|lock|svg|map|min\.js|log|xml|pdf)$)"
+    r"|(^|/)(docs?|documentation|tests?|__tests__|spec|fixtures?|testdata)/"
+    r"|(^|/)test_[^/]*$|[._-](test|spec)\.[a-z0-9]+$|_test\.[a-z0-9]+$",
+    re.IGNORECASE,
+)
+SUFFIXES = ("ations", "ation", "ings", "ing", "ies", "ied", "ed", "es", "s", "ly")
+
+
+def stem(term: str) -> str:
+    for suffix in SUFFIXES:
+        if term.endswith(suffix) and len(term) - len(suffix) >= 4:
+            return term[: -len(suffix)] + ("y" if suffix in ("ies", "ied") else "")
+    return term
+
+
+def run_bm25_plus_baseline(rg: str, repo: Path, question: str, corpus: Corpus) -> dict[str, Any]:
+    """BM25 over stemmed terms, code files only, plus a path-token bonus."""
+    terms = list(dict.fromkeys(stem(term) for term in extract_terms(question)))
+    code = {path: length for path, length in corpus.lengths.items() if not NON_CODE_RE.search(path)}
+    n = len(code) or 1
+    average = sum(code.values()) / n if code else 1.0
+    scores: dict[str, float] = {}
+    started = time.monotonic()
+    for term in terms:
+        counts = {
+            p: c for p, c in _rg_counts(rg, repo, term, "--count-matches").items() if p in code
+        }
+        in_path = [p for p in code if term in p.lower()]
+        df = len(set(counts) | set(in_path))
+        if not df:
+            continue
+        idf = math.log(1.0 + (n - df + 0.5) / (df + 0.5))
+        for path, tf in counts.items():
+            norm = BM25_K1 * (1.0 - BM25_B + BM25_B * code[path] / average)
+            scores[path] = scores.get(path, 0.0) + idf * tf * (BM25_K1 + 1.0) / (tf + norm)
+        for path in in_path:
+            scores[path] = scores.get(path, 0.0) + idf  # path names the concept
+    wall = round(time.monotonic() - started, 3)
+    ranked = sorted(scores, key=lambda p: (-scores[p], p))
+    return {
+        "wall_seconds": wall,
+        "terms": terms,
+        "paths": ranked[:MAX_RANK],
+        "spans": baseline_spans(rg, repo, terms, ranked),
         "top_scores": [[p, round(scores[p], 3)] for p in ranked[:5]],
         "files_matched": len(ranked),
     }
@@ -374,11 +553,53 @@ def first_rank(paths: list[str], truth: set[str]) -> int | None:
     return None
 
 
-def score(paths: list[str], accepted: set[str], primary: set[str]) -> dict[str, Any]:
-    return {
+def answer_ranges(
+    answers: list[dict[str, Any]], primary_only: bool
+) -> dict[str, list[tuple[int, int]]]:
+    """Accepted line ranges per path; an answer without lines accepts the whole file."""
+    ranges: dict[str, list[tuple[int, int]]] = {}
+    for answer in answers:
+        if primary_only and not answer_is_primary(answer):
+            continue
+        start = answer.get("start_line")
+        end = answer.get("end_line", start)
+        span = (int(start), int(end)) if isinstance(start, int) else WHOLE_FILE
+        ranges.setdefault(answer["path"], []).append(span)
+    return ranges
+
+
+def first_span_rank(
+    paths: list[str],
+    spans: dict[str, list[list[int]]] | None,
+    ranges: dict[str, list[tuple[int, int]]],
+) -> int | None:
+    """First rank whose path is accepted AND one of its returned spans overlaps an accepted range."""
+    spans = spans or {}
+    for index, path in enumerate(paths[:MAX_RANK]):
+        wanted = ranges.get(path)
+        if not wanted:
+            continue
+        for start, end in spans.get(path, []):
+            if any(start <= hi and end >= lo for lo, hi in wanted):
+                return index + 1
+    return None
+
+
+def score(
+    paths: list[str],
+    accepted: set[str],
+    primary: set[str],
+    spans: dict[str, list[list[int]]] | None = None,
+    answers: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
         "first_hit_rank": first_rank(paths, accepted),
         "primary_rank": first_rank(paths, primary),
     }
+    if answers is not None:
+        result["span_rank"] = first_span_rank(paths, spans, answer_ranges(answers, False))
+        result["span_primary_rank"] = first_span_rank(paths, spans, answer_ranges(answers, True))
+    return result
 
 
 def wilson(successes: int, n: int) -> list[float] | None:
@@ -435,12 +656,30 @@ def group_summary(rows: list[dict[str, Any]], methods: list[str], name: str) -> 
             "primary": rank_metrics(primary, f"{name}:{method}:primary"),
             "median_seconds": round(statistics.median(times), 3) if times else None,
         }
+        if all("span_rank" in row[method]["score"] for row in rows):
+            entry[method]["span"] = rank_metrics(
+                [row[method]["score"]["span_rank"] for row in rows], f"{name}:{method}:span"
+            )
+            entry[method]["span_primary"] = rank_metrics(
+                [row[method]["score"]["span_primary_rank"] for row in rows],
+                f"{name}:{method}:span_primary",
+            )
     return entry
+
+
+def explore_completeness(record: dict[str, Any]) -> str:
+    explore = record.get("explore") or {}
+    if explore.get("error"):
+        return f"error:{explore['error']}"
+    fallback = explore.get("source_fallback") or {}
+    return "complete" if fallback.get("complete", True) else "incomplete"
 
 
 def summarize(records: list[dict[str, Any]], methods: list[str]) -> dict[str, Any]:
     summary: dict[str, Any] = {}
-    for field in ("repo", "kind", "origin"):
+    for record in records:
+        record.setdefault("explore_search", explore_completeness(record))
+    for field in ("repo", "kind", "origin", "explore_search"):
         groups: dict[str, list[dict[str, Any]]] = {}
         for record in records:
             groups.setdefault(str(record.get(field)), []).append(record)
@@ -565,6 +804,8 @@ def metric_table(
     for name, entry in groups.items():
         for method in methods:
             data = entry[method]
+            if which not in data:
+                continue
             cells = [name, str(entry["questions"]), METHODS[method]]
             cells += [_fmt_rate(data[which][f"r@{k}"]) for k in ks]
             cells += [_fmt_mrr(data[which]["mrr"]), str(data["median_seconds"])]
@@ -590,6 +831,19 @@ def render_markdown(result: dict[str, Any]) -> str:
         "## Total, primary answer only",
         "",
         *metric_table({"total": summary["total"]}, methods, "primary", TOP_KS),
+        "",
+        "## Total, span overlap (a hit needs a returned span inside an accepted range)",
+        "",
+        "Explore spans are its `line_refs`; a baseline's spans are +/-"
+        f"{SNIPPET_RADIUS}-line windows around its {SNIPPET_LINES} densest match lines.",
+        "",
+        *metric_table({"total": summary["total"]}, methods, "span", TOP_KS),
+        "",
+        *metric_table({"total": summary["total"]}, methods, "span_primary", TOP_KS),
+        "",
+        "## By Explore search completeness (any accepted answer)",
+        "",
+        *metric_table(summary["by_explore_search"], methods, "any", (1, 3, 8)),
         "",
         "## By repository (any accepted answer)",
         "",
@@ -652,6 +906,140 @@ def render_markdown(result: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+# --------------------------------------------------------------------------- paired comparison
+
+
+def mcnemar_exact(b: int, c: int) -> float:
+    """Two-sided exact McNemar p-value: binomial test of b vs c discordant pairs."""
+    n = b + c
+    if n == 0:
+        return 1.0
+    k = min(b, c)
+    tail = sum(math.comb(n, i) for i in range(k + 1)) / 2**n
+    return min(1.0, 2 * tail)
+
+
+def paired_bootstrap(diffs: list[float], seed: str) -> tuple[list[float], float]:
+    """95% percentile CI of the mean paired difference, and a two-sided bootstrap p-value."""
+    rng = random.Random(seed)
+    n = len(diffs)
+    means = sorted(sum(rng.choice(diffs) for _ in range(n)) / n for _ in range(BOOTSTRAP_RESAMPLES))
+    lower = means[int(0.025 * BOOTSTRAP_RESAMPLES)]
+    upper = means[int(0.975 * BOOTSTRAP_RESAMPLES) - 1]
+    below = sum(1 for m in means if m <= 0) / BOOTSTRAP_RESAMPLES
+    above = sum(1 for m in means if m >= 0) / BOOTSTRAP_RESAMPLES
+    return [round(lower, 3), round(upper, 3)], round(min(1.0, 2 * min(below, above)), 4)
+
+
+def _ranks(record: dict[str, Any], method: str, which: str) -> int | None:
+    key = {
+        "any": "first_hit_rank",
+        "primary": "primary_rank",
+        "span": "span_rank",
+        "span_primary": "span_primary_rank",
+    }[which]
+    return (record.get(method) or {}).get("score", {}).get(key)
+
+
+def compare_runs(path_a: Path, path_b: Path, method_a: str, method_b: str) -> str:
+    """Paired comparison of two result files (or two methods of one file) on shared question ids."""
+    runs = [json.loads(Path(p).read_text(encoding="utf-8")) for p in (path_a, path_b)]
+    records = [
+        {r["id"]: r for r in run["records"] if r.get(m)}
+        for run, m in zip(runs, (method_a, method_b), strict=True)
+    ]
+    ids = sorted(set(records[0]) & set(records[1]))
+    title = f"{path_a.name}:{method_a} (A) vs {path_b.name}:{method_b} (B)"
+    lines = [
+        f"# Paired comparison: {title}",
+        "",
+        f"- shared questions: {len(ids)}"
+        f" (A only {len(set(records[0]) - set(records[1]))}, B only {len(set(records[1]) - set(records[0]))})",
+        "- recall: exact McNemar on discordant pairs; MRR: paired bootstrap of the per-question"
+        f" reciprocal-rank difference ({BOOTSTRAP_RESAMPLES} resamples, fixed seed)",
+        "",
+        "| Metric | A | B | A-only | B-only | diff (B-A) [95% CI] | p |",
+        "| --- | --- | --- | --- | --- | --- | --- |",
+    ]
+    for which in ("any", "primary", "span", "span_primary"):
+        pairs = [
+            (_ranks(records[0][i], method_a, which), _ranks(records[1][i], method_b, which))
+            for i in ids
+        ]
+        if which.startswith("span") and not all(
+            "span_rank" in records[side][i][m]["score"]
+            for i in ids
+            for side, m in ((0, method_a), (1, method_b))
+        ):
+            continue
+        for k in TOP_KS:
+            hit = [(a is not None and a <= k, b is not None and b <= k) for a, b in pairs]
+            only_a = sum(1 for a, b in hit if a and not b)
+            only_b = sum(1 for a, b in hit if b and not a)
+            ci, _ = paired_bootstrap([float(b) - float(a) for a, b in hit], f"cmp:{which}:{k}")
+            lines.append(
+                f"| {which} R@{k} | {sum(a for a, _ in hit)} | {sum(b for _, b in hit)} | {only_a} | "
+                f"{only_b} | {(only_b - only_a) / len(ids):+.3f} [{ci[0]:+.3f}, {ci[1]:+.3f}] | "
+                f"{mcnemar_exact(only_a, only_b):.3f} |"
+            )
+        rr = [((1.0 / a) if a else 0.0, (1.0 / b) if b else 0.0) for a, b in pairs]
+        ci, p = paired_bootstrap([b - a for a, b in rr], f"cmp:{which}:mrr")
+        mean_a = sum(a for a, _ in rr) / len(ids)
+        mean_b = sum(b for _, b in rr) / len(ids)
+        lines.append(
+            f"| {which} MRR | {mean_a:.3f} | {mean_b:.3f} | | | {mean_b - mean_a:+.3f} "
+            f"[{ci[0]:+.3f}, {ci[1]:+.3f}] | {p:.3f} |"
+        )
+    lines += [
+        "",
+        "A difference is only evidence when p < 0.05 and the CI excludes 0. With N ~ 60,"
+        " expect to need roughly 8+ net discordant questions at R@3 before that happens.",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------- isolation
+
+
+def explore_environment(mode: str, scratch: Path) -> dict[str, str]:
+    """Environment for Explore calls.
+
+    ``shared`` (the historical behaviour) uses the host symbol-index cache in
+    ~/Library/Caches/Aethyme, which other sessions and earlier runs warm. Explore's
+    source fallback has a 2 s wall-clock budget, so cache state changes how many
+    files are scanned and therefore the ranking on large repos. ``warm`` and
+    ``cold`` point AETHYME_HOST_CACHE_DIR at a run-private directory: ``warm``
+    fills it first (see ``warm_up``), ``cold`` starts every question empty.
+    Output measurement is forced off so inspection commands stay write-free.
+    """
+    env = dict(os.environ)
+    env["AETHYME_MEASURE_OUTPUT"] = "0"
+    if mode != "shared":
+        env["AETHYME_HOST_CACHE_DIR"] = str(scratch)
+    return env
+
+
+def warm_up(aethyme: str, repo: Path, env: dict[str, str], attempts: int = 8) -> list[bool]:
+    """Run a throwaway query until the symbol index is fully cached.
+
+    A complete scan is not enough: a cheap query can finish inside the budget
+    while most files are still unparsed, and the next heavy question then
+    parses (and times out) instead. Stop only when a complete scan parsed
+    nothing new.
+    """
+    history: list[bool] = []
+    for _ in range(attempts):
+        outcome = run_explore(aethyme, repo, "where is the main entry point configured", env)
+        fallback = outcome.get("source_fallback") or {}
+        parsed = (fallback.get("symbol_index") or {}).get("parsed_files")
+        settled = bool(fallback.get("complete")) and parsed == 0
+        history.append(settled)
+        if settled:
+            break
+    return history
+
+
 def tool_version(command: list[str]) -> str:
     try:
         completed = subprocess.run(command, capture_output=True, text=True, check=False)
@@ -684,16 +1072,39 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--repos-json", type=Path, help="default: repos.json next to the questions")
     parser.add_argument(
         "--methods",
-        default=",".join(METHODS),
+        default=",".join(DEFAULT_METHODS),
         help=f"comma-separated subset of {','.join(METHODS)}",
     )
     parser.add_argument("--label", default="", help="suffix for the result file names")
     parser.add_argument("--date", default=dt.date.today().isoformat())
+    parser.add_argument(
+        "--host-cache",
+        choices=("shared", "warm", "cold"),
+        default="warm",
+        help="Explore symbol-index cache: shared host cache (irreproducible), a run-private"
+        " cache warmed to a complete scan per repo first (default), or empty per question",
+    )
+    parser.add_argument(
+        "--compare",
+        nargs=2,
+        type=Path,
+        metavar=("A.json", "B.json"),
+        help="paired comparison of two result files on shared question ids; no runs",
+    )
+    parser.add_argument(
+        "--compare-methods",
+        default="explore,explore",
+        help="METHOD_A,METHOD_B for --compare (e.g. explore,bm25 with the same file twice)",
+    )
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(sys.argv[1:] if argv is None else argv)
+    if args.compare:
+        method_a, _, method_b = args.compare_methods.partition(",")
+        print(compare_runs(args.compare[0], args.compare[1], method_a, method_b or method_a))
+        return 0
     methods = [method for method in args.methods.split(",") if method]
     unknown = [method for method in methods if method not in METHODS]
     if unknown:
@@ -712,10 +1123,27 @@ def main(argv: list[str] | None = None) -> int:
 
     corpora: dict[str, Corpus] = {}
     before = {name: snapshot_repo(roots[name]) for name in repos_used}
+    cache_root = Path(tempfile.mkdtemp(prefix="aethyme-eval-cache-"))
+    explore_env = explore_environment(args.host_cache, cache_root)
+    warmups: dict[str, list[bool]] = {}
+    if "explore" in methods and args.host_cache == "warm":
+        for name in repos_used:
+            warmups[name] = warm_up(args.aethyme, roots[name], explore_env)
+            print(f"warm-up {name}: complete after {warmups[name]}", file=sys.stderr)
+
+    def explore_runner(repo: Path, _name: str, text: str) -> dict[str, Any]:
+        if args.host_cache == "cold":
+            shutil.rmtree(cache_root, ignore_errors=True)
+            cache_root.mkdir(parents=True, exist_ok=True)
+        return run_explore(args.aethyme, repo, text, explore_env)
+
     runners: dict[str, Callable[[Path, str, str], dict[str, Any]]] = {
-        "explore": lambda repo, _name, text: run_explore(args.aethyme, repo, text),
+        "explore": explore_runner,
         "rg": lambda repo, _name, text: run_rg_baseline(args.rg, repo, text),
         "bm25": lambda repo, name, text: run_bm25_baseline(
+            args.rg, repo, text, corpora.setdefault(name, Corpus(args.rg, repo))
+        ),
+        "bm25plus": lambda repo, name, text: run_bm25_plus_baseline(
             args.rg, repo, text, corpora.setdefault(name, Corpus(args.rg, repo))
         ),
     }
@@ -735,7 +1163,9 @@ def main(argv: list[str] | None = None) -> int:
         progress = [question["id"]]
         for method in methods:
             outcome = runners[method](repo, question["repo"], question["question"])
-            outcome["score"] = score(outcome["paths"], accepted, primary)
+            outcome["score"] = score(
+                outcome["paths"], accepted, primary, outcome.get("spans"), question["answers"]
+            )
             outcome["paths"] = outcome["paths"][:KEPT_PATHS]
             record[method] = outcome
             progress.append(
@@ -745,6 +1175,7 @@ def main(argv: list[str] | None = None) -> int:
         records.append(record)
         print(" ".join(progress), file=sys.stderr)
     after = {name: snapshot_repo(roots[name]) for name in repos_used}
+    shutil.rmtree(cache_root, ignore_errors=True)
 
     result: dict[str, Any] = {
         "schema": "aethyme-nav-eval-v2",
@@ -774,6 +1205,10 @@ def main(argv: list[str] | None = None) -> int:
             }
             for name, corpus in corpora.items()
         },
+        "host_cache": args.host_cache,
+        "warm_up_complete_history": warmups,
+        # mtime diffs cannot attribute writes: broker hooks and other agent sessions
+        # write the same .aethyme files concurrently. Treat this as a tripwire only.
         "repo_writes": {name: diff_snapshots(before[name], after[name]) for name in repos_used},
         "summary": summarize(records, methods),
         "answer_rule_precision": answer_rule_precision(records) if "explore" in methods else None,
