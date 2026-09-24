@@ -19,7 +19,9 @@ use std::time::{Duration, Instant};
 use rayon::prelude::*;
 
 use super::path_role::{self, PathRole};
-use super::query_terms::{QueryTerms, boundary_matches, split_identifier, stem, token_count};
+use super::query_terms::{
+    QueryTerms, boundary_matches, may_contain, split_identifier, token_count, token_matches,
+};
 use super::symbol_index::{self, Definition, IndexStats, Stamp, SymbolIndex};
 use super::{AnswerItem, ExploreSubsystem, ExploreSubsystemTarget};
 use bm25f::{Corpus, Document, Field};
@@ -564,7 +566,7 @@ fn scan_file(
     if !query
         .terms
         .iter()
-        .any(|term| lowered.contains(term.stem.as_str()))
+        .any(|term| may_contain(&lowered, &term.stem))
     {
         return Scan::Searched(Box::new(file));
     }
@@ -589,7 +591,7 @@ fn scan_file(
                 index += 1;
             }
             let (_, end, comment) = table[index];
-            if at + term.stem.len() > end {
+            if at >= end {
                 continue;
             }
             if counted.0 != index {
@@ -687,7 +689,7 @@ fn path_parts(path: &str) -> (Vec<String>, Vec<String>) {
 }
 
 fn part_matches(part: &str, stem_of_term: &str) -> bool {
-    part.starts_with(stem_of_term)
+    token_matches(part, stem_of_term)
 }
 
 const ALL_FIELDS: [Field; bm25f::FIELD_COUNT] = [
@@ -719,10 +721,9 @@ fn best_symbol<'a>(
         let mut mask = 0u32;
         let mut matched_parts = 0usize;
         for part in &parts {
-            let part_stem = stem(part);
             let mut hit = false;
             for (bit, term) in query.terms.iter().enumerate() {
-                if part.starts_with(&term.stem) || part_stem == term.stem {
+                if part_matches(part, &term.stem) {
                     mask |= 1 << bit;
                     hit = true;
                 }
@@ -835,9 +836,7 @@ fn document(file: &ScannedFile, query: &QueryTerms) -> Option<Document> {
             }
         }
         for (bit, term) in query.terms.iter().enumerate() {
-            let matched = parts
-                .iter()
-                .any(|part| part_matches(part, &term.stem) || stem(part) == term.stem);
+            let matched = parts.iter().any(|part| part_matches(part, &term.stem));
             if matched {
                 doc.add(bit, Field::Symbol, 1.0);
             }

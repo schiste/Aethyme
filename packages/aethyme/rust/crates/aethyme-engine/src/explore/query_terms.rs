@@ -324,22 +324,95 @@ pub(super) fn split_identifier(word: &str) -> Vec<String> {
     parts
 }
 
-/// Light, language-agnostic suffix stripping. The stem is only ever used as
-/// an identifier-boundary prefix, so over-stripping costs precision, never
-/// recall; a stem is never shorter than three characters.
+/// A light, conservative English stemmer (Porter-style suffix stripping),
+/// applied alike to request terms and to the identifier sub-tokens they are
+/// matched against, so `retries`, `retried` and `retrying` all meet `retry`,
+/// and `validation`, `validates` and `validated` meet `validate`.
+///
+/// Steps: plurals (`-ies`, `-sses`, `-es` after a sibilant, `-s`), then one
+/// of `-ied`, `-ation`, `-ing`, `-ed`, `-able`, `-er` (undoubling a final
+/// double consonant: `running` -> `run`), then a final `-e`. No stem is
+/// shorter than three characters; a step that would go shorter is skipped.
 pub(super) fn stem(word: &str) -> String {
-    const SUFFIXES: &[&str] = &[
-        "ations", "ation", "ings", "ing", "ions", "ion", "ies", "ers", "er", "ed", "es", "s", "e",
-    ];
-    for suffix in SUFFIXES {
-        if let Some(base) = word.strip_suffix(suffix)
-            && base.len() >= 3
-            && !(*suffix == "s" && base.ends_with('s'))
-        {
-            return base.to_string();
-        }
+    const MIN: usize = 3;
+    let mut word = word.to_string();
+    // Plurals.
+    if let Some(base) = word
+        .strip_suffix("ies")
+        .filter(|base| base.len() + 1 >= MIN)
+    {
+        word = format!("{base}y");
+    } else if let Some(base) = word.strip_suffix("sses") {
+        word = format!("{base}ss");
+    } else if let Some(base) = word.strip_suffix("es").filter(|base| {
+        base.len() >= MIN
+            && ["s", "x", "z", "ch", "sh"]
+                .iter()
+                .any(|end| base.ends_with(end))
+    }) {
+        word = base.to_string();
+    } else if let Some(base) = word
+        .strip_suffix('s')
+        .filter(|base| base.len() >= MIN && !["s", "u", "i"].iter().any(|end| base.ends_with(end)))
+    {
+        word = base.to_string();
     }
-    word.to_string()
+    // One derivational or inflectional suffix.
+    if let Some(base) = word
+        .strip_suffix("ied")
+        .filter(|base| base.len() + 1 >= MIN)
+    {
+        word = format!("{base}y");
+    } else if let Some(base) = word.strip_suffix("ation").filter(|base| base.len() >= MIN) {
+        word = format!("{base}ate");
+    } else if let Some(base) = ["ing", "ed", "able"]
+        .iter()
+        .find_map(|suffix| word.strip_suffix(suffix))
+        .filter(|base| base.len() >= MIN && base.bytes().any(is_vowel))
+    {
+        word = undouble(base);
+    } else if let Some(base) = word.strip_suffix("er").filter(|base| base.len() > MIN) {
+        word = undouble(base);
+    }
+    if let Some(base) = word.strip_suffix('e').filter(|base| base.len() >= MIN) {
+        word = base.to_string();
+    }
+    word
+}
+
+fn is_vowel(byte: u8) -> bool {
+    matches!(byte, b'a' | b'e' | b'i' | b'o' | b'u' | b'y')
+}
+
+/// `runn` -> `run`, but `pass`, `fall` and `buzz` keep their double letter.
+fn undouble(base: &str) -> String {
+    let bytes = base.as_bytes();
+    let n = bytes.len();
+    if n >= 4
+        && bytes[n - 1] == bytes[n - 2]
+        && !is_vowel(bytes[n - 1])
+        && !matches!(bytes[n - 1], b'l' | b's' | b'z')
+    {
+        return base[..n - 1].to_string();
+    }
+    base.to_string()
+}
+
+/// Whether an identifier sub-token (lowercase) matches a request term's
+/// stem: the token starts with the stem, or stems to it.
+pub(super) fn token_matches(token: &str, term_stem: &str) -> bool {
+    token.starts_with(term_stem) || stem(token) == term_stem
+}
+
+/// The part of a stem every surface form it comes from starts with: a
+/// restored `y` (`retries` -> `retry`) is not in `retri...`.
+fn probe(term_stem: &str) -> &str {
+    term_stem.strip_suffix('y').unwrap_or(term_stem)
+}
+
+/// Whether `lower` (lowercase text) could hold a match for the stem at all.
+pub(super) fn may_contain(lower: &str, term_stem: &str) -> bool {
+    lower.contains(probe(term_stem))
 }
 
 /// True when `stem` occurs in `line` starting at an identifier boundary
@@ -349,27 +422,49 @@ pub(super) fn occurs_at_boundary(line: &str, lower: &str, stem: &str) -> bool {
     boundary_matches(line, lower, stem).next().is_some()
 }
 
-/// Byte offsets where `stem` occurs in `text` starting at an identifier
-/// boundary: the start of the text, after a non-alphanumeric byte, or at a
-/// camelCase or digit-to-letter transition. `lower` must be
-/// `text.to_ascii_lowercase()` (same byte offsets).
+/// Byte offsets of identifier sub-tokens in `text` that match `term_stem`
+/// (see [`token_matches`]). A sub-token starts at the start of the text,
+/// after a non-alphanumeric byte, or at a camelCase or digit-to-letter
+/// transition. The stem may also run across a camelCase boundary
+/// (`backoff` in `backOff`). `lower` must be `text.to_ascii_lowercase()`.
 pub(super) fn boundary_matches<'a>(
     text: &'a str,
     lower: &'a str,
-    stem: &'a str,
+    term_stem: &'a str,
 ) -> impl Iterator<Item = usize> + 'a {
     let bytes = text.as_bytes();
     lower
-        .match_indices(stem)
+        .match_indices(probe(term_stem))
         .map(|(at, _)| at)
         .filter(move |&at| {
-            at == 0 || {
+            let starts_token = at == 0 || {
                 let prev = bytes[at - 1];
                 !prev.is_ascii_alphanumeric()
                     || (bytes[at].is_ascii_uppercase() && prev.is_ascii_lowercase())
                     || (prev.is_ascii_digit() && bytes[at].is_ascii_alphabetic())
-            }
+            };
+            starts_token
+                && (lower[at..].starts_with(term_stem)
+                    || stem(&lower[at..sub_token_end(bytes, at)]) == term_stem)
         })
+}
+
+/// End of the identifier sub-token that starts at `at`.
+fn sub_token_end(bytes: &[u8], at: usize) -> usize {
+    let mut end = at + 1;
+    while end < bytes.len() {
+        let (prev, ch) = (bytes[end - 1], bytes[end]);
+        let next_lower = bytes.get(end + 1).is_some_and(u8::is_ascii_lowercase);
+        if !ch.is_ascii_alphanumeric()
+            || (ch.is_ascii_uppercase() && prev.is_ascii_lowercase())
+            || (ch.is_ascii_uppercase() && prev.is_ascii_uppercase() && next_lower)
+            || (ch.is_ascii_alphabetic() && prev.is_ascii_digit())
+        {
+            break;
+        }
+        end += 1;
+    }
+    end
 }
 
 /// Identifier-ish tokens (runs of ASCII alphanumerics and `_`) in `line`:
@@ -401,11 +496,36 @@ mod tests {
 
     #[test]
     fn stems_converge_on_inflections() {
-        assert_eq!(stem("caching"), "cach");
-        assert_eq!(stem("cache"), "cach");
-        assert_eq!(stem("cached"), "cach");
-        assert_eq!(stem("class"), "class");
-        assert_eq!(stem("validation"), "valid");
+        for group in [
+            &["cache", "caches", "cached", "caching"][..],
+            &["retry", "retries", "retried", "retrying"],
+            &[
+                "validate",
+                "validates",
+                "validated",
+                "validating",
+                "validation",
+            ],
+            &["parse", "parser", "parses", "parsing"],
+            &["run", "running"],
+            &["stop", "stopped"],
+            &["class", "classes"],
+            &["match", "matches", "matching"],
+            &["configure", "configurable"],
+        ] {
+            let stems = group.iter().map(|word| stem(word)).collect::<Vec<_>>();
+            assert!(
+                stems.iter().all(|s| *s == stems[0]),
+                "{group:?} -> {stems:?}"
+            );
+        }
+        for kept in [
+            "class", "status", "analysis", "pass", "fall", "user", "order", "need",
+        ] {
+            assert!(stem(kept).len() >= 3, "{kept}");
+        }
+        assert_eq!(stem("status"), "status");
+        assert_eq!(stem("pass"), "pass");
         assert_eq!(stem("run"), "run");
     }
 
@@ -427,6 +547,22 @@ mod tests {
                 "{compound}"
             );
         }
+    }
+
+    #[test]
+    fn inflected_sub_tokens_match_the_request_stem() {
+        let line = "fn retriesLeft() { retried += 1; retryCount; backOff }";
+        let lower = line.to_ascii_lowercase();
+        assert_eq!(boundary_matches(line, &lower, &stem("retries")).count(), 3);
+        assert_eq!(boundary_matches(line, &lower, "backoff").count(), 1);
+        assert_eq!(
+            boundary_matches("entries", "entries", &stem("retries")).count(),
+            0
+        );
+        assert!(token_matches("validation", &stem("validate")));
+        assert!(token_matches("config", &stem("config")));
+        assert!(token_matches("configuration", &stem("config")));
+        assert!(may_contain("the retries", &stem("retry")));
     }
 
     #[test]
