@@ -156,7 +156,7 @@ pub fn run(args: &[String]) -> u8 {
         if diff.is_empty() {
             println!("No changes to show");
         } else {
-            println!("{diff}");
+            print!("{diff}");
         }
         println!();
         println!("Run with --apply to apply these changes");

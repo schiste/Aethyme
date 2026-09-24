@@ -7,7 +7,6 @@ use std::path::{Path, PathBuf};
 use regex::Regex;
 
 use crate::fix::fixers::base::Fixer;
-use crate::fix::pystr;
 use crate::walk;
 
 const INTERACTIVE_ELEMENTS: [&str; 10] = [
@@ -76,7 +75,7 @@ impl SelectorInserter {
                 format!("<{element_name}{prefix}data-ui=\"{selector_name}\"{closing}");
             // Replace only the FIRST remaining occurrence, so repeated
             // identical elements are each rewritten in turn.
-            new_content = pystr::replace_first(&new_content, old_element, &new_element);
+            new_content = new_content.replacen(old_element, &new_element, 1);
             changes_made = true;
         }
         Some((new_content, changes_made))
@@ -92,10 +91,7 @@ impl SelectorInserter {
         let template_content = caps.get(1).unwrap().as_str();
         let (new_template, changed) = self.fix_jsx(template_content, file_path)?;
         if changed {
-            Some((
-                pystr::replace_all(content, template_content, &new_template),
-                true,
-            ))
+            Some((content.replace(template_content, &new_template), true))
         } else {
             Some((content.to_string(), false))
         }
@@ -114,7 +110,10 @@ impl SelectorInserter {
         file_path: &Path,
     ) -> Option<String> {
         let mut parts: Vec<String> = Vec::new();
-        let component_name = pystr::py_stem(file_path);
+        let component_name = file_path
+            .file_stem()
+            .map(|stem| stem.to_string_lossy())
+            .unwrap_or_default();
         if !component_name.is_empty() && component_name != "index" {
             parts.push(kebab_from_camel(&component_name));
         }
@@ -173,7 +172,7 @@ impl SelectorInserter {
                     .path
                     .strip_prefix(&self.repo_path)
                     .unwrap_or(&entry.path);
-                missing.push((pystr::as_posix(rel), line, element_name.to_string()));
+                missing.push((rel.display().to_string(), line, element_name.to_string()));
             }
         }
         missing
@@ -468,7 +467,7 @@ mod tests {
         let fixes = process_directory(&f, &tmp);
         assert_eq!(fixes.len(), 1);
         assert_eq!(fixes[0].fix_type, "selector_insert");
-        assert_eq!(pystr::file_name(&fixes[0].file_path), "Panel.tsx");
+        assert!(fixes[0].file_path.ends_with("Panel.tsx"));
     }
 
     #[test]

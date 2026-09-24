@@ -8,7 +8,6 @@ use std::path::{Path, PathBuf};
 use regex::Regex;
 
 use crate::fix::fixers::base::Fixer;
-use crate::fix::pystr;
 use crate::util::py_strip;
 use crate::walk;
 
@@ -76,7 +75,7 @@ impl I18nScaffolder {
 
     /// Port of `_is_likely_code`.
     fn is_likely_code(&self, text: &str) -> bool {
-        let len = pystr::char_len(text);
+        let len = text.chars().count();
         if !(3..=100).contains(&len) {
             return true;
         }
@@ -97,11 +96,15 @@ impl I18nScaffolder {
 
     /// Port of `_generate_i18n_key`.
     fn generate_i18n_key(&self, text: &str, file_path: &Path) -> String {
-        let namespace = pystr::py_stem(file_path).to_lowercase();
+        let namespace = file_path
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_lowercase();
         let lowered = text.to_lowercase();
         let key = self.non_word.replace_all(&lowered, "");
         let key = self.whitespace_run.replace_all(&key, "_").to_string();
-        let key = if pystr::char_len(&key) > 40 {
+        let key = if key.chars().count() > 40 {
             key.split('_').take(4).collect::<Vec<_>>().join("_")
         } else {
             key
@@ -153,7 +156,7 @@ impl I18nScaffolder {
             if !new_content.contains(old.as_str()) {
                 continue;
             }
-            new_content = pystr::replace_first(&new_content, old, new);
+            new_content = new_content.replacen(old.as_str(), new, 1);
             changes_made = true;
         }
 
@@ -207,7 +210,7 @@ impl I18nScaffolder {
                 .path
                 .strip_prefix(&self.repo_path)
                 .unwrap_or(&entry.path);
-            let rel = pystr::as_posix(rel);
+            let rel = rel.display().to_string();
             for (regex, kind) in [(&self.jsx_text, "jsx_text"), (&self.string_literal, "prop")] {
                 for caps in regex.captures_iter(&content) {
                     let text = py_strip(caps.get(1).unwrap().as_str());

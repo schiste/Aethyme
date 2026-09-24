@@ -9,12 +9,10 @@
 //! `assess_risk` and `validate_changes`).
 
 use std::fs::File;
-use std::io::{BufReader, Read};
+use std::io::{BufRead, BufReader};
 use std::path::Path;
 
 use regex::Regex;
-
-use super::pystr;
 
 /// Risk levels for autofix operations. String values match the Python
 /// `Enum` values (they reach stdout and the PR body).
@@ -181,16 +179,17 @@ impl GeneratedFileDetector {
     /// build-directory component, path pattern, then — only for paths
     /// that exist as files — the first ten lines' header markers.
     pub fn is_generated(&self, file_path: &Path) -> bool {
-        let file_str = pystr::as_posix(file_path);
+        let file_str = file_path.to_string_lossy();
 
-        if LOCK_FILES.contains(&pystr::file_name(file_path).as_str()) {
+        if file_path
+            .file_name()
+            .is_some_and(|name| LOCK_FILES.iter().any(|lock| name == *lock))
+        {
             return true;
         }
-        let parts = pystr::named_parts(file_path);
-        if self
-            .build_dirs
-            .iter()
-            .any(|dir| parts.iter().any(|part| part == dir))
+        if file_path
+            .components()
+            .any(|part| self.build_dirs.iter().any(|dir| part.as_os_str() == *dir))
         {
             return true;
         }
@@ -230,53 +229,17 @@ impl GeneratedFileDetector {
     }
 }
 
-/// `"".join(handle.readline() for _ in range(10))` over a file opened
-/// with `encoding="utf-8", errors="ignore"`. Line boundaries are found
-/// on the raw bytes first (every terminator is ASCII, and dropped
-/// invalid bytes are never `\n`/`\r`), so only the needed prefix is
-/// read; the prefix is then decoded with the dropping error handler and
-/// newline-translated the way text mode does.
+/// The first `max_lines` lines of a file (terminators kept), decoded
+/// lossily; `None` when the file cannot be opened or read.
 fn read_header_lines(path: &Path, max_lines: usize) -> Option<String> {
-    let file = File::open(path).ok()?;
-    let mut reader = BufReader::new(file);
+    let mut reader = BufReader::new(File::open(path).ok()?);
     let mut buf: Vec<u8> = Vec::new();
-    let mut chunk = [0u8; 4096];
-    let mut lines = 0usize;
-    let mut scanned = 0usize;
-    loop {
-        // Count terminators in the bytes we already hold.
-        while scanned < buf.len() && lines < max_lines {
-            match buf[scanned] {
-                b'\n' => {
-                    scanned += 1;
-                    lines += 1;
-                }
-                b'\r' => {
-                    // `\r\n` is one terminator; a lone `\r` at the very
-                    // end of the buffer may still be joined by a `\n`
-                    // that has not been read yet.
-                    if scanned + 1 < buf.len() {
-                        scanned += if buf[scanned + 1] == b'\n' { 2 } else { 1 };
-                        lines += 1;
-                    } else {
-                        break;
-                    }
-                }
-                _ => scanned += 1,
-            }
-        }
-        if lines >= max_lines {
-            buf.truncate(scanned);
+    for _ in 0..max_lines {
+        if reader.read_until(b'\n', &mut buf).ok()? == 0 {
             break;
         }
-        let read = reader.read(&mut chunk).ok()?;
-        if read == 0 {
-            // EOF: a trailing lone `\r` closes its line.
-            break;
-        }
-        buf.extend_from_slice(&chunk[..read]);
     }
-    Some(pystr::translate_newlines(&pystr::decode_utf8_ignore(&buf)))
+    Some(String::from_utf8_lossy(&buf).into_owned())
 }
 
 /// Assess risk and validate autofix changes.
@@ -320,7 +283,7 @@ impl SafetyEngine {
     /// directory named e.g. `api` escalates every file to medium. That
     /// is the shipped behavior; parity first.
     pub fn assess_risk(&self, file_path: &Path, fix_type: &str) -> Result<RiskLevel, String> {
-        let file_str = pystr::as_posix(file_path);
+        let file_str = file_path.to_string_lossy();
 
         if self.detector.is_generated(file_path) {
             return Err(format!(
@@ -354,18 +317,18 @@ impl SafetyEngine {
     /// "reduced X" warnings are informational only — they never clear
     /// `safe`.
     pub fn validate_changes(&self, original_content: &str, new_content: &str) -> ValidationResult {
-        let orig_lines = pystr::splitlines(original_content, false);
-        let new_lines = pystr::splitlines(new_content, false);
-        let orig_len = pystr::char_len(original_content) as i64;
-        let new_len = pystr::char_len(new_content) as i64;
+        let orig_lines = original_content.lines().count() as i64;
+        let new_lines = new_content.lines().count() as i64;
+        let orig_len = original_content.chars().count() as i64;
+        let new_len = new_content.chars().count() as i64;
 
         let mut result = ValidationResult {
             safe: true,
             warnings: Vec::new(),
             stats: ValidationStats {
-                original_lines: orig_lines.len() as i64,
-                new_lines: new_lines.len() as i64,
-                lines_added: new_lines.len() as i64 - orig_lines.len() as i64,
+                original_lines: orig_lines,
+                new_lines,
+                lines_added: new_lines - orig_lines,
                 size_change_bytes: new_len - orig_len,
             },
         };
@@ -376,7 +339,7 @@ impl SafetyEngine {
                 .push("File size doubled - review recommended".to_string());
             result.safe = false;
         }
-        if new_lines.is_empty() && !orig_lines.is_empty() {
+        if new_lines == 0 && orig_lines > 0 {
             result
                 .warnings
                 .push("All content removed - blocking change".to_string());
@@ -855,15 +818,5 @@ mod tests {
                 "Reduced exports from 1 to 0",
             ]
         );
-    }
-
-    #[test]
-    fn line_counts_use_cpython_splitlines_boundaries() {
-        let engine = SafetyEngine::new();
-        // \u{2028} is a line boundary for str.splitlines but not for
-        // Rust's str::lines.
-        let validation = engine.validate_changes("a\u{2028}b", "a\u{2028}b\u{2028}c");
-        assert_eq!(validation.stats.original_lines, 2);
-        assert_eq!(validation.stats.new_lines, 3);
     }
 }

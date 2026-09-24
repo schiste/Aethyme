@@ -5,31 +5,21 @@
 //! advisory and never feed operational readiness. `ai-ready` preserves the
 //! old scorecard contract as a deprecated compatibility alias.
 //!
-//! The legacy implementation is a port of `src/scorecard/` — the `Finding` model, the eight detectors,
-//! the integer 100-point scoring engine, and the json/md report
-//! renderers. The contract is byte parity with the Python
-//! implementation (decision #2): identical finding sets per detector
-//! (file, line, severity, message, evidence, suggestion), identical
-//! scores, and `--format json`/`--format md` outputs byte-identical
-//! after volatile-field normalization (scan_id, timestamps, durations).
+//! The legacy implementation is a port of `src/scorecard/` (the
+//! `Finding` model, eight detectors, the integer 100-point scoring
+//! engine, and the json/md renderers) and `src/autofixers/` (`fix`: the
+//! safety/risk engine, patch generation and application, five fixers,
+//! and the git/PR helper behind `aethyme autofix`).
 //!
-//! Parity-first discipline: detectors replicate Python quirks on
-//! purpose (see per-detector comments); improvements — graph-backed
-//! detection, smarter heuristics — are V2 material, not this port.
+//! # Frozen (decision D3)
 //!
-//! # Fix side (retirement plan Phase 5)
-//!
-//! `fix` is the port of `src/autofixers/`: the safety/risk engine,
-//! patch generation and application, the five fixers, and the git/PR
-//! helper, behind the native `aethyme autofix` front end. Same
-//! contract, extended to the produced unified diffs: byte-identical
-//! patches on the parity corpus.
-//!
-//! The two sides share the crate (decision #1: "the unification is the
-//! point") but not yet a scan. The fixers keep their own scanning
-//! rather than consuming `Finding`s, because the two disagree about
-//! what counts — see `fix::fixers` for why that unification is deferred
-//! to a post-parity refactor.
+//! The crate is frozen: it takes fixes, not features. The byte-parity
+//! contract with the retired Python implementation is withdrawn, and
+//! the emulation layer that served it (CPython `json.dumps`, `str`, and
+//! `difflib` ports) is gone: JSON is `serde_json`, diffs are `similar`
+//! unified diffs, strings and paths are std. `ai-ready` and `autofix`
+//! remain working, internal commands; `quality inspect` is the
+//! maintained surface.
 
 pub mod ai_ready_cli;
 pub mod autofix_cli;
