@@ -22,6 +22,34 @@ live in `.aethyme/`; the optional graph store is derived locally.
 The broker is the public front door. Explore and the lower-level graph and task
 commands are supporting repository intelligence for agents and operators.
 
+## Why not plain worktrees?
+
+`git worktree` plus pull requests, or Claude Code's native worktree isolation,
+already give each agent its own checkout. That solves "two agents editing one
+directory". It does not solve what happens when their work meets. The broker
+adds that part:
+
+| Concern | `git worktree` + PRs | Claude Code native worktrees | Aethyme broker |
+| --- | --- | --- | --- |
+| Isolated checkout per task | yes | yes | yes (`broker start`) |
+| Gates run on the *merged* tree before integration | only if CI does it, after push | no | yes: `broker submit` simulates the merge onto `aethyme/integration` and runs the repository's affected gates on that result |
+| Path ownership between concurrent agents | no | no | leases: a conflicting `leases claim` is refused, and `broker exec` fails a command that dirties paths outside its leases |
+| A local integration branch that only verified work reaches | no | no | `aethyme/integration`; nothing is pushed until someone publishes |
+| Serialized, journaled Git/GitHub writes | no | no | `broker git` / `broker gh` queue per repository and journal each write; an unknown remote outcome fails closed until `broker operations reconcile` |
+| Recovery after conflicts or crashes | manual | manual | conflict notices with exact rebase steps (`.aethyme/broker-action-required.md`), `broker blockers`, `broker cleanup` with provenance checks |
+
+You do **not** need the broker when:
+
+- one agent works at a time, in which case a plain branch or worktree is simpler;
+- there are no shared gates, so merged-tree verification has nothing to run;
+- every change already goes through a PR whose CI you trust, and agents never
+  touch the same files concurrently.
+
+The broker costs a local SQLite database, one worktree per session, and a
+submit step that runs gates. It pays off when several agents share one
+repository and its gates, and when an unverified merge or a duplicated push
+is expensive.
+
 ## Quick start
 
 ### 1. Install the Rust binaries
