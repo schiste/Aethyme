@@ -311,12 +311,25 @@ fn line_refs_from_value(value: &serde_json::Value) -> Vec<usize> {
         .unwrap_or_default()
 }
 
+/// Keep the first occurrence of each target, but inherit line references
+/// from a later duplicate when the first has none: subsystem targets carry
+/// no evidence, while the same target under `answer`/`navigation_hints`
+/// carries the spans that anchor verification.
 fn dedupe_candidates(candidates: Vec<CandidateTarget>) -> Vec<CandidateTarget> {
-    let mut seen = BTreeSet::new();
-    let mut out = Vec::new();
+    let mut positions = std::collections::BTreeMap::<String, usize>::new();
+    let mut out: Vec<CandidateTarget> = Vec::new();
     for candidate in candidates {
-        if seen.insert(candidate_key(&candidate)) {
-            out.push(candidate);
+        match positions.get(&candidate_key(&candidate)) {
+            Some(&index) => {
+                let kept = &mut out[index];
+                if kept.line_refs.is_empty() {
+                    kept.line_refs = candidate.line_refs;
+                }
+            }
+            None => {
+                positions.insert(candidate_key(&candidate), out.len());
+                out.push(candidate);
+            }
         }
     }
     out
@@ -729,6 +742,23 @@ mod tests {
         ];
         let (start, end) = python_span(&lines, 3);
         assert_eq!((start, end), (2, 8));
+    }
+
+    #[test]
+    fn subsystem_targets_inherit_line_refs_from_the_matching_hint() {
+        let explore = serde_json::json!({
+            "subsystems": [{"top_verification_targets": [
+                {"kind": "source_file", "target": "src/a.rs", "path": "src/a.rs"}
+            ]}],
+            "navigation_hints": [
+                {"kind": "source_file", "target": "src/a.rs", "path": "src/a.rs",
+                 "evidence": {"line_refs": [{"line": 42}, {"line": 7}]}}
+            ]
+        });
+        let candidates = dedupe_candidates(collect_candidates(&explore));
+        assert_eq!(candidates.len(), 1);
+        assert!(candidates[0].source.starts_with("subsystems["));
+        assert_eq!(candidates[0].line_refs, [42, 7]);
     }
 
     #[test]

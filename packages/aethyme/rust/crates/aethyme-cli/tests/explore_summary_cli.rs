@@ -264,3 +264,71 @@ fn listed_in_router_help() {
     result.ok();
     result.assert_contains("explore-summary --from");
 }
+
+/// End to end on a repository with no graph: the source-search answer-json
+/// from `aethyme explore` must still parse in both readers of the deployed
+/// quick start, and name the defining source file first.
+#[test]
+fn graph_free_explore_output_feeds_both_readers() {
+    let tmp = tmp_dir();
+    let repo = tmp.path().join("repo");
+    write(
+        repo.join("src/billing/invoice.py"),
+        "def finalize_invoice_total(lines):\n    return sum(line.amount for line in lines)\n",
+    );
+    write(
+        repo.join("docs/invoice-total.md"),
+        "# Invoice total\n\nThe invoice total is finalized once. Invoice total, invoice total.\n",
+    );
+    let status = std::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&repo)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let repo_arg = repo.display().to_string();
+    let explore = invoke_aethyme([
+        "explore",
+        "--repo",
+        &repo_arg,
+        "--request",
+        "where is the invoice total finalized",
+        "--format",
+        "answer-json",
+        "--show-observability",
+    ]);
+    let saved = tmp.path().join("explore.json");
+    write(&saved, explore.ok());
+    let saved_arg = saved.display().to_string();
+
+    let summary: Value =
+        serde_json::from_str(invoke_aethyme(["explore-summary", "--from", &saved_arg]).ok())
+            .unwrap();
+    assert_eq!(summary["observability"]["readiness"]["status"], "ready");
+    assert_eq!(summary["safe_to_use_as_answer"], false);
+    assert_eq!(
+        summary["top_verification_targets"][0]["path"], "src/billing/invoice.py",
+        "{summary}"
+    );
+
+    let verified: Value = serde_json::from_str(
+        invoke_aethyme([
+            "verify-targets",
+            "--repo",
+            &repo_arg,
+            "--from",
+            &saved_arg,
+            "--max-targets",
+            "1",
+        ])
+        .ok(),
+    )
+    .unwrap();
+    assert_eq!(verified["targets"][0]["path"], "src/billing/invoice.py");
+    assert_eq!(
+        verified["targets"][0]["line_span"]["start"], 1,
+        "{verified}"
+    );
+}

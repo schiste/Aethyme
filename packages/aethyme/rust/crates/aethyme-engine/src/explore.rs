@@ -31,7 +31,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
+mod path_role;
+mod query_terms;
 mod source_fallback;
+mod symbol_index;
+
+pub use source_fallback::{
+    DEFAULT_SOURCE_SEARCH_BUDGET, DEFAULT_SOURCE_SEARCH_HITS, SourceSearchOptions, SymbolCache,
+};
 
 use crate::graph::navigation::{task_anchors_view_redb, task_next_view_redb, task_scope_view_redb};
 use crate::graph::search::{SearchHit, symbol_search_redb};
@@ -939,8 +946,9 @@ pub(super) fn graph_store_explore_error(error: GraphStoreError) -> ExploreError 
 }
 
 /// Build the stable answer-json contract for a repository whose optional
-/// local graph store cannot currently answer. No source scan is attempted:
-/// callers receive an explicit unsafe result and deterministic recovery.
+/// local graph store cannot currently answer. A bounded full-content source
+/// search supplies ranked navigation hints with line spans; it never
+/// supplies caller or impact evidence, so the answer stays unsafe.
 pub fn graph_unavailable_response(
     repo: &Path,
     request: &str,
@@ -949,8 +957,33 @@ pub fn graph_unavailable_response(
     status: &'static str,
     reason: String,
 ) -> ExploreResponse {
-    let fallback = source_fallback::inspect(repo, request);
+    graph_unavailable_response_with(
+        repo,
+        request,
+        intent,
+        intent_source,
+        status,
+        reason,
+        &SourceSearchOptions::default(),
+    )
+}
+
+/// [`graph_unavailable_response`] with explicit source-search knobs (hit
+/// count, wall-time budget, symbol-index cache location).
+pub fn graph_unavailable_response_with(
+    repo: &Path,
+    request: &str,
+    intent: &'static str,
+    intent_source: &'static str,
+    status: &'static str,
+    reason: String,
+    options: &SourceSearchOptions,
+) -> ExploreResponse {
+    let mut fallback = source_fallback::inspect_with(repo, request, options);
     let hint_count = fallback.hints.len();
+    let source_observability = fallback.observability();
+    let hints = std::mem::take(&mut fallback.hints);
+    let subsystems = std::mem::take(&mut fallback.subsystems);
     let policy = aethyme_graph_storage::GraphIntegrityPolicy::load(repo);
     let next_action = match policy {
         Ok(policy) if policy.enforces_committed_fragments() => {
@@ -974,10 +1007,10 @@ pub fn graph_unavailable_response(
             parameters: serde_json::json!({}),
         },
         answer: Vec::new(),
-        navigation_hints: fallback.hints,
+        navigation_hints: hints,
         excluded: Vec::new(),
         ambiguous: Vec::new(),
-        subsystems: fallback.subsystems,
+        subsystems,
         evidence: Evidence {
             answer_count: 0,
             navigation_hint_count: hint_count,
@@ -999,13 +1032,13 @@ pub fn graph_unavailable_response(
             navigation_hint_count: hint_count,
             degraded: true,
             trust_policy: "verify_before_use",
-            reason: "The graph is unavailable. Bounded tracked-source hints are navigation only, not caller or impact evidence."
+            reason: "The graph is unavailable. Ranked source-search hints are navigation only, not caller or impact evidence."
                 .into(),
         },
         degraded_reasons: vec![format!("graph_store_{status}")],
         verification_steps: vec![serde_json::json!({
             "kind": "manual_source_inspection",
-            "reason": "Verify bounded source hints; no graph-backed semantic claims are available"
+            "reason": "Verify the ranked source spans; no graph-backed semantic claims are available"
         })],
         next_actions: vec![next_action.into()],
         available_specialized_intents: vec![
@@ -1017,17 +1050,20 @@ pub fn graph_unavailable_response(
         output_adapters: None,
         resolved_parameters: None,
         observability: Some(serde_json::json!({
-            "readiness": {
-                "status": "degraded",
-                "reason": "optional_graph_unavailable"
+            "readiness": if fallback.complete {
+                serde_json::json!({
+                    "status": "ready",
+                    "reason": "source_search_complete",
+                    "mode": "bounded_content_search"
+                })
+            } else {
+                serde_json::json!({
+                    "status": "partial",
+                    "reason": fallback.incomplete_reason,
+                    "mode": "bounded_content_search"
+                })
             },
-            "source_fallback": {
-                "tracked_only": true,
-                "scanned_files": fallback.scanned_files,
-                "max_files": 128,
-                "max_bytes_per_file": 8192,
-                "complete": false
-            },
+            "source_fallback": source_observability,
             "graph_store": {
                 "status": status,
                 "source_of_truth": "graph_fragments",

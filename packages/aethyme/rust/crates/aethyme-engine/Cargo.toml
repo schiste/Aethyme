@@ -26,9 +26,11 @@ dhat = { version = "0.3", optional = true }
 aethyme-graph-storage = { path = "../aethyme-graph-storage" }
 aethyme-graph-schema = { path = "../aethyme-graph-schema" }
 aethyme-producers = { path = "../aethyme-producers" }
+# Definition extraction for the graph-free Explore symbol index (Ruff, Oxc,
+# ra_ap_syntax, tree-sitter-php): the same parsers the graph indexer uses.
+aethyme-graph-indexer = { path = "../aethyme-graph-indexer" }
 
 [dev-dependencies]
-aethyme-graph-indexer = { path = "../aethyme-graph-indexer" }
 aethyme-testkit = { path = "../aethyme-testkit" }
 tempfile = "3"
 
