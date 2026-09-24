@@ -25,6 +25,7 @@ mod session;
 mod ship;
 mod status;
 mod submit;
+mod surface;
 mod telemetry;
 #[cfg(test)]
 mod tests;
@@ -45,6 +46,11 @@ use status::*;
 use submit::*;
 use telemetry::*;
 use watch::*;
+
+pub use surface::{
+    ADVANCED_VERBS, DEPRECATED_SPELLING_REMOVAL_RELEASE, Deprecation, PUBLIC_VERBS, Resolution,
+    deprecation_warning, help_text, resolve, wants_help,
+};
 
 const RESOURCES_RECONCILE_USAGE: &str =
     "usage: aethyme broker resources reconcile <lease-id> --confirm <generation> [--json]";
@@ -693,6 +699,40 @@ pub enum CompatibilityMode {
 }
 
 pub fn run_with_mode(args: &[String], mode: CompatibilityMode) -> u8 {
+    // Help is answered before anything opens the broker or records a metric:
+    // asking what a command does must never do any of it (Phase 4, P4.3).
+    if wants_help(args) {
+        return match help_text(args) {
+            Some(text) => {
+                out!("{}", text.trim_end());
+                0
+            }
+            None => {
+                eprintln!(
+                    "Error: unknown broker subcommand {:?} — see `aethyme broker --help`",
+                    args.iter()
+                        .find(|arg| !arg.starts_with('-'))
+                        .map(String::as_str)
+                        .unwrap_or_default()
+                );
+                crate::exit_status::USAGE
+            }
+        };
+    }
+    // Public verbs, `advanced <verb>` and old spellings all dispatch to the
+    // internal subcommand that implements them. The router prints the
+    // deprecation warning; in-process callers pass internal spellings.
+    let resolved = resolve(args);
+    if resolved.args.is_empty() {
+        let text = if args.is_empty() {
+            surface::public_help()
+        } else {
+            surface::advanced_help()
+        };
+        eprint!("{text}");
+        return crate::exit_status::USAGE;
+    }
+    let args = resolved.args.as_slice();
     // Dispatched before the shared parser: the contract check is a CI/gate
     // entry point with its own flags (`--base`, `--pr-body`) and its own
     // exit-code contract (2 = bad invocation), and it deliberately records
@@ -705,8 +745,8 @@ pub fn run_with_mode(args: &[String], mode: CompatibilityMode) -> u8 {
     let (code, record_outcome) = match run_inner(args, mode) {
         Ok(()) => (0, true),
         Err(UsageError::Help) => {
-            eprint!("{USAGE}");
-            (2, false)
+            eprint!("{}", surface::public_help());
+            (crate::exit_status::USAGE, false)
         }
         Err(UsageError::Message(message)) => {
             eprintln!("Error: {message}");
@@ -845,6 +885,8 @@ struct Parsed {
     check: bool,
     dispatch: bool,
     reuse: bool,
+    /// `start --adopt`: register an existing worktree (formerly `adopt`).
+    adopt: bool,
     replace_stale: bool,
     all: bool,
     all_cleaned: bool,
@@ -951,6 +993,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         check: false,
         dispatch: false,
         reuse: false,
+        adopt: false,
         replace_stale: false,
         all: false,
         all_cleaned: false,
@@ -1023,6 +1066,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
             "--check" => parsed.check = true,
             "--dispatch" => parsed.dispatch = true,
             "--reuse" => parsed.reuse = true,
+            "--adopt" => parsed.adopt = true,
             "--all" => parsed.all = true,
             "--all-cleaned" => parsed.all_cleaned = true,
             "--keep-worktree" => parsed.keep_worktree = true,
@@ -1556,6 +1600,13 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
         }
     })?;
     parsed.read_only_snapshot = mode == CompatibilityMode::ReadOnlySnapshot;
+    // `start` is the one public verb that merges by flag: registering an
+    // existing worktree and spawning a process keep their own handlers.
+    let subcommand = &match subcommand.as_str() {
+        "start" if parsed.adopt || parsed.reuse || parsed.replace_stale => "adopt".to_string(),
+        "start" if parsed.cmd.is_some() => "start-agent".to_string(),
+        other => other.to_string(),
+    };
     // One declarative check replaces the per-flag guards that grew after #285:
     // a flag the subcommand never reads is refused rather than dropped.
     validate_flags(subcommand, &parsed)?;
