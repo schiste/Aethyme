@@ -44,6 +44,62 @@ pub(super) fn graph_store_explore_error(error: GraphStoreError) -> ExploreError 
 /// at least 95% on the development set.
 const GRAPH_FREE_ANSWER_PROMOTION: bool = false;
 
+/// Evidence keys a graph-free hint keeps in the default compact profile.
+/// `line_refs` anchors `verify-targets` and is what an agent reads next; the
+/// matched terms, role and defining symbol are already spelled out in the
+/// hint's `reason`. `answer_rule` names why a promoted hit is answer-safe.
+const COMPACT_HINT_EVIDENCE_KEYS: [&str; 2] = ["line_refs", "answer_rule"];
+
+/// Shape a graph-free envelope for the requested output profile.
+///
+/// [`graph_unavailable_response`] builds every field; this trims what an
+/// agent does not need to act on, so the default call stays small:
+///
+/// - `--detail compact` without `--show-observability` (the default agent
+///   call): each hint's `evidence` keeps only `line_refs`, and
+///   `observability` keeps only `readiness`.
+/// - `--show-observability`, or `--detail standard`: the full per-hint
+///   evidence (`score`, `term_coverage`, `matched_terms`, `path_role`,
+///   `symbol_match`, ...). `--show-observability` also keeps
+///   `observability.source_fallback` and `graph_store`.
+/// - `--detail full`: everything, including the scoring-model constants in
+///   `observability.source_fallback.scoring`.
+///
+/// Ranking, hint order and line spans are identical in every profile; only
+/// diagnostics are omitted. `output_chars_estimate` is recomputed.
+pub fn project_graph_free_output(
+    mut response: ExploreResponse,
+    detail: Detail,
+    show_observability: bool,
+) -> ExploreResponse {
+    let full = matches!(detail, Detail::Full);
+    let keep_hint_diagnostics = show_observability || !matches!(detail, Detail::Compact);
+    if !keep_hint_diagnostics {
+        for item in response
+            .answer
+            .iter_mut()
+            .chain(response.navigation_hints.iter_mut())
+        {
+            if let Some(evidence) = item.evidence.as_object_mut() {
+                evidence.retain(|key, _| COMPACT_HINT_EVIDENCE_KEYS.contains(&key.as_str()));
+            }
+        }
+    }
+    if !full && let Some(observability) = response.observability.as_mut() {
+        if show_observability {
+            if let Some(source) = observability
+                .get_mut("source_fallback")
+                .and_then(|value| value.as_object_mut())
+            {
+                source.remove("scoring");
+            }
+        } else if let Some(map) = observability.as_object_mut() {
+            map.retain(|key, _| key == "readiness");
+        }
+    }
+    response_with_output_estimate(response)
+}
+
 /// Build the stable answer-json contract for a repository whose optional
 /// local graph store cannot currently answer. A bounded full-content source
 /// search supplies ranked navigation hints with line spans. Graph-free hits

@@ -75,7 +75,9 @@ mod disclosure_tests;
 #[cfg(test)]
 mod tests;
 
-pub use graph_free::{graph_unavailable_response, graph_unavailable_response_with};
+pub use graph_free::{
+    graph_unavailable_response, graph_unavailable_response_with, project_graph_free_output,
+};
 pub use graph_path::explore_with_intent;
 pub use params::{DISCLOSURE_LEVELS, Detail, DisclosureLevel, ExploreParams, Intent, IntentSource};
 pub use source_fallback::{

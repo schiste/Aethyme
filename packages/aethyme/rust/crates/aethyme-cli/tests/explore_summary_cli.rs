@@ -338,3 +338,88 @@ fn graph_free_explore_output_feeds_both_readers() {
         "{verified}"
     );
 }
+
+/// The default agent call (no `--show-observability`) omits per-hint
+/// diagnostics and all observability except `readiness`, but both readers
+/// still get what they need: readiness, trust, targets and line spans.
+#[test]
+fn default_compact_graph_free_explore_still_feeds_both_readers() {
+    let tmp = tmp_dir();
+    let repo = tmp.path().join("repo");
+    write(
+        repo.join("src/billing/invoice.py"),
+        "def finalize_invoice_total(lines):\n    return sum(line.amount for line in lines)\n",
+    );
+    let status = std::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&repo)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let repo_arg = repo.display().to_string();
+    let raw = invoke_aethyme([
+        "explore",
+        "--repo",
+        &repo_arg,
+        "--request",
+        "where is the invoice total finalized",
+        "--format",
+        "answer-json",
+    ])
+    .ok()
+    .to_string();
+    let explore: Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(
+        explore["output_chars_estimate"].as_u64().unwrap() as usize,
+        raw.trim_end_matches('\n').len()
+    );
+    let hint = &explore["navigation_hints"][0];
+    assert_eq!(hint["path"], "src/billing/invoice.py");
+    assert_eq!(
+        hint["evidence"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .collect::<Vec<_>>(),
+        ["line_refs"]
+    );
+    assert_eq!(
+        explore["observability"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .collect::<Vec<_>>(),
+        ["readiness"]
+    );
+    let saved = tmp.path().join("explore.json");
+    write(&saved, &raw);
+    let saved_arg = saved.display().to_string();
+
+    let summary: Value =
+        serde_json::from_str(invoke_aethyme(["explore-summary", "--from", &saved_arg]).ok())
+            .unwrap();
+    assert_eq!(summary["observability"]["readiness"]["status"], "ready");
+    assert_eq!(summary["safe_to_use_as_answer"], false);
+    assert_eq!(
+        summary["top_verification_targets"][0]["path"],
+        "src/billing/invoice.py"
+    );
+
+    let verified: Value = serde_json::from_str(
+        invoke_aethyme([
+            "verify-targets",
+            "--repo",
+            &repo_arg,
+            "--from",
+            &saved_arg,
+            "--max-targets",
+            "1",
+        ])
+        .ok(),
+    )
+    .unwrap();
+    assert_eq!(verified["targets"][0]["path"], "src/billing/invoice.py");
+    assert_eq!(verified["targets"][0]["line_span"]["start"], 1);
+}

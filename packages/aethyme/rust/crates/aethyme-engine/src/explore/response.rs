@@ -835,10 +835,22 @@ pub(super) fn budget_evidence_value(
     }
 }
 
+/// Set `output_chars_estimate` to the byte length of the pretty-printed
+/// response *including the estimate itself*. The first pass measures with
+/// the previous value in place, so it can be off by the number of digits
+/// that change; iterating until the value is stable makes it exact (two or
+/// three passes: the length changes by at most a digit).
 pub(super) fn response_with_output_estimate(mut response: ExploreResponse) -> ExploreResponse {
-    response.output_chars_estimate = serde_json::to_string_pretty(&response)
-        .map(|json| json.len())
-        .unwrap_or(0);
+    response.output_chars_estimate = 0;
+    for _ in 0..4 {
+        let measured = serde_json::to_string_pretty(&response)
+            .map(|json| json.len())
+            .unwrap_or(0);
+        if measured == response.output_chars_estimate {
+            break;
+        }
+        response.output_chars_estimate = measured;
+    }
     response
 }
 
