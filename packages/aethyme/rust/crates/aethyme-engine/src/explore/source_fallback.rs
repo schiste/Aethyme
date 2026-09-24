@@ -2,10 +2,11 @@
 //!
 //! The repository's files (tracked plus untracked-but-not-ignored, as Git
 //! reports them) are searched in full for the request's meaningful terms and
-//! ranked by content signals: term coverage, BM25-style density, matches on
-//! definition lines, proximity of distinct terms, definitions from the
-//! on-demand symbol index, file-name matches, and a generic path role
-//! (source over tests, docs, vendored and generated code). The search is
+//! ranked by BM25F (see [`bm25f`]) over the file name, directory names,
+//! definition names from the on-demand symbol index, code lines and comment
+//! lines, scaled by a generic path role (source over tests, docs, vendored
+//! and generated code). The reported span is the densest window of distinct
+//! matched terms or the best-matching definition. The search is
 //! bounded by wall time, not by a file count, and reports whether it
 //! finished. Results are lexical navigation hints, never evidence of callers
 //! or impact closure.
@@ -18,9 +19,12 @@ use std::time::{Duration, Instant};
 use rayon::prelude::*;
 
 use super::path_role::{self, PathRole};
-use super::query_terms::{QueryTerms, occurs_at_boundary, split_identifier, stem};
+use super::query_terms::{
+    QueryTerms, boundary_matches, may_contain, split_identifier, token_count, token_matches,
+};
 use super::symbol_index::{self, Definition, IndexStats, Stamp, SymbolIndex};
 use super::{AnswerItem, ExploreSubsystem, ExploreSubsystemTarget};
+use bm25f::{Corpus, Document, Field};
 
 /// Files larger than this are treated as data, not source, and skipped.
 const MAX_FILE_BYTES: u64 = 1024 * 1024;
@@ -33,8 +37,9 @@ const MAX_MATCHED_LINES: usize = 512;
 /// Lines spanned by one proximity window.
 const WINDOW_LINES: u32 = 6;
 const MAX_LINE_REFS: usize = 3;
-const BM25_K1: f64 = 1.2;
-const BM25_B: f64 = 0.75;
+/// Occurrences of one term counted per line: enough to measure density
+/// without letting one pathological line dominate.
+const MAX_MATCHES_PER_LINE: u32 = 8;
 
 /// Term coverage the top hit needs for the coverage rule of
 /// [`answer_safety`].
@@ -204,6 +209,13 @@ impl SourceFallback {
             "reason": self.incomplete_reason,
             "max_hits": self.max_hits,
             "terms": self.terms,
+            "scoring": {
+                "model": "bm25f",
+                "k1": bm25f::K1,
+                "fields": ["name", "dir", "symbol", "code", "comment"],
+                "weights": bm25f::FIELDS.map(|field| field.weight),
+                "b": bm25f::FIELDS.map(|field| field.b),
+            },
             "answer_safety": {
                 "safe": self.answer_safety.safe,
                 "rule": self.answer_safety.rule,
@@ -488,17 +500,19 @@ struct MatchedLine {
     line: u32,
     mask: u32,
     definition: bool,
+    /// An import or include line: evidence the file uses a name, not where
+    /// the behavior is.
+    import: bool,
 }
 
 struct ScannedFile {
     path: String,
     role: PathRole,
     retired: bool,
-    line_count: u32,
-    /// Matching lines per term.
-    tf: Vec<u32>,
-    /// Terms seen on a definition-looking line.
-    definition_mask: u32,
+    /// Term occurrences per term: `[code, comment]`.
+    tf: Vec<[u32; 2]>,
+    /// Tokens on code and comment lines.
+    tokens: [u32; 2],
     lines: Vec<MatchedLine>,
     definitions: Vec<Definition>,
 }
@@ -538,37 +552,74 @@ fn scan_file(
         path: path.to_string(),
         role,
         retired: classified.retired,
-        line_count: 0,
-        tf: vec![0; query.terms.len()],
-        definition_mask: 0,
+        tf: vec![[0; 2]; query.terms.len()],
+        tokens: [0; 2],
         lines: Vec::new(),
         definitions: Vec::new(),
     };
-    for (number, line) in text.lines().enumerate() {
-        file.line_count += 1;
-        let line = truncate_at_char(line, MAX_LINE_BYTES);
-        let lower = line.to_ascii_lowercase();
-        let mut mask = 0u32;
-        for (bit, term) in query.terms.iter().enumerate() {
-            if occurs_at_boundary(line, &lower, &term.stem) {
-                mask |= 1 << bit;
-                file.tf[bit] += 1;
+    // ASCII lowercasing keeps byte offsets, so line slices of `lowered` line
+    // up with the original lines.
+    let lowered = text.to_ascii_lowercase();
+    // Most files hold no request term at all: one substring pass each
+    // settles that without per-line work. Such a file has no field lengths
+    // either; averages are taken over the files that match (see `rank`).
+    if !query
+        .terms
+        .iter()
+        .any(|term| may_contain(&lowered, &term.stem))
+    {
+        return Scan::Searched(Box::new(file));
+    }
+    // Line table: start offset, end of the searched prefix, comment flag.
+    let mut table = Vec::new();
+    let mut offset = 0;
+    for raw in text.split_inclusive('\n') {
+        let line = truncate_at_char(raw.trim_end_matches(['\n', '\r']), MAX_LINE_BYTES);
+        let comment = is_comment_line(line);
+        file.tokens[usize::from(comment)] += token_count(line);
+        table.push((offset, offset + line.len(), comment));
+        offset += raw.len();
+    }
+    // One whole-text pass per term; occurrences come in ascending order, so
+    // the line cursor only moves forward.
+    let mut masks = vec![0u32; table.len()];
+    for (bit, term) in query.terms.iter().enumerate() {
+        let mut index = 0;
+        let mut counted = (usize::MAX, 0u32);
+        for at in boundary_matches(&text, &lowered, &term.stem) {
+            while index + 1 < table.len() && table[index + 1].0 <= at {
+                index += 1;
             }
+            let (_, end, comment) = table[index];
+            if at >= end {
+                continue;
+            }
+            if counted.0 != index {
+                counted = (index, 0);
+            }
+            if counted.1 >= MAX_MATCHES_PER_LINE {
+                continue;
+            }
+            counted.1 += 1;
+            masks[index] |= 1 << bit;
+            file.tf[bit][usize::from(comment)] += 1;
         }
+    }
+    for (index, &mask) in masks.iter().enumerate() {
         if mask == 0 {
             continue;
         }
-        let definition = is_definition_line(line);
-        if definition {
-            file.definition_mask |= mask;
+        if file.lines.len() >= MAX_MATCHED_LINES {
+            break;
         }
-        if file.lines.len() < MAX_MATCHED_LINES {
-            file.lines.push(MatchedLine {
-                line: number as u32 + 1,
-                mask,
-                definition,
-            });
-        }
+        let (start, end, _) = table[index];
+        let line = &text[start..end];
+        file.lines.push(MatchedLine {
+            line: index as u32 + 1,
+            mask,
+            definition: is_definition_line(line),
+            import: is_import_line(line),
+        });
     }
     if !file.lines.is_empty() && symbol_index::supports(path) {
         file.definitions = index.definitions(path, Stamp::of(&metadata), &text);
@@ -591,31 +642,31 @@ fn is_definition_line(line: &str) -> bool {
     symbol_index::line_definition(line).is_some()
 }
 
-// ── ranking ─────────────────────────────────────────────────────────────
-
-struct Weights {
-    idf: Vec<f64>,
-    /// Sum of idf over terms that occur anywhere (content or a path).
-    present_total: f64,
+/// A line that imports or includes another module in a widely used syntax.
+fn is_import_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    [
+        "import ", "from ", "use ", "#include", "#import", "using ", "require ", "require(",
+    ]
+    .iter()
+    .any(|prefix| trimmed.starts_with(prefix))
+        || (trimmed.starts_with("export ") && trimmed.contains(" from "))
 }
 
-fn weights(query: &QueryTerms, files: &[ScannedFile], path_masks: &[u32]) -> Weights {
-    let n = files.len().max(1) as f64;
-    let any_path = path_masks
-        .iter()
-        .fold(0u32, |all, mask| all | mask | (mask >> 16));
-    let mut idf = Vec::with_capacity(query.terms.len());
-    let mut present_total = 0.0;
-    for bit in 0..query.terms.len() {
-        let df = files.iter().filter(|file| file.tf[bit] > 0).count() as f64;
-        let weight = (1.0 + (n - df + 0.5) / (df + 0.5)).ln();
-        idf.push(weight);
-        if df > 0.0 || any_path & (1 << bit) != 0 {
-            present_total += weight;
-        }
+/// A line that is only a comment in a widely used comment syntax (`//`,
+/// `/*`, `*`, `#`, `--`, `;`, `<!--`, docstring quotes). `#` followed by a
+/// word or `[` is a preprocessor directive or an attribute, not a comment.
+fn is_comment_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    if let Some(rest) = trimmed.strip_prefix('#') {
+        return !rest.starts_with(|ch: char| ch.is_ascii_alphanumeric() || ch == '[');
     }
-    Weights { idf, present_total }
+    ["//", "/*", "*", "--", ";", "<!--", "\"\"\"", "'''"]
+        .iter()
+        .any(|marker| trimmed.starts_with(marker))
 }
+
+// ── ranking ─────────────────────────────────────────────────────────────
 
 fn mask_weight(mask: u32, idf: &[f64]) -> f64 {
     idf.iter()
@@ -625,30 +676,32 @@ fn mask_weight(mask: u32, idf: &[f64]) -> f64 {
         .sum()
 }
 
-/// Terms matching a file-name part (bits 0..16) or a directory part
-/// (bits 16..32).
-fn path_term_mask(path: &str, query: &QueryTerms) -> u32 {
+/// Lowercase parts of the file name (without extensions) and of the
+/// directory names.
+fn path_parts(path: &str) -> (Vec<String>, Vec<String>) {
     let (dirs, name) = path.rsplit_once('/').unwrap_or(("", path));
     let name = name.split('.').next().unwrap_or(name);
-    let name_parts = split_identifier(name);
     let dir_parts = dirs
         .split('/')
         .flat_map(split_identifier)
         .collect::<Vec<_>>();
-    let mut mask = 0u32;
-    for (bit, term) in query.terms.iter().enumerate() {
-        if name_parts.iter().any(|part| part.starts_with(&term.stem)) {
-            mask |= 1 << bit;
-        } else if dir_parts.iter().any(|part| part.starts_with(&term.stem)) {
-            mask |= 1 << (bit + 16);
-        }
-    }
-    mask
+    (split_identifier(name), dir_parts)
 }
+
+fn part_matches(part: &str, stem_of_term: &str) -> bool {
+    token_matches(part, stem_of_term)
+}
+
+const ALL_FIELDS: [Field; bm25f::FIELD_COUNT] = [
+    Field::Name,
+    Field::Dir,
+    Field::Symbol,
+    Field::Code,
+    Field::Comment,
+];
 
 struct SymbolMatch<'a> {
     definition: &'a Definition,
-    mask: u32,
     score: f64,
     exact: bool,
 }
@@ -668,10 +721,9 @@ fn best_symbol<'a>(
         let mut mask = 0u32;
         let mut matched_parts = 0usize;
         for part in &parts {
-            let part_stem = stem(part);
             let mut hit = false;
             for (bit, term) in query.terms.iter().enumerate() {
-                if part.starts_with(&term.stem) || part_stem == term.stem {
+                if part_matches(part, &term.stem) {
                     mask |= 1 << bit;
                     hit = true;
                 }
@@ -700,7 +752,6 @@ fn best_symbol<'a>(
         if score > best.as_ref().map_or(0.0, |best| best.score) {
             best = Some(SymbolMatch {
                 definition,
-                mask,
                 score,
                 exact,
             });
@@ -710,8 +761,10 @@ fn best_symbol<'a>(
 }
 
 /// Best proximity window: the densest run of `WINDOW_LINES` lines by the
-/// idf weight of the distinct terms it contains.
+/// idf weight of the distinct terms it contains. Import lines are skipped:
+/// a block of imports names many terms without implementing any.
 fn best_window(lines: &[MatchedLine], idf: &[f64]) -> Option<(u32, u32, u32, f64)> {
+    let lines = lines.iter().filter(|line| !line.import).collect::<Vec<_>>();
     let mut best: Option<(u32, u32, u32, f64)> = None;
     for (start_index, first) in lines.iter().enumerate() {
         let mut mask = 0u32;
@@ -736,64 +789,227 @@ fn best_window(lines: &[MatchedLine], idf: &[f64]) -> Option<(u32, u32, u32, f64
     best
 }
 
+/// The BM25F document for one scanned file. Its terms are the request
+/// terms followed by the request's compounds (`loadtoken`), which only the
+/// symbol field can hold: a definition named exactly like a compound is a
+/// phrase match, weighted by how rare that definition is in the corpus.
+///
+/// `None` for a file that matches no term in any field: it only counts
+/// toward the corpus size.
+fn document(file: &ScannedFile, query: &QueryTerms) -> Option<Document> {
+    let (name_parts, dir_parts) = path_parts(&file.path);
+    let path_match = || {
+        query.terms.iter().any(|term| {
+            name_parts
+                .iter()
+                .chain(&dir_parts)
+                .any(|part| part_matches(part, &term.stem))
+        })
+    };
+    if file.lines.is_empty() && !path_match() {
+        return None;
+    }
+    let mut doc = Document::new(query.terms.len() + query.compounds.len());
+    doc.len[Field::Name as usize] = name_parts.len() as f64;
+    doc.len[Field::Dir as usize] = dir_parts.len() as f64;
+    doc.len[Field::Code as usize] = f64::from(file.tokens[0]);
+    doc.len[Field::Comment as usize] = f64::from(file.tokens[1]);
+    for (bit, term) in query.terms.iter().enumerate() {
+        let hits = |parts: &[String]| {
+            parts
+                .iter()
+                .filter(|part| part_matches(part, &term.stem))
+                .count() as f64
+        };
+        doc.add(bit, Field::Name, hits(&name_parts));
+        doc.add(bit, Field::Dir, hits(&dir_parts));
+        doc.add(bit, Field::Code, f64::from(file.tf[bit][0]));
+        doc.add(bit, Field::Comment, f64::from(file.tf[bit][1]));
+    }
+    for definition in &file.definitions {
+        let parts = split_identifier(&definition.name);
+        doc.len[Field::Symbol as usize] += parts.len() as f64;
+        if parts.len() >= 2 {
+            let joined = parts.concat();
+            if let Some(index) = query.compounds.iter().position(|c| *c == joined) {
+                doc.add(query.terms.len() + index, Field::Symbol, 1.0);
+            }
+        }
+        for (bit, term) in query.terms.iter().enumerate() {
+            let matched = parts.iter().any(|part| part_matches(part, &term.stem));
+            if matched {
+                doc.add(bit, Field::Symbol, 1.0);
+            }
+        }
+    }
+    Some(doc)
+}
+
+/// Lines a one-line (keyword-found) definition is taken to span when no
+/// later definition bounds it.
+const PASSAGE_FALLBACK_LINES: u32 = 60;
+
+/// Share of the best coverage within which a shorter passage is preferred.
+const PASSAGE_NEAR_BEST: f64 = 0.9;
+/// Passages reported per file.
+const MAX_PASSAGES: usize = 2;
+
+/// The definitions whose name and body cover the most of the request.
+///
+/// A passage's coverage is the idf weight of the distinct request terms on
+/// its matched lines, with terms its name matches counted twice (the name
+/// says what the passage is about). An enclosing class covers everything its
+/// methods do, so among passages within [`PASSAGE_NEAR_BEST`] of the best
+/// coverage the shortest wins: the innermost definition that still holds
+/// the request. The next passage is chosen the same way among those that do
+/// not overlap one already chosen. A one-line definition (found by keyword,
+/// without a parser) spans until the next definition, the end of its
+/// enclosing definition, or [`PASSAGE_FALLBACK_LINES`], whichever is first.
+fn best_passages<'a>(
+    file: &'a ScannedFile,
+    query: &QueryTerms,
+    idf: &[f64],
+) -> Vec<(&'a Definition, u32)> {
+    let definitions = &file.definitions;
+    if definitions.is_empty() || file.lines.is_empty() {
+        return Vec::new();
+    }
+    let mut candidates = Vec::new();
+    for (index, definition) in definitions.iter().enumerate() {
+        let start = definition.start_line;
+        let end = if definition.end_line > start {
+            definition.end_line
+        } else {
+            let bound = definitions
+                .iter()
+                .filter(|outer| outer.start_line <= start && outer.end_line > start)
+                .map(|outer| outer.end_line)
+                .min()
+                .unwrap_or(start + PASSAGE_FALLBACK_LINES);
+            definitions[index + 1..]
+                .iter()
+                .map(|next| next.start_line)
+                .find(|&line| line > start)
+                .map_or(bound, |line| line - 1)
+                .min(bound)
+        };
+        let from = file.lines.partition_point(|line| line.line < start);
+        let body = file.lines[from..]
+            .iter()
+            .take_while(|line| line.line <= end)
+            .fold(0u32, |mask, line| mask | line.mask);
+        let parts = split_identifier(&definition.name);
+        let name = query
+            .terms
+            .iter()
+            .enumerate()
+            .filter(|(_, term)| parts.iter().any(|part| part_matches(part, &term.stem)))
+            .fold(0u32, |mask, (bit, _)| mask | (1 << bit));
+        let coverage = mask_weight(body | name, idf) + mask_weight(name, idf);
+        if coverage > 0.0 {
+            candidates.push((definition, start, end, coverage));
+        }
+    }
+    let mut chosen: Vec<(&Definition, u32, u32)> = Vec::new();
+    while chosen.len() < MAX_PASSAGES {
+        let open = candidates
+            .iter()
+            .filter(|(_, start, end, _)| {
+                chosen
+                    .iter()
+                    .all(|(_, taken_start, taken_end)| end < taken_start || start > taken_end)
+            })
+            .collect::<Vec<_>>();
+        let Some(best) = open.iter().map(|candidate| candidate.3).reduce(f64::max) else {
+            break;
+        };
+        let pick = open
+            .iter()
+            .filter(|candidate| candidate.3 >= best * PASSAGE_NEAR_BEST)
+            .min_by(|a, b| {
+                (a.2 - a.1)
+                    .cmp(&(b.2 - b.1))
+                    .then_with(|| b.3.total_cmp(&a.3))
+                    .then_with(|| a.1.cmp(&b.1))
+            })
+            .copied();
+        let Some(&(definition, start, end, _)) = pick else {
+            break;
+        };
+        chosen.push((definition, start, end));
+    }
+    chosen
+        .into_iter()
+        .map(|(definition, _, end)| (definition, end))
+        .collect()
+}
+
 fn rank(query: &QueryTerms, files: &[ScannedFile]) -> Vec<(AnswerItem, HitSignal)> {
-    let path_masks = files
+    let (candidates, documents): (Vec<&ScannedFile>, Vec<Document>) = files
+        .par_iter()
+        .filter_map(|file| Some((file, document(file, query)?)))
+        .unzip();
+    // Field-length averages come from the files that match at least one
+    // term (the only ones ranked); idf uses every searched file.
+    let mut corpus = Corpus::new(
+        &documents,
+        query.terms.len() + query.compounds.len(),
+        files.len(),
+    );
+    // A phrase is rare by construction; it may count as much as matching
+    // the request terms it is made of, never more.
+    for (index, compound) in query.compounds.iter().enumerate() {
+        let parts = query
+            .terms
+            .iter()
+            .enumerate()
+            .filter(|(_, term)| compound.contains(term.text.as_str()))
+            .map(|(bit, _)| corpus.idf[bit])
+            .sum::<f64>();
+        let phrase = &mut corpus.idf[query.terms.len() + index];
+        *phrase = phrase.min(parts);
+    }
+    let idf = &corpus.idf[..query.terms.len()];
+    let term_mask = |doc: &Document, fields: &[Field]| {
+        (0..query.terms.len())
+            .filter(|&bit| {
+                fields
+                    .iter()
+                    .any(|field| doc.tf[bit][*field as usize] > 0.0)
+            })
+            .fold(0u32, |mask, bit| mask | (1 << bit))
+    };
+    // Share of idf weight counts only terms present somewhere in the corpus.
+    let present = documents
         .iter()
-        .map(|file| path_term_mask(&file.path, query))
-        .collect::<Vec<_>>();
-    let weights = weights(query, files, &path_masks);
-    let idf = &weights.idf;
-    let avg_len = (files.iter().map(|file| file.line_count as f64).sum::<f64>()
-        / files.len().max(1) as f64)
-        .max(1.0);
+        .fold(0u32, |all, doc| all | term_mask(doc, &ALL_FIELDS));
+    let present_total = mask_weight(present, idf);
     let wants_tests = query.mentions(&["test", "tests", "testing", "spec", "specs"]);
     let wants_docs = query.mentions(&["doc", "docs", "documentation", "readme", "guide"]);
 
     let mut scored = Vec::new();
-    for (file, &path_mask) in files.iter().zip(&path_masks) {
-        let name_mask = path_mask & 0xFFFF;
-        let dir_mask = path_mask >> 16;
-        let content_mask = file
-            .tf
-            .iter()
-            .enumerate()
-            .filter(|(_, tf)| **tf > 0)
-            .fold(0u32, |mask, (bit, _)| mask | (1 << bit));
-        if content_mask == 0 && name_mask == 0 {
+    for (file, doc) in candidates.into_iter().zip(&documents) {
+        // A directory-only match says nothing about this file in particular.
+        let matched = term_mask(
+            doc,
+            &[Field::Name, Field::Symbol, Field::Code, Field::Comment],
+        );
+        if matched == 0 {
             continue;
         }
-        let length_norm = 1.0 - BM25_B + BM25_B * file.line_count as f64 / avg_len;
-        let content = file
-            .tf
-            .iter()
-            .enumerate()
-            .map(|(bit, tf)| {
-                let tf = *tf as f64;
-                idf[bit] * tf * (BM25_K1 + 1.0) / (tf + BM25_K1 * length_norm)
-            })
-            .sum::<f64>();
-        let definition = mask_weight(file.definition_mask, idf) * 0.8;
-        let path =
-            mask_weight(name_mask, idf) * 1.5 + mask_weight(dir_mask & !name_mask, idf) * 0.4;
-        let window = best_window(&file.lines, idf);
-        let window_score = window
-            .filter(|window| window.2.count_ones() >= 2)
-            .map_or(0.0, |window| window.3 * 0.8);
-        let symbol = best_symbol(&file.definitions, query, idf);
-        let symbol_score = symbol.as_ref().map_or(0.0, |symbol| symbol.score);
-        let matched = content_mask | name_mask | symbol.as_ref().map_or(0, |symbol| symbol.mask);
-        let coverage = if weights.present_total > 0.0 {
-            (mask_weight(matched, idf) / weights.present_total).min(1.0)
+        let coverage = if present_total > 0.0 {
+            (mask_weight(matched, idf) / present_total).min(1.0)
         } else {
             0.0
         };
         let role_weight =
             file.role.weight(wants_tests, wants_docs) * if file.retired { 0.6 } else { 1.0 };
-        let raw = content + definition + path + window_score + symbol_score;
-        let score = raw * (0.3 + 0.7 * coverage * coverage) * role_weight;
+        let score = corpus.score(doc) * role_weight;
         if score <= 0.0 {
             continue;
         }
+        let window = best_window(&file.lines, idf);
+        let symbol = best_symbol(&file.definitions, query, idf);
         scored.push((score, file, matched, coverage, window, symbol));
     }
     scored.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.path.cmp(&b.1.path)));
@@ -801,39 +1017,54 @@ fn rank(query: &QueryTerms, files: &[ScannedFile]) -> Vec<(AnswerItem, HitSignal
     scored
         .into_iter()
         .map(|(score, file, matched, coverage, window, symbol)| {
-            let mut line_refs = Vec::new();
-            let symbol_first = symbol
-                .as_ref()
-                .is_some_and(|symbol| symbol.score >= window.map_or(0.0, |window| window.3));
-            let symbol_ref = symbol.as_ref().map(|symbol| {
+            let mut line_refs: Vec<serde_json::Value> = Vec::new();
+            let covered = |refs: &[serde_json::Value], line: u32| {
+                refs.iter().any(|existing| {
+                    let start = existing["line"].as_u64().unwrap_or(0) as u32;
+                    let end = existing["end_line"].as_u64().unwrap_or(0) as u32;
+                    (start..=end.max(start)).contains(&line)
+                })
+            };
+            // The definition that best covers the request leads, then the
+            // densest window outside it, then the next-best definition, then
+            // the definition whose name best matches the request.
+            let passages = best_passages(file, query, idf);
+            let passage_ref = |(definition, end): &(&Definition, u32)| {
                 serde_json::json!({
+                    "line": definition.start_line,
+                    "end_line": end,
+                    "kind": "definition",
+                    "symbol": definition.name,
+                    "symbol_kind": definition.kind,
+                })
+            };
+            line_refs.extend(passages.first().map(passage_ref));
+            if let Some((start, end, _, _)) = window
+                && !(covered(&line_refs, start) && covered(&line_refs, end))
+            {
+                line_refs
+                    .push(serde_json::json!({"line": start, "end_line": end, "kind": "match"}));
+            }
+            if let Some(second) = passages.get(1)
+                && !covered(&line_refs, second.0.start_line)
+            {
+                line_refs.push(passage_ref(second));
+            }
+            if let Some(symbol) = &symbol
+                && !covered(&line_refs, symbol.definition.start_line)
+            {
+                line_refs.push(serde_json::json!({
                     "line": symbol.definition.start_line,
                     "end_line": symbol.definition.end_line,
                     "kind": "definition",
                     "symbol": symbol.definition.name,
                     "symbol_kind": symbol.definition.kind,
-                })
-            });
-            let window_ref = window.map(|(start, end, _, _)| {
-                serde_json::json!({"line": start, "end_line": end, "kind": "match"})
-            });
-            if symbol_first {
-                line_refs.extend(symbol_ref.clone());
-                line_refs.extend(window_ref);
-            } else {
-                line_refs.extend(window_ref);
-                line_refs.extend(symbol_ref.clone());
+                }));
             }
-            if let Some(line) = file.lines.iter().find(|line| line.definition) {
-                let covered = line_refs.iter().any(|existing| {
-                    let start = existing["line"].as_u64().unwrap_or(0) as u32;
-                    let end = existing["end_line"].as_u64().unwrap_or(0) as u32;
-                    (start..=end).contains(&line.line)
-                });
-                if !covered {
-                    line_refs
-                        .push(serde_json::json!({"line": line.line, "kind": "definition_line"}));
-                }
+            if let Some(line) = file.lines.iter().find(|line| line.definition)
+                && !covered(&line_refs, line.line)
+            {
+                line_refs.push(serde_json::json!({"line": line.line, "kind": "definition_line"}));
             }
             if line_refs.is_empty()
                 && let Some(line) = file.lines.first()
@@ -902,5 +1133,6 @@ fn rank(query: &QueryTerms, files: &[ScannedFile]) -> Vec<(AnswerItem, HitSignal
         .collect()
 }
 
+mod bm25f;
 #[cfg(test)]
 mod tests;
