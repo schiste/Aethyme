@@ -183,8 +183,7 @@ pub(super) fn line_definition(line: &str) -> Option<(&'static str, &str)> {
 }
 
 /// Keyword-introduced definitions for any language, including the ones no
-/// parser covers and declarations a parser skips (such as exported
-/// TypeScript declarations).
+/// parser covers and declarations a parser skips.
 fn keyword_definitions(content: &str) -> Vec<Definition> {
     content
         .lines()
@@ -314,13 +313,6 @@ impl SymbolIndex {
             top_node: Node::File(file),
             language: language.into(),
         };
-        let unexported;
-        let content = if language == "typescript" {
-            unexported = blank_export_keywords(content);
-            unexported.as_str()
-        } else {
-            content
-        };
         // A parser bug on one odd file must not take Explore down with it.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             indexer.index_file(context, &indexed, content)
@@ -369,52 +361,6 @@ impl SymbolIndex {
         }
         stats
     }
-}
-
-/// The TypeScript indexer only walks top-level declarations and skips
-/// `export`-wrapped ones. Blanking `export` / `export default` in front of a
-/// declaration keyword (same byte length, so every line number and span is
-/// unchanged) exposes those declarations, and their class members, to it.
-fn blank_export_keywords(content: &str) -> String {
-    const DECLARATIONS: &[&str] = &[
-        "function",
-        "class",
-        "const",
-        "let",
-        "var",
-        "interface",
-        "type",
-        "enum",
-        "namespace",
-        "abstract",
-        "async",
-        "declare",
-    ];
-    let mut out = String::with_capacity(content.len());
-    for line in content.split_inclusive('\n') {
-        let indent = line.len() - line.trim_start().len();
-        let mut rest = &line[indent..];
-        let mut blank = 0;
-        for keyword in ["export ", "default "] {
-            if let Some(after) = rest.strip_prefix(keyword) {
-                let after_trimmed = after.trim_start();
-                blank += keyword.len() + (after.len() - after_trimmed.len());
-                rest = after_trimmed;
-            }
-        }
-        let next_word = rest
-            .split(|ch: char| !ch.is_alphanumeric())
-            .next()
-            .unwrap_or("");
-        if blank > 0 && DECLARATIONS.contains(&next_word) {
-            out.push_str(&line[..indent]);
-            out.extend(std::iter::repeat_n(' ', blank));
-            out.push_str(rest);
-        } else {
-            out.push_str(line);
-        }
-    }
-    out
 }
 
 fn definition_of(node: &Node) -> Option<Definition> {
@@ -538,6 +484,28 @@ mod tests {
             names.contains(&("refreshAccessToken".into(), "method".into(), 2)),
             "{names:?}"
         );
+        // Export-wrapped declarations come from the TypeScript indexer itself,
+        // with their original line numbers.
+        let exported = "import { x } from './x';\n\
+                        export default class Loader {\n  load(): void {}\n}\n\
+                        export async function fetchToken(): Promise<void> {}\n\
+                        export interface TokenShape { id: string }\n";
+        let names = index
+            .definitions("app/loader.ts", stamp(exported.len() as u64), exported)
+            .into_iter()
+            .map(|definition| (definition.name, definition.start_line))
+            .collect::<Vec<_>>();
+        for expected in [
+            ("Loader", 2),
+            ("load", 3),
+            ("fetchToken", 5),
+            ("TokenShape", 6),
+        ] {
+            assert!(
+                names.contains(&(expected.0.to_string(), expected.1)),
+                "{expected:?} missing from {names:?}"
+            );
+        }
         let go = "package q\n\nfunc (q *Queue) Drain() error {\n\treturn nil\n}\n";
         let names = index
             .definitions("q/queue.go", stamp(go.len() as u64), go)
@@ -577,17 +545,6 @@ mod tests {
         ] {
             assert_eq!(line_definition(line), expected, "{line}");
         }
-    }
-
-    #[test]
-    fn export_blanking_preserves_offsets() {
-        let source = "export default class A {}\n  export async function b() {}\nexport { c };\nexport * from './d';\n";
-        let blanked = blank_export_keywords(source);
-        assert_eq!(blanked.len(), source.len());
-        assert_eq!(
-            blanked,
-            "               class A {}\n         async function b() {}\nexport { c };\nexport * from './d';\n"
-        );
     }
 
     #[test]
