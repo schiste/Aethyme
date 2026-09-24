@@ -6,6 +6,37 @@ artifacts and their exact source revision are recorded in each signed
 
 ## [Unreleased]
 
+## [0.8.3] - 2026-09-24
+
+Phase 3 of the recovery plan: Explore works without a graph. No schema bump
+(42); rollback to 0.8.2 is unrestricted.
+
+### Added
+
+- Graph-free Explore. With no graph store (the default in every repository),
+  Explore searches file contents within a 2 s budget and returns ranked hits
+  with line spans, backed by an on-demand symbol index cached under the host
+  cache (`symbol-index/v1/`). Before, it matched path names in the first 128
+  files (#331).
+- `observability.source_fallback` reports the search: completeness, budget,
+  scoring details, and the verdict of the content-evidence answer rule in
+  `answer_safety` (#331, #332).
+
+### Changed
+
+- Graph-free ranking uses BM25F over file-name, directory, definition-name,
+  code and comment fields, with question stopwords and light stemming. A hit's
+  reported spans are the definitions that cover the most of the request (#337).
+- Graph-free results are navigation only: `safe_to_use_as_answer` is always
+  false and `answer[]` is empty. The answer rule is still evaluated and
+  reported, but it does not promote hits until its measured precision reaches
+  95%; it was 4 of 6 on the held-out set (#332, #334).
+
+### Fixed
+
+- The TypeScript and JavaScript indexer now indexes `export`-wrapped
+  declarations, which is most symbols in typical TypeScript (#330).
+
 ## [0.8.2] - 2026-09-24
 
 Phase 2 of the recovery plan: broker hardening. No schema bump (42); rollback
