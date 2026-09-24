@@ -139,10 +139,10 @@ pub fn run(args: &[String]) -> ExploreCliOutcome {
         Err(explore::ExploreError::GraphUnavailable { status, reason }) => print_graph_unavailable(
             &repo,
             &request,
-            intent.as_str(),
-            intent_source.as_str(),
-            status,
-            reason,
+            (intent.as_str(), intent_source.as_str()),
+            (status, reason),
+            detail_enum,
+            show_observability,
         ),
         Err(other) => ExploreCliOutcome::Failed(format!("explore: {other}")),
     }
@@ -199,28 +199,40 @@ fn run_usage_boundary(args: &[String], repo_str: &str, request: &str) -> Explore
         Err(explore::ExploreError::BadParams(msg)) => {
             ExploreCliOutcome::BadUsage(format!("explore (usage_boundary_query): {msg}"))
         }
-        Err(explore::ExploreError::GraphUnavailable { status, reason }) => print_graph_unavailable(
-            &repo,
-            request,
-            "usage_boundary_query",
-            "explicit",
-            status,
-            reason,
-        ),
+        Err(explore::ExploreError::GraphUnavailable { status, reason }) => {
+            let detail = match read_option(args, "--detail").as_deref() {
+                Ok("full") => explore::Detail::Full,
+                Ok("standard") => explore::Detail::Standard,
+                _ => explore::Detail::Compact,
+            };
+            print_graph_unavailable(
+                &repo,
+                request,
+                ("usage_boundary_query", "explicit"),
+                (status, reason),
+                detail,
+                has_flag(args, "--show-observability"),
+            )
+        }
         Err(err) => ExploreCliOutcome::Failed(format!("explore (usage_boundary_query): {err}")),
     }
 }
 
+/// Print the graph-free envelope shaped for the caller's output profile
+/// (see [`explore::project_graph_free_output`]).
 fn print_graph_unavailable(
     repo: &std::path::Path,
     request: &str,
-    intent: &'static str,
-    intent_source: &'static str,
-    status: &'static str,
-    reason: String,
+    (intent, intent_source): (&'static str, &'static str),
+    (status, reason): (&'static str, String),
+    detail: explore::Detail,
+    show_observability: bool,
 ) -> ExploreCliOutcome {
-    let response =
-        explore::graph_unavailable_response(repo, request, intent, intent_source, status, reason);
+    let response = explore::project_graph_free_output(
+        explore::graph_unavailable_response(repo, request, intent, intent_source, status, reason),
+        detail,
+        show_observability,
+    );
     match serde_json::to_string_pretty(&response) {
         Ok(json) => {
             println!("{json}");

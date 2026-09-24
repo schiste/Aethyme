@@ -233,6 +233,102 @@ fn strong_fallback_envelope_reports_the_rule_but_stays_navigation_only() {
 }
 
 #[test]
+fn output_profiles_trim_diagnostics_but_never_the_ranking() {
+    use crate::explore::{Detail, project_graph_free_output};
+    let repo = fixture();
+    let build = || {
+        super::super::graph_unavailable_response_with(
+            repo.path(),
+            "retry delay",
+            "task_localization_query",
+            "test",
+            "missing",
+            "fixture".into(),
+            &options(),
+        )
+    };
+    let render = |detail, show| {
+        let response = project_graph_free_output(build(), detail, show);
+        let text = serde_json::to_string_pretty(&response).unwrap();
+        // The estimate is the exact length of what is printed.
+        assert_eq!(
+            response.output_chars_estimate,
+            text.len(),
+            "{detail:?}/{show}"
+        );
+        serde_json::to_value(&response).unwrap()
+    };
+    let spans = |json: &serde_json::Value| -> Vec<(String, serde_json::Value)> {
+        json["navigation_hints"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|hint| {
+                (
+                    hint["path"].as_str().unwrap().to_string(),
+                    hint["evidence"]["line_refs"].clone(),
+                )
+            })
+            .collect()
+    };
+
+    let compact = render(Detail::Compact, false);
+    let observed = render(Detail::Compact, true);
+    let standard = render(Detail::Standard, false);
+    let full = render(Detail::Full, true);
+    assert!(!spans(&compact).is_empty());
+    for other in [&observed, &standard, &full] {
+        assert_eq!(spans(&compact), spans(other));
+        assert_eq!(
+            compact["subsystems"][0]["top_verification_targets"],
+            other["subsystems"][0]["top_verification_targets"]
+        );
+        assert_eq!(compact["trust_policy"], other["trust_policy"]);
+    }
+
+    // Default agent call: spans and readiness only.
+    for hint in compact["navigation_hints"].as_array().unwrap() {
+        let keys: Vec<&String> = hint["evidence"].as_object().unwrap().keys().collect();
+        assert_eq!(keys, ["line_refs"], "{hint}");
+        assert!(!hint["reason"].as_str().unwrap().contains("verify the span"));
+    }
+    let keys: Vec<&String> = compact["observability"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .collect();
+    assert_eq!(keys, ["readiness"]);
+    assert_eq!(compact["observability"]["readiness"]["status"], "ready");
+
+    // --show-observability and --detail standard keep per-hint diagnostics.
+    for json in [&observed, &standard] {
+        let evidence = &json["navigation_hints"][0]["evidence"];
+        for key in [
+            "score",
+            "term_coverage",
+            "matched_terms",
+            "path_role",
+            "symbol_match",
+        ] {
+            assert!(evidence.get(key).is_some(), "{key} missing: {evidence}");
+        }
+    }
+    let source = &observed["observability"]["source_fallback"];
+    assert_eq!(source["complete"], true);
+    assert_eq!(source["answer_safety"]["safe"], true);
+    assert!(source.get("scoring").is_none(), "{source}");
+    assert!(observed["observability"].get("graph_store").is_some());
+    assert!(standard["observability"].get("source_fallback").is_none());
+
+    // --detail full keeps everything, including the scoring constants.
+    assert_eq!(
+        full["observability"]["source_fallback"]["scoring"]["model"],
+        "bm25f"
+    );
+    assert!(compact["output_chars_estimate"].as_u64() < observed["output_chars_estimate"].as_u64());
+}
+
+#[test]
 fn incomplete_fallback_envelope_is_navigation_only() {
     let repo = fixture();
     let envelope = super::super::graph_unavailable_response_with(

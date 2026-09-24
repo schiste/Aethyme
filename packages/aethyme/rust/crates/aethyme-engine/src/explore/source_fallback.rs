@@ -1092,10 +1092,10 @@ fn rank(query: &QueryTerms, files: &[ScannedFile]) -> Vec<(AnswerItem, HitSignal
                     symbol.definition.name, symbol.definition.kind, symbol.definition.start_line
                 ));
             }
-            reason.push_str(&format!(
-                "; {} file. Lexical navigation only: verify the span before making semantic claims",
-                file.role.as_str()
-            ));
+            // The navigation-only caveat is stated once, in `trust_policy`;
+            // repeating it on every hint and subsystem target cost ~1.4k
+            // characters per call.
+            reason.push_str(&format!("; {} file", file.role.as_str()));
             let confidence = ((0.25 + 0.45 * coverage) * 100.0).round() / 100.0;
             let signal = HitSignal {
                 score,
