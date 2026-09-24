@@ -4,8 +4,8 @@
 
 Work against the current core flow only:
 
-1. ingest and inspect a repository (`aethyme repo ingest` / `inspect`)
-2. run `explore`, graph, and task-context queries
+1. run `explore` against a repository (no graph required)
+2. run graph and task-context queries on a graph-enrolled repository
 3. run scorecard and broker workflows
 4. keep tests and docs aligned with that flow
 
@@ -27,7 +27,7 @@ is 100% Rust: no venv, no `pip install`, no `pyproject.toml`.
 
 ```bash
 cd rust && cargo test --workspace && cd ..
-aethyme repo ingest .
+aethyme explore --repo "$PWD" --request "Where are broker leases claimed?" --format answer-json
 ```
 
 `cargo test --workspace` is the whole test story, including the
@@ -39,7 +39,6 @@ implementation-blind suites that drive the built binaries. See
 If behavior changes, update one of these instead of adding a new status file:
 
 - `README.md`
-- `roadmap.md`
 - `docs/getting-started/quickstart.md`
 - `docs/reference/cli.md`
-- `tests/README.md`
+- `docs/guides/testing.md`

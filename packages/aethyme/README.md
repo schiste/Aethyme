@@ -106,14 +106,15 @@ Primary commands:
 - `aethyme repo commit-message-template --type fix --scope watchlist`
 - `aethyme repo lint-commit-message .git/COMMIT_EDITMSG`
 
-Supporting commands:
+Supporting commands (the `repo ingest`/`inspect`/`warm`, `query`, `graph` and
+`task` commands read the graph store, so they need a graph-enrolled repository;
+see `docs/guides/graph-refresh.md`):
 
 - `aethyme repo ingest /path/to/repo`
 - `aethyme repo inspect /path/to/repo --json-output`
 - `aethyme repo clear-cache /path/to/repo`
 - `aethyme repo warm /path/to/repo`
-- `aethyme --engine-transport auto repo engine-info`
-- `aethyme --engine-transport pyo3 repo engine-info --check`
+- `aethyme repo engine-info`
 - `aethyme query symbol /path/to/repo main`
 - `aethyme query deps /path/to/repo src/main.py`
 - `aethyme graph node /path/to/repo src/main.py --json-output`
@@ -189,4 +190,4 @@ Runtime notes:
 - [`docs/architecture/rust-transition.md`](docs/architecture/rust-transition.md)
 - [`rust/README.md`](rust/README.md)
 - [`docs/getting-started/quickstart.md`](docs/getting-started/quickstart.md)
-- [`roadmap.md`](roadmap.md)
+- [`roadmap.md`](roadmap.md) (historical, March 2026)

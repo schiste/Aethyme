@@ -1,69 +1,122 @@
-# Aethyme Graph Engine Quick Start
+# Aethyme Quick Start
 
-Last Updated: 2026-08-23
+Last Updated: 2026-09-24
 
-This page covers the lower-level graph-engine path. For the current public
-product quickstart, use the broker-first flow in
-[`../../../../README.md`](../../../../README.md) and the product map in
-[`../../../../docs/product-surface.md`](../../../../docs/product-surface.md):
-install -> `aethyme init` -> `aethyme broker quick-test` -> start -> submit.
+This page takes a fresh machine to a first Explore answer, a first broker
+round trip, and (optionally) the graph-backed commands. Every command below was
+run against `aethyme 0.8.3`. The canonical product overview is the
+[top-level README](../../../../README.md); the product map is
+[`docs/product-surface.md`](../../../../docs/product-surface.md).
 
 ## 1. Install
 
+Releases ship the `aethyme` router and its required `aethyme-engine-cli`
+sibling as one unit, for Apple Silicon macOS, Intel macOS, and x86-64 Linux.
+
 ```bash
+brew install schiste/tap/aethyme
+# or, without Homebrew, the checksum-verified installer:
 curl -fsSL https://github.com/schiste/Aethyme/releases/latest/download/install.sh | sh
+
 aethyme --version
 aethyme-engine-cli --version
 ```
 
-This installs the Rust router and its required engine-daemon sibling from one
-checksum-verified archive. No interpreter, virtualenv, pip step, or background
-updater is involved. Re-run the command for the newest stable release; see the
-[v0.2.2 upgrade guide](../guides/upgrading-to-v0.2.2.md) for pinned versions,
-signature verification, source installation, and rollback.
+Both commands must print the same version. No interpreter, virtualenv, pip
+step, or background updater is involved. Installer users review updates
+explicitly with `aethyme update check`, `aethyme update plan`, and
+`aethyme update execute --confirm <manifest-sha256>`; Homebrew users run
+`brew upgrade aethyme`.
 
-## 2. Or Build From The Checkout
-
-```bash
-cd packages/aethyme
-cargo build --release --manifest-path rust/Cargo.toml
-```
-
-## 3. Run The Local-First Path
-
-Aethyme is local-first. No services, database, credentials, **or Python**
-are required.
+To build from this checkout instead, install both crates. `--locked` is
+required: without it Cargo re-resolves dependencies and the build can fail.
 
 ```bash
-aethyme repo ingest /absolute/path/to/repo
-aethyme repo inspect /absolute/path/to/repo --json-output
-aethyme repo clear-cache /absolute/path/to/repo
-aethyme query symbol /absolute/path/to/repo main
-aethyme task pack --repo /absolute/path/to/repo --task "Explain this repo" --json-output
-aethyme task explain --repo /absolute/path/to/repo
+cargo install --locked --path packages/aethyme/rust/crates/aethyme-cli
+cargo install --locked --path packages/aethyme/rust/crates/aethyme-engine
 ```
 
-This path proves:
+## 2. Explore A Repository
 
-1. deterministic repository mapping
-2. deterministic discoverability
-3. deterministic task-context packs
-
-At this stage:
-
-- the Rust engine is executed as a built binary
-- local artifacts are cached by repository snapshot
-- Git repositories use commit plus dirty-state metadata for cache keys
-
-## 4. Run The Test Suite
+Explore needs no enrollment and no graph. Without a graph it returns ranked
+source-search hints marked `degraded` and `verify_before_use`: navigation, not
+an authoritative answer.
 
 ```bash
-cd rust && cargo test --workspace
+cd /path/to/your-repo
+AETHYME_JSON="$(mktemp -t aethyme-explore.XXXXXX.json)"
+aethyme explore --repo "$PWD" --request "Where is the request handler defined?" \
+    --format answer-json --show-observability --depth 0 > "$AETHYME_JSON"
+aethyme explore-summary --from "$AETHYME_JSON"
+aethyme verify-targets --repo "$PWD" --from "$AETHYME_JSON" --max-targets 2 --max-lines 80
 ```
 
-That is all of it — no venv, no `pip install`. The implementation-blind
-suites that drive the built binaries and the repo-hygiene suites over
-docs and templates are part of the workspace since python-retirement
-Phase 7 (2026-08-06).
+Read `safe_to_use_as_answer` and `trust_policy` in the summary, then check the
+bounded source spans that `verify-targets` prints.
 
-See [`../guides/testing.md`](../guides/testing.md) for the suite layout.
+## 3. Set Up The Broker
+
+`aethyme init` certifies the repository (read-only), scaffolds the broker
+configuration and database, and drafts `.aethyme/gates.toml` when none exists.
+It is idempotent.
+
+```bash
+aethyme init
+aethyme broker quick-test
+```
+
+`quick-test` runs a full adopt, commit, and submit round trip in a disposable
+repository and removes it afterwards. For shared, reviewed enrollment of the
+agent guidance (`AGENTS.md`, `CLAUDE.md`, skills, hooks), follow the
+[repository deployment guide](../guides/repository-deployment.md) instead of
+running `aethyme deploy` blind.
+
+## 4. Coordinate A Task
+
+```bash
+aethyme broker status
+aethyme broker start --task "Describe the task"
+# Change into the worktree printed by `broker start`, then edit and commit.
+aethyme broker leases claim path/to/area --session <id>
+aethyme broker submit --session <id>
+aethyme broker finish --session <id>
+```
+
+`broker submit` simulates the merge onto the local `aethyme/integration`
+branch, runs the affected gates on the merged tree, and promotes on success.
+It never pushes. See the [broker workflows guide](../guides/broker-workflows.md)
+for leases, gates, handoffs, and recovery.
+
+## 5. Optional: Graph-Backed Commands
+
+`aethyme repo inspect`, `aethyme query symbol`, `aethyme task pack`,
+`aethyme task explain`, and `aethyme graph callers` read a graph store and
+refuse when it is missing. The graph is a repository opt-in:
+
+```bash
+aethyme deploy --repo . --with-graph
+git add -A && git commit -m "chore: enroll Aethyme graph"
+aethyme graph refresh plan --repo . --diff
+aethyme graph refresh execute --repo . --confirm <plan-sha256>
+```
+
+Add `--graph-repository owner/name` to the deploy when the repository has no
+canonical origin. Commit the refreshed fragments; other clones then run
+`aethyme graph materialize --repo .`. The full procedure, including the
+version pin, is in the [graph refresh guide](../guides/graph-refresh.md).
+With a graph in place:
+
+```bash
+aethyme query symbol "$PWD" main
+aethyme task pack --repo "$PWD" --task "Explain this repo" --json-output
+aethyme graph callers "$PWD" helper --json-output
+```
+
+## 6. Run The Test Suite (Contributors)
+
+```bash
+cargo test --manifest-path packages/aethyme/rust/Cargo.toml --workspace
+```
+
+That is the whole test story: no venv and no `pip install`. See
+[`../guides/testing.md`](../guides/testing.md) for the suite layout.

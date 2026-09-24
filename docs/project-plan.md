@@ -8,8 +8,11 @@ Last Updated: 2026-03-06
 > "Verified Flow" below describes the earlier cloud lineage and is no longer
 > the priority path. See
 > [`aethyme-local-agent-broker.md`](aethyme-local-agent-broker.md) for the
-> current direction. The "First Local Proof" section below remains accurate
-> for the graph engine.
+> current direction. The "First Local Proof" section below is historical too:
+> `aethyme eval` was removed (evaluation lives in the separate
+> `packages/aethyme-eval` harness), and the `repo`, `query` and `task`
+> commands now need a graph-enrolled repository. For current first steps see
+> [`packages/aethyme/docs/getting-started/quickstart.md`](../packages/aethyme/docs/getting-started/quickstart.md).
 
 ## Goal
 
