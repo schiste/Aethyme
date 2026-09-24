@@ -127,7 +127,7 @@ fn the_next_action_does_not_contradict_the_suppression_reason() {
         "a verify-only repository must not be told it is in manual mode: {rendered}"
     );
     assert!(
-        !rendered.contains("broker promote --entry"),
+        !rendered.contains("promote --entry"),
         "a verify-only repository must not be told to promote: {rendered}"
     );
 }

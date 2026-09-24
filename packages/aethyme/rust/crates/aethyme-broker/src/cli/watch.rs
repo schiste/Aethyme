@@ -408,7 +408,7 @@ pub(super) fn run_deliveries(parsed: Parsed) -> Result<(), UsageError> {
                     if !parsed.json {
                         out!("send delivery {} to {tab_id}", envelope.item.id);
                         out!(
-                            "  complete with: aethyme broker deliveries complete --id {} --worker {worker} --generation {} --outcome delivered",
+                            "  complete with: aethyme broker advanced deliveries complete --id {} --worker {worker} --generation {} --outcome delivered",
                             envelope.item.id,
                             envelope.item.generation
                         );

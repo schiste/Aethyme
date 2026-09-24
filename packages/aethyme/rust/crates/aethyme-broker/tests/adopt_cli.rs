@@ -526,7 +526,7 @@ fn adopt_cli_exposes_structured_reuse_drift_and_safe_guidance() {
     assert!(report["integration_drift"]["warning"].is_string());
     assert_eq!(
         report["integration_drift"]["safe_next_action"],
-        "aethyme broker integration status"
+        "aethyme broker advanced integration status"
     );
 
     let rendered = stdout(&run(
@@ -537,7 +537,7 @@ fn adopt_cli_exposes_structured_reuse_drift_and_safe_guidance() {
     assert!(rendered.contains("Overlapping changed paths:\n  shared.txt"));
     assert!(rendered.contains("Warning:"), "{rendered}");
     assert!(
-        rendered.contains("Safe next action: aethyme broker integration status"),
+        rendered.contains("Safe next action: aethyme broker advanced integration status"),
         "{rendered}"
     );
 }

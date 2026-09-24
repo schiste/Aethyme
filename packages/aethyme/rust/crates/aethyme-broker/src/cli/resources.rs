@@ -535,7 +535,7 @@ pub(super) fn run_console(parsed: Parsed) -> Result<(), UsageError> {
                         String::from("a console is already running for this repository");
                     for lease in &running {
                         message.push_str(&format!(
-                            "\n  port {} pid {} (aethyme broker console status)",
+                            "\n  port {} pid {} (aethyme broker advanced console status)",
                             crate::console_port(lease).unwrap_or("-"),
                             lease
                                 .holder_pid
@@ -775,7 +775,7 @@ pub(super) fn run_resources(parsed: Parsed) -> Result<(), UsageError> {
                     "resources {action} takes the grant JSON written at acquire, not a lease \
                          id; {argument} is a {} lease. The grant carries the ownership token that \
                          authorizes {action}, and a holder that died leaves none to reuse -- \
-                         reclaim that lease instead: aethyme broker resources reconcile \
+                         reclaim that lease instead: aethyme broker advanced resources reconcile \
                          {argument} --confirm {}",
                     lease.state.as_str(),
                     lease.generation,

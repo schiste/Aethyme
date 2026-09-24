@@ -114,7 +114,7 @@ pub enum BlockerRef {
 impl BlockerRef {
     pub fn parse(id: &str) -> Result<Self, String> {
         let (prefix, rest) = id.split_once(':').ok_or_else(|| {
-            format!("blocker id {id:?} must be <kind>:<key>; run `aethyme broker blockers`")
+            format!("blocker id {id:?} must be <kind>:<key>; run `aethyme broker unblock`")
         })?;
         let positive = |value: &str| {
             value
@@ -477,7 +477,7 @@ impl Broker {
                 clear: if worktree_gone {
                     format!("{UNBLOCK} lease:{}", lease.id)
                 } else {
-                    format!("aethyme broker close --session {}", session.id)
+                    format!("aethyme broker finish close --session {}", session.id)
                 },
                 safe_to_clear_automatically: worktree_gone,
             });
@@ -1086,7 +1086,7 @@ pub(crate) fn status_advice(blockers: &[Blocker]) -> Option<crate::StatusAdvice>
         severity,
         reason: "coordination state is blocking work; each blocker names the one command that clears it",
         summary: format!(
-            "{count} {} across broker stores; `aethyme broker blockers` lists them with causes",
+            "{count} {} across broker stores; `aethyme broker unblock` lists them with causes",
             if count == 1 { "blocker" } else { "blockers" }
         ),
         session_id: None,

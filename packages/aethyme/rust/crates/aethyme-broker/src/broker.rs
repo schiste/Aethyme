@@ -60,7 +60,7 @@ pub enum BrokerOpError {
     /// offered here (issue #142).
     #[error(
         "the reviewed main reconciliation plan no longer matches current state, so nothing was \
-         moved; review a new plan with `aethyme broker main reconcile plan` and confirm the \
+         moved; review a new plan with `aethyme broker advanced main reconcile plan` and confirm the \
          digest it prints (the digest passed, {actual}, is stale)"
     )]
     MainReconcileConfirmationMismatch { actual: String },
@@ -162,7 +162,7 @@ pub enum BrokerOpError {
     /// nobody read (issue #142).
     #[error(
         "the reviewed cleanup plan no longer matches current state, so nothing was removed; \
-         review a new plan with `aethyme broker cleanup --all-cleaned` and confirm the digest \
+         review a new plan with `aethyme broker finish cleanup --all-cleaned` and confirm the digest \
          it prints (the digest passed, {actual}, is stale)"
     )]
     CleanupConfirmationMismatch { actual: String },
@@ -184,14 +184,14 @@ pub enum BrokerOpError {
         "an interrupted GC run is pending and must be resumed on its own plan: confirm \
          {expected}, not {actual}. `aethyme broker gc plan` cannot reproduce that digest \
          because it belongs to the partially applied run recorded in \
-         .aethyme/gc-journal.json; inspect it with `aethyme broker doctor`"
+         .aethyme/gc-journal.json; inspect it with `aethyme broker status doctor`"
     )]
     GcResumeConfirmationMismatch { expected: String, actual: String },
     /// See [`BrokerOpError::CleanupConfirmationMismatch`] for why no digest is
     /// offered here (issue #142).
     #[error(
         "the reviewed promotion record plan no longer matches current state, so nothing was \
-         restored; review a new plan with `aethyme broker promotion-record plan` and confirm \
+         restored; review a new plan with `aethyme broker submit promotion-record plan` and confirm \
          the digest it prints (the digest passed, {actual}, is stale)"
     )]
     PromotionRecordConfirmationMismatch { actual: String },
@@ -227,7 +227,7 @@ pub enum BrokerOpError {
         guidance: String,
     },
     #[error(
-        "broker repair is not applicable to session {id}: no conflicted submission or promoted-path conflict was found; repair does not rewrite checkpoint divergence\nnext: aethyme broker checkpoint plan --session {id}"
+        "broker repair is not applicable to session {id}: no conflicted submission or promoted-path conflict was found; repair does not rewrite checkpoint divergence\nnext: aethyme broker advanced checkpoint plan --session {id}"
     )]
     RepairNotApplicable { id: i64 },
     #[error("session checkpoint recovery is not safe: {reasons}")]
@@ -238,7 +238,7 @@ pub enum BrokerOpError {
     /// offered here (issue #142).
     #[error(
         "the reviewed checkpoint recovery plan no longer matches current state, so nothing was \
-         re-anchored; review a new plan with `aethyme broker checkpoint plan --session <id>` \
+         re-anchored; review a new plan with `aethyme broker advanced checkpoint plan --session <id>` \
          and confirm the digest it prints (the digest passed, {actual}, is stale)"
     )]
     CheckpointConfirmationMismatch { actual: String },
@@ -321,7 +321,7 @@ pub enum BrokerOpError {
     #[error("invalid coordinated operation: {reason}")]
     InvalidCoordinatedOperation { reason: String },
     #[error(
-        "session {session_id} is closed and cannot authorize coordinated operations; start a new session with `aethyme broker start --task <text>` or adopt an active worktree with `aethyme broker adopt --task <text>`"
+        "session {session_id} is closed and cannot authorize coordinated operations; start a new session with `aethyme broker start --task <text>` or adopt an active worktree with `aethyme broker start --adopt --task <text>`"
     )]
     ClosedSessionOperation { session_id: i64 },
     #[error("{recovery}")]
@@ -383,7 +383,7 @@ pub enum BrokerOpError {
     /// offered here (issue #142).
     #[error(
         "the reviewed exposure reconciliation plan no longer matches current state, so nothing \
-         was reconciled; review a new plan with `aethyme broker exposures plan` and confirm \
+         was reconciled; review a new plan with `aethyme broker advanced exposures plan` and confirm \
          the digest it prints (the digest passed, {actual}, is stale)"
     )]
     ExposureConfirmationMismatch { actual: String },
@@ -460,7 +460,7 @@ pub enum BrokerOpError {
         "the publication prefix moved since the plan was reviewed: ship now proposes \
          {expected}, not the confirmed {actual}. Do not confirm {expected} without reading it \
          -- it publishes work you have not reviewed. Inspect the difference with \
-         `git log --oneline {actual}..{expected}`, then re-run `aethyme broker ship plan`"
+         `git log --oneline {actual}..{expected}`, then re-run `aethyme broker advanced ship plan`"
     )]
     ShipConfirmationMismatch { expected: String, actual: String },
     #[error(
@@ -474,7 +474,7 @@ pub enum BrokerOpError {
     #[error(
         "the reviewed integration reconciliation plan no longer matches current state, so \
          nothing was reconciled; review a new plan with \
-         `aethyme broker integration reconcile --upstream <ref> --dry-run` and confirm the \
+         `aethyme broker advanced integration reconcile --upstream <ref> --dry-run` and confirm the \
          digest it prints (the digest passed, {actual}, is stale)"
     )]
     ReconciliationConfirmationMismatch { actual: String },
@@ -520,9 +520,9 @@ pub enum BrokerOpError {
     #[error(
         "session {id} ({status}) already exists for this worktree{task}. Options:\n  \
          aethyme broker submit --session {id}        submit its committed work\n  \
-         aethyme broker adopt --reuse --task \"...\"   point it at a follow-up task\n  \
-         aethyme broker close --session {id}         mark it finished (state only)\n  \
-         aethyme broker adopt --replace-stale        close it and register fresh"
+         aethyme broker start --reuse --task \"...\"   point it at a follow-up task\n  \
+         aethyme broker finish close --session {id}         mark it finished (state only)\n  \
+         aethyme broker start --replace-stale        close it and register fresh"
     )]
     SessionExistsForWorktree {
         id: i64,
@@ -1753,7 +1753,7 @@ fn checkpoint_recovery_actions(
         return vec![CheckpointRecoveryAction {
             kind: "apply_reviewed_plan".into(),
             command: format!(
-                "aethyme broker checkpoint apply --session {} --confirm <plan-digest>",
+                "aethyme broker advanced checkpoint apply --session {} --confirm <plan-digest>",
                 plan.session_id
             ),
             description: "Apply only after reviewing this exact digest-bound plan.".into(),
@@ -2934,7 +2934,7 @@ impl Broker {
                 Some(format!(
                     "session HEAD is {behind_commits} commit(s) behind {integration_branch}; inspect drift before editing"
                 )),
-                "aethyme broker integration status".into(),
+                "aethyme broker advanced integration status".into(),
             ),
             AdoptIntegrationRelation::Ahead
                 if submission_plan_safe && pending_owned_commits.is_some_and(|count| count > 0) =>
@@ -2951,13 +2951,13 @@ impl Broker {
                 Some(format!(
                     "session HEAD is {ahead_commits} commit(s) ahead of {integration_branch}, but none are session-owned under the recorded baseline, so submit will not replay them; they predate this adoption. To submit them, re-adopt from a base that precedes them"
                 )),
-                "aethyme broker integration status".into(),
+                "aethyme broker advanced integration status".into(),
             ),
             AdoptIntegrationRelation::Diverged => (
                 Some(format!(
                     "session HEAD and {integration_branch} have diverged ({ahead_commits} ahead, {behind_commits} behind); reconcile before editing"
                 )),
-                "aethyme broker integration status".into(),
+                "aethyme broker advanced integration status".into(),
             ),
         };
 
@@ -4980,7 +4980,7 @@ impl Broker {
             format!("  1. git branch {preserve_branch} {session_head}"),
             format!("  2. git reset --hard {target}"),
             format!(
-                "  3. aethyme broker adopt --reuse --sync-integration --task \"continue preserved session {}\"",
+                "  3. aethyme broker start --reuse --sync-integration --task \"continue preserved session {}\"",
                 session.id
             ),
             format!("  4. {cherry_pick}"),
@@ -5129,7 +5129,7 @@ impl Broker {
             "No path-triggered gates are selected; semantic suggestions are advisory and currently do not add enforced gates.".into()
         } else {
             format!(
-                "Run `aethyme broker gates run --session {session_id}` to execute the enforced path-triggered gates; treat semantic suggestions as hints only."
+                "Run `aethyme broker advanced gates run --session {session_id}` to execute the enforced path-triggered gates; treat semantic suggestions as hints only."
             )
         };
 
@@ -5650,7 +5650,7 @@ impl Broker {
                     state: IntegrationDeliveryState::ReconciliationReady,
                     summary: assessment.explanation.clone(),
                     commands: vec![format!(
-                        "aethyme broker integration reconcile --upstream {upstream} --dry-run"
+                        "aethyme broker advanced integration reconcile --upstream {upstream} --dry-run"
                     )],
                 }
             } else {
@@ -5660,7 +5660,7 @@ impl Broker {
                         "external main movement detected: integration does not contain {upstream}; unresolved or unrecorded work requires reviewed reconciliation"
                     ),
                     commands: vec![format!(
-                        "aethyme broker integration reconcile --upstream {upstream} --dry-run"
+                        "aethyme broker advanced integration reconcile --upstream {upstream} --dry-run"
                     )],
                 }
             };
@@ -5727,11 +5727,11 @@ impl Broker {
         let mut commands = Vec::new();
         if stable {
             if !live_sessions.is_empty() {
-                commands.push("aethyme broker agents".into());
+                commands.push("aethyme broker advanced agents".into());
             }
         } else {
             commands.push(format!(
-                "aethyme broker integration wait-stable --seconds {seconds}"
+                "aethyme broker advanced integration wait-stable --seconds {seconds}"
             ));
             commands.push("aethyme broker status".into());
         }
@@ -5957,7 +5957,7 @@ impl Broker {
                         Vec::new()
                     } else {
                         vec![format!(
-                            "aethyme broker integration reconcile --upstream {upstream} --dry-run"
+                            "aethyme broker advanced integration reconcile --upstream {upstream} --dry-run"
                         )]
                     },
                 },
@@ -6118,8 +6118,8 @@ impl Broker {
                     ]
                 } else {
                     vec![
-                        "aethyme broker cleanup --all-cleaned".into(),
-                        "aethyme broker cleanup --all-cleaned --apply --confirm <sha256-from-plan>"
+                        "aethyme broker finish cleanup --all-cleaned".into(),
+                        "aethyme broker finish cleanup --all-cleaned --apply --confirm <sha256-from-plan>"
                             .into(),
                     ]
                 },
@@ -6242,7 +6242,7 @@ impl Broker {
                     .first()
                     .map(|refusal| {
                         vec![format!(
-                            "aethyme broker review ledger --repo {} --pr {}",
+                            "aethyme broker advanced review ledger --repo {} --pr {}",
                             refusal.repository, refusal.pull_request
                         )]
                     })
@@ -6311,7 +6311,7 @@ impl Broker {
             queue_history: StatusQueueHistory {
                 schema_version: crate::MERGE_QUEUE_HISTORY_SCHEMA_VERSION,
                 terminal_counts,
-                command: "aethyme broker queue history".into(),
+                command: "aethyme broker advanced queue history".into(),
             },
             integration_branch,
             integration_head,
@@ -6798,9 +6798,12 @@ impl Broker {
                 })
                 .collect(),
             commands: if stalled.len() == 1 {
-                vec![format!("aethyme broker operations show {}", stalled[0].id)]
+                vec![format!(
+                    "aethyme broker advanced operations show {}",
+                    stalled[0].id
+                )]
             } else {
-                vec!["aethyme broker operations list".into()]
+                vec!["aethyme broker advanced operations list".into()]
             },
         })
     }
@@ -6896,7 +6899,7 @@ impl Broker {
             ),
             live_sessions,
             commands: vec![
-                "aethyme broker integration wait-stable --seconds 30".into(),
+                "aethyme broker advanced integration wait-stable --seconds 30".into(),
                 "aethyme broker status".into(),
             ],
         }))
@@ -7329,11 +7332,11 @@ impl Broker {
         } else if report.delivery.promoted && !report.delivery.published {
             report
                 .latest_queue_entry_id
-                .map(|entry| format!("aethyme broker ship plan --entry {entry}"))
+                .map(|entry| format!("aethyme broker advanced ship plan --entry {entry}"))
         } else {
             report.next_commands.first().cloned().or_else(|| {
                 (report.delivery.published && !report.cleanup_safe)
-                    .then(|| "aethyme broker integration status".into())
+                    .then(|| "aethyme broker advanced integration status".into())
             })
         };
     }
@@ -7389,8 +7392,10 @@ impl Broker {
             .unwrap_or(0);
         report.cleanup.branch_ref = item.as_ref().map(|item| item.branch_ref.clone());
         report.cleanup.branch_tip = item.as_ref().and_then(|item| item.branch_tip.clone());
-        report.cleanup.recovery_action =
-            Some(format!("aethyme broker cleanup {}", report.session_id));
+        report.cleanup.recovery_action = Some(format!(
+            "aethyme broker finish cleanup {}",
+            report.session_id
+        ));
 
         let start_payload =
             crate::events::session_finish_cleanup_started_payload(worktree_present, branch_present);
@@ -7434,9 +7439,10 @@ impl Broker {
                     "physical cleanup did not complete: {error}; retained artifacts remain represented"
                 ));
                 report.next_commands.clear();
-                report
-                    .next_commands
-                    .push(format!("aethyme broker cleanup {}", report.session_id));
+                report.next_commands.push(format!(
+                    "aethyme broker finish cleanup {}",
+                    report.session_id
+                ));
             }
         }
         self.finalize_finish_report(report);
@@ -7538,7 +7544,7 @@ impl Broker {
                 if report.cleanup_safe {
                     report
                         .next_commands
-                        .push(format!("aethyme broker cleanup {session_id}"));
+                        .push(format!("aethyme broker finish cleanup {session_id}"));
                 }
                 self.finalize_finish_report(&mut report);
                 return Ok(report);
@@ -7658,9 +7664,10 @@ impl Broker {
                         "queue entry {} is verified but not promoted; promote it before finish",
                         entry.id
                     ));
-                    report
-                        .next_commands
-                        .push(format!("aethyme broker promote --entry {}", entry.id));
+                    report.next_commands.push(format!(
+                        "aethyme broker submit promote --entry {}",
+                        entry.id
+                    ));
                     report
                         .next_commands
                         .push(format!("aethyme broker finish --session {session_id}"));
@@ -7672,9 +7679,9 @@ impl Broker {
                         "latest submit qid {} conflicted; repair and resubmit before finish",
                         entry.id
                     ));
-                    report
-                        .next_commands
-                        .push(format!("aethyme broker repair --session {session_id}"));
+                    report.next_commands.push(format!(
+                        "aethyme broker advanced repair --session {session_id}"
+                    ));
                     report
                         .next_commands
                         .push(format!("aethyme broker submit --session {session_id}"));
@@ -7711,7 +7718,9 @@ impl Broker {
                         entry.id,
                         entry.status.as_str()
                     ));
-                    report.next_commands.push("aethyme broker queue".into());
+                    report
+                        .next_commands
+                        .push("aethyme broker advanced queue".into());
                     self.finalize_finish_report(&mut report);
                     return Ok(report);
                 }
@@ -7756,7 +7765,7 @@ impl Broker {
             // placeholder the operator cannot run -- the same unreachable
             // remedy this block exists to remove.
             report.next_commands.push(format!(
-                "aethyme broker representation scan --session {session_id}"
+                "aethyme broker advanced representation scan --session {session_id}"
             ));
             self.finalize_finish_report(&mut report);
             return Ok(report);
@@ -7778,7 +7787,7 @@ impl Broker {
         } else if report.cleanup_safe {
             report
                 .next_commands
-                .push(format!("aethyme broker cleanup {session_id}"));
+                .push(format!("aethyme broker finish cleanup {session_id}"));
         } else if worktree_path.as_path() != self.main_root.as_path() {
             report.warnings.push(
                 "cleanup not suggested yet; cleanup only removes worktrees with no dirty paths \
@@ -8458,7 +8467,7 @@ impl Broker {
             estimated_bytes,
             reason,
             inspection_commands,
-            force_cleanup_command: format!("aethyme broker cleanup {} --force", session.id),
+            force_cleanup_command: format!("aethyme broker finish cleanup {} --force", session.id),
         }))
     }
 
@@ -8942,7 +8951,10 @@ fn rejected_submit_advice(agent: &AgentView, entry: &MergeQueueEntry) -> StatusA
         evidence,
         commands: vec![
             format!("git -C {worktree} status --short"),
-            format!("aethyme broker gates run --session {}", agent.session.id),
+            format!(
+                "aethyme broker advanced gates run --session {}",
+                agent.session.id
+            ),
             format!("aethyme broker submit --session {}", agent.session.id),
         ],
     }
@@ -8981,7 +8993,10 @@ fn conflict_submit_advice(agent: &AgentView, entry: &MergeQueueEntry) -> StatusA
         queue_entry_id: Some(entry.id),
         evidence,
         commands: vec![
-            format!("aethyme broker repair --session {}", agent.session.id),
+            format!(
+                "aethyme broker advanced repair --session {}",
+                agent.session.id
+            ),
             format!("aethyme broker submit --session {}", agent.session.id),
             format!("cat {}/{}", worktree, crate::ACTION_REQUIRED_RELPATH),
         ],
@@ -9013,7 +9028,9 @@ fn promoted_conflict_advice(
     }
 
     let mut commands = Vec::new();
-    commands.push(format!("aethyme broker repair --session {session_id}"));
+    commands.push(format!(
+        "aethyme broker advanced repair --session {session_id}"
+    ));
     commands.push(format!("aethyme broker submit --session {session_id}"));
 
     StatusAdvice {
@@ -9244,10 +9261,10 @@ fn status_summary(
 
     let mut commands = Vec::new();
     if may_move_integration {
-        commands.push("aethyme broker integration wait-stable --seconds 30".into());
+        commands.push("aethyme broker advanced integration wait-stable --seconds 30".into());
     }
     if integration_relation != StatusIntegrationRelation::CurrentWithMain {
-        commands.push("aethyme broker integration status".into());
+        commands.push("aethyme broker advanced integration status".into());
     }
 
     StatusSummary {
@@ -9395,8 +9412,8 @@ fn integration_movement_advice(
         queue_entry_id: None,
         evidence,
         commands: vec![
-            "aethyme broker integration wait-stable --seconds 30".into(),
-            "aethyme broker agents".into(),
+            "aethyme broker advanced integration wait-stable --seconds 30".into(),
+            "aethyme broker advanced agents".into(),
         ],
     }
 }
@@ -9426,7 +9443,7 @@ fn integration_next_action(
         let commands = conflict_sessions
             .iter()
             .take(5)
-            .map(|session_id| format!("aethyme broker repair --session {session_id}"))
+            .map(|session_id| format!("aethyme broker advanced repair --session {session_id}"))
             .collect();
         return IntegrationNextAction {
             state: IntegrationDeliveryState::Blocked,
@@ -9454,7 +9471,7 @@ fn integration_next_action(
                 "{branch} is published at {integration_head}; local main is not synchronized"
             ),
             commands: vec![format!(
-                "aethyme broker ship execute --entry {entry_id} --confirm {integration_head} --sync-main"
+                "aethyme broker advanced ship execute --entry {entry_id} --confirm {integration_head} --sync-main"
             )],
         };
     }
@@ -9475,7 +9492,9 @@ fn integration_next_action(
                 summary: format!(
                     "{count} {noun} {verb} promoted on {branch} and ready for a ship plan"
                 ),
-                commands: vec![format!("aethyme broker ship plan --entry {entry_id}")],
+                commands: vec![format!(
+                    "aethyme broker advanced ship plan --entry {entry_id}"
+                )],
             };
         }
         let entry_id =
@@ -9485,7 +9504,9 @@ fn integration_next_action(
             summary: format!(
                 "{count} {noun} {verb} pending, but main and {branch} have diverged; inspect the blocked ship plan"
             ),
-            commands: vec![format!("aethyme broker ship plan --entry {entry_id}")],
+            commands: vec![format!(
+                "aethyme broker advanced ship plan --entry {entry_id}"
+            )],
         };
     }
 
@@ -10151,7 +10172,7 @@ mod tests {
         assert!(
             advice
                 .commands
-                .contains(&"aethyme broker integration wait-stable --seconds 30".into())
+                .contains(&"aethyme broker advanced integration wait-stable --seconds 30".into())
         );
     }
 
@@ -10205,7 +10226,7 @@ mod tests {
         );
         assert_eq!(
             summary.commands,
-            vec!["aethyme broker integration wait-stable --seconds 30"]
+            vec!["aethyme broker advanced integration wait-stable --seconds 30"]
         );
     }
 

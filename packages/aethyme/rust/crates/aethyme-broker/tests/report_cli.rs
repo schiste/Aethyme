@@ -1183,7 +1183,7 @@ body:
         .unwrap()
         .replace(
             "> Unfilled: no allowlisted report value maps to `reproduction` (Textarea).",
-            "1. Run `aethyme broker gates run`.\n2. Observe the failure.",
+            "1. Run `aethyme broker advanced gates run`.\n2. Observe the failure.",
         )
         .into();
     let reviewed = serde_json::to_vec_pretty(&reviewed).unwrap();
@@ -1259,10 +1259,10 @@ fn ambiguous_file_outcome_requires_reconciliation_and_is_never_retried() {
         "Inspect GitHub state for canonical repository github.com/owner/repo at scope report:"
     ));
     assert!(first_stderr.contains(&format!(
-        "aethyme broker operations reconcile --operation {operation_id} --outcome succeeded --reason \"external inspection confirmed operation {operation_id} took effect\""
+        "aethyme broker advanced operations reconcile --operation {operation_id} --outcome succeeded --reason \"external inspection confirmed operation {operation_id} took effect\""
     )));
     assert!(first_stderr.contains(&format!(
-        "aethyme broker operations reconcile --operation {operation_id} --outcome failed --reason \"external inspection confirmed operation {operation_id} did not take effect\""
+        "aethyme broker advanced operations reconcile --operation {operation_id} --outcome failed --reason \"external inspection confirmed operation {operation_id} did not take effect\""
     )));
     assert!(first_stderr.contains("Blind retry is forbidden"));
 

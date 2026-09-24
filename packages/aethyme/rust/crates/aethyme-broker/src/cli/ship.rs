@@ -402,18 +402,18 @@ pub(super) fn render_ship_plan(
     }
     if report.delivery.requires_explicit_selection {
         out!(
-            "Re-plan with an explicit route: aethyme broker ship plan --entry {} --delivery <local_main_merge|pull_request>",
+            "Re-plan with an explicit route: aethyme broker advanced ship plan --entry {} --delivery <local_main_merge|pull_request>",
             report.queue_entry.id,
         );
     } else if report.delivery.source == crate::RepositoryDeliveryModeSource::LegacyDefault {
         out!(
-            "Confirm with: aethyme broker ship execute --entry {} --confirm {}",
+            "Confirm with: aethyme broker advanced ship execute --entry {} --confirm {}",
             report.queue_entry.id,
             report.publication_sha
         );
     } else if report.delivery.source == crate::RepositoryDeliveryModeSource::CliOverride {
         out!(
-            "Confirm with: aethyme broker ship execute --entry {} --confirm {} --delivery {} --plan {}",
+            "Confirm with: aethyme broker advanced ship execute --entry {} --confirm {} --delivery {} --plan {}",
             report.queue_entry.id,
             report.publication_sha,
             report.delivery.mode.as_str(),
@@ -421,7 +421,7 @@ pub(super) fn render_ship_plan(
         );
     } else {
         out!(
-            "Confirm with: aethyme broker ship execute --entry {} --confirm {} --plan {}",
+            "Confirm with: aethyme broker advanced ship execute --entry {} --confirm {} --plan {}",
             report.queue_entry.id,
             report.publication_sha,
             report.plan_digest

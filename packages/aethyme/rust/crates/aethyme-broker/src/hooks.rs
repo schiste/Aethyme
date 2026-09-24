@@ -62,7 +62,7 @@ pub enum HooksError {
     #[error(
         "refusing to install: {path} exists without the aethyme marker — that hook belongs \
          to you (or another tool) and is never clobbered. Move it aside or merge it \
-         manually, then re-run `aethyme broker hooks install`."
+         manually, then re-run `aethyme broker advanced hooks install`."
     )]
     ForeignHook { path: PathBuf },
     #[error(
@@ -70,7 +70,7 @@ pub enum HooksError {
          {configured:?} (a hook manager like husky?), so scripts written to the default \
          hooks directory would never run. Wire `aethyme broker hooks pre-commit` and \
          `hooks post-commit` into the scripts there yourself, or unset core.hooksPath \
-         and re-run `aethyme broker hooks install`."
+         and re-run `aethyme broker advanced hooks install`."
     )]
     HooksPathOverride { configured: String },
     #[error("commit blocked by Aethyme pre-commit: {0}")]
@@ -106,7 +106,7 @@ pub enum HooksError {
          protected branch {branch:?} is {ahead} commit(s) ahead and {behind} commit(s) behind {upstream}; committing on this stale history is unsafe.\n\
          Your staged changes remain unchanged and session {session_id} remains active.\n\
          Inspect: aethyme broker status --json\n\
-         Plan recovery: aethyme broker integration reconcile --upstream {upstream} --dry-run"
+         Plan recovery: aethyme broker advanced integration reconcile --upstream {upstream} --dry-run"
     )]
     ProtectedBranchDiverged {
         branch: String,
@@ -121,7 +121,7 @@ pub enum HooksError {
         "git commit refused by Aethyme pre-commit:\n\
          session {session_id} requires declared worktree preparation ({state}): {reason}\n\
          Your staged changes remain unchanged.\n\
-         Prepare this exact worktree: aethyme broker prepare --session {session_id}"
+         Prepare this exact worktree: aethyme broker submit prepare --session {session_id}"
     )]
     PreparationRequired {
         session_id: i64,
@@ -131,8 +131,8 @@ pub enum HooksError {
     #[error(
         "git push refused by Aethyme pre-push:\n\
          enrolled repository is publishing protected ref(s): {refs}.\n\
-         Publish verified integration with: aethyme broker ship plan --entry <id>\n\
-         Or run an explicitly authorized push through: aethyme broker git --session <id> --reason \"<authorization>\" -- push ...\n\
+         Publish verified integration with: aethyme broker advanced ship plan --entry <id>\n\
+         Or run an explicitly authorized push through: aethyme broker advanced git --session <id> --reason \"<authorization>\" -- push ...\n\
          Emergency break glass (journaled): AETHYME_BROKER_BREAK_GLASS_REASON=\"<reason>\" git push ..."
     )]
     ProtectedPush { refs: String },
@@ -672,7 +672,7 @@ fn unprepared_worktree_note(main_root: &Path, worktree: &Path) -> String {
     format!(
         "\nThis worktree lacks ignored path(s) the primary checkout has: {}. \
          If the gate needs them, declare preparation in .aethyme/prepare.toml \
-         or run the repository's setup here; `aethyme broker prepare status \
+         or run the repository's setup here; `aethyme broker submit prepare status \
          --session <id>` reports what is known.",
         absent.join(", ")
     )
@@ -905,7 +905,7 @@ fn protected_branches(checkout: &GitRepo) -> BTreeSet<String> {
 
 fn adopt_command(worktree: &str, staged: &[String]) -> String {
     let mut command = format!(
-        "aethyme broker adopt {} --task \"<task>\"",
+        "aethyme broker start --adopt {} --task \"<task>\"",
         sh_quote(worktree)
     );
     for path in staged {

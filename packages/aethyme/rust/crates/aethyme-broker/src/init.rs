@@ -167,7 +167,7 @@ pub fn certification_facts(repo_hint: &Path) -> Result<CertificationFacts, Broke
             id: "certify.gates",
             status: CheckStatus::Warn,
             detail: "no gates.toml — broker runs conflict-only (no verification); \
-                     `aethyme broker gates draft` can draft one"
+                     `aethyme broker advanced gates draft` can draft one"
                 .into(),
         }
     });
@@ -534,13 +534,13 @@ fn check_enrollment_visibility(repo: &crate::GitRepo, checkout_root: &Path) -> V
         Ok(Ok(_)) => Check {
             id: "certify.shared-activation",
             status: CheckStatus::Fail,
-            detail: "shared enrollment marker is invalid; re-run `aethyme broker scaffold`"
+            detail: "shared enrollment marker is invalid; re-run `aethyme broker advanced scaffold`"
                 .into(),
         },
         _ => Check {
             id: "certify.shared-activation",
             status: CheckStatus::Warn,
-            detail: "shared enrollment marker is absent; sibling worktrees cannot discover local enrollment until `aethyme broker scaffold` runs".into(),
+            detail: "shared enrollment marker is absent; sibling worktrees cannot discover local enrollment until `aethyme broker advanced scaffold` runs".into(),
         },
     };
     let activated = activation.status == CheckStatus::Pass;
@@ -713,7 +713,7 @@ fn check_gitignore_contract(main_root: &Path) -> Check {
             id: "certify.gitignore",
             status: CheckStatus::Warn,
             detail: ".gitignore is missing broker entries — \
-                     `aethyme broker scaffold` appends the managed block"
+                     `aethyme broker advanced scaffold` appends the managed block"
                 .into(),
         }
     }
@@ -1023,7 +1023,7 @@ schema = 1
 
 [promote]
 # \"auto\" (default): verified submissions promote to the local integration
-# branch immediately. \"manual\" holds them for `aethyme broker promote`.
+# branch immediately. \"manual\" holds them for `aethyme broker submit promote`.
 # \"verify-only\" verifies and promotes nothing -- for a repository that ships
 # through pull requests, where a second copy of the work on an integration
 # branch costs drift and contributes nothing. An unrecognised value falls back

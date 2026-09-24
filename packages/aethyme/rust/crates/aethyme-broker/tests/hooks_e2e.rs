@@ -265,7 +265,7 @@ fn pre_push_blocks_direct_default_branch_updates_and_journals_break_glass() {
         stderr.contains("git push refused by Aethyme pre-push"),
         "{stderr}"
     );
-    assert!(stderr.contains("broker ship plan"), "{stderr}");
+    assert!(stderr.contains("broker advanced ship plan"), "{stderr}");
     assert!(
         stderr.contains("AETHYME_BROKER_BREAK_GLASS_REASON"),
         "{stderr}"
@@ -376,7 +376,7 @@ fn protected_branch_commit_requires_a_live_local_session_when_broker_is_deployed
     );
     assert!(stderr.contains("not owned by a live session"), "{stderr}");
     assert!(stderr.contains("aethyme broker status --json"), "{stderr}");
-    assert!(stderr.contains("aethyme broker adopt"), "{stderr}");
+    assert!(stderr.contains("aethyme broker start --adopt"), "{stderr}");
     assert!(stderr.contains("--path 'docs.md'"), "{stderr}");
     assert!(!stderr.contains("--session"), "{stderr}");
     assert_eq!(head_commit(tmp.path()), head_before);

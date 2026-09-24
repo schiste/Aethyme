@@ -131,7 +131,7 @@ fn finish_cli_json_is_structured_and_persists_a_redacted_handoff() {
         report["recommended_next_action"]
             .as_str()
             .unwrap()
-            .starts_with("aethyme broker ship plan --entry ")
+            .starts_with("aethyme broker advanced ship plan --entry ")
     );
 
     let mut broker = Broker::open(tmp.path()).unwrap();
@@ -182,7 +182,7 @@ fn finish_cli_text_summarizes_the_structured_handoff() {
     assert!(text.contains("(removed)"), "{text}");
     assert!(!worktree.exists());
     assert!(
-        text.contains("recommended next: aethyme broker ship plan --entry"),
+        text.contains("recommended next: aethyme broker advanced ship plan --entry"),
         "{text}"
     );
 }
@@ -255,7 +255,7 @@ fn finish_cli_reports_partial_cleanup_and_resumes_idempotently() {
     assert!(first["cleanup"]["failure"].is_string());
     assert_eq!(
         first["cleanup"]["recovery_action"],
-        format!("aethyme broker cleanup {session_id}")
+        format!("aethyme broker finish cleanup {session_id}")
     );
     assert!(worktree.exists());
 

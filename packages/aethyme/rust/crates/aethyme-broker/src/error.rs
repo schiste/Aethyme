@@ -100,7 +100,7 @@ pub enum BrokerError {
     ReviewLifecycleIdentityConflict,
 
     #[error(
-        "review lifecycle for {repository} PR #{pr_number} is already owned by session {session_id}; inspect it with `aethyme broker review show --session {session_id}`, then reassign or abandon it explicitly"
+        "review lifecycle for {repository} PR #{pr_number} is already owned by session {session_id}; inspect it with `aethyme broker advanced review show --session {session_id}`, then reassign or abandon it explicitly"
     )]
     ReviewLifecyclePrOwned {
         repository: String,

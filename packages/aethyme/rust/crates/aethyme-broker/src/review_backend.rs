@@ -811,7 +811,7 @@ pub fn review_prompt(
          - Limit the review to {review_type}. Another reviewer covers the rest.\n\
          - Do not commit, push, or edit the branch under review.\n\
          - This session has no GitHub credentials, on purpose: `gh`, `git push` and \
-           `aethyme broker gh` will fail. Do not try to work around that; everything \
+           `aethyme broker advanced gh` will fail. Do not try to work around that; everything \
            you need is in the files above, and the broker posts your review.\n\n",
         diff = sandbox.diff_file,
         metadata = sandbox.metadata_file,

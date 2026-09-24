@@ -1240,7 +1240,7 @@ pub(super) fn run_review_state(parsed: Parsed) -> Result<(), UsageError> {
     // to have stopped being one.
     if state == crate::ReviewRequestState::Waived {
         return Err(UsageError::Message(
-            "`review state --state waived` is not a thing; use `aethyme broker review waive \
+            "`review state --state waived` is not a thing; use `aethyme broker advanced review waive \
              --repo <owner/name> --pr <number> --type <review-type> --head <sha> --reason <text>`, \
              which records who waived it and why"
                 .into(),
@@ -1397,7 +1397,7 @@ pub(super) fn run_review_state(parsed: Parsed) -> Result<(), UsageError> {
             }
             None => {
                 return Err(UsageError::Message(format!(
-                    "no {review_type} review is recorded for {repository}#{pull_request}{}; `aethyme broker review ledger --repo {repository} --pr {pull_request}` lists what is, and omit --head only for an unsolicited completion",
+                    "no {review_type} review is recorded for {repository}#{pull_request}{}; `aethyme broker advanced review ledger --repo {repository} --pr {pull_request}` lists what is, and omit --head only for an unsolicited completion",
                     match parsed.head.as_deref() {
                         Some(head) => format!(" at {head}"),
                         None => String::new(),
@@ -1408,7 +1408,7 @@ pub(super) fn run_review_state(parsed: Parsed) -> Result<(), UsageError> {
     } else {
         let existing = existing.ok_or_else(|| {
             UsageError::Message(format!(
-                "no {review_type} review is recorded for {repository}#{pull_request}{}; `aethyme broker review ledger --repo {repository} --pr {pull_request}` lists what is",
+                "no {review_type} review is recorded for {repository}#{pull_request}{}; `aethyme broker advanced review ledger --repo {repository} --pr {pull_request}` lists what is",
                 match parsed.head.as_deref() {
                     Some(head) => format!(" at {head}"),
                     None => String::new(),
@@ -1685,7 +1685,7 @@ pub(super) fn run_review(parsed: Parsed) -> Result<(), UsageError> {
             let session = broker.store().session(session_id)?;
             if session.status.is_closed() {
                 return Err(UsageError::Message(format!(
-                    "session {session_id} is closed; `review show` remains available for diagnostics, but review mutations require `aethyme broker review reassign --session {session_id} --to-session <live-id> --reason <text>` or `aethyme broker review abandon --session {session_id} --reason <text>`"
+                    "session {session_id} is closed; `review show` remains available for diagnostics, but review mutations require `aethyme broker advanced review reassign --session {session_id} --to-session <live-id> --reason <text>` or `aethyme broker advanced review abandon --session {session_id} --reason <text>`"
                 )));
             }
             let policy = crate::ReviewPolicy::load(broker.main_root())?;
@@ -1793,13 +1793,13 @@ pub(super) fn review_next_action(lifecycle: &crate::ReviewLifecycle) -> String {
         crate::ReviewLifecycleState::LocalSubmissionVerified
         | crate::ReviewLifecycleState::ReplacementCommitSubmitted => {
             format!(
-                "aethyme broker review request --session {}",
+                "aethyme broker advanced review request --session {}",
                 lifecycle.session_id
             )
         }
         crate::ReviewLifecycleState::ReviewRequested => {
             format!(
-                "aethyme broker review show --session {}",
+                "aethyme broker advanced review show --session {}",
                 lifecycle.session_id
             )
         }
@@ -1808,7 +1808,7 @@ pub(super) fn review_next_action(lifecycle: &crate::ReviewLifecycle) -> String {
         }
         crate::ReviewLifecycleState::ReviewSatisfied => {
             format!(
-                "aethyme broker review unlock --session {}",
+                "aethyme broker advanced review unlock --session {}",
                 lifecycle.session_id
             )
         }

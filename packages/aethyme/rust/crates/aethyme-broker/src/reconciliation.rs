@@ -570,8 +570,9 @@ impl Broker {
 
         let assessment =
             self.assess_integration_drift(upstream_ref, &upstream_head, &old_integration)?;
-        let manual_command =
-            format!("aethyme broker integration reconcile --upstream {upstream_ref} --dry-run");
+        let manual_command = format!(
+            "aethyme broker advanced integration reconcile --upstream {upstream_ref} --dry-run"
+        );
         if !assessment.automatic_cleanup_safe {
             return Ok(AutomaticIntegrationCleanupReport {
                 state: AutomaticIntegrationCleanupState::Deferred,
@@ -1033,7 +1034,7 @@ impl Broker {
         if !missing_unrecorded.is_empty() {
             report.safe = false;
             report.next_action = format!(
-                "review the complete schema_version 2 resolution_template, optionally write it with `aethyme broker integration reconcile --upstream {} --write-resolution-template <path> --dry-run`, fill every null judgment and reason, then rerun with --resolution-file <path>; no refs or broker rows were changed",
+                "review the complete schema_version 2 resolution_template, optionally write it with `aethyme broker advanced integration reconcile --upstream {} --write-resolution-template <path> --dry-run`, fill every null judgment and reason, then rerun with --resolution-file <path>; no refs or broker rows were changed",
                 options.upstream
             );
             return Ok(report);
@@ -1056,7 +1057,7 @@ impl Broker {
                 )
             } else {
                 format!(
-                    "review this dry-run, then run `aethyme broker integration reconcile --upstream {} --apply --confirm {digest}`",
+                    "review this dry-run, then run `aethyme broker advanced integration reconcile --upstream {} --apply --confirm {digest}`",
                     options.upstream,
                 )
             };

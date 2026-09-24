@@ -243,7 +243,7 @@ fn bulk_cleanup_confirmation_binds_the_exact_reviewed_branch_tip() {
     let refusal = String::from_utf8_lossy(&apply.stderr).into_owned();
     assert!(
         refusal.contains("no longer matches current state")
-            && refusal.contains("aethyme broker cleanup --all-cleaned"),
+            && refusal.contains("aethyme broker finish cleanup --all-cleaned"),
         "{refusal}"
     );
     assert!(

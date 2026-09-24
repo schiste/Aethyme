@@ -53,16 +53,16 @@ pub use surface::{
 };
 
 const RESOURCES_RECONCILE_USAGE: &str =
-    "usage: aethyme broker resources reconcile <lease-id> --confirm <generation> [--json]";
-const OPERATIONS_RECONCILE_USAGE: &str = "usage: aethyme broker operations reconcile \
+    "usage: aethyme broker advanced resources reconcile <lease-id> --confirm <generation> [--json]";
+const OPERATIONS_RECONCILE_USAGE: &str = "usage: aethyme broker advanced operations reconcile \
      --operation <id> --outcome <succeeded|failed> --reason <text> [--json]";
-const OPERATIONS_SHOW_USAGE: &str = "usage: aethyme broker operations show <id> [--json]";
-const OPERATIONS_STATS_USAGE: &str =
-    "usage: aethyme broker operations stats [--repo <canonical-id>] [--limit <n>] [--json]";
-const ADVISORIES_SHOW_USAGE: &str = "usage: aethyme broker advisories show <id> [--json]";
-const ADVISORIES_ACK_USAGE: &str = "usage: aethyme broker advisories ack <id> [--json]";
-const ADVISORIES_SUPPRESS_USAGE: &str = "usage: aethyme broker advisories suppress <id> [--json]";
-const INTEGRATION_RECONCILE_USAGE: &str = "usage: aethyme broker integration reconcile \
+const OPERATIONS_SHOW_USAGE: &str = "usage: aethyme broker advanced operations show <id> [--json]";
+const OPERATIONS_STATS_USAGE: &str = "usage: aethyme broker advanced operations stats [--repo <canonical-id>] [--limit <n>] [--json]";
+const ADVISORIES_SHOW_USAGE: &str = "usage: aethyme broker advanced advisories show <id> [--json]";
+const ADVISORIES_ACK_USAGE: &str = "usage: aethyme broker advanced advisories ack <id> [--json]";
+const ADVISORIES_SUPPRESS_USAGE: &str =
+    "usage: aethyme broker advanced advisories suppress <id> [--json]";
+const INTEGRATION_RECONCILE_USAGE: &str = "usage: aethyme broker advanced integration reconcile \
      --upstream <ref> [--resolution-file <path>] [--write-resolution-template <path>] \
      [--dry-run | --apply --confirm <sha256>] [--json]";
 
@@ -1744,7 +1744,7 @@ fn surface_command_advisories(subcommand: &str, parsed: &Parsed) {
             note.id, note.sender_session_id, note.message
         );
         eprintln!(
-            "  acknowledge: aethyme broker note ack --session {} --id {}",
+            "  acknowledge: aethyme broker advanced note ack --session {} --id {}",
             session_id, note.id
         );
     }

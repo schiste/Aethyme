@@ -136,10 +136,13 @@ pub(super) fn render_advisory(advisory: &crate::Advisory) {
         }
     }
     if advisory.resolution_state == crate::AdvisoryResolutionState::Outstanding {
-        out!("Acknowledge: aethyme broker advisories ack {}", advisory.id);
+        out!(
+            "Acknowledge: aethyme broker advanced advisories ack {}",
+            advisory.id
+        );
         if advisory.audience == crate::AdvisoryAudience::Maintainer {
             out!(
-                "Suppress: aethyme broker advisories suppress {}",
+                "Suppress: aethyme broker advanced advisories suppress {}",
                 advisory.id
             );
         }
@@ -311,7 +314,7 @@ pub(super) fn run_advisories(parsed: Parsed) -> Result<(), UsageError> {
         Some("list") => {
             if parsed.positional.len() != 1 {
                 return Err(UsageError::Message(
-                    "usage: aethyme broker advisories list [--all] [--json]".into(),
+                    "usage: aethyme broker advanced advisories list [--all] [--json]".into(),
                 ));
             }
             if !parsed.read_only_snapshot {
@@ -403,7 +406,7 @@ pub(super) fn run_advisories(parsed: Parsed) -> Result<(), UsageError> {
         Some("metrics") => {
             if parsed.positional.len() != 1 {
                 return Err(UsageError::Message(
-                    "usage: aethyme broker advisories metrics [--json]".into(),
+                    "usage: aethyme broker advanced advisories metrics [--json]".into(),
                 ));
             }
             let summary = broker.advisory_delivery_summary()?;
@@ -507,7 +510,7 @@ pub(super) fn run_exposures(parsed: Parsed) -> Result<(), UsageError> {
                 out!("Plan digest: {}", plan.digest);
                 if plan.safe {
                     out!(
-                        "Apply with: aethyme broker exposures apply --session <id> --confirm {}",
+                        "Apply with: aethyme broker advanced exposures apply --session <id> --confirm {}",
                         plan.digest
                     );
                 }
