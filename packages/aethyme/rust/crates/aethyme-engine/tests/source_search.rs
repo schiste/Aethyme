@@ -177,16 +177,17 @@ fn two_thousand_file_repo_is_searched_completely_within_budget_cold_and_warm() {
         // The request names `retry_throttle_window`; vendored copies also
         // defines it, so the exact-symbol rule is ambiguous, but the real
         // definition dominates on term coverage and score margin.
-        assert_eq!(response["safe_to_use_as_answer"], true);
+        // Promotion is off; the rule's verdict is still reported.
+        assert_eq!(response["safe_to_use_as_answer"], false);
         assert_eq!(
-            response["answer"][0]["evidence"]["answer_rule"],
-            "dominant_term_coverage"
+            source["answer_safety"]["rule"], "dominant_term_coverage",
+            "{source}"
         );
         assert_eq!(response["truncated"], true, "more than 8 files match");
         let paths = hint_paths(response);
         assert_eq!(paths.len(), 8);
         assert_eq!(paths[0], "src/net/limits.py", "{paths:?}");
-        let first = &response["answer"][0]["evidence"];
+        let first = &response["navigation_hints"][0]["evidence"];
         assert_eq!(first["symbol_match"]["name"], "retry_throttle_window");
         assert_eq!(first["line_refs"][0]["line"], 10);
         for (rank, path) in paths.iter().enumerate() {

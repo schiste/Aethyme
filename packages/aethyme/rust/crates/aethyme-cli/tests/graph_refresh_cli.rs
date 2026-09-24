@@ -568,18 +568,20 @@ fn explore_returns_structured_degradation_when_the_opt_in_store_is_missing() {
     )))
     .unwrap();
     assert_eq!(response["status"], "degraded");
-    // The request names the fixture's only `answer` definition, so graph-free
-    // content evidence is decisive (P3.4) while the response stays degraded.
-    assert_eq!(response["safe_to_use_as_answer"], true);
+    // Graph-free answer promotion is off: the exact-symbol rule still holds
+    // and is reported in observability, but the hit stays navigation.
+    assert_eq!(response["safe_to_use_as_answer"], false);
     assert_eq!(response["safe_to_use_as_navigation"], true);
-    let answer = response["answer"].as_array().unwrap();
-    assert_eq!(answer.len(), 1, "{answer:?}");
-    assert_eq!(answer[0]["status"], "content_evidence");
-    assert!(answer[0].to_string().contains("app.py"), "{answer:?}");
-    assert_eq!(answer[0]["path"], "app.py");
-    assert_eq!(answer[0]["evidence"]["graph_available"], false);
+    assert_eq!(response["answer"], serde_json::json!([]));
+    assert!(
+        response["navigation_hints"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|hint| hint["path"] == "app.py" && hint["evidence"]["graph_available"] == false)
+    );
     assert_eq!(
-        answer[0]["evidence"]["answer_rule"],
+        response["observability"]["source_fallback"]["answer_safety"]["rule"],
         "exact_symbol_definition"
     );
     assert!(!repo.join(".aethyme/graph_store.redb").exists());

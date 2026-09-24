@@ -188,7 +188,7 @@ fn untracked_files_are_searched_but_ignored_hidden_and_symlinked_files_are_not()
 }
 
 #[test]
-fn strong_fallback_envelope_answers_with_source_navigation_evidence() {
+fn strong_fallback_envelope_reports_the_rule_but_stays_navigation_only() {
     let repo = fixture();
     let envelope = super::super::graph_unavailable_response(
         repo.path(),
@@ -198,22 +198,16 @@ fn strong_fallback_envelope_answers_with_source_navigation_evidence() {
         "missing",
         "fixture".into(),
     );
-    assert!(envelope.safe_to_use_as_answer);
+    // Promotion is off (GRAPH_FREE_ANSWER_PROMOTION): the rule's verdict is
+    // measured, not acted on.
+    assert!(!envelope.safe_to_use_as_answer);
     assert!(envelope.safe_to_use_as_navigation);
-    assert_eq!(envelope.answer.len(), 1);
-    let answer = &envelope.answer[0];
-    assert_eq!(answer.target, "src/net/backoff.py");
-    assert_eq!(answer.status, "content_evidence");
-    assert_eq!(answer.evidence["graph_available"], false);
-    assert!(answer.evidence["answer_rule"].is_string());
-    assert!(
-        envelope
-            .navigation_hints
-            .iter()
-            .all(|hint| hint.target != answer.target)
-    );
+    assert!(envelope.answer.is_empty());
+    let top = &envelope.navigation_hints[0];
+    assert_eq!(top.target, "src/net/backoff.py");
+    assert_eq!(top.evidence["graph_available"], false);
     let policy = &envelope.trust_policy;
-    assert_eq!(policy.trust_policy, "answer_candidate");
+    assert_eq!(policy.trust_policy, "verify_before_use");
     assert_eq!(policy.evidence_level, "source_navigation");
     assert!(policy.degraded);
     assert!(

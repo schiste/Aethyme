@@ -34,12 +34,21 @@ pub(super) fn graph_store_explore_error(error: GraphStoreError) -> ExploreError 
     ExploreError::GraphUnavailable { status, reason }
 }
 
+/// Whether a graph-free top hit that passes [`source_fallback::answer_safety`]
+/// is promoted to `answer[]` with `safe_to_use_as_answer: true`.
+///
+/// Off: on the 2026-09-24 held-out run the rule marked 3 answers safe and one
+/// was wrong, and agents act on this flag without verifying. The rule's
+/// verdict is still reported in observability (`source_fallback.answer_safety`)
+/// so its precision can be measured; turn this on only once that precision is
+/// at least 95% on the development set.
+const GRAPH_FREE_ANSWER_PROMOTION: bool = false;
+
 /// Build the stable answer-json contract for a repository whose optional
 /// local graph store cannot currently answer. A bounded full-content source
-/// search supplies ranked navigation hints with line spans. When its top hit
-/// passes [`source_fallback::answer_safety`] that hit becomes the single
-/// `answer[]` item and `safe_to_use_as_answer` is true; it is still
-/// source-navigation evidence, never caller or impact evidence.
+/// search supplies ranked navigation hints with line spans. Graph-free hits
+/// are navigation only while [`GRAPH_FREE_ANSWER_PROMOTION`] is off; they are
+/// never caller or impact evidence.
 pub fn graph_unavailable_response(
     repo: &Path,
     request: &str,
@@ -75,7 +84,7 @@ pub fn graph_unavailable_response_with(
     let mut hints = std::mem::take(&mut fallback.hints);
     let subsystems = std::mem::take(&mut fallback.subsystems);
     let safety = fallback.answer_safety;
-    let answer = if safety.safe && !hints.is_empty() {
+    let answer = if GRAPH_FREE_ANSWER_PROMOTION && safety.safe && !hints.is_empty() {
         let mut top = hints.remove(0);
         top.status = "content_evidence".into();
         top.evidence["answer_rule"] = serde_json::json!(safety.rule);
