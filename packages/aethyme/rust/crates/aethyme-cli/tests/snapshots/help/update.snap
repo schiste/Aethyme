@@ -1,6 +1,5 @@
 exit: 0
 --- stdout
---- stderr
 aethyme update — explicit paired-binary updates (never runs in the background)
 
 Usage:
@@ -14,3 +13,4 @@ the plan is recomputed every run, so a reinstall shows up immediately.
 
 Homebrew installs are updated with `brew upgrade aethyme`.
 After either binary update, run `aethyme upgrade plan` in each enrolled repository.
+--- stderr

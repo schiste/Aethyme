@@ -581,35 +581,73 @@ pub fn run(args: &[String]) -> u8 {
             0
         }
         "-h" | "--help" | "help" | "" => {
-            print_help();
+            print_help(true);
             0
         }
         other => {
             eprintln!("aethyme plugin: unknown action '{other}'");
-            print_help();
+            print_help(false);
             2
         }
     }
 }
 
-fn print_help() {
-    eprintln!("aethyme plugin — install the agent-surface plugin and check the CLI behind it");
-    eprintln!();
-    eprintln!("Usage: aethyme plugin <action> [options]");
-    eprintln!();
-    eprintln!("Actions:");
-    eprintln!("  install     register the marketplace and install the plugin");
-    eprintln!("  remove      uninstall the plugin and forget the marketplace");
-    eprintln!("  status      report the plugin, the CLI on PATH, and the hook floor");
-    eprintln!();
-    eprintln!("Options:");
-    eprintln!("  --surface codex|claude|all   default: all surfaces present on this machine");
-    eprintln!("  --source <path|owner/repo>   default: {DEFAULT_MARKETPLACE_SOURCE}");
-    eprintln!("  --dry-run                    print the commands without running them");
-    eprintln!("  --json                       machine-readable status");
-    eprintln!();
-    eprintln!("`status` exits nonzero when the plugin is installed but the `aethyme`");
-    eprintln!("on PATH is older than {MIN_HOOK_CLI_VERSION}, which makes its hooks inert.");
+/// Help goes to stdout when asked for and to stderr beside a usage error.
+fn print_help(to_stdout: bool) {
+    use std::fmt::Write as _;
+    let mut text = String::new();
+    let _ = writeln!(
+        text,
+        "aethyme plugin — install the agent-surface plugin and check the CLI behind it"
+    );
+    text.push('\n');
+    let _ = writeln!(text, "Usage: aethyme plugin <action> [options]");
+    text.push('\n');
+    let _ = writeln!(text, "Actions:");
+    let _ = writeln!(
+        text,
+        "  install     register the marketplace and install the plugin"
+    );
+    let _ = writeln!(
+        text,
+        "  remove      uninstall the plugin and forget the marketplace"
+    );
+    let _ = writeln!(
+        text,
+        "  status      report the plugin, the CLI on PATH, and the hook floor"
+    );
+    text.push('\n');
+    let _ = writeln!(text, "Options:");
+    let _ = writeln!(
+        text,
+        "  --surface codex|claude|all   default: all surfaces present on this machine"
+    );
+    let _ = writeln!(
+        text,
+        "  --source <path|owner/repo>   default: {DEFAULT_MARKETPLACE_SOURCE}"
+    );
+    let _ = writeln!(
+        text,
+        "  --dry-run                    print the commands without running them"
+    );
+    let _ = writeln!(
+        text,
+        "  --json                       machine-readable status"
+    );
+    text.push('\n');
+    let _ = writeln!(
+        text,
+        "`status` exits nonzero when the plugin is installed but the `aethyme`"
+    );
+    let _ = writeln!(
+        text,
+        "on PATH is older than {MIN_HOOK_CLI_VERSION}, which makes its hooks inert."
+    );
+    if to_stdout {
+        print!("{text}");
+    } else {
+        eprint!("{text}");
+    }
 }
 
 #[cfg(test)]

@@ -1,1 +1,20 @@
-same-as: broker
+exit: 2
+--- stdout
+--- stderr
+aethyme broker — coordinate concurrent AI agent sessions on this repository
+
+Usage: aethyme broker <verb> [args...]
+
+Verbs:
+  start     create an isolated worktree + session, or adopt/reuse an existing one
+  status    sessions, overlaps, queue and integration; readiness and doctor views
+  submit    simulate, gate and promote a session; preparation and promotion recovery
+  finish    close a completed session; state-only close and worktree cleanup
+  unblock   list current blockers, or clear one by id
+  gc        reviewed plan/apply cleanup: retention, build output, storage, resources
+
+Everything else (leases, git, gh, ship, review, operations, exec, ...):
+  aethyme broker advanced --help
+
+Run `aethyme broker <verb> --help` for a verb's forms and flags.
+Overlaps warn — they never block (v0 policy).

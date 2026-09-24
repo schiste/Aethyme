@@ -1,13 +1,13 @@
 exit: 0
 --- stdout
---- stderr
 aethyme — repository navigation, task localization, agent brokering
 
-Usage: aethyme <subcommand> [args...]
+Usage: aethyme <command> [args...]
+       aethyme <command> --help
        aethyme --version | -V
 
 Hot path:
-  explore --repo <path> --request "<task>" [--format answer-json]
+  explore --repo <path> --request "<task>"
                               in-process engine; auto-starts the engine daemon
   explore-summary --from explore.json
                               compact decision surface from a saved answer-json
@@ -15,35 +15,39 @@ Hot path:
                               bounded source spans for Explore targets
 
 Agent broker:
-  init                        guided setup: certify + scaffold + gates draft
-  certify                     read-only certification checks for this repo
   broker start --task <text>  create an isolated worktree + session
-  broker submit --session <id> simulate, gate, and promote a session
-  broker status              show sessions, conflicts, queue, and integration
-  broker finish --session <id> safely close a completed session
-  broker leases [claim|plan|release] inspect or manage path ownership
-  broker git|gh --session <id> coordinate Git and GitHub operations
-  broker operations          inspect/reconcile the remote-operation journal
-  broker adopt|start-agent|agents|cleanup   (see `broker --help`)
-  hook <event>               agent-surface hook entry point (the plugin's
-                              only entry point; reads event JSON on stdin)
-  plugin install|status|remove  install the agent-surface plugin, or
-                              report the plugin/CLI version skew that
-                              makes an installed one silently inert
-  update check|plan|execute  explicit paired-binary updates; never background
-  upgrade plan|apply|recover review, apply, or recover repository migrations
-  graph status|units|materialize|refresh  inspect, page, materialize, or refresh graph artifacts
-  graph impact --repo <path> --revision <ref> --diff <path-or-json> [--mode calls|imports] [--budget <n>] [--json]
+  broker status               sessions, overlaps, queue, integration, readiness
+  broker submit --session <id>
+                              simulate, gate, and promote a session
+  broker finish --session <id>
+                              safely close a completed session
+  broker unblock [<id>]       list blockers, or clear one
+  broker gc plan|apply        reviewed cleanup of retained state and disk
+  broker advanced <verb>      leases, git, gh, ship, review, operations, exec, ...
+  hook <event>                agent-surface hook entry point (the plugin's only
+                              entry point; reads event JSON on stdin)
+  plugin install|status|remove
+                              install the agent-surface plugin, or report the
+                              plugin/CLI version skew that makes one inert
+  update check|plan|execute   explicit paired-binary updates; never background
+  upgrade plan|apply|recover  review, apply, or recover repository migrations
 
 Setup:
-  deploy [verify|bridge] [--repo <path>]  enroll repository policy
+  init                        guided setup: certify + scaffold + gates draft
+  certify                     read-only certification checks for this repo
+  deploy [verify|bridge] [--repo <path>]
+                              enroll repository policy and agent guidance
   root show|set <path>        developer checkout pointer (legacy compatibility)
 
+Graph and analysis:
+  graph status|units|materialize|refresh|impact|node|callers|...
+  task | query | analyze | facts | intents | repo   (each takes --help)
+
 Quality:
-  readiness [--require <level>] authoritative operational readiness
   quality inspect [--repo <path>] bounded optional repository-quality analysis
   ai-ready [--repo <path>]    legacy quality scorecard alias (deprecated)
   autofix <path> [--dry-run|--apply|--pr]
-                              safe automated fixes (see `autofix --help`)
+                              safe automated fixes
 
-Every subcommand is native; unknown ones are errors.
+Deprecated spellings still work and print one warning line on stderr.
+--- stderr

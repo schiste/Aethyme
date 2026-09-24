@@ -99,6 +99,19 @@ const BROKER: &[&str] = &[
     "cleanup",
 ];
 
+const PUBLIC_FORMS: &[&str] = &[
+    "status readiness",
+    "status doctor",
+    "submit prepare",
+    "submit promote",
+    "submit promotion-record",
+    "finish close",
+    "finish cleanup",
+    "gc reclaim",
+    "gc storage",
+    "gc reap",
+];
+
 fn git(repo: &Path, args: &[&str]) {
     let status = Command::new("/usr/bin/git")
         .args(args)
@@ -159,11 +172,23 @@ fn help_surface_matches_snapshots() {
         invocations.push(vec!["broker", subcommand, "--help"]);
     }
 
+    // The Phase 4 surface: `advanced`, and the public verbs' merged forms.
+    invocations.push(vec!["broker", "advanced", "--help"]);
+    invocations.push(vec!["broker", "advanced"]);
+    for form in PUBLIC_FORMS {
+        let mut args: Vec<&str> = vec!["broker"];
+        args.extend(form.split(' '));
+        args.push("--help");
+        invocations.push(args);
+    }
+
     let mut entries: Vec<(String, String)> = Vec::new();
     for args in &invocations {
         let body = help(&repo, &home, args);
         let name = if args.len() == 1 && args[0] == "broker" {
             "broker-no-args".to_string()
+        } else if args.as_slice() == ["broker", "advanced"] {
+            "broker-advanced-no-args".to_string()
         } else {
             slug(args)
         };
@@ -173,7 +198,5 @@ fn help_surface_matches_snapshots() {
         };
         entries.push((name, stored));
     }
-    // Keep only full bodies searchable for later dedup lookups: a `same-as`
-    // body never equals real output, so the lookup above stays correct.
     assert_snapshots("help", &entries);
 }

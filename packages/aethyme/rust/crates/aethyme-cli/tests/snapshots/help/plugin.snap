@@ -1,6 +1,5 @@
 exit: 0
 --- stdout
---- stderr
 aethyme plugin — install the agent-surface plugin and check the CLI behind it
 
 Usage: aethyme plugin <action> [options]
@@ -18,3 +17,4 @@ Options:
 
 `status` exits nonzero when the plugin is installed but the `aethyme`
 on PATH is older than 0.7.17, which makes its hooks inert.
+--- stderr

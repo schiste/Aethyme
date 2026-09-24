@@ -454,25 +454,24 @@ fn run_bootstrap(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// Explicitly requested help, so it goes to stdout with exit 0.
 fn print_update_help() {
-    eprintln!("aethyme update — explicit paired-binary updates (never runs in the background)");
-    eprintln!();
-    eprintln!("Usage:");
-    eprintln!("  aethyme update check [--json] [--refresh]");
-    eprintln!("  aethyme update plan [--channel stable|preview] [--json] [--refresh]");
-    eprintln!("  aethyme update execute --confirm <manifest-sha256> [--json]");
-    eprintln!();
-    eprintln!(
+    println!("aethyme update — explicit paired-binary updates (never runs in the background)");
+    println!();
+    println!("Usage:");
+    println!("  aethyme update check [--json] [--refresh]");
+    println!("  aethyme update plan [--channel stable|preview] [--json] [--refresh]");
+    println!("  aethyme update execute --confirm <manifest-sha256> [--json]");
+    println!();
+    println!(
         "The release manifest is cached for {}h; --refresh bypasses the cache, and",
         update_cache::DEFAULT_TTL_SECONDS / 3600
     );
-    eprintln!("AETHYME_UPDATE_CACHE_TTL_SECONDS=0 disables it. Only the answer is cached:");
-    eprintln!("the plan is recomputed every run, so a reinstall shows up immediately.");
-    eprintln!();
-    eprintln!("Homebrew installs are updated with `brew upgrade aethyme`.");
-    eprintln!(
-        "After either binary update, run `aethyme upgrade plan` in each enrolled repository."
-    );
+    println!("AETHYME_UPDATE_CACHE_TTL_SECONDS=0 disables it. Only the answer is cached:");
+    println!("the plan is recomputed every run, so a reinstall shows up immediately.");
+    println!();
+    println!("Homebrew installs are updated with `brew upgrade aethyme`.");
+    println!("After either binary update, run `aethyme upgrade plan` in each enrolled repository.");
 }
 
 fn parse_check_options(args: &[String]) -> Result<(bool, bool), String> {

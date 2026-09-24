@@ -1,1 +1,12 @@
-same-as: broker
+exit: 0
+--- stdout
+  aethyme broker advanced checkpoint plan --session <id> [--json]
+      Read-only recovery plan for a session whose accepted checkpoint is no
+      longer an ancestor of its rewritten branch. Reports the old and proposed
+      checkpoints, integration relation, pending commit provenance, safety
+      refusals, preservation branch, and review digest.
+  aethyme broker advanced checkpoint apply --session <id> --confirm <sha256> [--json]
+      Rebuild and confirm the exact recovery plan, create the preservation ref
+      first, then atomically re-anchor the broker checkpoint. Never rewrites the
+      session worktree or hides uncommitted work.
+--- stderr

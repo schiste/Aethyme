@@ -1,1 +1,7 @@
-same-as: broker
+exit: 0
+--- stdout
+  aethyme broker advanced handoff (--session <id> | --worktree <path>) [--json]
+      Read the latest persisted session.finished handoff for one session,
+      or the newest completed session registered to a worktree. Does not
+      refresh sessions, leases, gates, events, or command telemetry.
+--- stderr

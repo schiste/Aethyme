@@ -1,1 +1,17 @@
-same-as: broker
+exit: 0
+--- stdout
+  aethyme broker advanced watch pr start --session <id> --repo <owner/name> --pr <number> [--events <comments,reviews,checks>] [--seconds <15..3600>] [--json]
+  aethyme broker advanced watch pr monitoring <activate|deactivate|status> --session <id> [--json]
+      Opt this session in to PR monitoring. Off by default: while active, a
+      pull request opened through `broker gh` starts a watch automatically, and
+      the scheduled poller may deliver its review activity to this session.
+  aethyme broker advanced watch pr list [--all] [--json]
+  aethyme broker advanced watch pr show|poll|pause|resume|stop --id <watch-id> [--json]
+  aethyme broker advanced watch pr tick [--limit <1..100>] [--json]
+  aethyme broker advanced watch pr batches --id <watch-id> [--all] [--json]
+  aethyme broker advanced watch pr ack --id <batch-id> --outcome <addressed|stale|non-actionable|superseded> --reason <text> [--json]
+      Persist a metadata-only PR watch and inspect it with one-shot polling.
+      Aethyme records provider ids, authors, states, URLs and timestamps, but
+      never comment/review bodies. `tick` performs one bounded foreground
+      scheduling pass; the broker never starts a background poller.
+--- stderr

@@ -1,1 +1,7 @@
-same-as: broker
+exit: 0
+--- stdout
+  aethyme broker advanced worktree-root [--json]
+      Resolve the scanner-safe external root used by future broker starts.
+      Read-only: reports the preferred per-user location, repository key,
+      and constrained legacy fallback without creating either directory.
+--- stderr

@@ -1,1 +1,8 @@
-same-as: broker
+exit: 0
+--- stdout
+  aethyme broker advanced metrics [--json]
+      Cost/benefit accounting from safe local telemetry: broker command
+      latency (names + numbers only, never task text or paths), gate
+      executions vs cache hits with time saved, conflicts caught before
+      any gate ran, overlaps warned.
+--- stderr

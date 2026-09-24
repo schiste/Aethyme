@@ -1,1 +1,9 @@
-same-as: broker
+exit: 0
+--- stdout
+  aethyme broker advanced note send --session <sender> --to-session <recipient> --message <text> [--json]
+  aethyme broker advanced note list --session <recipient> [--json]
+  aethyme broker advanced note ack --session <recipient> --id <note-id> [--json]
+      Send, inspect, and acknowledge bounded repository-local coordination
+      notes between live sessions. Unread notes surface on the recipient's
+      next broker command; event payloads never contain message text.
+--- stderr

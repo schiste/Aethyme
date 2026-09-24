@@ -1,4 +1,39 @@
-exit: 1
+exit: 0
 --- stdout
+aethyme graph — repository graph lifecycle and navigation
+
+Usage:
+  aethyme graph status [--repo <path>] [--json]
+      Report fragment, derived-store, and compatibility health (default repo: .).
+  aethyme graph units [--repo <path>] [--revision <sha>] [--cursor <token>] [--limit <n>] [--json]
+      Page through committed graph units; --limit 1-1000 (default 100).
+  aethyme graph materialize [--repo <path>] [--json]
+      Build or refresh the derived graph store from committed fragments (writes the store).
+  aethyme graph refresh plan [--repo <path>] [--json | --diff]
+      Regenerate fragments from committed HEAD in a disposable clone and print the plan.
+  aethyme graph refresh execute --confirm <plan-sha256> [--repo <path>] [--json]
+      Apply a reviewed refresh plan; refuses if state changed since the plan.
+  aethyme graph refresh recover --plan <plan-sha256> [--repo <path>]
+      Recover an interrupted refresh from its journal.
+  aethyme graph impact --repo <path> --revision <rev> --diff <file|text>
+                       [--mode calls|imports] [--budget <n>] [--json]
+      Impact report for a diff: callers/importers, tests, configs, risk hints (budget default 128).
+  aethyme graph node <repo_path> <target> [--json-output]
+      Show one node. <target>: node id, file path, area, or symbol (path::name or name).
+  aethyme graph children <repo_path> <target> [--json-output]
+      Contained nodes.
+  aethyme graph parents <repo_path> <target> [--json-output]
+      Containing nodes.
+  aethyme graph callers <repo_path> <target> [--json-output]
+      Call-graph callers.
+  aethyme graph callees <repo_path> <target> [--json-output]
+      Call-graph callees.
+  aethyme graph docs <repo_path> <target> [--json-output]
+      Documentation linked to the target.
+  aethyme graph configs <repo_path> <target> [--json-output]
+      Configuration linked to the target.
+  aethyme graph expand <repo_path> <target> [--json-output]
+      The target with its immediate neighborhood.
+  aethyme graph overview <repo_path> [--json-output]
+      Repository overview from the graph store.
 --- stderr
-Error: usage: aethyme graph --help <repo_path> [target] [--json-output]

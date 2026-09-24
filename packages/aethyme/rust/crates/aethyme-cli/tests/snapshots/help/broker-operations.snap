@@ -1,1 +1,16 @@
-same-as: broker
+exit: 0
+--- stdout
+  aethyme broker advanced operations list [--limit <n>] [--before <id>] [--session <id>] [--status <status>] [--repo <canonical-id>] [--provider <git|github>] [--json]
+      List a filtered newest-first page of the durable operation journal.
+      `operations` without `list` is a compatibility alias during deprecation.
+  aethyme broker advanced operations show <id> [--json]
+      Show one exact durable operation and its reconciliation state, evidence,
+      write barrier, and complete recovery commands when inspection is required.
+  aethyme broker advanced operations reconcile --operation <id> --outcome <succeeded|failed> --reason <text> [--json]
+      Resolve a crash-ambiguous operation after independently inspecting the
+      remote state. Overlapping writes remain blocked until reconciliation.
+  aethyme broker advanced operations stats [--repo <canonical-id>] [--limit <n>] [--json]
+      Read bounded lock-hold, queue-wait, queue-depth, and known-unrelated
+      contention measurements. Older operations without timing data are
+      reported as unmeasured; this command never changes lock policy.
+--- stderr

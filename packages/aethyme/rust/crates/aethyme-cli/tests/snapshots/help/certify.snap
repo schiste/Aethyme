@@ -1,1 +1,8 @@
-same-as: broker
+exit: 0
+--- stdout
+  aethyme certify [--json]             (also: aethyme broker certify)
+      The certification method: deterministic, strictly read-only checks
+      (git version, repo, configs valid, gitignore contract, protocol,
+      db integrity). Exits non-zero on failures — CI/cron-able as the
+      recurring inspection. Never writes anything.
+--- stderr

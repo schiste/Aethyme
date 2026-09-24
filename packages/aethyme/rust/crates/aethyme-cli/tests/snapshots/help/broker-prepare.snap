@@ -1,1 +1,12 @@
-same-as: broker
+exit: 0
+--- stdout
+  aethyme broker submit prepare status --session <id> [--json]
+      Inspect repository-declared dependency preparation for one worktree.
+      This is read-only and reports the exact remediation when preparation is
+      absent, stale, interrupted, failed, or invalid.
+  aethyme broker submit prepare --session <id> [--offline] [--wait <duration>] [--json]
+      Explicitly run the repository's .aethyme/prepare.toml commands in the
+      session worktree. Shared caches are serialized host-wide; no command is
+      ever run automatically by start or adopt. --offline refuses any step
+      without a declared offline_command.
+--- stderr

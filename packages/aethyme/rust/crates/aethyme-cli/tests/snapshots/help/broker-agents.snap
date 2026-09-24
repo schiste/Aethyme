@@ -1,1 +1,6 @@
-same-as: broker
+exit: 0
+--- stdout
+  aethyme broker advanced agents [--json]
+      List live sessions with activity-derived liveness, refreshing
+      diff-derived leases and warning on overlapping edits.
+--- stderr

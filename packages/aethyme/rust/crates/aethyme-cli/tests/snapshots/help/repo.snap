@@ -1,4 +1,40 @@
-exit: 2
+exit: 0
 --- stdout
+aethyme repo — repository utilities, skills, overrides, telemetry, commit hygiene
+
+Usage:
+  aethyme repo ingest <repo_path>
+      Build the repository map; report file count and graph-store presence.
+  aethyme repo inspect <repo_path> [--mode brief|structure|full] [--json-output]
+      Show the repository map (default mode: full).
+  aethyme repo warm <repo_path>
+      Build the repository map once.
+  aethyme repo clear-cache <repo_path>
+      Delete the legacy output cache root ($AETHYME_CACHE_DIR, default /tmp/aethyme-cache).
+  aethyme repo engine-info [--repo <path>] [--check] [--json-output]
+      Binary, version, graph store, and daemon status; --check exits 1 when not ready.
+  aethyme repo deploy-skills <repo_path> [--force | --remove]
+      Compatibility path; prefer `aethyme deploy`.
+  aethyme repo compile-skills <repo_path> [--skill repo-onboarding]
+      Regenerate the repo-onboarding skill files.
+  aethyme repo init-onboarding-overrides <repo_path> [--force]
+      Write the onboarding override template.
+  aethyme repo validate-onboarding-overrides <repo_path>
+      Validate the onboarding override file.
+  aethyme repo init-agents-overrides <repo_path> [--force]
+      Write the agents-policy override template.
+  aethyme repo validate-agents-overrides <repo_path>
+      Validate the agents-policy override file.
+  aethyme repo experience-telemetry <repo_path> [--check] [--json-output]
+      Report experience telemetry; --check exits 1 on attention signals.
+  aethyme repo experience-status <repo_path> [--json-output]
+      Write and print the experience-status artifacts.
+  aethyme repo commit-message-template [--type <type>] [--scope <scope>]
+      Print a typed commit template (defaults: fix, scope).
+  aethyme repo lint-commit-message [<message_path> | --message <text>] [--json-output]
+      Lint a commit message from a file, --message, or stdin.
+  aethyme repo hook-envelope [--event <name>]
+      Wrap stdin as a hook additionalContext envelope (default event: SessionStart).
+  aethyme repo record-wrapper-invocation <repo_path> --wrapper <name> [--detail key=value ...]
+      Record a wrapper invocation in the telemetry ledger (used by hooks).
 --- stderr
-Error: unsupported repo subcommand: --help

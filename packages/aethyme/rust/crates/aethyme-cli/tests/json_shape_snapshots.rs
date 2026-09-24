@@ -83,7 +83,10 @@ fn session_lifecycle_json_shapes_match_snapshots() {
     let repo = tmp.path().join("repo");
     let mut entries = Vec::new();
 
-    let started = json(&repo, &["broker", "start", "--task", "shape fixture", "--json"]);
+    let started = json(
+        &repo,
+        &["broker", "start", "--task", "shape fixture", "--json"],
+    );
     entries.push(("start".to_string(), shape(&started)));
     let session = started["id"]
         .as_i64()

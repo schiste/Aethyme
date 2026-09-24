@@ -1,1 +1,9 @@
-same-as: broker
+exit: 0
+--- stdout
+  aethyme broker advanced exposures plan [--json]
+      Read-only reconciliation plan against the remote default branch's
+      freshly advertised exact SHA. Normal status never performs this check.
+  aethyme broker advanced exposures apply --session <id> --confirm <sha256> [--json]
+      Rebuild the plan, journal a second exact remote observation, and resolve
+      only contained exposures and advisories without live lease overlap.
+--- stderr

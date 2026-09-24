@@ -1,1 +1,11 @@
-same-as: broker
+exit: 0
+--- stdout
+  aethyme broker advanced queue [--active] [--json]
+      `--active` lists only entries that can still change (submitted,
+      simulating, verified, conflict) — the cheap way to watch a submit in
+      flight without paying for the whole inventory on every poll.
+  aethyme broker advanced queue history [--limit <n>] [--before <id>] [--json]
+      The bare command remains the compatibility inventory. `history` is a
+      bounded newest-first terminal page with a stable next_before_id cursor.
+      Show the merge queue.
+--- stderr

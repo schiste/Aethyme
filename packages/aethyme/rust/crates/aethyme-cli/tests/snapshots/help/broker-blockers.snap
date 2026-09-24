@@ -1,1 +1,15 @@
-same-as: broker
+exit: 0
+--- stdout
+  aethyme broker unblock <id> [--outcome <succeeded|failed>] [--reason <text>] [--confirm <generation>] [--json]
+      Clear one blocker through its store's recovery path. Outcome-unknown
+      operations need --outcome and --reason from an operator who inspected
+      the remote; cached failing gate verdicts need --reason; unclosed
+      resource leases need --confirm <generation>. Refusals exit 3 and name
+      the flag they need.
+  aethyme broker unblock [--json]
+      Read-only: every current blocker across broker.db, the host operation
+      and resource ledgers, gate pidfiles, and conflict notices, each with a
+      stable id (op:<n>, hostop:<hex>, resource:<id>, lease:<id>,
+      gatecache:<gate>@<tree>, pidfile:<session>-<gate>, action:<session>),
+      its cause, and the one command that clears it.
+--- stderr

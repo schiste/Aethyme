@@ -1,1 +1,37 @@
-same-as: broker
+exit: 0
+--- stdout
+  aethyme broker submit --session <id> [--no-cache] [--verify-only] [--json]
+      Submit the session's head commit: simulate the merge onto the local
+      integration branch, run affected gates on the merged tree, and
+      promote when verified (default; set [promote] mode = 'manual' to
+      hold verified entries for explicit promote). Conflicts reject
+      before any gate runs and write instructions to
+      <worktree>/.aethyme/broker-action-required.md. V1 submits the
+      whole session head only; --path/--commit scoping is intentionally
+      out of scope while worktree identity is the coordination unit.
+      Executed and cached gate results identify the proven tree hash.
+      --no-cache bypasses merged-tree cache lookup for this submission,
+      but stores each fresh result for later normal reuse.
+  aethyme broker submit prepare status --session <id> [--json]
+      Inspect repository-declared dependency preparation for one worktree.
+      This is read-only and reports the exact remediation when preparation is
+      absent, stale, interrupted, failed, or invalid.
+  aethyme broker submit prepare --session <id> [--offline] [--wait <duration>] [--json]
+      Explicitly run the repository's .aethyme/prepare.toml commands in the
+      session worktree. Shared caches are serialized host-wide; no command is
+      ever run automatically by start or adopt. --offline refuses any step
+      without a declared offline_command.
+  aethyme broker submit promote --entry <id> [--json]
+      Manual-mode only: advance the local integration branch to a verified
+      entry's merge commit; other in-flight entries are re-simulated.
+      Promotion stays local; publish through `broker ship plan --entry <id>`.
+  aethyme broker submit promotion-record plan [--json]
+      Read-only plan for integration commits that no promoted queue entry
+      claims. A commit is recoverable when exactly one non-promoted entry
+      recorded a merge tree equal to the commit's tree; ambiguous or
+      unmatched commits are reported, never repaired.
+  aethyme broker submit promotion-record apply --confirm <sha256> [--json]
+      Restore the promoted record for every recoverable candidate in the
+      reviewed plan. Re-proves each precondition, writes only status and
+      commit details, and rebuilds the missing path exposures.
+--- stderr

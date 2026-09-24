@@ -28,6 +28,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 mod graph_refresh;
+mod help;
 mod readiness_remediation;
 mod repository_deploy;
 mod repository_enrollment;
@@ -209,8 +210,24 @@ fn eligible_pinned_session_contract(
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
+    if args.is_empty() {
+        print_top_level_help(false);
+        return ExitCode::from(2);
+    }
+    // Help is answered before the compatibility preflight and before any
+    // command runs, so asking what a command does has no side effects.
+    if matches!(args[0].as_str(), "-h" | "--help") {
+        print_top_level_help(true);
+        return ExitCode::SUCCESS;
+    }
+    if help::wants_help(&args)
+        && let Some(route) = help::route(&args)
+    {
+        return answer_help(route, &args);
+    }
+    let args = resolve_spelling(args);
     let Some(command) = ParsedCommand::parse(&args) else {
-        print_top_level_help();
+        print_top_level_help(false);
         return ExitCode::from(2);
     };
 
@@ -272,10 +289,6 @@ fn main() -> ExitCode {
     }
 
     match command.name {
-        "-h" | "--help" => {
-            print_top_level_help();
-            ExitCode::SUCCESS
-        }
         "-V" | "--version" => {
             print_version();
             ExitCode::SUCCESS
@@ -571,60 +584,144 @@ fn run_graph_impact_inner(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn print_top_level_help() {
-    eprintln!("aethyme — repository navigation, task localization, agent brokering");
-    eprintln!();
-    eprintln!("Usage: aethyme <subcommand> [args...]");
-    eprintln!("       aethyme --version | -V");
-    eprintln!();
-    eprintln!("Hot path:");
-    eprintln!("  explore --repo <path> --request \"<task>\" [--format answer-json]");
-    eprintln!("                              in-process engine; auto-starts the engine daemon");
-    eprintln!("  explore-summary --from explore.json");
-    eprintln!("                              compact decision surface from a saved answer-json");
-    eprintln!(
-        "  verify-targets --repo <path> --from explore.json [--max-targets 2 --max-lines 80]"
-    );
-    eprintln!("                              bounded source spans for Explore targets");
-    eprintln!();
-    eprintln!("Agent broker:");
-    eprintln!("  init                        guided setup: certify + scaffold + gates draft");
-    eprintln!("  certify                     read-only certification checks for this repo");
-    eprintln!("  broker start --task <text>  create an isolated worktree + session");
-    eprintln!("  broker submit --session <id> simulate, gate, and promote a session");
-    eprintln!("  broker status              show sessions, conflicts, queue, and integration");
-    eprintln!("  broker finish --session <id> safely close a completed session");
-    eprintln!("  broker leases [claim|plan|release] inspect or manage path ownership");
-    eprintln!("  broker git|gh --session <id> coordinate Git and GitHub operations");
-    eprintln!("  broker operations          inspect/reconcile the remote-operation journal");
-    eprintln!("  broker adopt|start-agent|agents|cleanup   (see `broker --help`)");
-    eprintln!("  hook <event>               agent-surface hook entry point (the plugin's");
-    eprintln!("                              only entry point; reads event JSON on stdin)");
-    eprintln!("  plugin install|status|remove  install the agent-surface plugin, or");
-    eprintln!("                              report the plugin/CLI version skew that");
-    eprintln!("                              makes an installed one silently inert");
-    eprintln!("  update check|plan|execute  explicit paired-binary updates; never background");
-    eprintln!("  upgrade plan|apply|recover review, apply, or recover repository migrations");
-    eprintln!(
-        "  graph status|units|materialize|refresh  inspect, page, materialize, or refresh graph artifacts"
-    );
-    eprintln!(
-        "  graph impact --repo <path> --revision <ref> --diff <path-or-json> [--mode calls|imports] [--budget <n>] [--json]"
-    );
-    eprintln!();
-    eprintln!("Setup:");
-    eprintln!("  deploy [verify|bridge] [--repo <path>]  enroll repository policy");
-    eprintln!("  root show|set <path>        developer checkout pointer (legacy compatibility)");
-    eprintln!();
-    eprintln!("Quality:");
-    eprintln!("  readiness [--require <level>] authoritative operational readiness");
-    eprintln!("  quality inspect [--repo <path>] bounded optional repository-quality analysis");
-    eprintln!("  ai-ready [--repo <path>]    legacy quality scorecard alias (deprecated)");
-    eprintln!("  autofix <path> [--dry-run|--apply|--pr]");
-    eprintln!("                              safe automated fixes (see `autofix --help`)");
-    eprintln!();
-    // Phase 6 deleted `src/` and the delegation path with it.
-    eprintln!("Every subcommand is native; unknown ones are errors.");
+const TOP_LEVEL_HELP: &str = "\
+aethyme — repository navigation, task localization, agent brokering
+
+Usage: aethyme <command> [args...]
+       aethyme <command> --help
+       aethyme --version | -V
+
+Hot path:
+  explore --repo <path> --request \"<task>\"
+                              in-process engine; auto-starts the engine daemon
+  explore-summary --from explore.json
+                              compact decision surface from a saved answer-json
+  verify-targets --repo <path> --from explore.json [--max-targets 2 --max-lines 80]
+                              bounded source spans for Explore targets
+
+Agent broker:
+  broker start --task <text>  create an isolated worktree + session
+  broker status               sessions, overlaps, queue, integration, readiness
+  broker submit --session <id>
+                              simulate, gate, and promote a session
+  broker finish --session <id>
+                              safely close a completed session
+  broker unblock [<id>]       list blockers, or clear one
+  broker gc plan|apply        reviewed cleanup of retained state and disk
+  broker advanced <verb>      leases, git, gh, ship, review, operations, exec, ...
+  hook <event>                agent-surface hook entry point (the plugin's only
+                              entry point; reads event JSON on stdin)
+  plugin install|status|remove
+                              install the agent-surface plugin, or report the
+                              plugin/CLI version skew that makes one inert
+  update check|plan|execute   explicit paired-binary updates; never background
+  upgrade plan|apply|recover  review, apply, or recover repository migrations
+
+Setup:
+  init                        guided setup: certify + scaffold + gates draft
+  certify                     read-only certification checks for this repo
+  deploy [verify|bridge] [--repo <path>]
+                              enroll repository policy and agent guidance
+  root show|set <path>        developer checkout pointer (legacy compatibility)
+
+Graph and analysis:
+  graph status|units|materialize|refresh|impact|node|callers|...
+  task | query | analyze | facts | intents | repo   (each takes --help)
+
+Quality:
+  quality inspect [--repo <path>] bounded optional repository-quality analysis
+  ai-ready [--repo <path>]    legacy quality scorecard alias (deprecated)
+  autofix <path> [--dry-run|--apply|--pr]
+                              safe automated fixes
+
+Deprecated spellings still work and print one warning line on stderr.
+";
+
+/// `aethyme --help` prints on stdout and exits 0; a missing command prints the
+/// same text on stderr beside the usage-error exit.
+fn print_top_level_help(requested: bool) {
+    if requested {
+        print!("{TOP_LEVEL_HELP}");
+    } else {
+        eprint!("{TOP_LEVEL_HELP}");
+    }
+}
+
+/// Answer `--help` without running the command.
+fn answer_help(route: help::HelpRoute, args: &[String]) -> ExitCode {
+    match route {
+        help::HelpRoute::Text(text) => {
+            print!("{text}");
+            ExitCode::SUCCESS
+        }
+        help::HelpRoute::Broker => {
+            let broker_args = if args[0] == "broker" {
+                &args[1..]
+            } else {
+                args
+            };
+            ExitCode::from(aethyme_broker::cli::run(broker_args))
+        }
+        help::HelpRoute::Native(native) => {
+            let rest = &native[1..];
+            let code = match native[0].as_str() {
+                "intents" => match aethyme_engine::facts_cli::run_intents(rest) {
+                    Ok(()) => 0,
+                    Err(message) => {
+                        eprintln!("Error: {message}");
+                        1
+                    }
+                },
+                "update" => aethyme_broker::run_update_cli(rest),
+                "plugin" => aethyme_broker::plugin_cli::run(rest),
+                "ai-ready" => aethyme_quality::ai_ready_cli::run(rest),
+                "quality" => aethyme_quality::quality_cli::run(rest),
+                "autofix" => aethyme_quality::autofix_cli::run(rest),
+                "deploy" => repository_deploy::run(rest),
+                "upgrade" => repository_upgrade::run(rest),
+                other => {
+                    eprintln!("Error: no help route for {other}");
+                    2
+                }
+            };
+            ExitCode::from(code)
+        }
+    }
+}
+
+/// Translate deprecated spellings to the ones this binary dispatches, and
+/// print the one-line warning for each (stderr only, so `--json` stays clean).
+fn resolve_spelling(args: Vec<String>) -> Vec<String> {
+    let warn = |old: &str, new: &str| {
+        eprintln!("{}", aethyme_broker::cli::deprecation_warning(old, new));
+    };
+    match args[0].as_str() {
+        "broker" => {
+            let resolved = aethyme_broker::cli::resolve(&args[1..]);
+            if let Some(deprecation) = &resolved.deprecation {
+                eprintln!("{}", deprecation.warning());
+            }
+            if resolved.args.is_empty() {
+                return args;
+            }
+            std::iter::once("broker".to_string())
+                .chain(resolved.args)
+                .collect()
+        }
+        "readiness" => {
+            warn("aethyme readiness", "aethyme broker status readiness");
+            args
+        }
+        "enhance" => {
+            match args.get(1).map(String::as_str) {
+                Some("deploy") => warn("aethyme enhance deploy", "aethyme deploy"),
+                Some("verify") => warn("aethyme enhance verify", "aethyme deploy verify"),
+                _ => {}
+            }
+            args
+        }
+        _ => args,
+    }
 }
 
 // ── explore ─────────────────────────────────────────────────────────────────
