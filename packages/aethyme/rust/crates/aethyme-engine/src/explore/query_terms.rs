@@ -10,60 +10,162 @@
 /// Words that carry no localization signal in a navigation request.
 /// Generic English and question vocabulary only; domain words stay terms.
 const STOP_WORDS: &[&str] = &[
+    "able",
     "about",
+    "above",
+    "across",
+    "actually",
+    "adjust",
     "after",
+    "again",
+    "against",
     "all",
+    "along",
+    "already",
     "also",
+    "although",
+    "always",
+    "among",
     "and",
+    "another",
     "any",
+    "anything",
+    "anywhere",
     "are",
+    "around",
+    "because",
+    "been",
+    "before",
+    "behind",
+    "being",
+    "below",
+    "between",
+    "both",
+    "but",
+    "call",
+    "called",
+    "caller",
+    "callers",
+    "calls",
     "can",
+    "change",
+    "changing",
     "code",
     "codebase",
+    "come",
+    "comes",
     "could",
+    "currently",
+    "decide",
+    "decided",
+    "decides",
+    "define",
     "defined",
+    "defines",
+    "determine",
+    "determined",
+    "determines",
     "did",
     "does",
     "doing",
     "done",
     "each",
+    "either",
+    "else",
+    "ever",
+    "every",
+    "everything",
+    "exactly",
+    "exist",
+    "exists",
+    "file",
+    "files",
+    "find",
+    "first",
     "for",
     "from",
     "function",
     "functions",
     "get",
     "gets",
+    "given",
+    "goes",
+    "going",
+    "handled",
+    "handles",
     "happen",
+    "happening",
     "happens",
     "has",
     "have",
     "here",
     "how",
     "implement",
-    "implemented",
     "implementation",
+    "implemented",
     "implements",
     "into",
+    "invoke",
+    "invoked",
+    "invokes",
     "its",
+    "just",
+    "kind",
+    "know",
+    "like",
     "live",
     "lives",
     "located",
     "logic",
     "look",
+    "made",
+    "make",
+    "makes",
+    "many",
+    "may",
+    "mean",
+    "means",
     "method",
     "methods",
+    "might",
+    "modify",
+    "more",
+    "most",
+    "much",
+    "must",
     "need",
+    "never",
+    "new",
     "not",
+    "now",
     "one",
+    "only",
+    "other",
+    "others",
     "our",
     "out",
+    "over",
+    "own",
     "part",
+    "per",
     "place",
+    "purpose",
+    "really",
     "repo",
     "repository",
+    "responsible",
+    "same",
+    "see",
+    "seen",
     "should",
     "show",
+    "since",
     "some",
+    "such",
+    "sure",
+    "take",
+    "takes",
+    "tell",
     "than",
     "that",
     "the",
@@ -72,39 +174,52 @@ const STOP_WORDS: &[&str] = &[
     "then",
     "there",
     "these",
+    "thing",
+    "things",
     "this",
     "those",
+    "though",
+    "through",
+    "too",
+    "tweak",
+    "under",
+    "until",
+    "upon",
     "use",
     "used",
     "uses",
     "using",
+    "very",
     "via",
+    "want",
+    "wants",
     "was",
+    "way",
+    "ways",
+    "well",
     "were",
     "what",
     "when",
+    "whenever",
     "where",
+    "wherever",
+    "whether",
     "which",
     "while",
     "who",
     "whom",
+    "whose",
     "why",
     "will",
     "with",
-    "would",
-    "you",
-    "your",
-    "find",
-    "file",
-    "files",
-    "happening",
-    "handled",
-    "decide",
-    "decides",
-    "decided",
-    "responsible",
+    "within",
+    "without",
     "work",
     "works",
+    "would",
+    "yet",
+    "you",
+    "your",
 ];
 
 const MAX_TERMS: usize = 16;
@@ -227,32 +342,49 @@ pub(super) fn stem(word: &str) -> String {
     word.to_string()
 }
 
-/// True when `stem` occurs in `line` starting at an identifier boundary:
-/// the start of the line, after a non-alphanumeric byte, or at a camelCase
-/// transition. `lower` must be `line.to_ascii_lowercase()`.
+/// True when `stem` occurs in `line` starting at an identifier boundary
+/// (see [`boundary_matches`]). `lower` must be `line.to_ascii_lowercase()`.
+#[cfg(test)]
 pub(super) fn occurs_at_boundary(line: &str, lower: &str, stem: &str) -> bool {
-    let bytes = line.as_bytes();
-    let mut from = 0;
-    while let Some(offset) = lower[from..].find(stem) {
-        let at = from + offset;
-        let boundary = at == 0 || {
-            let prev = bytes[at - 1];
-            !prev.is_ascii_alphanumeric()
-                || (bytes[at].is_ascii_uppercase() && prev.is_ascii_lowercase())
-                || (prev.is_ascii_digit() && bytes[at].is_ascii_alphabetic())
-        };
-        if boundary {
-            return true;
+    boundary_matches(line, lower, stem).next().is_some()
+}
+
+/// Byte offsets where `stem` occurs in `text` starting at an identifier
+/// boundary: the start of the text, after a non-alphanumeric byte, or at a
+/// camelCase or digit-to-letter transition. `lower` must be
+/// `text.to_ascii_lowercase()` (same byte offsets).
+pub(super) fn boundary_matches<'a>(
+    text: &'a str,
+    lower: &'a str,
+    stem: &'a str,
+) -> impl Iterator<Item = usize> + 'a {
+    let bytes = text.as_bytes();
+    lower
+        .match_indices(stem)
+        .map(|(at, _)| at)
+        .filter(move |&at| {
+            at == 0 || {
+                let prev = bytes[at - 1];
+                !prev.is_ascii_alphanumeric()
+                    || (bytes[at].is_ascii_uppercase() && prev.is_ascii_lowercase())
+                    || (prev.is_ascii_digit() && bytes[at].is_ascii_alphabetic())
+            }
+        })
+}
+
+/// Identifier-ish tokens (runs of ASCII alphanumerics and `_`) in `line`:
+/// the length unit of the code and comment fields.
+pub(super) fn token_count(line: &str) -> u32 {
+    let mut count = 0;
+    let mut inside = false;
+    for byte in line.bytes() {
+        let word = byte.is_ascii_alphanumeric() || byte == b'_';
+        if word && !inside {
+            count += 1;
         }
-        from = at + 1;
-        while from < lower.len() && !lower.is_char_boundary(from) {
-            from += 1;
-        }
-        if from >= lower.len() {
-            break;
-        }
+        inside = word;
     }
-    false
+    count
 }
 
 #[cfg(test)]
@@ -305,5 +437,37 @@ mod tests {
         assert!(occurs_at_boundary(line, &lower, "log"));
         assert!(!occurs_at_boundary("dialog()", "dialog()", "log"));
         assert!(occurs_at_boundary("x.é_cache", "x.é_cache", "cach"));
+    }
+
+    #[test]
+    fn every_boundary_match_is_reported() {
+        let line = "cacheKey = cache.get(cachedKey) + recache";
+        let lower = line.to_ascii_lowercase();
+        assert_eq!(boundary_matches(line, &lower, "cach").count(), 3);
+        assert_eq!(
+            boundary_matches(line, &lower, "key").collect::<Vec<_>>(),
+            [5, 27]
+        );
+        assert_eq!(token_count("let x_y = foo(1, bar);"), 5);
+    }
+
+    #[test]
+    fn question_phrasing_is_not_a_term() {
+        let query = QueryTerms::parse(
+            "Which file handles the code that is implemented to decide how retries back off?",
+        );
+        let texts = query
+            .terms
+            .iter()
+            .map(|term| term.text.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(texts, ["retries", "back", "off"]);
+        let query = QueryTerms::parse("Where would I change what calls the session cache?");
+        let texts = query
+            .terms
+            .iter()
+            .map(|term| term.text.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(texts, ["session", "cache"]);
     }
 }

@@ -441,3 +441,77 @@ fn hit_count_is_configurable_and_ranking_is_deterministic() {
     );
     assert_eq!(three.hints.len(), 3);
 }
+
+#[test]
+fn a_focused_file_outranks_a_hub_that_mentions_everything() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    git(root, &["init", "-q"]);
+    // The hub mentions the request's words more often in absolute terms,
+    // spread over a file thirty times the size of the focused one.
+    let mut hub = String::from("// Application entry point.\n");
+    for index in 0..300 {
+        hub.push_str(&format!(
+            "fn handler_{index}(request: Request) -> Response {{ route(request) }}\n"
+        ));
+        if index % 20 == 0 {
+            hub.push_str(
+                "// quota reset window is configured elsewhere\nlet quota = load_quota();\n",
+            );
+        }
+    }
+    write(root, "src/main.rs", &hub);
+    write(
+        root,
+        "src/limits.rs",
+        "/// When a quota resets.\npub fn quota_reset_window(plan: &Plan) -> Duration {\n    plan.window\n}\n",
+    );
+    for index in 0..10 {
+        write(
+            root,
+            &format!("src/other_{index}.rs"),
+            "fn unrelated() {}\n",
+        );
+    }
+    git(root, &["add", "--all"]);
+    let result = inspect_with(
+        root,
+        "Where is the quota reset window computed?",
+        &options(),
+    );
+    assert_eq!(
+        targets(&result)[0],
+        "src/limits.rs",
+        "{:?}",
+        targets(&result)
+    );
+    let first = &result.hints[0];
+    assert_eq!(
+        first.evidence["line_refs"][0]["symbol"], "quota_reset_window",
+        "{}",
+        first.evidence
+    );
+}
+
+#[test]
+fn the_span_is_the_definition_densest_in_request_terms() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    git(root, &["init", "-q"]);
+    write(
+        root,
+        "billing/invoice.py",
+        "import retry\n\n\
+         def render_invoice(invoice):\n\
+         \x20   return str(invoice)\n\n\
+         def invoice_retry_delay(attempt):\n\
+         \x20   # retry delay doubles per attempt\n\
+         \x20   delay = 2 ** attempt\n\
+         \x20   return delay\n",
+    );
+    git(root, &["add", "--all"]);
+    let result = inspect_with(root, "invoice retry delay", &options());
+    let refs = &result.hints[0].evidence["line_refs"];
+    assert_eq!(refs[0]["line"], 6, "{refs}");
+    assert_eq!(refs[0]["symbol"], "invoice_retry_delay", "{refs}");
+}
