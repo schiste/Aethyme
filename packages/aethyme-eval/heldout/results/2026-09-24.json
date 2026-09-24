@@ -1,0 +1,2108 @@
+{
+  "schema": "aethyme-heldout-nav-v1",
+  "date": "2026-09-24",
+  "aethyme_version": "aethyme 0.8.1 (v0.8.1 build_commit=fa40ad5f8955704cddceb15863861935a86825a2) build_date=2026-09-23T18:00:44Z",
+  "rg_version": "ripgrep 15.2.0",
+  "questions_file": "questions.jsonl",
+  "repo_heads": {
+    "SP42": "9c4dea0c03159a9946669398161c776dcea5d3b5",
+    "aedventure": "59eba247eed77cdc331a5c5b7325f7ea60aab8c3",
+    "blybot": "a240318488eab3e5c7836d34c24fcb93ce283ac3"
+  },
+  "repo_writes": {
+    "SP42": {
+      "aethyme_dir_created": false,
+      "new_aethyme_files": [],
+      "modified_aethyme_files": [],
+      "new_status_entries": []
+    },
+    "aedventure": {
+      "aethyme_dir_created": false,
+      "new_aethyme_files": [],
+      "modified_aethyme_files": [],
+      "new_status_entries": []
+    },
+    "blybot": {
+      "aethyme_dir_created": false,
+      "new_aethyme_files": [],
+      "modified_aethyme_files": [],
+      "new_status_entries": []
+    }
+  },
+  "summary": {
+    "SP42": {
+      "questions": 7,
+      "explore_top1": 1,
+      "explore_top3": 1,
+      "explore_median_seconds": 0.015,
+      "rg_top1": 0,
+      "rg_top3": 1,
+      "rg_median_seconds": 0.111
+    },
+    "aedventure": {
+      "questions": 7,
+      "explore_top1": 1,
+      "explore_top3": 2,
+      "explore_median_seconds": 0.015,
+      "rg_top1": 1,
+      "rg_top3": 1,
+      "rg_median_seconds": 0.241
+    },
+    "blybot": {
+      "questions": 6,
+      "explore_top1": 0,
+      "explore_top3": 0,
+      "explore_median_seconds": 0.014,
+      "rg_top1": 0,
+      "rg_top3": 0,
+      "rg_median_seconds": 0.093
+    },
+    "total": {
+      "questions": 20,
+      "explore_top1": 2,
+      "explore_top3": 3,
+      "explore_median_seconds": 0.015,
+      "rg_top1": 1,
+      "rg_top3": 2,
+      "rg_median_seconds": 0.131
+    }
+  },
+  "records": [
+    {
+      "id": "sp42-01",
+      "repo": "SP42",
+      "kind": "where_implemented",
+      "truth_paths": [
+        "crates/sp42-fetch/src/client.rs",
+        "crates/sp42-fetch/src/resolver.rs"
+      ],
+      "explore": {
+        "wall_seconds": 0.034,
+        "exit_code": 0,
+        "status": "degraded",
+        "intent": "task_localization_query",
+        "degraded_reasons": [
+          "graph_store_missing"
+        ],
+        "safe_to_use_as_answer": false,
+        "readiness": {
+          "reason": "optional_graph_unavailable",
+          "status": "degraded"
+        },
+        "source_fallback": {
+          "complete": false,
+          "max_bytes_per_file": 8192,
+          "max_files": 128,
+          "scanned_files": 128,
+          "tracked_only": true
+        },
+        "answer_count": 0,
+        "paths": [
+          "attic/design-plans/2026-06-24-article-citation-extractor.md",
+          "attic/implementation-plans/2026-06-24-article-citation-extractor/phase_01.md",
+          "attic/implementation-plans/2026-06-24-article-citation-extractor/phase_02.md",
+          "attic/implementation-plans/2026-06-24-article-citation-extractor/phase_03.md"
+        ],
+        "score": {
+          "top1": false,
+          "top3": false,
+          "first_hit_rank": null
+        }
+      },
+      "rg": {
+        "wall_seconds": 0.211,
+        "terms": [
+          "citation",
+          "checker",
+          "fetches",
+          "source",
+          "url",
+          "put",
+          "article",
+          "stops",
+          "pointed",
+          "internal",
+          "addresses",
+          "localhost",
+          "cloud",
+          "metadata",
+          "endpoint"
+        ],
+        "paths": [
+          "docs/domains/references/adr/0015-rules-compliant-read-only-fetch-edge.md",
+          "crates/sp42-citation/src/citation/page.rs",
+          "attic/design-plans/2026-06-30-citation-verification-mcp-surface.md",
+          "docs/domains/references/adr/0007-citation-verification-semantics.md",
+          "attic/implementation-notes/research/05-wikiharness-pure-algorithms.md",
+          "docs/domains/references/prd/0014-citation-repair-insertion-browser-surface.md",
+          "docs/domains/references/adr/0008-citation-verification-contract.md",
+          "attic/design-plans/2026-06-09-bare-url-repair-mvp.md",
+          "docs/domains/references/adr/0011-article-citation-verification.md",
+          "docs/design-plans/2026-06-25-fetched-but-unusable-source-recovery.md"
+        ],
+        "top_scores": [
+          [
+            "docs/domains/references/adr/0015-rules-compliant-read-only-fetch-edge.md",
+            12,
+            90
+          ],
+          [
+            "crates/sp42-citation/src/citation/page.rs",
+            11,
+            431
+          ],
+          [
+            "attic/design-plans/2026-06-30-citation-verification-mcp-surface.md",
+            11,
+            108
+          ],
+          [
+            "docs/domains/references/adr/0007-citation-verification-semantics.md",
+            10,
+            139
+          ],
+          [
+            "attic/implementation-notes/research/05-wikiharness-pure-algorithms.md",
+            9,
+            164
+          ]
+        ],
+        "files_matched": 379,
+        "score": {
+          "top1": false,
+          "top3": false,
+          "first_hit_rank": null
+        }
+      }
+    },
+    {
+      "id": "sp42-02",
+      "repo": "SP42",
+      "kind": "where_change",
+      "truth_paths": [
+        "crates/sp42-fetch/src/client.rs"
+      ],
+      "explore": {
+        "wall_seconds": 0.015,
+        "exit_code": 0,
+        "status": "degraded",
+        "intent": "behavior_localization_query",
+        "degraded_reasons": [
+          "graph_store_missing"
+        ],
+        "safe_to_use_as_answer": false,
+        "readiness": {
+          "reason": "optional_graph_unavailable",
+          "status": "degraded"
+        },
+        "source_fallback": {
+          "complete": false,
+          "max_bytes_per_file": 8192,
+          "max_files": 128,
+          "scanned_files": 128,
+          "tracked_only": true
+        },
+        "answer_count": 0,
+        "paths": [
+          "attic/implementation-plans/2026-06-25-fetched-but-unusable-source-recovery/phase_01.md",
+          "attic/implementation-plans/2026-06-25-fetched-but-unusable-source-recovery/phase_02.md",
+          "attic/implementation-plans/2026-06-25-fetched-but-unusable-source-recovery/phase_03.md",
+          "attic/implementation-plans/2026-06-25-fetched-but-unusable-source-recovery/phase_04.md"
+        ],
+        "score": {
+          "top1": false,
+          "top3": false,
+          "first_hit_rank": null
+        }
+      },
+      "rg": {
+        "wall_seconds": 0.109,
+        "terms": [
+          "many",
+          "times",
+          "failed",
+          "source",
+          "fetch",
+          "retried",
+          "long",
+          "waits",
+          "attempts"
+        ],
+        "paths": [
+          "crates/sp42-cli/src/main.rs",
+          "crates/sp42-citation/src/citation/page.rs",
+          "crates/sp42-assessment/src/ga_appendix.rs",
+          "crates/sp42-server/src/citation_routes.rs",
+          "docs/platform/CLI.md",
+          "docs/domains/assessment/prd/0015-article-stability-signal.md",
+          "docs/domains/references/prd/0008-bare-url-repair.md",
+          "attic/implementation-plans/2026-06-09-bare-url-repair-mvp/phase_03.md",
+          "crates/sp42-citation/src/citation/verify.rs",
+          "crates/sp42-parsoid/src/lib.rs"
+        ],
+        "top_scores": [
+          [
+            "crates/sp42-cli/src/main.rs",
+            8,
+            273
+          ],
+          [
+            "crates/sp42-citation/src/citation/page.rs",
+            6,
+            285
+          ],
+          [
+            "crates/sp42-assessment/src/ga_appendix.rs",
+            6,
+            119
+          ],
+          [
+            "crates/sp42-server/src/citation_routes.rs",
+            6,
+            49
+          ],
+          [
+            "docs/platform/CLI.md",
+            6,
+            30
+          ]
+        ],
+        "files_matched": 314,
+        "score": {
+          "top1": false,
+          "top3": false,
+          "first_hit_rank": 18
+        }
+      }
+    },
+    {
+      "id": "sp42-03",
+      "repo": "SP42",
+      "kind": "callers",
+      "truth_paths": [
+        "crates/sp42-cli/src/main.rs",
+        "crates/sp42-inference/src/lib.rs",
+        "crates/sp42-mcp/src/server.rs",
+        "crates/sp42-server/src/citation_routes.rs"
+      ],
+      "explore": {
+        "wall_seconds": 0.015,
+        "exit_code": 0,
+        "status": "degraded",
+        "intent": "behavior_localization_query",
+        "degraded_reasons": [
+          "graph_store_missing"
+        ],
+        "safe_to_use_as_answer": false,
+        "readiness": {
+          "reason": "optional_graph_unavailable",
+          "status": "degraded"
+        },
+        "source_fallback": {
+          "complete": false,
+          "max_bytes_per_file": 8192,
+          "max_files": 128,
+          "scanned_files": 110,
+          "tracked_only": true
+        },
+        "answer_count": 0,
+        "paths": [
+          "crates/sp42-app/build.rs",
+          "attic/implementation-notes/model-boundary-research.mjs",
+          "attic/implementation-notes/research/03-sp42-lib-build-test.md",
+          "attic/implementation-notes/research/07-rust-llm-multiprovider-crates.md"
+        ],
+        "score": {
+          "top1": false,
+          "top3": false,
+          "first_hit_rank": null
+        }
+      },
+      "rg": {
+        "wall_seconds": 0.146,
+        "terms": [
+          "parts",
+          "app",
+          "build",
+          "llm",
+          "model",
+          "client",
+          "environment",
+          "variables",
+          "entry",
+          "point",
+          "depends",
+          "setup"
+        ],
+        "paths": [
+          "attic/implementation-notes/research/07-rust-llm-multiprovider-crates.md",
+          "README.md",
+          "crates/sp42-cli/src/main.rs",
+          "docs/domains/references/adr/0007-citation-verification-semantics.md",
+          "attic/implementation-notes/research/06-wikiharness-fetch-citoid-article.md",
+          "docs/domains/references/prd/0007-llm-output-benchmarking.md",
+          "attic/implementation-plans/2026-06-09-bare-url-repair-mvp/phase_06.md",
+          "attic/implementation-plans/2026-06-23-citation-claim-context/phase_02.md",
+          "docs/platform/adr/0003-node-anchored-wikitext-editing.md",
+          "docs/domains/references/adr/0008-citation-verification-contract.md"
+        ],
+        "top_scores": [
+          [
+            "attic/implementation-notes/research/07-rust-llm-multiprovider-crates.md",
+            9,
+            119
+          ],
+          [
+            "README.md",
+            9,
+            52
+          ],
+          [
+            "crates/sp42-cli/src/main.rs",
+            8,
+            292
+          ],
+          [
+            "docs/domains/references/adr/0007-citation-verification-semantics.md",
+            8,
+            89
+          ],
+          [
+            "attic/implementation-notes/research/06-wikiharness-fetch-citoid-article.md",
+            8,
+            56
+          ]
+        ],
+        "files_matched": 355,
+        "score": {
+          "top1": false,
+          "top3": true,
+          "first_hit_rank": 3
+        }
+      }
+    },
+    {
+      "id": "sp42-04",
+      "repo": "SP42",
+      "kind": "where_change",
+      "truth_paths": [
+        "crates/sp42-platform/src/score_tier.rs"
+      ],
+      "explore": {
+        "wall_seconds": 0.015,
+        "exit_code": 0,
+        "status": "degraded",
+        "intent": "behavior_localization_query",
+        "degraded_reasons": [
+          "graph_store_missing"
+        ],
+        "safe_to_use_as_answer": false,
+        "readiness": {
+          "reason": "optional_graph_unavailable",
+          "status": "degraded"
+        },
+        "source_fallback": {
+          "complete": false,
+          "max_bytes_per_file": 8192,
+          "max_files": 128,
+          "scanned_files": 128,
+          "tracked_only": true
+        },
+        "answer_count": 0,
+        "paths": [
+          "fixtures/frwiki_recentchange_edit.json",
+          "attic/implementation-notes/ADR-CHANGE-NOTES.md",
+          "attic/implementation-notes/research-workflow.mjs",
+          "attic/implementation-plans/2026-06-09-node-anchored-editing/phase_01.md"
+        ],
+        "score": {
+          "top1": false,
+          "top3": false,
+          "first_hit_rank": null
+        }
+      },
+      "rg": {
+        "wall_seconds": 0.109,
+        "terms": [
+          "score",
+          "cutoffs",
+          "whether",
+          "queued",
+          "edit",
+          "high",
+          "medium",
+          "low",
+          "risk"
+        ],
+        "paths": [
+          "docs/domains/patrolling/prd/0002-patrol-review-workflow.md",
+          "crates/sp42-platform/src/lib.rs",
+          "crates/sp42-cli/src/main.rs",
+          "docs/platform/FRONTEND_DESIGN_CONTRACT.md",
+          "crates/sp42-patrol/src/patrol_scenario_report.rs",
+          "docs/domains/patrolling/prd/0003-edit-scoring-and-queue-ranking.md",
+          "crates/sp42-platform/src/queue_builder.rs",
+          "docs/domains/references/prd/0014-citation-repair-insertion-browser-surface.md",
+          "docs/domains/references/adr/0007-citation-verification-semantics.md",
+          "docs/platform/scoring/SCORING_CONSTITUTION.md"
+        ],
+        "top_scores": [
+          [
+            "docs/domains/patrolling/prd/0002-patrol-review-workflow.md",
+            8,
+            71
+          ],
+          [
+            "crates/sp42-platform/src/lib.rs",
+            7,
+            22
+          ],
+          [
+            "crates/sp42-cli/src/main.rs",
+            6,
+            113
+          ],
+          [
+            "docs/platform/FRONTEND_DESIGN_CONTRACT.md",
+            6,
+            91
+          ],
+          [
+            "crates/sp42-patrol/src/patrol_scenario_report.rs",
+            6,
+            83
+          ]
+        ],
+        "files_matched": 336,
+        "score": {
+          "top1": false,
+          "top3": false,
+          "first_hit_rank": null
+        }
+      }
+    },
+    {
+      "id": "sp42-05",
+      "repo": "SP42",
+      "kind": "which_file_handles",
+      "truth_paths": [
+        "crates/sp42-platform/src/scoring_engine.rs"
+      ],
+      "explore": {
+        "wall_seconds": 0.015,
+        "exit_code": 0,
+        "status": "degraded",
+        "intent": "task_localization_query",
+        "degraded_reasons": [
+          "graph_store_missing"
+        ],
+        "safe_to_use_as_answer": false,
+        "readiness": {
+          "reason": "optional_graph_unavailable",
+          "status": "degraded"
+        },
+        "source_fallback": {
+          "complete": false,
+          "max_bytes_per_file": 8192,
+          "max_files": 128,
+          "scanned_files": 128,
+          "tracked_only": true
+        },
+        "answer_count": 0,
+        "paths": [
+          "crates/sp42-platform/src/wikitext_editor.rs",
+          "crates/sp42-server/src/parsoid_editor.rs",
+          "attic/implementation-plans/2026-06-09-node-anchored-editing/phase_01.md",
+          "attic/implementation-plans/2026-06-09-node-anchored-editing/phase_02.md"
+        ],
+        "score": {
+          "top1": false,
+          "top3": false,
+          "first_hit_rank": null
+        }
+      },
+      "rg": {
+        "wall_seconds": 0.105,
+        "terms": [
+          "editor",
+          "history",
+          "prior",
+          "talk-page",
+          "warnings",
+          "raise",
+          "risk",
+          "score",
+          "edit"
+        ],
+        "paths": [
+          "docs/domains/assessment/prd/0015-article-stability-signal.md",
+          "docs/domains/patrolling/patrol-tool-landscape.md",
+          "docs/domains/patrolling/prd/0003-edit-scoring-and-queue-ranking.md",
+          "docs/domains/references/prd/0014-citation-repair-insertion-browser-surface.md",
+          "crates/sp42-cli/src/main.rs",
+          "docs/platform/FRONTEND_DESIGN_CONTRACT.md",
+          "docs/domains/wikidata/prd/0011-wikidata-first-class-target.md",
+          "crates/sp42-platform/src/lib.rs",
+          "docs/domains/patrolling/prd/0004-reviewer-actions-on-wikimedia.md",
+          "docs/domains/references/prd/0012-citation-insertion.md"
+        ],
+        "top_scores": [
+          [
+            "docs/domains/assessment/prd/0015-article-stability-signal.md",
+            8,
+            96
+          ],
+          [
+            "docs/domains/patrolling/patrol-tool-landscape.md",
+            7,
+            120
+          ],
+          [
+            "docs/domains/patrolling/prd/0003-edit-scoring-and-queue-ranking.md",
+            7,
+            81
+          ],
+          [
+            "docs/domains/references/prd/0014-citation-repair-insertion-browser-surface.md",
+            7,
+            51
+          ],
+          [
+            "crates/sp42-cli/src/main.rs",
+            6,
+            98
+          ]
+        ],
+        "files_matched": 290,
+        "score": {
+          "top1": false,
+          "top3": false,
+          "first_hit_rank": 16
+        }
+      }
+    },
+    {
+      "id": "sp42-06",
+      "repo": "SP42",
+      "kind": "which_file_handles",
+      "truth_paths": [
+        "crates/sp42-coordination/src/state.rs"
+      ],
+      "explore": {
+        "wall_seconds": 0.014,
+        "exit_code": 0,
+        "status": "degraded",
+        "intent": "behavior_localization_query",
+        "degraded_reasons": [
+          "graph_store_missing"
+        ],
+        "safe_to_use_as_answer": false,
+        "readiness": {
+          "reason": "optional_graph_unavailable",
+          "status": "degraded"
+        },
+        "source_fallback": {
+          "complete": false,
+          "max_bytes_per_file": 8192,
+          "max_files": 128,
+          "scanned_files": 128,
+          "tracked_only": true
+        },
+        "answer_count": 0,
+        "paths": [
+          "attic/implementation-plans/2026-06-09-node-anchored-editing/phase_01.md",
+          "attic/implementation-plans/2026-06-09-node-anchored-editing/phase_02.md",
+          "attic/implementation-plans/2026-06-09-node-anchored-editing/phase_03.md",
+          "attic/implementation-plans/2026-06-09-node-anchored-editing/phase_04.md"
+        ],
+        "score": {
+          "top1": false,
+          "top3": false,
+          "first_hit_rank": null
+        }
+      },
+      "rg": {
+        "wall_seconds": 0.154,
+        "terms": [
+          "two",
+          "patrollers",
+          "grab",
+          "edit",
+          "already",
+          "won",
+          "race",
+          "shared",
+          "room",
+          "state",
+          "ignore",
+          "loser",
+          "claim"
+        ],
+        "paths": [
+          "crates/sp42-cli/src/main.rs",
+          "crates/sp42-server/src/tests.rs",
+          "docs/domains/patrolling/prd/0006-multi-operator-coordination.md",
+          "attic/implementation-notes/research/05-wikiharness-pure-algorithms.md",
+          "docs/domains/references/adr/0025-open-library-apply-contract.md",
+          "attic/implementation-notes/research/03-sp42-lib-build-test.md",
+          "docs/domains/references/prd/0017-interactive-review-sessions.md",
+          "docs/domains/references/adr/0018-review-session-bridge-contract.md",
+          "docs/domains/references/prd/0009-book-citation-grounding-and-open-library-enrichment.md",
+          "docs/domains/references/adr/0007-citation-verification-semantics.md"
+        ],
+        "top_scores": [
+          [
+            "crates/sp42-cli/src/main.rs",
+            9,
+            128
+          ],
+          [
+            "crates/sp42-server/src/tests.rs",
+            8,
+            571
+          ],
+          [
+            "docs/domains/patrolling/prd/0006-multi-operator-coordination.md",
+            8,
+            146
+          ],
+          [
+            "attic/implementation-notes/research/05-wikiharness-pure-algorithms.md",
+            8,
+            59
+          ],
+          [
+            "docs/domains/references/adr/0025-open-library-apply-contract.md",
+            8,
+            32
+          ]
+        ],
+        "files_matched": 362,
+        "score": {
+          "top1": false,
+          "top3": false,
+          "first_hit_rank": 25
+        }
+      }
+    },
+    {
+      "id": "sp42-07",
+      "repo": "SP42",
+      "kind": "config_read",
+      "truth_paths": [
+        "crates/sp42-server/src/deployment.rs"
+      ],
+      "explore": {
+        "wall_seconds": 0.014,
+        "exit_code": 0,
+        "status": "degraded",
+        "intent": "task_localization_query",
+        "degraded_reasons": [
+          "graph_store_missing"
+        ],
+        "safe_to_use_as_answer": false,
+        "readiness": {
+          "reason": "optional_graph_unavailable",
+          "status": "degraded"
+        },
+        "source_fallback": {
+          "complete": false,
+          "max_bytes_per_file": 8192,
+          "max_files": 128,
+          "scanned_files": 128,
+          "tracked_only": true
+        },
+        "answer_count": 0,
+        "paths": [
+          "crates/sp42-server/src/deployment.rs",
+          "README.md",
+          "attic/README.md",
+          "attic/design-plans/2026-06-24-article-citation-extractor.md"
+        ],
+        "score": {
+          "top1": true,
+          "top3": true,
+          "first_hit_rank": 1
+        }
+      },
+      "rg": {
+        "wall_seconds": 0.111,
+        "terms": [
+          "public",
+          "deployment",
+          "server",
+          "extra",
+          "browser",
+          "origins",
+          "allow",
+          "cross-origin",
+          "requests"
+        ],
+        "paths": [
+          "crates/sp42-server/src/tests.rs",
+          "attic/implementation-notes/research/11-reconcile-adr0006-and-wikiharness.md",
+          "docs/platform/RUNTIME_CONFIGURATION.md",
+          "attic/implementation-notes/research/12-alex-tweaks-vs-rust-genai.md",
+          "crates/sp42-parsoid/src/lib.rs",
+          "attic/design-plans/2026-06-30-citation-verification-mcp-surface.md",
+          "crates/sp42-server/src/main.rs",
+          "docs/domains/references/adr/0015-rules-compliant-read-only-fetch-edge.md",
+          "xtask/src/main.rs",
+          "crates/sp42-citation/src/citation/verify.rs"
+        ],
+        "top_scores": [
+          [
+            "crates/sp42-server/src/tests.rs",
+            7,
+            109
+          ],
+          [
+            "attic/implementation-notes/research/11-reconcile-adr0006-and-wikiharness.md",
+            7,
+            38
+          ],
+          [
+            "docs/platform/RUNTIME_CONFIGURATION.md",
+            7,
+            23
+          ],
+          [
+            "attic/implementation-notes/research/12-alex-tweaks-vs-rust-genai.md",
+            6,
+            61
+          ],
+          [
+            "crates/sp42-parsoid/src/lib.rs",
+            6,
+            46
+          ]
+        ],
+        "files_matched": 307,
+        "score": {
+          "top1": false,
+          "top3": false,
+          "first_hit_rank": 16
+        }
+      }
+    },
+    {
+      "id": "aed-01",
+      "repo": "aedventure",
+      "kind": "where_change",
+      "truth_paths": [
+        "apps/add-rpg/src/browser/save-runtime.ts"
+      ],
+      "explore": {
+        "wall_seconds": 0.032,
+        "exit_code": 0,
+        "status": "degraded",
+        "intent": "task_localization_query",
+        "degraded_reasons": [
+          "graph_store_missing"
+        ],
+        "safe_to_use_as_answer": false,
+        "readiness": {
+          "reason": "optional_graph_unavailable",
+          "status": "degraded"
+        },
+        "source_fallback": {
+          "complete": false,
+          "max_bytes_per_file": 8192,
+          "max_files": 128,
+          "scanned_files": 128,
+          "tracked_only": true
+        },
+        "answer_count": 0,
+        "paths": [
+          "apps/add-rpg/src/browser/add-runtime-bridge.ts",
+          "apps/add-rpg/src/browser/save-runtime.ts",
+          "apps/add-rpg/src/workers/add-runtime.worker.ts",
+          "apps/api/test/runtime-config.test.js"
+        ],
+        "score": {
+          "top1": false,
+          "top3": true,
+          "first_hit_rank": 2
+        }
+      },
+      "rg": {
+        "wall_seconds": 0.341,
+        "terms": [
+          "players",
+          "credited",
+          "progress",
+          "time",
+          "spent",
+          "away",
+          "game",
+          "maximum",
+          "amount",
+          "offline",
+          "capped",
+          "elapsed",
+          "worked"
+        ],
+        "paths": [
+          "legacy/add/mechanics/specifications.md",
+          "docs/narrative-system-specification.md",
+          "progress.md",
+          "crates/add-core/src/simulation.rs",
+          "crates/add-core/src/lib.rs",
+          "legacy/add/apps/web/src/App.tsx",
+          "apps/add-rpg/src/browser/main.ts",
+          "legacy/add/documentation/object-templates.json",
+          "legacy/add/lore/timeline.md",
+          "lore/timeline.md"
+        ],
+        "top_scores": [
+          [
+            "legacy/add/mechanics/specifications.md",
+            10,
+            218
+          ],
+          [
+            "docs/narrative-system-specification.md",
+            10,
+            108
+          ],
+          [
+            "progress.md",
+            9,
+            537
+          ],
+          [
+            "crates/add-core/src/simulation.rs",
+            9,
+            453
+          ],
+          [
+            "crates/add-core/src/lib.rs",
+            9,
+            334
+          ]
+        ],
+        "files_matched": 817,
+        "score": {
+          "top1": false,
+          "top3": false,
+          "first_hit_rank": null
+        }
+      }
+    },
+    {
+      "id": "aed-02",
+      "repo": "aedventure",
+      "kind": "config_read",
+      "truth_paths": [
+        "apps/api/src/index.ts"
+      ],
+      "explore": {
+        "wall_seconds": 0.015,
+        "exit_code": 0,
+        "status": "degraded",
+        "intent": "task_localization_query",
+        "degraded_reasons": [
+          "graph_store_missing"
+        ],
+        "safe_to_use_as_answer": false,
+        "readiness": {
+          "reason": "optional_graph_unavailable",
+          "status": "degraded"
+        },
+        "source_fallback": {
+          "complete": false,
+          "max_bytes_per_file": 8192,
+          "max_files": 128,
+          "scanned_files": 26,
+          "tracked_only": true
+        },
+        "answer_count": 0,
+        "paths": [
+          "legacy/skyoffice-original/client/src/components/LoginDialog.tsx",
+          "apps/web/public/assets/internal-office-atlas.manifest.json",
+          "apps/web/src/browser/phaser-office-renderer.ts",
+          "apps/web/test/customer-office-app.test.js"
+        ],
+        "score": {
+          "top1": false,
+          "top3": false,
+          "first_hit_rank": null
+        }
+      },
+      "rg": {
+        "wall_seconds": 0.22,
+        "terms": [
+          "long",
+          "office",
+          "login",
+          "session",
+          "last",
+          "expires",
+          "environment",
+          "variable",
+          "overrides"
+        ],
+        "paths": [
+          "docs/customer-virtual-office-platform-spec.md",
+          "docs/narrative-system-specification.md",
+          "legacy/add/lore/timeline.md",
+          "lore/timeline.md",
+          "docs/add-narrative-system-plan.md",
+          "progress.md",
+          "docs/development-rollout-plan.md",
+          "legacy/add/documentation/save-load.md",
+          "legacy/add/lore/factions/paris_underground/factions/le_palais_profond.md",
+          "lore/factions/paris_underground/factions/le_palais_profond.md"
+        ],
+        "top_scores": [
+          [
+            "docs/customer-virtual-office-platform-spec.md",
+            9,
+            95
+          ],
+          [
+            "docs/narrative-system-specification.md",
+            7,
+            38
+          ],
+          [
+            "legacy/add/lore/timeline.md",
+            6,
+            42
+          ],
+          [
+            "lore/timeline.md",
+            6,
+            42
+          ],
+          [
+            "docs/add-narrative-system-plan.md",
+            6,
+            38
+          ]
+        ],
+        "files_matched": 594,
+        "score": {
+          "top1": false,
+          "top3": false,
+          "first_hit_rank": 16
+        }
+      }
+    },
+    {
+      "id": "aed-03",
+      "repo": "aedventure",
+      "kind": "which_file_handles",
+      "truth_paths": [
+        "apps/api/src/index.ts"
+      ],
+      "explore": {
+        "wall_seconds": 0.015,
+        "exit_code": 0,
+        "status": "degraded",
+        "intent": "task_localization_query",
+        "degraded_reasons": [
+          "graph_store_missing"
+        ],
+        "safe_to_use_as_answer": false,
+        "readiness": {
+          "reason": "optional_graph_unavailable",
+          "status": "degraded"
+        },
+        "source_fallback": {
+          "complete": false,
+          "max_bytes_per_file": 8192,
+          "max_files": 128,
+          "scanned_files": 121,
+          "tracked_only": true
+        },
+        "answer_count": 0,
+        "paths": [
+          "apps/api/src/wikimedia-oauth-controller.ts",
+          "apps/api/test/wikimedia-oauth-controller.test.js",
+          "apps/web/public/assets/internal-office-atlas.manifest.json",
+          "apps/web/src/browser/phaser-office-renderer.ts"
+        ],
+        "score": {
+          "top1": false,
+          "top3": false,
+          "first_hit_rank": null
+        }
+      },
+      "rg": {
+        "wall_seconds": 0.218,
+        "terms": [
+          "user",
+          "blocked",
+          "wikimedia",
+          "tries",
+          "sign",
+          "office",
+          "app",
+          "sign-in",
+          "refused"
+        ],
+        "paths": [
+          "README.md",
+          "apps/web/src/browser/main.ts",
+          "scripts/dev-http-host.cjs",
+          "scripts/dev-app-loop.test.cjs",
+          "scripts/dev-http-host.test.cjs",
+          "progress.md",
+          "docs/customer-virtual-office-platform-spec.md",
+          "docs/engine-boundary.md",
+          "legacy/add/lore/timeline.md",
+          "lore/timeline.md"
+        ],
+        "top_scores": [
+          [
+            "README.md",
+            8,
+            72
+          ],
+          [
+            "apps/web/src/browser/main.ts",
+            7,
+            205
+          ],
+          [
+            "scripts/dev-http-host.cjs",
+            7,
+            46
+          ],
+          [
+            "scripts/dev-app-loop.test.cjs",
+            7,
+            37
+          ],
+          [
+            "scripts/dev-http-host.test.cjs",
+            7,
+            36
+          ]
+        ],
+        "files_matched": 772,
+        "score": {
+          "top1": false,
+          "top3": false,
+          "first_hit_rank": 18
+        }
+      }
+    },
+    {
+      "id": "aed-04",
+      "repo": "aedventure",
+      "kind": "where_implemented",
+      "truth_paths": [
+        "apps/add-rpg/src/browser/audio/music-tracks.ts"
+      ],
+      "explore": {
+        "wall_seconds": 0.015,
+        "exit_code": 0,
+        "status": "degraded",
+        "intent": "task_localization_query",
+        "degraded_reasons": [
+          "graph_store_missing"
+        ],
+        "safe_to_use_as_answer": false,
+        "readiness": {
+          "reason": "optional_graph_unavailable",
+          "status": "degraded"
+        },
+        "source_fallback": {
+          "complete": false,
+          "max_bytes_per_file": 8192,
+          "max_files": 128,
+          "scanned_files": 123,
+          "tracked_only": true
+        },
+        "answer_count": 0,
+        "paths": [
+          "apps/add-rpg/src/browser/audio/music-tracks.ts",
+          "crates/add-core/src/game_data/catalog/story_beats.rs",
+          "crates/add-core/src/game_data/catalog/storylets.rs",
+          "legacy/skyoffice-original/client/src/scenes/Background.ts"
+        ],
+        "score": {
+          "top1": true,
+          "top3": true,
+          "first_hit_rank": 1
+        }
+      },
+      "rg": {
+        "wall_seconds": 0.247,
+        "terms": [
+          "combat",
+          "story",
+          "scene",
+          "ask",
+          "background",
+          "music",
+          "time",
+          "game",
+          "track",
+          "plays"
+        ],
+        "paths": [
+          "progress.md",
+          "docs/narrative-system-specification.md",
+          "crates/add-core/src/lib.rs",
+          "crates/add-core/tests/golden/catalog.json",
+          "legacy/add/mechanics/specifications.md",
+          "legacy/add/lore/timeline.md",
+          "lore/timeline.md",
+          "crates/add-core/src/game_data.rs",
+          "apps/add-rpg/src/browser/dev/trace-recorder.ts",
+          "legacy/add/lore/factions/the_unplugged/faction_id_card.md"
+        ],
+        "top_scores": [
+          [
+            "progress.md",
+            10,
+            555
+          ],
+          [
+            "docs/narrative-system-specification.md",
+            10,
+            186
+          ],
+          [
+            "crates/add-core/src/lib.rs",
+            8,
+            458
+          ],
+          [
+            "crates/add-core/tests/golden/catalog.json",
+            8,
+            264
+          ],
+          [
+            "legacy/add/mechanics/specifications.md",
+            8,
+            177
+          ]
+        ],
+        "files_matched": 870,
+        "score": {
+          "top1": false,
+          "top3": false,
+          "first_hit_rank": null
+        }
+      }
+    },
+    {
+      "id": "aed-05",
+      "repo": "aedventure",
+      "kind": "callers",
+      "truth_paths": [
+        "apps/add-rpg/src/browser/main.ts"
+      ],
+      "explore": {
+        "wall_seconds": 0.015,
+        "exit_code": 0,
+        "status": "degraded",
+        "intent": "task_localization_query",
+        "degraded_reasons": [
+          "graph_store_missing"
+        ],
+        "safe_to_use_as_answer": false,
+        "readiness": {
+          "reason": "optional_graph_unavailable",
+          "status": "degraded"
+        },
+        "source_fallback": {
+          "complete": false,
+          "max_bytes_per_file": 8192,
+          "max_files": 128,
+          "scanned_files": 66,
+          "tracked_only": true
+        },
+        "answer_count": 0,
+        "paths": [
+          "legacy/skyoffice-original/client/src/PhaserGame.ts",
+          "legacy/skyoffice-original/client/src/characters/MyPlayer.ts",
+          "legacy/skyoffice-original/client/src/characters/OtherPlayer.ts",
+          "legacy/skyoffice-original/client/src/characters/Player.ts"
+        ],
+        "score": {
+          "top1": false,
+          "top3": false,
+          "first_hit_rank": null
+        }
+      },
+      "rg": {
+        "wall_seconds": 0.263,
+        "terms": [
+          "parts",
+          "game",
+          "kick",
+          "offline",
+          "catch-up",
+          "simulation",
+          "player",
+          "comes",
+          "back",
+          "loads",
+          "save"
+        ],
+        "paths": [
+          "apps/add-rpg/src/browser/main.ts",
+          "progress.md",
+          "legacy/add/mechanics/specifications.md",
+          "docs/add-narrative-system-plan.md",
+          "crates/add-core/src/lib.rs",
+          "legacy/add/apps/web/src/App.tsx",
+          "crates/add-core/tests/golden/catalog.json",
+          "crates/add-core/src/game_data/catalog/ui_elements.rs",
+          "packages/add-content/src/content/ui-elements.ts",
+          "scripts/add-rpg-smoke.test.cjs"
+        ],
+        "top_scores": [
+          [
+            "apps/add-rpg/src/browser/main.ts",
+            11,
+            504
+          ],
+          [
+            "progress.md",
+            10,
+            523
+          ],
+          [
+            "legacy/add/mechanics/specifications.md",
+            10,
+            153
+          ],
+          [
+            "docs/add-narrative-system-plan.md",
+            10,
+            141
+          ],
+          [
+            "crates/add-core/src/lib.rs",
+            9,
+            988
+          ]
+        ],
+        "files_matched": 771,
+        "score": {
+          "top1": true,
+          "top3": true,
+          "first_hit_rank": 1
+        }
+      }
+    },
+    {
+      "id": "aed-06",
+      "repo": "aedventure",
+      "kind": "where_change",
+      "truth_paths": [
+        "crates/add-core/src/migrations.rs"
+      ],
+      "explore": {
+        "wall_seconds": 0.015,
+        "exit_code": 0,
+        "status": "degraded",
+        "intent": "task_localization_query",
+        "degraded_reasons": [
+          "graph_store_missing"
+        ],
+        "safe_to_use_as_answer": false,
+        "readiness": {
+          "reason": "optional_graph_unavailable",
+          "status": "degraded"
+        },
+        "source_fallback": {
+          "complete": false,
+          "max_bytes_per_file": 8192,
+          "max_files": 128,
+          "scanned_files": 125,
+          "tracked_only": true
+        },
+        "answer_count": 0,
+        "paths": [
+          "apps/add-rpg/src/browser/save-runtime.ts",
+          "crates/add-core/src/game_data.rs",
+          "crates/add-core/src/game_data/catalog/actions.rs",
+          "crates/add-core/src/game_data/catalog/balance.rs"
+        ],
+        "score": {
+          "top1": false,
+          "top3": false,
+          "first_hit_rank": null
+        }
+      },
+      "rg": {
+        "wall_seconds": 0.217,
+        "terms": [
+          "player",
+          "imports",
+          "save",
+          "made",
+          "newer",
+          "build",
+          "game",
+          "relax",
+          "rule"
+        ],
+        "paths": [
+          "progress.md",
+          "apps/add-rpg/src/browser/main.ts",
+          "legacy/add/lore/locations/touraine/les_grottes_de_la_bresme.md",
+          "lore/locations/touraine/les_grottes_de_la_bresme.md",
+          "packages/add-protocol/src/index.ts",
+          "legacy/add/lore/factions/the_unplugged/faction_id_card.md",
+          "lore/factions/the_unplugged/faction_id_card.md",
+          "legacy/add/apps/web/src/App.tsx",
+          "crates/add-core/src/lib.rs",
+          "crates/add-core/src/game_data/catalog/entity_schemas.rs"
+        ],
+        "top_scores": [
+          [
+            "progress.md",
+            8,
+            639
+          ],
+          [
+            "apps/add-rpg/src/browser/main.ts",
+            7,
+            307
+          ],
+          [
+            "legacy/add/lore/locations/touraine/les_grottes_de_la_bresme.md",
+            7,
+            33
+          ],
+          [
+            "lore/locations/touraine/les_grottes_de_la_bresme.md",
+            7,
+            33
+          ],
+          [
+            "packages/add-protocol/src/index.ts",
+            7,
+            32
+          ]
+        ],
+        "files_matched": 812,
+        "score": {
+          "top1": false,
+          "top3": false,
+          "first_hit_rank": 25
+        }
+      }
+    },
+    {
+      "id": "aed-07",
+      "repo": "aedventure",
+      "kind": "which_file_handles",
+      "truth_paths": [
+        "packages/policy/src/index.ts"
+      ],
+      "explore": {
+        "wall_seconds": 0.015,
+        "exit_code": 0,
+        "status": "degraded",
+        "intent": "task_localization_query",
+        "degraded_reasons": [
+          "graph_store_missing"
+        ],
+        "safe_to_use_as_answer": false,
+        "readiness": {
+          "reason": "optional_graph_unavailable",
+          "status": "degraded"
+        },
+        "source_fallback": {
+          "complete": false,
+          "max_bytes_per_file": 8192,
+          "max_files": 128,
+          "scanned_files": 31,
+          "tracked_only": true
+        },
+        "answer_count": 0,
+        "paths": [
+          "legacy/skyoffice-original/server/rooms/commands/ChatMessageUpdateCommand.ts",
+          "docs/customer-virtual-office-platform-spec.md",
+          "legacy/skyoffice-original/client/src/components/Chat.tsx",
+          "legacy/skyoffice-original/client/src/components/MobileVirtualJoystick.tsx"
+        ],
+        "score": {
+          "top1": false,
+          "top3": false,
+          "first_hit_rank": null
+        }
+      },
+      "rg": {
+        "wall_seconds": 0.241,
+        "terms": [
+          "virtual",
+          "office",
+          "receives",
+          "nearby",
+          "chat",
+          "message",
+          "people",
+          "close",
+          "enough",
+          "hear"
+        ],
+        "paths": [
+          "legacy/add/lore/timeline.md",
+          "lore/timeline.md",
+          "docs/customer-virtual-office-platform-spec.md",
+          "progress.md",
+          "legacy/add/lore/creatures/the_last_humans.md",
+          "lore/creatures/the_last_humans.md",
+          "legacy/add/lore/characters/the_unplugged/henri_marchand.md",
+          "lore/characters/the_unplugged/henri_marchand.md",
+          "apps/web/src/browser/main.ts",
+          "docs/engine-boundary.md"
+        ],
+        "top_scores": [
+          [
+            "legacy/add/lore/timeline.md",
+            9,
+            91
+          ],
+          [
+            "lore/timeline.md",
+            9,
+            91
+          ],
+          [
+            "docs/customer-virtual-office-platform-spec.md",
+            8,
+            153
+          ],
+          [
+            "progress.md",
+            8,
+            108
+          ],
+          [
+            "legacy/add/lore/creatures/the_last_humans.md",
+            7,
+            46
+          ]
+        ],
+        "files_matched": 587,
+        "score": {
+          "top1": false,
+          "top3": false,
+          "first_hit_rank": null
+        }
+      }
+    },
+    {
+      "id": "bly-01",
+      "repo": "blybot",
+      "kind": "where_implemented",
+      "truth_paths": [
+        "src/blybot/domain/pseudonym.py"
+      ],
+      "explore": {
+        "wall_seconds": 0.032,
+        "exit_code": 0,
+        "status": "degraded",
+        "intent": "task_localization_query",
+        "degraded_reasons": [
+          "graph_store_missing"
+        ],
+        "safe_to_use_as_answer": false,
+        "readiness": {
+          "reason": "optional_graph_unavailable",
+          "status": "degraded"
+        },
+        "source_fallback": {
+          "complete": false,
+          "max_bytes_per_file": 8192,
+          "max_files": 128,
+          "scanned_files": 128,
+          "tracked_only": true
+        },
+        "answer_count": 0,
+        "paths": [
+          "src/blybot/__init__.py",
+          "src/blybot/__main__.py",
+          "src/blybot/adapters/__init__.py",
+          "src/blybot/adapters/discord/__init__.py"
+        ],
+        "score": {
+          "top1": false,
+          "top3": false,
+          "first_hit_rank": null
+        }
+      },
+      "rg": {
+        "wall_seconds": 0.095,
+        "terms": [
+          "anonymous",
+          "display",
+          "names",
+          "people",
+          "message",
+          "bot",
+          "privately",
+          "generated",
+          "name",
+          "pool"
+        ],
+        "paths": [
+          "docs/OPERATIONS.md",
+          "docs/SPECIFICATION.md",
+          "docs/admin-guide.wiki",
+          "tests/test_discord_gateway.py",
+          "src/blybot/adapters/discord/gateway.py",
+          "docs/PLAN-V3-CHANNEL-INTELLIGENCE.md",
+          "src/blybot/adapters/telegram/handlers.py",
+          "src/blybot/adapters/irc/gateway.py",
+          "src/blybot/services/commands.py",
+          "tests/test_group_handlers.py"
+        ],
+        "top_scores": [
+          [
+            "docs/OPERATIONS.md",
+            10,
+            234
+          ],
+          [
+            "docs/SPECIFICATION.md",
+            9,
+            231
+          ],
+          [
+            "docs/admin-guide.wiki",
+            8,
+            89
+          ],
+          [
+            "tests/test_discord_gateway.py",
+            7,
+            281
+          ],
+          [
+            "src/blybot/adapters/discord/gateway.py",
+            7,
+            130
+          ]
+        ],
+        "files_matched": 164,
+        "score": {
+          "top1": false,
+          "top3": false,
+          "first_hit_rank": null
+        }
+      }
+    },
+    {
+      "id": "bly-02",
+      "repo": "blybot",
+      "kind": "which_file_handles",
+      "truth_paths": [
+        "src/blybot/adapters/telegram/app.py",
+        "src/blybot/services/capture.py"
+      ],
+      "explore": {
+        "wall_seconds": 0.017,
+        "exit_code": 0,
+        "status": "degraded",
+        "intent": "task_localization_query",
+        "degraded_reasons": [
+          "graph_store_missing"
+        ],
+        "safe_to_use_as_answer": false,
+        "readiness": {
+          "reason": "optional_graph_unavailable",
+          "status": "degraded"
+        },
+        "source_fallback": {
+          "complete": false,
+          "max_bytes_per_file": 8192,
+          "max_files": 128,
+          "scanned_files": 128,
+          "tracked_only": true
+        },
+        "answer_count": 0,
+        "paths": [
+          "docs/PLAN-V3-CHANNEL-INTELLIGENCE.md",
+          "README.md",
+          "pyproject.toml",
+          "CODE_OF_CONDUCT.md"
+        ],
+        "score": {
+          "top1": false,
+          "top3": false,
+          "first_hit_rank": null
+        }
+      },
+      "rg": {
+        "wall_seconds": 0.091,
+        "terms": [
+          "old",
+          "archived",
+          "channel",
+          "messages",
+          "deleted",
+          "past",
+          "retention",
+          "period",
+          "triggers",
+          "cleanup"
+        ],
+        "paths": [
+          "docs/SPECIFICATION.md",
+          "docs/OPERATIONS.md",
+          "docs/PLAN-V3-CHANNEL-INTELLIGENCE.md",
+          "src/blybot/adapters/telegram/handlers.py",
+          "src/blybot/services/capture.py",
+          ".env.example",
+          "docs/admin-guide.wiki",
+          "tests/test_capture.py",
+          "src/blybot/domain/models.py",
+          "src/blybot/__main__.py"
+        ],
+        "top_scores": [
+          [
+            "docs/SPECIFICATION.md",
+            10,
+            105
+          ],
+          [
+            "docs/OPERATIONS.md",
+            8,
+            116
+          ],
+          [
+            "docs/PLAN-V3-CHANNEL-INTELLIGENCE.md",
+            8,
+            41
+          ],
+          [
+            "src/blybot/adapters/telegram/handlers.py",
+            7,
+            47
+          ],
+          [
+            "src/blybot/services/capture.py",
+            7,
+            36
+          ]
+        ],
+        "files_matched": 138,
+        "score": {
+          "top1": false,
+          "top3": false,
+          "first_hit_rank": 5
+        }
+      }
+    },
+    {
+      "id": "bly-03",
+      "repo": "blybot",
+      "kind": "config_read",
+      "truth_paths": [
+        "src/blybot/config.py"
+      ],
+      "explore": {
+        "wall_seconds": 0.014,
+        "exit_code": 0,
+        "status": "degraded",
+        "intent": "task_localization_query",
+        "degraded_reasons": [
+          "graph_store_missing"
+        ],
+        "safe_to_use_as_answer": false,
+        "readiness": {
+          "reason": "optional_graph_unavailable",
+          "status": "degraded"
+        },
+        "source_fallback": {
+          "complete": false,
+          "max_bytes_per_file": 8192,
+          "max_files": 128,
+          "scanned_files": 128,
+          "tracked_only": true
+        },
+        "answer_count": 0,
+        "paths": [
+          "README.md",
+          "docs/OPERATIONS.md",
+          "src/blybot/__init__.py",
+          "src/blybot/__main__.py"
+        ],
+        "score": {
+          "top1": false,
+          "top3": false,
+          "first_hit_rank": null
+        }
+      },
+      "rg": {
+        "wall_seconds": 0.092,
+        "terms": [
+          "many",
+          "log",
+          "requests",
+          "per",
+          "minute",
+          "bot",
+          "accept",
+          "throttling",
+          "limit",
+          "environment"
+        ],
+        "paths": [
+          "docs/SPECIFICATION.md",
+          "docs/OPERATIONS.md",
+          "src/blybot/services/commands.py",
+          "docs/PLAN-V3-CHANNEL-INTELLIGENCE.md",
+          "tests/test_discord_gateway.py",
+          "src/blybot/domain/models.py",
+          "src/blybot/services/directory.py",
+          "src/blybot/services/relay_queue.py",
+          "tests/test_admin_handlers.py",
+          "src/blybot/adapters/telegram/handlers.py"
+        ],
+        "top_scores": [
+          [
+            "docs/SPECIFICATION.md",
+            9,
+            286
+          ],
+          [
+            "docs/OPERATIONS.md",
+            8,
+            229
+          ],
+          [
+            "src/blybot/services/commands.py",
+            8,
+            135
+          ],
+          [
+            "docs/PLAN-V3-CHANNEL-INTELLIGENCE.md",
+            8,
+            130
+          ],
+          [
+            "tests/test_discord_gateway.py",
+            7,
+            107
+          ]
+        ],
+        "files_matched": 165,
+        "score": {
+          "top1": false,
+          "top3": false,
+          "first_hit_rank": 16
+        }
+      }
+    },
+    {
+      "id": "bly-04",
+      "repo": "blybot",
+      "kind": "where_change",
+      "truth_paths": [
+        "src/blybot/services/transcribe.py"
+      ],
+      "explore": {
+        "wall_seconds": 0.014,
+        "exit_code": 0,
+        "status": "degraded",
+        "intent": "task_localization_query",
+        "degraded_reasons": [
+          "graph_store_missing"
+        ],
+        "safe_to_use_as_answer": false,
+        "readiness": {
+          "reason": "optional_graph_unavailable",
+          "status": "degraded"
+        },
+        "source_fallback": {
+          "complete": false,
+          "max_bytes_per_file": 8192,
+          "max_files": 128,
+          "scanned_files": 128,
+          "tracked_only": true
+        },
+        "answer_count": 0,
+        "paths": [
+          "src/blybot/adapters/mediawiki/__init__.py",
+          "src/blybot/adapters/mediawiki/publisher.py",
+          "src/blybot/domain/rendering.py",
+          "tests/test_mediawiki_publisher.py"
+        ],
+        "score": {
+          "top1": false,
+          "top3": false,
+          "first_hit_rank": null
+        }
+      },
+      "rg": {
+        "wall_seconds": 0.097,
+        "terms": [
+          "sends",
+          "several",
+          "private",
+          "messages",
+          "quick",
+          "succession",
+          "end",
+          "single",
+          "wiki",
+          "edit",
+          "batching"
+        ],
+        "paths": [
+          "docs/OPERATIONS.md",
+          "docs/SPECIFICATION.md",
+          "docs/admin-guide.wiki",
+          "docs/PLAN-V3-CHANNEL-INTELLIGENCE.md",
+          "src/blybot/__main__.py",
+          "src/blybot/domain/ports.py",
+          "README.md",
+          "src/blybot/domain/models.py",
+          "scripts/liftwing_baseline.py",
+          "tests/test_irc_adapter.py"
+        ],
+        "top_scores": [
+          [
+            "docs/OPERATIONS.md",
+            8,
+            111
+          ],
+          [
+            "docs/SPECIFICATION.md",
+            7,
+            161
+          ],
+          [
+            "docs/admin-guide.wiki",
+            7,
+            74
+          ],
+          [
+            "docs/PLAN-V3-CHANNEL-INTELLIGENCE.md",
+            7,
+            64
+          ],
+          [
+            "src/blybot/__main__.py",
+            7,
+            64
+          ]
+        ],
+        "files_matched": 145,
+        "score": {
+          "top1": false,
+          "top3": false,
+          "first_hit_rank": null
+        }
+      }
+    },
+    {
+      "id": "bly-05",
+      "repo": "blybot",
+      "kind": "callers",
+      "truth_paths": [
+        "src/blybot/adapters/discord/gateway.py",
+        "src/blybot/adapters/telegram/handlers.py",
+        "src/blybot/services/transcribe.py"
+      ],
+      "explore": {
+        "wall_seconds": 0.014,
+        "exit_code": 0,
+        "status": "degraded",
+        "intent": "task_localization_query",
+        "degraded_reasons": [
+          "graph_store_missing"
+        ],
+        "safe_to_use_as_answer": false,
+        "readiness": {
+          "reason": "optional_graph_unavailable",
+          "status": "degraded"
+        },
+        "source_fallback": {
+          "complete": false,
+          "max_bytes_per_file": 8192,
+          "max_files": 128,
+          "scanned_files": 128,
+          "tracked_only": true
+        },
+        "answer_count": 0,
+        "paths": [
+          "tests/test_private_handlers.py",
+          "src/blybot/adapters/mediawiki/__init__.py",
+          "src/blybot/adapters/mediawiki/publisher.py",
+          "src/blybot/adapters/telegram/handlers.py"
+        ],
+        "score": {
+          "top1": false,
+          "top3": false,
+          "first_hit_rank": 4
+        }
+      },
+      "rg": {
+        "wall_seconds": 0.083,
+        "terms": [
+          "chat-platform",
+          "handlers",
+          "pass",
+          "user",
+          "private",
+          "message",
+          "service",
+          "writes",
+          "wiki"
+        ],
+        "paths": [
+          "docs/SPECIFICATION.md",
+          "tests/test_discord_gateway.py",
+          "docs/PLAN-V3-CHANNEL-INTELLIGENCE.md",
+          "src/blybot/domain/models.py",
+          "README.md",
+          "tests/test_group_handlers.py",
+          "tests/test_admin_handlers.py",
+          "tests/test_private_handlers.py",
+          "src/blybot/adapters/telegram/handlers.py",
+          "docs/OPERATIONS.md"
+        ],
+        "top_scores": [
+          [
+            "docs/SPECIFICATION.md",
+            8,
+            238
+          ],
+          [
+            "tests/test_discord_gateway.py",
+            8,
+            175
+          ],
+          [
+            "docs/PLAN-V3-CHANNEL-INTELLIGENCE.md",
+            8,
+            115
+          ],
+          [
+            "src/blybot/domain/models.py",
+            8,
+            62
+          ],
+          [
+            "README.md",
+            8,
+            40
+          ]
+        ],
+        "files_matched": 154,
+        "score": {
+          "top1": false,
+          "top3": false,
+          "first_hit_rank": 9
+        }
+      }
+    },
+    {
+      "id": "bly-06",
+      "repo": "blybot",
+      "kind": "where_implemented",
+      "truth_paths": [
+        "src/blybot/domain/sanitizer.py"
+      ],
+      "explore": {
+        "wall_seconds": 0.013,
+        "exit_code": 0,
+        "status": "degraded",
+        "intent": "task_localization_query",
+        "degraded_reasons": [
+          "graph_store_missing"
+        ],
+        "safe_to_use_as_answer": false,
+        "readiness": {
+          "reason": "optional_graph_unavailable",
+          "status": "degraded"
+        },
+        "source_fallback": {
+          "complete": false,
+          "max_bytes_per_file": 8192,
+          "max_files": 128,
+          "scanned_files": 128,
+          "tracked_only": true
+        },
+        "answer_count": 0,
+        "paths": [
+          "src/blybot/adapters/mediawiki/__init__.py",
+          "src/blybot/adapters/mediawiki/publisher.py",
+          "tests/conformance/test_message_archive.py",
+          "tests/test_mediawiki_publisher.py"
+        ],
+        "score": {
+          "top1": false,
+          "top3": false,
+          "first_hit_rank": null
+        }
+      },
+      "rg": {
+        "wall_seconds": 0.116,
+        "terms": [
+          "logs",
+          "message",
+          "contains",
+          "template",
+          "category",
+          "markup",
+          "stops",
+          "breaking",
+          "changing",
+          "wiki",
+          "page",
+          "published"
+        ],
+        "paths": [
+          "docs/SPECIFICATION.md",
+          "src/blybot/adapters/telegram/handlers.py",
+          "docs/PLAN-V3-CHANNEL-INTELLIGENCE.md",
+          "docs/OPERATIONS.md",
+          "tests/test_analyze.py",
+          "src/blybot/services/commands.py",
+          "tests/test_injection.py",
+          "tests/test_discord_gateway.py",
+          "docs/admin-guide.wiki",
+          "src/blybot/services/analyze.py"
+        ],
+        "top_scores": [
+          [
+            "docs/SPECIFICATION.md",
+            11,
+            184
+          ],
+          [
+            "src/blybot/adapters/telegram/handlers.py",
+            8,
+            176
+          ],
+          [
+            "docs/PLAN-V3-CHANNEL-INTELLIGENCE.md",
+            8,
+            103
+          ],
+          [
+            "docs/OPERATIONS.md",
+            7,
+            140
+          ],
+          [
+            "tests/test_analyze.py",
+            7,
+            87
+          ]
+        ],
+        "files_matched": 135,
+        "score": {
+          "top1": false,
+          "top3": false,
+          "first_hit_rank": 14
+        }
+      }
+    }
+  ]
+}
