@@ -6,14 +6,53 @@ artifacts and their exact source revision are recorded in each signed
 
 ## [Unreleased]
 
+## [0.8.2] - 2026-09-24
+
+Phase 2 of the recovery plan: broker hardening. No schema bump (42); rollback
+to 0.8.1 is unrestricted.
+
+### Added
+
+- `aethyme broker trust [--repo] [--json]` and `trust status`. A repository's
+  gate and prepare commands run only once their policy is trusted on this
+  machine. A new repository, or a changed gate or prepare policy, needs
+  `broker trust`, which works only from an interactive terminal. Repositories
+  with gate history on this machine are trusted automatically. An untrusted
+  policy is refused with exit 3 and the command to run.
+- `aethyme broker blockers [--json]` lists everything blocking a repository in
+  one id namespace, and `aethyme broker unblock <id>` clears one through the
+  matching recovery path. It covers unknown-outcome operations (including
+  host operations by their hex id, #276), cached failing gate verdicts
+  (previously a hand-written SQL delete, #281), stale pidfiles, stale leases
+  and quarantined resources. `broker status --json` gains a `blockers` array.
+- `[review.trigger] include_forks`. Fork pull requests are skipped by default.
+
 ### Changed
 
+- Flags a broker subcommand does not read are refused with exit 2 and a message
+  saying where the flag applies, instead of being silently ignored (#285
+  class). `broker cleanup <id> --dry-run` used to ignore `--dry-run` and clean
+  the session; it is now refused.
 - The broker database records `min_compatible_schema`. From this release on, an
   older binary opens a newer database without migrating when every newer
-  migration was declared compatible (new tables, indexes, nullable or defaulted
-  columns), instead of refusing with "schema version N is newer than this
-  binary supports" (#293). Databases migrated before this marker existed are
-  still refused by older binaries.
+  migration was declared compatible, instead of refusing (#293).
+- Reviewers in the review lane run without push-capable credentials. The broker
+  fetches the diff and posts the review.
+- Git subprocesses run by the broker time out after 10 minutes
+  (`AETHYME_GIT_TIMEOUT_SECS`) and exit 6.
+- Failed state writes that were silently discarded now propagate or print a
+  `warning: aethyme could not ...` line.
+- The broker CLI is split into modules under `crates/aethyme-broker/src/cli/`.
+  There is no user-visible change.
+
+### Fixed
+
+- `enhance deploy` refuses to write or chmod through symlinks.
+- The operation journal redacts credential-bearing `-c` values and
+  `Authorization` headers.
+- A gate's process group is signalled only after checking the pid, pgid and
+  start time, so a reused PID is never signalled. Pidfiles are written
+  atomically.
 
 ## [0.8.1] - 2026-09-23
 
