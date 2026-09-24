@@ -2,6 +2,15 @@
 
 Last Updated: 2026-03-06
 
+> **Historical (superseded).** This is the March 2026 engine roadmap, kept as a
+> record. Its Python/Rust split is obsolete: the API and Python SDK were
+> removed on 2026-07-13, the Python CLI (`python -m src.cli`) on 2026-08-01
+> with no shim, and the dev test stack on 2026-08-06, so `packages/aethyme` is
+> 100% Rust. The "Keep these in Python" list and the "Python remains a thin
+> delivery and orchestration layer" goal below no longer apply. Current
+> direction lives in the [top-level README](../../README.md), the
+> [changelog](../../CHANGELOG.md), and the GitHub issues.
+
 > **Repositioning note (2026-07-09):** the next product milestone is a
 > **local-first agent broker** (per-agent worktrees, session registry, leases,
 > gate runner, merge simulation) built as a new local subsystem alongside the

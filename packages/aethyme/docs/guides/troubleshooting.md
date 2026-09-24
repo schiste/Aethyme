@@ -1,49 +1,49 @@
 # Troubleshooting
 
-Last Updated: 2026-09-11
+Last Updated: 2026-09-24
 
-## API Will Not Start
+## Explore Returns `degraded`
+
+Explore answers without a graph, but then its `trust_policy` is
+`verify_before_use` and `safe_to_use_as_answer` is `false`: the hints are
+ranked source-search navigation, not caller or impact evidence. This is the
+expected result for a repository that has not opted into the graph. Verify the
+spans that `aethyme verify-targets` prints, or enroll the graph (below) when
+you need caller and impact answers.
+
+## Graph Commands Refuse: Graph Store Missing
 
 ### Symptoms
-- startup exits early
-- `/health/ready` is unavailable
+
+- `aethyme query symbol`, `task pack`, `task explain` or `graph callers` fail
+  with `graph store at .../.aethyme/graph_store.redb is missing`
+- `aethyme repo ingest` or `repo inspect` fail with `open fragment store`
+- `aethyme graph materialize` refuses with `AuthorityDisabled`
 
 ### Checks
 
 ```bash
-cd packages/aethyme
-bash scripts/start-api.sh
+aethyme graph status --repo . --json
 ```
 
-Verify:
+Graph support is a repository opt-in, and query commands are read-only: they
+never build the store. Enroll with `aethyme deploy --repo . --with-graph`,
+commit, then follow the [graph refresh guide](graph-refresh.md) to generate the
+committed fragments and materialize the local store.
 
-- `DATABASE_URL` points to PostgreSQL
-- migrations have been applied
-- PostgreSQL is reachable
+## Broker Refuses: Schema Version Is Newer
 
-## Indexing Fails
+### Symptoms
 
-### Checks
+- `broker db schema version N is newer than this binary supports (M); upgrade aethyme`
+- agent plugin hooks fail or go quiet on the same machine
 
-```bash
-cd packages/aethyme
-aethyme repo ingest .
-```
-
-If fallback works and SCIP mode fails, the issue is in the language indexer toolchain rather than the shared indexing contract.
-
-## Search Returns No Results
-
-Check that the repository was indexed successfully:
-
-```bash
-curl -s http://localhost:8001/api/v1/index/freshness \
-  -H "Authorization: Bearer $TOKEN"
-```
-
-## Scorecard Fails
-
-Verify that the repository path still exists and that the repository was indexed under the expected tenant.
+The broker database is machine-wide, and migrations are one-way. A newer
+binary (possibly a gate's build, or another worktree's `cargo install`) has
+migrated it. Upgrade every installed copy of the `aethyme` and
+`aethyme-engine-cli` pair on the machine; see
+[`UPGRADING.md`](../../../../UPGRADING.md) for the release that introduced
+schema `N`.
 
 ## Aethyme Behaves In Ways Its Version Cannot Explain
 
@@ -90,9 +90,10 @@ The `SessionStart` hook reports a split pair to the agent as well, so an agent
 session that starts on a skewed machine is told before it does any work. Set
 `AETHYME_UPDATE_CHECK=off` to silence that notice.
 
-## First Debug Command
+## First Debug Commands
 
 ```bash
-cd packages/aethyme
-make test-full
+aethyme broker doctor
+aethyme broker blockers
+cargo test --manifest-path packages/aethyme/rust/Cargo.toml --workspace
 ```

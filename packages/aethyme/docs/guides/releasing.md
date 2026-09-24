@@ -1,6 +1,6 @@
 # Releasing Aethyme
 
-Last Updated: 2026-09-01
+Last Updated: 2026-09-24
 
 This is the maintainer contract for choosing and publishing Aethyme versions.
 
@@ -23,8 +23,17 @@ the requested version change.
 ## Patch release checklist
 
 1. Integrate each implementation series independently through the broker.
-2. Update the workspace version, lockfile, changelog, workflow guide path, and
-   version-specific upgrade guide to the chosen patch version.
+2. Update the workspace version, lockfile, the `.aethyme/engine-version` pin,
+   and `CHANGELOG.md`: rename `[Unreleased]` to `## [X.Y.Z] - <date>`. If the
+   release migrates the broker database one way, removes or changes a command,
+   flag, exit code, or output contract, or adds an install requirement, it is
+   breaking: add a `## vX.Y.Z` section to the top-level `UPGRADING.md` (with
+   `### Compatibility`, `### Migrate and verify`, and `### Rollback`) and open
+   the CHANGELOG entry with a `**Breaking:**` line that links
+   `UPGRADING.md#vXYZ` (the version without dots). Nothing else is
+   per-release: the workflow renders the GitHub release body from those two
+   files, and `cargo test -p aethyme-testkit --test release_contract` renders
+   it for the workspace version and checks the pairing for every release.
 3. Stage every new file, then redeploy the enhancement from a binary built at
    the new version:
 
@@ -38,8 +47,8 @@ the requested version change.
    Both halves of that order matter. The stamp is compiled in through
    `env!("CARGO_PKG_VERSION")`, so a deploy run from the installed binary
    records the *previous* version. And the generated onboarding freshness digest
-   counts **tracked** files, so a deploy run before `git add` omits the upgrade
-   guide this release just created and records a digest one file short. It is
+   counts **tracked** files, so a deploy run before `git add` omits any file
+   this release just created and records a digest one file short. It is
    self-correcting at the next deploy, which is exactly why it survives review:
    nothing fails, and the committed digest is quietly wrong until someone
    redeploys.

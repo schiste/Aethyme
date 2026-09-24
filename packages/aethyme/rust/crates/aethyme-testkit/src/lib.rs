@@ -12,6 +12,8 @@
 //!   did.
 //! * [`repos`] — programmatic fixture repositories, the job
 //!   `tests/support/repo_builders.py` did.
+//! * [`release_notes`] — the CHANGELOG/UPGRADING release-notes contract,
+//!   shared by the release workflow's renderer and `release_contract`.
 //!
 //! **Placement.** It is a workspace member rather than a
 //! `tests/common/mod.rs` inside one crate because more than one crate
@@ -32,6 +34,7 @@
 pub mod bins;
 pub mod invoke;
 pub mod paths;
+pub mod release_notes;
 pub mod repos;
 
 pub use bins::{aethyme_bin, engine_bin, graph_index_bin};

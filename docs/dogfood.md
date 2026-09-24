@@ -1,5 +1,10 @@
 # Broker v0 Dogfood Playbook (issue #33)
 
+> **Historical.** The dogfood week ran in July 2026 and #33 is closed; its
+> friction log, [`dogfood-friction.md`](dogfood-friction.md), is frozen. File
+> new friction as GitHub issues instead. Commands below reflect the v0 broker
+> of that time.
+
 Goal: use `aethyme broker` for real multi-agent development on this
 repository for about a week, with at least two agent vendors attached
 concurrently, and produce a friction log with cost/time accounting.

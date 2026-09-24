@@ -295,34 +295,64 @@ cp "$INSTALL_FIXTURE/${url##*/}" "$destination"
     }
 }
 
+/// The release body is rendered from `CHANGELOG.md` and `UPGRADING.md`
+/// (see `aethyme_testkit::release_notes`), not read from a per-version file,
+/// so a release needs no workflow edit and no new guide unless it is breaking.
 #[test]
-fn release_notes_publish_migration_compatibility_rollback_and_known_issues() {
-    let root = aethyme_testkit::paths::repo_root();
-    let workflow = std::fs::read_to_string(root.join(".github/workflows/release.yml")).unwrap();
-    let version = product_version();
-    let guide_path = format!("packages/aethyme/docs/guides/upgrading-to-v{version}.md");
-    // The release body is the guide named by the tag, so a release needs no
-    // workflow edit; the guide for the current version must still exist.
-    assert!(workflow.contains(
-        "body_path: packages/aethyme/docs/guides/upgrading-to-${{ github.ref_name }}.md"
-    ));
-
-    let guide = std::fs::read_to_string(root.join(&guide_path)).unwrap();
-    for heading in [
-        "## Compatibility",
-        "## Before upgrading",
-        "## Install or update",
-        "## Migrate and verify",
-        "## Rollback",
-        "## Known issues",
+fn release_workflow_renders_its_body_from_changelog_and_upgrading() {
+    let workflow = std::fs::read_to_string(
+        aethyme_testkit::paths::repo_root().join(".github/workflows/release.yml"),
+    )
+    .unwrap();
+    let render = workflow
+        .find("-p aethyme-testkit --example release_notes")
+        .expect("release workflow must render the body with the release_notes example");
+    let publish = workflow.find("- name: Create or update release").unwrap();
+    assert!(
+        render < publish,
+        "the body must be rendered before publishing"
+    );
+    for fragment in [
+        "--repo \"$GITHUB_WORKSPACE\"",
+        "--tag \"$REF_NAME\"",
+        "--output \"$RUNNER_TEMP/release-notes.md\"",
+        "body_path: ${{ runner.temp }}/release-notes.md",
     ] {
         assert!(
-            guide.contains(heading),
-            "upgrade guide is missing {heading}"
+            workflow.contains(fragment),
+            "release workflow is missing {fragment}"
         );
     }
+    assert!(
+        !workflow.contains("upgrading-to-"),
+        "per-version upgrade guides were merged into UPGRADING.md"
+    );
+}
 
+#[test]
+fn every_release_pairs_its_breaking_marker_with_an_upgrade_section() {
+    let root = aethyme_testkit::paths::repo_root();
     let changelog = std::fs::read_to_string(root.join("CHANGELOG.md")).unwrap();
-    assert!(changelog.contains(&format!("## [{version}] - ")));
+    let upgrading = std::fs::read_to_string(root.join("UPGRADING.md")).unwrap();
+    let problems = aethyme_testkit::release_notes::contract_violations(&changelog, &upgrading);
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
     assert!(changelog.contains("release-manifest.json"));
+}
+
+#[test]
+fn the_current_version_renders_release_notes() {
+    let root = aethyme_testkit::paths::repo_root();
+    let version = product_version();
+    let changelog = std::fs::read_to_string(root.join("CHANGELOG.md")).unwrap();
+    let upgrading = std::fs::read_to_string(root.join("UPGRADING.md")).unwrap();
+    let body =
+        aethyme_testkit::release_notes::render(&format!("v{version}"), &changelog, &upgrading)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "release notes for v{version} (the workspace version) do not render: {error}"
+                )
+            });
+    let breaking =
+        aethyme_testkit::release_notes::upgrading_sections(&upgrading).contains_key(&version);
+    assert_eq!(body.contains("\n## Upgrading\n"), breaking);
 }

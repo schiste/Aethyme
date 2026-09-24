@@ -1,5 +1,12 @@
 # Broker v0 Friction Log
 
+> **Historical (closed 2026-07-17).** This log covered the broker v0 dogfood
+> week (issue #33) and ends with its exit verdict. It is no longer appended to.
+> Friction is now tracked as GitHub issues, using the bug report and feature
+> request forms under `.github/ISSUE_TEMPLATE/`; `aethyme broker report capture`
+> builds a redacted diagnostic snapshot to attach. The entries below are kept
+> unchanged as the record of that week.
+
 Append-only. Each entry: date, type (blocker / noise / catch / gap),
 what happened, cost or saving in minutes, action (issue filed / accepted / fixed).
 

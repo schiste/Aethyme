@@ -199,12 +199,25 @@ jobs:
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
             dist/release-manifest.json
 
+      - name: Render release notes
+        # The body is the tag's CHANGELOG.md entry plus its UPGRADING.md
+        # section when the release is breaking; release_contract checks the
+        # same renderer for the workspace version before anything is built.
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          cargo run --locked --manifest-path packages/aethyme/rust/Cargo.toml \
+            -p aethyme-testkit --example release_notes -- \
+            --repo "$GITHUB_WORKSPACE" \
+            --tag "$REF_NAME" \
+            --output "$RUNNER_TEMP/release-notes.md"
+
       - name: Create or update release
         # Third-party action with a write-scoped token: pinned to a full
         # commit SHA rather than a movable tag.
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
           files: dist/*
-          body_path: packages/aethyme/docs/guides/upgrading-to-${{ github.ref_name }}.md
+          body_path: ${{ runner.temp }}/release-notes.md
           generate_release_notes: true
           prerelease: ${{ contains(github.ref_name, '-') }}

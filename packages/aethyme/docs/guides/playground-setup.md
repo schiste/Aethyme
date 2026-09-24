@@ -1,6 +1,6 @@
 # Playground Setup Guide
 
-Last Updated: 2026-08-06
+Last Updated: 2026-09-24
 
 How to create an eval playground — a pair of repos (Control + Aethyme) from any source repository.
 
@@ -8,10 +8,12 @@ How to create an eval playground — a pair of repos (Control + Aethyme) from an
 
 - Git
 - Engine binary compiled: `cd packages/aethyme/rust && cargo build --release`
-- Router on PATH: `cargo install --path packages/aethyme/rust/crates/aethyme-cli`
+- Router and engine on PATH:
+  `cargo install --locked --path packages/aethyme/rust/crates/aethyme-cli` and
+  `cargo install --locked --path packages/aethyme/rust/crates/aethyme-engine`
   (no Python: the product path has needed none since 2026-08-01)
-- Python venv ONLY for the eval runner scripts under `scripts/eval/`:
-  `cd packages/aethyme && python3 -m venv .venv`
+- Python venv ONLY for the eval runner, which lives in the separate
+  `packages/aethyme-eval` package: `cd packages/aethyme-eval && python3 -m venv .venv`
 - Disk space: ~2x the source repo size (two clones + graph DB)
 
 ## Quick Start
