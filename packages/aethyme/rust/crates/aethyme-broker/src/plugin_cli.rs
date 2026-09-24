@@ -594,54 +594,25 @@ pub fn run(args: &[String]) -> u8 {
 
 /// Help goes to stdout when asked for and to stderr beside a usage error.
 fn print_help(to_stdout: bool) {
-    use std::fmt::Write as _;
-    let mut text = String::new();
-    let _ = writeln!(
-        text,
-        "aethyme plugin — install the agent-surface plugin and check the CLI behind it"
-    );
-    text.push('\n');
-    let _ = writeln!(text, "Usage: aethyme plugin <action> [options]");
-    text.push('\n');
-    let _ = writeln!(text, "Actions:");
-    let _ = writeln!(
-        text,
-        "  install     register the marketplace and install the plugin"
-    );
-    let _ = writeln!(
-        text,
-        "  remove      uninstall the plugin and forget the marketplace"
-    );
-    let _ = writeln!(
-        text,
-        "  status      report the plugin, the CLI on PATH, and the hook floor"
-    );
-    text.push('\n');
-    let _ = writeln!(text, "Options:");
-    let _ = writeln!(
-        text,
-        "  --surface codex|claude|all   default: all surfaces present on this machine"
-    );
-    let _ = writeln!(
-        text,
-        "  --source <path|owner/repo>   default: {DEFAULT_MARKETPLACE_SOURCE}"
-    );
-    let _ = writeln!(
-        text,
-        "  --dry-run                    print the commands without running them"
-    );
-    let _ = writeln!(
-        text,
-        "  --json                       machine-readable status"
-    );
-    text.push('\n');
-    let _ = writeln!(
-        text,
-        "`status` exits nonzero when the plugin is installed but the `aethyme`"
-    );
-    let _ = writeln!(
-        text,
-        "on PATH is older than {MIN_HOOK_CLI_VERSION}, which makes its hooks inert."
+    let text = format!(
+        "aethyme plugin — install the agent-surface plugin and check the CLI behind it
+
+Usage: aethyme plugin <action> [options]
+
+Actions:
+  install     register the marketplace and install the plugin
+  remove      uninstall the plugin and forget the marketplace
+  status      report the plugin, the CLI on PATH, and the hook floor
+
+Options:
+  --surface codex|claude|all   default: all surfaces present on this machine
+  --source <path|owner/repo>   default: {DEFAULT_MARKETPLACE_SOURCE}
+  --dry-run                    print the commands without running them
+  --json                       machine-readable status
+
+`status` exits nonzero when the plugin is installed but the `aethyme`
+on PATH is older than {MIN_HOOK_CLI_VERSION}, which makes its hooks inert.
+"
     );
     if to_stdout {
         print!("{text}");
