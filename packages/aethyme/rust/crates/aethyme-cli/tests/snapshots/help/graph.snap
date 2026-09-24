@@ -1,0 +1,4 @@
+exit: 1
+--- stdout
+--- stderr
+Error: usage: aethyme graph --help <repo_path> [target] [--json-output]

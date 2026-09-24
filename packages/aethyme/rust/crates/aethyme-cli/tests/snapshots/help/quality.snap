@@ -1,0 +1,18 @@
+exit: 0
+--- stdout
+Usage: aethyme quality inspect [OPTIONS]
+
+  Run bounded, optional repository-quality analysis.
+
+  This report is advisory. Use `aethyme readiness` for authoritative
+  operational readiness.
+
+Options:
+  --repo PATH             Git working tree (defaults to current directory)
+  -f, --format [json|md]  Output format (default: md)
+  -o, --output PATH       Output file (defaults to stdout)
+  --detectors TEXT        Comma-separated detector names
+  --limit N               Maximum rendered findings (default: 100)
+  --full                  Render every finding
+  --help                  Show this message and exit.
+--- stderr

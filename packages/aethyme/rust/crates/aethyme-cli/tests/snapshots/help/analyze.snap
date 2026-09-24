@@ -1,0 +1,4 @@
+exit: 1
+--- stdout
+--- stderr
+Error: unsupported analyze subcommand: --help

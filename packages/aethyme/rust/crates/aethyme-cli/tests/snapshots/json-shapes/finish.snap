@@ -1,0 +1,63 @@
+{
+  "cleanup": {
+    "attempted": "bool",
+    "branch_ref": "string",
+    "branch_removed": "bool",
+    "branch_tip": "string",
+    "completed": "bool",
+    "failure": "null",
+    "kept": "bool",
+    "reclaimed_bytes": "integer",
+    "recovery_action": "null",
+    "requested": "bool",
+    "worktree_removed": "bool"
+  },
+  "cleanup_safe": "bool",
+  "closed": "bool",
+  "delivery": {
+    "promoted": "bool",
+    "promotion_commit": "string",
+    "published": "bool",
+    "submitted": "bool"
+  },
+  "dirty_paths": [],
+  "last_gate": "null",
+  "last_graph_integrity": "null",
+  "latest_queue_entry_id": "integer",
+  "latest_queue_status": "string",
+  "leases_held": [
+    {
+      "expires_at": "null",
+      "kind": "string",
+      "path": "string",
+      "released_at": "integer",
+      "state": "string"
+    }
+  ],
+  "next_commands": [],
+  "pending_work": {
+    "dirty_path_count": "integer",
+    "present": "bool",
+    "unsubmitted_commits": "integer",
+    "worktree_missing": "bool"
+  },
+  "recommended_next_action": "string",
+  "representation": {
+    "created_at": "integer",
+    "discovery": "string",
+    "evidence": "string",
+    "id": "integer",
+    "paths_json": "string",
+    "pr_number": "null",
+    "representing_commit": "string",
+    "representing_ref": "string",
+    "session_head": "string",
+    "session_id": "integer"
+  },
+  "session_id": "integer",
+  "status": "string",
+  "summary": "string",
+  "unsubmitted_commits": "integer",
+  "warnings": [],
+  "worktree_path": "string"
+}

@@ -1,0 +1,10 @@
+exit: 0
+--- stdout
+Usage:
+  aethyme deploy plan [--repo <path>] [--diff|--json]
+  aethyme deploy execute [--repo <path>] --confirm <plan-sha256> [--json]
+  aethyme deploy [--repo <path>] [--force] [--with-graph [--graph-repository <owner/name>]]
+  aethyme deploy bridge [--repo <path>]
+  aethyme deploy --local-only [--repo <path>] [--force]
+  aethyme deploy verify [--repo <path>] [--local-only]
+--- stderr

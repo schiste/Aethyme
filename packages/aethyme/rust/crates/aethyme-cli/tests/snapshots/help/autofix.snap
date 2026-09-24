@@ -1,0 +1,15 @@
+exit: 0
+--- stdout
+Usage: aethyme autofix [OPTIONS] REPO_PATH
+
+  Apply automated fixes to codebase issues.
+
+Options:
+  --dry-run                       Show changes without applying
+  --apply                         Apply changes to disk
+  --pr                            Create pull request
+  --fix-type [all|docs|links|selectors|i18n|format]
+                                  Type of fix to apply
+  --skip-approval                 Skip approval for risky changes
+  --help                          Show this message and exit.
+--- stderr

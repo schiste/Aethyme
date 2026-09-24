@@ -1,0 +1,161 @@
+{
+  "advice": [
+    {
+      "commands": [
+        "string"
+      ],
+      "evidence": [
+        "string"
+      ],
+      "id": "string",
+      "queue_entry_id": "integer",
+      "reason": "string",
+      "session_id": "integer",
+      "severity": "string",
+      "summary": "string"
+    }
+  ],
+  "advisory_delivery": {
+    "actioned_advisories": "integer",
+    "shown_advisories": "integer",
+    "surface_rows": "integer",
+    "total_shows": "integer"
+  },
+  "agents": [
+    {
+      "accepted_at": "integer",
+      "accepted_integration_commit": "string",
+      "accepted_integration_tree": "string",
+      "accepted_queue_entry_id": "integer",
+      "accepted_session_head": "string",
+      "activity_at": "integer",
+      "adopted_head": "string",
+      "adoption_base": "string",
+      "agent_identity": "null",
+      "ai_provider": "null",
+      "branch": "string",
+      "cleanup_completed_at": "null",
+      "cleanup_state": "string",
+      "closed_at": "null",
+      "command": "null",
+      "created_at": "integer",
+      "derived_status": "string",
+      "diff_base": "string",
+      "exit_code": "null",
+      "id": "integer",
+      "last_activity_at": "integer",
+      "log_path": "null",
+      "origin": "string",
+      "pid": "null",
+      "pid_alive": "null",
+      "repository_contract": {
+        "aethyme_version": "string",
+        "backfilled": "bool",
+        "deployment_state_digest": "string",
+        "gate_definition_digest": "null",
+        "repository_schema": "null"
+      },
+      "repository_name": "null",
+      "status": "string",
+      "tab_name": "null",
+      "task": "string",
+      "updated_at": "integer",
+      "worktree_path": "string"
+    }
+  ],
+  "blockers": [],
+  "cleanup_retention": {
+    "broker_owned_worktree_count": "integer",
+    "budget_verdict": "string",
+    "clears_retained_bytes_budget": "bool",
+    "closed_worktrees_policy_days": "integer",
+    "eligible_worktree_count": "integer",
+    "estimated_blocked_bytes": "integer",
+    "estimated_reclaimable_bytes": "integer",
+    "estimated_retained_bytes": "integer",
+    "oldest_closed_age_days": "integer",
+    "over_retained_bytes_budget": "bool",
+    "reconciliation": {
+      "claimed_count": "integer",
+      "directory_count": "integer",
+      "scanned_root_count": "integer",
+      "schema_version": "integer",
+      "sized": "bool",
+      "unclaimed": [],
+      "unclaimed_bytes": "integer",
+      "unclaimed_count": "integer"
+    },
+    "retained_bytes_budget": "integer",
+    "retained_bytes_deficit": "integer",
+    "retained_session_branch_count": "integer",
+    "severity": "string",
+    "sizes_measured_at_ms": "null",
+    "unmeasured_worktree_count": "integer"
+  },
+  "coordinated_operations": [],
+  "integration_branch": "string",
+  "integration_head": "string",
+  "leases": [
+    {
+      "created_at": "integer",
+      "expires_at": "null",
+      "id": "integer",
+      "kind": "string",
+      "path": "string",
+      "released_at": "null",
+      "session_id": "integer"
+    }
+  ],
+  "main_ahead_upstream_commits": "integer",
+  "main_behind_upstream_commits": "integer",
+  "main_head": "string",
+  "outstanding_advisories": [],
+  "outstanding_entry_exposures": [
+    {
+      "created_at": "integer",
+      "id": "integer",
+      "paths": [
+        "string"
+      ],
+      "promotion_sha": "string",
+      "queue_entry_id": "integer",
+      "resolution_evidence": "null",
+      "resolution_kind": "null",
+      "resolution_sha": "null",
+      "resolved_at": "null",
+      "state": "string"
+    }
+  ],
+  "overlaps": [],
+  "promoted_conflicts": [],
+  "publication_baseline_head": "string",
+  "publication_baseline_ref": "string",
+  "queue": [],
+  "queue_history": {
+    "command": "string",
+    "schema_version": "integer",
+    "terminal_counts": [
+      {
+        "count": "integer",
+        "status": "string"
+      }
+    ]
+  },
+  "review_refusals": [],
+  "summary": {
+    "active_sessions": "integer",
+    "commands": [
+      "string"
+    ],
+    "dirty_sessions": "integer",
+    "idle_sessions": "integer",
+    "integration_ahead_main_commits": "integer",
+    "integration_relation": "string",
+    "live_sessions": "integer",
+    "may_move_integration": "bool",
+    "message": "string",
+    "overlap_count": "integer",
+    "promoted_conflict_count": "integer",
+    "stale_sessions": "integer"
+  }
+}
