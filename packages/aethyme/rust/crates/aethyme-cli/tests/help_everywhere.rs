@@ -1,8 +1,9 @@
 //! `--help` works on every command and subcommand, and has no side effects.
 //!
-//! Each invocation runs in a fresh repository with a throwaway `HOME`. It must
-//! exit 0, print its help on stdout, and leave no file behind in either
-//! directory. The motivating failure: `graph materialize --help` treated
+//! Each invocation runs in a fresh repository with a throwaway `HOME`, and
+//! every host-state, cache and worktree-root override points inside that
+//! watched directory. It must exit 0, print its help on stdout, and leave no
+//! file behind in the repository or anywhere under the watched directory. The motivating failure: `graph materialize --help` treated
 //! `--help` as noise, defaulted `--repo` to `.`, and built the graph store.
 
 use std::path::{Path, PathBuf};
@@ -225,6 +226,10 @@ fn check(repo: &Path, home: &Path, line: &str, flag: &str, problems: &mut Vec<St
         .current_dir(repo)
         .env("HOME", home)
         .env("AETHYME_CACHE_DIR", home.join("cache"))
+        .env("AETHYME_HOST_STATE_DIR", home.join("host-state"))
+        .env("XDG_STATE_HOME", home.join("xdg-state"))
+        .env("AETHYME_HOST_CACHE_DIR", home.join("host-cache"))
+        .env("AETHYME_WORKTREE_ROOT", home.join("worktrees"))
         .env_remove("AETHYME_REPO")
         .stdin(Stdio::null())
         .output()
