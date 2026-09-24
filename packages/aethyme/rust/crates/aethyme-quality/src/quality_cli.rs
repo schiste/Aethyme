@@ -1,7 +1,7 @@
 use std::cmp::Ordering;
 use std::path::PathBuf;
 
-use aethyme_enhance::pyjson::{Value, dumps_indent2};
+use serde::Serialize;
 
 use crate::engine::ScorecardEngine;
 use crate::model::{Finding, QualityInspection, Severity};
@@ -217,127 +217,130 @@ fn quality_level(severity: Severity) -> &'static str {
     }
 }
 
-fn format_json(report: &QualityInspection, rendered: &[Finding], full: bool) -> String {
-    let mut root = Value::object();
-    root.set("schema_version", Value::int(1));
-    root.set("kind", Value::str("repository_quality"));
-    root.set("advisory_only", Value::Bool(true));
-
-    let mut readiness = Value::object();
-    readiness.set("authoritative", Value::Bool(false));
-    readiness.set("affects_readiness", Value::Bool(false));
-    readiness.set("operational_blockers", Value::Array(Vec::new()));
-    readiness.set("command", Value::str("aethyme readiness"));
-    root.set("operational_readiness", readiness);
-
-    let mut repository = Value::object();
-    repository.set("path", Value::str(report.repository_path.clone()));
-    repository.set("source", Value::str("tracked_relevant_files"));
-    repository.set(
-        "tracked_files",
-        Value::int(report.tracked_file_count as i128),
-    );
-    repository.set(
-        "relevant_files",
-        Value::int(report.relevant_file_count as i128),
-    );
-    repository.set(
-        "excluded_vendored",
-        Value::int(report.excluded_vendored_count as i128),
-    );
-    repository.set(
-        "excluded_generated",
-        Value::int(report.excluded_generated_count as i128),
-    );
-    repository.set(
-        "excluded_non_regular",
-        Value::int(report.excluded_non_regular_count as i128),
-    );
-    root.set("repository", repository);
-
-    let mut totals = Value::object();
-    totals.set("findings", Value::int(report.total_findings as i128));
-    totals.set("high", Value::int(report.high_count as i128));
-    totals.set("medium", Value::int(report.medium_count as i128));
-    totals.set("low", Value::int(report.low_count as i128));
-    totals.set("rendered", Value::int(rendered.len() as i128));
-    totals.set(
-        "omitted",
-        Value::int(report.total_findings.saturating_sub(rendered.len()) as i128),
-    );
-    totals.set("full_output", Value::Bool(full));
-    root.set("totals", totals);
-
-    root.set(
-        "detectors",
-        Value::Array(
-            report
-                .detector_results
-                .iter()
-                .map(|result| {
-                    let mut value = Value::object();
-                    value.set("name", Value::str(result.detector_name.clone()));
-                    value.set("description", Value::str(result.description.clone()));
-                    value.set(
-                        "status",
-                        Value::str(if result.applicability.is_applicable() {
-                            "executed"
-                        } else {
-                            "skipped"
-                        }),
-                    );
-                    value.set(
-                        "applicability_reason",
-                        Value::str(result.applicability.reason()),
-                    );
-                    value.set("findings", Value::int(result.findings.len() as i128));
-                    value.set(
-                        "error",
-                        result
-                            .error
-                            .as_ref()
-                            .map_or(Value::Null, |error| Value::str(error.clone())),
-                    );
-                    value
-                })
-                .collect(),
-        ),
-    );
-    root.set(
-        "findings",
-        Value::Array(rendered.iter().map(finding_json).collect()),
-    );
-    dumps_indent2(&root)
+#[derive(Serialize)]
+struct JsonInspection<'a> {
+    schema_version: u32,
+    kind: &'static str,
+    advisory_only: bool,
+    operational_readiness: JsonReadiness,
+    repository: JsonRepository<'a>,
+    totals: JsonTotals,
+    detectors: Vec<JsonDetector<'a>>,
+    findings: Vec<JsonFinding<'a>>,
 }
 
-fn finding_json(finding: &Finding) -> Value {
-    let mut value = Value::object();
-    value.set("detector", Value::str(finding.detector.clone()));
-    value.set("quality_level", Value::str(quality_level(finding.severity)));
-    value.set("operational_blocker", Value::Bool(false));
-    value.set("message", Value::str(finding.message.clone()));
-    value.set("file", Value::str(finding.file_path.clone()));
-    value.set(
-        "line",
-        finding
-            .line_number
-            .map_or(Value::Null, |line| Value::int(line as i128)),
-    );
-    value.set(
-        "evidence",
-        finding
-            .evidence
-            .as_ref()
-            .map_or(Value::Null, |evidence| Value::str(evidence.clone())),
-    );
-    value.set(
-        "suggestion",
-        finding
-            .suggestion
-            .as_ref()
-            .map_or(Value::Null, |suggestion| Value::str(suggestion.clone())),
-    );
-    value
+#[derive(Serialize)]
+struct JsonReadiness {
+    authoritative: bool,
+    affects_readiness: bool,
+    operational_blockers: &'static [&'static str],
+    command: &'static str,
+}
+
+#[derive(Serialize)]
+struct JsonRepository<'a> {
+    path: &'a str,
+    source: &'static str,
+    tracked_files: usize,
+    relevant_files: usize,
+    excluded_vendored: usize,
+    excluded_generated: usize,
+    excluded_non_regular: usize,
+}
+
+#[derive(Serialize)]
+struct JsonTotals {
+    findings: usize,
+    high: usize,
+    medium: usize,
+    low: usize,
+    rendered: usize,
+    omitted: usize,
+    full_output: bool,
+}
+
+#[derive(Serialize)]
+struct JsonDetector<'a> {
+    name: &'a str,
+    description: &'a str,
+    status: &'static str,
+    applicability_reason: &'a str,
+    findings: usize,
+    error: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+struct JsonFinding<'a> {
+    detector: &'a str,
+    quality_level: &'static str,
+    operational_blocker: bool,
+    message: &'a str,
+    file: &'a str,
+    line: Option<i64>,
+    evidence: Option<&'a str>,
+    suggestion: Option<&'a str>,
+}
+
+fn format_json(report: &QualityInspection, rendered: &[Finding], full: bool) -> String {
+    let json = JsonInspection {
+        schema_version: 1,
+        kind: "repository_quality",
+        advisory_only: true,
+        operational_readiness: JsonReadiness {
+            authoritative: false,
+            affects_readiness: false,
+            operational_blockers: &[],
+            command: "aethyme readiness",
+        },
+        repository: JsonRepository {
+            path: &report.repository_path,
+            source: "tracked_relevant_files",
+            tracked_files: report.tracked_file_count,
+            relevant_files: report.relevant_file_count,
+            excluded_vendored: report.excluded_vendored_count,
+            excluded_generated: report.excluded_generated_count,
+            excluded_non_regular: report.excluded_non_regular_count,
+        },
+        totals: JsonTotals {
+            findings: report.total_findings,
+            high: report.high_count,
+            medium: report.medium_count,
+            low: report.low_count,
+            rendered: rendered.len(),
+            omitted: report.total_findings.saturating_sub(rendered.len()),
+            full_output: full,
+        },
+        detectors: report
+            .detector_results
+            .iter()
+            .map(|result| JsonDetector {
+                name: &result.detector_name,
+                description: &result.description,
+                status: if result.applicability.is_applicable() {
+                    "executed"
+                } else {
+                    "skipped"
+                },
+                applicability_reason: result.applicability.reason(),
+                findings: result.findings.len(),
+                error: result.error.as_deref(),
+            })
+            .collect(),
+        findings: rendered
+            .iter()
+            .map(|finding| JsonFinding {
+                detector: &finding.detector,
+                quality_level: quality_level(finding.severity),
+                operational_blocker: false,
+                message: &finding.message,
+                file: &finding.file_path,
+                line: finding.line_number,
+                evidence: finding.evidence.as_deref(),
+                suggestion: finding.suggestion.as_deref(),
+            })
+            .collect(),
+    };
+    serde_json::to_string_pretty(&json).expect("quality inspection serializes")
 }
 
 fn format_markdown(report: &QualityInspection, rendered: &[Finding], full: bool) -> String {

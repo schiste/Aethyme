@@ -6,19 +6,17 @@
 //! diffs and applies them, the fixers propose the content, and
 //! `github` wraps the whole thing in a branch/commit/push/PR flow.
 //!
-//! Byte parity is the contract (retirement decision #2): produced
-//! unified diffs, stdout, exit codes, and post-apply trees match the
-//! Python implementation on the parity corpus. Where the Python has a
-//! quirk — malformed-looking diffs from `lineterm=""`, `str.replace`
-//! against a progressively-rewritten buffer, risk patterns matched
-//! against absolute paths — the quirk is ported, not corrected.
+//! Frozen (decision D3): the Python-parity layer (`difflib`, `pystr`)
+//! is retired. Diffs come from `similar` as standard unified diffs;
+//! string and path handling is plain std. Behavior quirks inherited
+//! from the Python port (first-occurrence `replace` against a
+//! progressively-rewritten buffer, risk patterns matched against
+//! absolute paths) remain; the crate takes fixes, not features.
 
 pub mod command;
-pub mod difflib;
 pub mod fixers;
 pub mod github;
 pub mod patch;
-pub mod pystr;
 pub mod safety;
 
 use std::path::Path;

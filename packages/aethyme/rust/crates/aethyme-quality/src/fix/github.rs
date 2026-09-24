@@ -21,7 +21,6 @@ use std::path::{Path, PathBuf};
 
 use crate::fix::command::{CommandRunner, RunOutcome, SystemCommandRunner};
 use crate::fix::patch::{ApplyOutcome, GeneratorSummary, PatchGenerator};
-use crate::fix::pystr;
 
 const BRANCH_PREFIX: &str = "autofix";
 
@@ -103,7 +102,7 @@ impl GitHubIntegration {
         match files {
             Some(files) if !files.is_empty() => {
                 for file_path in files {
-                    let rendered = pystr::as_posix(file_path);
+                    let rendered = file_path.display().to_string();
                     if !self.git(&["git", "add", &rendered]).succeeded() {
                         return None;
                     }
@@ -314,7 +313,7 @@ fn generate_pr_body(summary: &GeneratorSummary, patch_generator: &PatchGenerator
     for patch in &patch_generator.patches {
         lines.push(format!(
             "- `{}` ({}, {})",
-            pystr::as_posix(&patch.file_path),
+            patch.file_path.display(),
             patch.fix_type,
             patch.risk_level.as_str()
         ));

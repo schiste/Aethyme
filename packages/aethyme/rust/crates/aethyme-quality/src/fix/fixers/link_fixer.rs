@@ -4,12 +4,11 @@
 //! ones. Only links whose target actually exists under the repo root
 //! are rewritten.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use regex::Regex;
 
 use crate::fix::fixers::base::Fixer;
-use crate::fix::pystr;
 use crate::walk;
 
 const INTERNAL_DOMAINS: [&str; 3] = ["localhost", "127.0.0.1", "github.com"];
@@ -59,7 +58,7 @@ impl LinkFixer {
             return None;
         }
         let parent = current_file.parent().unwrap_or(Path::new(""));
-        Some(pystr::as_posix(&pystr::relpath(&target_path, parent)))
+        Some(relative_path(&target_path, parent).display().to_string())
     }
 }
 
@@ -115,7 +114,7 @@ impl Fixer for LinkFixer {
 
             let old_link = format!("[{link_text}]({link_url})");
             let new_link = format!("[{link_text}]({new_url})");
-            new_content = pystr::replace_all(&new_content, &old_link, &new_link);
+            new_content = new_content.replace(&old_link, &new_link);
             changes_made = true;
         }
 
@@ -124,6 +123,25 @@ impl Fixer for LinkFixer {
         } else {
             None
         }
+    }
+}
+
+/// `path` relative to the directory `base`, lexically: the shared
+/// component prefix is dropped and each remaining `base` component
+/// becomes `..`. Both inputs are joined onto the same repo root.
+fn relative_path(path: &Path, base: &Path) -> PathBuf {
+    let path: Vec<Component> = path.components().collect();
+    let base: Vec<Component> = base.components().collect();
+    let common = path.iter().zip(&base).take_while(|(a, b)| a == b).count();
+    let mut rel: PathBuf = base[common..]
+        .iter()
+        .map(|_| Component::ParentDir)
+        .collect();
+    rel.extend(&path[common..]);
+    if rel.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        rel
     }
 }
 
@@ -272,26 +290,23 @@ mod tests {
         fs::write(tmp.join("bad.md"), [0xff, 0xfe, b'[']).unwrap();
         let fixer = LinkFixer::new(&tmp);
         let fixes = process_directory(&fixer, &tmp);
-        let files: Vec<String> = fixes
-            .iter()
-            .map(|f| pystr::file_name(&f.file_path))
-            .collect();
-        assert_eq!(files, vec!["ok.md".to_string()]);
+        assert_eq!(fixes.len(), 1);
+        assert!(fixes[0].file_path.ends_with("ok.md"));
         assert_eq!(fixes[0].fix_type, "link_fix");
     }
 
     #[test]
     fn relpath_is_lexical() {
         assert_eq!(
-            pystr::relpath(Path::new("/a/b/c.md"), Path::new("/a/d")),
+            relative_path(Path::new("/a/b/c.md"), Path::new("/a/d")),
             PathBuf::from("../b/c.md")
         );
         assert_eq!(
-            pystr::relpath(Path::new("/a/b"), Path::new("/a/b")),
+            relative_path(Path::new("/a/b"), Path::new("/a/b")),
             PathBuf::from(".")
         );
         assert_eq!(
-            pystr::relpath(Path::new("/a/b/c"), Path::new("/a")),
+            relative_path(Path::new("/a/b/c"), Path::new("/a")),
             PathBuf::from("b/c")
         );
     }

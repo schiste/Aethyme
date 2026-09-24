@@ -10,7 +10,6 @@ use std::path::{Path, PathBuf};
 use regex::Regex;
 
 use crate::fix::fixers::base::{FixProposal, Fixer};
-use crate::fix::pystr;
 use crate::walk;
 
 pub const FOLDER_DOC_NAME: &str = "FOLDER.md";
@@ -64,10 +63,9 @@ impl DocsRegenerator {
                 continue;
             }
             let dirpath = &entry.path;
-            let parts = pystr::named_parts(dirpath);
-            if SKIP_DIRS
-                .iter()
-                .any(|skip| parts.iter().any(|part| part == skip))
+            if dirpath
+                .components()
+                .any(|part| SKIP_DIRS.iter().any(|skip| part.as_os_str() == *skip))
             {
                 continue;
             }
@@ -93,7 +91,10 @@ impl DocsRegenerator {
         // `sorted(directory.iterdir())` — Path ordering on POSIX is
         // ordering of the full path string.
         for item in read_dir_sorted(directory, true) {
-            if pystr::file_name(&item).starts_with('.') {
+            if item
+                .file_name()
+                .is_some_and(|name| name.as_encoded_bytes().starts_with(b"."))
+            {
                 continue;
             }
             if item.is_file() {
@@ -110,9 +111,9 @@ impl DocsRegenerator {
         };
 
         let mut lines: Vec<String> = vec![
-            format!("# {}", pystr::file_name(directory)),
+            format!("# {}", directory.file_name().unwrap_or_default().display()),
             String::new(),
-            format!("**Location:** `{}`", pystr::as_posix(&rel_path)),
+            format!("**Location:** `{}`", rel_path.display()),
             String::new(),
             "## Overview".to_string(),
             String::new(),
@@ -150,7 +151,7 @@ impl DocsRegenerator {
                 let mut sorted_bucket = bucket.clone();
                 sorted_bucket.sort();
                 for f in &sorted_bucket {
-                    let name = pystr::file_name(f);
+                    let name = f.file_name().unwrap_or_default().display();
                     match self.extract_file_purpose(f) {
                         Some(purpose) => lines.push(format!("- `{name}` - {purpose}")),
                         None => lines.push(format!("- `{name}`")),
@@ -164,7 +165,10 @@ impl DocsRegenerator {
             lines.push("## Subdirectories".to_string());
             lines.push(String::new());
             for d in &subdirs {
-                lines.push(format!("- `{}/`", pystr::file_name(d)));
+                lines.push(format!(
+                    "- `{}/`",
+                    d.file_name().unwrap_or_default().display()
+                ));
             }
             lines.push(String::new());
         }
@@ -265,12 +269,12 @@ fn read_dir_sorted(directory: &Path, sorted: bool) -> Vec<PathBuf> {
     items
 }
 
-/// `"".join(f.readline() for _ in range(n))` with `errors="ignore"`.
+/// The first `max_lines` lines of a file (terminators kept), decoded
+/// lossily so a stray invalid byte does not hide the docblock.
 fn read_first_lines(path: &Path, max_lines: usize) -> Option<String> {
     let bytes = std::fs::read(path).ok()?;
-    let text = pystr::translate_newlines(&pystr::decode_utf8_ignore(&bytes));
-    let lines = pystr::first_lines(&text, max_lines);
-    Some(lines)
+    let text = String::from_utf8_lossy(&bytes).replace("\r\n", "\n");
+    Some(text.split_inclusive('\n').take(max_lines).collect())
 }
 
 /// `doc.split('\n')[0][:100]`.

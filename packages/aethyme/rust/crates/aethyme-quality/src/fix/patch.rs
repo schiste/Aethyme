@@ -7,8 +7,6 @@
 
 use std::path::{Path, PathBuf};
 
-use super::difflib;
-use super::pystr;
 use super::safety::{RiskLevel, SafetyEngine, ValidationResult};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,36 +66,29 @@ impl FilePatch {
         }
     }
 
-    /// Port of `generate_diff`: `difflib.unified_diff` over
-    /// `splitlines(keepends=True)` with `lineterm=""`, joined with `""`.
-    /// The empty line terminator means the `---`/`+++`/`@@` records
-    /// carry no newline, so they run together in the joined result —
-    /// see the note on `difflib::unified_diff`.
+    /// Unified diff (3 lines of context) from `a/<path>` to `b/<path>`;
+    /// empty when the content is unchanged.
     pub fn generate_diff(&self) -> String {
-        let original_lines = pystr::splitlines(&self.original_content, true);
-        let new_lines = pystr::splitlines(&self.new_content, true);
-        let name = pystr::as_posix(&self.file_path);
-        difflib::unified_diff(
-            &original_lines,
-            &new_lines,
-            &format!("a/{name}"),
-            &format!("b/{name}"),
+        let name = self.file_path.display();
+        similar::udiff::unified_diff(
+            similar::Algorithm::Myers,
+            &self.original_content,
+            &self.new_content,
             3,
-            "",
+            Some((&format!("a/{name}"), &format!("b/{name}"))),
         )
-        .join("")
     }
 
     pub fn get_summary(&self) -> PatchSummary {
-        let orig_lines = pystr::splitlines(&self.original_content, false);
-        let new_lines = pystr::splitlines(&self.new_content, false);
+        let orig_lines = self.original_content.lines().count() as i64;
+        let new_lines = self.new_content.lines().count() as i64;
         PatchSummary {
-            file: pystr::as_posix(&self.file_path),
+            file: self.file_path.display().to_string(),
             fix_type: self.fix_type.clone(),
             risk_level: self.risk_level,
-            lines_added: new_lines.len() as i64 - orig_lines.len() as i64,
-            size_change: pystr::char_len(&self.new_content) as i64
-                - pystr::char_len(&self.original_content) as i64,
+            lines_added: new_lines - orig_lines,
+            size_change: self.new_content.chars().count() as i64
+                - self.original_content.chars().count() as i64,
             has_changes: self.original_content != self.new_content,
         }
     }
@@ -219,15 +210,13 @@ impl PatchGenerator {
         Some(self.patches.len() - 1)
     }
 
-    /// Port of `generate_unified_diff`: per-patch diffs, empties
-    /// dropped, joined with a single newline.
+    /// Every patch's unified diff, concatenated (each already ends in a
+    /// newline, so the result is one multi-file patch).
     pub fn generate_unified_diff(&self) -> String {
         self.patches
             .iter()
             .map(|patch| patch.generate_diff())
-            .filter(|diff| !diff.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n")
+            .collect()
     }
 
     pub fn get_summary(&self) -> GeneratorSummary {
@@ -290,7 +279,7 @@ impl PatchGenerator {
         let mut applied: Vec<String> = Vec::new();
         let mut failed: Vec<String> = Vec::new();
         for patch in &self.patches {
-            let name = pystr::as_posix(&patch.file_path);
+            let name = patch.file_path.display().to_string();
             if patch.apply(Some(&self.repo_path)) {
                 applied.push(name);
             } else {
@@ -375,12 +364,9 @@ mod tests {
         let diff = patch.generate_diff();
         assert!(diff.contains("--- a/test.py"));
         assert!(diff.contains("+++ b/test.py"));
-        assert!(diff.contains("-line2\n"));
-        assert!(diff.contains("+line2 modified\n"));
-        // The exact bytes, including the run-together headers.
         assert_eq!(
             diff,
-            "--- a/test.py+++ b/test.py@@ -1,3 +1,3 @@ line1\n-line2\n+line2 modified\n line3"
+            "--- a/test.py\n+++ b/test.py\n@@ -1,3 +1,3 @@\n line1\n-line2\n+line2 modified\n line3\n\\ No newline at end of file\n"
         );
     }
 
@@ -535,8 +521,8 @@ mod tests {
         let diff = pg.generate_unified_diff();
         assert_eq!(
             diff,
-            "--- a/file1.py+++ b/file1.py@@ -1 +1 @@-content1\n+modified1\n\
-             \n--- a/file2.py+++ b/file2.py@@ -1 +1 @@-content2\n+modified2\n"
+            "--- a/file1.py\n+++ b/file1.py\n@@ -1 +1 @@\n-content1\n+modified1\n\
+             --- a/file2.py\n+++ b/file2.py\n@@ -1 +1 @@\n-content2\n+modified2\n"
         );
     }
 

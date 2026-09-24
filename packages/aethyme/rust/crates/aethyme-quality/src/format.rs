@@ -1,98 +1,126 @@
-//! Report renderers (port of `src/scorecard/formatters.py`).
+//! Report renderers for the legacy `ai-ready` scorecard.
 //!
-//! JSON goes through `aethyme_enhance::pyjson` so the bytes match
-//! CPython's `json.dumps(data, indent=2, default=str)` exactly
-//! (insertion-ordered keys, `ensure_ascii` escapes, repr float
-//! rendering). Markdown is a line-for-line port.
+//! JSON is `serde_json` pretty output over borrowed, field-ordered
+//! structs, so keys keep the documented order. Markdown layout is the
+//! frozen scorecard layout.
 
-use aethyme_enhance::pyjson::{Value, dumps_indent2};
+use serde::Serialize;
 
 use crate::model::{Finding, ScorecardReport};
 
-/// Port of `JSONFormatter.format`.
-pub fn format_json(report: &ScorecardReport) -> String {
-    let mut root = Value::object();
-    root.set("scan_id", Value::str(report.scan_id.clone()));
+#[derive(Serialize)]
+struct JsonReport<'a> {
+    scan_id: &'a str,
+    repository: JsonRepository<'a>,
+    timestamp: &'a str,
+    score: i64,
+    summary: JsonSummary,
+    findings: JsonFindings<'a>,
+    detectors: Vec<JsonDetector<'a>>,
+    performance: JsonPerformance,
+}
 
-    let mut repository = Value::object();
-    repository.set("path", Value::str(report.repository_path.clone()));
-    repository.set("id", opt_str(&report.repository_id));
-    repository.set("tenant_id", opt_str(&report.tenant_id));
-    root.set("repository", repository);
+#[derive(Serialize)]
+struct JsonRepository<'a> {
+    path: &'a str,
+    id: Option<&'a str>,
+    tenant_id: Option<&'a str>,
+}
 
-    root.set("timestamp", Value::str(report.timestamp_iso.clone()));
-    root.set("score", Value::int(report.score as i128));
+#[derive(Serialize)]
+struct JsonSummary {
+    total_findings: i64,
+    blockers: i64,
+    warnings: i64,
+    info: i64,
+}
 
-    let mut summary = Value::object();
-    summary.set("total_findings", Value::int(report.total_findings as i128));
-    summary.set("blockers", Value::int(report.blocker_count as i128));
-    summary.set("warnings", Value::int(report.warning_count as i128));
-    summary.set("info", Value::int(report.info_count as i128));
-    root.set("summary", summary);
+#[derive(Serialize)]
+struct JsonFindings<'a> {
+    blockers: Vec<JsonFinding<'a>>,
+    warnings: Vec<JsonFinding<'a>>,
+    info: Vec<JsonFinding<'a>>,
+}
 
-    let mut findings = Value::object();
-    findings.set(
-        "blockers",
-        Value::Array(report.blockers.iter().map(finding_to_value).collect()),
-    );
-    findings.set(
-        "warnings",
-        Value::Array(report.warnings.iter().map(finding_to_value).collect()),
-    );
-    findings.set(
-        "info",
-        Value::Array(report.info.iter().map(finding_to_value).collect()),
-    );
-    root.set("findings", findings);
+#[derive(Serialize)]
+struct JsonFinding<'a> {
+    detector: &'a str,
+    severity: &'a str,
+    message: &'a str,
+    file: &'a str,
+    line: Option<i64>,
+    evidence: Option<&'a str>,
+    suggestion: Option<&'a str>,
+}
 
-    let detectors: Vec<Value> = report
-        .detector_results
+#[derive(Serialize)]
+struct JsonDetector<'a> {
+    name: &'a str,
+    findings_count: usize,
+    execution_time_ms: f64,
+    error: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+struct JsonPerformance {
+    total_scan_time_ms: f64,
+    files_scanned: i64,
+}
+
+fn findings_json(findings: &[Finding]) -> Vec<JsonFinding<'_>> {
+    findings
         .iter()
-        .map(|dr| {
-            let mut d = Value::object();
-            d.set("name", Value::str(dr.detector_name.clone()));
-            d.set("findings_count", Value::int(dr.findings.len() as i128));
-            d.set("execution_time_ms", Value::Float(dr.execution_time_ms));
-            d.set("error", opt_str(&dr.error));
-            d
+        .map(|finding| JsonFinding {
+            detector: &finding.detector,
+            severity: finding.severity.as_str(),
+            message: &finding.message,
+            file: &finding.file_path,
+            line: finding.line_number,
+            evidence: finding.evidence.as_deref(),
+            suggestion: finding.suggestion.as_deref(),
         })
-        .collect();
-    root.set("detectors", Value::Array(detectors));
-
-    let mut performance = Value::object();
-    performance.set(
-        "total_scan_time_ms",
-        Value::Float(report.total_scan_time_ms),
-    );
-    performance.set("files_scanned", Value::int(report.files_scanned as i128));
-    root.set("performance", performance);
-
-    dumps_indent2(&root)
+        .collect()
 }
 
-fn opt_str(value: &Option<String>) -> Value {
-    match value {
-        Some(s) => Value::str(s.clone()),
-        None => Value::Null,
-    }
-}
-
-fn finding_to_value(finding: &Finding) -> Value {
-    let mut v = Value::object();
-    v.set("detector", Value::str(finding.detector.clone()));
-    v.set("severity", Value::str(finding.severity.as_str()));
-    v.set("message", Value::str(finding.message.clone()));
-    v.set("file", Value::str(finding.file_path.clone()));
-    v.set(
-        "line",
-        match finding.line_number {
-            Some(n) => Value::int(n as i128),
-            None => Value::Null,
+/// The `--format json` scorecard report (2-space indent, no trailing
+/// newline).
+pub fn format_json(report: &ScorecardReport) -> String {
+    let json = JsonReport {
+        scan_id: &report.scan_id,
+        repository: JsonRepository {
+            path: &report.repository_path,
+            id: report.repository_id.as_deref(),
+            tenant_id: report.tenant_id.as_deref(),
         },
-    );
-    v.set("evidence", opt_str(&finding.evidence));
-    v.set("suggestion", opt_str(&finding.suggestion));
-    v
+        timestamp: &report.timestamp_iso,
+        score: report.score,
+        summary: JsonSummary {
+            total_findings: report.total_findings,
+            blockers: report.blocker_count,
+            warnings: report.warning_count,
+            info: report.info_count,
+        },
+        findings: JsonFindings {
+            blockers: findings_json(&report.blockers),
+            warnings: findings_json(&report.warnings),
+            info: findings_json(&report.info),
+        },
+        detectors: report
+            .detector_results
+            .iter()
+            .map(|dr| JsonDetector {
+                name: &dr.detector_name,
+                findings_count: dr.findings.len(),
+                execution_time_ms: dr.execution_time_ms,
+                error: dr.error.as_deref(),
+            })
+            .collect(),
+        performance: JsonPerformance {
+            total_scan_time_ms: report.total_scan_time_ms,
+            files_scanned: report.files_scanned,
+        },
+    };
+    serde_json::to_string_pretty(&json).expect("scorecard report serializes")
 }
 
 /// Port of `MarkdownFormatter.format`.
@@ -291,7 +319,7 @@ mod tests {
     }
 
     #[test]
-    fn json_shape_matches_python_layout() {
+    fn json_shape_keeps_documented_layout() {
         let out = format_json(&sample_report());
         assert!(out.starts_with("{\n  \"scan_id\": \"abc-123\","));
         assert!(out.contains("\"repository\": {\n    \"path\": \"/repo\",\n    \"id\": null,\n    \"tenant_id\": null\n  }"));
@@ -299,8 +327,6 @@ mod tests {
         assert!(out.contains("\"line\": 2"));
         assert!(out.contains("\"line\": null"));
         assert!(out.contains("\"execution_time_ms\": 1.5"));
-        // ensure_ascii is irrelevant here (no non-ASCII in JSON output),
-        // and no trailing newline, exactly like json.dumps.
         assert!(!out.ends_with('\n'));
     }
 
