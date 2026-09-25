@@ -18,6 +18,10 @@ pub const REF_GRAPH_TASK_MD: &str =
     include_str!("../../../../skills/aethyme/references/graph-task.md");
 pub const REF_DEAD_CODE_MD: &str =
     include_str!("../../../../skills/aethyme/references/dead-code.md");
+/// Commit format, branch and review practice, and generated-file upkeep:
+/// the detail the generated root guidance compresses to a few lines
+/// (recovery plan P4.5).
+pub const REF_POLICY_MD: &str = include_str!("../../../../skills/aethyme/references/policy.md");
 pub const LOAD_CONTEXT_SH: &str =
     include_str!("../../../../skills/aethyme/aethyme-load-context.sh");
 pub const AETHYME_EXPLORE: &str = include_str!("../../../../skills/aethyme/aethyme-explore");
@@ -43,6 +47,7 @@ pub const AETHYME_SKILL_FILES: &[(&str, &str, bool)] = &[
     ("references/dead-code.md", REF_DEAD_CODE_MD, false),
     ("references/explore.md", REF_EXPLORE_MD, false),
     ("references/graph-task.md", REF_GRAPH_TASK_MD, false),
+    ("references/policy.md", REF_POLICY_MD, false),
 ];
 
 #[cfg(test)]
@@ -61,6 +66,8 @@ mod tests {
         assert!(!REF_EXPLORE_MD.is_empty());
         assert!(!REF_GRAPH_TASK_MD.is_empty());
         assert!(!REF_DEAD_CODE_MD.is_empty());
+        assert!(REF_POLICY_MD.contains("## Commit Hygiene"));
+        assert!(REF_POLICY_MD.contains("## Branch And Review Practices"));
         assert!(!AETHYME_EXPLORE.is_empty());
         assert!(REVIEW_RULES_SKILL_MD.starts_with("---"));
         assert!(REVIEW_RULES_SKILL_MD.contains("name: aethyme-review-rule-maker"));

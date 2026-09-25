@@ -255,24 +255,47 @@ pub fn validate_agents_overrides(repo: &Path) -> Value {
     ])
 }
 
-/// `_render_agents_document`: template + routing + broker protocol +
-/// override sections, normalized to a single trailing newline.
+/// Upper bound on the generated block, in approximate tokens (bytes / 4),
+/// for a broker-configured repository with onboarding and no overrides.
+/// Recovery plan P4.5: the root file is read on every turn, so everything
+/// beyond what an agent needs before and after an edit lives in the skill's
+/// `references/` instead. Override sections are repository-owned and are not
+/// counted.
+pub const GENERATED_POLICY_MAX_TOKENS: usize = 1_000;
+
+/// `_render_agents_document`: the template header, then the repository and
+/// edit-workflow sections, then the rest of the template, then override
+/// sections, normalized to a single trailing newline.
+///
+/// The repository and broker sections go right after the header because
+/// they are what an agent acts on first; the template's own sections
+/// (Explore, commits, the skill pointer) follow.
 pub fn render_agents_document(repo: Option<&Path>) -> Result<String, String> {
-    let mut content = templates::AGENTS_MD.to_string();
+    let template = templates::AGENTS_MD.trim_end();
+    let (header, rest) = match template.find("\n## ") {
+        Some(split) => (&template[..split], &template[split + 1..]),
+        None => (template, ""),
+    };
+    let mut sections: Vec<String> = vec![header.trim_end().to_string()];
+    let mut overrides = String::new();
     if let Some(repo) = repo {
         let routing = render_repo_routing(repo)?;
         if !routing.is_empty() {
-            content = format!("{}\n\n{routing}", content.trim_end());
+            sections.push(routing);
         }
         let broker = render_broker_protocol_compact(repo);
         if !broker.is_empty() {
-            content = format!("{}\n\n{broker}", content.trim_end());
+            sections.push(broker);
         }
-        let override_sections = render_agents_override_sections(repo);
-        if !override_sections.is_empty() {
-            content = format!("{}\n\n{override_sections}", content.trim_end());
-        }
+        overrides = render_agents_override_sections(repo);
     }
+    if !rest.trim().is_empty() {
+        sections.push(rest.trim().to_string());
+    }
+    if !overrides.is_empty() {
+        sections.push(overrides);
+    }
+    let content = sections.join("\n\n");
     Ok(stamp_generated_policy(&content, env!("CARGO_PKG_VERSION")))
 }
 
@@ -282,45 +305,22 @@ fn render_broker_protocol_compact(repo: &Path) -> String {
     if !(repo.join(".aethyme/gates.toml").exists() || repo.join(".aethyme/config.toml").exists()) {
         return String::new();
     }
-    r#"## Broker Coordination (multi-agent repository)
+    // The heading keeps "Broker Coordination": `certify`'s agents-protocol
+    // check, local-only deploy verification and the upgrade classifier all
+    // recognize a broker-configured policy by that phrase.
+    r#"## Broker Coordination: before and after an edit
 
-Aethyme coordination is local-only: contributors without local broker state
-are not blocked. Other agents may be editing sibling worktrees, so inspect
-activity and create an isolated session before changing files:
+Other agents may be working in sibling worktrees.
 
-```bash
-aethyme broker status --json
-aethyme broker start --task "<your task>" --path <planned-path>
-```
+1. `aethyme broker start --task "<task>"`, then work only in the worktree it
+   reports. Never edit another session's worktree.
+2. When done: `aethyme broker submit --session <id>`, then
+   `aethyme broker finish --session <id>`.
 
-Graph support is repository opt-in and Explore never generates graph state.
-When Explore reports `graph_store_missing`, follow its bounded manual
-verification or run `aethyme graph materialize --repo .` for an already
-enrolled repository. Do not enable graph authority merely to silence a
-degraded response.
-
-Work only in the reported worktree. If scope expands, claim it before editing:
-`aethyme broker leases claim <path> --session <id>`. Commit small changes, then
-run `aethyme broker submit --session <id>`. Finish with
-`aethyme broker finish --session <id>` or reuse the worktree with
-`aethyme broker adopt --reuse --task "<follow-up>"`.
-
-Never edit another session's worktree or bypass a broker refusal. Read
-`.aethyme/broker-action-required.md` immediately when present. Treat delivered
-advisories as work context: inspect `aethyme broker status --json`; advisories
-inform but never expand gates or authorize publication.
-
-Remote/shared mutations require broker coordination. Use `broker submit` for
-integration, `broker git` for other shared Git operations, and `broker gh` for
-GitHub writes. Editing or submitting never implies publication authority.
-Only an explicitly authorized operator may use the reviewed full-SHA
-`broker ship plan` / `broker ship execute` lane. Never blindly retry an unknown
-remote outcome.
-
-Load the full local reference when the task involves gates, leases, resources,
-cleanup, operations, publication, conflicts, or recovery:
-`.codex/skills/aethyme/references/broker.md` or
-`.claude/skills/aethyme/references/broker.md`."#
+Remote or shared Git and GitHub writes go through `aethyme broker advanced git`
+and `aethyme broker advanced gh`; editing or submitting never authorizes
+publishing. If `.aethyme/broker-action-required.md` appears, read it first.
+Leases, gates, advisories and recovery: `references/broker.md`."#
         .to_string()
 }
 
@@ -334,7 +334,7 @@ check the paired runtime with `aethyme --version` and
 `aethyme-engine-cli --version`.
 Follow this protocol:
 
-When `aethyme broker hooks install` is active (or its pre-commit command is
+When `aethyme broker advanced hooks install` is active (or its pre-commit command is
 wired into an existing hook manager), Git enforces the session boundary on
 protected branches: local broker state requires the exact worktree to belong
 to a live session, and fetched upstream divergence blocks the commit before
@@ -353,7 +353,7 @@ blocked.
 
    `cd` into the reported worktree before editing. If you are already in a
    dedicated worktree, use
-   `aethyme broker adopt --task "<your task>" --path <planned-path>` instead.
+   `aethyme broker start --adopt --task "<your task>" --path <planned-path>` instead.
    Repeat `--path` for every file or trailing-slash directory known up front.
    The broker validates the whole set first, then creates the session plus
    explicit leases atomically. Omit `--path` only when no target is known yet.
@@ -362,12 +362,12 @@ blocked.
    overlapping edits will conflict at merge time.
 
 2. **Lease additional shared files before the diff exists**. Prefer the
-   atomic `start/adopt --path` declaration above for initial intent. If the
+   atomic `start --path` / `start --adopt --path` declaration above for initial intent. If the
    session already exists and scope expands, claim the new path explicitly:
 
    ```bash
-   aethyme broker leases claim <path> --session <your-session-id>
-   aethyme broker leases release <path> --session <your-session-id>
+   aethyme broker advanced leases claim <path> --session <your-session-id>
+   aethyme broker advanced leases release <path> --session <your-session-id>
    ```
 
    Use a trailing `/` for directory leases. Implicit leases refresh from
@@ -377,7 +377,7 @@ blocked.
    command likely to touch many files, run through the broker guard:
 
    ```bash
-   aethyme broker exec --session <your-session-id> -- <command>
+   aethyme broker advanced exec --session <your-session-id> -- <command>
    ```
 
    The guard fails if the command leaves dirty paths outside your explicit
@@ -431,8 +431,8 @@ blocked.
    confirm the plan's full publication SHA:
 
    ```bash
-   aethyme broker ship plan --entry <promoted-entry-id>
-   aethyme broker ship execute --entry <promoted-entry-id> --confirm <full-publication-sha>
+   aethyme broker advanced ship plan --entry <promoted-entry-id>
+   aethyme broker advanced ship execute --entry <promoted-entry-id> --confirm <full-publication-sha>
    ```
 
    Prefer this reviewed broker ship workflow over a raw push. Never infer
@@ -442,13 +442,13 @@ blocked.
    Report the outcome (verified / rejected / conflict) in your summary.
    Afterwards, finish the session with
    `aethyme broker finish --session <id>`, or point it at a follow-up task
-   with `aethyme broker adopt --reuse --task "..."`. `finish` closes broker
+   with `aethyme broker start --reuse --task "..."`. `finish` closes broker
    state but deliberately leaves the worktree available for review or reuse.
    When it reports cleanup is safe, reclaim that exact worktree with
-   `aethyme broker cleanup <id>`. Operators can periodically review all
-   retained broker-owned worktrees with `aethyme broker cleanup --all-cleaned`
-   and apply the unchanged plan explicitly with
-   `aethyme broker cleanup --all-cleaned --apply`.
+   `aethyme broker finish cleanup <id>`. Operators can periodically review all
+   retained broker-owned worktrees with
+   `aethyme broker finish cleanup --all-cleaned` and apply the unchanged plan
+   explicitly with `aethyme broker finish cleanup --all-cleaned --apply`.
 
 7. **If a file named `.aethyme/broker-action-required.md` appears in your
    worktree**, read it immediately: your submission conflicted. It names
@@ -487,7 +487,7 @@ blocked.
    durable Git operation coordinator:
 
    ```bash
-   aethyme broker git --session <your-session-id> \
+   aethyme broker advanced git --session <your-session-id> \
      [--repo <owner/name>] --reason "<authorization>" -- <git-args> ...
    ```
 
@@ -497,7 +497,7 @@ blocked.
    or non-GET API calls) must use the GitHub operation coordinator:
 
    ```bash
-   aethyme broker gh --session <your-session-id> \
+   aethyme broker advanced gh --session <your-session-id> \
      --repo <owner/name> --reason "<authorization>" -- <gh-args> ...
    ```
 
@@ -507,7 +507,7 @@ blocked.
    Every coordinated write requires a concise `--reason` identifying the user
    request or documented workflow that authorized it.
    If a crashed command leaves an unknown outcome, inspect external state and
-   use `aethyme broker operations reconcile`; do not retry blindly.
+   use `aethyme broker advanced operations reconcile`; do not retry blindly.
 
    Direct Git is limited to read-only inspection and operations confined to
    the isolated session worktree and session branch that cannot affect other
@@ -570,23 +570,59 @@ fn render_repo_routing(repo: &Path) -> Result<String, String> {
         Some(v) if v.truthy() => v.clone(),
         _ => Value::object(),
     };
-    let mut lines: Vec<String> = vec![
-        "## Aethyme Repo Routing".to_string(),
-        String::new(),
-        format!("- Onboarding skill: `{ONBOARDING_CODEX_PATH}` or `{ONBOARDING_CLAUDE_PATH}`"),
-        format!("- Act skill: `{ACT_CODEX_PATH}` or `{ACT_CLAUDE_PATH}`"),
-        format!("- Experience status: `{STATUS_MARKDOWN_PATH}`"),
-    ];
+    let empty_repo = Value::object();
+    let repo_facts = match onboarding.get("repo") {
+        Some(v) if v.is_object() => v,
+        _ => &empty_repo,
+    };
+    let text = |key: &str| -> Option<String> {
+        repo_facts
+            .get(key)
+            .filter(|value| value.truthy())
+            .and_then(Value::as_str)
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    };
+    // What the repository is, in one line: name, then kind, primary
+    // language and package manager when onboarding knows them.
+    let mut what = String::new();
+    if let Some(name) = text("name") {
+        what.push_str(&format!("`{name}`"));
+    }
+    let shape: Vec<String> = [text("primary_language"), text("kind")]
+        .into_iter()
+        .flatten()
+        .collect();
+    if !shape.is_empty() {
+        if !what.is_empty() {
+            what.push_str(": ");
+        }
+        what.push_str(&shape.join(" "));
+    }
+    if let Some(manager) = text("package_manager") {
+        what.push_str(&format!(" ({manager})"));
+    }
+    let mut facts: Vec<String> = Vec::new();
+    if !what.trim().is_empty() {
+        facts.push(format!("{}.", what.trim()));
+    }
     if let Some(fast_test) = fast_test {
         if fast_test.truthy() {
-            lines.push(format!("- Primary fast test: `{}`", fast_test.py_str()));
+            facts.push(format!("Fast test: `{}`.", fast_test.py_str()));
         }
     }
     if let Some(path) = app_entrypoint.get("path") {
         if path.truthy() {
-            lines.push(format!("- Primary app entrypoint: `{}`", path.py_str()));
+            facts.push(format!("App entrypoint: `{}`.", path.py_str()));
         }
     }
+    let mut lines: Vec<String> = vec!["## This repository".to_string(), String::new()];
+    if !facts.is_empty() {
+        lines.push(facts.join(" "));
+    }
+    lines.push(format!(
+        "Orientation: `{ONBOARDING_CLAUDE_PATH}`, then `{ACT_CLAUDE_PATH}` (Codex: `{ONBOARDING_CODEX_PATH}`, `{ACT_CODEX_PATH}`). Status: `{STATUS_MARKDOWN_PATH}`."
+    ));
     Ok(lines.join("\n"))
 }
 
@@ -598,7 +634,7 @@ fn render_agents_override_sections(repo: &Path) -> String {
         .unwrap_or(false)
     {
         return format!(
-            "## Aethyme Override Status\n\nAgents override file `{AGENTS_OVERRIDE_PATH}` is invalid JSON. Fix it and rerun `aethyme enhance deploy --repo \"$PWD\"`.\n"
+            "## Aethyme Override Status\n\nAgents override file `{AGENTS_OVERRIDE_PATH}` is invalid JSON. Fix it and rerun `aethyme deploy --repo \"$PWD\"`.\n"
         );
     }
     let mut sections: Vec<String> = Vec::new();
@@ -656,20 +692,34 @@ fn render_override_list_section(title: &str, value: Option<&Value>) -> Vec<Strin
     ]
 }
 
-/// Detect legacy generated Aethyme root guidance, including stale variants.
-pub fn looks_like_generated_agents_document(content: &str) -> bool {
-    if content.is_empty() {
-        return false;
-    }
-    [
+/// Marker sets that identify generated Aethyme root guidance. The first is
+/// the pre-P4.5 long form, still recognized so an older generated file is
+/// migrated rather than preserved as hand-written content; the second is
+/// the compact form rendered today.
+const GENERATED_DOCUMENT_MARKERS: &[&[&str]] = &[
+    &[
         "# Agent Instructions",
         "This repository is **Aethyme-enhanced**",
         "## Quick start (any agent)",
         "## Detailed reference",
         "## Verifying this enhancement",
-    ]
-    .iter()
-    .all(|marker| content.contains(marker))
+    ],
+    &[
+        "# Agent Instructions",
+        "Generated by Aethyme; do not edit.",
+        "## Finding code",
+        "## Everything else",
+    ],
+];
+
+/// Detect generated Aethyme root guidance, including stale variants.
+pub fn looks_like_generated_agents_document(content: &str) -> bool {
+    if content.is_empty() {
+        return false;
+    }
+    GENERATED_DOCUMENT_MARKERS
+        .iter()
+        .any(|markers| markers.iter().all(|marker| content.contains(marker)))
 }
 
 /// `_extract_legacy_agents_content`.
@@ -727,32 +777,30 @@ mod tests {
         assert!(doc.contains("aethyme explore"));
         assert!(!doc.contains("AETHYME_ROOT"));
         assert!(!doc.contains("/rust/target/release/aethyme"));
-        assert!(doc.ends_with("placeholders.\n"));
+        assert!(doc.ends_with("`dead-code.md`.\n"));
     }
 
+    fn policy_list(types: &[&str]) -> String {
+        types
+            .iter()
+            .map(|commit_type| format!("`{commit_type}`"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// The root file carries the commit policy compressed; the skill's
+    /// policy reference carries it in full. Both are held to the typed
+    /// policy so neither can drift from what `lint-commit-message` enforces.
     #[test]
     fn generated_commit_guidance_matches_typed_policy() {
-        let doc = render_agents_document(None).unwrap();
-        let allowed = COMMIT_POLICIES
+        let all: Vec<&str> = COMMIT_POLICIES.iter().map(|p| p.commit_type).collect();
+        let substantive: Vec<_> = COMMIT_POLICIES.iter().filter(|p| p.body_required).collect();
+        let substantive_types: Vec<&str> = substantive.iter().map(|p| p.commit_type).collect();
+        let non_substantive: Vec<&str> = COMMIT_POLICIES
             .iter()
-            .map(|policy| format!("`{}`", policy.commit_type))
-            .collect::<Vec<_>>()
-            .join(", ");
-        assert!(doc.contains(&format!("- Allowed types: {allowed}")));
-
-        let substantive = COMMIT_POLICIES
-            .iter()
-            .filter(|policy| policy.body_required)
-            .collect::<Vec<_>>();
-        let substantive_types = substantive
-            .iter()
-            .map(|policy| format!("`{}`", policy.commit_type))
-            .collect::<Vec<_>>()
-            .join(", ");
-        assert!(doc.contains(&format!(
-            "- Substantive commits ({substantive_types}) must include:"
-        )));
-
+            .filter(|p| !p.body_required)
+            .map(|p| p.commit_type)
+            .collect();
         let required_sections = substantive
             .first()
             .expect("at least one substantive commit policy")
@@ -760,24 +808,39 @@ mod tests {
         assert!(substantive
             .iter()
             .all(|policy| policy.required_sections == required_sections));
-        for section in required_sections {
-            assert!(doc.contains(&format!("  - `{section}`")));
-        }
-
-        let non_substantive_types = COMMIT_POLICIES
-            .iter()
-            .filter(|policy| !policy.body_required)
-            .map(|policy| format!("`{}`", policy.commit_type))
-            .collect::<Vec<_>>()
-            .join(", ");
-        assert!(doc.contains(&format!(
-            "- Non-substantive commits ({non_substantive_types}) may use a subject-only message; structured bodies remain optional."
-        )));
         assert!(COMMIT_POLICIES
             .iter()
             .filter(|policy| !policy.body_required)
             .all(|policy| policy.required_sections.is_empty()));
-        assert!(doc.contains(
+
+        let doc = render_agents_document(None).unwrap();
+        assert!(doc.contains(&format!("Types: {}.", policy_list(&all))));
+        let sections = required_sections
+            .iter()
+            .map(|section| format!("`{section}`"))
+            .collect::<Vec<_>>();
+        let (last, head) = sections.split_last().unwrap();
+        assert!(doc.contains(&format!(
+            "Substantive commits ({}) need {} and {last} sections; the others may be subject-only.",
+            policy_list(&substantive_types),
+            head.join(", ")
+        )));
+        assert!(doc.contains("aethyme repo lint-commit-message"));
+
+        let reference = templates::REF_POLICY_MD;
+        assert!(reference.contains(&format!("- Allowed types: {}", policy_list(&all))));
+        assert!(reference.contains(&format!(
+            "- Substantive commits ({}) must include:",
+            policy_list(&substantive_types)
+        )));
+        for section in required_sections {
+            assert!(reference.contains(&format!("  - `{section}`")));
+        }
+        assert!(reference.contains(&format!(
+            "- Non-substantive commits ({}) may use a subject-only message; structured bodies remain optional.",
+            policy_list(&non_substantive)
+        )));
+        assert!(reference.contains(
             "- Section content may start on the header line (`Problem: text`) or the following line (`Problem:` then `text`)."
         ));
     }
@@ -786,28 +849,74 @@ mod tests {
     fn broker_section_gated_on_config() {
         let repo = fixture_repo("broker");
         let doc = render_agents_document(Some(&repo)).unwrap();
-        assert!(!doc.contains("## Broker Coordination"));
+        assert!(!doc.contains("## Broker Coordination: before and after an edit"));
+        assert!(!doc.contains("aethyme broker"));
         std::fs::create_dir_all(repo.join(".aethyme")).unwrap();
         std::fs::write(repo.join(".aethyme/gates.toml"), "[[gate]]\n").unwrap();
         let doc = render_agents_document(Some(&repo)).unwrap();
-        assert!(doc.contains("## Broker Coordination (multi-agent repository)"));
-        assert!(doc.contains("coordination is local-only"));
-        assert!(doc.contains("aethyme broker submit --session"));
-        assert!(doc.contains("broker start --task \"<your task>\" --path <planned-path>"));
-        assert!(doc.contains("broker-action-required.md"));
-        assert!(doc.contains("broker ship plan` / `broker ship execute"));
-        assert!(doc.contains("Editing or submitting never implies publication authority"));
-        assert!(doc.contains("aethyme broker finish --session <id>"));
-        assert!(doc.contains(".codex/skills/aethyme/references/broker.md"));
-        assert!(doc.contains("Graph support is repository opt-in"));
-        assert!(doc.contains("aethyme graph materialize --repo ."));
-        assert!(doc.contains("Do not enable graph authority merely to silence"));
-        assert!(doc.len() <= COMPACT_POLICY_MAX_BYTES, "{} bytes", doc.len());
+        for needle in [
+            "## Broker Coordination: before and after an edit",
+            "`aethyme broker start --task \"<task>\"`",
+            "work only in the worktree it\n   reports",
+            "Never edit another session's worktree.",
+            "`aethyme broker submit --session <id>`",
+            "`aethyme broker finish --session <id>`",
+            "`aethyme broker advanced git`",
+            "`aethyme broker advanced gh`",
+            "editing or submitting never authorizes\npublishing",
+            ".aethyme/broker-action-required.md",
+            "`references/broker.md`",
+        ] {
+            assert!(doc.contains(needle), "missing {needle:?}:\n{doc}");
+        }
+        // The broker section sits before the template's own sections.
+        assert!(
+            doc.find("## Broker Coordination: before and after an edit")
+                < doc.find("## Finding code")
+        );
+        let tokens = doc.len() / 4;
+        assert!(
+            tokens <= GENERATED_POLICY_MAX_TOKENS,
+            "{tokens} tokens:\n{doc}"
+        );
+        // What left the root file lives in the reference, in current spellings.
         let reference = render_broker_reference();
-        assert!(reference.contains("aethyme broker cleanup --all-cleaned --apply"));
-        assert!(reference.contains("aethyme broker operations reconcile"));
-        assert!(reference.contains("aethyme broker ship execute"));
+        for moved in [
+            "aethyme broker status --json",
+            "--path <planned-path>",
+            "aethyme broker start --adopt --task",
+            "aethyme broker advanced leases claim <path>",
+            "aethyme broker advanced exec --session",
+            "AETHYME_TEST_DB_SUFFIX",
+            "aethyme broker finish cleanup --all-cleaned --apply",
+            "aethyme broker advanced operations reconcile",
+            "aethyme broker advanced ship execute",
+            "aethyme broker start --reuse --task",
+            "aethyme graph materialize --repo .",
+            "authority merely to silence a degraded response",
+            "local-only",
+            "Advisories never expand gate selection",
+            "do not retry blindly",
+        ] {
+            assert!(
+                reference.contains(moved),
+                "broker reference missing {moved:?}"
+            );
+        }
         std::fs::remove_dir_all(&repo).unwrap();
+    }
+
+    #[test]
+    fn both_generated_document_forms_are_recognized() {
+        let current = render_agents_document(None).unwrap();
+        assert!(looks_like_generated_agents_document(&current));
+        let legacy = "# Agent Instructions\nThis repository is **Aethyme-enhanced**\n\
+                      ## Quick start (any agent)\n## Detailed reference\n\
+                      ## Verifying this enhancement\n";
+        assert!(looks_like_generated_agents_document(legacy));
+        assert!(!looks_like_generated_agents_document(
+            "# Agent Instructions\nmine\n"
+        ));
     }
 
     #[test]
