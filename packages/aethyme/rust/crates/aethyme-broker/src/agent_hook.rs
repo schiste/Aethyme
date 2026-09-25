@@ -186,7 +186,7 @@ fn decide(
 
     let outcome = match event {
         HookEvent::SessionStart => with_installation_notice(
-            on_session_start(&mut broker, session.as_ref()),
+            on_session_start(&mut broker, &canonical, session.as_ref()),
             &installation_notice,
         ),
         HookEvent::UserPromptSubmit => on_user_prompt_submit(&mut broker, session.as_ref()),
@@ -237,9 +237,27 @@ fn installation_context(warnings: &[String]) -> Option<HookOutcome> {
 /// An agent working in the main checkout, or in a worktree the broker
 /// does not know, has no session — that is a normal state, not an error,
 /// and `SessionStart` turns it into a nudge to register.
+///
+/// An exact worktree match wins. Otherwise the deepest live session worktree
+/// containing `cwd` does, so a hook invoked from a subdirectory of a session
+/// worktree (no `--repo`) still finds its session instead of reporting an
+/// unregistered checkout.
 fn current_session(broker: &mut Broker, cwd: &std::path::Path) -> Option<Session> {
     let key = cwd.to_string_lossy().to_string();
-    broker.store().session_for_worktree(&key).ok().flatten()
+    if let Some(found) = broker.store().session_for_worktree(&key).ok().flatten() {
+        return Some(found);
+    }
+    broker
+        .store()
+        .live_sessions()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|candidate| {
+            let root = std::path::Path::new(&candidate.worktree_path);
+            let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+            cwd.starts_with(&root)
+        })
+        .max_by_key(|candidate| candidate.worktree_path.len())
 }
 
 fn touch(broker: &mut Broker, session: Option<&Session>) {
@@ -252,64 +270,299 @@ fn touch(broker: &mut Broker, session: Option<&Session>) {
     }
 }
 
-/// Register presence, and tell every peer that the repository just
-/// became crowded.
+/// Register presence, tell every peer that the repository just became
+/// crowded, and hand the agent its current state plus the one command to run
+/// next.
 ///
-/// This is the T1 transition (SOLO → COORDINATED) and it is announced by
-/// the session that *causes* it, at the moment it causes it. No peer has
-/// to poll to discover the new arrival, and no extra state is needed to
-/// remember whether the announcement was already made — the note channel
-/// itself is the memory.
-fn on_session_start(broker: &mut Broker, session: Option<&Session>) -> HookOutcome {
+/// The arrival note is the T1 transition (SOLO → COORDINATED), announced by
+/// the session that *causes* it, at the moment it causes it. No peer has to
+/// poll to discover the new arrival, and no extra state is needed to remember
+/// whether the announcement was already made — the note channel itself is the
+/// memory.
+///
+/// What the agent receives is state, not rules (recovery plan P4.7). The
+/// policy lives in the generated root guidance and the skill; restating it
+/// here billed it twice and still left the agent to work out which rule
+/// applied. A state line and a `Next:` command are what it acts on.
+fn on_session_start(
+    broker: &mut Broker,
+    cwd: &std::path::Path,
+    session: Option<&Session>,
+) -> HookOutcome {
     let Some(session) = session else {
-        return HookOutcome::Context(
-            "This repository coordinates concurrent agents through the Aethyme broker, and \
-             this session is not registered. Before editing, run `aethyme broker status --json` \
-             and then `aethyme broker start --task \"<task>\"`, and work in the worktree it \
-             reports."
-                .into(),
-        );
+        let live = broker.store().live_sessions().unwrap_or_default();
+        let tab_session = host_tab_name().and_then(|tab| {
+            live.iter()
+                .find(|other| {
+                    !other.status.is_closed() && other.tab_name.as_deref() == Some(tab.as_str())
+                })
+                .map(|other| (other.id, other.worktree_path.clone()))
+        });
+        let facts = StartFacts {
+            checkout: cwd.display().to_string(),
+            tab_session,
+            peers: live
+                .iter()
+                .filter(|other| !other.status.is_closed())
+                .map(|other| (other.id, other.task.clone()))
+                .collect(),
+            ..StartFacts::default()
+        };
+        return HookOutcome::Context(render_start(&facts));
     };
     touch(broker, Some(session));
 
+    if session.status.is_closed() {
+        let facts = StartFacts {
+            checkout: cwd.display().to_string(),
+            session: Some(SessionFacts {
+                id: session.id,
+                worktree: session.worktree_path.clone(),
+                task: session.task.clone(),
+                closed: true,
+            }),
+            ..StartFacts::default()
+        };
+        return HookOutcome::Context(render_start(&facts));
+    }
+
     let peers = live_peers(broker, session.id);
-    if peers.is_empty() {
-        return HookOutcome::Context(
-            "Aethyme: you are the only live session on this repository. Nothing is contended, \
-             so you do not need to poll `aethyme broker status` — you will be told at your next \
-             turn boundary if a second session appears."
-                .into(),
+    if !peers.is_empty() {
+        let joined = format!(
+            "Aethyme: session {} joined this repository. You are no longer the only live \
+             session — claim paths before editing shared files (`aethyme broker advanced \
+             leases claim <path> --session <id>`) and integrate through `aethyme broker submit`.",
+            session.id
         );
-    }
-
-    let joined = format!(
-        "Aethyme: session {} joined this repository. You are no longer the only live session — \
-         claim paths before editing shared files (`aethyme broker advanced leases claim <path> --session \
-         <id>`) and integrate through `aethyme broker submit`.",
-        session.id
-    );
-    for peer in &peers {
-        // SessionStart fires again whenever the agent's TUI restarts on
-        // the same worktree. Announce a given pairing once, or a peer
-        // collects one identical note per restart.
-        if already_announced(broker, session.id, peer.id) {
-            continue;
+        for peer in &peers {
+            // SessionStart fires again whenever the agent's TUI restarts on
+            // the same worktree. Announce a given pairing once, or a peer
+            // collects one identical note per restart.
+            if already_announced(broker, session.id, peer.id) {
+                continue;
+            }
+            crate::warn_unrecorded(
+                "record the arrival note for a peer session",
+                broker
+                    .store()
+                    .record_session_note(session.id, peer.id, &joined),
+            );
         }
-        crate::warn_unrecorded(
-            "record the arrival note for a peer session",
-            broker
-                .store()
-                .record_session_note(session.id, peer.id, &joined),
-        );
     }
 
-    HookOutcome::Context(format!(
-        "Aethyme: {} other live session(s) on this repository ({}). Work only in your own \
-         worktree, claim shared paths before editing, and integrate through `aethyme broker \
-         submit`.",
-        peers.len(),
-        describe(&peers)
-    ))
+    let blockers: Vec<crate::Blocker> = broker
+        .blockers()
+        .blockers
+        .into_iter()
+        .filter(|blocker| blocker.session_id.is_none_or(|owner| owner == session.id))
+        .collect();
+    let advisories = broker
+        .store()
+        .outstanding_advisories_for_session(session.id)
+        .map(|found| found.len())
+        .unwrap_or(0);
+    let facts = StartFacts {
+        checkout: cwd.display().to_string(),
+        session: Some(SessionFacts {
+            id: session.id,
+            worktree: session.worktree_path.clone(),
+            task: session.task.clone(),
+            closed: false,
+        }),
+        tab_session: None,
+        peers: peers
+            .iter()
+            .map(|peer| (peer.id, peer.task.clone()))
+            .collect(),
+        first_blocker: blockers.first().map(|blocker| blocker.clear.clone()),
+        blocker_count: blockers.len(),
+        advisories,
+        unintegrated_commits: unintegrated_commits(broker, session),
+    };
+    HookOutcome::Context(render_start(&facts))
+}
+
+/// The host tab this agent runs in, when the host exports one — the same
+/// variables `broker start` records as a session's `tab_name`. It is the only
+/// signal that ties an agent sitting in the wrong checkout to the session it
+/// registered, so without it the hook does not guess.
+fn host_tab_name() -> Option<String> {
+    ["AETHYME_SESSION_TAB_NAME", "AETHYME_CHAU7_TAB_NAME"]
+        .iter()
+        .find_map(|name| std::env::var(name).ok())
+        .filter(|value| !value.trim().is_empty())
+}
+
+/// Commits in the session worktree that the integration branch does not hold
+/// yet. Two local `git` reads; zero on any failure, which only ever costs the
+/// agent a `submit` suggestion, never a wrong one.
+fn unintegrated_commits(broker: &Broker, session: &Session) -> usize {
+    let branch = crate::merge::PromoteConfig::load(&broker.main_root_path()).branch;
+    let Ok(worktree) = crate::GitRepo::discover(std::path::Path::new(&session.worktree_path))
+    else {
+        return 0;
+    };
+    let base = if worktree.resolve_ref(&branch).is_some() {
+        branch
+    } else if let Some(diff_base) = session.diff_base.clone() {
+        diff_base
+    } else {
+        return 0;
+    };
+    worktree
+        .commit_count_between(&base, "HEAD")
+        .map(|count| count as usize)
+        .unwrap_or(0)
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct SessionFacts {
+    id: i64,
+    worktree: String,
+    task: Option<String>,
+    closed: bool,
+}
+
+/// Everything the `SessionStart` brief reports, gathered once so the
+/// rendering — the part agents read — is a pure function under test.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct StartFacts {
+    checkout: String,
+    session: Option<SessionFacts>,
+    /// A live session registered for this agent's host tab, when the agent
+    /// is sitting in a checkout that is not that session's worktree.
+    tab_session: Option<(i64, String)>,
+    peers: Vec<(i64, Option<String>)>,
+    /// The clear command of the first blocker that is this session's (or the
+    /// whole repository's) to clear.
+    first_blocker: Option<String>,
+    blocker_count: usize,
+    advisories: usize,
+    unintegrated_commits: usize,
+}
+
+/// Longest task text quoted in the brief. A task is a label here, not a
+/// specification; the full text is one `broker status` away.
+const TASK_PREVIEW_CHARS: usize = 60;
+
+fn preview(task: &str) -> String {
+    let task = task.trim();
+    if task.chars().count() <= TASK_PREVIEW_CHARS {
+        return task.to_string();
+    }
+    let cut: String = task.chars().take(TASK_PREVIEW_CHARS - 1).collect();
+    format!("{}…", cut.trim_end())
+}
+
+fn shell_quote(path: &str) -> String {
+    format!("'{}'", path.replace('\'', "'\\''"))
+}
+
+fn describe_peers(peers: &[(i64, Option<String>)], other: bool) -> String {
+    let other = if other { "other " } else { "" };
+    if peers.is_empty() {
+        return format!("no {other}live session");
+    }
+    let listed = peers
+        .iter()
+        .take(3)
+        .map(|(id, task)| match task.as_deref() {
+            Some(task) => format!("{id}: {}", preview(task)),
+            None => id.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    let more = peers.len().saturating_sub(3);
+    let suffix = if more > 0 {
+        format!("; +{more} more")
+    } else {
+        String::new()
+    };
+    let noun = if peers.len() == 1 {
+        "session"
+    } else {
+        "sessions"
+    };
+    format!("{} {other}live {noun} ({listed}{suffix})", peers.len())
+}
+
+/// The brief: at most five lines in the normal case, always ending in one
+/// `Next:` command.
+fn render_start(facts: &StartFacts) -> String {
+    let mut lines = Vec::new();
+    let Some(session) = &facts.session else {
+        lines.push(format!(
+            "Aethyme: this checkout ({}) is not a broker session; {}.",
+            facts.checkout,
+            describe_peers(&facts.peers, false)
+        ));
+        match &facts.tab_session {
+            Some((id, worktree)) => {
+                lines.push(format!(
+                    "Session {id} is registered for this tab in another worktree."
+                ));
+                lines.push(format!("Next: cd {}", shell_quote(worktree)));
+            }
+            None => {
+                lines.push(
+                    "Next: aethyme broker start --task \"<task>\" (then work only in the worktree it reports)"
+                        .to_string(),
+                );
+            }
+        }
+        return lines.join("\n");
+    };
+
+    let task = session
+        .task
+        .as_deref()
+        .map(|task| format!(": {}", preview(task)))
+        .unwrap_or_default();
+    if session.closed {
+        lines.push(format!(
+            "Aethyme: session {}{task} is finished; this worktree is no longer registered for new work.",
+            session.id
+        ));
+        lines.push("Next: aethyme broker start --reuse --task \"<follow-up task>\"".to_string());
+        return lines.join("\n");
+    }
+
+    lines.push(format!("Aethyme: session {}{task}", session.id));
+    lines.push(format!("Worktree: {}", session.worktree));
+    let blockers = match facts.blocker_count {
+        0 => "no blockers".to_string(),
+        1 => "1 blocker".to_string(),
+        n => format!("{n} blockers"),
+    };
+    let advisories = match facts.advisories {
+        0 => "no advisories".to_string(),
+        1 => "1 outstanding advisory".to_string(),
+        n => format!("{n} outstanding advisories"),
+    };
+    let commits = match facts.unintegrated_commits {
+        0 => "nothing committed to integrate".to_string(),
+        1 => "1 commit to integrate".to_string(),
+        n => format!("{n} commits to integrate"),
+    };
+    lines.push(format!(
+        "State: {}; {blockers}; {advisories}; {commits}.",
+        describe_peers(&facts.peers, true)
+    ));
+    let next = if let Some(clear) = &facts.first_blocker {
+        clear.clone()
+    } else if facts.unintegrated_commits > 0 {
+        format!("aethyme broker submit --session {}", session.id)
+    } else if facts.advisories > 0 {
+        "aethyme broker status --json (read the advisories before editing the named paths)"
+            .to_string()
+    } else {
+        format!(
+            "edit in this worktree and commit, then aethyme broker submit --session {}",
+            session.id
+        )
+    };
+    lines.push(format!("Next: {next}"));
+    lines.join("\n")
 }
 
 /// Deliver what changed since the last turn, and nothing else.
@@ -439,17 +692,6 @@ fn live_peers(broker: &mut Broker, self_id: i64) -> Vec<Session> {
         .collect()
 }
 
-fn describe(peers: &[Session]) -> String {
-    peers
-        .iter()
-        .map(|peer| match peer.task.as_deref() {
-            Some(task) => format!("{}: {task}", peer.id),
-            None => peer.id.to_string(),
-        })
-        .collect::<Vec<_>>()
-        .join("; ")
-}
-
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -528,6 +770,133 @@ mod tests {
             repo_relative(std::path::Path::new("/elsewhere/a.rs"), "/wt/s1", main),
             None
         );
+    }
+
+    fn open_session(id: i64) -> SessionFacts {
+        SessionFacts {
+            id,
+            worktree: "/wt/s7".into(),
+            task: Some("fix the parser".into()),
+            closed: false,
+        }
+    }
+
+    fn next_line(text: &str) -> &str {
+        text.lines()
+            .last()
+            .and_then(|line| line.strip_prefix("Next: "))
+            .unwrap_or_else(|| panic!("the brief must end in one Next: line: {text}"))
+    }
+
+    /// P4.7: the brief is state plus one command, never a paragraph of rules.
+    #[test]
+    fn unregistered_checkout_is_told_to_start() {
+        let text = render_start(&StartFacts {
+            checkout: "/repo".into(),
+            peers: vec![(3, Some("other work".into()))],
+            ..StartFacts::default()
+        });
+        assert!(text.lines().count() <= 5, "{text}");
+        assert!(text.contains("not a broker session"), "{text}");
+        assert!(
+            text.contains("1 other live session (3: other work)"),
+            "{text}"
+        );
+        assert!(
+            next_line(&text).starts_with("aethyme broker start --task \"<task>\""),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_checkout_other_than_the_tab_session_is_told_to_cd() {
+        let text = render_start(&StartFacts {
+            checkout: "/repo".into(),
+            tab_session: Some((7, "/wt/it's here".into())),
+            ..StartFacts::default()
+        });
+        assert_eq!(next_line(&text), "cd '/wt/it'\\''s here'", "{text}");
+    }
+
+    #[test]
+    fn a_finished_session_is_told_to_reuse() {
+        let text = render_start(&StartFacts {
+            checkout: "/wt/s7".into(),
+            session: Some(SessionFacts {
+                closed: true,
+                ..open_session(7)
+            }),
+            ..StartFacts::default()
+        });
+        assert!(
+            next_line(&text).starts_with("aethyme broker start --reuse --task"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn next_action_prefers_blocker_then_commits_then_advisories() {
+        let base = StartFacts {
+            checkout: "/wt/s7".into(),
+            session: Some(open_session(7)),
+            ..StartFacts::default()
+        };
+        let idle = render_start(&base);
+        assert_eq!(idle.lines().count(), 4, "{idle}");
+        assert!(idle.contains("Worktree: /wt/s7"), "{idle}");
+        assert!(
+            idle.contains("no other live session; no blockers; no advisories"),
+            "{idle}"
+        );
+        assert!(
+            next_line(&idle).ends_with("aethyme broker submit --session 7"),
+            "{idle}"
+        );
+
+        let advised = render_start(&StartFacts {
+            advisories: 2,
+            ..base.clone()
+        });
+        assert!(
+            next_line(&advised).starts_with("aethyme broker status --json"),
+            "{advised}"
+        );
+
+        let committed = render_start(&StartFacts {
+            advisories: 2,
+            unintegrated_commits: 3,
+            ..base.clone()
+        });
+        assert!(committed.contains("3 commits to integrate"), "{committed}");
+        assert_eq!(next_line(&committed), "aethyme broker submit --session 7");
+
+        let blocked = render_start(&StartFacts {
+            advisories: 2,
+            unintegrated_commits: 3,
+            blocker_count: 1,
+            first_blocker: Some("aethyme broker unblock op:4 --outcome succeeded".into()),
+            ..base
+        });
+        assert!(blocked.contains("1 blocker"), "{blocked}");
+        assert_eq!(
+            next_line(&blocked),
+            "aethyme broker unblock op:4 --outcome succeeded"
+        );
+        assert!(blocked.lines().count() <= 5, "{blocked}");
+    }
+
+    #[test]
+    fn long_task_text_is_previewed_not_dumped() {
+        let long = "x".repeat(200);
+        let text = render_start(&StartFacts {
+            checkout: "/wt/s7".into(),
+            session: Some(SessionFacts {
+                task: Some(long),
+                ..open_session(7)
+            }),
+            ..StartFacts::default()
+        });
+        assert!(text.lines().next().unwrap().chars().count() < 100, "{text}");
     }
 
     /// Read-only tools cost nothing: no lease lookup happens at all.

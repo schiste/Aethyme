@@ -5,6 +5,8 @@ aethyme hook — agent-surface hook entry point (called by the Aethyme plugin)
 Usage:
   aethyme hook <SessionStart|UserPromptSubmit|PreToolUse|PostToolUse|Stop> [--repo <path>]
       Reads the event JSON on stdin and prints a hook envelope only when it has
-      something new to say. Always exits 0; any failure is silent.
+      something new to say. SessionStart reports this checkout's broker state
+      (session, worktree, blockers, advisories, commits to integrate) and ends
+      in one `Next:` command. Always exits 0; any failure is silent.
       --repo <path>   Checkout to act for (default: current directory).
 --- stderr
