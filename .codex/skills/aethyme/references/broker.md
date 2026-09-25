@@ -7,7 +7,7 @@ check the paired runtime with `aethyme --version` and
 `aethyme-engine-cli --version`.
 Follow this protocol:
 
-When `aethyme broker hooks install` is active (or its pre-commit command is
+When `aethyme broker advanced hooks install` is active (or its pre-commit command is
 wired into an existing hook manager), Git enforces the session boundary on
 protected branches: local broker state requires the exact worktree to belong
 to a live session, and fetched upstream divergence blocks the commit before
@@ -26,7 +26,7 @@ blocked.
 
    `cd` into the reported worktree before editing. If you are already in a
    dedicated worktree, use
-   `aethyme broker adopt --task "<your task>" --path <planned-path>` instead.
+   `aethyme broker start --adopt --task "<your task>" --path <planned-path>` instead.
    Repeat `--path` for every file or trailing-slash directory known up front.
    The broker validates the whole set first, then creates the session plus
    explicit leases atomically. Omit `--path` only when no target is known yet.
@@ -35,12 +35,12 @@ blocked.
    overlapping edits will conflict at merge time.
 
 2. **Lease additional shared files before the diff exists**. Prefer the
-   atomic `start/adopt --path` declaration above for initial intent. If the
+   atomic `start --path` / `start --adopt --path` declaration above for initial intent. If the
    session already exists and scope expands, claim the new path explicitly:
 
    ```bash
-   aethyme broker leases claim <path> --session <your-session-id>
-   aethyme broker leases release <path> --session <your-session-id>
+   aethyme broker advanced leases claim <path> --session <your-session-id>
+   aethyme broker advanced leases release <path> --session <your-session-id>
    ```
 
    Use a trailing `/` for directory leases. Implicit leases refresh from
@@ -50,7 +50,7 @@ blocked.
    command likely to touch many files, run through the broker guard:
 
    ```bash
-   aethyme broker exec --session <your-session-id> -- <command>
+   aethyme broker advanced exec --session <your-session-id> -- <command>
    ```
 
    The guard fails if the command leaves dirty paths outside your explicit
@@ -104,8 +104,8 @@ blocked.
    confirm the plan's full publication SHA:
 
    ```bash
-   aethyme broker ship plan --entry <promoted-entry-id>
-   aethyme broker ship execute --entry <promoted-entry-id> --confirm <full-publication-sha>
+   aethyme broker advanced ship plan --entry <promoted-entry-id>
+   aethyme broker advanced ship execute --entry <promoted-entry-id> --confirm <full-publication-sha>
    ```
 
    Prefer this reviewed broker ship workflow over a raw push. Never infer
@@ -115,13 +115,13 @@ blocked.
    Report the outcome (verified / rejected / conflict) in your summary.
    Afterwards, finish the session with
    `aethyme broker finish --session <id>`, or point it at a follow-up task
-   with `aethyme broker adopt --reuse --task "..."`. `finish` closes broker
+   with `aethyme broker start --reuse --task "..."`. `finish` closes broker
    state but deliberately leaves the worktree available for review or reuse.
    When it reports cleanup is safe, reclaim that exact worktree with
-   `aethyme broker cleanup <id>`. Operators can periodically review all
-   retained broker-owned worktrees with `aethyme broker cleanup --all-cleaned`
-   and apply the unchanged plan explicitly with
-   `aethyme broker cleanup --all-cleaned --apply`.
+   `aethyme broker finish cleanup <id>`. Operators can periodically review all
+   retained broker-owned worktrees with
+   `aethyme broker finish cleanup --all-cleaned` and apply the unchanged plan
+   explicitly with `aethyme broker finish cleanup --all-cleaned --apply`.
 
 7. **If a file named `.aethyme/broker-action-required.md` appears in your
    worktree**, read it immediately: your submission conflicted. It names
@@ -160,7 +160,7 @@ blocked.
    durable Git operation coordinator:
 
    ```bash
-   aethyme broker git --session <your-session-id> \
+   aethyme broker advanced git --session <your-session-id> \
      [--repo <owner/name>] --reason "<authorization>" -- <git-args> ...
    ```
 
@@ -170,7 +170,7 @@ blocked.
    or non-GET API calls) must use the GitHub operation coordinator:
 
    ```bash
-   aethyme broker gh --session <your-session-id> \
+   aethyme broker advanced gh --session <your-session-id> \
      --repo <owner/name> --reason "<authorization>" -- <gh-args> ...
    ```
 
@@ -180,7 +180,7 @@ blocked.
    Every coordinated write requires a concise `--reason` identifying the user
    request or documented workflow that authorized it.
    If a crashed command leaves an unknown outcome, inspect external state and
-   use `aethyme broker operations reconcile`; do not retry blindly.
+   use `aethyme broker advanced operations reconcile`; do not retry blindly.
 
    Direct Git is limited to read-only inspection and operations confined to
    the isolated session worktree and session branch that cannot affect other
