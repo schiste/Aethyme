@@ -56,18 +56,19 @@ fn assert_native_root_guidance(repo: &Path) {
         assert!(text.contains("aethyme explore"));
         assert!(!text.contains("AETHYME_ROOT"));
         assert!(!text.contains("/rust/target/release/aethyme"));
-        // Phase 6 (2026-08-01) widened the notice: the Python CLI is gone
-        // entirely, not just its `explore` subcommand. The "Do not run"
-        // marker must survive — the contract checker and verify-playground
-        // exempt lines carrying it from the stale-invocation greps.
-        assert!(text.contains("Do not run `python -m src.cli ...` for anything"));
+        // Recovery plan P4.5 (2026-09-25): the root file prescribes the one
+        // Explore command; the temp-file projection flow (and the
+        // "Do not run `python -m src.cli`" notice) moved to the skill.
+        assert!(text.contains("--format brief"));
+        assert!(text.contains("navigation aid, not an answer"));
         assert!(!text.contains(r#""$AETHYME_ROOT/.venv/bin/python" -m src.cli explore"#));
-        // Phase 5.5: the compact projection is native, and nothing in the
-        // deployed root guidance may reach for the Aethyme venv Python.
-        assert!(text.contains("explore-summary --from"));
         assert!(
             !text.contains(".venv/bin/python"),
             "{filename} reaches for the venv"
+        );
+        assert!(
+            !text.contains("-m src.cli"),
+            "{filename} names the Python CLI"
         );
     }
 }
@@ -152,7 +153,11 @@ fn verify_playground_enforces_guidance_and_discovery_hygiene() {
 
     for needle in [
         "check_root_guidance",
-        r#""$AETHYME_ROOT/rust/target/release/aethyme" explore"#,
+        // Recovery plan P4.5/P4.6: root guidance is checked for the one-call
+        // brief and its verification warning; the projection flow is checked
+        // on the skill.
+        "--format brief",
+        "navigation aid, not an answer",
         // Phase 2 template flip (2026-07-30): the staleness check widened
         // from 'src.cli explore' to any executable `-m src.cli` line.
         "executable 'python -m src.cli' guidance",

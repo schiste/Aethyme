@@ -85,11 +85,38 @@ fn every_documented_broker_flag_appears_in_the_usage_text() {
         if !line.starts_with("- `aethyme broker ") {
             continue;
         }
-        let documented = flags(line);
+        let mut documented = flags(line);
         if documented.is_empty() {
             continue;
         }
-        let name = command(line);
+        // The reference uses the public spellings (`advanced leases claim`,
+        // `status readiness`, `start --adopt`); the usage text lists internal
+        // commands. Resolve the way the router does before comparing.
+        let span = line
+            .trim_start_matches("- `aethyme broker ")
+            .split('`')
+            .next()
+            .unwrap_or_default();
+        // An optional `[--json]` is still `--json` to the resolver, which is
+        // what turns a bare `unblock` into the `blockers` listing.
+        let words: Vec<String> = span
+            .split_whitespace()
+            .map(|word| if word == "[--json]" { "--json" } else { word })
+            .map(str::to_string)
+            .collect();
+        let mut args = aethyme_broker::cli::resolve(&words).args;
+        // `start` merges by flag, as the dispatcher does; `--adopt` only
+        // selects the form, so the adopt usage line does not list it.
+        if args.first().map(String::as_str) == Some("start") {
+            let has = |flag: &str| args.iter().any(|arg| arg == flag);
+            if has("--adopt") || has("--reuse") || has("--replace-stale") {
+                args[0] = "adopt".to_string();
+                documented.remove("--adopt");
+            } else if has("--cmd") {
+                args[0] = "start-agent".to_string();
+            }
+        }
+        let name = command(&format!("aethyme broker {}", args.join(" ")));
         match usage.get(&name) {
             // A documented flag absent from the usage text is either an
             // undocumented-in-help feature or, worse, one that does not exist.

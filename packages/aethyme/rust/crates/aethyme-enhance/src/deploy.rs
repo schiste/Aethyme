@@ -63,6 +63,14 @@ pub const TARGETS: &[(&str, &str)] = &[
         templates::REF_DEAD_CODE_MD,
     ),
     (
+        ".claude/skills/aethyme/references/policy.md",
+        templates::REF_POLICY_MD,
+    ),
+    (
+        ".codex/skills/aethyme/references/policy.md",
+        templates::REF_POLICY_MD,
+    ),
+    (
         ".claude/skills/aethyme-review-rule-maker/SKILL.md",
         templates::REVIEW_RULES_SKILL_MD,
     ),
@@ -843,8 +851,8 @@ mod tests {
         assert_eq!(actions.first().unwrap().relative_path, "AGENTS.md");
         assert_eq!(actions.last().unwrap().relative_path, SETTINGS_FILE);
         assert!(actions.iter().all(|a| a.action == "created"));
-        // 1 AGENTS + 6 onboarding + 17 targets + settings = 25.
-        assert_eq!(actions.len(), 25);
+        // 1 AGENTS + 6 onboarding + 19 targets + settings = 27.
+        assert_eq!(actions.len(), 27);
 
         let settings = std::fs::read_to_string(repo.join(SETTINGS_FILE)).unwrap();
         assert_eq!(
@@ -894,19 +902,18 @@ mod tests {
         let agents = std::fs::read_to_string(repo.join("AGENTS.md")).unwrap();
         let claude = std::fs::read_to_string(repo.join("CLAUDE.md")).unwrap();
         assert_eq!(agents, claude);
-        for required in [
-            "delivered\nadvisories as work context",
-            "aethyme broker status --json",
-        ] {
-            assert!(
-                agents.contains(required),
-                "missing protocol clause: {required}"
-            );
-        }
+        // The root file stays compact (recovery plan P4.5) and points at the
+        // reference, which carries the advisory lifecycle in full.
+        assert!(
+            agents.contains("`references/broker.md`"),
+            "root guidance must point at the broker reference"
+        );
         let reference =
             std::fs::read_to_string(repo.join(".codex/skills/aethyme/references/broker.md"))
                 .unwrap();
         for required in [
+            "Treat broker advisories as delivered work context",
+            "aethyme broker status --json",
             "gitignored persistence projection",
             "Acknowledging a notice stops repeat delivery",
             "selected integration prefix clears only entries contained",

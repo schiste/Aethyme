@@ -86,6 +86,12 @@ fn skill_md_is_concise_auto_load_card() {
         "references/explore.md",
         "references/graph-task.md",
         "references/dead-code.md",
+        // Recovery plan P4.5/P4.6: the one-call brief leads, as a
+        // navigation aid to verify, and the relocated policy is linked.
+        "--format brief",
+        "navigation aid, not an authority",
+        "references/broker.md",
+        "references/policy.md",
     ] {
         assert!(text.contains(needle), "SKILL.md missing {needle:?}");
     }
@@ -93,17 +99,20 @@ fn skill_md_is_concise_auto_load_card() {
     assert!(!text.contains("navigation_hints[]"));
 }
 
+/// Recovery plan P4.5/P4.6: the generated root template prescribes the one
+/// Explore command, says it must be verified, and points at the skill for
+/// the full projection contract instead of repeating it.
 #[test]
-fn generated_agents_template_uses_projection_contract() {
+fn generated_agents_template_prescribes_one_verified_explore_call() {
     let text = read(agents_path());
     for needle in [
-        "mktemp -t aethyme-explore",
-        "top_verification_targets",
-        "observability.readiness",
-        "verify-targets",
-        "explore-summary --from",
-        "120 output lines / 20k chars",
-        "multi-file `sed`",
+        "aethyme explore --request \"<question>\" --format brief",
+        "navigation aid, not an answer",
+        "Verify the spans",
+        ".claude/skills/aethyme/SKILL.md",
+        "`explore.md`",
+        "`broker.md`",
+        "`policy.md`",
     ] {
         assert!(
             text.contains(needle),
@@ -112,6 +121,7 @@ fn generated_agents_template_uses_projection_contract() {
     }
     assert!(!text.contains(".venv/bin/python"));
     assert!(!text.contains("navigation_hints[]"));
+    assert!(!text.contains("mktemp -t aethyme-explore"));
 }
 
 #[test]
@@ -172,7 +182,13 @@ fn enhance_deploys_aethyme_skill_references() {
     invoke_aethyme(["enhance", "deploy", "--repo", &repo.display().to_string()]).ok();
 
     for product in [".codex", ".claude"] {
-        for name in ["explore.md", "graph-task.md", "dead-code.md"] {
+        for name in [
+            "explore.md",
+            "graph-task.md",
+            "dead-code.md",
+            "policy.md",
+            "broker.md",
+        ] {
             let path = repo
                 .join(product)
                 .join("skills/aethyme/references")

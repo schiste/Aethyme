@@ -35,7 +35,7 @@ When Aethyme is run from its source checkout, session start, adopt, and
 start-agent also compare the installed broker build with the checkout's
 correctness sources. A stale installed build emits a non-blocking stderr
 warning; it does not silently block the lifecycle command. Run
-`aethyme broker doctor --fix-version` from the source checkout to install and
+`aethyme broker status doctor --fix-version` from the source checkout to install and
 verify the router/engine pair from the current revision.
 **`python -m src.cli` no longer exists** — the Python
 package was deleted on 2026-08-01 (python-retirement Phase 6) with no
@@ -63,59 +63,58 @@ product surface.
 - `aethyme deploy verify`
 - `aethyme deploy bridge`
 - `aethyme deploy --local-only`
+- `aethyme deploy plan`
+- `aethyme deploy execute`
 - `aethyme init`
 - `aethyme certify`
-- `aethyme broker readiness`
-- `aethyme broker status`
-- `aethyme broker start`
-- `aethyme broker adopt`
-- `aethyme broker exec`
-- `aethyme broker git`
-- `aethyme broker gh`
-- `aethyme broker operations`
-- `aethyme broker advisories`
-- `aethyme broker queue history`
-- `aethyme broker submit`
-- `aethyme broker repair`
-- `aethyme broker finish`
-- `aethyme broker representation`
-- `aethyme broker handoff`
-- `aethyme broker report capture`
-- `aethyme broker report list`
-- `aethyme broker report show`
-- `aethyme broker report render`
-- `aethyme broker report file`
-- `aethyme broker ship plan`
-- `aethyme broker ship execute`
-- `aethyme broker integration status`
-- `aethyme broker integration reconcile`
-- `aethyme broker quick-test`
-- `aethyme broker verify-loop`
+- `aethyme broker start` (its adopt, reuse and spawn forms are in the verb table under Broker Commands)
+- `aethyme broker status` (also `status readiness`, `status doctor`)
+- `aethyme broker submit` (also `submit prepare`, `submit promote`, `submit promotion-record`)
+- `aethyme broker finish` (also `finish close`, `finish cleanup`)
+- `aethyme broker unblock`
+- `aethyme broker gc` (also `gc reclaim`, `gc storage`, `gc reap`)
 - `aethyme update check`
 - `aethyme update plan`
 - `aethyme update execute`
-- `aethyme deploy plan`
-- `aethyme deploy execute`
 - `aethyme upgrade plan`
 - `aethyme upgrade apply`
-- `aethyme explore`
+- `aethyme explore` (`--format brief` for one-call navigation)
 
 ### Advanced Public Tools
 
-- `aethyme broker gates ...`
-- `aethyme broker events`
-- `aethyme broker metrics`
-- `aethyme broker doctor`
-- `aethyme broker leases ...`
-- `aethyme broker pr check`
-- `aethyme broker cleanup`
-- `aethyme broker storage ...`
+Everything else in the broker is reached through `aethyme broker advanced
+<verb>`; `aethyme broker advanced --help` lists every verb. The ones operators
+use most:
+
+- `aethyme broker advanced git`
+- `aethyme broker advanced gh`
+- `aethyme broker advanced operations`
+- `aethyme broker advanced exec`
+- `aethyme broker advanced leases ...`
+- `aethyme broker advanced ship plan`
+- `aethyme broker advanced ship execute`
+- `aethyme broker advanced advisories`
+- `aethyme broker advanced queue history`
+- `aethyme broker advanced repair`
+- `aethyme broker advanced representation`
+- `aethyme broker advanced handoff`
+- `aethyme broker advanced report capture`
+- `aethyme broker advanced report list`
+- `aethyme broker advanced report show`
+- `aethyme broker advanced report render`
+- `aethyme broker advanced report file`
+- `aethyme broker advanced integration status`
+- `aethyme broker advanced integration reconcile`
+- `aethyme broker advanced quick-test`
+- `aethyme broker advanced verify-loop`
+- `aethyme broker advanced gates ...`
+- `aethyme broker advanced events`
+- `aethyme broker advanced metrics`
+- `aethyme broker advanced pr check`
 - `aethyme graph ...`
 - `aethyme facts ...`
 - `aethyme task ...`
 - `aethyme analyze dead-code`
-- `aethyme enhance deploy`
-- `aethyme enhance verify`
 - `aethyme repo experience-*`
 
 ### Internal Or Historical
@@ -152,7 +151,7 @@ Update authority follows installation provenance:
 `execute` requires the full reviewed manifest SHA-256. It re-downloads and
 revalidates that exact manifest, verifies archive size and SHA-256, requires
 exactly the two expected archive members, validates both embedded versions,
-runs `aethyme broker quick-test` against the staged pair, then atomically swaps
+runs `aethyme broker advanced quick-test` against the staged pair, then atomically swaps
 one shared `current` symlink. The prior bundle remains available as the single
 rollback bundle. A failed download, checksum, staged smoke, or activation
 verification leaves or restores the earlier `current` link.
@@ -217,6 +216,42 @@ For task-oriented examples that connect session reuse, gate cache policy,
 lease planning, and durable finish handoffs, see the
 [broker follow-up workflows guide](../guides/broker-workflows.md).
 
+### Verbs, `advanced`, and the deprecation window
+
+`aethyme broker --help` lists six public verbs: `start`, `status`, `submit`,
+`finish`, `unblock`, and `gc`. Every other broker command is spelled
+`aethyme broker advanced <verb>` (`aethyme broker advanced --help` lists them).
+Each public form resolves to the implementation that already existed, so
+behaviour, flags and `--json` output are unchanged; only the spelling moved.
+This reference uses the current spellings throughout.
+
+The older spellings still work until **v0.8.6**. Each prints one line on
+stderr, never on stdout, so `--json` output stays parseable:
+`warning: '<old>' is deprecated; use '<new>' (the old spelling is removed in v0.8.6)`.
+
+| Old spelling | Current spelling |
+| --- | --- |
+| `aethyme broker adopt` | `aethyme broker start --adopt` |
+| `aethyme broker adopt --reuse` | `aethyme broker start --reuse` |
+| `aethyme broker adopt --replace-stale` | `aethyme broker start --replace-stale` |
+| `aethyme broker start-agent --cmd <command>` | `aethyme broker start --cmd <command>` |
+| `aethyme broker readiness`, `aethyme readiness` | `aethyme broker status readiness` |
+| `aethyme broker doctor` | `aethyme broker status doctor` |
+| `aethyme broker prepare` / `promote` / `promotion-record` | `aethyme broker submit prepare` / `submit promote` / `submit promotion-record` |
+| `aethyme broker close` / `cleanup` | `aethyme broker finish close` / `finish cleanup` |
+| `aethyme broker blockers` | `aethyme broker unblock` (no id lists blockers) |
+| `aethyme broker reclaim` / `storage` / `resources reap` | `aethyme broker gc reclaim` / `gc storage` / `gc reap` |
+| `aethyme broker init` / `certify` | `aethyme init` / `aethyme certify` |
+| `aethyme broker e2e` | `aethyme broker advanced verify-loop` |
+| `aethyme broker <verb>` for any other verb (`leases`, `git`, `gh`, `ship`, `operations`, `exec`, `review`, `gates`, ...) | `aethyme broker advanced <verb>` |
+| `aethyme enhance deploy` / `aethyme enhance verify` | `aethyme deploy` / `aethyme deploy verify` |
+
+A public verb spelled under `advanced` (for example `advanced start`) is
+refused with exit 2 rather than guessed at. Entry points that installed hooks,
+CI and other binaries invoke (`broker check-contract`, `broker quick-test`,
+and `broker hooks pre-commit|post-commit|pre-push`) are permanent in both
+spellings and never warn.
+
 ### Exit codes
 
 `aethyme broker` exit codes name the outcome, so an agent can branch on
@@ -229,14 +264,14 @@ the code without parsing output. They apply with or without `--json`.
 | 2 | Usage error | Fix the command line; see `--help` |
 | 3 | Refused: a policy, lease, confirmation or state precondition blocked the request, or a submission conflicted. Nothing changed. | Fix the precondition, then retry |
 | 4 | Verification failed: a gate or graph-integrity check did not pass | Fix the code; the gate output names the failure |
-| 5 | Outcome unknown: a remote write may or may not have happened | Inspect external state, then `broker operations reconcile`. Never retry blindly. |
+| 5 | Outcome unknown: a remote write may or may not have happened | Inspect external state, then `broker advanced operations reconcile`. Never retry blindly. |
 | 6 | Environment: a missing tool, path or remote base, or host I/O failure | Fix the host, then retry |
 
 Before 2026-09-23, `submit --json` exited 0 for rejected and conflicted
 entries, and every refusal exited 1. Some subcommands keep their own
 documented codes, for example `check-contract` and the `exec` guard.
 
-`broker worktree-root` is a strictly read-only placement plan. It reports the
+`broker advanced worktree-root` is a strictly read-only placement plan. It reports the
 canonical checkout identity, the preferred private host-state root, whether
 that root is outside the repository, and the legacy fallback. Normal starts
 use a clone-specific key derived from the canonical Git common directory, so
@@ -254,7 +289,7 @@ falling back. Existing legacy sessions remain cleanup-compatible.
 
 ### Repository readiness
 
-`aethyme broker readiness` interprets deterministic repository and broker
+`aethyme broker status readiness` interprets deterministic repository and broker
 facts into an agent-readiness outcome. It complements `aethyme certify`:
 certification retains its stable pass/warn/fail fact contract, while readiness
 groups those facts into seven typed dimensions:
@@ -302,9 +337,9 @@ an undeployed or invalid repository—so diagnostics remain available. CI must
 choose its policy explicitly:
 
 ```bash
-aethyme broker readiness --require conflict-only
-aethyme broker readiness --require agent-ready
-aethyme broker readiness --require parallel-ready --json
+aethyme broker status readiness --require conflict-only
+aethyme broker status readiness --require agent-ready
+aethyme broker status readiness --require parallel-ready --json
 ```
 
 An unmet `--require` level exits 1 after printing the complete report. Bad
@@ -316,10 +351,10 @@ Readiness remediation is a separate reviewed workflow; there is deliberately
 no immediate `--fix`:
 
 ```bash
-aethyme broker readiness plan --repo . --json
-aethyme broker readiness plan --repo . --diff
-aethyme broker readiness apply --repo . --confirm <plan-sha256>
-aethyme broker readiness recover --repo . --plan <plan-sha256>
+aethyme broker status readiness plan --repo . --json
+aethyme broker status readiness plan --repo . --diff
+aethyme broker status readiness apply --repo . --confirm <plan-sha256>
+aethyme broker status readiness recover --repo . --plan <plan-sha256>
 ```
 
 `plan` builds the proposed repository tree from committed `HEAD` without
@@ -354,57 +389,58 @@ stashing multi-worktree changes.
 
 - `aethyme init`
 - `aethyme certify`
-- `aethyme broker readiness [--require <conflict-only|agent-ready|parallel-ready>] [--json]`
-- `aethyme broker readiness plan [--repo <path>] [--local-only] [--resolution-file <path>] [--diff|--json]`
-- `aethyme broker readiness apply [--repo <path>] [--local-only] [--resolution-file <path>] --confirm <plan-sha256> [--json]`
-- `aethyme broker readiness recover [--repo <path>] --plan <plan-sha256> [--json]`
+- `aethyme broker status readiness [--require <conflict-only|agent-ready|parallel-ready>] [--json]`
+- `aethyme broker status readiness plan [--repo <path>] [--local-only] [--resolution-file <path>] [--diff|--json]`
+- `aethyme broker status readiness apply [--repo <path>] [--local-only] [--resolution-file <path>] --confirm <plan-sha256> [--json]`
+- `aethyme broker status readiness recover [--repo <path>] --plan <plan-sha256> [--json]`
 - `aethyme broker status [--json]`
-- `aethyme broker worktree-root [--json]`
+- `aethyme broker advanced worktree-root [--json]`
 - `aethyme broker start --task "..." [--pull-request <number>] [--path <repo-path>]... [--agent "<Name> <email>"] [--repo-name <name>] [--tab-name <name>] [--ai-provider <provider>] [--json]`
-- `aethyme broker start-agent --task "..." --cmd <command> [--pull-request <number>] [--agent "<Name> <email>"] [--repo-name <name>] [--tab-name <name>] [--ai-provider <provider>] [--json]`
+- `aethyme broker start --task "..." --cmd <command> [--pull-request <number>] [--agent "<Name> <email>"] [--repo-name <name>] [--tab-name <name>] [--ai-provider <provider>] [--json]`
 - Supplying `--pull-request` explicitly refuses the integration-tip lane:
   pull-request reviews must use the routed review adapter, which provisions and
   verifies the exact pull-request head. Ordinary task text is not inspected for
   review-looking phrases.
-- `aethyme broker adopt [<path>] --task "..." [--path <repo-path>]... [--agent "<Name> <email>"] [--repo-name <name>] [--tab-name <name>] [--ai-provider <provider>] [--reuse [--sync-integration]] [--json]`
-- `aethyme broker prepare status --session <id> [--json]`
-- `aethyme broker prepare --session <id> [--offline] [--wait <duration>] [--json]`
-- `aethyme broker exec --session <id> -- <command> [--json]`
-- `aethyme broker git --session <id> [--repo <owner/name>] [--scope <scope>] [--effect <read|write|destructive>] [--reason <text>] [--destructive] [--no-wait|--queue-timeout <seconds>] -- <git-args>`
-- `aethyme broker gh --session <id> --repo <owner/name> [--scope <scope>] [--effect <read|write|destructive>] [--reason <text>] [--destructive] [--no-wait|--queue-timeout <seconds>] -- <gh-args>`
-- `aethyme broker operations list [--limit <n>] [--before <id>] [--session <id>] [--status <status>] [--repo <canonical-id>] [--provider <git|github>] [--json]`
-- `aethyme broker operations [same options]` (compatibility alias during deprecation)
-- `aethyme broker operations show <id> [--json]`
-- `aethyme broker operations stats [--repo <canonical-id>] [--limit <n>] [--json]`
-- `aethyme broker operations reconcile --operation <id> --outcome <succeeded|failed> --reason <text> [--json]`
-- `aethyme broker blockers [--json]` — read-only: every current blocker across `broker.db`, the host operation and resource ledgers, gate pidfiles, and conflict notices, each with a stable id (`op:<n>`, `hostop:<32-hex>`, `resource:<lease-id>`, `lease:<id>`, `gatecache:<gate>@<tree>`, `pidfile:<session>-<gate>`, `action:<session>`), its scope (`repo` or `host`), cause, owning session, `safe_to_clear_automatically`, and the exact command that clears it. `broker status --json` carries the same list as `blockers`, and `broker doctor` prints it.
+- `aethyme broker start --adopt [<path>] --task "..." [--path <repo-path>]... [--agent "<Name> <email>"] [--repo-name <name>] [--tab-name <name>] [--ai-provider <provider>] [--json]`
+- `aethyme broker start --reuse --task "..." [--sync-integration] [--json]` — point this worktree's existing session at a follow-up task (formerly `adopt --reuse`); `start --replace-stale` replaces a stale registration (formerly `adopt --replace-stale`).
+- `aethyme broker submit prepare status --session <id> [--json]`
+- `aethyme broker submit prepare --session <id> [--offline] [--wait <duration>] [--json]`
+- `aethyme broker advanced exec --session <id> -- <command> [--json]`
+- `aethyme broker advanced git --session <id> [--repo <owner/name>] [--scope <scope>] [--effect <read|write|destructive>] [--reason <text>] [--destructive] [--no-wait|--queue-timeout <seconds>] -- <git-args>`
+- `aethyme broker advanced gh --session <id> --repo <owner/name> [--scope <scope>] [--effect <read|write|destructive>] [--reason <text>] [--destructive] [--no-wait|--queue-timeout <seconds>] -- <gh-args>`
+- `aethyme broker advanced operations list [--limit <n>] [--before <id>] [--session <id>] [--status <status>] [--repo <canonical-id>] [--provider <git|github>] [--json]`
+- `aethyme broker advanced operations [same options]` (compatibility alias during deprecation)
+- `aethyme broker advanced operations show <id> [--json]`
+- `aethyme broker advanced operations stats [--repo <canonical-id>] [--limit <n>] [--json]`
+- `aethyme broker advanced operations reconcile --operation <id> --outcome <succeeded|failed> --reason <text> [--json]`
+- `aethyme broker unblock [--json]` — read-only: every current blocker across `broker.db`, the host operation and resource ledgers, gate pidfiles, and conflict notices, each with a stable id (`op:<n>`, `hostop:<32-hex>`, `resource:<lease-id>`, `lease:<id>`, `gatecache:<gate>@<tree>`, `pidfile:<session>-<gate>`, `action:<session>`), its scope (`repo` or `host`), cause, owning session, `safe_to_clear_automatically`, and the exact command that clears it. `broker status --json` carries the same list as `blockers`, and `broker status doctor` prints it.
 - `aethyme broker unblock <id> [--outcome <succeeded|failed>] [--reason <text>] [--confirm <generation>] [--json]` — clear one blocker through its store's recovery path: `op:` and `hostop:` reconcile through `operations reconcile` and need `--outcome` and `--reason` from an operator who inspected the remote (the host id is accepted directly, #276); `gatecache:` deletes exactly that gate's failing verdicts for that tree and needs `--reason` (#281); `pidfile:` is removed only when its process is gone; `resource:` releases a quarantined lease once its holder is gone, without `--confirm` only when its owning session is closed; `lease:` releases a stale session's claim only when its worktree is gone; `action:` always refuses and names the resubmission. A refusal changes nothing, prints the reason and the flag it needs, and exits 3.
-- `aethyme broker advisories list [--all] [--json]`
-- `aethyme broker advisories show <id> [--json]`
-- `aethyme broker advisories ack <id> [--json]`
-- `aethyme broker advisories metrics [--json]`
-- `aethyme broker external-events ingest <normalized.json> [--json]`
-- `aethyme broker external-events list [--all] [--json]`
-- `aethyme broker external-events show <id> [--json]`
-- `aethyme broker external-events reconcile <id> --outcome <assign|ignore> --reason <text> [--session <id>] [--json]`
-- `aethyme broker review plan [--base <ref>] [--pr <number>]`
-- `aethyme broker review run --session <id> --repo <owner/name> --pr <number> [--base <ref>] [--tabs-file <path>] [--from-provider] [--dry-run]`
-- `aethyme broker review tick --session <id> --repo <owner/name> [--limit <count>] [--tabs-file <path>] [--dry-run]`
-- `aethyme broker review ledger --repo <owner/name> [--pr <number>] [--json]`
-- `aethyme broker review state --repo <owner/name> --pr <number> --type <review-type> --state <state> [--head <sha>] [--note <text>] [--completed-for-commit <sha> --verdict <pass|fail|changes_requested|commented> --reviewer-provider <provider> [--reviewer-model <model>]] [--json]`
-- `aethyme broker review register --session <id> --repo <owner/name> --pr <number> [--json]`
-- `aethyme broker review show --session <id> [--json]`
-- `aethyme broker review request --session <id> [--json]`
-- `aethyme broker review unlock --session <id> [--json]`
-- `aethyme broker review reassign --session <closed-id> --to-session <live-id> --reason <text> [--json]`
-- `aethyme broker review abandon --session <id> --reason <text> [--json]`
-- `aethyme broker queue history [--limit <n>] [--before <id>] [--json]`
-- `aethyme broker queue [--json]` (compatibility full-inventory view)
-- `aethyme broker exposures plan [--json]`
-- `aethyme broker exposures apply --session <id> --confirm <sha256> [--json]`
-- `aethyme broker note send --session <sender> --to-session <recipient> --message <text> [--json]`
-- `aethyme broker note list --session <recipient> [--json]`
-- `aethyme broker note ack --session <recipient> --id <note-id> [--json]`
+- `aethyme broker advanced advisories list [--all] [--json]`
+- `aethyme broker advanced advisories show <id> [--json]`
+- `aethyme broker advanced advisories ack <id> [--json]`
+- `aethyme broker advanced advisories metrics [--json]`
+- `aethyme broker advanced external-events ingest <normalized.json> [--json]`
+- `aethyme broker advanced external-events list [--all] [--json]`
+- `aethyme broker advanced external-events show <id> [--json]`
+- `aethyme broker advanced external-events reconcile <id> --outcome <assign|ignore> --reason <text> [--session <id>] [--json]`
+- `aethyme broker advanced review plan [--base <ref>] [--pr <number>]`
+- `aethyme broker advanced review run --session <id> --repo <owner/name> --pr <number> [--base <ref>] [--tabs-file <path>] [--from-provider] [--dry-run]`
+- `aethyme broker advanced review tick --session <id> --repo <owner/name> [--limit <count>] [--tabs-file <path>] [--dry-run]`
+- `aethyme broker advanced review ledger --repo <owner/name> [--pr <number>] [--json]`
+- `aethyme broker advanced review state --repo <owner/name> --pr <number> --type <review-type> --state <state> [--head <sha>] [--note <text>] [--completed-for-commit <sha> --verdict <pass|fail|changes_requested|commented> --reviewer-provider <provider> [--reviewer-model <model>]] [--json]`
+- `aethyme broker advanced review register --session <id> --repo <owner/name> --pr <number> [--json]`
+- `aethyme broker advanced review show --session <id> [--json]`
+- `aethyme broker advanced review request --session <id> [--json]`
+- `aethyme broker advanced review unlock --session <id> [--json]`
+- `aethyme broker advanced review reassign --session <closed-id> --to-session <live-id> --reason <text> [--json]`
+- `aethyme broker advanced review abandon --session <id> --reason <text> [--json]`
+- `aethyme broker advanced queue history [--limit <n>] [--before <id>] [--json]`
+- `aethyme broker advanced queue [--json]` (compatibility full-inventory view)
+- `aethyme broker advanced exposures plan [--json]`
+- `aethyme broker advanced exposures apply --session <id> --confirm <sha256> [--json]`
+- `aethyme broker advanced note send --session <sender> --to-session <recipient> --message <text> [--json]`
+- `aethyme broker advanced note list --session <recipient> [--json]`
+- `aethyme broker advanced note ack --session <recipient> --id <note-id> [--json]`
 
 Repository-owned dependency preparation is optional and declarative. When
 `.aethyme/prepare.toml` exists, `start` and `adopt` return a structured
@@ -452,15 +488,15 @@ Preparation commands run through the broker's worktree guard. Dirty work that
 already exists is preserved; newly changed tracked paths still require the
 session's explicit leases. Hooks block only when a step sets
 `required_for_hooks = true`, keep staged changes intact, and print the exact
-`broker prepare --session <id>` remediation. Contributors without local
+`broker submit prepare --session <id>` remediation. Contributors without local
 broker activation retain the existing no-op behavior.
 
 Status is a bounded present-state view. Text and JSON expose live, pending, and
 conflicted merge-queue entries individually, while `queue_history` contains a
 versioned terminal-count summary and the exact history command. Use
-`aethyme broker queue history` for a stable newest-first page; `--before`
+`aethyme broker advanced queue history` for a stable newest-first page; `--before`
 advances without duplicating the boundary row, and `next_before_id: null`
-proves the end. The bare `broker queue` command remains a documented
+proves the end. The bare `broker advanced queue` command remains a documented
 compatibility full-inventory view, but status no longer loads terminal rows.
 
 Text status orders remediation by urgency: summary and warnings, outstanding
@@ -481,17 +517,17 @@ rebuilds that plan and records a second coordinated remote observation before
 resolving local lifecycle rows. Stale tracking refs are reported but are not
 used as publication authority; a missing remote commit object blocks the plan
 until an explicit fetch makes ancestry verification possible.
-- `aethyme broker resources plan <request.json> [--json]`
-- `aethyme broker resources acquire <request.json> [--wait <duration>] [--grant-out <path>] [--json]`
-- `aethyme broker resources run <request.json> [--wait <duration>] [--cleanup-command <shell>] [--json] -- <command> ...`
-- `aethyme broker resources renew <grant.json> --ttl <seconds> [--json]`
-- `aethyme broker resources release <grant.json> [--json]`
-- `aethyme broker resources list [--all] [--json]`
-- `aethyme broker resources reap [--json]`
-- `aethyme broker resources reconcile <lease-id> --confirm <generation> [--json]`
-- `aethyme broker console [status|list] [--json]`
-- `aethyme broker console plan [--allow-parallel] [--json]`
-- `aethyme broker console run [--wait <duration>] [--allow-parallel] [--json] -- <command> ...`
+- `aethyme broker advanced resources plan <request.json> [--json]`
+- `aethyme broker advanced resources acquire <request.json> [--wait <duration>] [--grant-out <path>] [--json]`
+- `aethyme broker advanced resources run <request.json> [--wait <duration>] [--cleanup-command <shell>] [--json] -- <command> ...`
+- `aethyme broker advanced resources renew <grant.json> --ttl <seconds> [--json]`
+- `aethyme broker advanced resources release <grant.json> [--json]`
+- `aethyme broker advanced resources list [--all] [--json]`
+- `aethyme broker gc reap [--json]`
+- `aethyme broker advanced resources reconcile <lease-id> --confirm <generation> [--json]`
+- `aethyme broker advanced console [status|list] [--json]`
+- `aethyme broker advanced console plan [--allow-parallel] [--json]`
+- `aethyme broker advanced console run [--wait <duration>] [--allow-parallel] [--json] -- <command> ...`
 
 A dev server is a host resource, and agent isolation and operator singularity
 want opposite defaults from it. `console` composes the `resources` primitives
@@ -522,14 +558,14 @@ registry, so a missing or tampered marker is never presented as revision
 evidence. `--allow-parallel` is an explicit testing escape hatch for
 `singular`: it bypasses only the repository singleton and allocates another
 port from the configured range; the process remains visible in `console list`.
-- `aethyme broker gates validate [--json]`
-- `aethyme broker gates doctor [--probe] [--only <gate>] [--json]`
-- `aethyme broker gates manifest [--head <ref>] [--json]`
-- `aethyme broker gates scope --base <ref> --head <ref> [--json]`
-- `aethyme broker gates affected --session <id> [--json]`
-- `aethyme broker gates semantic --session <id> [--json]`
-- `aethyme broker gates run --session <id> [--only <gate>] [--no-cache] [--json]`
-- `aethyme broker gates run --all [--only <gate>] [--no-cache] [--json]`
+- `aethyme broker advanced gates validate [--json]`
+- `aethyme broker advanced gates doctor [--probe] [--only <gate>] [--json]`
+- `aethyme broker advanced gates manifest [--head <ref>] [--json]`
+- `aethyme broker advanced gates scope --base <ref> --head <ref> [--json]`
+- `aethyme broker advanced gates affected --session <id> [--json]`
+- `aethyme broker advanced gates semantic --session <id> [--json]`
+- `aethyme broker advanced gates run --session <id> [--only <gate>] [--no-cache] [--json]`
+- `aethyme broker advanced gates run --all [--only <gate>] [--no-cache] [--json]`
 
 Repositories that commit `.aethyme/graph/**` as authoritative generated state
 must opt in explicitly:
@@ -553,50 +589,50 @@ Repositories without this declaration retain normal gate behavior.
 triggers, for focused diagnosis after a failure. Text-mode failures replay the
 last 20 captured output lines (bounded to 16 KiB); JSON remains structured and
 continues to expose the complete local `log_path` without embedding log data.
-- `aethyme broker gates pre-push <remote-name> [<remote-url>] [--no-cache] [--json]`
-- `aethyme broker hooks install [--json]`
-- `aethyme broker hooks uninstall [--json]`
-- `aethyme broker hooks status [--json]`
-- `aethyme broker trust [--repo <path>] [--json]`
-- `aethyme broker trust status [--repo <path>] [--json]`
-- `aethyme broker leases plan <paths...> [--session <id>] [--json]`
-- `aethyme broker leases export (--session <id> | --entry <id>) [--limit <n>] [--json]`
+- `aethyme broker advanced gates pre-push <remote-name> [<remote-url>] [--no-cache] [--json]`
+- `aethyme broker advanced hooks install [--json]`
+- `aethyme broker advanced hooks uninstall [--json]`
+- `aethyme broker advanced hooks status [--json]`
+- `aethyme broker advanced trust [--repo <path>] [--json]`
+- `aethyme broker advanced trust status [--repo <path>] [--json]`
+- `aethyme broker advanced leases plan <paths...> [--session <id>] [--json]`
+- `aethyme broker advanced leases export (--session <id> | --entry <id>) [--limit <n>] [--json]`
 - `aethyme broker submit --session <id> [--no-cache] [--json]`
-- `aethyme broker repair --session <id> [--json]`
+- `aethyme broker advanced repair --session <id> [--json]`
 - `aethyme broker finish --session <id> [--json]`
-- `aethyme broker representation scan --session <id> [--json]`
-- `aethyme broker representation status --session <id> [--json]`
-- `aethyme broker representation record --session <id> --confirm <sha256> [--json]`
-- `aethyme broker cleanup <session-id> [--force] [--json]`
-- `aethyme broker cleanup --all-cleaned [--apply --confirm <sha256>] [--json]`
-- `aethyme broker main reconcile plan [--detail] [--resolution-file <path>] [--write-resolution-template <path>] [--json]`
-- `aethyme broker main reconcile apply --session <id> --confirm <sha256> [--resolution-file <path>] [--json]`
+- `aethyme broker advanced representation scan --session <id> [--json]`
+- `aethyme broker advanced representation status --session <id> [--json]`
+- `aethyme broker advanced representation record --session <id> --confirm <sha256> [--json]`
+- `aethyme broker finish cleanup <session-id> [--force] [--json]`
+- `aethyme broker finish cleanup --all-cleaned [--apply --confirm <sha256>] [--json]`
+- `aethyme broker advanced main reconcile plan [--detail] [--resolution-file <path>] [--write-resolution-template <path>] [--json]`
+- `aethyme broker advanced main reconcile apply --session <id> --confirm <sha256> [--resolution-file <path>] [--json]`
 - `aethyme broker gc plan [--json]`
 - `aethyme broker gc apply --confirm <sha256> [--json]`
-- `aethyme broker storage [--json]`
-- `aethyme broker storage plan [--json]`
-- `aethyme broker storage apply --confirm <sha256> [--json]`
-- `aethyme broker handoff (--session <id> | --worktree <path>) [--json]`
-- `aethyme broker report capture --kind <bug|improvement> --title <text> [--session <id>] [--include-task] [--stdout | --output <filename>] [--json]`
-- `aethyme broker report list [--json]`
-- `aethyme broker report show <filename> [--json]`
-- `aethyme broker report render <filename> --form <form.yml> [--output <name>.issue.md] [--json]`
-- `aethyme broker report file <path> --repo <owner/name> --confirm <sha256> [--json]`
-- `aethyme broker ship plan --entry <id> [--json]`
-- `aethyme broker ship execute --entry <id> --confirm <full-integration-sha> [--sync-main] [--break-glass --reason <authorization>] [--json]`
-- `aethyme broker integration status [--json]`
-- `aethyme broker integration reconcile --upstream <ref> [--resolution-file <path>] [--write-resolution-template <path>] [--dry-run|--apply --confirm <sha256>] [--json]`
-- `aethyme broker quick-test [--with-gate] [--json]`
-- `aethyme broker verify-loop [--json]`
-- `aethyme broker pr check [--target <branch>] [--pr <number>] [--agent <name>] [--dispatch] [--cmd <command>] [--json]`
+- `aethyme broker gc storage [--json]`
+- `aethyme broker gc storage plan [--json]`
+- `aethyme broker gc storage apply --confirm <sha256> [--json]`
+- `aethyme broker advanced handoff (--session <id> | --worktree <path>) [--json]`
+- `aethyme broker advanced report capture --kind <bug|improvement> --title <text> [--session <id>] [--include-task] [--stdout | --output <filename>] [--json]`
+- `aethyme broker advanced report list [--json]`
+- `aethyme broker advanced report show <filename> [--json]`
+- `aethyme broker advanced report render <filename> --form <form.yml> [--output <name>.issue.md] [--json]`
+- `aethyme broker advanced report file <path> --repo <owner/name> --confirm <sha256> [--json]`
+- `aethyme broker advanced ship plan --entry <id> [--json]`
+- `aethyme broker advanced ship execute --entry <id> --confirm <full-integration-sha> [--sync-main] [--break-glass --reason <authorization>] [--json]`
+- `aethyme broker advanced integration status [--json]`
+- `aethyme broker advanced integration reconcile --upstream <ref> [--resolution-file <path>] [--write-resolution-template <path>] [--dry-run|--apply --confirm <sha256>] [--json]`
+- `aethyme broker advanced quick-test [--with-gate] [--json]`
+- `aethyme broker advanced verify-loop [--json]`
+- `aethyme broker advanced pr check [--target <branch>] [--pr <number>] [--agent <name>] [--dispatch] [--cmd <command>] [--json]`
 
-`broker trust` approves the commands a repository defines. `.aethyme/gates.toml`
+`broker advanced trust` approves the commands a repository defines. `.aethyme/gates.toml`
 and `.aethyme/prepare.toml` travel with a clone, and the broker runs their
 commands as you, so nothing they declare runs until a human on this machine has
 trusted the exact policy. Until then `submit`, `gates run` (session, `--all`,
 `--only` and `pre-push`), `gates doctor --probe`, `prepare` and the installed
 pre-commit hook refuse with exit 3 before running any repository-defined
-command, naming `aethyme broker trust --repo <path>`. `trust` prints every gate
+command, naming `aethyme broker advanced trust --repo <path>`. `trust` prints every gate
 and prepare command of the checkout and, when it differs, of the integration
 tip, asks for confirmation, and records SHA-256 digests of those policies in
 host state (`<host-state>/gate-trust/<repository-key>.json`, shared by every
@@ -622,7 +658,7 @@ runs without being recorded. This repository's `.cargo/config.toml` sets it for
 operator E2E: it reports the integration commit tested and flags movement during
 the run, so callers know whether the result proves the current integration tip.
 
-`broker operations list` reads the durable operation journal newest-first. The
+`broker advanced operations list` reads the durable operation journal newest-first. The
 default page size is 50 and `--limit` accepts 1 through 500. Filters combine
 with AND semantics; `--repo` matches the persisted canonical coordination ID
 exactly. JSON is a stable page object:
@@ -636,11 +672,11 @@ exactly. JSON is a stable page object:
 
 When `next_before_id` is non-null, pass it unchanged as `--before`; the cursor
 is exclusive, so adjacent pages do not duplicate the boundary row. A null
-cursor proves that no older matching row remains. The bare `broker operations`
-spelling is retained as an alias for `broker operations list` during its
+cursor proves that no older matching row remains. The bare `broker advanced operations`
+spelling is retained as an alias for `broker advanced operations list` during its
 deprecation window.
 
-`broker operations show <id>` returns the exact durable row plus a typed
+`broker advanced operations show <id>` returns the exact durable row plus a typed
 reconciliation view. The view distinguishes `not_required`, `required`,
 `reconciled_succeeded`, and `reconciled_failed`; includes preserved exact-push
 evidence when available; and renders both complete reconciliation commands for
@@ -653,7 +689,7 @@ contract—`--operation`, `--outcome`, and `--reason`—in one message. Successf
 manual reconciliation appends the operator outcome and reason without deleting
 the original push plan or remote evidence.
 
-`broker operations stats` is a bounded, read-only measurement surface for the
+`broker advanced operations stats` is a bounded, read-only measurement surface for the
 coordination-lock decision. It reports p50/p99 lock-hold and queue-wait
 durations by operation kind, queue depth, samples that used
 `hooks_outside_lock`, and known disjoint-scope waits. It counts only completed
@@ -670,7 +706,7 @@ the result to narrow today's repository lock. This makes the provider
 round-trip cost measurable before a future ref-scoped design is considered;
 it is off by default.
 
-`broker advisories` exposes durable, explicitly non-blocking findings. Each row
+`broker advanced advisories` exposes durable, explicitly non-blocking findings. Each row
 has an immutable producer identity, optional session and queue-entry links,
 severity, the exact integration SHA when relevant, repository-relative paths,
 structured evidence, creation time, and a typed `outstanding`, `acknowledged`,
@@ -699,7 +735,7 @@ CLAUDE guidance tells agents to inspect `broker status --json` when a notice
 appears and after rebase or worktree reuse, then read the projection when a
 delivery surface points to it.
 
-`broker external-events` is the bounded handoff from authenticated provider
+`broker advanced external-events` is the bounded handoff from authenticated provider
 adapters into that advisory model. Aethyme does not run a webhook listener or
 poll a provider in the background. The adapter must first authenticate its
 source, then write one strict schema-1 JSON envelope containing only the
@@ -739,7 +775,7 @@ remains parseable. `broker status --json` includes both
 Acknowledgement stops future session notices without deleting history or
 changing the underlying publication exposure.
 
-`broker note` is a deliberately small, repository-local coordination channel
+`broker advanced note` is a deliberately small, repository-local coordination channel
 between live sessions. Messages are trimmed, limited to 1,000 UTF-8 bytes, and
 must be a single line without control characters. The recipient sees unread
 notes on stderr at the next session-associated broker command, while JSON
@@ -757,7 +793,7 @@ Every promotion also creates one authoritative path exposure owned by its
 queue entry. It contains the exact promoted SHA and repository-relative path
 set, survives closure of either the promoting or affected session, and is not
 cleared by a worktree rebase. The broker resolves it—and any still-outstanding
-advisory linked to that entry—only after `broker ship execute` observes a
+advisory linked to that entry—only after `broker advanced ship execute` observes a
 remote-main SHA containing the promotion, or a confirmed `integration
 reconcile --apply` proves an exact, patch-equivalent, or reviewed superseding
 landing. Read-only plans, stale remote state, failed verification, ambiguous
@@ -772,7 +808,7 @@ On the first normal open after the storage upgrade, currently promoted legacy
 entries are backfilled from their exact first-parent commit deltas; diagnostic
 snapshot opens remain non-mutating.
 
-`broker gates pre-push` remains an opt-in full-gate adapter for repositories
+`broker advanced gates pre-push` remains an opt-in full-gate adapter for repositories
 that wire it into their own hook manager. It reads Git's ref-update lines from
 stdin, requires all non-deletion updates to name one clean checked-out `HEAD`,
 and runs the complete gate set. This makes the reported tree truthful and lets
@@ -781,12 +817,12 @@ declared host resources coordinate concurrent clones. See
 for the gate schema, repository-independent supervised runs, hook example,
 fallback contract, and quarantine recovery.
 
-`broker adopt --reuse --sync-integration` starts a follow-up from the current
+`broker start --reuse --sync-integration` starts a follow-up from the current
 integration tip. It requires a clean session worktree, permits only a
 fast-forward, and synchronizes before recording the follow-up diff baseline;
 dirty or diverged worktrees are left unchanged.
 
-Plain `broker adopt --reuse` preserves a live session's recorded ownership
+Plain `broker start --reuse` preserves a live session's recorded ownership
 baseline. Reuse may update its task and activity, but cannot absorb pending
 commits into a new baseline. Close the completed session before adopting a new
 identity when a genuinely fresh ownership boundary is required.
@@ -832,12 +868,12 @@ integration-side commits, remediation text, and ordered commands. A blocking
 session is reported only when its current active lease overlaps a surviving
 replay conflict.
 
-`broker checkpoint plan --session <id> --json` exposes stable
+`broker advanced checkpoint plan --session <id> --json` exposes stable
 `refusal_codes` and ordered `next_actions`. A safe plan can be applied only by
 rebuilding it and confirming its digest with `checkpoint apply`. An unsafe
 plan begins by preserving the exact session tip and directs the operator to
 inspect and replay pending commits from a clean session. It never recommends a
-blanket rebase onto integration. `broker repair` applies only to a recorded
+blanket rebase onto integration. `broker advanced repair` applies only to a recorded
 submit or promoted-path conflict; otherwise it refuses immediately and points
 to the checkpoint planner.
 
@@ -848,7 +884,7 @@ Pass `--no-cache` to either gate-run form or submit to require fresh gate
 execution. Bypass skips cache lookup only: the fresh result is stored normally
 and is available to a subsequent run using the default cache policy.
 
-`broker gates manifest` is the portable, content-free policy export for CI and
+`broker advanced gates manifest` is the portable, content-free policy export for CI and
 merge-queue consumers. It reads `.aethyme/gates.toml` from the exact committed
 `--head` (default `HEAD`), not from dirty or ignored checkout content. JSON
 contains the normalized triggers, cost, cache policy, resource requirements,
@@ -869,7 +905,7 @@ normal gate parsing. Newly generated drafts contain conservative explicit
 timeouts, while remaining `reviewed = false` until a maintainer approves the
 commands, triggers, costs, and deadlines.
 
-`broker gates doctor` is an advisory exact-HEAD quality inspection. It reports
+`broker advanced gates doctor` is an advisory exact-HEAD quality inspection. It reports
 confidence and redacted evidence for missing or invalid timeouts, missing
 cheap/full lanes, dead or overly broad triggers, uncovered source areas,
 undeclared Docker/PostgreSQL isolation, fixed database/port/project names,
@@ -905,8 +941,8 @@ hazard the fallback carries.
 Probe execution is always explicit:
 
 ```bash
-aethyme broker gates doctor --probe
-aethyme broker gates doctor --probe --only integration --json
+aethyme broker advanced gates doctor --probe
+aethyme broker advanced gates doctor --probe --only integration --json
 ```
 
 The probe creates a locked disposable detached worktree at exact committed
@@ -918,7 +954,7 @@ the exact probe worktree, temporary evidence, and owned resource leases. The
 invoking checkout is never cleaned or rewritten. Gate failures and mutations
 remain findings in the report rather than silently modifying enforcement.
 
-`broker gates scope` evaluates that same committed policy with the same
+`broker advanced gates scope` evaluates that same committed policy with the same
 `select_gates` implementation used by broker execution. It resolves both refs
 to full commit SHAs and returns sorted repository-relative changed paths,
 selected gates, first triggering path, and reason. Rename detection is
@@ -928,12 +964,12 @@ deterministic behavior. The exact evaluator does not consult a local graph:
 semantic suggestions are explicitly reported as advisory, unenforced, and not
 included.
 
-`broker gates semantic` is a separate, strictly advisory read surface:
+`broker advanced gates semantic` is a separate, strictly advisory read surface:
 
 ```bash
-aethyme broker gates affected --session 111
-aethyme broker gates semantic --session 111
-aethyme broker gates semantic --session 111 --json
+aethyme broker advanced gates affected --session 111
+aethyme broker advanced gates semantic --session 111
+aethyme broker advanced gates semantic --session 111 --json
 ```
 
 The first command reports the path-triggered gates that `gates run` and
@@ -974,7 +1010,7 @@ configured result/depth/node limits, visited-node count, and truncation state.
 Suggestion entries include the explainable changed-file → caller-file → gate
 chain when the graph provider supplied one.
 
-`broker hooks install` installs shared pre-commit, post-commit, and pre-push
+`broker advanced hooks install` installs shared pre-commit, post-commit, and pre-push
 shims. The
 pre-commit hook runs matching cost-1 gates against the staged change and stays
 silent when they pass. If a gate fails, the hook replays its complete standard
@@ -986,8 +1022,8 @@ The managed pre-push shim is a publication guard, not the full-gate adapter.
 From an enrolled Git common directory it rejects updates to `main`, `master`,
 the advertised origin default branch, and `aethyme/integration` unless Git is
 running inside a broker-coordinated operation. Normal publication therefore
-uses `broker ship plan` followed by digest/SHA-confirmed `broker ship execute`;
-an explicitly authorized exceptional push uses `broker git`.
+uses `broker advanced ship plan` followed by digest/SHA-confirmed `broker advanced ship execute`;
+an explicitly authorized exceptional push uses `broker advanced git`.
 
 For emergency recovery only, set
 `AETHYME_BROKER_BREAK_GLASS_REASON="<reviewed reason>"` on the one Git push.
@@ -996,7 +1032,7 @@ in a local event, never the reason text. This is a cooperative local safety
 boundary—`--no-verify` still exists in Git—but the safe and exceptional paths
 are now explicit and auditable.
 
-`broker leases plan` is a read-only preflight for files or trailing-slash
+`broker advanced leases plan` is a read-only preflight for files or trailing-slash
 directory claims. It reports exact and directory overlaps with each active
 lease's owning session, implicit or explicit kind, and expiry. Supplying
 `--session` separates leases already owned by that session from foreign
@@ -1005,7 +1041,7 @@ claims nor refreshes leases and does not append broker events or command
 telemetry. Paths are sorted deterministically and must be unambiguous,
 repository-relative spellings without `.` or `..` components.
 
-`broker leases export` is the stable integration boundary for external
+`broker advanced leases export` is the stable integration boundary for external
 path-scoped queues. It selects one session directly or through a merge-queue
 entry and returns schema version 1 with a source timestamp, credential-free
 canonical repository identity, and at most 200 lease rows by default (1,000
@@ -1033,7 +1069,7 @@ command telemetry. GitHub-label and merge-queue adapters should retry this
 read-only projection and treat their own delivery as idempotent; they must not
 write adapter state into the lease registry.
 
-`broker start` and `broker adopt` accept repeatable `--path` declarations for
+`broker start` and `broker start --adopt` accept repeatable `--path` declarations for
 work known before a diff exists. The broker validates the complete normalized
 set first, then commits session creation or reuse and every accepted path as an
 ordinary explicit lease in one transaction. One exact or directory conflict
@@ -1052,13 +1088,13 @@ and one recommended next action. A successful finish closes broker state first,
 then reclaims a represented broker-owned spawned worktree and its exact checked
 branch by default. It reports exact reclaimed bytes and whether each artifact
 was removed. Use `--keep-worktree` to close the session without physical
-cleanup; `broker close` also remains state-only.
+cleanup; `broker finish close` also remains state-only.
 
 Work that reaches the default branch through a reviewed pull request is
 delivered, but leaves no promoted queue entry, and a squash merge rewrites the
 SHA so ancestry cannot see it either. Such a session used to be unfinishable:
 `finish` counted its commits as unsubmitted forever, and resubmitting was the
-wrong cure. `broker representation scan --session <id>` decides the question
+wrong cure. `broker advanced representation scan --session <id>` decides the question
 from content instead. It takes the net effect of the session -- the blob at each
 changed path at HEAD, or its absence for a deletion -- and compares it against
 every commit the default branch gained since the session branched, oldest
@@ -1071,7 +1107,7 @@ whereas the commit that carried it is a fixed historical fact that stays true.
 A refusal names the closest commit and the first path that did not match, so
 partially-landed work is distinguishable from work that never landed.
 
-`broker representation record --session <id> --confirm <sha256>` re-proves the
+`broker advanced representation record --session <id> --confirm <sha256>` re-proves the
 scan and stores the landing, after which `finish` treats the head as delivered.
 The digest binds the session, its head, and the representing commit, so a
 record cannot be applied to a scan that has since moved.
@@ -1079,11 +1115,11 @@ record cannot be applied to a scan that has since moved.
 The redacted `session.finished` handoff survives both state closure and physical
 cleanup. If cleanup stops part-way, the session remains closed, retained
 artifacts remain represented, and the report gives the exact
-`broker cleanup <session-id>` recovery action. Running `finish` again resumes
+`broker finish cleanup <session-id>` recovery action. Running `finish` again resumes
 that cleanup idempotently. Refused finishes do not emit a misleading handoff.
 
-`broker cleanup <session-id>` explicitly removes one exact session worktree
-after the same safety checks. `broker cleanup --all-cleaned` is a read-only
+`broker finish cleanup <session-id>` explicitly removes one exact session worktree
+after the same safety checks. `broker finish cleanup --all-cleaned` is a read-only
 bulk plan by default. It classifies each retained worktree and branch as represented,
 pending, or unproven from the accepted session checkpoint, queue entry, promoted
 integration commit/tree, and current delivery refs. The plan includes exact
@@ -1096,12 +1132,12 @@ symlinked, unsafe-path, pending, unproven, or inspection-failed candidates remai
 untouched. `--force` is available only for one exact session and is rejected
 with `--all-cleaned`; there is no blanket discard authorization.
 
-`broker reclaim plan` inventories regenerable build directories inside this
+`broker gc reclaim plan` inventories regenerable build directories inside this
 repository's broker worktree root and saves the reviewed decision set under a
 digest-keyed host-state filename. A snapshot write failure is reported as a
 warning and does not suppress the plan; the digest is still recomputed at apply
 time, so deletion safety does not depend on the diagnostic snapshot.
-`broker reclaim apply --confirm <sha256>` re-scans and removes only the exact
+`broker gc reclaim apply --confirm <sha256>` re-scans and removes only the exact
 reviewed paths that are still reclaimable. The digest binds the root and the
 sorted candidate paths plus their kept/reclaimable decisions; measured byte
 counts remain visible in the plan but are deliberately excluded, so a build
@@ -1140,7 +1176,7 @@ Retention parsing reads `schema_version` before the field set. An older binary
 therefore ignores and reports each retention key it does not know while still
 applying the known settings; this keeps a newer config from disabling all
 reclamation. A schema version newer than the binary remains an explicit
-`UnsupportedSchema` error. `broker status` and `broker gates doctor` surface
+`UnsupportedSchema` error. `broker status` and `broker advanced gates doctor` surface
 ignored or invalid retention keys with the remediation to edit this file.
 
 `artefact_directories` is an additive list of single directory names. It can
@@ -1150,7 +1186,7 @@ built-in witness. Configured names must also avoid repository source and control
 roots such as `.git`, `.aethyme`, `src`, `lib`,
 `tests`, and `docs`; invalid names fail retention-policy validation.
 Configured names still have to be git-ignored and live inside the owning session
-worktree before GC can reclaim them. The legacy `broker reclaim` plan uses
+worktree before GC can reclaim them. The legacy `broker gc reclaim` plan uses
 the same additive list.
 
 `retained_bytes_budget` is a soft, non-blocking budget used by status, doctor,
@@ -1265,7 +1301,7 @@ walks every retained worktree, build cache and orphaned root, and writes each
 measured size to `.aethyme/worktree-sizes.json`. Its totals are measurements and
 it alone produces an authorization digest.
 
-**The routine check** is `broker status`, `broker doctor`, `broker certify` and
+**The routine check** is `broker status`, `broker status doctor`, `broker certify` and
 the verify loop. It reads those records and walks nothing. Counts, dispositions,
 git state and provenance are exact as before — only the byte totals come from
 records, because only they were ever expensive. A routine plan carries no
@@ -1391,7 +1427,7 @@ system temporary directory are never anchored in the implicit platform host-stat
 directory for this reason, though an explicitly configured
 `AETHYME_HOST_STATE_DIR` or `AETHYME_WORKTREE_ROOT` is always honoured.
 
-`broker storage` is the host-wide inventory for that boundary. It enumerates
+`broker gc storage` is the host-wide inventory for that boundary. It enumerates
 every direct entry below the host worktree container, including roots whose
 owner is missing, and reconciles each usable root's on-disk directories with
 Git's worktree registrations and the owning repository's live and closed
@@ -1420,7 +1456,7 @@ ledgers, and any ownership disagreement remain blockers. Apply only the exact
 reviewed digest:
 
 ```bash
-aethyme broker storage apply --confirm <sha256>
+aethyme broker gc storage apply --confirm <sha256>
 ```
 
 Apply rechecks the root marker, owner checkout, direct containment, Git
@@ -1442,14 +1478,14 @@ Subsequent broker startup may spend only the configured monotonic time budget
 resuming that already-confirmed journal; startup never authorizes a fresh plan.
 If a file changed or remains locked, it is retained and the exact recovery
 command remains available. Event IDs and operation cursors are not reused.
-`broker doctor` and `aethyme certify` report policy validity, eligible counts,
+`broker status doctor` and `aethyme certify` report policy validity, eligible counts,
 bytes, blockers, and pending recovery without embedding retained content.
 
 Retrieve the newest persisted handoff without changing broker state:
 
 ```bash
-aethyme broker handoff --session 110
-aethyme broker handoff --worktree /path/to/former-session-worktree --json
+aethyme broker advanced handoff --session 110
+aethyme broker advanced handoff --worktree /path/to/former-session-worktree --json
 ```
 
 Exactly one selector is required. Session lookup returns that session's latest
@@ -1467,10 +1503,10 @@ For the end-to-end security workflow, private-repository warnings, and a
 redacted example, see [Capture And File Broker Reports Safely](../guides/report-capture.md).
 
 ```bash
-aethyme broker report capture --kind bug --title "Submit gate failed"
-aethyme broker report capture --kind improvement \
+aethyme broker advanced report capture --kind bug --title "Submit gate failed"
+aethyme broker advanced report capture --kind improvement \
   --title "Explain cache misses" --output reviewed.json
-aethyme broker report capture --kind bug --title "Pipe this report" --stdout
+aethyme broker advanced report capture --kind bug --title "Pipe this report" --stdout
 ```
 
 The default and `--output` forms publish a new JSON file atomically beneath
@@ -1492,10 +1528,10 @@ JSON byte stream.
 Inspect the local report inventory without changing broker or report state:
 
 ```bash
-aethyme broker report list
-aethyme broker report list --json
-aethyme broker report show reviewed.json
-aethyme broker report show .aethyme/reports/reviewed.json --json
+aethyme broker advanced report list
+aethyme broker advanced report list --json
+aethyme broker advanced report show reviewed.json
+aethyme broker advanced report show .aethyme/reports/reviewed.json --json
 ```
 
 List ordering is deterministic: valid reports are newest-first by
@@ -1516,8 +1552,8 @@ or creates the broker database, appends telemetry, or contacts external state.
 Render a captured report into the repository's own GitHub issue-form order:
 
 ```bash
-aethyme broker report render reviewed.json --form bug_report.yml
-aethyme broker report render reviewed.json \
+aethyme broker advanced report render reviewed.json --form bug_report.yml
+aethyme broker advanced report render reviewed.json \
   --form .github/ISSUE_TEMPLATE/bug_report.yml --json
 ```
 
@@ -1553,12 +1589,12 @@ stderr so redirection stays useful.
 For a review-and-file workflow, write a human-editable Markdown artifact:
 
 ```bash
-aethyme broker report render reviewed.json --form bug_report.yml \
+aethyme broker advanced report render reviewed.json --form bug_report.yml \
   --output reviewed.issue.md
 # Read and edit .aethyme/reports/reviewed.issue.md, replacing required
 # Unfilled sections with the human-supplied answers.
 shasum -a 256 .aethyme/reports/reviewed.issue.md
-aethyme broker report file .aethyme/reports/reviewed.issue.md \
+aethyme broker advanced report file .aethyme/reports/reviewed.issue.md \
   --repo owner/name \
   --confirm <full-sha256-printed-above>
 ```
@@ -1586,20 +1622,20 @@ then report that source capture as `filed`.
 Any non-zero mutating command, unparseable success response, or failure to
 persist the issue identity becomes `outcome_unknown`. The command prints the
 operation ID, exits non-zero, and directs the operator to inspect GitHub and run
-`broker operations reconcile`. A later `report file` does not retry while that
+`broker advanced operations reconcile`. A later `report file` does not retry while that
 unknown repository operation remains unresolved. Reconciliation as `succeeded`
 continues to block duplicate filing for that source report; reconciliation as
 `failed` permits a later, separately confirmed filing command.
 
-Promotion only advances the local integration ref. Use `broker ship plan` to
+Promotion only advances the local integration ref. Use `broker advanced ship plan` to
 inspect the selected promoted-prefix SHA, the entries included through it,
 later entries explicitly excluded from it, the current integration tip, remote
 freshness, proposed non-force push, and local-main safety without mutating refs
 or remote state. Publish only with the plan's full publication SHA:
 
 ```bash
-aethyme broker ship plan --entry 42
-aethyme broker ship execute --entry 42 \
+aethyme broker advanced ship plan --entry 42
+aethyme broker advanced ship execute --entry 42 \
   --confirm 0123456789abcdef0123456789abcdef01234567
 ```
 
@@ -1613,7 +1649,7 @@ of that verified remote SHA; selecting a later promoted entry therefore closes
 the verified published prefix without guessing about unrelated entries. It
 leaves the primary checkout unchanged unless `--sync-main` is present; that
 option additionally requires a clean, unchanged, fast-forwardable local
-default branch. `broker integration status` reports whether the integration tip
+default branch. `broker advanced integration status` reports whether the integration tip
 is promoted, published, or locally synchronized and routes its next action
 through this ship lane.
 
@@ -1641,7 +1677,7 @@ Emergency publication is unavailable unless the committed policy sets
 `allow_break_glass = true`. It is then a separate explicit action:
 
 ```bash
-aethyme broker ship execute --entry 42 \
+aethyme broker advanced ship execute --entry 42 \
   --confirm 0123456789abcdef0123456789abcdef01234567 \
   --break-glass --reason "incident authorization reference"
 ```
@@ -1653,7 +1689,7 @@ Frozen broker JSON contracts are limited to the commands listed in
 [`../../../../docs/json-contracts.md`](../../../../docs/json-contracts.md).
 Other `--json` outputs are useful but provisional.
 
-`broker git` and `broker gh` are the coordinated route for commands that can
+`broker advanced git` and `broker advanced gh` are the coordinated route for commands that can
 affect shared refs or GitHub state. The executable is fixed (no shell), known
 commands are classified as read, write, or destructive, and ambiguous commands
 fail closed unless `--effect` and `--scope` are declared. Destructive commands
@@ -1757,7 +1793,7 @@ Entries proven landed or superseded resolve their path exposures in that same
 database transaction. Entries replayed onto the new integration tip retain the
 same exposure with its promoted SHA retargeted to the replayed commit.
 
-`broker status` and `broker integration status` run the conclusive portion of
+`broker status` and `broker advanced integration status` run the conclusive portion of
 this classifier without changing refs, queue rows, worktrees, or remote state.
 JSON includes full promotion and upstream landing SHAs. A complete layer whose
 entries are all landed is `reconciliation_ready` with notice severity; any
@@ -1784,7 +1820,7 @@ whether Git proved a commit content-empty. Write only the ready-to-edit
 document atomically, without overwriting an existing review file, with:
 
 ```bash
-aethyme broker integration reconcile \
+aethyme broker advanced integration reconcile \
   --upstream origin/main \
   --write-resolution-template reconciliation.json \
   --dry-run
@@ -1824,12 +1860,12 @@ automatic matches are rejected before planning or mutation.
 Always run the same document through a dry-run before apply:
 
 ```bash
-aethyme broker integration reconcile \
+aethyme broker advanced integration reconcile \
   --upstream origin/main \
   --resolution-file reconciliation.json \
   --dry-run
 
-aethyme broker integration reconcile \
+aethyme broker advanced integration reconcile \
   --upstream origin/main \
   --resolution-file reconciliation.json \
   --apply \
@@ -1851,16 +1887,16 @@ For continuing review after an agent has opened an open or draft PR, create a
 metadata-only watch and subscribe a delivery adapter:
 
 ```bash
-aethyme broker watch pr start --session 111 --repo owner/name --pr 42 \
+aethyme broker advanced watch pr start --session 111 --repo owner/name --pr 42 \
   --events comments,reviews,checks --seconds 60 --json
-aethyme broker deliveries subscribe --watch 7 \
+aethyme broker advanced deliveries subscribe --watch 7 \
   --adapter my-adapter --target opaque-target --policy notify --json
 ```
 
 Run one bounded foreground scheduling pass with:
 
 ```bash
-aethyme broker watch pr tick --limit 32 --json
+aethyme broker advanced watch pr tick --limit 32 --json
 ```
 
 `tick` contacts only due active watches and exits. The schema-versioned report
@@ -1874,11 +1910,11 @@ its reported retry time. Aethyme never starts a background poller.
 Adapters consume the provider-neutral, schema-versioned outbox with:
 
 ```bash
-aethyme broker deliveries claim --adapter my-adapter \
+aethyme broker advanced deliveries claim --adapter my-adapter \
   --worker host-worker-1 --seconds 120 --json
-aethyme broker deliveries complete --id 19 \
+aethyme broker advanced deliveries complete --id 19 \
   --worker host-worker-1 --generation 3 --outcome delivered
-aethyme broker watch pr ack --id 12 --outcome addressed \
+aethyme broker advanced watch pr ack --id 12 --outcome addressed \
   --reason "classified and durably delivered"
 ```
 
@@ -1891,7 +1927,7 @@ for scheduler setup, adapter duties, failure recovery, and removal.
 
 ### PR Follow-Up
 
-`aethyme broker pr check` is the first production-PR routing surface. It is
+`aethyme broker advanced pr check` is the first production-PR routing surface. It is
 designed for local push wrappers, CI pollers, or a future Chau7/MCP bridge after
 a branch has been pushed and an open PR to production exists.
 
@@ -1984,7 +2020,7 @@ session, so it needs no `--session` and performs nothing. It reads git and
 ask for, who would perform them, and what it would put on the pull request:
 
 ```bash
-aethyme broker review plan --base aethyme/integration --pr 42
+aethyme broker advanced review plan --base aethyme/integration --pr 42
 ```
 
 Policy is read from the repository's main checkout; the change is read from the
@@ -1997,10 +2033,10 @@ plan. See [`../guides/review-routing.md`](../guides/review-routing.md).
 Register only after the draft PR exists and its head is the live session HEAD:
 
 ```bash
-aethyme broker review register --session 111 \
+aethyme broker advanced review register --session 111 \
   --repo owner/name --pr 42 --json
 aethyme broker submit --session 111
-aethyme broker review request --session 111
+aethyme broker advanced review request --session 111
 ```
 
 Registration reads live GitHub evidence and binds the canonical repository,
@@ -2030,8 +2066,8 @@ nothing.
 After `review_satisfied`, unlock explicitly:
 
 ```bash
-aethyme broker review show --session 111 --json
-aethyme broker review unlock --session 111 --json
+aethyme broker advanced review show --session 111 --json
+aethyme broker advanced review unlock --session 111 --json
 ```
 
 Unlock polls the configured evidence and refuses a changed base or head,
@@ -2096,7 +2132,7 @@ Provisional JSON shape:
     "message": "dispatch not requested; prompt is ready on disk"
   },
   "next_commands": [
-    "aethyme broker pr check --target 'production' --pr 42 --dispatch"
+    "aethyme broker advanced pr check --target 'production' --pr 42 --dispatch"
   ]
 }
 ```
@@ -2234,7 +2270,7 @@ neither deploy nor upgrade silently treats it as a known generated version.
 
 `repo deploy-skills` is now a compatibility path that deploys only the static
 runtime navigation skill. For real repositories, prefer
-`aethyme enhance deploy --repo /path/to/repo`.
+`aethyme deploy --repo /path/to/repo`.
 
 `repo commit-message-template` prints the typed commit message skeleton Aethyme
 expects for durable commit hygiene. `repo lint-commit-message` validates a real
@@ -2283,8 +2319,8 @@ docs(cli): clarify commit hygiene examples
 - `aethyme deploy plan --repo /path/to/repo --diff`
 - `aethyme deploy execute --repo /path/to/repo --confirm <plan-sha256>`
 - `aethyme deploy verify --repo /path/to/repo`
-- `aethyme enhance deploy --repo /path/to/repo`
-- `aethyme enhance verify --repo /path/to/repo`
+- `aethyme deploy --repo /path/to/repo`
+- `aethyme deploy verify --repo /path/to/repo`
 - `aethyme query symbol /path/to/repo main`
 - `aethyme query deps /path/to/repo src/main.py`
 - `aethyme query impact /path/to/repo src/main.py`
@@ -2546,6 +2582,20 @@ session, lease, or recovery contract required for authoritative fragments.
 > **Note (2026-08-01):** every command is served by the native Rust binary. The Python CLI that once carried a targeted recovery error for `explore` is itself deleted; `python -m src.cli` now fails with `No module named src`.
 
 - `aethyme explore --repo /path/to/repo --request "Find public functions with no outside callers" --format answer-json`
+
+`aethyme explore --request "<question>" --format brief` is the one-call form
+for "where is X" questions. It folds `explore` + `explore-summary` +
+`verify-targets` into one command: it prints the compact projection (trust
+policy, `safe_to_use_as_answer`, status, readiness, up to 3 subsystem lanes and
+2 verification steps) followed by the top 2 verified source spans, each capped
+at 80 lines. Its first line always says the result is a navigation aid, not an
+answer, and must be verified. The brief is text for an agent; `answer-json`
+stays the default format and the machine surface that `explore-summary`,
+`verify-targets`, and the eval runner read. `--format brief` implies
+`--show-observability` and, when neither `--depth` nor `--detail` is given,
+`--depth 0`. `--repo` defaults to the current directory for every format.
+
+- `aethyme explore --request "Where is the session start hook implemented?" --format brief`
 - `aethyme intents --request "Find public functions with no outside callers" --format compact-json`
 - `aethyme explore --repo /path/to/repo --intent behavior_localization_query --request "Find the files responsible for this behavior" --format answer-json --show-observability`
 - `aethyme explore --repo /path/to/repo --intent behavior_localization_query --request "Find the files responsible for this behavior" --format answer-json --show-observability --detail full`

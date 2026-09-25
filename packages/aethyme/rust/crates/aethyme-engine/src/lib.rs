@@ -4,6 +4,7 @@ pub mod context_pack;
 pub mod daemon;
 pub mod deps;
 pub mod explore;
+pub mod explore_brief;
 pub mod explore_cli;
 pub mod facts_cli;
 pub mod graph;

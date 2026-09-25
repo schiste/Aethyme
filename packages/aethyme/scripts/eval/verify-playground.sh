@@ -115,34 +115,17 @@ check_root_guidance() {
 
     [[ -f "$file" ]] && check_pass "$label present" || { check_fail "Missing $label"; return; }
     grep -q '{{AETHYME_ROOT}}' "$file" && check_fail "$label has unresolved {{AETHYME_ROOT}} placeholder" || check_pass "$label placeholders resolved"
-    grep -q '"$AETHYME_ROOT/rust/target/release/aethyme" explore' "$file" \
-        && check_pass "$label points Explore at native aethyme binary" \
-        || check_fail "$label missing native Explore quick start"
-    grep -q 'mktemp -t aethyme-explore' "$file" \
-        && check_pass "$label writes full Explore JSON to temp" \
-        || check_fail "$label missing temp-file Explore capture"
-    grep -q 'top_verification_targets' "$file" \
-        && check_pass "$label prints compact verification-target projection" \
-        || check_fail "$label missing compact verification-target projection"
-    grep -q 'observability.readiness' "$file" \
-        && check_pass "$label inspects compact readiness" \
-        || check_fail "$label missing readiness-only observability guidance"
-    # 2026-08-01 (python-retirement Phase 5.5): the compact projection is
-    # built by `aethyme explore-summary --from <json>`, never by a
-    # `.venv/bin/python` heredoc — the product path must not need Python.
-    grep -q 'explore-summary --from' "$file" \
-        && check_pass "$label projects Explore via native explore-summary" \
-        || check_fail "$label missing native explore-summary projection"
+    # 2026-09-25 (recovery plan P4.5/P4.6): the root file prescribes the one
+    # Explore command, `explore --format brief`, as a navigation aid to verify.
+    # The temp-file projection flow (mktemp, explore-summary, verify-targets,
+    # output caps) moved to the skill, which is checked below.
+    grep -q -- '--format brief' "$file" \
+        && check_pass "$label prescribes the one-call Explore brief" \
+        || check_fail "$label missing one-call 'explore --format brief' guidance"
+    grep -q 'navigation aid, not an answer' "$file" \
+        && check_pass "$label says Explore results must be verified" \
+        || check_fail "$label missing the navigation-aid verification warning"
     check_no_venv_python "$file" "$label"
-    grep -q 'verify-targets' "$file" \
-        && check_pass "$label uses bounded verify-targets source spans" \
-        || check_fail "$label missing bounded verify-targets source spans"
-    grep -q '120 output lines / 20k chars' "$file" \
-        && check_pass "$label caps manual source output" \
-        || check_fail "$label missing manual source-output cap"
-    grep -q 'multi-file `sed`' "$file" \
-        && check_pass "$label blocks multi-file source dumps" \
-        || check_fail "$label missing multi-file source-dump guard"
     grep -q 'navigation_hints\[\]' "$file" \
         && check_fail "$label still tells agents to inspect navigation_hints[]" \
         || check_pass "$label does not inspect navigation_hints[] by default"
@@ -250,6 +233,7 @@ if [[ -d "$AETHYME_DIR/.git" ]]; then
         SKILL_FILE=".codex/skills/aethyme/SKILL.md"
         grep -q '{{AETHYME_ROOT}}' "$SKILL_FILE" && check_fail "Skill has unresolved {{AETHYME_ROOT}} placeholder" || check_pass "Skill placeholders resolved"
         grep -q 'one bounded Explore call' "$SKILL_FILE" && check_pass "Skill states one bounded Explore-call contract" || check_fail "Skill missing one-call contract"
+        grep -q -- '--format brief' "$SKILL_FILE" && check_pass "Skill leads with the one-call Explore brief" || check_fail "Skill missing 'explore --format brief'"
         grep -q 'safe_to_use_as_answer' "$SKILL_FILE" && check_pass "Skill tells agents to inspect trust fields" || check_fail "Skill missing trust-field guidance"
         grep -q 'mktemp -t aethyme-explore' "$SKILL_FILE" && check_pass "Skill writes full Explore JSON to temp" || check_fail "Skill missing temp-file Explore capture"
         grep -q 'top_verification_targets' "$SKILL_FILE" && check_pass "Skill prints compact verification-target projection" || check_fail "Skill missing compact verification-target projection"
