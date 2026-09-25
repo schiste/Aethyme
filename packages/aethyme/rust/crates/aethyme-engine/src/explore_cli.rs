@@ -27,22 +27,43 @@ pub enum ExploreCliOutcome {
     Failed(String),
 }
 
+/// Output formats `explore` prints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Format {
+    /// The `aethyme-explore-v1` document. The default and the machine
+    /// surface: cross-process consumers and the eval runner parse it.
+    AnswerJson,
+    /// A text summary plus the top verified source spans, for an agent to
+    /// read in one call (see [`crate::explore_brief`]).
+    Brief,
+}
+
+fn parse_format(args: &[String]) -> Result<Format, String> {
+    match read_option(args, "--format").as_deref() {
+        Err(_) | Ok("answer-json") => Ok(Format::AnswerJson),
+        Ok("brief") => Ok(Format::Brief),
+        Ok(other) => Err(format!(
+            "explore: unknown --format {other:?}; expected answer-json or brief"
+        )),
+    }
+}
+
+/// `--repo`, defaulting to the current directory. The default is what lets
+/// the guidance prescribe one short command from inside a checkout.
+fn read_repo(args: &[String]) -> String {
+    read_option(args, "--repo").unwrap_or_else(|_| ".".to_string())
+}
+
 pub fn run(args: &[String]) -> ExploreCliOutcome {
-    let repo_str = match read_option(args, "--repo") {
-        Ok(v) => v,
-        Err(e) => return ExploreCliOutcome::BadUsage(e),
-    };
+    let repo_str = read_repo(args);
     let request = match read_option(args, "--request") {
         Ok(v) => v,
         Err(e) => return ExploreCliOutcome::BadUsage(e),
     };
-    let format = read_option(args, "--format").unwrap_or_else(|_| "answer-json".to_string());
-    if format != "answer-json" {
-        return ExploreCliOutcome::BadUsage(format!(
-            "explore: only --format answer-json is supported in the native \
-             path; got {format:?}"
-        ));
-    }
+    let format = match parse_format(args) {
+        Ok(format) => format,
+        Err(message) => return ExploreCliOutcome::BadUsage(message),
+    };
     let detail = read_option(args, "--detail").unwrap_or_else(|_| "compact".to_string());
     let detail_enum = match detail.as_str() {
         "compact" => explore::Detail::Compact,
@@ -75,9 +96,13 @@ pub fn run(args: &[String]) -> ExploreCliOutcome {
                 return ExploreCliOutcome::BadUsage(format!("explore: --depth must be 0..=3: {e}"));
             }
         },
+        // The brief is the one-call discovery surface, so it starts on the
+        // discovery rung unless the caller chose a budget.
+        Err(_) if format == Format::Brief && !has_flag_value(args, "--detail") => Some(0),
         Err(_) => None,
     };
-    let show_observability = has_flag(args, "--show-observability");
+    // The brief reports readiness, which lives in the observability block.
+    let show_observability = has_flag(args, "--show-observability") || format == Format::Brief;
 
     // --intent picks the orchestration shape. The default when no
     // --intent is passed is `auto`: scan the first ~10 tokens of the
@@ -100,7 +125,7 @@ pub fn run(args: &[String]) -> ExploreCliOutcome {
         "usage_boundary_query" => {
             // Different orchestrator: hybrid redb seed discovery plus
             // source-text evidence scanning.
-            return run_usage_boundary(args, &repo_str, &request);
+            return run_usage_boundary(args, &repo_str, &request, format);
         }
         other => {
             return ExploreCliOutcome::BadUsage(format!("explore: unknown --intent {other:?}"));
@@ -126,13 +151,7 @@ pub fn run(args: &[String]) -> ExploreCliOutcome {
     }
 
     match explore::explore_with_intent(&repo, &request, intent, intent_source, &params) {
-        Ok(response) => match serde_json::to_string_pretty(&response) {
-            Ok(json) => {
-                println!("{json}");
-                ExploreCliOutcome::Done
-            }
-            Err(e) => ExploreCliOutcome::Failed(format!("serialize response: {e}")),
-        },
+        Ok(response) => emit(&repo, format, &response),
         Err(explore::ExploreError::DaemonNotRunning) => {
             ExploreCliOutcome::DaemonNotRunning { repo }
         }
@@ -143,6 +162,7 @@ pub fn run(args: &[String]) -> ExploreCliOutcome {
             (status, reason),
             detail_enum,
             show_observability,
+            format,
         ),
         Err(other) => ExploreCliOutcome::Failed(format!("explore: {other}")),
     }
@@ -150,7 +170,12 @@ pub fn run(args: &[String]) -> ExploreCliOutcome {
 
 /// Run the `usage_boundary_query` intent path. This remains hybrid: redb
 /// chooses candidates and source text supplies evidence.
-fn run_usage_boundary(args: &[String], repo_str: &str, request: &str) -> ExploreCliOutcome {
+fn run_usage_boundary(
+    args: &[String],
+    repo_str: &str,
+    request: &str,
+    format: Format,
+) -> ExploreCliOutcome {
     let scope = match read_option(args, "--scope") {
         Ok(v) => v,
         Err(_) => {
@@ -189,13 +214,7 @@ fn run_usage_boundary(args: &[String], repo_str: &str, request: &str) -> Explore
     }
 
     match explore::explore_usage_boundary(&repo, request, &params) {
-        Ok(response) => match serde_json::to_string_pretty(&response) {
-            Ok(json) => {
-                println!("{json}");
-                ExploreCliOutcome::Done
-            }
-            Err(e) => ExploreCliOutcome::Failed(format!("serialize response: {e}")),
-        },
+        Ok(response) => emit(&repo, format, &response),
         Err(explore::ExploreError::BadParams(msg)) => {
             ExploreCliOutcome::BadUsage(format!("explore (usage_boundary_query): {msg}"))
         }
@@ -211,7 +230,8 @@ fn run_usage_boundary(args: &[String], repo_str: &str, request: &str) -> Explore
                 ("usage_boundary_query", "explicit"),
                 (status, reason),
                 detail,
-                has_flag(args, "--show-observability"),
+                has_flag(args, "--show-observability") || format == Format::Brief,
+                format,
             )
         }
         Err(err) => ExploreCliOutcome::Failed(format!("explore (usage_boundary_query): {err}")),
@@ -227,18 +247,38 @@ fn print_graph_unavailable(
     (status, reason): (&'static str, String),
     detail: explore::Detail,
     show_observability: bool,
+    format: Format,
 ) -> ExploreCliOutcome {
     let response = explore::project_graph_free_output(
         explore::graph_unavailable_response(repo, request, intent, intent_source, status, reason),
         detail,
         show_observability,
     );
-    match serde_json::to_string_pretty(&response) {
-        Ok(json) => {
-            println!("{json}");
-            ExploreCliOutcome::Done
-        }
-        Err(error) => ExploreCliOutcome::Failed(format!("serialize response: {error}")),
+    emit(repo, format, &response)
+}
+
+/// Print one answer document in the requested format.
+fn emit<T: serde::Serialize>(
+    repo: &std::path::Path,
+    format: Format,
+    response: &T,
+) -> ExploreCliOutcome {
+    match format {
+        Format::AnswerJson => match serde_json::to_string_pretty(response) {
+            Ok(json) => {
+                println!("{json}");
+                ExploreCliOutcome::Done
+            }
+            Err(error) => ExploreCliOutcome::Failed(format!("serialize response: {error}")),
+        },
+        Format::Brief => match serde_json::to_value(response) {
+            Ok(answer) => {
+                let root = repo.canonicalize().unwrap_or_else(|_| repo.to_path_buf());
+                print!("{}", crate::explore_brief::render(&root, &answer));
+                ExploreCliOutcome::Done
+            }
+            Err(error) => ExploreCliOutcome::Failed(format!("serialize response: {error}")),
+        },
     }
 }
 
@@ -261,4 +301,8 @@ fn read_options(args: &[String], flag: &str) -> Vec<String> {
 
 fn has_flag(args: &[String], flag: &str) -> bool {
     args.iter().any(|arg| arg == flag)
+}
+
+fn has_flag_value(args: &[String], flag: &str) -> bool {
+    read_option(args, flag).is_ok()
 }

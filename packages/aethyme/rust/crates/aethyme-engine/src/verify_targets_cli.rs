@@ -34,32 +34,32 @@ struct VerifyTargetsLimits {
 }
 
 #[derive(Debug, Serialize)]
-struct VerifiedTarget {
-    rank: usize,
+pub(crate) struct VerifiedTarget {
+    pub(crate) rank: usize,
     source: String,
     kind: String,
     target: String,
-    path: String,
-    status: &'static str,
+    pub(crate) path: String,
+    pub(crate) status: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    line_span: Option<LineSpan>,
-    matched_terms: Vec<String>,
-    lines: Vec<SourceLine>,
+    pub(crate) line_span: Option<LineSpan>,
+    pub(crate) matched_terms: Vec<String>,
+    pub(crate) lines: Vec<SourceLine>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    note: Option<String>,
+    pub(crate) note: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
-struct LineSpan {
-    start: usize,
-    end: usize,
+pub(crate) struct LineSpan {
+    pub(crate) start: usize,
+    pub(crate) end: usize,
     line_count: usize,
 }
 
 #[derive(Debug, Serialize)]
-struct SourceLine {
-    line: usize,
-    text: String,
+pub(crate) struct SourceLine {
+    pub(crate) line: usize,
+    pub(crate) text: String,
 }
 
 #[derive(Debug, Clone)]
@@ -152,6 +152,31 @@ fn run_inner(args: &[String]) -> Result<(), VerifyTargetsError> {
         .map_err(|error| VerifyTargetsError::Failed(format!("serialize report: {error}")))?;
     println!("{json}");
     Ok(())
+}
+
+/// Verified spans for the top `max_targets` Explore targets, each capped at
+/// `max_lines_per_target` lines, plus how many ranked candidates were left
+/// out. The same selection and span rules as `verify-targets`; only the line
+/// budget differs (per target here, shared across targets there), so one
+/// long first span cannot starve the second. Used by `explore --format brief`.
+pub(crate) fn verify_top_targets(
+    repo: &Path,
+    explore: &serde_json::Value,
+    max_targets: usize,
+    max_lines_per_target: usize,
+) -> (Vec<VerifiedTarget>, usize) {
+    let candidates = dedupe_candidates(collect_candidates(explore));
+    let candidate_count = candidates.len();
+    let selected = select_candidates(explore, candidates, max_targets);
+    let targets = selected
+        .iter()
+        .enumerate()
+        .map(|(index, candidate)| {
+            verify_candidate(repo, candidate, index + 1, max_lines_per_target)
+        })
+        .collect::<Vec<_>>();
+    let omitted = candidate_count.saturating_sub(targets.len());
+    (targets, omitted)
 }
 
 fn collect_candidates(explore: &serde_json::Value) -> Vec<CandidateTarget> {

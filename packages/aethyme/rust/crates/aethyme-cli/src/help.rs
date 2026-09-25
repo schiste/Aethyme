@@ -100,16 +100,23 @@ fn blocks(text: &str, prefix: &str) -> String {
 const GROUP_TEXT: &[(&str, &str)] = &[
     (
         "explore",
-        r#"aethyme explore — bounded Explore query; prints answer-json
+        r#"aethyme explore — bounded Explore query; prints answer-json or a brief
 
 Usage:
-  aethyme explore --repo <path> --request <text> [--format answer-json]
+  aethyme explore --request <text> --format brief
+      One call for "where is X": a compact summary (trust, readiness,
+      subsystems, verification steps) plus the top 2 verified source spans,
+      at most 80 lines each. A navigation aid, not an answer: verify the spans.
+  aethyme explore [--repo <path>] --request <text> [--format answer-json|brief]
                   [--intent auto|default|behavior|usage_boundary_query]
                   [--detail compact|standard|full] [--depth 0-3]
                   [--max-answer-items <n>] [--show-observability]
-      --repo <path>           Repository directory (required).
+      --repo <path>           Repository directory (default: current directory).
       --request <text>        Task or question to localize (required).
-      --format answer-json    Only answer-json is supported (default).
+      --format <format>       answer-json (default; the machine surface that
+                              explore-summary and verify-targets read) or
+                              brief (text; implies --show-observability and,
+                              without --depth/--detail, --depth 0).
       --intent <name>         auto (default) picks from the request's verbs;
                               default|task_localization_query,
                               behavior|behavior_localization_query,
