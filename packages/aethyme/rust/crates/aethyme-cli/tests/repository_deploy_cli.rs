@@ -348,8 +348,8 @@ fn deploy_verify_is_read_only_and_rejects_missing_policy() {
 fn top_level_help_exposes_the_canonical_deployment_surface() {
     let help = Command::new(aethyme_bin()).arg("--help").output().unwrap();
     assert!(help.status.success());
-    assert!(String::from_utf8_lossy(&help.stderr).contains("deploy [verify|bridge]"));
-    assert!(String::from_utf8_lossy(&help.stderr).contains("upgrade plan|apply|recover"));
+    assert!(String::from_utf8_lossy(&help.stdout).contains("deploy [verify|bridge]"));
+    assert!(String::from_utf8_lossy(&help.stdout).contains("upgrade plan|apply|recover"));
 
     let deploy_help = Command::new(aethyme_bin())
         .args(["deploy", "--help"])

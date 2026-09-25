@@ -1,0 +1,15 @@
+exit: 0
+--- stdout
+  aethyme broker advanced trust [--repo <path>] [--json]
+      Show every gate and prepare command this repository defines, then
+      record their exact policy digest as trusted on this machine. Until a
+      policy is trusted, submit, gates run, the pre-commit hook and prepare
+      refuse (exit 3) before running any repository-defined command; a policy
+      change needs trusting again. Requires an interactive terminal on stdin,
+      so an agent cannot approve itself. Repositories that already had gate
+      history are trusted with their current policy automatically.
+      AETHYME_TRUST_NONINTERACTIVE_FOR_TESTS=1 is a test-only escape.
+  aethyme broker advanced trust status [--repo <path>] [--json]
+      Read-only: the checkout's and integration tip's policy digests, whether
+      each is trusted, and the approved digests on record.
+--- stderr

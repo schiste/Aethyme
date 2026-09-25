@@ -58,7 +58,7 @@ pub(crate) fn session_notice_lines(advisories: &[Advisory]) -> Vec<String> {
             lines.push(format!("  safe next action: {}", action.summary));
         }
         lines.push(format!(
-            "  inspect: aethyme broker advisories show {}",
+            "  inspect: aethyme broker advanced advisories show {}",
             advisory.id
         ));
     }
@@ -124,7 +124,7 @@ pub(crate) fn render(advisories: &[Advisory]) -> String {
             }
         }
         output.push_str(&format!(
-            "- Acknowledge: `aethyme broker advisories ack {}`\n\n",
+            "- Acknowledge: `aethyme broker advanced advisories ack {}`\n\n",
             advisory.id
         ));
     }
@@ -211,7 +211,7 @@ mod tests {
     fn projection_is_deterministic_and_quotes_untrusted_text() {
         let rendered = render(&[advisory("heading\n## injected")]);
         assert!(rendered.contains("\"heading\\n## injected\""));
-        assert!(rendered.contains("aethyme broker advisories ack 7"));
+        assert!(rendered.contains("aethyme broker advanced advisories ack 7"));
         assert_eq!(rendered, render(&[advisory("heading\n## injected")]));
     }
 

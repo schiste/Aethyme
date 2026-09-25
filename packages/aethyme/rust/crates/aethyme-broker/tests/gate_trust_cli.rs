@@ -168,8 +168,13 @@ fn assert_refused_with_hint(output: &Output, root: &Path) {
         String::from_utf8_lossy(&output.stdout)
     );
     assert!(
-        stderr.contains(&format!("aethyme broker trust --repo {}", root.display()))
-            || stderr.contains(&format!("aethyme broker trust --repo '{}'", root.display())),
+        stderr.contains(&format!(
+            "aethyme broker advanced trust --repo {}",
+            root.display()
+        )) || stderr.contains(&format!(
+            "aethyme broker advanced trust --repo '{}'",
+            root.display()
+        )),
         "refusal does not name the trust command: {stderr}"
     );
 }
@@ -288,7 +293,7 @@ fn the_pre_commit_hook_refuses_an_untrusted_policy() {
         .output()
         .unwrap();
     assert!(!commit.status.success(), "the commit went through");
-    assert!(String::from_utf8_lossy(&commit.stderr).contains("aethyme broker trust"));
+    assert!(String::from_utf8_lossy(&commit.stderr).contains("aethyme broker advanced trust"));
     assert!(!fixture.marker("gate.marker"), "the hook ran the gate");
     assert_eq!(fixture.git(&root, &["rev-parse", "HEAD"]).stdout, head);
 

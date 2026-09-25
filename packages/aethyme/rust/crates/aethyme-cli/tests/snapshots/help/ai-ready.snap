@@ -1,0 +1,19 @@
+exit: 0
+--- stdout
+Usage: aethyme ai-ready [OPTIONS]
+
+  Run the legacy repository-quality scorecard.
+
+  This score does not determine broker or agent readiness. Use
+  `aethyme readiness` for operational readiness and `aethyme quality inspect`
+  for bounded repository-quality analysis.
+
+Options:
+  --repo PATH                  Repository path (defaults to current directory)
+  --repo-id TEXT               Repository ID for API mode
+  -f, --format [json|md|both]  Output format
+  -o, --output PATH            Output file (defaults to stdout)
+  --detectors TEXT             Comma-separated list of detectors to run (runs
+                               all if not specified)
+  --help                       Show this message and exit.
+--- stderr

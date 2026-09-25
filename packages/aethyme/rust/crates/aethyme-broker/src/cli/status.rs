@@ -139,17 +139,17 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
                     advisory_text(&advisory.identity),
                 );
                 out!(
-                    "    inspect: aethyme broker advisories show {}",
+                    "    inspect: aethyme broker advanced advisories show {}",
                     advisory.id
                 );
                 out!(
-                    "    acknowledge: aethyme broker advisories ack {}",
+                    "    acknowledge: aethyme broker advanced advisories ack {}",
                     advisory.id
                 );
             }
             if status.outstanding_advisories.len() > 10 {
                 out!(
-                    "  and {} more; inspect: aethyme broker advisories list",
+                    "  and {} more; inspect: aethyme broker advanced advisories list",
                     status.outstanding_advisories.len() - 10
                 );
             }
@@ -176,7 +176,7 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
                     status.outstanding_entry_exposures.len() - 10
                 );
             }
-            out!("  inspect: aethyme broker exposures plan");
+            out!("  inspect: aethyme broker advanced exposures plan");
         }
         // A caller parked behind a wedged operation is inside a command
         // that never returns, so it cannot report its own wait. Status
@@ -217,7 +217,7 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
             if status.coordinated_operations.len() > 10 {
                 out!("  and {} more", status.coordinated_operations.len() - 10);
             }
-            out!("  inspect: aethyme broker operations list");
+            out!("  inspect: aethyme broker advanced operations list");
         }
         out!();
         if status.agents.is_empty() {
@@ -298,7 +298,7 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
                 status.advisory_delivery.actioned_advisories,
                 status.advisory_delivery.total_shows,
             );
-            out!("  inspect: aethyme broker advisories metrics");
+            out!("  inspect: aethyme broker advanced advisories metrics");
         }
         print_overlap_warnings(&status.overlaps);
         print_promoted_conflict_warnings(&status.promoted_conflicts);

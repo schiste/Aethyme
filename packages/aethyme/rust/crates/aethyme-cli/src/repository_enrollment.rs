@@ -587,7 +587,7 @@ pub fn execute(repo_hint: &Path, confirmation: &str) -> Result<FirstEnrollmentEx
             || advertised.sha != journal.remote_base.exact_sha
         {
             return Err(format!(
-                "upstream moved after enrollment review; planned {} at {}, now {} at {}. The repository remains preservation-first; inspect `aethyme broker integration reconcile` and never retry publication blindly",
+                "upstream moved after enrollment review; planned {} at {}, now {} at {}. The repository remains preservation-first; inspect `aethyme broker advanced integration reconcile` and never retry publication blindly",
                 journal.remote_base.default_branch_ref,
                 journal.remote_base.exact_sha,
                 advertised.ref_name,
@@ -663,7 +663,7 @@ pub fn execute(repo_hint: &Path, confirmation: &str) -> Result<FirstEnrollmentEx
             .map_err(|error| format!("coordinate enrollment fetch: {error}"))?;
         if !fetch.ok() {
             return Err(format!(
-                "enrollment fetch operation {} did not succeed; inspect `aethyme broker operations show {}` before recovery",
+                "enrollment fetch operation {} did not succeed; inspect `aethyme broker advanced operations show {}` before recovery",
                 fetch.operation.id, fetch.operation.id
             ));
         }

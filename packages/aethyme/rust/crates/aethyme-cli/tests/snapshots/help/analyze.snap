@@ -1,0 +1,13 @@
+exit: 0
+--- stdout
+aethyme analyze — repository analyzers
+
+Usage:
+  aethyme analyze dead-code --repo <path> --scope <prefix> [--roots <a,b,...>]
+                            [--include-methods] [--boundary outside-directory]
+                            [--format summary|full-json|eval-json] [--json-output]
+                            [--show-observability]
+      Find functions under <prefix> with no callers outside it.
+      --roots: comma-separated entry roots; --json-output implies --format full-json;
+      --show-observability adds observability to eval-json.
+--- stderr

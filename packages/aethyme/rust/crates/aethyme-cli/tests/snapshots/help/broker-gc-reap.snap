@@ -1,0 +1,6 @@
+exit: 0
+--- stdout
+  aethyme broker gc reap [--json]
+      Reclaim capacity from quarantined leases whose holder process is gone;
+      named allocations remain quarantined for cleanup review.
+--- stderr

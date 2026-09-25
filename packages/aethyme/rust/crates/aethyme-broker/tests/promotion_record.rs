@@ -125,7 +125,7 @@ fn a_stale_digest_is_refused() {
     let err = format!("{err}");
     assert!(
         err.contains("no longer matches current state")
-            && err.contains("aethyme broker promotion-record plan"),
+            && err.contains("aethyme broker submit promotion-record plan"),
         "unexpected error: {err}"
     );
     assert!(

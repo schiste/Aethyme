@@ -1,0 +1,29 @@
+exit: 0
+--- stdout
+  aethyme broker advanced resources plan <request.json> [--json]
+      Read-only host-wide availability estimate for a typed resource bundle.
+      Never reserves a port, namespace, capacity slot, or exclusive key.
+  aethyme broker advanced resources explain <request.json> [--json]
+      Read-only diagnosis joining each blocked resource to its exact lease,
+      holder process, liveness, and wait/reconcile guidance.
+  aethyme broker advanced resources acquire <request.json> [--wait <duration>] [--grant-out <path>] [--json]
+      Atomically reserve the full bundle. --wait bounds contention retries.
+      --grant-out atomically creates a mode-0600 private grant and keeps the
+      ownership token out of command output.
+  aethyme broker advanced resources run <request.json> [--wait <duration>] [--cleanup-command <shell>] [--json] -- <command> ...
+      Acquire, expose only public allocations, supervise the process group,
+      renew while it runs, execute optional exact cleanup, then release. Lost
+      authority or unproven cleanup quarantines the bundle.
+  aethyme broker advanced resources renew <grant.json> --ttl <seconds> [--json]
+  aethyme broker advanced resources release <grant.json> [--json]
+      Renew or release with the exact grant returned by acquire. Tokens are
+      read from the file rather than command arguments or broker telemetry.
+  aethyme broker advanced resources list [--all] [--json]
+      Read-only inventory. Ownership tokens are never included.
+  aethyme broker advanced resources reap [--json]
+      Reclaim capacity from quarantined leases whose holder process is gone;
+      named allocations remain quarantined for cleanup review.
+  aethyme broker advanced resources reconcile <lease-id> --confirm <generation> [--json]
+      Release an expired, quarantined allocation after reviewing host cleanup.
+      The generation confirmation fences stale cleanup commands.
+--- stderr

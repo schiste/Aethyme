@@ -1,0 +1,4 @@
+exit: 0
+--- stdout
+  aethyme broker advanced pr check [--target <branch>] [--pr <number>] [--agent <name>] [--dispatch] [--cmd <command>] [--json]
+--- stderr

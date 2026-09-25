@@ -1,0 +1,22 @@
+exit: 0
+--- stdout
+  aethyme broker advanced advisories list [--all] [--json]
+      List outstanding non-blocking advisories newest-first. --all includes
+      acknowledged, suppressed, and resolved history. Deliberate inventory
+      refreshes bounded maintainer recommendations; the broker database is authoritative.
+  aethyme broker advanced advisories show <id> [--json]
+      Show one exact advisory with paths, evidence, integration provenance,
+      creation time, and resolution state.
+  aethyme broker advanced advisories ack <id> [--json]
+      Acknowledge one advisory idempotently and atomically refresh
+      .aethyme/broker-advisory.md from the remaining outstanding rows.
+      Promotion/lease advisories repeat on session commands, after
+      post-commit, and before uncached gates whose cost exceeds 1; they
+      remain informational and never alter command or promotion outcomes.
+  aethyme broker advanced advisories suppress <id> [--json]
+      Suppress a maintainer recommendation across later evidence samples.
+      Session-facing coordination advisories cannot be suppressed.
+  aethyme broker advanced advisories metrics [--json]
+      Inspect bounded, content-free shown-to-action correlation. Metrics
+      never retain task text, command arguments, paths, evidence, or secrets.
+--- stderr

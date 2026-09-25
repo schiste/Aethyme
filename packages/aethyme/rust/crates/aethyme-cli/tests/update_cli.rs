@@ -231,7 +231,8 @@ fn update_help_is_explicit_and_never_background() {
         .output()
         .unwrap();
     assert!(output.status.success());
-    let stderr = String::from_utf8(output.stderr).unwrap();
+    // Requested help is output: stdout, exit 0 (Phase 4, P4.3).
+    let stderr = String::from_utf8(output.stdout).unwrap();
     for expected in [
         "update check",
         "update plan [--channel stable|preview] [--json] [--refresh]",

@@ -1,0 +1,9 @@
+exit: 0
+--- stdout
+  aethyme broker advanced quality-report plan <path> --repo <owner/name> --pr <number> [--json]
+  aethyme broker advanced quality-report publish <path> --repo <owner/name> --pr <number> --session <id> [--json]
+      Validate and idempotently publish a revision-bound, redacted quality
+      report as the broker-owned neutral/advisory PR summary. Publication is
+      opt-in and uses the coordinated GitHub operation lane; it never changes
+      gate selection or CI certification.
+--- stderr

@@ -1,0 +1,8 @@
+exit: 0
+--- stdout
+  aethyme broker advanced verify-loop [--json]   (alias: e2e)
+      End-to-end broker verification for operators: snapshot integration,
+      run quick-test, run doctor, run broker source tests when this is an
+      Aethyme source checkout, then fail if integration moved during the
+      run so the result cannot be mistaken for current-tip proof.
+--- stderr

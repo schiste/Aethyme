@@ -1,0 +1,7 @@
+exit: 0
+--- stdout
+  aethyme broker advanced exec --session <id> -- <command> [--json]
+      Run a command in the session worktree, then fail if it creates or
+      modifies dirty paths outside explicit leases or in adoption-time
+      foreign files. Exports AETHYME_TEST_DB_SUFFIX=s<id>-exec.
+--- stderr

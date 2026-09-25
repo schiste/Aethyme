@@ -1,0 +1,8 @@
+exit: 0
+--- stdout
+  aethyme broker advanced scaffold [--json]
+      Deterministic setup: ONLY what the broker needs, with content that
+      is identical for every repo (config.toml skeleton, .gitignore
+      block, broker database). Never overwrites. Certify + scaffold are
+      the 'always exactly the same' pair — one reads, one writes.
+--- stderr

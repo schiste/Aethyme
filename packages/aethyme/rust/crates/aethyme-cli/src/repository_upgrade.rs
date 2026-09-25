@@ -2854,13 +2854,13 @@ pub(crate) fn build_readiness_remediation_plan(
     };
     report.plan_sha256 = readiness_plan_digest(&report)?;
     report.next_action = if !report.safe {
-        "resolve every listed blocker while preserving unrelated work in place, then regenerate `aethyme broker readiness plan --diff`"
+        "resolve every listed blocker while preserving unrelated work in place, then regenerate `aethyme broker status readiness plan --diff`"
             .into()
     } else if report.planned_write_set.is_empty() {
         "repository readiness artifacts already match the reviewed generators".into()
     } else {
         format!(
-            "review this plan and diff, then run `aethyme broker readiness apply --confirm {}`",
+            "review this plan and diff, then run `aethyme broker status readiness apply --confirm {}`",
             report.plan_sha256
         )
     };

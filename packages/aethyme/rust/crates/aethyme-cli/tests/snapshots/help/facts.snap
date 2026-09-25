@@ -1,0 +1,11 @@
+exit: 0
+--- stdout
+aethyme facts — derived function facts
+
+Usage:
+  aethyme facts public-functions --repo <path> --scope <prefix> [--include-methods] [--json-output]
+      List public functions defined under <prefix> and how each is exposed.
+  aethyme facts function-usage --repo <path> --target <fn> --boundary <prefix>
+                               [--roots <a,b,...>] [--json-output]
+      Internal and external callers of one function (<fn>: id, name, or qualified name).
+--- stderr

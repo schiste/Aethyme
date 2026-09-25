@@ -1,0 +1,9 @@
+exit: 0
+--- stdout
+  aethyme broker gc storage [--json]
+  aethyme broker gc storage plan [--json]
+  aethyme broker gc storage apply --confirm <sha256> [--json]
+      Inventory every host worktree root by reconciling disk directories,
+      Git registrations, and repository session ledgers. Apply removes only
+      exact reviewed orphan roots or stray directories.
+--- stderr

@@ -1,0 +1,20 @@
+exit: 0
+--- stdout
+aethyme plugin — install the agent-surface plugin and check the CLI behind it
+
+Usage: aethyme plugin <action> [options]
+
+Actions:
+  install     register the marketplace and install the plugin
+  remove      uninstall the plugin and forget the marketplace
+  status      report the plugin, the CLI on PATH, and the hook floor
+
+Options:
+  --surface codex|claude|all   default: all surfaces present on this machine
+  --source <path|owner/repo>   default: schiste/Aethyme
+  --dry-run                    print the commands without running them
+  --json                       machine-readable status
+
+`status` exits nonzero when the plugin is installed but the `aethyme`
+on PATH is older than 0.7.17, which makes its hooks inert.
+--- stderr

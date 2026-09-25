@@ -1,0 +1,7 @@
+exit: 0
+--- stdout
+  aethyme broker submit promote --entry <id> [--json]
+      Manual-mode only: advance the local integration branch to a verified
+      entry's merge commit; other in-flight entries are re-simulated.
+      Promotion stays local; publish through `broker ship plan --entry <id>`.
+--- stderr

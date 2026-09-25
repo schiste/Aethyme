@@ -213,9 +213,9 @@ pub(super) fn render_verify_loop_report(report: &crate::VerifyLoopReport) {
     if report.ok {
         out!("Next: none");
     } else if report.integration_moved {
-        out!("Next: rerun `aethyme broker verify-loop` on the current integration tip.");
+        out!("Next: rerun `aethyme broker advanced verify-loop` on the current integration tip.");
     } else {
-        out!("Next: fix the failed step above, then rerun `aethyme broker verify-loop`.");
+        out!("Next: fix the failed step above, then rerun `aethyme broker advanced verify-loop`.");
     }
 }
 
@@ -946,7 +946,7 @@ pub(super) fn run_hooks(parsed: Parsed) -> Result<(), UsageError> {
             if !parsed.json {
                 out!(
                     "Hooks are shared by every worktree. Uninstall any time with \
-                     `aethyme broker hooks uninstall`."
+                     `aethyme broker advanced hooks uninstall`."
                 );
             }
         }

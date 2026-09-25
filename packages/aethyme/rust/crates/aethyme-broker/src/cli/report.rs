@@ -621,7 +621,7 @@ pub(super) fn run_report(parsed: Parsed) -> Result<(), UsageError> {
                 .store()
                 .session_for_worktree(&worktree)?
                 .ok_or(UsageError::Message(
-                    "report file requires a broker session for the current worktree; run `aethyme broker adopt --task \"File reviewed report\"` first".into(),
+                    "report file requires a broker session for the current worktree; run `aethyme broker start --adopt --task \"File reviewed report\"` first".into(),
                 ))?;
             let filed = crate::file_reviewed_report(
                 &mut broker,

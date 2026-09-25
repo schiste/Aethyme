@@ -203,6 +203,9 @@ fn v0_three_agents_end_to_end() {
             .map(|item| item.count),
         Some(3)
     );
-    assert_eq!(status.queue_history.command, "aethyme broker queue history");
+    assert_eq!(
+        status.queue_history.command,
+        "aethyme broker advanced queue history"
+    );
     assert_eq!(status.integration_branch, "aethyme/integration");
 }

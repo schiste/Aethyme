@@ -1,0 +1,24 @@
+exit: 0
+--- stdout
+  aethyme broker gc plan [--json]
+      Report exact retention-eligible rows, runtime files, represented
+      worktrees/refs, estimated bytes, blockers, and a stable plan digest.
+  aethyme broker gc apply --confirm <sha256> [--json]
+      Apply or resume the exact reviewed plan under an exclusive lock. A
+      recovery journal makes interrupted row, file, and worktree cleanup safe.
+  aethyme broker gc reclaim plan [--json]
+  aethyme broker gc reclaim apply --confirm <sha256> [--json]
+      Report regenerable build output (target, node_modules, .venv, build,
+      dist) in session worktrees, and remove only what was reviewed. An active
+      session's artefacts are listed but never removed. Nothing here is
+      recreated for you: a reclaimed worktree pays a cold build next time.
+  aethyme broker gc storage [--json]
+  aethyme broker gc storage plan [--json]
+  aethyme broker gc storage apply --confirm <sha256> [--json]
+      Inventory every host worktree root by reconciling disk directories,
+      Git registrations, and repository session ledgers. Apply removes only
+      exact reviewed orphan roots or stray directories.
+  aethyme broker gc reap [--json]
+      Reclaim capacity from quarantined leases whose holder process is gone;
+      named allocations remain quarantined for cleanup review.
+--- stderr

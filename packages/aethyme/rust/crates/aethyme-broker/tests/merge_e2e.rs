@@ -796,7 +796,7 @@ fn follow_up_refuses_to_replace_a_rewritten_accepted_checkpoint_with_integration
     )));
     assert!(message.contains("cannot replace it as the ownership boundary"));
     assert!(message.contains(&format!(
-        "aethyme broker checkpoint plan --session {}",
+        "aethyme broker advanced checkpoint plan --session {}",
         session.id
     )));
     let recovery_branch = format!(
@@ -908,7 +908,7 @@ fn reviewed_checkpoint_recovery_preserves_head_and_reanchors_without_hiding_foll
     let mismatch = mismatch.to_string();
     assert!(
         mismatch.contains("no longer matches current state")
-            && mismatch.contains("aethyme broker checkpoint plan"),
+            && mismatch.contains("aethyme broker advanced checkpoint plan"),
         "{mismatch}"
     );
     assert!(!mismatch.contains("expected"), "{mismatch}");
@@ -1014,7 +1014,7 @@ fn checkpoint_recovery_refuses_divergence_and_sessions_without_acceptance_proof(
         "{repair_error}"
     );
     assert!(repair_error.contains(&format!(
-        "aethyme broker checkpoint plan --session {}",
+        "aethyme broker advanced checkpoint plan --session {}",
         session.id
     )));
     assert!(!repair_error.contains("git reset"));
@@ -2118,7 +2118,8 @@ fn status_reports_promoted_unmerged_work_as_separate_conflict_surface() {
         advice
             .commands
             .iter()
-            .any(|command| command == &format!("aethyme broker repair --session {}", live.id)),
+            .any(|command| command
+                == &format!("aethyme broker advanced repair --session {}", live.id)),
         "{advice:?}"
     );
 }
@@ -2169,7 +2170,8 @@ fn integration_status_reports_pending_layer_entries_files_and_conflicts() {
             .next_action
             .commands
             .iter()
-            .any(|command| command == &format!("aethyme broker repair --session {}", live.id)),
+            .any(|command| command
+                == &format!("aethyme broker advanced repair --session {}", live.id)),
         "{report:?}"
     );
     assert_eq!(report.next_action.state, IntegrationDeliveryState::Blocked);
@@ -3513,7 +3515,7 @@ fn status_warns_on_the_first_external_main_movement() {
             && advice.severity == StatusAdviceSeverity::Notice
             && advice.summary.contains("external main movement detected")
             && advice.commands
-                == vec!["aethyme broker integration reconcile --upstream origin/main --dry-run"]
+                == vec!["aethyme broker advanced integration reconcile --upstream origin/main --dry-run"]
     }));
 
     let integration = broker.integration_status(0).unwrap();
@@ -3705,7 +3707,7 @@ fn status_warns_when_local_and_upstream_main_move_together_beyond_integration() 
                     .summary
                     .contains("integration does not contain origin/main")
                 && advice.commands
-                    == vec!["aethyme broker integration reconcile --upstream origin/main --dry-run"]
+                    == vec!["aethyme broker advanced integration reconcile --upstream origin/main --dry-run"]
         }),
         "{:?}",
         status.advice

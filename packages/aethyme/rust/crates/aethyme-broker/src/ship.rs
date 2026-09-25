@@ -1114,7 +1114,7 @@ impl Broker {
                     before_sha,
                     after_sha,
                     follow_up_command: Some(format!(
-                        "aethyme broker ship execute --entry {} --confirm {} --sync-main",
+                        "aethyme broker advanced ship execute --entry {} --confirm {} --sync-main",
                         plan.queue_entry.id, confirm
                     )),
                 },
@@ -3040,7 +3040,7 @@ fn local_main_sync_refusal(
     if !assessment.current_branch_matches {
         return format!(
             "primary checkout is not on expected default branch {default_branch}; \
-             check it out there and re-run `aethyme broker ship execute --entry {} \
+             check it out there and re-run `aethyme broker advanced ship execute --entry {} \
              --confirm {} --sync-main`",
             plan.queue_entry.id, plan.publication_sha,
         );
@@ -3048,14 +3048,14 @@ fn local_main_sync_refusal(
     if !assessment.local_head_unchanged {
         return format!(
             "local {} moved since planning, so the reviewed synchronization no longer \
-             applies; review a new plan with `aethyme broker ship plan --entry {}`",
+             applies; review a new plan with `aethyme broker advanced ship plan --entry {}`",
             plan.local_default_branch_ref, plan.queue_entry.id,
         );
     }
     if !assessment.local_commits_not_in_integration.is_empty() {
         return format!(
             "local {} contains commits not represented by integration: {}. Review them with \
-             `aethyme broker main reconcile plan` before retrying delivery",
+             `aethyme broker advanced main reconcile plan` before retrying delivery",
             plan.local_default_branch_ref,
             assessment.local_commits_not_in_integration.join(", "),
         );

@@ -1,0 +1,10 @@
+exit: 0
+--- stdout
+  aethyme broker advanced git --session <id> [--repo <owner/name>] [--scope <scope>] [--effect <read|write|destructive>] [--reason <text>] [--destructive] [--no-wait|--queue-timeout <seconds>] [--json] -- <git-args>
+      Run Git through the durable operation coordinator. Remote Git commands
+      require an exact --repo. Repository writes are serialized, journaled,
+      and fail closed after a crash with an unknown remote outcome.
+      A write queues for the repository lock and is recorded while it waits, so
+      `operations list` shows it. Use --no-wait to refuse rather than queue, or
+      --queue-timeout <seconds> to give up after a bounded wait.
+--- stderr

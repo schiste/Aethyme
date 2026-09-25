@@ -1,0 +1,9 @@
+exit: 0
+--- stdout
+  aethyme init [--json]                (also: aethyme broker init)
+      Guided setup: certify (read-only), then scaffold (deterministic,
+      only-if-missing), then gates draft (adaptive, only when no
+      gates.toml exists) — the three commands below in sequence, then a
+      summary of what already existed vs what was created. Idempotent:
+      a second run on the same repo changes nothing and says so.
+--- stderr

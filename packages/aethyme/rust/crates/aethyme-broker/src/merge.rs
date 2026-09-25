@@ -873,7 +873,7 @@ impl Broker {
                 PromoteMode::Manual => {
                     promotion_suppressed = Some(format!(
                         "verified; promotion is manual for this repository — \
-                         run `aethyme broker promote --entry {}`",
+                         run `aethyme broker submit promote --entry {}`",
                         entry.id
                     ));
                 }
@@ -932,7 +932,7 @@ impl Broker {
                 );
                 reason.push_str(&format!(
                     "\nSafe recovery:\n\
-                       1. Review `aethyme broker checkpoint plan --session {}` and apply its exact digest if the plan is safe.\n\
+                       1. Review `aethyme broker advanced checkpoint plan --session {}` and apply its exact digest if the plan is safe.\n\
                        2. If automatic recovery refuses an amended promoted commit, preserve it first:\n\
                           git branch {recovery_branch} {}\n\
                           git reset --hard {recorded_baseline}\n\

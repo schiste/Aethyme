@@ -1,0 +1,10 @@
+exit: 0
+--- stdout
+  aethyme broker advanced events [--since <id>] [--kind <prefix>] [--follow] [--json]
+      Show the append-only event log (see docs/events-contract.md).
+      --kind filters by prefix (e.g. merge. or lease.overlap); --follow
+      polls for new events and survives transient read errors.
+  aethyme broker advanced events prune --keep-days <n> [--json]
+      Retention: delete events older than <n> days. Event ids stay
+      strictly increasing, so existing --since cursors remain valid.
+--- stderr

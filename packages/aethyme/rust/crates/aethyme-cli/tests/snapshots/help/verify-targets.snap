@@ -1,0 +1,11 @@
+exit: 0
+--- stdout
+aethyme verify-targets — bounded source spans for Explore targets
+
+Usage:
+  aethyme verify-targets --from <file|-> [--repo <path>] [--max-targets <n>] [--max-lines <n>]
+      --from <file|->     Saved `explore --format answer-json` output; `-` reads stdin (required).
+      --repo <path>       Repository the spans are read from (default: current directory).
+      --max-targets <n>   Verification targets to print, > 0 (default 2).
+      --max-lines <n>     Maximum source lines per target, > 0 (default 80).
+--- stderr

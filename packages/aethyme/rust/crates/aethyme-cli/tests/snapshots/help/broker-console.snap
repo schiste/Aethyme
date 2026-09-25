@@ -1,0 +1,24 @@
+exit: 0
+--- stdout
+  aethyme broker advanced console [status|list] [--json]
+      Show the exact revision of this checkout and list consoles serving this
+      repository right now, including each marker's branch, commit, worktree,
+      port, and integration relation. Read-only; reserves nothing.
+  aethyme broker advanced console plan [--allow-parallel] [--json]
+      Show exactly what a console launch would reserve under the current mode
+      without reserving it.
+  aethyme broker advanced console run [--wait <duration>] [--allow-parallel] [--json] -- <command> ...
+      Run a dev server under the repository's console mode. `singular` takes
+      one exclusive key and one pinned port, so a second launch anywhere on
+      this host is refused with the console that already holds it.
+      `--allow-parallel` is an explicit testing escape hatch: it keeps a
+      registry lease and allocates another port from the configured range.
+      `per_worktree` takes a distinct port, namespace, and one slot from a
+      bounded pool, so worktrees run side by side without exhausting the host.
+      `unmanaged` reserves nothing and executes directly. Allocations reach
+      the command as AETHYME_RESOURCE_PORT, AETHYME_RESOURCE_NAMESPACE, and
+      AETHYME_RESOURCE_SLOT. Managed commands also receive
+      AETHYME_CONSOLE_MARKER and AETHYME_CONSOLE_MARKER_DIGEST; the marker is
+      removed after clean shutdown. Configure with [console] in
+      .aethyme/config.toml: mode, port, port_end, pool_limit, ttl_seconds.
+--- stderr

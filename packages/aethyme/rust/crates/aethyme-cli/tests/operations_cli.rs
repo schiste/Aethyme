@@ -23,9 +23,16 @@ fn repo() -> (tempfile::TempDir, i64) {
     std::fs::write(tmp.path().join("tracked.txt"), "base\n").unwrap();
     git(tmp.path(), &["add", "tracked.txt"]);
     git(tmp.path(), &["commit", "-qm", "init"]);
-    let adopted = Invoke::new(["broker", "adopt", "--task", "operation test", "--json"])
-        .cwd(tmp.path())
-        .run();
+    let adopted = Invoke::new([
+        "broker",
+        "start",
+        "--adopt",
+        "--task",
+        "operation test",
+        "--json",
+    ])
+    .cwd(tmp.path())
+    .run();
     adopted.ok();
     let session = adopted.json()["id"].as_i64().unwrap();
     (tmp, session)
@@ -37,6 +44,7 @@ fn coordinated_git_frontend_journals_a_read() {
     let session_arg = session.to_string();
     let result = Invoke::new([
         "broker",
+        "advanced",
         "git",
         "--session",
         &session_arg,
@@ -53,7 +61,7 @@ fn coordinated_git_frontend_journals_a_read() {
     assert_eq!(payload["operation"]["effect"], "read");
     assert_eq!(payload["operation"]["status"], "succeeded");
 
-    let journal = Invoke::new(["broker", "operations", "--json"])
+    let journal = Invoke::new(["broker", "advanced", "operations", "--json"])
         .cwd(tmp.path())
         .run();
     journal.ok();
@@ -67,6 +75,7 @@ fn github_and_destructive_frontends_fail_before_execution_without_required_scope
     let session_arg = session.to_string();
     let missing_repo = Invoke::new([
         "broker",
+        "advanced",
         "gh",
         "--session",
         &session_arg,
@@ -83,6 +92,7 @@ fn github_and_destructive_frontends_fail_before_execution_without_required_scope
 
     let destructive = Invoke::new([
         "broker",
+        "advanced",
         "git",
         "--session",
         &session_arg,
@@ -98,6 +108,7 @@ fn github_and_destructive_frontends_fail_before_execution_without_required_scope
 
     let missing_reason = Invoke::new([
         "broker",
+        "advanced",
         "git",
         "--session",
         &session_arg,
@@ -112,6 +123,7 @@ fn github_and_destructive_frontends_fail_before_execution_without_required_scope
 
     Invoke::new([
         "broker",
+        "advanced",
         "git",
         "--session",
         &session_arg,
@@ -143,6 +155,7 @@ fn github_frontend_refuses_targets_after_the_broker_separator() {
     ] {
         let mut args = vec![
             "broker",
+            "advanced",
             "gh",
             "--session",
             &session_arg,
@@ -156,7 +169,7 @@ fn github_frontend_refuses_targets_after_the_broker_separator() {
         refusal.assert_contains(expected);
     }
 
-    let journal = Invoke::new(["broker", "operations", "--json"])
+    let journal = Invoke::new(["broker", "advanced", "operations", "--json"])
         .cwd(tmp.path())
         .run();
     journal.ok();
@@ -170,6 +183,7 @@ fn operation_history_lists_filters_and_pages_with_a_bare_alias() {
     for _ in 0..4 {
         Invoke::new([
             "broker",
+            "advanced",
             "git",
             "--session",
             &session_arg,
@@ -183,18 +197,33 @@ fn operation_history_lists_filters_and_pages_with_a_bare_alias() {
         .ok();
     }
 
-    let first = Invoke::new(["broker", "operations", "list", "--limit", "2", "--json"])
-        .cwd(tmp.path())
-        .run();
+    let first = Invoke::new([
+        "broker",
+        "advanced",
+        "operations",
+        "list",
+        "--limit",
+        "2",
+        "--json",
+    ])
+    .cwd(tmp.path())
+    .run();
     first.ok();
     let first_json = first.json();
     let first_operations = first_json["operations"].as_array().unwrap();
     assert_eq!(first_operations.len(), 2);
     assert!(first_operations[0]["id"].as_i64() > first_operations[1]["id"].as_i64());
     let first_id = first_operations[0]["id"].as_i64().unwrap().to_string();
-    let shown = Invoke::new(["broker", "operations", "show", &first_id, "--json"])
-        .cwd(tmp.path())
-        .run();
+    let shown = Invoke::new([
+        "broker",
+        "advanced",
+        "operations",
+        "show",
+        &first_id,
+        "--json",
+    ])
+    .cwd(tmp.path())
+    .run();
     shown.ok();
     assert_eq!(shown.json()["operation"], first_operations[0]);
     assert_eq!(shown.json()["reconciliation"]["state"], "not_required");
@@ -203,7 +232,7 @@ fn operation_history_lists_filters_and_pages_with_a_bare_alias() {
         false
     );
 
-    let shown_text = Invoke::new(["broker", "operations", "show", &first_id])
+    let shown_text = Invoke::new(["broker", "advanced", "operations", "show", &first_id])
         .cwd(tmp.path())
         .run();
     shown_text.ok();
@@ -213,6 +242,7 @@ fn operation_history_lists_filters_and_pages_with_a_bare_alias() {
 
     let second = Invoke::new([
         "broker",
+        "advanced",
         "operations",
         "list",
         "--limit",
@@ -230,6 +260,7 @@ fn operation_history_lists_filters_and_pages_with_a_bare_alias() {
     let repository = first_operations[0]["repository"].as_str().unwrap();
     let filtered = Invoke::new([
         "broker",
+        "advanced",
         "operations",
         "list",
         "--session",
@@ -247,19 +278,19 @@ fn operation_history_lists_filters_and_pages_with_a_bare_alias() {
     filtered.ok();
     assert_eq!(filtered.json()["operations"].as_array().unwrap().len(), 4);
 
-    let bare = Invoke::new(["broker", "operations", "--limit", "2", "--json"])
+    let bare = Invoke::new(["broker", "advanced", "operations", "--limit", "2", "--json"])
         .cwd(tmp.path())
         .run();
     bare.ok();
     assert_eq!(bare.json(), first_json);
 
-    let invalid = Invoke::new(["broker", "operations", "list", "--limit", "0"])
+    let invalid = Invoke::new(["broker", "advanced", "operations", "list", "--limit", "0"])
         .cwd(tmp.path())
         .run();
     invalid.expect_code(1);
     invalid.assert_contains("--limit must be between 1 and 500");
 
-    let missing_show_id = Invoke::new(["broker", "operations", "show"])
+    let missing_show_id = Invoke::new(["broker", "advanced", "operations", "show"])
         .cwd(tmp.path())
         .run();
     missing_show_id.expect_code(1);

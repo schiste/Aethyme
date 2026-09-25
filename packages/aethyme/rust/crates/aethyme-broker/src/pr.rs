@@ -383,7 +383,7 @@ fn decision(
 fn next_commands(options: &PrCheckOptions, decision: &PrDecision) -> Vec<String> {
     if decision.should_dispatch && !options.dispatch {
         return vec![format!(
-            "aethyme broker pr check --target {}{} --dispatch",
+            "aethyme broker advanced pr check --target {}{} --dispatch",
             shell_word(&options.target_branch),
             options
                 .pr_number

@@ -1,0 +1,32 @@
+exit: 0
+--- stdout
+  aethyme broker advanced report capture --kind <bug|improvement> --title <text> [--session <id>] [--include-task] [--stdout | --output <filename>] [--json]
+      Build an allowlist-only diagnostic snapshot entirely offline. By
+      default, atomically writes a new JSON artifact beneath
+      .aethyme/reports/ and prints its SHA-256 for review. --output accepts
+      a filename (or .aethyme/reports/<filename>) without overwriting;
+      --stdout emits the exact report bytes and prints the digest to stderr.
+      Task text and coordinated-operation reasons are omitted unless
+      --include-task is explicit.
+  aethyme broker advanced report list [--json]
+      List valid captured reports newest-first with capture time, kind,
+      Aethyme version, current SHA-256 digest, and filed/unfiled state.
+      Invalid local artifacts are reported separately; no state is changed.
+  aethyme broker advanced report show <filename> [--json]
+      Inspect one captured report by filename or its repository-relative
+      .aethyme/reports/<filename> path. Recomputes the current digest and
+      refuses symlinks, path escapes, oversized files, and invalid schemas.
+  aethyme broker advanced report render <filename> --form <form.yml> [--output <name>.issue.md] [--json]
+      Render a captured report through one repository issue form, entirely
+      offline. The form must be a .github/ISSUE_TEMPLATE/*.yml file. Known
+      allowlisted report fields become Markdown sections in form order;
+      unknown fields remain explicit unfilled sections. Exits non-zero after
+      rendering when any required field is still unfilled. --output atomically
+      creates an editable .aethyme/reports/*.issue.md review artifact.
+  aethyme broker advanced report file <path> --repo <owner/name> --confirm <sha256> [--json]
+      File an exact reviewed `report render --output` artifact through the
+      coordinated GitHub operation layer. Refuses digest drift and unresolved
+      required fields. Successful issue URL/number metadata is journaled and
+      recorded locally; ambiguous outcomes require explicit reconciliation and
+      are never retried automatically.
+--- stderr

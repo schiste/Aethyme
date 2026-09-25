@@ -5,10 +5,10 @@ use aethyme_broker::Broker;
 
 const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
 const RESOURCES_USAGE: &str =
-    "usage: aethyme broker resources reconcile <lease-id> --confirm <generation> [--json]";
-const OPERATIONS_USAGE: &str = "usage: aethyme broker operations reconcile --operation <id> \
+    "usage: aethyme broker advanced resources reconcile <lease-id> --confirm <generation> [--json]";
+const OPERATIONS_USAGE: &str = "usage: aethyme broker advanced operations reconcile --operation <id> \
      --outcome <succeeded|failed> --reason <text> [--json]";
-const INTEGRATION_USAGE: &str = "usage: aethyme broker integration reconcile --upstream <ref> \
+const INTEGRATION_USAGE: &str = "usage: aethyme broker advanced integration reconcile --upstream <ref> \
      [--resolution-file <path>] [--write-resolution-template <path>] \
      [--dry-run | --apply --confirm <sha256>] [--json]";
 

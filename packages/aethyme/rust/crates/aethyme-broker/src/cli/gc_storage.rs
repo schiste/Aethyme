@@ -122,7 +122,7 @@ pub(super) fn render_storage_plan(plan: &crate::StoragePlan, detail: bool) {
         out!("  apply: nothing eligible");
     } else {
         out!(
-            "  apply: aethyme broker storage apply --confirm {}",
+            "  apply: aethyme broker gc storage apply --confirm {}",
             plan.digest
         );
     }
@@ -515,7 +515,7 @@ pub(super) fn run_reclaim(parsed: Parsed) -> Result<(), UsageError> {
                     out!("Nothing to reclaim.");
                 } else {
                     out!(
-                        "Apply with: aethyme broker reclaim apply --confirm {}",
+                        "Apply with: aethyme broker gc reclaim apply --confirm {}",
                         plan.digest
                     );
                 }
@@ -554,7 +554,7 @@ pub(super) fn run_reclaim(parsed: Parsed) -> Result<(), UsageError> {
                     format!("changes since review: {}", capped_join(&changes, 8))
                 };
                 return Err(UsageError::Message(format!(
-                    "confirmation does not match the current plan; re-run `aethyme broker reclaim plan` and review it again (reviewed {}, current {}); {}",
+                    "confirmation does not match the current plan; re-run `aethyme broker gc reclaim plan` and review it again (reviewed {}, current {}); {}",
                     confirm, plan.digest, detail
                 )));
             }
@@ -680,7 +680,7 @@ pub(super) fn run_storage(parsed: Parsed) -> Result<(), UsageError> {
             }
             if !report.complete {
                 return Err(UsageError::Message(report.recovery_action.unwrap_or_else(
-                    || "review a new plan with `aethyme broker storage plan`".into(),
+                    || "review a new plan with `aethyme broker gc storage plan`".into(),
                 )));
             }
         }

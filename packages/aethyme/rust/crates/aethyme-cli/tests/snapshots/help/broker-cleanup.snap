@@ -1,0 +1,10 @@
+exit: 0
+--- stdout
+  aethyme broker finish cleanup <session-id> [--force] [--json]
+  aethyme broker finish cleanup --all-cleaned [--apply --confirm <sha256>] [--json]
+      Remove one session worktree, or inventory all retained broker-owned
+      worktrees from already-closed sessions. Bulk cleanup is a read-only plan
+      by default; --apply revalidates and removes only clean worktrees whose
+      session work is represented on main, integration, or configured upstream.
+      Adopted worktrees are never included in the bulk sweep.
+--- stderr

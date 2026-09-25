@@ -1536,7 +1536,7 @@ fn blocker_recovery(conflict: &HostResourceConflict, leases: &[HostResourceLease
             |pid| format!("holder PID {pid}"),
         );
         return format!(
-            "holder process for lease {} ({holder}) is gone; review cleanup, then run `aethyme broker resources reconcile {} --confirm {}`",
+            "holder process for lease {} ({holder}) is gone; review cleanup, then run `aethyme broker advanced resources reconcile {} --confirm {}`",
             lease.lease_id, lease.lease_id, lease.generation
         );
     }
@@ -1571,7 +1571,7 @@ fn wait_advice(blockers: &[HostResourceBlocker]) -> HostResourceWaitAdvice {
             waitable: false,
             reason: "orphaned_holder".into(),
             action: format!(
-                "review cleanup for lease {} (holder PID {}), then run `aethyme broker resources reconcile {} --confirm {}`",
+                "review cleanup for lease {} (holder PID {}), then run `aethyme broker advanced resources reconcile {} --confirm {}`",
                 holder.lease_id,
                 holder
                     .holder_pid

@@ -284,7 +284,7 @@ fn on_session_start(broker: &mut Broker, session: Option<&Session>) -> HookOutco
 
     let joined = format!(
         "Aethyme: session {} joined this repository. You are no longer the only live session — \
-         claim paths before editing shared files (`aethyme broker leases claim <path> --session \
+         claim paths before editing shared files (`aethyme broker advanced leases claim <path> --session \
          <id>`) and integrate through `aethyme broker submit`.",
         session.id
     );

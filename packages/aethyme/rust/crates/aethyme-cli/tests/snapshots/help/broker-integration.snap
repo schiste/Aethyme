@@ -1,0 +1,19 @@
+exit: 0
+--- stdout
+  aethyme broker advanced integration status [--json]
+      Focused promoted-but-unmerged view: the local integration branch as
+      a pending layer above main, with promoted entries, files changed,
+      live sessions conflicting with that layer, and the next action.
+  aethyme broker advanced integration wait-stable [--seconds <n>] [--json]
+      Sample integration, wait for a quiet window (default: 30s), then
+      sample again. Fails if integration moved, printing the old and new
+      tips so long checks are not mistaken for current-tip proof.
+  aethyme broker advanced integration reconcile --upstream <ref> [--resolution-file <path>] [--write-resolution-template <path>] [--dry-run|--apply --confirm <sha256>] [--json]
+      Compare already-fetched upstream with local main and promoted queue
+      state. Dry-run is the default. --apply marks externally landed work,
+      replays reviewed pending work, and rebuilds integration only when
+      --confirm matches the dry-run plan digest. A resolution file binds
+      queue attestations and per-SHA unrecorded-commit dispositions. The
+      template option atomically writes a no-clobber schema-v2 document with
+      exact identifiers and deliberately invalid null operator judgments.
+--- stderr

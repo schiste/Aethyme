@@ -73,7 +73,7 @@ pub(super) fn render_start_base(base: &crate::SessionStartBase) {
             default_ref()
         );
         out!(
-            "         inspect with `aethyme broker integration status`, or start \
+            "         inspect with `aethyme broker advanced integration status`, or start \
              from the default branch if integration is not the base you want."
         );
     }
@@ -369,7 +369,7 @@ pub(super) fn render_cleanup_sweep_report(report: &crate::CleanupSweepReport, de
         }
     } else if report.plan.eligible_worktree_count > 0 || report.plan.eligible_branch_count > 0 {
         out!(
-            "  apply: aethyme broker cleanup --all-cleaned --apply --confirm {}",
+            "  apply: aethyme broker finish cleanup --all-cleaned --apply --confirm {}",
             report.plan.digest
         );
     }
@@ -1074,7 +1074,7 @@ pub(super) fn run_close(parsed: Parsed) -> Result<(), UsageError> {
     } else {
         out!(
             "Session {session} closed (state only — worktree untouched). \
-             Next task on the same worktree: `aethyme broker adopt --task \"...\"`."
+             Next task on the same worktree: `aethyme broker start --adopt --task \"...\"`."
         );
     }
     Ok(())

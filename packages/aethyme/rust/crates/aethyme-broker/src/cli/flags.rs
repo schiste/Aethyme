@@ -68,6 +68,8 @@ pub(super) const FLAG_RULES: &[(&str, &[&str])] = &[
             "--reuse",
             "--sync-integration",
             "--replace-stale",
+            // `start --adopt` resolves here; the flag only selects the handler.
+            "--adopt",
         ],
     ),
     (

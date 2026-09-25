@@ -1,0 +1,50 @@
+exit: 0
+--- stdout
+aethyme — repository navigation, task localization, agent brokering
+
+Usage: aethyme <command> [args...]
+       aethyme <command> --help
+       aethyme --version | -V
+
+Hot path:
+  explore --repo <path> --request "<task>"
+                              in-process engine; auto-starts the engine daemon
+  explore-summary --from explore.json
+                              compact decision surface from a saved answer-json
+  verify-targets --repo <path> --from explore.json [--max-targets 2 --max-lines 80]
+                              bounded source spans for Explore targets
+
+Agent broker:
+  broker start --task <text>  create an isolated worktree + session
+  broker status               sessions, overlaps, queue, integration, readiness
+  broker submit --session <id>
+                              simulate, gate, and promote a session
+  broker finish --session <id>
+                              safely close a completed session
+  broker unblock [<id>]       list blockers, or clear one
+  broker gc plan|apply        reviewed cleanup of retained state and disk
+  broker advanced <verb>      leases, git, gh, ship, review, operations, exec, ...
+  hook <event>                agent-surface hook entry point (the plugin's only
+                              entry point; reads event JSON on stdin)
+  plugin install|status|remove
+                              install the agent-surface plugin, or report the
+                              plugin/CLI version skew that makes one inert
+  update check|plan|execute   explicit paired-binary updates; never background
+  upgrade plan|apply|recover  review, apply, or recover repository migrations
+
+Setup:
+  init                        guided setup: certify + scaffold + gates draft
+  certify                     read-only certification checks for this repo
+  deploy [verify|bridge] [--repo <path>]
+                              enroll repository policy and agent guidance
+  root show|set <path>        developer checkout pointer (legacy compatibility)
+
+Graph and analysis:
+  graph status|units|materialize|refresh|impact|node|callers|...
+  task | query | analyze | facts | intents | repo   (each takes --help)
+
+Quality:
+  quality inspect [--repo <path>] bounded optional repository-quality analysis
+
+Deprecated spellings still work and print one warning line on stderr.
+--- stderr

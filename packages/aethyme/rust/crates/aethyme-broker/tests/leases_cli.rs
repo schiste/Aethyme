@@ -173,7 +173,10 @@ fn lease_plan_cli_renders_structured_and_text_results_without_mutation() {
         text.contains("owner active [Aethyme / Fix auth / claude] at"),
         "{text}"
     );
-    assert!(text.contains("next: aethyme broker adopt"), "{text}");
+    assert!(
+        text.contains("next: aethyme broker start --adopt"),
+        "{text}"
+    );
     assert!(
         text.contains(&format!("expires {}", directory.expires_at.unwrap())),
         "{text}"

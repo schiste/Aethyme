@@ -113,7 +113,7 @@ fn status_shows_a_wedged_operation_and_what_is_parked_behind_it() {
         "status must attribute the parked operation to its blocker; got:\n{text}"
     );
     assert!(
-        text.contains("aethyme broker operations list"),
+        text.contains("aethyme broker advanced operations list"),
         "status must point at the surface with the full detail; got:\n{text}"
     );
 }

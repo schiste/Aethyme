@@ -1,0 +1,19 @@
+exit: 0
+--- stdout
+  aethyme broker advanced leases [--json]
+      Refresh and list active leases plus current overlaps.
+  aethyme broker advanced leases claim <path> --session <id> [--ttl <seconds>] [--json]
+      Explicitly claim a path (end it with / for a directory claim).
+  aethyme broker advanced leases plan <paths...> [--session <id>] [--json]
+      Read-only preflight for proposed claims. Reports exact and directory
+      overlaps, owner liveness and worktree, expiry, valid next actions, and
+      whether each claim conflicts.
+      Does not create or refresh leases.
+  aethyme broker advanced leases export (--session <id> | --entry <id>) [--limit <n>] [--json]
+      Export bounded, redacted lease ownership and deterministic routing
+      categories from committed [leases.routing] configuration. Includes
+      historical released and expired rows for the selected session. Never
+      refreshes leases or writes broker state or command telemetry.
+  aethyme broker advanced leases release <path> --session <id> [--json]
+      Release an explicit claim.
+--- stderr

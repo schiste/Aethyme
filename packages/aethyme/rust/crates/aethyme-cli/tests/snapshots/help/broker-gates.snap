@@ -1,0 +1,45 @@
+exit: 0
+--- stdout
+  aethyme broker advanced gates draft [--json]
+      Adaptive (NOT scaffolding): sniff this repo's manifests and draft
+      a gates.toml. Output depends on the repo — review it, then run
+      certify.
+  aethyme broker advanced gates doctor [--probe] [--only <gate>] [--json]
+      Inspect exact-HEAD gate quality without changing enforced selection.
+      --probe explicitly runs all or one selected gate in a disposable
+      detached worktree with ephemeral cache evidence and mutation capture.
+  aethyme broker advanced gates validate [--json]
+      Parse and validate .aethyme/gates.toml.
+  aethyme broker advanced gates manifest [--head <ref>] [--json]
+      Emit a versioned content-free gate-selection manifest from exact
+      committed policy (default head: HEAD). Commands are never included.
+  aethyme broker advanced gates scope --base <ref> --head <ref> [--json]
+      Evaluate the shared path selector for two exact commits using the
+      gates.toml committed at head. Read-only; semantic hints stay advisory.
+  aethyme broker advanced gates affected --session <id> [--json]
+      Show which gates the session's diff selects and why.
+  aethyme broker advanced gates semantic --session <id> [--json]
+      Advisory semantic gate-selection report: shows enforced path-triggered
+      gates plus caller-edge suggestion status. Never changes what submit,
+      CI, or gates run execute.
+  aethyme broker advanced gates run --session <id> [--only <gate>] [--no-cache] [--json]
+      Run affected gates cheap-first with tree-hash caching; cancels this
+      session's obsolete in-flight runs; stops at first failure. Text
+      abbreviates each proven tree hash; JSON includes the full hash.
+      --no-cache executes fresh, then stores the new result normally.
+  aethyme broker advanced gates run --all [--only <gate>] [--no-cache] [--json]
+      Run EVERY gate in cost order against the current worktree — no
+      diff selection, no session. Same runner, streaming, and tree-hash
+      result cache as session runs; stops at first failure and exits
+      non-zero if any gate does not pass. The CI entrypoint: gates.toml
+      is the single definition of verified for CI and broker alike. Text
+      abbreviates each proven tree hash; JSON includes the full hash.
+      --no-cache executes fresh, then stores the new result normally.
+  aethyme broker advanced gates pre-push <remote-name> [<remote-url>] [--no-cache] [--json]
+      Opt-in adapter for a repository-owned Git pre-push hook. Reads Git's
+      ref-update protocol from stdin, requires one clean current-HEAD tip,
+      then runs every gate with the same cache and host-resource lifecycle.
+      Deletion-only pushes need no content gates. Wire this adapter manually
+      when a repository wants full pre-push gates in addition to the managed
+      publication guard.
+--- stderr

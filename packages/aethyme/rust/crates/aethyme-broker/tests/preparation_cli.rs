@@ -120,7 +120,7 @@ fn preparation_is_explicit_language_neutral_and_invalidates_on_input_change() {
     assert_eq!(required["state"], "required");
     assert_eq!(
         required["next_action"],
-        format!("aethyme broker prepare --session {session}")
+        format!("aethyme broker submit prepare --session {session}")
     );
 
     std::fs::write(temp.path().join("work.txt"), "staged work\n").unwrap();
@@ -133,7 +133,9 @@ fn preparation_is_explicit_language_neutral_and_invalidates_on_input_change() {
         "{error}"
     );
     assert!(
-        error.contains(&format!("aethyme broker prepare --session {session}")),
+        error.contains(&format!(
+            "aethyme broker submit prepare --session {session}"
+        )),
         "{error}"
     );
 

@@ -1,0 +1,21 @@
+exit: 0
+--- stdout
+  aethyme broker finish --session <id> [--keep-worktree] [--json]
+      Higher-level lifecycle close: closes only when the session has no
+      dirty WIP and no committed work waiting for submit/promotion. If it
+      is not safe, prints the next command; suggests cleanup only when
+      cleanup would pass without --force. Successful closure atomically
+      persists a redacted session.finished handoff with delivery, pending
+      work, leases, last-gate provenance, and the recommended next action.
+  aethyme broker finish close --session <id> [--json]
+      Low-level state-only close. Never touches the worktree and does
+      not check whether commits were submitted. Prefer finish for normal
+      lifecycle use.
+  aethyme broker finish cleanup <session-id> [--force] [--json]
+  aethyme broker finish cleanup --all-cleaned [--apply --confirm <sha256>] [--json]
+      Remove one session worktree, or inventory all retained broker-owned
+      worktrees from already-closed sessions. Bulk cleanup is a read-only plan
+      by default; --apply revalidates and removes only clean worktrees whose
+      session work is represented on main, integration, or configured upstream.
+      Adopted worktrees are never included in the bulk sweep.
+--- stderr

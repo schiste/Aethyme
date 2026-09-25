@@ -987,7 +987,7 @@ fn ship_execute_publishes_and_verifies_the_exact_confirmed_sha() {
     assert_eq!(report.local_main_sync.before_sha, main_before);
     assert_eq!(report.local_main_sync.after_sha, main_before);
     let follow_up = format!(
-        "aethyme broker ship execute --entry {entry_id} --confirm {integration} --sync-main"
+        "aethyme broker advanced ship execute --entry {entry_id} --confirm {integration} --sync-main"
     );
     assert_eq!(
         report.local_main_sync.follow_up_command.as_deref(),
@@ -1281,7 +1281,9 @@ fn integration_status_routes_promoted_published_and_synchronized_states_through_
     );
     assert_eq!(
         promoted.next_action.commands,
-        vec![format!("aethyme broker ship plan --entry {entry_id}")]
+        vec![format!(
+            "aethyme broker advanced ship plan --entry {entry_id}"
+        )]
     );
 
     broker.ship_execute(entry_id, &integration).unwrap();
@@ -1293,7 +1295,7 @@ fn integration_status_routes_promoted_published_and_synchronized_states_through_
     assert_eq!(
         published.next_action.commands,
         vec![format!(
-            "aethyme broker ship execute --entry {entry_id} --confirm {integration} --sync-main"
+            "aethyme broker advanced ship execute --entry {entry_id} --confirm {integration} --sync-main"
         )]
     );
 

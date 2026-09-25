@@ -1,0 +1,12 @@
+exit: 0
+--- stdout
+aethyme query — direct graph-store lookups
+
+Usage:
+  aethyme query symbol <repo_path> <query> [--json-output]
+      Search symbols by name (top 20 hits).
+  aethyme query deps <repo_path> <node-id>
+      Files the node depends on (outgoing edges), e.g. file:<repo>:<path>.
+  aethyme query impact <repo_path> <target>
+      Impact frontier for the target.
+--- stderr

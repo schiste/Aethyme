@@ -634,7 +634,7 @@ impl Broker {
                 .abandon_review_lifecycle(current.id, session_id, &reason_digest, now)?;
         Ok(ReviewLifecycleAbandonReport {
             next_action: format!(
-                "register {} PR #{} under a live session with `aethyme broker review register --session <id> --repo {} --pr {}`",
+                "register {} PR #{} under a live session with `aethyme broker advanced review register --session <id> --repo {} --pr {}`",
                 lifecycle.repository,
                 lifecycle.pr_number,
                 lifecycle
@@ -925,7 +925,7 @@ fn required_live_lifecycle(
     let session = broker.store().session(session_id)?;
     if session.status.is_closed() {
         return review_error(&format!(
-            "session {session_id} is closed; `review show` remains available for diagnostics, but review mutations require `aethyme broker review reassign --session {session_id} --to-session <live-id> --reason <text>` or `aethyme broker review abandon --session {session_id} --reason <text>`"
+            "session {session_id} is closed; `review show` remains available for diagnostics, but review mutations require `aethyme broker advanced review reassign --session {session_id} --to-session <live-id> --reason <text>` or `aethyme broker advanced review abandon --session {session_id} --reason <text>`"
         ));
     }
     Ok(lifecycle)
@@ -1051,13 +1051,13 @@ fn report(
         ReviewLifecycleState::LocalSubmissionVerified
         | ReviewLifecycleState::ReplacementCommitSubmitted => {
             format!(
-                "aethyme broker review request --session {}",
+                "aethyme broker advanced review request --session {}",
                 lifecycle.session_id
             )
         }
         ReviewLifecycleState::ReviewRequested => {
             format!(
-                "aethyme broker review show --session {}",
+                "aethyme broker advanced review show --session {}",
                 lifecycle.session_id
             )
         }
@@ -1066,7 +1066,7 @@ fn report(
         }
         ReviewLifecycleState::ReviewSatisfied => {
             format!(
-                "aethyme broker review unlock --session {}",
+                "aethyme broker advanced review unlock --session {}",
                 lifecycle.session_id
             )
         }

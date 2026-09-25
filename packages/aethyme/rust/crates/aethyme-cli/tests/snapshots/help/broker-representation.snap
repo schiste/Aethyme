@@ -1,0 +1,12 @@
+exit: 0
+--- stdout
+  aethyme broker advanced representation scan --session <id> [--json]
+  aethyme broker advanced representation status --session <id> [--json]
+      Read-only: decide whether this session's work is already present on the
+      default branch, by comparing its content against each commit the branch
+      gained since the session branched. Ancestry is never consulted, so a
+      provider-side squash under a new SHA is still found.
+  aethyme broker advanced representation record --session <id> --confirm <sha256> [--json]
+      Record the reviewed landing so the session can finish. Re-proves the scan
+      and refuses if anything moved since it was reviewed.
+--- stderr

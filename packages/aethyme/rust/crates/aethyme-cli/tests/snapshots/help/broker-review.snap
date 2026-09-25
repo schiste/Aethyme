@@ -1,0 +1,62 @@
+exit: 0
+--- stdout
+  aethyme broker advanced review plan [--base <ref>] [--pr <number>]
+      Print the reviews this repository's policy would ask for on the current
+      change, who would perform them, and what would go on the pull request.
+      Reads git and .aethyme/config.toml, needs no session, and performs
+      nothing. Every review table is off by default, so an unconfigured
+      repository plans nothing.
+  aethyme broker advanced review run --session <id> --repo <owner/name> --pr <number> [--base <ref>] [--tabs-file <path>] [--from-provider] [--dry-run]
+      Perform one tick of the review router for one pull request: decide as
+      `review plan` does but with the spent reviews read from the ledger, the
+      in-flight reviews read from a Chau7 tab snapshot, and the pull request
+      read with read-only gh. First gives up on any review whose reviewer has
+      not reported inside the route's stale_after_minutes, so a dead reviewer
+      cannot hold a slot forever. Records each request before it is handed out,
+      then performs the GitHub writes through the coordinated lane and prints
+      the Chau7 spawns for an adapter to start. --dry-run stops after the plan.
+  aethyme broker advanced review tick --session <id> --repo <owner/name> [--limit <count>] [--tabs-file <path>] [--dry-run]
+      Run `review run --from-provider` over the open pull requests of one
+      repository, oldest first, and print one report for the sweep. This is
+      the whole scheduler: the broker starts no background poller, so a
+      cron entry, a CI step, or a person runs this bounded pass. A pull
+      request that fails is recorded in the report and skipped, never fatal,
+      so one broken pull request cannot stop the rest of the sweep.
+  aethyme broker advanced review ledger --repo <owner/name> [--pr <number>] [--json]
+      Print the review ledger: every review request or provider completion, for
+      which heads, through which backend, and how it ended. This is the answer
+      to "why was there no review" -- read-only, needs no session.
+  aethyme broker advanced review state --repo <owner/name> --pr <number> --type <review-type> --state <state> [--head <sha>] [--note <text>] [--completed-for-commit <sha> --verdict <verdict> --reviewer-provider <provider> [--reviewer-model <model>]] [--json]
+      Report what became of one requested review: running, satisfied, failed,
+      recorded, or abandoned. A satisfied report includes the typed completion
+      commit, verdict, and reviewer identity. Without --head, an exact
+      completion-head match is used or a new unsolicited provider result is
+      recorded. The broker decides and records; whoever performs the review
+      closes the row here, which is what drains the router's concurrency slots.
+      --head targets a superseded request.
+  aethyme broker advanced review waive --repo <owner/name> --pr <number> --type <review-type> --head <sha> --reason <text> [--agent <name-and-email>] [--json]
+      Excuse one review dimension at one head, on the record. Waives exactly
+      the named type at the named commit and nothing else: a new head has no
+      waiver, so it expires without anyone withdrawing it. --reason is stored
+      as text, not as a digest, because it is addressed to whoever later asks
+      why this dimension is green. Never use `review state --state satisfied`
+      for this -- that claims a review ran.
+  aethyme broker advanced review register --session <id> --repo <owner/name> --pr <number> [--json]
+      Opt an exact live session and open draft PR into the configured review
+      lifecycle after verifying repository, base, and full head SHA evidence.
+  aethyme broker advanced review show --session <id> [--json]
+      Read the exact persisted review state and next action without provider I/O.
+  aethyme broker advanced review request --session <id> [--json]
+      After a successful broker submission, revalidate GitHub evidence and
+      coordinate the idempotent ready-for-review write.
+  aethyme broker advanced review unlock --session <id> [--json]
+      Poll and revalidate configured review/head/base/open evidence, then
+      and run the configured validation-unlock adapter exactly once.
+  aethyme broker advanced review reassign --session <closed-id> --to-session <live-id> --reason <text> [--json]
+      Move an active lifecycle from its closed owner to a live session whose
+      HEAD exactly matches the lifecycle commit. State and evidence remain intact;
+      only a SHA-256 digest of the reason is retained.
+  aethyme broker advanced review abandon --session <id> --reason <text> [--json]
+      Explicitly retire a stuck lifecycle without deleting its audit history,
+      freeing the PR for fresh registration. Only the reason digest is stored.
+--- stderr

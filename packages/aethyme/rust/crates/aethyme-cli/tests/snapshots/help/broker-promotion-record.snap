@@ -1,0 +1,12 @@
+exit: 0
+--- stdout
+  aethyme broker submit promotion-record plan [--json]
+      Read-only plan for integration commits that no promoted queue entry
+      claims. A commit is recoverable when exactly one non-promoted entry
+      recorded a merge tree equal to the commit's tree; ambiguous or
+      unmatched commits are reported, never repaired.
+  aethyme broker submit promotion-record apply --confirm <sha256> [--json]
+      Restore the promoted record for every recoverable candidate in the
+      reviewed plan. Re-proves each precondition, writes only status and
+      commit details, and rebuilds the missing path exposures.
+--- stderr

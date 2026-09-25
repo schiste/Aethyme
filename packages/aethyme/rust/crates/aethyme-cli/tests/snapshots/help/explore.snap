@@ -1,0 +1,30 @@
+exit: 0
+--- stdout
+aethyme explore — bounded Explore query; prints answer-json
+
+Usage:
+  aethyme explore --repo <path> --request <text> [--format answer-json]
+                  [--intent auto|default|behavior|usage_boundary_query]
+                  [--detail compact|standard|full] [--depth 0-3]
+                  [--max-answer-items <n>] [--show-observability]
+      --repo <path>           Repository directory (required).
+      --request <text>        Task or question to localize (required).
+      --format answer-json    Only answer-json is supported (default).
+      --intent <name>         auto (default) picks from the request's verbs;
+                              default|task_localization_query,
+                              behavior|behavior_localization_query,
+                              usage_boundary_query (needs --scope).
+      --detail <level>        compact (default), standard, or full.
+      --depth <0-3>           Progressive-disclosure rung; overrides --detail
+                              and --max-answer-items when set.
+      --max-answer-items <n>  Answer items to return (default 5; 25 for
+                              usage_boundary_query).
+      --show-observability    Include the observability block.
+    usage_boundary_query only:
+      --scope <path>          Repo-relative boundary path (required).
+      --search-root <path>    Restrict evidence search; repeatable.
+      --no-methods            Exclude methods from the symbol set.
+      --budget-ms <n>         Time budget in ms (default 10000).
+      --max-evidence-per-symbol <n>  Evidence items per symbol (default 5).
+    Starts the engine daemon automatically when it is not running.
+--- stderr

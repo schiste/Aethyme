@@ -514,7 +514,7 @@ impl Broker {
             },
             AdvisoryEvidence {
                 kind: "safe_next_action".into(),
-                summary: format!("aethyme broker external-events show {}", event.id),
+                summary: format!("aethyme broker advanced external-events show {}", event.id),
             },
         ];
         if reconciled {
@@ -711,7 +711,7 @@ fn validate_repository(value: &str) -> Result<(), ExternalEventError> {
 fn remediation(event: &ExternalEventRecord) -> Option<String> {
     event.status.is_unresolved().then(|| {
         format!(
-            "aethyme broker external-events reconcile {} --outcome <assign|ignore> --reason <text> [--session <id>]",
+            "aethyme broker advanced external-events reconcile {} --outcome <assign|ignore> --reason <text> [--session <id>]",
             event.id
         )
     })

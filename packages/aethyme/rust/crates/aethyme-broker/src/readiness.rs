@@ -627,7 +627,7 @@ fn coordination_dimension(state: &BrokerStateInspection) -> ReadinessDimension {
             vec![evidence("broker-state", reason.clone())],
             vec![action(
                 "Inspect broker recovery options",
-                Some("aethyme broker doctor"),
+                Some("aethyme broker status doctor"),
             )],
         ),
         BrokerStateInspection::Inaccessible(reason) => dimension_with(
@@ -637,7 +637,7 @@ fn coordination_dimension(state: &BrokerStateInspection) -> ReadinessDimension {
             vec![evidence("broker-state", reason.clone())],
             vec![action(
                 "Grant read access and rerun readiness",
-                Some("aethyme broker readiness"),
+                Some("aethyme broker status readiness"),
             )],
         ),
     }
@@ -720,7 +720,7 @@ fn validation_dimension(gates: &GateInspection) -> ReadinessDimension {
             Vec::new(),
             vec![action(
                 "Draft repository validation gates for review",
-                Some("aethyme broker gates draft"),
+                Some("aethyme broker advanced gates draft"),
             )],
         ),
         GateInspection::Draft { total } => dimension_with(
@@ -809,7 +809,7 @@ fn parallel_dimension(
                 )],
                 vec![action(
                     "Declare reproducible dependency preparation for isolated worktrees",
-                    Some("aethyme broker prepare status --session <id>"),
+                    Some("aethyme broker submit prepare status --session <id>"),
                 )],
             );
         }

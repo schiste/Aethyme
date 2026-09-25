@@ -837,14 +837,14 @@ impl UnknownOutcomeRecovery {
 
     pub fn succeeded_command(&self) -> String {
         format!(
-            "aethyme broker operations reconcile --operation {} --outcome succeeded --reason \"external inspection confirmed operation {} took effect\"",
+            "aethyme broker advanced operations reconcile --operation {} --outcome succeeded --reason \"external inspection confirmed operation {} took effect\"",
             self.operation_id, self.operation_id
         )
     }
 
     pub fn failed_command(&self) -> String {
         format!(
-            "aethyme broker operations reconcile --operation {} --outcome failed --reason \"external inspection confirmed operation {} did not take effect\"",
+            "aethyme broker advanced operations reconcile --operation {} --outcome failed --reason \"external inspection confirmed operation {} did not take effect\"",
             self.operation_id, self.operation_id
         )
     }
@@ -3212,7 +3212,7 @@ impl Broker {
                 None,
                 "the configured upstream is not a remote-tracking branch",
                 Some(format!(
-                    "aethyme broker integration reconcile --upstream {upstream_ref} --dry-run"
+                    "aethyme broker advanced integration reconcile --upstream {upstream_ref} --dry-run"
                 )),
             );
         };
@@ -3243,7 +3243,7 @@ impl Broker {
                     Some(fetch.operation.id),
                     "the pull request merged, but refreshing its target branch did not complete successfully",
                     Some(format!(
-                        "aethyme broker operations show {}",
+                        "aethyme broker advanced operations show {}",
                         fetch.operation.id
                     )),
                 );
@@ -3256,7 +3256,7 @@ impl Broker {
                         "the pull request merged, but the tracked target could not be refreshed: {error}"
                     ),
                     Some(format!(
-                        "aethyme broker integration reconcile --upstream {upstream_ref} --dry-run"
+                        "aethyme broker advanced integration reconcile --upstream {upstream_ref} --dry-run"
                     )),
                 );
             }
@@ -3291,7 +3291,7 @@ impl Broker {
                     "the pull request merged and upstream refreshed, but automatic cleanup was refused: {error}"
                 ),
                 Some(format!(
-                    "aethyme broker integration reconcile --upstream {upstream_ref} --dry-run"
+                    "aethyme broker advanced integration reconcile --upstream {upstream_ref} --dry-run"
                 )),
             ),
         }

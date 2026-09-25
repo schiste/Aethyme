@@ -1,0 +1,49 @@
+exit: 2
+--- stdout
+--- stderr
+aethyme broker advanced — the full broker surface beyond the six public verbs
+
+Usage: aethyme broker advanced <verb> [args...]
+
+Verbs:
+  leases           inspect, claim, plan, export or release path ownership
+  git              run Git through the durable operation coordinator
+  gh               run GitHub CLI through the same coordinator
+  operations       inspect or reconcile the remote-operation journal
+  exec             run a command in a session worktree under the dirty-path guard
+  ship             plan or execute a reviewed full-SHA publication
+  review           plan, run, record and route pull request reviews
+  gates            validate, draft, scope, run and diagnose gates
+  hooks            install, remove or inspect the managed git hooks
+  trust            approve this repository's gate and prepare commands
+  agents           list live sessions with activity-derived liveness
+  handoff          read a finished session's persisted handoff
+  queue            show the merge queue
+  integration      inspect, wait on or reconcile the integration branch
+  main             reconcile the local default branch onto integration
+  representation   prove a session's work already landed on main
+  checkpoint       recover a session whose checkpoint was rewritten
+  repair           apply the documented recovery for a submit conflict
+  resources        plan, acquire, run and release host-wide resources
+  console          run a dev server under the repository's console mode
+  advisories       list, show, acknowledge or suppress advisories
+  exposures        reconcile exposures against the remote default branch
+  note             send and acknowledge notes between live sessions
+  watch            metadata-only pull request watches
+  deliveries       the durable delivery outbox for watch adapters
+  pr               check pull request state
+  report           capture, render and file diagnostic reports
+  quality-report   publish a quality report as a PR summary
+  external-events  ingest and reconcile normalized external events
+  events           show or prune the append-only event log
+  metrics          cost/benefit accounting from local telemetry
+  worktree-root    resolve the external worktree root
+  worktrees        list broker-owned worktrees
+  scaffold         deterministic only-if-missing broker setup
+  quick-test       disposable first-run smoke test
+  verify-loop      end-to-end broker verification for operators
+  check-contract   cross-process contract gate (CI entry point)
+
+Run `aethyme broker advanced <verb> --help` for a verb's forms and flags.
+Until the deprecation window closes, `aethyme broker <verb>` still works
+for each of these and prints a warning naming the `advanced` spelling.

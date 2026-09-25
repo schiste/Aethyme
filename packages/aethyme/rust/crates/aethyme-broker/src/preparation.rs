@@ -29,7 +29,7 @@ pub enum PreparationError {
     )]
     SymlinkOutput { path: String },
     #[error(
-        "runtime executable for {name:?} is unavailable; install the declared tool, then retry `aethyme broker prepare --session {session_id}`"
+        "runtime executable for {name:?} is unavailable; install the declared tool, then retry `aethyme broker submit prepare --session {session_id}`"
     )]
     RuntimeProbe { name: String, session_id: i64 },
     #[error(
@@ -37,7 +37,7 @@ pub enum PreparationError {
     )]
     OfflineUnavailable { step: String },
     #[error(
-        "preparation step {step:?} failed with exit {exit_code:?}; inspect its output, then retry `aethyme broker prepare --session {session_id}`"
+        "preparation step {step:?} failed with exit {exit_code:?}; inspect its output, then retry `aethyme broker submit prepare --session {session_id}`"
     )]
     StepFailed {
         step: String,
@@ -345,7 +345,7 @@ impl Broker {
             hook_required,
             reason,
             next_action: (state != PreparationState::Current)
-                .then(|| format!("aethyme broker prepare --session {session_id}")),
+                .then(|| format!("aethyme broker submit prepare --session {session_id}")),
         })
     }
 
@@ -966,7 +966,7 @@ fn invalid_status(session_id: i64, reason: String) -> PreparationStatus {
         hook_required: true,
         reason,
         next_action: Some(format!(
-            "fix {PREPARATION_CONFIG_RELPATH}, then run `aethyme broker prepare --session {session_id}`"
+            "fix {PREPARATION_CONFIG_RELPATH}, then run `aethyme broker submit prepare --session {session_id}`"
         )),
     }
 }

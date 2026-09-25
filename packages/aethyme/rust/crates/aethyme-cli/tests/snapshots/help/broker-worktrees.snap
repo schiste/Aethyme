@@ -1,0 +1,5 @@
+exit: 0
+--- stdout
+  aethyme broker advanced worktrees [--json]
+      list broker-owned worktrees
+--- stderr

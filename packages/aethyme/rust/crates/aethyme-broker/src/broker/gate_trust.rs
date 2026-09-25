@@ -514,7 +514,7 @@ pub(crate) fn trust(dir: &Path, source: &str) -> Result<GateTrustReport, BrokerO
 /// The exact command a human runs to approve this repository's policy.
 pub(crate) fn trust_command(main_root: &Path) -> String {
     format!(
-        "aethyme broker trust --repo {}",
+        "aethyme broker advanced trust --repo {}",
         shell_word(&main_root.to_string_lossy())
     )
 }
@@ -590,11 +590,11 @@ mod tests {
     fn a_path_with_spaces_is_quoted_in_the_hint() {
         assert_eq!(
             trust_command(Path::new("/tmp/My Repo")),
-            "aethyme broker trust --repo '/tmp/My Repo'"
+            "aethyme broker advanced trust --repo '/tmp/My Repo'"
         );
         assert_eq!(
             trust_command(Path::new("/tmp/repo")),
-            "aethyme broker trust --repo /tmp/repo"
+            "aethyme broker advanced trust --repo /tmp/repo"
         );
     }
 }

@@ -584,7 +584,7 @@ pub(super) fn run_git_gh(parsed: Parsed, subcommand: &str) -> Result<(), UsageEr
             out!(
                 "Pull request {number} opened. PR monitoring is off for session {session}; enable with:"
             );
-            out!("  aethyme broker watch pr monitoring activate --session {session}");
+            out!("  aethyme broker advanced watch pr monitoring activate --session {session}");
         }
     }
     if !report.ok() {
@@ -740,7 +740,7 @@ pub(super) fn run_operations(parsed: Parsed) -> Result<(), UsageError> {
 pub(super) fn run_blockers(parsed: Parsed) -> Result<(), UsageError> {
     if !parsed.positional.is_empty() {
         return Err(UsageError::Message(
-            "blockers does not accept positional arguments; usage: aethyme broker blockers [--json]"
+            "blockers does not accept positional arguments; usage: aethyme broker unblock [--json]"
                 .into(),
         ));
     }

@@ -1,0 +1,10 @@
+exit: 0
+--- stdout
+  aethyme broker advanced quick-test [--chau7] [--with-gate] [--json]
+      Disposable first-run smoke: creates a temporary git repo, runs init,
+      adopt, commit, submit, verifies promotion, and removes the repo.
+      --chau7 requires a Chau7 runtime marker; outside Chau7 it reports
+      that this test is designed to run in Chau7 and skips the smoke.
+      --with-gate installs a passing fixture gate and then proves a
+      failing variant is rejected without promotion.
+--- stderr

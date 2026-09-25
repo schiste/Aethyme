@@ -1,0 +1,26 @@
+exit: 0
+--- stdout
+  aethyme broker advanced deliveries subscribe --watch <id> --adapter <name> --target <opaque-id> [--policy <notify|resume|review-and-push>] [--json]
+  aethyme broker advanced deliveries list [--adapter <name>] [--all] [--json]
+  aethyme broker advanced deliveries claim --adapter <name> --worker <id> [--seconds <15..900>] [--json]
+  aethyme broker advanced deliveries resolve-tab --session <id> [--tabs-file <path>] [--json]
+  aethyme broker advanced deliveries dispatch --adapter chau7 --worker <id> [--tabs-file <path>] [--seconds <15..900>] [--json]
+      Claim one delivery and decide what to do with it: send to a resolved tab,
+      defer while that tab is mid-turn or absent, or abandon when it cannot be
+      identified. Deferred and abandoned outcomes are completed for you; a send
+      is left open so the caller completes it after the transport succeeds.
+      Resolve which Chau7 tab is running a session, from a `tab_list` snapshot
+      on stdin or --tabs-file. The broker never calls Chau7 itself; an adapter
+      supplies the snapshot and performs the transport. Ambiguity refuses.
+  aethyme broker advanced deliveries complete --id <delivery-id> --worker <id> --generation <n> --outcome <delivered|retry|failed> [--error-code <code>] [--json]
+      Provider-neutral durable outbox. Claiming fences concurrent adapters;
+      completion requires the exact worker and generation. Prompts contain
+      allowlisted PR metadata, never comment or review bodies.
+      Inspect the open PR for the current branch targeting <branch>
+      (default: production). A thumbs-up marker in the PR body means all
+      good and skips activity checks. A looking-eyes marker or no marker
+      checks comments, reviews, and status checks; new actionable
+      activity prepares a Push2prod prompt. With --dispatch, the broker
+      attaches that prompt to an existing matching session when possible
+      or spawns a Codex agent command.
+--- stderr

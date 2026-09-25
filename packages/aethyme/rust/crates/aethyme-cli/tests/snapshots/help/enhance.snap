@@ -1,0 +1,13 @@
+exit: 0
+--- stdout
+aethyme enhance — deprecated spelling of `aethyme deploy`
+
+Usage:
+  aethyme enhance deploy --repo <path> [--force]
+      Write or refresh the generated root files and skills; --force rewrites unchanged files.
+      Prefer `aethyme deploy --repo <path>`, which also scaffolds the broker and
+      drafts gates only when they are missing.
+  aethyme enhance verify --repo <path>
+      Check the generated files for missing files, placeholders, and drift; exits 1 on failure.
+      Prefer `aethyme deploy verify --repo <path>`.
+--- stderr

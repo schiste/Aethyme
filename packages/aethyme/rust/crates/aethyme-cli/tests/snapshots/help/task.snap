@@ -1,0 +1,20 @@
+exit: 0
+--- stdout
+aethyme task — task-scoped context from the graph store
+
+Usage:
+  aethyme task pack --repo <path> --task <text> [--json-output]
+      Build a context pack for the task.
+  aethyme task context --repo <path> --task <text> [--content-budget <n>] [--json-output]
+      Context pack with file content inlined (budget default 80000).
+  aethyme task anchors --repo <path> --task <text> [--json-output]
+      Anchor nodes for the task, with reasons.
+  aethyme task scope --repo <path> --task <text> [--json-output]
+      Suggested edit scope for the task.
+  aethyme task next --repo <path> --task <text> [--json-output]
+      Next nodes to inspect.
+  aethyme task expand --repo <path> --node <target> [--json-output]
+      Expand one node in task context.
+  aethyme task explain --repo <path> [--task <text>]
+      Plain-text explanation (default task: "Explain this repo").
+--- stderr

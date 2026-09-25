@@ -1,0 +1,16 @@
+exit: 0
+--- stdout
+aethyme update — explicit paired-binary updates (never runs in the background)
+
+Usage:
+  aethyme update check [--json] [--refresh]
+  aethyme update plan [--channel stable|preview] [--json] [--refresh]
+  aethyme update execute --confirm <manifest-sha256> [--json]
+
+The release manifest is cached for 6h; --refresh bypasses the cache, and
+AETHYME_UPDATE_CACHE_TTL_SECONDS=0 disables it. Only the answer is cached:
+the plan is recomputed every run, so a reinstall shows up immediately.
+
+Homebrew installs are updated with `brew upgrade aethyme`.
+After either binary update, run `aethyme upgrade plan` in each enrolled repository.
+--- stderr

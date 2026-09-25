@@ -38,7 +38,7 @@ pub(super) fn render_queue_history(page: &crate::MergeQueueHistoryPage) {
         if summary.is_empty() { "none" } else { &summary }
     );
     if let Some(before) = page.next_before_id {
-        out!("Next: aethyme broker queue history --before {before}");
+        out!("Next: aethyme broker advanced queue history --before {before}");
     }
 }
 
@@ -117,7 +117,7 @@ pub(super) fn render_promotion_record_plan(plan: &crate::PromotionRecordPlan) {
         out!("  apply: nothing recoverable");
     } else {
         out!(
-            "  apply: aethyme broker promotion-record apply --confirm {}",
+            "  apply: aethyme broker submit promotion-record apply --confirm {}",
             plan.digest
         );
     }
@@ -195,7 +195,7 @@ pub(super) fn render_main_reconcile_plan(plan: &crate::MainReconcilePlan, detail
         None => {
             out!("  preservation ref: {}", plan.preservation_ref);
             out!(
-                "  apply: aethyme broker main reconcile apply --session <id> --confirm {}",
+                "  apply: aethyme broker advanced main reconcile apply --session <id> --confirm {}",
                 plan.digest
             );
         }
@@ -277,7 +277,7 @@ pub(super) fn render_representation_scan(scan: &crate::RepresentationScan) {
                 scan.branch
             );
             out!(
-                "  next: aethyme broker representation record --session {} --confirm {}",
+                "  next: aethyme broker advanced representation record --session {} --confirm {}",
                 scan.session_id,
                 scan.digest
             );
@@ -296,7 +296,7 @@ pub(super) fn render_representation_scan(scan: &crate::RepresentationScan) {
                 scan.search.examined
             );
             out!(
-                "  next: aethyme broker representation record --session {} --confirm {}",
+                "  next: aethyme broker advanced representation record --session {} --confirm {}",
                 scan.session_id,
                 scan.digest
             );
@@ -529,7 +529,7 @@ pub(super) fn run_submit(parsed: Parsed) -> Result<(), UsageError> {
                 "verification: conflict-only — the base has no .aethyme/gates.toml; 0 gates selected"
             ),
             crate::SubmissionGateVerificationStatus::NoGatesTriggered => out!(
-                "verification: no gate matched this diff ({} configured, 0 selected); review triggers with `aethyme broker gates affected --session {}`",
+                "verification: no gate matched this diff ({} configured, 0 selected); review triggers with `aethyme broker advanced gates affected --session {}`",
                 outcome.gate_verification.configured_gates,
                 outcome.entry.session_id
             ),
@@ -643,7 +643,7 @@ pub(super) fn run_submit(parsed: Parsed) -> Result<(), UsageError> {
             out!(
                 "What now: aethyme/integration is at {integration} and contains this work. \
                  Your checkout and branches are untouched — keep working, or start \
-                 a follow-up with `aethyme broker adopt --reuse --task \"...\"`, or \
+                 a follow-up with `aethyme broker start --reuse --task \"...\"`, or \
                  finish safely with `aethyme broker finish --session {}`.",
                 outcome.entry.session_id,
             );
@@ -664,7 +664,7 @@ pub(super) fn run_submit(parsed: Parsed) -> Result<(), UsageError> {
         } else {
             out!(
                 "What now: entry {} is verified but not promoted (manual mode). \
-                 Promote with `aethyme broker promote --entry {}`.",
+                 Promote with `aethyme broker submit promote --entry {}`.",
                 outcome.entry.id,
                 outcome.entry.id,
             );
@@ -867,7 +867,7 @@ pub(super) fn run_checkpoint(parsed: Parsed) -> Result<(), UsageError> {
                 out!("Plan digest: {}", report.digest);
                 if report.safe {
                     out!(
-                        "Apply with: aethyme broker checkpoint apply --session {} --confirm {}",
+                        "Apply with: aethyme broker advanced checkpoint apply --session {} --confirm {}",
                         session,
                         report.digest
                     );
@@ -978,7 +978,7 @@ pub(super) fn run_promote(parsed: Parsed) -> Result<(), UsageError> {
         out!("{{\"promoted\":{entry}}}");
     } else {
         out!("Promoted entry {entry} to the local integration branch.");
-        out!("Next: aethyme broker ship plan --entry {entry}");
+        out!("Next: aethyme broker advanced ship plan --entry {entry}");
     }
     Ok(())
 }

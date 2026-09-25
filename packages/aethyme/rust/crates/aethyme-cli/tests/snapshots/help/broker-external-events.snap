@@ -1,0 +1,15 @@
+exit: 0
+--- stdout
+  aethyme broker advanced external-events ingest <normalized.json> [--json]
+      Ingest one adapter-verified, digest-bound normalized event. The strict
+      schema rejects provider payload fields and stores only allowlisted
+      repository/PR/commit provenance. No listener or poller is started.
+  aethyme broker advanced external-events list [--all] [--json]
+      List unresolved events newest-first (or the bounded full history).
+  aethyme broker advanced external-events show <id> [--json]
+      Inspect one exact redacted event and its resolution state.
+  aethyme broker advanced external-events reconcile <id> --outcome <assign|ignore> --reason <text> [--session <id>] [--json]
+      Resolve retained ambiguity explicitly. Assignment requires --session;
+      unsupported or repository-mismatched events can only be ignored. The
+      reason is stored as a SHA-256 digest, never as text.
+--- stderr

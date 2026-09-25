@@ -1,0 +1,10 @@
+exit: 0
+--- stdout
+aethyme explore-summary — compact decision surface from a saved answer-json
+
+Usage:
+  aethyme explore-summary --from <file|->
+      --from <file|->     Saved `explore --format answer-json` output; `-` reads stdin (required).
+                          Prints the trust policy, subsystems, verification targets and steps,
+                          and readiness as JSON.
+--- stderr

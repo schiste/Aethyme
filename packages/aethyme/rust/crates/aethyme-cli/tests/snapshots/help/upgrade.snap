@@ -1,0 +1,7 @@
+exit: 0
+--- stdout
+Usage:
+  aethyme upgrade plan [--repo <path>] [--local-only] [--resolution-file <path>] [--diff|--json]
+  aethyme upgrade apply [--repo <path>] [--local-only] [--resolution-file <path>] --confirm <plan-sha256> [--json]
+  aethyme upgrade recover [--repo <path>] --plan <plan-sha256> [--json]
+--- stderr

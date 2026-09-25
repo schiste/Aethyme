@@ -1,0 +1,9 @@
+exit: 0
+--- stdout
+  aethyme broker advanced gh --session <id> --repo <owner/name> [--scope <scope>] [--effect <read|write|destructive>] [--reason <text>] [--destructive] [--no-wait|--queue-timeout <seconds>] [--json] -- <gh-args>
+      Run GitHub CLI through the same repository coordinator. The broker sets
+      GH_REPO from the exact target and never persists command output or
+      secret-bearing argument values. After a successful `gh pr merge`, it
+      refreshes the tracked target and removes a fully landed integration
+      layer; mixed or uncertain work remains unchanged with recovery guidance.
+--- stderr

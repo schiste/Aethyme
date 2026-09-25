@@ -1,0 +1,10 @@
+exit: 0
+--- stdout
+aethyme root — locate the Aethyme package root (legacy compatibility)
+
+Usage:
+  aethyme root show
+      Print the resolved root and how it was found (the default action).
+  aethyme root set <path>
+      Save the package or monorepo path to ~/.config/aethyme/root.
+--- stderr

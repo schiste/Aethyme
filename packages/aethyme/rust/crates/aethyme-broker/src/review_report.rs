@@ -386,7 +386,7 @@ impl ReviewReportingPolicy {
         out.push_str(&format!(
             "\n## Finishing\n\n\
              Close the row once the review is written:\n\n    \
-             aethyme broker review state --repo {repository} --pr {pull_request} \\\n        \
+             aethyme broker advanced review state --repo {repository} --pr {pull_request} \\\n        \
              --type {review_type} --head {head} --state satisfied \\\n        \
              --completed-for-commit {head} --verdict pass \\\n        \
              --reviewer-provider <provider> [--reviewer-model <model>]\n\n\
@@ -553,8 +553,8 @@ severity = []
             assert!(text.contains(BODY), "{text}");
             assert!(text.contains(MARKER), "{text}");
             assert!(!text.contains("gh pr review"), "{text}");
-            assert!(!text.contains("aethyme broker gh"), "{text}");
-            assert!(!text.contains("aethyme broker adopt"), "{text}");
+            assert!(!text.contains("aethyme broker advanced gh"), "{text}");
+            assert!(!text.contains("aethyme broker start --adopt"), "{text}");
         }
     }
 
@@ -571,7 +571,9 @@ severity = []
             }
             .instructions("security", "schiste/Aethyme", 179, "e53b60a3", BODY, MARKER);
             assert!(
-                text.contains("aethyme broker review state --repo schiste/Aethyme --pr 179"),
+                text.contains(
+                    "aethyme broker advanced review state --repo schiste/Aethyme --pr 179"
+                ),
                 "coordinated={coordinated}: {text}"
             );
             // The head is what makes a late report land on the row it was

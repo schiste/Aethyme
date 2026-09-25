@@ -847,7 +847,10 @@ fn adopt_reuse_reports_behind_drift_and_dirty_path_overlap() {
     assert_eq!(drift.behind_commits, 1);
     assert_eq!(drift.overlapping_changed_paths, vec!["shared.txt"]);
     assert!(drift.warning.as_deref().unwrap().contains("behind"));
-    assert_eq!(drift.safe_next_action, "aethyme broker integration status");
+    assert_eq!(
+        drift.safe_next_action,
+        "aethyme broker advanced integration status"
+    );
 }
 
 #[test]
@@ -1284,7 +1287,7 @@ fn finish_blocks_dirty_then_unsubmitted_commits() {
         vec![
             format!("aethyme broker submit --session {}", session.id),
             format!(
-                "aethyme broker representation scan --session {}",
+                "aethyme broker advanced representation scan --session {}",
                 session.id
             ),
         ]
@@ -1392,7 +1395,7 @@ fn finish_closes_promoted_session_and_suggests_cleanup_when_integration_contains
     assert!(closed.cleanup_safe);
     assert_eq!(
         closed.next_commands,
-        vec![format!("aethyme broker cleanup {}", session.id)]
+        vec![format!("aethyme broker finish cleanup {}", session.id)]
     );
     assert!(closed.delivery.submitted);
     assert!(closed.delivery.promoted);
@@ -1403,7 +1406,7 @@ fn finish_closes_promoted_session_and_suggests_cleanup_when_integration_contains
     assert_eq!(
         closed.recommended_next_action,
         Some(format!(
-            "aethyme broker ship plan --entry {}",
+            "aethyme broker advanced ship plan --entry {}",
             queue_entry.id
         ))
     );
@@ -1533,7 +1536,7 @@ fn finish_distinguishes_fully_published_work_from_local_promotion() {
     assert!(closed.cleanup_safe);
     assert_eq!(
         closed.recommended_next_action,
-        Some(format!("aethyme broker cleanup {}", session.id))
+        Some(format!("aethyme broker finish cleanup {}", session.id))
     );
     let event = broker
         .store()

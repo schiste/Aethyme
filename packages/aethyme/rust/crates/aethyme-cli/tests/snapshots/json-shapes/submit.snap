@@ -1,0 +1,57 @@
+{
+  "conflict_details": [],
+  "conflicts": [],
+  "entry": {
+    "base_commit": "string",
+    "created_at": "integer",
+    "details_json": "string",
+    "head_commit": "string",
+    "id": "integer",
+    "merged_tree": "string",
+    "session_id": "integer",
+    "status": "string",
+    "updated_at": "integer"
+  },
+  "gate_outcomes": [],
+  "gate_verification": {
+    "cached_gates": "integer",
+    "configured_gates": "integer",
+    "executed_gates": "integer",
+    "selected_gates": "integer",
+    "status": "string"
+  },
+  "graph_integrity": {
+    "changed_paths": [],
+    "enforced": "bool",
+    "policy_digest": "string",
+    "reason": "string",
+    "status": "string",
+    "tree_hash": "string"
+  },
+  "no_changes": "bool",
+  "promoted": "bool",
+  "promotion_suppressed": "null",
+  "submission_plan": {
+    "commits": [
+      {
+        "commit": "string",
+        "integration_state": "string",
+        "matching_integration_commits": [],
+        "ownership": "string",
+        "parents": [
+          "string"
+        ],
+        "patch_id": "string"
+      }
+    ],
+    "integration_head": "string",
+    "merged_tree_paths": [
+      "string"
+    ],
+    "recorded_baseline": "string",
+    "safe": "bool",
+    "session_head": "string",
+    "session_id": "integer",
+    "warnings": []
+  }
+}

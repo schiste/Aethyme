@@ -787,7 +787,7 @@ fn confirmed_reconciliation_rebuilds_from_upstream_and_journals_the_reviewed_dig
     let mismatch = mismatch.to_string();
     assert!(
         mismatch.contains("no longer matches current state")
-            && mismatch.contains("aethyme broker integration reconcile"),
+            && mismatch.contains("aethyme broker advanced integration reconcile"),
         "{mismatch}"
     );
     assert!(!mismatch.contains("expected"), "{mismatch}");
