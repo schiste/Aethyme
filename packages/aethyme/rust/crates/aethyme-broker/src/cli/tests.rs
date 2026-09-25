@@ -1172,6 +1172,19 @@ fn every_usage_example_passes_flag_validation() {
 #[test]
 fn every_cli_reference_example_passes_flag_validation() {
     let text = include_str!("../../../../../docs/reference/cli.md");
+    let deprecation_rows: Vec<&str> = text
+        .lines()
+        .filter(|line| line.starts_with("| `aethyme "))
+        .filter_map(|line| {
+            line.find("`aethyme broker ")
+                .map(|start| &line[start + 1..])
+                .and_then(|rest| rest.split('`').next())
+        })
+        .collect();
+    // The reference spells commands the public way (`status readiness`,
+    // `advanced leases claim`, `start --adopt`); flag rules key on the
+    // internal command, so each example is resolved the way the router
+    // resolves it before validation.
     let lines: String = text
         .lines()
         .filter_map(|line| {
@@ -1179,7 +1192,35 @@ fn every_cli_reference_example_passes_flag_validation() {
                 .map(|start| &line[start + 1..])
                 .and_then(|rest| rest.split('`').next())
         })
-        .map(|line| format!("{line}\n"))
+        .map(|line| {
+            let words: Vec<String> = line
+                .trim_start_matches("aethyme broker ")
+                .split_whitespace()
+                .map(|word| if word == "[--json]" { "--json" } else { word })
+                .map(str::to_string)
+                .collect();
+            let resolved = super::resolve(&words);
+            assert!(
+                resolved.refusal.is_none(),
+                "cli.md documents a refused spelling: {line}"
+            );
+            // Old spellings belong only in the deprecation table.
+            assert!(
+                resolved.deprecation.is_none() || deprecation_rows.contains(&line),
+                "cli.md documents a deprecated spelling: {line}"
+            );
+            let mut args = resolved.args;
+            // `start` merges by flag, as `run_inner` does.
+            if args.first().map(String::as_str) == Some("start") {
+                let has = |flag: &str| args.iter().any(|arg| arg == flag);
+                if has("--adopt") || has("--reuse") || has("--replace-stale") {
+                    args[0] = "adopt".to_string();
+                } else if has("--cmd") {
+                    args[0] = "start-agent".to_string();
+                }
+            }
+            format!("aethyme broker {}\n", args.join(" "))
+        })
         .collect();
     let invocations = documented_invocations(&lines);
     assert!(invocations.len() > 50, "found {}", invocations.len());
