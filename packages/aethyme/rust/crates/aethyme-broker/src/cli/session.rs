@@ -602,14 +602,36 @@ pub(super) fn render_worktree_report(report: &crate::WorktreeReport) {
             .idle_days
             .map(|days| format!("{days}d idle"))
             .unwrap_or_else(|| "-".to_string());
+        let git = row
+            .git
+            .as_ref()
+            .map(|git| {
+                let mut flags = Vec::new();
+                if git.detached {
+                    flags.push("detached");
+                }
+                if git.locked {
+                    flags.push("locked");
+                }
+                if git.prunable {
+                    flags.push("prunable");
+                }
+                if flags.is_empty() {
+                    String::new()
+                } else {
+                    format!("  [git: {}]", flags.join(", "))
+                }
+            })
+            .unwrap_or_else(|| "  [git state unknown]".to_string());
         out!(
-            "  {:<22} {:>9}  {:<26} {:<10} {}{}",
+            "  {:<22} {:>9}  {:<26} {:<10} {}{}{}",
             truncate(&row.repository, 22),
             human_bytes(row.bytes),
             state,
             idle,
             row.branch.as_deref().unwrap_or("-"),
             if row.live { "  [live session]" } else { "" },
+            git,
         );
     }
 }

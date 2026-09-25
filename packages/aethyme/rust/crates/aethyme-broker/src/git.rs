@@ -45,6 +45,9 @@ pub enum GitError {
          (set AETHYME_GIT_TIMEOUT_SECS to change the limit)"
     )]
     TimedOut { args: String, seconds: u64 },
+
+    #[error("could not parse git worktree list --porcelain -z: {reason}")]
+    WorktreeListParse { reason: String },
 }
 
 /// Overrides [`DEFAULT_GIT_TIMEOUT`], in whole seconds.
@@ -785,6 +788,13 @@ fn run_git(cwd: &Path, args: &[&str]) -> Result<String, GitError> {
     run_git_inner(cwd, None, args)
 }
 
+fn run_git_bytes(cwd: &Path, args: &[&str]) -> Result<Vec<u8>, GitError> {
+    let mut command = Command::new(&git_program().program);
+    command.args(args).current_dir(cwd);
+    let output = run_git_command_output(command, args, git_timeout())?;
+    Ok(output.stdout)
+}
+
 /// Like [`run_git`] but against a private index file (GIT_INDEX_FILE) so
 /// staging operations never disturb the checkout's real index.
 fn run_git_with_index(cwd: &Path, index_file: &str, args: &[&str]) -> Result<String, GitError> {
@@ -801,11 +811,19 @@ fn run_git_inner(cwd: &Path, index_file: Option<&str>, args: &[&str]) -> Result<
 }
 
 /// Run a prepared git `command` within `budget`, killing it on expiry.
-fn run_git_command(
+fn run_git_command(command: Command, args: &[&str], budget: Duration) -> Result<String, GitError> {
+    let output = run_git_command_output(command, args, budget)?;
+    // trim_end ONLY: porcelain status lines carry significant leading spaces.
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .trim_end()
+        .to_string())
+}
+
+fn run_git_command_output(
     mut command: Command,
     args: &[&str],
     budget: Duration,
-) -> Result<String, GitError> {
+) -> Result<std::process::Output, GitError> {
     let output = crate::bounded_output::output_within(&mut command, budget)
         .map_err(|source| GitError::Spawn {
             args: args.join(" "),
@@ -821,14 +839,8 @@ fn run_git_command(
             stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
         });
     }
-    // trim_end ONLY: porcelain status lines carry a significant leading
-    // space (` M path`), and a full trim breaks the first line's XY
-    // column alignment, silently dropping that entry.
-    Ok(String::from_utf8_lossy(&output.stdout)
-        .trim_end()
-        .to_string())
+    Ok(output)
 }
-
 /// Result of a `git merge-tree --write-tree` simulation.
 #[derive(Debug)]
 pub struct MergeSimulation {
@@ -850,6 +862,22 @@ pub struct RemoteDefaultBranch {
 pub struct GitRepo {
     /// Top level of *this* checkout.
     root: PathBuf,
+}
+
+/// One entry from Git's authoritative worktree list output. Optional lock and
+/// prune reasons are separate from their flags because Git permits reason-free
+/// as well as reason-bearing forms.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitWorktreeInfo {
+    pub path: PathBuf,
+    pub head: Option<String>,
+    pub branch: Option<String>,
+    pub detached: bool,
+    pub bare: bool,
+    pub locked: bool,
+    pub lock_reason: Option<String>,
+    pub prunable: bool,
+    pub prunable_reason: Option<String>,
 }
 
 impl GitRepo {
@@ -2108,17 +2136,172 @@ impl GitRepo {
         Ok(())
     }
 
-    /// Paths of all linked worktrees registered on this repository
-    /// (excluding the main checkout).
+    /// Paths of Git-registered linked worktrees, including registrations Git
+    /// marks prunable, but excluding the main checkout.
     pub fn worktree_paths(&self) -> Result<Vec<PathBuf>, GitError> {
-        let listing = run_git(&self.root, &["worktree", "list", "--porcelain"])?;
+        let inventory = self.worktree_inventory()?;
         let main = self.main_root()?;
-        Ok(listing
-            .lines()
-            .filter_map(|line| line.strip_prefix("worktree "))
-            .map(PathBuf::from)
+        Ok(inventory
+            .into_iter()
+            .map(|entry| entry.path)
             .filter(|path| path.canonicalize().map(|p| p != main).unwrap_or(true))
             .collect())
+    }
+
+    /// All worktree registrations Git knows about, including the main checkout
+    /// and entries Git marks prunable. A failed or malformed listing is an
+    /// error so cleanup callers cannot mistake unknown state for no worktrees.
+    pub fn worktree_inventory(&self) -> Result<Vec<GitWorktreeInfo>, GitError> {
+        let listing = run_git_bytes(&self.root, &["worktree", "list", "--porcelain", "-z"])?;
+        parse_worktree_porcelain_z(&listing)
+    }
+}
+
+fn parse_worktree_porcelain_z(output: &[u8]) -> Result<Vec<GitWorktreeInfo>, GitError> {
+    let mut entries = Vec::new();
+    let mut record = Vec::new();
+    for field in output.split(|byte| *byte == 0) {
+        if field.is_empty() {
+            if !record.is_empty() {
+                entries.push(parse_worktree_record(&record)?);
+                record.clear();
+            }
+        } else {
+            record.push(field);
+        }
+    }
+    if !record.is_empty() {
+        entries.push(parse_worktree_record(&record)?);
+    }
+    if entries.is_empty() {
+        return Err(GitError::WorktreeListParse {
+            reason: "Git returned no worktree records".into(),
+        });
+    }
+    Ok(entries)
+}
+
+fn parse_worktree_record(fields: &[&[u8]]) -> Result<GitWorktreeInfo, GitError> {
+    let mut path = None;
+    let mut head = None;
+    let mut branch = None;
+    let mut detached = false;
+    let mut bare = false;
+    let mut locked = false;
+    let mut lock_reason = None;
+    let mut prunable = false;
+    let mut prunable_reason = None;
+
+    for field in fields {
+        if let Some(value) = field.strip_prefix(b"worktree ") {
+            if path.is_some() || value.is_empty() {
+                return Err(GitError::WorktreeListParse {
+                    reason: "record has a duplicate or empty worktree path".into(),
+                });
+            }
+            path = Some(worktree_path_from_bytes(value));
+        } else if let Some(value) = field.strip_prefix(b"HEAD ") {
+            head = Some(String::from_utf8_lossy(value).into_owned());
+        } else if let Some(value) = field.strip_prefix(b"branch ") {
+            branch = Some(String::from_utf8_lossy(value).into_owned());
+        } else if *field == b"detached" {
+            detached = true;
+        } else if *field == b"bare" {
+            bare = true;
+        } else if *field == b"locked" {
+            locked = true;
+        } else if let Some(value) = field.strip_prefix(b"locked ") {
+            locked = true;
+            lock_reason = Some(String::from_utf8_lossy(value).into_owned());
+        } else if *field == b"prunable" {
+            prunable = true;
+        } else if let Some(value) = field.strip_prefix(b"prunable ") {
+            prunable = true;
+            prunable_reason = Some(String::from_utf8_lossy(value).into_owned());
+        }
+        // Unknown fields are reserved for forward-compatible Git extensions.
+    }
+
+    let path = path.ok_or_else(|| GitError::WorktreeListParse {
+        reason: "record is missing its worktree path".into(),
+    })?;
+    Ok(GitWorktreeInfo {
+        path,
+        head,
+        branch,
+        detached,
+        bare,
+        locked,
+        lock_reason,
+        prunable,
+        prunable_reason,
+    })
+}
+
+fn worktree_path_from_bytes(path: &[u8]) -> PathBuf {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        PathBuf::from(std::ffi::OsString::from_vec(path.to_vec()))
+    }
+    #[cfg(not(unix))]
+    {
+        PathBuf::from(String::from_utf8_lossy(path).into_owned())
+    }
+}
+
+#[cfg(test)]
+mod worktree_porcelain_tests {
+    use super::{GitError, parse_worktree_porcelain_z};
+    use std::path::PathBuf;
+
+    #[test]
+    fn parses_paths_and_registration_states_from_nul_records() {
+        let output = concat!(
+            "worktree /repo/main\0HEAD aaa\0branch refs/heads/main\0\0",
+            "worktree /repo/path with spaces\tand\nnewline\0HEAD bbb\0detached\0",
+            "locked keep for review\0prunable missing gitdir\0\0",
+            "worktree /repo/bare\0bare\0\0",
+        );
+        let entries = parse_worktree_porcelain_z(output.as_bytes()).unwrap();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].path, PathBuf::from("/repo/main"));
+        assert_eq!(entries[0].branch.as_deref(), Some("refs/heads/main"));
+        assert!(!entries[0].detached);
+        assert_eq!(
+            entries[1].path,
+            PathBuf::from("/repo/path with spaces\tand\nnewline")
+        );
+        assert!(entries[1].detached);
+        assert!(entries[1].locked);
+        assert_eq!(entries[1].lock_reason.as_deref(), Some("keep for review"));
+        assert!(entries[1].prunable);
+        assert_eq!(
+            entries[1].prunable_reason.as_deref(),
+            Some("missing gitdir")
+        );
+        assert!(entries[2].bare);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preserves_non_utf8_worktree_paths() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let entries = parse_worktree_porcelain_z(b"worktree /repo/bad-\xff\0bare\0\0").unwrap();
+        assert_eq!(entries[0].path.as_os_str().as_bytes(), b"/repo/bad-\xff");
+    }
+
+    #[test]
+    fn malformed_and_empty_inventory_fail_closed() {
+        assert!(matches!(
+            parse_worktree_porcelain_z(b"HEAD abc\0\0"),
+            Err(GitError::WorktreeListParse { .. })
+        ));
+        assert!(matches!(
+            parse_worktree_porcelain_z(b""),
+            Err(GitError::WorktreeListParse { .. })
+        ));
     }
 }
 

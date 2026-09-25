@@ -45,6 +45,21 @@ impl WorkState {
     }
 }
 
+/// Git registration details for a checkout matched to Git's inventory.
+/// None means the checkout's registration state could not be confirmed.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct GitWorktreeState {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub head: Option<String>,
+    pub detached: bool,
+    pub locked: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lock_reason: Option<String>,
+    pub prunable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prunable_reason: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct WorktreeRow {
     /// The repository root this worktree belongs to, as the host names it.
@@ -60,6 +75,8 @@ pub struct WorktreeRow {
     pub work: WorkState,
     /// A session is using this checkout right now.
     pub live: bool,
+    /// Git's lock and prune state, when the registration was readable.
+    pub git: Option<GitWorktreeState>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
@@ -97,11 +114,32 @@ fn tree_bytes(root: &Path) -> u64 {
 }
 
 /// Read a checkout's state without changing it.
-fn inspect(path: &Path) -> (Option<String>, Option<i64>, WorkState) {
+fn inspect(
+    path: &Path,
+) -> (
+    Option<String>,
+    Option<i64>,
+    WorkState,
+    Option<GitWorktreeState>,
+) {
     let Ok(repo) = GitRepo::discover(path) else {
-        return (None, None, WorkState::NotACheckout);
+        return (None, None, WorkState::NotACheckout, None);
     };
     let branch = repo.current_branch().ok();
+    let root = repo.root().canonicalize().ok();
+    let git = repo.worktree_inventory().ok().and_then(|entries| {
+        entries
+            .into_iter()
+            .find(|entry| entry.path.canonicalize().ok().as_ref() == root.as_ref())
+            .map(|entry| GitWorktreeState {
+                head: entry.head,
+                detached: entry.detached,
+                locked: entry.locked,
+                lock_reason: entry.lock_reason,
+                prunable: entry.prunable,
+                prunable_reason: entry.prunable_reason,
+            })
+    });
 
     // Untracked build output is not work. Counting it would report every
     // checkout that has ever been built as holding something unique, which is
@@ -140,14 +178,19 @@ fn inspect(path: &Path) -> (Option<String>, Option<i64>, WorkState) {
         });
 
     if dirty > 0 {
-        return (branch, idle_days, WorkState::Uncommitted { files: dirty });
+        return (
+            branch,
+            idle_days,
+            WorkState::Uncommitted { files: dirty },
+            git,
+        );
     }
     let state = match repo.commits_not_on_any_remote() {
         Ok(0) => WorkState::Recoverable,
         Ok(commits) => WorkState::Unpushed { commits },
         Err(_) => WorkState::NotACheckout,
     };
-    (branch, idle_days, state)
+    (branch, idle_days, state, git)
 }
 
 /// Classify an enumerated set of worktrees, worst first.
@@ -166,7 +209,7 @@ pub fn build(worktrees: &[(String, PathBuf)], live: &BTreeSet<PathBuf>) -> Workt
             continue;
         }
         let bytes = tree_bytes(path);
-        let (branch, idle_days, work) = inspect(path);
+        let (branch, idle_days, work, git) = inspect(path);
         report.total_bytes += bytes;
         if work.holds_unique_work() {
             report.unique_work_bytes += bytes;
@@ -180,6 +223,7 @@ pub fn build(worktrees: &[(String, PathBuf)], live: &BTreeSet<PathBuf>) -> Workt
             bytes,
             idle_days,
             work,
+            git,
         });
     }
     // Work at risk first, then the largest, then stable by path. A reader
