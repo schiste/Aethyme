@@ -798,10 +798,7 @@ mod tests {
         });
         assert!(text.lines().count() <= 5, "{text}");
         assert!(text.contains("not a broker session"), "{text}");
-        assert!(
-            text.contains("1 other live session (3: other work)"),
-            "{text}"
-        );
+        assert!(text.contains("1 live session (3: other work)"), "{text}");
         assert!(
             next_line(&text).starts_with("aethyme broker start --task \"<task>\""),
             "{text}"
