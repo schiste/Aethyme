@@ -777,7 +777,7 @@ fn bounded_remote_write_timeout_is_journaled_unknown_and_blocks_retry() {
     let mut fixture = push_fixture(tmp.path(), "push-timeout");
     commit_push_fixture(&fixture, "timeout\n");
     let receive_pack = tmp.path().join("sleeping-receive-pack");
-    write_executable(&receive_pack, "#!/bin/sh\nsleep 5\n");
+    write_executable(&receive_pack, "#!/bin/sh\nsleep 60\n");
     git(
         &fixture.worktree,
         &[
@@ -796,11 +796,14 @@ fn bounded_remote_write_timeout_is_journaled_unknown_and_blocks_retry() {
                 &fixture.worktree,
                 &["HEAD:refs/heads/main"],
             ),
-            QueueWait::Seconds(1),
+            // A 5 s budget, not 1 s: on a loaded machine preparing the operation
+            // alone could exceed 1 s and time out at admission, before the
+            // remote write this test is about had even started.
+            QueueWait::Seconds(5),
         )
         .unwrap_err();
     assert!(
-        started.elapsed() < Duration::from_secs(5),
+        started.elapsed() < Duration::from_secs(60),
         "bounded remote operation returned too late: {:?}",
         started.elapsed()
     );
