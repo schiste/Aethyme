@@ -1,6 +1,6 @@
 # Aethyme Quick Start
 
-Last Updated: 2026-09-24
+Last Updated: 2026-09-26
 
 This page takes a fresh machine to a first Explore answer, a first broker
 round trip, and (optionally) the graph-backed commands. Every command below was
@@ -11,11 +11,12 @@ run against `aethyme 0.8.3`. The canonical product overview is the
 ## 1. Install
 
 Releases ship the `aethyme` router and its required `aethyme-engine-cli`
-sibling as one unit, for Apple Silicon macOS, Intel macOS, and x86-64 Linux.
+sibling as one unit, for Apple Silicon macOS, Intel macOS, x86-64 and arm64
+Linux (glibc), and x86-64 Linux (musl, static, for Alpine).
 
 ```bash
 brew install schiste/tap/aethyme
-# or, without Homebrew, the checksum-verified installer:
+# or, without Homebrew, the installer (detects glibc vs musl on Linux):
 curl -fsSL https://github.com/schiste/Aethyme/releases/latest/download/install.sh | sh
 
 aethyme --version
@@ -23,7 +24,16 @@ aethyme-engine-cli --version
 ```
 
 Both commands must print the same version. No interpreter, virtualenv, pip
-step, or background updater is involved. Installer users review updates
+step, or background updater is involved.
+
+The installer always checks the archive against the release manifest's
+SHA-256. When `cosign` is on `PATH` it also verifies the manifest's Sigstore
+signature (issued to this repository's release workflow at the release tag)
+and stops if that fails; without cosign it prints a note and continues.
+`--no-verify-signature` skips the signature check, and `--require-signature`
+makes it mandatory and also checks a downloaded, reviewed `install.sh`
+against the signed manifest. The Homebrew formula is published to
+`schiste/tap` by the release workflow for every stable release. Installer users review updates
 explicitly with `aethyme update check`, `aethyme update plan`, and
 `aethyme update execute --confirm <manifest-sha256>`; Homebrew users run
 `brew upgrade aethyme`.
