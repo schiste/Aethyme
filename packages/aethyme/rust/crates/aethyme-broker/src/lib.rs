@@ -32,7 +32,8 @@ mod clock;
 mod disk_headroom;
 pub mod exit_status;
 pub use disk_headroom::{
-    DEFAULT_GATE_HEADROOM_BYTES, available_bytes, refusal as disk_headroom_refusal,
+    DEFAULT_GATE_HEADROOM_BYTES, GateCacheUsage, available_bytes, refusal as disk_headroom_refusal,
+    refusal_with_gate_cache as disk_headroom_refusal_with_gate_cache,
 };
 pub mod cli;
 mod cli_output;
@@ -44,6 +45,7 @@ pub mod events;
 mod exposures;
 mod external_events;
 mod file_lock;
+mod gate_cache_gc;
 mod gate_database;
 mod gate_doctor;
 mod gates;
@@ -389,7 +391,8 @@ pub use resources::{
 };
 pub use retention::{
     BROKER_CONFIG_RELPATH, GcApplyReport, GcArtifactCandidate, GcBlocker, GcBlockerSummary,
-    GcCheckpointPinRelease, GcDeclinedArtifact, GcFileAction, GcFileCandidate, GcHealth,
+    GcCheckpointPinRelease, GcDeclinedArtifact, GcFileAction, GcFileCandidate,
+    GcGateCacheCandidate, GcGateCacheDisposition, GcGateCacheEntry, GcGateCacheInventory, GcHealth,
     GcOrphanCandidate, GcPlan, GcPublicationExposureExpiry, GcRowCandidate, GcRowKind,
     GcWorktreeBlockerSummary, GcWorktreeCandidate, RETENTION_POLICY_SCHEMA_VERSION,
     RetentionConfigError, RetentionConfigWarning, RetentionPolicy, RetentionPolicyLoadReport,

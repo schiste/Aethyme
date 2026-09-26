@@ -386,8 +386,11 @@ pub(super) const FLAG_RULES: &[(&str, &[&str])] = &[
     ("promotion-record plan", &[]),
     ("promotion-record apply", &["--confirm"]),
     // `plan` reads `--confirm` only to refuse it by name.
-    ("gc plan", &["--detail", "--confirm"]),
-    ("gc apply", &["--confirm"]),
+    (
+        "gc plan",
+        &["--detail", "--confirm", "--include-active-gate-cache"],
+    ),
+    ("gc apply", &["--confirm", "--include-active-gate-cache"]),
     ("worktrees", &[]),
     ("storage", &["--detail", "--confirm"]),
     ("storage plan", &["--detail", "--confirm"]),

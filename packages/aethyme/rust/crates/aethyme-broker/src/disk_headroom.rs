@@ -96,6 +96,18 @@ fn gibibytes(bytes: u64) -> String {
     format!("{:.1} GiB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
 }
 
+/// What a refusing gate knows about its repository's gate cache.
+#[derive(Debug, Clone, Copy)]
+pub struct GateCacheUsage<'a> {
+    /// `<host cache>/gates/<repository key>`.
+    pub root: &'a std::path::Path,
+    /// Every entry under `root`.
+    pub total_bytes: u64,
+    /// The cache key this gate uses: the entry `gc plan` keeps as active.
+    pub active_key: &'a str,
+    pub active_bytes: u64,
+}
+
 /// The refusal message for a gate that cannot safely start, or `None`.
 ///
 /// Separated from the syscall so the decision is testable without a full disk.
@@ -109,18 +121,52 @@ fn gibibytes(bytes: u64) -> String {
 /// still runs, against something else. `gc plan` cannot be wrong that way, and
 /// it reports reclaimable bytes per worktree rather than raw sizes.
 pub fn refusal(available: Option<u64>, required: u64) -> Option<String> {
+    refusal_with_gate_cache(available, required, None)
+}
+
+/// [`refusal`], naming this repository's gate cache and its measured size.
+///
+/// The gate cache sits under the per-user cache directory rather than in any
+/// worktree, and on the host behind #295 it was the largest reclaimable item
+/// on the disk -- 7.7 GiB, almost exactly the headroom the gates were refusing
+/// for -- while this message pointed only at worktree build artefacts. Naming
+/// it, with bytes, is what stops an operator from concluding that `gc plan`'s
+/// total is everything there is.
+pub fn refusal_with_gate_cache(
+    available: Option<u64>,
+    required: u64,
+    gate_cache: Option<GateCacheUsage<'_>>,
+) -> Option<String> {
     let available = available?;
     if available >= required {
         return None;
     }
+    let gate_cache = match gate_cache {
+        Some(usage) if usage.total_bytes > 0 => {
+            let older = usage.total_bytes.saturating_sub(usage.active_bytes);
+            format!(
+                "\nThis repository's gate cache holds {} at {}: {} in `{}`, the cache \
+                 this gate reuses, which `gc plan` keeps (active), and {} in older \
+                 entries, which `gc plan` proposes beyond its budget once no gate \
+                 holds them. `gc plan --include-active-gate-cache` proposes the \
+                 active cache too, and the next gate then rebuilds it from scratch.",
+                gibibytes(usage.total_bytes),
+                usage.root.display(),
+                gibibytes(usage.active_bytes),
+                usage.active_key,
+                gibibytes(older),
+            )
+        }
+        _ => String::new(),
+    };
     Some(format!(
         "refusing to start: {} free, {} required. A build that runs out of space \
          does not report a disk error -- it reports link failures, a corrupt \
          incremental cache and unrelated test failures, and that verdict is then \
          cached against this tree. Reclaim space and retry.\n\
-         Build artefacts in finished session worktrees are usually the largest \
-         reclaimable set, and the broker already measures them:\n  \
-         aethyme broker gc plan",
+         Build artefacts in finished session worktrees and the gate cache are \
+         usually the largest reclaimable sets, and the broker measures both:\n  \
+         aethyme broker gc plan{gate_cache}",
         gibibytes(available),
         gibibytes(required)
     ))
@@ -237,6 +283,47 @@ mod tests {
     #[test]
     fn unknown_free_space_does_not_refuse() {
         assert!(refusal(None, DEFAULT_GATE_HEADROOM_BYTES).is_none());
+    }
+
+    /// #295: the gate cache was the largest reclaimable item and the message
+    /// never mentioned it. With a measured size it must say where and how much.
+    ///
+    /// And it must say what `gc plan` will actually do with it: the cache
+    /// this gate reuses is kept (active), so a message promising it would be
+    /// proposed sends the operator to a plan that proposes nothing.
+    #[test]
+    fn a_measured_gate_cache_is_named_with_its_bytes() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let root = std::path::Path::new("/cache/gates/abc");
+        let usage = GateCacheUsage {
+            root,
+            total_bytes: 7 * GIB + 800 * 1024 * 1024,
+            active_key: "rust-workspace-v3",
+            active_bytes: 5 * GIB,
+        };
+        let message =
+            refusal_with_gate_cache(Some(0), DEFAULT_GATE_HEADROOM_BYTES, Some(usage)).unwrap();
+        assert!(message.contains("gate cache holds 7.8 GiB"), "{message}");
+        assert!(message.contains("/cache/gates/abc"), "{message}");
+        assert!(
+            message.contains("5.0 GiB in `rust-workspace-v3`"),
+            "{message}"
+        );
+        assert!(message.contains("keeps (active)"), "{message}");
+        assert!(message.contains("2.8 GiB in older entries"), "{message}");
+        assert!(message.contains("--include-active-gate-cache"), "{message}");
+        assert!(message.contains("rebuilds it from scratch"), "{message}");
+        assert!(!message.contains("least recently used"), "{message}");
+        assert!(message.contains("aethyme broker gc plan"), "{message}");
+        // An empty cache is not worth a sentence.
+        let empty = GateCacheUsage {
+            total_bytes: 0,
+            active_bytes: 0,
+            ..usage
+        };
+        let quiet =
+            refusal_with_gate_cache(Some(0), DEFAULT_GATE_HEADROOM_BYTES, Some(empty)).unwrap();
+        assert!(!quiet.contains("gate cache holds"), "{quiet}");
     }
 
     #[test]

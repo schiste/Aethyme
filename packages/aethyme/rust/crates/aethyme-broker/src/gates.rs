@@ -839,6 +839,88 @@ fn running_dir(main_root: &Path) -> PathBuf {
     main_root.join(".aethyme/run/gates")
 }
 
+/// The host resource lease a gate holds for as long as it uses its managed
+/// cache. `gc` names the same lease to prove no gate is using an entry before
+/// removing it, so the two must never spell it differently (#295).
+pub(crate) fn managed_cache_lease_name(repository: &str, key: &str) -> String {
+    format!("aethyme-gate-cache:{repository}:{key}")
+}
+
+/// Evidence that a gate of the repository rooted at `main_root` is running
+/// right now, one human-readable line per witness. Empty means none was found.
+///
+/// Two independent witnesses, because neither covers every run: a pidfile is
+/// written only for a gate run on behalf of a session, while owner locks are
+/// held by every run for its whole duration. Whatever cannot be read counts as
+/// evidence -- this answers "may I delete a cache a gate could be writing
+/// into?", and on 2026-09-26 a blanket delete that guessed wrong broke a live
+/// gate (#295).
+pub(crate) fn running_gate_evidence(main_root: &Path) -> Vec<String> {
+    let run_dir = running_dir(main_root);
+    let mut evidence = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&run_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !name.ends_with(".pid") {
+                continue;
+            }
+            let Some(record) = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|content| GatePidRecord::parse(&content))
+            else {
+                evidence.push(format!("gate pidfile {name} is unreadable"));
+                continue;
+            };
+            let pid = record.pid.unwrap_or(record.pgid);
+            let alive = match (record.start, process_start_time(pid)) {
+                // A different process reusing the PID is not the gate.
+                (Some(recorded), Some(live)) => recorded == live,
+                (_, Some(_)) => true,
+                // No start time on this platform: fall back to existence.
+                (_, None) => {
+                    cfg!(not(any(target_os = "macos", target_os = "linux")))
+                        && crate::broker::pid_alive(i64::from(pid))
+                }
+            };
+            if alive {
+                evidence.push(format!("gate pidfile {name} names running process {pid}"));
+            }
+        }
+    }
+    if let Ok(entries) = std::fs::read_dir(run_dir.join("owners")) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !name.ends_with(".lock") {
+                continue;
+            }
+            let file = match std::fs::OpenOptions::new().read(true).open(entry.path()) {
+                Ok(file) => file,
+                Err(error) => {
+                    evidence.push(format!("gate owner lock {name} cannot be opened: {error}"));
+                    continue;
+                }
+            };
+            match file.try_lock() {
+                // Released at once: a probe, not a claim.
+                Ok(()) => {
+                    // Dropping the file also releases it; report a failed unlock
+                    // rather than discard it.
+                    crate::warn_unrecorded("release a gate owner lock probe", file.unlock());
+                }
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    evidence.push(format!("gate owner lock {name} is held by a running gate"));
+                }
+                Err(std::fs::TryLockError::Error(error)) => {
+                    evidence.push(format!("gate owner lock {name} cannot be probed: {error}"));
+                }
+            }
+        }
+    }
+    evidence.sort();
+    evidence
+}
+
 /// What a gate pidfile says about the process group it names.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct GatePidRecord {
@@ -1367,7 +1449,7 @@ fn acquire_gate_resources(
         resources.push(crate::HostResourceRequirement {
             key: "managed_cache".into(),
             resource: crate::HostResourceKind::ExclusiveKey {
-                name: format!("aethyme-gate-cache:{repository}:{}", cache.key),
+                name: managed_cache_lease_name(&repository, &cache.key),
             },
         });
     }
@@ -2182,10 +2264,32 @@ fn run_gate_command(
     // verdict is then cached against the tree -- so the retry that would clear
     // it is exactly what the cache prevents. Refusing here keeps the condition
     // and its symptom attached to each other.
-    if let Some(refusal) = crate::disk_headroom_refusal(
-        crate::available_bytes(context.cwd),
-        crate::DEFAULT_GATE_HEADROOM_BYTES,
-    ) {
+    let available = crate::available_bytes(context.cwd);
+    if crate::disk_headroom_refusal(available, crate::DEFAULT_GATE_HEADROOM_BYTES).is_some() {
+        // Sized only once refusing: the walk costs seconds on a warm cache,
+        // which a gate about to fail can afford and one about to run cannot.
+        let measured = context.managed_cache.and_then(|cache| {
+            let root = cache.directory.parent()?;
+            Some((
+                root,
+                directory_usage(root).ok()?,
+                cache.provenance.key.as_str(),
+                directory_usage(&cache.directory).unwrap_or(0),
+            ))
+        });
+        let refusal = crate::disk_headroom_refusal_with_gate_cache(
+            available,
+            crate::DEFAULT_GATE_HEADROOM_BYTES,
+            measured.map(
+                |(root, total_bytes, active_key, active_bytes)| crate::GateCacheUsage {
+                    root,
+                    total_bytes,
+                    active_key,
+                    active_bytes,
+                },
+            ),
+        )
+        .unwrap_or_default();
         return Err(std::io::Error::new(
             std::io::ErrorKind::StorageFull,
             format!("gate {refusal}"),

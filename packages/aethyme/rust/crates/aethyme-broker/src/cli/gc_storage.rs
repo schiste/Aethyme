@@ -162,15 +162,70 @@ pub(super) fn render_storage_apply(report: &crate::StorageApplyReport) {
 
 pub(super) fn render_gc_plan(plan: &crate::GcPlan, detail: bool) {
     out!(
-        "GC plan {}: {} rows, {} files, {} represented worktrees, {} build caches, {} orphaned roots, {} reclaimable",
+        "GC plan {}: {} rows, {} files, {} represented worktrees, {} build caches, {} gate cache entries, {} orphaned roots, {} reclaimable",
         plan.digest,
         plan.rows.len(),
         plan.files.len(),
         plan.worktrees.len(),
         plan.artifacts.len(),
+        plan.gate_caches.len(),
         plan.orphans.len(),
         human_bytes(plan.estimated_reclaimable_bytes),
     );
+    out!(
+        "  build output reclaimable: {} (finished sessions' build caches and gate cache entries)",
+        human_bytes(plan.estimated_build_output_reclaimable_bytes),
+    );
+    // Printed whether or not anything is proposed: #295 was an operator
+    // reading a near-zero total as "the disk is unreclaimable" while the gate
+    // cache was the largest thing on it and simply not listed.
+    if let Some(cache) = &plan.gate_cache {
+        out!(
+            "  gate cache: {} in {} {} at {}; {} kept (active), {} held by running gates, {} reclaimable; budget for older entries {}",
+            human_bytes(cache.total_bytes),
+            cache.entries.len(),
+            crate::broker::plural_word(cache.entries.len(), "entry", "entries"),
+            cache.root,
+            human_bytes(cache.active_bytes),
+            human_bytes(cache.held_bytes),
+            human_bytes(cache.reclaimable_bytes),
+            human_bytes(cache.budget_bytes),
+        );
+        if cache.include_active {
+            out!(
+                "    --include-active-gate-cache: the most recently used cache of each kind is proposed; the next gate will rebuild from scratch"
+            );
+        } else if cache.active_bytes > 0 {
+            out!(
+                "    the active cache is kept because the next gate reuses it; `gc plan --include-active-gate-cache` proposes it too (the next gate will rebuild from scratch)"
+            );
+        }
+        for holder in &cache.holders {
+            out!("    held: {holder}");
+        }
+        render_capped(&cache.entries, GC_LIST_CAP, detail, |entry| {
+            out!(
+                "    {} {} ({}, {}) — {}",
+                match entry.disposition {
+                    crate::GcGateCacheDisposition::Reclaimable => "reclaimable",
+                    crate::GcGateCacheDisposition::Held => "held",
+                    crate::GcGateCacheDisposition::Active => "kept (active)",
+                    crate::GcGateCacheDisposition::WithinBudget => "kept",
+                    crate::GcGateCacheDisposition::Unmeasured => "unmeasured",
+                },
+                entry.entry,
+                entry
+                    .estimated_bytes
+                    .map(human_bytes)
+                    .unwrap_or_else(|| "unknown bytes".into()),
+                entry
+                    .age_days
+                    .map(|days| format!("used {days}d ago"))
+                    .unwrap_or_else(|| "last use unknown".into()),
+                entry.reason,
+            );
+        });
+    }
     for warning in &plan.retention_config_warnings {
         out!("  retention warning: {warning}");
     }
@@ -405,18 +460,31 @@ pub(super) fn render_gc_plan(plan: &crate::GcPlan, detail: bool) {
         && plan.worktrees.is_empty()
         && plan.artifacts.is_empty()
         && plan.orphans.is_empty()
+        && plan.gate_caches.is_empty()
         && plan.checkpoint_pin_releases.is_empty()
         && plan.publication_exposure_expiries.is_empty()
     {
         out!("  apply: nothing eligible");
     } else {
-        out!("  apply: aethyme broker gc apply --confirm {}", plan.digest);
+        out!(
+            "  apply: aethyme broker gc apply --confirm {}{}",
+            plan.digest,
+            if plan
+                .gate_cache
+                .as_ref()
+                .is_some_and(|cache| cache.include_active)
+            {
+                " --include-active-gate-cache"
+            } else {
+                ""
+            }
+        );
     }
 }
 
 pub(super) fn render_gc_apply(report: &crate::GcApplyReport) {
     out!(
-        "GC apply {}: {} rows, {} files, {} worktrees, {} build caches, {} orphaned roots, {} checkpoint pins released, {} exposures expired, {} reclaimed",
+        "GC apply {}: {} rows, {} files, {} worktrees, {} build caches, {} gate cache entries, {} orphaned roots, {} checkpoint pins released, {} exposures expired, {} reclaimed",
         if report.complete {
             "complete"
         } else {
@@ -426,6 +494,7 @@ pub(super) fn render_gc_apply(report: &crate::GcApplyReport) {
         report.files_completed.len(),
         report.sessions_cleaned.len(),
         report.artifacts_reclaimed.len(),
+        report.gate_caches_reclaimed.len(),
         report.orphans_removed.len(),
         report.checkpoint_pins_released.len(),
         report.publication_exposures_expired.len(),
@@ -608,7 +677,11 @@ pub(super) fn run_gc(parsed: Parsed) -> Result<(), UsageError> {
                     "gc plan does not accept --confirm; review its emitted digest".into(),
                 ));
             }
-            let plan = broker.gc_plan()?;
+            let plan = if parsed.include_active_gate_cache {
+                broker.gc_plan_including_active_gate_cache()?
+            } else {
+                broker.gc_plan()?
+            };
             if parsed.json {
                 out!("{}", serde_json::to_string_pretty(&plan)?);
             } else {
@@ -619,7 +692,11 @@ pub(super) fn run_gc(parsed: Parsed) -> Result<(), UsageError> {
             let confirm = parsed.confirm.as_deref().ok_or_else(|| {
                 UsageError::Message("gc apply requires --confirm <sha256>".into())
             })?;
-            let report = broker.gc_apply(confirm)?;
+            let report = if parsed.include_active_gate_cache {
+                broker.gc_apply_including_active_gate_cache(confirm)?
+            } else {
+                broker.gc_apply(confirm)?
+            };
             if parsed.json {
                 out!("{}", serde_json::to_string_pretty(&report)?);
             } else {
