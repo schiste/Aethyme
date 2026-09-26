@@ -30,6 +30,23 @@ within the user's trust boundary.
 
 ## Publishing a stable update
 
+The `homebrew-tap` job in `.github/workflows/release.yml` does this
+automatically for every stable tag (tags containing `-` are skipped): after the
+GitHub release is created it downloads the rendered `aethyme.rb` release asset,
+checks that it points at that release's archives, and commits it to
+`Formula/aethyme.rb` on the tap's `main` as `chore: update Aethyme to vX.Y.Z`.
+It needs the repository secret `HOMEBREW_TAP_TOKEN`: a fine-grained personal
+access token scoped to `schiste/homebrew-tap` only, with repository permission
+Contents: Read and write (Metadata: Read-only is implied). Without the secret
+the job emits a warning and succeeds without touching the tap. That push
+bypasses the maintainer's local broker enrollment of the tap, which is accepted
+for a formula-only bump.
+
+The formula covers macOS (arm64, x86-64) and glibc Linux (arm64, x86-64). The
+musl archive is for the installer only; Homebrew on Linux requires glibc.
+
+To publish by hand instead (for example when the secret is absent):
+
 1. Download `aethyme.rb`, `release-manifest.json`, and its Sigstore bundle from
    the stable release.
 2. Verify the signed manifest and compare the reviewed formula to the generated

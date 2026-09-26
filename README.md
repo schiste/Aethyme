@@ -54,9 +54,14 @@ is expensive.
 
 ### 1. Install the Rust binaries
 
-Supported release targets are Apple Silicon macOS, Intel macOS, and x86-64
-Linux. A release contains the paired `aethyme` router and
+Supported release targets are Apple Silicon macOS, Intel macOS, x86-64 and
+arm64 Linux (glibc), and x86-64 Linux (musl, static, for Alpine and other
+non-glibc distributions). A release contains the paired `aethyme` router and
 `aethyme-engine-cli` engine binary.
+
+Windows is not supported natively; run the x86-64 Linux build under WSL2.
+The cost of a native port is scoped in
+[docs/architecture/windows-port.md](packages/aethyme/docs/architecture/windows-port.md).
 
 With Homebrew:
 
@@ -66,7 +71,12 @@ aethyme --version
 aethyme-engine-cli --version
 ```
 
-Without Homebrew, use the checksum-verified installer:
+The tap formula (macOS and glibc Linux, Intel and ARM) is updated by the
+release workflow for every stable release.
+
+Without Homebrew, use the installer. It picks the archive for your platform,
+including the musl build where `ldd` reports musl, and checks it against the
+release manifest's SHA-256:
 
 ```bash
 curl -fsSL https://github.com/schiste/Aethyme/releases/latest/download/install.sh | sh
@@ -74,8 +84,14 @@ aethyme --version
 aethyme-engine-cli --version
 ```
 
-For signature-authenticated installation, download and review `install.sh`,
-then run it with `--verify-signature` and Cosign 3. Installer users can review
+When `cosign` (Cosign 3) is on `PATH`, the installer also verifies the
+release manifest's keyless Sigstore signature against this repository's
+release workflow before installing, and stops if it fails. Without cosign it
+prints a one-line note and continues on checksums alone. `--no-verify-signature`
+skips the signature check. For the strictest installation, download and review
+`install.sh`, then run it with `--require-signature`: it fails when cosign is
+missing and also checks the installer file itself against the signed manifest
+(`--verify-signature` is the older spelling of the same flag). Installer users can review
 updates explicitly with `aethyme update check`, `aethyme update plan`, and
 `aethyme update execute --confirm <manifest-sha256>`.
 

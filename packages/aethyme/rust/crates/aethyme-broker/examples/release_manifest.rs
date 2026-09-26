@@ -204,7 +204,7 @@ mod tests {
         assert_eq!(manifest.version, env!("CARGO_PKG_VERSION"));
         assert_eq!(manifest.source_sha, "a".repeat(40));
         assert_eq!(manifest.release_channel, "stable");
-        assert_eq!(manifest.artifacts.len(), 3);
+        assert_eq!(manifest.artifacts.len(), RELEASE_TARGETS.len());
         assert_eq!(
             manifest.required_binaries,
             REQUIRED_RELEASE_BINARIES

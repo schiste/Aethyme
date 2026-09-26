@@ -4,14 +4,24 @@ set -eu
 repository_url="${AETHYME_RELEASE_BASE_URL:-https://github.com/schiste/Aethyme}"
 install_dir="${AETHYME_INSTALL_DIR:-${HOME}/.local/bin}"
 requested_version=""
-verify_signature=false
+# auto: verify the signed release manifest whenever cosign is on PATH.
+# require: fail without cosign, and also check this installer against the
+#          signed manifest. off: checksums only.
+signature_mode=auto
+signature_opt_out=false
 
 usage() {
     printf '%s\n' \
-        'Usage: install.sh [--version <version>] [--install-dir <directory>] [--verify-signature]' \
+        'Usage: install.sh [--version <version>] [--install-dir <directory>]' \
+        '                  [--require-signature | --no-verify-signature]' \
         '' \
         'Without --version, installs the latest stable GitHub release.' \
-        '--verify-signature requires Cosign 3 and verifies the signed release manifest.'
+        'When cosign (Cosign 3) is on PATH, the signed release manifest is verified' \
+        'before anything is installed. Without cosign, a note is printed and the' \
+        'archive is still checked against the manifest SHA-256.' \
+        '--require-signature fails when cosign is missing and also checks this' \
+        '  installer file against the signed manifest (--verify-signature is an alias).' \
+        '--no-verify-signature skips signature verification.'
 }
 
 while [ "$#" -gt 0 ]; do
@@ -26,8 +36,12 @@ while [ "$#" -gt 0 ]; do
             install_dir="$2"
             shift 2
             ;;
-        --verify-signature)
-            verify_signature=true
+        --verify-signature|--require-signature)
+            signature_mode=require
+            shift
+            ;;
+        --no-verify-signature)
+            signature_opt_out=true
             shift
             ;;
         -h|--help)
@@ -42,6 +56,14 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 
+if [ "$signature_opt_out" = true ]; then
+    if [ "$signature_mode" = require ]; then
+        printf '%s\n' 'install: --no-verify-signature conflicts with --require-signature' >&2
+        exit 2
+    fi
+    signature_mode=off
+fi
+
 command -v jq >/dev/null 2>&1 || {
     printf 'install: jq is required to parse the release manifest safely\n' >&2
     exit 1
@@ -54,15 +76,50 @@ case "$requested_version" in
         ;;
 esac
 
-case "$(uname -s):$(uname -m)" in
-    Darwin:arm64) target="aarch64-apple-darwin" ;;
-    Darwin:x86_64) target="x86_64-apple-darwin" ;;
-    Linux:x86_64) target="x86_64-unknown-linux-gnu" ;;
-    *)
-        printf 'install: unsupported platform %s %s\n' "$(uname -s)" "$(uname -m)" >&2
-        exit 1
-        ;;
-esac
+# Prints gnu or musl. ldd names its C library; the musl loader is the
+# fallback because Debian's musl-tools installs it on glibc systems too.
+linux_libc() {
+    ldd_banner="$(ldd --version 2>&1 || true)"
+    case "$ldd_banner" in
+        *musl*) printf '%s\n' musl; return ;;
+        *GNU*|*glibc*|*GLIBC*) printf '%s\n' gnu; return ;;
+    esac
+    for loader in /lib/ld-musl-*; do
+        [ -e "$loader" ] && { printf '%s\n' musl; return; }
+    done
+    printf '%s\n' gnu
+}
+
+# Prints the release target for this machine, or fails for an unsupported one.
+detect_target() {
+    os="$(uname -s)"
+    arch="$(uname -m)"
+    case "$os:$arch" in
+        Darwin:arm64|Darwin:aarch64) printf '%s\n' aarch64-apple-darwin ;;
+        Darwin:x86_64) printf '%s\n' x86_64-apple-darwin ;;
+        Linux:x86_64|Linux:amd64)
+            case "$(linux_libc)" in
+                musl) printf '%s\n' x86_64-unknown-linux-musl ;;
+                *) printf '%s\n' x86_64-unknown-linux-gnu ;;
+            esac
+            ;;
+        Linux:aarch64|Linux:arm64)
+            case "$(linux_libc)" in
+                musl)
+                    printf 'install: no musl release for %s; use a glibc distribution or build from source\n' "$arch" >&2
+                    return 1
+                    ;;
+                *) printf '%s\n' aarch64-unknown-linux-gnu ;;
+            esac
+            ;;
+        *)
+            printf 'install: unsupported platform %s %s\n' "$os" "$arch" >&2
+            return 1
+            ;;
+    esac
+}
+
+target="$(detect_target)" || exit 1
 
 temp_root="$(mktemp -d "${TMPDIR:-/tmp}/aethyme-install.XXXXXX")"
 trap 'rm -rf "$temp_root"' EXIT HUP INT TERM
@@ -104,30 +161,53 @@ if [ -z "$requested_version" ] && [ "$channel" != "stable" ]; then
     exit 1
 fi
 
-if [ "$verify_signature" = true ]; then
-    command -v cosign >/dev/null 2>&1 || {
-        printf 'install: --verify-signature requires cosign on PATH\n' >&2
+# Mirrors the "Sign and verify release manifest" step in release.yml: keyless
+# Sigstore, bound to this repository's release workflow at the exact tag.
+verify_manifest_signature() {
+    bundle="$temp_root/release-manifest.sigstore.json"
+    download "$repository_url/$release_path/release-manifest.sigstore.json" "$bundle" || {
+        printf 'install: could not download the release manifest signature bundle\n' >&2
         exit 1
     }
-    bundle="$temp_root/release-manifest.sigstore.json"
-    download "$repository_url/$release_path/release-manifest.sigstore.json" "$bundle"
     cosign verify-blob \
         --bundle "$bundle" \
         --certificate-identity "https://github.com/schiste/Aethyme/.github/workflows/release.yml@refs/tags/v${version}" \
         --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-        "$manifest" >/dev/null
-    [ -f "$0" ] || {
-        printf 'install: signature verification requires running a reviewed installer file\n' >&2
+        "$manifest" >/dev/null || {
+        printf 'install: release manifest signature verification failed (pass --no-verify-signature to skip)\n' >&2
         exit 1
     }
-    installer_digest="$(jq -er '.installer.sha256 | select(type == "string")' "$manifest")"
-    [ "$(sha256_file "$0")" = "$installer_digest" ] || {
-        printf 'install: reviewed installer does not match the signed manifest\n' >&2
-        exit 1
-    }
-else
-    printf 'install: signature verification is disabled; checksums alone do not authenticate a release\n' >&2
-fi
+}
+
+case "$signature_mode" in
+    require)
+        command -v cosign >/dev/null 2>&1 || {
+            printf 'install: --require-signature requires cosign on PATH\n' >&2
+            exit 1
+        }
+        verify_manifest_signature
+        [ -f "$0" ] || {
+            printf 'install: signature verification requires running a reviewed installer file\n' >&2
+            exit 1
+        }
+        installer_digest="$(jq -er '.installer.sha256 | select(type == "string")' "$manifest")"
+        [ "$(sha256_file "$0")" = "$installer_digest" ] || {
+            printf 'install: reviewed installer does not match the signed manifest\n' >&2
+            exit 1
+        }
+        ;;
+    auto)
+        if command -v cosign >/dev/null 2>&1; then
+            verify_manifest_signature
+            printf 'install: verified the signed release manifest for v%s\n' "$version" >&2
+        else
+            printf 'install: cosign not found; skipping signature verification (checksums alone do not authenticate a release)\n' >&2
+        fi
+        ;;
+    *)
+        printf 'install: signature verification is disabled; checksums alone do not authenticate a release\n' >&2
+        ;;
+esac
 
 archive="aethyme-v${version}-${target}.tar.gz"
 expected="$(jq -er --arg archive "$archive" --arg target "$target" '

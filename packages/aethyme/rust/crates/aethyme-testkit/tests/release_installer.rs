@@ -43,7 +43,9 @@ fn stable_installer_fetches_verifies_and_updates_the_binary_pair() {
     let target = match (std::env::consts::OS, std::env::consts::ARCH) {
         ("macos", "aarch64") => "aarch64-apple-darwin",
         ("macos", "x86_64") => "x86_64-apple-darwin",
+        ("linux", "x86_64") if cfg!(target_env = "musl") => "x86_64-unknown-linux-musl",
         ("linux", "x86_64") => "x86_64-unknown-linux-gnu",
+        ("linux", "aarch64") => "aarch64-unknown-linux-gnu",
         pair => panic!("unsupported installer test platform: {pair:?}"),
     };
     let archive = format!("aethyme-v{version}-{target}.tar.gz");
@@ -70,6 +72,8 @@ fn stable_installer_fetches_verifies_and_updates_the_binary_pair() {
         "aarch64-apple-darwin",
         "x86_64-apple-darwin",
         "x86_64-unknown-linux-gnu",
+        "aarch64-unknown-linux-gnu",
+        "x86_64-unknown-linux-musl",
     ];
     let artifacts = targets
         .iter()
@@ -120,9 +124,15 @@ fn stable_installer_fetches_verifies_and_updates_the_binary_pair() {
         .unwrap();
     assert!(syntax.success());
 
+    // Explicit opt-out: a developer machine may have a real cosign on PATH,
+    // which would reject the fixture bundle under the default mode.
     let output = Command::new("sh")
         .arg(repo_root().join("install.sh"))
-        .args(["--install-dir", install_dir.to_str().unwrap()])
+        .args([
+            "--no-verify-signature",
+            "--install-dir",
+            install_dir.to_str().unwrap(),
+        ])
         .env(
             "AETHYME_RELEASE_BASE_URL",
             format!("file://{}", download_root.display()),
@@ -187,6 +197,70 @@ fn stable_installer_fetches_verifies_and_updates_the_binary_pair() {
         String::from_utf8_lossy(&verified.stderr)
     );
 
+    // Default mode verifies whenever cosign is on PATH, and a failed
+    // verification stops the install before anything is downloaded.
+    let failing_bin = temp.path().join("failing-bin");
+    fs::create_dir(&failing_bin).unwrap();
+    let failing_cosign = failing_bin.join("cosign");
+    fs::write(&failing_cosign, "#!/bin/sh\nexit 1\n").unwrap();
+    fs::set_permissions(
+        &failing_cosign,
+        fs::metadata(&cosign).unwrap().permissions(),
+    )
+    .unwrap();
+    let default_dir = temp.path().join("default-bin");
+    let rejected = Command::new("sh")
+        .arg(&installer_path)
+        .args(["--install-dir", default_dir.to_str().unwrap()])
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                failing_bin.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .env(
+            "AETHYME_RELEASE_BASE_URL",
+            format!("file://{}", download_root.display()),
+        )
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr).contains("signature verification failed"),
+        "default-mode stderr:\n{}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+    assert!(!default_dir.exists());
+
+    // A passing cosign in default mode installs without the installer
+    // self-check, which only --require-signature enforces.
+    let auto_dir = temp.path().join("auto-bin");
+    let auto = Command::new("sh")
+        .arg(&installer_path)
+        .args(["--install-dir", auto_dir.to_str().unwrap()])
+        .env("PATH", &path)
+        .env(
+            "AETHYME_RELEASE_BASE_URL",
+            format!("file://{}", download_root.display()),
+        )
+        .output()
+        .unwrap();
+    assert!(
+        auto.status.success(),
+        "auto stderr:\n{}",
+        String::from_utf8_lossy(&auto.stderr)
+    );
+    assert!(String::from_utf8_lossy(&auto.stderr).contains("verified the signed release manifest"));
+
+    let conflicting = Command::new("sh")
+        .arg(&installer_path)
+        .args(["--require-signature", "--no-verify-signature"])
+        .output()
+        .unwrap();
+    assert_eq!(conflicting.status.code(), Some(2));
+
     let tampered_installer = temp.path().join("tampered-install.sh");
     let mut tampered = fs::read_to_string(&installer_path).unwrap();
     tampered.push_str("\n# tampered after review\n");
@@ -211,7 +285,11 @@ fn stable_installer_fetches_verifies_and_updates_the_binary_pair() {
     let refused_dir = temp.path().join("refused-bin");
     let refused = Command::new("sh")
         .arg(repo_root().join("install.sh"))
-        .args(["--install-dir", refused_dir.to_str().unwrap()])
+        .args([
+            "--no-verify-signature",
+            "--install-dir",
+            refused_dir.to_str().unwrap(),
+        ])
         .env(
             "AETHYME_RELEASE_BASE_URL",
             format!("file://{}", download_root.display()),

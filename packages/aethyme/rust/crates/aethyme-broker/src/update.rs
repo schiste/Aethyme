@@ -212,15 +212,32 @@ pub enum UpdateError {
     UnsupportedPlatform { os: String, arch: String },
 }
 
+/// The release target this binary was built for, so a self-update replaces a
+/// musl build with the musl archive rather than the glibc one for the same
+/// OS and architecture.
 pub fn current_release_target() -> Result<&'static str, UpdateError> {
-    release_target_for(std::env::consts::OS, std::env::consts::ARCH)
+    let musl = cfg!(target_env = "musl");
+    release_target_for_libc(std::env::consts::OS, std::env::consts::ARCH, musl)
 }
 
+/// Map an OS and architecture to a glibc (or macOS) release target.
 pub fn release_target_for(os: &str, arch: &str) -> Result<&'static str, UpdateError> {
-    match (os, arch) {
-        ("macos", "aarch64") => Ok("aarch64-apple-darwin"),
-        ("macos", "x86_64") => Ok("x86_64-apple-darwin"),
-        ("linux", "x86_64") => Ok("x86_64-unknown-linux-gnu"),
+    release_target_for_libc(os, arch, false)
+}
+
+/// Map an OS, architecture and C library to a release target. `musl` only
+/// matters on Linux; only x86_64 has a musl release archive.
+pub fn release_target_for_libc(
+    os: &str,
+    arch: &str,
+    musl: bool,
+) -> Result<&'static str, UpdateError> {
+    match (os, arch, musl) {
+        ("macos", "aarch64", _) => Ok("aarch64-apple-darwin"),
+        ("macos", "x86_64", _) => Ok("x86_64-apple-darwin"),
+        ("linux", "x86_64", false) => Ok("x86_64-unknown-linux-gnu"),
+        ("linux", "aarch64", false) => Ok("aarch64-unknown-linux-gnu"),
+        ("linux", "x86_64", true) => Ok("x86_64-unknown-linux-musl"),
         _ => Err(UpdateError::UnsupportedPlatform {
             os: os.to_string(),
             arch: arch.to_string(),
@@ -1546,7 +1563,29 @@ mod tests {
             release_target_for("linux", "x86_64").unwrap(),
             RELEASE_TARGETS[2]
         );
-        assert!(release_target_for("linux", "aarch64").is_err());
+        assert_eq!(
+            release_target_for("linux", "aarch64").unwrap(),
+            RELEASE_TARGETS[3]
+        );
+        assert_eq!(
+            release_target_for_libc("linux", "x86_64", true).unwrap(),
+            RELEASE_TARGETS[4]
+        );
+        assert!(release_target_for_libc("linux", "aarch64", true).is_err());
+        assert!(release_target_for("linux", "riscv64").is_err());
+        assert!(release_target_for("windows", "x86_64").is_err());
+        for target in RELEASE_TARGETS {
+            assert!(
+                [false, true].iter().any(|musl| {
+                    ["macos", "linux"].iter().any(|os| {
+                        ["aarch64", "x86_64"].iter().any(|arch| {
+                            release_target_for_libc(os, arch, *musl).ok() == Some(*target)
+                        })
+                    })
+                }),
+                "{target} is published but unreachable from self-update"
+            );
+        }
     }
 
     #[test]
