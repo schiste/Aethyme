@@ -1,0 +1,31 @@
+diff --git a/shoplib/reports.py b/shoplib/reports.py
+index 2704c62..989e05c 100644
+--- a/shoplib/reports.py
++++ b/shoplib/reports.py
+@@ -19,3 +19,10 @@ def units_by_sku(orders):
+ 
+ def revenue(orders):
+     return sum(pricing.total(o) for o in placed(orders))
++
++
++def top_skus(orders, n):
++    if n <= 0:
++        return []
++    ranked = sorted(units_by_sku(orders).items(), key=lambda kv: (-kv[1], kv[0]))
++    return ranked[:n]
+diff --git a/tests/test_top_skus.py b/tests/test_top_skus.py
+new file mode 100644
+index 0000000..02c55d1
+--- /dev/null
++++ b/tests/test_top_skus.py
+@@ -0,0 +1,10 @@
++import unittest
++from shoplib.models import LineItem, Order
++from shoplib.reports import top_skus
++
++
++class TopSkusTest(unittest.TestCase):
++    def test_top(self):
++        orders = [Order("O1", "C1", [LineItem("MUG-001", 3, 1), LineItem("TEA-010", 4, 1),
++                                     LineItem("BAG-100", 3, 1)], status="placed")]
++        self.assertEqual(top_skus(orders, 2), [("TEA-010", 4), ("BAG-100", 3)])

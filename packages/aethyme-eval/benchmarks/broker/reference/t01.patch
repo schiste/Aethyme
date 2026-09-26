@@ -1,0 +1,43 @@
+diff --git a/shoplib/money.py b/shoplib/money.py
+index b4bc512..b86d862 100644
+--- a/shoplib/money.py
++++ b/shoplib/money.py
+@@ -3,12 +3,20 @@
+ from shoplib.errors import ValidationError
+ 
+ 
+-def format_price(cents, currency="USD"):
+-    """Format an integer amount of cents, e.g. 123456 -> '1234.56 USD'."""
++SYMBOLS = {"USD": "$", "EUR": "\u20ac", "GBP": "\u00a3"}
++
++
++def format_price(cents, currency="USD", symbol=False):
++    """Format an integer amount of cents, e.g. 123456 -> '1234.56 USD'.
++
++    With symbol=True a known currency is shown as a prefix symbol: '$1234.56'.
++    """
+     if not isinstance(cents, int) or isinstance(cents, bool):
+         raise TypeError("cents must be an int")
+     sign = "-" if cents < 0 else ""
+     whole, frac = divmod(abs(cents), 100)
++    if symbol and currency in SYMBOLS:
++        return f"{sign}{SYMBOLS[currency]}{whole}.{frac:02d}"
+     return f"{sign}{whole}.{frac:02d} {currency}"
+ 
+ 
+diff --git a/tests/test_money_symbol.py b/tests/test_money_symbol.py
+new file mode 100644
+index 0000000..308a1f9
+--- /dev/null
++++ b/tests/test_money_symbol.py
+@@ -0,0 +1,10 @@
++import unittest
++from shoplib.money import format_price
++
++
++class MoneySymbolTest(unittest.TestCase):
++    def test_symbol(self):
++        self.assertEqual(format_price(123456, "USD", symbol=True), "$1234.56")
++        self.assertEqual(format_price(-250, "GBP", symbol=True), "-\u00a32.50")
++        self.assertEqual(format_price(100, "JPY", symbol=True), "1.00 JPY")
++        self.assertEqual(format_price(123456), "1234.56 USD")

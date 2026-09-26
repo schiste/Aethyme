@@ -1,0 +1,37 @@
+diff --git a/shoplib/commands.py b/shoplib/commands.py
+index b19e0c9..64672c7 100644
+--- a/shoplib/commands.py
++++ b/shoplib/commands.py
+@@ -10,3 +10,8 @@ def cmd_price(args, ctx):
+ 
+ def cmd_stock(args, ctx):
+     return str(ctx.inventory.available(args[0]))
++
++
++def cmd_low_stock(args, ctx):
++    threshold = int(args[0]) if args else None
++    return "\n".join(ctx.inventory.low_stock(threshold)) or "none"
+diff --git a/shoplib/registry.py b/shoplib/registry.py
+index 20bc1e1..bc9d3be 100644
+--- a/shoplib/registry.py
++++ b/shoplib/registry.py
+@@ -44,4 +44,5 @@ def names(table):
+ COMMANDS = {
+     "price": "shoplib.commands:cmd_price",
+     "stock": "shoplib.commands:cmd_stock",
++    "low-stock": "shoplib.commands:cmd_low_stock",
+ }
+diff --git a/tests/test_low_stock_command.py b/tests/test_low_stock_command.py
+new file mode 100644
+index 0000000..9b18132
+--- /dev/null
++++ b/tests/test_low_stock_command.py
+@@ -0,0 +1,8 @@
++import unittest
++from shoplib import cli
++
++
++class LowStockTest(unittest.TestCase):
++    def test_low_stock(self):
++        self.assertEqual(cli.main(["low-stock"]), "MUG-002")
++        self.assertEqual(cli.main(["low-stock", "20"]), "MUG-002\nTEA-010")

@@ -1,0 +1,466 @@
+diff --git a/shoplib/catalog.py b/shoplib/catalog.py
+index fe1e46e..fc3496f 100644
+--- a/shoplib/catalog.py
++++ b/shoplib/catalog.py
+@@ -22,6 +22,7 @@ class Catalog:
+     def all(self):
+         return sorted(self._products.values(), key=lambda p: p.sku)
+ 
+-    def search(self, query):
+-        """Products whose name contains `query`, ordered by SKU."""
+-        return [p for p in self.all() if query in p.name]
++    def search(self, query, tag=None):
++        """Products whose name contains `query` (any case), optionally with `tag`, by SKU."""
++        needle = query.lower()
++        return [p for p in self.all() if needle in p.name.lower() and (tag is None or tag in p.tags)]
+diff --git a/shoplib/commands.py b/shoplib/commands.py
+index b19e0c9..64672c7 100644
+--- a/shoplib/commands.py
++++ b/shoplib/commands.py
+@@ -10,3 +10,8 @@ def cmd_price(args, ctx):
+ 
+ def cmd_stock(args, ctx):
+     return str(ctx.inventory.available(args[0]))
++
++
++def cmd_low_stock(args, ctx):
++    threshold = int(args[0]) if args else None
++    return "\n".join(ctx.inventory.low_stock(threshold)) or "none"
+diff --git a/shoplib/customers.py b/shoplib/customers.py
+index baeb241..7a8647d 100644
+--- a/shoplib/customers.py
++++ b/shoplib/customers.py
+@@ -2,6 +2,7 @@
+ 
+ from dataclasses import dataclass
+ 
++from shoplib import pricing
+ from shoplib.validation import validate_email
+ 
+ 
+@@ -30,3 +31,12 @@ class CustomerBook:
+             if customer.email == email:
+                 return customer
+         return None
++
++
++def loyalty_tier(customer_id, orders):
++    spend = sum(pricing.total(o) for o in orders if o.customer_id == customer_id and o.status == "placed")
++    if spend >= 50000:
++        return "gold"
++    if spend >= 20000:
++        return "silver"
++    return "bronze"
+diff --git a/shoplib/exporters/tsv_export.py b/shoplib/exporters/tsv_export.py
+new file mode 100644
+index 0000000..9d53065
+--- /dev/null
++++ b/shoplib/exporters/tsv_export.py
+@@ -0,0 +1,7 @@
++def export_orders_tsv(orders):
++    lines = ["\t".join(["order_id", "customer_id", "sku", "qty", "unit_price_cents"])]
++    for order in orders:
++        for item in order.items:
++            lines.append("\t".join(str(v) for v in (order.id, order.customer_id, item.sku, item.qty,
++                                                     item.unit_price_cents)))
++    return "\n".join(lines) + "\n"
+diff --git a/shoplib/inventory.py b/shoplib/inventory.py
+index 39d5faa..7396364 100644
+--- a/shoplib/inventory.py
++++ b/shoplib/inventory.py
+@@ -18,7 +18,7 @@ class Inventory:
+             raise UnknownSku(sku)
+         return self._on_hand[sku] - self._reserved[sku]
+ 
+-    def reserve(self, sku, qty):
++    def reserve_stock(self, sku, qty):
+         """Hold `qty` units of `sku` for an order. Raises OutOfStock."""
+         free = self.available(sku)
+         if qty > free:
+diff --git a/shoplib/money.py b/shoplib/money.py
+index b4bc512..d9cfff5 100644
+--- a/shoplib/money.py
++++ b/shoplib/money.py
+@@ -3,13 +3,23 @@
+ from shoplib.errors import ValidationError
+ 
+ 
+-def format_price(cents, currency="USD"):
+-    """Format an integer amount of cents, e.g. 123456 -> '1234.56 USD'."""
++SYMBOLS = {"USD": "$", "EUR": "\u20ac", "GBP": "\u00a3"}
++
++
++def format_price(cents, currency="USD", symbol=False, thousands_sep=""):
++    """Format an integer amount of cents, e.g. 123456 -> '1234.56 USD'.
++
++    With symbol=True a known currency is shown as a prefix symbol: '$1234.56'.
++    A non-empty thousands_sep groups the whole units: '1,234.56 USD'.
++    """
+     if not isinstance(cents, int) or isinstance(cents, bool):
+         raise TypeError("cents must be an int")
+     sign = "-" if cents < 0 else ""
+     whole, frac = divmod(abs(cents), 100)
+-    return f"{sign}{whole}.{frac:02d} {currency}"
++    units = f"{whole:,}".replace(",", thousands_sep) if thousands_sep else str(whole)
++    if symbol and currency in SYMBOLS:
++        return f"{sign}{SYMBOLS[currency]}{units}.{frac:02d}"
++    return f"{sign}{units}.{frac:02d} {currency}"
+ 
+ 
+ def parse_price(text):
+diff --git a/shoplib/orders.py b/shoplib/orders.py
+index 4d526e2..7d06c9f 100644
+--- a/shoplib/orders.py
++++ b/shoplib/orders.py
+@@ -29,7 +29,7 @@ class OrderService:
+         held = []
+         try:
+             for item in order.items:
+-                self.inventory.reserve(item.sku, item.qty)
++                self.inventory.reserve_stock(item.sku, item.qty)
+                 held.append(item)
+         except OutOfStock:
+             for item in held:
+diff --git a/shoplib/registry.py b/shoplib/registry.py
+index 20bc1e1..39ab753 100644
+--- a/shoplib/registry.py
++++ b/shoplib/registry.py
+@@ -11,6 +11,7 @@ import importlib
+ EXPORTERS = {
+     "csv": "shoplib.exporters.csv_export:export_orders_csv",
+     "json": "shoplib.exporters.json_export:export_orders_json",
++    "tsv": "shoplib.exporters.tsv_export:export_orders_tsv",
+ }
+ 
+ 
+@@ -44,4 +45,5 @@ def names(table):
+ COMMANDS = {
+     "price": "shoplib.commands:cmd_price",
+     "stock": "shoplib.commands:cmd_stock",
++    "low-stock": "shoplib.commands:cmd_low_stock",
+ }
+diff --git a/shoplib/reports.py b/shoplib/reports.py
+index 2704c62..989e05c 100644
+--- a/shoplib/reports.py
++++ b/shoplib/reports.py
+@@ -19,3 +19,10 @@ def units_by_sku(orders):
+ 
+ def revenue(orders):
+     return sum(pricing.total(o) for o in placed(orders))
++
++
++def top_skus(orders, n):
++    if n <= 0:
++        return []
++    ranked = sorted(units_by_sku(orders).items(), key=lambda kv: (-kv[1], kv[0]))
++    return ranked[:n]
+diff --git a/shoplib/shipping.py b/shoplib/shipping.py
+index aad55d6..249c8a8 100644
+--- a/shoplib/shipping.py
++++ b/shoplib/shipping.py
+@@ -4,9 +4,13 @@
+ RATES = {"US": (499, 150), "FR": (699, 200), "GB": (699, 220)}
+ 
+ 
+-def shipping_cost(weight_grams, region):
++EXPRESS_SURCHARGE = 500
++
++
++def shipping_cost(weight_grams, region, express=False):
+     if weight_grams < 0:
+         raise ValueError("weight must be non-negative")
+     base, per_block = RATES.get(region, (1299, 400))
+     blocks = -(-weight_grams // 500)  # ceil
+-    return base + blocks * per_block
++    cost = base + blocks * per_block
++    return 2 * cost + EXPRESS_SURCHARGE if express else cost
+diff --git a/shoplib/subscriptions.py b/shoplib/subscriptions.py
+new file mode 100644
+index 0000000..17e5008
+--- /dev/null
++++ b/shoplib/subscriptions.py
+@@ -0,0 +1,25 @@
++"""Recurring orders."""
++
++from dataclasses import dataclass
++
++from shoplib.models import LineItem
++
++
++@dataclass
++class Subscription:
++    customer_id: str
++    sku: str
++    qty: int
++    interval_days: int
++
++
++class SubscriptionService:
++    def __init__(self, catalog, inventory):
++        self.catalog = catalog
++        self.inventory = inventory
++
++    def renew(self, subscription):
++        """Hold stock for one delivery and return its line item."""
++        product = self.catalog.get(subscription.sku)
++        self.inventory.reserve_stock(subscription.sku, subscription.qty)
++        return LineItem(subscription.sku, subscription.qty, product.price_cents)
+diff --git a/shoplib/text.py b/shoplib/text.py
+index 49fa516..94cb06b 100644
+--- a/shoplib/text.py
++++ b/shoplib/text.py
+@@ -1,13 +1,16 @@
+ """Text helpers."""
+ 
+ import re
++import unicodedata
+ 
+ _NON_WORD = re.compile(r"[^a-z0-9]+")
+ 
+ 
+ def slugify(text):
+     """'Blue Mug (Large)' -> 'blue-mug-large'."""
+-    return _NON_WORD.sub("-", text.lower()).strip("-")
++    folded = unicodedata.normalize("NFKD", text)
++    ascii_text = folded.encode("ascii", "ignore").decode("ascii")
++    return _NON_WORD.sub("-", ascii_text.lower()).strip("-")
+ 
+ 
+ def truncate(text, width, suffix="..."):
+diff --git a/shoplib/validation.py b/shoplib/validation.py
+index 01d28c5..5b05000 100644
+--- a/shoplib/validation.py
++++ b/shoplib/validation.py
+@@ -6,6 +6,11 @@ from shoplib import config
+ from shoplib.errors import ValidationError
+ 
+ _SKU = re.compile(r"^[A-Z]{3}-\d{3,5}$")
++_POSTAL = {
++    "US": re.compile(r"^\d{5}(-\d{4})?$"),
++    "FR": re.compile(r"^\d{5}$"),
++    "GB": re.compile(r"^[A-Z][A-Z0-9]{1,3} \d[A-Z]{2}$"),
++}
+ _EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[a-z]{2,}$", re.IGNORECASE)
+ 
+ 
+@@ -29,3 +34,13 @@ def validate_quantity(qty):
+     if qty > config.get("max_line_quantity"):
+         raise ValidationError(f"quantity {qty} exceeds the per-line maximum")
+     return qty
++
++
++def validate_postal_code(code, region):
++    pattern = _POSTAL.get(region)
++    if pattern is None:
++        raise ValidationError(f"unsupported region: {region!r}")
++    code = code.strip().upper()
++    if not pattern.match(code):
++        raise ValidationError(f"invalid {region} postal code: {code!r}")
++    return code
+diff --git a/tests/test_catalog_search.py b/tests/test_catalog_search.py
+new file mode 100644
+index 0000000..ff03483
+--- /dev/null
++++ b/tests/test_catalog_search.py
+@@ -0,0 +1,9 @@
++import unittest
++from tests.helpers import make_shop
++
++
++class SearchTest(unittest.TestCase):
++    def test_search(self):
++        catalog, _, _ = make_shop()
++        self.assertEqual([p.sku for p in catalog.search("mug")], ["MUG-001", "MUG-002"])
++        self.assertEqual([p.sku for p in catalog.search("", tag="blue")], ["BAG-100", "MUG-001"])
+diff --git a/tests/test_express_shipping.py b/tests/test_express_shipping.py
+new file mode 100644
+index 0000000..6dfef99
+--- /dev/null
++++ b/tests/test_express_shipping.py
+@@ -0,0 +1,8 @@
++import unittest
++from shoplib.shipping import shipping_cost
++
++
++class ExpressTest(unittest.TestCase):
++    def test_express(self):
++        self.assertEqual(shipping_cost(501, "US", express=True), 2 * (499 + 2 * 150) + 500)
++        self.assertEqual(shipping_cost(0, "FR"), 699)
+diff --git a/tests/test_inventory.py b/tests/test_inventory.py
+index 05dfa20..e4fc815 100644
+--- a/tests/test_inventory.py
++++ b/tests/test_inventory.py
+@@ -10,7 +10,7 @@ class InventoryTest(unittest.TestCase):
+ 
+     def test_reserve_and_release(self):
+         _, inventory, _ = make_shop()
+-        inventory.reserve("MUG-001", 4)
++        inventory.reserve_stock("MUG-001", 4)
+         self.assertEqual(inventory.available("MUG-001"), 6)
+         inventory.release("MUG-001", 4)
+         self.assertEqual(inventory.available("MUG-001"), 10)
+@@ -18,7 +18,7 @@ class InventoryTest(unittest.TestCase):
+     def test_out_of_stock(self):
+         _, inventory, _ = make_shop()
+         with self.assertRaises(OutOfStock) as ctx:
+-            inventory.reserve("MUG-002", 3)
++            inventory.reserve_stock("MUG-002", 3)
+         self.assertEqual(ctx.exception.available, 2)
+ 
+     def test_unknown(self):
+diff --git a/tests/test_inventory_rename.py b/tests/test_inventory_rename.py
+new file mode 100644
+index 0000000..87a7aa6
+--- /dev/null
++++ b/tests/test_inventory_rename.py
+@@ -0,0 +1,8 @@
++import unittest
++from shoplib.inventory import Inventory
++
++
++class RenameTest(unittest.TestCase):
++    def test_old_name_gone(self):
++        self.assertFalse(hasattr(Inventory, "reserve"))
++        self.assertTrue(hasattr(Inventory, "reserve_stock"))
+diff --git a/tests/test_low_stock_command.py b/tests/test_low_stock_command.py
+new file mode 100644
+index 0000000..9b18132
+--- /dev/null
++++ b/tests/test_low_stock_command.py
+@@ -0,0 +1,8 @@
++import unittest
++from shoplib import cli
++
++
++class LowStockTest(unittest.TestCase):
++    def test_low_stock(self):
++        self.assertEqual(cli.main(["low-stock"]), "MUG-002")
++        self.assertEqual(cli.main(["low-stock", "20"]), "MUG-002\nTEA-010")
+diff --git a/tests/test_loyalty.py b/tests/test_loyalty.py
+new file mode 100644
+index 0000000..3b12b31
+--- /dev/null
++++ b/tests/test_loyalty.py
+@@ -0,0 +1,10 @@
++import unittest
++from shoplib.customers import loyalty_tier
++from shoplib.models import LineItem, Order
++
++
++class LoyaltyTest(unittest.TestCase):
++    def test_tiers(self):
++        order = Order("O1", "C1", [LineItem("MUG-001", 1, 20000)], region="XX", status="placed")
++        self.assertEqual(loyalty_tier("C1", []), "bronze")
++        self.assertEqual(loyalty_tier("C1", [order]), "silver")
+diff --git a/tests/test_money_symbol.py b/tests/test_money_symbol.py
+new file mode 100644
+index 0000000..308a1f9
+--- /dev/null
++++ b/tests/test_money_symbol.py
+@@ -0,0 +1,10 @@
++import unittest
++from shoplib.money import format_price
++
++
++class MoneySymbolTest(unittest.TestCase):
++    def test_symbol(self):
++        self.assertEqual(format_price(123456, "USD", symbol=True), "$1234.56")
++        self.assertEqual(format_price(-250, "GBP", symbol=True), "-\u00a32.50")
++        self.assertEqual(format_price(100, "JPY", symbol=True), "1.00 JPY")
++        self.assertEqual(format_price(123456), "1234.56 USD")
+diff --git a/tests/test_money_thousands.py b/tests/test_money_thousands.py
+new file mode 100644
+index 0000000..064ecd0
+--- /dev/null
++++ b/tests/test_money_thousands.py
+@@ -0,0 +1,9 @@
++import unittest
++from shoplib.money import format_price
++
++
++class MoneyThousandsTest(unittest.TestCase):
++    def test_grouping(self):
++        self.assertEqual(format_price(123456789, "USD", thousands_sep=","), "1,234,567.89 USD")
++        self.assertEqual(format_price(-100000, "EUR", thousands_sep=" "), "-1 000.00 EUR")
++        self.assertEqual(format_price(99999, thousands_sep=","), "999.99 USD")
+diff --git a/tests/test_postal_codes.py b/tests/test_postal_codes.py
+new file mode 100644
+index 0000000..edc90a3
+--- /dev/null
++++ b/tests/test_postal_codes.py
+@@ -0,0 +1,12 @@
++import unittest
++from shoplib.errors import ValidationError
++from shoplib.validation import validate_postal_code
++
++
++class PostalTest(unittest.TestCase):
++    def test_codes(self):
++        self.assertEqual(validate_postal_code(" 12345-6789 ", "US"), "12345-6789")
++        self.assertEqual(validate_postal_code("sw1a 1aa", "GB"), "SW1A 1AA")
++        for code, region in [("1234", "FR"), ("12345", "DE")]:
++            with self.assertRaises(ValidationError):
++                validate_postal_code(code, region)
+diff --git a/tests/test_slugify_unicode.py b/tests/test_slugify_unicode.py
+new file mode 100644
+index 0000000..64db0e8
+--- /dev/null
++++ b/tests/test_slugify_unicode.py
+@@ -0,0 +1,8 @@
++import unittest
++from shoplib.text import slugify
++
++
++class SlugifyUnicodeTest(unittest.TestCase):
++    def test_fold(self):
++        self.assertEqual(slugify("Cr\u00e8me Br\u00fbl\u00e9e"), "creme-brulee")
++        self.assertEqual(slugify("\u00c7a va? 100%"), "ca-va-100")
+diff --git a/tests/test_subscriptions.py b/tests/test_subscriptions.py
+new file mode 100644
+index 0000000..ba6d394
+--- /dev/null
++++ b/tests/test_subscriptions.py
+@@ -0,0 +1,12 @@
++import unittest
++from shoplib.models import LineItem
++from shoplib.subscriptions import Subscription, SubscriptionService
++from tests.helpers import make_shop
++
++
++class SubscriptionTest(unittest.TestCase):
++    def test_renew(self):
++        catalog, inventory, _ = make_shop()
++        item = SubscriptionService(catalog, inventory).renew(Subscription("C1", "TEA-010", 3, 30))
++        self.assertEqual(item, LineItem("TEA-010", 3, 850))
++        self.assertEqual(inventory.available("TEA-010"), 17)
+diff --git a/tests/test_top_skus.py b/tests/test_top_skus.py
+new file mode 100644
+index 0000000..02c55d1
+--- /dev/null
++++ b/tests/test_top_skus.py
+@@ -0,0 +1,10 @@
++import unittest
++from shoplib.models import LineItem, Order
++from shoplib.reports import top_skus
++
++
++class TopSkusTest(unittest.TestCase):
++    def test_top(self):
++        orders = [Order("O1", "C1", [LineItem("MUG-001", 3, 1), LineItem("TEA-010", 4, 1),
++                                     LineItem("BAG-100", 3, 1)], status="placed")]
++        self.assertEqual(top_skus(orders, 2), [("TEA-010", 4), ("BAG-100", 3)])
+diff --git a/tests/test_tsv_export.py b/tests/test_tsv_export.py
+new file mode 100644
+index 0000000..9e2baaa
+--- /dev/null
++++ b/tests/test_tsv_export.py
+@@ -0,0 +1,9 @@
++import unittest
++from shoplib import registry
++from shoplib.models import LineItem, Order
++
++
++class TsvTest(unittest.TestCase):
++    def test_tsv(self):
++        text = registry.exporter("tsv")([Order("O1", "C1", [LineItem("MUG-001", 2, 1299)])])
++        self.assertEqual(text, "order_id\tcustomer_id\tsku\tqty\tunit_price_cents\nO1\tC1\tMUG-001\t2\t1299\n")

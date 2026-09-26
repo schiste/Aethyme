@@ -1,0 +1,34 @@
+diff --git a/shoplib/shipping.py b/shoplib/shipping.py
+index aad55d6..249c8a8 100644
+--- a/shoplib/shipping.py
++++ b/shoplib/shipping.py
+@@ -4,9 +4,13 @@
+ RATES = {"US": (499, 150), "FR": (699, 200), "GB": (699, 220)}
+ 
+ 
+-def shipping_cost(weight_grams, region):
++EXPRESS_SURCHARGE = 500
++
++
++def shipping_cost(weight_grams, region, express=False):
+     if weight_grams < 0:
+         raise ValueError("weight must be non-negative")
+     base, per_block = RATES.get(region, (1299, 400))
+     blocks = -(-weight_grams // 500)  # ceil
+-    return base + blocks * per_block
++    cost = base + blocks * per_block
++    return 2 * cost + EXPRESS_SURCHARGE if express else cost
+diff --git a/tests/test_express_shipping.py b/tests/test_express_shipping.py
+new file mode 100644
+index 0000000..6dfef99
+--- /dev/null
++++ b/tests/test_express_shipping.py
+@@ -0,0 +1,8 @@
++import unittest
++from shoplib.shipping import shipping_cost
++
++
++class ExpressTest(unittest.TestCase):
++    def test_express(self):
++        self.assertEqual(shipping_cost(501, "US", express=True), 2 * (499 + 2 * 150) + 500)
++        self.assertEqual(shipping_cost(0, "FR"), 699)

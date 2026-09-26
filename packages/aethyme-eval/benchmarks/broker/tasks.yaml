@@ -1,0 +1,267 @@
+# Broker benchmark (P5.6) workload: 4 agent slots x 3 sequential tasks.
+#
+# The prompt text an agent sees is built from `title` + `spec` + `acceptance`
+# by harness.py; `hidden_check` names the file under hidden_checks/ that the
+# scorer runs against the arm's final landing ref. Agents never see it.
+#
+# Deliberate overlaps (each pair is split across two slots and sits at the
+# same position in both queues, so the two tasks are in flight together):
+#
+#   textual   t01 x t04  both change the signature and body of
+#                        shoplib.money.format_price -> git reports a conflict.
+#   semantic  t05 x t08  t05 renames Inventory.reserve -> reserve_stock;
+#                        t08 adds a new module that holds stock the way
+#                        OrderService.place does (i.e. calls reserve). The
+#                        files are disjoint, so git merges cleanly, but the
+#                        merged tree fails t08's own tests.
+#   shared    t03 x t09  both register an entry in shoplib/registry.py,
+#                        t03 in EXPORTERS (top), t09 in COMMANDS (bottom).
+#                        Clean merge; both must survive. Measures false
+#                        refusals / over-serialisation, not real conflicts.
+#
+# Every other task is independent. Each task names its own new test file so
+# test additions never collide by accident.
+
+version: 1
+base_test_command: "python3 -m unittest discover -s tests -t . -q"
+
+# Slot -> model. Keep identical across arms A, B and C.
+slots:
+  s1:
+    harness: claude
+    model: sonnet
+    agent_command: "claude --model sonnet --permission-mode bypassPermissions"
+  s2:
+    harness: claude
+    model: opus
+    agent_command: "claude --model opus --permission-mode bypassPermissions"
+  s3:
+    harness: codex
+    model: gpt-6-luna
+    agent_command: "codex -m gpt-6-luna -c model_reasoning_effort=high -a never -s danger-full-access"
+  s4:
+    harness: codex
+    model: gpt-6-sol
+    agent_command: "codex -m gpt-6-sol -c model_reasoning_effort=high -a never -s danger-full-access"
+
+overlaps:
+  - id: textual
+    tasks: [t01, t04]
+    kind: textual
+    note: "Same function (money.format_price): signature and body both change."
+    hidden_check: test_overlap_textual.py
+  - id: semantic
+    tasks: [t05, t08]
+    kind: semantic
+    note: "Rename Inventory.reserve plus a new caller of the old name; merges cleanly, breaks tests."
+    hidden_check: test_overlap_semantic.py
+  - id: shared
+    tasks: [t03, t09]
+    kind: shared_file
+    note: "Both edit shoplib/registry.py in different tables; merges cleanly."
+    hidden_check: test_overlap_shared.py
+
+tasks:
+  - id: t01
+    slot: s1
+    position: 1
+    overlap: textual
+    title: "Currency symbols in format_price"
+    spec: |
+      Add an optional parameter `symbol=False` to `shoplib.money.format_price`.
+      When `symbol=True`, prefix the amount with the currency's symbol instead of
+      appending the code: USD -> "$", EUR -> "€", GBP -> "£". A negative amount
+      puts the sign before the symbol. A currency with no known symbol keeps the
+      plain "<amount> <CODE>" form even when `symbol=True`. The default output is
+      unchanged.
+    acceptance: |
+      format_price(123456, "USD", symbol=True) == "$1234.56";
+      format_price(-250, "GBP", symbol=True) == "-£2.50";
+      format_price(100, "JPY", symbol=True) == "1.00 JPY";
+      format_price(123456) == "1234.56 USD". Tests go in tests/test_money_symbol.py.
+    test_file: tests/test_money_symbol.py
+    hidden_check: test_t01.py
+
+  - id: t02
+    slot: s1
+    position: 2
+    title: "Postal code validation"
+    spec: |
+      Add `validate_postal_code(code, region)` to `shoplib/validation.py`. It strips
+      surrounding whitespace, uppercases, and returns the normalised code, or raises
+      `ValidationError`. Rules: "US" accepts 5 digits or 5 digits, a hyphen and 4
+      digits; "FR" accepts exactly 5 digits; "GB" accepts an outward code of 2-4
+      letters/digits starting with a letter, one space, then a digit and two letters
+      (e.g. "SW1A 1AA"). Any other region raises `ValidationError`.
+    acceptance: |
+      validate_postal_code(" 12345-6789 ", "US") == "12345-6789";
+      validate_postal_code("sw1a 1aa", "GB") == "SW1A 1AA";
+      validate_postal_code("1234", "FR") raises ValidationError;
+      validate_postal_code("12345", "DE") raises ValidationError.
+      Tests go in tests/test_postal_codes.py.
+    test_file: tests/test_postal_codes.py
+    hidden_check: test_t02.py
+
+  - id: t03
+    slot: s1
+    position: 3
+    overlap: shared
+    title: "TSV exporter"
+    spec: |
+      Add a tab-separated exporter in a new module `shoplib/exporters/tsv_export.py`
+      with `export_orders_tsv(orders)`. Same columns and row order as the CSV
+      exporter, tab-separated, "\n" line endings, header row first. Register it in
+      `shoplib/registry.py` under the name "tsv".
+    acceptance: |
+      registry.exporter("tsv")(orders) returns a header line
+      "order_id\tcustomer_id\tsku\tqty\tunit_price_cents" followed by one line per
+      order item. Tests go in tests/test_tsv_export.py.
+    test_file: tests/test_tsv_export.py
+    hidden_check: test_t03.py
+
+  - id: t04
+    slot: s2
+    position: 1
+    overlap: textual
+    title: "Thousands separator in format_price"
+    spec: |
+      Add an optional parameter `thousands_sep=""` to `shoplib.money.format_price`.
+      When it is non-empty, group the whole-units part in threes with that
+      separator. The default output is unchanged.
+    acceptance: |
+      format_price(123456789, "USD", thousands_sep=",") == "1,234,567.89 USD";
+      format_price(-100000, "EUR", thousands_sep=" ") == "-1 000.00 EUR";
+      format_price(99999, thousands_sep=",") == "999.99 USD".
+      Tests go in tests/test_money_thousands.py.
+    test_file: tests/test_money_thousands.py
+    hidden_check: test_t04.py
+
+  - id: t05
+    slot: s2
+    position: 2
+    overlap: semantic
+    title: "Rename Inventory.reserve to reserve_stock"
+    spec: |
+      Rename the method `Inventory.reserve` in `shoplib/inventory.py` to
+      `reserve_stock`, and update every caller and test in the repository. Do not
+      keep the old name as an alias: after this change `Inventory` has no `reserve`
+      attribute. Behaviour is otherwise unchanged.
+    acceptance: |
+      Inventory().reserve_stock(sku, qty) behaves as reserve did;
+      hasattr(Inventory, "reserve") is False; the full test suite passes.
+      Put a test asserting the old name is gone in tests/test_inventory_rename.py.
+    test_file: tests/test_inventory_rename.py
+    hidden_check: test_t05.py
+
+  - id: t06
+    slot: s2
+    position: 3
+    title: "Express shipping"
+    spec: |
+      Add an `express=False` keyword to `shoplib.shipping.shipping_cost`. Express
+      shipping costs twice the standard price plus a flat 500 cents surcharge.
+      Standard pricing is unchanged.
+    acceptance: |
+      shipping_cost(501, "US", express=True) == 2 * (499 + 2 * 150) + 500;
+      shipping_cost(0, "FR") == 699. Tests go in tests/test_express_shipping.py.
+    test_file: tests/test_express_shipping.py
+    hidden_check: test_t06.py
+
+  - id: t07
+    slot: s3
+    position: 1
+    title: "Case-insensitive catalog search with tag filter"
+    spec: |
+      Make `Catalog.search(query)` in `shoplib/catalog.py` case-insensitive and add
+      an optional keyword `tag=None`: when given, only products carrying that tag
+      are returned. An empty query matches every product. Results stay ordered by
+      SKU.
+    acceptance: |
+      search("mug") returns both mugs; search("", tag="blue") returns
+      ["BAG-100", "MUG-001"] by SKU in the shared test shop (tests/helpers.py).
+      Tests go in tests/test_catalog_search.py.
+    test_file: tests/test_catalog_search.py
+    hidden_check: test_t07.py
+
+  - id: t08
+    slot: s3
+    position: 2
+    overlap: semantic
+    title: "Subscription renewals"
+    spec: |
+      Add a new module `shoplib/subscriptions.py` with a dataclass
+      `Subscription(customer_id, sku, qty, interval_days)` and a class
+      `SubscriptionService(catalog, inventory)` exposing `renew(subscription)`.
+      `renew` holds `qty` units of the SKU in the inventory using the same
+      inventory call that `OrderService.place` uses to hold stock, then returns a
+      `shoplib.models.LineItem` priced from the catalog. When stock is short it
+      raises `OutOfStock` and holds nothing. Do not modify existing modules.
+    acceptance: |
+      After renew(Subscription("C1", "TEA-010", 3, 30)) on the shared test shop,
+      inventory.available("TEA-010") has dropped by 3 and the returned LineItem is
+      LineItem("TEA-010", 3, 850). Tests go in tests/test_subscriptions.py.
+    test_file: tests/test_subscriptions.py
+    hidden_check: test_t08.py
+
+  - id: t09
+    slot: s3
+    position: 3
+    overlap: shared
+    title: "low-stock CLI command"
+    spec: |
+      Add a CLI command "low-stock". Implement it as `cmd_low_stock(args, ctx)` in
+      `shoplib/commands.py` and register it in `shoplib/registry.py`. It prints the
+      SKUs returned by `ctx.inventory.low_stock()` one per line; an optional first
+      argument is an integer threshold. With nothing low it prints "none".
+    acceptance: |
+      cli.main(["low-stock"]) == "MUG-002" on the demo context;
+      cli.main(["low-stock", "20"]) == "MUG-002\nTEA-010".
+      Tests go in tests/test_low_stock_command.py.
+    test_file: tests/test_low_stock_command.py
+    hidden_check: test_t09.py
+
+  - id: t10
+    slot: s4
+    position: 1
+    title: "Customer loyalty tiers"
+    spec: |
+      Add `loyalty_tier(customer_id, orders)` to `shoplib/customers.py`. It sums
+      `shoplib.pricing.total` over that customer's placed orders and returns
+      "gold" at 50000 cents or more, "silver" at 20000 or more, otherwise "bronze".
+    acceptance: |
+      A customer with no placed orders is "bronze"; exactly 20000 cents of placed
+      totals is "silver"; draft and cancelled orders do not count.
+      Tests go in tests/test_loyalty.py.
+    test_file: tests/test_loyalty.py
+    hidden_check: test_t10.py
+
+  - id: t11
+    slot: s4
+    position: 2
+    title: "Top SKUs report"
+    spec: |
+      Add `top_skus(orders, n)` to `shoplib/reports.py`: the `n` SKUs with the most
+      units across placed orders, as a list of (sku, units) tuples sorted by units
+      descending then SKU ascending. `n <= 0` returns an empty list.
+    acceptance: |
+      With placed orders totalling MUG-001: 3, TEA-010: 4, BAG-100: 3,
+      top_skus(orders, 2) == [("TEA-010", 4), ("BAG-100", 3)].
+      Tests go in tests/test_top_skus.py.
+    test_file: tests/test_top_skus.py
+    hidden_check: test_t11.py
+
+  - id: t12
+    slot: s4
+    position: 3
+    title: "Accent-folding slugify"
+    spec: |
+      Make `shoplib.text.slugify` fold accented Latin letters to ASCII before
+      slugging (use `unicodedata` NFKD and drop combining marks), so that
+      "Crème Brûlée" becomes "creme-brulee". Characters with no ASCII form are
+      dropped. Existing behaviour for ASCII input is unchanged.
+    acceptance: |
+      slugify("Crème Brûlée") == "creme-brulee"; slugify("Ça va? 100%") ==
+      "ca-va-100"; slugify("Blue Mug (Large)") == "blue-mug-large".
+      Tests go in tests/test_slugify_unicode.py.
+    test_file: tests/test_slugify_unicode.py
+    hidden_check: test_t12.py
