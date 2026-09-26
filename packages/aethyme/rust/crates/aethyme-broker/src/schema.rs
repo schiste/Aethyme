@@ -23,18 +23,32 @@ use rusqlite::Connection;
 use crate::error::BrokerError;
 
 /// Current database schema version (== `MIGRATIONS.len()`).
-pub const SCHEMA_VERSION: i64 = 42;
+pub const SCHEMA_VERSION: i64 = 43;
 
 /// The oldest schema version whose binaries can safely use a database at
 /// [`SCHEMA_VERSION`]. Before this existed every newer database locked out
 /// every older binary, including for purely additive migrations (#293).
+///
+/// Migrations declared compatible (left at the previous minimum):
+/// - v43: nullable machine-environment columns on `gate_results`. A v42
+///   writer names its columns explicitly, so its rows simply leave them NULL.
 pub const MIN_COMPATIBLE_SCHEMA: i64 = 42;
 
 /// Whether this binary may use a database at `found`, a version newer than
 /// its own, because every migration past [`SCHEMA_VERSION`] was declared
 /// compatible. A database without the marker predates it and is refused.
 pub fn newer_schema_is_compatible(conn: &Connection, found: i64) -> Result<bool, BrokerError> {
-    if found <= SCHEMA_VERSION {
+    schema_is_compatible_with(conn, found, SCHEMA_VERSION)
+}
+
+/// [`newer_schema_is_compatible`] for a binary whose own schema version is
+/// `supported`, so the decision an older binary makes can be tested here.
+fn schema_is_compatible_with(
+    conn: &Connection,
+    found: i64,
+    supported: i64,
+) -> Result<bool, BrokerError> {
+    if found <= supported {
         return Ok(true);
     }
     let minimum: Option<i64> = conn
@@ -45,7 +59,7 @@ pub fn newer_schema_is_compatible(conn: &Connection, found: i64) -> Result<bool,
         )
         .ok()
         .and_then(|value| value.parse().ok());
-    Ok(minimum.is_some_and(|minimum| SCHEMA_VERSION >= minimum))
+    Ok(minimum.is_some_and(|minimum| supported >= minimum))
 }
 
 /// Version stamped on every event row written by this binary.
@@ -1270,6 +1284,15 @@ CREATE TABLE session_scopes (
 CREATE INDEX session_scopes_by_target ON session_scopes (kind, value, released_at);
 CREATE INDEX session_scopes_by_session ON session_scopes (session_id, released_at);
 ";
+/// Machine conditions per gate run (`GateEnvironment`), so gate-duration
+/// trends can be separated from machine load. Purely additive and nullable:
+/// declared compatible, so [`MIN_COMPATIBLE_SCHEMA`] stays at 42.
+const MIGRATION_V43: &str = "
+ALTER TABLE gate_results ADD COLUMN load_avg_1m_start REAL;
+ALTER TABLE gate_results ADD COLUMN load_avg_1m_end REAL;
+ALTER TABLE gate_results ADD COLUMN cpu_count INTEGER;
+ALTER TABLE gate_results ADD COLUMN free_disk_bytes_start INTEGER;
+";
 const MIGRATIONS: &[&str] = &[
     MIGRATION_V1,
     MIGRATION_V2,
@@ -1313,6 +1336,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_V40,
     MIGRATION_V41,
     MIGRATION_V42,
+    MIGRATION_V43,
 ];
 
 pub(crate) fn current_version(conn: &Connection) -> Result<i64, BrokerError> {
@@ -1463,6 +1487,120 @@ mod tests {
             )
             .unwrap();
         assert_eq!(value, (MIN_COMPATIBLE_SCHEMA + 5).to_string());
+    }
+
+    /// Apply migrations 1..=`through` the way `migrate` does, without the
+    /// min-compatible bookkeeping, to build a database an older binary left.
+    fn migrated_through(through: usize) -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON").unwrap();
+        conn.execute_batch("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            .unwrap();
+        for (index, sql) in MIGRATIONS.iter().take(through).enumerate() {
+            conn.execute_batch(sql).unwrap();
+            set_meta(&conn, "schema_version", (index + 1) as i64);
+        }
+        conn
+    }
+
+    /// The exact insert a v42 binary (0.8.2-0.8.6) issues for a gate result: it
+    /// names its columns and knows nothing of the v43 environment columns.
+    const V42_GATE_RESULT_INSERT: &str = "INSERT INTO gate_results (gate_name, tree_hash,
+             definition_hash, status, failure_class, exit_code, duration_ms, log_path,
+             session_id, created_at, wait_duration_ms, first_output_ms, output_bytes)
+         VALUES (?1, 'tree', 'def', 'pass', NULL, 0, 1200, NULL, NULL, ?2, 0, 5, 10)";
+
+    #[test]
+    fn v43_adds_nullable_gate_environment_columns_to_existing_rows() {
+        let conn = migrated_through(42);
+        conn.execute(V42_GATE_RESULT_INSERT, rusqlite::params!["before", 1])
+            .unwrap();
+
+        migrate(&conn).unwrap();
+        assert_eq!(current_version(&conn).unwrap(), 43);
+
+        // The row written before the migration keeps its data and has no
+        // environment: NULL, never a fabricated zero.
+        let (duration, load_start, load_end, cpus, free): (
+            i64,
+            Option<f64>,
+            Option<f64>,
+            Option<i64>,
+            Option<i64>,
+        ) = conn
+            .query_row(
+                "SELECT duration_ms, load_avg_1m_start, load_avg_1m_end, cpu_count,
+                        free_disk_bytes_start
+                 FROM gate_results WHERE gate_name = 'before'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(duration, 1200);
+        assert_eq!((load_start, load_end, cpus, free), (None, None, None, None));
+
+        // A row written after it carries values.
+        conn.execute(
+            "INSERT INTO gate_results (gate_name, tree_hash, definition_hash, status,
+                 created_at, load_avg_1m_start, load_avg_1m_end, cpu_count,
+                 free_disk_bytes_start)
+             VALUES ('after', 'tree', 'def', 'pass', 2, 12.5, 9.25, 10, 25000000000)",
+            [],
+        )
+        .unwrap();
+        let (load_start, load_end, cpus, free): (f64, f64, i64, i64) = conn
+            .query_row(
+                "SELECT load_avg_1m_start, load_avg_1m_end, cpu_count, free_disk_bytes_start
+                 FROM gate_results WHERE gate_name = 'after'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (load_start, load_end, cpus, free),
+            (12.5, 9.25, 10, 25_000_000_000)
+        );
+    }
+
+    #[test]
+    fn v43_is_declared_compatible_so_a_v42_binary_keeps_using_the_database() {
+        // The declaration itself: v43 did not raise the minimum. Raising it
+        // would lock every 0.8.2+ binary and plugin hook out of this
+        // repository's database (0.8.0/0.8.1 predate the check and already
+        // refuse any newer schema), so doing so must be a deliberate edit.
+        assert_eq!(SCHEMA_VERSION, 43);
+        assert_eq!(MIN_COMPATIBLE_SCHEMA, 42);
+
+        // A database this binary migrated to v43 ...
+        let conn = migrated();
+        assert_eq!(current_version(&conn).unwrap(), 43);
+
+        // ... is accepted by a binary whose SCHEMA_VERSION is 42, through the
+        // compatibility path rather than the equal-version one ...
+        assert!(schema_is_compatible_with(&conn, 43, 42).unwrap());
+        // ... but not by one from before the minimum.
+        assert!(!schema_is_compatible_with(&conn, 43, 41).unwrap());
+
+        // And that binary's writes still succeed: its insert names only the
+        // columns it knows, and the new ones default to NULL.
+        conn.execute(V42_GATE_RESULT_INSERT, rusqlite::params!["old-writer", 3])
+            .unwrap();
+        let cpus: Option<i64> = conn
+            .query_row(
+                "SELECT cpu_count FROM gate_results WHERE gate_name = 'old-writer'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(cpus, None);
     }
 
     #[test]

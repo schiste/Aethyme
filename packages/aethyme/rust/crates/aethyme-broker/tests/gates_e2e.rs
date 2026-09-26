@@ -746,6 +746,81 @@ triggers = ["**/*.py"]
 }
 
 #[test]
+fn executed_gates_record_machine_load_and_free_disk_and_cache_hits_do_not() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    write_gates(
+        tmp.path(),
+        r#"
+[[gate]]
+name = "env-sample"
+command = "echo sampled"
+triggers = ["**/*.py"]
+"#,
+    );
+    commit_all(tmp.path(), "add gates");
+
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let wt = add_worktree(tmp.path(), "env-sample");
+    let session = broker.adopt(&wt, None).unwrap();
+    std::fs::write(wt.join("src/app.py"), "x = 2\n").unwrap();
+
+    let outcomes = broker.run_gates(session.id).unwrap();
+    assert_eq!(outcomes.len(), 1);
+    let executed = &outcomes[0];
+    assert_eq!(executed.status, GateStatus::Pass);
+    assert!(!executed.cached);
+
+    // The JSON surface carries the four fields as numbers. macOS and Linux
+    // both report load, CPUs and free space, so none is missing here.
+    let json = serde_json::to_value(executed).unwrap();
+    for field in ["load_avg_1m_start", "load_avg_1m_end"] {
+        let load = json[field]
+            .as_f64()
+            .unwrap_or_else(|| panic!("{field}: {json}"));
+        assert!(load >= 0.0, "{field}: {load}");
+    }
+    assert!(json["cpu_count"].as_i64().unwrap() >= 1, "{json}");
+    assert!(
+        json["free_disk_bytes_start"].as_i64().unwrap() > 0,
+        "{json}"
+    );
+
+    // The stored row holds the same values the outcome reported.
+    let tree = executed.tree_hash.clone();
+    let stored = broker
+        .store()
+        .cached_gate_result("env-sample", &tree)
+        .unwrap()
+        .expect("executed pass is cached");
+    assert_eq!(stored.environment, executed.environment);
+
+    // The log header states the environment on aethyme's own prefixed line.
+    let log = std::fs::read_to_string(executed.log_path.as_deref().unwrap()).unwrap();
+    let header = log
+        .lines()
+        .find(|line| line.starts_with("aethyme gate environment: load 1m "))
+        .unwrap_or_else(|| panic!("no environment header in log: {log}"));
+    assert!(
+        header.contains(" cpus, ") && header.ends_with(" GiB free"),
+        "{header}"
+    );
+
+    // A cache hit executed nothing now, so it reports no environment.
+    let outcomes = broker.run_gates(session.id).unwrap();
+    assert!(outcomes[0].cached);
+    let json = serde_json::to_value(&outcomes[0]).unwrap();
+    for field in [
+        "load_avg_1m_start",
+        "load_avg_1m_end",
+        "cpu_count",
+        "free_disk_bytes_start",
+    ] {
+        assert!(json[field].is_null(), "{field} on a cache hit: {json}");
+    }
+}
+
+#[test]
 fn cache_false_gate_reruns_for_the_same_tree() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());

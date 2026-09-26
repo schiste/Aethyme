@@ -34,7 +34,7 @@ use sha2::{Digest, Sha256};
 use crate::clock::epoch_ms;
 use crate::git::GitRepo;
 use crate::store::BrokerStore;
-use crate::types::{GateFailureClass, GateStatus, NewGateResult};
+use crate::types::{GateEnvironment, GateFailureClass, GateStatus, NewGateResult};
 
 pub const GATES_CONFIG_RELPATH: &str = ".aethyme/gates.toml";
 pub const GATE_SCOPE_MANIFEST_SCHEMA_VERSION: u32 = 3;
@@ -663,6 +663,10 @@ pub struct GateRunOutcome {
     /// Combined stdout/stderr bytes captured without exposing their content.
     pub output_bytes: Option<i64>,
     pub log_path: Option<String>,
+    /// Machine load and free disk around this execution; all `null` for a
+    /// cache hit or a result recorded before the command stage.
+    #[serde(flatten)]
+    pub environment: GateEnvironment,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -1721,6 +1725,9 @@ fn run_selections(
                 first_output_ms: hit.first_output_ms,
                 output_bytes: hit.output_bytes,
                 log_path: hit.log_path,
+                // Not executed now: today's load says nothing about the run
+                // whose verdict is reused, so the cache hit reports none.
+                environment: GateEnvironment::default(),
             });
             if failed {
                 break;
@@ -1806,6 +1813,7 @@ fn run_selections(
                         first_output_ms: None,
                         output_bytes: Some(0),
                         log_path: Some(log_path.to_string_lossy().into_owned()),
+                        environment: GateEnvironment::default(),
                     });
                     break;
                 }
@@ -1867,6 +1875,7 @@ fn run_selections(
                     first_output_ms: None,
                     output_bytes: Some(0),
                     log_path: Some(log_path.to_string_lossy().into_owned()),
+                    environment: GateEnvironment::default(),
                 });
                 break;
             }
@@ -1878,11 +1887,22 @@ fn run_selections(
             gate.cost,
             short_tree_hash(&tree)
         ));
+        // Sampled once, here, and handed to the headroom check so the free
+        // space recorded is the free space the gate was admitted on.
+        let available = crate::available_bytes(checkout.root());
+        let mut environment = GateEnvironment {
+            load_avg_1m_start: load_average_1m(),
+            load_avg_1m_end: None,
+            cpu_count: logical_cpu_count(),
+            free_disk_bytes_start: available.and_then(|bytes| i64::try_from(bytes).ok()),
+        };
         let started = Instant::now();
         let status = run_gate_command(
             &gate.command,
             GateCommandContext {
                 cwd: checkout.root(),
+                available,
+                environment: &environment,
                 log_path: &log_path,
                 run_dir: &run_dir,
                 session_id,
@@ -1906,6 +1926,7 @@ fn run_selections(
             .map(|error| format!("host resource release failed: {error}"));
         drop(owner_locks);
         let duration_ms = started.elapsed().as_millis() as i64;
+        environment.load_avg_1m_end = load_average_1m();
         let status = match (status, release_error) {
             (Ok(mut outcome), release_error) => {
                 if outcome.resource_error.is_none() {
@@ -1942,26 +1963,33 @@ fn run_selections(
         // contradicted.
         let log_path = preserve_failed_gate_log(&log_path, gate_status);
         progress.report(&format!(
-            "gate {} {} in {}s (tree {})",
+            "gate {} {} in {}s (tree {}){}",
             gate.name,
             gate_status.as_str(),
             started.elapsed().as_secs(),
-            short_tree_hash(&tree)
+            short_tree_hash(&tree),
+            environment
+                .load_avg_1m_end
+                .map(|load| format!(" at load 1m {load:.1}{}", cpu_suffix(&environment)))
+                .unwrap_or_default()
         ));
-        store.record_gate_result(&NewGateResult {
-            gate_name: gate.name.clone(),
-            tree_hash: tree.clone(),
-            definition_hash: gate.definition_hash.clone(),
-            status: gate_status,
-            failure_class,
-            exit_code,
-            duration_ms: Some(duration_ms),
-            wait_duration_ms: Some(wait_duration_ms),
-            first_output_ms,
-            output_bytes,
-            log_path: Some(log_path.to_string_lossy().into_owned()),
-            session_id,
-        })?;
+        store.record_gate_result_with_environment(
+            &NewGateResult {
+                gate_name: gate.name.clone(),
+                tree_hash: tree.clone(),
+                definition_hash: gate.definition_hash.clone(),
+                status: gate_status,
+                failure_class,
+                exit_code,
+                duration_ms: Some(duration_ms),
+                wait_duration_ms: Some(wait_duration_ms),
+                first_output_ms,
+                output_bytes,
+                log_path: Some(log_path.to_string_lossy().into_owned()),
+                session_id,
+            },
+            &environment,
+        )?;
         let failed = gate_status != GateStatus::Pass;
         outcomes.push(GateRunOutcome {
             gate: gate.name.clone(),
@@ -1978,6 +2006,7 @@ fn run_selections(
             first_output_ms,
             output_bytes,
             log_path: Some(log_path.to_string_lossy().into_owned()),
+            environment,
         });
         if failed {
             break;
@@ -2231,6 +2260,11 @@ fn command_mentions_cargo(command: &str) -> bool {
 /// maintaining the pidfile for cancellation. Returns the exit code.
 struct GateCommandContext<'a> {
     cwd: &'a Path,
+    /// Free bytes on `cwd`'s filesystem, measured once by the caller: the
+    /// headroom check refuses on it and the gate result records it.
+    available: Option<u64>,
+    /// Written into the log header so the log carries its own load context.
+    environment: &'a GateEnvironment,
     log_path: &'a Path,
     run_dir: &'a Path,
     session_id: Option<i64>,
@@ -2264,7 +2298,7 @@ fn run_gate_command(
     // verdict is then cached against the tree -- so the retry that would clear
     // it is exactly what the cache prevents. Refusing here keeps the condition
     // and its symptom attached to each other.
-    let available = crate::available_bytes(context.cwd);
+    let available = context.available;
     if crate::disk_headroom_refusal(available, crate::DEFAULT_GATE_HEADROOM_BYTES).is_some() {
         // Sized only once refusing: the walk costs seconds on a warm cache,
         // which a gate about to fail can afford and one about to run cannot.
@@ -2310,6 +2344,10 @@ fn run_gate_command(
     {
         use std::io::Write as _;
         let _ = log.write_all(crate::git::subprocess_path_note().as_bytes());
+        crate::warn_unrecorded(
+            "write the gate environment line to the gate log",
+            log.write_all(gate_environment_note(context.environment).as_bytes()),
+        );
     }
     let log_err = log.try_clone()?;
     // Gates execute binaries built from the tree under test.  Those binaries
@@ -2539,6 +2577,50 @@ fn run_gate_command(
     })
 }
 
+/// One-minute load average, or `None` when the platform will not report it.
+/// A missing reading is recorded as unknown; it never fails the gate.
+fn load_average_1m() -> Option<f64> {
+    let mut loads = [0f64; 1];
+    // SAFETY: `loads` is a valid, writable buffer of exactly the one element
+    // requested, and `getloadavg` writes at most that many samples.
+    let read = unsafe { libc::getloadavg(loads.as_mut_ptr(), 1) };
+    (read >= 1 && loads[0].is_finite() && loads[0] >= 0.0).then_some(loads[0])
+}
+
+/// Logical CPUs online, so a load average can be normalised.
+fn logical_cpu_count() -> Option<i64> {
+    // SAFETY: `sysconf` takes a plain integer name and has no memory-safety
+    // preconditions.
+    let count = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) };
+    (count > 0).then_some(count as i64)
+}
+
+fn cpu_suffix(environment: &GateEnvironment) -> String {
+    environment
+        .cpu_count
+        .map(|cpus| format!("/{cpus} cpus"))
+        .unwrap_or_default()
+}
+
+/// The gate log's machine-environment header line. It shares the
+/// [`crate::git::SUBPROCESS_PATH_NOTE_PREFIX`] so every reader that holds
+/// aethyme's own header out of a gate's output holds this line out too.
+fn gate_environment_note(environment: &GateEnvironment) -> String {
+    let load = environment
+        .load_avg_1m_start
+        .map(|load| format!("load 1m {load:.1}{}", cpu_suffix(environment)))
+        .unwrap_or_else(|| "load 1m unknown".to_string());
+    let disk = environment
+        .free_disk_bytes_start
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .map(|bytes| format!("{} free", crate::disk_headroom::format_gibibytes(bytes)))
+        .unwrap_or_else(|| "free disk unknown".to_string());
+    format!(
+        "{}{load}, {disk}\n",
+        crate::git::SUBPROCESS_PATH_NOTE_PREFIX
+    )
+}
+
 fn append_gate_log(path: &Path, message: &str) -> Result<(), std::io::Error> {
     use std::io::Write;
     let mut file = std::fs::OpenOptions::new().append(true).open(path)?;
@@ -2590,6 +2672,36 @@ fn preserve_failed_gate_log(log_path: &Path, status: GateStatus) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_environment_header_names_load_cpus_and_free_disk_or_says_unknown() {
+        let known = GateEnvironment {
+            load_avg_1m_start: Some(12.34),
+            load_avg_1m_end: Some(3.0),
+            cpu_count: Some(10),
+            free_disk_bytes_start: Some(23 * 1024 * 1024 * 1024 + 400 * 1024 * 1024),
+        };
+        assert_eq!(
+            gate_environment_note(&known),
+            "aethyme gate environment: load 1m 12.3/10 cpus, 23.4 GiB free\n"
+        );
+        // An unreadable value is stated as unknown, not as zero, and never
+        // stops the header from being written.
+        assert_eq!(
+            gate_environment_note(&GateEnvironment::default()),
+            "aethyme gate environment: load 1m unknown, free disk unknown\n"
+        );
+        assert!(
+            gate_environment_note(&known).starts_with(crate::git::SUBPROCESS_PATH_NOTE_PREFIX),
+            "the failure-tail renderer holds lines out by this prefix"
+        );
+    }
+
+    #[test]
+    fn this_platform_reports_load_and_cpus() {
+        assert!(load_average_1m().is_some_and(|load| load >= 0.0));
+        assert!(logical_cpu_count().is_some_and(|cpus| cpus >= 1));
+    }
 
     fn pid_record(pgid: i32, start: Option<u64>) -> GatePidRecord {
         GatePidRecord {

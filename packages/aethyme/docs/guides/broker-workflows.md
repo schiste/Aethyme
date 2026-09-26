@@ -536,8 +536,12 @@ Text output shows an abbreviated 12-character tree hash. JSON returns the full
 hash in `tree_hash` and identifies whether the result was executed or cached.
 Executed results also separate `wait_duration_ms` from command `duration_ms`,
 record `first_output_ms`, and count combined `output_bytes` without storing
-output content in telemetry. Cached results preserve the original execution's
-startup/output measurements and report zero new wait. Use these fields to tell
+output content in telemetry. They also record the machine they ran on:
+`load_avg_1m_start`, `load_avg_1m_end`, `cpu_count`, and
+`free_disk_bytes_start`, so a slow run can be told apart from a loaded
+machine. Cached results preserve the original execution's
+startup/output measurements, report zero new wait, and report `null`
+machine-environment fields. Use these fields to tell
 resource contention from slow startup and slow test execution. Before acting
 on any result, compare its tree with the tree you intend to submit.
 

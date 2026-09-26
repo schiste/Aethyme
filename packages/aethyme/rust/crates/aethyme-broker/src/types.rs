@@ -576,6 +576,23 @@ pub struct GateDef {
     pub updated_at: i64,
 }
 
+/// Machine conditions a gate executed under, so a slow run can be told apart
+/// from a loaded machine. Every field is `None` when it could not be read, and
+/// all of them are `None` for a result that did not execute a command (a cache
+/// hit, a cancellation, or an error raised before the command was reached):
+/// the machine's state at that moment says nothing about the recorded run.
+#[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize)]
+pub struct GateEnvironment {
+    /// One-minute load average sampled just before the gate command started.
+    pub load_avg_1m_start: Option<f64>,
+    /// One-minute load average sampled once the gate command finished.
+    pub load_avg_1m_end: Option<f64>,
+    /// Logical CPUs, so a load average can be normalised across machines.
+    pub cpu_count: Option<i64>,
+    /// Free bytes on the filesystem the disk-headroom check measured.
+    pub free_disk_bytes_start: Option<i64>,
+}
+
 /// Input for recording one gate run.
 #[derive(Debug, Clone)]
 pub struct NewGateResult {
@@ -610,6 +627,8 @@ pub struct GateResult {
     pub log_path: Option<String>,
     pub session_id: Option<i64>,
     pub created_at: i64,
+    #[serde(flatten)]
+    pub environment: GateEnvironment,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]

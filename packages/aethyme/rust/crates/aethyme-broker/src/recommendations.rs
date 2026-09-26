@@ -727,6 +727,7 @@ mod tests {
             log_path: Some("/absolute/log/must-not-leak".into()),
             session_id: Some(1),
             created_at: id,
+            environment: crate::GateEnvironment::default(),
         }
     }
 

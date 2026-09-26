@@ -587,6 +587,7 @@ mod not_promoted_tests {
             first_output_ms: None,
             output_bytes: None,
             log_path: Some("/logs/gate.log".into()),
+            environment: crate::GateEnvironment::default(),
         }
     }
 

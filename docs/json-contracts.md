@@ -300,11 +300,25 @@ matching `gate_caches_reclaimed` count.
     }
   ],
   "gate_outcomes": [ { "gate", "status", "cached", "exit_code",
-                       "duration_ms", "log_path" } ],
+                       "duration_ms", "log_path", "load_avg_1m_start",
+                       "load_avg_1m_end", "cpu_count",
+                       "free_disk_bytes_start" } ],
   "no_changes": true|false,
   "promoted": true|false
 }
 ```
+
+The four machine-environment fields in `gate_outcomes` (introduced
+2026-09-26, schema 43) describe the machine an executed gate ran on:
+`load_avg_1m_start` and `load_avg_1m_end` are the one-minute load average
+(number) just before the command started and once it finished, `cpu_count`
+is logical CPUs online (integer, to normalise load), and
+`free_disk_bytes_start` is the free space (integer bytes) the disk-headroom
+check measured on the gate's checkout filesystem. Each is `null` when the
+platform could not report it; all four are `null` for a cache hit (the
+reused verdict's machine state is not re-reported) and for a result recorded
+before the command stage. `broker gates run --json` and
+`broker advanced gates pre-push --json` outcomes carry the same fields.
 
 `submission_plan` preserves deterministic commit order and separates ownership
 from integration state. Full SHAs are never abbreviated in JSON. `conflicts`
