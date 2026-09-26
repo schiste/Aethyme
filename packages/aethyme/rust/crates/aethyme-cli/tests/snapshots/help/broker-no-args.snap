@@ -9,7 +9,7 @@ Verbs:
   start     create an isolated worktree + session, or adopt/reuse an existing one
   status    sessions, overlaps, queue and integration; readiness and doctor views
   submit    simulate, gate and promote a session; preparation and promotion recovery
-  finish    close a completed session; state-only close and worktree cleanup
+  finish    close sessions; reclaim ignored build output or clean up retained checkouts
   unblock   list current blockers, or clear one by id
   gc        reviewed plan/apply cleanup: retention, build output, storage, resources
 

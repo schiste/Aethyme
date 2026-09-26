@@ -51,6 +51,12 @@ const ARTIFACT_SWEEP_STAMP_KEY: &str = "gc.artifact_sweep.last_run_ms";
 /// ran; this records *how far* it got (#222).
 const ARTIFACT_SWEEP_CURSOR_KEY: &str = "gc.artifact_sweep.cursor_session_id";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ArtifactSweepOutcome {
+    pub directories_reclaimed: usize,
+    pub complete: bool,
+}
+
 /// Visit order for one sweep pass: everything after the cursor, then the head
 /// of the list.
 ///
@@ -1550,8 +1556,19 @@ impl Broker {
         };
         // The sweep only reclaims rebuildable caches, and this runs inside
         // broker open: its failure must not stop every command.
-        let _ = self.sweep_artifacts_autonomously(&policy);
+        let _ = self.sweep_artifacts_autonomously(&policy, None);
         Ok(resumed)
+    }
+
+    /// Reclaim build caches from one just-closed session while retaining its
+    /// checkout and branch. The periodic sweep cadence does not delay this
+    /// targeted pass.
+    pub(crate) fn reclaim_closed_session_artifacts(
+        &mut self,
+        session_id: i64,
+    ) -> Result<ArtifactSweepOutcome, BrokerOpError> {
+        let policy = load_retention_policy(self.main_root())?;
+        self.sweep_artifacts_autonomously(&policy, Some(session_id))
     }
 
     /// Reclaim build caches from long-idle closed worktrees without operator
@@ -1576,9 +1593,13 @@ impl Broker {
     fn sweep_artifacts_autonomously(
         &mut self,
         policy: &RetentionPolicy,
-    ) -> Result<usize, BrokerOpError> {
+        closed_session_id: Option<i64>,
+    ) -> Result<ArtifactSweepOutcome, BrokerOpError> {
         if policy.artifact_sweep_budget_ms == 0 {
-            return Ok(0);
+            return Ok(ArtifactSweepOutcome {
+                directories_reclaimed: 0,
+                complete: true,
+            });
         }
         let main_root = self.main_root().to_path_buf();
         let now = now_ms();
@@ -1593,17 +1614,24 @@ impl Broker {
             .saturating_mul(urgency.budget_scale());
         let interval_ms = (i64::from(policy.artifact_sweep_interval_hours) * 3_600_000)
             / urgency.interval_divisor().max(1);
-        if let Some(last) = self
-            .store()
-            .meta_get(ARTIFACT_SWEEP_STAMP_KEY)?
-            .and_then(|value| value.parse::<i64>().ok())
-            && now.saturating_sub(last) < interval_ms
+        if closed_session_id.is_none()
+            && self
+                .store()
+                .meta_get(ARTIFACT_SWEEP_STAMP_KEY)?
+                .and_then(|value| value.parse::<i64>().ok())
+                .is_some_and(|last| now.saturating_sub(last) < interval_ms)
         {
-            return Ok(0);
+            return Ok(ArtifactSweepOutcome {
+                directories_reclaimed: 0,
+                complete: true,
+            });
         }
         // A concurrent GC owns the artifact namespace; skip rather than race.
         let Ok(_lock) = GcLock::acquire(&main_root) else {
-            return Ok(0);
+            return Ok(ArtifactSweepOutcome {
+                directories_reclaimed: 0,
+                complete: closed_session_id.is_none(),
+            });
         };
         let live_sessions = self.store().live_sessions()?;
         let live = live_sessions
@@ -1615,27 +1643,29 @@ impl Broker {
             .map(|session| PathBuf::from(&session.worktree_path))
             .collect::<Vec<_>>();
         let deadline = Instant::now() + Duration::from_millis(budget_ms);
-        // The shared preparation cache is content-addressed: an entry no
-        // checkout computes is unreadable forever, so it needs no operator
-        // review. It was reachable only from the manual lane, which is why a
-        // hand reclaim of 13.3 GB returned as 15 GB within three days.
-        let (cache_entries, cache_bytes) = crate::storage::sweep_preparation_cache(
-            &main_root,
-            policy.orphan_worktree_roots_days,
-            deadline,
-        );
-        if cache_entries > 0 {
-            let payload = serde_json::json!({
-                "entries": cache_entries,
-                "bytes": cache_bytes,
-                "urgency": format!("{urgency:?}"),
-            })
-            .to_string();
-            self.store().append_event(
-                crate::events::BROKER_GC_PREPARATION_SWEPT,
-                None,
-                Some(&payload),
-            )?;
+        if closed_session_id.is_none() {
+            // The shared preparation cache is content-addressed: an entry no
+            // checkout computes is unreadable forever, so it needs no operator
+            // review. It was reachable only from the manual lane, which is why a
+            // hand reclaim of 13.3 GB returned as 15 GB within three days.
+            let (cache_entries, cache_bytes) = crate::storage::sweep_preparation_cache(
+                &main_root,
+                policy.orphan_worktree_roots_days,
+                deadline,
+            );
+            if cache_entries > 0 {
+                let payload = serde_json::json!({
+                    "entries": cache_entries,
+                    "bytes": cache_bytes,
+                    "urgency": format!("{urgency:?}"),
+                })
+                .to_string();
+                self.store().append_event(
+                    crate::events::BROKER_GC_PREPARATION_SWEPT,
+                    None,
+                    Some(&payload),
+                )?;
+            }
         }
         let mut removed = Vec::new();
         let mut eligible_worktree_seen = false;
@@ -1647,7 +1677,15 @@ impl Broker {
             .unwrap_or(0);
         let mut last_visited = cursor;
         let all = self.store().cleaned_sessions()?;
-        for session in sweep_order(&all, cursor, |session| session.id) {
+        let sessions = match closed_session_id {
+            Some(session_id) => all
+                .iter()
+                .filter(|session| session.id == session_id)
+                .cloned()
+                .collect(),
+            None => sweep_order(&all, cursor, |session| session.id),
+        };
+        for session in sessions {
             last_visited = session.id;
             if live.contains(&session.id) {
                 continue;
@@ -1695,6 +1733,7 @@ impl Broker {
                     // stamp below is what makes a next pass happen today
                     // rather than after the interval.
                     Ok(TreeRemoval::Interrupted) => scan_completed = false,
+                    Err(_) if closed_session_id.is_some() => scan_completed = false,
                     Err(_) => {}
                 }
                 if check_deadline(Some(deadline)) {
@@ -1712,18 +1751,29 @@ impl Broker {
         // and do not hide an unfinished backlog for a full interval. Removal
         // failures do consume the window, preventing a broken path from
         // slowing every broker command until an operator can inspect it.
-        if eligible_worktree_seen && scan_completed {
-            self.store()
-                .meta_set(ARTIFACT_SWEEP_STAMP_KEY, &now.to_string())?;
-        }
-        // A finished lap starts the next one from the top; an interrupted pass
-        // remembers where it stopped so the next one advances instead of
-        // re-walking what it already cleared.
-        if scan_completed {
-            self.store().meta_set(ARTIFACT_SWEEP_CURSOR_KEY, "0")?;
+        if let Some(session_id) = closed_session_id {
+            if !scan_completed {
+                // Retry this session first on the next ordinary broker open.
+                self.store().meta_set(
+                    ARTIFACT_SWEEP_CURSOR_KEY,
+                    &session_id.saturating_sub(1).to_string(),
+                )?;
+                self.store().meta_set(ARTIFACT_SWEEP_STAMP_KEY, "0")?;
+            }
         } else {
-            self.store()
-                .meta_set(ARTIFACT_SWEEP_CURSOR_KEY, &last_visited.to_string())?;
+            if eligible_worktree_seen && scan_completed {
+                self.store()
+                    .meta_set(ARTIFACT_SWEEP_STAMP_KEY, &now.to_string())?;
+            }
+            // A finished lap starts the next one from the top; an interrupted pass
+            // remembers where it stopped so the next one advances instead of
+            // re-walking what it already cleared.
+            if scan_completed {
+                self.store().meta_set(ARTIFACT_SWEEP_CURSOR_KEY, "0")?;
+            } else {
+                self.store()
+                    .meta_set(ARTIFACT_SWEEP_CURSOR_KEY, &last_visited.to_string())?;
+            }
         }
         if !removed.is_empty() {
             let payload = serde_json::json!({
@@ -1737,7 +1787,10 @@ impl Broker {
                 Some(&payload),
             )?;
         }
-        Ok(removed.len())
+        Ok(ArtifactSweepOutcome {
+            directories_reclaimed: removed.len(),
+            complete: scan_completed,
+        })
     }
 
     /// Apply or resume an authorized plan. A budget is used by amortized

@@ -37,7 +37,7 @@ pub const PUBLIC_VERBS: &[(&str, &str)] = &[
     ),
     (
         "finish",
-        "close a completed session; state-only close and worktree cleanup",
+        "close sessions; reclaim ignored build output or clean up retained checkouts",
     ),
     ("unblock", "list current blockers, or clear one by id"),
     (

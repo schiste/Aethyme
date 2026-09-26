@@ -476,6 +476,39 @@ fn default_policy_reclaims_closed_session_build_caches() {
     let (repo, container) = fixture("");
     let (_id, worktree) = blocked_session_with_build_cache(repo.path(), container.path());
     let target = worktree.join("rust/target");
+    assert!(
+        !target.exists(),
+        "close should reclaim build caches immediately under the default policy"
+    );
+    assert!(worktree.exists(), "the retained checkout must remain");
+    assert!(
+        worktree.join("work.txt").exists(),
+        "committed work must remain"
+    );
+    let branch_output = Command::new("git")
+        .args(["branch", "--show-current"])
+        .current_dir(&worktree)
+        .output()
+        .unwrap();
+    assert!(branch_output.status.success());
+    let branch = String::from_utf8_lossy(&branch_output.stdout)
+        .trim()
+        .to_string();
+    assert!(
+        !branch.is_empty(),
+        "the retained checkout must remain on its branch"
+    );
+    let branch_ref = format!("refs/heads/{branch}");
+    let branch_check = Command::new("git")
+        .args(["show-ref", "--verify", branch_ref.as_str()])
+        .current_dir(repo.path())
+        .output()
+        .unwrap();
+    assert!(
+        branch_check.status.success(),
+        "the retained branch must remain: {}",
+        String::from_utf8_lossy(&branch_check.stderr)
+    );
 
     let output = run(repo.path(), container.path(), &["status", "--json"]);
     assert!(
@@ -506,6 +539,65 @@ fn explicit_opt_out_preserves_closed_session_build_caches() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(target.exists(), "explicit opt-out must preserve the cache");
+}
+
+#[test]
+fn finish_keep_worktree_reclaims_build_artifacts() {
+    let (repo, container) =
+        fixture("[retention]\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 0\n");
+    let output = run(
+        repo.path(),
+        container.path(),
+        &["start", "--task", "retained finish", "--json"],
+    );
+    assert!(
+        output.status.success(),
+        "start: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let session: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let id = session["id"].as_i64().unwrap().to_string();
+    let worktree = PathBuf::from(session["worktree_path"].as_str().unwrap());
+    let target = worktree.join("rust/target");
+    std::fs::create_dir_all(target.join("debug")).unwrap();
+    std::fs::write(target.join("CACHEDIR.TAG"), "Signature: 8a477f597d28d172\n").unwrap();
+    std::fs::write(target.join("debug/artifact.bin"), vec![0_u8; 4096]).unwrap();
+
+    std::fs::write(
+        repo.path().join(".aethyme/broker.toml"),
+        "[retention]\nauto_cleanup_worktrees_on_finish = false\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 5000\n",
+    )
+    .unwrap();
+    let output = run(
+        repo.path(),
+        container.path(),
+        &["finish", "--session", &id, "--keep-worktree", "--json"],
+    );
+    assert!(
+        output.status.success(),
+        "finish: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["closed"], true);
+    assert_eq!(report["cleanup"]["kept"], true);
+    assert_eq!(report["cleanup"]["worktree_removed"], false);
+    assert!(
+        report["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|warning| warning
+                .as_str()
+                .unwrap()
+                .contains("reclaimed build artifacts")),
+        "finish should report the reclaim: {report}"
+    );
+    assert!(
+        !target.exists(),
+        "finish should reclaim ignored build output"
+    );
+    assert!(worktree.exists(), "finish must retain the checkout");
 }
 
 #[test]

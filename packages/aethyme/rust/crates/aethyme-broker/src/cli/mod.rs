@@ -113,13 +113,13 @@ Usage:
       reports its relation to the current integration tip;
       --sync-integration requires --reuse and first fast-forwards a clean
       session worktree to the exact integration tip;
-      --replace-stale closes it (state only) and registers fresh;
+      --replace-stale closes it and registers fresh; policy may reclaim known ignored build artifacts;
       neither flag = error listing your options. Every --path is validated
       and claimed explicitly in the same transaction as create/reuse.
   aethyme broker close --session <id> [--json]
-      Low-level state-only close. Never touches the worktree and does
-      not check whether commits were submitted. Prefer finish for normal
-      lifecycle use.
+      Low-level close. Retains the checkout and branch; policy may reclaim
+      known ignored build artifacts. Does not check whether commits were
+      submitted. Prefer finish for normal lifecycle use.
   aethyme broker finish --session <id> [--keep-worktree] [--json]
       Higher-level lifecycle close: closes only when the session has no
       dirty WIP and no committed work waiting for submit/promotion. If it

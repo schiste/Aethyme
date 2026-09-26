@@ -16,7 +16,7 @@ exit: 0
       reports its relation to the current integration tip;
       --sync-integration requires --reuse and first fast-forwards a clean
       session worktree to the exact integration tip;
-      --replace-stale closes it (state only) and registers fresh;
+      --replace-stale closes it and registers fresh; policy may reclaim known ignored build artifacts;
       neither flag = error listing your options. Every --path is validated
       and claimed explicitly in the same transaction as create/reuse.
 
