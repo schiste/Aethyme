@@ -943,10 +943,15 @@ fn independent_repositories_share_gate_host_resources_and_release_them() {
     let first = fixture();
     let second = fixture();
     let state = tempfile::tempdir().unwrap();
+    // The gate holds its host bundle until the test has seen the second
+    // repository blocked: it sleeps long enough to renew its lease, then waits
+    // for this release file (capped at 60 s so a failing test cannot hang).
+    // A fixed hold time raced the test on a loaded machine.
+    let release = state.path().join("release-first-gate");
     let config = r#"
 [[gate]]
 name = "host-resources"
-command = "test -n \"$AETHYME_RESOURCE_DOCKER_PROJECT\" && test \"$AETHYME_RESOURCE_DATABASE\" = host-test-shared && sleep 6"
+command = "test -n \"$AETHYME_RESOURCE_DOCKER_PROJECT\" && test \"$AETHYME_RESOURCE_DATABASE\" = host-test-shared && sleep 6 && { i=0; while [ ! -e 'RELEASE_PATH' ] && [ $i -lt 1200 ]; do sleep 0.05; i=$((i+1)); done; }"
 cache = false
 resource_ttl_seconds = 15
 
@@ -959,9 +964,10 @@ prefix = "gate-test"
 key = "database"
 kind = "exclusive_key"
 name = "host-test-shared"
-"#;
+"#
+    .replace("RELEASE_PATH", &release.display().to_string());
     for repo in [first.path(), second.path()] {
-        std::fs::write(repo.join(".aethyme/gates.toml"), config).unwrap();
+        std::fs::write(repo.join(".aethyme/gates.toml"), &config).unwrap();
         git(repo, &["add", ".aethyme/gates.toml"]);
         git(repo, &["commit", "-qm", "configure host resource gate"]);
     }
@@ -976,7 +982,8 @@ name = "host-test-shared"
         .unwrap();
     let db_path = state.path().join("host-resources.db");
     let mut observed = false;
-    for _ in 0..100 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while std::time::Instant::now() < deadline {
         if db_path.exists()
             && aethyme_broker::HostResourceCoordinator::open_read_only(&db_path)
                 .and_then(|coordinator| coordinator.list(false))
@@ -1001,6 +1008,7 @@ name = "host-test-shared"
     assert_eq!(blocked_json[0]["failure_class"], "resource_contention");
     assert!(blocked_json[0].get("resource_lease").is_none());
 
+    std::fs::write(&release, b"").unwrap();
     let completed = running.wait_with_output().unwrap();
     assert!(
         completed.status.success(),
