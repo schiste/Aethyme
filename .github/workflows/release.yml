@@ -78,6 +78,13 @@ jobs:
           toolchain: stable
           targets: ${{ matrix.target }}
 
+      - name: Add the target to the pinned toolchain
+        # rust-toolchain.toml pins the channel, so inside the checkout cargo
+        # runs that toolchain, not the `stable` one set up above. A target
+        # that is not the runner's host (musl) must be added to the pinned
+        # toolchain, or std is missing: "can't find crate for `core`" (v0.8.5).
+        run: rustup target add ${{ matrix.target }}
+
       - name: Install musl toolchain
         if: endsWith(matrix.target, '-musl')
         run: |
