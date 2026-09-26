@@ -521,7 +521,7 @@ pub enum BrokerOpError {
         "session {id} ({status}) already exists for this worktree{task}. Options:\n  \
          aethyme broker submit --session {id}        submit its committed work\n  \
          aethyme broker start --reuse --task \"...\"   point it at a follow-up task\n  \
-         aethyme broker finish close --session {id}         mark it finished (state only)\n  \
+         aethyme broker finish close --session {id}         mark it closed; policy may reclaim ignored build artifacts\n  \
          aethyme broker start --replace-stale        close it and register fresh"
     )]
     SessionExistsForWorktree {
@@ -554,7 +554,7 @@ pub enum AdoptMode {
     New,
     /// Return the existing session, pointed at a follow-up task.
     Reuse,
-    /// Close the existing session (state only) and register fresh.
+    /// Close the existing session and register fresh; policy may reclaim ignored build artifacts.
     ReplaceStale,
 }
 
@@ -2974,11 +2974,12 @@ impl Broker {
         })
     }
 
-    /// Close broker state without touching the worktree. Physical cleanup is
-    /// a separate transition and remains available for exact later recovery.
+    /// Close broker state without removing the worktree. Policy-eligible,
+    /// ignored build artifacts may be reclaimed while the checkout is retained.
     pub fn close(&mut self, session_id: i64) -> Result<(), BrokerOpError> {
         self.store
             .set_session_status(session_id, SessionStatus::Closed, None)?;
+        let _ = self.reclaim_closed_session_artifacts(session_id);
         Ok(())
     }
 
@@ -7497,6 +7498,32 @@ impl Broker {
                     lease.state = FinishLeaseState::Released;
                     lease.released_at.get_or_insert(released_at);
                 }
+            }
+        }
+        if report.closed && !report.cleanup.worktree_removed {
+            match self.reclaim_closed_session_artifacts(session_id) {
+                Ok(outcome) => {
+                    if outcome.directories_reclaimed > 0 {
+                        let count = outcome.directories_reclaimed;
+                        let noun = if count == 1 {
+                            "directory"
+                        } else {
+                            "directories"
+                        };
+                        report.warnings.push(format!(
+                            "reclaimed build artifacts from {count} {noun} while retaining the worktree"
+                        ));
+                    }
+                    if !outcome.complete {
+                        report.warnings.push(
+                            "build artifact reclaim was deferred; a later artifact sweep will retry it"
+                                .into(),
+                        );
+                    }
+                }
+                Err(error) => report.warnings.push(format!(
+                    "build artifact reclaim was skipped and left for GC: {error}"
+                )),
             }
         }
         Ok(report)

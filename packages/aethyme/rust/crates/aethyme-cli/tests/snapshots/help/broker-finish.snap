@@ -8,9 +8,9 @@ exit: 0
       persists a redacted session.finished handoff with delivery, pending
       work, leases, last-gate provenance, and the recommended next action.
   aethyme broker finish close --session <id> [--json]
-      Low-level state-only close. Never touches the worktree and does
-      not check whether commits were submitted. Prefer finish for normal
-      lifecycle use.
+      Low-level close. Retains the checkout and branch; policy may reclaim
+      known ignored build artifacts. Does not check whether commits were
+      submitted. Prefer finish for normal lifecycle use.
   aethyme broker finish cleanup <session-id> [--force] [--json]
   aethyme broker finish cleanup --all-cleaned [--apply --confirm <sha256>] [--json]
       Remove one session worktree, or inventory all retained broker-owned
