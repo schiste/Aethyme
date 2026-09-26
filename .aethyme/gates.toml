@@ -62,7 +62,11 @@ triggers = ["packages/aethyme-eval/**"]
 name = "cargo-test"
 command = 'export CHAU7_CTO_OPTIM_ACTIVE=1 CARGO_INCREMENTAL=0 CARGO_PROFILE_TEST_DEBUG=1 CARGO_TARGET_DIR="$AETHYME_GATE_CACHE_DIR" && cargo test --workspace --quiet --manifest-path packages/aethyme/rust/Cargo.toml'
 cost = 3
-timeout_seconds = 1200
+# 2026-09-26: raised from 1200. A full workspace run took 1056 s on a passing
+# gate that day and hit 1200 four times (sessions 677, 684, 621) while other
+# repositories' builds held the load average at 30-70. The limit exists to
+# stop a hung gate, not to time a healthy one under load.
+timeout_seconds = 2400
 resource_wait_seconds = 900
 triggers = [
     "**/*.rs",
