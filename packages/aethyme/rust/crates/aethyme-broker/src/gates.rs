@@ -904,7 +904,9 @@ pub(crate) fn running_gate_evidence(main_root: &Path) -> Vec<String> {
             match file.try_lock() {
                 // Released at once: a probe, not a claim.
                 Ok(()) => {
-                    let _ = file.unlock();
+                    // Dropping the file also releases it; report a failed unlock
+                    // rather than discard it.
+                    crate::warn_unrecorded("release a gate owner lock probe", file.unlock());
                 }
                 Err(std::fs::TryLockError::WouldBlock) => {
                     evidence.push(format!("gate owner lock {name} is held by a running gate"));
