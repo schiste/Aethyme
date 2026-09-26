@@ -6,6 +6,43 @@ artifacts and their exact source revision are recorded in each signed
 
 ## [Unreleased]
 
+## [0.8.5] - 2026-09-26
+
+Phase 5 of the recovery plan: more platforms, signed installs by default, a
+Homebrew tap that updates with each release, and the first broker benchmark.
+No schema bump (42); rollback to 0.8.4 is unrestricted.
+
+### Added
+
+- Release archives for `aarch64-unknown-linux-gnu` (built on a native arm64
+  runner) and `x86_64-unknown-linux-musl` (static, for Alpine and other
+  non-glibc systems). `install.sh` detects both. `aethyme update` picks the
+  archive that matches the running binary. The Homebrew formula gains a Linux
+  arm64 block (#350).
+- The Homebrew tap updates automatically: a final release job commits the
+  release's own formula to `schiste/homebrew-tap` for every stable tag (#350).
+- `install.sh --require-signature` and `--no-verify-signature` (#350).
+- `aethyme broker advanced worktrees --json` reports Git worktree registration
+  state (detached, bare, locked, prunable), read from `git worktree list
+  --porcelain -z`. Paths that aren't valid UTF-8 are preserved (#347).
+- A benchmark harness under `packages/aethyme-eval/benchmarks/broker/`, with
+  the results of its first run in `docs/reports/broker-benchmark-2026-09.md`.
+  The run used four agents across git worktrees + PRs, native agent worktrees
+  and the broker. Only the broker kept main green throughout (#353, #355).
+
+### Changed
+
+- `install.sh` verifies the cosign signature on the release manifest whenever
+  `cosign` is installed, using the same identity and issuer the release signs
+  with. Without cosign it prints a note and continues (#350).
+
+### Documentation
+
+- A scoping document for a Windows port. Windows is supported through WSL2 only
+  for now, and the README says so (#351).
+- An Explore re-baseline report, including where results got worse, and a
+  pilot kit for early teams (#349).
+
 ## [0.8.4] - 2026-09-25
 
 Phase 4 of the recovery plan: a smaller command surface and shorter agent
