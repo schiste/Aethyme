@@ -245,3 +245,76 @@ jobs:
           generate_release_notes: true
           prerelease: ${{ contains(github.ref_name, '-') }}
 
+  # Issue #253: keep the Homebrew tap in lock-step with each stable release by
+  # committing the formula rendered above (the aethyme.rb release asset) to
+  # schiste/homebrew-tap. The tap is broker-enrolled on the maintainer's
+  # machine; this push deliberately bypasses that local broker, which is
+  # accepted for a formula-only bump that the release itself already reviewed.
+  homebrew-tap:
+    name: Update Homebrew tap
+    needs: release
+    # Preview tags (containing '-') get no formula: Homebrew exposes one
+    # current version, and the release job renders aethyme.rb only for stable.
+    if: ${{ !contains(github.ref_name, '-') }}
+    runs-on: ubuntu-latest
+    # The tap is written only through HOMEBREW_TAP_TOKEN; this job's own
+    # token only reads the release asset.
+    permissions:
+      contents: read
+    concurrency:
+      group: homebrew-tap
+      cancel-in-progress: false
+    steps:
+      - name: Check for tap token
+        id: tap-token
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          if [ -n "$HOMEBREW_TAP_TOKEN" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning title=Homebrew tap not updated::HOMEBREW_TAP_TOKEN is not set; update Formula/aethyme.rb in schiste/homebrew-tap by hand from this release's aethyme.rb asset."
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download rendered formula
+        if: steps.tap-token.outputs.present == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          gh release download "$REF_NAME" --repo "$GITHUB_REPOSITORY" \
+            --pattern aethyme.rb --dir "$RUNNER_TEMP/formula"
+          # Refuse a formula that does not point at this release's archives.
+          grep -F "https://github.com/${GITHUB_REPOSITORY}/releases/download/${REF_NAME}/" \
+            "$RUNNER_TEMP/formula/aethyme.rb" >/dev/null
+
+      - name: Check out tap
+        if: steps.tap-token.outputs.present == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: schiste/homebrew-tap
+          ref: main
+          path: homebrew-tap
+          # Fine-grained PAT, contents:write on schiste/homebrew-tap only.
+          # checkout keeps it in the git credential config, never on a
+          # command line, so it is not echoed.
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+
+      - name: Commit and push formula
+        if: steps.tap-token.outputs.present == 'true'
+        working-directory: homebrew-tap
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          cp "$RUNNER_TEMP/formula/aethyme.rb" Formula/aethyme.rb
+          if git diff --quiet -- Formula/aethyme.rb; then
+            echo "schiste/homebrew-tap already carries the ${REF_NAME} formula"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/aethyme.rb
+          git commit --quiet -m "chore: update Aethyme to ${REF_NAME}"
+          git push origin HEAD:main
