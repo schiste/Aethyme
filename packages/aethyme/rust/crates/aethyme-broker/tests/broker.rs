@@ -1307,6 +1307,80 @@ fn finish_blocks_dirty_then_unsubmitted_commits() {
 }
 
 #[test]
+fn finish_counts_only_commits_missing_from_the_remote_default_branch() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let base = rev(tmp.path(), "HEAD");
+    sh(tmp.path(), &["branch", "aethyme/integration", "HEAD"]);
+    let wt = tmp.path().join("upstream-drift-wt");
+    sh(
+        tmp.path(),
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "agent/upstream-drift",
+            wt.to_str().unwrap(),
+            "main",
+        ],
+    );
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let session = broker.adopt(&wt, Some("upstream drift task")).unwrap();
+
+    // The session picks up a commit that reaches the remote default branch
+    // while integration stays at the older session base.
+    std::fs::write(wt.join("upstream.txt"), "already on origin/main\n").unwrap();
+    sh(&wt, &["add", "-A"]);
+    sh(&wt, &["commit", "-qm", "upstream change"]);
+    let upstream_commit = rev(&wt, "HEAD");
+    sh(
+        tmp.path(),
+        &[
+            "update-ref",
+            "refs/remotes/origin/main",
+            upstream_commit.as_str(),
+        ],
+    );
+    sh(
+        tmp.path(),
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        ],
+    );
+    assert_eq!(rev(tmp.path(), "refs/heads/aethyme/integration"), base);
+
+    std::fs::write(wt.join("local.txt"), "still only in the session\n").unwrap();
+    sh(&wt, &["add", "-A"]);
+    sh(&wt, &["commit", "-qm", "local session change"]);
+    let session_head = rev(&wt, "HEAD");
+
+    let blocked = broker.finish(session.id).unwrap();
+    assert_eq!(blocked.status, FinishStatus::Blocked);
+    assert_eq!(blocked.unsubmitted_commits, 1);
+    assert!(blocked.pending_work.present);
+    assert!(!blocked.delivery.published);
+
+    // Once the full session head is on the default branch, it can finish even
+    // though integration still has not advanced from the original base.
+    sh(
+        tmp.path(),
+        &[
+            "update-ref",
+            "refs/remotes/origin/main",
+            session_head.as_str(),
+        ],
+    );
+    let finished = broker.finish(session.id).unwrap();
+    assert_eq!(finished.status, FinishStatus::Closed);
+    assert_eq!(finished.unsubmitted_commits, 0);
+    assert!(!finished.pending_work.present);
+    assert!(finished.delivery.published);
+    assert!(!finished.delivery.submitted);
+}
+
+#[test]
 fn finish_closes_promoted_session_and_suggests_cleanup_when_integration_contains_it() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());
