@@ -72,7 +72,7 @@ still finds the wrapper. Never put `rustc-wrapper` in the repository's
 To opt out, delete that file, or run a single command with `RUSTC_WRAPPER=`
 (empty) set.
 
-### Cache cap: 10 GiB
+### Cache cap: 2 GiB
 
 The cap is set in sccache's own config file,
 `~/Library/Application Support/Mozilla.sccache/config` on macOS, rather than
@@ -82,16 +82,18 @@ environment variable would have to be exported everywhere.
 
 ```toml
 [cache.disk]
-size = 10737418240   # 10 GiB; least-recently-used entries are evicted
+size = 2147483648    # 2 GiB; least-recently-used entries are evicted
 ```
 
 The cache lives in `~/Library/Caches/Mozilla.sccache`. After you edit the
 config, restart the server with `sccache --stop-server`. The next build starts
 it again.
 
-**Disk headroom.** Broker gates refuse to run below 8 GiB free. A full 10 GiB
-cache on a nearly full disk can cause that. Lower `size` if your disk runs
-close to the limit.
+**Why 2 GiB.** Every dependency of the whole workspace fits in about 0.6 GiB
+(measured 2026-09-26), so 2 GiB leaves room for toolchain and dependency
+updates. Broker gates refuse to run below 8 GiB free, so a larger cap on a
+nearly full disk can starve the gates. Raise `size` only if your disk has
+plenty of room.
 
 ### Check it
 
