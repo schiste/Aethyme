@@ -11,7 +11,7 @@ use super::USAGE;
 
 /// The release that removes every deprecated broker and top-level spelling.
 /// The single place the deprecation window is recorded.
-pub const DEPRECATED_SPELLING_REMOVAL_RELEASE: &str = "v0.8.6";
+pub const DEPRECATED_SPELLING_REMOVAL_RELEASE: &str = "v0.8.8";
 
 /// The one stderr line for a deprecated spelling. Never printed on stdout, so
 /// `--json` output stays parseable.

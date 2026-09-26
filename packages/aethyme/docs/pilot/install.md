@@ -154,4 +154,4 @@ Then add it to cron; see [metrics-export.md](metrics-export.md).
 
 `init`, `certify`, `deploy`, `start --task`, `status`, `submit`, `finish`,
 `unblock <id>` and `gc plan|apply` are the same in both. The old spellings
-keep working until v0.8.6.
+keep working until v0.8.8.
