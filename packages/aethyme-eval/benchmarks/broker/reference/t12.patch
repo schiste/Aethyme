@@ -1,0 +1,36 @@
+diff --git a/shoplib/text.py b/shoplib/text.py
+index 49fa516..94cb06b 100644
+--- a/shoplib/text.py
++++ b/shoplib/text.py
+@@ -1,13 +1,16 @@
+ """Text helpers."""
+ 
+ import re
++import unicodedata
+ 
+ _NON_WORD = re.compile(r"[^a-z0-9]+")
+ 
+ 
+ def slugify(text):
+     """'Blue Mug (Large)' -> 'blue-mug-large'."""
+-    return _NON_WORD.sub("-", text.lower()).strip("-")
++    folded = unicodedata.normalize("NFKD", text)
++    ascii_text = folded.encode("ascii", "ignore").decode("ascii")
++    return _NON_WORD.sub("-", ascii_text.lower()).strip("-")
+ 
+ 
+ def truncate(text, width, suffix="..."):
+diff --git a/tests/test_slugify_unicode.py b/tests/test_slugify_unicode.py
+new file mode 100644
+index 0000000..64db0e8
+--- /dev/null
++++ b/tests/test_slugify_unicode.py
+@@ -0,0 +1,8 @@
++import unittest
++from shoplib.text import slugify
++
++
++class SlugifyUnicodeTest(unittest.TestCase):
++    def test_fold(self):
++        self.assertEqual(slugify("Cr\u00e8me Br\u00fbl\u00e9e"), "creme-brulee")
++        self.assertEqual(slugify("\u00c7a va? 100%"), "ca-va-100")

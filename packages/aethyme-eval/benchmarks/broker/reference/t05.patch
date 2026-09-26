@@ -1,0 +1,62 @@
+diff --git a/shoplib/inventory.py b/shoplib/inventory.py
+index 39d5faa..7396364 100644
+--- a/shoplib/inventory.py
++++ b/shoplib/inventory.py
+@@ -18,7 +18,7 @@ class Inventory:
+             raise UnknownSku(sku)
+         return self._on_hand[sku] - self._reserved[sku]
+ 
+-    def reserve(self, sku, qty):
++    def reserve_stock(self, sku, qty):
+         """Hold `qty` units of `sku` for an order. Raises OutOfStock."""
+         free = self.available(sku)
+         if qty > free:
+diff --git a/shoplib/orders.py b/shoplib/orders.py
+index 4d526e2..7d06c9f 100644
+--- a/shoplib/orders.py
++++ b/shoplib/orders.py
+@@ -29,7 +29,7 @@ class OrderService:
+         held = []
+         try:
+             for item in order.items:
+-                self.inventory.reserve(item.sku, item.qty)
++                self.inventory.reserve_stock(item.sku, item.qty)
+                 held.append(item)
+         except OutOfStock:
+             for item in held:
+diff --git a/tests/test_inventory.py b/tests/test_inventory.py
+index 05dfa20..e4fc815 100644
+--- a/tests/test_inventory.py
++++ b/tests/test_inventory.py
+@@ -10,7 +10,7 @@ class InventoryTest(unittest.TestCase):
+ 
+     def test_reserve_and_release(self):
+         _, inventory, _ = make_shop()
+-        inventory.reserve("MUG-001", 4)
++        inventory.reserve_stock("MUG-001", 4)
+         self.assertEqual(inventory.available("MUG-001"), 6)
+         inventory.release("MUG-001", 4)
+         self.assertEqual(inventory.available("MUG-001"), 10)
+@@ -18,7 +18,7 @@ class InventoryTest(unittest.TestCase):
+     def test_out_of_stock(self):
+         _, inventory, _ = make_shop()
+         with self.assertRaises(OutOfStock) as ctx:
+-            inventory.reserve("MUG-002", 3)
++            inventory.reserve_stock("MUG-002", 3)
+         self.assertEqual(ctx.exception.available, 2)
+ 
+     def test_unknown(self):
+diff --git a/tests/test_inventory_rename.py b/tests/test_inventory_rename.py
+new file mode 100644
+index 0000000..87a7aa6
+--- /dev/null
++++ b/tests/test_inventory_rename.py
+@@ -0,0 +1,8 @@
++import unittest
++from shoplib.inventory import Inventory
++
++
++class RenameTest(unittest.TestCase):
++    def test_old_name_gone(self):
++        self.assertFalse(hasattr(Inventory, "reserve"))
++        self.assertTrue(hasattr(Inventory, "reserve_stock"))

@@ -1,0 +1,41 @@
+diff --git a/shoplib/customers.py b/shoplib/customers.py
+index baeb241..7a8647d 100644
+--- a/shoplib/customers.py
++++ b/shoplib/customers.py
+@@ -2,6 +2,7 @@
+ 
+ from dataclasses import dataclass
+ 
++from shoplib import pricing
+ from shoplib.validation import validate_email
+ 
+ 
+@@ -30,3 +31,12 @@ class CustomerBook:
+             if customer.email == email:
+                 return customer
+         return None
++
++
++def loyalty_tier(customer_id, orders):
++    spend = sum(pricing.total(o) for o in orders if o.customer_id == customer_id and o.status == "placed")
++    if spend >= 50000:
++        return "gold"
++    if spend >= 20000:
++        return "silver"
++    return "bronze"
+diff --git a/tests/test_loyalty.py b/tests/test_loyalty.py
+new file mode 100644
+index 0000000..3b12b31
+--- /dev/null
++++ b/tests/test_loyalty.py
+@@ -0,0 +1,10 @@
++import unittest
++from shoplib.customers import loyalty_tier
++from shoplib.models import LineItem, Order
++
++
++class LoyaltyTest(unittest.TestCase):
++    def test_tiers(self):
++        order = Order("O1", "C1", [LineItem("MUG-001", 1, 20000)], region="XX", status="placed")
++        self.assertEqual(loyalty_tier("C1", []), "bronze")
++        self.assertEqual(loyalty_tier("C1", [order]), "silver")

@@ -1,0 +1,48 @@
+diff --git a/shoplib/validation.py b/shoplib/validation.py
+index 01d28c5..5b05000 100644
+--- a/shoplib/validation.py
++++ b/shoplib/validation.py
+@@ -6,6 +6,11 @@ from shoplib import config
+ from shoplib.errors import ValidationError
+ 
+ _SKU = re.compile(r"^[A-Z]{3}-\d{3,5}$")
++_POSTAL = {
++    "US": re.compile(r"^\d{5}(-\d{4})?$"),
++    "FR": re.compile(r"^\d{5}$"),
++    "GB": re.compile(r"^[A-Z][A-Z0-9]{1,3} \d[A-Z]{2}$"),
++}
+ _EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[a-z]{2,}$", re.IGNORECASE)
+ 
+ 
+@@ -29,3 +34,13 @@ def validate_quantity(qty):
+     if qty > config.get("max_line_quantity"):
+         raise ValidationError(f"quantity {qty} exceeds the per-line maximum")
+     return qty
++
++
++def validate_postal_code(code, region):
++    pattern = _POSTAL.get(region)
++    if pattern is None:
++        raise ValidationError(f"unsupported region: {region!r}")
++    code = code.strip().upper()
++    if not pattern.match(code):
++        raise ValidationError(f"invalid {region} postal code: {code!r}")
++    return code
+diff --git a/tests/test_postal_codes.py b/tests/test_postal_codes.py
+new file mode 100644
+index 0000000..edc90a3
+--- /dev/null
++++ b/tests/test_postal_codes.py
+@@ -0,0 +1,12 @@
++import unittest
++from shoplib.errors import ValidationError
++from shoplib.validation import validate_postal_code
++
++
++class PostalTest(unittest.TestCase):
++    def test_codes(self):
++        self.assertEqual(validate_postal_code(" 12345-6789 ", "US"), "12345-6789")
++        self.assertEqual(validate_postal_code("sw1a 1aa", "GB"), "SW1A 1AA")
++        for code, region in [("1234", "FR"), ("12345", "DE")]:
++            with self.assertRaises(ValidationError):
++                validate_postal_code(code, region)

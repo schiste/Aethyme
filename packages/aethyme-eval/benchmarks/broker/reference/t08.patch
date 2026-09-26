@@ -1,0 +1,49 @@
+diff --git a/shoplib/subscriptions.py b/shoplib/subscriptions.py
+new file mode 100644
+index 0000000..882c50d
+--- /dev/null
++++ b/shoplib/subscriptions.py
+@@ -0,0 +1,25 @@
++"""Recurring orders."""
++
++from dataclasses import dataclass
++
++from shoplib.models import LineItem
++
++
++@dataclass
++class Subscription:
++    customer_id: str
++    sku: str
++    qty: int
++    interval_days: int
++
++
++class SubscriptionService:
++    def __init__(self, catalog, inventory):
++        self.catalog = catalog
++        self.inventory = inventory
++
++    def renew(self, subscription):
++        """Hold stock for one delivery and return its line item."""
++        product = self.catalog.get(subscription.sku)
++        self.inventory.reserve(subscription.sku, subscription.qty)
++        return LineItem(subscription.sku, subscription.qty, product.price_cents)
+diff --git a/tests/test_subscriptions.py b/tests/test_subscriptions.py
+new file mode 100644
+index 0000000..ba6d394
+--- /dev/null
++++ b/tests/test_subscriptions.py
+@@ -0,0 +1,12 @@
++import unittest
++from shoplib.models import LineItem
++from shoplib.subscriptions import Subscription, SubscriptionService
++from tests.helpers import make_shop
++
++
++class SubscriptionTest(unittest.TestCase):
++    def test_renew(self):
++        catalog, inventory, _ = make_shop()
++        item = SubscriptionService(catalog, inventory).renew(Subscription("C1", "TEA-010", 3, 30))
++        self.assertEqual(item, LineItem("TEA-010", 3, 850))
++        self.assertEqual(inventory.available("TEA-010"), 17)

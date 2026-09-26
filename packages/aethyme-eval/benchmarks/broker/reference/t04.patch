@@ -1,0 +1,40 @@
+diff --git a/shoplib/money.py b/shoplib/money.py
+index b4bc512..eb90aae 100644
+--- a/shoplib/money.py
++++ b/shoplib/money.py
+@@ -3,13 +3,17 @@
+ from shoplib.errors import ValidationError
+ 
+ 
+-def format_price(cents, currency="USD"):
+-    """Format an integer amount of cents, e.g. 123456 -> '1234.56 USD'."""
++def format_price(cents, currency="USD", thousands_sep=""):
++    """Format an integer amount of cents, e.g. 123456 -> '1234.56 USD'.
++
++    A non-empty thousands_sep groups the whole units: '1,234.56 USD'.
++    """
+     if not isinstance(cents, int) or isinstance(cents, bool):
+         raise TypeError("cents must be an int")
+     sign = "-" if cents < 0 else ""
+     whole, frac = divmod(abs(cents), 100)
+-    return f"{sign}{whole}.{frac:02d} {currency}"
++    units = f"{whole:,}".replace(",", thousands_sep) if thousands_sep else str(whole)
++    return f"{sign}{units}.{frac:02d} {currency}"
+ 
+ 
+ def parse_price(text):
+diff --git a/tests/test_money_thousands.py b/tests/test_money_thousands.py
+new file mode 100644
+index 0000000..064ecd0
+--- /dev/null
++++ b/tests/test_money_thousands.py
+@@ -0,0 +1,9 @@
++import unittest
++from shoplib.money import format_price
++
++
++class MoneyThousandsTest(unittest.TestCase):
++    def test_grouping(self):
++        self.assertEqual(format_price(123456789, "USD", thousands_sep=","), "1,234,567.89 USD")
++        self.assertEqual(format_price(-100000, "EUR", thousands_sep=" "), "-1 000.00 EUR")
++        self.assertEqual(format_price(99999, thousands_sep=","), "999.99 USD")

@@ -1,0 +1,40 @@
+diff --git a/shoplib/exporters/tsv_export.py b/shoplib/exporters/tsv_export.py
+new file mode 100644
+index 0000000..9d53065
+--- /dev/null
++++ b/shoplib/exporters/tsv_export.py
+@@ -0,0 +1,7 @@
++def export_orders_tsv(orders):
++    lines = ["\t".join(["order_id", "customer_id", "sku", "qty", "unit_price_cents"])]
++    for order in orders:
++        for item in order.items:
++            lines.append("\t".join(str(v) for v in (order.id, order.customer_id, item.sku, item.qty,
++                                                     item.unit_price_cents)))
++    return "\n".join(lines) + "\n"
+diff --git a/shoplib/registry.py b/shoplib/registry.py
+index 20bc1e1..12c15b3 100644
+--- a/shoplib/registry.py
++++ b/shoplib/registry.py
+@@ -11,6 +11,7 @@ import importlib
+ EXPORTERS = {
+     "csv": "shoplib.exporters.csv_export:export_orders_csv",
+     "json": "shoplib.exporters.json_export:export_orders_json",
++    "tsv": "shoplib.exporters.tsv_export:export_orders_tsv",
+ }
+ 
+ 
+diff --git a/tests/test_tsv_export.py b/tests/test_tsv_export.py
+new file mode 100644
+index 0000000..9e2baaa
+--- /dev/null
++++ b/tests/test_tsv_export.py
+@@ -0,0 +1,9 @@
++import unittest
++from shoplib import registry
++from shoplib.models import LineItem, Order
++
++
++class TsvTest(unittest.TestCase):
++    def test_tsv(self):
++        text = registry.exporter("tsv")([Order("O1", "C1", [LineItem("MUG-001", 2, 1299)])])
++        self.assertEqual(text, "order_id\tcustomer_id\tsku\tqty\tunit_price_cents\nO1\tC1\tMUG-001\t2\t1299\n")

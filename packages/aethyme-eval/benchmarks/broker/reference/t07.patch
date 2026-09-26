@@ -1,0 +1,30 @@
+diff --git a/shoplib/catalog.py b/shoplib/catalog.py
+index fe1e46e..fc3496f 100644
+--- a/shoplib/catalog.py
++++ b/shoplib/catalog.py
+@@ -22,6 +22,7 @@ class Catalog:
+     def all(self):
+         return sorted(self._products.values(), key=lambda p: p.sku)
+ 
+-    def search(self, query):
+-        """Products whose name contains `query`, ordered by SKU."""
+-        return [p for p in self.all() if query in p.name]
++    def search(self, query, tag=None):
++        """Products whose name contains `query` (any case), optionally with `tag`, by SKU."""
++        needle = query.lower()
++        return [p for p in self.all() if needle in p.name.lower() and (tag is None or tag in p.tags)]
+diff --git a/tests/test_catalog_search.py b/tests/test_catalog_search.py
+new file mode 100644
+index 0000000..ff03483
+--- /dev/null
++++ b/tests/test_catalog_search.py
+@@ -0,0 +1,9 @@
++import unittest
++from tests.helpers import make_shop
++
++
++class SearchTest(unittest.TestCase):
++    def test_search(self):
++        catalog, _, _ = make_shop()
++        self.assertEqual([p.sku for p in catalog.search("mug")], ["MUG-001", "MUG-002"])
++        self.assertEqual([p.sku for p in catalog.search("", tag="blue")], ["BAG-100", "MUG-001"])
