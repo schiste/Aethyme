@@ -772,7 +772,7 @@ fn adopt_conflict_close_reuse_and_replace_stale_lifecycle() {
     assert_eq!(reused.adoption_base, first.adoption_base);
     assert_eq!(reused.repository_contract, first.repository_contract);
 
-    // close is state-only: session closed, worktree untouched.
+    // close retains the checkout and branch while allowing policy-approved cache reclaim.
     broker.close(first.id).unwrap();
     let closed = broker.store().session(first.id).unwrap();
     assert_eq!(closed.status, SessionStatus::Closed);
