@@ -6,6 +6,20 @@ artifacts and their exact source revision are recorded in each signed
 
 ## [Unreleased]
 
+### Added
+
+- Every executed gate result now records the machine conditions it ran
+  under: `load_avg_1m_start`, `load_avg_1m_end`, `cpu_count` and
+  `free_disk_bytes_start` (the free space the disk-headroom check admitted
+  the gate on), so gate-duration trends can be separated from machine load.
+  They appear in `broker gates run --json` and `submit --json`
+  `gate_outcomes`, in a second `aethyme gate environment:` line at the head
+  of each gate log, and after the duration in the gate progress line. Cache
+  hits, cancellations and results recorded before the command stage report
+  `null`. Schema bump to 43 is additive and declared compatible, so 0.8.x
+  binaries and plugin hooks keep using a v43 database and leave the new
+  columns NULL.
+
 ## [0.8.6] - 2026-09-26
 
 Build and disk maintenance, plus reliability fixes. No schema bump (42), so

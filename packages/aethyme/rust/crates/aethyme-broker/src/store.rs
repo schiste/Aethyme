@@ -39,11 +39,12 @@ use crate::schema::{self, EVENTS_SCHEMA_VERSION};
 use crate::types::{
     Advisory, AdvisoryResolutionState, AdvisorySeverity, CoordinatedOperation,
     EntryExposureResolutionKind, EntryExposureState, EntryPathExposure, Event, GateDef,
-    GateFailureClass, GateResult, GateStatus, Lease, LeaseKind, MAX_OPERATION_HISTORY_LIMIT,
-    MergeQueueEntry, MergeStatus, NewAdvisory, NewCoordinatedOperation, NewGateResult,
-    NewPrWatchState, NewSession, OperationEffect, OperationHistoryPage, OperationHistoryQuery,
-    OperationIdentityProvenance, OperationProvider, OperationStatus, PrWatchState, Session,
-    SessionCleanupState, SessionContext, SessionNote, SessionOrigin, SessionStatus,
+    GateEnvironment, GateFailureClass, GateResult, GateStatus, Lease, LeaseKind,
+    MAX_OPERATION_HISTORY_LIMIT, MergeQueueEntry, MergeStatus, NewAdvisory,
+    NewCoordinatedOperation, NewGateResult, NewPrWatchState, NewSession, OperationEffect,
+    OperationHistoryPage, OperationHistoryQuery, OperationIdentityProvenance, OperationProvider,
+    OperationStatus, PrWatchState, Session, SessionCleanupState, SessionContext, SessionNote,
+    SessionOrigin, SessionStatus,
 };
 use crate::types::{NewSessionRepresentation, RepresentationDiscovery, SessionRepresentation};
 
@@ -1137,15 +1138,28 @@ impl BrokerStore {
     }
 
     /// Record a gate run; emits `gate.<status>` in the same transaction.
+    /// The machine environment is left unrecorded (NULL): use
+    /// [`Self::record_gate_result_with_environment`] for an executed run.
     pub fn record_gate_result(&mut self, result: &NewGateResult) -> Result<i64, BrokerError> {
+        self.record_gate_result_with_environment(result, &GateEnvironment::default())
+    }
+
+    /// Record a gate run together with the machine conditions it ran under.
+    pub fn record_gate_result_with_environment(
+        &mut self,
+        result: &NewGateResult,
+        environment: &GateEnvironment,
+    ) -> Result<i64, BrokerError> {
         let now = now_ms();
         let tx = self.conn.transaction()?;
         tx.execute(
             "INSERT INTO gate_results (gate_name, tree_hash, definition_hash, status,
                                        failure_class, exit_code, duration_ms, log_path,
                                        session_id, created_at, wait_duration_ms,
-                                       first_output_ms, output_bytes)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                                       first_output_ms, output_bytes, load_avg_1m_start,
+                                       load_avg_1m_end, cpu_count, free_disk_bytes_start)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+                     ?16, ?17)",
             params![
                 result.gate_name,
                 result.tree_hash,
@@ -1160,6 +1174,10 @@ impl BrokerStore {
                 result.wait_duration_ms,
                 result.first_output_ms,
                 result.output_bytes,
+                environment.load_avg_1m_start,
+                environment.load_avg_1m_end,
+                environment.cpu_count,
+                environment.free_disk_bytes_start,
             ],
         )?;
         let id = tx.last_insert_rowid();
@@ -5940,7 +5958,8 @@ const LEASE_SELECT: &str =
 
 const GATE_RESULT_SELECT: &str = "SELECT id, gate_name, tree_hash, definition_hash, status, \
      failure_class, exit_code, duration_ms, log_path, session_id, created_at, wait_duration_ms, \
-     first_output_ms, output_bytes FROM gate_results";
+     first_output_ms, output_bytes, load_avg_1m_start, load_avg_1m_end, cpu_count, \
+     free_disk_bytes_start FROM gate_results";
 
 const MERGE_SELECT: &str = "SELECT id, session_id, head_commit, base_commit, status, \
      merged_tree, details_json, created_at, updated_at FROM merge_queue";
@@ -6091,6 +6110,12 @@ fn gate_result_from_row(row: &rusqlite::Row<'_>) -> RowResult<GateResult> {
             wait_duration_ms: row.get(11)?,
             first_output_ms: row.get(12)?,
             output_bytes: row.get(13)?,
+            environment: GateEnvironment {
+                load_avg_1m_start: row.get(14)?,
+                load_avg_1m_end: row.get(15)?,
+                cpu_count: row.get(16)?,
+                free_disk_bytes_start: row.get(17)?,
+            },
         })
     })())
 }
