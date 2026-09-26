@@ -1,11 +1,16 @@
 exit: 0
 --- stdout
-  aethyme broker gc plan [--json]
+  aethyme broker gc plan [--include-active-gate-cache] [--json]
       Report exact retention-eligible rows, runtime files, represented
-      worktrees/refs, estimated bytes, blockers, and a stable plan digest.
-  aethyme broker gc apply --confirm <sha256> [--json]
+      worktrees/refs, finished sessions' build caches, this repository's gate
+      cache, estimated bytes, blockers, and a stable plan digest. The newest
+      gate cache of each kind is kept (active) unless
+      --include-active-gate-cache is given; the next gate then rebuilds it
+      from scratch.
+  aethyme broker gc apply --confirm <sha256> [--include-active-gate-cache] [--json]
       Apply or resume the exact reviewed plan under an exclusive lock. A
       recovery journal makes interrupted row, file, and worktree cleanup safe.
+      Pass --include-active-gate-cache when the plan was made with it.
   aethyme broker gc reclaim plan [--json]
   aethyme broker gc reclaim apply --confirm <sha256> [--json]
       Report regenerable build output (target, node_modules, .venv, build,
