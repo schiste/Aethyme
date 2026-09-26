@@ -51,6 +51,15 @@ jobs:
             target: x86_64-apple-darwin
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+          # Native arm64 runner rather than cross-compiling: the smoke step
+          # below then exercises the archive on the platform it ships for.
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          # Static musl build for Alpine and other non-glibc distributions.
+          # The C dependencies (bundled SQLite, tree-sitter, BLAKE3) build
+          # with musl-gcc from musl-tools; everything else is pure Rust.
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -67,6 +76,13 @@ jobs:
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - name: Install musl toolchain
+        if: endsWith(matrix.target, '-musl')
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends musl-tools
 
       - name: Verify release version contract
         env:
@@ -74,15 +90,20 @@ jobs:
         run: cargo test --locked -p aethyme-testkit --test release_contract
 
       - name: Build release binaries
-        run: cargo build --release --locked -p aethyme-cli --bin aethyme -p aethyme-engine --bin aethyme-engine-cli
+        env:
+          # cc-rs compiles the C dependencies with musl-gcc for the musl target.
+          CC_x86_64_unknown_linux_musl: musl-gcc
+        run: |
+          cargo build --release --locked --target "${{ matrix.target }}" \
+            -p aethyme-cli --bin aethyme -p aethyme-engine --bin aethyme-engine-cli
 
       - name: Verify embedded release versions
         env:
           REF_NAME: ${{ github.ref_name }}
         run: |
           expected="${REF_NAME#v}"
-          router_version="$(./target/release/aethyme --version | awk '{print $2}')"
-          engine_version="$(./target/release/aethyme-engine-cli --version | awk '{print $2}')"
+          router_version="$(./target/${{ matrix.target }}/release/aethyme --version | awk '{print $2}')"
+          engine_version="$(./target/${{ matrix.target }}/release/aethyme-engine-cli --version | awk '{print $2}')"
           test "$router_version" = "$expected"
           test "$engine_version" = "$expected"
 
@@ -92,7 +113,7 @@ jobs:
           # github.ref_name into run: commands.
           REF_NAME: ${{ github.ref_name }}
         run: |
-          tar -C target/release -czf "aethyme-${REF_NAME}-${{ matrix.target }}.tar.gz" \
+          tar -C "target/${{ matrix.target }}/release" -czf "aethyme-${REF_NAME}-${{ matrix.target }}.tar.gz" \
             aethyme aethyme-engine-cli
 
       - name: Smoke installed archive
@@ -153,7 +174,9 @@ jobs:
           find dist -mindepth 2 -type f -name '*.tar.gz' -exec mv {} dist/ \;
           find dist -mindepth 1 -type d -empty -delete
           count="$(find dist -maxdepth 1 -type f -name '*.tar.gz' | wc -l | tr -d ' ')"
-          test "$count" = "3"
+          # One archive per build matrix target (RELEASE_TARGETS in
+          # aethyme-broker's release_manifest.rs).
+          test "$count" = "5"
 
       - name: Build release manifest and checksums
         env:
@@ -221,3 +244,4 @@ jobs:
           body_path: ${{ runner.temp }}/release-notes.md
           generate_release_notes: true
           prerelease: ${{ contains(github.ref_name, '-') }}
+

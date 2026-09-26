@@ -43,7 +43,9 @@ fn stable_installer_fetches_verifies_and_updates_the_binary_pair() {
     let target = match (std::env::consts::OS, std::env::consts::ARCH) {
         ("macos", "aarch64") => "aarch64-apple-darwin",
         ("macos", "x86_64") => "x86_64-apple-darwin",
+        ("linux", "x86_64") if cfg!(target_env = "musl") => "x86_64-unknown-linux-musl",
         ("linux", "x86_64") => "x86_64-unknown-linux-gnu",
+        ("linux", "aarch64") => "aarch64-unknown-linux-gnu",
         pair => panic!("unsupported installer test platform: {pair:?}"),
     };
     let archive = format!("aethyme-v{version}-{target}.tar.gz");
@@ -70,6 +72,8 @@ fn stable_installer_fetches_verifies_and_updates_the_binary_pair() {
         "aarch64-apple-darwin",
         "x86_64-apple-darwin",
         "x86_64-unknown-linux-gnu",
+        "aarch64-unknown-linux-gnu",
+        "x86_64-unknown-linux-musl",
     ];
     let artifacts = targets
         .iter()

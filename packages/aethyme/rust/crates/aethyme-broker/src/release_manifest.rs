@@ -19,6 +19,8 @@ pub const RELEASE_TARGETS: &[&str] = &[
     "aarch64-apple-darwin",
     "x86_64-apple-darwin",
     "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-unknown-linux-musl",
 ];
 pub const REQUIRED_RELEASE_BINARIES: &[&str] = &["aethyme", "aethyme-engine-cli"];
 

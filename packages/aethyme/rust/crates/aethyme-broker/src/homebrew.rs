@@ -5,6 +5,7 @@ use crate::ReleaseManifest;
 const MACOS_ARM_TARGET: &str = "aarch64-apple-darwin";
 const MACOS_INTEL_TARGET: &str = "x86_64-apple-darwin";
 const LINUX_INTEL_TARGET: &str = "x86_64-unknown-linux-gnu";
+const LINUX_ARM_TARGET: &str = "aarch64-unknown-linux-gnu";
 
 pub fn render_homebrew_formula(
     manifest: &ReleaseManifest,
@@ -19,6 +20,7 @@ pub fn render_homebrew_formula(
     let macos_arm = artifact(manifest, MACOS_ARM_TARGET)?;
     let macos_intel = artifact(manifest, MACOS_INTEL_TARGET)?;
     let linux_intel = artifact(manifest, LINUX_INTEL_TARGET)?;
+    let linux_arm = artifact(manifest, LINUX_ARM_TARGET)?;
     let release_url = format!(
         "https://github.com/{repository}/releases/download/v{}",
         manifest.version
@@ -46,7 +48,10 @@ class Aethyme < Formula
   end
 
   on_linux do
-    depends_on arch: :x86_64
+    on_arm do
+      url "{release_url}/{linux_arm_archive}"
+      sha256 "{linux_arm_sha}"
+    end
 
     on_intel do
       url "{release_url}/{linux_intel_archive}"
@@ -73,6 +78,8 @@ end
         macos_intel_sha = macos_intel.sha256,
         linux_intel_archive = linux_intel.archive,
         linux_intel_sha = linux_intel.sha256,
+        linux_arm_archive = linux_arm.archive,
+        linux_arm_sha = linux_arm.sha256,
     ))
 }
 
@@ -145,13 +152,24 @@ mod tests {
         let formula = render_homebrew_formula(&manifest("stable"), "schiste/Aethyme").unwrap();
 
         assert!(formula.contains("bin.install \"aethyme\", \"aethyme-engine-cli\""));
-        assert_eq!(formula.matches("url \"").count(), 3);
-        assert_eq!(formula.matches("sha256 \"").count(), 3);
+        assert_eq!(formula.matches("url \"").count(), 4);
+        assert_eq!(formula.matches("sha256 \"").count(), 4);
         assert!(!formula.contains("  version \""));
+        // Homebrew users on Linux are glibc; the musl archive serves the
+        // installer on musl distributions only.
         for target in RELEASE_TARGETS {
-            assert!(formula.contains(&format!("aethyme-v0.2.0-{target}.tar.gz")));
+            let archive = format!("aethyme-v0.2.0-{target}.tar.gz");
+            assert_eq!(
+                formula.contains(&archive),
+                !target.ends_with("-musl"),
+                "{archive}"
+            );
         }
-        assert!(formula.contains("depends_on arch: :x86_64"));
+        let linux = &formula[formula.find("on_linux do").unwrap()..];
+        assert!(
+            linux.find("on_arm do").unwrap() < linux.find("aarch64-unknown-linux-gnu").unwrap()
+        );
+        assert!(!formula.contains("depends_on arch:"));
         assert!(formula.contains("broker\", \"quick-test"));
     }
 
