@@ -1,0 +1,68 @@
+name: Release Targets
+
+# Builds the release targets that are not a GitHub runner's native host
+# toolchain, the same way release.yml does, whenever the release workflow or
+# the toolchain pin changes. v0.8.5's tag was the first run of the musl
+# target and failed ("can't find crate for `core`"), because nothing
+# exercised it before a tag. This runs only on pull requests that touch these
+# paths and is not a required check.
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - .github/workflows/release-targets.yml
+      - rust-toolchain.toml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-targets-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: packages/aethyme/rust
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - name: Add the target to the pinned toolchain
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Install musl toolchain
+        if: endsWith(matrix.target, '-musl')
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends musl-tools
+
+      - name: Build release binaries
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+        run: |
+          cargo build --release --locked --target "${{ matrix.target }}" \
+            -p aethyme-cli --bin aethyme -p aethyme-engine --bin aethyme-engine-cli
+
+      - name: Smoke-test the binaries
+        run: |
+          ./target/${{ matrix.target }}/release/aethyme --version
+          ./target/${{ matrix.target }}/release/aethyme-engine-cli --version
