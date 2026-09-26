@@ -19,6 +19,7 @@ const RETENTION_POLICY_FIELDS: &[&str] = &[
     "terminal_merge_queue_days",
     "command_metrics_days",
     "closed_worktrees_days",
+    "auto_cleanup_worktrees_on_finish",
     "publication_exposure_days",
     "retained_bytes_budget",
     "artifact_reclaim_days",
@@ -74,6 +75,10 @@ pub struct RetentionPolicy {
     /// build caches use `artifact_reclaim_days` instead. This does not affect
     /// committed work or authorize removal without provenance proof.
     pub closed_worktrees_days: u32,
+    /// Automatically remove safe, broker-owned worktrees when `finish` closes
+    /// a session. Set false to retain them for inspection or reuse; manual
+    /// cleanup remains available, and unsafe or unproven work is never removed.
+    pub auto_cleanup_worktrees_on_finish: bool,
     /// Idle days before a closed session's build caches are reclaimed without
     /// confirmation. This does not affect committed work or the worktree
     /// itself; a maintainer may raise it to trade disk space for faster reuse.
@@ -123,6 +128,7 @@ impl Default for RetentionPolicy {
             terminal_merge_queue_days: 180,
             command_metrics_days: 30,
             closed_worktrees_days: 7,
+            auto_cleanup_worktrees_on_finish: true,
             publication_exposure_days: 30,
             retained_bytes_budget: 1_073_741_824,
             artifact_reclaim_days: 0,
