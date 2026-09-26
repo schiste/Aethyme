@@ -9,3 +9,17 @@
 # remove it from the child environment. Never set it outside tests; see
 # `aethyme broker trust`.
 AETHYME_TRUST_NONINTERACTIVE_FOR_TESTS = "1"
+
+# Dev/test builds: keep file:line backtraces for workspace crates but drop the
+# full DWARF that made `target/` several GiB per worktree. `profile.test`
+# inherits from `profile.dev`, so `cargo test` gets the same settings. The
+# release profile is untouched. Config profiles override the same keys in any
+# Cargo.toml [profile] table (Cargo reference, "Configuration": [profile]), so
+# change dev debug info here, not in the manifest. See
+# packages/aethyme/docs/guides/build-performance.md for measurements.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+# No debug info for third-party crates; their frames still show symbol names.
+debug = false
