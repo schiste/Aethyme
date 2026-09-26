@@ -1,0 +1,5 @@
+{"ts": "2026-09-26T06:24:59+00:00", "kind": "arm_start"}
+{"ts": "2026-09-26T06:26:27+00:00", "kind": "intervention", "slot": "s1", "category": "env", "note": "Claude folder-trust dialog exited agent at launch; relaunched, accepted trust, re-sent the same prompt"}
+{"ts": "2026-09-26T06:26:27+00:00", "kind": "intervention", "slot": "s2", "category": "env", "note": "Claude folder-trust dialog exited agent at launch; relaunched, accepted trust, re-sent the same prompt"}
+{"ts": "2026-09-26T06:26:27+00:00", "kind": "intervention", "slot": "s3", "category": "env", "note": "Codex prompt pasted but not submitted by launcher; pressed Enter"}
+{"ts": "2026-09-26T06:47:03+00:00", "kind": "arm_end"}

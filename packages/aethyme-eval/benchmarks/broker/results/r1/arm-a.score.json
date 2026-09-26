@@ -1,0 +1,230 @@
+{
+  "benchmark": "aethyme-broker-p5.6",
+  "arm": "a",
+  "repetition": 1,
+  "root": "/Users/christophehenner/bench-p56/arm-a-r1",
+  "scored_at": "2026-09-26T07:02:16+00:00",
+  "headline": {
+    "wall_time_s": 1324.0,
+    "wall_time_source": "operator_log",
+    "tasks_passing_hidden": 12,
+    "tasks_total": 12,
+    "overlaps_resolved": 3,
+    "overlaps_total": 3,
+    "final_main_green": true,
+    "conflicts_caught_before_merge": 1,
+    "broken_merges_reaching_main": 1,
+    "operator_interventions": 3,
+    "agent_turns": 88,
+    "tokens_total": 4555201
+  },
+  "repo": {
+    "landing_ref": "refs/heads/main",
+    "final_sha": "34fe78690bae9d9328eccab29d64c83c5aaad32d",
+    "final_visible_suite_pass": true,
+    "hidden_checks": {
+      "t01": {
+        "pass": true
+      },
+      "t02": {
+        "pass": true
+      },
+      "t03": {
+        "pass": true
+      },
+      "t04": {
+        "pass": true
+      },
+      "t05": {
+        "pass": true
+      },
+      "t06": {
+        "pass": true
+      },
+      "t07": {
+        "pass": true
+      },
+      "t08": {
+        "pass": true
+      },
+      "t09": {
+        "pass": true
+      },
+      "t10": {
+        "pass": true
+      },
+      "t11": {
+        "pass": true
+      },
+      "t12": {
+        "pass": true
+      },
+      "overlap:textual": {
+        "pass": true
+      },
+      "overlap:semantic": {
+        "pass": true
+      },
+      "overlap:shared": {
+        "pass": true
+      }
+    },
+    "tasks_passing": 12,
+    "overlaps_passing": 3,
+    "states_source": "reflog",
+    "states": [
+      {
+        "sha": "8ec2ff455505b13e01a46ac4ba53325d10b3380d",
+        "tests_pass": true
+      },
+      {
+        "sha": "6a4029b97a8b88640cb67a624ea3dc0c269c5024",
+        "tests_pass": true
+      },
+      {
+        "sha": "03934360c6bd17334beb671fbc9197305fab601b",
+        "tests_pass": true
+      },
+      {
+        "sha": "5c23a3ae30271452a14d9911739944b6268020c0",
+        "tests_pass": true
+      },
+      {
+        "sha": "a840b77a62e61d6516d2faf0f82cefa4a10468c4",
+        "tests_pass": true
+      },
+      {
+        "sha": "095f44dec930fe03d093aa4370e09588b5ea4797",
+        "tests_pass": false
+      },
+      {
+        "sha": "e89415c75059d858c450e27af9ab9da94a624ef6",
+        "tests_pass": false
+      },
+      {
+        "sha": "6b9e933cd2c7244289b9bee4d1e796265769d5b7",
+        "tests_pass": true
+      },
+      {
+        "sha": "7aad46bfa703eb75385f4b24e288a6cb9303fe21",
+        "tests_pass": true
+      },
+      {
+        "sha": "2c249920beaeb202c471813068145642cfef9ed6",
+        "tests_pass": true
+      },
+      {
+        "sha": "02f0772f54ac3372bd40bdd2a969f348f0c72aed",
+        "tests_pass": true
+      },
+      {
+        "sha": "0d8b133bf3a8439f2d659e7ebe8a357ee2a55da7",
+        "tests_pass": true
+      },
+      {
+        "sha": "61a02915bf62f961fca8b7d6bde19e052a954c8a",
+        "tests_pass": true
+      },
+      {
+        "sha": "34fe78690bae9d9328eccab29d64c83c5aaad32d",
+        "tests_pass": true
+      }
+    ],
+    "broken_merges_replayed": 1,
+    "red_states": 2
+  },
+  "gatekeeping": {
+    "source": "merge_log.jsonl",
+    "conflicts_caught_before_merge": 1,
+    "breakdown": {
+      "ci_failed": 1,
+      "merged": 12,
+      "merged_main_red": 2
+    },
+    "broken_merges_logged": 1,
+    "merges_onto_red_main_logged": 2,
+    "entries": 15
+  },
+  "operator": {
+    "count": 3,
+    "by_category": {
+      "env": 3
+    },
+    "by_slot": {
+      "s1": 1,
+      "s2": 1,
+      "s3": 1
+    },
+    "arm_start": "2026-09-26T06:24:59+00:00",
+    "arm_end": "2026-09-26T06:47:03+00:00"
+  },
+  "telemetry": {
+    "per_slot": {
+      "s1": {
+        "runs": 0,
+        "turns_chau7": 0,
+        "assistant_turns_transcript": 0,
+        "model_calls_native": 37,
+        "tokens": {
+          "cache_read": 2769777,
+          "cache_write": 84052,
+          "input": 74,
+          "output": 8977,
+          "total": 2862880
+        },
+        "tokens_source": "native:claude"
+      },
+      "s2": {
+        "runs": 0,
+        "turns_chau7": 0,
+        "assistant_turns_transcript": 0,
+        "model_calls_native": 12,
+        "tokens": {
+          "cache_read": 693514,
+          "cache_write": 41399,
+          "input": 24,
+          "output": 5016,
+          "total": 739953
+        },
+        "tokens_source": "native:claude"
+      },
+      "s3": {
+        "runs": 0,
+        "turns_chau7": 0,
+        "assistant_turns_transcript": 0,
+        "model_calls_native": 23,
+        "tokens": {
+          "cache_read": 515328,
+          "cache_write": 0,
+          "input": 32389,
+          "output": 4508,
+          "reasoning": 897,
+          "total": 552225
+        },
+        "tokens_source": "native:codex"
+      },
+      "s4": {
+        "runs": 0,
+        "turns_chau7": 0,
+        "assistant_turns_transcript": 0,
+        "model_calls_native": 16,
+        "tokens": {
+          "cache_read": 377088,
+          "cache_write": 0,
+          "input": 19516,
+          "output": 3539,
+          "reasoning": 83,
+          "total": 400143
+        },
+        "tokens_source": "native:codex"
+      }
+    },
+    "totals": {
+      "turns_chau7": 0,
+      "assistant_turns_transcript": 0,
+      "model_calls_native": 88,
+      "tokens_total": 4555201,
+      "slots_missing_tokens": []
+    }
+  }
+}

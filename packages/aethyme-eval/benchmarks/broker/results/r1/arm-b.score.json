@@ -1,0 +1,225 @@
+{
+  "benchmark": "aethyme-broker-p5.6",
+  "arm": "b",
+  "repetition": 1,
+  "root": "/Users/christophehenner/bench-p56/arm-b-r1",
+  "scored_at": "2026-09-26T07:02:17+00:00",
+  "headline": {
+    "wall_time_s": 249.0,
+    "wall_time_source": "operator_log",
+    "tasks_passing_hidden": 12,
+    "tasks_total": 12,
+    "overlaps_resolved": 3,
+    "overlaps_total": 3,
+    "final_main_green": true,
+    "conflicts_caught_before_merge": 0,
+    "broken_merges_reaching_main": 1,
+    "operator_interventions": 3,
+    "agent_turns": 86,
+    "tokens_total": 4549383
+  },
+  "repo": {
+    "landing_ref": "refs/heads/main",
+    "final_sha": "39672c8a63e06d21dd84c90bb488a293481bd9dc",
+    "final_visible_suite_pass": true,
+    "hidden_checks": {
+      "t01": {
+        "pass": true
+      },
+      "t02": {
+        "pass": true
+      },
+      "t03": {
+        "pass": true
+      },
+      "t04": {
+        "pass": true
+      },
+      "t05": {
+        "pass": true
+      },
+      "t06": {
+        "pass": true
+      },
+      "t07": {
+        "pass": true
+      },
+      "t08": {
+        "pass": true
+      },
+      "t09": {
+        "pass": true
+      },
+      "t10": {
+        "pass": true
+      },
+      "t11": {
+        "pass": true
+      },
+      "t12": {
+        "pass": true
+      },
+      "overlap:textual": {
+        "pass": true
+      },
+      "overlap:semantic": {
+        "pass": true
+      },
+      "overlap:shared": {
+        "pass": true
+      }
+    },
+    "tasks_passing": 12,
+    "overlaps_passing": 3,
+    "states_source": "reflog",
+    "states": [
+      {
+        "sha": "39da07f0a746b6c9cd050a118f5ebc5b65e22e1a",
+        "tests_pass": true
+      },
+      {
+        "sha": "1d4dd838d21d045b082d1df0b191ac5acb58cb31",
+        "tests_pass": true
+      },
+      {
+        "sha": "d369647f98354bd1e3c98e6cb5039e7aa05bd125",
+        "tests_pass": true
+      },
+      {
+        "sha": "ae142625b384e0b0e34c580ba3a3606b3782e992",
+        "tests_pass": true
+      },
+      {
+        "sha": "6f205a11dc27681dfa1f54e9f63b4648836183a0",
+        "tests_pass": true
+      },
+      {
+        "sha": "647d7bcebb8e44c4afc6385c359befa8916e5b60",
+        "tests_pass": false
+      },
+      {
+        "sha": "b57ba99edf5f645be53f3ca26d71783abaac6a16",
+        "tests_pass": true
+      },
+      {
+        "sha": "74c2926575812cc7a40d44000ef3a6a63b07c1be",
+        "tests_pass": true
+      },
+      {
+        "sha": "b2fc1b5f97cc2aebed0079f6f71910e2c1319151",
+        "tests_pass": true
+      },
+      {
+        "sha": "e4c6d55a4af6e56befafc4cf7d1efd136834c50e",
+        "tests_pass": true
+      },
+      {
+        "sha": "4cb207a11aa7b606ec0c6c01cc4dd7d83de7acf1",
+        "tests_pass": true
+      },
+      {
+        "sha": "a59a4626502f2e8fd6b37354438ba312cd01431f",
+        "tests_pass": true
+      },
+      {
+        "sha": "39672c8a63e06d21dd84c90bb488a293481bd9dc",
+        "tests_pass": true
+      }
+    ],
+    "broken_merges_replayed": 1,
+    "red_states": 1
+  },
+  "gatekeeping": {
+    "source": "merge_log.jsonl",
+    "conflicts_caught_before_merge": 0,
+    "breakdown": {
+      "merged": 12,
+      "merged_main_red": 1
+    },
+    "broken_merges_logged": 1,
+    "merges_onto_red_main_logged": 1,
+    "entries": 13
+  },
+  "operator": {
+    "count": 3,
+    "by_category": {
+      "env": 3
+    },
+    "by_slot": {
+      "s1": 1,
+      "s2": 1,
+      "s3": 1
+    },
+    "arm_start": "2026-09-26T06:48:13+00:00",
+    "arm_end": "2026-09-26T06:52:22+00:00"
+  },
+  "telemetry": {
+    "per_slot": {
+      "s1": {
+        "runs": 0,
+        "turns_chau7": 0,
+        "assistant_turns_transcript": 0,
+        "model_calls_native": 34,
+        "tokens": {
+          "cache_read": 2558860,
+          "cache_write": 53749,
+          "input": 68,
+          "output": 8128,
+          "total": 2620805
+        },
+        "tokens_source": "native:claude"
+      },
+      "s2": {
+        "runs": 0,
+        "turns_chau7": 0,
+        "assistant_turns_transcript": 0,
+        "model_calls_native": 18,
+        "tokens": {
+          "cache_read": 1063677,
+          "cache_write": 42491,
+          "input": 36,
+          "output": 5473,
+          "total": 1111677
+        },
+        "tokens_source": "native:claude"
+      },
+      "s3": {
+        "runs": 0,
+        "turns_chau7": 0,
+        "assistant_turns_transcript": 0,
+        "model_calls_native": 21,
+        "tokens": {
+          "cache_read": 455424,
+          "cache_write": 0,
+          "input": 44871,
+          "output": 4540,
+          "reasoning": 1085,
+          "total": 504835
+        },
+        "tokens_source": "native:codex"
+      },
+      "s4": {
+        "runs": 0,
+        "turns_chau7": 0,
+        "assistant_turns_transcript": 0,
+        "model_calls_native": 13,
+        "tokens": {
+          "cache_read": 291584,
+          "cache_write": 0,
+          "input": 17180,
+          "output": 3302,
+          "reasoning": 0,
+          "total": 312066
+        },
+        "tokens_source": "native:codex"
+      }
+    },
+    "totals": {
+      "turns_chau7": 0,
+      "assistant_turns_transcript": 0,
+      "model_calls_native": 86,
+      "tokens_total": 4549383,
+      "slots_missing_tokens": []
+    }
+  }
+}

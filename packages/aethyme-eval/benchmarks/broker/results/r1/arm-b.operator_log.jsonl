@@ -1,0 +1,5 @@
+{"ts": "2026-09-26T06:48:13+00:00", "kind": "arm_start"}
+{"ts": "2026-09-26T06:49:38+00:00", "kind": "intervention", "slot": "s1", "category": "env", "note": "Claude --worktree refused: exact-folder trust needed; accepted trust in repo, relaunched, re-sent the same prompt"}
+{"ts": "2026-09-26T06:49:38+00:00", "kind": "intervention", "slot": "s2", "category": "env", "note": "Claude --worktree refused: exact-folder trust needed; accepted trust in repo, relaunched, re-sent the same prompt"}
+{"ts": "2026-09-26T06:49:38+00:00", "kind": "intervention", "slot": "s3", "category": "env", "note": "Codex prompt lost at launch in managed worktree; re-sent the same prompt"}
+{"ts": "2026-09-26T06:52:22+00:00", "kind": "arm_end"}
