@@ -131,6 +131,50 @@ One JSON object per line (NDJSON): `id`, `schema_version`, `ts`, `kind`,
 `session_id`, `payload_json`. Kinds and payload field names are the
 event-stream contract — see [events-contract.md](events-contract.md).
 
+### `worktrees --json`
+
+`aethyme broker worktrees --json` returns a read-only inventory of the
+host's reported worktrees:
+
+```
+{
+  "rows": [
+    {
+      "repository": "...",
+      "path": "...",
+      "branch": "...",
+      "bytes": 0,
+      "idle_days": 0,
+      "state": "recoverable",
+      "live": false,
+      "git": {
+        "head": "<commit>",
+        "detached": false,
+        "locked": false,
+        "lock_reason": "...",
+        "prunable": false,
+        "prunable_reason": "..."
+      },
+      "git_registered": true,
+      "git_error": "..."
+    }
+  ],
+  "total_bytes": 0,
+  "unique_work_bytes": 0,
+  "unique_work_count": 0
+}
+```
+
+`branch`, `idle_days`, and optional strings inside `git` are omitted when
+unknown. `state` is flattened into each row: `uncommitted` carries `files`,
+`unpushed` carries `commits`, and the other values are `recoverable`,
+`not_a_checkout`, and `prunable_registration`. `git` is `null` when no
+registration details are available. `git_registered` is `true` or `false`
+when inventory succeeded, and omitted when Git state could not be confirmed;
+`git_error` explains an inventory failure. A prunable row may describe a path
+that no longer exists and therefore has zero bytes. The report is diagnostic:
+neither `prunable` nor any other row state authorizes deletion.
+
 ### `metrics --json`
 
 ```

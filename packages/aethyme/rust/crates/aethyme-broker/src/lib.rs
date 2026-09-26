@@ -484,7 +484,10 @@ pub use worktree_reconcile::{
     WORKTREE_RECONCILIATION_SCHEMA_VERSION, WorktreeReconciliation,
     reconcile as reconcile_worktree_directories, summarise as summarise_worktree_reconciliation,
 };
-pub use worktree_report::{WorkState, WorktreeReport, WorktreeRow, build as build_worktree_report};
+pub(crate) use worktree_report::append_prunable_registrations;
+pub use worktree_report::{
+    GitWorktreeState, WorkState, WorktreeReport, WorktreeRow, build as build_worktree_report,
+};
 
 /// Repo-relative location of the broker database.
 pub const BROKER_DB_RELPATH: &str = ".aethyme/broker.db";

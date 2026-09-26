@@ -10,10 +10,10 @@
 //!
 //! Strictly read-only. It walks, it reads git state, it prints.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use crate::git::GitRepo;
+use crate::git::{GitRepo, GitWorktreeInfo};
 
 /// Whether removing a worktree would lose anything.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -27,6 +27,8 @@ pub enum WorkState {
     Recoverable,
     /// Present on disk but not a git checkout; nothing can be said about it.
     NotACheckout,
+    /// Git retains a registration marked prunable; its work could not be classified.
+    PrunableRegistration,
 }
 
 impl WorkState {
@@ -41,8 +43,24 @@ impl WorkState {
             Self::Unpushed { .. } => "unpushed",
             Self::Recoverable => "recoverable",
             Self::NotACheckout => "not_a_checkout",
+            Self::PrunableRegistration => "prunable_registration",
         }
     }
+}
+
+/// Git registration details for a checkout matched to Git's inventory.
+/// None means the checkout's registration state could not be confirmed.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct GitWorktreeState {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub head: Option<String>,
+    pub detached: bool,
+    pub locked: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lock_reason: Option<String>,
+    pub prunable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prunable_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -60,6 +78,16 @@ pub struct WorktreeRow {
     pub work: WorkState,
     /// A session is using this checkout right now.
     pub live: bool,
+    /// Git's lock and prune state, when the registration was readable.
+    pub git: Option<GitWorktreeState>,
+    /// Whether Git listed this checkout. Absent when this is not a checkout or
+    /// the inventory could not be read; see git_error for the latter.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub git_registered: Option<bool>,
+    /// Why Git inventory could not be read. A missing registration is reported
+    /// separately by git_registered = false.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub git_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
@@ -96,12 +124,156 @@ fn tree_bytes(root: &Path) -> u64 {
     total
 }
 
+fn path_key(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn same_path(left: &Path, right: &Path) -> bool {
+    path_key(left) == path_key(right)
+}
+
+fn git_state(entry: &GitWorktreeInfo) -> GitWorktreeState {
+    GitWorktreeState {
+        head: entry.head.clone(),
+        detached: entry.detached,
+        locked: entry.locked,
+        lock_reason: entry.lock_reason.clone(),
+        prunable: entry.prunable,
+        prunable_reason: entry.prunable_reason.clone(),
+    }
+}
+
+fn short_branch(branch: Option<&str>) -> Option<String> {
+    branch.map(|branch| {
+        branch
+            .strip_prefix("refs/heads/")
+            .unwrap_or(branch)
+            .to_string()
+    })
+}
+
+fn identify_registration(
+    root: &Path,
+    inventory: Result<&[GitWorktreeInfo], &str>,
+) -> (Option<GitWorktreeState>, Option<bool>, Option<String>) {
+    let entries = match inventory {
+        Ok(entries) => entries,
+        Err(error) => return (None, None, Some(error.to_string())),
+    };
+    match entries.iter().find(|entry| same_path(&entry.path, root)) {
+        Some(entry) => (Some(git_state(entry)), Some(true), None),
+        None => (None, Some(false), None),
+    }
+}
+
+type InventoryCache = BTreeMap<PathBuf, Result<Vec<GitWorktreeInfo>, String>>;
+
+fn sort_report(report: &mut WorktreeReport) {
+    report.rows.sort_by(|a, b| {
+        b.work
+            .holds_unique_work()
+            .cmp(&a.work.holds_unique_work())
+            .then_with(|| b.bytes.cmp(&a.bytes))
+            .then_with(|| a.path.cmp(&b.path))
+    });
+}
+
+fn append_prunable_rows(
+    report: &mut WorktreeReport,
+    repository: &str,
+    entries: &[GitWorktreeInfo],
+    live: &BTreeSet<PathBuf>,
+) {
+    for entry in entries.iter().filter(|entry| entry.prunable) {
+        if let Some(row) = report
+            .rows
+            .iter_mut()
+            .find(|row| same_path(&row.path, &entry.path))
+        {
+            row.git = Some(git_state(entry));
+            row.git_registered = Some(true);
+            row.git_error = None;
+            if row.branch.is_none() {
+                row.branch = short_branch(entry.branch.as_deref());
+            }
+            if row.work == WorkState::NotACheckout {
+                row.work = WorkState::PrunableRegistration;
+            }
+            continue;
+        }
+
+        let bytes = if entry.path.is_dir() {
+            tree_bytes(&entry.path)
+        } else {
+            0
+        };
+        report.total_bytes += bytes;
+        report.rows.push(WorktreeRow {
+            repository: repository.to_string(),
+            path: entry.path.clone(),
+            branch: short_branch(entry.branch.as_deref()),
+            bytes,
+            idle_days: None,
+            work: WorkState::PrunableRegistration,
+            live: live.iter().any(|path| same_path(path, &entry.path)),
+            git: Some(git_state(entry)),
+            git_registered: Some(true),
+            git_error: None,
+        });
+    }
+}
+
+pub(crate) fn append_prunable_registrations(
+    report: &mut WorktreeReport,
+    repository: &str,
+    entries: &[GitWorktreeInfo],
+    live: &BTreeSet<PathBuf>,
+) {
+    append_prunable_rows(report, repository, entries, live);
+    sort_report(report);
+}
+
+struct WorktreeInspection {
+    branch: Option<String>,
+    idle_days: Option<i64>,
+    work: WorkState,
+    git: Option<GitWorktreeState>,
+    git_registered: Option<bool>,
+    git_error: Option<String>,
+}
+
 /// Read a checkout's state without changing it.
-fn inspect(path: &Path) -> (Option<String>, Option<i64>, WorkState) {
+fn inspect(
+    path: &Path,
+    repository: &str,
+    inventories: &mut InventoryCache,
+    inventory_repositories: &mut BTreeMap<PathBuf, String>,
+) -> WorktreeInspection {
     let Ok(repo) = GitRepo::discover(path) else {
-        return (None, None, WorkState::NotACheckout);
+        return WorktreeInspection {
+            branch: None,
+            idle_days: None,
+            work: WorkState::NotACheckout,
+            git: None,
+            git_registered: None,
+            git_error: None,
+        };
     };
     let branch = repo.current_branch().ok();
+    let repository_root = repo
+        .main_root()
+        .unwrap_or_else(|_| repo.root().to_path_buf());
+    inventory_repositories
+        .entry(repository_root.clone())
+        .or_insert_with(|| repository.to_string());
+    let inventory = inventories
+        .entry(repository_root)
+        .or_insert_with(|| repo.worktree_inventory().map_err(|error| error.to_string()));
+    let inventory = match inventory {
+        Ok(entries) => Ok(entries.as_slice()),
+        Err(error) => Err(error.as_str()),
+    };
+    let (git, git_registered, git_error) = identify_registration(repo.root(), inventory);
 
     // Untracked build output is not work. Counting it would report every
     // checkout that has ever been built as holding something unique, which is
@@ -140,14 +312,28 @@ fn inspect(path: &Path) -> (Option<String>, Option<i64>, WorkState) {
         });
 
     if dirty > 0 {
-        return (branch, idle_days, WorkState::Uncommitted { files: dirty });
+        return WorktreeInspection {
+            branch,
+            idle_days,
+            work: WorkState::Uncommitted { files: dirty },
+            git,
+            git_registered,
+            git_error,
+        };
     }
     let state = match repo.commits_not_on_any_remote() {
         Ok(0) => WorkState::Recoverable,
         Ok(commits) => WorkState::Unpushed { commits },
         Err(_) => WorkState::NotACheckout,
     };
-    (branch, idle_days, state)
+    WorktreeInspection {
+        branch,
+        idle_days,
+        work: state,
+        git,
+        git_registered,
+        git_error,
+    }
 }
 
 /// Classify an enumerated set of worktrees, worst first.
@@ -161,12 +347,26 @@ fn inspect(path: &Path) -> (Option<String>, Option<i64>, WorkState) {
 /// "abandoned" without consulting the broker separately.
 pub fn build(worktrees: &[(String, PathBuf)], live: &BTreeSet<PathBuf>) -> WorktreeReport {
     let mut report = WorktreeReport::default();
+    let mut inventories = InventoryCache::new();
+    let mut inventory_repositories = BTreeMap::new();
     for (repository, path) in worktrees {
         if !path.is_dir() {
             continue;
         }
         let bytes = tree_bytes(path);
-        let (branch, idle_days, work) = inspect(path);
+        let WorktreeInspection {
+            branch,
+            idle_days,
+            work,
+            git,
+            git_registered,
+            git_error,
+        } = inspect(
+            path,
+            repository,
+            &mut inventories,
+            &mut inventory_repositories,
+        );
         report.total_bytes += bytes;
         if work.holds_unique_work() {
             report.unique_work_bytes += bytes;
@@ -180,24 +380,39 @@ pub fn build(worktrees: &[(String, PathBuf)], live: &BTreeSet<PathBuf>) -> Workt
             bytes,
             idle_days,
             work,
+            git,
+            git_registered,
+            git_error,
         });
+    }
+    for (root, inventory) in &inventories {
+        if let (Some(repository), Ok(entries)) = (inventory_repositories.get(root), inventory) {
+            append_prunable_rows(&mut report, repository, entries, live);
+        }
     }
     // Work at risk first, then the largest, then stable by path. A reader
     // scanning from the top sees what they could lose before what they could
     // free -- the inverse of a disk report, deliberately.
-    report.rows.sort_by(|a, b| {
-        b.work
-            .holds_unique_work()
-            .cmp(&a.work.holds_unique_work())
-            .then_with(|| b.bytes.cmp(&a.bytes))
-            .then_with(|| a.path.cmp(&b.path))
-    });
+    sort_report(&mut report);
     report
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn run_git(path: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     fn checkout(dir: &Path, name: &str) -> PathBuf {
         let path = dir.join(name);
@@ -207,21 +422,98 @@ mod tests {
             vec!["config", "user.email", "t@t"],
             vec!["config", "user.name", "t"],
         ] {
-            std::process::Command::new("git")
-                .args(&args)
-                .current_dir(&path)
-                .output()
-                .unwrap();
+            run_git(&path, &args);
         }
         std::fs::write(path.join("file.txt"), "one\n").unwrap();
         for args in [vec!["add", "-A"], vec!["commit", "-qm", "one"]] {
-            std::process::Command::new("git")
-                .args(&args)
-                .current_dir(&path)
-                .output()
-                .unwrap();
+            run_git(&path, &args);
         }
         path
+    }
+
+    #[test]
+    fn inventory_failure_is_distinct_from_an_unregistered_checkout() {
+        let path = Path::new("/repo/checkout");
+        let (state, registered, error) =
+            identify_registration(path, Err("git worktree list timed out"));
+        assert_eq!(state, None);
+        assert_eq!(registered, None);
+        assert_eq!(error.as_deref(), Some("git worktree list timed out"));
+
+        let (state, registered, error) = identify_registration(path, Ok(&[] as &[GitWorktreeInfo]));
+        assert_eq!(state, None);
+        assert_eq!(registered, Some(false));
+        assert_eq!(error, None);
+    }
+
+    #[test]
+    fn report_matches_detached_and_locked_worktree_inventory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let main = checkout(tmp.path(), "main");
+        let linked = tmp.path().join("linked");
+        let linked_arg = linked.to_str().unwrap();
+        run_git(&main, &["worktree", "add", "--detach", linked_arg]);
+        run_git(
+            &main,
+            &[
+                "worktree",
+                "lock",
+                "--reason",
+                "keep for review",
+                linked_arg,
+            ],
+        );
+
+        let report = build(
+            &[
+                ("repo".to_string(), main),
+                ("repo".to_string(), linked.clone()),
+            ],
+            &BTreeSet::new(),
+        );
+        let row = report
+            .rows
+            .iter()
+            .find(|row| same_path(&row.path, &linked))
+            .unwrap();
+        assert_eq!(row.git_registered, Some(true));
+        let git = row.git.as_ref().unwrap();
+        assert!(git.detached);
+        assert!(git.locked);
+        assert_eq!(git.lock_reason.as_deref(), Some("keep for review"));
+    }
+
+    #[test]
+    fn report_includes_missing_prunable_registrations() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let main = checkout(&root, "main");
+        let missing = root.join("removed");
+        let missing_arg = missing.to_str().unwrap();
+        run_git(&main, &["worktree", "add", "--detach", missing_arg]);
+        std::fs::remove_dir_all(&missing).unwrap();
+
+        let inventory = GitRepo::discover(&main)
+            .unwrap()
+            .worktree_inventory()
+            .unwrap();
+        assert!(
+            inventory
+                .iter()
+                .any(|entry| same_path(&entry.path, &missing) && entry.prunable),
+            "fixture should produce a prunable registration: {inventory:?}"
+        );
+
+        let report = build(&[("repo".to_string(), main)], &BTreeSet::new());
+        let row = report
+            .rows
+            .iter()
+            .find(|row| same_path(&row.path, &missing))
+            .unwrap();
+        assert_eq!(row.work, WorkState::PrunableRegistration);
+        assert_eq!(row.bytes, 0);
+        assert_eq!(row.git_registered, Some(true));
+        assert!(row.git.as_ref().unwrap().prunable);
     }
 
     /// A checkout with no remote holds its commits and nothing else does.
