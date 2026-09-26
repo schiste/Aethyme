@@ -59,6 +59,10 @@ arm64 Linux (glibc), and x86-64 Linux (musl, static, for Alpine and other
 non-glibc distributions). A release contains the paired `aethyme` router and
 `aethyme-engine-cli` engine binary.
 
+Windows is not supported natively; run the x86-64 Linux build under WSL2.
+The cost of a native port is scoped in
+[docs/architecture/windows-port.md](packages/aethyme/docs/architecture/windows-port.md).
+
 With Homebrew:
 
 ```bash
