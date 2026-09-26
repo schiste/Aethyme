@@ -1079,6 +1079,62 @@ fn adopt_reuse_sync_refuses_divergence_without_changing_head_or_session() {
     assert_eq!(persisted.diff_base, session.diff_base);
 }
 
+#[test]
+fn finish_retention_policy_keeps_safe_worktrees_when_disabled_or_invalid() {
+    for (policy, warning) in [
+        (
+            "[retention]\nauto_cleanup_worktrees_on_finish = false\n",
+            "automatic finish cleanup is disabled",
+        ),
+        (
+            "[retention]\nschema_version = 99\n",
+            "automatic finish cleanup was skipped",
+        ),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let external_root = tempfile::tempdir().unwrap();
+        init_repo(tmp.path());
+        std::fs::create_dir_all(tmp.path().join(".aethyme")).unwrap();
+        std::fs::write(tmp.path().join(".aethyme/broker.toml"), policy).unwrap();
+
+        let mut broker = Broker::open(tmp.path())
+            .unwrap()
+            .with_worktree_root(external_root.path());
+        let session = broker.start_worktree("keep landed worktree", None).unwrap();
+        let wt = std::path::PathBuf::from(&session.worktree_path);
+        std::fs::write(wt.join("landed.txt"), "delivered\n").unwrap();
+        sh(&wt, &["add", "landed.txt"]);
+        sh(&wt, &["commit", "-qm", "landed work"]);
+        assert!(broker.submit(session.id).unwrap().promoted);
+
+        let finished = broker.finish(session.id).unwrap();
+        assert_eq!(finished.status, FinishStatus::Closed);
+        assert!(finished.cleanup_safe, "{finished:#?}");
+        assert!(finished.cleanup.kept, "{finished:#?}");
+        assert!(!finished.cleanup.attempted, "{finished:#?}");
+        assert!(!finished.cleanup.completed, "{finished:#?}");
+        assert!(wt.exists(), "policy must retain {wt:?}");
+        assert!(ref_exists(
+            tmp.path(),
+            &format!("refs/heads/{}", session.branch)
+        ));
+        assert!(
+            finished
+                .warnings
+                .iter()
+                .any(|message| message.contains(warning)),
+            "{finished:#?}"
+        );
+        assert!(
+            finished
+                .next_commands
+                .iter()
+                .any(|command| command.contains("finish cleanup")),
+            "{finished:#?}"
+        );
+    }
+}
+
 /// The bug: a squash merge puts the session's work on the default branch under
 /// a brand new SHA with no ancestry link, so `finish` counted the session's
 /// commits as unsubmitted forever and the session could never close (#152).
@@ -1099,20 +1155,12 @@ fn a_squash_merged_session_can_be_recorded_and_finished() {
         ],
     );
 
-    let wt = tmp.path().join("squash-wt");
-    sh(
-        tmp.path(),
-        &[
-            "worktree",
-            "add",
-            "-b",
-            "agent/squash",
-            wt.to_str().unwrap(),
-            "main",
-        ],
-    );
-    let mut broker = Broker::open(tmp.path()).unwrap();
-    let session = broker.adopt(&wt, Some("squash task")).unwrap();
+    let external_root = tempfile::tempdir().unwrap();
+    let mut broker = Broker::open(tmp.path())
+        .unwrap()
+        .with_worktree_root(external_root.path());
+    let session = broker.start_worktree("squash task", None).unwrap();
+    let wt = std::path::PathBuf::from(&session.worktree_path);
 
     // Two commits in the session, as a real branch would have.
     std::fs::write(wt.join("feature.txt"), "first\n").unwrap();
@@ -1162,13 +1210,29 @@ fn a_squash_merged_session_can_be_recorded_and_finished() {
     );
 
     let finished = broker.finish(session.id).unwrap();
-    assert_eq!(finished.status, FinishStatus::Closed);
+    assert_eq!(finished.status, FinishStatus::Cleaned);
     assert_eq!(finished.unsubmitted_commits, 0);
     assert_eq!(
         finished
             .representation
-            .and_then(|record| record.representing_commit),
-        Some(squash)
+            .as_ref()
+            .and_then(|record| record.representing_commit.as_deref()),
+        Some(squash.as_str())
+    );
+    assert!(finished.cleanup.completed, "{finished:#?}");
+    assert!(finished.cleanup.reclaimed_bytes > 0, "{finished:#?}");
+    assert!(finished.cleanup.worktree_removed, "{finished:#?}");
+    assert!(finished.cleanup.branch_removed, "{finished:#?}");
+    assert!(!wt.exists(), "landed session worktree remains at {wt:?}");
+    let branch_ref = format!("refs/heads/{}", session.branch);
+    assert!(
+        !std::process::Command::new("git")
+            .current_dir(tmp.path())
+            .args(["show-ref", "--verify", "--quiet", &branch_ref])
+            .status()
+            .unwrap()
+            .success(),
+        "landed session branch remains at {branch_ref}"
     );
 }
 

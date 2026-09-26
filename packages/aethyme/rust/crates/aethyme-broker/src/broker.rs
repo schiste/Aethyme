@@ -7517,6 +7517,13 @@ impl Broker {
             .find(|entry| entry.session_id == session_id);
         let retention = self.cleanup_retention(at_ms)?;
         let retention_warning = cleanup_retention_warning(&retention);
+        // Cleanup is safe only when the repository policy can be read and
+        // explicitly permits automation. A malformed policy therefore keeps
+        // a worktree available for manual review rather than deleting it.
+        let auto_cleanup_policy = crate::load_retention_policy(&self.main_root);
+        let auto_cleanup_enabled = auto_cleanup_policy
+            .as_ref()
+            .is_ok_and(|policy| policy.auto_cleanup_worktrees_on_finish);
         let mut report = FinishReport {
             session_id,
             worktree_path: session.worktree_path.clone(),
@@ -7816,10 +7823,29 @@ impl Broker {
         if options.keep_worktree {
             report.cleanup.kept = true;
         }
-        if report.cleanup_safe && broker_owned && !options.keep_worktree {
+        if report.cleanup_safe && broker_owned && !options.keep_worktree && auto_cleanup_enabled {
             self.run_finish_cleanup(&mut report, &session)?;
             return Ok(report);
         } else if report.cleanup_safe {
+            if broker_owned && !options.keep_worktree && !auto_cleanup_enabled {
+                report.cleanup.kept = true;
+                if auto_cleanup_policy.is_err() {
+                    report.summary = format!(
+                        "session {session_id} closed; worktree retained because retention policy could not be loaded"
+                    );
+                    report.warnings.push(
+                        "automatic finish cleanup was skipped because the repository retention policy could not be loaded"
+                            .into(),
+                    );
+                } else {
+                    report.summary = format!(
+                        "session {session_id} closed; worktree retained by repository policy"
+                    );
+                    report
+                        .warnings
+                        .push("automatic finish cleanup is disabled by repository policy".into());
+                }
+            }
             report
                 .next_commands
                 .push(format!("aethyme broker finish cleanup {session_id}"));
