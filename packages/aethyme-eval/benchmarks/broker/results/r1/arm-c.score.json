@@ -1,0 +1,233 @@
+{
+  "benchmark": "aethyme-broker-p5.6",
+  "arm": "c",
+  "repetition": 1,
+  "root": "/Users/christophehenner/bench-p56/arm-c-r1",
+  "scored_at": "2026-09-26T07:02:19+00:00",
+  "headline": {
+    "wall_time_s": 374.0,
+    "wall_time_source": "operator_log",
+    "tasks_passing_hidden": 12,
+    "tasks_total": 12,
+    "overlaps_resolved": 3,
+    "overlaps_total": 3,
+    "final_main_green": true,
+    "conflicts_caught_before_merge": 2,
+    "broken_merges_reaching_main": 0,
+    "operator_interventions": 1,
+    "agent_turns": 105,
+    "tokens_total": 5766864
+  },
+  "repo": {
+    "landing_ref": "refs/heads/aethyme/integration",
+    "final_sha": "a91ac385e13864f92764b818b988bd6ee41a28e5",
+    "final_visible_suite_pass": true,
+    "hidden_checks": {
+      "t01": {
+        "pass": true
+      },
+      "t02": {
+        "pass": true
+      },
+      "t03": {
+        "pass": true
+      },
+      "t04": {
+        "pass": true
+      },
+      "t05": {
+        "pass": true
+      },
+      "t06": {
+        "pass": true
+      },
+      "t07": {
+        "pass": true
+      },
+      "t08": {
+        "pass": true
+      },
+      "t09": {
+        "pass": true
+      },
+      "t10": {
+        "pass": true
+      },
+      "t11": {
+        "pass": true
+      },
+      "t12": {
+        "pass": true
+      },
+      "overlap:textual": {
+        "pass": true
+      },
+      "overlap:semantic": {
+        "pass": true
+      },
+      "overlap:shared": {
+        "pass": true
+      }
+    },
+    "tasks_passing": 12,
+    "overlaps_passing": 3,
+    "states_source": "reflog",
+    "states": [
+      {
+        "sha": "e1937b47abac024d103c143afa60e50474f7c1c0",
+        "tests_pass": true
+      },
+      {
+        "sha": "f324df362e8322a1862012c82e885b9a288e953d",
+        "tests_pass": true
+      },
+      {
+        "sha": "ec937b6a8a2a3c1da290e0e481032b19e4cf5da2",
+        "tests_pass": true
+      },
+      {
+        "sha": "7c528d4efc597a0596d48c96b2702b3fb1144281",
+        "tests_pass": true
+      },
+      {
+        "sha": "18fd4f03d423582cff66f38109012f3fe086ee78",
+        "tests_pass": true
+      },
+      {
+        "sha": "ea2aad55fa0e8a2d00b0e611985a0689636cba82",
+        "tests_pass": true
+      },
+      {
+        "sha": "2d31a12c232a796fdf7f7e74d0563d6b8bce2a07",
+        "tests_pass": true
+      },
+      {
+        "sha": "890cbec7bd1d756592f03a0c1b7c30b73f52ca64",
+        "tests_pass": true
+      },
+      {
+        "sha": "29df386471ded3ddecd4fc7160e9c5cbb62cab92",
+        "tests_pass": true
+      },
+      {
+        "sha": "7df04d50bb408420c40ce4b7ad8a158edff554ac",
+        "tests_pass": true
+      },
+      {
+        "sha": "6f8e41567ead486b3a9efa542f3c42918da3a052",
+        "tests_pass": true
+      },
+      {
+        "sha": "9c720f5207f96cf773cc3555be4b042b7883dd9a",
+        "tests_pass": true
+      },
+      {
+        "sha": "a91ac385e13864f92764b818b988bd6ee41a28e5",
+        "tests_pass": true
+      }
+    ],
+    "broken_merges_replayed": 0,
+    "red_states": 0
+  },
+  "gatekeeping": {
+    "source": "broker_log.jsonl",
+    "conflicts_caught_before_merge": 2,
+    "breakdown": {
+      "submit_ok": 12,
+      "submit_refused_3": 1,
+      "submit_gate_failed_4": 1,
+      "submit_other": 0
+    },
+    "broker_calls": {
+      "": 4,
+      "advanced": 2,
+      "finish": 12,
+      "hook": 123,
+      "repo": 127,
+      "start": 12,
+      "status": 2,
+      "submit": 14
+    },
+    "entries": 296
+  },
+  "operator": {
+    "count": 1,
+    "by_category": {
+      "env": 1
+    },
+    "by_slot": {
+      "s2": 1
+    },
+    "arm_start": "2026-09-26T06:55:26+00:00",
+    "arm_end": "2026-09-26T07:01:40+00:00"
+  },
+  "telemetry": {
+    "per_slot": {
+      "s1": {
+        "runs": 0,
+        "turns_chau7": 0,
+        "assistant_turns_transcript": 0,
+        "model_calls_native": 38,
+        "tokens": {
+          "cache_read": 3001489,
+          "cache_write": 61435,
+          "input": 76,
+          "output": 10165,
+          "total": 3073165
+        },
+        "tokens_source": "native:claude"
+      },
+      "s2": {
+        "runs": 0,
+        "turns_chau7": 0,
+        "assistant_turns_transcript": 0,
+        "model_calls_native": 14,
+        "tokens": {
+          "cache_read": 851574,
+          "cache_write": 46551,
+          "input": 28,
+          "output": 5568,
+          "total": 903721
+        },
+        "tokens_source": "native:claude"
+      },
+      "s3": {
+        "runs": 0,
+        "turns_chau7": 0,
+        "assistant_turns_transcript": 0,
+        "model_calls_native": 37,
+        "tokens": {
+          "cache_read": 1153792,
+          "cache_write": 0,
+          "input": 78297,
+          "output": 7554,
+          "reasoning": 1518,
+          "total": 1239643
+        },
+        "tokens_source": "native:codex"
+      },
+      "s4": {
+        "runs": 0,
+        "turns_chau7": 0,
+        "assistant_turns_transcript": 0,
+        "model_calls_native": 16,
+        "tokens": {
+          "cache_read": 504192,
+          "cache_write": 0,
+          "input": 42316,
+          "output": 3827,
+          "reasoning": 60,
+          "total": 550335
+        },
+        "tokens_source": "native:codex"
+      }
+    },
+    "totals": {
+      "turns_chau7": 0,
+      "assistant_turns_transcript": 0,
+      "model_calls_native": 105,
+      "tokens_total": 5766864,
+      "slots_missing_tokens": []
+    }
+  }
+}
