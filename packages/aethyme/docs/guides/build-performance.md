@@ -72,7 +72,7 @@ still finds the wrapper. Never put `rustc-wrapper` in the repository's
 To opt out, delete that file, or run a single command with `RUSTC_WRAPPER=`
 (empty) set.
 
-### Cache cap: 2 GiB
+### Cache cap: 4 GiB
 
 The cap is set in sccache's own config file,
 `~/Library/Application Support/Mozilla.sccache/config` on macOS, rather than
@@ -82,18 +82,19 @@ environment variable would have to be exported everywhere.
 
 ```toml
 [cache.disk]
-size = 2147483648    # 2 GiB; least-recently-used entries are evicted
+size = 4294967296    # 4 GiB; least-recently-used entries are evicted
 ```
 
 The cache lives in `~/Library/Caches/Mozilla.sccache`. After you edit the
 config, restart the server with `sccache --stop-server`. The next build starts
 it again.
 
-**Why 2 GiB.** Every dependency of the whole workspace fits in about 0.6 GiB
-(measured 2026-09-26), so 2 GiB leaves room for toolchain and dependency
-updates. Broker gates refuse to run below 8 GiB free, so a larger cap on a
-nearly full disk can starve the gates. Raise `size` only if your disk has
-plenty of room.
+**Why 4 GiB.** One dev build of the workspace's dependencies is about 0.6 GiB,
+but each distinct configuration is cached separately. Dev, test (the gates build
+with `CARGO_INCREMENTAL=0`), release and other repositories each add their own
+entries, and a 2 GiB cap filled within a day (measured 2026-09-26). 4 GiB holds
+the common set. Broker gates refuse to run below 8 GiB free, so don't raise it
+on a nearly full disk: LRU eviction only costs cache misses, never correctness.
 
 ### Check it
 
