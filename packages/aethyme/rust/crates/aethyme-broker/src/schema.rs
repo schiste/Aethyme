@@ -1503,7 +1503,7 @@ mod tests {
         conn
     }
 
-    /// The exact insert a v42 binary (0.8.x) issues for a gate result: it
+    /// The exact insert a v42 binary (0.8.2-0.8.6) issues for a gate result: it
     /// names its columns and knows nothing of the v43 environment columns.
     const V42_GATE_RESULT_INSERT: &str = "INSERT INTO gate_results (gate_name, tree_hash,
              definition_hash, status, failure_class, exit_code, duration_ms, log_path,
@@ -1573,8 +1573,9 @@ mod tests {
     #[test]
     fn v43_is_declared_compatible_so_a_v42_binary_keeps_using_the_database() {
         // The declaration itself: v43 did not raise the minimum. Raising it
-        // would lock every 0.8.x binary and plugin hook out of the shared
-        // database, so doing so must be a deliberate edit of this test.
+        // would lock every 0.8.2+ binary and plugin hook out of this
+        // repository's database (0.8.0/0.8.1 predate the check and already
+        // refuse any newer schema), so doing so must be a deliberate edit.
         assert_eq!(SCHEMA_VERSION, 43);
         assert_eq!(MIN_COMPATIBLE_SCHEMA, 42);
 

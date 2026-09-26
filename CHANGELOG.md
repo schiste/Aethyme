@@ -16,9 +16,10 @@ artifacts and their exact source revision are recorded in each signed
   `gate_outcomes`, in a second `aethyme gate environment:` line at the head
   of each gate log, and after the duration in the gate progress line. Cache
   hits, cancellations and results recorded before the command stage report
-  `null`. Schema bump to 43 is additive and declared compatible, so 0.8.x
+  `null`. Schema bump to 43 is additive and declared compatible, so 0.8.2+
   binaries and plugin hooks keep using a v43 database and leave the new
-  columns NULL.
+  columns NULL. 0.8.0 and 0.8.1 predate the compatibility check and refuse
+  any newer schema; upgrade them before using this repository.
 
 ## [0.8.6] - 2026-09-26
 

@@ -317,8 +317,8 @@ is logical CPUs online (integer, to normalise load), and
 check measured on the gate's checkout filesystem. Each is `null` when the
 platform could not report it; all four are `null` for a cache hit (the
 reused verdict's machine state is not re-reported) and for a result recorded
-before the command stage. `broker gates run --json` outcomes carry the same
-fields.
+before the command stage. `broker gates run --json` and
+`broker advanced gates pre-push --json` outcomes carry the same fields.
 
 `submission_plan` preserves deterministic commit order and separates ownership
 from integration state. Full SHAs are never abbreviated in JSON. `conflicts`
