@@ -206,17 +206,27 @@ than beside any worktree:
 
 `gate_caches` are the candidates a reviewed `gc apply --confirm <digest>`
 removes, interrupted rotations first and then least recently used first. The
-most recently used entry of each cache kind (the name without a trailing
-`-v<N>`) is the one the next gate reuses. It is kept whatever the budget, as
-disposition `active`, unless the plan was made with
-`--include-active-gate-cache`. Such a digest must be applied with the same
-flag, and `include_active` records it. `gate_cache_bytes_budget` applies only
-to the older entries. Held and active entries are outside the budget, so a
-running gate never pushes an idle entry out of it. They
-are part of the authorization digest, sizes and `last_used_at_ms` included, so
-a gate that runs between plan and apply invalidates the digest. The digest
-omits the field when it is empty, so plans with no gate cache candidates keep
-their earlier digests.
+active entry of each cache kind (the kind is the name without a trailing
+`-v<N>`) is the one the next gate reuses. That is the key the repository's
+gate configuration names, or, for a kind the configuration does not name, the
+most recently used entry. It is kept whatever the budget, as disposition
+`active`, unless the plan was made with `--include-active-gate-cache`. Such a
+digest must be applied with the same flag, and `include_active` records it.
+`gate_cache_bytes_budget` applies only to the older entries. Held and active
+entries are outside the budget, so a running gate never pushes an idle entry
+out of it.
+
+Gate cache candidates are part of the authorization digest, sizes and
+`last_used_at_ms` included, so a gate that runs between plan and apply
+invalidates the digest. A plan resumed from its journal has no fresh digest to
+compare, so `gc apply` re-checks each entry's size and `last_used_at_ms`
+against the plan under the entry's lease. It leaves an entry that changed in
+place and reports it in `failures`. The unattended resume on broker open never
+reclaims gate cache entries: the journal stays incomplete and
+`recovery_action` names the `gc apply --confirm` that finishes it. The digest
+omits `gate_caches` and `policy.gate_cache_bytes_budget` when there are no
+gate cache candidates, so such a plan keeps the digest it had before gate
+caches were inventoried.
 
 `gate_cache` is reporting only and outside the digest. It is `null` when the
 per-user cache directory cannot be resolved. `disposition` is one of
@@ -224,7 +234,8 @@ per-user cache directory cannot be resolved. `disposition` is one of
 tolerate new values. An entry is `held`, and is never proposed, while a
 non-released host resource lease names it (`aethyme-gate-cache:<repository
 key>:<cache_key>`), while a gate pidfile names a live process, while a gate
-owner lock is held, or when the lease registry cannot be read. `holders` lists
+owner lock is held, or when the lease registry is absent or cannot be read.
+`gc apply` never creates a registry. `holders` lists
 the repository-wide witnesses, which are pidfiles and owner locks. Other
 repositories' gate caches are never inventoried. `estimated_bytes`,
 `last_used_at_ms`, and `age_days` are omitted for an entry that was not

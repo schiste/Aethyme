@@ -32,7 +32,7 @@ mod clock;
 mod disk_headroom;
 pub mod exit_status;
 pub use disk_headroom::{
-    DEFAULT_GATE_HEADROOM_BYTES, available_bytes, refusal as disk_headroom_refusal,
+    DEFAULT_GATE_HEADROOM_BYTES, GateCacheUsage, available_bytes, refusal as disk_headroom_refusal,
     refusal_with_gate_cache as disk_headroom_refusal_with_gate_cache,
 };
 pub mod cli;

@@ -116,6 +116,26 @@ pub(crate) fn cache_kind(name: &str) -> &str {
     if stem.is_empty() { name } else { stem }
 }
 
+/// `Err` naming the path unless the lease registry exists as a file.
+fn require_registry(registry: &Path) -> Result<(), String> {
+    match std::fs::metadata(registry) {
+        Ok(metadata) if metadata.is_file() => Ok(()),
+        Ok(_) => Err(format!(
+            "lease registry at {} is not a file",
+            registry.display()
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(format!(
+            "lease registry not found at {}; a gate cache entry exists, so a gate took a \
+             lease in some registry this process cannot see",
+            registry.display()
+        )),
+        Err(error) => Err(format!(
+            "lease registry at {} cannot be read: {error}",
+            registry.display()
+        )),
+    }
+}
+
 fn days_between(now: i64, earlier: i64) -> u32 {
     u32::try_from(now.saturating_sub(earlier).max(0) / 86_400_000).unwrap_or(u32::MAX)
 }
@@ -123,6 +143,12 @@ fn days_between(now: i64, earlier: i64) -> u32 {
 /// Leases in the host registry naming one of this repository's gate caches,
 /// keyed by cache key. `Err` when the registry cannot be read, which holds
 /// every entry: a registry nobody can read is not evidence that no gate runs.
+///
+/// An *absent* registry is an error too. Every gate cache entry was created
+/// by a gate that first took a lease in it, so an entry without a registry
+/// means this process is looking at a different registry than the gates use
+/// (another `AETHYME_HOST_STATE_DIR`, say) -- not that no gate holds anything.
+/// Read-only opening would otherwise answer with an empty in-memory registry.
 fn cache_leases(
     location: &GateCacheLocation,
 ) -> Result<std::collections::BTreeMap<String, Vec<String>>, String> {
@@ -131,6 +157,7 @@ fn cache_leases(
         .registry
         .as_deref()
         .ok_or_else(|| "the host state directory cannot be resolved".to_string())?;
+    require_registry(registry)?;
     let coordinator = crate::HostResourceCoordinator::open_read_only(registry)
         .map_err(|error| error.to_string())?;
     let leases = coordinator.list(false).map_err(|error| error.to_string())?;
@@ -162,15 +189,29 @@ fn cache_leases(
 /// size records the last full audit left; an entry with no size is reported
 /// as unmeasured and never proposed, because a budget cannot be applied to a
 /// size nobody knows.
+/// What decides which gate cache entries a plan keeps.
+pub(crate) struct KeepRule<'a> {
+    /// `gate_cache_bytes_budget`: bytes of older, idle entries to keep.
+    pub(crate) budget_bytes: u64,
+    /// `--include-active-gate-cache`: propose the active entries too.
+    pub(crate) include_active: bool,
+    /// Managed cache keys the repository's gate configuration names.
+    pub(crate) configured_keys: &'a std::collections::BTreeSet<String>,
+}
+
 pub(crate) fn inspect(
     main_root: &Path,
     location: &GateCacheLocation,
-    budget_bytes: u64,
-    include_active: bool,
+    rule: KeepRule<'_>,
     evaluated_at: i64,
     scan: crate::SizeScan,
     records: &mut crate::measurement::SizeRecords,
 ) -> (GcGateCacheInventory, Vec<GcGateCacheCandidate>) {
+    let KeepRule {
+        budget_bytes,
+        include_active,
+        configured_keys,
+    } = rule;
     let mut holders = crate::gates::running_gate_evidence(main_root);
     let leases = match cache_leases(location) {
         Ok(leases) => leases,
@@ -255,8 +296,29 @@ pub(crate) fn inspect(
     // that kind will open. Removing it frees nothing lasting -- the next gate
     // rebuilds it at the same size -- and turns that gate into a cold build.
     // So it is kept whatever the budget, unless the operator opts in.
+    //
+    // Which entry that is comes from the gate configuration first: a kind the
+    // configuration names is active under the configured key, however its
+    // modification times read -- a link created inside an old generation must
+    // not make it look newer than the one gates actually open. Only a kind
+    // the configuration does not name falls back to the most recent use.
     let mut newest = std::collections::BTreeMap::<String, (i64, String)>::new();
+    let configured_kinds = configured_keys
+        .iter()
+        .map(|key| cache_kind(key).to_string())
+        .collect::<std::collections::BTreeSet<_>>();
+    for key in configured_keys {
+        if entries
+            .iter()
+            .any(|entry| entry.entry == *key && entry.last_used_at_ms.is_some())
+        {
+            newest.insert(cache_kind(key).to_string(), (i64::MAX, key.clone()));
+        }
+    }
     for entry in &entries {
+        if configured_kinds.contains(cache_kind(&entry.entry)) {
+            continue;
+        }
         let (Some(used), None) = (entry.last_used_at_ms, retired_rotation(&entry.entry)) else {
             continue;
         };
@@ -462,6 +524,9 @@ pub(crate) fn reclaim_in(
         ));
     }
 
+    // `open` would create a missing registry, handing gc a lease in a
+    // registry no gate reads and proving nothing.
+    require_registry(registry).map_err(|reason| format!("{}: {reason}", candidate.path))?;
     let mut coordinator =
         crate::HostResourceCoordinator::open(registry).map_err(|error| error.to_string())?;
     let request = crate::HostResourceRequest {
@@ -512,6 +577,26 @@ pub(crate) fn reclaim_in(
             evidence.join("; ")
         ));
     }
+    // The entry must still be the one the operator reviewed. A gate that ran
+    // since the plan -- or since a journal recorded it -- changed its last use
+    // or its size, and removing it now would discard a cache that became warm
+    // again. Checked under the lease, so no gate can change it after this.
+    let current_used = last_used_at_ms(&path);
+    let current_bytes = directory_size_without_following_links(&path).ok();
+    if current_used != Some(candidate.last_used_at_ms)
+        || current_bytes != Some(candidate.estimated_bytes)
+    {
+        release(&mut coordinator);
+        return Err(format!(
+            "{}: changed since the plan (last used {:?} -> {:?}, {} -> {:?} bytes); it was \
+             left in place, review a new GC plan",
+            candidate.path,
+            candidate.last_used_at_ms,
+            current_used,
+            candidate.estimated_bytes,
+            current_bytes
+        ));
+    }
     let condemned = if retired.is_some() {
         path
     } else {
@@ -528,7 +613,7 @@ pub(crate) fn reclaim_in(
         aside
     };
     release(&mut coordinator);
-    let bytes = directory_size_without_following_links(&condemned).unwrap_or(0);
+    let bytes = candidate.estimated_bytes;
     match remove_condemned_tree(&condemned, None, deadline) {
         Ok(TreeRemoval::Complete) => Ok(GateCacheReclaim::Removed(bytes)),
         Ok(TreeRemoval::Interrupted) => Ok(GateCacheReclaim::Interrupted),
@@ -555,10 +640,13 @@ mod tests {
         let root = tmp.path().join("cache/gates/rk");
         std::fs::create_dir_all(root.join(entry).join("debug")).unwrap();
         std::fs::write(root.join(entry).join("debug/blob"), vec![b'x'; bytes]).unwrap();
+        let registry = tmp.path().join("state/host-resources.db");
+        // Gates create the registry before any cache entry exists.
+        crate::HostResourceCoordinator::open(&registry).unwrap();
         let location = GateCacheLocation {
             root,
             repository_key: "rk".into(),
-            registry: Some(tmp.path().join("state/host-resources.db")),
+            registry: Some(registry),
         };
         Fixture {
             _tmp: tmp,
@@ -577,11 +665,169 @@ mod tests {
                 .join(entry)
                 .to_string_lossy()
                 .into_owned(),
-            estimated_bytes: 0,
-            last_used_at_ms: 0,
+            // What a plan measured a moment ago.
+            estimated_bytes: directory_size_without_following_links(
+                &fixture.location.root.join(entry),
+            )
+            .unwrap_or(0),
+            last_used_at_ms: last_used_at_ms(&fixture.location.root.join(entry)).unwrap_or(0),
             age_days: 0,
             reason: String::new(),
         }
+    }
+
+    fn inspect_fixture(
+        fixture: &Fixture,
+        configured: &[&str],
+    ) -> (GcGateCacheInventory, Vec<GcGateCacheCandidate>) {
+        let mut records = crate::measurement::SizeRecords::default();
+        inspect(
+            &fixture.main_root,
+            &fixture.location,
+            KeepRule {
+                budget_bytes: 0,
+                include_active: false,
+                configured_keys: &configured.iter().map(|key| key.to_string()).collect(),
+            },
+            crate::clock::epoch_ms(),
+            crate::SizeScan::Measure,
+            &mut records,
+        )
+    }
+
+    /// Finding 1: an absent registry is a registry this process cannot see,
+    /// not proof that no gate holds anything. Every entry is held with the
+    /// path named, and apply neither removes the entry nor creates a
+    /// registry as a side effect.
+    #[test]
+    fn an_absent_registry_holds_every_entry_and_apply_creates_none() {
+        let mut fixture = fixture("rust-workspace-v2", 10);
+        std::fs::create_dir_all(fixture.location.root.join("rust-workspace-v3")).unwrap();
+        let absent = fixture.location.root.join("elsewhere/host-resources.db");
+        fixture.location.registry = Some(absent.clone());
+        let (inventory, candidates) = inspect_fixture(&fixture, &[]);
+        assert!(candidates.is_empty(), "{candidates:?}");
+        assert!(
+            inventory
+                .entries
+                .iter()
+                .all(|entry| entry.disposition == GcGateCacheDisposition::Held),
+            "{inventory:#?}"
+        );
+        assert!(
+            inventory.holders.iter().any(|holder| holder
+                .contains(&format!("lease registry not found at {}", absent.display()))),
+            "{:?}",
+            inventory.holders
+        );
+        let error = reclaim_in(
+            &fixture.main_root,
+            &fixture.location,
+            &candidate(&fixture, "rust-workspace-v2"),
+            None,
+        )
+        .unwrap_err();
+        assert!(error.contains("lease registry not found"), "{error}");
+        assert!(!absent.exists(), "apply must not create a registry");
+        assert!(
+            fixture
+                .location
+                .root
+                .join("rust-workspace-v2/debug/blob")
+                .is_file()
+        );
+    }
+
+    /// Finding 2: an entry that changed after the plan -- a gate ran in it,
+    /// so its size or last use moved -- is not the entry that was reviewed.
+    #[test]
+    fn apply_leaves_an_entry_that_changed_since_the_plan() {
+        let grown = fixture("rust-workspace-v2", 1000);
+        let reviewed = candidate(&grown, "rust-workspace-v2");
+        std::fs::write(
+            grown.location.root.join("rust-workspace-v2/debug/more"),
+            vec![b'y'; 10],
+        )
+        .unwrap();
+        let error = reclaim_in(&grown.main_root, &grown.location, &reviewed, None).unwrap_err();
+        assert!(error.contains("changed since the plan"), "{error}");
+        assert!(
+            grown
+                .location
+                .root
+                .join("rust-workspace-v2/debug/more")
+                .is_file()
+        );
+
+        // Same size, later use: still not the reviewed entry.
+        let used = fixture("rust-workspace-v2", 1000);
+        let mut reviewed = candidate(&used, "rust-workspace-v2");
+        reviewed.last_used_at_ms -= 60_000;
+        let error = reclaim_in(&used.main_root, &used.location, &reviewed, None).unwrap_err();
+        assert!(error.contains("changed since the plan"), "{error}");
+        assert!(
+            used.location
+                .root
+                .join("rust-workspace-v2/debug/blob")
+                .is_file()
+        );
+    }
+
+    /// Finding 3: the configured key is the active cache of its kind, even
+    /// when an older generation carries the newer modification time.
+    #[test]
+    fn the_configured_key_is_active_whatever_the_mtimes_say() {
+        let fixture = fixture("rust-workspace-v3", 10);
+        let old = fixture.location.root.join("rust-workspace-v3");
+        std::fs::File::open(old.join("debug/blob"))
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(86_400))
+            .unwrap();
+        std::fs::File::open(old.join("debug"))
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(86_400))
+            .unwrap();
+        std::fs::File::open(&old)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(86_400))
+            .unwrap();
+        // An older generation touched just now.
+        std::fs::create_dir_all(fixture.location.root.join("rust-workspace-v2/debug")).unwrap();
+        std::fs::write(
+            fixture.location.root.join("rust-workspace-v2/debug/link"),
+            "x",
+        )
+        .unwrap();
+
+        let (inventory, _) = inspect_fixture(&fixture, &["rust-workspace-v3"]);
+        let disposition = |name: &str| {
+            inventory
+                .entries
+                .iter()
+                .find(|entry| entry.entry == name)
+                .unwrap()
+                .disposition
+        };
+        assert_eq!(
+            disposition("rust-workspace-v3"),
+            GcGateCacheDisposition::Active
+        );
+        assert_eq!(
+            disposition("rust-workspace-v2"),
+            GcGateCacheDisposition::Reclaimable
+        );
+
+        // With no configuration the fallback is most recent use.
+        let (inventory, _) = inspect_fixture(&fixture, &[]);
+        assert_eq!(
+            inventory
+                .entries
+                .iter()
+                .find(|entry| entry.entry == "rust-workspace-v2")
+                .unwrap()
+                .disposition,
+            GcGateCacheDisposition::Active
+        );
     }
 
     fn hold_lease(fixture: &Fixture, cache_key: &str) -> crate::HostResourceCoordinator {
@@ -735,8 +981,11 @@ mod tests {
         let (inventory, candidates) = inspect(
             &fixture.main_root,
             &fixture.location,
-            0,
-            false,
+            KeepRule {
+                budget_bytes: 0,
+                include_active: false,
+                configured_keys: &Default::default(),
+            },
             crate::clock::epoch_ms(),
             crate::SizeScan::Measure,
             &mut records,

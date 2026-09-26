@@ -849,8 +849,9 @@ impl GcPlan {
             worktrees: &'a [GcWorktreeCandidate],
             artifacts: &'a [GcArtifactCandidate],
             orphans: &'a [GcOrphanCandidate],
-            // Omitted when empty so a plan with no gate cache candidates keeps
-            // the digest it had before gate caches were inventoried.
+            // Omitted when empty, like the budget below, so a plan with no
+            // gate cache candidates keeps the digest it had before gate
+            // caches were inventoried.
             #[serde(skip_serializing_if = "<[_]>::is_empty")]
             gate_caches: &'a [GcGateCacheCandidate],
             blockers: &'a [GcBlocker],
@@ -870,15 +871,99 @@ impl GcPlan {
             checkpoint_pin_releases: &self.checkpoint_pin_releases,
             publication_exposure_expiries: &self.publication_exposure_expiries,
         })?;
+        let bytes = if self.gate_caches.is_empty() {
+            without_gate_cache_budget(bytes, self.policy.gate_cache_bytes_budget)
+        } else {
+            bytes
+        };
         self.digest = format!("{:x}", Sha256::digest(bytes));
         Ok(())
     }
+}
+
+/// The authorization bytes with `policy.gate_cache_bytes_budget` taken out.
+///
+/// The budget decides only which gate cache entries are candidates. With none,
+/// it authorizes nothing, and leaving it in would change the digest of every
+/// plan -- including one reviewed with a binary that predates the field --
+/// for a setting that removes nothing. It is the last field of
+/// [`RetentionPolicy`] and `rows` follows `policy`, so the serialized form is
+/// exactly `,"gate_cache_bytes_budget":N},"rows":`; the struct order is fixed
+/// at compile time and a test pins it.
+fn without_gate_cache_budget(bytes: Vec<u8>, budget: u64) -> Vec<u8> {
+    let needle = format!(r#","gate_cache_bytes_budget":{budget}}},"rows":"#);
+    let text = String::from_utf8(bytes).expect("serde_json writes UTF-8");
+    text.replacen(&needle, r#"},"rows":"#, 1).into_bytes()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    fn empty_plan(policy: RetentionPolicy) -> GcPlan {
+        serde_json::from_value(serde_json::json!({
+            "schema_version": 2, "digest": "", "evaluated_at": 0,
+            "policy": policy, "rows": [], "files": [], "worktrees": [],
+            "artifacts": [], "orphans": [], "blockers": [],
+            "estimated_reclaimable_bytes": 0, "estimated_retained_bytes": 0,
+            "estimated_blocked_bytes": 0,
+        }))
+        .unwrap()
+    }
+
+    /// Without gate cache candidates the budget authorizes nothing, so it
+    /// must not move the digest -- and the digest is exactly the one a policy
+    /// without the field produces, which is what an older binary computed.
+    #[test]
+    fn the_gate_cache_budget_leaves_a_plan_without_gate_caches_digest_alone() {
+        let mut small = empty_plan(RetentionPolicy {
+            gate_cache_bytes_budget: 1,
+            ..RetentionPolicy::default()
+        });
+        let mut large = empty_plan(RetentionPolicy {
+            gate_cache_bytes_budget: 1 << 40,
+            ..RetentionPolicy::default()
+        });
+        small.finish_digest().unwrap();
+        large.finish_digest().unwrap();
+        assert_eq!(small.digest, large.digest);
+
+        // Only the key order of the struct matters here; the reference is
+        // rebuilt from the struct's own serialization with the field removed.
+        let policy_text = serde_json::to_string(&RetentionPolicy::default()).unwrap();
+        let stripped = policy_text.replacen(
+            &format!(
+                r#","gate_cache_bytes_budget":{}"#,
+                RetentionPolicy::default().gate_cache_bytes_budget
+            ),
+            "",
+            1,
+        );
+        assert_ne!(policy_text, stripped, "the field must be last and present");
+        let legacy = format!(
+            r#"{{"schema_version":2,"policy":{stripped},"rows":[],"files":[],"worktrees":[],"artifacts":[],"orphans":[],"blockers":[],"checkpoint_pin_releases":[],"publication_exposure_expiries":[]}}"#
+        );
+        let mut default = empty_plan(RetentionPolicy::default());
+        default.finish_digest().unwrap();
+        assert_eq!(default.digest, format!("{:x}", Sha256::digest(legacy)));
+
+        // With a candidate the budget is part of what was authorized.
+        let candidate = GcGateCacheCandidate {
+            entry: "rust-v2".into(),
+            cache_key: "rust-v2".into(),
+            path: "/c/rust-v2".into(),
+            estimated_bytes: 1,
+            last_used_at_ms: 1,
+            age_days: 0,
+            reason: String::new(),
+        };
+        small.gate_caches = vec![candidate.clone()];
+        large.gate_caches = vec![candidate];
+        small.finish_digest().unwrap();
+        large.finish_digest().unwrap();
+        assert_ne!(small.digest, large.digest);
+    }
 
     #[test]
     fn missing_config_uses_conservative_bounded_defaults() {

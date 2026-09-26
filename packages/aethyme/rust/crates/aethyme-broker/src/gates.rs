@@ -2266,16 +2266,26 @@ fn run_gate_command(
     if crate::disk_headroom_refusal(available, crate::DEFAULT_GATE_HEADROOM_BYTES).is_some() {
         // Sized only once refusing: the walk costs seconds on a warm cache,
         // which a gate about to fail can afford and one about to run cannot.
-        let gate_cache_root = context
-            .managed_cache
-            .and_then(|cache| cache.directory.parent().map(Path::to_path_buf));
-        let gate_cache = gate_cache_root
-            .as_deref()
-            .and_then(|root| directory_usage(root).ok().map(|bytes| (root, bytes)));
+        let measured = context.managed_cache.and_then(|cache| {
+            let root = cache.directory.parent()?;
+            Some((
+                root,
+                directory_usage(root).ok()?,
+                cache.provenance.key.as_str(),
+                directory_usage(&cache.directory).unwrap_or(0),
+            ))
+        });
         let refusal = crate::disk_headroom_refusal_with_gate_cache(
             available,
             crate::DEFAULT_GATE_HEADROOM_BYTES,
-            gate_cache,
+            measured.map(
+                |(root, total_bytes, active_key, active_bytes)| crate::GateCacheUsage {
+                    root,
+                    total_bytes,
+                    active_key,
+                    active_bytes,
+                },
+            ),
         )
         .unwrap_or_default();
         return Err(std::io::Error::new(

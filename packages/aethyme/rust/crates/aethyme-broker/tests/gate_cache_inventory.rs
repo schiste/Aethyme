@@ -278,6 +278,9 @@ fn world() -> World {
     world.other_repository = world.cache.join("gates/another-repository/cold");
     filled(&world.other_repository, 3000);
     age(&world.other_repository, DAY * 30);
+    // A gate created the registry when it first took a cache lease; gc treats
+    // a missing one as a registry it cannot see and holds everything.
+    drop(world.registry());
     world
 }
 
@@ -664,4 +667,82 @@ fn reported_sizes_match_what_apply_deletes() {
     assert_eq!(size(&world.gates.join("rust-workspace-v3")), 2000);
     assert_eq!(size(&world.gates.join("py-tools-v1")), 800);
     assert_eq!(std::fs::read_dir(&world.gates).unwrap().count(), 2);
+}
+
+/// Finding 2: the journal is resumed unattended on every broker open, inside
+/// a startup budget. Gate caches are not reclaimed there -- re-proving one
+/// walks it -- and an operator's resume re-checks each entry against the
+/// plan, leaving one a gate used since then.
+#[test]
+fn a_resumed_journal_never_removes_a_gate_cache_unattended_or_changed() {
+    let world = world();
+    // The largest startup budget the policy allows, so nothing but the rule
+    // keeps the unattended resume away from the gate cache.
+    let config = world.repo.join(".aethyme/broker.toml");
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str("startup_budget_ms = 5000\n");
+    std::fs::write(&config, text).unwrap();
+    let plan = world.plan();
+    assert_eq!(candidate_entries(&plan).len(), 3);
+
+    // The journal an interrupted `gc apply --confirm` leaves behind.
+    let journal = world.repo.join(".aethyme/gc-journal.json");
+    std::fs::write(
+        &journal,
+        serde_json::to_vec(&serde_json::json!({
+            "schema_version": plan["schema_version"],
+            "digest": plan["digest"],
+            "evaluated_at": plan["evaluated_at"],
+            "policy": plan["policy"],
+            "remaining_rows": [],
+            "remaining_files": [],
+            "remaining_worktrees": [],
+            "remaining_gate_caches": plan["gate_caches"],
+            "rows_removed": 0,
+            "files_completed": [],
+            "sessions_cleaned": [],
+            "reclaimed_bytes": 0,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    // Any command that opens the broker resumes the journal.
+    let opened = world.run(&["status", "--json"]);
+    assert!(
+        opened.status.success(),
+        "{}",
+        String::from_utf8_lossy(&opened.stderr)
+    );
+    assert!(journal.exists(), "the gate caches are still owed");
+    for name in ["rust-workspace-v1", "rust-workspace-v2"] {
+        assert!(world.gates.join(name).is_dir(), "{name} removed unattended");
+    }
+    assert!(world.gates.join(&world.retired).is_dir());
+
+    // A gate uses -v2 before the operator resumes: it is left in place.
+    std::fs::write(
+        world.gates.join("rust-workspace-v2/debug/new"),
+        vec![b'y'; 100],
+    )
+    .unwrap();
+    let output = world.apply(plan["digest"].as_str().unwrap());
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        report["failures"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|failure| failure.as_str().unwrap().contains("changed since the plan")),
+        "{report:#}"
+    );
+    assert_eq!(size(&world.gates.join("rust-workspace-v2")), 3100);
+    assert!(!world.gates.join("rust-workspace-v1").exists());
+    assert!(!world.gates.join(&world.retired).exists());
+    assert_eq!(report["reclaimed_bytes"], 1500, "{report:#}");
 }

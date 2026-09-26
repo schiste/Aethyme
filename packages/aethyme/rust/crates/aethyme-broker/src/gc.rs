@@ -1151,13 +1151,26 @@ impl Broker {
         // Rooted at the per-user cache directory, not at any worktree: that
         // is why no total here ever counted it (#295).
         let mut size_records = crate::measurement::load_size_records(&main_root);
+        // A configuration that does not load names no key, which leaves every
+        // kind to the most-recent-use fallback.
+        let configured_keys = crate::gates::load_gates(&main_root)
+            .map(|gates| {
+                gates
+                    .into_iter()
+                    .filter_map(|gate| gate.managed_cache.map(|cache| cache.key))
+                    .collect()
+            })
+            .unwrap_or_default();
         let (gate_cache, gate_caches) = match crate::gate_cache_gc::location(&main_root) {
             Some(location) => {
                 let (inventory, candidates) = crate::gate_cache_gc::inspect(
                     &main_root,
                     &location,
-                    policy.gate_cache_bytes_budget,
-                    include_active_gate_cache,
+                    crate::gate_cache_gc::KeepRule {
+                        budget_bytes: policy.gate_cache_bytes_budget,
+                        include_active: include_active_gate_cache,
+                        configured_keys: &configured_keys,
+                    },
                     evaluated_at,
                     scan,
                     &mut size_records,
@@ -2097,9 +2110,19 @@ impl Broker {
         }
 
         // Each entry re-proves at removal that no gate uses it, taking the
-        // entry's own lease to do so; one that fails is retained and the run
-        // carries on, because gate cache entries share no fate (#295).
-        while !journal.remaining_gate_caches.is_empty() && !check_deadline(deadline) {
+        // entry's own lease to do so, and that it is still the entry the plan
+        // measured; one that fails is retained and the run carries on,
+        // because gate cache entries share no fate (#295).
+        //
+        // Only an operator-invoked apply reaches this. Re-proving an entry
+        // walks it -- gigabytes -- which no startup budget absorbs, and the
+        // unattended resume on broker open must not be what decides to
+        // discard a cache. A journal that still lists gate caches stays
+        // incomplete and names the `gc apply --confirm` that finishes it.
+        while budget_ms.is_none()
+            && !journal.remaining_gate_caches.is_empty()
+            && !check_deadline(deadline)
+        {
             let candidate = journal.remaining_gate_caches[0].clone();
             match crate::gate_cache_gc::reclaim(&main_root, &candidate, deadline) {
                 Ok(crate::gate_cache_gc::GateCacheReclaim::Removed(bytes)) => {
