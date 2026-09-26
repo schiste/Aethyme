@@ -400,7 +400,10 @@ fn auto_promotion_releases_the_verification_slot_before_requeue() {
         if let Some(status) = child.try_wait().unwrap() {
             break status;
         }
-        if started.elapsed() >= Duration::from_secs(10) {
+        // 60 s, not 10: a real deadlock never finishes, so this still
+        // catches it, while a full submit subprocess on a machine at load
+        // average 50-100 took longer than 10 s and failed as a false deadlock.
+        if started.elapsed() >= Duration::from_secs(60) {
             child.kill().unwrap();
             child.wait().unwrap();
             panic!("concurrent auto-promotion deadlocked on the verification slot");
