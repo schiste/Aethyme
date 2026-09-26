@@ -2445,6 +2445,27 @@ mod git_program_tests {
         path
     }
 
+    /// `porcelain_probe` on a wrapper this test just wrote. On Linux a sibling
+    /// test that forks while the wrapper's write handle is still open holds
+    /// that descriptor until its child execs, and executing the wrapper in
+    /// that window fails with ETXTBSY ("Text file busy"). That is a property
+    /// of the test harness, not of the probe, so retry only that error.
+    fn probe(path: &Path) -> PorcelainProbe {
+        let mut attempts = 0;
+        loop {
+            let result = porcelain_probe(path);
+            let busy = matches!(
+                &result,
+                PorcelainProbe::Unusable { reason } if reason.contains("Text file busy")
+            );
+            attempts += 1;
+            if !busy || attempts >= 50 {
+                return result;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
     /// A wrapper that prints only git's own bytes and lies in its exit code:
     /// `git diff --quiet` always succeeds. This is #178's wrapper reduced to
     /// the one behaviour that matters, and it is exactly what a probe reading
@@ -2486,7 +2507,7 @@ exit $status
         };
         let dir = tempfile::tempdir().expect("tempdir");
         let path = wrapper(dir.path(), &real, false);
-        assert_eq!(porcelain_probe(&path), PorcelainProbe::Undecorated);
+        assert_eq!(probe(&path), PorcelainProbe::Undecorated);
     }
 
     /// The #176 wrapper: six bytes on a clean repository, which made every
@@ -2501,7 +2522,7 @@ exit $status
         let dir = tempfile::tempdir().expect("tempdir");
         let path = wrapper(dir.path(), &real, true);
         assert_eq!(
-            porcelain_probe(&path),
+            probe(&path),
             PorcelainProbe::Decorated { bytes: 6 },
             "`ok \u{2713}\\n` is six bytes, and none of them are a porcelain entry"
         );
@@ -2520,7 +2541,7 @@ exit $status
         };
         let dir = tempfile::tempdir().expect("tempdir");
         let path = quiet_rewriting_wrapper(dir.path(), &real);
-        match porcelain_probe(&path) {
+        match probe(&path) {
             PorcelainProbe::StatusRewritten { detail } => assert!(
                 detail.contains("where git exits 1"),
                 "the rejection should name the direction that costs work: {detail}"
@@ -2563,7 +2584,7 @@ exit $status
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
                 .expect("chmod wrapper");
         }
-        match porcelain_probe(&path) {
+        match probe(&path) {
             PorcelainProbe::StatusRewritten { detail } => assert!(
                 detail.contains("where git exits 0"),
                 "the unmodified case should be the one that fired: {detail}"
@@ -2616,7 +2637,7 @@ done
 exec "{real}" "$@"
 "#,
         );
-        match porcelain_probe(&path) {
+        match probe(&path) {
             PorcelainProbe::StatusRewritten { detail } => assert!(
                 detail.contains("look identical"),
                 "the rejection should name the consequence, not just the bytes: {detail}"
@@ -2651,7 +2672,7 @@ exit $status
 "#,
         );
         assert_eq!(
-            porcelain_probe(&path),
+            probe(&path),
             PorcelainProbe::Decorated { bytes: 2 },
             "a --quiet that writes two bytes to the broker's stdout is not quiet"
         );
