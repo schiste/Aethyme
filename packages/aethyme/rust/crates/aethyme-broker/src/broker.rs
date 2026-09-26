@@ -3868,7 +3868,15 @@ impl Broker {
             .into_iter()
             .map(|(path, label)| (label, path))
             .collect();
-        Ok(crate::build_worktree_report(&worktrees, &live))
+        let mut report = crate::build_worktree_report(&worktrees, &live);
+        let registrations = self.repo.worktree_inventory()?;
+        crate::append_prunable_registrations(
+            &mut report,
+            &plan.repository_key,
+            &registrations,
+            &live,
+        );
+        Ok(report)
     }
 
     /// Return overlaps from the persisted lease snapshot without recomputing

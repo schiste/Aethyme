@@ -597,15 +597,14 @@ pub(super) fn render_worktree_report(report: &crate::WorktreeReport) {
             }
             crate::WorkState::Recoverable => "recoverable".to_string(),
             crate::WorkState::NotACheckout => "not a checkout".to_string(),
+            crate::WorkState::PrunableRegistration => "prunable registration".to_string(),
         };
         let idle = row
             .idle_days
             .map(|days| format!("{days}d idle"))
             .unwrap_or_else(|| "-".to_string());
-        let git = row
-            .git
-            .as_ref()
-            .map(|git| {
+        let git = match (row.git.as_ref(), row.git_registered, row.git_error.as_ref()) {
+            (Some(git), _, _) => {
                 let mut flags = Vec::new();
                 if git.detached {
                     flags.push("detached");
@@ -621,8 +620,14 @@ pub(super) fn render_worktree_report(report: &crate::WorktreeReport) {
                 } else {
                     format!("  [git: {}]", flags.join(", "))
                 }
-            })
-            .unwrap_or_else(|| "  [git state unknown]".to_string());
+            }
+            (None, Some(false), _) => "  [git: unregistered]".to_string(),
+            (None, _, Some(error)) => {
+                let reason = error.split_whitespace().collect::<Vec<_>>().join(" ");
+                format!("  [git state unknown: {reason}]")
+            }
+            _ => String::new(),
+        };
         out!(
             "  {:<22} {:>9}  {:<26} {:<10} {}{}{}",
             truncate(&row.repository, 22),
