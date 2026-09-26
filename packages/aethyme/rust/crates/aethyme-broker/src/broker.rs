@@ -6578,6 +6578,15 @@ impl Broker {
             .then_some((remote_ref, remote_tip))
     }
 
+    fn remote_tracking_default_tip(&self) -> Option<String> {
+        let head_ref = self.repo.symbolic_ref("refs/remotes/origin/HEAD")?;
+        let branch = head_ref.strip_prefix("refs/remotes/origin/")?;
+        if branch.is_empty() || branch == "HEAD" {
+            return None;
+        }
+        self.repo.resolve_ref(&head_ref)
+    }
+
     /// The commit publication actually targets, and a label naming it.
     ///
     /// `head_commit()` is whatever branch happens to be checked out, which is
@@ -7616,7 +7625,16 @@ impl Broker {
         // squash rewrites the SHA. A recorded representation is the evidence
         // that it landed (#152); without it the session can never close.
         report.representation = self.store.session_representation(session_id, &head)?;
-        let head_is_delivered = submitted_head_is_delivered || report.representation.is_some();
+        let remote_default_tip = self.remote_tracking_default_tip();
+        let head_is_on_remote_default = remote_default_tip
+            .as_deref()
+            .is_some_and(|tip| self.repo.is_ancestor(&head, tip));
+        if head_is_on_remote_default {
+            report.delivery.published = true;
+        }
+        let head_is_delivered = submitted_head_is_delivered
+            || report.representation.is_some()
+            || head_is_on_remote_default;
         report.unsubmitted_commits = if head_is_delivered {
             0
         } else {
@@ -7624,7 +7642,16 @@ impl Broker {
                 self.build_submission_plan(&session, &head, &integration_head)
                     .ok()
                     .filter(|plan| plan.safe)
-                    .map(|plan| plan.pending_owned_commit_ids().len() as u64)
+                    .map(|plan| {
+                        plan.pending_owned_commit_ids()
+                            .into_iter()
+                            .filter(|commit| {
+                                !remote_default_tip
+                                    .as_deref()
+                                    .is_some_and(|tip| self.repo.is_ancestor(commit, tip))
+                            })
+                            .count() as u64
+                    })
             });
             if let Some(pending) = pending_from_plan {
                 pending
@@ -7657,7 +7684,7 @@ impl Broker {
             return Ok(report);
         }
 
-        if let Some(entry) = latest_for_head {
+        if let Some(entry) = latest_for_head.filter(|_| !head_is_delivered) {
             match entry.status {
                 MergeStatus::Promoted | MergeStatus::ExternallyLanded => {}
                 // A repository that never promotes leaves every entry
