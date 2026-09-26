@@ -6,6 +6,56 @@ artifacts and their exact source revision are recorded in each signed
 
 ## [Unreleased]
 
+## [0.8.4] - 2026-09-25
+
+Phase 4 of the recovery plan: a smaller command surface and shorter agent
+guidance, plus two Explore improvements. No schema bump (42); rollback to 0.8.3
+is unrestricted. Old broker spellings keep working until v0.8.6 and print a
+warning on stderr.
+
+### Added
+
+- `aethyme explore --request "<q>" --format brief` answers with one call: a
+  summary and the top 2 verified source spans. `--repo` defaults to the
+  current directory, and answer-json remains the default format (#345).
+- `aethyme broker advanced <verb>` holds every non-core broker verb: `leases`,
+  `git`, `gh`, `ship`, `review`, `operations`, `exec` and the rest (#344).
+- A single `UPGRADING.md` at the repository root, with a section for each
+  breaking release. Release notes are now rendered from this changelog plus
+  that section (#342).
+
+### Changed
+
+- `aethyme broker --help` lists six verbs: `start`, `status`, `submit`,
+  `finish`, `unblock` and `gc`. Old spellings still work until v0.8.6, with
+  one deprecation warning on stderr (never on stdout). For example,
+  `adopt --reuse` becomes `start --reuse`, `close` becomes `finish close`,
+  `promote` becomes `submit promote` and `blockers` becomes `unblock`. Other
+  renames: `enhance deploy` becomes `deploy`, `broker init` becomes
+  `aethyme init`, and `aethyme readiness` becomes `broker status readiness`.
+  `--json` output shapes are unchanged (#344).
+- `--help` and `-h` work on every command, and they no longer write anything.
+  Before, `graph materialize --help` rebuilt the graph store (#344).
+- The generated CLAUDE.md and AGENTS.md policy block is at most 1,000 tokens.
+  This repository's block went from about 1,900 to about 580. The detail moved
+  to the skill's `references/policy.md` (#345, #346).
+- The SessionStart hook prints the session's state and the single next
+  command, instead of policy text (#345).
+- Explore's default graph-free answer-json is about 31% smaller: per-hint
+  diagnostics and scoring moved to `--show-observability` and
+  `--detail standard` or `--detail full`. Ranking is unchanged, and agents
+  using it cost less per question (#339).
+- Graph-free ranking averages BM25F field lengths over every searched file, so
+  large hub files are properly length-penalised (#340).
+- `ai-ready` and `quality inspect` JSON emits non-ASCII text as UTF-8 instead
+  of `\u` escapes. Autofix diffs are now standard unified diffs. `ai-ready`
+  and `autofix` are hidden from top-level help but still work (#343, #344).
+
+### Removed
+
+- The Python-parity layer in aethyme-quality: `difflib` and `pystr`
+  emulation, and the byte-parity tests. That is 801 lines net (#343).
+
 ## [0.8.3] - 2026-09-24
 
 Phase 3 of the recovery plan: Explore works without a graph. No schema bump
