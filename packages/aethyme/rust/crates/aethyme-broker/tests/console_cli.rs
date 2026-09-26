@@ -17,14 +17,39 @@ const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
 /// one with nowhere to fall back to. Disjoint ranges keep the concurrency
 /// out of the assertions. Off 4173 as well: that is the Vite preview
 /// default, and an operator serving one should not fail this suite.
-const SINGULAR_PORT: u16 = 45173;
-const SINGULAR_PORT_END: u16 = 45199;
-const PER_WORKTREE_PORT: u16 = 45273;
-const PER_WORKTREE_PORT_END: u16 = 45299;
-const HELD_PORT: u16 = 45373;
-const MARKER_PORT: u16 = 45473;
-const PARALLEL_PORT: u16 = 45476;
-const PARALLEL_PORT_END: u16 = 45479;
+/// Each test process gets its own block of 100 ports, chosen from its pid,
+/// so two runs of this file at once (two broker gates, or a gate and a
+/// developer's `cargo test`) no longer race for the same ports. Within a
+/// process the ranges below stay disjoint, as before.
+fn port_base() -> u16 {
+    // 20000..=49900, clear of 4173 and of the usual ephemeral range.
+    20000 + (std::process::id() % 300) as u16 * 100
+}
+
+struct Ports {
+    singular: u16,
+    singular_end: u16,
+    per_worktree: u16,
+    per_worktree_end: u16,
+    held: u16,
+    marker: u16,
+    parallel: u16,
+    parallel_end: u16,
+}
+
+fn ports() -> Ports {
+    let base = port_base();
+    Ports {
+        singular: base,
+        singular_end: base + 26,
+        per_worktree: base + 30,
+        per_worktree_end: base + 56,
+        held: base + 60,
+        marker: base + 70,
+        parallel: base + 73,
+        parallel_end: base + 76,
+    }
+}
 
 fn run(cwd: &Path, state: &Path, args: &[&str]) -> Output {
     Command::new(CLI)
@@ -118,8 +143,11 @@ fn a_linked_worktree_is_reported_as_not_canonical() {
 
 #[test]
 fn singular_plans_one_exclusive_key_and_one_pinned_port() {
+    let ports = ports();
+    let singular_port = ports.singular;
+    let singular_port_end = ports.singular_end;
     let (temp, state) = repo(Some(&format!(
-        "[console]\nmode = 'singular'\nport = {SINGULAR_PORT}\nport_end = {SINGULAR_PORT_END}\n"
+        "[console]\nmode = 'singular'\nport = {singular_port}\nport_end = {singular_port_end}\n"
     )));
     let root = temp.path().join("repo");
     let plan = json(&run(&root, &state, &["console", "plan", "--json"]));
@@ -132,14 +160,17 @@ fn singular_plans_one_exclusive_key_and_one_pinned_port() {
             .clone()
     };
     assert_eq!(by_key("console")["kind"], "exclusive_key");
-    assert_eq!(by_key("port")["value"], SINGULAR_PORT.to_string());
+    assert_eq!(by_key("port")["value"], singular_port.to_string());
 }
 
 #[test]
 fn per_worktree_plans_a_namespace_and_a_bounded_slot_instead_of_a_singleton() {
+    let ports = ports();
+    let per_worktree_port = ports.per_worktree;
+    let per_worktree_port_end = ports.per_worktree_end;
     let (temp, state) = repo(Some(&format!(
-        "[console]\nmode = 'per_worktree'\nport = {PER_WORKTREE_PORT}\nport_end = \
-         {PER_WORKTREE_PORT_END}\npool_limit = 3\n"
+        "[console]\nmode = 'per_worktree'\nport = {per_worktree_port}\nport_end = \
+         {per_worktree_port_end}\npool_limit = 3\n"
     )));
     let root = temp.path().join("repo");
     let plan = json(&run(&root, &state, &["console", "plan", "--json"]));
@@ -161,8 +192,10 @@ fn per_worktree_plans_a_namespace_and_a_bounded_slot_instead_of_a_singleton() {
 /// instead of quietly answering on another port.
 #[test]
 fn singular_refuses_a_second_console_and_names_the_one_already_serving() {
+    let ports = ports();
+    let held_port = ports.held;
     let (temp, state) = repo(Some(&format!(
-        "[console]\nmode = 'singular'\nport = {HELD_PORT}\n"
+        "[console]\nmode = 'singular'\nport = {held_port}\n"
     )));
     let root = temp.path().join("repo");
     let identity = json(&run(&root, &state, &["console", "status", "--json"]));
@@ -182,7 +215,7 @@ fn singular_refuses_a_second_console_and_names_the_one_already_serving() {
             "holder_pid": 4242,
             "resources": [
                 {"key": "console", "kind": "exclusive_key", "name": format!("console:{repository}")},
-                {"key": "port", "kind": "tcp_port", "start": HELD_PORT, "end": HELD_PORT}
+                {"key": "port", "kind": "tcp_port", "start": held_port, "end": held_port}
             ]
         }))
         .unwrap(),
@@ -209,7 +242,7 @@ fn singular_refuses_a_second_console_and_names_the_one_already_serving() {
     let status = json(&run(&root, &state, &["console", "status", "--json"]));
     let running = status["running"].as_array().unwrap();
     assert_eq!(running.len(), 1);
-    assert_eq!(running[0]["port"], HELD_PORT.to_string());
+    assert_eq!(running[0]["port"], held_port.to_string());
     assert_eq!(
         running[0]["canonical"], false,
         "the holder is another worktree, and saying which one is the point"
@@ -223,7 +256,7 @@ fn singular_refuses_a_second_console_and_names_the_one_already_serving() {
     assert!(!refused.status.success());
     let message = String::from_utf8_lossy(&refused.stderr);
     assert!(
-        message.contains("already running") && message.contains(&HELD_PORT.to_string()),
+        message.contains("already running") && message.contains(&held_port.to_string()),
         "a bare resource conflict does not tell the operator where to look: {message}"
     );
 }
@@ -286,6 +319,16 @@ fn an_unknown_action_names_the_ones_that_exist() {
     assert!(message.contains("run"), "{message}");
 }
 
+/// A console command that stays up until the test writes `release` (capped
+/// at 60 s), then exits cleanly. A fixed `sleep` let the console exit before
+/// a loaded machine had even registered it.
+fn hold_until(release: &Path) -> String {
+    format!(
+        "i=0; while [ ! -e '{}' ] && [ $i -lt 1200 ]; do sleep 0.05; i=$((i+1)); done",
+        release.display()
+    )
+}
+
 fn wait_for_running(root: &Path, state: &Path, expected: usize) -> serde_json::Value {
     // A deadline, not a poll count: each poll spawns the CLI, and on a
     // machine running other builds 80 polls could elapse before two console
@@ -312,10 +355,17 @@ fn wait_for_running(root: &Path, state: &Path, expected: usize) -> serde_json::V
 
 #[test]
 fn managed_console_publishes_and_lists_its_exact_revision_marker() {
+    let ports = ports();
+    let marker_port = ports.marker;
     let (temp, state) = repo(Some(&format!(
-        "[console]\nmode = 'singular'\nport = {MARKER_PORT}\n"
+        "[console]\nmode = 'singular'\nport = {marker_port}\n"
     )));
     let root = temp.path().join("repo");
+    let release = state.join("release-console");
+    let marker_command = format!(
+        "test -s \"$AETHYME_CONSOLE_MARKER\" && {{ {}; }}",
+        hold_until(&release)
+    );
     let mut child = Command::new(CLI)
         .args([
             "console",
@@ -324,7 +374,7 @@ fn managed_console_publishes_and_lists_its_exact_revision_marker() {
             "--",
             "/bin/sh",
             "-c",
-            "test -s \"$AETHYME_CONSOLE_MARKER\" && sleep 2",
+            &marker_command,
         ])
         .current_dir(&root)
         .env("AETHYME_HOST_STATE_DIR", &state)
@@ -338,7 +388,7 @@ fn managed_console_publishes_and_lists_its_exact_revision_marker() {
     assert_eq!(status["identity"]["commit"].as_str().unwrap().len(), 40);
     assert_eq!(status["identity"]["dirty"], false);
     assert_eq!(status["identity"]["integration_relation"], "current");
-    assert_eq!(serving["port"], MARKER_PORT.to_string());
+    assert_eq!(serving["port"], marker_port.to_string());
     assert_eq!(serving["branch"], "main");
     assert_eq!(serving["commit"].as_str().unwrap().len(), 40);
     assert_eq!(serving["dirty"], false);
@@ -350,7 +400,7 @@ fn managed_console_publishes_and_lists_its_exact_revision_marker() {
         serde_json::from_slice(&std::fs::read(marker_path).unwrap()).expect("marker JSON");
     assert_eq!(marker["marker_digest"], serving["marker"]["digest"]);
     assert_eq!(marker["commit"], serving["commit"]);
-    assert_eq!(marker["port"], MARKER_PORT);
+    assert_eq!(marker["port"], marker_port);
     assert_eq!(marker["integration_branch"], "aethyme/integration");
     assert_eq!(
         Path::new(marker["worktree"].as_str().unwrap()),
@@ -359,6 +409,7 @@ fn managed_console_publishes_and_lists_its_exact_revision_marker() {
 
     let alias = json(&run(&root, &state, &["console", "status", "--json"]));
     assert_eq!(alias["running"], status["running"]);
+    std::fs::write(&release, b"").unwrap();
     child.wait().unwrap();
     let stopped = json(&run(&root, &state, &["console", "list", "--json"]));
     assert!(stopped["running"].as_array().unwrap().is_empty());
@@ -370,12 +421,19 @@ fn managed_console_publishes_and_lists_its_exact_revision_marker() {
 
 #[test]
 fn allow_parallel_keeps_both_processes_in_the_registry_on_distinct_ports() {
+    let ports = ports();
+    let parallel_port = ports.parallel;
+    let parallel_port_end = ports.parallel_end;
     let (temp, state) = repo(Some(&format!(
-        "[console]\nmode = 'singular'\nport = {PARALLEL_PORT}\nport_end = {PARALLEL_PORT_END}\n"
+        "[console]\nmode = 'singular'\nport = {parallel_port}\nport_end = {parallel_port_end}\n"
     )));
     let root = temp.path().join("repo");
+    let release_first = state.join("release-first");
+    let release_second = state.join("release-second");
+    let first_command = hold_until(&release_first);
+    let second_command = hold_until(&release_second);
     let mut first = Command::new(CLI)
-        .args(["console", "run", "--", "/bin/sh", "-c", "sleep 2"])
+        .args(["console", "run", "--", "/bin/sh", "-c", &first_command])
         .current_dir(&root)
         .env("AETHYME_HOST_STATE_DIR", &state)
         .spawn()
@@ -390,7 +448,7 @@ fn allow_parallel_keeps_both_processes_in_the_registry_on_distinct_ports() {
             "--",
             "/bin/sh",
             "-c",
-            "sleep 1",
+            &second_command,
         ])
         .current_dir(&root)
         .env("AETHYME_HOST_STATE_DIR", &state)
@@ -413,7 +471,9 @@ fn allow_parallel_keeps_both_processes_in_the_registry_on_distinct_ports() {
             .is_some_and(|commit| commit.len() == 40)
     }));
 
+    std::fs::write(&release_second, b"").unwrap();
     assert!(second.wait().unwrap().success());
+    std::fs::write(&release_first, b"").unwrap();
     assert!(first.wait().unwrap().success());
     let stopped = json(&run(&root, &state, &["console", "list", "--json"]));
     assert!(stopped["running"].as_array().unwrap().is_empty());
