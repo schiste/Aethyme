@@ -99,7 +99,7 @@ fn old_adopt_spelling_warns_once_on_stderr_and_matches_start_adopt() {
         warnings(&old),
         [
             "warning: 'aethyme broker adopt' is deprecated; use 'aethyme broker start --adopt' \
-          (the old spelling is removed in v0.8.6)"
+          (the old spelling is removed in v0.8.8)"
         ]
     );
 

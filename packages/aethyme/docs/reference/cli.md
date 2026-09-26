@@ -225,9 +225,9 @@ Each public form resolves to the implementation that already existed, so
 behaviour, flags and `--json` output are unchanged; only the spelling moved.
 This reference uses the current spellings throughout.
 
-The older spellings still work until **v0.8.6**. Each prints one line on
+The older spellings still work until **v0.8.8**. Each prints one line on
 stderr, never on stdout, so `--json` output stays parseable:
-`warning: '<old>' is deprecated; use '<new>' (the old spelling is removed in v0.8.6)`.
+`warning: '<old>' is deprecated; use '<new>' (the old spelling is removed in v0.8.8)`.
 
 | Old spelling | Current spelling |
 | --- | --- |

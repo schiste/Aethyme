@@ -6,6 +6,47 @@ artifacts and their exact source revision are recorded in each signed
 
 ## [Unreleased]
 
+## [0.8.6] - 2026-09-26
+
+Build and disk maintenance, plus reliability fixes. No schema bump (42), so
+rollback to 0.8.5 is unrestricted. Old broker spellings still work and warn;
+their removal moves from v0.8.6 to v0.8.8, so that the remaining callers
+(generated guidance templates, adapters, one CI step, docs) can migrate
+first.
+
+### Added
+
+- `broker gc` now sees and reclaims this repository's gate cache under
+  `~/Library/Caches/Aethyme/gates/<repo>`, which could hold 4–11 GiB while
+  gates refused to start below 8 GiB free. Reclaim is scoped to this
+  repository only. Held entries (a lease, a live pidfile, an owner lock, or a
+  missing lease registry) are never proposed. The active cache is kept unless
+  `--include-active-gate-cache` is given. Older entries are held to
+  `gate_cache_bytes_budget` (default 4 GiB), and apply re-verifies each entry
+  against the plan. `gc plan --json` gains `gate_cache`, `gate_caches` and
+  `estimated_build_output_reclaimable_bytes` (#371, closes #295).
+
+### Changed
+
+- Dev and test builds keep file:line debug info for workspace crates and
+  drop it for dependencies. `docs/guides/build-performance.md` documents an
+  optional machine-level sccache setup (#365).
+- The repository's cargo-test gate may run for 2400 s, up from 1200 s. This
+  policy change requires `aethyme broker advanced trust` once per machine
+  (#370).
+- The disk-headroom refusal names the gate cache: what is kept as active and
+  what is reclaimable (#371).
+
+### Fixed
+
+- Upgrade proposals, graph refresh proposals and enrollment clone local
+  repositories with `--no-local`. The previous file-level copy could fail
+  when the source repository repacked during the clone (#368).
+- `broker finish` counts commits already on the default branch as delivered
+  when integration lags (#364).
+- Four broker tests that failed under machine load are now deterministic
+  (#367).
+
 ## [0.8.5] - 2026-09-26
 
 Phase 5 of the recovery plan: more platforms, signed installs by default, a
