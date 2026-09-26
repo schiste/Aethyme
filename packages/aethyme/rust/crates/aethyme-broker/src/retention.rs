@@ -113,10 +113,11 @@ pub struct RetentionPolicy {
     /// How long a recorded directory size is treated as current. Past this, a
     /// routine check prefers to spend its measurement budget refreshing it.
     pub size_record_ttl_hours: u32,
-    /// Bytes of this repository's managed gate cache that `gc plan` leaves in
-    /// place. Entries are kept most-recently-used first until the next one
-    /// would exceed this; that entry and every older one are proposed. `0`
-    /// proposes every entry no running gate holds (#295).
+    /// Bytes of *older* gate cache entries `gc plan` leaves in place (#295).
+    /// The most recently used entry of each kind and every entry a running
+    /// gate holds are kept outside this budget. Older idle entries are kept
+    /// most-recently-used first until the next would exceed it; that entry and
+    /// every older one are proposed. `0` proposes every older idle entry.
     pub gate_cache_bytes_budget: u64,
 }
 
@@ -507,7 +508,11 @@ pub enum GcGateCacheDisposition {
     /// A running gate, a live gate process, or an unreadable lease registry
     /// may be using it. Never proposed.
     Held,
-    /// Recently used enough to fit the budget; kept warm.
+    /// The most recently used entry of its kind, which the next gate of that
+    /// kind reuses. Kept whatever the budget unless the plan was made with
+    /// `--include-active-gate-cache`.
+    Active,
+    /// An older entry recently used enough to fit the budget; kept warm.
     WithinBudget,
     /// Not sized on this pass, so it cannot be ranked against the budget.
     Unmeasured,
@@ -546,6 +551,14 @@ pub struct GcGateCacheInventory {
     pub total_bytes: u64,
     pub reclaimable_bytes: u64,
     pub held_bytes: u64,
+    /// Bytes in the most recently used entry of each kind, kept because the
+    /// next gate reuses them. Outside the budget, like held bytes.
+    #[serde(default)]
+    pub active_bytes: u64,
+    /// Whether this plan was made with `--include-active-gate-cache`, which
+    /// proposes those entries too at the cost of a cold next gate.
+    #[serde(default)]
+    pub include_active: bool,
     /// Repository-wide reasons every entry is held: live gate pidfiles and
     /// gate owner locks some process holds right now. Empty when none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

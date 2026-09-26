@@ -607,8 +607,8 @@ continues to expose the complete local `log_path` without embedding log data.
 - `aethyme broker finish cleanup --all-cleaned [--apply --confirm <sha256>] [--json]`
 - `aethyme broker advanced main reconcile plan [--detail] [--resolution-file <path>] [--write-resolution-template <path>] [--json]`
 - `aethyme broker advanced main reconcile apply --session <id> --confirm <sha256> [--resolution-file <path>] [--json]`
-- `aethyme broker gc plan [--json]`
-- `aethyme broker gc apply --confirm <sha256> [--json]`
+- `aethyme broker gc plan [--include-active-gate-cache] [--json]`
+- `aethyme broker gc apply --confirm <sha256> [--include-active-gate-cache] [--json]`
 - `aethyme broker gc storage [--json]`
 - `aethyme broker gc storage plan [--json]`
 - `aethyme broker gc storage apply --confirm <sha256> [--json]`

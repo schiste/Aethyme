@@ -100,6 +100,22 @@ fn last_used_at_ms(path: &Path) -> Option<i64> {
     Some(latest)
 }
 
+/// What a cache entry is a generation of: its name without a trailing
+/// `-v<N>` (or `v<N>`) version, so `rust-workspace-v3` and `rust-workspace-v2`
+/// are one kind and a bump of the key leaves the old generation behind as an
+/// older entry of the same kind.
+pub(crate) fn cache_kind(name: &str) -> &str {
+    let trimmed = name.trim_end_matches(|c: char| c.is_ascii_digit());
+    if trimmed.len() == name.len() {
+        return name;
+    }
+    let Some(stem) = trimmed.strip_suffix('v') else {
+        return name;
+    };
+    let stem = stem.strip_suffix('-').unwrap_or(stem);
+    if stem.is_empty() { name } else { stem }
+}
+
 fn days_between(now: i64, earlier: i64) -> u32 {
     u32::try_from(now.saturating_sub(earlier).max(0) / 86_400_000).unwrap_or(u32::MAX)
 }
@@ -150,6 +166,7 @@ pub(crate) fn inspect(
     main_root: &Path,
     location: &GateCacheLocation,
     budget_bytes: u64,
+    include_active: bool,
     evaluated_at: i64,
     scan: crate::SizeScan,
     records: &mut crate::measurement::SizeRecords,
@@ -234,13 +251,56 @@ pub(crate) fn inspect(
         }
     }
 
-    // Held entries are in use now, which makes them the most recently used of
-    // all; they are kept and count against the budget first.
-    let mut kept_bytes = entries
-        .iter()
-        .filter(|entry| entry.disposition == GcGateCacheDisposition::Held)
-        .filter_map(|entry| entry.estimated_bytes)
-        .fold(0_u64, u64::saturating_add);
+    // The most recently used entry of each kind is the one the next gate of
+    // that kind will open. Removing it frees nothing lasting -- the next gate
+    // rebuilds it at the same size -- and turns that gate into a cold build.
+    // So it is kept whatever the budget, unless the operator opts in.
+    let mut newest = std::collections::BTreeMap::<String, (i64, String)>::new();
+    for entry in &entries {
+        let (Some(used), None) = (entry.last_used_at_ms, retired_rotation(&entry.entry)) else {
+            continue;
+        };
+        let kind = cache_kind(&entry.entry).to_string();
+        let candidate = (used, entry.entry.clone());
+        newest
+            .entry(kind)
+            .and_modify(|current| {
+                // Latest use wins; the higher name breaks a tie, so `-v3`
+                // beats a `-v2` touched in the same instant.
+                if (candidate.0, &candidate.1) > (current.0, &current.1) {
+                    *current = candidate.clone();
+                }
+            })
+            .or_insert(candidate);
+    }
+    for entry in &mut entries {
+        let is_newest = newest
+            .get(cache_kind(&entry.entry))
+            .is_some_and(|(_, name)| *name == entry.entry);
+        if !is_newest || entry.disposition != GcGateCacheDisposition::WithinBudget {
+            continue;
+        }
+        if include_active {
+            entry.disposition = GcGateCacheDisposition::Reclaimable;
+            entry.reason = format!(
+                "the most recently used `{}` cache (used {} day(s) ago), proposed because --include-active-gate-cache was given; the next gate will rebuild it from scratch, at about the same size",
+                cache_kind(&entry.entry),
+                entry.age_days.unwrap_or(0)
+            );
+        } else {
+            entry.disposition = GcGateCacheDisposition::Active;
+            entry.reason = format!(
+                "kept (active): the most recently used `{}` cache, which the next gate reuses; removing it frees nothing lasting and makes that gate rebuild from scratch. Pass --include-active-gate-cache to propose it anyway",
+                cache_kind(&entry.entry)
+            );
+        }
+    }
+
+    // The budget covers only older, idle entries. Held and active entries are
+    // outside it, so a gate running right now cannot push an idle entry out
+    // of the budget by occupying it: what is kept for later is decided among
+    // the entries nothing is using, by recency alone.
+    let mut kept_bytes = 0_u64;
     let mut ranked = entries
         .iter_mut()
         .filter(|entry| {
@@ -262,7 +322,8 @@ pub(crate) fn inspect(
         if !overflowed && kept_bytes.saturating_add(bytes) <= budget_bytes {
             kept_bytes = kept_bytes.saturating_add(bytes);
             entry.reason = format!(
-                "used {} day(s) ago and fits the {} byte gate cache budget; kept warm",
+                "an older entry used {} day(s) ago that fits the {} byte budget for older \
+                 gate caches; kept warm",
                 entry.age_days.unwrap_or(0),
                 budget_bytes
             );
@@ -270,8 +331,8 @@ pub(crate) fn inspect(
             overflowed = true;
             entry.disposition = GcGateCacheDisposition::Reclaimable;
             entry.reason = format!(
-                "least recently used ({} day(s) idle) beyond the {} byte gate cache budget, \
-                 and no running gate holds it",
+                "an older entry, least recently used ({} day(s) idle), beyond the {} byte \
+                 budget for older gate caches, and no running gate holds it",
                 entry.age_days.unwrap_or(0),
                 budget_bytes
             );
@@ -319,6 +380,8 @@ pub(crate) fn inspect(
             .fold(0_u64, u64::saturating_add),
         reclaimable_bytes: sum(GcGateCacheDisposition::Reclaimable),
         held_bytes: sum(GcGateCacheDisposition::Held),
+        active_bytes: sum(GcGateCacheDisposition::Active),
+        include_active,
         holders,
         entries,
     };
@@ -673,6 +736,7 @@ mod tests {
             &fixture.main_root,
             &fixture.location,
             0,
+            false,
             crate::clock::epoch_ms(),
             crate::SizeScan::Measure,
             &mut records,
@@ -691,6 +755,16 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn a_cache_kind_drops_only_a_trailing_version() {
+        assert_eq!(cache_kind("rust-workspace-v3"), "rust-workspace");
+        assert_eq!(cache_kind("rust-workspace-v12"), "rust-workspace");
+        assert_eq!(cache_kind("rust-workspacev2"), "rust-workspace");
+        assert_eq!(cache_kind("py-tools"), "py-tools");
+        assert_eq!(cache_kind("node-18"), "node-18");
+        assert_eq!(cache_kind("v3"), "v3");
     }
 
     #[test]

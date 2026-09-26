@@ -181,15 +181,25 @@ pub(super) fn render_gc_plan(plan: &crate::GcPlan, detail: bool) {
     // cache was the largest thing on it and simply not listed.
     if let Some(cache) = &plan.gate_cache {
         out!(
-            "  gate cache: {} in {} {} at {}; {} reclaimable, {} held by running gates, budget {}",
+            "  gate cache: {} in {} {} at {}; {} kept (active), {} held by running gates, {} reclaimable; budget for older entries {}",
             human_bytes(cache.total_bytes),
             cache.entries.len(),
             crate::broker::plural_word(cache.entries.len(), "entry", "entries"),
             cache.root,
-            human_bytes(cache.reclaimable_bytes),
+            human_bytes(cache.active_bytes),
             human_bytes(cache.held_bytes),
+            human_bytes(cache.reclaimable_bytes),
             human_bytes(cache.budget_bytes),
         );
+        if cache.include_active {
+            out!(
+                "    --include-active-gate-cache: the most recently used cache of each kind is proposed; the next gate will rebuild from scratch"
+            );
+        } else if cache.active_bytes > 0 {
+            out!(
+                "    the active cache is kept because the next gate reuses it; `gc plan --include-active-gate-cache` proposes it too (the next gate will rebuild from scratch)"
+            );
+        }
         for holder in &cache.holders {
             out!("    held: {holder}");
         }
@@ -199,6 +209,7 @@ pub(super) fn render_gc_plan(plan: &crate::GcPlan, detail: bool) {
                 match entry.disposition {
                     crate::GcGateCacheDisposition::Reclaimable => "reclaimable",
                     crate::GcGateCacheDisposition::Held => "held",
+                    crate::GcGateCacheDisposition::Active => "kept (active)",
                     crate::GcGateCacheDisposition::WithinBudget => "kept",
                     crate::GcGateCacheDisposition::Unmeasured => "unmeasured",
                 },
@@ -455,7 +466,19 @@ pub(super) fn render_gc_plan(plan: &crate::GcPlan, detail: bool) {
     {
         out!("  apply: nothing eligible");
     } else {
-        out!("  apply: aethyme broker gc apply --confirm {}", plan.digest);
+        out!(
+            "  apply: aethyme broker gc apply --confirm {}{}",
+            plan.digest,
+            if plan
+                .gate_cache
+                .as_ref()
+                .is_some_and(|cache| cache.include_active)
+            {
+                " --include-active-gate-cache"
+            } else {
+                ""
+            }
+        );
     }
 }
 
@@ -654,7 +677,11 @@ pub(super) fn run_gc(parsed: Parsed) -> Result<(), UsageError> {
                     "gc plan does not accept --confirm; review its emitted digest".into(),
                 ));
             }
-            let plan = broker.gc_plan()?;
+            let plan = if parsed.include_active_gate_cache {
+                broker.gc_plan_including_active_gate_cache()?
+            } else {
+                broker.gc_plan()?
+            };
             if parsed.json {
                 out!("{}", serde_json::to_string_pretty(&plan)?);
             } else {
@@ -665,7 +692,11 @@ pub(super) fn run_gc(parsed: Parsed) -> Result<(), UsageError> {
             let confirm = parsed.confirm.as_deref().ok_or_else(|| {
                 UsageError::Message("gc apply requires --confirm <sha256>".into())
             })?;
-            let report = broker.gc_apply(confirm)?;
+            let report = if parsed.include_active_gate_cache {
+                broker.gc_apply_including_active_gate_cache(confirm)?
+            } else {
+                broker.gc_apply(confirm)?
+            };
             if parsed.json {
                 out!("{}", serde_json::to_string_pretty(&report)?);
             } else {

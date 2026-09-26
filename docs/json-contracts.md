@@ -191,7 +191,8 @@ than beside any worktree:
   ],
   "gate_cache": {
     "root", "repository_key", "budget_bytes",
-    "total_bytes", "reclaimable_bytes", "held_bytes",
+    "total_bytes", "reclaimable_bytes", "held_bytes", "active_bytes",
+    "include_active",
     "holders": [ "..." ],
     "entries": [
       { "entry", "cache_key", "path", "estimated_bytes", "last_used_at_ms",
@@ -204,7 +205,14 @@ than beside any worktree:
 ```
 
 `gate_caches` are the candidates a reviewed `gc apply --confirm <digest>`
-removes, interrupted rotations first and then least recently used first. They
+removes, interrupted rotations first and then least recently used first. The
+most recently used entry of each cache kind (the name without a trailing
+`-v<N>`) is the one the next gate reuses. It is kept whatever the budget, as
+disposition `active`, unless the plan was made with
+`--include-active-gate-cache`. Such a digest must be applied with the same
+flag, and `include_active` records it. `gate_cache_bytes_budget` applies only
+to the older entries. Held and active entries are outside the budget, so a
+running gate never pushes an idle entry out of it. They
 are part of the authorization digest, sizes and `last_used_at_ms` included, so
 a gate that runs between plan and apply invalidates the digest. The digest
 omits the field when it is empty, so plans with no gate cache candidates keep
@@ -212,7 +220,7 @@ their earlier digests.
 
 `gate_cache` is reporting only and outside the digest. It is `null` when the
 per-user cache directory cannot be resolved. `disposition` is one of
-`reclaimable`, `held`, `within_budget`, or `unmeasured`, and consumers must
+`reclaimable`, `held`, `active`, `within_budget`, or `unmeasured`, and consumers must
 tolerate new values. An entry is `held`, and is never proposed, while a
 non-released host resource lease names it (`aethyme-gate-cache:<repository
 key>:<cache_key>`), while a gate pidfile names a live process, while a gate

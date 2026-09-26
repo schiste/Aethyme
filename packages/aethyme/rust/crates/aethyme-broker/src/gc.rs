@@ -882,7 +882,15 @@ impl Broker {
     /// is acceptable for something an operator asks for and unacceptable for
     /// anything that runs on its own -- hence [`Broker::gc_plan_recorded`].
     pub fn gc_plan(&mut self) -> Result<GcPlan, BrokerOpError> {
-        self.gc_plan_scanned(crate::SizeScan::Measure)
+        self.gc_plan_scanned(crate::SizeScan::Measure, false)
+    }
+
+    /// [`Broker::gc_plan`], also proposing the most recently used entry of
+    /// each gate cache kind. That entry is what the next gate reuses, so its
+    /// removal is paid back as a cold build of the same size; it is opt-in
+    /// (`--include-active-gate-cache`) for when the disk cannot wait (#295).
+    pub fn gc_plan_including_active_gate_cache(&mut self) -> Result<GcPlan, BrokerOpError> {
+        self.gc_plan_scanned(crate::SizeScan::Measure, true)
     }
 
     /// The same plan assembled without walking a single tree.
@@ -893,10 +901,14 @@ impl Broker {
     /// digest -- a plan that does not know how big things are must not be able
     /// to authorize removing them.
     pub fn gc_plan_recorded(&mut self) -> Result<GcPlan, BrokerOpError> {
-        self.gc_plan_scanned(crate::SizeScan::Recorded)
+        self.gc_plan_scanned(crate::SizeScan::Recorded, false)
     }
 
-    fn gc_plan_scanned(&mut self, scan: crate::SizeScan) -> Result<GcPlan, BrokerOpError> {
+    fn gc_plan_scanned(
+        &mut self,
+        scan: crate::SizeScan,
+        include_active_gate_cache: bool,
+    ) -> Result<GcPlan, BrokerOpError> {
         let evaluated_at = now_ms();
         let main_root = self.main_root().to_path_buf();
         let retention_config = load_retention_policy_report(&main_root)?;
@@ -1145,6 +1157,7 @@ impl Broker {
                     &main_root,
                     &location,
                     policy.gate_cache_bytes_budget,
+                    include_active_gate_cache,
                     evaluated_at,
                     scan,
                     &mut size_records,
@@ -1456,6 +1469,16 @@ impl Broker {
         self.gc_apply_bounded(confirm, None)
     }
 
+    /// Apply a plan made with `--include-active-gate-cache`. The digest binds
+    /// the exact candidate set, so a plain apply of such a digest is refused
+    /// as stale rather than silently taking the narrower set.
+    pub fn gc_apply_including_active_gate_cache(
+        &mut self,
+        confirm: &str,
+    ) -> Result<GcApplyReport, BrokerOpError> {
+        self.gc_apply_with(confirm, None, true)
+    }
+
     /// The retention summary `doctor`, `certify` and the verify loop report.
     ///
     /// All three run unattended, so this takes the recorded-size path. Its
@@ -1712,6 +1735,15 @@ impl Broker {
         confirm: &str,
         budget_ms: Option<u64>,
     ) -> Result<GcApplyReport, BrokerOpError> {
+        self.gc_apply_with(confirm, budget_ms, false)
+    }
+
+    fn gc_apply_with(
+        &mut self,
+        confirm: &str,
+        budget_ms: Option<u64>,
+        include_active_gate_cache: bool,
+    ) -> Result<GcApplyReport, BrokerOpError> {
         if confirm.len() != 64 || !confirm.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err(BrokerOpError::GcConfirmationNotSha256);
         }
@@ -1737,7 +1769,8 @@ impl Broker {
                 journal
             }
             None => {
-                let plan = self.gc_plan()?;
+                let plan =
+                    self.gc_plan_scanned(crate::SizeScan::Measure, include_active_gate_cache)?;
                 if !plan.digest.eq_ignore_ascii_case(confirm) {
                     return Err(BrokerOpError::GcConfirmationMismatch {
                         actual: confirm.to_owned(),

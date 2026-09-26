@@ -664,12 +664,17 @@ Usage:
       dist) in session worktrees, and remove only what was reviewed. An active
       session's artefacts are listed but never removed. Nothing here is
       recreated for you: a reclaimed worktree pays a cold build next time.
-  aethyme broker gc plan [--json]
+  aethyme broker gc plan [--include-active-gate-cache] [--json]
       Report exact retention-eligible rows, runtime files, represented
-      worktrees/refs, estimated bytes, blockers, and a stable plan digest.
-  aethyme broker gc apply --confirm <sha256> [--json]
+      worktrees/refs, finished sessions' build caches, this repository's gate
+      cache, estimated bytes, blockers, and a stable plan digest. The newest
+      gate cache of each kind is kept (active) unless
+      --include-active-gate-cache is given; the next gate then rebuilds it
+      from scratch.
+  aethyme broker gc apply --confirm <sha256> [--include-active-gate-cache] [--json]
       Apply or resume the exact reviewed plan under an exclusive lock. A
       recovery journal makes interrupted row, file, and worktree cleanup safe.
+      Pass --include-active-gate-cache when the plan was made with it.
   aethyme broker storage [--json]
   aethyme broker storage plan [--json]
   aethyme broker storage apply --confirm <sha256> [--json]
@@ -900,6 +905,7 @@ struct Parsed {
     with_gate: bool,
     apply: bool,
     dry_run: bool,
+    include_active_gate_cache: bool,
     destructive: bool,
     no_wait: bool,
     allow_parallel: bool,
@@ -1007,6 +1013,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         with_gate: false,
         apply: false,
         dry_run: false,
+        include_active_gate_cache: false,
         destructive: false,
         no_wait: false,
         allow_parallel: false,
@@ -1079,6 +1086,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
             "--with-gate" => parsed.with_gate = true,
             "--apply" => parsed.apply = true,
             "--dry-run" => parsed.dry_run = true,
+            "--include-active-gate-cache" => parsed.include_active_gate_cache = true,
             "--from-provider" => parsed.from_provider = true,
             "--no-wait" => parsed.no_wait = true,
             "--queue-timeout" => {
