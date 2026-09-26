@@ -2344,7 +2344,10 @@ fn run_gate_command(
     {
         use std::io::Write as _;
         let _ = log.write_all(crate::git::subprocess_path_note().as_bytes());
-        let _ = log.write_all(gate_environment_note(context.environment).as_bytes());
+        crate::warn_unrecorded(
+            "write the gate environment line to the gate log",
+            log.write_all(gate_environment_note(context.environment).as_bytes()),
+        );
     }
     let log_err = log.try_clone()?;
     // Gates execute binaries built from the tree under test.  Those binaries
