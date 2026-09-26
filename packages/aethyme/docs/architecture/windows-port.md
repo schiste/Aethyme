@@ -1,5 +1,7 @@
 # Windows Port: Scope and Estimate (P5.2)
 
+Last Updated: 2026-09-26
+
 Status: scoping only. No port code exists or is planned by this document.
 Date: 2026-09-26. Baseline: `1d9f5a35` (all file:line references are at that
 commit, relative to `packages/aethyme/rust/crates/`).
