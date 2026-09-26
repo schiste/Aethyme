@@ -162,15 +162,59 @@ pub(super) fn render_storage_apply(report: &crate::StorageApplyReport) {
 
 pub(super) fn render_gc_plan(plan: &crate::GcPlan, detail: bool) {
     out!(
-        "GC plan {}: {} rows, {} files, {} represented worktrees, {} build caches, {} orphaned roots, {} reclaimable",
+        "GC plan {}: {} rows, {} files, {} represented worktrees, {} build caches, {} gate cache entries, {} orphaned roots, {} reclaimable",
         plan.digest,
         plan.rows.len(),
         plan.files.len(),
         plan.worktrees.len(),
         plan.artifacts.len(),
+        plan.gate_caches.len(),
         plan.orphans.len(),
         human_bytes(plan.estimated_reclaimable_bytes),
     );
+    out!(
+        "  build output reclaimable: {} (finished sessions' build caches and gate cache entries)",
+        human_bytes(plan.estimated_build_output_reclaimable_bytes),
+    );
+    // Printed whether or not anything is proposed: #295 was an operator
+    // reading a near-zero total as "the disk is unreclaimable" while the gate
+    // cache was the largest thing on it and simply not listed.
+    if let Some(cache) = &plan.gate_cache {
+        out!(
+            "  gate cache: {} in {} {} at {}; {} reclaimable, {} held by running gates, budget {}",
+            human_bytes(cache.total_bytes),
+            cache.entries.len(),
+            crate::broker::plural_word(cache.entries.len(), "entry", "entries"),
+            cache.root,
+            human_bytes(cache.reclaimable_bytes),
+            human_bytes(cache.held_bytes),
+            human_bytes(cache.budget_bytes),
+        );
+        for holder in &cache.holders {
+            out!("    held: {holder}");
+        }
+        render_capped(&cache.entries, GC_LIST_CAP, detail, |entry| {
+            out!(
+                "    {} {} ({}, {}) — {}",
+                match entry.disposition {
+                    crate::GcGateCacheDisposition::Reclaimable => "reclaimable",
+                    crate::GcGateCacheDisposition::Held => "held",
+                    crate::GcGateCacheDisposition::WithinBudget => "kept",
+                    crate::GcGateCacheDisposition::Unmeasured => "unmeasured",
+                },
+                entry.entry,
+                entry
+                    .estimated_bytes
+                    .map(human_bytes)
+                    .unwrap_or_else(|| "unknown bytes".into()),
+                entry
+                    .age_days
+                    .map(|days| format!("used {days}d ago"))
+                    .unwrap_or_else(|| "last use unknown".into()),
+                entry.reason,
+            );
+        });
+    }
     for warning in &plan.retention_config_warnings {
         out!("  retention warning: {warning}");
     }
@@ -405,6 +449,7 @@ pub(super) fn render_gc_plan(plan: &crate::GcPlan, detail: bool) {
         && plan.worktrees.is_empty()
         && plan.artifacts.is_empty()
         && plan.orphans.is_empty()
+        && plan.gate_caches.is_empty()
         && plan.checkpoint_pin_releases.is_empty()
         && plan.publication_exposure_expiries.is_empty()
     {
@@ -416,7 +461,7 @@ pub(super) fn render_gc_plan(plan: &crate::GcPlan, detail: bool) {
 
 pub(super) fn render_gc_apply(report: &crate::GcApplyReport) {
     out!(
-        "GC apply {}: {} rows, {} files, {} worktrees, {} build caches, {} orphaned roots, {} checkpoint pins released, {} exposures expired, {} reclaimed",
+        "GC apply {}: {} rows, {} files, {} worktrees, {} build caches, {} gate cache entries, {} orphaned roots, {} checkpoint pins released, {} exposures expired, {} reclaimed",
         if report.complete {
             "complete"
         } else {
@@ -426,6 +471,7 @@ pub(super) fn render_gc_apply(report: &crate::GcApplyReport) {
         report.files_completed.len(),
         report.sessions_cleaned.len(),
         report.artifacts_reclaimed.len(),
+        report.gate_caches_reclaimed.len(),
         report.orphans_removed.len(),
         report.checkpoint_pins_released.len(),
         report.publication_exposures_expired.len(),

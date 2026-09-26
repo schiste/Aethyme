@@ -13,10 +13,10 @@ use crate::broker::{
 use crate::retention::is_safe_artefact_directory_name;
 use crate::{
     Broker, BrokerOpError, GcApplyReport, GcArtifactCandidate, GcBlocker, GcBlockerSummary,
-    GcCheckpointPinRelease, GcDeclinedArtifact, GcFileAction, GcFileCandidate, GcHealth,
-    GcOrphanCandidate, GcPlan, GcPublicationExposureExpiry, GcRowCandidate,
-    GcWorktreeBlockerSummary, GcWorktreeCandidate, GitRepo, OperationStatus, RetentionPolicy,
-    load_retention_policy, load_retention_policy_report,
+    GcCheckpointPinRelease, GcDeclinedArtifact, GcFileAction, GcFileCandidate,
+    GcGateCacheCandidate, GcHealth, GcOrphanCandidate, GcPlan, GcPublicationExposureExpiry,
+    GcRowCandidate, GcWorktreeBlockerSummary, GcWorktreeCandidate, GitRepo, OperationStatus,
+    RetentionPolicy, load_retention_policy, load_retention_policy_report,
 };
 
 pub const GC_PLAN_SCHEMA_VERSION: u32 = 2;
@@ -128,6 +128,33 @@ fn artifact_witness_for_with_extras(path: &Path, extras: &[String]) -> Option<Ar
                 .then_some(ArtifactWitness::NonEmptyDirectory)
         })?;
     witness.confirms(path).then_some(witness)
+}
+
+/// Worktrees whose build caches a plan must not propose.
+#[derive(Clone, Copy)]
+struct ArtifactExclusions<'a> {
+    /// Sessions already scheduled for whole-worktree removal, so the two
+    /// candidate sets never double-count the same bytes.
+    already_removed: &'a [i64],
+    /// Checkouts live sessions work in (see [`overlaps_live_worktree`]).
+    live_worktrees: &'a [PathBuf],
+}
+
+/// Whether a live session works in `root` or somewhere beneath it.
+///
+/// Compared on canonical paths where they resolve, because a session row
+/// records the path as it was given and the same directory can be spelled
+/// through a symlink (`/var` and `/private/var` on macOS). A root *inside* a
+/// live checkout is deliberately not an overlap: a session adopted at the main
+/// checkout would otherwise shelter every repo-local worktree beneath it, and
+/// removing another checkout's ignored build output touches none of its files.
+fn overlaps_live_worktree(root: &Path, live_worktrees: &[PathBuf]) -> bool {
+    let canonical =
+        |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let root = canonical(root);
+    live_worktrees
+        .iter()
+        .any(|live| canonical(live).starts_with(&root))
 }
 
 fn is_known_artifact_name(name: &str, extras: &[String]) -> bool {
@@ -351,6 +378,8 @@ struct GcJournal {
     #[serde(default)]
     remaining_orphans: Vec<GcOrphanCandidate>,
     #[serde(default)]
+    remaining_gate_caches: Vec<GcGateCacheCandidate>,
+    #[serde(default)]
     remaining_checkpoint_pin_releases: Vec<GcCheckpointPinRelease>,
     #[serde(default)]
     remaining_publication_exposure_expiries: Vec<GcPublicationExposureExpiry>,
@@ -361,6 +390,8 @@ struct GcJournal {
     artifacts_reclaimed: Vec<String>,
     #[serde(default)]
     orphans_removed: Vec<String>,
+    #[serde(default)]
+    gate_caches_reclaimed: Vec<String>,
     #[serde(default)]
     checkpoint_pins_released: Vec<i64>,
     #[serde(default)]
@@ -380,6 +411,7 @@ impl From<GcPlan> for GcJournal {
             remaining_worktrees: plan.worktrees,
             remaining_artifacts: plan.artifacts,
             remaining_orphans: plan.orphans,
+            remaining_gate_caches: plan.gate_caches,
             remaining_checkpoint_pin_releases: plan.checkpoint_pin_releases,
             remaining_publication_exposure_expiries: plan.publication_exposure_expiries,
             rows_removed: 0,
@@ -387,6 +419,7 @@ impl From<GcPlan> for GcJournal {
             sessions_cleaned: Vec::new(),
             artifacts_reclaimed: Vec::new(),
             orphans_removed: Vec::new(),
+            gate_caches_reclaimed: Vec::new(),
             checkpoint_pins_released: Vec::new(),
             publication_exposures_expired: Vec::new(),
             reclaimed_bytes: 0,
@@ -672,9 +705,13 @@ impl Broker {
         policy: &RetentionPolicy,
         cleanup: &[crate::CleanupWorktreePlan],
         sessions: &BTreeMap<i64, crate::Session>,
-        already_removed: &[i64],
+        excluded: ArtifactExclusions<'_>,
         size_scan: crate::SizeScan,
     ) -> (Vec<GcArtifactCandidate>, Vec<GcDeclinedArtifact>) {
+        let ArtifactExclusions {
+            already_removed,
+            live_worktrees,
+        } = excluded;
         let mut candidates = Vec::new();
         let mut declined = Vec::new();
         for item in cleanup {
@@ -692,6 +729,13 @@ impl Broker {
             }
             let root = PathBuf::from(&item.worktree_path);
             if !is_real_directory(&root) {
+                continue;
+            }
+            // A finished session's directory can be adopted again by a new
+            // session, which leaves the old row pointing at a live checkout.
+            // Its build output is then the live session's, and a cargo build
+            // may be writing into it right now.
+            if overlaps_live_worktree(&root, live_worktrees) {
                 continue;
             }
             let Ok(checkout) = GitRepo::discover(&root) else {
@@ -1076,15 +1120,45 @@ impl Broker {
             .iter()
             .map(|worktree| worktree.session_id)
             .collect::<Vec<_>>();
+        let live_worktrees = live_sessions
+            .iter()
+            .map(|session| PathBuf::from(&session.worktree_path))
+            .collect::<Vec<_>>();
         let (mut artifacts, declined_artifacts) = self.artifact_candidates(
             evaluated_at,
             &policy,
             &cleanup.worktrees,
             &sessions,
-            &removed_sessions,
+            ArtifactExclusions {
+                already_removed: &removed_sessions,
+                live_worktrees: &live_worktrees,
+            },
             scan,
         );
         let mut orphans = self.orphan_candidates(evaluated_at, &policy, &mut blockers, scan)?;
+        // Rooted at the per-user cache directory, not at any worktree: that
+        // is why no total here ever counted it (#295).
+        let mut size_records = crate::measurement::load_size_records(&main_root);
+        let (gate_cache, gate_caches) = match crate::gate_cache_gc::location(&main_root) {
+            Some(location) => {
+                let (inventory, candidates) = crate::gate_cache_gc::inspect(
+                    &main_root,
+                    &location,
+                    policy.gate_cache_bytes_budget,
+                    evaluated_at,
+                    scan,
+                    &mut size_records,
+                );
+                (Some(inventory), candidates)
+            }
+            None => (None, Vec::new()),
+        };
+        if scan.measures() {
+            crate::warn_unrecorded(
+                "record gate cache sizes",
+                crate::measurement::save_size_records(&main_root, &size_records),
+            );
+        }
 
         rows.sort_by_key(|row| (row.kind, row.id));
         let mut files = files.into_values().collect::<Vec<_>>();
@@ -1248,6 +1322,12 @@ impl Broker {
             .chain(worktrees.iter().map(|worktree| worktree.estimated_bytes))
             .chain(artifacts.iter().map(|artifact| artifact.estimated_bytes))
             .chain(orphans.iter().map(|orphan| orphan.estimated_bytes))
+            .chain(gate_caches.iter().map(|cache| cache.estimated_bytes))
+            .fold(0_u64, u64::saturating_add);
+        let estimated_build_output_reclaimable_bytes = artifacts
+            .iter()
+            .map(|artifact| artifact.estimated_bytes)
+            .chain(gate_caches.iter().map(|cache| cache.estimated_bytes))
             .fold(0_u64, u64::saturating_add);
         let estimated_declined_artifact_bytes = declined_artifacts
             .iter()
@@ -1336,6 +1416,7 @@ impl Broker {
             worktrees,
             artifacts,
             orphans,
+            gate_caches,
             blockers,
             checkpoint_pin_releases,
             publication_exposure_expiries,
@@ -1346,6 +1427,8 @@ impl Broker {
             estimated_retained_bytes,
             estimated_blocked_bytes,
             estimated_declined_artifact_bytes,
+            gate_cache,
+            estimated_build_output_reclaimable_bytes,
             reclaim_order,
             retained_bytes_deficit: crate::reclaim_order::deficit_bytes(
                 estimated_retained_bytes,
@@ -1486,11 +1569,14 @@ impl Broker {
         let Ok(_lock) = GcLock::acquire(&main_root) else {
             return Ok(0);
         };
-        let live = self
-            .store()
-            .live_sessions()?
-            .into_iter()
+        let live_sessions = self.store().live_sessions()?;
+        let live = live_sessions
+            .iter()
             .map(|session| session.id)
+            .collect::<Vec<_>>();
+        let live_worktrees = live_sessions
+            .iter()
+            .map(|session| PathBuf::from(&session.worktree_path))
             .collect::<Vec<_>>();
         let deadline = Instant::now() + Duration::from_millis(budget_ms);
         // The shared preparation cache is content-addressed: an entry no
@@ -1535,7 +1621,10 @@ impl Broker {
                 continue;
             }
             let root = PathBuf::from(&session.worktree_path);
-            if !is_real_directory(&root) || !self.is_broker_owned_worktree(&session, &root) {
+            if !is_real_directory(&root)
+                || !self.is_broker_owned_worktree(&session, &root)
+                || overlaps_live_worktree(&root, &live_worktrees)
+            {
                 continue;
             }
             let Ok(checkout) = GitRepo::discover(&root) else {
@@ -1860,11 +1949,14 @@ impl Broker {
             write_journal(&journal_path, &journal)?;
         }
 
-        let live = self
-            .store()
-            .live_sessions()?
-            .into_iter()
+        let live_sessions = self.store().live_sessions()?;
+        let live = live_sessions
+            .iter()
             .map(|session| session.id)
+            .collect::<Vec<_>>();
+        let live_worktrees = live_sessions
+            .iter()
+            .map(|session| PathBuf::from(&session.worktree_path))
             .collect::<Vec<_>>();
         while !journal.remaining_artifacts.is_empty() && !check_deadline(deadline) {
             let candidate = journal.remaining_artifacts[0].clone();
@@ -1906,6 +1998,15 @@ impl Broker {
                 failures.push(format!(
                     "{}: session {} is live again",
                     candidate.relative_dir, candidate.session_id
+                ));
+                journal.remaining_artifacts.remove(0);
+                write_journal(&journal_path, &journal)?;
+                continue;
+            }
+            if overlaps_live_worktree(&root, &live_worktrees) {
+                failures.push(format!(
+                    "{}: a live session now works in {}",
+                    candidate.relative_dir, candidate.worktree_path
                 ));
                 journal.remaining_artifacts.remove(0);
                 write_journal(&journal_path, &journal)?;
@@ -1962,6 +2063,31 @@ impl Broker {
             write_journal(&journal_path, &journal)?;
         }
 
+        // Each entry re-proves at removal that no gate uses it, taking the
+        // entry's own lease to do so; one that fails is retained and the run
+        // carries on, because gate cache entries share no fate (#295).
+        while !journal.remaining_gate_caches.is_empty() && !check_deadline(deadline) {
+            let candidate = journal.remaining_gate_caches[0].clone();
+            match crate::gate_cache_gc::reclaim(&main_root, &candidate, deadline) {
+                Ok(crate::gate_cache_gc::GateCacheReclaim::Removed(bytes)) => {
+                    journal.reclaimed_bytes = journal.reclaimed_bytes.saturating_add(bytes);
+                    journal.gate_caches_reclaimed.push(candidate.path);
+                }
+                // Gone is the outcome asked for; this run did not free it.
+                Ok(crate::gate_cache_gc::GateCacheReclaim::Gone) => {}
+                // Already renamed aside, so no gate will use it again; the
+                // remainder is a dead rotation the next plan proposes.
+                Ok(crate::gate_cache_gc::GateCacheReclaim::Interrupted) => {
+                    journal.remaining_gate_caches.remove(0);
+                    write_journal(&journal_path, &journal)?;
+                    break;
+                }
+                Err(reason) => failures.push(reason),
+            }
+            journal.remaining_gate_caches.remove(0);
+            write_journal(&journal_path, &journal)?;
+        }
+
         while !journal.remaining_orphans.is_empty() && !check_deadline(deadline) {
             let candidate = journal.remaining_orphans[0].clone();
             let root = PathBuf::from(&candidate.worktree_root);
@@ -2010,6 +2136,7 @@ impl Broker {
                 || !journal.remaining_files.is_empty()
                 || !journal.remaining_worktrees.is_empty()
                 || !journal.remaining_artifacts.is_empty()
+                || !journal.remaining_gate_caches.is_empty()
                 || !journal.remaining_orphans.is_empty());
         let complete = journal.remaining_rows.is_empty()
             && journal.remaining_checkpoint_pin_releases.is_empty()
@@ -2017,6 +2144,7 @@ impl Broker {
             && journal.remaining_files.is_empty()
             && journal.remaining_worktrees.is_empty()
             && journal.remaining_artifacts.is_empty()
+            && journal.remaining_gate_caches.is_empty()
             && journal.remaining_orphans.is_empty();
         let recovery_action =
             (!complete).then(|| format!("aethyme broker gc apply --confirm {}", journal.digest));
@@ -2029,6 +2157,7 @@ impl Broker {
             sessions_cleaned: journal.sessions_cleaned.clone(),
             artifacts_reclaimed: journal.artifacts_reclaimed.clone(),
             orphans_removed: journal.orphans_removed.clone(),
+            gate_caches_reclaimed: journal.gate_caches_reclaimed.clone(),
             checkpoint_pins_released: journal.checkpoint_pins_released.clone(),
             publication_exposures_expired: journal.publication_exposures_expired.clone(),
             reclaimed_bytes: journal.reclaimed_bytes,
@@ -2043,6 +2172,7 @@ impl Broker {
                 "sessions_cleaned": report.sessions_cleaned.len(),
                 "artifacts_reclaimed": report.artifacts_reclaimed.len(),
                 "orphans_removed": report.orphans_removed.len(),
+                "gate_caches_reclaimed": report.gate_caches_reclaimed.len(),
                 "checkpoint_pins_released": report.checkpoint_pins_released.len(),
                 "publication_exposures_expired": report.publication_exposures_expired.len(),
                 "reclaimed_bytes": report.reclaimed_bytes,
@@ -2116,6 +2246,29 @@ mod tests {
         let path = root.join(relative);
         std::fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    /// (c) for a reused directory: a finished session's row can point at a
+    /// checkout a new live session has since adopted. Its build output is the
+    /// live session's then, however old the finished row is.
+    #[test]
+    fn a_worktree_a_live_session_works_in_is_never_a_build_cache_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let finished = dir(tmp.path(), "worktrees/finished");
+        let nested_live = dir(tmp.path(), "worktrees/finished/nested");
+        let sibling = dir(tmp.path(), "worktrees/other");
+        assert!(overlaps_live_worktree(
+            &finished,
+            std::slice::from_ref(&finished)
+        ));
+        assert!(overlaps_live_worktree(&finished, &[nested_live]));
+        assert!(!overlaps_live_worktree(&finished, &[sibling]));
+        // A session adopted at an enclosing checkout does not shelter the
+        // separate checkouts beneath it.
+        assert!(!overlaps_live_worktree(
+            &finished,
+            &[tmp.path().to_path_buf()]
+        ));
     }
 
     #[test]

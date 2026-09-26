@@ -30,6 +30,7 @@ const RETENTION_POLICY_FIELDS: &[&str] = &[
     "startup_budget_ms",
     "routine_size_budget_ms",
     "size_record_ttl_hours",
+    "gate_cache_bytes_budget",
 ];
 
 /// Directory names that are repository source or control roots rather than
@@ -112,6 +113,11 @@ pub struct RetentionPolicy {
     /// How long a recorded directory size is treated as current. Past this, a
     /// routine check prefers to spend its measurement budget refreshing it.
     pub size_record_ttl_hours: u32,
+    /// Bytes of this repository's managed gate cache that `gc plan` leaves in
+    /// place. Entries are kept most-recently-used first until the next one
+    /// would exceed this; that entry and every older one are proposed. `0`
+    /// proposes every entry no running gate holds (#295).
+    pub gate_cache_bytes_budget: u64,
 }
 
 impl Default for RetentionPolicy {
@@ -134,6 +140,11 @@ impl Default for RetentionPolicy {
             startup_budget_ms: 25,
             routine_size_budget_ms: 200,
             size_record_ttl_hours: 24,
+            // Half the free space a gate demands before it starts. One warm
+            // cargo target for this workspace is 2-8 GiB, so the budget keeps
+            // a typical cache warm while an overgrown one -- the 7.7 GiB entry
+            // behind #295 -- is proposed rather than silently retained.
+            gate_cache_bytes_budget: crate::DEFAULT_GATE_HEADROOM_BYTES / 2,
         }
     }
 }
@@ -241,6 +252,13 @@ impl RetentionPolicy {
                 field: "size_record_ttl_hours",
                 value: self.size_record_ttl_hours.to_string(),
                 constraint: "must be between 1 and 8760 hours",
+            });
+        }
+        if self.gate_cache_bytes_budget > 1_125_899_906_842_624 {
+            return Err(RetentionConfigError::InvalidValue {
+                field: "gate_cache_bytes_budget",
+                value: self.gate_cache_bytes_budget.to_string(),
+                constraint: "must be between 0 (keep nothing idle) and 1 PiB",
             });
         }
         if !(1..=5_000).contains(&self.startup_budget_ms) {
@@ -458,6 +476,83 @@ pub struct GcArtifactCandidate {
     pub idle_days: u32,
 }
 
+/// One entry of this repository's managed gate cache that a reviewed
+/// `gc apply` may remove (#295).
+///
+/// Every field is part of the authorization digest, sizes and last use
+/// included: a gate that ran between plan and apply changes them, and an
+/// operator who approved removing an idle cache has not approved removing one
+/// that just became warm again.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct GcGateCacheCandidate {
+    /// Directory name under the repository's gate cache root.
+    pub entry: String,
+    /// The gate's `managed_cache.key` this directory belongs to; the host
+    /// resource lease a running gate holds is named after it.
+    pub cache_key: String,
+    pub path: String,
+    pub estimated_bytes: u64,
+    pub last_used_at_ms: i64,
+    pub age_days: u32,
+    pub reason: String,
+}
+
+/// Why one gate cache entry is or is not proposed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GcGateCacheDisposition {
+    /// Proposed: least recently used beyond the budget, or an interrupted
+    /// rotation whose process is gone.
+    Reclaimable,
+    /// A running gate, a live gate process, or an unreadable lease registry
+    /// may be using it. Never proposed.
+    Held,
+    /// Recently used enough to fit the budget; kept warm.
+    WithinBudget,
+    /// Not sized on this pass, so it cannot be ranked against the budget.
+    Unmeasured,
+}
+
+/// One directory under this repository's gate cache root, proposed or not.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct GcGateCacheEntry {
+    pub entry: String,
+    pub cache_key: String,
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_used_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub age_days: Option<u32>,
+    pub disposition: GcGateCacheDisposition,
+    pub reason: String,
+}
+
+/// This repository's managed gate cache, as `gc plan` found it (#295).
+///
+/// The cache lives under the per-user cache directory, not beside any
+/// worktree, which is why no earlier `gc plan` total ever counted it. Only
+/// this repository's subdirectory is inventoried: another repository's gate
+/// cache belongs to that repository's broker. Reporting only -- the digest
+/// covers [`GcPlan::gate_caches`], never this.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct GcGateCacheInventory {
+    /// `<host cache dir>/gates/<repository key>`.
+    pub root: String,
+    pub repository_key: String,
+    pub budget_bytes: u64,
+    /// Every sized entry, reclaimable or not.
+    pub total_bytes: u64,
+    pub reclaimable_bytes: u64,
+    pub held_bytes: u64,
+    /// Repository-wide reasons every entry is held: live gate pidfiles and
+    /// gate owner locks some process holds right now. Empty when none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub holders: Vec<String>,
+    pub entries: Vec<GcGateCacheEntry>,
+}
+
 /// A large git-ignored directory that was deliberately not classified as
 /// regenerable artifact output. This is evidence for an operator, never a GC
 /// candidate: the broker does not infer that an arbitrary ignored directory is
@@ -571,6 +666,10 @@ pub struct GcPlan {
     pub worktrees: Vec<GcWorktreeCandidate>,
     pub artifacts: Vec<GcArtifactCandidate>,
     pub orphans: Vec<GcOrphanCandidate>,
+    /// Entries of this repository's managed gate cache a reviewed `gc apply`
+    /// may remove, least recently used first (#295).
+    #[serde(default)]
+    pub gate_caches: Vec<GcGateCacheCandidate>,
     pub blockers: Vec<GcBlocker>,
     /// Closed-session checkpoint pins that a reviewed `gc apply` may release.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -606,6 +705,16 @@ pub struct GcPlan {
     /// deletion authorization.
     #[serde(default)]
     pub estimated_declined_artifact_bytes: u64,
+    /// This repository's gate cache, held entries included. `None` when the
+    /// per-user cache directory cannot be resolved at all.
+    #[serde(default)]
+    pub gate_cache: Option<GcGateCacheInventory>,
+    /// Regenerable build output this plan would remove: build caches in
+    /// finished sessions' worktrees plus gate cache candidates. Already part
+    /// of `estimated_reclaimable_bytes`; broken out because it is the figure a
+    /// gate refusing for disk headroom needs (#295).
+    #[serde(default)]
+    pub estimated_build_output_reclaimable_bytes: u64,
     /// Directories under a broker worktree root that no session row claims
     /// (#176). Reporting only, and excluded from the digest for the same
     /// reason the byte totals are: this plan does not act on these, so a
@@ -656,6 +765,8 @@ pub struct GcApplyReport {
     pub sessions_cleaned: Vec<i64>,
     pub artifacts_reclaimed: Vec<String>,
     pub orphans_removed: Vec<String>,
+    /// Gate cache entries removed, as paths.
+    pub gate_caches_reclaimed: Vec<String>,
     pub checkpoint_pins_released: Vec<i64>,
     pub publication_exposures_expired: Vec<i64>,
     pub reclaimed_bytes: u64,
@@ -725,6 +836,10 @@ impl GcPlan {
             worktrees: &'a [GcWorktreeCandidate],
             artifacts: &'a [GcArtifactCandidate],
             orphans: &'a [GcOrphanCandidate],
+            // Omitted when empty so a plan with no gate cache candidates keeps
+            // the digest it had before gate caches were inventoried.
+            #[serde(skip_serializing_if = "<[_]>::is_empty")]
+            gate_caches: &'a [GcGateCacheCandidate],
             blockers: &'a [GcBlocker],
             checkpoint_pin_releases: &'a [GcCheckpointPinRelease],
             publication_exposure_expiries: &'a [GcPublicationExposureExpiry],
@@ -737,6 +852,7 @@ impl GcPlan {
             worktrees: &self.worktrees,
             artifacts: &self.artifacts,
             orphans: &self.orphans,
+            gate_caches: &self.gate_caches,
             blockers: &self.blockers,
             checkpoint_pin_releases: &self.checkpoint_pin_releases,
             publication_exposure_expiries: &self.publication_exposure_expiries,

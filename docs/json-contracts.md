@@ -175,6 +175,63 @@ when inventory succeeded, and omitted when Git state could not be confirmed;
 that no longer exists and therefore has zero bytes. The report is diagnostic:
 neither `prunable` nor any other row state authorizes deletion.
 
+### `gc plan --json` and `gc apply --json`
+
+Best-effort, not frozen, but additive under the change policy above. Since
+#295 the plan covers this repository's managed gate cache, which lives under
+the per-user cache directory (`<host cache>/gates/<repository key>/`) rather
+than beside any worktree:
+
+```
+{
+  ...,
+  "gate_caches": [
+    { "entry", "cache_key", "path", "estimated_bytes",
+      "last_used_at_ms", "age_days", "reason" }
+  ],
+  "gate_cache": {
+    "root", "repository_key", "budget_bytes",
+    "total_bytes", "reclaimable_bytes", "held_bytes",
+    "holders": [ "..." ],
+    "entries": [
+      { "entry", "cache_key", "path", "estimated_bytes", "last_used_at_ms",
+        "age_days", "disposition", "reason" }
+    ]
+  },
+  "estimated_build_output_reclaimable_bytes": n,
+  "policy": { ..., "gate_cache_bytes_budget": n }
+}
+```
+
+`gate_caches` are the candidates a reviewed `gc apply --confirm <digest>`
+removes, interrupted rotations first and then least recently used first. They
+are part of the authorization digest, sizes and `last_used_at_ms` included, so
+a gate that runs between plan and apply invalidates the digest. The digest
+omits the field when it is empty, so plans with no gate cache candidates keep
+their earlier digests.
+
+`gate_cache` is reporting only and outside the digest. It is `null` when the
+per-user cache directory cannot be resolved. `disposition` is one of
+`reclaimable`, `held`, `within_budget`, or `unmeasured`, and consumers must
+tolerate new values. An entry is `held`, and is never proposed, while a
+non-released host resource lease names it (`aethyme-gate-cache:<repository
+key>:<cache_key>`), while a gate pidfile names a live process, while a gate
+owner lock is held, or when the lease registry cannot be read. `holders` lists
+the repository-wide witnesses, which are pidfiles and owner locks. Other
+repositories' gate caches are never inventoried. `estimated_bytes`,
+`last_used_at_ms`, and `age_days` are omitted for an entry that was not
+measured.
+
+`estimated_build_output_reclaimable_bytes` is the sum of `artifacts[].
+estimated_bytes` (build caches in finished sessions' worktrees) and
+`gate_caches[].estimated_bytes`. It is already included in
+`estimated_reclaimable_bytes`.
+
+`gc apply --json` gains `gate_caches_reclaimed`, a list of removed paths. Its
+`reclaimed_bytes` counts each gate cache entry by the size measured just
+before it was removed. The `broker.gc.applied` event payload gains the
+matching `gate_caches_reclaimed` count.
+
 ### `metrics --json`
 
 ```

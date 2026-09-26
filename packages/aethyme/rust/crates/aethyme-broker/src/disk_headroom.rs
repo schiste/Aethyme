@@ -109,18 +109,44 @@ fn gibibytes(bytes: u64) -> String {
 /// still runs, against something else. `gc plan` cannot be wrong that way, and
 /// it reports reclaimable bytes per worktree rather than raw sizes.
 pub fn refusal(available: Option<u64>, required: u64) -> Option<String> {
+    refusal_with_gate_cache(available, required, None)
+}
+
+/// [`refusal`], naming this repository's gate cache and its measured size.
+///
+/// The gate cache sits under the per-user cache directory rather than in any
+/// worktree, and on the host behind #295 it was the largest reclaimable item
+/// on the disk -- 7.7 GiB, almost exactly the headroom the gates were refusing
+/// for -- while this message pointed only at worktree build artefacts. Naming
+/// it, with bytes, is what stops an operator from concluding that `gc plan`'s
+/// total is everything there is.
+pub fn refusal_with_gate_cache(
+    available: Option<u64>,
+    required: u64,
+    gate_cache: Option<(&std::path::Path, u64)>,
+) -> Option<String> {
     let available = available?;
     if available >= required {
         return None;
     }
+    let gate_cache = match gate_cache {
+        Some((root, bytes)) if bytes > 0 => format!(
+            "\nThis repository's gate cache holds {} at {}. Once this gate exits, \
+             `gc plan` proposes its least recently used entries beyond the \
+             retention budget, and never one a running gate holds.",
+            gibibytes(bytes),
+            root.display()
+        ),
+        _ => String::new(),
+    };
     Some(format!(
         "refusing to start: {} free, {} required. A build that runs out of space \
          does not report a disk error -- it reports link failures, a corrupt \
          incremental cache and unrelated test failures, and that verdict is then \
          cached against this tree. Reclaim space and retry.\n\
-         Build artefacts in finished session worktrees are usually the largest \
-         reclaimable set, and the broker already measures them:\n  \
-         aethyme broker gc plan",
+         Build artefacts in finished session worktrees and the gate cache are \
+         usually the largest reclaimable sets, and the broker measures both:\n  \
+         aethyme broker gc plan{gate_cache}",
         gibibytes(available),
         gibibytes(required)
     ))
@@ -237,6 +263,26 @@ mod tests {
     #[test]
     fn unknown_free_space_does_not_refuse() {
         assert!(refusal(None, DEFAULT_GATE_HEADROOM_BYTES).is_none());
+    }
+
+    /// #295: the gate cache was the largest reclaimable item and the message
+    /// never mentioned it. With a measured size it must say where and how much.
+    #[test]
+    fn a_measured_gate_cache_is_named_with_its_bytes() {
+        let root = std::path::Path::new("/cache/gates/abc");
+        let message = refusal_with_gate_cache(
+            Some(0),
+            DEFAULT_GATE_HEADROOM_BYTES,
+            Some((root, 7 * 1024 * 1024 * 1024 + 800 * 1024 * 1024)),
+        )
+        .unwrap();
+        assert!(message.contains("gate cache holds 7.8 GiB"), "{message}");
+        assert!(message.contains("/cache/gates/abc"), "{message}");
+        assert!(message.contains("aethyme broker gc plan"), "{message}");
+        // An empty cache is not worth a sentence.
+        let quiet =
+            refusal_with_gate_cache(Some(0), DEFAULT_GATE_HEADROOM_BYTES, Some((root, 0))).unwrap();
+        assert!(!quiet.contains("gate cache holds"), "{quiet}");
     }
 
     #[test]
