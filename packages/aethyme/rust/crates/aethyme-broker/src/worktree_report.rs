@@ -233,22 +233,31 @@ pub(crate) fn append_prunable_registrations(
     sort_report(report);
 }
 
+struct WorktreeInspection {
+    branch: Option<String>,
+    idle_days: Option<i64>,
+    work: WorkState,
+    git: Option<GitWorktreeState>,
+    git_registered: Option<bool>,
+    git_error: Option<String>,
+}
+
 /// Read a checkout's state without changing it.
 fn inspect(
     path: &Path,
     repository: &str,
     inventories: &mut InventoryCache,
     inventory_repositories: &mut BTreeMap<PathBuf, String>,
-) -> (
-    Option<String>,
-    Option<i64>,
-    WorkState,
-    Option<GitWorktreeState>,
-    Option<bool>,
-    Option<String>,
-) {
+) -> WorktreeInspection {
     let Ok(repo) = GitRepo::discover(path) else {
-        return (None, None, WorkState::NotACheckout, None, None, None);
+        return WorktreeInspection {
+            branch: None,
+            idle_days: None,
+            work: WorkState::NotACheckout,
+            git: None,
+            git_registered: None,
+            git_error: None,
+        };
     };
     let branch = repo.current_branch().ok();
     let repository_root = repo
@@ -303,21 +312,28 @@ fn inspect(
         });
 
     if dirty > 0 {
-        return (
+        return WorktreeInspection {
             branch,
             idle_days,
-            WorkState::Uncommitted { files: dirty },
+            work: WorkState::Uncommitted { files: dirty },
             git,
             git_registered,
             git_error,
-        );
+        };
     }
     let state = match repo.commits_not_on_any_remote() {
         Ok(0) => WorkState::Recoverable,
         Ok(commits) => WorkState::Unpushed { commits },
         Err(_) => WorkState::NotACheckout,
     };
-    (branch, idle_days, state, git, git_registered, git_error)
+    WorktreeInspection {
+        branch,
+        idle_days,
+        work: state,
+        git,
+        git_registered,
+        git_error,
+    }
 }
 
 /// Classify an enumerated set of worktrees, worst first.
@@ -338,7 +354,14 @@ pub fn build(worktrees: &[(String, PathBuf)], live: &BTreeSet<PathBuf>) -> Workt
             continue;
         }
         let bytes = tree_bytes(path);
-        let (branch, idle_days, work, git, git_registered, git_error) = inspect(
+        let WorktreeInspection {
+            branch,
+            idle_days,
+            work,
+            git,
+            git_registered,
+            git_error,
+        } = inspect(
             path,
             repository,
             &mut inventories,
