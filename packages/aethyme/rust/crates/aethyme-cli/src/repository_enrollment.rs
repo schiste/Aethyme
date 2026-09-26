@@ -884,7 +884,10 @@ impl DisposableRemoteTree {
         let root = temporary.path().join("repository");
         run_git_external(
             source_repo,
-            &["clone", "--quiet", "--no-checkout", "--no-hardlinks"],
+            // --no-local: take objects through git's pack transport rather than copying
+            // loose object files. A file copy races any repack of the source (such as
+            // `git gc --auto` after a commit) and fails with "failed to copy file".
+            &["clone", "--quiet", "--no-checkout", "--no-local"],
             Some(&root),
         )?;
         let origin_url = git_output(source_repo, &["remote", "get-url", remote])?;

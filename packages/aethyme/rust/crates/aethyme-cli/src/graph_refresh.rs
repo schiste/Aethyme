@@ -412,7 +412,10 @@ impl ProposedRepository {
         let root = temporary.path().join("repository");
         let output = Command::new("git")
             .arg("clone")
-            .args(["--quiet", "--no-checkout", "--no-hardlinks"])
+            // --no-local: take objects through git's pack transport rather than copying
+            // loose object files. A file copy races any repack of the source (such as
+            // `git gc --auto` after a commit) and fails with "failed to copy file".
+            .args(["--quiet", "--no-checkout", "--no-local"])
             .arg(repo)
             .arg(&root)
             .output()
