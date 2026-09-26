@@ -287,7 +287,11 @@ fn an_unknown_action_names_the_ones_that_exist() {
 }
 
 fn wait_for_running(root: &Path, state: &Path, expected: usize) -> serde_json::Value {
-    for _ in 0..80 {
+    // A deadline, not a poll count: each poll spawns the CLI, and on a
+    // machine running other builds 80 polls could elapse before two console
+    // processes had registered. 60 s is never reached when the machine is idle.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while std::time::Instant::now() < deadline {
         let status = run(root, state, &["console", "list", "--json"]);
         if status.status.success()
             && let Ok(value) = serde_json::from_slice::<serde_json::Value>(&status.stdout)
