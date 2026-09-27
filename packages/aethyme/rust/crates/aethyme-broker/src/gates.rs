@@ -81,6 +81,9 @@ pub struct Gate {
     /// Maximum time to wait for a contended host resource bundle. Zero
     /// preserves the historical fail-fast behavior.
     pub resource_wait_seconds: u64,
+    /// Load-admission threshold (1-minute load average per logical CPU).
+    /// See [`crate::gate_admission`] for which gates are admitted by load.
+    pub max_load_per_cpu: Option<f64>,
     pub managed_cache: Option<ManagedGateCache>,
     pub definition_hash: String,
     matcher: Option<GlobSet>,
@@ -296,6 +299,7 @@ pub fn parse_gates(text: &str) -> Result<Vec<Gate>, GateConfigError> {
             })
             .transpose()?
             .unwrap_or(0);
+        let max_load_per_cpu = crate::gate_admission::parse_max_load_per_cpu(entry, &name)?;
         let managed_cache: Option<ManagedGateCache> = entry
             .get("managed_cache")
             .cloned()
@@ -336,6 +340,7 @@ pub fn parse_gates(text: &str) -> Result<Vec<Gate>, GateConfigError> {
             &resources,
             resource_ttl_seconds,
             resource_wait_seconds,
+            max_load_per_cpu,
             managed_cache.as_ref(),
         );
 
@@ -366,6 +371,7 @@ pub fn parse_gates(text: &str) -> Result<Vec<Gate>, GateConfigError> {
             resources,
             resource_ttl_seconds,
             resource_wait_seconds,
+            max_load_per_cpu,
             managed_cache,
             definition_hash,
             matcher,
@@ -560,9 +566,10 @@ fn gate_definition_hash(
     resources: &[crate::HostResourceRequirement],
     resource_ttl_seconds: u64,
     resource_wait_seconds: u64,
+    max_load_per_cpu: Option<f64>,
     managed_cache: Option<&ManagedGateCache>,
 ) -> String {
-    let bytes = serde_json::to_vec(&serde_json::json!({
+    let mut definition = serde_json::json!({
         "name": name,
         "command": command,
         "cost": cost,
@@ -573,8 +580,14 @@ fn gate_definition_hash(
         "resource_ttl_seconds": resource_ttl_seconds,
         "resource_wait_seconds": resource_wait_seconds,
         "managed_cache": managed_cache,
-    }))
-    .expect("gate definition contains only serializable values");
+    });
+    // Present only when set, so every gate that does not opt in keeps the
+    // definition hash (and therefore the cached verdicts) it had before.
+    if let Some(max) = max_load_per_cpu {
+        definition["max_load_per_cpu"] = serde_json::json!(max);
+    }
+    let bytes =
+        serde_json::to_vec(&definition).expect("gate definition contains only serializable values");
     format!("{:x}", Sha256::digest(bytes))
 }
 
@@ -1770,6 +1783,8 @@ fn run_selections(
         }
 
         let wait_started = Instant::now();
+        // Before owner locks, leases and the timeout clock: see gate_admission.
+        crate::gate_admission::admit_gate(gate, progress);
         let owner_dir = run_dir.join("owners");
         let owner_locks =
             GateOwnerLocks::acquire(&owner_dir, &gate.name, &selection.owner_paths, progress)
@@ -2638,7 +2653,7 @@ fn run_gate_command(
 
 /// One-minute load average, or `None` when the platform will not report it.
 /// A missing reading is recorded as unknown; it never fails the gate.
-fn load_average_1m() -> Option<f64> {
+pub(crate) fn load_average_1m() -> Option<f64> {
     let mut loads = [0f64; 1];
     // SAFETY: `loads` is a valid, writable buffer of exactly the one element
     // requested, and `getloadavg` writes at most that many samples.
@@ -2647,7 +2662,7 @@ fn load_average_1m() -> Option<f64> {
 }
 
 /// Logical CPUs online, so a load average can be normalised.
-fn logical_cpu_count() -> Option<i64> {
+pub(crate) fn logical_cpu_count() -> Option<i64> {
     // SAFETY: `sysconf` takes a plain integer name and has no memory-safety
     // preconditions.
     let count = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) };

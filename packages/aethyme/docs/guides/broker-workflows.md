@@ -1,6 +1,6 @@
 # Broker Follow-Up Workflows
 
-Last Updated: 2026-09-01
+Last Updated: 2026-09-27
 
 This guide covers broker workflows that matter after the basic
 start-edit-submit loop: preparing declared worktree dependencies, reusing a session worktree, choosing fresh or cached
@@ -615,6 +615,33 @@ deadline changes both the execution-definition hash and the portable scope
 manifest, so cached evidence from the old policy cannot authorize the new one.
 On expiry, the broker terminates the complete process group and records a typed
 timeout rather than a test failure.
+
+A deadline sized for an idle machine is too short on a host whose CPUs are
+already saturated by other repositories' builds. Expensive gates are therefore
+admitted by host load before they start: while the one-minute load average
+divided by the logical CPU count is above the gate's threshold, the broker
+waits, reporting `gate <name> waiting for host load: ...` about every 30
+seconds. The threshold is `max_load_per_cpu` when the gate sets it, otherwise
+`3.0` for any gate with `cost >= 3`; cheaper gates without the key are never
+delayed. The wait is bounded by the gate's `resource_wait_seconds` (so a gate
+with the default `0` is never delayed), and when the bound is reached, or the
+load cannot be read, the gate runs anyway: load never refuses a gate. The wait
+happens before owner locks and host resource leases are taken and before the
+`timeout_seconds` clock starts, and it is counted in the result's
+`wait_duration_ms`.
+
+```toml
+[[gate]]
+name = "cross-process-contract"
+command = "./scripts/contract-check"
+cost = 1
+timeout_seconds = 300
+resource_wait_seconds = 900
+max_load_per_cpu = 2.5   # opt a cheap-by-cost gate in; any positive number
+```
+
+Setting the key changes the gate's execution-definition hash; leaving it unset
+keeps the hash a gate had before the key existed.
 
 When static evidence is insufficient, opt into a disposable probe:
 

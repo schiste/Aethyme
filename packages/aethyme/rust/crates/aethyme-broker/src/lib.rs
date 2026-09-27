@@ -46,6 +46,7 @@ pub mod events;
 mod exposures;
 mod external_events;
 mod file_lock;
+mod gate_admission;
 mod gate_cache_gc;
 mod gate_database;
 pub use gate_database::GateBrokerDatabase;
