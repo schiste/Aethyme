@@ -1119,8 +1119,124 @@ pub(super) fn run_worktrees(parsed: Parsed) -> Result<(), UsageError> {
     Ok(())
 }
 
+/// `broker cleanup audit`.
+fn run_cleanup_audit(parsed: Parsed) -> Result<(), UsageError> {
+    if parsed.positional.len() > 1 {
+        return Err(UsageError::Message(
+            "cleanup audit takes no session id; it audits the whole repository".into(),
+        ));
+    }
+    let broker = match parsed.repository.as_deref() {
+        Some(path) => {
+            let path = std::path::Path::new(path);
+            if !path.is_dir() {
+                return Err(UsageError::Message(format!(
+                    "cleanup audit --repo takes a local repository path; {} is not a directory",
+                    path.display()
+                )));
+            }
+            if parsed.read_only_snapshot {
+                crate::Broker::open_snapshot(path)?
+            } else {
+                crate::Broker::open(path)?
+            }
+        }
+        None => open_broker(parsed.read_only_snapshot)?,
+    };
+    let audit = broker.cleanup_audit()?;
+    if parsed.json {
+        out!("{}", serde_json::to_string_pretty(&audit)?);
+    } else {
+        render_cleanup_audit(&audit, parsed.detail);
+    }
+    Ok(())
+}
+
+pub(super) fn render_cleanup_audit(audit: &crate::CleanupAudit, detail: bool) {
+    let target = &audit.target;
+    out!("Cleanup audit: {}", audit.repository);
+    out!(
+        "  target: {} at {} ({}); local {} {}; integration {} {}",
+        target.proof_ref,
+        target.proof_commit,
+        target.branch_source,
+        target.local_ref,
+        target.local_commit.as_deref().unwrap_or("(missing)"),
+        target.integration_ref,
+        target.integration_commit.as_deref().unwrap_or("(missing)"),
+    );
+    for warning in &audit.warnings {
+        out!("  Warning: {warning}");
+    }
+    out!(
+        "  {} item(s): {}",
+        audit.summary.item_count,
+        audit
+            .summary
+            .by_disposition
+            .iter()
+            .filter(|(_, count)| **count > 0)
+            .map(|(name, count)| format!("{name} {count}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    out!(
+        "  measured: {}; removable now: {} in {} item(s); unmeasured: {}",
+        human_bytes(audit.summary.measured_bytes),
+        human_bytes(audit.summary.removable_bytes),
+        audit.summary.removable_count,
+        audit.summary.unmeasured_count,
+    );
+    render_capped(&audit.items, GC_LIST_CAP, detail, |item| {
+        let owner = match &item.owner {
+            crate::AuditOwner::Session {
+                session_id, status, ..
+            } => format!("session {session_id} ({status})"),
+            crate::AuditOwner::None => "no session".into(),
+        };
+        out!(
+            "  {}: {} [{}] {}{}",
+            owner,
+            item.disposition.as_str(),
+            item.checkout.as_str(),
+            item.bytes
+                .map(human_bytes)
+                .unwrap_or_else(|| "size unavailable".into()),
+            if item.removable { ", removable" } else { "" },
+        );
+        if let Some(path) = &item.path {
+            out!("    {path}");
+        }
+        if item.tracked_changes + item.untracked_files > 0 {
+            out!(
+                "    uncommitted: {} tracked, {} untracked",
+                item.tracked_changes,
+                item.untracked_files
+            );
+        }
+        for evidence in &item.evidence {
+            out!("    evidence: {evidence}");
+        }
+        if let Some(blocker) = &item.blocker {
+            out!("    blocker: {blocker}");
+        }
+        out!("    next: {}", item.next_action);
+    });
+    out!("  cleanup plan digest: {}", audit.cleanup_plan_digest);
+    match &audit.apply_command {
+        Some(command) => out!("  apply: {command}"),
+        None if audit.summary.removable_count > 0 => {
+            out!("  apply: withheld (see the warning above)")
+        }
+        None => out!("  apply: none (nothing the reviewed plan may remove)"),
+    }
+}
+
 /// `broker cleanup`.
 pub(super) fn run_cleanup(parsed: Parsed) -> Result<(), UsageError> {
+    if parsed.positional.first().map(String::as_str) == Some("audit") {
+        return run_cleanup_audit(parsed);
+    }
     let mut broker = open_broker(parsed.read_only_snapshot)?;
     if parsed.all_cleaned {
         if !parsed.positional.is_empty() || parsed.force || parsed.dry_run {

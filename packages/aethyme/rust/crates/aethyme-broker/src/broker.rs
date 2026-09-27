@@ -1002,6 +1002,11 @@ pub struct CleanupPlan {
     /// The oldest recorded measurement that went into the totals, so a reader
     /// can tell a fresh figure from one assembled out of stale records.
     pub sizes_measured_at_ms: Option<i64>,
+    /// Every ref the plan judged provenance against, as `ref=commit`. Part of
+    /// the digest, so a confirmation reviewed before any of them moved no
+    /// longer matches after: a target that advanced can turn a retained
+    /// worktree into an eligible one, and that is a different plan (#354).
+    pub target_snapshot: Vec<String>,
     pub worktrees: Vec<CleanupWorktreePlan>,
 }
 
@@ -1018,6 +1023,7 @@ impl Default for CleanupPlan {
             estimated_reclaimable_bytes: 0,
             unmeasured_worktree_count: 0,
             sizes_measured_at_ms: None,
+            target_snapshot: Vec::new(),
             worktrees: Vec::new(),
         }
     }
@@ -8562,7 +8568,10 @@ impl Broker {
         &self,
         scan: crate::SizeScan,
     ) -> Result<CleanupPlan, BrokerOpError> {
-        let mut plan = CleanupPlan::default();
+        let mut plan = CleanupPlan {
+            target_snapshot: self.cleanup_target_snapshot(),
+            ..CleanupPlan::default()
+        };
         let mut records = crate::measurement::load_size_records(&self.main_root);
         let mut retained = crate::MeasuredTotal::default();
         let mut reclaimable = crate::MeasuredTotal::default();

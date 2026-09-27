@@ -2050,6 +2050,25 @@ impl GitRepo {
         Ok(count.parse().unwrap_or(0))
     }
 
+    /// Non-merge commits on `head` since it forked from `target` whose patch
+    /// `target` does not already carry. Zero means every change was applied
+    /// to `target` under another SHA -- a rebase or cherry-pick delivery that
+    /// ancestry cannot see.
+    pub fn patch_unique_commit_count(&self, target: &str, head: &str) -> Result<u64, GitError> {
+        let count = run_git(
+            &self.root,
+            &[
+                "rev-list",
+                "--count",
+                "--right-only",
+                "--cherry-pick",
+                "--no-merges",
+                &format!("{target}...{head}"),
+            ],
+        )?;
+        Ok(count.parse().unwrap_or(0))
+    }
+
     /// Create a linked worktree at `dest` on new branch `branch` starting
     /// from `base`, returning a handle on it.
     pub fn worktree_add(&self, dest: &Path, branch: &str, base: &str) -> Result<GitRepo, GitError> {

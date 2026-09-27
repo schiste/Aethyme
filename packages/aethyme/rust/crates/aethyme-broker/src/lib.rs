@@ -28,6 +28,7 @@ mod blockers;
 mod bounded_output;
 mod broker;
 mod chau7_tabs;
+mod cleanup_audit;
 mod clock;
 mod disk_headroom;
 pub mod exit_status;
@@ -176,6 +177,10 @@ pub use broker::{
     StartReport, StatusAdvice, StatusAdviceSeverity, StatusBrief, StatusIntegrationRelation,
     StatusSummary, StatusView, VersionRepairReport, VersionRepairStep,
     WORKTREE_ROOT_SCHEMA_VERSION, WorktreePlacement, WorktreeRootPlan, WorktreeRootSource,
+};
+pub use cleanup_audit::{
+    AuditDisposition, AuditItem, AuditOwner, AuditSummary, AuditTarget,
+    CLEANUP_AUDIT_SCHEMA_VERSION, CheckoutState, CleanupAudit, CommittedWork, LandingEvidence,
 };
 pub use console::{
     CONSOLE_EXCLUSIVE_KEY, CONSOLE_INTEGRATION_REF, CONSOLE_MARKER_DIGEST_ENV, CONSOLE_MARKER_ENV,
