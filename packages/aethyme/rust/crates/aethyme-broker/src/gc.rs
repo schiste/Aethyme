@@ -1088,6 +1088,11 @@ impl Broker {
         }
 
         let worktree_cutoff = cutoff(evaluated_at, policy.closed_worktrees_days);
+        let live_worktrees = live_sessions
+            .iter()
+            .map(|session| PathBuf::from(&session.worktree_path))
+            .collect::<Vec<_>>();
+        let grace_ms = i64::from(policy.closed_worktree_grace_hours).saturating_mul(3_600_000);
         let mut worktrees = Vec::new();
         for item in cleanup.worktrees.iter().cloned() {
             let Some(session) = sessions.get(&item.session_id) else {
@@ -1095,9 +1100,47 @@ impl Broker {
             };
             let closed_at = session.closed_at.unwrap_or(session.updated_at);
             let retained_bytes = item.estimated_bytes.unwrap_or(0);
+            // A closed session's directory can be adopted again, by `start
+            // --replace-stale` or by hand, which leaves this row naming a
+            // checkout a live session is working in. Its cleanliness and
+            // provenance then describe the live session's work, not this
+            // one's, and no proof about a closed row authorizes removing it.
+            if item.worktree_present
+                && overlaps_live_worktree(Path::new(&item.worktree_path), &live_worktrees)
+            {
+                let blocker = GcBlocker {
+                    kind: "live_worktree".into(),
+                    id: Some(item.session_id),
+                    reason: "the worktree is the checkout of a live session".into(),
+                };
+                blocked_worktree_bytes.insert((blocker.kind.clone(), blocker.id), retained_bytes);
+                blockers.push(blocker);
+                continue;
+            }
             // Cleanup eligibility is the representation proof. Once it holds,
             // GC must schedule the same worktree regardless of its age; an
             // age gate here made `cleanup --all-cleaned` and `gc` disagree.
+            // The one exception is a short grace period after a state-only
+            // close: that close keeps the checkout on purpose, so GC waits
+            // before second-guessing it. Explicit `finish cleanup` does not.
+            if item.eligible()
+                && item.worktree_present
+                && session.cleanup_state == crate::SessionCleanupState::Closed
+                && session.cleanup_completed_at.is_none()
+                && evaluated_at.saturating_sub(closed_at) < grace_ms
+            {
+                let blocker = GcBlocker {
+                    kind: "closed_worktree_grace".into(),
+                    id: Some(item.session_id),
+                    reason: format!(
+                        "closed less than the {} hour grace period ago; eligible afterwards: {}",
+                        policy.closed_worktree_grace_hours, item.reason
+                    ),
+                };
+                blocked_worktree_bytes.insert((blocker.kind.clone(), blocker.id), retained_bytes);
+                blockers.push(blocker);
+                continue;
+            }
             if item.eligible() {
                 worktrees.push(GcWorktreeCandidate {
                     session_id: item.session_id,
@@ -1134,13 +1177,39 @@ impl Broker {
             blockers.push(blocker);
         }
 
+        // Adopted checkouts were never created by the broker, so neither
+        // cleanup nor GC removes them; `cleanup_plan` skips them entirely.
+        // Saying so is the whole of the lane: otherwise a closed adopted
+        // checkout is disk nobody's arithmetic mentions.
+        let canonical_main =
+            std::fs::canonicalize(&main_root).unwrap_or_else(|_| main_root.clone());
+        for session in sessions.values() {
+            if session.origin != crate::SessionOrigin::Adopted
+                || session.cleanup_state != crate::SessionCleanupState::Closed
+                || session.cleanup_completed_at.is_some()
+            {
+                continue;
+            }
+            let path = Path::new(&session.worktree_path);
+            if !is_real_directory(path)
+                || std::fs::canonicalize(path).is_ok_and(|path| path == canonical_main)
+                || overlaps_live_worktree(path, &live_worktrees)
+            {
+                continue;
+            }
+            blockers.push(GcBlocker {
+                kind: "adopted_worktree".into(),
+                id: Some(session.id),
+                reason: format!(
+                    "adopted checkout {} was not created by the broker and is never removed by GC",
+                    session.worktree_path
+                ),
+            });
+        }
+
         let removed_sessions = worktrees
             .iter()
             .map(|worktree| worktree.session_id)
-            .collect::<Vec<_>>();
-        let live_worktrees = live_sessions
-            .iter()
-            .map(|session| PathBuf::from(&session.worktree_path))
             .collect::<Vec<_>>();
         let (mut artifacts, declined_artifacts) = self.artifact_candidates(
             evaluated_at,
@@ -1474,6 +1543,11 @@ impl Broker {
             // Sizing unclaimed directories is another full walk, so it
             // belongs to whichever pass was already paying for walks.
             reconciliation: Some(self.reconcile_worktree_directories(scan.measures())?),
+            closed_worktrees: crate::retention::ClosedWorktreeSummary::from_cleanup(
+                &cleanup,
+                &sessions.values().cloned().collect::<Vec<_>>(),
+                &main_root,
+            ),
             unmeasured_directory_count,
             sizes_measured_at_ms: cleanup.sizes_measured_at_ms,
             budget_verdict,
@@ -1535,6 +1609,7 @@ impl Broker {
                 .reconciliation
                 .as_ref()
                 .map_or(0, |sweep| sweep.unclaimed_bytes),
+            closed_worktrees: plan.closed_worktrees,
         })
     }
 
@@ -2018,11 +2093,31 @@ impl Broker {
 
         while !journal.remaining_worktrees.is_empty() && !check_deadline(deadline) {
             let candidate = journal.remaining_worktrees[0].clone();
-            let current = self
-                .cleanup_plan()?
-                .worktrees
-                .into_iter()
-                .find(|item| item.session_id == candidate.session_id);
+            // A resumed journal was authorized earlier, so each entry is
+            // re-proven here -- from its own session row, without the full
+            // size walk a whole `cleanup_plan()` costs per iteration. A
+            // checkout that became live since is retained and dropped from
+            // the journal rather than pinning it: nothing a later run could do
+            // would make removing a live checkout right.
+            let session = self.store().session(candidate.session_id)?;
+            let retained_live = |failures: &mut Vec<String>| {
+                failures.push(format!(
+                    "session {}: its worktree is now the checkout of a live session and was retained; review a new GC plan",
+                    candidate.session_id
+                ));
+            };
+            if !session.status.is_closed() {
+                retained_live(&mut failures);
+                journal.remaining_worktrees.remove(0);
+                write_journal(&journal_path, &journal)?;
+                continue;
+            }
+            let mut records = crate::measurement::SizeRecords::default();
+            let current = if session.origin == crate::SessionOrigin::Spawned {
+                self.cleanup_item_scanned(&session, crate::SizeScan::Recorded, &mut records)?
+            } else {
+                None
+            };
             if let Some(current) = current {
                 let exact = current.eligible()
                     && current.worktree_path == candidate.worktree_path
@@ -2035,9 +2130,36 @@ impl Broker {
                     ));
                     break;
                 }
-                if let Err(error) = self.cleanup(candidate.session_id, false) {
-                    failures.push(format!("session {}: {error}", candidate.session_id));
-                    break;
+                // Immediately before removal, with no walk in between.
+                // `cleanup` repeats this check right before it removes, which
+                // is the guard every caller shares; this one keeps the entry
+                // from pinning the journal.
+                let live_worktrees = self
+                    .store()
+                    .live_sessions()?
+                    .iter()
+                    .map(|session| PathBuf::from(&session.worktree_path))
+                    .collect::<Vec<_>>();
+                if candidate.worktree_present
+                    && overlaps_live_worktree(Path::new(&candidate.worktree_path), &live_worktrees)
+                {
+                    retained_live(&mut failures);
+                    journal.remaining_worktrees.remove(0);
+                    write_journal(&journal_path, &journal)?;
+                    continue;
+                }
+                match self.cleanup(candidate.session_id, false) {
+                    Ok(()) => {}
+                    Err(BrokerOpError::WorktreeInUseByLiveSession { .. }) => {
+                        retained_live(&mut failures);
+                        journal.remaining_worktrees.remove(0);
+                        write_journal(&journal_path, &journal)?;
+                        continue;
+                    }
+                    Err(error) => {
+                        failures.push(format!("session {}: {error}", candidate.session_id));
+                        break;
+                    }
                 }
             }
             journal.reclaimed_bytes = journal

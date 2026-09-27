@@ -155,6 +155,11 @@ pub enum BrokerOpError {
     },
     #[error("refusing to clean session {id}: {reason} (use --force to discard)")]
     DirtyWorktree { id: i64, reason: String },
+    #[error(
+        "refusing to clean session {id}: its worktree {path} is the checkout of live session \
+         {live_id}; finish that session first (--force does not override this)"
+    )]
+    WorktreeInUseByLiveSession { id: i64, live_id: i64, path: String },
     #[error("bulk cleanup confirmation must be a full SHA-256 digest")]
     CleanupConfirmationNotSha256,
     /// The freshly computed digest is deliberately withheld: it is an opaque
@@ -521,7 +526,8 @@ pub enum BrokerOpError {
         "session {id} ({status}) already exists for this worktree{task}. Options:\n  \
          aethyme broker submit --session {id}        submit its committed work\n  \
          aethyme broker start --reuse --task \"...\"   point it at a follow-up task\n  \
-         aethyme broker finish close --session {id}         mark it closed; policy may reclaim ignored build artifacts\n  \
+         aethyme broker finish --session {id}        close it; removes a broker-created checkout when safe\n  \
+         aethyme broker finish close --session {id}  close it but keep the checkout on disk\n  \
          aethyme broker start --replace-stale        close it and register fresh"
     )]
     SessionExistsForWorktree {
@@ -1094,6 +1100,10 @@ pub struct CleanupRetention {
     /// (#176). Unsized on this path -- status runs often, and the count is
     /// the signal; `gc plan` measures the bytes.
     pub reconciliation: WorktreeReconciliation,
+    /// Closed sessions whose checkout is still on disk -- what a state-only
+    /// `finish close` leaves behind -- with recorded bytes and the command
+    /// that shows which of them GC would reclaim.
+    pub closed_worktrees: crate::retention::ClosedWorktreeSummary,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -6130,6 +6140,7 @@ impl Broker {
                         cleanup_retention.oldest_closed_age_days,
                         cleanup_retention.closed_worktrees_policy_days
                     ),
+                    closed_worktree_evidence(&cleanup_retention.closed_worktrees),
                 ],
                 commands: if cleanup_retention.over_retained_bytes_budget {
                     vec![
@@ -8438,7 +8449,7 @@ impl Broker {
     /// recorded-size pass reuses it rather than inventing a second way to say
     /// so. Everything else here -- git dirtiness, ancestry, provenance -- is
     /// milliseconds and runs either way; the walk is the whole cost (#176).
-    fn cleanup_item_scanned(
+    pub(crate) fn cleanup_item_scanned(
         &self,
         session: &Session,
         scan: crate::SizeScan,
@@ -8791,9 +8802,13 @@ impl Broker {
             ),
         };
         let plan = self.cleanup_plan_recorded()?;
-        let oldest_closed_at = self
-            .store
-            .cleaned_sessions()?
+        let closed_sessions = self.store.cleaned_sessions()?;
+        let closed_worktrees = crate::retention::ClosedWorktreeSummary::from_cleanup(
+            &plan,
+            &closed_sessions,
+            &self.main_root,
+        );
+        let oldest_closed_at = closed_sessions
             .into_iter()
             .filter(|session| {
                 let path = Path::new(&session.worktree_path);
@@ -8854,6 +8869,7 @@ impl Broker {
             severity,
             retention_config,
             reconciliation: self.reconcile_worktree_directories(false)?,
+            closed_worktrees,
         })
     }
 
@@ -8875,13 +8891,18 @@ impl Broker {
                         });
                     }
                 }
+                self.refuse_live_checkout(session_id, &worktree_path)?;
                 self.repo.worktree_remove(&worktree_path, force)?;
             }
             self.store
                 .set_session_status(session_id, SessionStatus::Cleaned, None)?;
             return Ok(());
         }
-        let item = self.cleanup_item(&session)?;
+        // Recorded sizes, not a walk: removal needs the provenance verdict,
+        // not the byte count, and a walk here only widens the window between
+        // the live-checkout check below and the removal.
+        let mut records = crate::measurement::SizeRecords::default();
+        let item = self.cleanup_item_scanned(&session, crate::SizeScan::Recorded, &mut records)?;
         if !force
             && let Some(item) = item.as_ref()
             && !item.eligible()
@@ -8904,6 +8925,7 @@ impl Broker {
         }
 
         if worktree_path.exists() {
+            self.refuse_live_checkout(session_id, &worktree_path)?;
             self.repo.worktree_remove(&worktree_path, force)?;
         }
         if let Some(branch_tip) = item.and_then(|item| item.branch_tip)
@@ -8914,6 +8936,32 @@ impl Broker {
         }
         self.store
             .set_session_status(session_id, SessionStatus::Cleaned, None)?;
+        Ok(())
+    }
+
+    /// Refuse to remove a checkout any other live session works in.
+    ///
+    /// A closed session's directory can be adopted again (`start --adopt`,
+    /// `--replace-stale`), leaving the closed row naming a live checkout.
+    /// Its cleanliness and provenance then describe the live session's work,
+    /// so no proof about the closed row authorizes removing it -- and no
+    /// `--force` does either. Checked immediately before removal, because
+    /// adoption takes no GC lock; paths are compared canonically, and a live
+    /// checkout nested inside the directory counts too.
+    fn refuse_live_checkout(&self, session_id: i64, worktree: &Path) -> Result<(), BrokerOpError> {
+        let canonical =
+            |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let root = canonical(worktree);
+        for live in self.store.live_sessions()? {
+            if live.id != session_id && canonical(Path::new(&live.worktree_path)).starts_with(&root)
+            {
+                return Err(BrokerOpError::WorktreeInUseByLiveSession {
+                    id: session_id,
+                    live_id: live.id,
+                    path: worktree.to_string_lossy().into_owned(),
+                });
+            }
+        }
         Ok(())
     }
 }
@@ -9218,6 +9266,34 @@ fn unclaimed_worktree_severity(unclaimed: usize) -> StatusAdviceSeverity {
         StatusAdviceSeverity::Warning
     } else {
         StatusAdviceSeverity::Notice
+    }
+}
+
+/// One status evidence line for checkouts closed sessions left on disk.
+fn closed_worktree_evidence(closed: &crate::retention::ClosedWorktreeSummary) -> String {
+    let bytes = if closed.unmeasured_count == 0 {
+        format!("{} bytes", closed.estimated_bytes)
+    } else {
+        format!(
+            "at least {} bytes ({} never sized)",
+            closed.estimated_bytes, closed.unmeasured_count
+        )
+    };
+    let adopted = if closed.adopted_count == 0 {
+        String::new()
+    } else {
+        format!(
+            "; {} adopted {} GC never removes",
+            closed.adopted_count,
+            plural_word(closed.adopted_count, "checkout", "checkouts")
+        )
+    };
+    match closed.command.as_deref() {
+        Some(command) => format!(
+            "closed sessions with checkouts on disk: {}, {bytes}{adopted}; see which GC would reclaim: {command}",
+            closed.count
+        ),
+        None => "closed sessions with checkouts on disk: 0".into(),
     }
 }
 
@@ -10377,6 +10453,7 @@ mod tests {
             super::StatusAdviceSeverity::Notice
         );
         let mut retention = super::CleanupRetention {
+            closed_worktrees: Default::default(),
             reconciliation: crate::WorktreeReconciliation {
                 schema_version: crate::WORKTREE_RECONCILIATION_SCHEMA_VERSION,
                 scanned_root_count: 0,
@@ -10459,6 +10536,7 @@ mod tests {
             orphaned_pidfiles: Vec::new(),
             purged_stale_leases: 0,
             retention: crate::GcHealth {
+                closed_worktrees: Default::default(),
                 unclaimed_worktree_count: 0,
                 unclaimed_worktree_bytes: 0,
                 policy: crate::RetentionPolicy::default(),

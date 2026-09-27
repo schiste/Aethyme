@@ -477,7 +477,10 @@ impl Broker {
                 clear: if worktree_gone {
                     format!("{UNBLOCK} lease:{}", lease.id)
                 } else {
-                    format!("aethyme broker finish close --session {}", session.id)
+                    // `finish` closes and removes the checkout when that is
+                    // safe, and refuses otherwise. `finish close` would keep
+                    // a whole checkout on disk to release one lease.
+                    format!("aethyme broker finish --session {}", session.id)
                 },
                 safe_to_clear_automatically: worktree_gone,
             });
@@ -844,11 +847,13 @@ impl Broker {
                 BlockerKind::PathLease,
                 format!(
                     "lease {lease_id} on {} belongs to session {} ({}) whose worktree may hold \
-                     uncommitted work; release it from that session or close it: aethyme broker \
-                     finish close --session {}",
+                     uncommitted work; release it from that session or finish it: aethyme broker \
+                     finish --session {} (or aethyme broker finish close --session {} to keep \
+                     the checkout on disk)",
                     lease.path,
                     session.id,
                     session.status.as_str(),
+                    session.id,
                     session.id
                 ),
                 Vec::new(),

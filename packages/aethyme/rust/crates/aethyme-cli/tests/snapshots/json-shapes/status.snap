@@ -68,6 +68,13 @@
     "broker_owned_worktree_count": "integer",
     "budget_verdict": "string",
     "clears_retained_bytes_budget": "bool",
+    "closed_worktrees": {
+      "adopted_count": "integer",
+      "command": "null",
+      "count": "integer",
+      "estimated_bytes": "integer",
+      "unmeasured_count": "integer"
+    },
     "closed_worktrees_policy_days": "integer",
     "eligible_worktree_count": "integer",
     "estimated_blocked_bytes": "integer",

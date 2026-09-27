@@ -620,6 +620,32 @@ pub(super) fn run_doctor(parsed: Parsed) -> Result<(), UsageError> {
         for warning in &report.retention.retention_config_warnings {
             out!("  retention warning: {warning}");
         }
+        let closed = &report.retention.closed_worktrees;
+        if let Some(command) = closed.command.as_deref() {
+            out!(
+                "  retention: {} closed {} still on disk ({}{}){}; see which GC would reclaim with `{command}`",
+                closed.count,
+                crate::broker::plural_word(
+                    closed.count,
+                    "session's checkout",
+                    "sessions' checkouts"
+                ),
+                if closed.unmeasured_count > 0 {
+                    "at least "
+                } else {
+                    ""
+                },
+                human_bytes(closed.estimated_bytes),
+                if closed.adopted_count > 0 {
+                    format!(
+                        ", plus {} adopted that GC never removes",
+                        closed.adopted_count
+                    )
+                } else {
+                    String::new()
+                },
+            );
+        }
         // Doctor takes the recorded-size path, so its byte figures
         // can be floors. Say so before the budget line: a floor
         // under the budget is not a pass, it is an unanswered

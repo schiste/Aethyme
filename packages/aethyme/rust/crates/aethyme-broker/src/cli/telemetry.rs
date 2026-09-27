@@ -75,6 +75,10 @@ pub(super) const KNOWN_COMMAND_WORDS: &[&str] = &[
     "verify-loop",
     "e2e",
     "finish",
+    // `finish close` resolves to `close` before a label is built. Without
+    // the word here every state-only close went unrecorded, which hid the
+    // lifecycle that leaves a whole checkout behind per task.
+    "close",
     "handoff",
     "report",
     "external-events",
@@ -286,5 +290,41 @@ pub(super) fn command_records_metric(args: &[String]) -> bool {
         Some("trust") => args.get(1).map(String::as_str) != Some("status"),
         Some("blockers") => false,
         _ => true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::safe_command_surface;
+
+    /// Labels are built from the resolved internal spelling, which is what
+    /// the dispatcher records.
+    fn label(public: &str) -> Option<String> {
+        let args = public
+            .split_whitespace()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        safe_command_surface(&super::super::surface::resolve(&args).args)
+    }
+
+    #[test]
+    fn the_three_ways_to_end_a_session_record_distinct_labels() {
+        assert_eq!(label("finish --session 3").as_deref(), Some("finish"));
+        assert_eq!(label("finish close --session 3").as_deref(), Some("close"));
+        assert_eq!(label("finish cleanup 3").as_deref(), Some("cleanup"));
+        // The pre-six-verb spelling is the same command, so the same label.
+        assert_eq!(label("close --session 3").as_deref(), Some("close"));
+    }
+
+    #[test]
+    fn positional_values_never_reach_a_label() {
+        assert_eq!(
+            label("finish close --session 3 --json").as_deref(),
+            Some("close")
+        );
+        assert_eq!(
+            label("finish cleanup 42 --force").as_deref(),
+            Some("cleanup")
+        );
     }
 }

@@ -19,6 +19,7 @@ const RETENTION_POLICY_FIELDS: &[&str] = &[
     "terminal_merge_queue_days",
     "command_metrics_days",
     "closed_worktrees_days",
+    "closed_worktree_grace_hours",
     "auto_cleanup_worktrees_on_finish",
     "publication_exposure_days",
     "retained_bytes_budget",
@@ -76,6 +77,13 @@ pub struct RetentionPolicy {
     /// build caches use `artifact_reclaim_days` instead. This does not affect
     /// committed work or authorize removal without provenance proof.
     pub closed_worktrees_days: u32,
+    /// Hours a state-only closed session's worktree is kept before `gc plan`
+    /// may propose removing it, even when it is clean and its work has
+    /// landed. `finish close` keeps the checkout on purpose, and an agent
+    /// that closed one a minute ago may still be about to look at it. `0`
+    /// means no grace period; like every worktree proposal, this never
+    /// authorizes removing a dirty or unrepresented checkout.
+    pub closed_worktree_grace_hours: u32,
     /// Automatically remove safe, broker-owned worktrees when `finish` closes
     /// a session. Set false to retain them for inspection or reuse; manual
     /// cleanup remains available, and unsafe or unproven work is never removed.
@@ -135,6 +143,7 @@ impl Default for RetentionPolicy {
             terminal_merge_queue_days: 180,
             command_metrics_days: 30,
             closed_worktrees_days: 7,
+            closed_worktree_grace_hours: 24,
             auto_cleanup_worktrees_on_finish: true,
             publication_exposure_days: 30,
             retained_bytes_budget: 1_073_741_824,
@@ -212,6 +221,13 @@ impl RetentionPolicy {
                 field: "session_abandoned_after_hours",
                 value: self.session_abandoned_after_hours.to_string(),
                 constraint: "must be between 0 (disabled) and 8760 hours",
+            });
+        }
+        if self.closed_worktree_grace_hours > 8_760 {
+            return Err(RetentionConfigError::InvalidValue {
+                field: "closed_worktree_grace_hours",
+                value: self.closed_worktree_grace_hours.to_string(),
+                constraint: "must be between 0 (no grace period) and 8760 hours",
             });
         }
         if self.artifact_sweep_budget_ms > 60_000 {
@@ -772,6 +788,82 @@ pub struct GcPlan {
     /// a clean root.
     #[serde(default)]
     pub reconciliation: Option<crate::WorktreeReconciliation>,
+    /// Closed sessions whose checkout is still on disk, whether or not GC
+    /// proposes them. Reporting only; not part of the digest.
+    #[serde(default)]
+    pub closed_worktrees: ClosedWorktreeSummary,
+}
+
+/// Closed sessions whose checkout is still on disk.
+///
+/// A state-only close (`finish close`) keeps the worktree and branch, and
+/// nothing else in the retention picture singles those out: one agent that
+/// ended every task that way left 42 checkouts and 22 GB behind while status
+/// listed one session. Counting them is cheap -- session rows plus one `stat`
+/// each -- and the bytes come from recorded sizes, so this never walks a tree
+/// and its byte total is a floor while `unmeasured_count` is non-zero.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct ClosedWorktreeSummary {
+    /// Broker-created checkouts of closed sessions still on disk.
+    pub count: usize,
+    /// Recorded bytes of those checkouts; a floor when `unmeasured_count > 0`.
+    pub estimated_bytes: u64,
+    /// Those checkouts nobody has sized yet.
+    pub unmeasured_count: usize,
+    /// Closed adopted checkouts still on disk. The broker did not create
+    /// them and never removes them; they are counted so they are not
+    /// invisible.
+    pub adopted_count: usize,
+    /// Where to see which of them GC would reclaim, and why the rest are
+    /// retained. `None` when there is nothing to review.
+    pub command: Option<String>,
+}
+
+impl ClosedWorktreeSummary {
+    /// Summarize from a cleanup plan and the closed session rows it came
+    /// from. Only rows closed state-only count: a `cleaned` row whose
+    /// directory survived is a failed removal, which cleanup reports itself.
+    pub(crate) fn from_cleanup(
+        plan: &crate::CleanupPlan,
+        sessions: &[crate::Session],
+        main_root: &Path,
+    ) -> Self {
+        let closed = |session: &crate::Session| {
+            session.cleanup_state == crate::SessionCleanupState::Closed
+                && session.cleanup_completed_at.is_none()
+        };
+        let mut summary = Self::default();
+        for item in plan.worktrees.iter().filter(|item| item.worktree_present) {
+            if !sessions
+                .iter()
+                .any(|session| session.id == item.session_id && closed(session))
+            {
+                continue;
+            }
+            summary.count += 1;
+            match item.estimated_bytes {
+                Some(bytes) => {
+                    summary.estimated_bytes = summary.estimated_bytes.saturating_add(bytes)
+                }
+                None => summary.unmeasured_count += 1,
+            }
+        }
+        let canonical_main =
+            std::fs::canonicalize(main_root).unwrap_or_else(|_| main_root.to_path_buf());
+        summary.adopted_count = sessions
+            .iter()
+            .filter(|session| session.origin == crate::SessionOrigin::Adopted && closed(session))
+            .filter(|session| {
+                let path = Path::new(&session.worktree_path);
+                path.is_dir()
+                    && !std::fs::canonicalize(path).is_ok_and(|path| path == canonical_main)
+            })
+            .count();
+        if summary.count > 0 || summary.adopted_count > 0 {
+            summary.command = Some("aethyme broker gc plan".into());
+        }
+        summary
+    }
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
@@ -823,6 +915,8 @@ pub struct GcHealth {
     /// Directories under a broker worktree root that no session claims.
     pub unclaimed_worktree_count: usize,
     pub unclaimed_worktree_bytes: u64,
+    /// Closed sessions whose checkout is still on disk.
+    pub closed_worktrees: ClosedWorktreeSummary,
 }
 
 /// A plan written before ordering was policy-driven was ordered by session id,

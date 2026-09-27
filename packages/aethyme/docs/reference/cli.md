@@ -1187,6 +1187,7 @@ gate_results_days = 30
 terminal_merge_queue_days = 180
 command_metrics_days = 30
 closed_worktrees_days = 7
+closed_worktree_grace_hours = 24
 publication_exposure_days = 30
 retained_bytes_budget = 1073741824
 artifact_reclaim_days = 0
@@ -1232,6 +1233,27 @@ Worktrees whose cleanup proof represents their contribution are eligible
 regardless of age, while their build caches remain governed by
 `artifact_reclaim_days`. The age setting never authorizes removal of an
 unproven contribution.
+
+`closed_worktree_grace_hours` (default 24, `0` for none) is how long GC waits
+after a state-only close (`aethyme broker finish close`) before proposing the
+checkout it kept. A clean checkout whose work is represented on a delivery
+target is proposed once the grace period has passed; until then the plan
+reports a `closed_worktree_grace` blocker with the checkout's bytes. Explicit
+cleanup does not wait: `finish cleanup <id>` and `finish cleanup --all-cleaned`
+both skip the grace period, so for up to 24 hours after a close `gc plan` can
+list fewer worktree candidates than `finish cleanup --all-cleaned` does. A closed session's checkout that a live session
+now uses is never proposed (`live_worktree`), and a closed adopted checkout is
+only reported (`adopted_worktree`): the broker did not create it and GC never
+removes it. `gc apply` rechecks the live-session guard per worktree before it
+removes anything, and a plan whose checkouts changed after review no longer
+matches its digest.
+
+Every worktree removal -- `finish cleanup <id>`, `finish cleanup --all-cleaned
+--apply` and `gc apply` -- refuses a checkout that any other live session uses,
+comparing canonical paths and counting a live checkout nested inside it. The
+refusal names the live session, `--force` does not override it, and the bulk
+and GC lanes report it per session and carry on. It is checked immediately
+before removal because adopting a directory takes no GC lock.
 
 `session_abandoned_after_hours` bounds how long a session may go without any
 evidence of a working agent before the broker closes it. A session with a live

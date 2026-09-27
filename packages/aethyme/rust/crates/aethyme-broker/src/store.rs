@@ -645,6 +645,11 @@ impl BrokerStore {
     ) -> Result<(), BrokerError> {
         let now = now_ms();
         let tx = self.conn.transaction()?;
+        // `closed_at` records the first close and is never moved: cleanup
+        // after a state-only close, or a second close, must not overwrite it.
+        // Retention and the closed-worktree grace period are measured from
+        // it, and overwriting it once stamped 97 sessions' close times with
+        // the minute a bulk cleanup ran.
         let (stored_status, cleanup_state, closed_at, cleanup_completed_at) = match status {
             SessionStatus::Closed => ("cleaned", "closed", Some(now), None),
             SessionStatus::Cleaned => ("cleaned", "cleaned", Some(now), Some(now)),
@@ -653,7 +658,7 @@ impl BrokerStore {
         let changed = tx.execute(
             "UPDATE sessions SET status = ?2, exit_code = COALESCE(?3, exit_code),
                                  updated_at = ?4, cleanup_state = ?5,
-                                 closed_at = COALESCE(?6, closed_at),
+                                 closed_at = COALESCE(closed_at, ?6),
                                  cleanup_completed_at = ?7
              WHERE id = ?1",
             params![
