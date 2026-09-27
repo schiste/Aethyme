@@ -336,3 +336,83 @@ fn closing_again_does_not_restart_the_grace_period() {
     );
     assert!(proposed(&mut broker).contains(&id));
 }
+
+/// A landed session closed state-only whose directory a live session then
+/// adopted: the closed row still proves "clean and landed", but about the
+/// live session's checkout.
+fn closed_then_adopted(broker: &mut Broker, name: &str) -> (i64, i64, PathBuf) {
+    let (id, worktree) = session_with_commit(broker, name, true);
+    broker.close(id).unwrap();
+    let live = broker.adopt(&worktree, Some("follow-up")).unwrap();
+    (id, live.id, worktree)
+}
+
+#[test]
+fn bulk_cleanup_refuses_a_closed_row_whose_checkout_a_live_session_adopted() {
+    let (_tmp, mut broker) = repository(Some(0));
+    let (id, live_id, worktree) = closed_then_adopted(&mut broker, "bulk");
+    let plan = broker.cleanup_cleaned_worktrees(false, None).unwrap().plan;
+    assert!(plan.worktrees.iter().any(|item| item.session_id == id));
+
+    let report = broker
+        .cleanup_cleaned_worktrees(true, Some(&plan.digest))
+        .unwrap();
+    assert!(report.removed_session_ids.is_empty(), "{report:?}");
+    assert_eq!(report.failures.len(), 1);
+    assert!(
+        report.failures[0]
+            .reason
+            .contains(&format!("live session {live_id}")),
+        "{:?}",
+        report.failures
+    );
+    assert!(worktree.join("bulk.txt").exists());
+}
+
+#[test]
+fn single_cleanup_refuses_a_live_checkout_even_when_forced() {
+    let (_tmp, mut broker) = repository(Some(0));
+    let (id, live_id, worktree) = closed_then_adopted(&mut broker, "single");
+    for force in [false, true] {
+        let refused = broker.cleanup(id, force).unwrap_err();
+        assert!(
+            matches!(
+                refused,
+                BrokerOpError::WorktreeInUseByLiveSession { id: refused_id, live_id: refused_live, .. }
+                    if refused_id == id && refused_live == live_id
+            ),
+            "force={force}: {refused:?}"
+        );
+    }
+    assert!(worktree.join("single.txt").exists());
+    assert_eq!(
+        broker.store().session(id).unwrap().cleanup_state,
+        SessionCleanupState::Closed
+    );
+}
+
+#[test]
+fn a_resumed_gc_apply_retains_a_checkout_adopted_after_review() {
+    let (_tmp, mut broker) = repository(Some(0));
+    let (id, worktree) = session_with_commit(&mut broker, "resumed", true);
+    broker.close(id).unwrap();
+    let plan = broker.gc_plan().unwrap();
+    assert!(plan.worktrees.iter().any(|item| item.session_id == id));
+    // A zero budget authorizes and journals the plan but removes nothing, so
+    // the adopt lands between review and removal.
+    let started = broker.gc_apply_bounded(&plan.digest, Some(0)).unwrap();
+    assert!(!started.complete);
+    assert!(started.sessions_cleaned.is_empty());
+    broker.adopt(&worktree, Some("follow-up")).unwrap();
+
+    let resumed = broker.gc_apply(&plan.digest).unwrap();
+    assert!(!resumed.sessions_cleaned.contains(&id), "{resumed:?}");
+    assert!(
+        resumed
+            .failures
+            .iter()
+            .any(|failure| failure.contains("live session")),
+        "{resumed:?}"
+    );
+    assert!(worktree.join("resumed.txt").exists());
+}

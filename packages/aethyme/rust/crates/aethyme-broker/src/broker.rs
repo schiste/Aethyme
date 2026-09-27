@@ -155,6 +155,11 @@ pub enum BrokerOpError {
     },
     #[error("refusing to clean session {id}: {reason} (use --force to discard)")]
     DirtyWorktree { id: i64, reason: String },
+    #[error(
+        "refusing to clean session {id}: its worktree {path} is the checkout of live session \
+         {live_id}; finish that session first (--force does not override this)"
+    )]
+    WorktreeInUseByLiveSession { id: i64, live_id: i64, path: String },
     #[error("bulk cleanup confirmation must be a full SHA-256 digest")]
     CleanupConfirmationNotSha256,
     /// The freshly computed digest is deliberately withheld: it is an opaque
@@ -8444,7 +8449,7 @@ impl Broker {
     /// recorded-size pass reuses it rather than inventing a second way to say
     /// so. Everything else here -- git dirtiness, ancestry, provenance -- is
     /// milliseconds and runs either way; the walk is the whole cost (#176).
-    fn cleanup_item_scanned(
+    pub(crate) fn cleanup_item_scanned(
         &self,
         session: &Session,
         scan: crate::SizeScan,
@@ -8886,13 +8891,18 @@ impl Broker {
                         });
                     }
                 }
+                self.refuse_live_checkout(session_id, &worktree_path)?;
                 self.repo.worktree_remove(&worktree_path, force)?;
             }
             self.store
                 .set_session_status(session_id, SessionStatus::Cleaned, None)?;
             return Ok(());
         }
-        let item = self.cleanup_item(&session)?;
+        // Recorded sizes, not a walk: removal needs the provenance verdict,
+        // not the byte count, and a walk here only widens the window between
+        // the live-checkout check below and the removal.
+        let mut records = crate::measurement::SizeRecords::default();
+        let item = self.cleanup_item_scanned(&session, crate::SizeScan::Recorded, &mut records)?;
         if !force
             && let Some(item) = item.as_ref()
             && !item.eligible()
@@ -8915,6 +8925,7 @@ impl Broker {
         }
 
         if worktree_path.exists() {
+            self.refuse_live_checkout(session_id, &worktree_path)?;
             self.repo.worktree_remove(&worktree_path, force)?;
         }
         if let Some(branch_tip) = item.and_then(|item| item.branch_tip)
@@ -8925,6 +8936,32 @@ impl Broker {
         }
         self.store
             .set_session_status(session_id, SessionStatus::Cleaned, None)?;
+        Ok(())
+    }
+
+    /// Refuse to remove a checkout any other live session works in.
+    ///
+    /// A closed session's directory can be adopted again (`start --adopt`,
+    /// `--replace-stale`), leaving the closed row naming a live checkout.
+    /// Its cleanliness and provenance then describe the live session's work,
+    /// so no proof about the closed row authorizes removing it -- and no
+    /// `--force` does either. Checked immediately before removal, because
+    /// adoption takes no GC lock; paths are compared canonically, and a live
+    /// checkout nested inside the directory counts too.
+    fn refuse_live_checkout(&self, session_id: i64, worktree: &Path) -> Result<(), BrokerOpError> {
+        let canonical =
+            |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let root = canonical(worktree);
+        for live in self.store.live_sessions()? {
+            if live.id != session_id && canonical(Path::new(&live.worktree_path)).starts_with(&root)
+            {
+                return Err(BrokerOpError::WorktreeInUseByLiveSession {
+                    id: session_id,
+                    live_id: live.id,
+                    path: worktree.to_string_lossy().into_owned(),
+                });
+            }
+        }
         Ok(())
     }
 }

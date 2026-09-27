@@ -57,6 +57,7 @@ pub fn for_broker_error(error: &BrokerOpError) -> u8 {
         | E::CoordinatedLockBusy { .. }
         | E::AdmissionTimedOut { .. }
         | E::DirtyWorktree { .. }
+        | E::WorktreeInUseByLiveSession { .. }
         | E::CleanupConfirmationNotSha256
         | E::CleanupConfirmationMismatch { .. }
         | E::GcConfirmationNotSha256

@@ -2093,32 +2093,31 @@ impl Broker {
 
         while !journal.remaining_worktrees.is_empty() && !check_deadline(deadline) {
             let candidate = journal.remaining_worktrees[0].clone();
-            // A resumed journal was authorized earlier; the checkout may have
-            // been adopted by a live session since. That candidate is retained
-            // and dropped from the journal rather than pinning it: nothing a
-            // later run could do would make removing a live checkout right.
-            let live_worktrees = self
-                .store()
-                .live_sessions()?
-                .iter()
-                .map(|session| PathBuf::from(&session.worktree_path))
-                .collect::<Vec<_>>();
-            if candidate.worktree_present
-                && overlaps_live_worktree(Path::new(&candidate.worktree_path), &live_worktrees)
-            {
+            // A resumed journal was authorized earlier, so each entry is
+            // re-proven here -- from its own session row, without the full
+            // size walk a whole `cleanup_plan()` costs per iteration. A
+            // checkout that became live since is retained and dropped from
+            // the journal rather than pinning it: nothing a later run could do
+            // would make removing a live checkout right.
+            let session = self.store().session(candidate.session_id)?;
+            let retained_live = |failures: &mut Vec<String>| {
                 failures.push(format!(
                     "session {}: its worktree is now the checkout of a live session and was retained; review a new GC plan",
                     candidate.session_id
                 ));
+            };
+            if !session.status.is_closed() {
+                retained_live(&mut failures);
                 journal.remaining_worktrees.remove(0);
                 write_journal(&journal_path, &journal)?;
                 continue;
             }
-            let current = self
-                .cleanup_plan()?
-                .worktrees
-                .into_iter()
-                .find(|item| item.session_id == candidate.session_id);
+            let mut records = crate::measurement::SizeRecords::default();
+            let current = if session.origin == crate::SessionOrigin::Spawned {
+                self.cleanup_item_scanned(&session, crate::SizeScan::Recorded, &mut records)?
+            } else {
+                None
+            };
             if let Some(current) = current {
                 let exact = current.eligible()
                     && current.worktree_path == candidate.worktree_path
@@ -2131,9 +2130,36 @@ impl Broker {
                     ));
                     break;
                 }
-                if let Err(error) = self.cleanup(candidate.session_id, false) {
-                    failures.push(format!("session {}: {error}", candidate.session_id));
-                    break;
+                // Immediately before removal, with no walk in between.
+                // `cleanup` repeats this check right before it removes, which
+                // is the guard every caller shares; this one keeps the entry
+                // from pinning the journal.
+                let live_worktrees = self
+                    .store()
+                    .live_sessions()?
+                    .iter()
+                    .map(|session| PathBuf::from(&session.worktree_path))
+                    .collect::<Vec<_>>();
+                if candidate.worktree_present
+                    && overlaps_live_worktree(Path::new(&candidate.worktree_path), &live_worktrees)
+                {
+                    retained_live(&mut failures);
+                    journal.remaining_worktrees.remove(0);
+                    write_journal(&journal_path, &journal)?;
+                    continue;
+                }
+                match self.cleanup(candidate.session_id, false) {
+                    Ok(()) => {}
+                    Err(BrokerOpError::WorktreeInUseByLiveSession { .. }) => {
+                        retained_live(&mut failures);
+                        journal.remaining_worktrees.remove(0);
+                        write_journal(&journal_path, &journal)?;
+                        continue;
+                    }
+                    Err(error) => {
+                        failures.push(format!("session {}: {error}", candidate.session_id));
+                        break;
+                    }
                 }
             }
             journal.reclaimed_bytes = journal
