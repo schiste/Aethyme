@@ -2985,7 +2985,12 @@ impl Broker {
     pub fn close(&mut self, session_id: i64) -> Result<(), BrokerOpError> {
         self.store
             .set_session_status(session_id, SessionStatus::Closed, None)?;
-        let _ = self.reclaim_closed_session_artifacts(session_id);
+        // Closing must not fail because a best-effort artifact sweep did;
+        // report the failure instead of discarding it.
+        crate::warn_unrecorded(
+            "reclaim a closed session's build artifacts",
+            self.reclaim_closed_session_artifacts(session_id),
+        );
         Ok(())
     }
 
