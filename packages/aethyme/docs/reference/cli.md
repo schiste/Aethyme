@@ -609,6 +609,7 @@ continues to expose the complete local `log_path` without embedding log data.
 - `aethyme broker advanced representation record --session <id> --confirm <sha256> [--json]`
 - `aethyme broker finish cleanup <session-id> [--force] [--json]`
 - `aethyme broker finish cleanup --all-cleaned [--apply --confirm <sha256>] [--json]`
+- `aethyme broker finish cleanup audit [--repo <path>] [--detail] [--json]`
 - `aethyme broker advanced main reconcile plan [--detail] [--resolution-file <path>] [--write-resolution-template <path>] [--json]`
 - `aethyme broker advanced main reconcile apply --session <id> --confirm <sha256> [--resolution-file <path>] [--json]`
 - `aethyme broker gc plan [--include-active-gate-cache] [--json]`
@@ -1134,7 +1135,30 @@ session branch. An interruption after worktree removal leaves the branch in the
 next plan for safe recovery. Adopted worktrees are outside the sweep, and dirty,
 symlinked, unsafe-path, pending, unproven, or inspection-failed candidates remain
 untouched. `--force` is available only for one exact session and is rejected
-with `--all-cleaned`; there is no blanket discard authorization.
+with `--all-cleaned`; there is no blanket discard authorization. The plan
+digest also binds a snapshot of every ref provenance was judged against (the
+primary checkout's HEAD, integration, the tracked upstream, and the local and
+fetched default branch), so a confirmation reviewed before any of them moved is
+refused.
+
+`broker finish cleanup audit` is the read-only, repository-scoped view of the
+same inventory, judged by content against a named target snapshot. It covers
+every session row whose checkout or branch still exists, every Git worktree
+registration of the repository, and every unclaimed directory under the
+repository's broker worktree roots; unrelated repositories are never walked.
+The proof ref is the fetched `origin/<default>` when it exists, and a local
+default branch that trails or leads it is named in a warning rather than used
+as the baseline. Delivery is recognised by ancestry (fast-forward or merge),
+net content (squash), and patch identity (rebase or cherry-pick). Each item
+reports its checkout state (`present`, `missing_directory`,
+`missing_git_metadata`, `prunable_registration`, `unowned_root`), owner,
+tracked and untracked changes separately, bytes, one disposition (`in_target`,
+`integration_only`, `remote_branch_only`, `worktree_only`, `dirty`, `live`,
+`missing_checkout_metadata`, `unknown_provenance`), evidence, blocker, and next
+action. The audit removes nothing. When anything is removable it prints the
+`--all-cleaned --apply` command with the current plan digest, and it withholds
+that command if the plan would remove an item the audit retains. `--repo
+<path>` audits the repository at `<path>` instead of the current directory.
 
 `broker gc reclaim plan` inventories regenerable build directories inside this
 repository's broker worktree root and saves the reviewed decision set under a

@@ -26,6 +26,24 @@ many hold work that exists nowhere else, and no cleanup path can reclaim those.
 A worktree outside this repository belongs to whoever ran it. Classify it, do
 not act on it.
 
+For one repository, the audit answers the same question by content and against
+a named target:
+
+```sh
+aethyme broker finish cleanup audit            # or --repo <path>, --detail, --json
+```
+
+It states the exact commit it proved against (the fetched upstream, not a local
+`main` that trails it), and separates `in_target`, `integration_only`,
+`remote_branch_only` (pushed, e.g. an open pull request), `worktree_only`,
+`dirty`, `live`, `missing_checkout_metadata` and `unknown_provenance`, each with
+a blocker and a next action. Squash and rebase landings count as `in_target`;
+when the cleanup plan still calls one unproven, the next action is
+`aethyme broker advanced representation scan` and then `record`, not `--force`.
+Registrations whose directory is gone are administrative metadata: `git
+worktree prune --dry-run --verbose` handles them, separately from removing a
+checkout or a branch.
+
 ## 2. Dry-run the supported sweep
 
 ```sh
