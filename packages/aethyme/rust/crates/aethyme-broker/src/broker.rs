@@ -1262,10 +1262,38 @@ pub struct StatusSummary {
     pub dirty_sessions: usize,
     pub overlap_count: usize,
     pub promoted_conflict_count: usize,
+    /// Relation to `baseline_ref`, the published branch -- not to the local
+    /// checkout, which `integration status` counts against.
     pub integration_relation: StatusIntegrationRelation,
     pub integration_ahead_main_commits: u64,
+    pub integration_head: String,
+    pub baseline_ref: String,
+    pub baseline_head: String,
+    /// The main checkout's HEAD and integration's lead over it: the same
+    /// pair `integration status` reports as `main_head` and
+    /// `commits_ahead_main`, so the two views can be compared like for like
+    /// (#374). After a local fast-forward that has not been pushed, this is 0
+    /// while `integration_ahead_main_commits` still counts the unpublished
+    /// commits.
+    pub main_head: String,
+    pub integration_ahead_local_main_commits: u64,
     pub may_move_integration: bool,
     pub commands: Vec<String>,
+}
+
+/// Where integration stands against the published baseline and against the
+/// local checkout, as one snapshot for the summary.
+#[derive(Debug, Clone)]
+struct SummaryIntegration {
+    branch: String,
+    head: String,
+    baseline_ref: String,
+    baseline_head: String,
+    relation: StatusIntegrationRelation,
+    ahead_baseline_commits: u64,
+    main_head: String,
+    main_is_ancestor: bool,
+    ahead_main_commits: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -5890,9 +5918,19 @@ impl Broker {
             overlaps.len(),
             promoted_conflicts.len(),
             dirty_sessions,
-            &integration_branch,
-            integration_relation,
-            integration_ahead_main_commits,
+            &SummaryIntegration {
+                branch: integration_branch.clone(),
+                head: integration_head.clone(),
+                baseline_ref: baseline_ref.clone(),
+                baseline_head: baseline_head.clone(),
+                relation: integration_relation,
+                ahead_baseline_commits: integration_ahead_main_commits,
+                main_head: main_head.clone(),
+                main_is_ancestor: self.repo.is_ancestor(&main_head, &integration_head),
+                ahead_main_commits: self
+                    .repo
+                    .commit_count_between(&main_head, &integration_head)?,
+            },
         );
         let mut advice = self.status_advice(
             &agents,
@@ -9390,9 +9428,7 @@ fn status_summary(
     overlap_count: usize,
     promoted_conflict_count: usize,
     dirty_sessions: usize,
-    integration_branch: &str,
-    integration_relation: StatusIntegrationRelation,
-    integration_ahead_main_commits: u64,
+    integration: &SummaryIntegration,
 ) -> StatusSummary {
     let live_sessions = agents.len();
     let active_sessions = agents
@@ -9416,11 +9452,7 @@ fn status_summary(
         stale_sessions,
     );
     let overlaps = overlap_summary_phrase(overlap_count, promoted_conflict_count);
-    let integration = integration_summary_phrase(
-        integration_branch,
-        integration_relation,
-        integration_ahead_main_commits,
-    );
+    let integration_phrase = integration_summary_phrase(integration);
     let mut notes = Vec::new();
     if dirty_sessions > 0 {
         notes.push(format!(
@@ -9441,13 +9473,13 @@ fn status_summary(
     if may_move_integration {
         commands.push("aethyme broker advanced integration wait-stable --seconds 30".into());
     }
-    if integration_relation != StatusIntegrationRelation::CurrentWithMain {
+    if integration.relation != StatusIntegrationRelation::CurrentWithMain {
         commands.push("aethyme broker advanced integration status".into());
     }
 
     StatusSummary {
         message: format!(
-            "{sessions}; {overlaps}; {integration}; {}",
+            "{sessions}; {overlaps}; {integration_phrase}; {}",
             notes.join("; ")
         ),
         live_sessions,
@@ -9457,8 +9489,13 @@ fn status_summary(
         dirty_sessions,
         overlap_count,
         promoted_conflict_count,
-        integration_relation,
-        integration_ahead_main_commits,
+        integration_relation: integration.relation,
+        integration_ahead_main_commits: integration.ahead_baseline_commits,
+        integration_head: integration.head.clone(),
+        baseline_ref: integration.baseline_ref.clone(),
+        baseline_head: integration.baseline_head.clone(),
+        main_head: integration.main_head.clone(),
+        integration_ahead_local_main_commits: integration.ahead_main_commits,
         may_move_integration,
         commands,
     }
@@ -9526,24 +9563,53 @@ fn overlap_summary_phrase(overlap_count: usize, promoted_conflict_count: usize) 
     }
 }
 
-fn integration_summary_phrase(
-    integration_branch: &str,
-    integration_relation: StatusIntegrationRelation,
-    commits_ahead_main: u64,
-) -> String {
-    match integration_relation {
-        StatusIntegrationRelation::CurrentWithMain => {
-            format!("{integration_branch} current with main")
-        }
-        StatusIntegrationRelation::AheadOfMain => format!(
-            "{integration_branch} ahead of main by {} {}",
-            commits_ahead_main,
-            plural_word(commits_ahead_main as usize, "commit", "commits")
-        ),
-        StatusIntegrationRelation::DivergedFromMain => {
-            format!("{integration_branch} diverged from main")
-        }
+/// Short name for a baseline ref: `origin/main`, `main`, or `checkout` for
+/// the HEAD fallback, which is not the default branch by any evidence.
+fn baseline_label(baseline_ref: &str) -> &str {
+    if baseline_ref == "HEAD" {
+        return "checkout";
     }
+    baseline_ref
+        .strip_prefix("refs/remotes/")
+        .or_else(|| baseline_ref.strip_prefix("refs/heads/"))
+        .unwrap_or(baseline_ref)
+}
+
+/// The summary's integration clause. It names the baseline it counts
+/// against, and when the local checkout sits somewhere else -- typically a
+/// fast-forward not yet pushed -- it says where, so the clause cannot be read
+/// as contradicting `integration status` (#374).
+fn integration_summary_phrase(integration: &SummaryIntegration) -> String {
+    let branch = &integration.branch;
+    let label = baseline_label(&integration.baseline_ref);
+    let mut phrase = match integration.relation {
+        StatusIntegrationRelation::CurrentWithMain => format!("{branch} current with {label}"),
+        StatusIntegrationRelation::AheadOfMain => format!(
+            "{branch} ahead of {label} by {} {}",
+            integration.ahead_baseline_commits,
+            plural_word(
+                integration.ahead_baseline_commits as usize,
+                "commit",
+                "commits"
+            )
+        ),
+        StatusIntegrationRelation::DivergedFromMain => format!("{branch} diverged from {label}"),
+    };
+    if integration.baseline_ref != "HEAD" && integration.main_head != integration.baseline_head {
+        let local = if integration.main_head == integration.head {
+            "local checkout matches integration".to_string()
+        } else if integration.main_is_ancestor {
+            format!(
+                "local checkout {} {} behind integration",
+                integration.ahead_main_commits,
+                plural_word(integration.ahead_main_commits as usize, "commit", "commits")
+            )
+        } else {
+            "local checkout diverged from integration".to_string()
+        };
+        phrase.push_str(&format!(" ({local})"));
+    }
+    phrase
 }
 
 fn integration_movement_advice(
@@ -10376,6 +10442,87 @@ mod tests {
         assert!(advice.summary.contains("session 69 is promoted and clean"));
     }
 
+    fn current_summary_integration() -> super::SummaryIntegration {
+        super::SummaryIntegration {
+            branch: "aethyme/integration".into(),
+            head: "a".repeat(40),
+            baseline_ref: "refs/heads/main".into(),
+            baseline_head: "a".repeat(40),
+            relation: super::StatusIntegrationRelation::CurrentWithMain,
+            ahead_baseline_commits: 0,
+            main_head: "a".repeat(40),
+            main_is_ancestor: true,
+            ahead_main_commits: 0,
+        }
+    }
+
+    /// The #374 field report: local main was fast-forwarded to integration
+    /// and not pushed. The baseline count is right -- publishing would still
+    /// add those commits -- but the summary must name what it counts against
+    /// and say the local checkout already matches, or it reads as a stale
+    /// contradiction of `integration status`.
+    #[test]
+    fn summary_names_its_baseline_after_an_unpushed_local_fast_forward() {
+        let integration = super::SummaryIntegration {
+            baseline_ref: "refs/remotes/origin/main".into(),
+            baseline_head: "b".repeat(40),
+            relation: super::StatusIntegrationRelation::AheadOfMain,
+            ahead_baseline_commits: 12,
+            ..current_summary_integration()
+        };
+        let summary = super::status_summary(&[], 0, 0, 0, &integration);
+        assert!(
+            summary.message.contains(
+                "aethyme/integration ahead of origin/main by 12 commits (local checkout matches integration)"
+            ),
+            "{}",
+            summary.message
+        );
+        assert_eq!(summary.integration_ahead_main_commits, 12);
+        assert_eq!(summary.integration_ahead_local_main_commits, 0);
+        assert_eq!(summary.main_head, summary.integration_head);
+        assert_eq!(summary.baseline_ref, "refs/remotes/origin/main");
+    }
+
+    #[test]
+    fn summary_reports_a_local_checkout_behind_integration() {
+        let integration = super::SummaryIntegration {
+            baseline_ref: "refs/remotes/origin/main".into(),
+            baseline_head: "b".repeat(40),
+            relation: super::StatusIntegrationRelation::AheadOfMain,
+            ahead_baseline_commits: 5,
+            main_head: "c".repeat(40),
+            ahead_main_commits: 3,
+            ..current_summary_integration()
+        };
+        let summary = super::status_summary(&[], 0, 0, 0, &integration);
+        assert!(
+            summary.message.contains(
+                "ahead of origin/main by 5 commits (local checkout 3 commits behind integration)"
+            ),
+            "{}",
+            summary.message
+        );
+    }
+
+    /// Without a default branch the baseline is the checkout itself, which
+    /// must not be called "main".
+    #[test]
+    fn a_head_fallback_baseline_is_named_checkout() {
+        let integration = super::SummaryIntegration {
+            baseline_ref: "HEAD".into(),
+            ..current_summary_integration()
+        };
+        let summary = super::status_summary(&[], 0, 0, 0, &integration);
+        assert!(
+            summary
+                .message
+                .contains("aethyme/integration current with checkout;"),
+            "{}",
+            summary.message
+        );
+    }
+
     #[test]
     fn status_summary_explains_single_active_session_risk() {
         let agent = super::AgentView {
@@ -10385,15 +10532,7 @@ mod tests {
             pid_alive: None,
         };
 
-        let summary = super::status_summary(
-            &[agent],
-            0,
-            0,
-            0,
-            "aethyme/integration",
-            super::StatusIntegrationRelation::CurrentWithMain,
-            0,
-        );
+        let summary = super::status_summary(&[agent], 0, 0, 0, &current_summary_integration());
 
         assert_eq!(summary.live_sessions, 1);
         assert_eq!(summary.active_sessions, 1);
@@ -10410,15 +10549,7 @@ mod tests {
 
     #[test]
     fn status_summary_explains_no_active_submitters() {
-        let summary = super::status_summary(
-            &[],
-            0,
-            0,
-            0,
-            "aethyme/integration",
-            super::StatusIntegrationRelation::CurrentWithMain,
-            0,
-        );
+        let summary = super::status_summary(&[], 0, 0, 0, &current_summary_integration());
 
         assert_eq!(summary.live_sessions, 0);
         assert_eq!(summary.active_sessions, 0);
