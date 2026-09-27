@@ -498,14 +498,15 @@ fn gate_refuses_invalid_inherited_database_scope_before_running_the_command() {
         .unwrap();
     assert!(!repo.path().join("must-not-run").exists());
     assert!(!output.status.success());
-    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(result[0]["status"], "error");
-    assert_eq!(result[0]["failure_class"], "environment");
-    let diagnostics = std::fs::read_to_string(result[0]["log_path"].as_str().unwrap()).unwrap();
+    // #361: an unreadable scope is refused where the database is resolved,
+    // before this process opens any store -- ignoring it would resolve the
+    // checkout's shared database, the fallback the scope exists to stop.
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        diagnostics.contains("invalid inherited gate database scope"),
-        "{diagnostics}"
+        stderr.contains("AETHYME_GATE_BROKER_DATABASES is set but unreadable"),
+        "{stderr}"
     );
+    assert!(!repo.path().join(".aethyme/broker.db").exists());
 }
 
 #[test]

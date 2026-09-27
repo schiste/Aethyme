@@ -3854,7 +3854,7 @@ impl Broker {
         if let Some(guard) = &mut host_guard {
             guard.mark_running()?;
         }
-        let operation_db_path = crate::broker_db_path(self.main_root());
+        let operation_db_path = crate::broker_db_path(self.main_root())?;
         let mut operation_heartbeat = OperationHeartbeat::start(
             &operation_db_path,
             operation.id,

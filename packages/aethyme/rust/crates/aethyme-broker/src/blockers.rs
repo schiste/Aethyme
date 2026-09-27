@@ -486,7 +486,7 @@ impl Broker {
     }
 
     fn gate_cache_blockers(&self) -> Result<Vec<Blocker>, BrokerOpError> {
-        let database = crate::broker_db_path(self.main_root());
+        let database = crate::broker_db_path(self.main_root())?;
         if !database.exists() {
             return Ok(Vec::new());
         }
@@ -905,8 +905,9 @@ impl Broker {
                 false,
             ));
         }
-        let removed = delete_failing_verdicts(&crate::broker_db_path(self.main_root()), gate, tree)
-            .map_err(sqlite_error)?;
+        let removed =
+            delete_failing_verdicts(&crate::broker_db_path(self.main_root())?, gate, tree)
+                .map_err(sqlite_error)?;
         if removed.is_empty() {
             return Err(BrokerOpError::InvalidCoordinatedOperation {
                 reason: format!(
