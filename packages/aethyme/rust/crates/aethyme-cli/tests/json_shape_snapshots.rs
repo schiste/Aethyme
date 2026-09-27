@@ -133,7 +133,14 @@ fn session_lifecycle_json_shapes_match_snapshots() {
     );
     let adopted = json(
         &adopted_path,
-        &["broker", "adopt", "--task", "adopt fixture", "--json"],
+        &[
+            "broker",
+            "start",
+            "--adopt",
+            "--task",
+            "adopt fixture",
+            "--json",
+        ],
     );
     entries.push(("adopt".to_string(), shape(&adopted)));
 

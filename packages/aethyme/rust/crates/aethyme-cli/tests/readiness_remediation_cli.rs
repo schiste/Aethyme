@@ -111,7 +111,10 @@ fn plan_is_read_only_complete_and_digest_bound() {
     remove_for_remediation(&repo);
     let before = git_status(&repo);
 
-    let plan = json(&run(&repo, &["broker", "readiness", "plan", "--json"]));
+    let plan = json(&run(
+        &repo,
+        &["broker", "status", "readiness", "plan", "--json"],
+    ));
 
     assert_eq!(plan["schema_version"], 1);
     assert_eq!(plan["repository_mode"], "canonical");
@@ -148,9 +151,12 @@ fn reviewed_diff_and_confirmed_apply_share_exact_outputs() {
     let temp = tmp_dir();
     let repo = repository(temp.path());
     remove_for_remediation(&repo);
-    let plan = json(&run(&repo, &["broker", "readiness", "plan", "--json"]));
+    let plan = json(&run(
+        &repo,
+        &["broker", "status", "readiness", "plan", "--json"],
+    ));
     let digest = plan["plan_sha256"].as_str().unwrap();
-    let diff = run(&repo, &["broker", "readiness", "plan", "--diff"]);
+    let diff = run(&repo, &["broker", "status", "readiness", "plan", "--diff"]);
     assert_success(&diff);
     let diff = String::from_utf8(diff.stdout).unwrap();
     assert!(diff.contains("Remediation diff:"));
@@ -181,7 +187,7 @@ fn reviewed_diff_and_confirmed_apply_share_exact_outputs() {
             .contains("reviewed = false")
     );
 
-    let readiness = json(&run(&repo, &["broker", "readiness", "--json"]));
+    let readiness = json(&run(&repo, &["broker", "status", "readiness", "--json"]));
     let validation = readiness["dimensions"]
         .as_array()
         .unwrap()
@@ -200,7 +206,7 @@ fn reviewed_diff_and_confirmed_apply_share_exact_outputs() {
         .unwrap()
         .replace("reviewed = false", "reviewed = true");
     fs::write(&gates_path, reviewed).unwrap();
-    let readiness = json(&run(&repo, &["broker", "readiness", "--json"]));
+    let readiness = json(&run(&repo, &["broker", "status", "readiness", "--json"]));
     let validation = readiness["dimensions"]
         .as_array()
         .unwrap()
@@ -220,14 +226,24 @@ fn confirmation_and_head_drift_are_refused_without_writes() {
     let temp = tmp_dir();
     let repo = repository(temp.path());
     remove_for_remediation(&repo);
-    let plan = json(&run(&repo, &["broker", "readiness", "plan", "--json"]));
+    let plan = json(&run(
+        &repo,
+        &["broker", "status", "readiness", "plan", "--json"],
+    ));
     let digest = plan["plan_sha256"].as_str().unwrap().to_string();
     fs::write(repo.join("unrelated.txt"), "committed later\n").unwrap();
     commit_all(&repo, "move head");
 
     let refused = run(
         &repo,
-        &["broker", "readiness", "apply", "--confirm", &digest],
+        &[
+            "broker",
+            "status",
+            "readiness",
+            "apply",
+            "--confirm",
+            &digest,
+        ],
     );
     assert!(!refused.status.success());
     assert!(String::from_utf8_lossy(&refused.stderr).contains("changed after review"));
@@ -240,7 +256,10 @@ fn customized_policy_and_symlink_targets_are_never_replaced() {
     let repo = repository(temp.path());
     fs::write(repo.join("AGENTS.md"), "maintainer policy\n").unwrap();
     commit_all(&repo, "custom policy");
-    let customized = json(&run(&repo, &["broker", "readiness", "plan", "--json"]));
+    let customized = json(&run(
+        &repo,
+        &["broker", "status", "readiness", "plan", "--json"],
+    ));
     assert_eq!(customized["safe"], false);
     assert!(
         customized["blockers"]
@@ -262,7 +281,10 @@ fn customized_policy_and_symlink_targets_are_never_replaced() {
     #[cfg(unix)]
     std::os::unix::fs::symlink("Cargo.toml", repo.join("AGENTS.md")).unwrap();
     commit_all(&repo, "symlink policy");
-    let symlinked = json(&run(&repo, &["broker", "readiness", "plan", "--json"]));
+    let symlinked = json(&run(
+        &repo,
+        &["broker", "status", "readiness", "plan", "--json"],
+    ));
     assert_eq!(symlinked["safe"], false);
     assert!(
         symlinked["blockers"]
@@ -279,19 +301,36 @@ fn interrupted_apply_is_recovered_only_by_the_exact_plan_digest() {
     let repo = repository(temp.path());
     remove_for_remediation(&repo);
     let before = git_status(&repo);
-    let plan = json(&run(&repo, &["broker", "readiness", "plan", "--json"]));
+    let plan = json(&run(
+        &repo,
+        &["broker", "status", "readiness", "plan", "--json"],
+    ));
     let digest = plan["plan_sha256"].as_str().unwrap().to_string();
 
     let crashed = command(&repo)
         .env("AETHYME_TEST_UPGRADE_CRASH", "after_first_replacement")
-        .args(["broker", "readiness", "apply", "--confirm", &digest])
+        .args([
+            "broker",
+            "status",
+            "readiness",
+            "apply",
+            "--confirm",
+            &digest,
+        ])
         .output()
         .unwrap();
     assert_eq!(crashed.status.code(), Some(86));
 
     let wrong = run(
         &repo,
-        &["broker", "readiness", "recover", "--plan", &"0".repeat(64)],
+        &[
+            "broker",
+            "status",
+            "readiness",
+            "recover",
+            "--plan",
+            &"0".repeat(64),
+        ],
     );
     assert!(!wrong.status.success());
     let recovered = json(&run(
@@ -316,7 +355,10 @@ fn disjoint_work_is_preserved_and_overlapping_work_blocks() {
     let repo = repository(temp.path());
     remove_for_remediation(&repo);
     fs::write(repo.join("notes.txt"), "keep me\n").unwrap();
-    let disjoint = json(&run(&repo, &["broker", "readiness", "plan", "--json"]));
+    let disjoint = json(&run(
+        &repo,
+        &["broker", "status", "readiness", "plan", "--json"],
+    ));
     assert_eq!(disjoint["safe"], true);
     assert_eq!(
         disjoint["dirty_disjoint_paths"],
@@ -326,7 +368,10 @@ fn disjoint_work_is_preserved_and_overlapping_work_blocks() {
     assert!(!disjoint.to_string().contains("stash"));
 
     fs::write(repo.join("AGENTS.md"), "uncommitted overlap\n").unwrap();
-    let overlapping = json(&run(&repo, &["broker", "readiness", "plan", "--json"]));
+    let overlapping = json(&run(
+        &repo,
+        &["broker", "status", "readiness", "plan", "--json"],
+    ));
     assert_eq!(overlapping["safe"], false);
     assert!(
         overlapping["dirty_overlapping_paths"]
@@ -364,7 +409,10 @@ fn live_sessions_and_exact_leases_block_the_reviewed_write_set() {
         .unwrap();
     store.claim_lease(session.id, "AGENTS.md", None).unwrap();
 
-    let plan = json(&run(&repo, &["broker", "readiness", "plan", "--json"]));
+    let plan = json(&run(
+        &repo,
+        &["broker", "status", "readiness", "plan", "--json"],
+    ));
     assert_eq!(plan["safe"], false);
     assert_eq!(plan["live_sessions"][0]["session_id"], session.id);
     assert_eq!(plan["relevant_leases"][0]["path"], "AGENTS.md");
@@ -395,7 +443,14 @@ fn local_only_remediation_stays_clone_local() {
 
     let plan = json(&run(
         &repo,
-        &["broker", "readiness", "plan", "--local-only", "--json"],
+        &[
+            "broker",
+            "status",
+            "readiness",
+            "plan",
+            "--local-only",
+            "--json",
+        ],
     ));
     assert_eq!(plan["repository_mode"], "local_only");
     assert_eq!(plan["safe"], true);

@@ -581,8 +581,8 @@ fn migration_diff_never_enters_reports_events_or_metrics() {
             "upgrade privacy",
             "--stdout",
         ][..],
-        &["broker", "metrics", "--json"][..],
-        &["broker", "events", "--json"][..],
+        &["broker", "advanced", "metrics", "--json"][..],
+        &["broker", "advanced", "events", "--json"][..],
     ] {
         let output = run(&repo, args);
         assert!(
@@ -802,8 +802,8 @@ fn homebrew_upgrade_mid_session_preserves_commit_and_recovery_lanes() {
     // while the new binary sees the old repository deployment.
     for args in [
         &["broker", "status", "--json"][..],
-        &["broker", "leases", "--json"][..],
-        &["broker", "operations", "--json"][..],
+        &["broker", "advanced", "leases", "--json"][..],
+        &["broker", "advanced", "operations", "--json"][..],
         &[
             "broker",
             "git",
@@ -849,7 +849,7 @@ fn homebrew_upgrade_mid_session_preserves_commit_and_recovery_lanes() {
 
     for args in [
         &["broker", "start", "--task", "must stay blocked"][..],
-        &["broker", "ship", "execute"][..],
+        &["broker", "advanced", "ship", "execute"][..],
     ] {
         let blocked = run(&repo, args);
         assert!(
@@ -969,12 +969,12 @@ fn older_repository_allows_diagnostics_recovery_and_only_pinned_continuation() {
 
     for args in [
         &["broker", "status", "--json"][..],
-        &["broker", "integration", "status", "--json"][..],
-        &["broker", "agents", "--json"][..],
-        &["broker", "leases", "--json"][..],
-        &["broker", "operations", "--json"][..],
-        &["broker", "events", "--json"][..],
-        &["broker", "report", "list", "--json"][..],
+        &["broker", "advanced", "integration", "status", "--json"][..],
+        &["broker", "advanced", "agents", "--json"][..],
+        &["broker", "advanced", "leases", "--json"][..],
+        &["broker", "advanced", "operations", "--json"][..],
+        &["broker", "advanced", "events", "--json"][..],
+        &["broker", "advanced", "report", "list", "--json"][..],
         &[
             "broker",
             "report",
@@ -997,7 +997,15 @@ fn older_repository_allows_diagnostics_recovery_and_only_pinned_continuation() {
     let session_arg = session.to_string();
     let continued = run(
         &repo,
-        &["broker", "exec", "--session", &session_arg, "--", "true"],
+        &[
+            "broker",
+            "advanced",
+            "exec",
+            "--session",
+            &session_arg,
+            "--",
+            "true",
+        ],
     );
     assert!(
         continued.status.success(),
@@ -1033,7 +1041,14 @@ fn older_repository_allows_diagnostics_recovery_and_only_pinned_continuation() {
     );
     let handoff = run(
         &repo,
-        &["broker", "handoff", "--session", &session_arg, "--json"],
+        &[
+            "broker",
+            "advanced",
+            "handoff",
+            "--session",
+            &session_arg,
+            "--json",
+        ],
     );
     assert!(
         handoff.status.success(),
@@ -1044,8 +1059,8 @@ fn older_repository_allows_diagnostics_recovery_and_only_pinned_continuation() {
     for args in [
         &["broker", "submit", "--session", "9999"][..],
         &["broker", "start", "--task", "work"][..],
-        &["broker", "adopt", "--reuse", "--task", "work"][..],
-        &["broker", "ship", "execute"][..],
+        &["broker", "start", "--reuse", "--task", "work"][..],
+        &["broker", "advanced", "ship", "execute"][..],
     ] {
         let output = run(&repo, args);
         assert!(!output.status.success(), "broker command ran: {args:?}");
@@ -1176,7 +1191,7 @@ fn repository_compatibility_states_preserve_refusal_remediation() {
         let stderr = String::from_utf8_lossy(&mutation.stderr);
         assert!(stderr.contains(expected), "expected {expected:?}: {stderr}");
 
-        let recovery = run(&repo, &["broker", "close", "--session", "9999"]);
+        let recovery = run(&repo, &["broker", "finish", "close", "--session", "9999"]);
         let recovery_stderr = String::from_utf8_lossy(&recovery.stderr);
         assert!(!recovery.status.success());
         assert_eq!(
