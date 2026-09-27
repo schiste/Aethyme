@@ -20,8 +20,7 @@ drift. Customize repo-specific policy through `.aethyme/overrides/agents.json`
 (`repo_summary`, `hard_constraints`, `validation_rules`,
 `commit_hygiene_notes`, `summon_policy_notes`, `maintainer_markdown`) and
 repo-specific orientation through `.aethyme/overrides/onboarding.json`, then
-rerun `aethyme deploy --repo "$PWD"`. `aethyme enhance deploy` is the
-deprecated spelling of the same step; it still works and prints a warning.
+rerun `aethyme deploy --repo "$PWD"`.
 
 Do not run `python -m src.cli ...` for anything; the Python CLI was removed
 entirely and that spelling now fails. Use the installed `aethyme` binary for
@@ -89,4 +88,4 @@ aethyme deploy verify --repo "$PWD"
 
 Returns nonzero if any generated root file, Aethyme skill, Aethyme skill
 reference, or repo-onboarding skill is missing or has unsubstituted
-placeholders. `aethyme enhance verify` is the deprecated spelling.
+placeholders.

@@ -20,11 +20,11 @@ This separation is intentional:
 The owning session must be live. Open and draft PRs are accepted.
 
 ```bash
-aethyme broker watch pr start \
+aethyme broker advanced watch pr start \
   --session 111 --repo owner/name --pr 42 \
   --events comments,reviews,checks --seconds 60 --json
 
-aethyme broker deliveries subscribe \
+aethyme broker advanced deliveries subscribe \
   --watch 7 --adapter my-adapter --target opaque-target \
   --policy notify --json
 ```
@@ -36,7 +36,7 @@ matching user authorization before it allows a remote write.
 ## Run one scheduler tick
 
 ```bash
-aethyme broker watch pr tick --limit 32 --json
+aethyme broker advanced watch pr tick --limit 32 --json
 ```
 
 The command polls only active watches whose `next_poll_at` is due, in a stable
@@ -61,7 +61,7 @@ Run under the developer account that owns the repository and its authenticated
 An adapter loop claims at most one durable item at a time:
 
 ```bash
-aethyme broker deliveries claim \
+aethyme broker advanced deliveries claim \
   --adapter my-adapter --worker host-worker-1 --seconds 120 --json
 ```
 
@@ -79,11 +79,11 @@ bounded prompt. The adapter must:
    classification of every item.
 
 ```bash
-aethyme broker deliveries complete \
+aethyme broker advanced deliveries complete \
   --id 19 --worker host-worker-1 --generation 3 \
   --outcome delivered
 
-aethyme broker watch pr ack \
+aethyme broker advanced watch pr ack \
   --id 12 --outcome addressed \
   --reason "all items classified and durable delivery completed"
 ```
@@ -103,11 +103,11 @@ wrong tree.
 ## Pause, recover, and remove
 
 ```bash
-aethyme broker watch pr pause --id 7
-aethyme broker watch pr resume --id 7
-aethyme broker watch pr stop --id 7
-aethyme broker watch pr batches --id 7 --all --json
-aethyme broker deliveries list --adapter my-adapter --all --json
+aethyme broker advanced watch pr pause --id 7
+aethyme broker advanced watch pr resume --id 7
+aethyme broker advanced watch pr stop --id 7
+aethyme broker advanced watch pr batches --id 7 --all --json
+aethyme broker advanced deliveries list --adapter my-adapter --all --json
 ```
 
 Paused and stopped watches are not polled. Stopped and completed watches are

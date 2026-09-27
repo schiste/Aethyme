@@ -38,8 +38,8 @@ contracts, so any future delivery surface is a client, not a rewrite.
 2. **Worktree-first, attach-capable.** Session identity is the
    (worktree, branch) pair. The normal entry point is now `broker start`,
    which creates an isolated worktree + branch and registers the session;
-   `broker adopt` remains the attach path for a worktree the user or agent
-   tool already created. `broker start-agent` is a convenience spawner
+   `broker start --adopt` remains the attach path for a worktree the user or agent
+   tool already created. `broker start --cmd <command>` is a convenience spawner
    layered on the same model. PID is optional metadata captured when the
    broker did the spawning; liveness derives from diff/file activity, with
    process state as a bonus signal. No design may assume the broker owns the
@@ -72,7 +72,7 @@ contracts, so any future delivery surface is a client, not a rewrite.
   no time is saved; the friction log includes cost/time accounting.
 - **Promotion lands on a local integration branch only.** `broker submit`
   never pushes and never opens PRs. Explicitly authorized Git and GitHub
-  mutations use `broker git` / `broker gh`: fixed executables, repository-wide
+  mutations use `broker advanced git` / `broker advanced gh`: fixed executables, repository-wide
   write serialization, a durable redacted journal, and fail-closed recovery
   when a crashed operation has an unknown external outcome.
 - **The broker manages conflicts; quality is repo-owned and optional**
@@ -86,12 +86,12 @@ contracts, so any future delivery surface is a client, not a rewrite.
   2026-07-13 after the first dogfood run: verified means verified, and a
   human promote step makes the human the bottleneck). Gates passing
   promotes immediately; `[promote] mode = "manual"` restores the explicit
-  `broker promote` step.
-- **Delivery is explicit and target-aware.** `broker ship plan` reads an
+  `broker submit promote` step.
+- **Delivery is explicit and target-aware.** `broker advanced ship plan` reads an
   optional `[delivery] default = "pull_request" | "local_main_merge"` from
   the exact remote default-branch commit, never from the pending integration
   tip. A plan reports the selected route, policy source, compared SHAs,
-  divergence reasons, and a SHA-256 digest. `broker ship execute` must bind
+  divergence reasons, and a SHA-256 digest. `broker advanced ship execute` must bind
   configured or overridden routes to that digest. A clean, unchanged local
   main may use the coordinated non-force publication path; a pull-request
   route pushes a deterministic branch and verifies the exact GitHub PR head,
@@ -143,14 +143,14 @@ the graph is cold or stale.
 
 Semantic gate selection follows that same split. Path triggers in
 `.aethyme/gates.toml` remain the enforced selection surface for session submit
-and `broker gates run`; CI still runs the full gates definition via
-`broker gates run --all`. Caller-edge or impact-frontier data may only appear
-as advisory operator guidance. The `broker gates semantic --session <id>`
+and `broker advanced gates run`; CI still runs the full gates definition via
+`broker advanced gates run --all`. Caller-edge or impact-frontier data may only appear
+as advisory operator guidance. The `broker advanced gates semantic --session <id>`
 command is the intentionally separate read surface: it walks a deterministic,
 strictly bounded incoming `Calls` frontier and reports explainable
 changed-file → caller-file → suggested-gate chains. Missing, stale, corrupted,
 empty, or truncated graph results remain successful advisory reports and do
-not affect `broker gates run` or submit-time merged-tree gates.
+not affect `broker advanced gates run` or submit-time merged-tree gates.
 
 ## v0 scope
 
@@ -158,8 +158,8 @@ Aethyme v0 local broker should eventually provide:
 
 - one isolated git worktree per agent/task
 - an agent session registry keyed on (worktree, branch): `broker start`
-  creates the default isolated worktree; `broker adopt` registers an
-  existing worktree; `broker start-agent` creates worktree + spawns a
+  creates the default isolated worktree; `broker start --adopt` registers an
+  existing worktree; `broker start --cmd <command>` creates worktree + spawns a
   command template as a convenience; task, logs, status, and exit state are
   recorded where known
 - changed-file tracking per session

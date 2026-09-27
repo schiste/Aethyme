@@ -26,7 +26,9 @@ pub struct ResolvedGithubTarget {
 pub enum GithubTargetError {
     #[error("repository must be an exact owner/name slug, got {value:?}")]
     InvalidRepository { value: String },
-    #[error("do not pass a second repository target after --; use broker gh --repo owner/name")]
+    #[error(
+        "do not pass a second repository target after --; use aethyme broker advanced gh --repo owner/name"
+    )]
     AlternateRepositoryFlag,
     #[error("unsupported gh api option {option:?} prevents deterministic endpoint validation")]
     UnsupportedApiOption { option: String },

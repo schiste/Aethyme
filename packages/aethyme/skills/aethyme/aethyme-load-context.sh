@@ -5,7 +5,7 @@
 # in-repo agent instructions even when the harness skips the standard
 # CWD-CLAUDE.md auto-load.
 #
-# This script is deployed by `aethyme enhance deploy --repo <path>` and
+# This script is deployed by `aethyme deploy --repo <path>` and
 # wired into the project's .claude/settings.local.json under
 # hooks.SessionStart.
 #

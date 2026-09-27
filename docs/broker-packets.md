@@ -222,8 +222,8 @@ Allowed v0 values:
 | `post_commit` | Aethyme-managed or Aethyme-wrapped Git post-commit hook. |
 | `pre_push` | Future user-owned push wrapper or external-hook adapter; Aethyme does not manage `pre-push`. |
 | `submit` | `aethyme broker submit --session <id>`. |
-| `gate_run` | `aethyme broker gates run --session <id>` or `--all`. |
-| `repair` | `aethyme broker repair --session <id>`. |
+| `gate_run` | `aethyme broker advanced gates run --session <id>` or `--all`. |
+| `repair` | `aethyme broker advanced repair --session <id>`. |
 | `status` | `aethyme broker status` compact packet rendering. |
 | `brief` | Future `aethyme broker brief --session <id>`. |
 | `last` | Future `aethyme broker last --session <id>`. |
@@ -670,7 +670,7 @@ Conflicts:
 - packages/aethyme/rust/crates/aethyme-broker/src/cli.rs
 
 Next:
-- run: aethyme broker repair --session 42
+- run: aethyme broker advanced repair --session 42
 - then: aethyme broker submit --session 42
 ```
 
@@ -686,14 +686,14 @@ Failed:
 
 Next:
 - inspect: .aethyme/logs/gates/cargo-test-9e685d05.log
-- run: aethyme broker gates run --session 42
+- run: aethyme broker advanced gates run --session 42
 - then: aethyme broker submit --session 42
 ```
 
 ### Gate-Run Packet
 
-Produced by `aethyme broker gates run --session <id>` or
-`aethyme broker gates run --all`.
+Produced by `aethyme broker advanced gates run --session <id>` or
+`aethyme broker advanced gates run --all`.
 
 Deterministic inputs:
 
@@ -735,12 +735,12 @@ Failed:
 
 Next:
 - inspect: .aethyme/logs/gates/pytest-local-f7d1a6dc.log
-- retry: aethyme broker gates run --session 42
+- retry: aethyme broker advanced gates run --session 42
 ```
 
 ### Repair Packet
 
-Produced by `aethyme broker repair --session <id>`.
+Produced by `aethyme broker advanced repair --session <id>`.
 
 Deterministic inputs:
 
@@ -833,7 +833,7 @@ Latest result:
 - log: .aethyme/logs/gates/cargo-test-9e685d05.log
 
 Next:
-- run: aethyme broker gates run --session 42
+- run: aethyme broker advanced gates run --session 42
 - then: aethyme broker submit --session 42
 ```
 

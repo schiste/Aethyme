@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Perform this repository's routed reviews in Codex Luna shells.
 #
-# `aethyme broker review tick` decides which reviews a pull request is owed and
+# `aethyme broker advanced review tick` decides which reviews a pull request is owed and
 # which workspace each gets; chau7-review-adapter.py performs the Chau7 half.
 # Neither of them names a model, and that is deliberate -- the broker builds
 # with no Chau7 present and the adapter works for any agent that takes a prompt

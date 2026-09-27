@@ -2,7 +2,7 @@ name: Aethyme Gates
 
 # Convergence lane: gates.toml is the single definition of "verified" —
 # this workflow runs the exact gates, via the exact runner, that the
-# broker runs before promoting a session (`aethyme broker gates run
+# broker runs before promoting a session (`aethyme broker advanced gates run
 # --all`). Certify merged trees here; OSS CI runs the full Rust workspace
 # on pull requests. Keep the binary-driven subset available manually.
 #
@@ -63,4 +63,4 @@ jobs:
           # gates this repository defines on its own main branch; that is the
           # trust decision, made here explicitly.
           AETHYME_TRUST_NONINTERACTIVE_FOR_TESTS: "1"
-        run: packages/aethyme/rust/target/release/aethyme broker gates run --all
+        run: packages/aethyme/rust/target/release/aethyme broker advanced gates run --all

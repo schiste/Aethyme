@@ -5,7 +5,7 @@
 //! agent submits, runs gates, commits through the installed hook, or prepares
 //! a session. A freshly cloned repository could therefore make the broker run
 //! arbitrary shell. Nothing repository-defined runs until a human on this
-//! machine has approved the exact policy with `aethyme broker trust`, which
+//! machine has approved the exact policy with `aethyme broker advanced trust`, which
 //! refuses without a terminal so an agent cannot approve itself.
 //!
 //! The record is host state, keyed by the repository's canonical Git common
@@ -31,7 +31,7 @@ use crate::store::BrokerStore;
 
 use super::BrokerOpError;
 
-/// Test-only escape. When set to `1`, `aethyme broker trust` records trust
+/// Test-only escape. When set to `1`, `aethyme broker advanced trust` records trust
 /// without a terminal or a prompt, and an untrusted policy is allowed to run
 /// without being recorded. Test harnesses set it; nothing else may.
 pub const TEST_ESCAPE_ENV: &str = "AETHYME_TRUST_NONINTERACTIVE_FOR_TESTS";
@@ -392,7 +392,7 @@ pub struct PolicySource {
     pub policy: GatePolicy,
 }
 
-/// `aethyme broker trust status`.
+/// `aethyme broker advanced trust status`.
 #[derive(Debug, Clone, Serialize)]
 pub struct GateTrustStatus {
     pub schema_version: u32,
@@ -405,7 +405,7 @@ pub struct GateTrustStatus {
     pub next_action: Option<String>,
 }
 
-/// `aethyme broker trust`.
+/// `aethyme broker advanced trust`.
 #[derive(Debug, Clone, Serialize)]
 pub struct GateTrustReport {
     pub schema_version: u32,

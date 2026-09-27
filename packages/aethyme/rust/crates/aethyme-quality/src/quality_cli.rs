@@ -12,7 +12,7 @@ const HELP: &str = "Usage: aethyme quality inspect [OPTIONS]
 
   Run bounded, optional repository-quality analysis.
 
-  This report is advisory. Use `aethyme readiness` for authoritative
+  This report is advisory. Use `aethyme broker status readiness` for authoritative
   operational readiness.
 
 Options:
@@ -290,7 +290,7 @@ fn format_json(report: &QualityInspection, rendered: &[Finding], full: bool) -> 
             authoritative: false,
             affects_readiness: false,
             operational_blockers: &[],
-            command: "aethyme readiness",
+            command: "aethyme broker status readiness",
         },
         repository: JsonRepository {
             path: &report.repository_path,
@@ -347,7 +347,7 @@ fn format_markdown(report: &QualityInspection, rendered: &[Finding], full: bool)
     let mut lines = vec![
         "# Repository Quality Inspection".to_string(),
         String::new(),
-        "> Advisory repository-quality suggestions only. Run `aethyme readiness` for operational readiness.".to_string(),
+        "> Advisory repository-quality suggestions only. Run `aethyme broker status readiness` for operational readiness.".to_string(),
         String::new(),
         format!("Repository: `{}`", report.repository_path),
         format!("Tracked/relevant files: {}/{}", report.tracked_file_count, report.relevant_file_count),

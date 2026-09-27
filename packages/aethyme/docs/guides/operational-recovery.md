@@ -38,15 +38,15 @@ aethyme-engine-cli --version
 Coordinate this host-wide operation with other agents first. Sequential Cargo
 installation is **not atomic**: if the second install fails, stop broker work and
 finish repairing the pair. Do not report the first successful install as success.
-`broker doctor --fix-version` targets integration; do not use it blindly when
+`broker status doctor --fix-version` targets integration; do not use it blindly when
 integration is divergent or contains work that should not be deployed.
 
 ## 2. Verify configuration without changing it
 
 ```sh
 aethyme certify --json
-aethyme readiness --json
-aethyme enhance verify --repo .
+aethyme broker status readiness --json
+aethyme deploy verify --repo .
 aethyme graph status --repo . --json
 ```
 
@@ -56,7 +56,7 @@ future settings remain warnings; malformed supported settings are errors.
 readiness. Graph-disabled is legitimate and must not require enrolling a graph
 merely to obtain navigation. Bounded source hints are not impact evidence.
 
-For generated deployment drift, inspect `aethyme readiness plan --repo . --diff`
+For generated deployment drift, inspect `aethyme broker status readiness plan --repo . --diff`
 before applying any repair. Keep overrides in their source configuration, never
 edit generated AGENTS.md or skills by hand. A repair plan does not authorize
 discarding working-tree changes.
@@ -65,8 +65,8 @@ discarding working-tree changes.
 
 ```sh
 aethyme broker status --json
-aethyme broker integration status --json
-aethyme broker integration reconcile --upstream origin/main --dry-run
+aethyme broker advanced integration status --json
+aethyme broker advanced integration reconcile --upstream origin/main --dry-run
 ```
 
 The dry run classifies each promoted delta. `already_landed` is evidence, not a

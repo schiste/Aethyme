@@ -40,7 +40,7 @@ the requested version change.
    ```bash
    git add -A
    (cd packages/aethyme/rust && cargo build -p aethyme-cli -p aethyme-engine)
-   ./packages/aethyme/rust/target/debug/aethyme enhance deploy --repo "$PWD"
+   ./packages/aethyme/rust/target/debug/aethyme deploy --repo "$PWD"
    git add -A
    ```
 
@@ -54,7 +54,7 @@ the requested version change.
    redeploys.
 4. Run `cargo fmt --check --all`, `cargo test --workspace`, release contract
    checks, and `git diff --check`.
-5. Submit the release series, inspect `broker ship plan`, and execute only the
+5. Submit the release series, inspect `broker advanced ship plan`, and execute only the
    exact confirmed integration SHA.
 6. Create and push the matching annotated tag through the coordinated Git
    lane. Wait for the release workflow and verify the manifest, checksums,

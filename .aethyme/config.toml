@@ -4,7 +4,7 @@
 [promote]
 # "auto" (default): verified submissions promote to the local integration
 # branch immediately (decision 2026-07-13, after the first dogfood run).
-# "manual" holds verified entries for an explicit `broker promote`.
+# "manual" holds verified entries for an explicit `broker submit promote`.
 # "verify-only" verifies and promotes nothing.
 #
 # Set to "verify-only" on 2026-09-22 (decision recorded on #290). This
@@ -40,7 +40,7 @@ mode = "verify-only"
 # every line of it is still a decision someone can revisit.
 #
 # Inspect a change against these rules without performing anything:
-#   aethyme broker review plan --base aethyme/integration --pr <number>
+#   aethyme broker advanced review plan --base aethyme/integration --pr <number>
 #
 # `review run` loads this file from the MAIN CHECKOUT, not from the branch
 # under review. A change here therefore does nothing until it reaches `main`,
@@ -231,7 +231,7 @@ schema_version = 1
 # No longer consulted by the Chau7 lane. A reviewer reads a diff somebody
 # else wrote, so it runs with no GitHub credentials and posts nothing: it
 # writes its review to a file beside its workspace, and the adapter posts that
-# file through `aethyme broker gh`. Kept so the table reads as it always has.
+# file through `aethyme broker advanced gh`. Kept so the table reads as it always has.
 coordinated = true
 
 # A finding the reader cannot locate is not actionable: the reviewer has the

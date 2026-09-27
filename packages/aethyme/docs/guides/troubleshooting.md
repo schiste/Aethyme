@@ -93,7 +93,7 @@ session that starts on a skewed machine is told before it does any work. Set
 ## First Debug Commands
 
 ```bash
-aethyme broker doctor
-aethyme broker blockers
+aethyme broker status doctor
+aethyme broker unblock
 cargo test --manifest-path packages/aethyme/rust/Cargo.toml --workspace
 ```

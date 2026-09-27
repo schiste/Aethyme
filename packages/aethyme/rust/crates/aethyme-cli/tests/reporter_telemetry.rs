@@ -42,7 +42,7 @@ fn hooks_status_leaves_a_fresh_repo_trace_free() {
     let temp = tempfile::tempdir().expect("tempdir");
     init_git_repo(temp.path());
 
-    let args = ["broker", "hooks", "status", "--json"];
+    let args = ["broker", "advanced", "hooks", "status", "--json"];
     let output = aethyme(temp.path(), &args);
     assert_success(&output, &args);
     assert!(
@@ -63,19 +63,35 @@ fn report_only_commands_do_not_append_metrics() {
         "[[gate]]\nname = \"noop\"\ncommand = \"true\"\ncost = 1\ntriggers = [\"**/*\"]\n",
     )
     .expect("write fixture gate");
-    let adopt_args = ["broker", "adopt", "--task", "fixture", "--json"];
+    let adopt_args = ["broker", "start", "--adopt", "--task", "fixture", "--json"];
     assert_success(&aethyme(temp.path(), &adopt_args), &adopt_args);
 
     let metrics_path = temp.path().join(".aethyme/logs/command-metrics.jsonl");
     let before = fs::read(&metrics_path).expect("setup commands recorded metrics");
     for args in [
-        &["broker", "hooks", "status", "--json"][..],
-        &["broker", "queue", "--json"][..],
-        &["broker", "events", "--json"][..],
-        &["broker", "metrics", "--json"][..],
-        &["broker", "doctor", "--json"][..],
-        &["broker", "gates", "affected", "--session", "1", "--json"][..],
-        &["broker", "gates", "semantic", "--session", "1", "--json"][..],
+        &["broker", "advanced", "hooks", "status", "--json"][..],
+        &["broker", "advanced", "queue", "--json"][..],
+        &["broker", "advanced", "events", "--json"][..],
+        &["broker", "advanced", "metrics", "--json"][..],
+        &["broker", "status", "doctor", "--json"][..],
+        &[
+            "broker",
+            "advanced",
+            "gates",
+            "affected",
+            "--session",
+            "1",
+            "--json",
+        ][..],
+        &[
+            "broker",
+            "advanced",
+            "gates",
+            "semantic",
+            "--session",
+            "1",
+            "--json",
+        ][..],
     ] {
         assert_success(&aethyme(temp.path(), args), args);
         assert_eq!(

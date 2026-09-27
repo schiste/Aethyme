@@ -31,7 +31,7 @@ guards first and widen them with evidence.
 ### 1. Read the current state before changing anything
 
 ```bash
-aethyme broker review plan --base <default-branch> --pr 0
+aethyme broker advanced review plan --base <default-branch> --pr 0
 ```
 
 It performs nothing. `trigger_enabled`, `routing_enabled`,
@@ -98,7 +98,7 @@ Take branches that actually merged and check what the policy would have said:
 ```bash
 for base in HEAD~1 HEAD~5 HEAD~20; do
   echo "=== $base ==="
-  aethyme broker review plan --base "$base" --pr 0 \
+  aethyme broker advanced review plan --base "$base" --pr 0 \
     | python3 -c 'import json,sys; d=json.load(sys.stdin); print([ (e["review_type"], e["because"]) for e in d["eligible"] ])'
 done
 ```
@@ -183,7 +183,7 @@ Review: security
 ```
 
 To get them written, add the instruction to `.aethyme/overrides/agents.json`
-and rerun `aethyme enhance deploy --repo "$PWD"`. Do not rely on them for a
+and rerun `aethyme deploy --repo "$PWD"`. Do not rely on them for a
 guard: a trailer is one line of unverified text, which is exactly why it can
 escalate a review and can never waive one.
 

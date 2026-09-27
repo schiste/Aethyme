@@ -14,7 +14,7 @@ all Aethyme processes on the host. Its default location follows the platform's
 user state convention and can be overridden with `AETHYME_HOST_STATE_DIR` for
 tests or an explicitly isolated environment.
 
-The entire `broker resources` surface is host infrastructure. It does not
+The entire `broker advanced resources` surface is host infrastructure. It does not
 discover a Git repository, require Aethyme deployment, or enforce repository
 schema compatibility. It is safe to invoke from an unenrolled checkout or a
 private runtime directory. Repository and worktree fields in a request are
@@ -26,7 +26,7 @@ Use the broker-owned lifecycle without migrating an established validation
 pipeline:
 
 ```bash
-aethyme broker resources run request.json --wait 30m \
+aethyme broker advanced resources run request.json --wait 30m \
   --cleanup-command './scripts/cleanup-exact-owned-services' \
   -- ./scripts/existing-pre-push
 ```
@@ -199,7 +199,7 @@ hook (or call the same command from the repository's existing hook manager):
 set -eu
 
 if command -v aethyme >/dev/null 2>&1; then
-  exec aethyme broker gates pre-push "$@"
+  exec aethyme broker advanced gates pre-push "$@"
 fi
 
 # During a staged rollout, this fallback must allocate unique namespaces and
@@ -225,7 +225,7 @@ complete gate definition, including resource declarations. Set `cache = false`
 for gates whose external dependencies make old evidence unsuitable, or use:
 
 ```sh
-aethyme broker gates pre-push "$@" --no-cache
+aethyme broker advanced gates pre-push "$@" --no-cache
 ```
 
 `--no-cache` bypasses lookup once and stores the new result normally.
@@ -249,13 +249,13 @@ containers.
 Use the low-level resource commands for diagnosis or non-gate integrations:
 
 ```bash
-aethyme broker resources plan request.json --json
-aethyme broker resources acquire request.json --wait 30m \
+aethyme broker advanced resources plan request.json --json
+aethyme broker advanced resources acquire request.json --wait 30m \
   --grant-out "$private_runtime/grant.json" --json
-aethyme broker resources list --json
-aethyme broker resources list --all --json
-aethyme broker resources reap --json
-aethyme broker resources reconcile <lease-id> --confirm <generation>
+aethyme broker advanced resources list --json
+aethyme broker advanced resources list --all --json
+aethyme broker gc reap --json
+aethyme broker advanced resources reconcile <lease-id> --confirm <generation>
 ```
 
 `plan` and `list` are read-only. `acquire`, `renew`, and `release` remain for

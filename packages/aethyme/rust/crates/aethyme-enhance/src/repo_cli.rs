@@ -232,7 +232,7 @@ fn run_deploy_skills(rest: &[String]) -> u8 {
         Err(message) => return runtime_error(&message),
     }
     println!(
-        "Note: `repo deploy-skills` is a compatibility path. Prefer `aethyme enhance deploy --repo <path>`."
+        "Note: `repo deploy-skills` is a compatibility path. Prefer `aethyme deploy --repo <path>`."
     );
     0
 }

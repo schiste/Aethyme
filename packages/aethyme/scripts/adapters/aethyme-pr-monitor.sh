@@ -24,7 +24,7 @@ printf '[%s] tick\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 # A tick that fails must not stop delivery: previously-polled batches may still
 # be sitting in the outbox undelivered.
-"$BROKER" broker watch pr tick --limit "$LIMIT" 2>&1 || \
+"$BROKER" broker advanced watch pr tick --limit "$LIMIT" 2>&1 || \
     printf '  tick failed; continuing to delivery\n'
 
 if [ -x "$ADAPTER" ] || [ -f "$ADAPTER" ]; then

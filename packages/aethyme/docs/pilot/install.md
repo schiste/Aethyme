@@ -143,6 +143,8 @@ Then add it to cron; see [metrics-export.md](metrics-export.md).
 
 ## v0.8.3 and v0.8.4 spellings
 
+<!-- deprecated-spellings: begin (old spellings named on purpose; see aethyme-testkit/tests/deprecated_spelling_callers.rs) -->
+
 | v0.8.4 | v0.8.3 |
 | --- | --- |
 | `aethyme broker start --adopt` | `aethyme broker adopt` |
@@ -151,6 +153,8 @@ Then add it to cron; see [metrics-export.md](metrics-export.md).
 | `aethyme broker advanced trust` | `aethyme broker trust` |
 | `aethyme broker advanced leases claim` | `aethyme broker leases claim` |
 | `aethyme broker advanced quick-test` | `aethyme broker quick-test` |
+
+<!-- deprecated-spellings: end -->
 
 `init`, `certify`, `deploy`, `start --task`, `status`, `submit`, `finish`,
 `unblock <id>` and `gc plan|apply` are the same in both. The old spellings

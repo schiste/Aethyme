@@ -385,7 +385,7 @@ pub fn rest_comment_id(url: &str) -> Option<i64> {
 /// One mutation to make on a pull request.
 ///
 /// A value, not an effect. [`Self::gh_args`] renders the arguments to pass
-/// after `--` to `aethyme broker gh`, which is the only path allowed to perform
+/// after `--` to `aethyme broker advanced gh`, which is the only path allowed to perform
 /// them; [`Self::reason`] renders that command's required authorization.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
@@ -415,7 +415,7 @@ pub enum PrProjectionAction {
 }
 
 impl PrProjectionAction {
-    /// Arguments for `aethyme broker gh --repo <owner/name> -- <these>`.
+    /// Arguments for `aethyme broker advanced gh --repo <owner/name> -- <these>`.
     ///
     /// The repository is never named here. It is asserted once, on the outer
     /// broker command, and a second target inside the arguments is refused --

@@ -845,7 +845,7 @@ impl Broker {
                 format!(
                     "lease {lease_id} on {} belongs to session {} ({}) whose worktree may hold \
                      uncommitted work; release it from that session or close it: aethyme broker \
-                     close --session {}",
+                     finish close --session {}",
                     lease.path,
                     session.id,
                     session.status.as_str(),
