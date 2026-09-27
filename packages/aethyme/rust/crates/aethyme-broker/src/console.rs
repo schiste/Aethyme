@@ -874,16 +874,42 @@ pub fn console_health(
     classify_console(lease, marker, holder_alive)
 }
 
-/// Whether the live process at `lease.holder_pid` started after the lease was
-/// granted, which means the pid was reused and signalling it would hit an
-/// unrelated process. `false` when the platform cannot say.
-pub fn console_holder_replaced(lease: &HostResourceLease) -> bool {
-    let Some(pid) = lease.holder_pid else {
-        return false;
+/// Whether the live process at a lease's `holder_pid` is provably the
+/// process the lease was granted to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsoleHolderIdentity {
+    /// It started no later than the lease was granted.
+    Proven,
+    /// It started after the lease was granted: the pid was reused, and
+    /// signalling it would hit an unrelated process.
+    Replaced,
+    /// No holder was recorded, or this platform cannot report a wall-clock
+    /// start time for it. Not evidence of reuse, but not proof against it.
+    Unproven,
+}
+
+/// Compare the holder's start time with the lease's grant time.
+pub fn console_holder_identity(lease: &HostResourceLease) -> ConsoleHolderIdentity {
+    let Some(started) = lease
+        .holder_pid
+        .and_then(|pid| crate::gates::process_started_at_ms(pid as i32))
+    else {
+        return ConsoleHolderIdentity::Unproven;
     };
-    crate::gates::process_started_at_ms(pid as i32)
-        // One second of slack absorbs clock granularity between the two.
-        .is_some_and(|started| started > lease.created_at.saturating_add(1_000))
+    // One second of slack absorbs clock granularity between the two.
+    if started > lease.created_at.saturating_add(1_000) {
+        ConsoleHolderIdentity::Replaced
+    } else {
+        ConsoleHolderIdentity::Proven
+    }
+}
+
+/// Whether the holder is proven to be a reused pid. `false` does not prove
+/// the holder is the lease's process; anything that signals it must require
+/// [`ConsoleHolderIdentity::Proven`] from [`console_holder_identity`].
+pub fn console_holder_replaced(lease: &HostResourceLease) -> bool {
+    console_holder_identity(lease) == ConsoleHolderIdentity::Replaced
 }
 
 #[cfg(test)]
@@ -1292,14 +1318,43 @@ mod tests {
     }
 
     /// This process started long after the epoch-0 lease, so where the
-    /// platform reports wall-clock start times it reads as a reused pid.
+    /// platform reports wall-clock start times it reads as a reused pid, and
+    /// elsewhere it is unproven rather than assumed to be the holder.
     #[test]
     fn a_holder_that_started_after_the_lease_reads_as_replaced() {
         let mut lease = lease("repo", &[(CONSOLE_PORT_KEY, "4173")], "fp");
         lease.holder_pid = Some(std::process::id());
-        assert_eq!(console_holder_replaced(&lease), cfg!(target_os = "macos"));
+        let (after, before) = if cfg!(target_os = "macos") {
+            (
+                ConsoleHolderIdentity::Replaced,
+                ConsoleHolderIdentity::Proven,
+            )
+        } else {
+            (
+                ConsoleHolderIdentity::Unproven,
+                ConsoleHolderIdentity::Unproven,
+            )
+        };
+        assert_eq!(console_holder_identity(&lease), after);
         lease.created_at = i64::MAX - 1_000;
-        assert!(!console_holder_replaced(&lease));
+        assert_eq!(console_holder_identity(&lease), before);
+    }
+
+    /// A pid that does not exist, or no recorded holder at all, never
+    /// reads as proven.
+    #[test]
+    fn a_missing_or_unrecorded_holder_is_unproven() {
+        let mut lease = lease("repo", &[(CONSOLE_PORT_KEY, "4173")], "fp");
+        lease.holder_pid = None;
+        assert_eq!(
+            console_holder_identity(&lease),
+            ConsoleHolderIdentity::Unproven
+        );
+        lease.holder_pid = Some(i32::MAX as u32);
+        assert_eq!(
+            console_holder_identity(&lease),
+            ConsoleHolderIdentity::Unproven
+        );
     }
 
     #[test]

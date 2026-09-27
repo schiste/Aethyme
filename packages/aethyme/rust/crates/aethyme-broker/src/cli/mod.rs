@@ -255,8 +255,9 @@ Usage:
   aethyme broker console stop <lease-id> [--force] [--dry-run] [--wait <duration>] [--json]
       Send SIGTERM to a console's supervising `console run`, which stops the
       server's process group, releases the lease, and removes the marker.
-      Refuses a console serving a present checkout without --force, and
-      never signals a holder whose lease expired or whose pid was reused.
+      Refuses a console that is not stale without --force, and never
+      signals a holder whose lease expired, whose console has no verified
+      marker, or whose pid cannot be proven to be the lease's supervisor.
       Waits up to --wait (default 10s) for the lease to be released.
   aethyme broker console plan [--allow-parallel] [--json]
       Show exactly what a console launch would reserve under the current mode

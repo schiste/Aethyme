@@ -638,7 +638,7 @@ fn console_stop_refusal(
     lease: &crate::HostResourceLease,
     health: &crate::ConsoleHealth,
     force: bool,
-    holder_replaced: bool,
+    identity: crate::console::ConsoleHolderIdentity,
 ) -> Option<String> {
     let Some(pid) = lease.holder_pid else {
         return Some("the lease recorded no holder process, so there is nothing to signal".into());
@@ -656,10 +656,26 @@ fn console_stop_refusal(
             lease.state.as_str()
         ));
     }
-    if holder_replaced {
-        return Some(format!(
-            "pid {pid} started after the lease was granted, so it is not the console's supervisor"
-        ));
+    match identity {
+        crate::console::ConsoleHolderIdentity::Proven => {}
+        crate::console::ConsoleHolderIdentity::Replaced => {
+            return Some(format!(
+                "pid {pid} started after the lease was granted, so it is not the console's supervisor"
+            ));
+        }
+        crate::console::ConsoleHolderIdentity::Unproven => {
+            return Some(format!(
+                "cannot prove pid {pid} is the console's supervisor (its start time is unavailable on this host); inspect it with `ps -p {pid}` before acting"
+            ));
+        }
+    }
+    // Without a verified marker nothing ties this lease to a checkout, so
+    // there is no ownership to act on, forced or not.
+    if health.checkout == crate::ConsoleCheckoutStatus::Unknown {
+        return Some(
+            "no verified console marker ties this lease to a checkout, so ownership is unproven"
+                .into(),
+        );
     }
     if !health.is_stale() && !force {
         return Some(format!(
@@ -714,12 +730,8 @@ fn stop_console(parsed: &Parsed, repository: &str) -> Result<(), UsageError> {
     let markers = crate::read_console_markers()?;
     let marker = crate::console_marker_for_lease(&markers, lease);
     let health = crate::console_health(lease, marker);
-    let refusal = console_stop_refusal(
-        lease,
-        &health,
-        parsed.force,
-        crate::console_holder_replaced(lease),
-    );
+    let identity = crate::console::console_holder_identity(lease);
+    let refusal = console_stop_refusal(lease, &health, parsed.force, identity);
     let port = crate::console_port(lease);
     let wait = parsed
         .wait
@@ -735,7 +747,8 @@ fn stop_console(parsed: &Parsed, repository: &str) -> Result<(), UsageError> {
     } else {
         let pid = lease.holder_pid.expect("refusal covers a missing holder");
         // SAFETY: kill(2) with a positive pid and SIGTERM has no memory
-        // effects; the pid was checked live, active, and not reused above.
+        // effects; the pid was checked live, active, and proven to be the
+        // holder the lease was granted to above.
         if unsafe { libc::kill(pid as i32, libc::SIGTERM) } != 0 {
             let error = std::io::Error::last_os_error();
             (
@@ -779,6 +792,7 @@ fn stop_console(parsed: &Parsed, repository: &str) -> Result<(), UsageError> {
                 "holder_pid": lease.holder_pid,
                 "worktree": marker.map(|record| record.marker.worktree.clone()),
                 "health": health,
+                "holder_identity": identity,
                 "outcome": outcome.0,
                 "reason": outcome.1,
             }))?
@@ -1174,9 +1188,12 @@ pub(super) fn run_resources(parsed: Parsed) -> Result<(), UsageError> {
 #[cfg(test)]
 mod tests {
     use super::console_stop_refusal;
+    use crate::console::ConsoleHolderIdentity;
     use crate::{
         ConsoleCheckoutStatus, ConsoleHealth, ConsoleStaleReason, HostLeaseState, HostResourceLease,
     };
+
+    const PROVEN: ConsoleHolderIdentity = ConsoleHolderIdentity::Proven;
 
     fn lease(state: HostLeaseState, holder_pid: Option<u32>) -> HostResourceLease {
         HostResourceLease {
@@ -1211,16 +1228,16 @@ mod tests {
     fn a_stale_console_with_a_live_active_holder_may_be_stopped() {
         let lease = lease(HostLeaseState::Active, Some(42));
         let health = health(ConsoleCheckoutStatus::Missing, Some(true));
-        assert_eq!(console_stop_refusal(&lease, &health, false, false), None);
+        assert_eq!(console_stop_refusal(&lease, &health, false, PROVEN), None);
     }
 
     #[test]
     fn a_live_console_needs_force() {
         let lease = lease(HostLeaseState::Active, Some(42));
         let health = health(ConsoleCheckoutStatus::Present, Some(true));
-        let refusal = console_stop_refusal(&lease, &health, false, false).unwrap();
+        let refusal = console_stop_refusal(&lease, &health, false, PROVEN).unwrap();
         assert!(refusal.contains("--force"), "{refusal}");
-        assert_eq!(console_stop_refusal(&lease, &health, true, false), None);
+        assert_eq!(console_stop_refusal(&lease, &health, true, PROVEN), None);
     }
 
     /// `--force` overrides only the live-console guard, never the identity
@@ -1229,18 +1246,40 @@ mod tests {
     fn force_never_signals_an_unproven_holder() {
         let missing = health(ConsoleCheckoutStatus::Missing, Some(true));
         let expired = lease(HostLeaseState::Quarantined, Some(42));
-        assert!(console_stop_refusal(&expired, &missing, true, false).is_some());
+        assert!(console_stop_refusal(&expired, &missing, true, PROVEN).is_some());
         let active = lease(HostLeaseState::Active, Some(42));
-        assert!(console_stop_refusal(&active, &missing, true, true).is_some());
+        let replaced = ConsoleHolderIdentity::Replaced;
+        assert!(console_stop_refusal(&active, &missing, true, replaced).is_some());
         let unheld = lease(HostLeaseState::Active, None);
-        assert!(console_stop_refusal(&unheld, &missing, true, false).is_some());
+        assert!(console_stop_refusal(&unheld, &missing, true, PROVEN).is_some());
+    }
+
+    /// A pid whose start time this host cannot report may have been reused;
+    /// unknown is refused like reused, even for a stale console under --force.
+    #[test]
+    fn an_unproven_holder_is_refused_even_with_force() {
+        let lease = lease(HostLeaseState::Active, Some(42));
+        let missing = health(ConsoleCheckoutStatus::Missing, Some(true));
+        let unproven = ConsoleHolderIdentity::Unproven;
+        let refusal = console_stop_refusal(&lease, &missing, true, unproven).unwrap();
+        assert!(refusal.contains("cannot prove pid 42"), "{refusal}");
+    }
+
+    /// Without a verified marker the lease is tied to no checkout, so a
+    /// live console of uncertain ownership is never signalled.
+    #[test]
+    fn a_console_of_unknown_ownership_is_refused_even_with_force() {
+        let lease = lease(HostLeaseState::Active, Some(42));
+        let unknown = health(ConsoleCheckoutStatus::Unknown, Some(true));
+        let refusal = console_stop_refusal(&lease, &unknown, true, PROVEN).unwrap();
+        assert!(refusal.contains("ownership is unproven"), "{refusal}");
     }
 
     #[test]
     fn a_gone_holder_points_at_resource_reap() {
         let lease = lease(HostLeaseState::Active, Some(42));
         let health = health(ConsoleCheckoutStatus::Missing, Some(false));
-        let refusal = console_stop_refusal(&lease, &health, true, false).unwrap();
+        let refusal = console_stop_refusal(&lease, &health, true, PROVEN).unwrap();
         assert!(refusal.contains("resources reap"), "{refusal}");
     }
 }
