@@ -1878,6 +1878,28 @@ impl GitRepo {
         Ok(files)
     }
 
+    /// Every file the checkout's working state consists of: tracked paths
+    /// plus untracked, non-ignored ones, relative to the root. It is the
+    /// same surface `working_tree_hash` hashes, so it names exactly the
+    /// sources a gate verdict claims to be about. A tracked path deleted
+    /// in the worktree is still listed; callers must tolerate its absence.
+    pub fn working_state_files(&self) -> Result<Vec<String>, GitError> {
+        let listed = run_git(
+            &self.root,
+            &[
+                "ls-files",
+                "--cached",
+                "--others",
+                "--exclude-standard",
+                "-z",
+            ],
+        )?;
+        let mut files = parse_nul_paths(&listed);
+        files.sort();
+        files.dedup();
+        Ok(files)
+    }
+
     /// Paths staged for the next commit (`git diff --cached --name-only`)
     /// — the selection surface of the derived pre-commit hook. Inherits
     /// GIT_INDEX_FILE when git set one, so partial commits see exactly
