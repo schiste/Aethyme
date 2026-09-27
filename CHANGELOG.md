@@ -6,20 +6,44 @@ artifacts and their exact source revision are recorded in each signed
 
 ## [Unreleased]
 
+## [0.8.7] - 2026-09-28
+
+Broker recovery, worktree lifecycle, and gate reliability improvements.
+
+The broker database schema advances from 42 to 43. The migration is additive
+and compatible with v0.8.2 and later. v0.8.0 and v0.8.1 refuse schema 43;
+upgrade those binaries before using this repository.
+
 ### Added
 
-- Every executed gate result now records the machine conditions it ran
-  under: `load_avg_1m_start`, `load_avg_1m_end`, `cpu_count` and
-  `free_disk_bytes_start` (the free space the disk-headroom check admitted
-  the gate on), so gate-duration trends can be separated from machine load.
-  They appear in `broker gates run --json` and `submit --json`
-  `gate_outcomes`, in a second `aethyme gate environment:` line at the head
-  of each gate log, and after the duration in the gate progress line. Cache
-  hits, cancellations and results recorded before the command stage report
-  `null`. Schema bump to 43 is additive and declared compatible, so 0.8.2+
-  binaries and plugin hooks keep using a v43 database and leave the new
-  columns NULL. 0.8.0 and 0.8.1 predate the compatibility check and refuse
-  any newer schema; upgrade them before using this repository.
+- Gate results now record machine load, CPU count, and free disk at admission,
+  so duration reports can distinguish slow gates from host contention (#376).
+- Cleanup inventory compares Git worktrees, broker ownership, and filesystem
+  state, and uses content-aware delivery proof before reclaiming eligible
+  closed-session checkouts or regenerable build output (#375, #388, #397;
+  broader lifecycle work remains in #335).
+- Console inventory explains each console's port, process identity, and
+  recorded checkout existence. Stop/reap requires proven process identity and
+  checkout ownership (#374 §3, #389; related context: #169 and #335).
+
+### Changed
+
+- A clean local main that is behind integration now gets an exact reviewed
+  fast-forward plan; summary status uses a baseline consistent with detailed
+  integration status (#374 §§1–2, #395, #396).
+- Expensive gate admission accounts for host load instead of timing out while
+  the machine is saturated (#399).
+- Repository callers use the six-verb broker surface. Deprecated aliases
+  continue to work with warnings; removal is scheduled for v0.8.8 (#387).
+
+### Fixed
+
+- Gate database resolution now fails closed around shared state, and workspace
+  members are derived from the tree under test so a passing result cannot
+  silently certify a different checkout (#392, #398).
+
+These changes resolve the three recovery cases in #374. They do not complete
+the broader worktree lifecycle tracked in #335.
 
 ## [0.8.6] - 2026-09-26
 
