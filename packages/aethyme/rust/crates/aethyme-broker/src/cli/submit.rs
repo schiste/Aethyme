@@ -193,7 +193,16 @@ pub(super) fn render_main_reconcile_plan(plan: &crate::MainReconcilePlan, detail
     match &plan.refusal {
         Some(refusal) => out!("  refusal: {refusal}"),
         None => {
-            out!("  preservation ref: {}", plan.preservation_ref);
+            if plan.strategy == crate::MainReconcileStrategy::FastForward {
+                out!(
+                    "  strategy: fast-forward {} to {} (merge --ff-only; nothing is left behind, so no preservation ref)",
+                    plan.default_branch,
+                    &plan.integration_sha[..12.min(plan.integration_sha.len())]
+                );
+            } else {
+                out!("  strategy: reset onto integration");
+                out!("  preservation ref: {}", plan.preservation_ref);
+            }
             out!(
                 "  apply: aethyme broker advanced main reconcile apply --session <id> --confirm {}",
                 plan.digest
@@ -746,11 +755,16 @@ pub(super) fn run_main_reconcile(parsed: Parsed) -> Result<(), UsageError> {
                     &report.moved_from[..12.min(report.moved_from.len())],
                     &report.moved_to[..12.min(report.moved_to.len())],
                 );
-                out!("  preserved pre-move tip: {}", report.preservation_ref);
-                out!(
-                    "  {} represented commit(s) left behind, recoverable from that ref",
-                    report.represented_commits
-                );
+                match &report.preservation_ref {
+                    Some(preservation_ref) => {
+                        out!("  preserved pre-move tip: {preservation_ref}");
+                        out!(
+                            "  {} represented commit(s) left behind, recoverable from that ref",
+                            report.represented_commits
+                        );
+                    }
+                    None => out!("  fast-forward: no commits left behind"),
+                }
             }
         }
         other => {

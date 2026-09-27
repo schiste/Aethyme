@@ -105,6 +105,29 @@ pub struct MainReconcileResolutionTemplateEntry {
     pub reason: String,
 }
 
+/// How an apply moves the local default branch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MainReconcileStrategy {
+    /// The local branch carries commits integration does not, all proven
+    /// represented: it is reset onto integration after a preservation ref
+    /// records the pre-move tip.
+    ResetOntoIntegration,
+    /// The local branch is a strict ancestor of integration and carries
+    /// nothing of its own (#374): an exact `merge --ff-only` loses nothing,
+    /// so no preservation ref is needed.
+    FastForward,
+}
+
+impl MainReconcileStrategy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ResetOntoIntegration => "reset_onto_integration",
+            Self::FastForward => "fast_forward",
+        }
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct MainReconcileCommit {
     pub commit: String,
@@ -131,8 +154,10 @@ pub struct MainReconcilePlan {
     /// no plan can classify, and moving the branch under them would lose it.
     pub dirty_tracked_paths: Vec<String>,
     pub commits: Vec<MainReconcileCommit>,
-    /// Ref created before the branch moves, so the pre-move tip is recoverable
-    /// even when every commit is represented.
+    pub strategy: MainReconcileStrategy,
+    /// Ref created before a reset moves the branch, so the pre-move tip is
+    /// recoverable even when every commit is represented. A fast-forward
+    /// leaves nothing behind and does not create it.
     pub preservation_ref: String,
     pub safe: bool,
     pub refusal: Option<String>,
@@ -156,6 +181,7 @@ impl MainReconcilePlan {
             integration_sha: &'a str,
             dirty_tracked_paths: &'a [String],
             commits: Vec<(&'a str, &'static str, Option<&'static str>)>,
+            strategy: &'static str,
         }
         let bytes = serde_json::to_vec(&Authorization {
             schema_version: self.schema_version,
@@ -173,6 +199,7 @@ impl MainReconcilePlan {
                     )
                 })
                 .collect(),
+            strategy: self.strategy.as_str(),
         })?;
         self.digest = format!("{:x}", Sha256::digest(bytes));
         Ok(())
@@ -183,7 +210,9 @@ impl MainReconcilePlan {
 pub struct MainReconcileApplyReport {
     pub digest: String,
     pub default_branch: String,
-    pub preservation_ref: String,
+    pub strategy: MainReconcileStrategy,
+    /// `None` for a fast-forward, which leaves no commit behind to preserve.
+    pub preservation_ref: Option<String>,
     pub moved_from: String,
     pub moved_to: String,
     pub represented_commits: usize,
@@ -258,7 +287,20 @@ impl Broker {
             .filter(|item| item.resolution.is_none())
             .count();
         let unrepresented = blocking;
-        let refusal = if !dirty_tracked_paths.is_empty() {
+        // Both strategies move whatever HEAD names, so the checkout has to be
+        // on the branch the plan classified or the apply would move another.
+        let checked_out = repo.symbolic_ref("HEAD");
+        let strategy = if local_only.is_empty() {
+            MainReconcileStrategy::FastForward
+        } else {
+            MainReconcileStrategy::ResetOntoIntegration
+        };
+        let refusal = if checked_out.as_deref() != Some(local_ref.as_str()) {
+            Some(format!(
+                "the primary checkout is on {}, not {local_ref}; switch it to {default_branch} before reconciling",
+                checked_out.as_deref().unwrap_or("a detached HEAD")
+            ))
+        } else if !dirty_tracked_paths.is_empty() {
             Some(format!(
                 "the primary checkout has {} uncommitted tracked path(s); commit them through a broker session or stash them before reconciling",
                 dirty_tracked_paths.len()
@@ -267,9 +309,17 @@ impl Broker {
             Some(format!(
                 "{unrepresented} commit(s) on {default_branch} are not represented on {integration_ref} ({unresolved} with no recorded decision); replay them through a broker session and submit, or record a reviewed disposition with `main reconcile plan --write-resolution-template <path>` and pass it back with --resolution-file"
             ))
-        } else if local_only.is_empty() {
+        } else if local_sha == integration_sha {
             Some(format!(
-                "{default_branch} carries nothing {integration_ref} does not already contain"
+                "{default_branch} is already at {integration_ref}; nothing to reconcile"
+            ))
+        } else if strategy == MainReconcileStrategy::FastForward
+            && !repo.is_ancestor(&local_sha, &integration_sha)
+        {
+            // An empty local-only list should imply ancestry; a shallow or
+            // grafted history can break that, and a fast-forward must be proven.
+            Some(format!(
+                "{default_branch} carries no commits of its own but is not an ancestor of {integration_ref}, so it cannot be fast-forwarded"
             ))
         } else {
             None
@@ -285,6 +335,7 @@ impl Broker {
             integration_sha,
             dirty_tracked_paths,
             commits,
+            strategy,
             preservation_ref: format!(
                 "aethyme/preserve/{default_branch}-{}",
                 &local_sha[..12.min(local_sha.len())]
@@ -346,15 +397,47 @@ impl Broker {
             return Err(BrokerOpError::MainReconcileUnsafe { reason });
         }
 
-        // Preserve before moving. The commits being left behind are represented
-        // by content, but they are still the only copy of that history.
-        let repo = self.repo_handle();
-        repo.create_branch_at(&plan.preservation_ref, &plan.local_sha)
-            .map_err(|source| BrokerOpError::MainReconcileUnavailable {
-                reason: format!("cannot create {}: {source}", plan.preservation_ref),
-            })?;
+        let fast_forward = plan.strategy == MainReconcileStrategy::FastForward;
+        if !fast_forward {
+            // Preserve before moving. The commits being left behind are
+            // represented by content, but they are still the only copy of that
+            // history.
+            let repo = self.repo_handle();
+            repo.create_branch_at(&plan.preservation_ref, &plan.local_sha)
+                .map_err(|source| BrokerOpError::MainReconcileUnavailable {
+                    reason: format!("cannot create {}: {source}", plan.preservation_ref),
+                })?;
+        }
 
         let main_root = self.main_root_path();
+        let (declared_effect, destructive_confirmed, args) = if fast_forward {
+            // `--ff-only` to the exact reviewed SHA: git itself refuses if the
+            // branch moved off the ancestor the plan proved, so this can only
+            // add commits, never drop one.
+            (
+                crate::OperationEffect::Write,
+                false,
+                vec![
+                    "merge".into(),
+                    "--ff-only".into(),
+                    plan.integration_sha.clone(),
+                ],
+            )
+        } else {
+            // Declared destructive on purpose, and confirmed only here: the
+            // digest proved every commit represented, the preservation ref
+            // already exists, and no tracked path is dirty. Those three are
+            // exactly the "resolved exact targets" the guard asks for.
+            (
+                crate::OperationEffect::Destructive,
+                true,
+                vec![
+                    "reset".into(),
+                    "--hard".into(),
+                    plan.integration_sha.clone(),
+                ],
+            )
+        };
         let moved = self.run_coordinated_operation_at(
             crate::CoordinatedCommand {
                 session_id,
@@ -362,37 +445,40 @@ impl Broker {
                 repository: None,
                 resolved_target: None,
                 scope: Some(format!("main-reconcile:{}", plan.local_ref)),
-                // Declared destructive on purpose, and confirmed only here: the
-                // digest proved every commit represented, the preservation ref
-                // already exists, and no tracked path is dirty. Those three are
-                // exactly the "resolved exact targets" the guard asks for.
-                declared_effect: Some(crate::OperationEffect::Destructive),
-                destructive_confirmed: true,
+                declared_effect: Some(declared_effect),
+                destructive_confirmed,
                 authorization_reason: Some(format!(
                     "reviewed main reconcile {} onto {}",
                     plan.digest, plan.integration_sha
                 )),
-                args: vec![
-                    "reset".into(),
-                    "--hard".into(),
-                    plan.integration_sha.clone(),
-                ],
+                args,
             },
             &main_root,
         )?;
         if !moved.ok() {
             return Err(BrokerOpError::MainReconcileUnavailable {
-                reason: format!(
-                    "moving {} onto {} failed; the pre-move tip is preserved at {}",
-                    plan.default_branch, plan.integration_sha, plan.preservation_ref
-                ),
+                reason: if fast_forward {
+                    format!(
+                        "fast-forwarding {} to {} failed; {} is unchanged at {}",
+                        plan.default_branch,
+                        plan.integration_sha,
+                        plan.default_branch,
+                        plan.local_sha
+                    )
+                } else {
+                    format!(
+                        "moving {} onto {} failed; the pre-move tip is preserved at {}",
+                        plan.default_branch, plan.integration_sha, plan.preservation_ref
+                    )
+                },
             });
         }
 
         Ok(MainReconcileApplyReport {
             digest: plan.digest,
             default_branch: plan.default_branch,
-            preservation_ref: plan.preservation_ref,
+            strategy: plan.strategy,
+            preservation_ref: (!fast_forward).then_some(plan.preservation_ref),
             moved_from: plan.local_sha,
             moved_to: plan.integration_sha,
             represented_commits: plan.commits.len(),
