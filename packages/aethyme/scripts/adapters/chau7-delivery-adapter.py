@@ -134,7 +134,7 @@ def dispatch_once(
 ) -> dict[str, Any]:
     # No --tabs-file: the broker reads the snapshot from stdin when the flag is
     # absent. Passing "-" looks conventional but is taken as a literal path.
-    command = [broker, "broker", "deliveries", "dispatch", "--adapter", "chau7",
+    command = [broker, "broker", "advanced", "deliveries", "dispatch", "--adapter", "chau7",
                "--worker", worker, "--json"]
     result = subprocess.run(
         command,
@@ -151,7 +151,7 @@ def dispatch_once(
 
 def complete(broker: str, repo: str | None, delivery_id: int, worker: str,
              generation: int, outcome: str, error_code: str | None = None) -> None:
-    command = [broker, "broker", "deliveries", "complete", "--id", str(delivery_id),
+    command = [broker, "broker", "advanced", "deliveries", "complete", "--id", str(delivery_id),
                "--worker", worker, "--generation", str(generation), "--outcome", outcome]
     if error_code:
         command += ["--error-code", error_code]

@@ -25,7 +25,7 @@ Loop, per invocation:
                                                       review state --state
                                                         running | abandoned
 
-and every teardown posts the reviewer's `review.md` through `broker gh` before
+and every teardown posts the reviewer's `review.md` through `broker advanced gh` before
 it closes the tab.
 
 The reviewer holds no GitHub credentials (audit finding M5). It reads a diff
@@ -68,7 +68,7 @@ closes one. Two consequences worth knowing:
   exactly what it is for; nothing here needs its own crash recovery.
 
 The workspace must exist and hold a checkout of the pull request's head. This
-adapter provisions it through `aethyme broker git` and proves the exact head
+adapter provisions it through `aethyme broker advanced git` and proves the exact head
 again immediately before spawning; a mismatch abandons the handoff instead of
 letting the prompt's revision claim go unchecked. The workspace path *is* the
 identity of an in-flight review and creating one is a shared-git mutation, so
@@ -255,7 +255,7 @@ def broker_git(broker: str, cwd: str | None, session: str, repository: str,
     maintained against a broker that is free to add one.
     """
     result = subprocess.run(
-        [broker, "broker", "git", "--session", session, "--repo", repository,
+        [broker, "broker", "advanced", "git", "--session", session, "--repo", repository,
          "--reason", reason, "--", *args],
         capture_output=True,
         text=True,
@@ -276,7 +276,7 @@ def close_row(
     state: str,
     note: str | None = None,
 ) -> None:
-    command = [broker, "broker", "review", "state", "--repo", repository,
+    command = [broker, "broker", "advanced", "review", "state", "--repo", repository,
                "--pr", str(pull_request), "--type", review_type, "--state", state]
     if head:
         command += ["--head", head]
@@ -367,7 +367,7 @@ def post_review(broker: str, cwd: str | None, session: str, repository: str,
             if os.path.exists(sandbox["request_changes_marker"])
             else teardown["post_comment_args"])
     result = subprocess.run(
-        [broker, "broker", "gh", "--session", session, "--repo", repository,
+        [broker, "broker", "advanced", "gh", "--session", session, "--repo", repository,
          "--reason", f"post the {review_type} review on {repository}#{pull_request}",
          "--", *post, "--repo", repository],
         capture_output=True, text=True, cwd=cwd, check=False,
@@ -439,7 +439,7 @@ def main() -> int:
         tabs_file = snapshot.name
 
     try:
-        tick = ["review", "tick", "--session", args.session, "--repo", args.repo,
+        tick = ["advanced", "review", "tick", "--session", args.session, "--repo", args.repo,
                 "--limit", str(args.limit), "--tabs-file", tabs_file]
         if args.dry_run:
             tick.append("--dry-run")

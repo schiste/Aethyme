@@ -58,7 +58,7 @@ fn pr_and_main_have_one_automatic_full_workspace_owner() {
     );
     let job = block(&gates, "  gates:");
     assert!(job.contains(
-        &"        run: packages/aethyme/rust/target/release/aethyme broker gates run --all"
+        &"        run: packages/aethyme/rust/target/release/aethyme broker advanced gates run --all"
     ));
     assert!(!job.iter().any(|line| line.trim_start().starts_with("if:")));
 }
