@@ -151,14 +151,19 @@
   "review_refusals": [],
   "summary": {
     "active_sessions": "integer",
+    "baseline_head": "string",
+    "baseline_ref": "string",
     "commands": [
       "string"
     ],
     "dirty_sessions": "integer",
     "idle_sessions": "integer",
+    "integration_ahead_local_main_commits": "integer",
     "integration_ahead_main_commits": "integer",
+    "integration_head": "string",
     "integration_relation": "string",
     "live_sessions": "integer",
+    "main_head": "string",
     "may_move_integration": "bool",
     "message": "string",
     "overlap_count": "integer",

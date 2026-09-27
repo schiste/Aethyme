@@ -2000,3 +2000,70 @@ fn a_finished_session_stops_colliding_on_its_declared_targets() {
         "a finished session must not keep colliding: {after:?}"
     );
 }
+
+/// The #374 field report, end to end: integration is ahead of `origin/main`,
+/// local main is fast-forwarded to integration and not pushed. `integration
+/// status` then reports 0 ahead of local main, and the summary used to report
+/// "ahead of main by N" with no refs, which read as a stale contradiction. Both
+/// views must now carry the same SHAs and the same local-main count, and the
+/// summary must name the baseline its own count is against.
+#[test]
+fn summary_and_integration_status_agree_after_an_unpushed_fast_forward() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    sh(
+        tmp.path(),
+        &["update-ref", "refs/remotes/origin/main", "HEAD"],
+    );
+    sh(
+        tmp.path(),
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        ],
+    );
+    let published = rev(tmp.path(), "HEAD");
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    broker.integration_status(now_ms()).unwrap();
+
+    // Two commits land on integration without touching main.
+    sh(tmp.path(), &["switch", "-q", "aethyme/integration"]);
+    for (index, body) in ["one\n", "two\n"].iter().enumerate() {
+        std::fs::write(tmp.path().join(format!("landed-{index}.txt")), body).unwrap();
+        sh(tmp.path(), &["add", "-A"]);
+        sh(tmp.path(), &["commit", "-qm", "landed"]);
+    }
+    let integration = rev(tmp.path(), "HEAD");
+    sh(tmp.path(), &["switch", "-q", "main"]);
+    sh(
+        tmp.path(),
+        &["merge", "-q", "--ff-only", "aethyme/integration"],
+    );
+    assert_eq!(rev(tmp.path(), "HEAD"), integration);
+    assert_eq!(rev(tmp.path(), "refs/remotes/origin/main"), published);
+
+    let detailed = broker.integration_status(now_ms()).unwrap();
+    let summary = broker.status_brief(now_ms()).unwrap().summary;
+
+    assert_eq!(detailed.head, integration);
+    assert_eq!(summary.integration_head, detailed.head);
+    assert_eq!(summary.main_head, detailed.main_head);
+    assert_eq!(detailed.commits_ahead_main, 0);
+    assert_eq!(
+        summary.integration_ahead_local_main_commits,
+        detailed.commits_ahead_main
+    );
+    // Publishing would still add both commits: that count is correct, and
+    // now says what it is counted against.
+    assert_eq!(summary.baseline_ref, "refs/remotes/origin/main");
+    assert_eq!(summary.baseline_head, published);
+    assert_eq!(summary.integration_ahead_main_commits, 2);
+    assert!(
+        summary.message.contains(
+            "aethyme/integration ahead of origin/main by 2 commits (local checkout matches integration)"
+        ),
+        "{}",
+        summary.message
+    );
+}
