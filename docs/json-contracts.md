@@ -73,6 +73,17 @@ usually `aethyme broker unblock <id>` plus any flag an operator must supply.
 present, `blockers` is incomplete, never "nothing blocks". The same report is
 `aethyme broker unblock --json`.
 
+`cleanup_retention.closed_worktrees` (introduced 2026-09-27) counts closed
+sessions whose checkout is still on disk, which a state-only
+`aethyme broker finish close` leaves behind: `count` (broker-created
+checkouts), `estimated_bytes` (recorded sizes, never a fresh walk, so a floor
+while `unmeasured_count` is non-zero), `unmeasured_count`, `adopted_count`
+(closed adopted checkouts, which GC never removes) and `command` (the command
+that shows which of them GC would reclaim, or `null` when there are none).
+`aethyme broker status doctor --json` carries the same object as
+`retention.closed_worktrees`, and `aethyme broker gc plan --json` as
+`closed_worktrees`.
+
 `review_refusals` lists reviews a provider declined and nothing has re-asked
 for since. `class` is `quota_exhausted`, `rate_limited`, `provider_error` or
 `unknown`, and answers whether waiting helps; `text` is the provider's own

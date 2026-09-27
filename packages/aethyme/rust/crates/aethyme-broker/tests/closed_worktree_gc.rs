@@ -245,3 +245,43 @@ fn a_stale_digest_is_refused_and_removes_nothing() {
     let session = broker.store().session(id).unwrap();
     assert_eq!(session.cleanup_state, SessionCleanupState::Closed);
 }
+
+#[test]
+fn status_and_doctor_count_closed_checkouts_still_on_disk() {
+    let (_tmp, mut broker) = repository(None);
+    let now = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64
+    };
+    let before = broker
+        .status(now())
+        .unwrap()
+        .cleanup_retention
+        .closed_worktrees;
+    assert_eq!(before.count, 0);
+    assert_eq!(before.command, None, "nothing to review, nothing advised");
+
+    let (id, _worktree) = session_with_commit(&mut broker, "kept", true);
+    broker.close(id).unwrap();
+    // The full audit records the checkout's size, which status then reads.
+    let plan = broker.gc_plan().unwrap();
+    assert_eq!(plan.closed_worktrees.count, 1);
+    assert_eq!(plan.closed_worktrees.unmeasured_count, 0);
+    assert!(plan.closed_worktrees.estimated_bytes > 0);
+
+    let status = broker
+        .status(now())
+        .unwrap()
+        .cleanup_retention
+        .closed_worktrees;
+    assert_eq!(status.count, 1);
+    assert_eq!(
+        status.estimated_bytes,
+        plan.closed_worktrees.estimated_bytes
+    );
+    assert_eq!(status.command.as_deref(), Some("aethyme broker gc plan"));
+    let doctor = broker.gc_health().unwrap().closed_worktrees;
+    assert_eq!(doctor, status);
+}

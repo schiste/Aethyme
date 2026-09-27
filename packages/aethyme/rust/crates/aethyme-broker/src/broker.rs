@@ -1095,6 +1095,10 @@ pub struct CleanupRetention {
     /// (#176). Unsized on this path -- status runs often, and the count is
     /// the signal; `gc plan` measures the bytes.
     pub reconciliation: WorktreeReconciliation,
+    /// Closed sessions whose checkout is still on disk -- what a state-only
+    /// `finish close` leaves behind -- with recorded bytes and the command
+    /// that shows which of them GC would reclaim.
+    pub closed_worktrees: crate::retention::ClosedWorktreeSummary,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -6131,6 +6135,7 @@ impl Broker {
                         cleanup_retention.oldest_closed_age_days,
                         cleanup_retention.closed_worktrees_policy_days
                     ),
+                    closed_worktree_evidence(&cleanup_retention.closed_worktrees),
                 ],
                 commands: if cleanup_retention.over_retained_bytes_budget {
                     vec![
@@ -8792,9 +8797,13 @@ impl Broker {
             ),
         };
         let plan = self.cleanup_plan_recorded()?;
-        let oldest_closed_at = self
-            .store
-            .cleaned_sessions()?
+        let closed_sessions = self.store.cleaned_sessions()?;
+        let closed_worktrees = crate::retention::ClosedWorktreeSummary::from_cleanup(
+            &plan,
+            &closed_sessions,
+            &self.main_root,
+        );
+        let oldest_closed_at = closed_sessions
             .into_iter()
             .filter(|session| {
                 let path = Path::new(&session.worktree_path);
@@ -8855,6 +8864,7 @@ impl Broker {
             severity,
             retention_config,
             reconciliation: self.reconcile_worktree_directories(false)?,
+            closed_worktrees,
         })
     }
 
@@ -9219,6 +9229,34 @@ fn unclaimed_worktree_severity(unclaimed: usize) -> StatusAdviceSeverity {
         StatusAdviceSeverity::Warning
     } else {
         StatusAdviceSeverity::Notice
+    }
+}
+
+/// One status evidence line for checkouts closed sessions left on disk.
+fn closed_worktree_evidence(closed: &crate::retention::ClosedWorktreeSummary) -> String {
+    let bytes = if closed.unmeasured_count == 0 {
+        format!("{} bytes", closed.estimated_bytes)
+    } else {
+        format!(
+            "at least {} bytes ({} never sized)",
+            closed.estimated_bytes, closed.unmeasured_count
+        )
+    };
+    let adopted = if closed.adopted_count == 0 {
+        String::new()
+    } else {
+        format!(
+            "; {} adopted {} GC never removes",
+            closed.adopted_count,
+            plural_word(closed.adopted_count, "checkout", "checkouts")
+        )
+    };
+    match closed.command.as_deref() {
+        Some(command) => format!(
+            "closed sessions with checkouts on disk: {}, {bytes}{adopted}; see which GC would reclaim: {command}",
+            closed.count
+        ),
+        None => "closed sessions with checkouts on disk: 0".into(),
     }
 }
 
@@ -10378,6 +10416,7 @@ mod tests {
             super::StatusAdviceSeverity::Notice
         );
         let mut retention = super::CleanupRetention {
+            closed_worktrees: Default::default(),
             reconciliation: crate::WorktreeReconciliation {
                 schema_version: crate::WORKTREE_RECONCILIATION_SCHEMA_VERSION,
                 scanned_root_count: 0,
@@ -10460,6 +10499,7 @@ mod tests {
             orphaned_pidfiles: Vec::new(),
             purged_stale_leases: 0,
             retention: crate::GcHealth {
+                closed_worktrees: Default::default(),
                 unclaimed_worktree_count: 0,
                 unclaimed_worktree_bytes: 0,
                 policy: crate::RetentionPolicy::default(),

@@ -1543,6 +1543,11 @@ impl Broker {
             // Sizing unclaimed directories is another full walk, so it
             // belongs to whichever pass was already paying for walks.
             reconciliation: Some(self.reconcile_worktree_directories(scan.measures())?),
+            closed_worktrees: crate::retention::ClosedWorktreeSummary::from_cleanup(
+                &cleanup,
+                &sessions.values().cloned().collect::<Vec<_>>(),
+                &main_root,
+            ),
             unmeasured_directory_count,
             sizes_measured_at_ms: cleanup.sizes_measured_at_ms,
             budget_verdict,
@@ -1604,6 +1609,7 @@ impl Broker {
                 .reconciliation
                 .as_ref()
                 .map_or(0, |sweep| sweep.unclaimed_bytes),
+            closed_worktrees: plan.closed_worktrees,
         })
     }
 
