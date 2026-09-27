@@ -73,7 +73,7 @@ mod tests {
         assert!(REVIEW_RULES_SKILL_MD.contains("name: aethyme-review-rule-maker"));
         // The skill's whole value is that it drives the dry run rather than
         // describing it, so losing that command would leave prose.
-        assert!(REVIEW_RULES_SKILL_MD.contains("aethyme broker review plan"));
+        assert!(REVIEW_RULES_SKILL_MD.contains("aethyme broker advanced review plan"));
         assert!(REVIEW_RULES_REFERENCE_MD.contains("[[review.trigger.rule]]"));
     }
 }
