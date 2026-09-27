@@ -1100,7 +1100,7 @@ pub(super) fn run_close(parsed: Parsed) -> Result<(), UsageError> {
         out!("{}", serde_json::json!({ "closed": session }));
     } else {
         out!(
-            "Session {session} closed (state only — worktree untouched). \
+            "Session {session} closed; checkout and branch remain available. Policy may reclaim known ignored build artifacts. \
              Next task on the same worktree: `aethyme broker start --adopt --task \"...\"`."
         );
     }
