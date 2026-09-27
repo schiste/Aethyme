@@ -148,7 +148,7 @@ fn help_names_the_options() {
         result.assert_contains(flag);
     }
     result.assert_contains("legacy repository-quality scorecard");
-    result.assert_contains("aethyme readiness");
+    result.assert_contains("aethyme broker status readiness");
 }
 
 #[test]

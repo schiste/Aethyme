@@ -724,7 +724,7 @@ fn enhance_verify_does_not_call_legacy_generated_drift_a_direct_edit() {
     let result = invoke_aethyme(["enhance", "verify", "--repo", &repo.display().to_string()]);
     result.expect_code(1);
     result.assert_contains("deployment provenance is unavailable");
-    result.assert_contains("aethyme enhance deploy --repo <repo>");
+    result.assert_contains("aethyme deploy --repo <repo>");
     result.assert_lacks("direct edits unsupported");
 }
 

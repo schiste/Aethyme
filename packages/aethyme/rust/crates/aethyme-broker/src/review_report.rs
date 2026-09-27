@@ -67,11 +67,11 @@ pub struct ReviewReportingPolicy {
     /// have an identity of their own.
     #[serde(default)]
     pub request_changes_at: Option<String>,
-    /// Post through `aethyme broker gh` rather than bare `gh`.
+    /// Post through `aethyme broker advanced gh` rather than bare `gh`.
     ///
     /// Accepted and no longer consulted by the Chau7 lane. A Chau7 reviewer
     /// holds no GitHub credentials and posts nothing; it writes its review to
-    /// a file and the adapter posts it, always through `aethyme broker gh`. The
+    /// a file and the adapter posts it, always through `aethyme broker advanced gh`. The
     /// key stays so a repository that sets it keeps loading.
     #[serde(default = "default_true")]
     pub coordinated: bool,

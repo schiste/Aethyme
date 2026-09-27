@@ -448,7 +448,7 @@ impl ReviewDispatchAction {
         }
     }
 
-    /// Arguments for `aethyme broker gh --repo <owner/name> -- <these>`, for
+    /// Arguments for `aethyme broker advanced gh --repo <owner/name> -- <these>`, for
     /// the one variant that talks to GitHub.
     pub fn gh_args(&self) -> Option<Vec<String>> {
         match self {
@@ -681,7 +681,7 @@ pub const REVIEW_GH_CONFIG_DIR: &str = "gh-config";
 /// push, comment on any repository, and read private ones. It now needs none of
 /// that: the adapter, which runs as the operator anyway, fetches the pull
 /// request into [`Self::outbox`] before the spawn and posts
-/// [`Self::body_file`] through `aethyme broker gh` after the row settles. The
+/// [`Self::body_file`] through `aethyme broker advanced gh` after the row settles. The
 /// reviewer reads files and writes one.
 ///
 /// The outbox is a sibling of the workspace rather than a directory inside it:
@@ -761,7 +761,7 @@ impl ReviewerSandbox {
     }
 
     /// `gh` arguments that post [`Self::body_file`] as the review, for the
-    /// adapter to run through `aethyme broker gh`. The adapter adds `--repo`.
+    /// adapter to run through `aethyme broker advanced gh`. The adapter adds `--repo`.
     pub fn post_args(&self, pull_request: i64, request_changes: bool) -> Vec<String> {
         vec![
             "pr".into(),

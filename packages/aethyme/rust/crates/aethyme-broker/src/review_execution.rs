@@ -108,7 +108,7 @@ pub struct Chau7Teardown {
     pub why: String,
     /// Where the reviewer left its review. The reviewer holds no credentials,
     /// so the adapter posts `sandbox.body_file` -- with the args below, through
-    /// `aethyme broker gh` -- before it closes the tab.
+    /// `aethyme broker advanced gh` -- before it closes the tab.
     pub sandbox: ReviewerSandbox,
     /// Post as a comment: the default.
     pub post_comment_args: Vec<String>,

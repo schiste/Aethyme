@@ -796,7 +796,7 @@ fn suggestions_from_signals(signals: &[Value]) -> Vec<Value> {
             (
                 "message",
                 Value::str(
-                    "Add a maintainer override for `commands[].test` in `.aethyme/overrides/onboarding.json`, then rerun `aethyme repo compile-skills <repo>` or `aethyme enhance deploy --repo <repo>`.",
+                    "Add a maintainer override for `commands[].test` in `.aethyme/overrides/onboarding.json`, then rerun `aethyme repo compile-skills <repo>` or `aethyme deploy --repo <repo>`.",
                 ),
             ),
         ]));
@@ -818,7 +818,7 @@ fn suggestions_from_signals(signals: &[Value]) -> Vec<Value> {
             (
                 "message",
                 Value::str(
-                    "Rerun `aethyme repo compile-skills <repo>` or `aethyme enhance deploy --repo <repo>` so onboarding and Act artifacts match the current override file.",
+                    "Rerun `aethyme repo compile-skills <repo>` or `aethyme deploy --repo <repo>` so onboarding and Act artifacts match the current override file.",
                 ),
             ),
         ]));
@@ -845,10 +845,7 @@ fn recommended_next_action(report: &Value) -> Value {
     let has = |code: &str| suggestion_codes.iter().any(|c| c == code);
     if has("regenerate_onboarding_artifacts") {
         return obj(vec![
-            (
-                "command",
-                Value::str("aethyme enhance deploy --repo <repo>"),
-            ),
+            ("command", Value::str("aethyme deploy --repo <repo>")),
             (
                 "reason",
                 Value::str("Override file is newer than generated onboarding/Act artifacts."),

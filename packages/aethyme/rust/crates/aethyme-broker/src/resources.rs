@@ -1396,7 +1396,7 @@ fn plan_allocations(
                         format!(
                             "exclusive key is held by lease {} ({holder}) whose holder process is gone; \
                              waiting cannot release it, review cleanup and run `aethyme broker \
-                             resources reconcile {} --confirm {}`",
+                             advanced resources reconcile {} --confirm {}`",
                             owner.lease_id, owner.lease_id, owner.generation
                         )
                     } else {

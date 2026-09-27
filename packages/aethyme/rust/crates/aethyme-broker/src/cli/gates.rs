@@ -377,7 +377,7 @@ pub(super) fn render_semantic_gate_advice(report: &crate::SemanticGateAdvice) {
     out!("  next: {}", report.next_action);
 }
 
-/// `aethyme broker trust [status]`. Never opens (or creates) the broker
+/// `aethyme broker advanced trust [status]`. Never opens (or creates) the broker
 /// database for the check itself: trust is host state.
 pub(super) fn run_trust_command(parsed: &Parsed) -> Result<(), UsageError> {
     use crate::broker::gate_trust;

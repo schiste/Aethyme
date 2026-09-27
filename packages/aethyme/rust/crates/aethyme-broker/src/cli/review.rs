@@ -7,7 +7,7 @@ use super::*;
 ///
 /// A dry run with no exceptions: it reads git, reads `.aethyme/config.toml`,
 /// and writes nothing. Every mutation it would make is printed as the exact
-/// `aethyme broker gh` command that would make it, so an operator can read the
+/// `aethyme broker advanced gh` command that would make it, so an operator can read the
 /// decision and run it themselves before ever switching the policy on.
 ///
 /// It deliberately does not consult the provider. Review *spend* and live
@@ -1143,7 +1143,7 @@ pub(super) fn build_review_run_report(
         "expired": expired,
         // The one thing the broker cannot do itself. An adapter with Chau7
         // access starts these, then closes each row with
-        // `aethyme broker review state --repo <r> --pr <n> --type <t> --state <s>`.
+        // `aethyme broker advanced review state --repo <r> --pr <n> --type <t> --state <s>`.
         "chau7_handoff": plan.chau7,
         // Tabs to close, performed before `chau7_handoff` is started: a tick
         // may reclaim a dimension's workspace and dispatch a new review of

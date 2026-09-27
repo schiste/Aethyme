@@ -705,7 +705,7 @@ fn agent_context_dimension(facts: &CertificationFacts, root: &Path) -> Readiness
         } else {
             vec![action(
                 "Regenerate agent-facing context after reviewing the deployment",
-                Some("aethyme enhance deploy --repo ."),
+                Some("aethyme deploy --repo ."),
             )]
         },
     )

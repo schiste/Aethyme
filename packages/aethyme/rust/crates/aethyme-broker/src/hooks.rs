@@ -1,4 +1,4 @@
-//! Git hook management (`aethyme broker hooks ...`): derived pre-commit
+//! Git hook management (`aethyme broker advanced hooks ...`): derived pre-commit
 //! gates and the post-commit conflict radar.
 //!
 //! Hooks are **repo policy**, not broker mechanism — installation is
@@ -301,7 +301,7 @@ fn hook_block(hook: &str, binary: &Path) -> Result<String, HooksError> {
     let invoke = hook_invocation(hook)?;
     Ok(format!(
         "{MARKER_BEGIN}\n\
-         # Managed by `aethyme broker hooks install` — edits inside the markers are overwritten.\n\
+         # Managed by `aethyme broker advanced hooks install` — edits inside the markers are overwritten.\n\
          AETHYME={bin}\n\
          {invoke}\n\
          {MARKER_END}\n"

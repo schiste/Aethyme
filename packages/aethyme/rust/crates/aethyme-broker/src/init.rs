@@ -405,7 +405,7 @@ pub fn scaffold_local(repo_hint: &Path) -> Result<InitReport, BrokerOpError> {
     })
 }
 
-/// Adaptive gate drafting (`aethyme broker gates draft`): sniff the
+/// Adaptive gate drafting (`aethyme broker advanced gates draft`): sniff the
 /// repo's manifests and write a draft gates.toml. Never overwrites.
 /// NOT scaffolding, NOT certification — output depends on the repo.
 pub fn draft_gates(repo_hint: &Path) -> Result<InitReport, BrokerOpError> {

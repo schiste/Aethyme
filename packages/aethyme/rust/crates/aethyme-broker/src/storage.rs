@@ -52,7 +52,7 @@ pub enum StorageError {
     #[error("storage confirmation must be a full SHA-256 digest")]
     ConfirmationNotSha256,
     #[error(
-        "the reviewed host storage plan no longer matches current state; nothing was removed; review a new plan with `aethyme broker storage plan` and confirm its digest"
+        "the reviewed host storage plan no longer matches current state; nothing was removed; review a new plan with `aethyme broker gc storage plan` and confirm its digest"
     )]
     ConfirmationMismatch,
 }
@@ -465,7 +465,7 @@ pub fn storage_apply(
         applied,
         failures,
         reclaimed_bytes,
-        recovery_action: (!complete).then(|| "aethyme broker storage plan".into()),
+        recovery_action: (!complete).then(|| "aethyme broker gc storage plan".into()),
     })
 }
 

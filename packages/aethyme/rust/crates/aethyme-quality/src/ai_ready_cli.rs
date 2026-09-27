@@ -25,7 +25,7 @@ const HELP: &str = "Usage: aethyme ai-ready [OPTIONS]
   Run the legacy repository-quality scorecard.
 
   This score does not determine broker or agent readiness. Use
-  `aethyme readiness` for operational readiness and `aethyme quality inspect`
+  `aethyme broker status readiness` for operational readiness and `aethyme quality inspect`
   for bounded repository-quality analysis.
 
 Options:
@@ -64,7 +64,7 @@ pub fn run(args: &[String]) -> u8 {
     };
 
     eprintln!(
-        "Notice: `aethyme ai-ready` is a legacy repository-quality scorecard; its score does not determine operational readiness. Use `aethyme readiness`, or `aethyme quality inspect` for bounded quality suggestions."
+        "Notice: `aethyme ai-ready` is a legacy repository-quality scorecard; its score does not determine operational readiness. Use `aethyme broker status readiness`, or `aethyme quality inspect` for bounded quality suggestions."
     );
 
     // Determine repository path (Python: Path(repo).resolve() / cwd).
