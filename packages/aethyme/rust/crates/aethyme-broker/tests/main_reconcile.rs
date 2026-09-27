@@ -4,7 +4,7 @@
 use std::path::Path;
 use std::process::Command;
 
-use aethyme_broker::{Broker, MainReconcileDisposition};
+use aethyme_broker::{Broker, MainReconcileDisposition, MainReconcileStrategy};
 
 fn sh(cwd: &Path, args: &[&str]) {
     let out = Command::new("git")
@@ -136,7 +136,13 @@ fn a_represented_branch_moves_and_keeps_a_preservation_ref() {
     let moved = broker.main_reconcile_plan().unwrap();
     assert_eq!(moved.local_sha, plan.integration_sha);
     let preserved = Command::new("git")
-        .args(["rev-parse", &report.preservation_ref])
+        .args([
+            "rev-parse",
+            report
+                .preservation_ref
+                .as_deref()
+                .expect("a reset preserves the pre-move tip"),
+        ])
         .current_dir(&repo)
         .output()
         .unwrap();
@@ -209,7 +215,13 @@ fn archiving_unrepresented_work_unblocks_the_apply() {
         .unwrap();
     assert_eq!(report.moved_from, before);
     let preserved = Command::new("git")
-        .args(["rev-parse", &report.preservation_ref])
+        .args([
+            "rev-parse",
+            report
+                .preservation_ref
+                .as_deref()
+                .expect("a reset preserves the pre-move tip"),
+        ])
         .current_dir(&repo)
         .output()
         .unwrap();
@@ -275,4 +287,133 @@ fn the_template_lists_only_commits_needing_a_decision() {
     );
     assert_eq!(template.resolutions[0].resolution, "replay_through_broker");
     assert_eq!(template.resolutions[0].subject, "feat: local only");
+}
+
+fn rev(repo: &Path, reference: &str) -> String {
+    let out = Command::new("git")
+        .args(["rev-parse", reference])
+        .current_dir(repo)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "rev-parse {reference}");
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// #374: a clean local main that is a strict ancestor of integration used to
+/// be refused as "carries nothing integration does not contain", leaving a
+/// manual `git merge --ff-only` outside the broker as the only way forward.
+/// It now gets an exact fast-forward plan, and the apply creates no
+/// preservation ref because nothing is left behind.
+#[test]
+fn a_clean_main_behind_integration_gets_an_exact_fast_forward() {
+    let (_tmp, repo) = fixture();
+    let mut broker = Broker::open(&repo).unwrap();
+    sh(&repo, &["checkout", "-q", "main"]);
+
+    let plan = broker.main_reconcile_plan().unwrap();
+    assert!(plan.safe, "refusal: {:?}", plan.refusal);
+    assert_eq!(plan.strategy, MainReconcileStrategy::FastForward);
+    assert!(plan.commits.is_empty());
+    assert_ne!(plan.local_sha, plan.integration_sha);
+
+    let session = broker.start_worktree("fast-forward main", None).unwrap();
+    let report = broker
+        .main_reconcile_apply(session.id, &plan.digest)
+        .unwrap();
+    assert_eq!(report.strategy, MainReconcileStrategy::FastForward);
+    assert_eq!(report.preservation_ref, None);
+    assert_eq!(report.moved_from, plan.local_sha);
+    assert_eq!(report.moved_to, plan.integration_sha);
+    assert_eq!(rev(&repo, "refs/heads/main"), plan.integration_sha);
+    assert!(
+        !Command::new("git")
+            .args(["rev-parse", "--verify", "--quiet", &plan.preservation_ref])
+            .current_dir(&repo)
+            .status()
+            .unwrap()
+            .success(),
+        "a fast-forward must not create a preservation ref"
+    );
+
+    // Equal refs are a refusal, not another plan.
+    let after = broker.main_reconcile_plan().unwrap();
+    assert!(!after.safe);
+    assert!(
+        after.refusal.as_deref().unwrap().contains("already at"),
+        "{:?}",
+        after.refusal
+    );
+}
+
+/// Dirty tracked work stays protected for a fast-forward too.
+#[test]
+fn a_dirty_main_behind_integration_is_refused() {
+    let (_tmp, repo) = fixture();
+    let mut broker = Broker::open(&repo).unwrap();
+    sh(&repo, &["checkout", "-q", "main"]);
+    std::fs::write(repo.join("src.txt"), "edited, uncommitted\n").unwrap();
+
+    let plan = broker.main_reconcile_plan().unwrap();
+    assert_eq!(plan.strategy, MainReconcileStrategy::FastForward);
+    assert!(!plan.safe);
+    assert!(
+        plan.refusal
+            .as_deref()
+            .unwrap()
+            .contains("uncommitted tracked"),
+        "{:?}",
+        plan.refusal
+    );
+    let before = rev(&repo, "refs/heads/main");
+    broker
+        .main_reconcile_apply(1, &plan.digest)
+        .expect_err("dirty work must never be moved under");
+    assert_eq!(rev(&repo, "refs/heads/main"), before);
+}
+
+/// Both strategies move whatever HEAD names, so a checkout on another branch
+/// must refuse rather than move that branch.
+#[test]
+fn a_checkout_on_another_branch_is_refused() {
+    let (_tmp, repo) = fixture();
+    let mut broker = Broker::open(&repo).unwrap();
+    sh(&repo, &["checkout", "-q", "-b", "feature", "main"]);
+
+    let plan = broker.main_reconcile_plan().unwrap();
+    assert!(!plan.safe);
+    assert!(
+        plan.refusal
+            .as_deref()
+            .unwrap()
+            .contains("primary checkout is on refs/heads/feature"),
+        "{:?}",
+        plan.refusal
+    );
+}
+
+/// A fast-forward plan reviewed before main diverged must not apply: the
+/// digest binds the strategy and both tips.
+#[test]
+fn a_fast_forward_plan_goes_stale_when_main_diverges() {
+    let (_tmp, repo) = fixture();
+    let mut broker = Broker::open(&repo).unwrap();
+    sh(&repo, &["checkout", "-q", "main"]);
+    let plan = broker.main_reconcile_plan().unwrap();
+    assert_eq!(plan.strategy, MainReconcileStrategy::FastForward);
+
+    std::fs::write(repo.join("only-local.txt"), "diverged\n").unwrap();
+    sh(&repo, &["add", "-A"]);
+    sh(&repo, &["commit", "-qm", "diverge"]);
+    let diverged = rev(&repo, "refs/heads/main");
+
+    let error = broker
+        .main_reconcile_apply(1, &plan.digest)
+        .expect_err("a plan reviewed against another main must not apply");
+    assert!(
+        error
+            .to_string()
+            .contains("no longer matches current state"),
+        "{error}"
+    );
+    assert_eq!(rev(&repo, "refs/heads/main"), diverged);
 }

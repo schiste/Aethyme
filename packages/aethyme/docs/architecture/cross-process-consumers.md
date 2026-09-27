@@ -132,6 +132,12 @@ consumer. This file exists so that doesn't happen again.
 |---|---|---|
 | Readers of gate outcomes: `aethyme broker advanced gates run --json` (one `GateRunOutcome` per gate) and any wrapper auditing where a gate's artifacts came from | Each outcome of a gate with `[gate.managed_cache]` carries `managed_cache.sources_refreshed`: the number of the tree's files (tracked plus untracked, non-ignored; symlinks and deleted paths skipped) whose mtime the broker advanced to "now" before the command ran, so Cargo rebuilds every workspace member from the tree under test instead of reusing another worktree's artifacts from the shared `CARGO_TARGET_DIR`. Content is untouched, so the tree hash the verdict is keyed on does not change. A refresh that fails records the gate as `error`/`environment` without running the command. | Additive field. A reader that rejects unknown keys in `managed_cache` breaks. Removing the refresh, or making it best-effort, reopens #391: a gate can execute a foreign tree's library and record pass or fail against its own tree. Gates run by a broker older than the release carrying this field still share artifacts across worktrees. |
 
+### Main reconcile fast-forward (introduced 2026-09-27, #374 section 1)
+
+| Source | Invokes / assumes | Failure mode |
+|---|---|---|
+| Readers of `aethyme broker advanced main reconcile plan --json` and `apply --json` | The plan adds `strategy`: `reset_onto_integration` (the #143 path) or `fast_forward`, for a clean default branch that is a strict ancestor of integration, which used to be refused as carrying nothing. The digest binds the strategy. The apply report adds `strategy`, and its `preservation_ref` becomes nullable: `null` for a fast-forward, which runs `merge --ff-only` to the exact reviewed SHA and leaves no commit to preserve. The plan's `preservation_ref` stays a string naming the ref a reset would create. New refusals: the default branch already at integration, or the primary checkout on another branch. | A consumer that dereferences the apply report's `preservation_ref` unconditionally breaks on a fast-forward; branch on `strategy`. A plan's `preservation_ref` is not proof the ref exists: it is created only by a reset apply. A plan reviewed before main or integration moved no longer matches its digest and is refused, as before. |
+
 ### Installed git hooks (`aethyme broker advanced hooks install`, 2026-07-17)
 
 | Source | Invokes | Failure mode |

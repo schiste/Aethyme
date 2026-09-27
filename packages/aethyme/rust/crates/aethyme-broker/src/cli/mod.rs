@@ -655,12 +655,15 @@ Usage:
       that the integration branch does not. A commit counts as already
       represented when integration holds its content for every path it touched,
       which recognizes work that landed through a squashed promotion and whose
-      SHA therefore differs. Uncommitted tracked changes, or any commit that
-      cannot be proven represented, refuse the apply.
+      SHA therefore differs. A clean default branch that is a strict ancestor
+      of integration gets a `fast_forward` plan instead. Uncommitted tracked
+      changes, a checkout on another branch, or any commit that cannot be
+      proven represented refuse the apply.
   aethyme broker main reconcile apply --session <id> --confirm <sha256> [--resolution-file <path>] [--json]
       Move the local default branch onto integration after re-proving the
-      reviewed plan. Creates a preservation ref at the pre-move tip first, and
-      never runs when anything would be lost.
+      reviewed plan. A reset creates a preservation ref at the pre-move tip
+      first; a fast-forward runs `merge --ff-only` to the exact reviewed SHA
+      and needs none. Never runs when anything would be lost.
   aethyme broker representation scan --session <id> [--json]
   aethyme broker representation status --session <id> [--json]
       Read-only: decide whether this session's work is already present on the

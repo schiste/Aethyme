@@ -265,7 +265,7 @@ pub use leases::{LeaseIgnoreRules, Overlap, detect_overlaps};
 pub use main_reconcile::{
     MAIN_RECONCILE_SCHEMA_VERSION, MainReconcileApplyReport, MainReconcileCommit,
     MainReconcileDisposition, MainReconcilePlan, MainReconcileResolution,
-    MainReconcileResolutionDocument, MainReconcileResolutionTemplate,
+    MainReconcileResolutionDocument, MainReconcileResolutionTemplate, MainReconcileStrategy,
 };
 pub use measurement::{
     BudgetVerdict, MeasuredTotal, SizeRecord, SizeRecords, SizeScan, budget_verdict,
