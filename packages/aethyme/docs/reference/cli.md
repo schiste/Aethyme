@@ -1163,6 +1163,7 @@ gate_results_days = 30
 terminal_merge_queue_days = 180
 command_metrics_days = 30
 closed_worktrees_days = 7
+closed_worktree_grace_hours = 24
 publication_exposure_days = 30
 retained_bytes_budget = 1073741824
 artifact_reclaim_days = 0
@@ -1208,6 +1209,18 @@ Worktrees whose cleanup proof represents their contribution are eligible
 regardless of age, while their build caches remain governed by
 `artifact_reclaim_days`. The age setting never authorizes removal of an
 unproven contribution.
+
+`closed_worktree_grace_hours` (default 24, `0` for none) is how long GC waits
+after a state-only close (`aethyme broker finish close`) before proposing the
+checkout it kept. A clean checkout whose work is represented on a delivery
+target is proposed once the grace period has passed; until then the plan
+reports a `closed_worktree_grace` blocker with the checkout's bytes. Explicit
+`finish cleanup` does not wait. A closed session's checkout that a live session
+now uses is never proposed (`live_worktree`), and a closed adopted checkout is
+only reported (`adopted_worktree`): the broker did not create it and GC never
+removes it. `gc apply` rechecks the live-session guard per worktree before it
+removes anything, and a plan whose checkouts changed after review no longer
+matches its digest.
 
 `session_abandoned_after_hours` bounds how long a session may go without any
 evidence of a working agent before the broker closes it. A session with a live

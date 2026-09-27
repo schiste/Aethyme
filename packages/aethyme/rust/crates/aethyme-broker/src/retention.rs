@@ -19,6 +19,7 @@ const RETENTION_POLICY_FIELDS: &[&str] = &[
     "terminal_merge_queue_days",
     "command_metrics_days",
     "closed_worktrees_days",
+    "closed_worktree_grace_hours",
     "auto_cleanup_worktrees_on_finish",
     "publication_exposure_days",
     "retained_bytes_budget",
@@ -76,6 +77,13 @@ pub struct RetentionPolicy {
     /// build caches use `artifact_reclaim_days` instead. This does not affect
     /// committed work or authorize removal without provenance proof.
     pub closed_worktrees_days: u32,
+    /// Hours a state-only closed session's worktree is kept before `gc plan`
+    /// may propose removing it, even when it is clean and its work has
+    /// landed. `finish close` keeps the checkout on purpose, and an agent
+    /// that closed one a minute ago may still be about to look at it. `0`
+    /// means no grace period; like every worktree proposal, this never
+    /// authorizes removing a dirty or unrepresented checkout.
+    pub closed_worktree_grace_hours: u32,
     /// Automatically remove safe, broker-owned worktrees when `finish` closes
     /// a session. Set false to retain them for inspection or reuse; manual
     /// cleanup remains available, and unsafe or unproven work is never removed.
@@ -135,6 +143,7 @@ impl Default for RetentionPolicy {
             terminal_merge_queue_days: 180,
             command_metrics_days: 30,
             closed_worktrees_days: 7,
+            closed_worktree_grace_hours: 24,
             auto_cleanup_worktrees_on_finish: true,
             publication_exposure_days: 30,
             retained_bytes_budget: 1_073_741_824,
@@ -212,6 +221,13 @@ impl RetentionPolicy {
                 field: "session_abandoned_after_hours",
                 value: self.session_abandoned_after_hours.to_string(),
                 constraint: "must be between 0 (disabled) and 8760 hours",
+            });
+        }
+        if self.closed_worktree_grace_hours > 8_760 {
+            return Err(RetentionConfigError::InvalidValue {
+                field: "closed_worktree_grace_hours",
+                value: self.closed_worktree_grace_hours.to_string(),
+                constraint: "must be between 0 (no grace period) and 8760 hours",
             });
         }
         if self.artifact_sweep_budget_ms > 60_000 {

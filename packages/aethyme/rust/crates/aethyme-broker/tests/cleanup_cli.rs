@@ -77,9 +77,27 @@ fn bulk_cleanup_is_dry_run_by_default_and_apply_revalidates() {
     assert!(plan["removed_session_ids"].as_array().unwrap().is_empty());
     assert!(worktree.exists());
 
-    // GC must use the same representation proof as cleanup. This session was
-    // closed only moments ago, so the old GC age gate would have omitted it
-    // even though cleanup reported it as eligible.
+    // GC must use the same representation proof as cleanup. The only thing
+    // GC adds is a short grace period after a state-only close, reported as
+    // its own blocker rather than as the `closed_worktrees_days` age gate
+    // that once made the two disagree for a week.
+    let gc = run(tmp.path(), &["gc", "plan", "--json"]);
+    assert!(
+        gc.status.success(),
+        "{}",
+        String::from_utf8_lossy(&gc.stderr)
+    );
+    let gc: serde_json::Value = serde_json::from_slice(&gc.stdout).unwrap();
+    assert!(gc["worktrees"].as_array().unwrap().is_empty(), "{gc}");
+    assert!(gc["blockers"].as_array().unwrap().iter().any(|blocker| {
+        blocker["kind"] == "closed_worktree_grace" && blocker["id"].as_i64() == Some(session.id)
+    }));
+    std::fs::create_dir_all(tmp.path().join(".aethyme")).unwrap();
+    std::fs::write(
+        tmp.path().join(".aethyme/broker.toml"),
+        "[retention]\nclosed_worktree_grace_hours = 0\n",
+    )
+    .unwrap();
     let gc = run(tmp.path(), &["gc", "plan", "--json"]);
     assert!(
         gc.status.success(),

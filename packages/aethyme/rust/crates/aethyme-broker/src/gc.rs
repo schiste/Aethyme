@@ -1088,6 +1088,11 @@ impl Broker {
         }
 
         let worktree_cutoff = cutoff(evaluated_at, policy.closed_worktrees_days);
+        let live_worktrees = live_sessions
+            .iter()
+            .map(|session| PathBuf::from(&session.worktree_path))
+            .collect::<Vec<_>>();
+        let grace_ms = i64::from(policy.closed_worktree_grace_hours).saturating_mul(3_600_000);
         let mut worktrees = Vec::new();
         for item in cleanup.worktrees.iter().cloned() {
             let Some(session) = sessions.get(&item.session_id) else {
@@ -1095,9 +1100,47 @@ impl Broker {
             };
             let closed_at = session.closed_at.unwrap_or(session.updated_at);
             let retained_bytes = item.estimated_bytes.unwrap_or(0);
+            // A closed session's directory can be adopted again, by `start
+            // --replace-stale` or by hand, which leaves this row naming a
+            // checkout a live session is working in. Its cleanliness and
+            // provenance then describe the live session's work, not this
+            // one's, and no proof about a closed row authorizes removing it.
+            if item.worktree_present
+                && overlaps_live_worktree(Path::new(&item.worktree_path), &live_worktrees)
+            {
+                let blocker = GcBlocker {
+                    kind: "live_worktree".into(),
+                    id: Some(item.session_id),
+                    reason: "the worktree is the checkout of a live session".into(),
+                };
+                blocked_worktree_bytes.insert((blocker.kind.clone(), blocker.id), retained_bytes);
+                blockers.push(blocker);
+                continue;
+            }
             // Cleanup eligibility is the representation proof. Once it holds,
             // GC must schedule the same worktree regardless of its age; an
             // age gate here made `cleanup --all-cleaned` and `gc` disagree.
+            // The one exception is a short grace period after a state-only
+            // close: that close keeps the checkout on purpose, so GC waits
+            // before second-guessing it. Explicit `finish cleanup` does not.
+            if item.eligible()
+                && item.worktree_present
+                && session.cleanup_state == crate::SessionCleanupState::Closed
+                && session.cleanup_completed_at.is_none()
+                && evaluated_at.saturating_sub(closed_at) < grace_ms
+            {
+                let blocker = GcBlocker {
+                    kind: "closed_worktree_grace".into(),
+                    id: Some(item.session_id),
+                    reason: format!(
+                        "closed less than the {} hour grace period ago; eligible afterwards: {}",
+                        policy.closed_worktree_grace_hours, item.reason
+                    ),
+                };
+                blocked_worktree_bytes.insert((blocker.kind.clone(), blocker.id), retained_bytes);
+                blockers.push(blocker);
+                continue;
+            }
             if item.eligible() {
                 worktrees.push(GcWorktreeCandidate {
                     session_id: item.session_id,
@@ -1134,13 +1177,39 @@ impl Broker {
             blockers.push(blocker);
         }
 
+        // Adopted checkouts were never created by the broker, so neither
+        // cleanup nor GC removes them; `cleanup_plan` skips them entirely.
+        // Saying so is the whole of the lane: otherwise a closed adopted
+        // checkout is disk nobody's arithmetic mentions.
+        let canonical_main =
+            std::fs::canonicalize(&main_root).unwrap_or_else(|_| main_root.clone());
+        for session in sessions.values() {
+            if session.origin != crate::SessionOrigin::Adopted
+                || session.cleanup_state != crate::SessionCleanupState::Closed
+                || session.cleanup_completed_at.is_some()
+            {
+                continue;
+            }
+            let path = Path::new(&session.worktree_path);
+            if !is_real_directory(path)
+                || std::fs::canonicalize(path).is_ok_and(|path| path == canonical_main)
+                || overlaps_live_worktree(path, &live_worktrees)
+            {
+                continue;
+            }
+            blockers.push(GcBlocker {
+                kind: "adopted_worktree".into(),
+                id: Some(session.id),
+                reason: format!(
+                    "adopted checkout {} was not created by the broker and is never removed by GC",
+                    session.worktree_path
+                ),
+            });
+        }
+
         let removed_sessions = worktrees
             .iter()
             .map(|worktree| worktree.session_id)
-            .collect::<Vec<_>>();
-        let live_worktrees = live_sessions
-            .iter()
-            .map(|session| PathBuf::from(&session.worktree_path))
             .collect::<Vec<_>>();
         let (mut artifacts, declined_artifacts) = self.artifact_candidates(
             evaluated_at,
@@ -2018,6 +2087,27 @@ impl Broker {
 
         while !journal.remaining_worktrees.is_empty() && !check_deadline(deadline) {
             let candidate = journal.remaining_worktrees[0].clone();
+            // A resumed journal was authorized earlier; the checkout may have
+            // been adopted by a live session since. That candidate is retained
+            // and dropped from the journal rather than pinning it: nothing a
+            // later run could do would make removing a live checkout right.
+            let live_worktrees = self
+                .store()
+                .live_sessions()?
+                .iter()
+                .map(|session| PathBuf::from(&session.worktree_path))
+                .collect::<Vec<_>>();
+            if candidate.worktree_present
+                && overlaps_live_worktree(Path::new(&candidate.worktree_path), &live_worktrees)
+            {
+                failures.push(format!(
+                    "session {}: its worktree is now the checkout of a live session and was retained; review a new GC plan",
+                    candidate.session_id
+                ));
+                journal.remaining_worktrees.remove(0);
+                write_journal(&journal_path, &journal)?;
+                continue;
+            }
             let current = self
                 .cleanup_plan()?
                 .worktrees
