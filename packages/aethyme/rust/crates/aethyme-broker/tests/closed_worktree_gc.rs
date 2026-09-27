@@ -285,3 +285,54 @@ fn status_and_doctor_count_closed_checkouts_still_on_disk() {
     let doctor = broker.gc_health().unwrap().closed_worktrees;
     assert_eq!(doctor, status);
 }
+
+fn set_closed_at(repo: &Path, session_id: i64, closed_at: i64) {
+    let db = rusqlite::Connection::open(repo.join(".aethyme/broker.db")).unwrap();
+    db.execute(
+        "UPDATE sessions SET closed_at = ?2 WHERE id = ?1",
+        rusqlite::params![session_id, closed_at],
+    )
+    .unwrap();
+}
+
+#[test]
+fn cleanup_keeps_the_time_a_session_was_first_closed() {
+    let (tmp, mut broker) = repository(Some(0));
+    let (id, _worktree) = session_with_commit(&mut broker, "timed", true);
+    broker.close(id).unwrap();
+    drop(broker);
+    set_closed_at(tmp.path(), id, 1_000);
+
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    broker.cleanup(id, false).unwrap();
+    let cleaned = broker.store().session(id).unwrap();
+    assert_eq!(cleaned.cleanup_state, SessionCleanupState::Cleaned);
+    assert_eq!(
+        cleaned.closed_at,
+        Some(1_000),
+        "cleanup moved the close time"
+    );
+    assert!(cleaned.cleanup_completed_at.unwrap() > 1_000);
+}
+
+#[test]
+fn closing_again_does_not_restart_the_grace_period() {
+    let (tmp, mut broker) = repository(None);
+    let (id, _worktree) = session_with_commit(&mut broker, "reclosed", true);
+    broker.close(id).unwrap();
+    drop(broker);
+    let two_days_ago = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+        - 48 * 3_600_000;
+    set_closed_at(tmp.path(), id, two_days_ago);
+
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    broker.close(id).unwrap();
+    assert_eq!(
+        broker.store().session(id).unwrap().closed_at,
+        Some(two_days_ago)
+    );
+    assert!(proposed(&mut broker).contains(&id));
+}
