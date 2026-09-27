@@ -997,6 +997,17 @@ fn signal_target(record: &GatePidRecord, live_start: Option<u64>) -> Result<i32,
     Ok(record.pgid)
 }
 
+/// When `pid` started, in milliseconds since the epoch, on platforms whose
+/// start time is wall-clock (macOS). `None` elsewhere, or when the process
+/// does not exist.
+pub(crate) fn process_started_at_ms(pid: i32) -> Option<i64> {
+    if cfg!(target_os = "macos") {
+        process_start_time(pid).and_then(|micros| i64::try_from(micros / 1_000).ok())
+    } else {
+        None
+    }
+}
+
 /// When `pid` started, as an opaque value comparable only on this host:
 /// microseconds since the epoch on macOS, clock ticks since boot on Linux.
 /// `None` when the process does not exist or the platform cannot say.

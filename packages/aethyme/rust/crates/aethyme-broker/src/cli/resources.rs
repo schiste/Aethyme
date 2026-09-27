@@ -232,6 +232,7 @@ pub(super) fn run_console(parsed: Parsed) -> Result<(), UsageError> {
                     .iter()
                     .map(|lease| {
                         let marker = crate::console_marker_for_lease(&markers, lease);
+                        let health = crate::console_health(lease, marker);
                         let marker_revision = marker.map(|record| {
                             serde_json::json!({
                                 "branch": record.marker.branch,
@@ -269,6 +270,13 @@ pub(super) fn run_console(parsed: Parsed) -> Result<(), UsageError> {
                             })),
                             "state": lease.state.as_str(),
                             "holder_pid": lease.holder_pid,
+                            "holder_alive": health.holder_alive,
+                            "checkout": health.checkout,
+                            "stale": health.is_stale(),
+                            "stale_reasons": health.stale_reasons,
+                            "stop_command": health
+                                .is_stale()
+                                .then(|| console_stop_command(&lease.lease_id)),
                             "expires_at": lease.expires_at,
                         })
                     })
@@ -279,6 +287,10 @@ pub(super) fn run_console(parsed: Parsed) -> Result<(), UsageError> {
                         "identity": identity,
                         "canonical_checkout": main_root,
                         "this_checkout": worktree_root,
+                        "stale_count": running
+                            .iter()
+                            .filter(|row| row["stale"] == serde_json::Value::Bool(true))
+                            .count(),
                         "running": running,
                     }))?
                 );
@@ -319,6 +331,7 @@ pub(super) fn run_console(parsed: Parsed) -> Result<(), UsageError> {
                     out!("Running consoles: {}", leases.len());
                     for lease in &leases {
                         let marker = crate::console_marker_for_lease(&markers, lease);
+                        let health = crate::console_health(lease, marker);
                         let revision_label = marker.map_or_else(
                             || "marker missing".to_string(),
                             |record| {
@@ -331,8 +344,9 @@ pub(super) fn run_console(parsed: Parsed) -> Result<(), UsageError> {
                             },
                         );
                         out!(
-                            "  {:<10} port {:<6} pid {:<8} {}{} — {}{}",
+                            "  {:<10} lease {} port {:<6} pid {:<8} {}{} — {}{} [checkout {}]",
                             lease.state.as_str(),
+                            &lease.lease_id[..12.min(lease.lease_id.len())],
                             crate::console_port(lease).unwrap_or("-"),
                             lease
                                 .holder_pid
@@ -349,7 +363,20 @@ pub(super) fn run_console(parsed: Parsed) -> Result<(), UsageError> {
                             } else {
                                 ""
                             },
+                            health.checkout.as_str(),
                         );
+                        if health.is_stale() {
+                            out!(
+                                "    stale: {}; stop with: {}",
+                                health
+                                    .stale_reasons
+                                    .iter()
+                                    .map(|reason| reason.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(", "),
+                                console_stop_command(&lease.lease_id),
+                            );
+                        }
                     }
                 }
             }
@@ -592,13 +619,192 @@ pub(super) fn run_console(parsed: Parsed) -> Result<(), UsageError> {
                 return Err(UsageError::SilentExit(exit));
             }
         }
+        "stop" => stop_console(&parsed, &repository)?,
         other => {
             return Err(UsageError::Message(format!(
-                "unknown console action {other:?}; expected status, list, plan, or run"
+                "unknown console action {other:?}; expected status, list, plan, run, or stop"
             )));
         }
     }
     Ok(())
+}
+
+fn console_stop_command(lease_id: &str) -> String {
+    format!("aethyme broker advanced console stop {lease_id}")
+}
+
+/// Why `console stop` declined to signal a console's holder.
+fn console_stop_refusal(
+    lease: &crate::HostResourceLease,
+    health: &crate::ConsoleHealth,
+    force: bool,
+    holder_replaced: bool,
+) -> Option<String> {
+    let Some(pid) = lease.holder_pid else {
+        return Some("the lease recorded no holder process, so there is nothing to signal".into());
+    };
+    if health.holder_alive == Some(false) {
+        return Some(format!(
+            "holder pid {pid} is already gone; reclaim the lease with `aethyme broker advanced resources reap`"
+        ));
+    }
+    // An expired lease means nobody renewed it, so the live pid is not
+    // proven to be the supervisor any more: never signal on that evidence.
+    if lease.state != crate::HostLeaseState::Active {
+        return Some(format!(
+            "lease is {} and holder pid {pid} is not proven to be its supervisor; inspect it with `ps -p {pid}` before acting",
+            lease.state.as_str()
+        ));
+    }
+    if holder_replaced {
+        return Some(format!(
+            "pid {pid} started after the lease was granted, so it is not the console's supervisor"
+        ));
+    }
+    if !health.is_stale() && !force {
+        return Some(format!(
+            "console is not stale (checkout {}, supervisor alive); pass --force to stop a live console",
+            health.checkout.as_str()
+        ));
+    }
+    None
+}
+
+/// `console stop <lease-id>`: ask a console's supervisor to shut down.
+///
+/// SIGTERM goes to the supervising `console run`, never to the server
+/// directly: the supervisor forwards it to the server's process group,
+/// releases the lease, and removes the marker, so one signal retires all
+/// three records (#374).
+fn stop_console(parsed: &Parsed, repository: &str) -> Result<(), UsageError> {
+    let Some(target) = parsed.positional.get(1) else {
+        return Err(UsageError::Message(
+            "console stop requires <lease-id>; `aethyme broker advanced console status` lists them"
+                .into(),
+        ));
+    };
+    let coordinator = crate::HostResourceCoordinator::open_read_only_default()?;
+    let leases = crate::console_leases(&coordinator.list(false)?, repository);
+    let lease = match leases.iter().find(|lease| &lease.lease_id == target) {
+        Some(lease) => lease,
+        None => {
+            let candidates: Vec<_> = if target.len() >= 8 {
+                leases
+                    .iter()
+                    .filter(|lease| lease.lease_id.starts_with(target.as_str()))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            match candidates.as_slice() {
+                [lease] => *lease,
+                [] => {
+                    return Err(UsageError::Message(format!(
+                        "no console lease {target:?} for this repository (prefixes need at least 8 characters)"
+                    )));
+                }
+                _ => {
+                    return Err(UsageError::Message(format!(
+                        "console lease prefix {target:?} is ambiguous; give more characters"
+                    )));
+                }
+            }
+        }
+    };
+    let markers = crate::read_console_markers()?;
+    let marker = crate::console_marker_for_lease(&markers, lease);
+    let health = crate::console_health(lease, marker);
+    let refusal = console_stop_refusal(
+        lease,
+        &health,
+        parsed.force,
+        crate::console_holder_replaced(lease),
+    );
+    let port = crate::console_port(lease);
+    let wait = parsed
+        .wait
+        .as_deref()
+        .map(parse_resource_duration)
+        .transpose()?
+        .unwrap_or(std::time::Duration::from_secs(10));
+
+    let outcome = if let Some(reason) = &refusal {
+        ("refused", Some(reason.clone()))
+    } else if parsed.dry_run {
+        ("would_signal", None)
+    } else {
+        let pid = lease.holder_pid.expect("refusal covers a missing holder");
+        // SAFETY: kill(2) with a positive pid and SIGTERM has no memory
+        // effects; the pid was checked live, active, and not reused above.
+        if unsafe { libc::kill(pid as i32, libc::SIGTERM) } != 0 {
+            let error = std::io::Error::last_os_error();
+            (
+                "signal_failed",
+                Some(format!("SIGTERM to pid {pid}: {error}")),
+            )
+        } else {
+            let deadline = std::time::Instant::now() + wait;
+            let released = loop {
+                let still_held = crate::HostResourceCoordinator::open_read_only_default()?
+                    .list(false)?
+                    .iter()
+                    .any(|candidate| candidate.lease_id == lease.lease_id);
+                if !still_held {
+                    break true;
+                }
+                if std::time::Instant::now() >= deadline {
+                    break false;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            };
+            if released {
+                ("stopped", None)
+            } else {
+                (
+                    "signalled_not_released",
+                    Some(format!(
+                        "pid {pid} has not released the lease after {}ms; re-check with `aethyme broker advanced console status`",
+                        wait.as_millis()
+                    )),
+                )
+            }
+        }
+    };
+    if parsed.json {
+        out!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "lease_id": lease.lease_id,
+                "port": port,
+                "holder_pid": lease.holder_pid,
+                "worktree": marker.map(|record| record.marker.worktree.clone()),
+                "health": health,
+                "outcome": outcome.0,
+                "reason": outcome.1,
+            }))?
+        );
+    } else {
+        out!(
+            "Console {} port {} pid {} worktree {} (checkout {})",
+            &lease.lease_id[..12.min(lease.lease_id.len())],
+            port.unwrap_or("-"),
+            lease
+                .holder_pid
+                .map_or_else(|| "-".into(), |pid| pid.to_string()),
+            marker.map_or("unknown", |record| record.marker.worktree.as_str()),
+            health.checkout.as_str(),
+        );
+        match outcome {
+            ("would_signal", _) => out!("Dry run: would send SIGTERM to the supervisor."),
+            ("stopped", _) => out!("Stopped: the supervisor released the lease."),
+            (state, reason) => out!("{state}: {}", reason.unwrap_or_default()),
+        }
+    }
+    if matches!(outcome.0, "stopped" | "would_signal") {
+        Ok(())
+    } else {
+        Err(UsageError::SilentExit(1))
+    }
 }
 
 pub(super) fn unmanaged_notice(json: bool, action: &str) -> Result<(), UsageError> {
@@ -963,4 +1169,78 @@ pub(super) fn run_resources(parsed: Parsed) -> Result<(), UsageError> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::console_stop_refusal;
+    use crate::{
+        ConsoleCheckoutStatus, ConsoleHealth, ConsoleStaleReason, HostLeaseState, HostResourceLease,
+    };
+
+    fn lease(state: HostLeaseState, holder_pid: Option<u32>) -> HostResourceLease {
+        HostResourceLease {
+            lease_id: "0123456789abcdef0123456789abcdef".into(),
+            request_id: "r".into(),
+            repository: "repo".into(),
+            worktree_fingerprint: "fp".into(),
+            run_id: "run".into(),
+            generation: 1,
+            state,
+            holder_pid,
+            created_at: 0,
+            expires_at: 0,
+            released_at: None,
+            allocations: Vec::new(),
+        }
+    }
+
+    fn health(checkout: ConsoleCheckoutStatus, holder_alive: Option<bool>) -> ConsoleHealth {
+        ConsoleHealth {
+            checkout,
+            holder_alive,
+            stale_reasons: if checkout == ConsoleCheckoutStatus::Missing {
+                vec![ConsoleStaleReason::WorktreeMissing]
+            } else {
+                Vec::new()
+            },
+        }
+    }
+
+    #[test]
+    fn a_stale_console_with_a_live_active_holder_may_be_stopped() {
+        let lease = lease(HostLeaseState::Active, Some(42));
+        let health = health(ConsoleCheckoutStatus::Missing, Some(true));
+        assert_eq!(console_stop_refusal(&lease, &health, false, false), None);
+    }
+
+    #[test]
+    fn a_live_console_needs_force() {
+        let lease = lease(HostLeaseState::Active, Some(42));
+        let health = health(ConsoleCheckoutStatus::Present, Some(true));
+        let refusal = console_stop_refusal(&lease, &health, false, false).unwrap();
+        assert!(refusal.contains("--force"), "{refusal}");
+        assert_eq!(console_stop_refusal(&lease, &health, true, false), None);
+    }
+
+    /// `--force` overrides only the live-console guard, never the identity
+    /// guards: a wrong pid is not made right by insisting.
+    #[test]
+    fn force_never_signals_an_unproven_holder() {
+        let missing = health(ConsoleCheckoutStatus::Missing, Some(true));
+        let expired = lease(HostLeaseState::Quarantined, Some(42));
+        assert!(console_stop_refusal(&expired, &missing, true, false).is_some());
+        let active = lease(HostLeaseState::Active, Some(42));
+        assert!(console_stop_refusal(&active, &missing, true, true).is_some());
+        let unheld = lease(HostLeaseState::Active, None);
+        assert!(console_stop_refusal(&unheld, &missing, true, false).is_some());
+    }
+
+    #[test]
+    fn a_gone_holder_points_at_resource_reap() {
+        let lease = lease(HostLeaseState::Active, Some(42));
+        let health = health(ConsoleCheckoutStatus::Missing, Some(false));
+        let refusal = console_stop_refusal(&lease, &health, true, false).unwrap();
+        assert!(refusal.contains("resources reap"), "{refusal}");
+    }
 }

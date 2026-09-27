@@ -181,6 +181,7 @@ pub(super) const FLAG_RULES: &[(&str, &[&str])] = &[
     ("console status", &[]),
     ("console list", &[]),
     ("console plan", &["--allow-parallel"]),
+    ("console stop", &["--force", "--dry-run", "--wait"]),
     (
         "console run",
         &["--wait", "--allow-parallel", "--cleanup-command", "--"],

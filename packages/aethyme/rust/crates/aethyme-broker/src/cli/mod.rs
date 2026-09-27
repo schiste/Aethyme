@@ -248,7 +248,16 @@ Usage:
   aethyme broker console [status|list] [--json]
       Show the exact revision of this checkout and list consoles serving this
       repository right now, including each marker's branch, commit, worktree,
-      port, and integration relation. Read-only; reserves nothing.
+      port, and integration relation. Each console also reports whether its
+      recorded checkout still exists and whether its supervisor is alive; a
+      stale console names the `console stop` command that retires it.
+      Read-only; reserves nothing.
+  aethyme broker console stop <lease-id> [--force] [--dry-run] [--wait <duration>] [--json]
+      Send SIGTERM to a console's supervising `console run`, which stops the
+      server's process group, releases the lease, and removes the marker.
+      Refuses a console serving a present checkout without --force, and
+      never signals a holder whose lease expired or whose pid was reused.
+      Waits up to --wait (default 10s) for the lease to be released.
   aethyme broker console plan [--allow-parallel] [--json]
       Show exactly what a console launch would reserve under the current mode
       without reserving it.
