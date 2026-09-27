@@ -680,6 +680,10 @@ pub struct ManagedGateCacheProvenance {
     pub bytes_before: u64,
     pub bytes_after: Option<u64>,
     pub rotated_before_run: bool,
+    /// Files of the tree under test whose mtime the broker advanced before
+    /// the command ran, so Cargo rebuilds workspace members from this tree
+    /// instead of reusing another worktree's artifacts (issue #391).
+    pub sources_refreshed: u64,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -1569,6 +1573,7 @@ pub(crate) fn git_origin_fingerprint(repo: &GitRepo) -> String {
 fn prepare_managed_gate_cache(
     policy: Option<&ManagedGateCache>,
     repository: &str,
+    checkout: &GitRepo,
     progress: &dyn GateProgressSink,
     gate_name: &str,
 ) -> Result<Option<ManagedGateCacheRuntime>, std::io::Error> {
@@ -1578,7 +1583,73 @@ fn prepare_managed_gate_cache(
     let root = crate::host_state::default_host_cache_dir().ok_or_else(|| {
         std::io::Error::other("cannot find per-user cache directory; set AETHYME_HOST_CACHE_DIR")
     })?;
-    prepare_managed_gate_cache_in(policy, repository, progress, gate_name, &root)
+    let mut runtime =
+        prepare_managed_gate_cache_in(policy, repository, progress, gate_name, &root)?;
+    if let Some(runtime) = runtime.as_mut() {
+        let files = checkout
+            .working_state_files()
+            .map_err(|error| std::io::Error::other(format!("list the tree's sources: {error}")))?;
+        runtime.provenance.sources_refreshed =
+            refresh_source_mtimes(checkout.root(), &files, SystemTime::now())?;
+    }
+    Ok(runtime)
+}
+
+/// Issue #391: the managed cache is one `CARGO_TARGET_DIR` shared by every
+/// worktree of the repository. Cargo decides whether a workspace member is
+/// fresh by comparing the mtimes of the sources its dep-info lists, resolved
+/// against the *current* package root, with the artifact's own mtime; the
+/// member's package id and metadata hash do not depend on which worktree it
+/// lives in. So once worktree A has built into the cache, worktree B's
+/// different but older sources look up to date and B's gate executes A's
+/// code, then records that verdict against B's tree. Reproduced with two
+/// worktrees of a two-crate workspace: the second build ran the first
+/// tree's library in either order.
+///
+/// Advancing every file of the tree under test to `now` before the command
+/// runs makes each of them newer than any artifact already in the cache, so
+/// every workspace member (and every build script that watches a tree file)
+/// is rebuilt from this tree. Registry and git dependencies are fingerprinted
+/// by version and source id, not by mtime, so the expensive third-party
+/// artifacts are still reused. Only mtimes change: file content, and with it
+/// the tree hash the verdict is keyed on, stays identical.
+///
+/// Symlinks are skipped rather than followed, so the refresh never reaches
+/// outside the checkout; a symlinked source is still read through its
+/// target, which the tree does not own. A tracked path deleted in the
+/// worktree is skipped. Any other failure is an error: a gate that cannot
+/// prove it will rebuild from its own tree must not run.
+fn refresh_source_mtimes(
+    root: &Path,
+    files: &[String],
+    now: SystemTime,
+) -> Result<u64, std::io::Error> {
+    let mut refreshed = 0_u64;
+    for relative in files {
+        let path = root.join(relative);
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(with_path(error, "inspect", &path)),
+        };
+        if !metadata.file_type().is_file() {
+            continue;
+        }
+        // futimens needs ownership, not write access, so a read-only
+        // handle also refreshes read-only files.
+        std::fs::File::open(&path)
+            .and_then(|file| file.set_modified(now))
+            .map_err(|error| with_path(error, "refresh the mtime of", &path))?;
+        refreshed += 1;
+    }
+    Ok(refreshed)
+}
+
+fn with_path(error: std::io::Error, action: &str, path: &Path) -> std::io::Error {
+    std::io::Error::new(
+        error.kind(),
+        format!("{action} {}: {error}", path.display()),
+    )
 }
 
 fn prepare_managed_gate_cache_in(
@@ -1623,6 +1694,7 @@ fn prepare_managed_gate_cache_in(
             bytes_before,
             bytes_after: None,
             rotated_before_run,
+            sources_refreshed: 0,
         },
     }))
 }
@@ -1847,6 +1919,7 @@ fn run_selections(
         let mut managed_cache_runtime = match prepare_managed_gate_cache(
             gate.managed_cache.as_ref(),
             &repository,
+            checkout,
             progress,
             &gate.name,
         ) {
@@ -3533,6 +3606,49 @@ end = 55999
         let mut unknown = serde_json::to_value(&first_manifest).unwrap();
         unknown["unexpected"] = serde_json::json!(true);
         assert!(serde_json::from_value::<GateScopeManifest>(unknown).is_err());
+    }
+
+    #[test]
+    fn source_refresh_advances_tree_files_and_never_leaves_the_checkout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let checkout = tmp.path().join("checkout");
+        let outside = tmp.path().join("outside.rs");
+        std::fs::create_dir_all(checkout.join("src")).unwrap();
+        std::fs::write(checkout.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
+        std::fs::write(&outside, "fn outside() {}\n").unwrap();
+        std::os::unix::fs::symlink(&outside, checkout.join("linked.rs")).unwrap();
+        let past = UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+        for path in [checkout.join("src/lib.rs"), outside.clone()] {
+            std::fs::File::open(&path)
+                .unwrap()
+                .set_modified(past)
+                .unwrap();
+        }
+        let now = UNIX_EPOCH + Duration::from_secs(2_000_000_000);
+
+        let refreshed = refresh_source_mtimes(
+            &checkout,
+            &[
+                "src/lib.rs".into(),
+                "linked.rs".into(),
+                "deleted-in-worktree.rs".into(),
+            ],
+            now,
+        )
+        .unwrap();
+
+        assert_eq!(refreshed, 1);
+        let modified = |path: &Path| std::fs::metadata(path).unwrap().modified().unwrap();
+        assert_eq!(modified(&checkout.join("src/lib.rs")), now);
+        assert_eq!(
+            modified(&outside),
+            past,
+            "a symlinked source must not reach outside the tree under test"
+        );
+        assert_eq!(
+            std::fs::read_to_string(checkout.join("src/lib.rs")).unwrap(),
+            "pub fn a() {}\n"
+        );
     }
 
     #[test]

@@ -1126,6 +1126,149 @@ max_bytes = 3
     assert_eq!(second[0]["managed_cache"]["rotated_before_run"], true);
 }
 
+/// Issue #391: two worktrees whose workspace member differs, gated one after
+/// the other through one managed cache key. Cargo judges a workspace member
+/// fresh by source mtime, not content, and the member's artifact names do
+/// not depend on the worktree, so without the broker's refresh the second
+/// gate ran the first worktree's library and recorded that as its own
+/// verdict. Each tree carries the marker its own library prints; the gate
+/// fails unless the binary it ran prints this tree's marker.
+#[test]
+fn managed_cache_gates_execute_their_own_workspace_member_sources() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path().join("main");
+    std::fs::create_dir_all(root.join(".aethyme")).unwrap();
+    git(&root, &["init", "-q", "-b", "main"]);
+    std::fs::write(
+        root.join(".gitignore"),
+        ".aethyme/broker.db*\n.aethyme/logs/\n.aethyme/run/\n.aethyme/worktrees/\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join(".aethyme/config.toml"),
+        "[graph]\nauthority='disabled'\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join(".aethyme/gates.toml"),
+        r#"
+[[gate]]
+name = "own-sources"
+command = 'export CARGO_INCREMENTAL=0 CARGO_TARGET_DIR="$AETHYME_GATE_CACHE_DIR" && ran="$(cargo run --offline --quiet -p marker-app)" && echo "ran $ran, tree expects $(cat expected.txt)" && test "$ran" = "$(cat expected.txt)"'
+cache = false
+timeout_seconds = 600
+resource_wait_seconds = 60
+
+[gate.managed_cache]
+key = "fixture"
+max_bytes = 4294967296
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"marker-lib\", \"marker-app\"]\nresolver = \"2\"\n",
+    )
+    .unwrap();
+    for (name, manifest_tail) in [
+        ("marker-lib", ""),
+        (
+            "marker-app",
+            "\n[dependencies]\nmarker-lib = { path = \"../marker-lib\" }\n",
+        ),
+    ] {
+        std::fs::create_dir_all(root.join(name).join("src")).unwrap();
+        std::fs::write(
+            root.join(name).join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n{manifest_tail}"
+            ),
+        )
+        .unwrap();
+    }
+    std::fs::write(
+        root.join("marker-app/src/main.rs"),
+        "fn main() { println!(\"{}\", marker_lib::marker()); }\n",
+    )
+    .unwrap();
+    let set_marker = |tree: &Path, marker: &str| {
+        std::fs::write(
+            tree.join("marker-lib/src/lib.rs"),
+            format!("pub fn marker() -> &'static str {{ \"{marker}\" }}\n"),
+        )
+        .unwrap();
+        std::fs::write(tree.join("expected.txt"), format!("{marker}\n")).unwrap();
+    };
+    set_marker(&root, "base");
+    git(&root, &["add", "-A"]);
+    git(&root, &["commit", "-qm", "base"]);
+    let second = repo.path().join("second");
+    git(
+        &root,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "second",
+            second.to_str().unwrap(),
+        ],
+    );
+    // Both trees are written before either gate builds, as they are when
+    // two sessions queue behind one cache lease: the second tree's sources
+    // are then older than the first tree's artifacts.
+    set_marker(&root, "tree-one");
+    git(&root, &["commit", "-qam", "tree one"]);
+    set_marker(&second, "tree-two");
+    git(&second, &["commit", "-qam", "tree two"]);
+
+    let host_state = tempfile::tempdir().unwrap();
+    let host_cache = tempfile::tempdir().unwrap();
+    let gate = |tree: &Path| {
+        let output = Command::new(CLI)
+            .args(["gates", "run", "--all", "--no-cache", "--json"])
+            .current_dir(tree)
+            .env("AETHYME_HOST_STATE_DIR", host_state.path())
+            .env("AETHYME_HOST_CACHE_DIR", host_cache.path())
+            .env_remove("CARGO_TARGET_DIR")
+            .output()
+            .unwrap();
+        let outcomes: serde_json::Value =
+            serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+                panic!(
+                    "{error}: stdout={} stderr={}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                )
+            });
+        let log = outcomes[0]["log_path"]
+            .as_str()
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .unwrap_or_default();
+        (outcomes, log)
+    };
+
+    let (first, first_log) = gate(&root);
+    assert_eq!(first[0]["status"], "pass", "{first}\n{first_log}");
+    let (second_run, second_log) = gate(&second);
+    assert_eq!(
+        second_run[0]["status"], "pass",
+        "the second tree's gate executed artifacts built from another tree: \
+         {second_run}\n{second_log}"
+    );
+    assert!(
+        second_log.contains("ran tree-two"),
+        "gate log does not show the second tree's own library: {second_log}"
+    );
+    // At least every tracked file of the tree under test was refreshed: the
+    // three manifests, both sources, expected.txt, .gitignore and the two
+    // .aethyme config files. Untracked, non-ignored files count too.
+    let refreshed = second_run[0]["managed_cache"]["sources_refreshed"]
+        .as_u64()
+        .unwrap_or_default();
+    assert!(refreshed >= 9, "{second_run}");
+}
+
 #[test]
 fn named_gate_rerun_executes_only_that_gate_and_replays_failure_tail() {
     let repo = fixture();
