@@ -739,9 +739,14 @@ fn adopt_conflict_close_reuse_and_replace_stale_lifecycle() {
         matches!(err, BrokerOpError::SessionExistsForWorktree { id, .. } if id == first.id),
         "expected guidance error, got: {msg}"
     );
+    // `finish` is the default close; `finish close` only keeps the checkout,
+    // and says so.
+    let finish = format!("aethyme broker finish --session {}", first.id);
     for needle in [
         "--reuse",
+        finish.as_str(),
         "close --session",
+        "keep the checkout",
         "--replace-stale",
         "first task",
     ] {

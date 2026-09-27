@@ -521,7 +521,8 @@ pub enum BrokerOpError {
         "session {id} ({status}) already exists for this worktree{task}. Options:\n  \
          aethyme broker submit --session {id}        submit its committed work\n  \
          aethyme broker start --reuse --task \"...\"   point it at a follow-up task\n  \
-         aethyme broker finish close --session {id}         mark it closed; policy may reclaim ignored build artifacts\n  \
+         aethyme broker finish --session {id}        close it; removes a broker-created checkout when safe\n  \
+         aethyme broker finish close --session {id}  close it but keep the checkout on disk\n  \
          aethyme broker start --replace-stale        close it and register fresh"
     )]
     SessionExistsForWorktree {
