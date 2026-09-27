@@ -118,6 +118,13 @@ consumer. This file exists so that doesn't happen again.
 |---|---|---|
 | Stable broker JSON command contract (`docs/json-contracts.md`) | `aethyme broker advanced worktrees --json` reports disk usage and Git registration state, including detached, locked, and prunable worktrees. `git_registered` separates a confirmed absence from unreadable inventory; see the field contract for exact omission and error behavior. | Treating unreadable inventory as unregistered can hide Git state; treating a prunable registration as deletion permission can lose work. Consumers must preserve the distinction and treat the report as diagnostic. |
 
+### Console lifecycle (introduced 2026-09-27, #374 section 3)
+
+| Source | Invokes / assumes | Failure mode |
+|---|---|---|
+| Scripts and dashboards reading `aethyme broker advanced console status --json` | Each `running[]` row adds `checkout` (`present`, `missing`, `unknown`), `holder_alive` (bool or null), `stale`, `stale_reasons` (`worktree_missing`, `holder_gone`, `lease_expired`), and `stop_command` (set only when stale). The top level adds `stale_count`. | `checkout: unknown` means no verified marker, not a missing worktree; reading it as stale would ask for stops that `console stop` refuses. `stop_command` is null for a healthy console, so a consumer must not run it unconditionally. |
+| Operators and automation calling `aethyme broker advanced console stop <lease-id> [--force] [--dry-run] [--wait <duration>] [--json]` | Sends SIGTERM to the supervising `console run` only, which stops the server's process group, releases the lease, and removes the marker. The JSON reports `outcome` (`stopped`, `would_signal`, `refused`, `signal_failed`, `signalled_not_released`), `reason`, `health`, and `holder_identity` (`proven`, `replaced`, `unproven`). The exit code is 0 only for `stopped` and `would_signal`. | `--force` relaxes only the refusal for a non-stale console. It never overrides an expired lease, a missing marker, or an unproven holder, so a caller that retries with `--force` after `refused` gets the same refusal. On a host without wall-clock process start times (Linux) every holder is `unproven`, so stop always refuses there; stop the supervisor manually after checking `ps -p <pid>`. |
+
 ### Installed git hooks (`aethyme broker advanced hooks install`, 2026-07-17)
 
 | Source | Invokes | Failure mode |

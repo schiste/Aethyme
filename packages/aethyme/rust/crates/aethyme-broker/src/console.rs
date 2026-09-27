@@ -770,6 +770,148 @@ pub fn console_port(lease: &crate::resources::HostResourceLease) -> Option<&str>
         .map(|allocation| allocation.value.as_str())
 }
 
+/// Whether the checkout a console's marker recorded still exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsoleCheckoutStatus {
+    Present,
+    Missing,
+    /// No verified marker, so the served path is not known.
+    Unknown,
+}
+
+impl ConsoleCheckoutStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Present => "present",
+            Self::Missing => "missing",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Why a console no longer serves what its inventory row claims (#374).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsoleStaleReason {
+    /// The recorded worktree was removed while the server kept running.
+    WorktreeMissing,
+    /// The supervising `console run` process is gone.
+    HolderGone,
+    /// Nobody renewed the lease within its TTL.
+    LeaseExpired,
+}
+
+impl ConsoleStaleReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::WorktreeMissing => "worktree_missing",
+            Self::HolderGone => "holder_gone",
+            Self::LeaseExpired => "lease_expired",
+        }
+    }
+}
+
+/// Lifecycle evidence for one console lease, independent of worktree cleanup:
+/// a removed worktree does not stop the process serving it, so the process
+/// has to be visible on its own.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ConsoleHealth {
+    pub checkout: ConsoleCheckoutStatus,
+    /// `None` when the lease recorded no holder.
+    pub holder_alive: Option<bool>,
+    pub stale_reasons: Vec<ConsoleStaleReason>,
+}
+
+impl ConsoleHealth {
+    pub fn is_stale(&self) -> bool {
+        !self.stale_reasons.is_empty()
+    }
+}
+
+/// Classify a console from its lease, its marker, and a holder liveness probe.
+/// Kept free of process probing so every verdict is testable.
+pub fn classify_console(
+    lease: &HostResourceLease,
+    marker: Option<&ConsoleMarkerRecord>,
+    holder_alive: Option<bool>,
+) -> ConsoleHealth {
+    // A worktree directory without its `.git` entry is not a checkout any
+    // more: `git worktree remove` can leave ignored build output behind.
+    let checkout = marker.map_or(ConsoleCheckoutStatus::Unknown, |record| {
+        let worktree = Path::new(&record.marker.worktree);
+        if worktree.is_dir() && worktree.join(".git").exists() {
+            ConsoleCheckoutStatus::Present
+        } else {
+            ConsoleCheckoutStatus::Missing
+        }
+    });
+    let mut stale_reasons = Vec::new();
+    if checkout == ConsoleCheckoutStatus::Missing {
+        stale_reasons.push(ConsoleStaleReason::WorktreeMissing);
+    }
+    if holder_alive == Some(false) {
+        stale_reasons.push(ConsoleStaleReason::HolderGone);
+    }
+    if lease.state == crate::resources::HostLeaseState::Quarantined {
+        stale_reasons.push(ConsoleStaleReason::LeaseExpired);
+    }
+    ConsoleHealth {
+        checkout,
+        holder_alive,
+        stale_reasons,
+    }
+}
+
+/// [`classify_console`] with the holder probed on this host.
+pub fn console_health(
+    lease: &HostResourceLease,
+    marker: Option<&ConsoleMarkerRecord>,
+) -> ConsoleHealth {
+    let holder_alive = lease
+        .holder_pid
+        .map(|pid| crate::blockers::process_alive(i64::from(pid)));
+    classify_console(lease, marker, holder_alive)
+}
+
+/// Whether the live process at a lease's `holder_pid` is provably the
+/// process the lease was granted to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsoleHolderIdentity {
+    /// It started no later than the lease was granted.
+    Proven,
+    /// It started after the lease was granted: the pid was reused, and
+    /// signalling it would hit an unrelated process.
+    Replaced,
+    /// No holder was recorded, or this platform cannot report a wall-clock
+    /// start time for it. Not evidence of reuse, but not proof against it.
+    Unproven,
+}
+
+/// Compare the holder's start time with the lease's grant time.
+pub fn console_holder_identity(lease: &HostResourceLease) -> ConsoleHolderIdentity {
+    let Some(started) = lease
+        .holder_pid
+        .and_then(|pid| crate::gates::process_started_at_ms(pid as i32))
+    else {
+        return ConsoleHolderIdentity::Unproven;
+    };
+    // One second of slack absorbs clock granularity between the two.
+    if started > lease.created_at.saturating_add(1_000) {
+        ConsoleHolderIdentity::Replaced
+    } else {
+        ConsoleHolderIdentity::Proven
+    }
+}
+
+/// Whether the holder is proven to be a reused pid. `false` does not prove
+/// the holder is the lease's process; anything that signals it must require
+/// [`ConsoleHolderIdentity::Proven`] from [`console_holder_identity`].
+pub fn console_holder_replaced(lease: &HostResourceLease) -> bool {
+    console_holder_identity(lease) == ConsoleHolderIdentity::Replaced
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1084,6 +1226,135 @@ mod tests {
 
         std::fs::write(root.join("untracked.txt"), "local\n").unwrap();
         assert!(console_revision(&repo).unwrap().dirty);
+    }
+
+    fn marker_at(worktree: &Path) -> ConsoleMarkerRecord {
+        let mut marker = ConsoleRuntimeMarker {
+            schema_version: CONSOLE_MARKER_SCHEMA_VERSION,
+            marker_digest: String::new(),
+            request_id: "r".into(),
+            lease_id: "l".into(),
+            repository: "repo".into(),
+            branch: "main".into(),
+            commit: "0".repeat(40),
+            dirty: false,
+            worktree: worktree.to_string_lossy().into_owned(),
+            worktree_fingerprint: "fp".into(),
+            port: 4173,
+            mode: ConsoleMode::Singular,
+            canonical: false,
+            parallel: false,
+            integration_branch: CONSOLE_INTEGRATION_REF.into(),
+            integration_head: None,
+            integration_relation: ConsoleIntegrationRelation::Unavailable,
+            ahead_commits: 0,
+            behind_commits: 0,
+        };
+        marker.marker_digest = marker.content_digest();
+        ConsoleMarkerRecord {
+            path: PathBuf::from("/markers/console.json"),
+            marker,
+        }
+    }
+
+    /// The #374 field report: the worktree was removed, the supervisor and
+    /// its server kept running, and inventory still listed an active console.
+    #[test]
+    fn a_console_whose_worktree_was_removed_is_stale_while_its_holder_lives() {
+        let temp = tempfile::tempdir().unwrap();
+        let removed = temp.path().join("removed-worktree");
+        let lease = lease("repo", &[(CONSOLE_PORT_KEY, "4173")], "fp");
+        let health = classify_console(&lease, Some(&marker_at(&removed)), Some(true));
+        assert_eq!(health.checkout, ConsoleCheckoutStatus::Missing);
+        assert_eq!(
+            health.stale_reasons,
+            vec![ConsoleStaleReason::WorktreeMissing]
+        );
+        assert!(health.is_stale());
+    }
+
+    /// `git worktree remove` can leave ignored build output behind; a
+    /// directory with no `.git` entry is not the checkout the console served.
+    #[test]
+    fn a_leftover_directory_without_git_is_not_a_present_checkout() {
+        let temp = tempfile::tempdir().unwrap();
+        let lease = lease("repo", &[(CONSOLE_PORT_KEY, "4173")], "fp");
+        let health = classify_console(&lease, Some(&marker_at(temp.path())), Some(true));
+        assert_eq!(health.checkout, ConsoleCheckoutStatus::Missing);
+    }
+
+    #[test]
+    fn a_console_serving_a_present_checkout_is_not_stale() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join(".git"), "gitdir: elsewhere\n").unwrap();
+        let lease = lease("repo", &[(CONSOLE_PORT_KEY, "4173")], "fp");
+        let health = classify_console(&lease, Some(&marker_at(temp.path())), Some(true));
+        assert_eq!(health.checkout, ConsoleCheckoutStatus::Present);
+        assert!(!health.is_stale());
+    }
+
+    /// Without a verified marker the served path is unknown, which is not
+    /// evidence of staleness on its own.
+    #[test]
+    fn a_console_without_a_marker_has_an_unknown_checkout() {
+        let lease = lease("repo", &[(CONSOLE_PORT_KEY, "4173")], "fp");
+        let health = classify_console(&lease, None, Some(true));
+        assert_eq!(health.checkout, ConsoleCheckoutStatus::Unknown);
+        assert!(!health.is_stale());
+    }
+
+    #[test]
+    fn a_dead_holder_and_an_expired_lease_are_each_reported() {
+        let mut lease = lease("repo", &[(CONSOLE_PORT_KEY, "4173")], "fp");
+        lease.state = HostLeaseState::Quarantined;
+        let health = classify_console(&lease, None, Some(false));
+        assert_eq!(
+            health.stale_reasons,
+            vec![
+                ConsoleStaleReason::HolderGone,
+                ConsoleStaleReason::LeaseExpired
+            ]
+        );
+    }
+
+    /// This process started long after the epoch-0 lease, so where the
+    /// platform reports wall-clock start times it reads as a reused pid, and
+    /// elsewhere it is unproven rather than assumed to be the holder.
+    #[test]
+    fn a_holder_that_started_after_the_lease_reads_as_replaced() {
+        let mut lease = lease("repo", &[(CONSOLE_PORT_KEY, "4173")], "fp");
+        lease.holder_pid = Some(std::process::id());
+        let (after, before) = if cfg!(target_os = "macos") {
+            (
+                ConsoleHolderIdentity::Replaced,
+                ConsoleHolderIdentity::Proven,
+            )
+        } else {
+            (
+                ConsoleHolderIdentity::Unproven,
+                ConsoleHolderIdentity::Unproven,
+            )
+        };
+        assert_eq!(console_holder_identity(&lease), after);
+        lease.created_at = i64::MAX - 1_000;
+        assert_eq!(console_holder_identity(&lease), before);
+    }
+
+    /// A pid that does not exist, or no recorded holder at all, never
+    /// reads as proven.
+    #[test]
+    fn a_missing_or_unrecorded_holder_is_unproven() {
+        let mut lease = lease("repo", &[(CONSOLE_PORT_KEY, "4173")], "fp");
+        lease.holder_pid = None;
+        assert_eq!(
+            console_holder_identity(&lease),
+            ConsoleHolderIdentity::Unproven
+        );
+        lease.holder_pid = Some(i32::MAX as u32);
+        assert_eq!(
+            console_holder_identity(&lease),
+            ConsoleHolderIdentity::Unproven
+        );
     }
 
     #[test]
