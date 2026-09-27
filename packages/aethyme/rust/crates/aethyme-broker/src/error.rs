@@ -16,11 +16,20 @@ pub enum BrokerError {
     #[error("broker db: {0}")]
     Sqlite(#[from] rusqlite::Error),
 
+    // Recovery must never be "run whatever binary is newer" (#361): the
+    // newer schema may have come from an unreviewed gate build, and the
+    // only binaries that should open shared state are released ones.
     #[error(
         "broker db schema version {found} is newer than this binary supports ({supported}); \
-         upgrade aethyme"
+         install a released aethyme that supports it (`aethyme update`), and do not build one \
+         from an unreviewed worktree to recover shared state"
     )]
     SchemaTooNew { found: i64, supported: i64 },
+
+    /// A gate child resolved, or was pointed at, broker state the gate
+    /// protects. Refused before any connection is opened (#361).
+    #[error("gate refused the broker database: {0}")]
+    GateDatabaseRefused(String),
 
     #[error(
         "broker db schema version {found} is outside this binary's non-mutating snapshot range {minimum}..={maximum}; use a compatible Aethyme binary for recovery"

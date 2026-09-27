@@ -651,6 +651,10 @@ pub struct GateRunOutcome {
     pub resource_lease: Option<GateResourceProvenance>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub managed_cache: Option<ManagedGateCacheProvenance>,
+    /// The disposable broker database the command's children resolved; absent
+    /// for a cache hit or a run refused before the command was prepared.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub broker_database: Option<crate::GateBrokerDatabase>,
     pub status: GateStatus,
     pub failure_class: Option<GateFailureClass>,
     pub cached: bool,
@@ -1716,6 +1720,7 @@ fn run_selections(
                 definition_hash: gate.definition_hash.clone(),
                 resource_lease: None,
                 managed_cache: None,
+                broker_database: None,
                 status: hit.status,
                 failure_class: cached_failure_class(hit.status),
                 cached: true,
@@ -1804,6 +1809,7 @@ fn run_selections(
                         definition_hash: gate.definition_hash.clone(),
                         resource_lease: None,
                         managed_cache: None,
+                        broker_database: None,
                         status: GateStatus::Error,
                         failure_class: Some(GateFailureClass::ResourceContention),
                         cached: false,
@@ -1866,6 +1872,7 @@ fn run_selections(
                     definition_hash: gate.definition_hash.clone(),
                     resource_lease: resource_provenance,
                     managed_cache: None,
+                    broker_database: None,
                     status: GateStatus::Error,
                     failure_class: Some(GateFailureClass::Environment),
                     cached: false,
@@ -1897,6 +1904,7 @@ fn run_selections(
             free_disk_bytes_start: available.and_then(|bytes| i64::try_from(bytes).ok()),
         };
         let started = Instant::now();
+        let broker_database = std::cell::OnceCell::new();
         let status = run_gate_command(
             &gate.command,
             GateCommandContext {
@@ -1915,6 +1923,7 @@ fn run_selections(
                 progress,
                 resources: resource_runtime.as_ref(),
                 managed_cache: managed_cache_runtime.as_ref(),
+                broker_database: &broker_database,
             },
         );
         if let Some(cache) = managed_cache_runtime.as_mut() {
@@ -1997,6 +2006,7 @@ fn run_selections(
             definition_hash: gate.definition_hash.clone(),
             resource_lease: resource_provenance,
             managed_cache: managed_cache_runtime.map(|runtime| runtime.provenance),
+            broker_database: broker_database.into_inner(),
             status: gate_status,
             failure_class,
             cached: false,
@@ -2122,10 +2132,15 @@ fn classify_gate_result(
                 std::io::ErrorKind::StorageFull => GateFailureClass::ResourceContention,
                 _ => GateFailureClass::Environment,
             };
-            let _ = write_gate_diagnostic(
-                log_path,
-                &format!("aethyme could not start this gate: {error}\n"),
-            );
+            let what = if error
+                .get_ref()
+                .is_some_and(|inner| inner.is::<HostBrokerDatabaseChanged>())
+            {
+                "invalidated this gate"
+            } else {
+                "could not start this gate"
+            };
+            let _ = write_gate_diagnostic(log_path, &format!("aethyme {what}: {error}\n"));
             (GateStatus::Error, Some(class), None)
         }
     }
@@ -2277,6 +2292,9 @@ struct GateCommandContext<'a> {
     progress: &'a dyn GateProgressSink,
     resources: Option<&'a GateResourceRuntime>,
     managed_cache: Option<&'a ManagedGateCacheRuntime>,
+    /// Filled once the command's disposable broker database is prepared, so
+    /// the caller can report it whatever the command then does.
+    broker_database: &'a std::cell::OnceCell<crate::GateBrokerDatabase>,
 }
 
 struct GateCommandOutcome {
@@ -2349,7 +2367,6 @@ fn run_gate_command(
             log.write_all(gate_environment_note(context.environment).as_bytes()),
         );
     }
-    let log_err = log.try_clone()?;
     // Gates execute binaries built from the tree under test.  Those binaries
     // may contain a broker-storage migration that is not present on any
     // reviewed branch yet.  Never let such a child discover the operator's
@@ -2365,6 +2382,25 @@ fn run_gate_command(
         &isolated_broker_db_path,
         std::env::var_os(crate::gate_database::SCOPE_ENV).as_deref(),
     )?;
+    // Recorded before the command runs, as one JSON line, so the log of any
+    // verdict names the only database its children could have written (#361).
+    let target = crate::GateBrokerDatabase::from_scope(&isolated_broker_scope)?;
+    {
+        use std::io::Write as _;
+        log.write_all(
+            format!(
+                "{}broker database {}\n",
+                crate::git::SUBPROCESS_PATH_NOTE_PREFIX,
+                serde_json::to_string(&target).map_err(std::io::Error::other)?
+            )
+            .as_bytes(),
+        )?;
+    }
+    let host_schemas = protected_schema_versions(&target);
+    context.broker_database.set(target).map_err(|_| {
+        std::io::Error::other("gate broker database was prepared twice for one command")
+    })?;
+    let log_err = log.try_clone()?;
     let mut process = std::process::Command::new("sh");
     process
         .arg("-c")
@@ -2564,6 +2600,18 @@ fn run_gate_command(
         .map(|metadata| metadata.len())
         .unwrap_or(0);
     let observed_first_output = first_output.load(std::sync::atomic::Ordering::Acquire);
+    // Isolation is environment-based, and a child can clear its environment.
+    // Whatever it did, a verdict produced while a protected database changed
+    // schema is not one to cache: the run is invalidated, never passed.
+    if let Some(broker_database) = context.broker_database.get() {
+        let after = protected_schema_versions(broker_database);
+        if after != host_schemas {
+            return Err(std::io::Error::other(HostBrokerDatabaseChanged {
+                before: host_schemas,
+                after,
+            }));
+        }
+    }
     Ok(GateCommandOutcome {
         exit_code: status?.code(),
         timed_out,
@@ -2636,6 +2684,59 @@ fn append_gate_log(path: &Path, message: &str) -> Result<(), std::io::Error> {
 /// `File::create`, so the log does not exist yet -- and an append-only write
 /// returns `NotFound`, which is how the one message explaining the empty log
 /// got discarded twice over (#167, #168).
+/// Schema version of each protected repository's shared broker database;
+/// `None` where it is absent or unreadable.
+fn protected_schema_versions(target: &crate::GateBrokerDatabase) -> Vec<(PathBuf, Option<i64>)> {
+    target
+        .protected_repositories
+        .iter()
+        .map(|root| {
+            let database = root.join(crate::BROKER_DB_RELPATH);
+            let version = database
+                .is_file()
+                .then(|| {
+                    rusqlite::Connection::open_with_flags(
+                        &database,
+                        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+                    )
+                    .ok()
+                    .and_then(|conn| crate::schema::current_version(&conn).ok())
+                })
+                .flatten();
+            (database, version)
+        })
+        .collect()
+}
+
+/// A protected shared broker database changed schema while a gate ran.
+#[derive(Debug)]
+struct HostBrokerDatabaseChanged {
+    before: Vec<(PathBuf, Option<i64>)>,
+    after: Vec<(PathBuf, Option<i64>)>,
+}
+
+impl std::fmt::Display for HostBrokerDatabaseChanged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let version = |v: &Option<i64>| v.map_or("absent".to_string(), |v| v.to_string());
+        for ((database, before), (_, after)) in self.before.iter().zip(&self.after) {
+            if before != after {
+                write!(
+                    f,
+                    "shared broker database {} changed schema from {} to {} while the gate ran; \
+                     the verdict is discarded (#361)",
+                    database.display(),
+                    version(before),
+                    version(after)
+                )?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for HostBrokerDatabaseChanged {}
+
 fn write_gate_diagnostic(path: &Path, message: &str) -> Result<(), std::io::Error> {
     use std::io::Write;
     let mut file = std::fs::OpenOptions::new()

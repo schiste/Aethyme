@@ -116,7 +116,7 @@ impl BrokerStore {
     /// repository root: `<repo>/.aethyme/broker.db`, or wherever
     /// [`crate::BROKER_DB_ENV`] points.
     pub fn open_in_repo(repo_root: &Path) -> Result<Self, BrokerError> {
-        Self::open(&crate::broker_db_path(repo_root))
+        Self::open(&crate::broker_db_path(repo_root)?)
     }
 
     /// Open the current broker schema without creating, migrating, or
@@ -124,7 +124,7 @@ impl BrokerStore {
     /// path so an observational command cannot become the write that upgrades
     /// storage or refreshes a session.
     pub fn open_snapshot_in_repo(repo_root: &Path) -> Result<Self, BrokerError> {
-        Self::open_snapshot_at(&crate::broker_db_path(repo_root))
+        Self::open_snapshot_at(&crate::broker_db_path(repo_root)?)
     }
 
     /// Open an exact broker database path read-only, without applying the
@@ -205,7 +205,7 @@ impl BrokerStore {
     /// an in-memory database or a migrated temporary copy. Readiness uses it to
     /// keep the absence and age of broker state observable facts.
     pub(crate) fn open_current_read_only_in_repo(repo_root: &Path) -> Result<Self, BrokerError> {
-        let path = crate::broker_db_path(repo_root);
+        let path = crate::broker_db_path(repo_root)?;
         let conn = Connection::open_with_flags(
             &path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -244,7 +244,7 @@ impl BrokerStore {
     /// because the redirect ([`crate::BROKER_DB_ENV`]) only helps a harness that
     /// remembers to set it, and the developer in the bug report had not.
     pub fn open_current_in_repo(repo_root: &Path) -> Result<Option<Self>, BrokerError> {
-        let path = crate::broker_db_path(repo_root);
+        let path = crate::broker_db_path(repo_root)?;
         if !path.is_file() {
             return Ok(None);
         }

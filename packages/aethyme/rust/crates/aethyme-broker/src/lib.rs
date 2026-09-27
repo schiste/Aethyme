@@ -47,6 +47,7 @@ mod external_events;
 mod file_lock;
 mod gate_cache_gc;
 mod gate_database;
+pub use gate_database::GateBrokerDatabase;
 mod gate_doctor;
 mod gates;
 mod gc;
@@ -532,12 +533,16 @@ pub(crate) fn warn_unrecorded<T, E: std::fmt::Display>(what: &str, result: Resul
 /// Gate runners additionally bind their override to canonical repository roots;
 /// independent fixture repositories then retain their own storage. An explicit
 /// different override still wins, and older children retain the legacy pin.
-pub fn broker_db_path(repo_root: &std::path::Path) -> std::path::PathBuf {
+///
+/// Inside a gate this refuses rather than resolve a protected repository's
+/// shared database (#361); see [`gate_database::resolve`].
+pub fn broker_db_path(repo_root: &std::path::Path) -> Result<std::path::PathBuf, BrokerError> {
     gate_database::resolve(
         repo_root,
         std::env::var_os(BROKER_DB_ENV).as_deref(),
         std::env::var_os(gate_database::SCOPE_ENV).as_deref(),
     )
+    .map_err(BrokerError::GateDatabaseRefused)
 }
 
 /// The resolution itself, with the environment passed in.
@@ -551,6 +556,7 @@ fn broker_db_path_with(
     override_value: Option<std::ffi::OsString>,
 ) -> std::path::PathBuf {
     gate_database::resolve(repo_root, override_value.as_deref(), None)
+        .expect("resolution without a gate scope never refuses")
 }
 
 /// Repo-relative generated projection of outstanding advisory rows.

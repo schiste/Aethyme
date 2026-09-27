@@ -578,6 +578,7 @@ mod not_promoted_tests {
             definition_hash: "d".into(),
             resource_lease: None,
             managed_cache: None,
+            broker_database: None,
             status,
             failure_class: class,
             cached: false,

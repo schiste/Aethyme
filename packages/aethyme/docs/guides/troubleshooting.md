@@ -1,6 +1,6 @@
 # Troubleshooting
 
-Last Updated: 2026-09-24
+Last Updated: 2026-09-27
 
 ## Explore Returns `degraded`
 
@@ -35,15 +35,26 @@ committed fragments and materialize the local store.
 
 ### Symptoms
 
-- `broker db schema version N is newer than this binary supports (M); upgrade aethyme`
+- `broker db schema version N is newer than this binary supports (M); install a released aethyme that supports it`
 - agent plugin hooks fail or go quiet on the same machine
 
 The broker database is machine-wide, and migrations are one-way. A newer
-binary (possibly a gate's build, or another worktree's `cargo install`) has
-migrated it. Upgrade every installed copy of the `aethyme` and
-`aethyme-engine-cli` pair on the machine; see
-[`UPGRADING.md`](../../../../UPGRADING.md) for the release that introduced
-schema `N`.
+binary has migrated it: another worktree's `cargo install`, or -- before
+#361 -- a gate's build. Gates now run against a disposable database and are
+refused the shared one, so a gate can no longer be the cause.
+
+Recover with released binaries only:
+
+1. Look up schema `N` in [`UPGRADING.md`](../../../../UPGRADING.md). If a
+   release introduced it, upgrade every installed copy of the `aethyme` and
+   `aethyme-engine-cli` pair to that release (`aethyme update`).
+2. If no release contains schema `N`, an unreviewed build migrated the
+   database. Do not build or run that branch against the shared database to
+   get unstuck: that hands shared state to code nobody reviewed. Stop the
+   broker sessions, copy `.aethyme/broker.db*` aside as evidence, and wait
+   for the migration to ship in a release -- or move the database aside and
+   let the released binary recreate it, re-adopting live worktrees with
+   `aethyme broker start --adopt`.
 
 ## Aethyme Behaves In Ways Its Version Cannot Explain
 
