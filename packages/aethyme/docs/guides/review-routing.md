@@ -32,7 +32,7 @@ without this feature at all.
 Confirm it for any repository without changing anything:
 
 ```console
-$ aethyme broker review plan --base aethyme/integration --pr 42
+$ aethyme broker advanced review plan --base aethyme/integration --pr 42
 {
   "assumptions": [
     "no reviews have been spent on this pull request yet",
@@ -61,7 +61,7 @@ $ aethyme broker review plan --base aethyme/integration --pr 42
 feature performs anything yet.** What ships is the decision plane: pure
 functions from a change to a list of actions, and one command that prints
 them. The executor that would take a `spawn_chau7_review` action and start an
-agent, or hand an `add_labels` action to `aethyme broker gh`, is not wired up.
+agent, or hand an `add_labels` action to `aethyme broker advanced gh`, is not wired up.
 An operator can therefore write and tune a policy against real changes, read
 exactly what it would do, and run the resulting `gh` commands by hand, with no
 risk that a half-written rule acts on a live pull request.
@@ -318,7 +318,7 @@ costs one unnecessary review and nothing worse. A change to a guarded path gets
 its security review whatever the trailer says.
 
 To get agents in a repository to write these trailers, add the instruction to
-`.aethyme/overrides/agents.json` and rerun `aethyme enhance deploy --repo
+`.aethyme/overrides/agents.json` and rerun `aethyme deploy --repo
 "$PWD"`. Trailers are not part of the default generated agent instructions,
 because a repository that has not enabled `[review.trigger]` would be asking
 its agents for metadata nothing reads.
@@ -521,12 +521,12 @@ helpfully delete the only record of that judgement.
 
 ## Trying a policy before switching it on
 
-`aethyme broker review plan` reads git and `.aethyme/config.toml`, and prints
+`aethyme broker advanced review plan` reads git and `.aethyme/config.toml`, and prints
 what the repository would do. It writes nothing, needs no session, and does not
 consult the provider.
 
 ```bash
-aethyme broker review plan --base aethyme/integration --pr 42
+aethyme broker advanced review plan --base aethyme/integration --pr 42
 ```
 
 | Flag | Default | Meaning |
@@ -594,11 +594,11 @@ queued writes behind the same repository lock.
 
 ## Performing it
 
-`aethyme broker review run` is `review plan` with the assumptions replaced by
+`aethyme broker advanced review run` is `review plan` with the assumptions replaced by
 facts, followed by the effects.
 
 ```bash
-aethyme broker review run --session 408 --repo owner/name --pr 42 \
+aethyme broker advanced review run --session 408 --repo owner/name --pr 42 \
     --tabs-file /tmp/tabs.json
 ```
 
@@ -675,7 +675,7 @@ because the ledger's unique index makes a duplicate request a no-op.
 `review run` acts on one pull request. `review tick` sweeps a repository:
 
 ```bash
-aethyme broker review tick --session 408 --repo owner/name --limit 20 \
+aethyme broker advanced review tick --session 408 --repo owner/name --limit 20 \
     --tabs-file /tmp/tabs.json
 ```
 
@@ -693,7 +693,7 @@ is something cron, a CI step, a git hook, or a person can run, and its failure
 is visible wherever it was run from.
 
 ```cron
-*/10 * * * * cd /path/to/repo && aethyme broker review tick --session 408 --repo owner/name
+*/10 * * * * cd /path/to/repo && aethyme broker advanced review tick --session 408 --repo owner/name
 ```
 
 ### Starting the Chau7 reviews
@@ -718,7 +718,7 @@ closes the row:
   `stale_after_minutes` reclaims it
 
 Every git write it makes -- fetching the pull ref, adding and removing the
-review worktree -- runs through `aethyme broker git`, because a review workspace
+review worktree -- runs through `aethyme broker advanced git`, because a review workspace
 is a shared-git mutation like any other. The workspace path *is* the identity of
 an in-flight review, which is why a workspace already sitting on the right
 commit is reused and one sitting on anything else is replaced: reviewing the
@@ -750,7 +750,7 @@ The reviewer writes its review to `review.md` in the outbox (and an empty
 its row with `review state`, which needs no GitHub access. On the next tick the
 row has settled, the teardown is planned, and the adapter posts `review.md`
 with the teardown's `post_comment_args` or `post_request_changes_args` through
-`aethyme broker gh` before closing the tab. A failed post keeps the tab open so
+`aethyme broker advanced gh` before closing the tab. A failed post keeps the tab open so
 the next tick retries it; a posted file is renamed `review.md.posted`, so a
 repeated teardown never posts twice. `[review.reporting] coordinated` is no
 longer consulted: the adapter always posts through the coordinated lane.
@@ -819,7 +819,7 @@ that took that path.
 ### The one thing it hands off
 
 GitHub writes go through `run_coordinated_operation`, which is the same
-authorization and locking any `aethyme broker gh` takes. Chau7 spawns do not:
+authorization and locking any `aethyme broker advanced gh` takes. Chau7 spawns do not:
 the broker has no Chau7 client and does not grow one. They come back in the
 report as `chau7_handoff`, for an adapter with Chau7 access to start:
 
@@ -842,7 +842,7 @@ report as `chau7_handoff`, for an adapter with Chau7 access to start:
 }
 ```
 
-This is the same seam `broker deliveries dispatch` uses: the broker decides, the
+This is the same seam `broker advanced deliveries dispatch` uses: the broker decides, the
 caller performs the transport.
 
 A failing GitHub write stops the tick. The rest of the plan describes a pull
@@ -862,7 +862,7 @@ The ledger is what answers "why was there no security review on #412", months
 after anyone remembers the pull request:
 
 ```bash
-aethyme broker review ledger --repo owner/repo --pr 412
+aethyme broker advanced review ledger --repo owner/repo --pr 412
 ```
 
 ```
@@ -935,7 +935,7 @@ the reviewer is a Chau7 tab or a provider bot rather than the broker. Whoever
 performed it closes the row:
 
 ```bash
-aethyme broker review state --repo owner/repo --pr 412 \
+aethyme broker advanced review state --repo owner/repo --pr 412 \
     --type security --head 9f3c1a2b4d5e --state satisfied \
     --completed-for-commit 9f3c1a2b4d5e --verdict pass \
     --reviewer-provider github --reviewer-model reviewer-model \
@@ -976,7 +976,7 @@ the wrong one -- that writes "a review happened" into the only record anybody
 will ever consult:
 
 ```bash
-aethyme broker review waive --repo owner/repo --pr 412 \
+aethyme broker advanced review waive --repo owner/repo --pr 412 \
     --type code --head 9f3c1a2b4d5e --reason "reverting the outage; reviewed offline"
 ```
 
@@ -1017,7 +1017,7 @@ problem is elsewhere.
 ## What this never does
 
 - It never performs a GitHub write directly. Every projection action renders
-  arguments for `aethyme broker gh --session <id> --repo <owner/name> --reason
+  arguments for `aethyme broker advanced gh --session <id> --repo <owner/name> --reason
   "<authorization>" -- <gh-args>`, which is where authorization and
   coordination live.
 - It never touches a label outside `label_prefix`, or a reserved one inside it.

@@ -93,7 +93,7 @@ every repository, for example `~/bench-p56/arm-a-r1`.
 2. **Set up.** `./arm_<x>_setup.sh <root> --rep <n>`. Read
    `<root>/launch_plan.json`.
    - Arm C only: from a real terminal (a Chau7 tab is fine), `cd <root>/repo`
-     and run `aethyme init` then `aethyme broker trust`. `trust` needs an
+     and run `aethyme init` then `aethyme broker advanced trust`. `trust` needs an
      interactive terminal. Commit anything `init` writes, before the launch.
      Check with `aethyme broker status --json`.
    - Arms A and B only: start the queue in its own tab:
@@ -201,5 +201,5 @@ agent, mostly cache reads. That is about 6M to 20M tokens per arm-run.
 - a synthetic arm C state scores as expected.
 
 It launches no agent and never runs the broker. The arm C `gates.toml` was
-checked with `aethyme broker gates validate` (0.8.3), using a scratch
+checked with `aethyme broker advanced gates validate` (0.8.3), using a scratch
 `HOME`.

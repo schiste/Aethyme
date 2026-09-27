@@ -229,6 +229,8 @@ The older spellings still work until **v0.8.8**. Each prints one line on
 stderr, never on stdout, so `--json` output stays parseable:
 `warning: '<old>' is deprecated; use '<new>' (the old spelling is removed in v0.8.8)`.
 
+<!-- deprecated-spellings: begin (old spellings named on purpose; see aethyme-testkit/tests/deprecated_spelling_callers.rs) -->
+
 | Old spelling | Current spelling |
 | --- | --- |
 | `aethyme broker adopt` | `aethyme broker start --adopt` |
@@ -245,6 +247,8 @@ stderr, never on stdout, so `--json` output stays parseable:
 | `aethyme broker e2e` | `aethyme broker advanced verify-loop` |
 | `aethyme broker <verb>` for any other verb (`leases`, `git`, `gh`, `ship`, `operations`, `exec`, `review`, `gates`, ...) | `aethyme broker advanced <verb>` |
 | `aethyme enhance deploy` / `aethyme enhance verify` | `aethyme deploy` / `aethyme deploy verify` |
+
+<!-- deprecated-spellings: end -->
 
 A public verb spelled under `advanced` (for example `advanced start`) is
 refused with exit 2 rather than guessed at. Entry points that installed hooks,
@@ -1301,7 +1305,7 @@ walks every retained worktree, build cache and orphaned root, and writes each
 measured size to `.aethyme/worktree-sizes.json`. Its totals are measurements and
 it alone produces an authorization digest.
 
-**The routine check** is `broker status`, `broker status doctor`, `broker certify` and
+**The routine check** is `broker status`, `broker status doctor`, `aethyme certify` and
 the verify loop. It reads those records and walks nothing. Counts, dispositions,
 git state and provenance are exact as before — only the byte totals come from
 records, because only they were ever expensive. A routine plan carries no

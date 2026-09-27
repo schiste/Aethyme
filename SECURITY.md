@@ -47,7 +47,7 @@ can do.
 
 - Gates and graph policy are read from the base tree, so a session cannot
   weaken the checks that judge its own diff (v0.8.0).
-- `broker git` / `broker gh` classify each command's effect, treat unknown
+- `broker advanced git` / `broker advanced gh` classify each command's effect, treat unknown
   commands as writes at minimum, refuse code-executing `-c` configuration
   keys, and verify pushes against the operation journal in a pre-push hook
   (v0.8.0).

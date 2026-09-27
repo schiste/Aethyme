@@ -77,7 +77,7 @@ the non-breaking ones, remain in Git history under
 
 v0.8.2 hardens the broker: phase 2 of the recovery plan. One change needs
 operator action: repositories whose gate commands have never run on this
-machine now need `aethyme broker trust` once.
+machine now need `aethyme broker advanced trust` once.
 
 ### Compatibility
 
@@ -86,7 +86,7 @@ machine now need `aethyme broker trust` once.
 - Install the CLI and engine pair together.
 - Scripts that pass flags a subcommand ignored now get exit 2. Remove those
   flags.
-- CI that runs `aethyme broker gates run` on a fresh runner has no trust
+- CI that runs `aethyme broker advanced gates run` on a fresh runner has no trust
   record. Trust the policy there explicitly: this repository sets
   `AETHYME_TRUST_NONINTERACTIVE_FOR_TESTS=1` on that step. That variable is
   meant only for tests and for CI that runs its own repository's gates.
@@ -95,15 +95,15 @@ machine now need `aethyme broker trust` once.
 
 - Check for in-flight submissions: `aethyme broker status --json`.
 - For each repository whose gates have never run on this machine, be ready to
-  run `aethyme broker trust --repo <path>` from a terminal.
+  run `aethyme broker advanced trust --repo <path>` from a terminal.
 
 ### Migrate and verify
 
 ```
 aethyme --version                  # 0.8.2; build_commit matches the release tag
 aethyme plugin status              # engine pair: matched
-aethyme broker trust status        # per repository
-aethyme broker blockers            # what, if anything, blocks this repository
+aethyme broker advanced trust status        # per repository
+aethyme broker unblock            # what, if anything, blocks this repository
 ```
 
 ### Rollback
@@ -322,7 +322,7 @@ aethyme certify
 installed binary speaks it. To see that gate history survived the rebuild:
 
 ```bash
-aethyme broker metrics --json
+aethyme broker advanced metrics --json
 ```
 
 ### Rollback
@@ -401,7 +401,7 @@ aethyme broker status
 ```
 
 Review routing remains inert unless the repository opts into its review tables.
-Use `aethyme broker review plan --pr <number>` to inspect a decision without
+Use `aethyme broker advanced review plan --pr <number>` to inspect a decision without
 performing a review or writing to GitHub.
 
 ### Rollback
@@ -488,7 +488,7 @@ Review routing stays inert until you opt in. To see what it would do without
 performing anything:
 
 ```bash
-aethyme broker review plan --pr <number>
+aethyme broker advanced review plan --pr <number>
 ```
 
 That command takes no session and writes nothing. It names both the tree it
@@ -570,9 +570,9 @@ Recover any session that was blocked before the upgrade. `scan` is read-only,
 so it is safe to run first and read before recording anything:
 
 ```bash
-aethyme broker representation scan --session <id>
-aethyme broker representation record --session <id> --confirm <digest>
-aethyme broker close --session <id>
+aethyme broker advanced representation scan --session <id>
+aethyme broker advanced representation record --session <id> --confirm <digest>
+aethyme broker finish close --session <id>
 ```
 
 Confirm the schema moved only after a write has occurred:
@@ -652,7 +652,7 @@ v0.7.8. No repository deployment migration is required.
 aethyme --version
 aethyme-engine-cli --version
 aethyme deploy --repo .
-aethyme enhance verify --repo .
+aethyme deploy verify --repo .
 aethyme broker quick-test
 aethyme broker status --json
 ```
@@ -729,10 +729,10 @@ healthy on the migrated database:
 aethyme --version
 aethyme-engine-cli --version
 aethyme deploy --repo .
-aethyme enhance verify --repo .
+aethyme deploy verify --repo .
 aethyme broker quick-test
 aethyme broker status --json
-aethyme broker readiness
+aethyme broker status readiness
 ```
 
 Both version commands must report `0.7.8`. `broker status` must return without
@@ -801,7 +801,7 @@ Verify the installed pair and the current repository contract:
 aethyme --version
 aethyme-engine-cli --version
 aethyme broker quick-test
-aethyme enhance verify --repo .
+aethyme deploy verify --repo .
 aethyme upgrade plan --repo . --diff
 ```
 
@@ -864,7 +864,7 @@ exact reviewed diff.
 aethyme --version
 aethyme-engine-cli --version
 aethyme broker quick-test
-aethyme enhance verify --repo .
+aethyme deploy verify --repo .
 aethyme upgrade plan --repo . --diff
 ```
 
@@ -873,9 +873,9 @@ the returned watch ID. Adapter targets are opaque to Aethyme and interpreted
 only by that delivery client:
 
 ```bash
-aethyme broker watch pr start --session <session-id> \
+aethyme broker advanced watch pr start --session <session-id> \
   --repo owner/name --pr <number> --events comments,reviews,checks
-aethyme broker deliveries subscribe --watch <watch-id> \
+aethyme broker advanced deliveries subscribe --watch <watch-id> \
   --adapter <adapter> --target <opaque-target> --policy notify
 ```
 
@@ -937,14 +937,14 @@ exact reviewed diff.
 aethyme --version
 aethyme-engine-cli --version
 aethyme broker quick-test
-aethyme enhance verify --repo .
+aethyme deploy verify --repo .
 aethyme upgrade plan --repo . --diff
 ```
 
 For a lifecycle whose owner was already closed, inspect it with `review show`,
 then choose either exact-head `review reassign` or explicit `review abandon`.
 For rewritten contribution checkpoints, start with
-`broker checkpoint plan --session <id> --json` and follow its ordered actions.
+`broker advanced checkpoint plan --session <id> --json` and follow its ordered actions.
 
 ### Rollback
 
@@ -1006,7 +1006,7 @@ and its exact digest has been reviewed.
 aethyme --version
 aethyme-engine-cli --version
 aethyme broker quick-test
-aethyme enhance verify --repo .
+aethyme deploy verify --repo .
 aethyme upgrade plan --repo . --diff
 ```
 
@@ -1054,7 +1054,7 @@ binary pair. Back up broker history when rollback matters:
 
 ```bash
 aethyme broker status --json
-aethyme broker operations list --status unknown --json
+aethyme broker advanced operations list --status unknown --json
 aethyme-engine-cli daemon stop --repo /path/to/repo
 cp /path/to/repo/.aethyme/broker.db /safe/location/broker.db.v0.2.2
 ```
@@ -1083,7 +1083,7 @@ git diff
 ```
 
 An already-current repository produces no migration write. If generated
-onboarding needs refreshing, run `aethyme enhance deploy --repo .`, review the
+onboarding needs refreshing, run `aethyme deploy --repo .`, review the
 tracked output, and verify again. Canonical and activated local-only
 deployments must retain their existing mode.
 

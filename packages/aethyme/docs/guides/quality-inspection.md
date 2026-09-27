@@ -5,7 +5,7 @@ Last Updated: 2026-09-06
 Aethyme separates operational readiness from optional repository-quality
 analysis:
 
-- `aethyme readiness` is the authoritative operational report. It evaluates
+- `aethyme broker status readiness` is the authoritative operational report. It evaluates
   deployment, coordination, agent context, validation, parallel execution,
   graph policy, and upgrade compatibility.
 - `aethyme quality inspect` provides bounded, advisory suggestions about

@@ -15,7 +15,7 @@ size, and a clean `git status` are all compatible with unique work.
 
 ```sh
 aethyme broker status --json
-aethyme broker worktrees
+aethyme broker advanced worktrees
 ```
 
 `worktrees` is the loss report: every worktree on the host with its repository,
@@ -29,7 +29,7 @@ not act on it.
 ## 2. Dry-run the supported sweep
 
 ```sh
-aethyme broker cleanup --all-cleaned
+aethyme broker finish cleanup --all-cleaned
 ```
 
 Read-only. It inventories every retained broker-owned worktree from an
@@ -41,7 +41,7 @@ session 493: dirty (14.8 MiB) — worktree has uncommitted or untracked changes
   /…/worktrees/<root>/implement-210-merge-order-remediation-la
   refs/heads/agent/implement-210-… at 11000ba8925521c8fac8efbc3da81d64c4194bb7
   inspect: git show --stat --oneline 11000ba8925521c8fac8efbc3da81d64c4194bb7
-  explicit discard: aethyme broker cleanup 493 --force
+  explicit discard: aethyme broker finish cleanup 493 --force
 ```
 
 Verdicts and what each means:
@@ -62,7 +62,7 @@ Adopted worktrees are never in the bulk sweep. Neither are live sessions.
 ## 3. Apply the safe subset
 
 ```sh
-aethyme broker cleanup --all-cleaned --apply --confirm <plan-sha256>
+aethyme broker finish cleanup --all-cleaned --apply --confirm <plan-sha256>
 ```
 
 The digest comes from the plan you just read; a stale digest is refused rather
@@ -111,7 +111,7 @@ and read the uncommitted content: changes confined to generated artifacts
 ## 5. Discard, with the reason recorded
 
 ```sh
-aethyme broker cleanup <session-id> --force
+aethyme broker finish cleanup <session-id> --force
 ```
 
 `--force` is the operator asserting what the broker could not prove. Run it only

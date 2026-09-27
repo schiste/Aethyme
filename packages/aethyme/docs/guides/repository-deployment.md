@@ -72,7 +72,7 @@ This does not lower the operating mode. Use the standalone CI gate when a
 specific level is mandatory:
 
 ```bash
-aethyme broker readiness --require parallel-ready --json
+aethyme broker status readiness --require parallel-ready --json
 ```
 
 `aethyme certify` and `aethyme deploy verify` retain their existing output and
@@ -85,9 +85,9 @@ Readiness findings do not authorize an immediate broad rewrite. Review an
 exact, digest-bound plan first:
 
 ```bash
-aethyme broker readiness plan --repo . --json
-aethyme broker readiness plan --repo . --diff
-aethyme broker readiness apply --repo . --confirm <plan-sha256>
+aethyme broker status readiness plan --repo . --json
+aethyme broker status readiness plan --repo . --diff
+aethyme broker status readiness apply --repo . --confirm <plan-sha256>
 ```
 
 Planning is offline and read-only. It records committed `HEAD`, repository
@@ -113,7 +113,7 @@ leaves a rollback journal, do not retry or infer intent from the marker. Run
 the exact recovery command printed by the failed apply:
 
 ```bash
-aethyme broker readiness recover --repo . --plan <plan-sha256>
+aethyme broker status readiness recover --repo . --plan <plan-sha256>
 ```
 
 Recovery accepts only the matching digest and restores the journaled bytes.
@@ -182,7 +182,7 @@ locally and must not travel between clones.
 `.aethyme/worktrees/` remains ignored for backward-compatible cleanup and the
 reported constrained fallback. New broker-managed sessions normally live in a
 private, clone-keyed per-user host-state directory outside the checkout. Use
-`aethyme broker worktree-root --json` to inspect that decision without creating
+`aethyme broker advanced worktree-root --json` to inspect that decision without creating
 the directory. This placement keeps broad repository scanners from traversing
 another complete checkout.
 

@@ -20,7 +20,7 @@ Each workflow separates observation from mutation:
 | Need | Inspect first | Explicit mutation | Refusal boundary |
 | --- | --- | --- | --- |
 | Prepare worktree dependencies | `prepare status --session <id>` | `prepare --session <id>`, optionally `--offline` | no implicit execution; symlink outputs, undeclared offline commands, lease loss, and writes outside session leases fail closed |
-| Continue in an existing worktree | `broker integration status` | `adopt --reuse`, optionally with `--sync-integration` | synchronization requires a clean, fast-forwardable worktree |
+| Continue in an existing worktree | `broker advanced integration status` | `start --reuse`, optionally with `--sync-integration` | synchronization requires a clean, fast-forwardable worktree |
 | Prove the current tree | default gate run and its tree provenance | rerun with `--no-cache` | a bypass never substitutes an older cached result |
 | Share gate scope with CI | `gates manifest` and `gates scope` | none | unsupported schema, digest drift, missing refs, or invalid committed policy fail closed |
 | Inspect graph-derived gate hints | `gates semantic` | none; suggestions remain advisory | only changed-path triggers reach `gates run` and `submit` |
@@ -33,7 +33,7 @@ Each workflow separates observation from mutation:
 
 These commands coordinate local repository state. Submission promotes only to
 the local `aethyme/integration` branch. Use the separate
-`broker ship plan`/`broker ship execute` lane when publication is authorized.
+`broker advanced ship plan`/`broker advanced ship execute` lane when publication is authorized.
 
 ## Inspect a Running Coordinated Operation
 
@@ -76,10 +76,10 @@ action. Creation remains cheap and deterministic: it never installs packages
 or runs a version command automatically.
 
 ```bash
-aethyme broker prepare status --session 111 --json
-aethyme broker prepare --session 111 --wait 10m
+aethyme broker submit prepare status --session 111 --json
+aethyme broker submit prepare --session 111 --wait 10m
 # only when every step declares an offline alternative:
-aethyme broker prepare --session 111 --offline
+aethyme broker submit prepare --session 111 --offline
 ```
 
 The repository defines argv commands, lockfile/config inputs, local output
@@ -107,7 +107,7 @@ reset refs by hand: update the remote-tracking ref through the coordinated Git
 lane, then inspect a reconciliation plan:
 
 When the movement follows a successful
-`aethyme broker gh ... -- pr merge ...`, the broker performs that target refresh
+`aethyme broker advanced gh ... -- pr merge ...`, the broker performs that target refresh
 itself. If every promotion in the complete integration layer is conclusively
 landed, it cleans the stale layer and resolves its publication exposures
 transactionally. This includes one upstream squash representing several
@@ -116,9 +116,9 @@ automatically; the merge succeeds, cleanup is reported as deferred, and the
 commands below remain the recovery path.
 
 ```bash
-aethyme broker git --session 111 --reason "inspect upstream for recovery" -- \
+aethyme broker advanced git --session 111 --reason "inspect upstream for recovery" -- \
   fetch origin main
-aethyme broker integration reconcile --upstream origin/main --dry-run --json
+aethyme broker advanced integration reconcile --upstream origin/main --dry-run --json
 ```
 
 The plan classifies upstream-only external commits, recorded promotions, exact
@@ -153,7 +153,7 @@ Do not transcribe that schema from diagnostics. Ask the first dry-run to write
 the complete, no-clobber review document:
 
 ```bash
-aethyme broker integration reconcile \
+aethyme broker advanced integration reconcile \
   --upstream origin/main \
   --write-resolution-template reconciliation.json \
   --dry-run
@@ -169,7 +169,7 @@ When the dry-run is safe, review the complete report and copy its 64-character
 `plan_digest` into the apply command:
 
 ```bash
-aethyme broker integration reconcile \
+aethyme broker advanced integration reconcile \
   --upstream origin/main \
   --resolution-file reconciliation.json \
   --apply \
@@ -186,7 +186,7 @@ it only when the old tip remains, and otherwise requests explicit recovery.
 
 ## Reuse A Worktree Safely
 
-Before starting work, `aethyme broker worktree-root --json` shows the exact
+Before starting work, `aethyme broker advanced worktree-root --json` shows the exact
 clone-specific root without changing state. A normal `broker start` creates a
 sibling beneath that external root even when invoked from an existing broker
 worktree; it never nests the new checkout below the invoking worktree. Start
@@ -197,9 +197,9 @@ task. Start by checking whether integration advanced while the session was
 working:
 
 ```bash
-aethyme broker integration status
+aethyme broker advanced integration status
 cd /path/to/the/session-worktree
-aethyme broker adopt --reuse --task "Address review feedback" --json
+aethyme broker start --reuse --task "Address review feedback" --json
 ```
 
 The adoption report says what actually happened with `outcome`: `created`
@@ -214,7 +214,7 @@ Plain reuse reports drift but does not silently move the checkout. To begin the
 follow-up at the current integration tip, request guarded synchronization:
 
 ```bash
-aethyme broker adopt --reuse --sync-integration \
+aethyme broker start --reuse --sync-integration \
   --task "Address review feedback"
 ```
 
@@ -231,8 +231,8 @@ explicit authenticated poll verifies one GitHub fact, normalize the allowlisted
 provenance fields, compute the envelope digest, and deliver the local file:
 
 ```bash
-aethyme broker external-events ingest verified-event.json --json
-aethyme broker external-events list --json
+aethyme broker advanced external-events ingest verified-event.json --json
+aethyme broker advanced external-events list --json
 ```
 
 There is no Aethyme listener, polling loop, or payload archive. Ingestion is
@@ -245,11 +245,11 @@ Uncertain events remain visible without being assigned. Reconcile only after
 checking the provider and broker provenance:
 
 ```bash
-aethyme broker external-events show 17 --json
-aethyme broker external-events reconcile 17 --outcome assign \
+aethyme broker advanced external-events show 17 --json
+aethyme broker advanced external-events reconcile 17 --outcome assign \
   --session 111 --reason "verified exact commit ownership"
 # Or retain the audit fact without an advisory:
-aethyme broker external-events reconcile 17 --outcome ignore \
+aethyme broker advanced external-events reconcile 17 --outcome ignore \
   --reason "provider event does not apply to this repository"
 ```
 
@@ -265,10 +265,10 @@ repository, create the draft PR through the repository's normal authenticated
 workflow, then bind it to the live session:
 
 ```bash
-aethyme broker review register --session 111 \
+aethyme broker advanced review register --session 111 \
   --repo owner/name --pr 42
 aethyme broker submit --session 111
-aethyme broker review request --session 111
+aethyme broker advanced review request --session 111
 ```
 
 The first command proves that the open draft's full head SHA equals the session
@@ -304,8 +304,8 @@ replace or spoof the workflow that creates the check.
 Inspect state locally and unlock only after review evidence is current:
 
 ```bash
-aethyme broker review show --session 111 --json
-aethyme broker review unlock --session 111
+aethyme broker advanced review show --session 111 --json
+aethyme broker advanced review unlock --session 111
 ```
 
 `review unlock` polls live evidence. A successful trusted check can advance
@@ -315,7 +315,7 @@ unavailable evidence fails closed without running the unlock mutation.
 
 Every GitHub write uses the coordinated operation journal. A failed or
 crash-ambiguous transition leaves lifecycle state unchanged and blocks blind
-retry until `broker operations reconcile` resolves the external outcome.
+retry until `broker advanced operations reconcile` resolves the external outcome.
 Cloud Build remains an external manual-trigger adapter boundary; the core
 state machine stores no GCP credential and performs no background polling.
 
@@ -328,11 +328,11 @@ recovery:
 
 ```bash
 # Continue the same exact-head review from a live replacement session.
-aethyme broker review reassign --session <closed-id> \
+aethyme broker advanced review reassign --session <closed-id> \
   --to-session <live-id> --reason "reviewed ownership transfer"
 
 # Retire the lifecycle while retaining its audit and generation history.
-aethyme broker review abandon --session <closed-id> \
+aethyme broker advanced review abandon --session <closed-id> \
   --reason "pull request superseded"
 ```
 
@@ -355,10 +355,10 @@ mode = "review_gated"
 allow_break_glass = false
 ```
 
-`broker ship plan --entry <id> --json` then explains coverage for every queue
+`broker advanced ship plan --entry <id> --json` then explains coverage for every queue
 entry included in the selected prefix. Coverage binds the registered canonical
 repository, target branch, session commit, promoted queue entry, and review
-lifecycle. `broker ship execute` revalidates the provider evidence immediately
+lifecycle. `broker advanced ship execute` revalidates the provider evidence immediately
 before its normal fetch, fast-forward, exact-push, and verify sequence. Missing,
 stale, mismatched, ambiguous, or unavailable evidence refuses publication; it
 never silently falls back to direct publication.
@@ -373,8 +373,8 @@ SHA, remote freshness, non-force push, and unknown-outcome barriers.
 
 A session branched before another session renamed the files it edits will fail
 to replay with `CONFLICT (modify/delete): ... deleted in HEAD`, which reads
-exactly like the file having been deleted. `broker adopt` now reports the rename
-instead:
+exactly like the file having been deleted. `broker start --adopt` (and `--reuse`) now reports
+the rename instead:
 
 ```
 Renamed target: plugins/old/tool.py is now plugins/new/tool.py (queue entry 118, session 131)
@@ -423,7 +423,7 @@ deterministic over the same commits.
 Before designing a finer ref lock, inspect the bounded timing window:
 
 ```bash
-aethyme broker operations stats --repo github.com/org/repo --json
+aethyme broker advanced operations stats --repo github.com/org/repo --json
 ```
 
 The report includes p50 and p99 lock-hold and queue-wait durations by
@@ -449,11 +449,11 @@ its duration, and leaves the current repository-wide lock policy unchanged.
 
 `ship` publishes an exact promoted prefix and refuses to discard local work the
 prefix omits. When the local default branch carries commits integration does
-not, `broker main reconcile` decides whether moving it is safe:
+not, `broker advanced main reconcile` decides whether moving it is safe:
 
 ```bash
-aethyme broker main reconcile plan
-aethyme broker main reconcile apply --session <id> --confirm <plan-sha256>
+aethyme broker advanced main reconcile plan
+aethyme broker advanced main reconcile apply --session <id> --confirm <plan-sha256>
 ```
 
 Representation is decided by content, not ancestry. The broker promotes by
@@ -477,10 +477,10 @@ experiment that should simply leave the branch -- record a reviewed decision
 instead:
 
 ```bash
-aethyme broker main reconcile plan --write-resolution-template resolutions.json
+aethyme broker advanced main reconcile plan --write-resolution-template resolutions.json
 # edit each entry's resolution and reason
-aethyme broker main reconcile plan --resolution-file resolutions.json
-aethyme broker main reconcile apply --session <id> --confirm <digest> \
+aethyme broker advanced main reconcile plan --resolution-file resolutions.json
+aethyme broker advanced main reconcile apply --session <id> --confirm <digest> \
     --resolution-file resolutions.json
 ```
 
@@ -521,8 +521,8 @@ Gate results prove an exact Git tree. Normal gate runs use the cache when the
 same gate has already passed or failed for that tree:
 
 ```bash
-aethyme broker gates run --session 111
-aethyme broker gates run --session 111 --json
+aethyme broker advanced gates run --session 111
+aethyme broker advanced gates run --session 111 --json
 ```
 
 Run this session-scoped command after the final commit instead of invoking the
@@ -550,8 +550,8 @@ repairing an external dependency or validating a flaky-environment
 hypothesis:
 
 ```bash
-aethyme broker gates run --session 111 --no-cache
-aethyme broker gates run --all --no-cache --json
+aethyme broker advanced gates run --session 111 --no-cache
+aethyme broker advanced gates run --all --no-cache --json
 aethyme broker submit --session 111 --no-cache
 ```
 
@@ -586,8 +586,8 @@ Syntax validity is necessary but does not prove that a gate is safe or useful
 for parallel agents. Inspect the committed policy without executing it:
 
 ```bash
-aethyme broker gates doctor
-aethyme broker gates doctor --json
+aethyme broker advanced gates doctor
+aethyme broker advanced gates doctor --json
 ```
 
 Every finding is advisory and includes confidence, bounded evidence, and a
@@ -596,7 +596,7 @@ lanes, trigger coverage over exact tracked paths, broad expensive gates,
 uncovered source areas, service isolation, fixed shared identifiers, writable
 caches, main-checkout coupling, failure-status preservation, and equivalent
 definitions. It does not expand path-selected gates, change submit behavior,
-or run as part of `broker readiness`.
+or run as part of `broker status readiness`.
 
 Add a reviewed native deadline to each gate:
 
@@ -619,8 +619,8 @@ timeout rather than a test failure.
 When static evidence is insufficient, opt into a disposable probe:
 
 ```bash
-aethyme broker gates doctor --probe
-aethyme broker gates doctor --probe --only integration --json
+aethyme broker advanced gates doctor --probe
+aethyme broker advanced gates doctor --probe --only integration --json
 ```
 
 The probe checks out exact committed HEAD in a broker-owned detached worktree,
@@ -649,10 +649,10 @@ Use the explicit advisory inventory to persist the current recommendation
 snapshot and manage its lifecycle:
 
 ```bash
-aethyme broker advisories list --json
-aethyme broker advisories show <id> --json
-aethyme broker advisories ack <id>
-aethyme broker advisories suppress <id>
+aethyme broker advanced advisories list --json
+aethyme broker advanced advisories show <id> --json
+aethyme broker advanced advisories ack <id>
+aethyme broker advanced advisories suppress <id>
 ```
 
 Acknowledgement hides the current evidence but allows the same deterministic
@@ -717,8 +717,8 @@ CI and path-scoped merge queues should consume the broker contract instead of
 reimplementing glob parsing or diff classification:
 
 ```bash
-aethyme broker gates manifest --head <head-sha> --json
-aethyme broker gates scope --base <base-sha> --head <head-sha> --json
+aethyme broker advanced gates manifest --head <head-sha> --json
+aethyme broker advanced gates scope --base <base-sha> --head <head-sha> --json
 ```
 
 The manifest is normalized and versioned. Its digest changes when execution
@@ -778,8 +778,8 @@ accepted content remains proven by the recorded integration commit. Do not
 replace that ownership boundary by hand. Review a typed recovery instead:
 
 ```bash
-aethyme broker checkpoint plan --session <id> --json
-aethyme broker checkpoint apply --session <id> --confirm <plan-sha256>
+aethyme broker advanced checkpoint plan --session <id> --json
+aethyme broker advanced checkpoint apply --session <id> --confirm <plan-sha256>
 ```
 
 The plan is read-only and binds the old checkpoint, proposed integration
@@ -795,7 +795,7 @@ is unsafe, the first action preserves the full session tip on the named
 recovery branch, followed by graph inspection and a clean replay-session
 workflow. Do not blanket-rebase a session onto `aethyme/integration`: that ref
 can contain unrelated promoted work and is a replay target, not an ownership
-boundary. `broker repair` is narrower still—it repairs a recorded submit or
+boundary. `broker advanced repair` is narrower still—it repairs a recorded submit or
 promoted-path conflict. With no such conflict it refuses immediately and
 points to `checkpoint plan` instead of repeating a non-progressing repair.
 
@@ -813,9 +813,9 @@ Use the semantic report when you want to see which additional gate surfaces
 callers of changed code might exercise:
 
 ```bash
-aethyme broker gates affected --session 111 --why
-aethyme broker gates semantic --session 111
-aethyme broker gates semantic --session 111 --json
+aethyme broker advanced gates affected --session 111 --why
+aethyme broker advanced gates semantic --session 111
+aethyme broker advanced gates semantic --session 111 --json
 ```
 
 `gates affected` is the enforced answer. `gates semantic` repeats that
@@ -843,9 +843,9 @@ Lease planning answers “would these claims conflict right now?” without
 reserving or refreshing anything:
 
 ```bash
-aethyme broker leases plan src/broker.rs packages/aethyme/docs/ \
+aethyme broker advanced leases plan src/broker.rs packages/aethyme/docs/ \
   --session 111
-aethyme broker leases plan src/broker.rs packages/aethyme/docs/ \
+aethyme broker advanced leases plan src/broker.rs packages/aethyme/docs/ \
   --session 111 --json
 ```
 
@@ -860,11 +860,11 @@ A plan is a point-in-time read. Another session can claim a path after the plan
 returns, so the claim remains authoritative:
 
 ```bash
-aethyme broker leases claim src/broker.rs --session 111
-aethyme broker leases claim packages/aethyme/docs/ --session 111
-aethyme broker exec --session 111 -- cargo fmt --all
+aethyme broker advanced leases claim src/broker.rs --session 111
+aethyme broker advanced leases claim packages/aethyme/docs/ --session 111
+aethyme broker advanced exec --session 111 -- cargo fmt --all
 # edit, verify, and commit
-aethyme broker leases release src/broker.rs --session 111
+aethyme broker advanced leases release src/broker.rs --session 111
 ```
 
 Planning does not append broker events or command telemetry. Claiming and
@@ -876,8 +876,8 @@ External queues can ask which category owns a selected session's current and
 historical lease rows without learning task text or machine layout:
 
 ```bash
-aethyme broker leases export --session 111 --json
-aethyme broker leases export --entry 320 --limit 100 --json
+aethyme broker advanced leases export --session 111 --json
+aethyme broker advanced leases export --entry 320 --limit 100 --json
 ```
 
 Define categories explicitly in committed repository policy:
@@ -927,14 +927,14 @@ An interrupted or refused physical cleanup leaves the session closed and
 prints its recovery command. Resume it with:
 
 ```bash
-aethyme broker cleanup 111
+aethyme broker finish cleanup 111
 ```
 
 For periodic reclamation, first inspect the dry-run plan, then apply it:
 
 ```bash
-aethyme broker cleanup --all-cleaned
-aethyme broker cleanup --all-cleaned --apply
+aethyme broker finish cleanup --all-cleaned
+aethyme broker finish cleanup --all-cleaned --apply
 ```
 
 The plan lists each retained spawned worktree, its eligibility, and estimated
@@ -949,8 +949,8 @@ the exact printed commands, then consider live sessions and current queue
 entries. Fetch terminal queue history separately and page it when needed:
 
 ```bash
-aethyme broker queue history --limit 50 --json
-aethyme broker queue history --limit 50 --before <next-before-id> --json
+aethyme broker advanced queue history --limit 50 --json
+aethyme broker advanced queue history --limit 50 --before <next-before-id> --json
 ```
 
 Status also grades retained cleanup cost using worktree and branch counts,
@@ -962,8 +962,8 @@ To assess whether agent-facing advisory delivery is effective without
 retaining repository content, inspect the bounded allowlisted metrics:
 
 ```bash
-aethyme broker advisories metrics
-aethyme broker advisories metrics --json
+aethyme broker advanced advisories metrics
+aethyme broker advanced advisories metrics --json
 ```
 
 These rows correlate display surfaces with acknowledgement or verified
@@ -984,7 +984,7 @@ The digest binds the exact rows, files, refs, hashes, byte estimates, policy,
 and blockers. Apply is crash-resumable and refuses changed artifacts. A later
 broker command may advance only an already-confirmed recovery journal for at
 most `[retention].startup_budget_ms`; no startup path silently approves new
-deletions. Check `aethyme broker doctor` or `aethyme certify` for pending
+deletions. Check `aethyme broker status doctor` or `aethyme certify` for pending
 recovery and retention health. Keep the shipped defaults unless repository
 history or storage constraints justify an explicit `.aethyme/broker.toml`.
 
@@ -1032,8 +1032,8 @@ writes it only when it is absent.
 Retrieve the latest completed handoff later with exactly one selector:
 
 ```bash
-aethyme broker handoff --session 111
-aethyme broker handoff --worktree /path/to/the/former-worktree --json
+aethyme broker advanced handoff --session 111
+aethyme broker advanced handoff --worktree /path/to/the/former-worktree --json
 ```
 
 Session lookup returns that session's newest completed handoff. Worktree lookup
@@ -1054,18 +1054,18 @@ One safe follow-up sequence is:
 ```bash
 aethyme broker submit --session 110
 aethyme broker finish --session 110
-aethyme broker handoff --session 110 --json
+aethyme broker advanced handoff --session 110 --json
 
 cd /path/to/the/session-worktree
-aethyme broker adopt --reuse --sync-integration --task "Follow-up work"
-aethyme broker leases plan src/broker.rs --session 111
-aethyme broker leases claim src/broker.rs --session 111
+aethyme broker start --reuse --sync-integration --task "Follow-up work"
+aethyme broker advanced leases plan src/broker.rs --session 111
+aethyme broker advanced leases claim src/broker.rs --session 111
 # edit and commit
-aethyme broker gates run --session 111 --no-cache
+aethyme broker advanced gates run --session 111 --no-cache
 aethyme broker submit --session 111
 aethyme broker finish --session 111
-aethyme broker cleanup 111
+aethyme broker finish cleanup 111
 ```
 
 The new session ID may differ from the old one. Always use the ID printed by
-`adopt`; “existing worktree” does not imply “same session identity.”
+`start --reuse`; “existing worktree” does not imply “same session identity.”

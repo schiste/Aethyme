@@ -19,7 +19,7 @@ cd /path/to/repo
 aethyme deploy --repo .
 aethyme deploy verify --repo .
 aethyme broker quick-test
-aethyme broker verify-loop
+aethyme broker advanced verify-loop
 ```
 
 What this proves:
@@ -28,7 +28,7 @@ What this proves:
   in the target repository; `deploy verify` is its read-only CI contract.
 - `aethyme broker quick-test` proves the local broker loop in a disposable
   repo without touching the target repo.
-- `aethyme broker verify-loop` snapshots the integration tip, runs the smoke,
+- `aethyme broker advanced verify-loop` snapshots the integration tip, runs the smoke,
   checks doctor output, and reports if integration moved during the run.
 
 ### 2. Coordinate Agent Work
@@ -38,22 +38,22 @@ Use this as the daily operator loop when agents work concurrently.
 ```bash
 aethyme broker status
 aethyme broker start --task "Describe the task"
-aethyme broker leases claim <path> --session <id>
-aethyme broker exec --session <id> -- <command>
-aethyme broker git --session <id> [--repo <owner/name>] [--reason <text>] -- <git-args>
-aethyme broker gh --session <id> --repo <owner/name> [--reason <text>] -- <gh-args>
-aethyme broker operations
+aethyme broker advanced leases claim <path> --session <id>
+aethyme broker advanced exec --session <id> -- <command>
+aethyme broker advanced git --session <id> [--repo <owner/name>] [--reason <text>] -- <git-args>
+aethyme broker advanced gh --session <id> --repo <owner/name> [--reason <text>] -- <gh-args>
+aethyme broker advanced operations
 # edit and commit in the session worktree
 aethyme broker submit --session <id>
-aethyme broker repair --session <id>
+aethyme broker advanced repair --session <id>
 aethyme broker finish --session <id>
-aethyme broker handoff --session <id>
-aethyme broker integration status
+aethyme broker advanced handoff --session <id>
+aethyme broker advanced integration status
 ```
 
 What this provides:
 
-- broker-created worktrees, with `adopt` available for existing worktrees
+- broker-created worktrees, with `start --adopt` available for existing worktrees
 - dirty-worktree visibility, explicit leases, and overlap warnings
 - guarded command execution for broad rewrites
 - durable, repository-serialized Git and GitHub mutations with crash recovery
@@ -97,18 +97,18 @@ These commands are the public product path and should stay easy to explain:
 - `aethyme certify`
 - `aethyme broker status`
 - `aethyme broker start`
-- `aethyme broker adopt`
-- `aethyme broker exec`
-- `aethyme broker git`
-- `aethyme broker gh`
-- `aethyme broker operations`
+- `aethyme broker start --adopt`
+- `aethyme broker advanced exec`
+- `aethyme broker advanced git`
+- `aethyme broker advanced gh`
+- `aethyme broker advanced operations`
 - `aethyme broker submit`
-- `aethyme broker repair`
+- `aethyme broker advanced repair`
 - `aethyme broker finish`
-- `aethyme broker handoff`
-- `aethyme broker integration status`
+- `aethyme broker advanced handoff`
+- `aethyme broker advanced integration status`
 - `aethyme broker quick-test`
-- `aethyme broker verify-loop`
+- `aethyme broker advanced verify-loop`
 - `aethyme update check`
 - `aethyme update plan`
 - `aethyme update execute`
@@ -119,19 +119,19 @@ These commands are the public product path and should stay easy to explain:
 These are public, but they are power-user or integration surfaces rather than
 the first-time story:
 
-- `aethyme broker gates ...`
-- `aethyme broker events`
-- `aethyme broker metrics`
-- `aethyme broker doctor`
-- `aethyme broker leases ...`
-- `aethyme broker pr check`
-- `aethyme broker cleanup`
+- `aethyme broker advanced gates ...`
+- `aethyme broker advanced events`
+- `aethyme broker advanced metrics`
+- `aethyme broker status doctor`
+- `aethyme broker advanced leases ...`
+- `aethyme broker advanced pr check`
+- `aethyme broker finish cleanup`
 - `aethyme graph ...`
 - `aethyme facts ...`
 - `aethyme task ...`
 - `aethyme analyze dead-code`
-- `aethyme enhance deploy`
-- `aethyme enhance verify`
+- `aethyme deploy`
+- `aethyme deploy verify`
 - `aethyme repo experience-*`
 
 ### Internal Or Historical
@@ -152,7 +152,7 @@ These should not lead product docs unless they are being actively promoted:
 runs init, adopts a session, commits a broker-owned change, submits it, verifies
 promotion, and removes the temporary repo.
 
-`aethyme broker verify-loop` is the fuller broker E2E. It reports the
+`aethyme broker advanced verify-loop` is the fuller broker E2E. It reports the
 integration commit tested and fails if integration moved before the result could
 prove the current tip. Inside the Aethyme source checkout, it may also run
 focused broker source tests.
@@ -163,9 +163,9 @@ Only the frozen broker JSON contracts in
 [`json-contracts.md`](json-contracts.md) are stable for long-lived scripts:
 
 - `aethyme broker status --json`
-- `aethyme broker integration status --json`
-- `aethyme broker events --json`
-- `aethyme broker metrics --json`
+- `aethyme broker advanced integration status --json`
+- `aethyme broker advanced events --json`
+- `aethyme broker advanced metrics --json`
 - `aethyme broker submit --json`
 
 Other JSON outputs are useful operationally but provisional until they are
@@ -235,13 +235,13 @@ of labels on the pull request.
 
 The split is the same one the rest of the broker uses: **the broker decides,
 the caller performs the transport.** Every decision is a serializable value,
-and every GitHub-touching action renders arguments for `broker gh` rather than
+and every GitHub-touching action renders arguments for `broker advanced gh` rather than
 executing anything itself.
 
 All three tables are off by default at every level -- missing file, missing
 table, and `enabled = false` -- so a repository that has not opted in gets pull
 requests byte-for-byte identical to one running a broker without the feature.
-`aethyme broker review plan` prints the whole decision for a change without a
+`aethyme broker advanced review plan` prints the whole decision for a change without a
 session and without performing anything, which is how a policy gets tuned
 before it is switched on.
 
@@ -255,7 +255,7 @@ See [`../packages/aethyme/docs/guides/review-routing.md`](../packages/aethyme/do
 ## Broker As Production PR Follow-Up Infrastructure
 
 The broker can also reduce production-PR review loops after a branch has pushed.
-`aethyme broker pr check` observes the open PR from the current branch to a
+`aethyme broker advanced pr check` observes the open PR from the current branch to a
 target branch (default `production`), classifies the PR body marker, fingerprints
 comments/reviews/checks, and prepares a bounded prompt for a `Push2prod` agent.
 
@@ -265,11 +265,11 @@ The contract is intentionally split:
   reviews, status checks, last observed fingerprint, prompt path, and dispatch
   status
 - the agent performs subjective work, while mutations such as push, reply, and
-  thread resolution run through `broker git` / `broker gh` after authorization
+  thread resolution run through `broker advanced git` / `broker advanced gh` after authorization
 - a thumbs-up marker means all good; looking-eyes or no marker means continue
   watching activity
 
 Because Git has no native post-push hook, controllers should run the push via
-`broker git`, then call `broker pr check` after the coordinated operation
+`broker advanced git`, then call `broker advanced pr check` after the coordinated operation
 succeeds. The broker commands are the deterministic core reused by CI/webhook
 workers and Chau7/MCP controllers.

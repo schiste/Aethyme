@@ -93,7 +93,7 @@ A snapshot of this repository's own broker, with the lists cut to one entry:
 
 On v0.8.4 and later the script reads blockers with
 `aethyme broker unblock --json`; on v0.8.3 it falls back to
-`aethyme broker blockers --json`. If `aethyme broker status --json` fails,
+`aethyme broker unblock --json`. If `aethyme broker status --json` fails,
 the script exits non-zero and writes nothing.
 
 ## Sharing

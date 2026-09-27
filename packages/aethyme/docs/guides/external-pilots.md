@@ -67,9 +67,9 @@ allowlist. Run the broker command in the participant repository and pass the abs
 path of the reviewed filter; the relative example below assumes it is in that checkout.
 
 ```sh
-aethyme broker metrics --json | jq -e -f scripts/pilot-report.jq > pilot-baseline.json
+aethyme broker advanced metrics --json | jq -e -f scripts/pilot-report.jq > pilot-baseline.json
 # After the observation window:
-aethyme broker metrics --json | jq -e -f scripts/pilot-report.jq > pilot-followup.json
+aethyme broker advanced metrics --json | jq -e -f scripts/pilot-report.jq > pilot-followup.json
 jq -e -s -f scripts/pilot-compare.jq pilot-baseline.json pilot-followup.json > pilot-delta.json
 ```
 

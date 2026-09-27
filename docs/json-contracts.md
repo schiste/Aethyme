@@ -10,12 +10,12 @@ may depend on their field names:
 | Surface | Command | Shape (source of truth) |
 |---|---|---|
 | Status | `aethyme broker status --json` | `StatusView` (`src/broker.rs`) |
-| Integration status | `aethyme broker integration status --json` | `IntegrationStatusView` (`src/broker.rs`) |
-| Events | `aethyme broker events --json` | `Event` rows (`src/types.rs`), NDJSON |
-| Metrics | `aethyme broker metrics --json` | inline object (`src/cli.rs`) |
+| Integration status | `aethyme broker advanced integration status --json` | `IntegrationStatusView` (`src/broker.rs`) |
+| Events | `aethyme broker advanced events --json` | `Event` rows (`src/types.rs`), NDJSON |
+| Metrics | `aethyme broker advanced metrics --json` | inline object (`src/cli.rs`) |
 | Submit outcome | `aethyme broker submit --json` | `SubmitOutcome` (`src/merge.rs`) |
-| Report list | `aethyme broker report list --json` | `ReportList` (`src/report.rs`) |
-| Report show | `aethyme broker report show <filename> --json` | `ReportInspection` (`src/report.rs`) |
+| Report list | `aethyme broker advanced report list --json` | `ReportList` (`src/report.rs`) |
+| Report show | `aethyme broker advanced report show <filename> --json` | `ReportInspection` (`src/report.rs`) |
 
 Every other `--json` output (doctor, certify, quick-test, verify-loop,
 agents, adopt, leases, gates, `pr check`, ...) is best-effort: useful, but not
@@ -71,7 +71,7 @@ no session owns the blocker. `clear` is the exact command that clears it,
 usually `aethyme broker unblock <id>` plus any flag an operator must supply.
 `blocker_sources_unavailable` is omitted when every store was read; when
 present, `blockers` is incomplete, never "nothing blocks". The same report is
-`aethyme broker blockers --json`.
+`aethyme broker unblock --json`.
 
 `review_refusals` lists reviews a provider declined and nothing has re-asked
 for since. `class` is `quota_exhausted`, `rate_limited`, `provider_error` or
@@ -133,7 +133,7 @@ event-stream contract — see [events-contract.md](events-contract.md).
 
 ### `worktrees --json`
 
-`aethyme broker worktrees --json` returns a read-only inventory of the
+`aethyme broker advanced worktrees --json` returns a read-only inventory of the
 host's reported worktrees:
 
 ```
@@ -317,7 +317,7 @@ is logical CPUs online (integer, to normalise load), and
 check measured on the gate's checkout filesystem. Each is `null` when the
 platform could not report it; all four are `null` for a cache hit (the
 reused verdict's machine state is not re-reported) and for a result recorded
-before the command stage. `broker gates run --json` and
+before the command stage. `broker advanced gates run --json` and
 `broker advanced gates pre-push --json` outcomes carry the same fields.
 
 `submission_plan` preserves deterministic commit order and separates ownership

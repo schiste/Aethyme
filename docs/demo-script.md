@@ -72,7 +72,7 @@ command = "python3 -m compileall -q src"
 cost = 1
 triggers = ["src/**/*.py"]
 EOF
-aethyme broker gates validate
+aethyme broker advanced gates validate
 git add .aethyme/gates.toml && git commit -qm "chore: add py-compile gate"
 ```
 
@@ -94,10 +94,10 @@ git worktree add -q -b agent/alpha .aethyme/worktrees/alpha main
 git worktree add -q -b agent/beta  .aethyme/worktrees/beta  main
 
 cd "$DEMO/.aethyme/worktrees/alpha"
-aethyme broker adopt --task "Make the greeting French"
+aethyme broker start --adopt --task "Make the greeting French"
 cd "$DEMO/.aethyme/worktrees/beta"
-aethyme broker adopt --task "Make the greeting shout"
-aethyme broker agents
+aethyme broker start --adopt --task "Make the greeting shout"
+aethyme broker advanced agents
 ```
 
 ```text
@@ -135,7 +135,7 @@ gate py-compile started (cost 1)
 gate py-compile           pass in 161ms
 gate wall time: 161ms
 entry 1 → promoted (auto-promoted)
-What now: aethyme/integration is at a51f7e2a42df and contains this work. Your checkout and branches are untouched — keep working, or start a follow-up with `aethyme broker adopt --reuse --task "..."`, or finish with `aethyme broker close --session 1`.
+What now: aethyme/integration is at a51f7e2a42df and contains this work. Your checkout and branches are untouched — keep working, or start a follow-up with `aethyme broker start --reuse --task "..."`, or finish with `aethyme broker finish close --session 1`.
 ```
 
 ## Scene 4 — beta is rejected in milliseconds
@@ -234,7 +234,7 @@ gate py-compile started (cost 1)
 gate py-compile           pass in 93ms
 gate wall time: 93ms
 entry 3 → promoted (auto-promoted)
-What now: aethyme/integration is at a6330f1a40c5 and contains this work. Your checkout and branches are untouched — keep working, or start a follow-up with `aethyme broker adopt --reuse --task "..."`, or finish with `aethyme broker close --session 2`.
+What now: aethyme/integration is at a6330f1a40c5 and contains this work. Your checkout and branches are untouched — keep working, or start a follow-up with `aethyme broker start --reuse --task "..."`, or finish with `aethyme broker finish close --session 2`.
 ```
 
 ## Scene 6 — the whole picture
@@ -247,9 +247,9 @@ recording.
 ```bash
 aethyme broker status
 git log --oneline aethyme/integration
-aethyme broker events --kind merge.
-aethyme broker close --session 1
-aethyme broker close --session 2
+aethyme broker advanced events --kind merge.
+aethyme broker finish close --session 1
+aethyme broker finish close --session 2
 ```
 
 ```text

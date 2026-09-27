@@ -45,9 +45,9 @@ Requires a **schema_version bump** (breaking — never do this silently):
 ## Consuming the stream
 
 ```bash
-aethyme broker events --json --since <last-id>        # replay / catch up
-aethyme broker events --json --follow                 # live NDJSON, ~700ms poll
-aethyme broker events --json --kind merge.            # prefix filter
+aethyme broker advanced events --json --since <last-id>        # replay / catch up
+aethyme broker advanced events --json --follow                 # live NDJSON, ~700ms poll
+aethyme broker advanced events --json --kind merge.            # prefix filter
 ```
 
 One JSON object per line:
@@ -74,7 +74,7 @@ One JSON object per line:
    (there is no daemon). The stream sees everything, the moment it is
    recorded — but "happens" means "a session invoked the broker".
 6. **Retention:** the log is append-only in normal operation.
-   `aethyme broker events prune --keep-days <n>` is an explicit operator
+   `aethyme broker advanced events prune --keep-days <n>` is an explicit operator
    action; cursors survive it (rule 1).
 
 ## Event catalog
@@ -113,11 +113,11 @@ One JSON object per line:
 
 ## Operational commands
 
-- `aethyme broker doctor [--json]` — database integrity, live sessions
+- `aethyme broker status doctor [--json]` — database integrity, live sessions
   with missing worktrees, orphaned gate pidfiles (removed on sight).
   Exit code 0 = healthy; non-zero otherwise (scriptable).
-- `aethyme broker events prune --keep-days <n>` — retention.
-- `aethyme broker metrics [--json]` — cost/benefit accounting: gate
+- `aethyme broker advanced events prune --keep-days <n>` — retention.
+- `aethyme broker advanced metrics [--json]` — cost/benefit accounting: gate
   executions vs cache hits (time saved), conflicts caught pre-gate,
   overlap warnings, and broker command latency. Command telemetry
   (`.aethyme/logs/command-metrics.jsonl`) is safe by construction: the

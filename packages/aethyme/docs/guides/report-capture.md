@@ -36,7 +36,7 @@ only records the operator's decision to include it.
 Run capture from the repository or a registered broker worktree:
 
 ```bash
-aethyme broker report capture --kind bug \
+aethyme broker advanced report capture --kind bug \
   --title "Submit gate failed" \
   --output submit-gate.json
 ```
@@ -126,13 +126,13 @@ instead of broadly opting in to task text.
 Inspect the captured document and its current digest locally:
 
 ```bash
-aethyme broker report show submit-gate.json
+aethyme broker advanced report show submit-gate.json
 ```
 
 Then render it against a repository issue form:
 
 ```bash
-aethyme broker report render submit-gate.json \
+aethyme broker advanced report render submit-gate.json \
   --form bug_report.yml \
   --output submit-gate.issue.md
 ```
@@ -169,7 +169,7 @@ From the registered broker worktree, file the reviewed artifact into the exact
 repository you inspected:
 
 ```bash
-aethyme broker report file .aethyme/reports/submit-gate.issue.md \
+aethyme broker advanced report file .aethyme/reports/submit-gate.issue.md \
   --repo owner/name \
   --confirm <full-lowercase-sha256>
 ```
@@ -180,7 +180,7 @@ issue URL and number and marks the source capture as filed by digest. Confirm
 the result locally with:
 
 ```bash
-aethyme broker report show submit-gate.json
+aethyme broker advanced report show submit-gate.json
 ```
 
 ## Ambiguous GitHub Outcomes
@@ -192,11 +192,11 @@ repository for an issue that may already have been created, then reconcile the
 recorded operation:
 
 ```bash
-aethyme broker operations reconcile --operation <operation-id> \
+aethyme broker advanced operations reconcile --operation <operation-id> \
   --outcome succeeded \
   --reason "Verified the issue exists in owner/name"
 # or, only after proving no issue was created:
-aethyme broker operations reconcile --operation <operation-id> \
+aethyme broker advanced operations reconcile --operation <operation-id> \
   --outcome failed \
   --reason "Verified no issue was created in owner/name"
 ```

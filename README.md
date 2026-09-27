@@ -17,7 +17,7 @@ live in `.aethyme/`; the optional graph store is derived locally.
 | --- | --- | --- |
 | **Coordinate** | Sessions, worktrees, leases, gates, merge simulation, integration, handoffs, and guarded Git/GitHub operations. | `aethyme broker start --task "..."` |
 | **Explore** | Deterministic repository orientation, bounded evidence, task context, graph queries, and verification targets. | `aethyme explore --repo . --request "..."` |
-| **Improve** | Readiness checks, repository-quality inspection, scorecards, and controlled autofixes. | `aethyme readiness` |
+| **Improve** | Readiness checks, repository-quality inspection, scorecards, and controlled autofixes. | `aethyme broker status readiness` |
 
 The broker is the public front door. Explore and the lower-level graph and task
 commands are supporting repository intelligence for agents and operators.
@@ -33,10 +33,10 @@ adds that part:
 | --- | --- | --- | --- |
 | Isolated checkout per task | yes | yes | yes (`broker start`) |
 | Gates run on the *merged* tree before integration | only if CI does it, after push | no | yes: `broker submit` simulates the merge onto `aethyme/integration` and runs the repository's affected gates on that result |
-| Path ownership between concurrent agents | no | no | leases: a conflicting `leases claim` is refused, and `broker exec` fails a command that dirties paths outside its leases |
+| Path ownership between concurrent agents | no | no | leases: a conflicting `leases claim` is refused, and `broker advanced exec` fails a command that dirties paths outside its leases |
 | A local integration branch that only verified work reaches | no | no | `aethyme/integration`; nothing is pushed until someone publishes |
-| Serialized, journaled Git/GitHub writes | no | no | `broker git` / `broker gh` queue per repository and journal each write; an unknown remote outcome fails closed until `broker operations reconcile` |
-| Recovery after conflicts or crashes | manual | manual | conflict notices with exact rebase steps (`.aethyme/broker-action-required.md`), `broker blockers`, `broker cleanup` with provenance checks |
+| Serialized, journaled Git/GitHub writes | no | no | `broker advanced git` / `broker advanced gh` queue per repository and journal each write; an unknown remote outcome fails closed until `broker advanced operations reconcile` |
+| Recovery after conflicts or crashes | manual | manual | conflict notices with exact rebase steps (`.aethyme/broker-action-required.md`), `broker unblock`, `broker finish cleanup` with provenance checks |
 
 You do **not** need the broker when:
 
@@ -146,7 +146,7 @@ Prove the local broker loop before starting real work:
 
 ```bash
 aethyme broker quick-test
-aethyme broker verify-loop
+aethyme broker advanced verify-loop
 ```
 
 `quick-test` uses a disposable repository. `verify-loop` also reports which
@@ -158,21 +158,21 @@ integration tip was tested and detects movement during the check.
 aethyme broker status
 aethyme broker start --task "Describe the task"
 # Change into the worktree printed by `broker start`.
-aethyme broker leases claim path/to/area --session <id>
+aethyme broker advanced leases claim path/to/area --session <id>
 # Edit, test, and commit in that worktree.
 aethyme broker submit --session <id>
 aethyme broker finish --session <id>
 ```
 
-Use `aethyme broker adopt --task "..."` for an existing dedicated worktree.
-Run broad commands through `aethyme broker exec --session <id> -- ...`; use
-`aethyme broker git` and `aethyme broker gh` for coordinated Git or GitHub
+Use `aethyme broker start --adopt --task "..."` for an existing dedicated worktree.
+Run broad commands through `aethyme broker advanced exec --session <id> -- ...`; use
+`aethyme broker advanced git` and `aethyme broker advanced gh` for coordinated Git or GitHub
 mutations. Only committed work can be submitted.
 
 `broker submit` simulates the merge, selects the affected repository gates,
 and promotes a verified result to the local `aethyme/integration` branch. It
-does not publish a remote branch. Use the reviewed `broker ship plan` /
-`broker ship execute` lane, or your normal review flow, when publication is
+does not publish a remote branch. Use the reviewed `broker advanced ship plan` /
+`broker advanced ship execute` lane, or your normal review flow, when publication is
 authorized.
 
 ## Explore a repository
