@@ -368,6 +368,7 @@ pub(super) const FLAG_RULES: &[(&str, &[&str])] = &[
             "--detail",
         ],
     ),
+    ("cleanup audit", &["--detail", "--repo"]),
     (
         "main reconcile plan",
         &[
