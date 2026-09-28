@@ -93,14 +93,12 @@ const COMMANDS: &[&str] = &[
     "deploy bridge",
     "deploy plan",
     "deploy execute",
-    "readiness",
+    "deploy --generated-only",
+    "deploy verify --generated-only",
     "ai-ready",
     "quality",
     "quality inspect",
     "autofix",
-    "enhance",
-    "enhance deploy",
-    "enhance verify",
     // broker: the six public verbs and their merged forms
     "broker",
     "broker start",
@@ -127,60 +125,44 @@ const COMMANDS: &[&str] = &[
     "broker advanced",
 ];
 
-/// Every internal broker subcommand. Each must answer help both under
-/// `advanced` and under its old top-level spelling.
-const BROKER_INTERNAL: &[&str] = &[
-    "readiness",
-    "worktree-root",
-    "adopt",
-    "start-agent",
-    "report",
-    "quality-report",
-    "external-events",
-    "reclaim",
-    "deliveries",
-    "review",
-    "prepare",
-    "console",
-    "resources",
-    "agents",
+/// Every current advanced broker subcommand.
+const BROKER_ADVANCED: &[&str] = &[
     "leases",
-    "exec",
     "git",
     "gh",
+    "operations",
+    "exec",
+    "ship",
+    "review",
+    "gates",
+    "hooks",
+    "trust",
+    "agents",
+    "handoff",
+    "queue",
+    "integration",
+    "main",
+    "representation",
+    "checkpoint",
+    "repair",
+    "resources",
+    "console",
     "advisories",
     "exposures",
     "note",
-    "operations",
-    "gates",
     "watch",
+    "deliveries",
     "pr",
-    "hooks",
-    "repair",
-    "representation",
-    "main",
-    "promotion-record",
-    "checkpoint",
-    "queue",
-    "promote",
-    "ship",
-    "integration",
+    "worktree-root",
+    "report",
+    "quality-report",
+    "external-events",
     "events",
     "metrics",
-    "blockers",
-    "doctor",
-    "quick-test",
-    "trust",
-    "verify-loop",
-    "e2e",
-    "init",
-    "certify",
-    "scaffold",
-    "handoff",
-    "close",
     "worktrees",
-    "storage",
-    "cleanup",
+    "scaffold",
+    "quick-test",
+    "verify-loop",
     "check-contract",
 ];
 
@@ -270,9 +252,8 @@ fn help_works_everywhere_without_side_effects() {
     git(&repo, &["init", "-q", "-b", "main"]);
 
     let mut lines: Vec<String> = COMMANDS.iter().map(|line| (*line).to_string()).collect();
-    for verb in BROKER_INTERNAL {
+    for verb in BROKER_ADVANCED {
         lines.push(format!("broker advanced {verb}"));
-        lines.push(format!("broker {verb}"));
     }
 
     let mut problems = Vec::new();
@@ -284,7 +265,7 @@ fn help_works_everywhere_without_side_effects() {
     for line in [
         "graph materialize",
         "task",
-        "enhance deploy",
+        "deploy --generated-only",
         "broker",
         "broker gc reap",
         "update check",
@@ -298,6 +279,50 @@ fn help_works_everywhere_without_side_effects() {
         problems.len(),
         problems.join("\n  ")
     );
+}
+
+#[test]
+fn removed_spellings_return_migration_hints_without_side_effects() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = tmp.path().join("repo");
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    let git_before = files_under(&repo.join(".git"));
+
+    for args in [
+        &["readiness", "--help"][..],
+        &["enhance", "deploy", "--help"][..],
+        &["enhance", "verify", "--help"][..],
+        &["broker", "readiness", "--help"][..],
+        &["broker", "leases", "--help"][..],
+        &["broker", "adopt", "--help"][..],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_aethyme"))
+            .args(args)
+            .current_dir(&repo)
+            .env("HOME", &home)
+            .env("AETHYME_CACHE_DIR", home.join("cache"))
+            .env("AETHYME_HOST_STATE_DIR", home.join("host-state"))
+            .env("XDG_STATE_HOME", home.join("xdg-state"))
+            .env("AETHYME_HOST_CACHE_DIR", home.join("host-cache"))
+            .env("AETHYME_WORKTREE_ROOT", home.join("worktrees"))
+            .env_remove("AETHYME_REPO")
+            .stdin(Stdio::null())
+            .output()
+            .expect("run aethyme");
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("removed in v0.8.8"),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    assert!(files_under(&repo).is_empty());
+    assert!(files_under(&home).is_empty());
+    assert_eq!(files_under(&repo.join(".git")), git_before);
 }
 
 #[test]

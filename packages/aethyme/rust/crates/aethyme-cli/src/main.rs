@@ -8,7 +8,7 @@
 //!      the sibling `aethyme-engine-cli` serve binary), waits for the
 //!      socket, and retries — `aethyme explore` just works.
 //!   2. Everything else is native too: `broker`/`certify`/`init`
-//!      (aethyme-broker), `enhance`/`repo` UX (aethyme-enhance),
+//!      (aethyme-broker), `deploy`/`repo` UX (aethyme-enhance),
 //!      `ai-ready`/`autofix` (aethyme-quality), and the engine groups.
 //!      There is no delegation path: unknown subcommands are errors.
 //!
@@ -393,7 +393,7 @@ fn main() -> ExitCode {
         "broker" if readiness_remediation::is_command(command.args) => {
             ExitCode::from(readiness_remediation::run(&command.args[1..]))
         }
-        "broker" => ExitCode::from(aethyme_broker::cli::run_with_mode(
+        "broker" => ExitCode::from(aethyme_broker::cli::run_resolved_with_mode(
             command.args,
             broker_compatibility_mode,
         )),
@@ -402,17 +402,15 @@ fn main() -> ExitCode {
         // Certification — top-level by design (the "airport certification"
         // inspection). Strictly read-only; adaptive setup lives in
         // `broker scaffold`.
-        "certify" => ExitCode::from(aethyme_broker::cli::run(&args)),
+        "certify" => ExitCode::from(aethyme_broker::cli::run_resolved(&args)),
         // Guided setup — certify + scaffold + gates draft in sequence,
         // idempotent. Top-level like certify: it is the first command a
         // new repo runs.
-        "init" => ExitCode::from(aethyme_broker::cli::run(&args)),
+        "init" => ExitCode::from(aethyme_broker::cli::run_resolved(&args)),
         "deploy" => ExitCode::from(repository_deploy::run(&args[1..])),
-        "readiness" => ExitCode::from(aethyme_broker::cli::run(&args)),
-        // Native since python-retirement Phase 2 (the Python `enhance`
-        // group is deleted). deploy/verify answer natively; unknown
-        // subcommands (and `--help`) get a native error like the other
-        // native groups — there is no Python surface to delegate to.
+        // Repository enrollment lives under deploy. Its --generated-only
+        // mode exposes the embedded discoverability renderer without broker
+        // scaffolding; unknown forms remain native errors.
         // Native since python-retirement Phase 4 (the Python `ai-ready`
         // command and src/scorecard/ are deleted). The 8 detectors,
         // integer scoring, and json/md renderers live in the
@@ -433,7 +431,6 @@ fn main() -> ExitCode {
         // errors keep Click's `Error: {message}` line without the usage
         // block (Phase 2 precedent).
         "autofix" => ExitCode::from(aethyme_quality::autofix_cli::run(&args[1..])),
-        "enhance" => ExitCode::from(aethyme_enhance::cli::run(&args[1..])),
         other => unknown_subcommand(other),
     }
 }
@@ -634,7 +631,7 @@ Graph and analysis:
 Quality:
   quality inspect [--repo <path>] bounded optional repository-quality analysis
 
-Deprecated spellings still work and print one warning line on stderr.
+Deprecated command spellings were removed in v0.8.8; current commands above are canonical.
 ";
 
 /// `aethyme --help` prints on stdout and exits 0; a missing command prints the
@@ -655,12 +652,11 @@ fn answer_help(route: help::HelpRoute, args: &[String]) -> ExitCode {
             ExitCode::SUCCESS
         }
         help::HelpRoute::Broker => {
-            let broker_args = if args[0] == "broker" {
-                &args[1..]
+            if args[0] == "broker" {
+                ExitCode::from(aethyme_broker::cli::run(&args[1..]))
             } else {
-                args
-            };
-            ExitCode::from(aethyme_broker::cli::run(broker_args))
+                ExitCode::from(aethyme_broker::cli::run_resolved(args))
+            }
         }
         help::HelpRoute::Native(native) => {
             let rest = &native[1..];
@@ -689,25 +685,19 @@ fn answer_help(route: help::HelpRoute, args: &[String]) -> ExitCode {
     }
 }
 
-/// Translate deprecated spellings to the ones this binary dispatches, and
-/// print the one-line warning for each (stderr only, so `--json` stays clean).
+/// Translate current broker spellings and refuse removed aliases before
+/// compatibility policy or command dispatch.
 ///
 /// The broker line is resolved exactly once, here, to the command the broker
 /// will dispatch, so the compatibility preflight classifies that command. A
 /// line resolution refuses (a public verb under `advanced`) never runs.
 fn resolve_spelling(args: Vec<String>) -> Result<Vec<String>, ExitCode> {
-    let warn = |old: &str, new: &str| {
-        eprintln!("{}", aethyme_broker::cli::deprecation_warning(old, new));
-    };
     match args[0].as_str() {
         "broker" => {
             let resolved = aethyme_broker::cli::resolve(&args[1..]);
             if let Some(refusal) = &resolved.refusal {
                 eprintln!("Error: {refusal}");
                 return Err(ExitCode::from(2));
-            }
-            if let Some(deprecation) = &resolved.deprecation {
-                eprintln!("{}", deprecation.warning());
             }
             if resolved.args.is_empty() {
                 return Ok(args);
@@ -717,17 +707,38 @@ fn resolve_spelling(args: Vec<String>) -> Result<Vec<String>, ExitCode> {
                 .collect())
         }
         "readiness" => {
-            warn("aethyme readiness", "aethyme broker status readiness");
-            Ok(args)
+            eprintln!(
+                "Error: {}",
+                aethyme_broker::cli::removed_spelling_message(
+                    "aethyme readiness",
+                    "aethyme broker status readiness"
+                )
+            );
+            Err(ExitCode::from(2))
         }
-        "enhance" => {
-            match args.get(1).map(String::as_str) {
-                Some("deploy") => warn("aethyme enhance deploy", "aethyme deploy"),
-                Some("verify") => warn("aethyme enhance verify", "aethyme deploy verify"),
-                _ => {}
+        "enhance" => match args.get(1).map(String::as_str) {
+            Some("deploy") => {
+                eprintln!(
+                    "Error: {}",
+                    aethyme_broker::cli::removed_spelling_message(
+                        "aethyme enhance deploy",
+                        "aethyme deploy --generated-only"
+                    )
+                );
+                Err(ExitCode::from(2))
             }
-            Ok(args)
-        }
+            Some("verify") => {
+                eprintln!(
+                    "Error: {}",
+                    aethyme_broker::cli::removed_spelling_message(
+                        "aethyme enhance verify",
+                        "aethyme deploy verify --generated-only"
+                    )
+                );
+                Err(ExitCode::from(2))
+            }
+            _ => Ok(args),
+        },
         _ => Ok(args),
     }
 }
@@ -1013,6 +1024,7 @@ mod compatibility_command_tests {
             .iter()
             .map(|arg| (*arg).to_string())
             .collect::<Vec<_>>();
+        let args = super::resolve_spelling(args).ok()?;
         ParsedCommand::parse(&args)
             .unwrap()
             .compatibility_capability
@@ -1023,6 +1035,7 @@ mod compatibility_command_tests {
             .iter()
             .map(|arg| (*arg).to_string())
             .collect::<Vec<_>>();
+        let args = super::resolve_spelling(args).ok()?;
         ParsedCommand::parse(&args).unwrap().invocation_surface
     }
 
@@ -1031,27 +1044,34 @@ mod compatibility_command_tests {
         let cases = [
             (&["broker", "status"][..], CommandCapability::DiagnosticRead),
             (
-                &["broker", "storage"][..],
+                &["broker", "advanced", "storage"][..],
                 CommandCapability::DiagnosticRead,
             ),
             (
-                &["broker", "storage", "apply"][..],
+                &["broker", "advanced", "storage", "apply"][..],
                 CommandCapability::RecoveryWrite,
             ),
             (
-                &["broker", "readiness", "--require", "agent-ready"][..],
+                &["broker", "status", "readiness", "--require", "agent-ready"][..],
                 CommandCapability::DiagnosticRead,
             ),
             (
-                &["broker", "integration", "reconcile", "--apply"][..],
+                &["broker", "advanced", "integration", "reconcile", "--apply"][..],
                 CommandCapability::RecoveryWrite,
             ),
             (
-                &["broker", "checkpoint", "plan", "--session", "7"][..],
+                &["broker", "advanced", "checkpoint", "plan", "--session", "7"][..],
                 CommandCapability::DiagnosticRead,
             ),
             (
-                &["broker", "checkpoint", "apply", "--session", "7"][..],
+                &[
+                    "broker",
+                    "advanced",
+                    "checkpoint",
+                    "apply",
+                    "--session",
+                    "7",
+                ][..],
                 CommandCapability::RecoveryWrite,
             ),
             (
@@ -1059,7 +1079,7 @@ mod compatibility_command_tests {
                 CommandCapability::SessionContinuation,
             ),
             (
-                &["broker", "hooks", "pre-commit"][..],
+                &["broker", "advanced", "hooks", "pre-commit"][..],
                 CommandCapability::ManagedPreCommit,
             ),
             (
@@ -1067,7 +1087,7 @@ mod compatibility_command_tests {
                 CommandCapability::NewSession,
             ),
             (
-                &["broker", "ship", "execute"][..],
+                &["broker", "advanced", "ship", "execute"][..],
                 CommandCapability::SharedMutation,
             ),
             (&["upgrade", "plan"][..], CommandCapability::Upgrade),
@@ -1085,11 +1105,11 @@ mod compatibility_command_tests {
     #[test]
     fn compatibility_is_scoped_to_the_existing_broker_boundary() {
         assert_eq!(
-            capability(&["broker", "adopt", "--reuse"]),
+            capability(&["broker", "start", "--reuse"]),
             Some(CommandCapability::NewSession)
         );
         assert_eq!(
-            capability(&["broker", "adopt"]),
+            capability(&["broker", "start", "--adopt"]),
             Some(CommandCapability::NewSession)
         );
         assert_eq!(capability(&["explore"]), None);
@@ -1105,17 +1125,17 @@ mod compatibility_command_tests {
     fn invoking_surface_is_identified_before_compatibility_rendering() {
         for (args, expected) in [
             (
-                &["broker", "hooks", "pre-commit"][..],
+                &["broker", "advanced", "hooks", "pre-commit"][..],
                 InvocationSurface::Hook,
             ),
             (&["broker", "status"][..], InvocationSurface::BrokerCommand),
             (&["upgrade", "plan"][..], InvocationSurface::UpgradeCommand),
             (
-                &["broker", "gh", "--session", "7"][..],
+                &["broker", "advanced", "gh", "--session", "7"][..],
                 InvocationSurface::CoordinatedOperation,
             ),
             (
-                &["broker", "operations"][..],
+                &["broker", "advanced", "operations"][..],
                 InvocationSurface::CoordinatedOperation,
             ),
         ] {

@@ -48,8 +48,8 @@ use telemetry::*;
 use watch::*;
 
 pub use surface::{
-    ADVANCED_VERBS, DEPRECATED_SPELLING_REMOVAL_RELEASE, Deprecation, PUBLIC_VERBS, Resolution,
-    deprecation_warning, help_text, resolve, wants_help,
+    ADVANCED_VERBS, PUBLIC_VERBS, REMOVED_SPELLING_RELEASE, Resolution, help_text,
+    removed_spelling_message, resolve, wants_help,
 };
 
 const RESOURCES_RECONCILE_USAGE: &str =
@@ -728,6 +728,11 @@ pub enum CompatibilityMode {
 }
 
 pub fn run_with_mode(args: &[String], mode: CompatibilityMode) -> u8 {
+    let resolved = resolve(args);
+    if let Some(refusal) = &resolved.refusal {
+        eprintln!("Error: {refusal}");
+        return crate::exit_status::USAGE;
+    }
     // Help is answered before anything opens the broker or records a metric:
     // asking what a command does must never do any of it (Phase 4, P4.3).
     if wants_help(args) {
@@ -748,14 +753,6 @@ pub fn run_with_mode(args: &[String], mode: CompatibilityMode) -> u8 {
             }
         };
     }
-    // Public verbs, `advanced <verb>` and old spellings all dispatch to the
-    // internal subcommand that implements them. The router prints the
-    // deprecation warning; in-process callers pass internal spellings.
-    let resolved = resolve(args);
-    if let Some(refusal) = &resolved.refusal {
-        eprintln!("Error: {refusal}");
-        return crate::exit_status::USAGE;
-    }
     if resolved.args.is_empty() {
         let text = if args.is_empty() {
             surface::public_help()
@@ -765,7 +762,36 @@ pub fn run_with_mode(args: &[String], mode: CompatibilityMode) -> u8 {
         eprint!("{text}");
         return crate::exit_status::USAGE;
     }
-    let args = resolved.args.as_slice();
+    run_resolved_with_mode(&resolved.args, mode)
+}
+
+/// Dispatch an internal command produced by `resolve`, for trusted in-process
+/// callers that have already applied the public-surface checks.
+pub fn run_resolved(args: &[String]) -> u8 {
+    run_resolved_with_mode(args, CompatibilityMode::Normal)
+}
+
+/// Dispatch an internal command produced by `resolve` using a router-selected
+/// compatibility mode.
+pub fn run_resolved_with_mode(args: &[String], mode: CompatibilityMode) -> u8 {
+    // Top-level `aethyme init --help` and `aethyme certify --help` use the
+    // internal spelling because those are canonical top-level commands.
+    if wants_help(args) {
+        return match surface::help_text_for_internal_command(args) {
+            Some(text) => {
+                out!("{}", text.trim_end());
+                0
+            }
+            None => {
+                eprintln!("Error: unknown internal broker command");
+                crate::exit_status::USAGE
+            }
+        };
+    }
+    if args.is_empty() {
+        eprint!("{}", surface::public_help());
+        return crate::exit_status::USAGE;
+    }
     // Dispatched before the shared parser: the contract check is a CI/gate
     // entry point with its own flags (`--base`, `--pr-body`) and its own
     // exit-code contract (2 = bad invocation), and it deliberately records

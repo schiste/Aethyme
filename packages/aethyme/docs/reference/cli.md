@@ -216,7 +216,7 @@ For task-oriented examples that connect session reuse, gate cache policy,
 lease planning, and durable finish handoffs, see the
 [broker follow-up workflows guide](../guides/broker-workflows.md).
 
-### Verbs, `advanced`, and the deprecation window
+### Broker verbs and removed spellings
 
 `aethyme broker --help` lists six public verbs: `start`, `status`, `submit`,
 `finish`, `unblock`, and `gc`. Every other broker command is spelled
@@ -225,9 +225,8 @@ Each public form resolves to the implementation that already existed, so
 behaviour, flags and `--json` output are unchanged; only the spelling moved.
 This reference uses the current spellings throughout.
 
-The older spellings still work until **v0.8.8**. Each prints one line on
-stderr, never on stdout, so `--json` output stays parseable:
-`warning: '<old>' is deprecated; use '<new>' (the old spelling is removed in v0.8.8)`.
+Deprecated spellings were removed in **v0.8.8**. They exit with status 2 and
+print the replacement command. The migration table names old forms explicitly:
 
 <!-- deprecated-spellings: begin (old spellings named on purpose; see aethyme-testkit/tests/deprecated_spelling_callers.rs) -->
 
@@ -245,16 +244,16 @@ stderr, never on stdout, so `--json` output stays parseable:
 | `aethyme broker reclaim` / `storage` / `resources reap` | `aethyme broker gc reclaim` / `gc storage` / `gc reap` |
 | `aethyme broker init` / `certify` | `aethyme init` / `aethyme certify` |
 | `aethyme broker e2e` | `aethyme broker advanced verify-loop` |
-| `aethyme broker <verb>` for any other verb (`leases`, `git`, `gh`, `ship`, `operations`, `exec`, `review`, `gates`, ...) | `aethyme broker advanced <verb>` |
-| `aethyme enhance deploy` / `aethyme enhance verify` | `aethyme deploy` / `aethyme deploy verify` |
+| `aethyme broker <verb>` for any advanced verb (`leases`, `git`, `gh`, `ship`, `operations`, `exec`, `review`, `gates`, ...) | `aethyme broker advanced <verb>` |
+| `aethyme enhance deploy` / `aethyme enhance verify` | `aethyme deploy --generated-only` / `aethyme deploy verify --generated-only` |
 
 <!-- deprecated-spellings: end -->
 
 A public verb spelled under `advanced` (for example `advanced start`) is
 refused with exit 2 rather than guessed at. Entry points that installed hooks,
 CI and other binaries invoke (`broker check-contract`, `broker quick-test`,
-and `broker hooks pre-commit|post-commit|pre-push`) are permanent in both
-spellings and never warn.
+and `broker hooks pre-commit|post-commit|pre-push`) remain available as
+machine-facing entry points.
 
 ### Exit codes
 
@@ -2404,8 +2403,8 @@ metadata rather than tracked `.gitignore`. `deploy verify --local-only` is
 read-only. Inactive clones perform only the bridge's marker existence check and
 do not probe for or invoke the binary.
 
-`enhance deploy` is the lower-level discoverability operation used by the
-canonical command. It writes:
+`deploy --generated-only` runs the lower-level discoverability operation
+used by canonical deployment without adding broker configuration or gates. It writes:
 - fully generated `AGENTS.md`
 - `CLAUDE.md`
 - `.claude/skills/aethyme/SKILL.md`
@@ -2456,7 +2455,7 @@ continue to accept `aethyme-onboarding-v1` while repositories regenerate.
 - likely fast test/lint/build commands
 - likely entrypoints and caution zones
 
-`enhance verify` also prints a compact summary: recommended skill/mode,
+`deploy verify --generated-only@ also prints a compact summary: recommended skill/mode,
 onboarding counts, override presence, override freshness, and Act starter
 readiness. Direct edits to `AGENTS.md` or `CLAUDE.md` are now verification
 failures; use `.aethyme/overrides/agents.json` instead.

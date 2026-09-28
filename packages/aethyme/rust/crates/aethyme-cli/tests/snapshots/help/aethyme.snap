@@ -46,5 +46,5 @@ Graph and analysis:
 Quality:
   quality inspect [--repo <path>] bounded optional repository-quality analysis
 
-Deprecated spellings still work and print one warning line on stderr.
+Deprecated command spellings were removed in v0.8.8; current commands above are canonical.
 --- stderr

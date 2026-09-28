@@ -1,7 +1,0 @@
-exit: 0
---- stdout
-  aethyme broker finish close --session <id> [--json]
-      Low-level close. Retains the checkout and branch; policy may reclaim
-      known ignored build artifacts. Does not check whether commits were
-      submitted. Prefer finish for normal lifecycle use.
---- stderr

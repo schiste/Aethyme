@@ -1,4 +1,4 @@
-//! Implementation-blind CLI tests for `aethyme enhance` and the
+//! Implementation-blind CLI tests for generated-only deployment and the
 //! generated onboarding/telemetry artifacts.
 //!
 //! Ported verbatim from `tests/local/test_enhance.py` (python-retirement
@@ -20,14 +20,14 @@ use serde_json::Value;
 /// constant now).
 const AGENTS_OVERRIDE_PATH: &str = ".aethyme/overrides/agents.json";
 
-/// Run `aethyme enhance deploy` and return stdout+stderr.
+/// Run `aethyme deploy --generated-only` and return stdout+stderr.
 ///
 /// Output lines are `  {action:9}  {relative_path}`, golden-verified
 /// byte-stable by the retired enhance-golden.sh.
 fn deploy(repo: &Path, force: bool) -> String {
     let mut args = vec![
-        "enhance".to_string(),
         "deploy".to_string(),
+        "--generated-only".to_string(),
         "--repo".to_string(),
         repo.display().to_string(),
     ];
@@ -207,9 +207,15 @@ fn enhance_deploy_writes_generated_onboarding() {
             .any(|kind| kind == "enhance.deploy")
     );
 
-    invoke_aethyme(["enhance", "verify", "--repo", &repo.display().to_string()])
-        .assert_contains("All discoverability files present and substituted.")
-        .ok();
+    invoke_aethyme([
+        "deploy",
+        "verify",
+        "--generated-only",
+        "--repo",
+        &repo.display().to_string(),
+    ])
+    .assert_contains("All discoverability files present and substituted.")
+    .ok();
 
     let wrapper = read(repo.join(".claude/hooks/aethyme-load-context.sh"));
     assert!(wrapper.contains("repo record-wrapper-invocation"));
@@ -262,7 +268,7 @@ fn installed_binary_deploys_without_a_source_checkout() {
     let repo = demo_repo(tmp.path());
     let isolated_config = tmp.path().join("empty-config");
     let output = std::process::Command::new(aethyme_bin())
-        .args(["enhance", "deploy", "--repo"])
+        .args(["deploy", "--generated-only", "--repo"])
         .arg(&repo)
         .env_remove("AETHYME_ROOT")
         .env("XDG_CONFIG_HOME", isolated_config)
@@ -392,7 +398,13 @@ fn enhance_verify_prints_summary() {
     let repo = demo_repo(tmp.path());
     deploy(&repo, false);
 
-    let result = invoke_aethyme(["enhance", "verify", "--repo", &repo.display().to_string()]);
+    let result = invoke_aethyme([
+        "deploy",
+        "verify",
+        "--generated-only",
+        "--repo",
+        &repo.display().to_string(),
+    ]);
     result.ok();
     result.assert_contains("Enhancement summary:");
     result.assert_contains("Recommendation: load `repo-onboarding` then run `explore`");
@@ -667,7 +679,13 @@ fn enhance_verify_refreshes_experience_status() {
     let repo = demo_repo(tmp.path());
     deploy(&repo, false);
 
-    let result = invoke_aethyme(["enhance", "verify", "--repo", &repo.display().to_string()]);
+    let result = invoke_aethyme([
+        "deploy",
+        "verify",
+        "--generated-only",
+        "--repo",
+        &repo.display().to_string(),
+    ]);
     result.ok();
     result.assert_contains("Experience status:");
 
@@ -696,7 +714,13 @@ fn enhance_verify_fails_on_direct_agents_edit() {
     let edited = read(&agents_path) + "\n\nManual direct edit.\n";
     write(&agents_path, &edited);
 
-    let result = invoke_aethyme(["enhance", "verify", "--repo", &repo.display().to_string()]);
+    let result = invoke_aethyme([
+        "deploy",
+        "verify",
+        "--generated-only",
+        "--repo",
+        &repo.display().to_string(),
+    ]);
     result.expect_code(1);
     result.assert_contains("AGENTS.md");
     result.assert_contains("direct edits unsupported; use .aethyme/overrides/agents.json");
@@ -721,7 +745,13 @@ fn enhance_verify_does_not_call_legacy_generated_drift_a_direct_edit() {
         &format!("{legacy_body}\nPrior generated clause.\n"),
     );
 
-    let result = invoke_aethyme(["enhance", "verify", "--repo", &repo.display().to_string()]);
+    let result = invoke_aethyme([
+        "deploy",
+        "verify",
+        "--generated-only",
+        "--repo",
+        &repo.display().to_string(),
+    ]);
     result.expect_code(1);
     result.assert_contains("deployment provenance is unavailable");
     result.assert_contains("aethyme deploy --repo <repo>");

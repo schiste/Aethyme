@@ -194,6 +194,57 @@ fn deploy_enrolls_and_verifies_a_repository_without_a_source_checkout() {
 }
 
 #[test]
+fn generated_only_deployment_preserves_the_discoverability_only_workflow() {
+    let temp = tmp_dir();
+    let repo = repository(temp.path());
+    let deployed = command(&repo)
+        .args(["deploy", "--generated-only", "--repo"])
+        .arg(&repo)
+        .output()
+        .unwrap();
+    assert!(
+        deployed.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&deployed.stdout),
+        String::from_utf8_lossy(&deployed.stderr)
+    );
+    for relative in ["AGENTS.md", ".aethyme/generated/onboarding.json"] {
+        assert!(repo.join(relative).is_file(), "missing {relative}");
+    }
+    for relative in [
+        ".aethyme/config.toml",
+        ".aethyme/gates.toml",
+        ".aethyme/repository.json",
+    ] {
+        assert!(!repo.join(relative).exists(), "unexpected {relative}");
+    }
+
+    let verified = command(&repo)
+        .args(["deploy", "verify", "--generated-only", "--repo"])
+        .arg(&repo)
+        .output()
+        .unwrap();
+    assert!(
+        verified.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&verified.stdout),
+        String::from_utf8_lossy(&verified.stderr)
+    );
+    assert!(
+        repo.join(".aethyme/generated/experience-status.md")
+            .is_file(),
+        "generated-only verification retains its experience-status output"
+    );
+    for relative in [
+        ".aethyme/config.toml",
+        ".aethyme/gates.toml",
+        ".aethyme/repository.json",
+    ] {
+        assert!(!repo.join(relative).exists(), "unexpected {relative}");
+    }
+}
+
+#[test]
 fn complete_deployment_reports_parallel_ready_without_materializing_host_state() {
     let temp = tmp_dir();
     let repo = repository(temp.path());

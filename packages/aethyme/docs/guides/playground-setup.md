@@ -133,7 +133,7 @@ $GRAPH_INDEXER \
 $ENGINE index --repo .
 
 # Deploy generated root guidance and per-product skills.
-"$AETHYME_ROOT/rust/target/release/aethyme" enhance deploy --repo "$PWD" --force
+"$AETHYME_ROOT/rust/target/release/aethyme" deploy --generated-only --repo "$PWD" --force
 ```
 
 The generated `AGENTS.md` and `CLAUDE.md` quick start must point Explore at
@@ -352,7 +352,7 @@ rm -rf "$DEST/Control/.chau7"
 
 **"Aethyme skill shows {{AETHYME_ROOT}}"** — The sed replacement failed. Check the path and re-run:
 ```bash
-"$AETHYME_ROOT/rust/target/release/aethyme" enhance deploy --repo "$PWD" --force
+"$AETHYME_ROOT/rust/target/release/aethyme" deploy --generated-only --repo "$PWD" --force
 ```
 
 **"Generated artifacts appear in git status or rg output"** — The local

@@ -53,7 +53,7 @@ fn hook_path() -> PathBuf {
 fn skill_md_exists() {
     assert!(
         skill_path().exists(),
-        "{} must exist — deployed by `aethyme enhance deploy` to \
+        "{} must exist — deployed by `aethyme deploy --generated-only` to \
          .codex/skills/aethyme/SKILL.md in target repos",
         skill_path().display()
     );
@@ -168,7 +168,7 @@ fn session_hook_template_emits_envelope_natively() {
 }
 
 #[test]
-fn enhance_deploys_aethyme_skill_references() {
+fn generated_only_deploys_aethyme_skill_references() {
     let tmp = tmp_dir();
     let repo = tmp.path().join("demo-repo");
     build_pnpm_demo_repo(&repo);
@@ -179,7 +179,13 @@ fn enhance_deploys_aethyme_skill_references() {
     );
     std::fs::remove_file(repo.join("pnpm-lock.yaml")).unwrap();
 
-    invoke_aethyme(["enhance", "deploy", "--repo", &repo.display().to_string()]).ok();
+    invoke_aethyme([
+        "deploy",
+        "--generated-only",
+        "--repo",
+        &repo.display().to_string(),
+    ])
+    .ok();
 
     for product in [".codex", ".claude"] {
         for name in [
