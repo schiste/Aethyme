@@ -726,14 +726,42 @@ impl Broker {
         };
 
         if !self.repo_handle().is_ancestor(&local_main, &upstream_head) {
+            // Local main *ahead* of upstream is not divergence: it is what an
+            // operator gets by pulling upstream into main. When integration
+            // contains upstream too, there is nothing to reconcile, and
+            // rebuilding onto upstream would only discard that merge (#405).
+            let upstream_in_main = self.repo_handle().is_ancestor(&upstream_head, &local_main);
+            if upstream_in_main
+                && self
+                    .repo_handle()
+                    .is_ancestor(&upstream_head, &old_integration)
+            {
+                report.new_integration = old_integration.clone();
+                report.next_action = format!(
+                    "nothing to reconcile: {} {upstream_head} is already contained in local main and {branch}; no refs or broker rows were changed",
+                    options.upstream
+                );
+                return Ok(report);
+            }
             report.safe = false;
-            report.warnings.push(format!(
-                "local main {local_main} is not an ancestor of {} {upstream_head}; refusing to choose between divergent histories",
-                options.upstream
-            ));
-            report.next_action =
-                "inspect the main/upstream divergence, update the local main checkout, then rerun the dry-run"
-                    .into();
+            if upstream_in_main {
+                report.warnings.push(format!(
+                    "local main {local_main} already contains {} {upstream_head}, but {branch} {old_integration} does not; refusing to rebuild integration behind local main",
+                    options.upstream
+                ));
+                report.next_action = format!(
+                    "inspect how local main absorbed {} outside {branch}; no refs or broker rows were changed",
+                    options.upstream
+                );
+            } else {
+                report.warnings.push(format!(
+                    "local main {local_main} is not an ancestor of {} {upstream_head}; refusing to choose between divergent histories",
+                    options.upstream
+                ));
+                report.next_action =
+                    "inspect the main/upstream divergence, update the local main checkout, then rerun the dry-run"
+                        .into();
+            }
             return Ok(report);
         }
 

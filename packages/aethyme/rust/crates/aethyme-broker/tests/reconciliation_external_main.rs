@@ -1027,3 +1027,160 @@ fn deploy_written_main_divergence_is_blocked_by_unrecorded_integration_work() {
         fixture.upstream_head
     );
 }
+
+/// Promote one change, land a patch-equivalent copy upstream, then pull
+/// upstream into local main with a merge commit -- the #405 shape. Returns
+/// (tmp, repo, merged local main).
+fn upstream_pulled_into_main_after_promotion() -> (tempfile::TempDir, PathBuf, String) {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    let remote = tmp.path().join("remote.git");
+    let deploy = tmp.path().join("deploy");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::create_dir_all(&remote).unwrap();
+    git(&remote, &["init", "--bare", "-q", "-b", "main"]);
+    git(&repo, &["init", "-q", "-b", "main"]);
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    std::fs::write(repo.join(".gitignore"), ".aethyme/\n").unwrap();
+    std::fs::write(repo.join("src/service.txt"), "feature=off\n").unwrap();
+    std::fs::write(repo.join("src/other.txt"), "other=0\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-qm", "initial"]);
+    git(
+        &repo,
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+    );
+    git(&repo, &["push", "-qu", "origin", "main"]);
+
+    let mut broker = Broker::open(&repo).unwrap();
+    let session = broker.start_worktree("promote feature", None).unwrap();
+    commit(
+        Path::new(&session.worktree_path),
+        "src/service.txt",
+        "feature=on\n",
+        "enable feature",
+    );
+    assert!(broker.submit(session.id).unwrap().promoted);
+    git(&repo, &["merge", "-q", "--ff-only", "aethyme/integration"]);
+
+    git(
+        tmp.path(),
+        &[
+            "clone",
+            "-q",
+            remote.to_str().unwrap(),
+            deploy.to_str().unwrap(),
+        ],
+    );
+    commit(
+        &deploy,
+        "src/service.txt",
+        "feature=on\n",
+        "replay feature upstream",
+    );
+    commit(
+        &deploy,
+        "src/other.txt",
+        "other=1\n",
+        "unrelated upstream work",
+    );
+    git(&deploy, &["push", "-q", "origin", "main"]);
+    git(&repo, &["fetch", "-q", "origin", "main"]);
+    git(
+        &repo,
+        &["merge", "-q", "--no-ff", "--no-edit", "origin/main"],
+    );
+    let merged_main = git(&repo, &["rev-parse", "HEAD"]);
+    (tmp, repo, merged_main)
+}
+
+#[test]
+fn reconcile_is_a_no_op_once_main_and_integration_contain_upstream() {
+    let (_tmp, repo, merged_main) = upstream_pulled_into_main_after_promotion();
+    git(
+        &repo,
+        &["update-ref", "refs/heads/aethyme/integration", &merged_main],
+    );
+
+    let mut broker = Broker::open(&repo).unwrap();
+    for apply in [false, true] {
+        let report = broker
+            .reconcile_integration(IntegrationReconcileOptions {
+                upstream: "origin/main".into(),
+                apply,
+                resolution_file: None,
+                confirm: None,
+            })
+            .unwrap();
+        assert!(report.safe, "{report:#?}");
+        assert!(!report.applied);
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+        assert_eq!(report.new_integration, merged_main);
+        assert!(report.plan_digest.is_none());
+        assert!(
+            report.next_action.starts_with("nothing to reconcile"),
+            "{}",
+            report.next_action
+        );
+    }
+    assert_eq!(
+        git(&repo, &["rev-parse", "aethyme/integration"]),
+        merged_main
+    );
+}
+
+#[test]
+fn reconcile_refuses_when_main_absorbed_upstream_but_integration_did_not() {
+    let (_tmp, repo, merged_main) = upstream_pulled_into_main_after_promotion();
+    // Integration follows a main that descends from it, so give it a commit
+    // main lacks: only then can main hold upstream while integration does not.
+    let promoted = git(&repo, &["rev-parse", "aethyme/integration"]);
+    let tree = git(&repo, &["rev-parse", &format!("{promoted}^{{tree}}")]);
+    let old_integration = git(
+        &repo,
+        &[
+            "commit-tree",
+            &tree,
+            "-p",
+            &promoted,
+            "-m",
+            "integration-only",
+        ],
+    );
+    git(
+        &repo,
+        &[
+            "update-ref",
+            "refs/heads/aethyme/integration",
+            &old_integration,
+        ],
+    );
+    assert!(
+        !git(&repo, &["branch", "--contains", "origin/main"]).contains("aethyme/integration"),
+        "integration must not contain upstream for this case"
+    );
+    assert_ne!(old_integration, merged_main);
+
+    let mut broker = Broker::open(&repo).unwrap();
+    let report = broker
+        .reconcile_integration(IntegrationReconcileOptions {
+            upstream: "origin/main".into(),
+            apply: false,
+            resolution_file: None,
+            confirm: None,
+        })
+        .unwrap();
+    assert!(!report.safe);
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("already contains") && !warning.contains("divergent")),
+        "{:?}",
+        report.warnings
+    );
+    assert_eq!(
+        git(&repo, &["rev-parse", "aethyme/integration"]),
+        old_integration
+    );
+}
