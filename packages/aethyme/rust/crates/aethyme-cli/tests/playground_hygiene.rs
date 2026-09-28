@@ -78,22 +78,34 @@ fn demo_repo(tmp: &Path) -> PathBuf {
 }
 
 #[test]
-fn enhance_deploy_root_guidance_uses_native_explore() {
+fn generated_deploy_root_guidance_uses_native_explore() {
     let tmp = tmp_dir();
     let repo = demo_repo(tmp.path());
 
-    invoke_aethyme(["enhance", "deploy", "--repo", &repo.display().to_string()]).ok();
+    invoke_aethyme([
+        "deploy",
+        "--generated-only",
+        "--repo",
+        &repo.display().to_string(),
+    ])
+    .ok();
 
     assert_native_root_guidance(&repo);
 }
 
 #[test]
-fn enhance_deploy_does_not_migrate_legacy_generated_agents_as_maintainer() {
+fn generated_deploy_does_not_migrate_legacy_generated_agents_as_maintainer() {
     let tmp = tmp_dir();
     let repo = demo_repo(tmp.path());
     write(repo.join("AGENTS.md"), &legacy_generated_agents_text());
 
-    invoke_aethyme(["enhance", "deploy", "--repo", &repo.display().to_string()]).ok();
+    invoke_aethyme([
+        "deploy",
+        "--generated-only",
+        "--repo",
+        &repo.display().to_string(),
+    ])
+    .ok();
 
     assert!(!read(repo.join("AGENTS.md")).contains("## Maintainer Notes"));
     assert_native_root_guidance(&repo);
@@ -101,7 +113,7 @@ fn enhance_deploy_does_not_migrate_legacy_generated_agents_as_maintainer() {
 }
 
 #[test]
-fn enhance_deploy_cleans_stale_generated_agents_override() {
+fn generated_deploy_cleans_stale_generated_agents_override() {
     let tmp = tmp_dir();
     let repo = demo_repo(tmp.path());
     let override_path = repo.join(AGENTS_OVERRIDE_PATH);
@@ -111,7 +123,13 @@ fn enhance_deploy_cleans_stale_generated_agents_override() {
             + "\n"),
     );
 
-    invoke_aethyme(["enhance", "deploy", "--repo", &repo.display().to_string()]).ok();
+    invoke_aethyme([
+        "deploy",
+        "--generated-only",
+        "--repo",
+        &repo.display().to_string(),
+    ])
+    .ok();
 
     assert!(!read(repo.join("AGENTS.md")).contains("## Maintainer Notes"));
     assert_native_root_guidance(&repo);
