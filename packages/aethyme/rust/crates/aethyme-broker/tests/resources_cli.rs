@@ -48,6 +48,7 @@ fn acquire_wait_is_structured_and_grant_out_is_private() {
         temp.path(),
         &state,
         &[
+            "advanced",
             "resources",
             "acquire",
             first_request.to_str().unwrap(),
@@ -75,6 +76,7 @@ fn acquire_wait_is_structured_and_grant_out_is_private() {
         temp.path(),
         &state,
         &[
+            "advanced",
             "resources",
             "acquire",
             second_request.to_str().unwrap(),
@@ -129,6 +131,7 @@ fn explain_joins_capacity_contention_to_the_live_holder_without_a_token() {
         temp.path(),
         &state,
         &[
+            "advanced",
             "resources",
             "acquire",
             first_request.to_str().unwrap(),
@@ -145,6 +148,7 @@ fn explain_joins_capacity_contention_to_the_live_holder_without_a_token() {
         temp.path(),
         &state,
         &[
+            "advanced",
             "resources",
             "explain",
             second_request.to_str().unwrap(),
@@ -219,6 +223,7 @@ fn reap_reclaims_dead_capacity_and_explain_names_the_quarantined_holder() {
         temp.path(),
         &state,
         &[
+            "advanced",
             "resources",
             "acquire",
             first_request.to_str().unwrap(),
@@ -234,7 +239,7 @@ fn reap_reclaims_dead_capacity_and_explain_names_the_quarantined_holder() {
     let lease_id = grant["lease"]["lease_id"].as_str().unwrap();
     let generation = grant["lease"]["generation"].as_u64().unwrap();
 
-    let reaped = run(temp.path(), &state, &["resources", "reap", "--json"]);
+    let reaped = run(temp.path(), &state, &["gc", "reap", "--json"]);
     assert!(
         reaped.status.success(),
         "{}",
@@ -247,7 +252,7 @@ fn reap_reclaims_dead_capacity_and_explain_names_the_quarantined_holder() {
     assert_eq!(report["leases"][0]["lease_id"], lease_id);
     assert_eq!(report["leases"][0]["state"], "quarantined");
 
-    let repeated = run(temp.path(), &state, &["resources", "reap", "--json"]);
+    let repeated = run(temp.path(), &state, &["gc", "reap", "--json"]);
     assert!(
         repeated.status.success(),
         "{}",
@@ -261,7 +266,12 @@ fn reap_reclaims_dead_capacity_and_explain_names_the_quarantined_holder() {
     let explained = run(
         temp.path(),
         &state,
-        &["resources", "explain", second_request.to_str().unwrap()],
+        &[
+            "advanced",
+            "resources",
+            "explain",
+            second_request.to_str().unwrap(),
+        ],
     );
     assert!(
         explained.status.success(),
@@ -311,6 +321,7 @@ fn supervised_run_preserves_child_status_and_quarantines_failed_cleanup() {
         temp.path(),
         &state,
         &[
+            "advanced",
             "resources",
             "run",
             request_path.to_str().unwrap(),
@@ -333,7 +344,11 @@ fn supervised_run_preserves_child_status_and_quarantines_failed_cleanup() {
     );
     assert!(!stderr.contains("ownership_token"), "{stderr}");
 
-    let inventory = run(temp.path(), &state, &["resources", "list", "--json"]);
+    let inventory = run(
+        temp.path(),
+        &state,
+        &["advanced", "resources", "list", "--json"],
+    );
     let inventory: serde_json::Value = serde_json::from_slice(&inventory.stdout).unwrap();
     assert_eq!(inventory[0]["state"], "quarantined");
 }
@@ -364,6 +379,7 @@ fn supervised_run_forwards_termination_to_the_child_group_and_releases() {
     .unwrap();
     let mut child = Command::new(CLI)
         .args([
+            "advanced",
             "resources",
             "run",
             request_path.to_str().unwrap(),
@@ -385,7 +401,11 @@ fn supervised_run_forwards_termination_to_the_child_group_and_releases() {
         .unwrap();
     assert_eq!(readiness, "child-ready\n");
 
-    let listed = run(temp.path(), &state, &["resources", "list", "--json"]);
+    let listed = run(
+        temp.path(),
+        &state,
+        &["advanced", "resources", "list", "--json"],
+    );
     let leases: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
     assert_eq!(leases.as_array().map(Vec::len), Some(1));
     unsafe {
@@ -438,6 +458,7 @@ fn host_resource_cli_plans_acquires_lists_and_releases_without_token_leaks() {
         temp.path(),
         &state,
         &[
+            "advanced",
             "resources",
             "plan",
             request_path.to_str().unwrap(),
@@ -461,6 +482,7 @@ fn host_resource_cli_plans_acquires_lists_and_releases_without_token_leaks() {
         temp.path(),
         &state,
         &[
+            "advanced",
             "resources",
             "acquire",
             request_path.to_str().unwrap(),
@@ -478,7 +500,11 @@ fn host_resource_cli_plans_acquires_lists_and_releases_without_token_leaks() {
     let grant_path = temp.path().join("grant.json");
     std::fs::write(&grant_path, &acquired.stdout).unwrap();
 
-    let listed = run(temp.path(), &state, &["resources", "list", "--json"]);
+    let listed = run(
+        temp.path(),
+        &state,
+        &["advanced", "resources", "list", "--json"],
+    );
     assert!(listed.status.success());
     let inventory: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
     assert_eq!(inventory[0]["request_id"], "cli-run-1");
@@ -488,6 +514,7 @@ fn host_resource_cli_plans_acquires_lists_and_releases_without_token_leaks() {
         temp.path(),
         &state,
         &[
+            "advanced",
             "resources",
             "release",
             grant_path.to_str().unwrap(),
@@ -502,7 +529,11 @@ fn host_resource_cli_plans_acquires_lists_and_releases_without_token_leaks() {
     let released_grant: serde_json::Value = serde_json::from_slice(&released.stdout).unwrap();
     assert_eq!(released_grant["lease"]["state"], "released");
 
-    let empty = run(temp.path(), &state, &["resources", "list", "--json"]);
+    let empty = run(
+        temp.path(),
+        &state,
+        &["advanced", "resources", "list", "--json"],
+    );
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&empty.stdout).unwrap(),
         serde_json::json!([])
@@ -541,6 +572,7 @@ fn release_given_a_lease_id_points_at_reconcile() {
         temp.path(),
         &state,
         &[
+            "advanced",
             "resources",
             "acquire",
             request.to_str().unwrap(),
@@ -558,7 +590,11 @@ fn release_given_a_lease_id_points_at_reconcile() {
         serde_json::from_slice(&std::fs::read(&grant_path).unwrap()).unwrap();
     let lease_id = grant["lease"]["lease_id"].as_str().unwrap();
 
-    let released = run(temp.path(), &state, &["resources", "release", lease_id]);
+    let released = run(
+        temp.path(),
+        &state,
+        &["advanced", "resources", "release", lease_id],
+    );
     assert!(!released.status.success(), "release must reject a lease id");
     let message = format!(
         "{}{}",

@@ -84,7 +84,7 @@ impl Fixture {
     }
 
     fn blockers(&self) -> Vec<serde_json::Value> {
-        let output = self.run(&["blockers", "--json"]);
+        let output = self.run(&["unblock", "--json"]);
         assert!(output.status.success(), "{}", stderr(&output));
         let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         report["blockers"].as_array().cloned().unwrap_or_default()

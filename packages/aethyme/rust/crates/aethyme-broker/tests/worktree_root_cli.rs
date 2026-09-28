@@ -113,8 +113,16 @@ fn worktree_root_plan_is_read_only_and_distinguishes_same_named_clones() {
     fixture_at(&first);
     fixture_at(&second);
 
-    let first_plan = json(run(&first, &state, &["worktree-root", "--json"]));
-    let second_plan = json(run(&second, &state, &["worktree-root", "--json"]));
+    let first_plan = json(run(
+        &first,
+        &state,
+        &["advanced", "worktree-root", "--json"],
+    ));
+    let second_plan = json(run(
+        &second,
+        &state,
+        &["advanced", "worktree-root", "--json"],
+    ));
 
     assert_ne!(first_plan["repository_key"], second_plan["repository_key"]);
     assert!(

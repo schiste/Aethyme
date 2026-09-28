@@ -39,7 +39,11 @@ fn fixture() -> tempfile::TempDir {
     std::fs::write(repo.path().join("a.txt"), "a\n").unwrap();
     git(repo.path(), &["add", "-A"]);
     git(repo.path(), &["commit", "-qm", "init"]);
-    assert!(run(repo.path(), None, &["scaffold"]).status.success());
+    assert!(
+        run(repo.path(), None, &["advanced", "scaffold"])
+            .status
+            .success()
+    );
     repo
 }
 
@@ -57,7 +61,11 @@ fn exempt_read_only_commands_write_no_telemetry_by_default() {
     let repo = fixture();
     run(repo.path(), None, &["status"]);
     let before = metrics(repo.path());
-    for args in [vec!["queue"], vec!["queue", "--active"], vec!["certify"]] {
+    for args in [
+        vec!["advanced", "queue"],
+        vec!["advanced", "queue", "--active"],
+        vec!["certify"],
+    ] {
         run(repo.path(), None, &args);
     }
     assert_eq!(
@@ -73,7 +81,11 @@ fn opting_in_records_read_only_command_output() {
     let repo = fixture();
     run(repo.path(), None, &["status"]);
     let before = metrics(repo.path()).len();
-    assert!(run(repo.path(), Some("1"), &["queue"]).status.success());
+    assert!(
+        run(repo.path(), Some("1"), &["advanced", "queue"])
+            .status
+            .success()
+    );
     let after = metrics(repo.path());
     assert!(
         after.len() > before,
@@ -95,7 +107,11 @@ fn falsey_opt_in_values_leave_the_invariant_intact() {
     run(repo.path(), None, &["status"]);
     let before = metrics(repo.path());
     for value in ["0", "false", "no", "off", ""] {
-        assert!(run(repo.path(), Some(value), &["queue"]).status.success());
+        assert!(
+            run(repo.path(), Some(value), &["advanced", "queue"])
+                .status
+                .success()
+        );
     }
     assert_eq!(
         metrics(repo.path()),
@@ -110,7 +126,7 @@ fn falsey_opt_in_values_leave_the_invariant_intact() {
 fn active_queue_excludes_terminal_entries() {
     let repo = fixture();
     // An empty queue distinguishes the two views by wording, not size.
-    let empty = run(repo.path(), None, &["queue", "--active"]);
+    let empty = run(repo.path(), None, &["advanced", "queue", "--active"]);
     assert!(
         String::from_utf8_lossy(&empty.stdout).contains("No queue entry is in flight"),
         "an empty active view must read differently from an empty inventory: {}",
@@ -136,9 +152,11 @@ fn active_queue_excludes_terminal_entries() {
             .success()
     );
 
-    let all = String::from_utf8_lossy(&run(repo.path(), None, &["queue"]).stdout).to_string();
+    let all =
+        String::from_utf8_lossy(&run(repo.path(), None, &["advanced", "queue"]).stdout).to_string();
     let active =
-        String::from_utf8_lossy(&run(repo.path(), None, &["queue", "--active"]).stdout).to_string();
+        String::from_utf8_lossy(&run(repo.path(), None, &["advanced", "queue", "--active"]).stdout)
+            .to_string();
     assert!(
         all.contains("promoted"),
         "the inventory keeps terminal entries: {all}"

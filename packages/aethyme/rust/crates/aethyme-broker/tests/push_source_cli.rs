@@ -108,7 +108,7 @@ fn fixture() -> (
 fn adopt(worktree: &Path) -> String {
     // `adopt` takes the worktree from the cwd; `--path` is a lease path and
     // must be repository-relative.
-    let output = run_from(worktree, &["adopt", "--task", "push guard"]);
+    let output = run_from(worktree, &["start", "--adopt", "--task", "push guard"]);
     let text = merged(&output);
     // "Created session 574 on ..." / "Started session 575 -- ...": the id is the
     // token after the word, not a suffix of it.
@@ -134,6 +134,7 @@ fn a_head_push_from_outside_the_session_worktree_is_refused() {
     let output = run_from(
         &elsewhere,
         &[
+            "advanced",
             "git",
             "--session",
             &session,
@@ -169,6 +170,7 @@ fn a_branch_named_push_source_is_not_refused_from_outside_the_worktree() {
     let output = run_from(
         &elsewhere,
         &[
+            "advanced",
             "git",
             "--session",
             &session,
@@ -203,6 +205,7 @@ fn a_head_push_from_inside_the_session_worktree_is_allowed() {
     let output = run_from(
         &worktree,
         &[
+            "advanced",
             "git",
             "--session",
             &session,

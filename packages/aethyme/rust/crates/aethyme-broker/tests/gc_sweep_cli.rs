@@ -62,7 +62,7 @@ fn plan_json(repo: &Path, container: &Path) -> serde_json::Value {
 }
 
 fn reclaim_plan_json(repo: &Path, container: &Path) -> serde_json::Value {
-    let output = run(repo, container, &["reclaim", "plan", "--json"]);
+    let output = run(repo, container, &["gc", "reclaim", "plan", "--json"]);
     assert!(
         output.status.success(),
         "reclaim plan: {}",
@@ -74,7 +74,11 @@ fn reclaim_plan_json(repo: &Path, container: &Path) -> serde_json::Value {
 #[test]
 fn reclaim_plan_warns_but_prints_when_snapshot_storage_is_unavailable() {
     let (repo, container) = fixture("");
-    let root_output = run(repo.path(), container.path(), &["worktree-root", "--json"]);
+    let root_output = run(
+        repo.path(),
+        container.path(),
+        &["advanced", "worktree-root", "--json"],
+    );
     assert!(root_output.status.success());
     let worktree_root =
         serde_json::from_slice::<serde_json::Value>(&root_output.stdout).unwrap()["preferred_root"]
@@ -91,7 +95,7 @@ fn reclaim_plan_warns_but_prints_when_snapshot_storage_is_unavailable() {
     let output = run(
         repo.path(),
         container.path(),
-        &["reclaim", "plan", "--json"],
+        &["gc", "reclaim", "plan", "--json"],
     );
     assert!(
         output.status.success(),
@@ -173,7 +177,11 @@ fn orphaned_roots_are_swept_while_owned_and_unmarked_roots_are_protected() {
 #[test]
 fn reclaim_confirmation_binds_decisions_not_sizes_and_explains_changes() {
     let (repo, container) = fixture("");
-    let root_output = run(repo.path(), container.path(), &["worktree-root", "--json"]);
+    let root_output = run(
+        repo.path(),
+        container.path(),
+        &["advanced", "worktree-root", "--json"],
+    );
     assert!(
         root_output.status.success(),
         "worktree root: {}",
@@ -197,7 +205,7 @@ fn reclaim_confirmation_binds_decisions_not_sizes_and_explains_changes() {
     let apply = run(
         repo.path(),
         container.path(),
-        &["reclaim", "apply", "--confirm", &digest],
+        &["gc", "reclaim", "apply", "--confirm", &digest],
     );
     assert!(
         apply.status.success(),
@@ -217,7 +225,7 @@ fn reclaim_confirmation_binds_decisions_not_sizes_and_explains_changes() {
     let refused = run(
         repo.path(),
         container.path(),
-        &["reclaim", "apply", "--confirm", &digest],
+        &["gc", "reclaim", "apply", "--confirm", &digest],
     );
     assert!(!refused.status.success());
     let message = String::from_utf8_lossy(&refused.stderr);
@@ -229,7 +237,11 @@ fn reclaim_confirmation_binds_decisions_not_sizes_and_explains_changes() {
 #[test]
 fn reclaim_confirmation_keeps_digest_mismatch_primary_when_snapshot_is_unreadable() {
     let (repo, container) = fixture("");
-    let root_output = run(repo.path(), container.path(), &["worktree-root", "--json"]);
+    let root_output = run(
+        repo.path(),
+        container.path(),
+        &["advanced", "worktree-root", "--json"],
+    );
     let worktree_root =
         serde_json::from_slice::<serde_json::Value>(&root_output.stdout).unwrap()["preferred_root"]
             .as_str()
@@ -248,7 +260,7 @@ fn reclaim_confirmation_keeps_digest_mismatch_primary_when_snapshot_is_unreadabl
     let refused = run(
         repo.path(),
         container.path(),
-        &["reclaim", "apply", "--confirm", &digest],
+        &["gc", "reclaim", "apply", "--confirm", &digest],
     );
     assert!(!refused.status.success());
     let message = String::from_utf8_lossy(&refused.stderr);
@@ -323,7 +335,7 @@ fn blocked_session_with_build_cache(repo: &Path, container: &Path) -> (String, P
 
     // `close` rather than `finish`: an unaccepted commit is exactly what makes
     // `finish` refuse, and a blocked-but-closed session is the case under test.
-    let output = run(repo, container, &["close", "--session", &id]);
+    let output = run(repo, container, &["finish", "close", "--session", &id]);
     assert!(
         output.status.success(),
         "close: {}",
@@ -690,7 +702,11 @@ fn tracked_directory_with_a_cache_witness_is_never_reclaimed() {
         ],
     );
     git(&worktree, &["commit", "-qm", "tracked target"]);
-    let output = run(repo.path(), container.path(), &["close", "--session", &id]);
+    let output = run(
+        repo.path(),
+        container.path(),
+        &["finish", "close", "--session", &id],
+    );
     assert!(output.status.success());
 
     let output = run(repo.path(), container.path(), &["status", "--json"]);
@@ -947,7 +963,11 @@ fn doctor_counts_an_unsized_orphaned_root_against_its_own_totals() {
     assert_eq!(plan["unmeasured_directory_count"].as_u64().unwrap(), 0);
     assert_eq!(plan["budget_verdict"].as_str().unwrap(), "within");
 
-    let output = run(repo.path(), container.path(), &["doctor", "--json"]);
+    let output = run(
+        repo.path(),
+        container.path(),
+        &["status", "doctor", "--json"],
+    );
     assert!(
         output.status.success(),
         "doctor: {}",

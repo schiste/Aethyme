@@ -563,7 +563,10 @@ fn a_finished_checkout_a_live_session_adopted_is_never_swept() {
     let stale = world.plan();
     assert_eq!(stale["artifacts"].as_array().unwrap().len(), 1);
 
-    let adopted = world.run_in(&world.finished, &["adopt", "--task", "resume the work"]);
+    let adopted = world.run_in(
+        &world.finished,
+        &["start", "--adopt", "--task", "resume the work"],
+    );
     assert!(
         adopted.status.success(),
         "adopt: {}",

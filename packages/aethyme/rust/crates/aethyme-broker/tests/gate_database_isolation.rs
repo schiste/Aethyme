@@ -57,7 +57,10 @@ fn fixture() -> tempfile::TempDir {
     std::fs::write(tmp.path().join(".aethyme/gates.toml"), "").unwrap();
     git(tmp.path(), &["add", "-A"]);
     git(tmp.path(), &["commit", "-qm", "fixture"]);
-    let adopted = run(tmp.path(), &["adopt", "--task", "live operator", "--json"]);
+    let adopted = run(
+        tmp.path(),
+        &["start", "--adopt", "--task", "live operator", "--json"],
+    );
     assert!(adopted.status.success(), "{adopted:?}");
     tmp
 }
@@ -87,7 +90,10 @@ fn write_gate(repo: &Path, command: &str) {
 }
 
 fn gates_run(repo: &Path) -> (bool, serde_json::Value) {
-    let output = run(repo, &["gates", "run", "--all", "--no-cache", "--json"]);
+    let output = run(
+        repo,
+        &["advanced", "gates", "run", "--all", "--no-cache", "--json"],
+    );
     let result = serde_json::from_slice(&output.stdout)
         .unwrap_or_else(|error| panic!("{error}: {output:?}"));
     (output.status.success(), result)
@@ -311,7 +317,9 @@ fn concurrent_gate_workers_receive_distinct_databases() {
     let workers: Vec<_> = (0..2)
         .map(|_| {
             let repo = repo.path().to_path_buf();
-            std::thread::spawn(move || run(&repo, &["gates", "run", "--all", "--no-cache"]))
+            std::thread::spawn(move || {
+                run(&repo, &["advanced", "gates", "run", "--all", "--no-cache"])
+            })
         })
         .collect();
     for worker in workers {

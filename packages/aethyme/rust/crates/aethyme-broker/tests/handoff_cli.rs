@@ -117,7 +117,10 @@ fn handoff_json_by_session_has_a_stable_read_only_contract() {
     let (tmp, _worktree, session_id) = finished_fixture();
     let before = event_fingerprints(tmp.path());
     let session = session_id.to_string();
-    let output = run(tmp.path(), &["handoff", "--session", &session, "--json"]);
+    let output = run(
+        tmp.path(),
+        &["advanced", "handoff", "--session", &session, "--json"],
+    );
     assert!(
         output.status.success(),
         "{}",
@@ -180,7 +183,12 @@ fn handoff_by_worktree_returns_the_latest_completed_session() {
 
     let output = run(
         tmp.path(),
-        &["handoff", "--worktree", worktree.to_str().unwrap()],
+        &[
+            "advanced",
+            "handoff",
+            "--worktree",
+            worktree.to_str().unwrap(),
+        ],
     );
     assert!(
         output.status.success(),
@@ -213,6 +221,7 @@ fn handoff_by_absolute_worktree_survives_worktree_removal() {
     let output = run(
         tmp.path(),
         &[
+            "advanced",
             "handoff",
             "--worktree",
             worktree.to_str().unwrap(),
@@ -236,11 +245,14 @@ fn handoff_requires_one_selector_and_a_completed_handoff() {
     let session = broker.adopt(tmp.path(), Some("still active")).unwrap();
     let session_id = session.id.to_string();
 
-    let missing = run(tmp.path(), &["handoff", "--session", &session_id]);
+    let missing = run(
+        tmp.path(),
+        &["advanced", "handoff", "--session", &session_id],
+    );
     assert!(!missing.status.success());
     assert!(String::from_utf8_lossy(&missing.stderr).contains("has no completed handoff"));
 
-    let neither = run(tmp.path(), &["handoff"]);
+    let neither = run(tmp.path(), &["advanced", "handoff"]);
     assert!(!neither.status.success());
     assert!(
         String::from_utf8_lossy(&neither.stderr)
@@ -250,6 +262,7 @@ fn handoff_requires_one_selector_and_a_completed_handoff() {
     let both = run(
         tmp.path(),
         &[
+            "advanced",
             "handoff",
             "--session",
             &session_id,

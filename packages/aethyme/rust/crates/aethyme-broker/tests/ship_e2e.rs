@@ -436,6 +436,7 @@ fn pull_request_delivery_pushes_and_reuses_one_exact_provider_pr() {
     let entry = entry_id.to_string();
     let planned = fixture.run_delivery_cli(
         &[
+            "advanced",
             "ship",
             "plan",
             "--entry",
@@ -460,6 +461,7 @@ fn pull_request_delivery_pushes_and_reuses_one_exact_provider_pr() {
     let remote_before = fixture.remote_main();
     let execute = fixture.run_delivery_cli(
         &[
+            "advanced",
             "ship",
             "execute",
             "--entry",
@@ -497,6 +499,7 @@ fn pull_request_delivery_pushes_and_reuses_one_exact_provider_pr() {
 
     let retry = fixture.run_delivery_cli(
         &[
+            "advanced",
             "ship",
             "execute",
             "--entry",
@@ -517,7 +520,11 @@ fn pull_request_delivery_pushes_and_reuses_one_exact_provider_pr() {
         "{}",
         String::from_utf8_lossy(&retry.stderr)
     );
-    let operations = fixture.run_delivery_cli(&["operations", "list", "--json"], &fake_bin, &state);
+    let operations = fixture.run_delivery_cli(
+        &["advanced", "operations", "list", "--json"],
+        &fake_bin,
+        &state,
+    );
     assert!(operations.status.success());
     let operations = String::from_utf8(operations.stdout).unwrap();
     assert_eq!(
@@ -536,6 +543,7 @@ fn pull_request_delivery_distinguishes_merged_from_target_verified_publication()
     let entry = entry_id.to_string();
     let planned = fixture.run_delivery_cli(
         &[
+            "advanced",
             "ship",
             "plan",
             "--entry",
@@ -553,6 +561,7 @@ fn pull_request_delivery_distinguishes_merged_from_target_verified_publication()
 
     let execute = fixture.run_delivery_cli(
         &[
+            "advanced",
             "ship",
             "execute",
             "--entry",
@@ -579,6 +588,7 @@ fn pull_request_delivery_distinguishes_merged_from_target_verified_publication()
     fixture.mark_fake_pr_merged(&state, &branch);
     let merged = fixture.run_delivery_cli(
         &[
+            "advanced",
             "ship",
             "execute",
             "--entry",
@@ -609,6 +619,7 @@ fn pull_request_delivery_distinguishes_merged_from_target_verified_publication()
     fixture.refresh_remote_main();
     let replanned = fixture.run_delivery_cli(
         &[
+            "advanced",
             "ship",
             "plan",
             "--entry",
@@ -625,6 +636,7 @@ fn pull_request_delivery_distinguishes_merged_from_target_verified_publication()
     let replanned_digest = replanned["plan_digest"].as_str().unwrap();
     let published = fixture.run_delivery_cli(
         &[
+            "advanced",
             "ship",
             "execute",
             "--entry",
@@ -1085,7 +1097,7 @@ fn exposure_plan_cli_is_stable_and_does_not_mutate_lifecycle_state() {
     let fixture = Fixture::new();
     let (entry_id, _, _) = fixture.promoted_entry();
     let output = Command::new(CLI)
-        .args(["exposures", "plan", "--json"])
+        .args(["advanced", "exposures", "plan", "--json"])
         .current_dir(&fixture.repo)
         .output()
         .unwrap();

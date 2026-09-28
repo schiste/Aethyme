@@ -288,6 +288,7 @@ fn promoted_review_candidate(fixture: &Fixture) -> (String, String, i64) {
     let head = git(&worktree, &["rev-parse", "HEAD"]);
     let register = fixture.run(
         &[
+            "advanced",
             "review",
             "register",
             "--session",
@@ -325,7 +326,14 @@ fn promoted_review_candidate(fixture: &Fixture) -> (String, String, i64) {
 
 fn unlock_review(fixture: &Fixture, session_id: &str, head: &str) {
     let request = fixture.run(
-        &["review", "request", "--session", session_id, "--json"],
+        &[
+            "advanced",
+            "review",
+            "request",
+            "--session",
+            session_id,
+            "--json",
+        ],
         head,
         true,
         None,
@@ -343,6 +351,7 @@ fn unlock_review(fixture: &Fixture, session_id: &str, head: &str) {
     .unwrap();
     let ingest = fixture.run(
         &[
+            "advanced",
             "external-events",
             "ingest",
             event_path.to_str().unwrap(),
@@ -358,7 +367,14 @@ fn unlock_review(fixture: &Fixture, session_id: &str, head: &str) {
         String::from_utf8_lossy(&ingest.stderr)
     );
     let unlock = fixture.run(
-        &["review", "unlock", "--session", session_id, "--json"],
+        &[
+            "advanced",
+            "review",
+            "unlock",
+            "--session",
+            session_id,
+            "--json",
+        ],
         head,
         false,
         Some("APPROVED"),
@@ -378,7 +394,7 @@ fn review_gated_ship_requires_every_entry_and_revalidates_live_evidence() {
     let remote_before = fixture.remote_main();
 
     let missing = fixture.run(
-        &["ship", "plan", "--entry", &entry, "--json"],
+        &["advanced", "ship", "plan", "--entry", &entry, "--json"],
         &head,
         true,
         None,
@@ -410,7 +426,7 @@ fn review_gated_ship_requires_every_entry_and_revalidates_live_evidence() {
     )
     .unwrap();
     let dirty_bypass = fixture.run(
-        &["ship", "plan", "--entry", &entry, "--json"],
+        &["advanced", "ship", "plan", "--entry", &entry, "--json"],
         &head,
         true,
         None,
@@ -424,6 +440,7 @@ fn review_gated_ship_requires_every_entry_and_revalidates_live_evidence() {
     std::fs::write(&config_path, committed_config).unwrap();
     let refused = fixture.run(
         &[
+            "advanced",
             "ship",
             "execute",
             "--entry",
@@ -441,7 +458,7 @@ fn review_gated_ship_requires_every_entry_and_revalidates_live_evidence() {
 
     unlock_review(&fixture, &session_id, &head);
     let planned = fixture.run(
-        &["ship", "plan", "--entry", &entry, "--json"],
+        &["advanced", "ship", "plan", "--entry", &entry, "--json"],
         &head,
         false,
         Some("APPROVED"),
@@ -515,6 +532,7 @@ fn review_gated_ship_requires_every_entry_and_revalidates_live_evidence() {
     ] {
         let drifted = fixture.run_with_evidence(
             &[
+                "advanced",
                 "ship",
                 "execute",
                 "--entry",
@@ -540,6 +558,7 @@ fn review_gated_ship_requires_every_entry_and_revalidates_live_evidence() {
 
     let shipped = fixture.run(
         &[
+            "advanced",
             "ship",
             "execute",
             "--entry",
@@ -572,7 +591,7 @@ fn break_glass_requires_committed_opt_in_and_journals_only_a_reason_digest() {
     let (_, head, entry_id) = promoted_review_candidate(&fixture);
     let entry = entry_id.to_string();
     let plan = fixture.run(
-        &["ship", "plan", "--entry", &entry, "--json"],
+        &["advanced", "ship", "plan", "--entry", &entry, "--json"],
         &head,
         true,
         None,
@@ -582,6 +601,7 @@ fn break_glass_requires_committed_opt_in_and_journals_only_a_reason_digest() {
     let secret_reason = "incident-authority-token-should-never-be-stored";
     let shipped = fixture.run(
         &[
+            "advanced",
             "ship",
             "execute",
             "--entry",
@@ -610,7 +630,12 @@ fn break_glass_requires_committed_opt_in_and_journals_only_a_reason_digest() {
         report["publication_authorization"]["reason_digest"],
         aethyme_broker::sha256_bytes(secret_reason.as_bytes())
     );
-    let operations = fixture.run(&["operations", "list", "--json"], "", true, None);
+    let operations = fixture.run(
+        &["advanced", "operations", "list", "--json"],
+        "",
+        true,
+        None,
+    );
     assert!(operations.status.success());
     assert!(!String::from_utf8_lossy(&operations.stdout).contains(secret_reason));
     assert_eq!(fixture.remote_main(), publication_sha);
@@ -619,7 +644,12 @@ fn break_glass_requires_committed_opt_in_and_journals_only_a_reason_digest() {
 #[test]
 fn review_cli_requires_submission_revalidates_evidence_and_unlocks_once() {
     let fixture = Fixture::new();
-    let adopt = fixture.run(&["adopt", "--task", "review", "--json"], "", true, None);
+    let adopt = fixture.run(
+        &["start", "--adopt", "--task", "review", "--json"],
+        "",
+        true,
+        None,
+    );
     assert!(
         adopt.status.success(),
         "{}",
@@ -636,6 +666,7 @@ fn review_cli_requires_submission_revalidates_evidence_and_unlocks_once() {
 
     let register = fixture.run(
         &[
+            "advanced",
             "review",
             "register",
             "--session",
@@ -660,7 +691,7 @@ fn review_cli_requires_submission_revalidates_evidence_and_unlocks_once() {
     assert_eq!(registered["lifecycle"]["commit_sha"], head);
 
     let premature = fixture.run(
-        &["review", "request", "--session", &id, "--json"],
+        &["advanced", "review", "request", "--session", &id, "--json"],
         &head,
         true,
         None,
@@ -676,7 +707,7 @@ fn review_cli_requires_submission_revalidates_evidence_and_unlocks_once() {
         String::from_utf8_lossy(&submit.stderr)
     );
     let requested = fixture.run(
-        &["review", "request", "--session", &id, "--json"],
+        &["advanced", "review", "request", "--session", &id, "--json"],
         &head,
         true,
         None,
@@ -696,7 +727,7 @@ fn review_cli_requires_submission_revalidates_evidence_and_unlocks_once() {
     );
 
     let drift = fixture.run(
-        &["review", "request", "--session", &id, "--json"],
+        &["advanced", "review", "request", "--session", &id, "--json"],
         &"a".repeat(40),
         false,
         None,
@@ -720,6 +751,7 @@ fn review_cli_requires_submission_revalidates_evidence_and_unlocks_once() {
     .unwrap();
     let ingest = fixture.run(
         &[
+            "advanced",
             "external-events",
             "ingest",
             event_path.to_str().unwrap(),
@@ -736,7 +768,7 @@ fn review_cli_requires_submission_revalidates_evidence_and_unlocks_once() {
     );
 
     let unlock = fixture.run(
-        &["review", "unlock", "--session", &id, "--json"],
+        &["advanced", "review", "unlock", "--session", &id, "--json"],
         &head,
         false,
         Some("APPROVED"),
@@ -758,7 +790,7 @@ fn review_cli_requires_submission_revalidates_evidence_and_unlocks_once() {
     );
 
     let repeated = fixture.run(
-        &["review", "unlock", "--session", &id, "--json"],
+        &["advanced", "review", "unlock", "--session", &id, "--json"],
         &head,
         false,
         Some("APPROVED"),
@@ -774,7 +806,7 @@ fn review_cli_requires_submission_revalidates_evidence_and_unlocks_once() {
     );
 
     let show = fixture.run(
-        &["review", "show", "--session", &id, "--json"],
+        &["advanced", "review", "show", "--session", &id, "--json"],
         "",
         false,
         None,
@@ -795,7 +827,12 @@ fn review_cli_requires_submission_revalidates_evidence_and_unlocks_once() {
 #[test]
 fn review_cli_default_profile_and_provider_outage_do_not_mutate_state() {
     let fixture = Fixture::new();
-    let adopt = fixture.run(&["adopt", "--task", "review", "--json"], "", true, None);
+    let adopt = fixture.run(
+        &["start", "--adopt", "--task", "review", "--json"],
+        "",
+        true,
+        None,
+    );
     let session: serde_json::Value = serde_json::from_slice(&adopt.stdout).unwrap();
     let id = session["id"].as_i64().unwrap().to_string();
     let head = git(fixture.root.path(), &["rev-parse", "HEAD"]);
@@ -806,6 +843,7 @@ fn review_cli_default_profile_and_provider_outage_do_not_mutate_state() {
     );
     let outage = Command::new(CLI)
         .args([
+            "advanced",
             "review",
             "register",
             "--session",
@@ -824,7 +862,12 @@ fn review_cli_default_profile_and_provider_outage_do_not_mutate_state() {
         .output()
         .unwrap();
     assert!(!outage.status.success());
-    let show = fixture.run(&["review", "show", "--session", &id], "", true, None);
+    let show = fixture.run(
+        &["advanced", "review", "show", "--session", &id],
+        "",
+        true,
+        None,
+    );
     assert!(!show.status.success());
     assert!(String::from_utf8_lossy(&show.stderr).contains("no review lifecycle"));
     assert!(fixture.writes().is_empty());
@@ -835,7 +878,12 @@ fn trusted_check_run_can_satisfy_review_without_an_approval_webhook() {
     let fixture = Fixture::new_with_policy(
         "[review]\nenabled = true\nevidence_adapter = \"github_check_run\"\nrequired_approvals = 0\nevidence_check_name = \"review-gate/codex\"\nevidence_app_slug = \"github-actions\"\nunlock_adapter = \"github_label\"\nunlock_label = \"validation-ready\"\n\n[publication]\nmode = \"review_gated\"\nallow_break_glass = true\n",
     );
-    let adopt = fixture.run(&["adopt", "--task", "bot review", "--json"], "", true, None);
+    let adopt = fixture.run(
+        &["start", "--adopt", "--task", "bot review", "--json"],
+        "",
+        true,
+        None,
+    );
     assert!(adopt.status.success());
     let session: serde_json::Value = serde_json::from_slice(&adopt.stdout).unwrap();
     let id = session["id"].as_i64().unwrap().to_string();
@@ -847,6 +895,7 @@ fn trusted_check_run_can_satisfy_review_without_an_approval_webhook() {
 
     for args in [
         vec![
+            "advanced",
             "review",
             "register",
             "--session",
@@ -858,7 +907,7 @@ fn trusted_check_run_can_satisfy_review_without_an_approval_webhook() {
             "--json",
         ],
         vec!["submit", "--session", &id, "--json"],
-        vec!["review", "request", "--session", &id, "--json"],
+        vec!["advanced", "review", "request", "--session", &id, "--json"],
     ] {
         let output = fixture.run_with_check(&args, &head, true, empty, None);
         assert!(
@@ -876,6 +925,7 @@ fn trusted_check_run_can_satisfy_review_without_an_approval_webhook() {
     .unwrap();
     let ignored = fixture.run_with_check(
         &[
+            "advanced",
             "external-events",
             "ingest",
             approval_path.to_str().unwrap(),
@@ -888,7 +938,7 @@ fn trusted_check_run_can_satisfy_review_without_an_approval_webhook() {
     );
     assert!(ignored.status.success());
     let shown = fixture.run(
-        &["review", "show", "--session", &id, "--json"],
+        &["advanced", "review", "show", "--session", &id, "--json"],
         "",
         false,
         None,
@@ -898,7 +948,7 @@ fn trusted_check_run_can_satisfy_review_without_an_approval_webhook() {
 
     let wrong_actor = check_run_evidence(&head, "untrusted", "success");
     let refused = fixture.run_with_check(
-        &["review", "unlock", "--session", &id, "--json"],
+        &["advanced", "review", "unlock", "--session", &id, "--json"],
         &head,
         false,
         &wrong_actor,
@@ -909,7 +959,7 @@ fn trusted_check_run_can_satisfy_review_without_an_approval_webhook() {
 
     let truncated = r#"{"total_count":101,"check_runs":[]}"#;
     let refused = fixture.run_with_check(
-        &["review", "unlock", "--session", &id, "--json"],
+        &["advanced", "review", "unlock", "--session", &id, "--json"],
         &head,
         false,
         truncated,
@@ -920,7 +970,7 @@ fn trusted_check_run_can_satisfy_review_without_an_approval_webhook() {
 
     let satisfied = check_run_evidence(&head, "github-actions", "success");
     let unlocked = fixture.run_with_check(
-        &["review", "unlock", "--session", &id, "--json"],
+        &["advanced", "review", "unlock", "--session", &id, "--json"],
         &head,
         false,
         &satisfied,
@@ -944,7 +994,7 @@ fn trusted_check_run_can_satisfy_review_without_an_approval_webhook() {
     );
 
     let repeated = fixture.run_with_check(
-        &["review", "unlock", "--session", &id, "--json"],
+        &["advanced", "review", "unlock", "--session", &id, "--json"],
         &head,
         false,
         &satisfied,
@@ -964,7 +1014,12 @@ fn trusted_check_run_can_satisfy_review_without_an_approval_webhook() {
 #[test]
 fn unknown_ready_outcome_preserves_state_and_blocks_blind_retry() {
     let fixture = Fixture::new();
-    let adopt = fixture.run(&["adopt", "--task", "review", "--json"], "", true, None);
+    let adopt = fixture.run(
+        &["start", "--adopt", "--task", "review", "--json"],
+        "",
+        true,
+        None,
+    );
     let session: serde_json::Value = serde_json::from_slice(&adopt.stdout).unwrap();
     let id = session["id"].as_i64().unwrap().to_string();
     std::fs::write(fixture.root.path().join("README.md"), "candidate\n").unwrap();
@@ -975,6 +1030,7 @@ fn unknown_ready_outcome_preserves_state_and_blocks_blind_retry() {
         fixture
             .run(
                 &[
+                    "advanced",
                     "review",
                     "register",
                     "--session",
@@ -1004,7 +1060,7 @@ fn unknown_ready_outcome_preserves_state_and_blocks_blind_retry() {
         std::env::var("PATH").unwrap_or_default()
     );
     let failed = Command::new(CLI)
-        .args(["review", "request", "--session", &id])
+        .args(["advanced", "review", "request", "--session", &id])
         .current_dir(fixture.root.path())
         .env("PATH", path)
         .env("AETHYME_HOST_STATE_DIR", &fixture.host_state)
@@ -1017,7 +1073,7 @@ fn unknown_ready_outcome_preserves_state_and_blocks_blind_retry() {
         .unwrap();
     assert!(!failed.status.success());
     let shown = fixture.run(
-        &["review", "show", "--session", &id, "--json"],
+        &["advanced", "review", "show", "--session", &id, "--json"],
         "",
         false,
         None,
@@ -1025,7 +1081,12 @@ fn unknown_ready_outcome_preserves_state_and_blocks_blind_retry() {
     let state: serde_json::Value = serde_json::from_slice(&shown.stdout).unwrap();
     assert_eq!(state["lifecycle"]["state"], "local_submission_verified");
 
-    let retry = fixture.run(&["review", "request", "--session", &id], &head, true, None);
+    let retry = fixture.run(
+        &["advanced", "review", "request", "--session", &id],
+        &head,
+        true,
+        None,
+    );
     assert!(!retry.status.success());
     assert!(
         String::from_utf8_lossy(&retry.stderr).contains("write-blocked"),
@@ -1058,6 +1119,7 @@ fn closed_review_lifecycle_can_be_reassigned_or_abandoned_without_losing_audit_h
     let original_id = original["id"].as_i64().unwrap().to_string();
     let register = fixture.run(
         &[
+            "advanced",
             "review",
             "register",
             "--session",
@@ -1078,21 +1140,35 @@ fn closed_review_lifecycle_can_be_reassigned_or_abandoned_without_losing_audit_h
         String::from_utf8_lossy(&register.stderr)
     );
     let close = fixture.run(
-        &["close", "--session", &original_id, "--json"],
+        &["finish", "close", "--session", &original_id, "--json"],
         &head,
         true,
         None,
     );
     assert!(close.status.success());
     let show_closed = fixture.run(
-        &["review", "show", "--session", &original_id, "--json"],
+        &[
+            "advanced",
+            "review",
+            "show",
+            "--session",
+            &original_id,
+            "--json",
+        ],
         &head,
         true,
         None,
     );
     assert!(show_closed.status.success());
     let mutate_closed = fixture.run_with_evidence(
-        &["review", "request", "--session", &original_id, "--json"],
+        &[
+            "advanced",
+            "review",
+            "request",
+            "--session",
+            &original_id,
+            "--json",
+        ],
         &head,
         "main",
         "OPEN",
@@ -1119,6 +1195,7 @@ fn closed_review_lifecycle_can_be_reassigned_or_abandoned_without_losing_audit_h
 
     let duplicate = fixture.run(
         &[
+            "advanced",
             "review",
             "register",
             "--session",
@@ -1146,6 +1223,7 @@ fn closed_review_lifecycle_can_be_reassigned_or_abandoned_without_losing_audit_h
 
     let reassign = fixture.run(
         &[
+            "advanced",
             "review",
             "reassign",
             "--session",
@@ -1175,6 +1253,7 @@ fn closed_review_lifecycle_can_be_reassigned_or_abandoned_without_losing_audit_h
 
     let abandon = fixture.run(
         &[
+            "advanced",
             "review",
             "abandon",
             "--session",
@@ -1214,6 +1293,7 @@ fn closed_review_lifecycle_can_be_reassigned_or_abandoned_without_losing_audit_h
     let fresh_id = fresh["id"].as_i64().unwrap().to_string();
     let fresh_register = fixture.run(
         &[
+            "advanced",
             "review",
             "register",
             "--session",
@@ -1235,7 +1315,7 @@ fn closed_review_lifecycle_can_be_reassigned_or_abandoned_without_losing_audit_h
     );
 
     let events = fixture.run(
-        &["events", "--kind", "review.lifecycle", "--json"],
+        &["advanced", "events", "--kind", "review.lifecycle", "--json"],
         &head,
         true,
         None,
@@ -1275,6 +1355,7 @@ fn review_state(fixture: &Fixture, review_type: &str, head: &str, state: &str) -
         head.to_string()
     };
     let mut args = vec![
+        "advanced",
         "review",
         "state",
         "--repo",
@@ -1304,7 +1385,15 @@ fn review_state(fixture: &Fixture, review_type: &str, head: &str, state: &str) -
 }
 
 fn review_waive(fixture: &Fixture, args: &[&str]) -> Output {
-    let mut argv = vec!["review", "waive", "--repo", "acme/product", "--pr", "42"];
+    let mut argv = vec![
+        "advanced",
+        "review",
+        "waive",
+        "--repo",
+        "acme/product",
+        "--pr",
+        "42",
+    ];
     argv.extend_from_slice(args);
     fixture.run(&argv, "", true, None)
 }
@@ -1322,6 +1411,7 @@ fn a_satisfied_state_requires_typed_completion_facts() {
     seed_review_request(&fixture, "code", WAIVE_HEAD);
     let refused = fixture.run(
         &[
+            "advanced",
             "review",
             "state",
             "--repo",
@@ -1357,6 +1447,7 @@ fn a_completion_records_distinct_commit_and_reviewer_identity() {
     seed_review_request(&fixture, "code", WAIVE_HEAD);
     let completed = fixture.run(
         &[
+            "advanced",
             "review",
             "state",
             "--repo",
@@ -1412,6 +1503,7 @@ fn an_unsolicited_completion_is_recorded_without_request_facts() {
     let fixture = Fixture::new();
     let completed = fixture.run(
         &[
+            "advanced",
             "review",
             "state",
             "--repo",
@@ -1461,6 +1553,7 @@ fn an_unmatched_completion_does_not_rewrite_the_latest_request() {
     seed_review_request(&fixture, "code", WAIVE_HEAD);
     let completed = fixture.run(
         &[
+            "advanced",
             "review",
             "state",
             "--repo",
@@ -1663,6 +1756,7 @@ fn review_state_cannot_write_the_waived_label() {
 fn review_row(fixture: &Fixture, review_type: &str) -> serde_json::Value {
     let ledger = fixture.run(
         &[
+            "advanced",
             "review",
             "ledger",
             "--repo",
@@ -1858,6 +1952,7 @@ fn refused_review_tick(fixture: &Fixture) -> (String, String, Output) {
     let head = git(&worktree, &["rev-parse", "HEAD"]);
     let run = fixture.run_with_evidence(
         &[
+            "advanced",
             "review",
             "run",
             "--session",
@@ -1903,6 +1998,7 @@ fn a_refused_review_records_the_providers_words_and_what_they_mean() {
 
     let ledger = fixture.run(
         &[
+            "advanced",
             "review",
             "ledger",
             "--repo",

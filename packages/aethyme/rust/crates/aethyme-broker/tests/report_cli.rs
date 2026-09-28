@@ -69,7 +69,7 @@ fn capture_report(repo: &Path, kind: &str, title: &str, filename: &str) {
     let output = run(
         repo,
         &[
-            "report", "capture", "--kind", kind, "--title", title, "--output", filename,
+            "advanced", "report", "capture", "--kind", kind, "--title", title, "--output", filename,
         ],
     );
     assert!(
@@ -107,7 +107,14 @@ body:
       required: true
 "#,
     );
-    let mut args = vec!["report", "render", "source.json", "--form", "fileable.yml"];
+    let mut args = vec![
+        "advanced",
+        "report",
+        "render",
+        "source.json",
+        "--form",
+        "fileable.yml",
+    ];
     if filename.ends_with(".issue.md") {
         args.extend(["--output", filename]);
     } else {
@@ -219,7 +226,7 @@ fn sorted_keys(value: &serde_json::Value) -> Vec<String> {
 fn capture_writes_ignored_report_atomically_and_prints_exact_digest() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());
-    let scaffold = run(tmp.path(), &["scaffold"]);
+    let scaffold = run(tmp.path(), &["advanced", "scaffold"]);
     assert!(scaffold.status.success());
     assert!(
         std::fs::read_to_string(tmp.path().join(".gitignore"))
@@ -230,6 +237,7 @@ fn capture_writes_ignored_report_atomically_and_prints_exact_digest() {
     let output = run(
         tmp.path(),
         &[
+            "advanced",
             "report",
             "capture",
             "--kind",
@@ -277,6 +285,7 @@ fn stdout_is_the_exact_digest_byte_stream_and_does_not_create_a_report_file() {
     let output = run(
         tmp.path(),
         &[
+            "advanced",
             "report",
             "capture",
             "--kind",
@@ -298,6 +307,7 @@ fn explicit_output_never_overwrites_and_cannot_escape_report_directory() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());
     let args = [
+        "advanced",
         "report",
         "capture",
         "--kind",
@@ -325,6 +335,7 @@ fn explicit_output_never_overwrites_and_cannot_escape_report_directory() {
         let output = run(
             tmp.path(),
             &[
+                "advanced",
                 "report",
                 "capture",
                 "--kind",
@@ -349,6 +360,7 @@ fn task_text_is_inferred_from_the_current_session_only_with_opt_in() {
     drop(broker);
 
     let base = [
+        "advanced",
         "report",
         "capture",
         "--kind",
@@ -401,6 +413,7 @@ fn failed_submit_is_captured_as_a_redacted_structured_command_failure() {
     let report = run(
         tmp.path(),
         &[
+            "advanced",
             "report",
             "capture",
             "--kind",
@@ -442,6 +455,7 @@ fn list_and_show_have_stable_json_with_digest_and_filing_state() {
     let capture = run(
         tmp.path(),
         &[
+            "advanced",
             "report",
             "capture",
             "--kind",
@@ -456,7 +470,7 @@ fn list_and_show_have_stable_json_with_digest_and_filing_state() {
     let report_path = tmp.path().join(".aethyme/reports/inspectable.json");
     let digest = sha256(&std::fs::read(&report_path).unwrap());
 
-    let listed = run(tmp.path(), &["report", "list", "--json"]);
+    let listed = run(tmp.path(), &["advanced", "report", "list", "--json"]);
     assert!(listed.status.success());
     let listed: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
     assert_eq!(
@@ -501,7 +515,7 @@ fn list_and_show_have_stable_json_with_digest_and_filing_state() {
     .unwrap();
     let shown = run(
         tmp.path(),
-        &["report", "show", "inspectable.json", "--json"],
+        &["advanced", "report", "show", "inspectable.json", "--json"],
     );
     assert!(shown.status.success());
     let shown: serde_json::Value = serde_json::from_slice(&shown.stdout).unwrap();
@@ -517,7 +531,7 @@ fn list_and_show_have_stable_json_with_digest_and_filing_state() {
     std::fs::write(&report_path, changed).unwrap();
     let changed = run(
         tmp.path(),
-        &["report", "show", "inspectable.json", "--json"],
+        &["advanced", "report", "show", "inspectable.json", "--json"],
     );
     assert!(changed.status.success());
     let changed: serde_json::Value = serde_json::from_slice(&changed.stdout).unwrap();
@@ -529,7 +543,7 @@ fn list_and_show_have_stable_json_with_digest_and_filing_state() {
 fn list_is_read_only_and_reports_corruption_without_hiding_valid_artifacts() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());
-    let empty = run(tmp.path(), &["report", "list", "--json"]);
+    let empty = run(tmp.path(), &["advanced", "report", "list", "--json"]);
     assert!(empty.status.success());
     assert!(
         !tmp.path().join(".aethyme/broker.db").exists(),
@@ -540,6 +554,7 @@ fn list_is_read_only_and_reports_corruption_without_hiding_valid_artifacts() {
         run(
             tmp.path(),
             &[
+                "advanced",
                 "report",
                 "capture",
                 "--kind",
@@ -558,7 +573,7 @@ fn list_is_read_only_and_reports_corruption_without_hiding_valid_artifacts() {
         "not json\n",
     )
     .unwrap();
-    let listed = run(tmp.path(), &["report", "list", "--json"]);
+    let listed = run(tmp.path(), &["advanced", "report", "list", "--json"]);
     assert!(listed.status.success());
     let listed: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
     assert_eq!(listed["reports"].as_array().unwrap().len(), 1);
@@ -588,7 +603,7 @@ fn list_is_read_only_and_reports_corruption_without_hiding_valid_artifacts() {
         serde_json::to_vec(&tampered).unwrap(),
     )
     .unwrap();
-    let listed = run(tmp.path(), &["report", "list", "--json"]);
+    let listed = run(tmp.path(), &["advanced", "report", "list", "--json"]);
     assert!(listed.status.success());
     let listed: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
     assert_eq!(listed["reports"].as_array().unwrap().len(), 1);
@@ -600,7 +615,10 @@ fn list_is_read_only_and_reports_corruption_without_hiding_valid_artifacts() {
                 .is_some_and(|error| error.contains("non-repository-relative"))
     }));
 
-    let shown = run(tmp.path(), &["report", "show", "corrupt.json", "--json"]);
+    let shown = run(
+        tmp.path(),
+        &["advanced", "report", "show", "corrupt.json", "--json"],
+    );
     assert!(!shown.status.success());
     assert!(String::from_utf8_lossy(&shown.stderr).contains("invalid report JSON"));
 }
@@ -613,6 +631,7 @@ fn list_order_is_newest_first_with_path_tiebreakers() {
         run(
             tmp.path(),
             &[
+                "advanced",
                 "report",
                 "capture",
                 "--kind",
@@ -642,7 +661,7 @@ fn list_order_is_newest_first_with_path_tiebreakers() {
         std::fs::write(tmp.path().join(".aethyme/reports").join(name), "invalid").unwrap();
     }
 
-    let output = run(tmp.path(), &["report", "list", "--json"]);
+    let output = run(tmp.path(), &["advanced", "report", "list", "--json"]);
     assert!(output.status.success());
     let output: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     let paths = output["reports"]
@@ -687,10 +706,16 @@ fn show_rejects_path_escape_and_symlinked_artifacts() {
     .unwrap();
 
     for selector in ["../outside.json", "/tmp/outside.json", "nested/out.json"] {
-        let output = run(tmp.path(), &["report", "show", selector, "--json"]);
+        let output = run(
+            tmp.path(),
+            &["advanced", "report", "show", selector, "--json"],
+        );
         assert!(!output.status.success(), "accepted {selector}");
     }
-    let linked = run(tmp.path(), &["report", "show", "link.json", "--json"]);
+    let linked = run(
+        tmp.path(),
+        &["advanced", "report", "show", "link.json", "--json"],
+    );
     assert!(!linked.status.success());
     assert!(String::from_utf8_lossy(&linked.stderr).contains("regular file"));
 }
@@ -743,7 +768,9 @@ body:
     }
     let output = run(
         tmp.path(),
-        &["report", "render", "bug.json", "--form", "bug.yml"],
+        &[
+            "advanced", "report", "render", "bug.json", "--form", "bug.yml",
+        ],
     );
     assert!(!output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -811,6 +838,7 @@ body:
     let output = run(
         tmp.path(),
         &[
+            "advanced",
             "report",
             "render",
             ".aethyme/reports/report.json",
@@ -883,6 +911,7 @@ body:
     let output = run(
         tmp.path(),
         &[
+            "advanced",
             "report",
             "render",
             "report.json",
@@ -916,7 +945,14 @@ fn render_rejects_malformed_forms_and_path_escapes() {
 
     let malformed = run(
         tmp.path(),
-        &["report", "render", "report.json", "--form", "broken.yml"],
+        &[
+            "advanced",
+            "report",
+            "render",
+            "report.json",
+            "--form",
+            "broken.yml",
+        ],
     );
     assert!(!malformed.status.success());
     assert!(String::from_utf8_lossy(&malformed.stderr).contains("invalid repository issue form"));
@@ -929,7 +965,14 @@ fn render_rejects_malformed_forms_and_path_escapes() {
     ] {
         let output = run(
             tmp.path(),
-            &["report", "render", "report.json", "--form", selector],
+            &[
+                "advanced",
+                "report",
+                "render",
+                "report.json",
+                "--form",
+                selector,
+            ],
         );
         assert!(!output.status.success(), "accepted {selector}");
         assert!(String::from_utf8_lossy(&output.stderr).contains("invalid issue form path"));
@@ -953,7 +996,14 @@ fn render_rejects_symlinked_issue_forms() {
 
     let output = run(
         tmp.path(),
-        &["report", "render", "report.json", "--form", "link.yml"],
+        &[
+            "advanced",
+            "report",
+            "render",
+            "report.json",
+            "--form",
+            "link.yml",
+        ],
     );
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("must not be a symbolic link"));
@@ -974,13 +1024,17 @@ fn file_uses_the_confirmed_render_and_journals_the_returned_issue() {
         .split_once("\n-->\n")
         .unwrap()
         .1;
-    let source = run(tmp.path(), &["report", "show", "source.json", "--json"]);
+    let source = run(
+        tmp.path(),
+        &["advanced", "report", "show", "source.json", "--json"],
+    );
     let source: serde_json::Value = serde_json::from_slice(&source.stdout).unwrap();
     let (path, args_path, calls_path, body_path) = install_fake_gh(tmp.path());
 
     let output = run_with_env(
         tmp.path(),
         &[
+            "advanced",
             "report",
             "file",
             ".aethyme/reports/reviewed.issue.md",
@@ -1038,7 +1092,7 @@ fn file_uses_the_confirmed_render_and_journals_the_returned_issue() {
     assert!(!operation.command_json.contains(".report-file-"));
     drop(broker);
 
-    let listed = run(tmp.path(), &["report", "list", "--json"]);
+    let listed = run(tmp.path(), &["advanced", "report", "list", "--json"]);
     assert!(listed.status.success());
     let listed: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
     assert_eq!(listed["reports"].as_array().unwrap().len(), 1);
@@ -1048,6 +1102,7 @@ fn file_uses_the_confirmed_render_and_journals_the_returned_issue() {
     let duplicate = run_with_env(
         tmp.path(),
         &[
+            "advanced",
             "report",
             "file",
             "reviewed.issue.md",
@@ -1087,6 +1142,7 @@ fn file_refuses_digest_drift_before_invoking_github() {
     let output = run_with_env(
         tmp.path(),
         &[
+            "advanced",
             "report",
             "file",
             "drift.issue.json",
@@ -1134,6 +1190,7 @@ body:
     let rendered = run(
         tmp.path(),
         &[
+            "advanced",
             "report",
             "render",
             "source.json",
@@ -1154,6 +1211,7 @@ body:
     let output = run_with_env(
         tmp.path(),
         &[
+            "advanced",
             "report",
             "file",
             "unfilled.issue.json",
@@ -1192,6 +1250,7 @@ body:
     let filed = run_with_env(
         tmp.path(),
         &[
+            "advanced",
             "report",
             "file",
             "unfilled.issue.json",
@@ -1234,6 +1293,7 @@ fn ambiguous_file_outcome_requires_reconciliation_and_is_never_retried() {
         ("AETHYME_FAKE_GH_MODE", "fail"),
     ];
     let args = [
+        "advanced",
         "report",
         "file",
         "ambiguous.issue.json",
@@ -1290,7 +1350,10 @@ fn ambiguous_file_outcome_requires_reconciliation_and_is_never_retried() {
     );
     assert_eq!(issue_creates(&calls_path), 1);
 
-    let shown = run(tmp.path(), &["report", "show", "source.json", "--json"]);
+    let shown = run(
+        tmp.path(),
+        &["advanced", "report", "show", "source.json", "--json"],
+    );
     assert!(shown.status.success());
     let shown: serde_json::Value = serde_json::from_slice(&shown.stdout).unwrap();
     assert_eq!(shown["summary"]["filing_state"], "unfiled");
@@ -1311,6 +1374,7 @@ fn successful_command_without_a_parseable_issue_url_is_ambiguous() {
     let output = run_with_env(
         tmp.path(),
         &[
+            "advanced",
             "report",
             "file",
             "malformed.issue.json",

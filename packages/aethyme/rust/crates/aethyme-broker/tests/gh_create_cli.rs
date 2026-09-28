@@ -153,6 +153,7 @@ impl Fixture {
 
     fn create(&self, labels: &[&str]) -> Output {
         let mut args = vec![
+            "advanced",
             "gh",
             "--session",
             &self.session,
@@ -201,7 +202,7 @@ fn an_undefined_label_is_refused_before_the_create_is_sent() {
     assert!(log.contains("label list"), "{log}");
     assert!(!log.contains("issue create"), "{log}");
 
-    let operations = fixture.run(&["operations", "list", "--json"]);
+    let operations = fixture.run(&["advanced", "operations", "list", "--json"]);
     let listed: serde_json::Value = serde_json::from_slice(&operations.stdout).unwrap();
     assert_eq!(listed["operations"].as_array().map(Vec::len), Some(0));
 }
@@ -303,7 +304,7 @@ fn a_failed_silent_create_absent_from_the_repository_is_recorded_as_failed() {
     assert_eq!(value["operation"]["status"], "failed");
 
     let operation = value["operation"]["id"].as_i64().unwrap().to_string();
-    let shown = fixture.run(&["operations", "show", &operation, "--json"]);
+    let shown = fixture.run(&["advanced", "operations", "show", &operation, "--json"]);
     let shown: serde_json::Value = serde_json::from_slice(&shown.stdout).unwrap();
     assert_eq!(shown["reconciliation"]["required"], false);
     assert_eq!(
@@ -334,6 +335,7 @@ fn the_create_outcome_is_stated_in_the_human_output() {
 impl Fixture {
     fn create_plain(&self) -> Output {
         self.run(&[
+            "advanced",
             "gh",
             "--session",
             &self.session,

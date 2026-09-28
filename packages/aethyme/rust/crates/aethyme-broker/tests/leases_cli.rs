@@ -105,6 +105,7 @@ fn lease_plan_cli_renders_structured_and_text_results_without_mutation() {
     let json_output = run(
         tmp.path(),
         &[
+            "advanced",
             "leases",
             "plan",
             "src/new.rs",
@@ -159,7 +160,14 @@ fn lease_plan_cli_renders_structured_and_text_results_without_mutation() {
 
     let text_output = run(
         tmp.path(),
-        &["leases", "plan", "src/owned.rs", "--session", &planner_id],
+        &[
+            "advanced",
+            "leases",
+            "plan",
+            "src/owned.rs",
+            "--session",
+            &planner_id,
+        ],
     );
     assert!(text_output.status.success());
     let text = String::from_utf8_lossy(&text_output.stdout);
@@ -212,6 +220,7 @@ fn closed_session_lease_claim_fails_without_persisting_a_phantom_lease() {
     let output = run(
         tmp.path(),
         &[
+            "advanced",
             "leases",
             "claim",
             "src/owned.rs",
@@ -242,11 +251,14 @@ fn lease_plan_cli_requires_paths_and_rejects_ambiguous_spelling() {
     let tmp = fixture();
     Broker::open(tmp.path()).unwrap();
 
-    let missing = run(tmp.path(), &["leases", "plan"]);
+    let missing = run(tmp.path(), &["advanced", "leases", "plan"]);
     assert!(!missing.status.success());
     assert!(String::from_utf8_lossy(&missing.stderr).contains("plan requires at least one path"));
 
-    let ambiguous = run(tmp.path(), &["leases", "plan", "src/../outside", "--json"]);
+    let ambiguous = run(
+        tmp.path(),
+        &["advanced", "leases", "plan", "src/../outside", "--json"],
+    );
     assert!(!ambiguous.status.success());
     assert!(
         String::from_utf8_lossy(&ambiguous.stderr)
@@ -316,6 +328,7 @@ fn lease_export_is_bounded_redacted_routed_and_read_only() {
     let limited = run(
         tmp.path(),
         &[
+            "advanced",
             "leases",
             "export",
             "--session",
@@ -345,7 +358,9 @@ fn lease_export_is_bounded_redacted_routed_and_read_only() {
     let entry_id = entry.id.to_string();
     let complete = run(
         tmp.path(),
-        &["leases", "export", "--entry", &entry_id, "--json"],
+        &[
+            "advanced", "leases", "export", "--entry", &entry_id, "--json",
+        ],
     );
     assert!(
         complete.status.success(),
@@ -459,13 +474,21 @@ fn lease_export_requires_a_selector_and_valid_bounds() {
     );
     Broker::open(tmp.path()).unwrap();
 
-    let missing = run(tmp.path(), &["leases", "export", "--json"]);
+    let missing = run(tmp.path(), &["advanced", "leases", "export", "--json"]);
     assert!(!missing.status.success());
     assert!(String::from_utf8_lossy(&missing.stderr).contains("requires --session"));
 
     let excessive = run(
         tmp.path(),
-        &["leases", "export", "--session", "1", "--limit", "1001"],
+        &[
+            "advanced",
+            "leases",
+            "export",
+            "--session",
+            "1",
+            "--limit",
+            "1001",
+        ],
     );
     assert!(!excessive.status.success());
     assert!(String::from_utf8_lossy(&excessive.stderr).contains("between 1 and 1000"));
@@ -504,7 +527,14 @@ fn a_lease_refusal_names_the_holder_and_its_status() {
 
     let refused = run(
         repo.path(),
-        &["leases", "claim", "shared.txt", "--session", &claimant_id],
+        &[
+            "advanced",
+            "leases",
+            "claim",
+            "shared.txt",
+            "--session",
+            &claimant_id,
+        ],
     );
     assert!(!refused.status.success(), "the claim must be refused");
     let text = String::from_utf8_lossy(&refused.stderr);
