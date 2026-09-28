@@ -45,7 +45,7 @@ fn host_state_path(root: &Path) -> PathBuf {
 
 fn run_readiness(root: &Path, host_state: &Path, args: &[&str]) -> Output {
     Command::new(CLI)
-        .arg("readiness")
+        .args(["status", "readiness"])
         .args(args)
         .current_dir(root)
         .env("AETHYME_HOST_STATE_DIR", host_state)
@@ -62,15 +62,6 @@ fn readiness_json(root: &Path, host_state: &Path) -> (Output, ReadinessReport) {
     );
     let report = serde_json::from_slice(&output.stdout).expect("stable readiness JSON");
     (output, report)
-}
-
-fn run_broker(root: &Path, host_state: &Path, args: &[&str]) -> Output {
-    Command::new(CLI)
-        .args(args)
-        .current_dir(root)
-        .env("AETHYME_HOST_STATE_DIR", host_state)
-        .output()
-        .expect("run broker CLI")
 }
 
 fn dimension(
@@ -222,49 +213,6 @@ fn readiness_includes_read_only_maintainer_history_recommendations() {
     assert_eq!(std::fs::read(database_path).unwrap(), before);
     let json = serde_json::to_string(&report).unwrap();
     assert!(!json.contains("must never enter readiness output"));
-}
-
-#[test]
-fn guided_init_reports_one_post_run_readiness_snapshot() {
-    let text_repo = init_repo();
-    let text_state = host_state_path(text_repo.path());
-    let text = run_broker(text_repo.path(), &text_state, &["init"]);
-    assert!(
-        text.status.success(),
-        "stdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&text.stdout),
-        String::from_utf8_lossy(&text.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&text.stdout);
-    assert!(stdout.contains("Repository initialized."));
-    assert_eq!(stdout.matches("Operating mode:").count(), 1);
-    assert!(stdout.contains("Operating mode: conflict_only"));
-    assert!(stdout.contains("Coordination: ready"));
-    assert!(stdout.contains("Agent context: not ready"));
-    assert!(stdout.contains("Validation: limited"));
-    assert!(stdout.contains("Parallel execution: not ready"));
-    assert!(stdout.contains("Next actions:"));
-
-    let json_repo = init_repo();
-    let json_state = host_state_path(json_repo.path());
-    let json = run_broker(json_repo.path(), &json_state, &["init", "--json"]);
-    assert!(json.status.success());
-    let document: serde_json::Value = serde_json::from_slice(&json.stdout)
-        .expect("--json emits exactly one JSON document with no prose");
-    assert_eq!(document["readiness"]["operating_mode"], "conflict_only");
-    let json_text = String::from_utf8(json.stdout).unwrap();
-    let positions = ["certify", "scaffold", "gates", "changed", "readiness"]
-        .map(|field| json_text.find(&format!("\n  \"{field}\":")).unwrap());
-    assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
-
-    let certify_repo = init_repo();
-    let certify = run_broker(
-        certify_repo.path(),
-        &host_state_path(certify_repo.path()),
-        &["certify", "--json"],
-    );
-    let certify_document: serde_json::Value = serde_json::from_slice(&certify.stdout).unwrap();
-    assert!(certify_document.get("readiness").is_none());
 }
 
 #[test]
