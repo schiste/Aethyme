@@ -103,6 +103,86 @@ fn gate_policy_changes_select_a_triggered_gate() {
     );
 }
 
+/// The guard suites `fast-guards` runs. Each one also runs under
+/// `cargo-test`; the gate exists so their failure arrives in seconds rather
+/// than after the whole workspace suite.
+const FAST_GUARD_SUITES: &[&str] = &[
+    "help_snapshots",
+    "help_surface",
+    "help_everywhere",
+    "broker_discarded_results",
+    "deprecated_spelling_callers",
+    "docs_hygiene",
+    "no_eval_tuning",
+    "pr_template",
+    "grammar_provenance",
+    "gate_policy",
+];
+
+/// `fast-guards` must run, and run first, on every diff that runs
+/// `cargo-test`. Gates run cheap-first and stop at the first failure, so a
+/// lower cost is what puts the seconds-long guards ahead of the ~10-minute
+/// workspace suite; a trigger `cargo-test` has and `fast-guards` lacks is a
+/// path on which a guard failure is again found only at the end.
+///
+/// Its cost must also stay above 1: the pre-commit hook runs every gate of
+/// cost 1 or less, and a Cargo build does not belong at commit time.
+#[test]
+fn fast_guards_precede_cargo_test_on_every_path_it_covers() {
+    let gates = load_gates(&repo_root()).expect("the shipped gates.toml parses");
+    let find = |name: &str| {
+        gates
+            .iter()
+            .find(|gate| gate.name == name)
+            .unwrap_or_else(|| panic!("gates.toml has no {name:?} gate"))
+    };
+    let fast = find("fast-guards");
+    let full = find("cargo-test");
+
+    assert!(
+        fast.cost > 1 && fast.cost < full.cost,
+        "fast-guards cost {} must be above the pre-commit ceiling (1) and below \
+         cargo-test's {}",
+        fast.cost,
+        full.cost
+    );
+    let missing: Vec<&str> = full
+        .triggers
+        .iter()
+        .filter(|trigger| !fast.triggers.contains(trigger))
+        .map(String::as_str)
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "cargo-test triggers missing from fast-guards: {missing:?}"
+    );
+    for suite in FAST_GUARD_SUITES {
+        assert!(
+            fast.command.contains(&format!("--test {suite} "))
+                || fast.command.ends_with(&format!("--test {suite}")),
+            "fast-guards does not run {suite}"
+        );
+    }
+    // Same cache and build flags as cargo-test, so the artifacts fast-guards
+    // builds are the ones cargo-test reuses instead of a second build.
+    let cache = |gate: &aethyme_broker::Gate| {
+        gate.managed_cache
+            .as_ref()
+            .map(|cache| (cache.key.clone(), cache.max_bytes))
+    };
+    assert_eq!(
+        cache(fast),
+        cache(full),
+        "fast-guards must share cargo-test's cache"
+    );
+    let prefix = |command: &str| command.split(" && ").next().unwrap_or_default().to_string();
+    assert_eq!(
+        prefix(&fast.command),
+        prefix(&full.command),
+        "fast-guards must build with cargo-test's environment"
+    );
+}
+
 /// A trigger glob that matches nothing fails silently: selection keeps
 /// working and one gate simply stops being reachable by the path it was
 /// written for. The retired `pytest-local` gate's `src/**` outlived `src/`

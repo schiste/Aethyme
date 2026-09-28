@@ -59,6 +59,55 @@ timeout_seconds = 300
 triggers = ["packages/aethyme-eval/**"]
 
 [[gate]]
+# 2026-09-27: 7 of the 21 failing `cargo-test` runs in the preceding 24 h
+# were found only after the ~10-minute workspace suite, by guards that take
+# seconds: `help_snapshots` (4x) and `broker_discarded_results` (3x). Gates
+# run cheap-first and stop at the first failure (`run_affected` in
+# `aethyme-broker/src/gates.rs`), so this gate puts the fast, deterministic
+# guard suites ahead of the full suite and a failing guard stops the entry
+# before the expensive run starts.
+#
+# Cost 2, not 1: the pre-commit hook runs every gate of cost 1 or less, and
+# a Cargo build does not belong at commit time. Below cargo-test's 3, so it
+# runs first.
+#
+# Same environment prefix, `--workspace` selection and managed cache as
+# `cargo-test`, chosen so both resolve features and fingerprint artifacts
+# the same way: what this gate builds is meant to be what `cargo-test` then
+# reuses, so a passing entry pays for the guard run, not a second build.
+#
+# Measured 2026-09-27 with this exact command, load average 55-110 from
+# concurrent builds: 279 s cold (empty cache, 1.1 GiB of artifacts), 10.6 s
+# warm, of which the ten suites themselves take under 12 s combined (every
+# suite finishes in under 5 s). Each suite is deterministic: it reads tracked
+# files or drives the built binary in a throwaway repository.
+#
+# COUPLING: the triggers are exactly `cargo-test`'s, so every entry that
+# runs the full suite runs these guards first. When a trigger is added to
+# `cargo-test`, add it here; `gate_policy.rs`
+# (`fast_guards_precede_cargo_test_on_every_path_it_covers`) fails
+# otherwise, and names the suites this command must keep. Every suite here
+# also runs under `cargo-test`, so nothing is lost if this gate is removed.
+name = "fast-guards"
+command = 'export CHAU7_CTO_OPTIM_ACTIVE=1 CARGO_INCREMENTAL=0 CARGO_PROFILE_TEST_DEBUG=1 CARGO_TARGET_DIR="$AETHYME_GATE_CACHE_DIR" && cargo test --workspace --quiet --manifest-path packages/aethyme/rust/Cargo.toml --test help_snapshots --test help_surface --test help_everywhere --test broker_discarded_results --test deprecated_spelling_callers --test docs_hygiene --test no_eval_tuning --test pr_template --test grammar_provenance --test gate_policy'
+cost = 2
+timeout_seconds = 2400
+resource_wait_seconds = 900
+triggers = [
+    "**/*.rs",
+    "**/Cargo.toml",
+    "packages/aethyme/skills/**",
+    "packages/aethyme/scripts/eval/*.sh",
+    "packages/aethyme/docs/**",
+    ".github/pull_request_template.md",
+    "packages/aethyme/rust/grammars/**",
+]
+
+[gate.managed_cache]
+key = "rust-workspace-v3"
+max_bytes = 12884901888
+
+[[gate]]
 name = "cargo-test"
 command = 'export CHAU7_CTO_OPTIM_ACTIVE=1 CARGO_INCREMENTAL=0 CARGO_PROFILE_TEST_DEBUG=1 CARGO_TARGET_DIR="$AETHYME_GATE_CACHE_DIR" && cargo test --workspace --quiet --manifest-path packages/aethyme/rust/Cargo.toml'
 cost = 3
@@ -78,6 +127,9 @@ triggers = [
     # silent-narrowing failure the retired `pytest-local` gate documented
     # when its `src/**` trigger outlived `src/`. Each entry names the
     # suite that reads it.
+    #
+    # COUPLING: `fast-guards` mirrors this list so it runs first on every
+    # path this gate covers; `gate_policy.rs` fails when they diverge.
     #
     # skill_templates.rs, playground_hygiene.rs (deployed templates,
     # references, the SessionStart hook):
