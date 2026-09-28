@@ -278,11 +278,11 @@ fn start_is_silent_when_its_base_carries_nothing_extra() {
     assert!(!rendered.contains("commit(s) behind"), "{rendered}");
 }
 
-/// `start-agent` selects a base exactly as `start` does and reported nothing
+/// `start --cmd` selects a base exactly as `start` does and reported nothing
 /// about it, which is the worse half of the gap: a detached agent has no one
 /// reading its terminal, and it opens pull requests from that base (#290).
 #[test]
-fn start_agent_reports_its_base_and_what_it_carries() {
+fn start_with_cmd_reports_its_base_and_what_it_carries() {
     let tmp = fixture();
     let main = git_output(tmp.path(), &["rev-parse", "HEAD"]);
     track_origin_main(tmp.path(), &main);
@@ -290,7 +290,7 @@ fn start_agent_reports_its_base_and_what_it_carries() {
 
     let rendered = stdout(&run(
         tmp.path(),
-        &["start-agent", "--task", "detached", "--cmd", "true"],
+        &["start", "--cmd", "true", "--task", "detached"],
     ));
     assert!(
         rendered.contains("Start base: refs/heads/aethyme/integration"),
@@ -358,12 +358,15 @@ fn start_refuses_a_base_that_does_not_resolve() {
     );
 }
 
-/// `adopt` registers an existing worktree, so there is no base to choose. The
+/// `start --adopt` registers an existing worktree, so there is no base to choose. The
 /// refusal says so rather than giving the generic "valid only with" list.
 #[test]
 fn adopt_refuses_a_base_and_explains_why() {
     let tmp = fixture();
-    let output = run(tmp.path(), &["adopt", "--task", "x", "--base", "main"]);
+    let output = run(
+        tmp.path(),
+        &["start", "--adopt", "--task", "x", "--base", "main"],
+    );
     assert!(!output.status.success());
     assert!(
         String::from_utf8_lossy(&output.stderr).contains("does not apply to broker adopt"),
@@ -374,14 +377,17 @@ fn adopt_refuses_a_base_and_explains_why() {
 
 /// `--base` is parsed for every subcommand, and only some can act on it.
 /// Accepting it where it is ignored reports a base choice that was never made
-/// (#290 phase 0.2). `start` and `start-agent` now honor it (phase 1.1); every
+/// (#290 phase 0.2). `start` and `start --cmd` now honor it (phase 1.1); every
 /// other subcommand must refuse rather than drop it.
 #[test]
 fn subcommands_that_cannot_honor_a_base_refuse_it() {
     let tmp = fixture();
 
-    // Only `scope` reads it within `gates`.
-    let output = run(tmp.path(), &["gates", "draft", "--base", "main"]);
+    // Only `scope` reads it within `advanced gates`.
+    let output = run(
+        tmp.path(),
+        &["advanced", "gates", "draft", "--base", "main"],
+    );
     assert!(!output.status.success());
     assert!(
         String::from_utf8_lossy(&output.stderr)
@@ -472,28 +478,28 @@ fn start_does_not_inspect_free_form_task_text_for_pull_request_reviews() {
 fn adopt_cli_distinguishes_created_and_reused_session_identities() {
     let tmp = fixture();
 
-    let created = stdout(&run(tmp.path(), &["adopt", "--task", "first"]));
+    let created = stdout(&run(tmp.path(), &["start", "--adopt", "--task", "first"]));
     assert!(
         created.contains("Created session 1 on the existing worktree"),
         "{created}"
     );
 
-    stdout(&run(tmp.path(), &["close", "--session", "1"]));
-    let created_after_close = stdout(&run(tmp.path(), &["adopt", "--reuse", "--task", "second"]));
+    stdout(&run(tmp.path(), &["finish", "close", "--session", "1"]));
+    let created_after_close = stdout(&run(tmp.path(), &["start", "--reuse", "--task", "second"]));
     assert!(
         created_after_close.contains("Created session 2 on the existing worktree"),
         "{created_after_close}"
     );
     assert!(!created_after_close.contains("Reusing session"));
 
-    let reused = stdout(&run(tmp.path(), &["adopt", "--reuse", "--task", "third"]));
+    let reused = stdout(&run(tmp.path(), &["start", "--reuse", "--task", "third"]));
     assert!(reused.contains("Reusing session 2"), "{reused}");
 }
 
 #[test]
 fn adopt_cli_exposes_structured_reuse_drift_and_safe_guidance() {
     let tmp = fixture();
-    stdout(&run(tmp.path(), &["adopt", "--task", "first"]));
+    stdout(&run(tmp.path(), &["start", "--adopt", "--task", "first"]));
 
     git(tmp.path(), &["checkout", "-qb", "integration-work"]);
     std::fs::write(tmp.path().join("shared.txt"), "integration\n").unwrap();
@@ -507,7 +513,7 @@ fn adopt_cli_exposes_structured_reuse_drift_and_safe_guidance() {
 
     let json = stdout(&run(
         tmp.path(),
-        &["adopt", "--reuse", "--task", "follow-up", "--json"],
+        &["start", "--reuse", "--task", "follow-up", "--json"],
     ));
     let report: serde_json::Value = serde_json::from_str(&json).unwrap();
     assert_eq!(report["outcome"], "reused");
@@ -531,7 +537,7 @@ fn adopt_cli_exposes_structured_reuse_drift_and_safe_guidance() {
 
     let rendered = stdout(&run(
         tmp.path(),
-        &["adopt", "--reuse", "--task", "render drift"],
+        &["start", "--reuse", "--task", "render drift"],
     ));
     assert!(rendered.contains("Integration drift: behind"), "{rendered}");
     assert!(rendered.contains("Overlapping changed paths:\n  shared.txt"));
@@ -545,7 +551,7 @@ fn adopt_cli_exposes_structured_reuse_drift_and_safe_guidance() {
 #[test]
 fn adopt_cli_syncs_reuse_to_integration_and_exposes_the_exact_transition() {
     let tmp = fixture();
-    stdout(&run(tmp.path(), &["adopt", "--task", "first"]));
+    stdout(&run(tmp.path(), &["start", "--adopt", "--task", "first"]));
     let session_head = git_output(tmp.path(), &["rev-parse", "HEAD"]);
 
     git(tmp.path(), &["checkout", "-qb", "integration-work"]);
@@ -559,7 +565,7 @@ fn adopt_cli_syncs_reuse_to_integration_and_exposes_the_exact_transition() {
     let json = stdout(&run(
         tmp.path(),
         &[
-            "adopt",
+            "start",
             "--reuse",
             "--sync-integration",
             "--task",
@@ -581,7 +587,7 @@ fn adopt_cli_syncs_reuse_to_integration_and_exposes_the_exact_transition() {
     let rendered = stdout(&run(
         tmp.path(),
         &[
-            "adopt",
+            "start",
             "--reuse",
             "--sync-integration",
             "--task",
@@ -597,7 +603,7 @@ fn adopt_cli_syncs_reuse_to_integration_and_exposes_the_exact_transition() {
 #[test]
 fn adopt_cli_requires_reuse_for_integration_sync() {
     let tmp = fixture();
-    let output = run(tmp.path(), &["adopt", "--sync-integration"]);
+    let output = run(tmp.path(), &["start", "--adopt", "--sync-integration"]);
     assert!(!output.status.success());
     assert!(
         String::from_utf8_lossy(&output.stderr).contains("--sync-integration requires --reuse")
@@ -617,17 +623,23 @@ fn adopt_warns_about_uncommitted_paths_it_did_not_create() {
     git(repo.path(), &["commit", "-qm", "init"]);
 
     // Clean checkout: nothing to warn about.
-    let clean = run(repo.path(), &["adopt", "--task", "clean checkout"]);
+    let clean = run(
+        repo.path(),
+        &["start", "--adopt", "--task", "clean checkout"],
+    );
     let clean_out = String::from_utf8_lossy(&clean.stdout);
     assert!(
         !clean_out.contains("warning:"),
         "a clean checkout must not warn: {clean_out}"
     );
-    run(repo.path(), &["close", "--session", "1"]);
+    run(repo.path(), &["finish", "close", "--session", "1"]);
 
     // Pre-existing unrelated work: the session must be told.
     std::fs::write(repo.path().join("unrelated.txt"), "not mine\n").unwrap();
-    let dirty = run(repo.path(), &["adopt", "--task", "dirty checkout"]);
+    let dirty = run(
+        repo.path(),
+        &["start", "--adopt", "--task", "dirty checkout"],
+    );
     let dirty_out = String::from_utf8_lossy(&dirty.stdout);
     assert!(
         dirty_out.contains("warning:") && dirty_out.contains("unrelated.txt"),
@@ -666,7 +678,8 @@ fn adopt_records_declared_scope_that_collides_with_a_json_start() {
     let adopted = stdout(&run(
         tmp.path(),
         &[
-            "adopt",
+            "start",
+            "--adopt",
             "--task",
             "second",
             "--claim",
@@ -697,7 +710,8 @@ fn json_adopt_records_declared_scope_that_collides_with_a_start() {
     let adopted = stdout(&run(
         tmp.path(),
         &[
-            "adopt",
+            "start",
+            "--adopt",
             "--task",
             "second",
             "--claim",
@@ -714,13 +728,7 @@ fn subcommands_that_cannot_honor_a_claim_refuse_it() {
     let tmp = fixture();
     for args in [
         &[
-            "start-agent",
-            "--task",
-            "t",
-            "--cmd",
-            "true",
-            "--claim",
-            "symbol:A",
+            "start", "--cmd", "true", "--task", "t", "--claim", "symbol:A",
         ][..],
         &["submit", "--session", "1", "--claim", "symbol:A"][..],
     ] {
