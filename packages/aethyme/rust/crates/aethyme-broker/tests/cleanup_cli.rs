@@ -61,7 +61,10 @@ fn bulk_cleanup_is_dry_run_by_default_and_apply_revalidates() {
     std::fs::write(worktree.join("target/debug/cache.bin"), vec![3_u8; 2048]).unwrap();
     drop(broker);
 
-    let plan = run(tmp.path(), &["cleanup", "--all-cleaned", "--json"]);
+    let plan = run(
+        tmp.path(),
+        &["finish", "cleanup", "--all-cleaned", "--json"],
+    );
     assert!(
         plan.status.success(),
         "{}",
@@ -119,7 +122,7 @@ fn bulk_cleanup_is_dry_run_by_default_and_apply_revalidates() {
 
     let unconfirmed = run(
         tmp.path(),
-        &["cleanup", "--all-cleaned", "--apply", "--json"],
+        &["finish", "cleanup", "--all-cleaned", "--apply", "--json"],
     );
     assert!(!unconfirmed.status.success());
     assert!(worktree.exists());
@@ -127,6 +130,7 @@ fn bulk_cleanup_is_dry_run_by_default_and_apply_revalidates() {
     let apply = run(
         tmp.path(),
         &[
+            "finish",
             "cleanup",
             "--all-cleaned",
             "--apply",
@@ -173,9 +177,9 @@ fn bulk_cleanup_rejects_force_and_session_mixups() {
     git(tmp.path(), &["commit", "-qm", "init"]);
 
     for args in [
-        vec!["cleanup", "--all-cleaned", "--force"],
-        vec!["cleanup", "12", "--all-cleaned"],
-        vec!["cleanup", "12", "--apply"],
+        vec!["finish", "cleanup", "--all-cleaned", "--force"],
+        vec!["finish", "cleanup", "12", "--all-cleaned"],
+        vec!["finish", "cleanup", "12", "--apply"],
     ] {
         let output = run(tmp.path(), &args);
         assert!(!output.status.success(), "unexpected success for {args:?}");
@@ -194,9 +198,12 @@ fn single_session_cleanup_refuses_sweep_only_flags() {
     git(tmp.path(), &["commit", "-qm", "init"]);
 
     for (args, flag) in [
-        (vec!["cleanup", "12", "--dry-run"], "--dry-run"),
-        (vec!["cleanup", "12", "--confirm", "abc"], "--confirm"),
-        (vec!["cleanup", "12", "--detail"], "--detail"),
+        (vec!["finish", "cleanup", "12", "--dry-run"], "--dry-run"),
+        (
+            vec!["finish", "cleanup", "12", "--confirm", "abc"],
+            "--confirm",
+        ),
+        (vec!["finish", "cleanup", "12", "--detail"], "--detail"),
     ] {
         let output = run(tmp.path(), &args);
         assert_eq!(output.status.code(), Some(2), "{args:?}");
@@ -237,7 +244,10 @@ fn bulk_cleanup_confirmation_binds_the_exact_reviewed_branch_tip() {
     );
     drop(broker);
 
-    let plan = run(tmp.path(), &["cleanup", "--all-cleaned", "--json"]);
+    let plan = run(
+        tmp.path(),
+        &["finish", "cleanup", "--all-cleaned", "--json"],
+    );
     assert!(plan.status.success());
     let plan: serde_json::Value = serde_json::from_slice(&plan.stdout).unwrap();
     let digest = plan["plan"]["digest"].as_str().unwrap().to_owned();
@@ -249,6 +259,7 @@ fn bulk_cleanup_confirmation_binds_the_exact_reviewed_branch_tip() {
     let apply = run(
         tmp.path(),
         &[
+            "finish",
             "cleanup",
             "--all-cleaned",
             "--apply",
@@ -313,7 +324,10 @@ fn an_interrupted_worktree_removal_is_judged_and_completed_rather_than_refused()
     assert!(worktree.join("done.txt").exists());
     drop(broker);
 
-    let plan = run(tmp.path(), &["cleanup", "--all-cleaned", "--json"]);
+    let plan = run(
+        tmp.path(),
+        &["finish", "cleanup", "--all-cleaned", "--json"],
+    );
     assert!(
         plan.status.success(),
         "{}",
@@ -331,6 +345,7 @@ fn an_interrupted_worktree_removal_is_judged_and_completed_rather_than_refused()
     let applied = run(
         tmp.path(),
         &[
+            "finish",
             "cleanup",
             "--all-cleaned",
             "--apply",
@@ -426,7 +441,10 @@ fn a_squash_merged_session_is_eligible_on_its_recorded_representation() {
     );
     drop(broker);
 
-    let plan = run(tmp.path(), &["cleanup", "--all-cleaned", "--json"]);
+    let plan = run(
+        tmp.path(),
+        &["finish", "cleanup", "--all-cleaned", "--json"],
+    );
     assert!(
         plan.status.success(),
         "{}",

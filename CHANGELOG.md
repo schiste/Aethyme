@@ -6,6 +6,14 @@ artifacts and their exact source revision are recorded in each signed
 
 ## [Unreleased]
 
+### Changed
+
+- Removed the deprecated broker and top-level CLI aliases as scheduled in
+  #387. Retired spellings now exit with status 2 and show their replacement.
+  Existing v0.8.7 readiness recovery journals remain recoverable, and
+  Playground setup uses `deploy --generated-only` to preserve its
+  discoverability-only behavior.
+
 ## [0.8.7] - 2026-09-28
 
 Broker recovery, worktree lifecycle, and gate reliability improvements.

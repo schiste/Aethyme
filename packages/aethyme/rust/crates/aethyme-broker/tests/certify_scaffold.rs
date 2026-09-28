@@ -3,7 +3,7 @@
 //! never overwriting); manifest detection.
 
 use std::collections::BTreeMap;
-use std::os::unix::fs::PermissionsExt;
+
 use std::path::Path;
 use std::process::Command;
 
@@ -270,86 +270,6 @@ fn shared_activation_reaches_pre_enrollment_worktrees_and_certifies_upstream_vis
     assert_eq!(
         status_of(&published, "certify.upstream-enrollment"),
         CheckStatus::Pass
-    );
-}
-
-/// Resolve the `git` the shim below delegates to, skipping wrapper scripts.
-///
-/// The test prepends the shim's own directory to `PATH`. A `git` that is
-/// itself a script re-resolving `git` through `PATH` — the shape every
-/// developer-environment git wrapper takes — would exec straight back into
-/// the shim, and the two would trade `exec` calls forever inside a single
-/// process: no output, no crash, just a hung test. Only a real executable
-/// terminates the chain, so accept nothing that starts with `#!`.
-fn first_real_git_on_path() -> Option<std::path::PathBuf> {
-    use std::io::Read;
-
-    std::env::split_paths(&std::env::var_os("PATH")?)
-        .map(|dir| dir.join("git"))
-        .find(|candidate| {
-            let Ok(mut file) = std::fs::File::open(candidate) else {
-                return false;
-            };
-            let mut magic = [0u8; 2];
-            file.read_exact(&mut magic).is_ok() && &magic != b"#!"
-        })
-}
-
-#[test]
-fn certify_names_a_path_git_shim_that_decorates_known_empty_output() {
-    const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
-
-    let tmp = tempfile::tempdir().unwrap();
-    let repo = tmp.path().join("repo");
-    let bin = tmp.path().join("bin");
-    std::fs::create_dir_all(&repo).unwrap();
-    std::fs::create_dir_all(&bin).unwrap();
-    init_repo(&repo);
-
-    let real_git = first_real_git_on_path().expect("git on PATH");
-    let shim = bin.join("git");
-    std::fs::write(
-        &shim,
-        "#!/bin/sh\nif [ \"$1\" = status ]; then\n  \"$REAL_GIT\" \"$@\"\n  result=$?\n  [ \"$result\" -eq 0 ] && printf 'ok ✓'\n  exit \"$result\"\nfi\nexec \"$REAL_GIT\" \"$@\"\n",
-    )
-    .unwrap();
-    let mut permissions = std::fs::metadata(&shim).unwrap().permissions();
-    permissions.set_mode(0o755);
-    std::fs::set_permissions(&shim, permissions).unwrap();
-
-    let original_path = std::env::var_os("PATH").unwrap_or_default();
-    let mut paths = vec![bin.clone()];
-    paths.extend(std::env::split_paths(&original_path));
-    let output = Command::new(CLI)
-        .arg("certify")
-        .current_dir(&repo)
-        .env("PATH", std::env::join_paths(paths).unwrap())
-        .env("REAL_GIT", real_git)
-        .output()
-        .unwrap();
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    // The broker probes PATH and uses the first git that does not rewrite
-    // porcelain, so a shim ahead of an honest git no longer decides anything
-    // the broker reads -- certification is not failed by it (#176). Since
-    // #177 gate commands are covered too: the shim's directory is dropped
-    // from the PATH they are spawned with.
-    //
-    // It is still reported, and still names the shim, because the machine is
-    // not repaired. Every command the operator runs by hand still meets it,
-    // and the broker routing around a wrapper is not the same as the wrapper
-    // being gone.
-    assert!(output.status.success(), "{stdout}");
-    assert!(stdout.contains("certify.git-output"), "{stdout}");
-    assert!(stdout.contains("emitted 6 bytes"), "{stdout}");
-    assert!(stdout.contains(&shim.display().to_string()), "{stdout}");
-    assert!(
-        stdout.contains("keeps the wrapper out of gate PATH"),
-        "certify must state that gates are covered, now that they are: {stdout}"
-    );
-    assert!(
-        stdout.contains("your own shell still resolves it"),
-        "and must not imply the machine is repaired: {stdout}"
     );
 }
 

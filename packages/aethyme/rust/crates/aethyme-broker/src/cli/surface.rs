@@ -9,16 +9,12 @@
 
 use super::USAGE;
 
-/// The release that removes every deprecated broker and top-level spelling.
-/// The single place the deprecation window is recorded.
-pub const DEPRECATED_SPELLING_REMOVAL_RELEASE: &str = "v0.8.8";
+/// The release that removes deprecated broker and top-level spellings.
+pub const REMOVED_SPELLING_RELEASE: &str = "v0.8.8";
 
-/// The one stderr line for a deprecated spelling. Never printed on stdout, so
-/// `--json` output stays parseable.
-pub fn deprecation_warning(old: &str, new: &str) -> String {
-    format!(
-        "warning: '{old}' is deprecated; use '{new}' (the old spelling is removed in {DEPRECATED_SPELLING_REMOVAL_RELEASE})"
-    )
+/// Actionable error for a spelling that was removed from the public surface.
+pub fn removed_spelling_message(old: &str, new: &str) -> String {
+    format!("'{old}' was removed in {REMOVED_SPELLING_RELEASE}; use '{new}'")
 }
 
 /// The six verbs `aethyme broker --help` lists.
@@ -172,27 +168,12 @@ fn is_machine_entry_point(args: &[String]) -> bool {
     }
 }
 
-/// A deprecated spelling and its replacement, both as full commands.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Deprecation {
-    pub old: String,
-    pub new: String,
-}
-
-impl Deprecation {
-    pub fn warning(&self) -> String {
-        deprecation_warning(&self.old, &self.new)
-    }
-}
-
 /// A broker command line translated to its internal spelling.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Resolution {
     /// The command line `run_inner` dispatches (no `advanced`, no public
     /// sub-form words).
     pub args: Vec<String>,
-    /// Set when the caller used an old spelling.
-    pub deprecation: Option<Deprecation>,
     /// Set when the command line must not run at all: a public verb spelled
     /// under `advanced`. Refusing it (rather than stripping `advanced`)
     /// keeps resolution a single step, so the router's compatibility
@@ -208,13 +189,12 @@ fn words(prefix: &[&str], rest: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// Translate `args` (after `broker`) to the internal spelling. Idempotent:
-/// resolving an already-internal command line returns it unchanged.
+/// Resolve a public broker command line to its internal spelling. Removed
+/// spellings are refused with their current replacement.
 pub fn resolve(args: &[String]) -> Resolution {
     let Some(first) = args.first().map(String::as_str) else {
         return Resolution {
             args: Vec::new(),
-            deprecation: None,
             refusal: None,
         };
     };
@@ -225,18 +205,17 @@ pub fn resolve(args: &[String]) -> Resolution {
         {
             return Resolution {
                 args: internal.clone(),
-                deprecation: None,
                 refusal: Some(format!(
                     "`{verb}` is not an advanced verb; use 'aethyme broker {}'",
                     internal.join(" ")
                 )),
             };
         }
-        let deprecation = old_spelling_replacement(&internal, true);
+        let refusal = removed_spelling_replacement(&internal, true)
+            .map(|(old, new)| removed_spelling_message(&old, &new));
         return Resolution {
             args: internal,
-            deprecation,
-            refusal: None,
+            refusal,
         };
     }
     if PUBLIC_VERBS.iter().any(|(verb, _)| *verb == first) {
@@ -247,7 +226,6 @@ pub fn resolve(args: &[String]) -> Resolution {
         {
             return Resolution {
                 args: words(internal, &args[2..]),
-                deprecation: None,
                 refusal: None,
             };
         }
@@ -255,20 +233,19 @@ pub fn resolve(args: &[String]) -> Resolution {
         if first == "unblock" && args[1..].iter().all(|arg| arg == "--json") {
             return Resolution {
                 args: words(&["blockers"], &args[1..]),
-                deprecation: None,
                 refusal: None,
             };
         }
         return Resolution {
             args: args.to_vec(),
-            deprecation: None,
             refusal: None,
         };
     }
+    let refusal = removed_spelling_replacement(args, false)
+        .map(|(old, new)| removed_spelling_message(&old, &new));
     Resolution {
         args: args.to_vec(),
-        deprecation: old_spelling_replacement(args, false),
-        refusal: None,
+        refusal,
     }
 }
 
@@ -278,9 +255,9 @@ fn has_flag(args: &[String], flag: &str) -> bool {
         .any(|arg| arg == flag)
 }
 
-/// The replacement for an old internal spelling, or `None` when the spelling
-/// is current (or unknown, which the dispatcher reports).
-fn old_spelling_replacement(args: &[String], via_advanced: bool) -> Option<Deprecation> {
+/// The old and replacement command lines, or `None` for a current or unknown
+/// spelling. These names only produce refusal guidance; they never dispatch.
+fn removed_spelling_replacement(args: &[String], via_advanced: bool) -> Option<(String, String)> {
     let first = args.first()?.as_str();
     if is_machine_entry_point(args) {
         return None;
@@ -319,7 +296,7 @@ fn old_spelling_replacement(args: &[String], via_advanced: bool) -> Option<Depre
             }
         }
     };
-    Some(Deprecation { old, new })
+    Some((old, new))
 }
 
 /// `-h`/`--help` anywhere before a `--` command separator.
@@ -332,6 +309,15 @@ pub fn wants_help(args: &[String]) -> bool {
 /// Help text for a broker command line, or `None` when the command is not
 /// one this surface knows (the dispatcher then reports it as unknown).
 pub fn help_text(args: &[String]) -> Option<String> {
+    if resolve(args).refusal.is_some() {
+        return None;
+    }
+    help_text_for_internal_command(args)
+}
+
+/// Help renderer for trusted internal callers that already resolved the
+/// public spelling before dispatch.
+pub(super) fn help_text_for_internal_command(args: &[String]) -> Option<String> {
     let words: Vec<&str> = args
         .iter()
         .map(String::as_str)
@@ -388,11 +374,7 @@ pub(super) fn advanced_help() -> String {
     for (verb, summary) in ADVANCED_VERBS {
         text.push_str(&format!("  {verb:<16} {summary}\n"));
     }
-    text.push_str(
-        "\nRun `aethyme broker advanced <verb> --help` for a verb's forms and flags.\n\
-         Until the deprecation window closes, `aethyme broker <verb>` still works\n\
-         for each of these and prints a warning naming the `advanced` spelling.\n",
-    );
+    text.push_str("\nRun aethyme broker advanced <verb> --help for command forms and flags.\n");
     text
 }
 
@@ -504,7 +486,7 @@ mod tests {
     }
 
     #[test]
-    fn public_sub_forms_resolve_to_the_old_implementation_without_warning() {
+    fn public_sub_forms_resolve_to_the_internal_implementation() {
         for (public, internal) in [
             ("status readiness plan --json", "readiness plan --json"),
             ("status doctor", "doctor"),
@@ -527,21 +509,31 @@ mod tests {
         ] {
             let resolved = resolve(&args(public));
             assert_eq!(resolved.args, args(internal), "{public}");
-            assert_eq!(resolved.deprecation, None, "{public}");
+            assert_eq!(resolved.refusal, None, "{public}");
         }
     }
 
     #[test]
-    fn resolution_is_idempotent_on_internal_spellings() {
-        for line in [
-            "readiness plan",
-            "adopt --reuse",
-            "leases claim a --session 1",
-            "resources reap",
-            "blockers --json",
+    fn removed_spellings_are_refused_with_their_replacement() {
+        for (line, replacement) in [
+            ("adopt --reuse --task t", "aethyme broker start --reuse"),
+            (
+                "start-agent --task t --cmd c",
+                "aethyme broker start --cmd <command>",
+            ),
+            ("readiness", "aethyme broker status readiness"),
+            ("doctor", "aethyme broker status doctor"),
+            ("prepare --session 1", "aethyme broker submit prepare"),
+            ("close --session 1", "aethyme broker finish close"),
+            ("blockers", "aethyme broker unblock"),
+            ("resources reap", "aethyme broker gc reap"),
+            ("leases claim src/", "aethyme broker advanced leases"),
         ] {
-            let once = resolve(&args(line)).args;
-            assert_eq!(resolve(&once).args, once, "{line}");
+            let refusal = resolve(&args(line))
+                .refusal
+                .unwrap_or_else(|| panic!("{line} should be refused"));
+            assert!(refusal.contains(REMOVED_SPELLING_RELEASE), "{refusal}");
+            assert!(refusal.contains(replacement), "{refusal}");
         }
     }
 
@@ -576,92 +568,30 @@ mod tests {
         }
     }
 
-    /// The router resolves once and hands the result to the broker, which
-    /// resolves again: both must see the identical command, or the router's
-    /// compatibility classification describes a different command than the
-    /// one that runs.
+    /// Public spellings used by the router and in-process broker entry point.
     #[test]
-    fn resolution_reaches_its_fixpoint_in_one_step() {
+    fn canonical_spellings_resolve_without_refusal() {
         let mut corpus: Vec<String> = Vec::new();
-        for (verb, _) in PUBLIC_VERBS.iter().chain(ADVANCED_VERBS) {
+        for (verb, _) in PUBLIC_VERBS {
             corpus.push(format!("{verb} --json"));
-            corpus.push(format!("advanced {verb} --json"));
-            for (_, word, _) in MERGED_FORMS {
+            for (_, word, _) in MERGED_FORMS.iter().filter(|(owner, _, _)| *owner == *verb) {
                 corpus.push(format!("{verb} {word} plan"));
-                corpus.push(format!("advanced {verb} {word} plan"));
             }
         }
-        for (_, _, internal) in MERGED_FORMS {
-            corpus.push(internal.join(" "));
-            corpus.push(format!("advanced {}", internal.join(" ")));
+        for (verb, _) in ADVANCED_VERBS {
+            corpus.push(format!("advanced {verb} --json"));
         }
-        for extra in ["adopt --reuse", "start-agent", "blockers", "init", "e2e"] {
+        for extra in ["start --reuse", "advanced leases claim", "unblock"] {
             corpus.push(extra.to_string());
-            corpus.push(format!("advanced {extra}"));
         }
         for line in corpus {
             let once = resolve(&args(&line));
-            if once.refusal.is_some() {
-                continue;
-            }
-            let twice = resolve(&once.args);
-            assert_eq!(twice.args, once.args, "{line}");
-            assert_eq!(twice.refusal, None, "{line}");
+            assert_eq!(once.refusal, None, "{line}");
         }
     }
 
     #[test]
-    fn old_spellings_warn_with_the_new_spelling() {
-        for (old, new) in [
-            ("adopt --reuse --task t", "aethyme broker start --reuse"),
-            (
-                "adopt --replace-stale",
-                "aethyme broker start --replace-stale",
-            ),
-            ("adopt --task t", "aethyme broker start --adopt"),
-            (
-                "start-agent --task t --cmd c",
-                "aethyme broker start --cmd <command>",
-            ),
-            ("readiness", "aethyme broker status readiness"),
-            ("doctor", "aethyme broker status doctor"),
-            ("prepare --session 1", "aethyme broker submit prepare"),
-            ("promote --entry 1", "aethyme broker submit promote"),
-            (
-                "promotion-record plan",
-                "aethyme broker submit promotion-record",
-            ),
-            ("close --session 1", "aethyme broker finish close"),
-            ("cleanup 1", "aethyme broker finish cleanup"),
-            ("blockers", "aethyme broker unblock"),
-            ("reclaim plan", "aethyme broker gc reclaim"),
-            ("storage", "aethyme broker gc storage"),
-            ("resources reap", "aethyme broker gc reap"),
-            ("init", "aethyme init"),
-            ("certify --json", "aethyme certify"),
-            (
-                "leases claim a --session 1",
-                "aethyme broker advanced leases",
-            ),
-            ("git --session 1 -- status", "aethyme broker advanced git"),
-            ("e2e", "aethyme broker advanced verify-loop"),
-        ] {
-            let deprecation = resolve(&args(old))
-                .deprecation
-                .unwrap_or_else(|| panic!("{old} should be deprecated"));
-            assert_eq!(deprecation.new, new, "{old}");
-            let warning = deprecation.warning();
-            assert!(
-                warning.starts_with("warning: 'aethyme broker "),
-                "{warning}"
-            );
-            assert!(warning.contains(DEPRECATED_SPELLING_REMOVAL_RELEASE));
-            assert_eq!(warning.lines().count(), 1);
-        }
-    }
-
-    #[test]
-    fn current_spellings_and_machine_entry_points_do_not_warn() {
+    fn current_spellings_and_machine_entry_points_are_not_refused() {
         for line in [
             "start --task t",
             "status --json",
@@ -670,14 +600,14 @@ mod tests {
             "gc plan",
             "unblock op:1",
             "advanced leases",
-            "hooks pre-commit",
-            "hooks post-commit",
-            "hooks pre-push",
+            "advanced hooks pre-commit",
+            "advanced hooks post-commit",
+            "advanced hooks pre-push",
             "quick-test",
             "check-contract --base main",
             "no-such-verb",
         ] {
-            assert_eq!(resolve(&args(line)).deprecation, None, "{line}");
+            assert_eq!(resolve(&args(line)).refusal, None, "{line}");
         }
     }
 
@@ -699,6 +629,7 @@ mod tests {
             assert!(top.contains(&format!("  {verb} ")), "{verb}");
         }
         assert!(help_text(&args("no-such-verb --help")).is_none());
+        assert!(help_text(&args("readiness --help")).is_none());
     }
 
     #[test]

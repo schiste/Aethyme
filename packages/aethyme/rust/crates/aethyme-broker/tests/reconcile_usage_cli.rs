@@ -60,22 +60,36 @@ fn every_reconcile_usage_error_includes_the_complete_required_contract() {
     let state = temp.path().join("host-state");
 
     for args in [
-        &["resources", "reconcile"][..],
-        &["resources", "reconcile", "lease-1"][..],
-        &["resources", "reconcile", "lease-1", "--confirm", "bad"][..],
+        &["advanced", "resources", "reconcile"][..],
+        &["advanced", "resources", "reconcile", "lease-1"][..],
+        &[
+            "advanced",
+            "resources",
+            "reconcile",
+            "lease-1",
+            "--confirm",
+            "bad",
+        ][..],
     ] {
         assert_usage(run(&repo, &state, args), RESOURCES_USAGE);
     }
 
     for args in [
-        &["operations", "reconcile"][..],
-        &["operations", "reconcile", "--operation", "1"][..],
-        &["operations", "reconcile", "--operation", "not-an-id"][..],
-        &["operations", "reconcile", "--operation"][..],
-        &["operations", "reconcile", "--outcome"][..],
-        &["operations", "reconcile", "--reason"][..],
-        &["operations", "reconcile", "--unexpected"][..],
+        &["advanced", "operations", "reconcile"][..],
+        &["advanced", "operations", "reconcile", "--operation", "1"][..],
         &[
+            "advanced",
+            "operations",
+            "reconcile",
+            "--operation",
+            "not-an-id",
+        ][..],
+        &["advanced", "operations", "reconcile", "--operation"][..],
+        &["advanced", "operations", "reconcile", "--outcome"][..],
+        &["advanced", "operations", "reconcile", "--reason"][..],
+        &["advanced", "operations", "reconcile", "--unexpected"][..],
+        &[
+            "advanced",
             "operations",
             "reconcile",
             "--operation",
@@ -84,6 +98,7 @@ fn every_reconcile_usage_error_includes_the_complete_required_contract() {
             "unknown",
         ][..],
         &[
+            "advanced",
             "operations",
             "reconcile",
             "--operation",
@@ -92,6 +107,7 @@ fn every_reconcile_usage_error_includes_the_complete_required_contract() {
             "failed",
         ][..],
         &[
+            "advanced",
             "operations",
             "reconcile",
             "--operation",
@@ -102,6 +118,7 @@ fn every_reconcile_usage_error_includes_the_complete_required_contract() {
             "external inspection found no effect",
         ][..],
         &[
+            "advanced",
             "operations",
             "reconcile",
             "--operation",
@@ -116,9 +133,17 @@ fn every_reconcile_usage_error_includes_the_complete_required_contract() {
     }
 
     for args in [
-        &["integration", "reconcile"][..],
-        &["integration", "reconcile", "--upstream", "HEAD", "--apply"][..],
+        &["advanced", "integration", "reconcile"][..],
         &[
+            "advanced",
+            "integration",
+            "reconcile",
+            "--upstream",
+            "HEAD",
+            "--apply",
+        ][..],
+        &[
+            "advanced",
             "integration",
             "reconcile",
             "--upstream",
@@ -166,6 +191,7 @@ fn originating_github_write_prints_the_complete_reconciliation_handoff() {
     let session_id = session.id.to_string();
     let output = Command::new(CLI)
         .args([
+            "advanced",
             "gh",
             "--session",
             &session_id,
@@ -212,7 +238,13 @@ fn originating_github_write_prints_the_complete_reconciliation_handoff() {
     let shown = run(
         &repo,
         &state,
-        &["operations", "show", &operation_id_arg, "--json"],
+        &[
+            "advanced",
+            "operations",
+            "show",
+            &operation_id_arg,
+            "--json",
+        ],
     );
     assert!(shown.status.success());
     let shown: serde_json::Value = serde_json::from_slice(&shown.stdout).unwrap();
@@ -233,7 +265,11 @@ fn originating_github_write_prints_the_complete_reconciliation_handoff() {
             .contains("--reason")
     );
 
-    let shown_text = run(&repo, &state, &["operations", "show", &operation_id_arg]);
+    let shown_text = run(
+        &repo,
+        &state,
+        &["advanced", "operations", "show", &operation_id_arg],
+    );
     assert!(shown_text.status.success());
     let shown_text = String::from_utf8_lossy(&shown_text.stdout);
     assert!(shown_text.contains("Reconciliation: required"));

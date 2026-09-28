@@ -1921,6 +1921,9 @@ fn read_rollback_journal(
     Ok((path, journal))
 }
 
+const READINESS_RECOVERY_COMMAND: &str = "aethyme broker status readiness recover";
+const LEGACY_READINESS_RECOVERY_COMMAND: &str = "aethyme broker readiness recover";
+
 fn validate_rollback_journal(
     journal: &UpgradeRollbackJournal,
     plan_digest: &str,
@@ -1946,7 +1949,8 @@ fn validate_rollback_journal(
         return Err("rollback journal marker path does not match its repository mode".into());
     }
     if journal.recovery_command != "aethyme upgrade recover"
-        && journal.recovery_command != "aethyme broker readiness recover"
+        && journal.recovery_command != READINESS_RECOVERY_COMMAND
+        && journal.recovery_command != LEGACY_READINESS_RECOVERY_COMMAND
     {
         return Err("rollback journal contains an unsupported recovery command".into());
     }
@@ -2153,26 +2157,34 @@ pub(crate) fn recover(
     repo_hint: &Path,
     plan_digest: &str,
 ) -> Result<RepositoryUpgradeRecovery, String> {
-    recover_for_command(repo_hint, plan_digest, "aethyme upgrade recover")
+    recover_for_command(repo_hint, plan_digest, "aethyme upgrade recover", None)
 }
 
 pub(crate) fn recover_readiness_remediation(
     repo_hint: &Path,
     plan_digest: &str,
 ) -> Result<RepositoryUpgradeRecovery, String> {
-    recover_for_command(repo_hint, plan_digest, "aethyme broker readiness recover")
+    recover_for_command(
+        repo_hint,
+        plan_digest,
+        READINESS_RECOVERY_COMMAND,
+        Some(LEGACY_READINESS_RECOVERY_COMMAND),
+    )
 }
 
 fn recover_for_command(
     repo_hint: &Path,
     plan_digest: &str,
     expected_recovery_command: &str,
+    legacy_recovery_command: Option<&str>,
 ) -> Result<RepositoryUpgradeRecovery, String> {
     validate_plan_digest(plan_digest)?;
     let repo = git_root(repo_hint)?;
     let _lock = acquire_upgrade_lock(&repo)?;
     let (path, journal) = read_rollback_journal(&repo, plan_digest)?;
-    if journal.recovery_command != expected_recovery_command {
+    if journal.recovery_command != expected_recovery_command
+        && Some(journal.recovery_command.as_str()) != legacy_recovery_command
+    {
         return Err(format!(
             "plan {plan_digest} belongs to `{}`; recover it through that exact command",
             journal.recovery_command
@@ -2916,7 +2928,7 @@ pub(crate) fn apply_readiness_remediation(
         existing_managed_state_digest: &built.report.managed_state_digest,
         mode: built.report.repository_mode,
         marker_path,
-        recovery_command: "aethyme broker readiness recover",
+        recovery_command: READINESS_RECOVERY_COMMAND,
         require_reviewed_before_state: true,
         changes: &built.transaction_plan.changes,
     };

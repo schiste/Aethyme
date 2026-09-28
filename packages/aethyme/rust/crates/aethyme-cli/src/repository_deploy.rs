@@ -13,6 +13,7 @@ struct Options {
     action: Action,
     repo: PathBuf,
     force: bool,
+    generated_only: bool,
     local_only: bool,
     with_graph: bool,
     graph_repository: Option<String>,
@@ -56,6 +57,9 @@ pub fn run(args: &[String]) -> u8 {
         }
     };
 
+    if options.generated_only {
+        return run_generated_only(&repo, options.action, options.force);
+    }
     if options.action == Action::Bridge {
         return install_bridge(&repo);
     }
@@ -77,7 +81,7 @@ pub fn run(args: &[String]) -> u8 {
     }
 
     let scaffold = in_repo(&repo, || {
-        aethyme_broker::cli::run(&["scaffold".to_string()])
+        aethyme_broker::cli::run_resolved(&["scaffold".to_string()])
     });
     if scaffold != 0 {
         return scaffold;
@@ -96,7 +100,7 @@ pub fn run(args: &[String]) -> u8 {
         }
     }
     let gates = in_repo(&repo, || {
-        aethyme_broker::cli::run(&["gates".to_string(), "draft".to_string()])
+        aethyme_broker::cli::run_resolved(&["gates".to_string(), "draft".to_string()])
     });
     if gates != 0 {
         return gates;
@@ -146,13 +150,16 @@ fn verify_repository(repo: &Path) -> u8 {
     if verified != 0 {
         return verified;
     }
-    in_repo(repo, || aethyme_broker::cli::run(&["certify".to_string()]))
+    in_repo(repo, || {
+        aethyme_broker::cli::run_resolved(&["certify".to_string()])
+    })
 }
 
 fn parse_args(args: &[String]) -> Result<Options, String> {
     let mut action = Action::Deploy;
     let mut repo = PathBuf::from(".");
     let mut force = false;
+    let mut generated_only = false;
     let mut local_only = false;
     let mut with_graph = false;
     let mut graph_repository = None;
@@ -179,6 +186,10 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
                 force = true;
                 index += 1;
             }
+            "--generated-only" if action != Action::Bridge => {
+                generated_only = true;
+                index += 1;
+            }
             "--local-only" if action != Action::Bridge => {
                 local_only = true;
                 index += 1;
@@ -203,10 +214,16 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
     if graph_repository.is_some() && !with_graph {
         return Err("--graph-repository requires --with-graph".into());
     }
+    if generated_only && (local_only || with_graph || graph_repository.is_some()) {
+        return Err(
+            "--generated-only cannot be combined with --local-only or graph options".into(),
+        );
+    }
     Ok(Options {
         action,
         repo,
         force,
+        generated_only,
         local_only,
         with_graph,
         graph_repository,
@@ -241,11 +258,31 @@ fn print_usage() {
     println!("  aethyme deploy plan [--repo <path>] [--diff|--json]");
     println!("  aethyme deploy execute [--repo <path>] --confirm <plan-sha256> [--json]");
     println!(
-        "  aethyme deploy [--repo <path>] [--force] [--with-graph [--graph-repository <owner/name>]]"
+        "  aethyme deploy [--repo <path>] [--force] [--generated-only] [--with-graph [--graph-repository <owner/name>]]"
     );
     println!("  aethyme deploy bridge [--repo <path>]");
     println!("  aethyme deploy --local-only [--repo <path>] [--force]");
-    println!("  aethyme deploy verify [--repo <path>] [--local-only]");
+    println!("  aethyme deploy verify [--repo <path>] [--local-only|--generated-only]");
+}
+
+fn run_generated_only(repo: &Path, action: Action, force: bool) -> u8 {
+    let command = match action {
+        Action::Deploy => "deploy",
+        Action::Verify => "verify",
+        Action::Bridge => {
+            eprintln!("aethyme deploy: --generated-only is unavailable for bridge");
+            return 2;
+        }
+    };
+    let mut args = vec![
+        command.to_string(),
+        "--repo".to_string(),
+        repo.display().to_string(),
+    ];
+    if force {
+        args.push("--force".to_string());
+    }
+    aethyme_enhance::cli::run(&args)
 }
 
 fn install_bridge(repo: &Path) -> u8 {
@@ -341,7 +378,9 @@ fn verify_local_repository(repo: &Path) -> u8 {
             return 1;
         }
     }
-    in_repo(repo, || aethyme_broker::cli::run(&["certify".to_string()]))
+    in_repo(repo, || {
+        aethyme_broker::cli::run_resolved(&["certify".to_string()])
+    })
 }
 
 fn print_checks(report: &aethyme_broker::init::InitReport) {

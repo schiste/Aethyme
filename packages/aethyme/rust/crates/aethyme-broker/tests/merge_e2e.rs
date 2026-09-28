@@ -886,6 +886,7 @@ fn reviewed_checkpoint_recovery_preserves_head_and_reanchors_without_hiding_foll
     assert_eq!(plan.digest.len(), 64);
     let cli = Command::new(env!("CARGO_BIN_EXE_broker-cli-shim"))
         .args([
+            "advanced",
             "checkpoint",
             "plan",
             "--session",

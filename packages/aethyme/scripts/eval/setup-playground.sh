@@ -148,8 +148,8 @@ if [[ ! -f "$GRAPH_INDEXER" ]]; then
     exit 1
 fi
 
-# enhance deploy/verify are native since the Phase 2 flip (2026-07-29):
-# the router binary answers them; python -m src.cli enhance no longer exists.
+# Use the installed router while preserving the evaluator's discoverability-only
+# setup: --generated-only skips broker enrollment and gate drafting.
 if [[ ! -f "$AETHYME_ROOT/rust/target/release/aethyme" ]]; then
     echo "ERROR: Router binary not found at $AETHYME_ROOT/rust/target/release/aethyme"
     echo "Build it: cd $AETHYME_ROOT/rust && cargo build --release --bin aethyme"
@@ -230,7 +230,7 @@ echo ">>> Materializing Redb graph store..."
 "$ENGINE" index --repo . 2>&1 | tail -5
 
 echo ">>> Deploying enhancement files..."
-"$AETHYME_ROOT/rust/target/release/aethyme" enhance deploy --repo "$AETHYME_DIR" --force
+"$AETHYME_ROOT/rust/target/release/aethyme" deploy --generated-only --repo "$AETHYME_DIR" --force
 hide_tracked_generated_artifacts "$AETHYME_DIR"
 echo "  Aethyme: generated artifacts hidden from git/ripgrep discovery via .git/info/exclude"
 
@@ -253,7 +253,7 @@ cd "$CONTROL_DIR"
 
 # Aethyme checks: enhancement files via the canonical verifier, plus the redb store
 cd "$AETHYME_DIR"
-if "$AETHYME_ROOT/rust/target/release/aethyme" enhance verify --repo "$AETHYME_DIR"; then
+if "$AETHYME_ROOT/rust/target/release/aethyme" deploy verify --generated-only --repo "$AETHYME_DIR"; then
     echo "  Aethyme: enhancement files OK"
 else
     echo "  FAIL: Aethyme enhancement verification failed"

@@ -76,7 +76,16 @@ fn a_command_that_fails_on_its_own_is_not_reported_as_an_ownership_failure() {
     let (repo, state, packed) = fixture();
     let (id, worktree) = split(&packed);
     let out = Command::new(CLI)
-        .args(["exec", "--session", id, "--", "sh", "-c", "exit 3"])
+        .args([
+            "advanced",
+            "exec",
+            "--session",
+            id,
+            "--",
+            "sh",
+            "-c",
+            "exit 3",
+        ])
         .current_dir(worktree)
         .env("AETHYME_HOST_STATE_DIR", state.path())
         .output()
@@ -113,6 +122,7 @@ fn a_write_outside_ownership_is_reported_as_a_refusal() {
     let (id, worktree) = split(&packed);
     let out = Command::new(CLI)
         .args([
+            "advanced",
             "exec",
             "--session",
             id,

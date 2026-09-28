@@ -115,6 +115,7 @@ fn an_operation_waiting_for_the_lock_is_visible_as_prepared() {
     // Holds the repository write lock for ~6 seconds.
     let mut holder = Command::new(CLI)
         .args([
+            "advanced",
             "git",
             "--session",
             &session,
@@ -146,7 +147,7 @@ fn an_operation_waiting_for_the_lock_is_visible_as_prepared() {
             repo.path(),
             state.path(),
             None,
-            &["operations", "list", "--json"],
+            &["advanced", "operations", "list", "--json"],
         );
         if String::from_utf8_lossy(&listed.stdout).contains("\"running\"") {
             holding = true;
@@ -158,6 +159,7 @@ fn an_operation_waiting_for_the_lock_is_visible_as_prepared() {
     // A second operation that can only queue behind it.
     let waiter = Command::new(CLI)
         .args([
+            "advanced",
             "git",
             "--session",
             &session,
@@ -184,7 +186,7 @@ fn an_operation_waiting_for_the_lock_is_visible_as_prepared() {
             repo.path(),
             state.path(),
             None,
-            &["operations", "list", "--json"],
+            &["advanced", "operations", "list", "--json"],
         );
         let parsed: serde_json::Value =
             serde_json::from_slice(&listed.stdout).unwrap_or(serde_json::Value::Null);
@@ -239,7 +241,12 @@ fn an_operation_waiting_for_the_lock_is_visible_as_prepared() {
             );
             assert!(details["coordination_wait"]["waited_ms"].as_i64().is_some());
 
-            let human = run(repo.path(), state.path(), None, &["operations", "list"]);
+            let human = run(
+                repo.path(),
+                state.path(),
+                None,
+                &["advanced", "operations", "list"],
+            );
             let human = String::from_utf8_lossy(&human.stdout);
             let holder_id = holder_id.expect("the holder must be visible beside the waiter");
             assert!(
@@ -297,6 +304,7 @@ fn an_identical_pending_command_from_one_session_is_refused() {
 
     let mut holder = Command::new(CLI)
         .args([
+            "advanced",
             "git",
             "--session",
             &session,
@@ -326,7 +334,7 @@ fn an_identical_pending_command_from_one_session_is_refused() {
             repo.path(),
             state.path(),
             None,
-            &["operations", "list", "--json"],
+            &["advanced", "operations", "list", "--json"],
         );
         if String::from_utf8_lossy(&listed.stdout).contains("\"running\"") {
             holding = true;
@@ -338,6 +346,7 @@ fn an_identical_pending_command_from_one_session_is_refused() {
     let queued = |name: &str| {
         Command::new(CLI)
             .args([
+                "advanced",
                 "git",
                 "--session",
                 &session,
@@ -405,6 +414,7 @@ fn no_wait_refuses_immediately_instead_of_queueing() {
 
     let mut holder = Command::new(CLI)
         .args([
+            "advanced",
             "git",
             "--session",
             &session,
@@ -434,7 +444,7 @@ fn no_wait_refuses_immediately_instead_of_queueing() {
             repo.path(),
             state.path(),
             None,
-            &["operations", "list", "--json"],
+            &["advanced", "operations", "list", "--json"],
         );
         if String::from_utf8_lossy(&listed.stdout).contains("\"running\"") {
             holding = true;
@@ -449,6 +459,7 @@ fn no_wait_refuses_immediately_instead_of_queueing() {
         state.path(),
         None,
         &[
+            "advanced",
             "git",
             "--session",
             &session,

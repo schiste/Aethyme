@@ -149,11 +149,11 @@ cost = 0
 
     let manifest = stdout(run(
         tmp.path(),
-        &["gates", "manifest", "--head", &head, "--json"],
+        &["advanced", "gates", "manifest", "--head", &head, "--json"],
     ));
     let repeated = stdout(run(
         tmp.path(),
-        &["gates", "manifest", "--head", &head, "--json"],
+        &["advanced", "gates", "manifest", "--head", &head, "--json"],
     ));
     assert_eq!(manifest, repeated);
     assert!(!manifest.contains("SECRET_TOKEN"), "{manifest}");
@@ -191,7 +191,9 @@ cost = 0
 
     let scope = stdout(run(
         tmp.path(),
-        &["gates", "scope", "--base", &base, "--head", &head, "--json"],
+        &[
+            "advanced", "gates", "scope", "--base", &base, "--head", &head, "--json",
+        ],
     ));
     assert!(
         !scope.contains(&tmp.path().display().to_string()),
@@ -222,7 +224,7 @@ cost = 0
     let empty_scope = stdout(run(
         tmp.path(),
         &[
-            "gates", "scope", "--base", &head, "--head", &empty, "--json",
+            "advanced", "gates", "scope", "--base", &head, "--head", &empty, "--json",
         ],
     ));
     let empty_scope: serde_json::Value = serde_json::from_str(&empty_scope).unwrap();
@@ -235,7 +237,7 @@ cost = 0
     let before = git_output(tmp.path(), &["status", "--porcelain=v1"]);
     let corrupted = run(
         tmp.path(),
-        &["gates", "manifest", "--head", "HEAD", "--json"],
+        &["advanced", "gates", "manifest", "--head", "HEAD", "--json"],
     );
     assert!(!corrupted.status.success());
     assert!(
@@ -246,6 +248,7 @@ cost = 0
     let missing = run(
         tmp.path(),
         &[
+            "advanced",
             "gates",
             "scope",
             "--base",
@@ -306,7 +309,7 @@ fn submit_verification_case(gates: Option<&str>) -> (serde_json::Value, String) 
     );
     let adopted = stdout(run(
         &worktree,
-        &["adopt", "--task", "gate evidence", "--json"],
+        &["start", "--adopt", "--task", "gate evidence", "--json"],
     ));
     let adopted: serde_json::Value = serde_json::from_str(&adopted).unwrap();
     let session = adopted["id"].as_i64().unwrap().to_string();
@@ -365,12 +368,15 @@ fn gate_cli_reports_tree_provenance_for_executed_and_cached_results() {
     let tmp = fixture();
     let first_tree = tree_hash(tmp.path());
 
-    let executed_text = stdout(run(tmp.path(), &["gates", "run", "--all"]));
+    let executed_text = stdout(run(tmp.path(), &["advanced", "gates", "run", "--all"]));
     assert!(executed_text.contains(&format!("(tree {})", &first_tree[..12])));
     assert!(!executed_text.contains("(cached)"));
     assert_eq!(run_count(&tmp.path().join("gate-runs.txt")), 1);
 
-    let cached_json = stdout(run(tmp.path(), &["gates", "run", "--all", "--json"]));
+    let cached_json = stdout(run(
+        tmp.path(),
+        &["advanced", "gates", "run", "--all", "--json"],
+    ));
     let cached: serde_json::Value = serde_json::from_str(&cached_json).unwrap();
     assert_eq!(cached[0]["cached"], true);
     assert_eq!(cached[0]["tree_hash"], first_tree);
@@ -383,7 +389,10 @@ fn gate_cli_reports_tree_provenance_for_executed_and_cached_results() {
     let second_tree = tree_hash(tmp.path());
     assert_ne!(second_tree, first_tree);
 
-    let executed_json = stdout(run(tmp.path(), &["gates", "run", "--all", "--json"]));
+    let executed_json = stdout(run(
+        tmp.path(),
+        &["advanced", "gates", "run", "--all", "--json"],
+    ));
     let executed: serde_json::Value = serde_json::from_str(&executed_json).unwrap();
     assert_eq!(executed[0]["cached"], false);
     assert_eq!(executed[0]["tree_hash"], second_tree);
@@ -392,21 +401,24 @@ fn gate_cli_reports_tree_provenance_for_executed_and_cached_results() {
     assert!(executed[0]["output_bytes"].as_i64().unwrap() > 0);
     assert_eq!(run_count(&tmp.path().join("gate-runs.txt")), 2);
 
-    let cached_text = stdout(run(tmp.path(), &["gates", "run", "--all"]));
+    let cached_text = stdout(run(tmp.path(), &["advanced", "gates", "run", "--all"]));
     assert!(cached_text.contains("(cached)"));
     assert!(cached_text.contains(&format!("(tree {})", &second_tree[..12])));
     assert_eq!(run_count(&tmp.path().join("gate-runs.txt")), 2);
 
     let bypassed_json = stdout(run(
         tmp.path(),
-        &["gates", "run", "--all", "--no-cache", "--json"],
+        &["advanced", "gates", "run", "--all", "--no-cache", "--json"],
     ));
     let bypassed: serde_json::Value = serde_json::from_str(&bypassed_json).unwrap();
     assert_eq!(bypassed[0]["cached"], false);
     assert_eq!(bypassed[0]["tree_hash"], second_tree);
     assert_eq!(run_count(&tmp.path().join("gate-runs.txt")), 3);
 
-    let refreshed_json = stdout(run(tmp.path(), &["gates", "run", "--all", "--json"]));
+    let refreshed_json = stdout(run(
+        tmp.path(),
+        &["advanced", "gates", "run", "--all", "--json"],
+    ));
     let refreshed: serde_json::Value = serde_json::from_str(&refreshed_json).unwrap();
     assert_eq!(refreshed[0]["cached"], true);
     assert_eq!(refreshed[0]["tree_hash"], second_tree);
@@ -414,13 +426,14 @@ fn gate_cli_reports_tree_provenance_for_executed_and_cached_results() {
 
     let adopted = stdout(run(
         tmp.path(),
-        &["adopt", "--task", "session gates", "--json"],
+        &["start", "--adopt", "--task", "session gates", "--json"],
     ));
     let session: serde_json::Value = serde_json::from_str(&adopted).unwrap();
     let session_id = session["id"].as_i64().unwrap().to_string();
     let session_bypass = stdout(run(
         tmp.path(),
         &[
+            "advanced",
             "gates",
             "run",
             "--session",
@@ -435,7 +448,14 @@ fn gate_cli_reports_tree_provenance_for_executed_and_cached_results() {
 
     let session_cached = stdout(run(
         tmp.path(),
-        &["gates", "run", "--session", &session_id, "--json"],
+        &[
+            "advanced",
+            "gates",
+            "run",
+            "--session",
+            &session_id,
+            "--json",
+        ],
     ));
     let session_cached: serde_json::Value = serde_json::from_str(&session_cached).unwrap();
     assert_eq!(session_cached[0]["cached"], true);
@@ -454,7 +474,10 @@ command = "printf '%s' \"$AETHYME_BROKER_DB\" > gate-broker-db-path.txt"
     )
     .unwrap();
 
-    stdout(run(tmp.path(), &["gates", "run", "--all", "--no-cache"]));
+    stdout(run(
+        tmp.path(),
+        &["advanced", "gates", "run", "--all", "--no-cache"],
+    ));
 
     let configured_path =
         std::fs::read_to_string(tmp.path().join("gate-broker-db-path.txt")).unwrap();
@@ -490,7 +513,7 @@ fn gate_refuses_invalid_inherited_database_scope_before_running_the_command() {
     let repo = fixture();
     write_gate(repo.path(), "touch must-not-run");
     let output = Command::new(CLI)
-        .args(["gates", "run", "--all", "--no-cache", "--json"])
+        .args(["advanced", "gates", "run", "--all", "--no-cache", "--json"])
         .current_dir(repo.path())
         .env("AETHYME_GATE_BROKER_DATABASES", "invalid json")
         .env_remove(aethyme_broker::BROKER_DB_ENV)
@@ -518,7 +541,7 @@ fn failed_gate_also_reclaims_its_temporary_database() {
     );
     let output = run(
         repo.path(),
-        &["gates", "run", "--all", "--no-cache", "--json"],
+        &["advanced", "gates", "run", "--all", "--no-cache", "--json"],
     );
     assert!(!output.status.success());
     let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
@@ -535,7 +558,7 @@ fn gate_scope_separates_fixtures_and_protects_the_linked_primary() {
     let second = fixture();
     stdout(run(
         primary.path(),
-        &["adopt", "--task", "live operator", "--json"],
+        &["start", "--adopt", "--task", "live operator", "--json"],
     ));
     let linked = primary.path().join(".aethyme/worktrees/linked");
     std::fs::create_dir_all(linked.parent().unwrap()).unwrap();
@@ -558,7 +581,7 @@ fn gate_scope_separates_fixtures_and_protects_the_linked_primary() {
         (second.path(), "second"),
     ] {
         commands.push(format!(
-            "(cd {} && {} adopt --task {} --json) > {}",
+            "(cd {} && {} start --adopt --task {} --json) > {}",
             shell_path(repo),
             shell_path(Path::new(CLI)),
             name,
@@ -568,7 +591,7 @@ fn gate_scope_separates_fixtures_and_protects_the_linked_primary() {
     write_gate(primary.path(), &commands.join(" && "));
     let result: serde_json::Value = serde_json::from_str(&stdout(run(
         primary.path(),
-        &["gates", "run", "--all", "--no-cache", "--json"],
+        &["advanced", "gates", "run", "--all", "--no-cache", "--json"],
     )))
     .unwrap();
     assert_eq!(result[0]["status"], "pass", "{result}");
@@ -604,13 +627,13 @@ fn nested_gate_retains_ancestor_database_isolation() {
     let inner = fixture();
     stdout(run(
         outer.path(),
-        &["adopt", "--task", "live operator", "--json"],
+        &["start", "--adopt", "--task", "live operator", "--json"],
     ));
     let commands: Vec<_> = [(outer.path(), "outer-child"), (inner.path(), "inner-child")]
         .into_iter()
         .map(|(repo, name)| {
             format!(
-                "(cd {} && {} adopt --task {} --json) > {}",
+                "(cd {} && {} start --adopt --task {} --json) > {}",
                 shell_path(repo),
                 shell_path(Path::new(CLI)),
                 name,
@@ -622,14 +645,14 @@ fn nested_gate_retains_ancestor_database_isolation() {
     write_gate(
         outer.path(),
         &format!(
-            "cd {} && {} gates run --all --no-cache",
+            "cd {} && {} advanced gates run --all --no-cache",
             shell_path(inner.path()),
             shell_path(Path::new(CLI))
         ),
     );
     let result: serde_json::Value = serde_json::from_str(&stdout(run(
         outer.path(),
-        &["gates", "run", "--all", "--no-cache", "--json"],
+        &["advanced", "gates", "run", "--all", "--no-cache", "--json"],
     )))
     .unwrap();
     assert_eq!(result[0]["status"], "pass", "{result}");
@@ -678,7 +701,7 @@ fn gate_validate_reads_the_invoking_worktree_snapshot() {
     )
     .unwrap();
 
-    let output = stdout(run(&worktree, &["gates", "validate", "--json"]));
+    let output = stdout(run(&worktree, &["advanced", "gates", "validate", "--json"]));
     let gates: serde_json::Value = serde_json::from_str(&output).unwrap();
     assert_eq!(gates[0]["name"], "worktree-only");
 }
@@ -694,7 +717,14 @@ fn pre_push_adapter_proves_the_clean_outgoing_head_and_refuses_drift() {
 
     let verified = stdout(run_with_stdin(
         tmp.path(),
-        &["gates", "pre-push", "origin", "unused-url", "--json"],
+        &[
+            "advanced",
+            "gates",
+            "pre-push",
+            "origin",
+            "unused-url",
+            "--json",
+        ],
         &update,
     ));
     let report: serde_json::Value = serde_json::from_str(&verified).unwrap();
@@ -707,7 +737,7 @@ fn pre_push_adapter_proves_the_clean_outgoing_head_and_refuses_drift() {
     std::fs::write(tmp.path().join("tracked.txt"), "dirty\n").unwrap();
     let dirty = run_with_stdin(
         tmp.path(),
-        &["gates", "pre-push", "origin", "unused-url"],
+        &["advanced", "gates", "pre-push", "origin", "unused-url"],
         &update,
     );
     assert!(!dirty.status.success());
@@ -721,7 +751,7 @@ fn pre_push_adapter_proves_the_clean_outgoing_head_and_refuses_drift() {
     );
     let mismatch = run_with_stdin(
         tmp.path(),
-        &["gates", "pre-push", "origin", "unused-url"],
+        &["advanced", "gates", "pre-push", "origin", "unused-url"],
         &wrong_tip,
     );
     assert!(!mismatch.status.success());
@@ -736,7 +766,7 @@ fn pre_push_adapter_proves_the_clean_outgoing_head_and_refuses_drift() {
     );
     let ambiguous = run_with_stdin(
         tmp.path(),
-        &["gates", "pre-push", "origin", "unused-url"],
+        &["advanced", "gates", "pre-push", "origin", "unused-url"],
         &multiple_tips,
     );
     assert!(!ambiguous.status.success());
@@ -747,7 +777,7 @@ fn pre_push_adapter_proves_the_clean_outgoing_head_and_refuses_drift() {
 
     let empty = run_with_stdin(
         tmp.path(),
-        &["gates", "pre-push", "origin", "unused-url"],
+        &["advanced", "gates", "pre-push", "origin", "unused-url"],
         "",
     );
     assert!(!empty.status.success());
@@ -756,7 +786,14 @@ fn pre_push_adapter_proves_the_clean_outgoing_head_and_refuses_drift() {
     let deletion = format!("(delete) {} refs/heads/old {head}\n", "0".repeat(40));
     let deleted = stdout(run_with_stdin(
         tmp.path(),
-        &["gates", "pre-push", "origin", "unused-url", "--json"],
+        &[
+            "advanced",
+            "gates",
+            "pre-push",
+            "origin",
+            "unused-url",
+            "--json",
+        ],
         &deletion,
     ));
     let report: serde_json::Value = serde_json::from_str(&deleted).unwrap();
@@ -783,7 +820,7 @@ fn submit_cli_reports_an_unchanged_worktree_submission_as_a_noop() {
     );
     let adopted = stdout(run(
         &worktree,
-        &["adopt", "--task", "inspect only", "--json"],
+        &["start", "--adopt", "--task", "inspect only", "--json"],
     ));
     let session: serde_json::Value = serde_json::from_str(&adopted).unwrap();
     let session_id = session["id"].as_i64().unwrap().to_string();
@@ -841,7 +878,7 @@ fn submit_cli_bypasses_and_then_refreshes_the_merged_tree_cache() {
     );
     let adopted = stdout(run(
         &worktree,
-        &["adopt", "--task", "submit cache", "--json"],
+        &["start", "--adopt", "--task", "submit cache", "--json"],
     ));
     let session: serde_json::Value = serde_json::from_str(&adopted).unwrap();
     let session_id = session["id"].as_i64().unwrap().to_string();
@@ -911,7 +948,10 @@ fn session_gate_proof_is_reused_by_unchanged_integration_submission() {
             "main",
         ],
     );
-    let adopted = stdout(run(&worktree, &["adopt", "--task", "prove once", "--json"]));
+    let adopted = stdout(run(
+        &worktree,
+        &["start", "--adopt", "--task", "prove once", "--json"],
+    ));
     let session: serde_json::Value = serde_json::from_str(&adopted).unwrap();
     let session_id = session["id"].as_i64().unwrap().to_string();
     std::fs::write(worktree.join("tracked.txt"), "proved\n").unwrap();
@@ -920,7 +960,14 @@ fn session_gate_proof_is_reused_by_unchanged_integration_submission() {
 
     let preflight = stdout(run(
         &worktree,
-        &["gates", "run", "--session", &session_id, "--json"],
+        &[
+            "advanced",
+            "gates",
+            "run",
+            "--session",
+            &session_id,
+            "--json",
+        ],
     ));
     let preflight: serde_json::Value = serde_json::from_str(&preflight).unwrap();
     assert_eq!(preflight[0]["cached"], false);
@@ -974,7 +1021,7 @@ name = "host-test-shared"
     }
 
     let running = Command::new(CLI)
-        .args(["gates", "run", "--all", "--no-cache", "--json"])
+        .args(["advanced", "gates", "run", "--all", "--no-cache", "--json"])
         .current_dir(first.path())
         .env("AETHYME_HOST_STATE_DIR", state.path())
         .stdout(Stdio::piped())
@@ -998,7 +1045,7 @@ name = "host-test-shared"
     assert!(observed, "first gate never acquired its host bundle");
 
     let blocked = Command::new(CLI)
-        .args(["gates", "run", "--all", "--no-cache", "--json"])
+        .args(["advanced", "gates", "run", "--all", "--no-cache", "--json"])
         .current_dir(second.path())
         .env("AETHYME_HOST_STATE_DIR", state.path())
         .output()
@@ -1053,7 +1100,7 @@ name = "host-test-shared"
     let failing_config = config.replace(" && sleep 6", " && false");
     std::fs::write(first.path().join(".aethyme/gates.toml"), failing_config).unwrap();
     let failed = Command::new(CLI)
-        .args(["gates", "run", "--all", "--no-cache", "--json"])
+        .args(["advanced", "gates", "run", "--all", "--no-cache", "--json"])
         .current_dir(first.path())
         .env("AETHYME_HOST_STATE_DIR", state.path())
         .output()
@@ -1092,7 +1139,7 @@ max_bytes = 3
 
     let run = || {
         Command::new(CLI)
-            .args(["gates", "run", "--all", "--no-cache", "--json"])
+            .args(["advanced", "gates", "run", "--all", "--no-cache", "--json"])
             .current_dir(repo.path())
             .env("AETHYME_HOST_STATE_DIR", host_state.path())
             .env("AETHYME_HOST_CACHE_DIR", host_cache.path())
@@ -1226,7 +1273,7 @@ max_bytes = 4294967296
     let host_cache = tempfile::tempdir().unwrap();
     let gate = |tree: &Path| {
         let output = Command::new(CLI)
-            .args(["gates", "run", "--all", "--no-cache", "--json"])
+            .args(["advanced", "gates", "run", "--all", "--no-cache", "--json"])
             .current_dir(tree)
             .env("AETHYME_HOST_STATE_DIR", host_state.path())
             .env("AETHYME_HOST_CACHE_DIR", host_cache.path())
@@ -1288,7 +1335,15 @@ command = "printf 'diagnostic-one\ndiagnostic-two\n' >&2; exit 7"
 
     let failed = run(
         repo.path(),
-        &["gates", "run", "--all", "--only", "spelling", "--no-cache"],
+        &[
+            "advanced",
+            "gates",
+            "run",
+            "--all",
+            "--only",
+            "spelling",
+            "--no-cache",
+        ],
     );
     assert!(!failed.status.success());
     let stdout = String::from_utf8(failed.stdout).unwrap();
@@ -1300,7 +1355,10 @@ command = "printf 'diagnostic-one\ndiagnostic-two\n' >&2; exit 7"
     assert!(stderr.contains("diagnostic-two"));
     assert!(!repo.path().join("gate-runs.txt").exists());
 
-    let unknown = run(repo.path(), &["gates", "run", "--all", "--only", "missing"]);
+    let unknown = run(
+        repo.path(),
+        &["advanced", "gates", "run", "--all", "--only", "missing"],
+    );
     assert!(!unknown.status.success());
     assert!(
         String::from_utf8(unknown.stderr)
@@ -1339,7 +1397,7 @@ fn submit_replays_a_bounded_gate_failure_tail() {
     );
     let adopted: serde_json::Value = serde_json::from_str(&stdout(run(
         &worktree,
-        &["adopt", "--task", "failure output", "--json"],
+        &["start", "--adopt", "--task", "failure output", "--json"],
     )))
     .unwrap();
     let session = adopted["id"].as_i64().unwrap().to_string();
@@ -1388,7 +1446,7 @@ triggers = ["src/**", "missing/**"]
         ],
     );
 
-    let validated = run(repo.path(), &["gates", "validate", "--json"]);
+    let validated = run(repo.path(), &["advanced", "gates", "validate", "--json"]);
     assert!(
         validated.status.success(),
         "{}",
@@ -1426,7 +1484,7 @@ fn gate_doctor_is_exact_head_read_only_and_advisory() {
     )
     .unwrap();
 
-    let report = stdout(run(repo.path(), &["gates", "doctor", "--json"]));
+    let report = stdout(run(repo.path(), &["advanced", "gates", "doctor", "--json"]));
     let report: serde_json::Value = serde_json::from_str(&report).unwrap();
     assert_eq!(report["source_head"], head);
     assert_eq!(report["advisory_only"], true);
@@ -1462,8 +1520,11 @@ fn gate_doctor_reports_invalid_retention_configuration() {
     )
     .unwrap();
 
-    let report: serde_json::Value =
-        serde_json::from_str(&stdout(run(repo.path(), &["gates", "doctor", "--json"]))).unwrap();
+    let report: serde_json::Value = serde_json::from_str(&stdout(run(
+        repo.path(),
+        &["advanced", "gates", "doctor", "--json"],
+    )))
+    .unwrap();
     assert!(
         report["findings"]
             .as_array()
@@ -1515,7 +1576,9 @@ name = "gate-doctor-cli-probe"
     let original = std::fs::read_to_string(repo.path().join("tracked.txt")).unwrap();
 
     let output = Command::new(CLI)
-        .args(["gates", "doctor", "--probe", "--only", "mutator", "--json"])
+        .args([
+            "advanced", "gates", "doctor", "--probe", "--only", "mutator", "--json",
+        ])
         .current_dir(repo.path())
         .env("AETHYME_HOST_STATE_DIR", host_state.path())
         .output()
@@ -1606,7 +1669,10 @@ fn exit_codes_name_the_outcome_an_agent_acts_on() {
             "main",
         ],
     );
-    let adopted = stdout(run(&worktree, &["adopt", "--task", "exit codes", "--json"]));
+    let adopted = stdout(run(
+        &worktree,
+        &["start", "--adopt", "--task", "exit codes", "--json"],
+    ));
     let adopted: serde_json::Value = serde_json::from_str(&adopted).unwrap();
     let session = adopted["id"].as_i64().unwrap().to_string();
     std::fs::write(worktree.join("tracked.txt"), "changed\n").unwrap();
@@ -1633,6 +1699,7 @@ fn exit_codes_name_the_outcome_an_agent_acts_on() {
     let refused = run(
         &worktree,
         &[
+            "advanced",
             "git",
             "--session",
             &session,
@@ -1693,7 +1760,7 @@ fn host_failures_exit_environment_and_a_repeated_git_is_refused() {
     );
     let adopted = stdout(run(
         &worktree,
-        &["adopt", "--task", "host failure", "--json"],
+        &["start", "--adopt", "--task", "host failure", "--json"],
     ));
     let adopted: serde_json::Value = serde_json::from_str(&adopted).unwrap();
     let session = adopted["id"].as_i64().unwrap().to_string();
@@ -1713,7 +1780,15 @@ fn host_failures_exit_environment_and_a_repeated_git_is_refused() {
 
     let repeated = run(
         &worktree,
-        &["git", "--session", &session, "--", "git", "status"],
+        &[
+            "advanced",
+            "git",
+            "--session",
+            &session,
+            "--",
+            "git",
+            "status",
+        ],
     );
     assert_eq!(
         repeated.status.code(),

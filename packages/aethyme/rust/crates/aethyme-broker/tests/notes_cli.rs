@@ -83,6 +83,7 @@ fn notes_are_local_bounded_recipient_scoped_and_redacted_from_events() {
     let sent = run(
         &sender_worktree,
         &[
+            "advanced",
             "note",
             "send",
             "--session",
@@ -117,7 +118,7 @@ fn notes_are_local_bounded_recipient_scoped_and_redacted_from_events() {
     assert!(!payload.contains("coordinate"), "{payload}");
     drop(broker);
 
-    let surfaced = run(&recipient_worktree, &["agents", "--json"]);
+    let surfaced = run(&recipient_worktree, &["advanced", "agents", "--json"]);
     let surfaced_stderr = String::from_utf8_lossy(&surfaced.stderr);
     assert!(surfaced.status.success(), "{surfaced_stderr}");
     assert!(surfaced_stderr.contains(&format!("Unread broker note {note_id}")));
@@ -126,7 +127,14 @@ fn notes_are_local_bounded_recipient_scoped_and_redacted_from_events() {
 
     let listed = run(
         &recipient_worktree,
-        &["note", "list", "--session", &recipient_id, "--json"],
+        &[
+            "advanced",
+            "note",
+            "list",
+            "--session",
+            &recipient_id,
+            "--json",
+        ],
     );
     let listed: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
     assert_eq!(listed["unread_count"], 1);
@@ -135,6 +143,7 @@ fn notes_are_local_bounded_recipient_scoped_and_redacted_from_events() {
     let wrong_recipient = run(
         &sender_worktree,
         &[
+            "advanced",
             "note",
             "ack",
             "--session",
@@ -149,6 +158,7 @@ fn notes_are_local_bounded_recipient_scoped_and_redacted_from_events() {
     let acknowledged = run(
         &recipient_worktree,
         &[
+            "advanced",
             "note",
             "ack",
             "--session",
@@ -162,12 +172,13 @@ fn notes_are_local_bounded_recipient_scoped_and_redacted_from_events() {
     let acknowledged: serde_json::Value = serde_json::from_slice(&acknowledged.stdout).unwrap();
     assert!(acknowledged["acknowledged_at"].as_i64().is_some());
 
-    let quiet = run(&recipient_worktree, &["agents", "--json"]);
+    let quiet = run(&recipient_worktree, &["advanced", "agents", "--json"]);
     assert!(!String::from_utf8_lossy(&quiet.stderr).contains("Unread broker note"));
 
     let multiline = run(
         &sender_worktree,
         &[
+            "advanced",
             "note",
             "send",
             "--session",

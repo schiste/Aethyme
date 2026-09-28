@@ -51,7 +51,7 @@ fn a_metric_does_not_create_the_database_it_wants_to_write_to() {
     let database = repo.path().join(aethyme_broker::BROKER_DB_RELPATH);
 
     let out = Command::new(CLI)
-        .args(["cleanup", "--not-a-flag"])
+        .args(["finish", "cleanup", "--not-a-flag"])
         .current_dir(repo.path())
         .output()
         .unwrap();

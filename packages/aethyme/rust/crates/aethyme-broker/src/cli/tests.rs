@@ -1172,7 +1172,7 @@ fn every_usage_example_passes_flag_validation() {
 #[test]
 fn every_cli_reference_example_passes_flag_validation() {
     let text = include_str!("../../../../../docs/reference/cli.md");
-    let deprecation_rows: Vec<&str> = text
+    let migration_rows: Vec<&str> = text
         .lines()
         .filter(|line| line.starts_with("| `aethyme "))
         .filter_map(|line| {
@@ -1201,13 +1201,8 @@ fn every_cli_reference_example_passes_flag_validation() {
                 .collect();
             let resolved = super::resolve(&words);
             assert!(
-                resolved.refusal.is_none(),
-                "cli.md documents a refused spelling: {line}"
-            );
-            // Old spellings belong only in the deprecation table.
-            assert!(
-                resolved.deprecation.is_none() || deprecation_rows.contains(&line),
-                "cli.md documents a deprecated spelling: {line}"
+                resolved.refusal.is_none() || migration_rows.contains(&line),
+                "cli.md documents a removed spelling outside its migration table: {line}"
             );
             let mut args = resolved.args;
             // `start` merges by flag, as `run_inner` does.

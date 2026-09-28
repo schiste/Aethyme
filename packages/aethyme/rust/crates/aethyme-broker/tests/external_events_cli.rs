@@ -96,6 +96,7 @@ fn external_event_cli_ingests_inspects_and_reconciles_without_background_state()
     let ingest = run(
         tmp.path(),
         &[
+            "advanced",
             "external-events",
             "ingest",
             event_path.to_str().unwrap(),
@@ -113,14 +114,23 @@ fn external_event_cli_ingests_inspects_and_reconciles_without_background_state()
 
     let metric_path = tmp.path().join(".aethyme/logs/command-metrics.jsonl");
     let metrics_before = std::fs::read(&metric_path).unwrap();
-    let list = run(tmp.path(), &["external-events", "list", "--all", "--json"]);
+    let list = run(
+        tmp.path(),
+        &["advanced", "external-events", "list", "--all", "--json"],
+    );
     assert!(list.status.success());
     let inventory: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap();
     assert_eq!(inventory["schema_version"], 1);
     assert_eq!(inventory["events"].as_array().unwrap().len(), 1);
     let show = run(
         tmp.path(),
-        &["external-events", "show", &event_id.to_string(), "--json"],
+        &[
+            "advanced",
+            "external-events",
+            "show",
+            &event_id.to_string(),
+            "--json",
+        ],
     );
     assert!(show.status.success());
     assert_eq!(
@@ -140,6 +150,7 @@ fn external_event_cli_ingests_inspects_and_reconciles_without_background_state()
     let unknown = run(
         tmp.path(),
         &[
+            "advanced",
             "external-events",
             "ingest",
             unknown_path.to_str().unwrap(),
@@ -154,6 +165,7 @@ fn external_event_cli_ingests_inspects_and_reconciles_without_background_state()
     let reconciled = run(
         tmp.path(),
         &[
+            "advanced",
             "external-events",
             "reconcile",
             &unknown_id,
@@ -185,7 +197,10 @@ fn external_event_cli_requires_the_complete_reconciliation_contract() {
     git(tmp.path(), &["commit", "-qm", "initial"]);
     Broker::open(tmp.path()).unwrap();
 
-    let missing = run(tmp.path(), &["external-events", "reconcile", "1"]);
+    let missing = run(
+        tmp.path(),
+        &["advanced", "external-events", "reconcile", "1"],
+    );
     assert!(!missing.status.success());
     let error = String::from_utf8_lossy(&missing.stderr);
     assert!(error.contains("--outcome <assign|ignore>"), "{error}");

@@ -32,7 +32,7 @@ const GROUP_NATIVE: &[&str] = &[
 const PASSTHROUGH_NATIVE: &[&str] = &["deploy", "upgrade"];
 
 /// Commands answered by the broker CLI's help surface.
-const BROKER_HELP: &[&str] = &["broker", "certify", "init", "readiness"];
+const BROKER_HELP: &[&str] = &["broker", "certify", "init"];
 
 /// `-h`/`--help` anywhere before a `--` command separator.
 pub fn wants_help(args: &[String]) -> bool {
@@ -324,20 +324,6 @@ Usage:
       --repo <path>   Checkout to act for (default: current directory).
 "#,
     ),
-    (
-        "enhance",
-        r#"aethyme enhance — deprecated spelling of `aethyme deploy`
-
-Usage:
-  aethyme enhance deploy --repo <path> [--force]
-      Write or refresh the generated root files and skills; --force rewrites unchanged files.
-      Prefer `aethyme deploy --repo <path>`, which also scaffolds the broker and
-      drafts gates only when they are missing.
-  aethyme enhance verify --repo <path>
-      Check the generated files for missing files, placeholders, and drift; exits 1 on failure.
-      Prefer `aethyme deploy verify --repo <path>`.
-"#,
-    ),
 ];
 
 #[cfg(test)]
@@ -373,5 +359,12 @@ mod tests {
     fn help_stops_at_the_command_separator() {
         assert!(wants_help(&args("graph --help")));
         assert!(!wants_help(&args("broker exec --session 1 -- ls --help")));
+    }
+
+    #[test]
+    fn removed_top_level_aliases_have_no_help_route() {
+        assert!(route(&args("readiness --help")).is_none());
+        assert!(route(&args("enhance deploy --help")).is_none());
+        assert!(route(&args("enhance verify --help")).is_none());
     }
 }

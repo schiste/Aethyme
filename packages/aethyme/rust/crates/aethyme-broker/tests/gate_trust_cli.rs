@@ -102,7 +102,13 @@ impl Fixture {
         let output = self
             .command(CLI, &self.root())
             .env(ESCAPE, "1")
-            .args(["trust", "--repo", self.root().to_str().unwrap(), "--json"])
+            .args([
+                "advanced",
+                "trust",
+                "--repo",
+                self.root().to_str().unwrap(),
+                "--json",
+            ])
             .output()
             .unwrap();
         succeeded(&output);
@@ -114,7 +120,7 @@ impl Fixture {
     }
 
     fn trust_status(&self) -> serde_json::Value {
-        let output = self.run(&self.root(), &["trust", "status", "--json"]);
+        let output = self.run(&self.root(), &["advanced", "trust", "status", "--json"]);
         succeeded(&output);
         serde_json::from_slice(&output.stdout).unwrap()
     }
@@ -135,7 +141,7 @@ impl Fixture {
                 "main",
             ],
         );
-        let adopted = self.run(&worktree, &["adopt", "--task", name, "--json"]);
+        let adopted = self.run(&worktree, &["start", "--adopt", "--task", name, "--json"]);
         succeeded(&adopted);
         let adopted: serde_json::Value = serde_json::from_slice(&adopted.stdout).unwrap();
         let session = adopted["id"].as_i64().unwrap().to_string();
@@ -184,10 +190,13 @@ fn a_new_clone_refuses_gates_and_submit_until_trusted() {
     let fixture = Fixture::new("gate.marker");
     let root = fixture.root();
 
-    let all = fixture.run(&root, &["gates", "run", "--all", "--json"]);
+    let all = fixture.run(&root, &["advanced", "gates", "run", "--all", "--json"]);
     assert_refused_with_hint(&all, &root);
     let (worktree, session) = fixture.session("first");
-    let session_gates = fixture.run(&worktree, &["gates", "run", "--session", &session]);
+    let session_gates = fixture.run(
+        &worktree,
+        &["advanced", "gates", "run", "--session", &session],
+    );
     assert_refused_with_hint(&session_gates, &root);
     let submit = fixture.run(&worktree, &["submit", "--session", &session, "--json"]);
     assert_refused_with_hint(&submit, &root);
@@ -200,7 +209,7 @@ fn a_new_clone_refuses_gates_and_submit_until_trusted() {
     // After a human trusts it, the same commands run -- without the escape.
     fixture.trust();
     assert_eq!(fixture.trust_status()["trusted"], true);
-    succeeded(&fixture.run(&root, &["gates", "run", "--all", "--json"]));
+    succeeded(&fixture.run(&root, &["advanced", "gates", "run", "--all", "--json"]));
     assert!(fixture.marker("gate.marker"));
     std::fs::remove_file(root.join("gate.marker")).unwrap();
     succeeded(&fixture.run(&worktree, &["submit", "--session", &session, "--json"]));
@@ -248,19 +257,22 @@ fn a_repository_with_gate_history_is_grandfathered() {
     let seeded = fixture
         .command(CLI, &root)
         .env(ESCAPE, "1")
-        .args(["gates", "run", "--all", "--json"])
+        .args(["advanced", "gates", "run", "--all", "--json"])
         .output()
         .unwrap();
     succeeded(&seeded);
     assert_eq!(fixture.trust_status()["trusted"], false);
     std::fs::remove_file(root.join("gate.marker")).unwrap();
 
-    succeeded(&fixture.run(&root, &["gates", "run", "--all", "--no-cache", "--json"]));
+    succeeded(&fixture.run(
+        &root,
+        &["advanced", "gates", "run", "--all", "--no-cache", "--json"],
+    ));
     assert!(fixture.marker("gate.marker"));
     let status = fixture.trust_status();
     assert_eq!(status["trusted"], true, "{status}");
     assert_eq!(status["trusted_policies"][0]["source"], "grandfathered");
-    let events = fixture.run(&root, &["events", "--json"]);
+    let events = fixture.run(&root, &["advanced", "events", "--json"]);
     succeeded(&events);
     assert!(String::from_utf8_lossy(&events.stdout).contains("gate.policy_trust_grandfathered"));
 }
@@ -269,11 +281,17 @@ fn a_repository_with_gate_history_is_grandfathered() {
 fn trust_refuses_without_a_terminal() {
     let fixture = Fixture::new("gate.marker");
     let root = fixture.root();
-    let refused = fixture.run(&root, &["trust", "--repo", root.to_str().unwrap()]);
+    let refused = fixture.run(
+        &root,
+        &["advanced", "trust", "--repo", root.to_str().unwrap()],
+    );
     assert_eq!(refused.status.code(), Some(REFUSED));
     assert!(String::from_utf8_lossy(&refused.stderr).contains("interactive terminal"));
     assert_eq!(fixture.trust_status()["trusted"], false);
-    assert_refused_with_hint(&fixture.run(&root, &["gates", "run", "--all"]), &root);
+    assert_refused_with_hint(
+        &fixture.run(&root, &["advanced", "gates", "run", "--all"]),
+        &root,
+    );
 }
 
 #[test]

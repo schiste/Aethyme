@@ -130,7 +130,7 @@ fn storage_plan_reconciles_disk_git_and_session_ledger_without_writing() {
     let plan = json(run(
         repo.path(),
         container.path(),
-        &["storage", "plan", "--json"],
+        &["gc", "storage", "plan", "--json"],
     ));
     assert_eq!(
         std::fs::read(&db).unwrap(),
@@ -236,7 +236,11 @@ fn storage_plan_reports_primary_artifacts_and_never_candidates_tracked_output() 
     // A build that is running leaves the checkout clean, because `target/` is
     // git-ignored. Candidacy therefore also requires the tree to have stopped
     // moving, so prove the live case first and only then age the fixture.
-    let busy = json(run(repo.path(), container.path(), &["storage", "--json"]));
+    let busy = json(run(
+        repo.path(),
+        container.path(),
+        &["gc", "storage", "--json"],
+    ));
     assert_eq!(
         busy["summary"]["primary_candidate_count"], 0,
         "an artifact still being written to must never be a candidate"
@@ -246,7 +250,11 @@ fn storage_plan_reports_primary_artifacts_and_never_candidates_tracked_output() 
     settle(&repo.path().join("build"));
     settle(&repo.path().join("dist"));
 
-    let plan = json(run(repo.path(), container.path(), &["storage", "--json"]));
+    let plan = json(run(
+        repo.path(),
+        container.path(),
+        &["gc", "storage", "--json"],
+    ));
     assert_eq!(plan["summary"]["primary_checkout_count"], 1);
     assert_eq!(plan["summary"]["primary_artifact_count"], 3);
     assert_eq!(plan["summary"]["primary_candidate_count"], 2);
@@ -273,7 +281,7 @@ fn storage_plan_reports_primary_artifacts_and_never_candidates_tracked_output() 
     let applied = json(run(
         repo.path(),
         container.path(),
-        &["storage", "apply", "--confirm", digest, "--json"],
+        &["gc", "storage", "apply", "--confirm", digest, "--json"],
     ));
     assert_eq!(applied["complete"], true);
     assert_eq!(applied["applied"].as_array().unwrap().len(), 2);
@@ -293,7 +301,7 @@ fn storage_plan_refuses_a_dirty_primary_checkout_as_a_whole() {
     let plan = json(run(
         repo.path(),
         container.path(),
-        &["storage", "plan", "--json"],
+        &["gc", "storage", "plan", "--json"],
     ));
     let checkout = &plan["primary_checkouts"][0];
     assert_eq!(checkout["clean"], false);
@@ -323,7 +331,7 @@ fn storage_plan_refuses_a_dirty_primary_checkout_as_a_whole() {
     let applied = json(run(
         repo.path(),
         container.path(),
-        &["storage", "apply", "--confirm", digest, "--json"],
+        &["gc", "storage", "apply", "--confirm", digest, "--json"],
     ));
     assert_eq!(applied["complete"], true);
     assert!(applied["applied"].as_array().unwrap().is_empty());
@@ -349,14 +357,18 @@ fn storage_apply_removes_only_the_reviewed_orphan_and_stray_paths() {
     std::fs::create_dir_all(protected_root.join("stray")).unwrap();
     std::fs::write(protected_root.join("stray/data"), "protected\n").unwrap();
 
-    let plan = json(run(repo.path(), container.path(), &["storage", "--json"]));
+    let plan = json(run(
+        repo.path(),
+        container.path(),
+        &["gc", "storage", "--json"],
+    ));
     let digest = plan["digest"].as_str().unwrap();
     assert_eq!(plan["summary"]["candidate_count"], 2);
 
     let apply = json(run(
         repo.path(),
         container.path(),
-        &["storage", "apply", "--confirm", digest, "--json"],
+        &["gc", "storage", "apply", "--confirm", digest, "--json"],
     ));
     assert_eq!(apply["complete"], true);
     assert_eq!(apply["applied"].as_array().unwrap().len(), 2);
@@ -374,7 +386,7 @@ fn storage_apply_refuses_a_plan_when_a_new_stray_appears() {
     let plan = json(run(
         repo.path(),
         container.path(),
-        &["storage", "plan", "--json"],
+        &["gc", "storage", "plan", "--json"],
     ));
     let digest = plan["digest"].as_str().unwrap().to_owned();
     std::fs::create_dir_all(owner_root.join("new-stray")).unwrap();
@@ -382,7 +394,7 @@ fn storage_apply_refuses_a_plan_when_a_new_stray_appears() {
     let output = run(
         repo.path(),
         container.path(),
-        &["storage", "apply", "--confirm", &digest, "--json"],
+        &["gc", "storage", "apply", "--confirm", &digest, "--json"],
     );
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("no longer matches current state"));
@@ -394,11 +406,19 @@ fn storage_apply_binds_preparation_candidates_to_confirmation() {
     let (repo, host) = fixture();
     let container = host.path().join("worktrees");
     std::fs::create_dir_all(&container).unwrap();
-    let empty = json(run(repo.path(), &container, &["storage", "plan", "--json"]));
+    let empty = json(run(
+        repo.path(),
+        &container,
+        &["gc", "storage", "plan", "--json"],
+    ));
     let entry = host.path().join("preparation-cache/repository/new-key");
     std::fs::create_dir_all(&entry).unwrap();
     std::fs::write(entry.join("payload"), "must survive stale approval").unwrap();
-    let populated = json(run(repo.path(), &container, &["storage", "plan", "--json"]));
+    let populated = json(run(
+        repo.path(),
+        &container,
+        &["gc", "storage", "plan", "--json"],
+    ));
     assert_ne!(empty["digest"], populated["digest"]);
     assert_eq!(populated["summary"]["preparation_candidate_count"], 1);
 
@@ -406,6 +426,7 @@ fn storage_apply_binds_preparation_candidates_to_confirmation() {
         repo.path(),
         &container,
         &[
+            "gc",
             "storage",
             "apply",
             "--confirm",
@@ -421,6 +442,7 @@ fn storage_apply_binds_preparation_candidates_to_confirmation() {
         repo.path(),
         &container,
         &[
+            "gc",
             "storage",
             "apply",
             "--confirm",
@@ -446,7 +468,11 @@ fn storage_plan_does_not_follow_a_root_symlink_or_remove_it() {
         .unwrap()
         .join(link.file_name().unwrap());
 
-    let plan = json(run(repo.path(), container.path(), &["storage", "--json"]));
+    let plan = json(run(
+        repo.path(),
+        container.path(),
+        &["gc", "storage", "--json"],
+    ));
     let root = plan["roots"]
         .as_array()
         .unwrap()
@@ -483,7 +509,11 @@ fn storage_reconciliation_lists_git_or_ledger_paths_missing_on_disk() {
     let registered_path = std::fs::canonicalize(&registered).unwrap();
     std::fs::remove_dir_all(&registered).unwrap();
 
-    let plan = json(run(repo.path(), container.path(), &["storage", "--json"]));
+    let plan = json(run(
+        repo.path(),
+        container.path(),
+        &["gc", "storage", "--json"],
+    ));
     let entries = plan["roots"][0]["reconciliation"]["entries"]
         .as_array()
         .unwrap();

@@ -135,39 +135,32 @@ const EXCLUDED: &[(&str, &str)] = &[
 /// Individual lines allowed to keep an old spelling. `(path, text the line
 /// contains, why)`. Keep each entry narrow; delete it when its reason ends.
 const ALLOWED_LINES: &[(&str, &str, &str)] = &[
-    // The router's alias handling: removed together with the aliases.
-    (
-        "packages/aethyme/rust/crates/aethyme-cli/src/main.rs",
-        "warn(\"aethyme readiness\"",
-        "the top-level readiness alias and its warning",
-    ),
-    (
-        "packages/aethyme/rust/crates/aethyme-cli/src/main.rs",
-        "warn(\"aethyme enhance ",
-        "the enhance deploy/verify aliases and their warnings",
-    ),
     (
         "packages/aethyme/rust/crates/aethyme-cli/src/help.rs",
         "const BROKER_HELP",
-        "top-level words that route `--help` to the broker, not an invocation",
+        "top-level words that route --help to canonical broker internals, not an invocation",
     ),
     (
-        "packages/aethyme/rust/crates/aethyme-cli/src/help.rs",
-        "aethyme enhance deploy --repo <path> [--force]",
-        "help for the deprecated `enhance` spelling itself",
+        "packages/aethyme/rust/crates/aethyme-cli/src/main.rs",
+        "\"aethyme readiness\",",
+        "retired spelling named only in its exit-2 migration hint",
     ),
     (
-        "packages/aethyme/rust/crates/aethyme-cli/src/help.rs",
-        "aethyme enhance verify --repo <path>",
-        "help for the deprecated `enhance` spelling itself",
+        "packages/aethyme/rust/crates/aethyme-cli/src/main.rs",
+        "\"aethyme enhance deploy\",",
+        "retired spelling named only in its exit-2 migration hint",
     ),
-    // A persisted value, not only a message: interrupted readiness repairs
-    // journal this exact string and recovery matches on it. Changing it needs
-    // a compatibility decision for journals written by older binaries.
+    (
+        "packages/aethyme/rust/crates/aethyme-cli/src/main.rs",
+        "\"aethyme enhance verify\",",
+        "retired spelling named only in its exit-2 migration hint",
+    ),
+    // A persisted value, not only a message: v0.8.7 readiness repairs journal
+    // this key. Recovery accepts it while new journals use the canonical command.
     (
         "packages/aethyme/rust/crates/aethyme-cli/src/repository_upgrade.rs",
         "\"aethyme broker readiness recover\"",
-        "journaled recovery command key (needs a contract decision)",
+        "legacy v0.8.7 recovery key remains readable for interrupted transactions",
     ),
     // Pilots may run a pre-v0.8.4 binary, where the new spellings do not exist.
     (
@@ -189,29 +182,6 @@ const ALLOWED_LINES: &[(&str, &str, &str)] = &[
         "packages/aethyme/docs/pilot/six-verbs.md",
         "(v0.8.3: list with `aethyme broker blockers`",
         "v0.8.3 pilot guidance",
-    ),
-    // Eval playground setup: `aethyme deploy` also scaffolds the broker and
-    // drafts gates, which would change what eval agents see. Moving it is an
-    // eval-protocol decision, not a spelling migration.
-    (
-        "packages/aethyme/scripts/eval/setup-playground.sh",
-        "/aethyme\" enhance deploy --repo",
-        "eval playground setup (eval-protocol decision)",
-    ),
-    (
-        "packages/aethyme/scripts/eval/setup-playground.sh",
-        "/aethyme\" enhance verify --repo",
-        "eval playground setup (eval-protocol decision)",
-    ),
-    (
-        "packages/aethyme/docs/guides/playground-setup.md",
-        "/aethyme\" enhance deploy --repo",
-        "documents the eval playground setup above",
-    ),
-    (
-        "packages/aethyme/docs/architecture/cross-process-consumers.md",
-        "`scripts/eval/setup-playground.sh` | `$AETHYME_ROOT/rust/target/release/aethyme enhance",
-        "documents the eval playground setup above",
     ),
 ];
 

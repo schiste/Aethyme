@@ -43,7 +43,5 @@ Verbs:
   verify-loop      end-to-end broker verification for operators
   check-contract   cross-process contract gate (CI entry point)
 
-Run `aethyme broker advanced <verb> --help` for a verb's forms and flags.
-Until the deprecation window closes, `aethyme broker <verb>` still works
-for each of these and prints a warning naming the `advanced` spelling.
+Run aethyme broker advanced <verb> --help for command forms and flags.
 --- stderr

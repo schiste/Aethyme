@@ -166,6 +166,7 @@ fn reviewed_diff_and_confirmed_apply_share_exact_outputs() {
         &repo,
         &[
             "broker",
+            "status",
             "readiness",
             "apply",
             "--confirm",
@@ -321,6 +322,22 @@ fn interrupted_apply_is_recovered_only_by_the_exact_plan_digest() {
         .unwrap();
     assert_eq!(crashed.status.code(), Some(86));
 
+    let state_root = repo.join(".git/aethyme-upgrades");
+    let worktree_state = fs::read_dir(&state_root)
+        .unwrap()
+        .map(Result::unwrap)
+        .find(|entry| entry.file_type().unwrap().is_dir())
+        .expect("readiness transaction state directory")
+        .path();
+    let journal_path = worktree_state.join(format!("{digest}.rollback.json"));
+    let mut journal: Value = serde_json::from_slice(&fs::read(&journal_path).unwrap()).unwrap();
+    assert_eq!(
+        journal["recovery_command"],
+        "aethyme broker status readiness recover"
+    );
+    journal["recovery_command"] = Value::String("aethyme broker readiness recover".into());
+    fs::write(&journal_path, serde_json::to_vec(&journal).unwrap()).unwrap();
+
     let wrong = run(
         &repo,
         &[
@@ -337,6 +354,7 @@ fn interrupted_apply_is_recovered_only_by_the_exact_plan_digest() {
         &repo,
         &[
             "broker",
+            "status",
             "readiness",
             "recover",
             "--plan",
@@ -465,6 +483,7 @@ fn local_only_remediation_stays_clone_local() {
         &repo,
         &[
             "broker",
+            "status",
             "readiness",
             "apply",
             "--local-only",

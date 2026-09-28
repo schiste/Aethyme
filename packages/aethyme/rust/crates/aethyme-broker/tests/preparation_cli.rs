@@ -103,7 +103,7 @@ fn preparation_is_explicit_language_neutral_and_invalidates_on_input_change() {
     let adopted = success_json(run(
         temp.path(),
         &state,
-        &["adopt", ".", "--task", "prepare", "--json"],
+        &["start", "--adopt", ".", "--task", "prepare", "--json"],
     ));
     let session = adopted["id"].as_i64().unwrap().to_string();
     assert_eq!(adopted["preparation"]["state"], "required");
@@ -115,7 +115,14 @@ fn preparation_is_explicit_language_neutral_and_invalidates_on_input_change() {
     let required = success_json(run(
         temp.path(),
         &state,
-        &["prepare", "status", "--session", &session, "--json"],
+        &[
+            "submit",
+            "prepare",
+            "status",
+            "--session",
+            &session,
+            "--json",
+        ],
     ));
     assert_eq!(required["state"], "required");
     assert_eq!(
@@ -142,7 +149,7 @@ fn preparation_is_explicit_language_neutral_and_invalidates_on_input_change() {
     let prepared = success_json(run(
         temp.path(),
         &state,
-        &["prepare", "--session", &session, "--json"],
+        &["submit", "prepare", "--session", &session, "--json"],
     ));
     assert_eq!(prepared["state"], "current");
     assert_eq!(prepared["shared_cache_coordinated"], true);
@@ -161,14 +168,28 @@ fn preparation_is_explicit_language_neutral_and_invalidates_on_input_change() {
     let current = success_json(run(
         temp.path(),
         &state,
-        &["prepare", "status", "--session", &session, "--json"],
+        &[
+            "submit",
+            "prepare",
+            "status",
+            "--session",
+            &session,
+            "--json",
+        ],
     ));
     assert_eq!(current["state"], "current");
     std::fs::write(temp.path().join("Cargo.lock"), "changed bytes\n").unwrap();
     let stale = success_json(run(
         temp.path(),
         &state,
-        &["prepare", "status", "--session", &session, "--json"],
+        &[
+            "submit",
+            "prepare",
+            "status",
+            "--session",
+            &session,
+            "--json",
+        ],
     ));
     assert_eq!(stale["state"], "stale");
     assert_ne!(stale["expected_digest"], stale["recorded_digest"]);
@@ -181,13 +202,20 @@ fn offline_preparation_uses_only_explicit_offline_commands() {
     let adopted = success_json(run(
         temp.path(),
         &state,
-        &["adopt", ".", "--task", "offline", "--json"],
+        &["start", "--adopt", ".", "--task", "offline", "--json"],
     ));
     let session = adopted["id"].as_i64().unwrap().to_string();
     let prepared = success_json(run(
         temp.path(),
         &state,
-        &["prepare", "--session", &session, "--offline", "--json"],
+        &[
+            "submit",
+            "prepare",
+            "--session",
+            &session,
+            "--offline",
+            "--json",
+        ],
     ));
     assert_eq!(prepared["offline"], true);
     assert_eq!(prepared["state"], "current");
@@ -200,7 +228,7 @@ fn failed_and_interrupted_preparation_states_are_explicit() {
     let adopted = success_json(run(
         temp.path(),
         &state,
-        &["adopt", ".", "--task", "failure", "--json"],
+        &["start", "--adopt", ".", "--task", "failure", "--json"],
     ));
     let session_id = adopted["id"].as_i64().unwrap();
     let session = session_id.to_string();
@@ -221,13 +249,20 @@ required_for_hooks = true
     let failed = run(
         temp.path(),
         &state,
-        &["prepare", "--session", &session, "--json"],
+        &["submit", "prepare", "--session", &session, "--json"],
     );
     assert!(!failed.status.success());
     let status = success_json(run(
         temp.path(),
         &state,
-        &["prepare", "status", "--session", &session, "--json"],
+        &[
+            "submit",
+            "prepare",
+            "status",
+            "--session",
+            &session,
+            "--json",
+        ],
     ));
     assert_eq!(status["state"], "failed");
     assert!(status["reason"].as_str().unwrap().contains("fails"));
@@ -256,7 +291,14 @@ required_for_hooks = true
     let interrupted = success_json(run(
         temp.path(),
         &state,
-        &["prepare", "status", "--session", &session, "--json"],
+        &[
+            "submit",
+            "prepare",
+            "status",
+            "--session",
+            &session,
+            "--json",
+        ],
     ));
     assert_eq!(interrupted["state"], "in_progress");
     let reason = interrupted["reason"].as_str().unwrap();
@@ -314,7 +356,14 @@ fn unconfigured_preparation_names_the_consequence_when_gates_exist() {
     let status = success_json(run(
         repo.path(),
         state.path(),
-        &["prepare", "status", "--session", &session, "--json"],
+        &[
+            "submit",
+            "prepare",
+            "status",
+            "--session",
+            &session,
+            "--json",
+        ],
     ));
     assert_eq!(status["state"], "not_configured");
     let reason = status["reason"].as_str().unwrap();
@@ -358,7 +407,14 @@ fn unconfigured_preparation_stays_quiet_without_gates() {
     let status = success_json(run(
         repo.path(),
         state.path(),
-        &["prepare", "status", "--session", &session, "--json"],
+        &[
+            "submit",
+            "prepare",
+            "status",
+            "--session",
+            &session,
+            "--json",
+        ],
     ));
     assert_eq!(status["state"], "not_configured");
     assert_eq!(

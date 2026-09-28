@@ -106,7 +106,11 @@ fn json(output: &Output) -> serde_json::Value {
 fn a_repository_that_configured_nothing_gets_the_singular_mode() {
     let (temp, state) = repo(None);
     let root = temp.path().join("repo");
-    let status = json(&run(&root, &state, &["console", "status", "--json"]));
+    let status = json(&run(
+        &root,
+        &state,
+        &["advanced", "console", "status", "--json"],
+    ));
     assert_eq!(status["identity"]["mode"], "singular");
     assert_eq!(status["identity"]["canonical"], true);
     assert_eq!(status["running"].as_array().unwrap().len(), 0);
@@ -130,11 +134,19 @@ fn a_linked_worktree_is_reported_as_not_canonical() {
             "side",
         ],
     );
-    let status = json(&run(&linked, &state, &["console", "status", "--json"]));
+    let status = json(&run(
+        &linked,
+        &state,
+        &["advanced", "console", "status", "--json"],
+    ));
     assert_eq!(status["identity"]["canonical"], false);
     // One repository, one key: a console started here contends with one
     // started in the primary checkout.
-    let canonical = json(&run(&root, &state, &["console", "status", "--json"]));
+    let canonical = json(&run(
+        &root,
+        &state,
+        &["advanced", "console", "status", "--json"],
+    ));
     assert_eq!(
         status["identity"]["repository"],
         canonical["identity"]["repository"]
@@ -150,7 +162,11 @@ fn singular_plans_one_exclusive_key_and_one_pinned_port() {
         "[console]\nmode = 'singular'\nport = {singular_port}\nport_end = {singular_port_end}\n"
     )));
     let root = temp.path().join("repo");
-    let plan = json(&run(&root, &state, &["console", "plan", "--json"]));
+    let plan = json(&run(
+        &root,
+        &state,
+        &["advanced", "console", "plan", "--json"],
+    ));
     let proposed = plan["proposed"].as_array().unwrap();
     let by_key = |key: &str| {
         proposed
@@ -173,7 +189,11 @@ fn per_worktree_plans_a_namespace_and_a_bounded_slot_instead_of_a_singleton() {
          {per_worktree_port_end}\npool_limit = 3\n"
     )));
     let root = temp.path().join("repo");
-    let plan = json(&run(&root, &state, &["console", "plan", "--json"]));
+    let plan = json(&run(
+        &root,
+        &state,
+        &["advanced", "console", "plan", "--json"],
+    ));
     let keys: Vec<&str> = plan["proposed"]
         .as_array()
         .unwrap()
@@ -198,7 +218,11 @@ fn singular_refuses_a_second_console_and_names_the_one_already_serving() {
         "[console]\nmode = 'singular'\nport = {held_port}\n"
     )));
     let root = temp.path().join("repo");
-    let identity = json(&run(&root, &state, &["console", "status", "--json"]));
+    let identity = json(&run(
+        &root,
+        &state,
+        &["advanced", "console", "status", "--json"],
+    ));
     let repository = identity["identity"]["repository"].as_str().unwrap();
 
     let held = temp.path().join("held.json");
@@ -225,6 +249,7 @@ fn singular_refuses_a_second_console_and_names_the_one_already_serving() {
         &root,
         &state,
         &[
+            "advanced",
             "resources",
             "acquire",
             held.to_str().unwrap(),
@@ -239,7 +264,11 @@ fn singular_refuses_a_second_console_and_names_the_one_already_serving() {
         String::from_utf8_lossy(&acquired.stderr)
     );
 
-    let status = json(&run(&root, &state, &["console", "status", "--json"]));
+    let status = json(&run(
+        &root,
+        &state,
+        &["advanced", "console", "status", "--json"],
+    ));
     let running = status["running"].as_array().unwrap();
     assert_eq!(running.len(), 1);
     assert_eq!(running[0]["port"], held_port.to_string());
@@ -251,7 +280,9 @@ fn singular_refuses_a_second_console_and_names_the_one_already_serving() {
     let refused = run(
         &root,
         &state,
-        &["console", "run", "--", "/bin/sh", "-c", "exit 0"],
+        &[
+            "advanced", "console", "run", "--", "/bin/sh", "-c", "exit 0",
+        ],
     );
     assert!(!refused.status.success());
     let message = String::from_utf8_lossy(&refused.stderr);
@@ -272,7 +303,7 @@ fn unmanaged_reserves_nothing_and_still_runs_the_command() {
     let output = run(
         &root,
         &state,
-        &["console", "run", "--", "/bin/sh", "-c", &script],
+        &["advanced", "console", "run", "--", "/bin/sh", "-c", &script],
     );
     assert!(
         output.status.success(),
@@ -283,7 +314,7 @@ fn unmanaged_reserves_nothing_and_still_runs_the_command() {
     let leases = json(&run(
         &root,
         &state,
-        &["resources", "list", "--all", "--json"],
+        &["advanced", "resources", "list", "--all", "--json"],
     ));
     let empty = leases["leases"]
         .as_array()
@@ -302,7 +333,9 @@ fn a_failing_command_fails_the_console() {
     let output = run(
         &root,
         &state,
-        &["console", "run", "--", "/bin/sh", "-c", "exit 3"],
+        &[
+            "advanced", "console", "run", "--", "/bin/sh", "-c", "exit 3",
+        ],
     );
     assert_eq!(output.status.code(), Some(3));
 }
@@ -311,7 +344,7 @@ fn a_failing_command_fails_the_console() {
 fn an_unknown_action_names_the_ones_that_exist() {
     let (temp, state) = repo(None);
     let root = temp.path().join("repo");
-    let output = run(&root, &state, &["console", "restart"]);
+    let output = run(&root, &state, &["advanced", "console", "restart"]);
     assert!(!output.status.success());
     let message = String::from_utf8_lossy(&output.stderr);
     assert!(message.contains("status"), "{message}");
@@ -335,7 +368,7 @@ fn wait_for_running(root: &Path, state: &Path, expected: usize) -> serde_json::V
     // processes had registered. 60 s is never reached when the machine is idle.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     while std::time::Instant::now() < deadline {
-        let status = run(root, state, &["console", "list", "--json"]);
+        let status = run(root, state, &["advanced", "console", "list", "--json"]);
         if status.status.success()
             && let Ok(value) = serde_json::from_slice::<serde_json::Value>(&status.stdout)
             && value["running"].as_array().is_some_and(|running| {
@@ -346,7 +379,7 @@ fn wait_for_running(root: &Path, state: &Path, expected: usize) -> serde_json::V
         }
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
-    let status = run(root, state, &["console", "list", "--json"]);
+    let status = run(root, state, &["advanced", "console", "list", "--json"]);
     panic!(
         "expected {expected} running console(s), got {}",
         String::from_utf8_lossy(&status.stdout)
@@ -368,6 +401,7 @@ fn managed_console_publishes_and_lists_its_exact_revision_marker() {
     );
     let mut child = Command::new(CLI)
         .args([
+            "advanced",
             "console",
             "run",
             "--json",
@@ -407,11 +441,19 @@ fn managed_console_publishes_and_lists_its_exact_revision_marker() {
         std::fs::canonicalize(&root).unwrap()
     );
 
-    let alias = json(&run(&root, &state, &["console", "status", "--json"]));
+    let alias = json(&run(
+        &root,
+        &state,
+        &["advanced", "console", "status", "--json"],
+    ));
     assert_eq!(alias["running"], status["running"]);
     std::fs::write(&release, b"").unwrap();
     child.wait().unwrap();
-    let stopped = json(&run(&root, &state, &["console", "list", "--json"]));
+    let stopped = json(&run(
+        &root,
+        &state,
+        &["advanced", "console", "list", "--json"],
+    ));
     assert!(stopped["running"].as_array().unwrap().is_empty());
     assert!(
         !marker_path.exists(),
@@ -433,7 +475,15 @@ fn allow_parallel_keeps_both_processes_in_the_registry_on_distinct_ports() {
     let first_command = hold_until(&release_first);
     let second_command = hold_until(&release_second);
     let mut first = Command::new(CLI)
-        .args(["console", "run", "--", "/bin/sh", "-c", &first_command])
+        .args([
+            "advanced",
+            "console",
+            "run",
+            "--",
+            "/bin/sh",
+            "-c",
+            &first_command,
+        ])
         .current_dir(&root)
         .env("AETHYME_HOST_STATE_DIR", &state)
         .spawn()
@@ -442,6 +492,7 @@ fn allow_parallel_keeps_both_processes_in_the_registry_on_distinct_ports() {
 
     let mut second = Command::new(CLI)
         .args([
+            "advanced",
             "console",
             "run",
             "--allow-parallel",
@@ -475,6 +526,10 @@ fn allow_parallel_keeps_both_processes_in_the_registry_on_distinct_ports() {
     assert!(second.wait().unwrap().success());
     std::fs::write(&release_first, b"").unwrap();
     assert!(first.wait().unwrap().success());
-    let stopped = json(&run(&root, &state, &["console", "list", "--json"]));
+    let stopped = json(&run(
+        &root,
+        &state,
+        &["advanced", "console", "list", "--json"],
+    ));
     assert!(stopped["running"].as_array().unwrap().is_empty());
 }

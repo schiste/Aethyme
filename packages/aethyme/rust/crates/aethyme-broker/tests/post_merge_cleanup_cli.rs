@@ -74,6 +74,7 @@ fn run_merge(
 ) -> Output {
     Command::new(CLI)
         .args([
+            "advanced",
             "gh",
             "--session",
             &session_id.to_string(),

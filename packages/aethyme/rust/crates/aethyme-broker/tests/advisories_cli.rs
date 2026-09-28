@@ -102,7 +102,7 @@ fn list_show_and_ack_keep_database_authoritative_and_projection_current() {
     );
     let event_count_before_reads = broker.store().events_after(0, i64::MAX).unwrap().len();
 
-    let listed = run(tmp.path(), &["advisories", "list", "--json"]);
+    let listed = run(tmp.path(), &["advanced", "advisories", "list", "--json"]);
     assert!(
         listed.status.success(),
         "{}",
@@ -117,7 +117,7 @@ fn list_show_and_ack_keep_database_authoritative_and_projection_current() {
     assert_eq!(listed["advisories"][0]["integration_sha"], "a".repeat(40));
 
     let id = created.id.to_string();
-    let shown = run(tmp.path(), &["advisories", "show", &id]);
+    let shown = run(tmp.path(), &["advanced", "advisories", "show", &id]);
     let shown_text = String::from_utf8_lossy(&shown.stdout);
     assert!(shown.status.success());
     assert!(shown_text.contains("integration-drift:fixture"));
@@ -128,7 +128,7 @@ fn list_show_and_ack_keep_database_authoritative_and_projection_current() {
         "content-free delivery correlation must not expand event history"
     );
 
-    let metrics = run(tmp.path(), &["advisories", "metrics", "--json"]);
+    let metrics = run(tmp.path(), &["advanced", "advisories", "metrics", "--json"]);
     assert!(metrics.status.success());
     let metrics_text = String::from_utf8(metrics.stdout).unwrap();
     let metrics_json: serde_json::Value = serde_json::from_str(&metrics_text).unwrap();
@@ -146,7 +146,10 @@ fn list_show_and_ack_keep_database_authoritative_and_projection_current() {
         assert!(!metrics_text.contains(forbidden), "leaked {forbidden:?}");
     }
 
-    let acknowledged = run(tmp.path(), &["advisories", "ack", &id, "--json"]);
+    let acknowledged = run(
+        tmp.path(),
+        &["advanced", "advisories", "ack", &id, "--json"],
+    );
     assert!(
         acknowledged.status.success(),
         "{}",
@@ -167,7 +170,10 @@ fn list_show_and_ack_keep_database_authoritative_and_projection_current() {
         AdvisoryResolutionState::Acknowledged
     );
 
-    let all = run(tmp.path(), &["advisories", "list", "--all", "--json"]);
+    let all = run(
+        tmp.path(),
+        &["advanced", "advisories", "list", "--all", "--json"],
+    );
     let all: serde_json::Value = serde_json::from_slice(&all.stdout).unwrap();
     assert_eq!(all["outstanding_count"], 0);
     assert_eq!(all["includes_acknowledged"], true);
@@ -190,7 +196,7 @@ fn maintainer_recommendations_reopen_suppress_and_resolve_deterministically() {
     }
     drop(broker);
 
-    let initial = run(tmp.path(), &["advisories", "list", "--json"]);
+    let initial = run(tmp.path(), &["advanced", "advisories", "list", "--json"]);
     assert!(initial.status.success());
     let initial: serde_json::Value = serde_json::from_slice(&initial.stdout).unwrap();
     let advisories = initial["advisories"].as_array().unwrap();
@@ -218,9 +224,12 @@ fn maintainer_recommendations_reopen_suppress_and_resolve_deterministically() {
     );
 
     assert!(
-        run(tmp.path(), &["advisories", "ack", &reopen_id.to_string()])
-            .status
-            .success()
+        run(
+            tmp.path(),
+            &["advanced", "advisories", "ack", &reopen_id.to_string()]
+        )
+        .status
+        .success()
     );
     let mut broker = Broker::open(tmp.path()).unwrap();
     let unrelated = broker
@@ -232,7 +241,7 @@ fn maintainer_recommendations_reopen_suppress_and_resolve_deterministically() {
         .set_merge_status(unrelated.id, MergeStatus::Rejected, None, None)
         .unwrap();
     drop(broker);
-    let unchanged = run(tmp.path(), &["advisories", "list", "--json"]);
+    let unchanged = run(tmp.path(), &["advanced", "advisories", "list", "--json"]);
     let unchanged: serde_json::Value = serde_json::from_slice(&unchanged.stdout).unwrap();
     assert!(
         unchanged["advisories"]
@@ -246,7 +255,7 @@ fn maintainer_recommendations_reopen_suppress_and_resolve_deterministically() {
     let mut broker = Broker::open(tmp.path()).unwrap();
     record_conflict(&mut broker, session.id, 5, &["src/reopen.rs"]);
     drop(broker);
-    let reopened = run(tmp.path(), &["advisories", "list", "--json"]);
+    let reopened = run(tmp.path(), &["advanced", "advisories", "list", "--json"]);
     let reopened: serde_json::Value = serde_json::from_slice(&reopened.stdout).unwrap();
     assert_eq!(
         reopened["advisories"]
@@ -261,7 +270,7 @@ fn maintainer_recommendations_reopen_suppress_and_resolve_deterministically() {
     assert!(
         run(
             tmp.path(),
-            &["advisories", "suppress", &reopen_id.to_string()]
+            &["advanced", "advisories", "suppress", &reopen_id.to_string()]
         )
         .status
         .success()
@@ -278,7 +287,10 @@ fn maintainer_recommendations_reopen_suppress_and_resolve_deterministically() {
     }
     drop(broker);
 
-    let refreshed = run(tmp.path(), &["advisories", "list", "--all", "--json"]);
+    let refreshed = run(
+        tmp.path(),
+        &["advanced", "advisories", "list", "--all", "--json"],
+    );
     assert!(
         refreshed.status.success(),
         "{}",
@@ -380,18 +392,23 @@ fn advisory_cli_rejects_missing_invalid_and_unknown_ids() {
         .persist_advisory(sample("session-cannot-be-suppressed", None, None))
         .unwrap();
     for args in [
-        &["advisories", "show"][..],
-        &["advisories", "show", "zero"][..],
-        &["advisories", "ack", "0"][..],
-        &["advisories", "ack", "999"][..],
-        &["advisories", "suppress", "999"][..],
+        &["advanced", "advisories", "show"][..],
+        &["advanced", "advisories", "show", "zero"][..],
+        &["advanced", "advisories", "ack", "0"][..],
+        &["advanced", "advisories", "ack", "999"][..],
+        &["advanced", "advisories", "suppress", "999"][..],
     ] {
         let output = run(tmp.path(), args);
         assert!(!output.status.success(), "unexpected success for {args:?}");
     }
     let suppression = run(
         tmp.path(),
-        &["advisories", "suppress", &session_advisory.id.to_string()],
+        &[
+            "advanced",
+            "advisories",
+            "suppress",
+            &session_advisory.id.to_string(),
+        ],
     );
     assert!(!suppression.status.success());
     assert!(String::from_utf8_lossy(&suppression.stderr).contains("session-facing"));
@@ -413,6 +430,7 @@ fn session_commands_surface_notices_without_corrupting_json() {
     let command = run(
         tmp.path(),
         &[
+            "advanced",
             "leases",
             "plan",
             "src/a.rs",
@@ -442,7 +460,14 @@ fn session_commands_surface_notices_without_corrupting_json() {
     broker.acknowledge_advisory(advisory.id).unwrap();
     let quiet = run(
         tmp.path(),
-        &["leases", "plan", "src/a.rs", "--session", &session_id],
+        &[
+            "advanced",
+            "leases",
+            "plan",
+            "src/a.rs",
+            "--session",
+            &session_id,
+        ],
     );
     assert!(quiet.status.success());
     assert!(!String::from_utf8_lossy(&quiet.stderr).contains("Aethyme advisory"));
