@@ -80,7 +80,7 @@
         },
         {
           "kind": "ci_usage",
-          "detail": "workspace root mentioned 23 time(s) in CI",
+          "detail": "workspace root mentioned 24 time(s) in CI",
           "confidence": "medium"
         }
       ],
@@ -90,9 +90,9 @@
         "root_manifest": false,
         "declares_workspace": true,
         "member_count": 10,
-        "ci_mentions": 23,
+        "ci_mentions": 24,
         "executable_entrypoints": 1,
-        "source_files": 463
+        "source_files": 473
       }
     },
     {
@@ -114,7 +114,7 @@
         },
         {
           "kind": "ci_usage",
-          "detail": "workspace root mentioned 28 time(s) in CI",
+          "detail": "workspace root mentioned 29 time(s) in CI",
           "confidence": "medium"
         }
       ],
@@ -124,9 +124,9 @@
         "root_manifest": false,
         "declares_workspace": false,
         "member_count": 0,
-        "ci_mentions": 28,
+        "ci_mentions": 29,
         "executable_entrypoints": 1,
-        "source_files": 465
+        "source_files": 475
       }
     },
     {
@@ -175,7 +175,7 @@
         "member_count": 0,
         "ci_mentions": 1,
         "executable_entrypoints": 0,
-        "source_files": 17
+        "source_files": 72
       }
     }
   ],
@@ -231,7 +231,7 @@
       },
       {
         "kind": "ci_usage",
-        "detail": "workspace root mentioned 23 time(s) in CI",
+        "detail": "workspace root mentioned 24 time(s) in CI",
         "confidence": "medium"
       }
     ],
@@ -241,9 +241,9 @@
       "root_manifest": false,
       "declares_workspace": true,
       "member_count": 10,
-      "ci_mentions": 23,
+      "ci_mentions": 24,
       "executable_entrypoints": 1,
-      "source_files": 463
+      "source_files": 473
     }
   },
   "commands": [
@@ -458,9 +458,9 @@
     ]
   },
   "freshness": {
-    "source_digest": "dabaf4a44e76caa2407eee4563d5e03d864b145e9619011adb4a222070efeab6",
+    "source_digest": "54004a26ccf1849b48774820610b440e75c3f8b35c740d8b352ea67eecafa74f",
     "source_commit": null,
-    "source_file_count": 797,
+    "source_file_count": 890,
     "generator": "deterministic"
   },
   "telemetry": {

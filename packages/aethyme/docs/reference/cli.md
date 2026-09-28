@@ -2455,10 +2455,10 @@ continue to accept `aethyme-onboarding-v1` while repositories regenerate.
 - likely fast test/lint/build commands
 - likely entrypoints and caution zones
 
-`deploy verify --generated-only@ also prints a compact summary: recommended skill/mode,
-onboarding counts, override presence, override freshness, and Act starter
-readiness. Direct edits to `AGENTS.md` or `CLAUDE.md` are now verification
-failures; use `.aethyme/overrides/agents.json` instead.
+`deploy verify --generated-only` also prints a compact summary: recommended
+skill/mode, onboarding counts, override presence, override freshness, and Act
+starter readiness. Direct edits to `AGENTS.md` or `CLAUDE.md` are now
+verification failures; use `.aethyme/overrides/agents.json` instead.
 
 After a successful `deploy`, commit `.gitignore`, broker configuration and
 gates, overrides, the two canonical onboarding JSON artifacts, `AGENTS.md`,
