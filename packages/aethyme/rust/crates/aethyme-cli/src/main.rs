@@ -1044,11 +1044,11 @@ mod compatibility_command_tests {
         let cases = [
             (&["broker", "status"][..], CommandCapability::DiagnosticRead),
             (
-                &["broker", "advanced", "storage"][..],
+                &["broker", "gc", "storage"][..],
                 CommandCapability::DiagnosticRead,
             ),
             (
-                &["broker", "advanced", "storage", "apply"][..],
+                &["broker", "gc", "storage", "apply"][..],
                 CommandCapability::RecoveryWrite,
             ),
             (
@@ -1151,23 +1151,29 @@ mod compatibility_command_tests {
     fn degraded_repository_lanes_match_command_semantics() {
         let cases = [
             (
-                &["broker", "integration", "reconcile", "--dry-run"][..],
+                &[
+                    "broker",
+                    "advanced",
+                    "integration",
+                    "reconcile",
+                    "--dry-run",
+                ][..],
                 CommandCapability::DiagnosticRead,
             ),
             (
-                &["broker", "integration", "reconcile", "--apply"][..],
+                &["broker", "advanced", "integration", "reconcile", "--apply"][..],
                 CommandCapability::RecoveryWrite,
             ),
             (
-                &["broker", "report", "capture"][..],
+                &["broker", "advanced", "report", "capture"][..],
                 CommandCapability::DiagnosticRead,
             ),
             (
-                &["broker", "report", "file"][..],
+                &["broker", "advanced", "report", "file"][..],
                 CommandCapability::RecoveryWrite,
             ),
             (
-                &["broker", "git", "--session", "7"][..],
+                &["broker", "advanced", "git", "--session", "7"][..],
                 CommandCapability::RecoveryWrite,
             ),
             (
@@ -1175,43 +1181,43 @@ mod compatibility_command_tests {
                 CommandCapability::RecoveryWrite,
             ),
             (
-                &["broker", "close", "--session", "7"][..],
+                &["broker", "finish", "close", "--session", "7"][..],
                 CommandCapability::RecoveryWrite,
             ),
             (
-                &["broker", "hooks", "pre-commit"][..],
+                &["broker", "advanced", "hooks", "pre-commit"][..],
                 CommandCapability::ManagedPreCommit,
             ),
             (
-                &["broker", "integration", "status"][..],
+                &["broker", "advanced", "integration", "status"][..],
                 CommandCapability::DiagnosticRead,
             ),
             (
-                &["broker", "advisories", "list"][..],
+                &["broker", "advanced", "advisories", "list"][..],
                 CommandCapability::DiagnosticRead,
             ),
             (
-                &["broker", "advisories", "show", "7"][..],
+                &["broker", "advanced", "advisories", "show", "7"][..],
                 CommandCapability::DiagnosticRead,
             ),
             (
-                &["broker", "advisories", "ack", "7"][..],
+                &["broker", "advanced", "advisories", "ack", "7"][..],
                 CommandCapability::RecoveryWrite,
             ),
             (
-                &["broker", "watch", "pr", "list"][..],
+                &["broker", "advanced", "watch", "pr", "list"][..],
                 CommandCapability::DiagnosticRead,
             ),
             (
-                &["broker", "watch", "pr", "poll", "--id", "7"][..],
+                &["broker", "advanced", "watch", "pr", "poll", "--id", "7"][..],
                 CommandCapability::SessionContinuation,
             ),
             (
-                &["broker", "deliveries", "list"][..],
+                &["broker", "advanced", "deliveries", "list"][..],
                 CommandCapability::DiagnosticRead,
             ),
             (
-                &["broker", "deliveries", "claim"][..],
+                &["broker", "advanced", "deliveries", "claim"][..],
                 CommandCapability::SharedMutation,
             ),
         ];
