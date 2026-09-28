@@ -573,6 +573,7 @@ fn migration_diff_never_enters_reports_events_or_metrics() {
     for args in [
         &[
             "broker",
+            "advanced",
             "report",
             "capture",
             "--kind",
@@ -806,6 +807,7 @@ fn homebrew_upgrade_mid_session_preserves_commit_and_recovery_lanes() {
         &["broker", "advanced", "operations", "--json"][..],
         &[
             "broker",
+            "advanced",
             "git",
             "--session",
             &session_arg,
@@ -826,6 +828,7 @@ fn homebrew_upgrade_mid_session_preserves_commit_and_recovery_lanes() {
         &repo,
         &[
             "broker",
+            "advanced",
             "report",
             "file",
             "missing.issue.md",
@@ -908,6 +911,7 @@ fn newer_repository_names_coordinated_operation_refusals() {
         &repo,
         &[
             "broker",
+            "advanced",
             "gh",
             "--session",
             "1",
@@ -977,6 +981,7 @@ fn older_repository_allows_diagnostics_recovery_and_only_pinned_continuation() {
         &["broker", "advanced", "report", "list", "--json"][..],
         &[
             "broker",
+            "advanced",
             "report",
             "capture",
             "--kind",
@@ -1016,6 +1021,7 @@ fn older_repository_allows_diagnostics_recovery_and_only_pinned_continuation() {
         &repo,
         &[
             "broker",
+            "advanced",
             "git",
             "--session",
             &session_arg,
