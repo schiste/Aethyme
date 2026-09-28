@@ -1,6 +1,4 @@
-//! The deprecation window: every old spelling keeps working, prints exactly
-//! one warning line on stderr naming the new spelling, and leaves stdout (and
-//! so `--json`) untouched. The new spelling reaches the same implementation.
+//! Removed v0.8.8 spellings fail with a replacement hint; canonical routes stay usable.
 
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
@@ -26,8 +24,11 @@ fn aethyme(cwd: &Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_aethyme"))
         .args(args)
         .current_dir(cwd)
+        .env_remove("AETHYME_ROOT")
+        .env_remove("AETHYME_BROKER_DB")
         .env_remove("AETHYME_REPO")
         .env_remove("AETHYME_AGENT")
+        .env("XDG_CONFIG_HOME", cwd.join("empty-config"))
         .stdin(Stdio::null())
         .output()
         .expect("run aethyme")
@@ -45,188 +46,128 @@ fn fixture() -> tempfile::TempDir {
     tmp
 }
 
-fn warnings(output: &Output) -> Vec<String> {
-    String::from_utf8_lossy(&output.stderr)
-        .lines()
-        .filter(|line| line.contains("is deprecated"))
-        .map(str::to_string)
-        .collect()
-}
-
-fn keys(output: &Output) -> Vec<String> {
-    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
-        panic!(
-            "stdout is not JSON ({error}):\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        )
-    });
-    let mut keys: Vec<String> = value
-        .as_object()
-        .map(|object| object.keys().cloned().collect())
-        .unwrap_or_default();
-    keys.sort();
-    keys
-}
-
-#[test]
-fn old_adopt_spelling_warns_once_on_stderr_and_matches_start_adopt() {
-    let tmp = fixture();
-    let repo = tmp.path().join("repo");
-    let old_path = tmp.path().join("old");
-    let new_path = tmp.path().join("new");
-    for (branch, path) in [("old", &old_path), ("new", &new_path)] {
-        git(
-            &repo,
-            &[
-                "worktree",
-                "add",
-                "-q",
-                "-b",
-                branch,
-                path.to_str().unwrap(),
-            ],
-        );
-    }
-
-    let old = aethyme(&old_path, &["broker", "adopt", "--task", "old", "--json"]);
-    assert!(
-        old.status.success(),
-        "{}",
-        String::from_utf8_lossy(&old.stderr)
-    );
+fn assert_removed(output: &Output, old: &str, new: &str) {
     assert_eq!(
-        warnings(&old),
-        [
-            "warning: 'aethyme broker adopt' is deprecated; use 'aethyme broker start --adopt' \
-          (the old spelling is removed in v0.8.8)"
-        ]
+        output.status.code(),
+        Some(2),
+        "expected removed-spelling refusal for {old}: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
-
-    let new = aethyme(
-        &new_path,
-        &["broker", "start", "--adopt", "--task", "new", "--json"],
+    let expected = format!("Error: '{old}' was removed in v0.8.8; use '{new}'");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr).trim(),
+        expected,
+        "unexpected refusal for {old}"
     );
-    assert!(
-        new.status.success(),
-        "{}",
-        String::from_utf8_lossy(&new.stderr)
-    );
-    assert!(warnings(&new).is_empty(), "{:?}", warnings(&new));
-    assert_eq!(keys(&old), keys(&new));
-
-    // `adopt --reuse` names its own replacement.
-    let reused = aethyme(
-        &old_path,
-        &["broker", "adopt", "--reuse", "--task", "again", "--json"],
-    );
-    assert!(
-        reused.status.success(),
-        "{}",
-        String::from_utf8_lossy(&reused.stderr)
-    );
-    assert_eq!(warnings(&reused).len(), 1);
-    assert!(warnings(&reused)[0].contains("use 'aethyme broker start --reuse'"));
-    let reused_new = aethyme(
-        &new_path,
-        &["broker", "start", "--reuse", "--task", "again", "--json"],
-    );
-    assert!(
-        reused_new.status.success(),
-        "{}",
-        String::from_utf8_lossy(&reused_new.stderr)
-    );
-    assert!(warnings(&reused_new).is_empty());
-    assert_eq!(keys(&reused), keys(&reused_new));
+    assert!(output.stdout.is_empty(), "removed route printed to stdout");
 }
 
 #[test]
-fn merged_verbs_reach_the_same_implementation() {
+fn removed_adopt_spellings_fail_with_specific_replacements() {
     let tmp = fixture();
     let repo = tmp.path().join("repo");
-    for (old, new) in [
+    for (args, old, new) in [
         (
-            vec!["broker", "blockers", "--json"],
-            vec!["broker", "unblock", "--json"],
+            &["broker", "adopt", "--task", "old", "--json"][..],
+            "aethyme broker adopt",
+            "aethyme broker start --adopt",
         ),
         (
-            vec!["broker", "reclaim", "plan", "--json"],
-            vec!["broker", "gc", "reclaim", "plan", "--json"],
-        ),
-        (
-            vec!["broker", "promotion-record", "plan", "--json"],
-            vec!["broker", "submit", "promotion-record", "plan", "--json"],
-        ),
-        (
-            vec!["broker", "leases", "--json"],
-            vec!["broker", "advanced", "leases", "--json"],
+            &["broker", "adopt", "--reuse", "--task", "again", "--json"][..],
+            "aethyme broker adopt --reuse",
+            "aethyme broker start --reuse",
         ),
     ] {
-        let old_output = aethyme(&repo, &old);
-        let new_output = aethyme(&repo, &new);
-        assert_eq!(
-            old_output.status.code(),
-            new_output.status.code(),
-            "{old:?} vs {new:?}"
-        );
-        assert_eq!(warnings(&old_output).len(), 1, "{old:?}");
-        assert!(warnings(&new_output).is_empty(), "{new:?}");
-        if old_output.status.success() {
-            assert_eq!(keys(&old_output), keys(&new_output), "{old:?} vs {new:?}");
-        } else {
-            // Same implementation, same refusal: only the warning differs.
-            let errors = |output: &Output| -> Vec<String> {
-                String::from_utf8_lossy(&output.stderr)
-                    .lines()
-                    .filter(|line| !line.contains("is deprecated"))
-                    .map(str::to_string)
-                    .collect()
-            };
-            assert_eq!(errors(&old_output), errors(&new_output), "{old:?}");
-        }
+        let output = aethyme(&repo, args);
+        assert_removed(&output, old, new);
+    }
+    assert!(
+        !repo.join(".aethyme").exists(),
+        "removed spellings must fail before creating broker state"
+    );
+}
+
+#[test]
+fn removed_merged_and_advanced_spellings_fail_with_replacements() {
+    let tmp = fixture();
+    let repo = tmp.path().join("repo");
+    for (args, old, new) in [
+        (
+            &["broker", "blockers", "--json"][..],
+            "aethyme broker blockers",
+            "aethyme broker unblock",
+        ),
+        (
+            &["broker", "reclaim", "plan", "--json"][..],
+            "aethyme broker reclaim",
+            "aethyme broker gc reclaim",
+        ),
+        (
+            &["broker", "promotion-record", "plan", "--json"][..],
+            "aethyme broker promotion-record",
+            "aethyme broker submit promotion-record",
+        ),
+        (
+            &["broker", "leases", "--json"][..],
+            "aethyme broker leases",
+            "aethyme broker advanced leases",
+        ),
+    ] {
+        let output = aethyme(&repo, args);
+        assert_removed(&output, old, new);
     }
 }
 
 #[test]
-fn top_level_duplicates_warn_and_keep_working() {
+fn removed_top_level_spellings_fail_and_canonical_routes_stay_usable() {
     let tmp = fixture();
     let repo = tmp.path().join("repo");
-    let readiness = aethyme(&repo, &["readiness", "--json"]);
-    assert_eq!(warnings(&readiness).len(), 1);
-    assert!(warnings(&readiness)[0].contains("use 'aethyme broker status readiness'"));
-    let merged = aethyme(&repo, &["broker", "status", "readiness", "--json"]);
-    assert!(warnings(&merged).is_empty());
-    assert_eq!(readiness.status.code(), merged.status.code());
-    assert_eq!(keys(&readiness), keys(&merged));
 
-    let certify = aethyme(&repo, &["broker", "certify", "--json"]);
-    assert_eq!(warnings(&certify).len(), 1);
-    assert!(warnings(&certify)[0].contains("use 'aethyme certify'"));
-    let top = aethyme(&repo, &["certify", "--json"]);
-    assert!(warnings(&top).is_empty());
-    assert_eq!(certify.status.code(), top.status.code());
+    assert_removed(
+        &aethyme(&repo, &["readiness", "--json"]),
+        "aethyme readiness",
+        "aethyme broker status readiness",
+    );
+    let readiness = aethyme(&repo, &["broker", "status", "readiness", "--json"]);
+    assert!(
+        readiness.status.success(),
+        "{}",
+        String::from_utf8_lossy(&readiness.stderr)
+    );
 
-    let enhance = aethyme(&repo, &["enhance", "verify", "--repo", "."]);
-    assert_eq!(warnings(&enhance).len(), 1);
-    assert!(warnings(&enhance)[0].contains("use 'aethyme deploy verify'"));
+    assert_removed(
+        &aethyme(&repo, &["broker", "certify", "--json"]),
+        "aethyme broker certify",
+        "aethyme certify",
+    );
+    let certify = aethyme(&repo, &["certify", "--json"]);
+    assert!(
+        certify.status.success(),
+        "{}",
+        String::from_utf8_lossy(&certify.stderr)
+    );
+
+    assert_removed(
+        &aethyme(&repo, &["enhance", "verify", "--repo", "."]),
+        "aethyme enhance verify",
+        "aethyme deploy verify --generated-only",
+    );
 }
 
 #[test]
-fn installed_hook_entry_points_never_warn() {
+fn installed_hook_entry_points_remain_available_without_deprecation() {
     let tmp = fixture();
     let repo = tmp.path().join("repo");
     let output = aethyme(&repo, &["broker", "hooks", "post-commit"]);
-    assert!(warnings(&output).is_empty(), "{:?}", warnings(&output));
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("is deprecated"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
-/// A public verb spelled under `advanced` used to be stripped twice: the
-/// router classified `advanced status doctor` as `status` (a diagnostic read)
-/// while the broker ran `doctor` (a shared mutation), so a repository on a
-/// newer schema refused `broker doctor` but let `advanced status doctor`
-/// through. Those spellings are now refused before the preflight, and each
-/// sub-form is gated exactly like the internal command it runs.
 #[test]
-fn public_verbs_under_advanced_cannot_bypass_the_compatibility_gate() {
+fn removed_public_spellings_and_advanced_duplicates_refuse_before_preflight() {
     let tmp = fixture();
     let repo = tmp.path().join("repo");
     std::fs::create_dir_all(repo.join(".aethyme")).unwrap();
@@ -236,10 +177,23 @@ fn public_verbs_under_advanced_cannot_bypass_the_compatibility_gate() {
     )
     .unwrap();
 
+    for (args, old, new) in [
+        (
+            &["broker", "doctor", "--json"][..],
+            "aethyme broker doctor",
+            "aethyme broker status doctor",
+        ),
+        (
+            &["broker", "promote", "--entry", "1", "--json"][..],
+            "aethyme broker promote",
+            "aethyme broker submit promote",
+        ),
+    ] {
+        assert_removed(&aethyme(&repo, args), old, new);
+    }
+
     for line in [
-        "broker doctor --json",
         "broker status doctor --json",
-        "broker promote --entry 1 --json",
         "broker submit promote --entry 1 --json",
     ] {
         let args: Vec<&str> = line.split(' ').collect();
@@ -247,7 +201,7 @@ fn public_verbs_under_advanced_cannot_bypass_the_compatibility_gate() {
         assert_eq!(
             output.status.code(),
             Some(1),
-            "`{line}` must be refused by the compatibility gate: {}",
+            "`{line}` must be refused by compatibility policy: {}",
             String::from_utf8_lossy(&output.stderr)
         );
     }
