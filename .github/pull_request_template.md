@@ -40,8 +40,8 @@ touch externally-consumed entry points without an explicit decision.
 <!-- Concrete commands the reviewer can run. For UI/eval changes:
      what playground was run against and what was observed. -->
 
-- [ ] `cd packages/aethyme && .venv/bin/python -m pytest tests/local/`
-- [ ] (if Rust touched) `cd packages/aethyme/rust && cargo test --release -p aethyme-engine`
+- [ ] `cargo test --manifest-path packages/aethyme/rust/Cargo.toml --workspace`
+- [ ] (if Python eval package touched) `cd packages/aethyme-eval && PYTHONPATH=src .venv/bin/python -m pytest -q tests`
 - [ ] (if eval pipeline touched) one full eval cycle on a Playground repo
 
 ## Eval impact
