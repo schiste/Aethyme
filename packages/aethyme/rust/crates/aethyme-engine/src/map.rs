@@ -414,16 +414,23 @@ impl RepositoryMap {
             .to_string();
         let root_path = canonical_root.to_string_lossy().to_string();
 
+        // This command reads the graph. Under the DEFAULT deployment graph
+        // authority is `disabled` and no fragment store exists, so the old
+        // advice -- run `aethyme-graph-index` -- named a step the default
+        // posture never asks for and never mentions the posture itself. It
+        // also contradicted `aethyme graph status`, which reports the
+        // disabled posture as `healthy: true, action required: false`. State
+        // the posture and name the two commands that change it.
         let store = FragmentStore::open(root).map_err(|err| {
             format!(
-                "open fragment store at {}: {err}. The legacy pass pipeline was deleted in 4.7.12; run `aethyme-graph-index` before using the engine.",
+                "open fragment store at {}: {err}. This command reads the graph and no graph fragment store is present. Graph authority is disabled in the default deployment, so this is a posture rather than a fault: `aethyme graph status` reports which posture applies, `aethyme graph refresh` materializes a local store, and `aethyme deploy --repo . --with-graph` enrolls one.",
                 root.display()
             )
         })?;
         let fragments = read_all_fragments(&store)?;
         if fragments.is_empty() {
             return Err(format!(
-                "fragment store at {} contains no source fragments; run `aethyme-graph-index` before using the engine",
+                "fragment store at {} exists but contains no source fragments; populate it with `aethyme graph refresh`",
                 root.display()
             ));
         }

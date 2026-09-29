@@ -193,3 +193,41 @@ fn local_task_navigation_commands() {
     expand.ok();
     assert!(expand.json().get("dependencies").is_some());
 }
+
+/// A repository with no graph fragment store is the DEFAULT deployment
+/// posture (`[graph] authority = "disabled"`), not a broken checkout.
+///
+/// `repo inspect` reads the graph, so it must fail — but its failure used to
+/// name only `aethyme-graph-index`, a step the default posture never asks
+/// for, while `aethyme graph status` called the very same state
+/// `healthy: true, action required: false`. A user following the error was
+/// sent to fix something the product had deliberately turned off.
+///
+/// The message now states the posture and names the commands that change it.
+#[test]
+fn repo_inspect_without_a_graph_store_explains_the_posture() {
+    let tmp = tmp_dir();
+    // Deliberately NOT `demo_repo()`: no `bootstrap_repo_fragments`, so no
+    // `.aethyme/graph` directory exists.
+    let repo = build_demo_source_repo(&tmp.path().join("graph-disabled-repo"));
+    let repo_arg = repo.display().to_string();
+
+    let inspect = invoke_aethyme(["repo", "inspect", &repo_arg, "--json-output"]);
+
+    assert_ne!(
+        inspect.exit_code, 0,
+        "a graph-reading command must fail without a graph store:\n{}",
+        inspect.output
+    );
+    inspect
+        .assert_contains("no graph fragment store is present")
+        .assert_contains("Graph authority is disabled")
+        // The two commands that actually change the posture.
+        .assert_contains("aethyme graph refresh")
+        .assert_contains("--with-graph")
+        // The posture reporter, so the user can confirm which one applies.
+        .assert_contains("aethyme graph status")
+        // The old advice pointed at an indexer step without saying why the
+        // store was missing, which is what made it read as a fault.
+        .assert_lacks("legacy pass pipeline");
+}
