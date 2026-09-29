@@ -559,15 +559,88 @@ pub fn scan_with_extra_directories(
         if !base.is_dir() {
             continue;
         }
-        collect(&base, &base, active, extras, &mut found, 0);
+        let checkout = own_checkout(&base);
+        collect(
+            &base,
+            &base,
+            checkout.as_ref(),
+            active,
+            extras,
+            &mut found,
+            0,
+        );
     }
     found.sort_by_key(|candidate| std::cmp::Reverse(candidate.bytes));
     found
 }
 
+/// The Git checkout rooted exactly at `worktree`, if there is one.
+///
+/// Discovery walks upward, so a directory that is not itself a checkout could
+/// resolve to some enclosing repository whose ignore rules say nothing about it.
+fn own_checkout(worktree: &Path) -> Option<crate::git::GitRepo> {
+    let checkout = crate::git::GitRepo::discover(worktree).ok()?;
+    let same = |path: &Path| std::fs::canonicalize(path).ok();
+    (same(checkout.root()) == same(worktree)).then_some(checkout)
+}
+
+/// Why Git forbids reclaiming `path`, if it does.
+///
+/// A matching name is not evidence of build output: projects commit `dist/`
+/// and `build/`, and deleting those destroyed tracked files. Only a
+/// directory Git ignores and holds no tracked file under is disposable.
+fn git_protection(
+    checkout: Option<&crate::git::GitRepo>,
+    worktree: &Path,
+    path: &Path,
+) -> Option<String> {
+    let Some(checkout) = checkout else {
+        return Some("not a Git checkout, so nothing shows this directory is disposable".into());
+    };
+    let Some(relative) = path
+        .strip_prefix(worktree)
+        .ok()
+        .and_then(|relative| relative.to_str())
+    else {
+        return Some("path cannot be expressed relative to its worktree".into());
+    };
+    // Tracked files first: `check-ignore` also reports a directory holding
+    // them as not ignored, and "tracked" is the reason that matters.
+    match checkout.is_tracked(relative) {
+        Ok(false) => {}
+        Ok(true) => return Some("Git tracks files under this directory".into()),
+        Err(error) => return Some(format!("cannot check for tracked files: {error}")),
+    }
+    (!checkout.path_is_ignored(relative))
+        .then(|| "Git does not ignore this directory, so it is not known to be build output".into())
+}
+
+/// Keep candidates in worktrees no session of this repository records.
+///
+/// "Not active" must not include "unknown": a worktree whose session row was
+/// lost, or that was made outside the broker, has no owner who reviewed it.
+pub fn protect_unrecorded_worktrees(candidates: &mut [ReclaimCandidate], recorded: &[PathBuf]) {
+    // Session rows and a scan can spell one directory differently, e.g.
+    // macOS `/var/...` versus `/private/var/...`.
+    let canonical: Vec<PathBuf> = recorded
+        .iter()
+        .filter_map(|path| std::fs::canonicalize(path).ok())
+        .collect();
+    for candidate in candidates.iter_mut().filter(|c| c.reclaimable) {
+        let known = recorded.contains(&candidate.worktree)
+            || std::fs::canonicalize(&candidate.worktree)
+                .is_ok_and(|worktree| canonical.contains(&worktree));
+        if !known {
+            candidate.reclaimable = false;
+            candidate.reason = "no session of this repository records this worktree".into();
+        }
+    }
+}
+
 fn collect(
     dir: &Path,
     worktree: &Path,
+    checkout: Option<&crate::git::GitRepo>,
     active: &[PathBuf],
     extras: &[String],
     found: &mut Vec<ReclaimCandidate>,
@@ -597,10 +670,17 @@ fn collect(
         }
         if is_artefact_directory_with_extras(name, extras) {
             let bytes = directory_bytes(&path);
-            found.push(classify(&path, worktree, bytes, active));
+            let mut candidate = classify(&path, worktree, bytes, active);
+            if candidate.reclaimable
+                && let Some(reason) = git_protection(checkout, worktree, &path)
+            {
+                candidate.reclaimable = false;
+                candidate.reason = reason;
+            }
+            found.push(candidate);
             continue;
         }
-        collect(&path, worktree, active, extras, found, depth + 1);
+        collect(&path, worktree, checkout, active, extras, found, depth + 1);
     }
 }
 
@@ -659,10 +739,31 @@ mod scan_tests {
         std::fs::write(path, vec![b'x'; bytes]).unwrap();
     }
 
+    fn git(dir: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.test")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.test")
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?}");
+    }
+
+    /// Make `worktree` its own Git checkout with the given `.gitignore`.
+    fn checkout(worktree: &Path, gitignore: &str) {
+        std::fs::create_dir_all(worktree).unwrap();
+        git(worktree, &["init", "-q"]);
+        std::fs::write(worktree.join(".gitignore"), gitignore).unwrap();
+    }
+
     #[test]
     fn a_nested_build_directory_is_found_and_sized() {
         let tmp = tempfile::tempdir().unwrap();
         let wt = tmp.path().join("session-a");
+        checkout(&wt, "target/\n");
         write(&wt.join("packages/app/rust/target/debug/lib.rlib"), 2048);
         write(&wt.join("src/main.rs"), 10);
 
@@ -731,6 +832,7 @@ mod scan_tests {
         let tmp = tempfile::tempdir().unwrap();
         let done = tmp.path().join("done");
         let live = tmp.path().join("live");
+        checkout(&done, "target/\n");
         write(&done.join("target/a"), 64);
         write(&live.join("target/b"), 64);
 
@@ -813,5 +915,104 @@ mod scan_tests {
         let found = scan(tmp.path(), &[]);
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].bytes, 0, "symlinked content is not counted");
+    }
+
+    /// Projects commit `dist/` and `build/`. A name match deleted tracked
+    /// files in a real worktree; only what Git ignores is disposable.
+    #[test]
+    fn a_tracked_build_named_directory_is_kept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wt = tmp.path().join("s");
+        checkout(&wt, "target/\n");
+        write(&wt.join("plugins/kanban/dist/index.js"), 64);
+        git(&wt, &["add", "plugins/kanban/dist/index.js"]);
+
+        let found = scan(tmp.path(), &[]);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(!found[0].reclaimable, "{found:?}");
+        assert!(
+            found[0].reason.contains("tracks files"),
+            "{}",
+            found[0].reason
+        );
+        assert_eq!(reclaimable_bytes(&found), 0);
+    }
+
+    /// Untracked output no rule ignores is not known to be build output.
+    #[test]
+    fn an_unignored_untracked_build_named_directory_is_kept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wt = tmp.path().join("s");
+        checkout(&wt, "target/\n");
+        write(&wt.join("build/report.html"), 64);
+
+        let found = scan(tmp.path(), &[]);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(!found[0].reclaimable);
+        assert!(
+            found[0].reason.contains("does not ignore"),
+            "{}",
+            found[0].reason
+        );
+    }
+
+    /// An ignore rule does not make a force-added file disposable.
+    #[test]
+    fn an_ignored_directory_holding_tracked_files_is_kept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wt = tmp.path().join("s");
+        checkout(&wt, "dist/\n");
+        write(&wt.join("dist/vendored.js"), 64);
+        git(&wt, &["add", "-f", "dist/vendored.js"]);
+
+        let found = scan(tmp.path(), &[]);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(!found[0].reclaimable);
+        assert!(
+            found[0].reason.contains("tracks files"),
+            "{}",
+            found[0].reason
+        );
+    }
+
+    #[test]
+    fn a_directory_that_is_not_its_own_checkout_is_kept() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(&tmp.path().join("plain/target/x"), 16);
+
+        let found = scan(tmp.path(), &[]);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(!found[0].reclaimable);
+        assert!(
+            found[0].reason.contains("not a Git checkout"),
+            "{}",
+            found[0].reason
+        );
+    }
+
+    #[test]
+    fn a_worktree_no_session_records_is_kept() {
+        let mut candidates = vec![
+            classify(
+                &PathBuf::from("/w/known/target"),
+                &PathBuf::from("/w/known"),
+                8,
+                &[],
+            ),
+            classify(
+                &PathBuf::from("/w/orphan/target"),
+                &PathBuf::from("/w/orphan"),
+                8,
+                &[],
+            ),
+        ];
+        protect_unrecorded_worktrees(&mut candidates, &[PathBuf::from("/w/known")]);
+        assert!(candidates[0].reclaimable);
+        assert!(!candidates[1].reclaimable);
+        assert!(
+            candidates[1].reason.contains("no session"),
+            "{}",
+            candidates[1].reason
+        );
     }
 }

@@ -536,11 +536,21 @@ pub(super) fn run_reclaim(parsed: Parsed) -> Result<(), UsageError> {
         .filter(|agent| agent.derived_status == crate::SessionStatus::Active)
         .map(|agent| std::path::PathBuf::from(agent.session.worktree_path.clone()))
         .collect();
-    let candidates = crate::scan_reclaim_with_extra_directories(
+    let mut candidates = crate::scan_reclaim_with_extra_directories(
         &root,
         &active,
         &retention_policy.artefact_directories,
     );
+    // A worktree no session records has no owner who reviewed it, so its
+    // artefacts are reported but kept rather than treated as abandoned.
+    let recorded: Vec<std::path::PathBuf> = broker
+        .store()
+        .live_sessions()?
+        .into_iter()
+        .chain(broker.store().cleaned_sessions()?)
+        .map(|session| std::path::PathBuf::from(session.worktree_path))
+        .collect();
+    crate::reclaim::protect_unrecorded_worktrees(&mut candidates, &recorded);
     let digest = crate::reclaim::plan_digest(&root, &candidates);
     let plan = crate::ReclaimPlan {
         digest: digest.clone(),
@@ -569,15 +579,15 @@ pub(super) fn run_reclaim(parsed: Parsed) -> Result<(), UsageError> {
                     gib(plan.total_bytes)
                 );
                 for candidate in plan.candidates.iter().take(20) {
+                    let kept = if candidate.reclaimable {
+                        String::new()
+                    } else {
+                        format!("  (kept: {})", candidate.reason)
+                    };
                     out!(
-                        "  {:>10}  {}{}",
+                        "  {:>10}  {}{kept}",
                         gib(candidate.bytes),
-                        candidate.path.display(),
-                        if candidate.reclaimable {
-                            ""
-                        } else {
-                            "  (active session; kept)"
-                        }
+                        candidate.path.display()
                     );
                 }
                 if plan.reclaimable_bytes == 0 {

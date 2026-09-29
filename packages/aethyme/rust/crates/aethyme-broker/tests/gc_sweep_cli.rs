@@ -32,7 +32,7 @@ fn fixture(retention: &str) -> (tempfile::TempDir, tempfile::TempDir) {
     std::fs::write(repo.path().join("README.md"), "fixture\n").unwrap();
     std::fs::write(
         repo.path().join(".gitignore"),
-        "/.aethyme/\n/rust/target/\n",
+        "/.aethyme/\n/rust/target/\n/rust/build/\n",
     )
     .unwrap();
     git(repo.path(), &["add", "-A"]);
@@ -177,22 +177,32 @@ fn orphaned_roots_are_swept_while_owned_and_unmarked_roots_are_protected() {
 #[test]
 fn reclaim_confirmation_binds_decisions_not_sizes_and_explains_changes() {
     let (repo, container) = fixture("");
-    let root_output = run(
+    // Reclaim takes only Git-ignored output from worktrees a session records,
+    // so the fixture is a real session closed with its checkout kept.
+    let started = run(
         repo.path(),
         container.path(),
-        &["advanced", "worktree-root", "--json"],
+        &["start", "--task", "reclaim fixture", "--json"],
     );
     assert!(
-        root_output.status.success(),
-        "worktree root: {}",
-        String::from_utf8_lossy(&root_output.stderr)
+        started.status.success(),
+        "start: {}",
+        String::from_utf8_lossy(&started.stderr)
     );
-    let worktree_root =
-        serde_json::from_slice::<serde_json::Value>(&root_output.stdout).unwrap()["preferred_root"]
-            .as_str()
-            .map(PathBuf::from)
-            .unwrap();
-    let target = worktree_root.join("session/target");
+    let session: serde_json::Value = serde_json::from_slice(&started.stdout).unwrap();
+    let worktree = PathBuf::from(session["worktree_path"].as_str().unwrap());
+    let id = session["id"].as_i64().unwrap().to_string();
+    let finished = run(
+        repo.path(),
+        container.path(),
+        &["finish", "--session", &id, "--keep-worktree"],
+    );
+    assert!(
+        finished.status.success(),
+        "finish: {}",
+        String::from_utf8_lossy(&finished.stderr)
+    );
+    let target = worktree.join("rust/target");
     std::fs::create_dir_all(&target).unwrap();
     std::fs::write(target.join("artifact"), "small\n").unwrap();
 
@@ -218,7 +228,7 @@ fn reclaim_confirmation_binds_decisions_not_sizes_and_explains_changes() {
     std::fs::write(target.join("artifact"), "small\n").unwrap();
     let plan = reclaim_plan_json(repo.path(), container.path());
     let digest = plan["digest"].as_str().unwrap().to_string();
-    let added = worktree_root.join("session/build");
+    let added = worktree.join("rust/build");
     std::fs::create_dir_all(&added).unwrap();
     std::fs::write(added.join("artifact"), "new\n").unwrap();
 
