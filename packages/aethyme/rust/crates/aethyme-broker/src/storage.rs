@@ -610,6 +610,33 @@ fn inspect_root(
         };
     }
 
+    // A checkout placed directly in the container (`git worktree add` aimed
+    // one level too high) is a worktree, not a root. Reconciling it as a root
+    // would list its source directories as strays -- removable once anything
+    // wrote a marker beside them -- so its children are never enumerated.
+    if has_git_marker(&path) {
+        let estimated_bytes = observed_size(&path, scan, records);
+        return StorageRoot {
+            age_days: age_days(&path, evaluated_at),
+            blockers: vec![foreign_worktree_blocker(&path)],
+            estimated_bytes,
+            filesystem_kind,
+            git_registered_count: 0,
+            ledger_claimed_count: 0,
+            marker_error: None,
+            marker_sha256: None,
+            marker_status: StorageMarkerStatus::NotApplicable,
+            on_disk_directory_count: 0,
+            owner_exists: None,
+            path,
+            reconciliation: empty_reconciliation(),
+            repository_key: None,
+            repository_root: None,
+            sized: estimated_bytes.is_some(),
+            worktree_count: 0,
+        };
+    }
+
     let marker = read_marker(&path);
     let mut blockers = Vec::new();
     if let Some(error) = &marker.error {
@@ -1871,6 +1898,19 @@ fn filesystem_kind(path: &Path) -> StorageFilesystemKind {
 
 fn has_git_marker(path: &Path) -> bool {
     std::fs::symlink_metadata(path.join(".git")).is_ok()
+}
+
+/// Name a checkout that sits where a worktree root belongs, and say what it
+/// holds, so the operator can publish its work before moving or removing it.
+fn foreign_worktree_blocker(path: &Path) -> String {
+    let branch = crate::git::GitRepo::discover(path)
+        .ok()
+        .and_then(|checkout| checkout.current_branch().ok())
+        .unwrap_or_else(|| "an unknown branch".into());
+    format!(
+        "{} is a Git worktree on {branch} placed directly in the worktree container, not a worktree root; it is never swept. Publish any work it holds, then `git worktree move` it under its repository's root or `git worktree remove` it",
+        path.display()
+    )
 }
 
 fn is_regular_file(path: &Path) -> bool {

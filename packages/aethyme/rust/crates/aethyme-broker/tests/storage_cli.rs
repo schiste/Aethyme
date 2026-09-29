@@ -526,3 +526,60 @@ fn storage_reconciliation_lists_git_or_ledger_paths_missing_on_disk() {
     assert_eq!(entry["ledger_claimed"], true);
     assert_eq!(entry["missing_from"], serde_json::json!(["disk"]));
 }
+
+/// `git worktree add` aimed one level too high leaves a checkout where a
+/// worktree root belongs. Reconciled as a root, its source directories are
+/// unregistered, unclaimed children -- strays -- and any ownership marker
+/// beside them would authorize deleting them.
+#[test]
+fn a_worktree_placed_at_the_root_level_is_never_reconciled_as_a_root() {
+    let (repo, container) = fixture();
+    let checkout = container.path().join("repo-feature");
+    git(
+        repo.path(),
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feature",
+            checkout.to_str().unwrap(),
+        ],
+    );
+    std::fs::create_dir_all(checkout.join("docs")).unwrap();
+    std::fs::write(checkout.join("docs/guide.md"), "unpublished\n").unwrap();
+    std::fs::create_dir_all(checkout.join("src")).unwrap();
+    std::fs::write(checkout.join("src/lib.rs"), "// unpublished\n").unwrap();
+    // The worst case: something wrote an ownership marker into the checkout.
+    marker(&checkout, "repo-feature", repo.path());
+
+    let plan = json(run(
+        repo.path(),
+        container.path(),
+        &["gc", "storage", "--json"],
+    ));
+    let root = plan["roots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|root| root["path"].as_str().unwrap().ends_with("repo-feature"))
+        .unwrap();
+    assert!(
+        root["reconciliation"]["entries"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "a checkout's contents must not be reconciled: {root:#}"
+    );
+    let blockers = root["blockers"].as_array().unwrap();
+    assert!(
+        blockers.iter().any(|blocker| {
+            let text = blocker.as_str().unwrap();
+            text.contains("placed directly in the worktree container") && text.contains("feature")
+        }),
+        "{blockers:?}"
+    );
+    assert_eq!(plan["summary"]["candidate_count"], 0, "{plan:#}");
+    assert!(checkout.join("docs/guide.md").exists());
+    assert!(checkout.join("src/lib.rs").exists());
+}
