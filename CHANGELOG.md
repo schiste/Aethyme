@@ -4,7 +4,20 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
-## [Unreleased]
+## [0.8.9] - 2026-09-29
+
+Broker storage safety and clearer gate results.
+
+### Added
+
+- Storage inventory recognizes a Git worktree placed directly in the broker worktree container, reports its branch, and excludes its contents from reconciliation and removal candidates even when it contains an ownership marker (#335).
+
+### Changed
+
+- The workspace cargo-test gate now completes all tests and reports all failures in one run.
+- Garbage collection does not offer tracked or unrecorded build output for reclamation.
+- Graph status describes a missing graph store as the repository posture.
+
 
 ## [0.8.8] - 2026-09-28
 
