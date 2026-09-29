@@ -6,12 +6,19 @@ artifacts and their exact source revision are recorded in each signed
 
 ## [Unreleased]
 
+## [0.8.8] - 2026-09-28
+
+**Breaking:** see [UPGRADING.md](UPGRADING.md#v088).
+
+The broker and top-level CLI now require the documented primary command
+spellings.
+
 ### Changed
 
-- Removed the deprecated broker and top-level CLI aliases as scheduled in
-  #387. Retired spellings now exit with status 2 and show their replacement.
-  Existing v0.8.7 readiness recovery journals remain recoverable, and
-  Playground setup uses `deploy --generated-only` to preserve its
+- Removed deprecated broker and top-level CLI aliases scheduled for removal
+  in #387. Retired spellings now exit with status 2 and show their
+  replacement. Existing v0.8.7 readiness recovery journals remain recoverable,
+  and Playground setup uses `deploy --generated-only` to preserve
   discoverability-only behavior.
 
 ## [0.8.7] - 2026-09-28
