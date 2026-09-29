@@ -59,6 +59,19 @@ packages/aethyme/.claude/
 .aethyme/graph/
 .aethyme/graph_store.redb*
 
+# Review workspaces. `review.routing.workspace_root` in
+# .aethyme/config.toml points at .aethyme/reviews, and the broker registers
+# a detached git worktree per review dimension inside it. Unignored, every
+# session's `git status` carried two permanent untracked entries, and a
+# review worktree registered inside the repository can surface in a gate's
+# working-tree diff -- which is the same tree-hash churn the managed block
+# below exists to prevent.
+.aethyme/reviews/
+
+# Measured worktree sizes, written by the broker's inventory and GC
+# accounting. A cache of measured bytes, not configuration.
+.aethyme/worktree-sizes.json
+
 # aethyme-broker:begin (managed block — do not edit inside)
 .aethyme/broker.db*
 .aethyme/logs/

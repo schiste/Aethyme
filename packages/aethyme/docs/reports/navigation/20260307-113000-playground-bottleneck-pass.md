@@ -21,7 +21,7 @@ Also upgrade eval tests so the current report and signal behavior is covered by 
 ### 1. Structure pass
 
 File:
-- [packages/aethyme/rust/crates/aethyme-engine/src/passes/structure.rs](/Users/christophehenner/Downloads/Repositories/Aethyme/packages/aethyme/rust/crates/aethyme-engine/src/passes/structure.rs)
+- `packages/aethyme/rust/crates/aethyme-engine/src/passes/structure.rs`
 
 Changes:
 - classify files once at the start of the pass
@@ -36,7 +36,7 @@ Effect:
 ### 2. Code pass
 
 File:
-- [packages/aethyme/rust/crates/aethyme-engine/src/passes/code.rs](/Users/christophehenner/Downloads/Repositories/Aethyme/packages/aethyme/rust/crates/aethyme-engine/src/passes/code.rs)
+- `packages/aethyme/rust/crates/aethyme-engine/src/passes/code.rs`
 
 Changes:
 - reuse per-function body analysis across call/reference resolution
@@ -50,7 +50,7 @@ Effect:
 ### 3. Docs pass
 
 File:
-- [packages/aethyme/rust/crates/aethyme-engine/src/passes/docs.rs](/Users/christophehenner/Downloads/Repositories/Aethyme/packages/aethyme/rust/crates/aethyme-engine/src/passes/docs.rs)
+- `packages/aethyme/rust/crates/aethyme-engine/src/passes/docs.rs`
 
 Changes:
 - replace content-wide area-name scanning with token-index-based area linking
@@ -61,7 +61,7 @@ Effect:
 ### 4. Annotation generation
 
 File:
-- [packages/aethyme/rust/crates/aethyme-engine/src/passes/overlays.rs](/Users/christophehenner/Downloads/Repositories/Aethyme/packages/aethyme/rust/crates/aethyme-engine/src/passes/overlays.rs)
+- `packages/aethyme/rust/crates/aethyme-engine/src/passes/overlays.rs`
 
 Changes:
 - add direct path -> file-id map for risk annotation generation
@@ -73,7 +73,7 @@ Effect:
 ### 5. Eval test upgrades
 
 File:
-- [packages/aethyme/tests/local/test_engine_cache_and_eval.py](/Users/christophehenner/Downloads/Repositories/Aethyme/packages/aethyme/tests/local/test_engine_cache_and_eval.py)
+- `packages/aethyme/tests/local/test_engine_cache_and_eval.py`
 
 Changes:
 - assert explain-repo eval propagates repo signals
