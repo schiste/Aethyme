@@ -7,10 +7,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
+use crate::artifact_catalog::ArtifactWitness;
 use crate::broker::{
     WORKTREE_ROOT_MARKER, WorktreeRootMarker, directory_size_without_following_links,
 };
-use crate::retention::is_safe_artefact_directory_name;
 use crate::{
     Broker, BrokerOpError, GcApplyReport, GcArtifactCandidate, GcBlocker, GcBlockerSummary,
     GcCheckpointPinRelease, GcDeclinedArtifact, GcFileAction, GcFileCandidate,
@@ -20,15 +20,6 @@ use crate::{
 };
 
 pub const GC_PLAN_SCHEMA_VERSION: u32 = 2;
-
-/// Git-ignored build directories that may be reclaimed independently of a
-/// worktree's cleanup disposition. Each name is paired with a witness that
-/// must be present before the directory is treated as a build cache, so an
-/// unrelated source directory that merely shares the name is never removed.
-const ARTIFACT_DIRECTORIES: &[(&str, ArtifactWitness)] = &[
-    ("target", ArtifactWitness::File("CACHEDIR.TAG")),
-    ("node_modules", ArtifactWitness::NonEmptyDirectory),
-];
 
 /// How deep below a worktree root a build directory is looked for. Deep enough
 /// for nested workspaces and package directories, shallow enough to keep the
@@ -74,36 +65,6 @@ fn sweep_order<T: Clone>(items: &[T], cursor: i64, id: impl Fn(&T) -> i64) -> Ve
         .collect()
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ArtifactWitness {
-    File(&'static str),
-    NonEmptyDirectory,
-}
-
-impl ArtifactWitness {
-    /// The entry that must outlive the rest of the removal, if there is one.
-    ///
-    /// A witness file classifies the directory, so taking it first turns an
-    /// interrupted removal into a directory GC can no longer explain. A
-    /// directory witnessed only by being non-empty needs no such care: while
-    /// anything is left it still witnesses itself.
-    fn deferrable_entry(self) -> Option<&'static str> {
-        match self {
-            Self::File(name) => Some(name),
-            Self::NonEmptyDirectory => None,
-        }
-    }
-
-    fn confirms(self, path: &Path) -> bool {
-        match self {
-            Self::File(name) => path.join(name).is_file(),
-            Self::NonEmptyDirectory => std::fs::read_dir(path)
-                .map(|mut entries| entries.next().is_some())
-                .unwrap_or(false),
-        }
-    }
-}
-
 fn is_real_directory(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir())
 }
@@ -118,21 +79,11 @@ fn artifact_witness_for(path: &Path) -> Option<ArtifactWitness> {
     artifact_witness_for_with_extras(path, &[])
 }
 
-/// Classify a directory with the built-in catalog plus additive configured
-/// names. Built-in entries always keep their built-in witness, even when a
-/// configuration repeats the name, so configuration cannot weaken safety.
+/// Classify a directory the unattended lane may remove, if it is one. Names
+/// the shared catalog reserves for reviewed paths never classify here.
 fn artifact_witness_for_with_extras(path: &Path, extras: &[String]) -> Option<ArtifactWitness> {
     let name = path.file_name()?.to_str()?;
-    let witness = ARTIFACT_DIRECTORIES
-        .iter()
-        .find(|(candidate, _)| *candidate == name)
-        .map(|(_, witness)| *witness)
-        .or_else(|| {
-            extras
-                .iter()
-                .any(|candidate| is_safe_artefact_directory_name(candidate) && candidate == name)
-                .then_some(ArtifactWitness::NonEmptyDirectory)
-        })?;
+    let witness = crate::artifact_catalog::unattended_witness(name, extras)?;
     witness.confirms(path).then_some(witness)
 }
 
@@ -164,12 +115,7 @@ fn overlaps_live_worktree(root: &Path, live_worktrees: &[PathBuf]) -> bool {
 }
 
 fn is_known_artifact_name(name: &str, extras: &[String]) -> bool {
-    ARTIFACT_DIRECTORIES
-        .iter()
-        .any(|(candidate, _)| *candidate == name)
-        || extras
-            .iter()
-            .any(|candidate| is_safe_artefact_directory_name(candidate) && candidate == name)
+    crate::artifact_catalog::unattended_witness(name, extras).is_some()
 }
 
 #[derive(Default)]
@@ -256,6 +202,7 @@ fn declined_artifacts(
     worktree_path: &str,
     root: &Path,
     paths: Vec<PathBuf>,
+    extras: &[String],
 ) -> Vec<GcDeclinedArtifact> {
     paths
         .into_iter()
@@ -268,12 +215,24 @@ fn declined_artifacts(
                     worktree_path: worktree_path.to_owned(),
                     relative_dir,
                     estimated_bytes,
-                    reason: "git-ignored directory is outside the regenerable artifact catalog"
-                        .into(),
+                    reason: declined_reason(&path, extras).into(),
                 }
             })
         })
         .collect()
+}
+
+/// Why an ignored directory was reported rather than proposed.
+fn declined_reason(path: &Path, extras: &[String]) -> &'static str {
+    let reviewed_only = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| crate::artifact_catalog::is_reviewed_only(name, extras));
+    if reviewed_only {
+        "build output name with no witness GC can check; review it with `aethyme broker gc reclaim plan`"
+    } else {
+        "git-ignored directory is outside the regenerable artifact catalog"
+    }
 }
 
 fn now_ms() -> i64 {
@@ -784,6 +743,7 @@ impl Broker {
                     &item.worktree_path,
                     &root,
                     artifact_scan.declined,
+                    &policy.artefact_directories,
                 ));
             }
         }
@@ -2523,6 +2483,36 @@ mod tests {
         let source = dir(root, "src/target");
         std::fs::write(source.join("main.rs"), "fn main() {}\n").unwrap();
         assert!(artifact_witness_for(&source).is_none());
+    }
+
+    #[test]
+    fn python_environments_and_pnpm_stores_are_witnessed_build_caches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        let venv = dir(root, "backend/.venv");
+        std::fs::write(venv.join("notes.txt"), "not a venv\n").unwrap();
+        assert!(artifact_witness_for(&venv).is_none());
+        std::fs::write(venv.join("pyvenv.cfg"), "home = /usr/bin\n").unwrap();
+        assert!(artifact_witness_for(&venv).is_some());
+
+        let store = dir(root, ".pnpm-store");
+        assert!(artifact_witness_for(&store).is_none());
+        dir(root, ".pnpm-store/v10");
+        assert!(artifact_witness_for(&store).is_some());
+    }
+
+    /// `build` and `dist` are in the shared catalog, but only reviewed paths
+    /// act on them: a non-empty directory is no evidence of build output.
+    #[test]
+    fn reviewed_only_names_never_classify_for_the_unattended_lane() {
+        let tmp = tempfile::tempdir().unwrap();
+        for name in ["build", "dist"] {
+            let path = dir(tmp.path(), name);
+            std::fs::write(path.join("index.js"), "x\n").unwrap();
+            assert!(artifact_witness_for(&path).is_none(), "{name}");
+            assert!(!is_known_artifact_name(name, &[]), "{name}");
+        }
     }
 
     #[test]

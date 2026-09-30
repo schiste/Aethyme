@@ -442,11 +442,11 @@ fn gc_plan_reports_large_ignored_directories_without_authorizing_them() {
 #[test]
 fn configured_artifact_directories_are_reclaimable_in_gc_and_reclaim() {
     let (repo, container) = fixture(
-        "[retention]\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 0\nartefact_directories = [\".pnpm-store\"]\n",
+        "[retention]\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 0\nartefact_directories = [\".aeptus-cache\"]\n",
     );
     let (_id, worktree) = blocked_session_with_build_cache(repo.path(), container.path());
-    std::fs::write(repo.path().join(".git/info/exclude"), ".pnpm-store/\n").unwrap();
-    let store = worktree.join(".pnpm-store");
+    std::fs::write(repo.path().join(".git/info/exclude"), ".aeptus-cache/\n").unwrap();
+    let store = worktree.join(".aeptus-cache");
     std::fs::create_dir_all(&store).unwrap();
     std::fs::write(store.join("index"), b"package-index").unwrap();
 
@@ -456,7 +456,7 @@ fn configured_artifact_directories_are_reclaimable_in_gc_and_reclaim() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|artifact| artifact["relative_dir"] == ".pnpm-store"),
+            .any(|artifact| artifact["relative_dir"] == ".aeptus-cache"),
         "configured cache should extend the built-in catalog: {}",
         serde_json::to_string_pretty(&plan).unwrap()
     );
@@ -471,7 +471,7 @@ fn configured_artifact_directories_are_reclaimable_in_gc_and_reclaim() {
             .any(|candidate| candidate["path"]
                 .as_str()
                 .unwrap()
-                .ends_with("/.pnpm-store")),
+                .ends_with("/.aeptus-cache")),
         "legacy reclaim should use the same configured catalog: {reclaim_plan}"
     );
 
@@ -819,6 +819,64 @@ fn the_autonomous_sweep_reclaims_build_caches_without_confirmation() {
         worktree.join("work.txt").exists(),
         "committed work must be untouched"
     );
+}
+
+/// The sweep and `gc reclaim` read one catalog. Closed sessions used to keep
+/// their `.venv` because only `gc reclaim` knew the name, and nothing knew
+/// `.pnpm-store`. Names with a witness the sweep can check are swept; generic
+/// ones and unwitnessed directories are left for a reviewed plan.
+#[test]
+fn the_sweep_uses_the_shared_catalog_and_its_witnesses() {
+    let (repo, container) =
+        fixture("[retention]\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 0\n");
+    let (_id, worktree) = blocked_session_with_build_cache(repo.path(), container.path());
+    std::fs::write(
+        repo.path().join(".git/info/exclude"),
+        ".venv/\n.pnpm-store/\nbuild/\ndist/\n",
+    )
+    .unwrap();
+    let populate = |relative: &str, file: &str| {
+        let dir = worktree.join(relative);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(file), vec![0_u8; 64]).unwrap();
+        dir
+    };
+    let venv = populate("backend/.venv", "pyvenv.cfg");
+    let store = populate(".pnpm-store", "index");
+    let unwitnessed = populate("tools/.venv", "notes.txt");
+    let build = populate("web/build", "bundle.js");
+    let dist = populate("web/dist", "bundle.js");
+    enable_sweep(repo.path());
+
+    let output = run(repo.path(), container.path(), &["status"]);
+    assert!(
+        output.status.success(),
+        "status: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!venv.exists(), "a witnessed .venv should be swept");
+    assert!(!store.exists(), "a pnpm store should be swept");
+    assert!(
+        unwitnessed.exists(),
+        "a .venv without pyvenv.cfg is not one"
+    );
+    assert!(build.exists(), "build/ is reviewed-only");
+    assert!(dist.exists(), "dist/ is reviewed-only");
+    assert!(worktree.join("work.txt").exists());
+
+    let reclaim_plan = reclaim_plan_json(repo.path(), container.path());
+    let proposed = |suffix: &str| {
+        reclaim_plan["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|candidate| {
+                candidate["reclaimable"] == true
+                    && candidate["path"].as_str().unwrap().ends_with(suffix)
+            })
+    };
+    assert!(proposed("/web/build"), "{reclaim_plan}");
+    assert!(proposed("/web/dist"), "{reclaim_plan}");
 }
 
 #[test]

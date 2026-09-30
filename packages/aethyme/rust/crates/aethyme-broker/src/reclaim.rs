@@ -18,8 +18,6 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
-use crate::retention::is_safe_artefact_directory_name;
-
 const RECLAIM_PLAN_SCHEMA_VERSION: u8 = 1;
 const RECLAIM_PLAN_FILENAME_PREFIX: &str = ".aethyme-reclaim-plan-";
 const RECLAIM_PLAN_FILENAME_SUFFIX: &str = ".json";
@@ -220,13 +218,6 @@ fn decisions_sorted(decisions: &[ReclaimDecision]) -> Vec<ReclaimDecision> {
     sorted
 }
 
-/// Directory names that hold regenerable build output.
-///
-/// A narrow built-in list rather than a heuristic. Configured names are
-/// additive, but "large and ignored" would also match a downloaded dataset or
-/// a local database someone cannot rebuild, and this deletes things.
-const ARTEFACT_DIRECTORIES: &[&str] = &["target", "node_modules", ".venv", "build", "dist"];
-
 /// One reclaimable directory.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ReclaimCandidate {
@@ -239,19 +230,17 @@ pub struct ReclaimCandidate {
     pub reason: String,
 }
 
-/// Whether a directory name is regenerable build output.
+/// Whether a directory name is regenerable build output in the shared
+/// catalog (see [`crate::artifact_catalog`]).
 pub fn is_artefact_directory(name: &str) -> bool {
-    ARTEFACT_DIRECTORIES.contains(&name)
+    crate::artifact_catalog::is_catalogued(name, &[])
 }
 
 /// Whether a directory name is regenerable build output under the built-in
 /// catalog plus additive configured names. Configuration never removes a
 /// built-in name from the catalog.
 pub fn is_artefact_directory_with_extras(name: &str, extras: &[String]) -> bool {
-    is_artefact_directory(name)
-        || extras
-            .iter()
-            .any(|candidate| is_safe_artefact_directory_name(candidate) && candidate == name)
+    crate::artifact_catalog::is_catalogued(name, extras)
 }
 
 /// Decide whether a candidate found under `worktree` may be reclaimed.
@@ -316,7 +305,14 @@ mod tests {
 
     #[test]
     fn known_build_directories_are_recognised() {
-        for name in ["target", "node_modules", ".venv", "build", "dist"] {
+        for name in [
+            "target",
+            "node_modules",
+            ".venv",
+            ".pnpm-store",
+            "build",
+            "dist",
+        ] {
             assert!(is_artefact_directory(name), "{name}");
         }
     }
@@ -798,12 +794,12 @@ mod scan_tests {
     #[test]
     fn configured_artifact_directories_extend_the_built_in_catalog() {
         let tmp = tempfile::tempdir().unwrap();
-        write(&tmp.path().join("s/.pnpm-store/v3/index"), 16);
+        write(&tmp.path().join("s/.aeptus-cache/v3/index"), 16);
 
         assert!(scan(tmp.path(), &[]).is_empty());
-        let found = scan_with_extra_directories(tmp.path(), &[], &[".pnpm-store".into()]);
+        let found = scan_with_extra_directories(tmp.path(), &[], &[".aeptus-cache".into()]);
         assert_eq!(found.len(), 1, "{found:?}");
-        assert!(found[0].path.ends_with(".pnpm-store"));
+        assert!(found[0].path.ends_with(".aeptus-cache"));
         assert_eq!(found[0].bytes, 16);
     }
 
