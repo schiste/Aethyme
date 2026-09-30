@@ -555,6 +555,9 @@ fn submit_blocks_paths_explicitly_owned_by_another_session() {
         .claim_lease(session_a.id, "src/auth.py", None)
         .unwrap();
 
+    // A claim alone no longer blocks: the owner must be actively working on
+    // an edit Git says conflicts with the submission (overlap_severity_e2e).
+    std::fs::write(wt_a.join("src/auth.py"), "owner\n").unwrap();
     std::fs::write(wt_b.join("src/auth.py"), "intruder\n").unwrap();
     sh(&wt_b, &["add", "-A"]);
     sh(&wt_b, &["commit", "-qm", "intruder"]);

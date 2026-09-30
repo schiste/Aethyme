@@ -1210,6 +1210,9 @@ pub struct StatusView {
     pub agents: Vec<AgentView>,
     pub leases: Vec<crate::Lease>,
     pub overlaps: Vec<crate::leases::Overlap>,
+    /// `overlaps` grouped by session pair and ranked: pairs whose edits Git
+    /// says would conflict first. Classified at the last lease refresh.
+    pub overlap_pairs: Vec<crate::OverlapPair>,
     /// Collisions between what live sessions say they will work on, which a
     /// path comparison cannot see until both sides have already edited.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1434,6 +1437,13 @@ pub struct LeaseBlocker {
     /// Repository, Chau7 tab, and AI provider when the holder supplied them.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub holder_context: Option<String>,
+    /// For the submit audit: whether the two sessions' edits conflict
+    /// (`high`) or merge cleanly (`low`). Absent where it was not assessed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub severity: Option<String>,
+    /// Why this lease blocks, or why it only warns.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -1550,6 +1560,11 @@ pub struct OwnershipAuditReport {
     pub changed_paths: Vec<String>,
     pub missing_lease_paths: Vec<String>,
     pub conflicting_leases: Vec<LeaseBlocker>,
+    /// Other sessions' leases on changed paths that do not block: their
+    /// edits merge cleanly, or their holder is not actively working. Each
+    /// carries the severity and reason it was judged by.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warned_leases: Vec<LeaseBlocker>,
     pub foreign_paths: Vec<String>,
     pub ok: bool,
 }
@@ -4176,20 +4191,15 @@ impl Broker {
 
     /// Recompute every live session's implicit leases from its diff
     /// against its recorded base (ignore rules applied), then return the
-    /// current overlap set. Emits one `lease.overlap` event per pair that
-    /// is NEW relative to before the refresh — repeated status calls do
-    /// not re-announce known overlaps.
+    /// current overlap set. Overlaps are classified per session pair and
+    /// announced once per pair: when it starts overlapping, and again only
+    /// when its severity or conflicting paths change (see `overlap_pairs`).
     ///
     /// Sessions whose worktree is gone or whose base no longer resolves
     /// are skipped, never fatal: lease freshness must not take the broker
     /// down.
     pub fn refresh_leases(&mut self) -> Result<Vec<crate::leases::Overlap>, BrokerOpError> {
         use crate::leases::{LeaseIgnoreRules, detect_overlaps};
-
-        let before: std::collections::HashSet<crate::leases::Overlap> =
-            detect_overlaps(&self.store.active_leases()?)
-                .into_iter()
-                .collect();
 
         let rules = LeaseIgnoreRules::load(&self.main_root);
         // The integration tip is the same for every session; resolving it
@@ -4224,15 +4234,7 @@ impl Broker {
         }
 
         let after = detect_overlaps(&self.store.active_leases()?);
-        for overlap in &after {
-            if !before.contains(overlap) {
-                self.store.append_event(
-                    crate::events::LEASE_OVERLAP,
-                    Some(overlap.session_a),
-                    Some(&serde_json::to_string(overlap)?),
-                )?;
-            }
-        }
+        self.classify_and_announce_overlaps(&after)?;
         Ok(after)
     }
 
@@ -4414,19 +4416,9 @@ impl Broker {
             .session_change_base(&checkout)
             .or(session.diff_base)
             .unwrap_or_else(|| "HEAD".to_string());
-        self.audit_ownership_for_paths(session_id, &base, &head, true)
-    }
-
-    fn audit_ownership_for_paths(
-        &mut self,
-        session_id: i64,
-        base: &str,
-        head: &str,
-        allow_implicit: bool,
-    ) -> Result<OwnershipAuditReport, BrokerOpError> {
         self.refresh_leases()?;
-        let changed = self.repo.changed_between(base, head)?;
-        self.audit_paths(session_id, base, head, changed, allow_implicit)
+        let changed = self.repo.changed_between(&base, &head)?;
+        self.audit_paths(session_id, &base, &head, changed, true, true)
     }
 
     fn audit_paths(
@@ -4436,6 +4428,10 @@ impl Broker {
         head: &str,
         mut changed: Vec<String>,
         allow_implicit: bool,
+        // Submit only: another session's lease blocks when its holder is
+        // actively working AND the two sessions' edits conflict. Guarded exec
+        // keeps explicit leases as a hard boundary.
+        block_only_on_conflicts: bool,
     ) -> Result<OwnershipAuditReport, BrokerOpError> {
         use crate::leases::{LeaseIgnoreRules, paths_overlap};
 
@@ -4470,6 +4466,8 @@ impl Broker {
                     kind: blocker.kind,
                     holder_status: self.lease_holder_status(blocker.session_id),
                     holder_context: self.lease_holder_context(blocker.session_id),
+                    severity: None,
+                    reason: None,
                 });
             }
 
@@ -4496,6 +4494,41 @@ impl Broker {
         });
         conflicting_leases
             .dedup_by(|a, b| a.session_id == b.session_id && a.path == b.path && a.kind == b.kind);
+        let mut warned_leases = Vec::new();
+        if block_only_on_conflicts && !conflicting_leases.is_empty() {
+            let active: std::collections::HashSet<i64> = self
+                .agents(crate::clock::epoch_ms())?
+                .into_iter()
+                .filter(|agent| agent.derived_status == SessionStatus::Active)
+                .map(|agent| agent.session.id)
+                .collect();
+            let overlaps = crate::detect_overlaps(&leases);
+            let (block, warn): (Vec<_>, Vec<_>) = conflicting_leases
+                .into_iter()
+                .map(|mut blocker| {
+                    let pair = self.overlap_pair_between(&overlaps, session_id, blocker.session_id);
+                    let conflicting = pair.as_ref().is_some_and(|pair| {
+                        pair.conflicting_paths
+                            .iter()
+                            .any(|path| paths_overlap(&blocker.path, path))
+                    });
+                    blocker.severity = Some(
+                        if conflicting { "high" } else { "low" }.to_string(),
+                    );
+                    let holder_active = active.contains(&blocker.session_id);
+                    blocker.reason = Some(match (conflicting, holder_active) {
+                        (true, true) => "the holder is actively working and Git reports a conflict with this session's edits".into(),
+                        (true, false) => "Git reports a conflict, but the holder is not actively working".into(),
+                        (false, _) => pair
+                            .map(|pair| pair.reason)
+                            .unwrap_or_else(|| "the holder has not edited this path".into()),
+                    });
+                    (blocker, conflicting && holder_active)
+                })
+                .partition(|(_, blocks)| *blocks);
+            conflicting_leases = block.into_iter().map(|(blocker, _)| blocker).collect();
+            warned_leases = warn.into_iter().map(|(blocker, _)| blocker).collect();
+        }
         missing_lease_paths.sort();
         missing_lease_paths.dedup();
         foreign_paths.sort();
@@ -4510,6 +4543,7 @@ impl Broker {
             changed_paths: changed,
             missing_lease_paths,
             conflicting_leases,
+            warned_leases,
             foreign_paths,
             ok,
         })
@@ -4536,6 +4570,8 @@ impl Broker {
                 holder_context: self.lease_holder_context(lease.session_id),
                 path: lease.path,
                 kind: lease.kind,
+                severity: None,
+                reason: None,
             })
             .collect();
         blockers.sort_by(|a, b| {
@@ -4662,6 +4698,7 @@ impl Broker {
             "GUARDED_EXEC_BEFORE",
             "GUARDED_EXEC_AFTER",
             touched.clone(),
+            false,
             false,
         )?;
         let command_success = status.success();
@@ -6074,9 +6111,17 @@ impl Broker {
                 (StatusIntegrationRelation::DivergedFromMain, 0)
             };
         let dirty_sessions = dirty_session_count(&agents);
+        let overlap_pairs = self.overlap_pairs_snapshot(&overlaps);
         let summary = status_summary(
             &agents,
             overlaps.len(),
+            OverlapPairCounts {
+                pairs: overlap_pairs.len(),
+                conflicting: overlap_pairs
+                    .iter()
+                    .filter(|pair| pair.severity == crate::OverlapSeverity::High)
+                    .count(),
+            },
             promoted_conflicts.len(),
             dirty_sessions,
             &SummaryIntegration {
@@ -6526,6 +6571,7 @@ impl Broker {
         // unpushed count is context, not a precondition for any command.
         let unpushed_work = self.unpushed_work(now_ms).unwrap_or_default();
         advice.extend(unpushed_work_advice(&unpushed_work, now_ms));
+        advice.extend(overlap_pair_advice(&overlap_pairs));
 
         Ok(StatusView {
             publication_baseline_ref: baseline_ref,
@@ -6538,6 +6584,7 @@ impl Broker {
             agents,
             leases: self.store.active_leases()?,
             overlaps,
+            overlap_pairs,
             scope_overlaps,
             promoted_conflicts,
             coordinated_operations,
@@ -9764,6 +9811,35 @@ fn cleanup_retention_warning(retention: &CleanupRetention) -> Option<String> {
     })
 }
 
+/// One advice row per session pair whose edits would conflict. Pairs that
+/// merge cleanly stay in `overlap_pairs` and produce no advice.
+fn overlap_pair_advice(pairs: &[crate::OverlapPair]) -> Vec<StatusAdvice> {
+    pairs
+        .iter()
+        .filter(|pair| pair.severity == crate::OverlapSeverity::High)
+        .map(|pair| StatusAdvice {
+            id: "lease.overlap-conflict",
+            severity: StatusAdviceSeverity::Warning,
+            reason: "overlap_conflict",
+            summary: format!(
+                "sessions {} and {} would conflict on {} path(s)",
+                pair.session_a,
+                pair.session_b,
+                pair.conflicting_paths.len()
+            ),
+            session_id: Some(pair.session_a),
+            queue_entry_id: None,
+            evidence: pair
+                .conflicting_paths
+                .iter()
+                .take(crate::overlap_pairs::OVERLAP_SAMPLE_PATHS)
+                .cloned()
+                .collect(),
+            commands: vec!["aethyme broker advanced leases --json".into()],
+        })
+        .collect()
+}
+
 fn retention_config_advice(status: &RetentionConfigStatus) -> Option<StatusAdvice> {
     if status.is_healthy() {
         return None;
@@ -9810,6 +9886,7 @@ fn retention_config_advice(status: &RetentionConfigStatus) -> Option<StatusAdvic
 fn status_summary(
     agents: &[AgentView],
     overlap_count: usize,
+    overlap_pairs: OverlapPairCounts,
     promoted_conflict_count: usize,
     dirty_sessions: usize,
     integration: &SummaryIntegration,
@@ -9835,7 +9912,7 @@ fn status_summary(
         idle_sessions,
         stale_sessions,
     );
-    let overlaps = overlap_summary_phrase(overlap_count, promoted_conflict_count);
+    let overlaps = overlap_summary_phrase(overlap_pairs, promoted_conflict_count);
     let integration_phrase = integration_summary_phrase(integration);
     let mut notes = Vec::new();
     if dirty_sessions > 0 {
@@ -9924,26 +10001,40 @@ fn session_summary_phrase(
     }
 }
 
-fn overlap_summary_phrase(overlap_count: usize, promoted_conflict_count: usize) -> String {
-    match (overlap_count, promoted_conflict_count) {
-        (0, 0) => "no overlaps".into(),
-        (overlaps, 0) => format!(
-            "{} live {}",
-            overlaps,
-            plural_word(overlaps, "overlap", "overlaps")
-        ),
-        (0, promoted) => format!(
+/// Overlapping session pairs, and how many of them Git says would conflict.
+#[derive(Debug, Clone, Copy, Default)]
+struct OverlapPairCounts {
+    pairs: usize,
+    conflicting: usize,
+}
+
+fn overlap_summary_phrase(overlaps: OverlapPairCounts, promoted_conflict_count: usize) -> String {
+    let live = match overlaps {
+        OverlapPairCounts { pairs: 0, .. } => None,
+        OverlapPairCounts {
+            pairs,
+            conflicting: 0,
+        } => Some(format!(
+            "{pairs} overlapping session {}",
+            plural_word(pairs, "pair", "pairs")
+        )),
+        OverlapPairCounts { pairs, conflicting } => Some(format!(
+            "{pairs} overlapping session {} ({conflicting} conflicting)",
+            plural_word(pairs, "pair", "pairs")
+        )),
+    };
+    let promoted = (promoted_conflict_count > 0).then(|| {
+        format!(
             "{} promoted {}",
-            promoted,
-            plural_word(promoted, "conflict", "conflicts")
-        ),
-        (overlaps, promoted) => format!(
-            "{} live {}, {} promoted {}",
-            overlaps,
-            plural_word(overlaps, "overlap", "overlaps"),
-            promoted,
-            plural_word(promoted, "conflict", "conflicts")
-        ),
+            promoted_conflict_count,
+            plural_word(promoted_conflict_count, "conflict", "conflicts")
+        )
+    });
+    match (live, promoted) {
+        (None, None) => "no overlaps".into(),
+        (Some(live), None) => live,
+        (None, Some(promoted)) => promoted,
+        (Some(live), Some(promoted)) => format!("{live}, {promoted}"),
     }
 }
 
@@ -10934,7 +11025,14 @@ mod tests {
             ahead_baseline_commits: 12,
             ..current_summary_integration()
         };
-        let summary = super::status_summary(&[], 0, 0, 0, &integration);
+        let summary = super::status_summary(
+            &[],
+            0,
+            super::OverlapPairCounts::default(),
+            0,
+            0,
+            &integration,
+        );
         assert!(
             summary.message.contains(
                 "aethyme/integration ahead of origin/main by 12 commits (local checkout matches integration)"
@@ -10959,7 +11057,14 @@ mod tests {
             ahead_main_commits: 3,
             ..current_summary_integration()
         };
-        let summary = super::status_summary(&[], 0, 0, 0, &integration);
+        let summary = super::status_summary(
+            &[],
+            0,
+            super::OverlapPairCounts::default(),
+            0,
+            0,
+            &integration,
+        );
         assert!(
             summary.message.contains(
                 "ahead of origin/main by 5 commits (local checkout 3 commits behind integration)"
@@ -10977,7 +11082,14 @@ mod tests {
             baseline_ref: "HEAD".into(),
             ..current_summary_integration()
         };
-        let summary = super::status_summary(&[], 0, 0, 0, &integration);
+        let summary = super::status_summary(
+            &[],
+            0,
+            super::OverlapPairCounts::default(),
+            0,
+            0,
+            &integration,
+        );
         assert!(
             summary
                 .message
@@ -10996,7 +11108,14 @@ mod tests {
             pid_alive: None,
         };
 
-        let summary = super::status_summary(&[agent], 0, 0, 0, &current_summary_integration());
+        let summary = super::status_summary(
+            &[agent],
+            0,
+            super::OverlapPairCounts::default(),
+            0,
+            0,
+            &current_summary_integration(),
+        );
 
         assert_eq!(summary.live_sessions, 1);
         assert_eq!(summary.active_sessions, 1);
@@ -11013,7 +11132,14 @@ mod tests {
 
     #[test]
     fn status_summary_explains_no_active_submitters() {
-        let summary = super::status_summary(&[], 0, 0, 0, &current_summary_integration());
+        let summary = super::status_summary(
+            &[],
+            0,
+            super::OverlapPairCounts::default(),
+            0,
+            0,
+            &current_summary_integration(),
+        );
 
         assert_eq!(summary.live_sessions, 0);
         assert_eq!(summary.active_sessions, 0);

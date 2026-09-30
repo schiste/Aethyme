@@ -28,12 +28,29 @@ pub(super) fn duration_label(duration_ms: Option<i64>) -> String {
         .unwrap_or_else(|| "-".into())
 }
 
-pub(super) fn print_overlap_warnings(overlaps: &[crate::Overlap]) {
-    for overlap in overlaps {
-        eprintln!(
-            "⚠ overlap: sessions {} and {} are both touching {}",
-            overlap.session_a, overlap.session_b, overlap.path
-        );
+pub(super) fn print_overlap_warnings(pairs: &[crate::OverlapPair]) {
+    for pair in pairs {
+        let more = pair.paths_count.saturating_sub(pair.sample_paths.len());
+        let more = if more > 0 {
+            format!(" (+{more} more)")
+        } else {
+            String::new()
+        };
+        match pair.severity {
+            crate::OverlapSeverity::High => eprintln!(
+                "⚠ overlap (high): sessions {} and {} conflict on {}{more}",
+                pair.session_a,
+                pair.session_b,
+                pair.sample_paths.join(", ")
+            ),
+            crate::OverlapSeverity::Low => eprintln!(
+                "overlap (low): sessions {} and {} both touch {}{more}; {}",
+                pair.session_a,
+                pair.session_b,
+                pair.sample_paths.join(", "),
+                pair.reason
+            ),
+        }
     }
 }
 

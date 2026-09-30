@@ -73,6 +73,7 @@ mod measurement;
 mod merge;
 mod operation_stats;
 mod operations;
+mod overlap_pairs;
 pub mod plugin_cli;
 mod pr;
 mod pr_link;
@@ -297,6 +298,7 @@ pub use operations::{
     UnknownOutcomeRecovery, classify_gh, classify_git,
 };
 pub(crate) use operations::{is_within, worktree_relative_push_sources};
+pub use overlap_pairs::{OverlapPair, OverlapSeverity};
 pub use pr::{
     PrActivityItem, PrCheckOptions, PrCheckReport, PrCheckRun, PrDecision, PrDecisionStatus,
     PrDispatchReport, PrDispatchStatus, PrError, PrMarker, PrSummary,

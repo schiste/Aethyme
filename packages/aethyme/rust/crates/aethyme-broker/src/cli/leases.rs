@@ -176,12 +176,14 @@ pub(super) fn run_leases(parsed: Parsed) -> Result<(), UsageError> {
                 broker.refresh_leases()?
             };
             let leases = broker.store().active_leases()?;
+            let overlap_pairs = broker.overlap_pairs_snapshot(&overlaps);
             if parsed.json {
                 out!(
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
                         "leases": leases,
                         "overlaps": overlaps,
+                        "overlap_pairs": overlap_pairs,
                     }))?
                 );
             } else if leases.is_empty() {
@@ -196,7 +198,7 @@ pub(super) fn run_leases(parsed: Parsed) -> Result<(), UsageError> {
                         lease.path
                     );
                 }
-                print_overlap_warnings(&overlaps);
+                print_overlap_warnings(&overlap_pairs);
             }
         }
         Some("claim") => {
