@@ -26,6 +26,7 @@ const RETENTION_POLICY_FIELDS: &[&str] = &[
     "artifact_reclaim_days",
     "orphan_worktree_roots_days",
     "session_abandoned_after_hours",
+    "idle_session_artifact_hours",
     "artifact_sweep_budget_ms",
     "artifact_sweep_interval_hours",
     "artefact_directories",
@@ -103,6 +104,19 @@ pub struct RetentionPolicy {
     /// raising this trades disk against how long a dead session's disk is
     /// held -- never against whether committed work survives.
     pub session_abandoned_after_hours: u32,
+    /// Hours an *open* session may go without any evidence of a working agent
+    /// before the unattended sweep reclaims its regenerable build output. `0`
+    /// disables the lane.
+    ///
+    /// Judged by the same rule as `session_abandoned_after_hours` -- a live
+    /// agent process is never touched however quiet -- but with a shorter
+    /// window, because the two decisions cost different things when wrong.
+    /// Abandonment closes a session and makes its checkout a removal
+    /// candidate; this removes only witnessed, git-ignored build caches and
+    /// leaves the session, its checkout and its branch alone. Being wrong here
+    /// costs the returning agent a rebuild, so the build output of a quiet
+    /// session need not be held for the full abandonment window.
+    pub idle_session_artifact_hours: u32,
     /// Wall-clock budget for the autonomous artifact sweep. `0` disables it.
     pub artifact_sweep_budget_ms: u64,
     /// Minimum spacing between autonomous artifact sweeps.
@@ -150,6 +164,7 @@ impl Default for RetentionPolicy {
             artifact_reclaim_days: 0,
             orphan_worktree_roots_days: 1,
             session_abandoned_after_hours: 72,
+            idle_session_artifact_hours: 24,
             artifact_sweep_budget_ms: 5_000,
             artifact_sweep_interval_hours: 24,
             artefact_directories: Vec::new(),
@@ -220,6 +235,13 @@ impl RetentionPolicy {
             return Err(RetentionConfigError::InvalidValue {
                 field: "session_abandoned_after_hours",
                 value: self.session_abandoned_after_hours.to_string(),
+                constraint: "must be between 0 (disabled) and 8760 hours",
+            });
+        }
+        if self.idle_session_artifact_hours > 8_760 {
+            return Err(RetentionConfigError::InvalidValue {
+                field: "idle_session_artifact_hours",
+                value: self.idle_session_artifact_hours.to_string(),
                 constraint: "must be between 0 (disabled) and 8760 hours",
             });
         }

@@ -906,6 +906,177 @@ fn a_live_session_keeps_its_build_cache() {
     );
 }
 
+const HOUR_MS: i64 = 60 * 60 * 1000;
+
+fn epoch_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+}
+
+/// Set a path's modification time to `hours_ago`.
+fn backdate(path: &Path, hours_ago: i64) {
+    let when = std::time::SystemTime::now()
+        - std::time::Duration::from_millis((hours_ago * HOUR_MS) as u64);
+    std::fs::File::open(path)
+        .unwrap()
+        .set_modified(when)
+        .unwrap();
+}
+
+/// Backdate a directory and every entry directly inside it; the sweep reads
+/// exactly that far when deciding whether output is still being written.
+fn backdate_tree_top(dir: &Path, hours_ago: i64) {
+    for entry in std::fs::read_dir(dir).unwrap().flatten() {
+        backdate(&entry.path(), hours_ago);
+    }
+    backdate(dir, hours_ago);
+}
+
+/// An open session whose agent has shown no evidence of work for
+/// `quiet_hours`, holding a Cargo `target/` and an ignored `build/`.
+///
+/// Quiet means every signal the broker reads for liveness: the session row's
+/// activity and creation times, and the mtimes of the worktree's Git index and
+/// HEAD. A session started through the CLI records no pid, so it is judged on
+/// the clock, as an adopted or abandoned agent is.
+fn quiet_open_session(repo: &Path, container: &Path, quiet_hours: i64) -> (i64, PathBuf) {
+    let output = run(repo, container, &["start", "--task", "quiet", "--json"]);
+    assert!(
+        output.status.success(),
+        "start: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let session: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let id = session["id"].as_i64().unwrap();
+    let worktree = PathBuf::from(session["worktree_path"].as_str().unwrap());
+
+    let target = worktree.join("rust/target");
+    std::fs::create_dir_all(target.join("debug")).unwrap();
+    std::fs::write(target.join("CACHEDIR.TAG"), "Signature: 8a477f597d28d172\n").unwrap();
+    std::fs::write(target.join("debug/artifact.bin"), vec![0_u8; 4096]).unwrap();
+    let build = worktree.join("rust/build");
+    std::fs::create_dir_all(&build).unwrap();
+    std::fs::write(build.join("bundle.js"), vec![0_u8; 64]).unwrap();
+    backdate_tree_top(&target, quiet_hours);
+    backdate_tree_top(&build, quiet_hours);
+
+    let quiet_since = epoch_ms() - quiet_hours * HOUR_MS;
+    let db = rusqlite::Connection::open(repo.join(".aethyme/broker.db")).unwrap();
+    db.execute(
+        "UPDATE sessions SET last_activity_at = ?2, created_at = ?2 WHERE id = ?1",
+        rusqlite::params![id, quiet_since],
+    )
+    .unwrap();
+    let name = worktree.file_name().unwrap();
+    for file in ["index", "HEAD"] {
+        let path = repo.join(".git/worktrees").join(name).join(file);
+        if path.exists() {
+            backdate(&path, quiet_hours);
+        }
+    }
+    (id, worktree)
+}
+
+fn session_status(repo: &Path, id: i64) -> String {
+    rusqlite::Connection::open(repo.join(".aethyme/broker.db"))
+        .unwrap()
+        .query_row("SELECT status FROM sessions WHERE id = ?1", [id], |row| {
+            row.get(0)
+        })
+        .unwrap()
+}
+
+/// A session inside the 72-hour abandonment window used to hold its build
+/// output for all three days after its agent left. Past the shorter idle
+/// window the sweep takes the witnessed caches and nothing else: the session
+/// stays open, and reviewed-only output stays for a reviewed plan.
+#[test]
+fn an_idle_open_sessions_build_output_is_swept_and_the_session_stays_open() {
+    let (repo, container) =
+        fixture("[retention]\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 0\n");
+    let (id, worktree) = quiet_open_session(repo.path(), container.path(), 30);
+    enable_sweep(repo.path());
+
+    let output = run(repo.path(), container.path(), &["status"]);
+    assert!(
+        output.status.success(),
+        "status: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !worktree.join("rust/target").exists(),
+        "an idle open session's Cargo cache should be swept"
+    );
+    assert!(
+        worktree.join("rust/build/bundle.js").exists(),
+        "build/ is reviewed-only and must survive the unattended sweep"
+    );
+    assert!(worktree.join("README.md").exists(), "the checkout stays");
+    assert_ne!(
+        session_status(repo.path(), id),
+        "cleaned",
+        "sweeping build output must not close the session"
+    );
+}
+
+#[test]
+fn an_open_session_inside_the_idle_window_keeps_its_build_output() {
+    let (repo, container) =
+        fixture("[retention]\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 0\n");
+    let (_id, worktree) = quiet_open_session(repo.path(), container.path(), 3);
+    // Old output, so only the session's own recent activity can keep it; a
+    // fresh cache would be kept by the write-recency guard instead.
+    backdate_tree_top(&worktree.join("rust/target"), 30);
+    enable_sweep(repo.path());
+
+    let output = run(repo.path(), container.path(), &["status"]);
+    assert!(output.status.success());
+    assert!(
+        worktree.join("rust/target/CACHEDIR.TAG").exists(),
+        "three quiet hours is inside the default 24-hour idle window"
+    );
+}
+
+#[test]
+fn a_zero_idle_window_disables_the_open_session_lane() {
+    let (repo, container) =
+        fixture("[retention]\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 0\n");
+    let (_id, worktree) = quiet_open_session(repo.path(), container.path(), 30);
+    std::fs::write(
+        repo.path().join(".aethyme/broker.toml"),
+        "[retention]\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 5000\n\
+         idle_session_artifact_hours = 0\n",
+    )
+    .unwrap();
+
+    let output = run(repo.path(), container.path(), &["status"]);
+    assert!(output.status.success());
+    assert!(
+        worktree.join("rust/target/CACHEDIR.TAG").exists(),
+        "idle_session_artifact_hours = 0 must leave open sessions alone"
+    );
+}
+
+/// The agent can be gone while something it started keeps writing: a dev
+/// server, a long build. Output touched inside the window is still in use.
+#[test]
+fn build_output_written_inside_the_idle_window_is_kept() {
+    let (repo, container) =
+        fixture("[retention]\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 0\n");
+    let (_id, worktree) = quiet_open_session(repo.path(), container.path(), 30);
+    std::fs::write(worktree.join("rust/target/debug/fresh.bin"), vec![0_u8; 16]).unwrap();
+    enable_sweep(repo.path());
+
+    let output = run(repo.path(), container.path(), &["status"]);
+    assert!(output.status.success());
+    assert!(
+        worktree.join("rust/target/CACHEDIR.TAG").exists(),
+        "a cache still being written must not be swept under its writer"
+    );
+}
+
 fn count_entries(dir: &Path) -> usize {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return 0;

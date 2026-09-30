@@ -1192,6 +1192,7 @@ retained_bytes_budget = 1073741824
 artifact_reclaim_days = 0
 orphan_worktree_roots_days = 1
 session_abandoned_after_hours = 72
+idle_session_artifact_hours = 24
 artifact_sweep_budget_ms = 5000
 artifact_sweep_interval_hours = 24
 artefact_directories = [] # e.g. [".pnpm-store"]; additive to built-ins
@@ -1264,6 +1265,22 @@ cleanup *candidate*; it never removes anything on its own. Dirty trees,
 unpromoted commits, and unproven provenance still block removal exactly as
 before. Set it to `0` to restore the previous behaviour, where a session held
 its worktree, its branch, and its leases until a human intervened.
+
+`idle_session_artifact_hours` (default 24, `0` to disable) lets the autonomous
+sweep reclaim the build output of a session that is still *open* once its agent
+has shown no evidence of work for that long. It uses the abandonment rule above
+over a shorter window -- a session with a live process is never touched -- and
+removes only what the sweep removes from closed sessions: witnessed, git-ignored
+caches from the unattended catalog (`target` with `CACHEDIR.TAG`,
+`node_modules`, `.venv` with `pyvenv.cfg`, `.pnpm-store`, and configured
+`artefact_directories`). A cache whose directory, or any entry directly inside
+it, was modified within the window is kept, because a dev server or a long build
+can outlive the agent's last commit. The session stays open and keeps its
+checkout, branch and leases; the returning agent rebuilds. `gc plan` does not
+list these caches, since its artifact candidates are re-validated at apply
+against closed sessions; `broker gc reclaim` is the reviewed lane for an open
+session's build output. The sweep event (`broker.gc.artifacts-swept`) reports
+`closed_session_directories` and `idle_open_session_directories` separately.
 
 When a session closes, its accepted-checkpoint pin is released in the same
 terminal transaction. The accepted session head, integration commit, tree, and

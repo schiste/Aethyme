@@ -1030,6 +1030,12 @@ stamp, so the next broker command resumes instead of waiting out
 `artifact_sweep_interval_hours`, and a backlog too large for one budget still
 drains.
 
+The sweep also reaches sessions that are still open once their agent has been
+quiet for `[retention].idle_session_artifact_hours` (default 24). The session
+stays open with its checkout and branch; only its witnessed build caches go,
+and a cache written to within the window is left for whatever is still
+writing it.
+
 `gc apply` re-proves each build cache before removing it, and a cache that no
 longer qualifies — a session live again, a directory no longer carrying its
 witness — is reported as `retained:` while the run continues. Candidates here
