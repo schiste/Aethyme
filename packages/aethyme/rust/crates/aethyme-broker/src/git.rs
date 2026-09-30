@@ -3324,3 +3324,45 @@ mod timeout_tests {
         assert_eq!(git_timeout_from(Some(" 45 ")), Duration::from_secs(45));
     }
 }
+
+/// Hunk-level views of one path, for telling two sessions' edits apart.
+impl GitRepo {
+    /// Zero-context patch of `path` from `base` to `head`. Callers parse only
+    /// the `@@` headers, so the old-side line ranges are the whole answer.
+    pub(crate) fn zero_context_diff(
+        &self,
+        base: &str,
+        head: &str,
+        path: &str,
+    ) -> Result<String, GitError> {
+        run_git(
+            &self.root,
+            &[
+                "diff",
+                "--no-color",
+                "--no-ext-diff",
+                "--unified=0",
+                base,
+                head,
+                "--",
+                path,
+            ],
+        )
+    }
+
+    /// Commit time, in seconds, of the oldest commit in `base..head` that
+    /// touches `path`; `None` when no commit in the range does.
+    pub(crate) fn first_commit_time_touching(
+        &self,
+        base: &str,
+        head: &str,
+        path: &str,
+    ) -> Result<Option<i64>, GitError> {
+        let range = format!("{base}..{head}");
+        let out = run_git(
+            &self.root,
+            &["log", "--reverse", "--format=%ct", &range, "--", path],
+        )?;
+        Ok(out.lines().next().and_then(|line| line.trim().parse().ok()))
+    }
+}
