@@ -4,6 +4,39 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.10] - 2026-09-30
+
+Push-early delivery, safer worktree cleanup, and quieter multi-agent coordination.
+
+### Added
+
+- `aethyme broker push --session <id> [--pr]` publishes a session's own `agent/*` branch while it works, and with `--pr` opens a draft pull request. It pushes nothing else, and rewrites a branch only under a lease on the commit it last pushed. A repository enables it with `[delivery] push_session_branches = true`, read from the committed configuration on the default branch (#433).
+- `broker status` and `doctor` report unpushed session commits and their age, and warn when the local integration branch runs ahead of upstream. With the push lane enabled, `broker finish` refuses to close a session that still holds unpushed commits unless it is given `--abandon --reason` (#434).
+- Sessions are warned when their changes overlap an open pull request, in `push`, `status` and `start` (#441), and are told which session should land a shared edit first when two live sessions change the same lines (#442).
+- `broker finish cleanup resolve --archive` archives a closed dirty or pending worktree, verifies the archive, then removes the worktree (#429). Archives expire through a reviewed `gc plan` after `retention.recovery_archive_days` (default 30) (#439).
+- Sessions take an optional `--short-name`, derived from the task when omitted, and matching Chau7 tabs are titled `<id> - <short name>` (#431).
+- `broker gc reclaim plan|apply --session <id>` scopes a reclaim to one session (#427).
+- `retention.idle_session_artifact_hours` (default 24) lets the automatic sweep reclaim ignored build output from open sessions whose agent has gone quiet (#428).
+- Generated agent instructions describe the push lane when a repository enables it (#432).
+
+### Changed
+
+- Lease overlaps are reported once per session pair, ranked by whether Git would actually conflict, and `broker submit` blocks only on a conflicting overlap with an actively working session (#440).
+- `broker gc reclaim apply` deletes the reviewed paths that are still reclaimable instead of refusing the whole plan when anything else changed (#427).
+- Garbage collection and reclaim share one artifact catalog, which now includes `.venv` (with `pyvenv.cfg`) and `.pnpm-store` (#425).
+- The representation scan, cleanup audit and cleanup plan share one landed-work check that recognizes rebased and squash-merged work (#426, fixes #408).
+- `gc storage` counts fully cleaned worktrees as retired rather than missing, and proposes empty worktree roots for reviewed removal (#424).
+- `broker push`, `finish` and `submit` count an untracked folder as one uncommitted entry (#443).
+- Promotion commits pass the repository's own commit-message lint, and every cargo gate and CI job runs with `--locked` (#435).
+- Dependencies: `thiserror` 2.0.21 (#444).
+
+### Fixed
+
+- `AETHYME_TRUST_NONINTERACTIVE_FOR_TESTS` can no longer record gate trust for a real checkout (#435).
+- Concurrent gate workers always receive distinct broker database directories (#438, fixes #430).
+- Release-manifest tests that were compiled but never run now run (#435).
+- The help snapshot suite covers every public command and fails on orphaned snapshots (#437).
+
 ## [0.8.9] - 2026-09-29
 
 Broker storage safety and clearer gate results.

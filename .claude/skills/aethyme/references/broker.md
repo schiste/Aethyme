@@ -60,6 +60,42 @@ blocked.
    verified and integrated. Never switch branches inside someone else's
    worktree; never edit files outside your own worktree.
 
+   **If `.aethyme/config.toml`, as committed on the default branch, sets
+   `[delivery] push_session_branches = true`, push your session branch as you
+   go.** Work that exists only in a worktree
+   is lost with it, and nobody can review what was never pushed. After each
+   commit:
+
+   ```bash
+   aethyme broker push --session <your-session-id>
+   ```
+
+   This pushes your own session branch (`agent/<slug>`) to the default
+   branch's remote and touches no other ref. A fast-forward is pushed plainly;
+   a branch you rewrote (for example after a rebase) is pushed only under a
+   lease on the commit the broker last pushed for your session. Uncommitted
+   files are reported, not pushed, so commit before you push. Once there is a first meaningful commit, open a draft
+   pull request, and keep pushing to it until it is ready for review:
+
+   ```bash
+   aethyme broker push --session <your-session-id> --pr
+   ```
+
+   `--pr` opens a draft PR, or reports the one already open. The policy is
+   the authorization for exactly these two things -- pushing your own session
+   branch and opening a draft PR -- and nothing more: it does not authorize
+   merging, marking a PR ready, or pushing any other ref. `broker status` and
+   `broker doctor` report sessions with unpushed commits, and
+   `aethyme broker finish` refuses to close a session while its commits are
+   unpushed. If the work should genuinely not be kept, say so explicitly with
+   `aethyme broker finish --session <id> --abandon --reason "<why>"`.
+   When `broker status` shows `coordination.land-shared-edit-first`, another
+   session changes the same lines or symbol as yours: follow it -- the named
+   session lands only the shared edit as its own small PR, then both rebase
+   on the default branch -- rather than waiting or building on the other
+   session's unmerged branch.
+   Without the policy, pushing stays a separately authorized action (step 9).
+
 5. **Gate resources are per worker**. Broker gate runs take path-scoped owner
    locks and export `AETHYME_GATE_WORKER_ID` plus `AETHYME_TEST_DB_SUFFIX`.
    Gate commands that need a test database, cache namespace, or similar
@@ -111,7 +147,11 @@ blocked.
    Prefer this reviewed broker ship workflow over a raw push. Never infer
    publication authority from permission to edit, submit, or promote.
    Without publication authority, stop after submit and report the promoted
-   entry.
+   entry. Under `push_session_branches` (step 4), your pushed session branch
+   and its draft PR are the delivery: report the PR rather than a promoted
+   entry. Repositories that deliver through pull requests usually also set
+   `[promote] mode = "verify-only"`, so verified work does not pile up
+   unpublished on the local integration branch.
    Report the outcome (verified / rejected / conflict) in your summary.
    Afterwards, finish the session with
    `aethyme broker finish --session <id>`, or point it at a follow-up task
