@@ -1232,10 +1232,97 @@ pub(super) fn render_cleanup_audit(audit: &crate::CleanupAudit, detail: bool) {
     }
 }
 
+/// `broker cleanup resolve <session-id> --archive [--confirm <sha256>]`.
+fn run_cleanup_resolve(parsed: Parsed) -> Result<(), UsageError> {
+    let usage = "usage: aethyme broker finish cleanup resolve <session-id> --archive [--confirm <sha256>] [--json]";
+    let [_, id] = parsed.positional.as_slice() else {
+        return Err(UsageError::Message(format!(
+            "cleanup resolve takes exactly one session id; {usage}"
+        )));
+    };
+    let id: i64 = id
+        .parse()
+        .map_err(|_| UsageError::Message("session id must be an integer".into()))?;
+    // Archiving is the only resolution this verb performs. Requiring the word
+    // keeps the command from reading as a softer spelling of discard, which
+    // stays `cleanup <session-id> --force`.
+    if !parsed.archive {
+        return Err(UsageError::Message(format!(
+            "cleanup resolve requires --archive; to discard instead, run `aethyme broker finish \
+             cleanup {id} --force`; {usage}"
+        )));
+    }
+    let mut broker = open_broker(parsed.read_only_snapshot)?;
+    match parsed.confirm.as_deref() {
+        None => {
+            let plan = broker.cleanup_resolve_plan(id)?;
+            if parsed.json {
+                out!("{}", serde_json::to_string_pretty(&plan)?);
+            } else {
+                render_cleanup_resolve_plan(&plan);
+            }
+        }
+        Some(confirm) => {
+            let outcome = broker.cleanup_resolve_apply(id, confirm)?;
+            if parsed.json {
+                out!("{}", serde_json::to_string_pretty(&outcome)?);
+            } else {
+                out!("Archived session {id} to {}", outcome.archive.display());
+                match &outcome.cleanup_error {
+                    None => out!("Removed its worktree {}.", outcome.plan.worktree_path),
+                    Some(error) => out!(
+                        "Warning: the archive is verified, but removing the worktree failed: {error}"
+                    ),
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn render_cleanup_resolve_plan(plan: &crate::CleanupResolvePlan) {
+    out!(
+        "Resolve plan {} for session {}: {}",
+        plan.digest,
+        plan.session_id,
+        plan.disposition.as_str()
+    );
+    out!("  worktree: {}", plan.worktree_path);
+    out!("  why cleanup refuses it: {}", plan.reason);
+    out!("  head: {}", plan.head);
+    let landing = match &plan.landing {
+        crate::LandingVerdict::Landed { evidence, .. } => {
+            format!("landed ({})", evidence.as_str())
+        }
+        crate::LandingVerdict::NotLanded { truncated, .. } => {
+            if *truncated {
+                "not proved landed (search truncated)".to_string()
+            } else {
+                "not landed".to_string()
+            }
+        }
+    };
+    out!("  committed work: {landing}");
+    out!(
+        "  archive would hold: {} unlanded commit(s) in a bundle; staged patch {}; unstaged patch {}; {} untracked file(s), {}",
+        plan.unlanded_commits.len(),
+        human_bytes(plan.staged_patch_bytes),
+        human_bytes(plan.unstaged_patch_bytes),
+        plan.untracked_files.len(),
+        human_bytes(plan.untracked_bytes),
+    );
+    out!("  archive root: {}", plan.archive_root.display());
+    out!("  ignored files (build output, caches) are not archived");
+    out!("  apply: {}", plan.apply_command);
+    out!("  discard instead: {}", plan.discard_command);
+}
+
 /// `broker cleanup`.
 pub(super) fn run_cleanup(parsed: Parsed) -> Result<(), UsageError> {
-    if parsed.positional.first().map(String::as_str) == Some("audit") {
-        return run_cleanup_audit(parsed);
+    match parsed.positional.first().map(String::as_str) {
+        Some("audit") => return run_cleanup_audit(parsed),
+        Some("resolve") => return run_cleanup_resolve(parsed),
+        _ => {}
     }
     let mut broker = open_broker(parsed.read_only_snapshot)?;
     if parsed.all_cleaned {

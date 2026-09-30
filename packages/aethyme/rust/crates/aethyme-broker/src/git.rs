@@ -2098,6 +2098,104 @@ impl GitRepo {
         .collect())
     }
 
+    /// A binary-safe patch of this checkout's staged (`cached`) or unstaged
+    /// changes, in the form `git apply` reads back.
+    ///
+    /// The prefixes, rename detection and diff drivers are pinned rather than
+    /// inherited: a user's `diff.noprefix`, `diff.external` or textconv filter
+    /// changes what `git diff` prints, and a recovery patch has to apply on a
+    /// machine that does not share that configuration.
+    pub fn recovery_patch(&self, cached: bool) -> Result<Vec<u8>, GitError> {
+        let mut args = vec![
+            "-c",
+            "diff.noprefix=false",
+            "-c",
+            "diff.mnemonicPrefix=false",
+            "diff",
+            "--binary",
+            "--full-index",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-renames",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
+        ];
+        if cached {
+            args.push("--cached");
+        }
+        run_git_bytes(&self.root, &args)
+    }
+
+    /// Commits reachable from `head` that none of `excluded` holds, newest
+    /// first. These are what a checkout's removal would take with it.
+    pub fn commits_not_on_any(
+        &self,
+        head: &str,
+        excluded: &[String],
+    ) -> Result<Vec<String>, GitError> {
+        let mut args = vec!["rev-list", head, "--not"];
+        args.extend(excluded.iter().map(String::as_str));
+        Ok(run_git(&self.root, &args)?
+            .lines()
+            .map(str::to_string)
+            .collect())
+    }
+
+    /// Write a bundle holding `HEAD` minus everything `excluded` holds, so it
+    /// restores into any clone that has those commits.
+    pub fn create_recovery_bundle(&self, path: &Path, excluded: &[String]) -> Result<(), GitError> {
+        let path = path.to_string_lossy();
+        let mut args = vec!["bundle", "create", path.as_ref(), "HEAD", "--not"];
+        args.extend(excluded.iter().map(String::as_str));
+        run_git(&self.root, &args).map(|_| ())
+    }
+
+    /// Read a bundle back -- its format, and that every prerequisite commit
+    /// exists in this repository -- and return the commits it carries as tips.
+    pub fn verify_bundle(&self, path: &Path) -> Result<Vec<String>, GitError> {
+        let path = path.to_string_lossy();
+        run_git(&self.root, &["bundle", "verify", "--quiet", path.as_ref()])?;
+        Ok(
+            run_git(&self.root, &["bundle", "list-heads", path.as_ref()])?
+                .lines()
+                .filter_map(|line| line.split_whitespace().next())
+                .map(str::to_string)
+                .collect(),
+        )
+    }
+
+    /// Prove that `staged` and then `unstaged` apply on top of `head`, using a
+    /// private index so neither this checkout's index nor its files move.
+    ///
+    /// The order mirrors how the patches were taken: `git diff --cached` is
+    /// HEAD to index, and `git diff` is index to working tree.
+    pub fn check_recovery_patches(
+        &self,
+        head: &str,
+        staged: Option<&Path>,
+        unstaged: Option<&Path>,
+        scratch_index: &Path,
+    ) -> Result<(), GitError> {
+        let index = scratch_index.to_string_lossy();
+        run_git_with_index(&self.root, &index, &["read-tree", head])?;
+        if let Some(staged) = staged {
+            run_git_with_index(
+                &self.root,
+                &index,
+                &["apply", "--cached", &staged.to_string_lossy()],
+            )?;
+        }
+        if let Some(unstaged) = unstaged {
+            run_git_with_index(
+                &self.root,
+                &index,
+                &["apply", "--cached", "--check", &unstaged.to_string_lossy()],
+            )?;
+        }
+        Ok(())
+    }
+
     /// Tracked paths with staged or unstaged changes. Kept separate from
     /// untracked paths for operations that can safely tolerate unrelated
     /// local files while still refusing modifications to committed state.

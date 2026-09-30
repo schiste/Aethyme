@@ -608,6 +608,7 @@ continues to expose the complete local `log_path` without embedding log data.
 - `aethyme broker advanced representation record --session <id> --confirm <sha256> [--json]`
 - `aethyme broker finish cleanup <session-id> [--force] [--json]`
 - `aethyme broker finish cleanup --all-cleaned [--apply --confirm <sha256>] [--json]`
+- `aethyme broker finish cleanup resolve <session-id> --archive [--confirm <sha256>] [--json]`
 - `aethyme broker finish cleanup audit [--repo <path>] [--detail] [--json]`
 - `aethyme broker advanced main reconcile plan [--detail] [--resolution-file <path>] [--write-resolution-template <path>] [--json]`
 - `aethyme broker advanced main reconcile apply --session <id> --confirm <sha256> [--resolution-file <path>] [--json]`
@@ -1158,6 +1159,29 @@ action. The audit removes nothing. When anything is removable it prints the
 `--all-cleaned --apply` command with the current plan digest, and it withholds
 that command if the plan would remove an item the audit retains. `--repo
 <path>` audits the repository at `<path>` instead of the current directory.
+
+`broker finish cleanup resolve <session-id> --archive` handles one closed,
+broker-spawned session whose worktree cleanup refuses because it is `dirty`,
+holds `pending_commits`, or is `unproven_provenance`. Without `--confirm` it is
+read-only: it prints the landed-work verdict for the head, the commits no
+delivery target holds, the sizes of the staged and unstaged patches, every
+untracked file Git does not ignore (with its SHA-256), the archive location and
+a digest. The digest binds the head, the delivery targets and the exact content
+of every patch and untracked file, so any change after review refuses the
+apply. `--confirm <sha256>` writes a recovery archive under
+`<host state>/recovery-archives/<repository-key>/` (a repository under the
+system temp directory uses `.aethyme/recovery-archives/` instead): a Git bundle
+of the unlanded commits, `staged.patch`, `unstaged.patch`, an `untracked/` copy,
+`manifest.json` and a `README.md` with restore steps. Every part is read back
+before anything is removed -- the bundle is verified and must carry the head,
+the patches must apply to the head in a private index, and every copied file is
+re-hashed -- and only a verified archive is renamed into place, after which the
+worktree is removed through the ordinary cleanup path and a
+`broker.cleanup.archived` event records the archive path. Any failure before
+that point leaves the worktree untouched. Ignored files (build output, caches)
+are never archived. Eligible, live, adopted, unsafe-path and inspection-failed
+sessions are refused; discarding stays `cleanup <session-id> --force`. Archives
+are not expired automatically.
 
 `broker gc reclaim plan` inventories regenerable build directories inside this
 repository's broker worktree root and saves the reviewed decision set under a

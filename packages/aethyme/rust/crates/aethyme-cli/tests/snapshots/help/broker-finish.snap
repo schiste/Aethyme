@@ -18,6 +18,15 @@ exit: 0
       by default; --apply revalidates and removes only clean worktrees whose
       session work is represented on main, integration, or configured upstream.
       Adopted worktrees are never included in the bulk sweep.
+  aethyme broker finish cleanup resolve <session-id> --archive [--confirm <sha256>] [--json]
+      Preserve, then remove, a closed session's worktree that cleanup refuses
+      because it is dirty, holds pending commits, or cannot be proved landed.
+      Without --confirm it prints what would be archived and a digest. With it,
+      it writes a recovery archive under the host state directory (a bundle of
+      commits no delivery target holds, staged and unstaged patches, untracked
+      files Git does not ignore, a manifest and restore steps), reads every part
+      back, and only then removes the worktree. A verification failure leaves
+      the worktree in place. Discarding stays `cleanup <session-id> --force`.
   aethyme broker finish cleanup audit [--repo <path>] [--detail] [--json]
       Read-only, repository-scoped audit of every retained worktree, branch,
       Git worktree registration and unowned worktree-root directory. Judges
