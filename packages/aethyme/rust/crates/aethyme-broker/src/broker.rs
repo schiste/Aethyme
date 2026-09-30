@@ -364,6 +364,23 @@ pub enum BrokerOpError {
         "session {session_id} is closed and cannot authorize coordinated operations; start a new session with `aethyme broker start --task <text>` or adopt an active worktree with `aethyme broker start --adopt --task <text>`"
     )]
     ClosedSessionOperation { session_id: i64 },
+    /// `broker push` declined before anything was sent: the repository has
+    /// not authorized session-branch pushes, the branch is not a session
+    /// branch, or the remote holds work this session never pushed.
+    #[error("broker push refused: {reason}")]
+    SessionPushRefused { reason: String },
+    #[error(
+        "broker push {phase} failed (operation {operation_id}, {status}){}",
+        if stderr.is_empty() { String::new() } else { format!(": {stderr}") }
+    )]
+    SessionPushFailed {
+        phase: &'static str,
+        operation_id: i64,
+        status: &'static str,
+        stderr: String,
+    },
+    #[error("session {session_id}'s branch {branch} does not exist in this repository")]
+    SessionBranchMissing { session_id: i64, branch: String },
     #[error("{recovery}")]
     CoordinatedOperationBlocked {
         repository: String,
@@ -3099,7 +3116,7 @@ impl Broker {
     /// Commits only this session's worktree holds, when the repository opted
     /// into the push lane and has a remote to push to; `None` otherwise.
     fn unpushed_close_check(&self, session: &Session) -> Option<(String, u32)> {
-        if !crate::unpushed::push_session_branches_enabled(&self.main_root)
+        if !crate::session_push::session_push_enabled(&self.repo)
             || self.repo.remotes().unwrap_or_default().is_empty()
         {
             return None;
@@ -6830,7 +6847,7 @@ impl Broker {
     /// Empty when the repository has no remote: there is nowhere to push to,
     /// so every commit would count and the number would mean nothing.
     pub fn unpushed_work(&self, now_ms: i64) -> Result<crate::UnpushedWorkReport, BrokerOpError> {
-        let push_session_branches = crate::unpushed::push_session_branches_enabled(&self.main_root);
+        let push_session_branches = crate::session_push::session_push_enabled(&self.repo);
         let mut report = crate::UnpushedWorkReport {
             push_session_branches,
             ..Default::default()
@@ -8059,7 +8076,7 @@ impl Broker {
             report
                 .next_commands
                 .push(format!("git -C {} commit", session.worktree_path));
-            if crate::unpushed::push_session_branches_enabled(&self.main_root) {
+            if crate::session_push::session_push_enabled(&self.repo) {
                 report
                     .next_commands
                     .push(format!("aethyme broker push --session {session_id}"));
@@ -8220,7 +8237,7 @@ impl Broker {
                     ));
                 }
             }
-        } else if crate::unpushed::push_session_branches_enabled(&self.main_root) {
+        } else if crate::session_push::session_push_enabled(&self.repo) {
             report.unpushed_commits = Some(0);
         }
 
@@ -10165,7 +10182,8 @@ fn unpushed_work_advice(report: &crate::UnpushedWorkReport, now_ms: i64) -> Vec<
                 // Without the repository opt-in the push command refuses, so
                 // naming only it would be a dead end.
                 commands.push(
-                    "opt in: set `push_session_branches = true` under [delivery] in .aethyme/config.toml"
+                    "opt in: commit `push_session_branches = true` under [delivery] in \
+                     .aethyme/config.toml on the default branch"
                         .into(),
                 );
             }

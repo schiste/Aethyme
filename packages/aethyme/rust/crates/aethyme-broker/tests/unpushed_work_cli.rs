@@ -48,9 +48,9 @@ struct Fixture {
     repo: PathBuf,
 }
 
-/// A repository with a bare `origin` whose default branch is fetched, so the
-/// broker has an upstream to compare against. `config` is written to
-/// `.aethyme/config.toml` before the broker opens.
+/// A repository with a bare `origin` whose default branch is fetched and
+/// tracked, so the broker has an upstream to compare against. A non-empty
+/// `config` is committed as `.aethyme/config.toml` before the push.
 fn fixture(config: &str) -> Fixture {
     let tmp = tempfile::tempdir().unwrap();
     let origin = tmp.path().join("origin.git");
@@ -65,17 +65,21 @@ fn fixture(config: &str) -> Fixture {
     std::fs::write(repo.join(".gitignore"), "/.aethyme/\n").unwrap();
     git(&repo, &["add", "-A"]);
     git(&repo, &["commit", "-qm", "init"]);
+    if !config.is_empty() {
+        // `broker push` trusts only the policy committed on the fetched
+        // default branch, and finish reads it the same way.
+        std::fs::create_dir_all(repo.join(".aethyme")).unwrap();
+        std::fs::write(repo.join(".aethyme/config.toml"), config).unwrap();
+        git(&repo, &["add", "-f", ".aethyme/config.toml"]);
+        git(&repo, &["commit", "-qm", "enable the push lane"]);
+    }
     git(
         &repo,
         &["remote", "add", "origin", origin.to_str().unwrap()],
     );
-    git(&repo, &["push", "-q", "origin", "main"]);
+    git(&repo, &["push", "-q", "-u", "origin", "main"]);
     git(&repo, &["fetch", "-q", "origin"]);
     git(&repo, &["remote", "set-head", "origin", "main"]);
-    if !config.is_empty() {
-        std::fs::create_dir_all(repo.join(".aethyme")).unwrap();
-        std::fs::write(repo.join(".aethyme/config.toml"), config).unwrap();
-    }
     Fixture { _tmp: tmp, repo }
 }
 

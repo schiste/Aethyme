@@ -99,7 +99,7 @@ const COMMANDS: &[&str] = &[
     "quality",
     "quality inspect",
     "autofix",
-    // broker: the six public verbs and their merged forms
+    // broker: the public verbs and their merged forms
     "broker",
     "broker start",
     "broker status",
@@ -112,6 +112,7 @@ const COMMANDS: &[&str] = &[
     "broker submit prepare",
     "broker submit promote",
     "broker submit promotion-record",
+    "broker push",
     "broker finish",
     "broker finish close",
     "broker finish cleanup",

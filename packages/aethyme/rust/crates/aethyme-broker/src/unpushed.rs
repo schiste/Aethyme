@@ -14,7 +14,6 @@
 //! unpushed, never the reverse.
 
 use std::collections::HashSet;
-use std::path::Path;
 
 use crate::StatusAdviceSeverity;
 use crate::git::{CherrySide, GitError, GitRepo};
@@ -30,25 +29,7 @@ const PUSH_SOON_MS: i64 = 4 * 3_600_000;
 /// artifact sweep uses before it treats an open session as abandoned (#428).
 const PUSH_OVERDUE_MS: i64 = 24 * 3_600_000;
 
-/// Whether `.aethyme/config.toml` sets `[delivery] push_session_branches`.
-///
-/// Read tolerantly on purpose. This only decides whether `finish` may refuse,
-/// so a missing or unreadable file means "not opted in", and keys beside it in
-/// `[delivery]` are not this reader's business: ship validates that table.
-pub(crate) fn push_session_branches_enabled(main_root: &Path) -> bool {
-    std::fs::read_to_string(main_root.join(".aethyme/config.toml"))
-        .ok()
-        .and_then(|text| text.parse::<toml::Value>().ok())
-        .and_then(|value| {
-            value
-                .get("delivery")?
-                .get("push_session_branches")?
-                .as_bool()
-        })
-        .unwrap_or(false)
-}
-
-/// Commits a push would add, and when the oldest of them was made.
+/// Commits only this machine holds, and when the oldest of them was made.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct OffRemoteWork {
     pub commits: u32,
@@ -69,7 +50,11 @@ pub(crate) fn off_remote_work(
     excluded: &[&str],
     upstream: Option<&str>,
 ) -> Result<OffRemoteWork, GitError> {
-    let mut commits = repo.commits_off_remotes(head, excluded)?;
+    let mut commits = repo
+        .own_commits_not_on_remotes(head, excluded)?
+        .into_iter()
+        .map(|commit| (commit.sha, commit.committed_at_ms))
+        .collect::<Vec<_>>();
     if let Some(upstream) = upstream
         && !commits.is_empty()
     {
@@ -127,8 +112,9 @@ pub(crate) fn describe_age(age_ms: i64) -> String {
 /// branch, as reported by `status` and `doctor`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub struct UnpushedWorkReport {
-    /// Whether the repository opted into the push lane
-    /// (`[delivery] push_session_branches = true`).
+    /// Whether the repository opted into the push lane: the same trusted
+    /// read `broker push` makes, `[delivery] push_session_branches = true`
+    /// committed on the fetched default branch.
     pub push_session_branches: bool,
     /// Live sessions holding commits only their worktree has.
     pub sessions: Vec<UnpushedSessionWork>,
@@ -150,7 +136,10 @@ pub struct UnpushedSessionWork {
     pub head: String,
     /// Commits reachable from the session head that no remote-tracking ref
     /// holds and the session did not inherit from its start or reuse base,
-    /// less those patch-equivalent to upstream.
+    /// less those patch-equivalent to upstream. Deliberately narrower than
+    /// `SessionPushState::unpushed_commits`, which counts everything a push
+    /// would send, inherited commits included: this counts only work that
+    /// would be lost with the worktree.
     pub unpushed_commits: u32,
     /// Committer time of the oldest of them, Unix epoch milliseconds.
     pub oldest_unpushed_at_ms: Option<i64>,
@@ -198,23 +187,5 @@ mod tests {
             session_severity(25 * HOUR, true),
             StatusAdviceSeverity::Blocked
         );
-    }
-
-    #[test]
-    fn the_policy_reader_tolerates_other_delivery_keys_and_bad_files() {
-        let tmp = tempfile::tempdir().unwrap();
-        assert!(!push_session_branches_enabled(tmp.path()));
-        std::fs::create_dir_all(tmp.path().join(".aethyme")).unwrap();
-        let config = tmp.path().join(".aethyme/config.toml");
-        std::fs::write(
-            &config,
-            "[delivery]\ndefault = \"pull_request\"\npush_session_branches = true\n",
-        )
-        .unwrap();
-        assert!(push_session_branches_enabled(tmp.path()));
-        std::fs::write(&config, "[delivery]\npush_session_branches = \"yes\"\n").unwrap();
-        assert!(!push_session_branches_enabled(tmp.path()));
-        std::fs::write(&config, "not = [valid toml").unwrap();
-        assert!(!push_session_branches_enabled(tmp.path()));
     }
 }
