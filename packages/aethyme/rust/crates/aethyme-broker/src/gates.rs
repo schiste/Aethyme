@@ -2404,6 +2404,24 @@ struct GateCommandOutcome {
     output_bytes: u64,
 }
 
+/// The private directory holding one gate command's broker database.
+///
+/// The name carries the owning process id, not only tempfile's random suffix.
+/// That suffix comes from fastrand, whose unix seed hashes nothing but the
+/// monotonic clock and the thread id -- no OS entropy -- so two gate workers
+/// that seed in the same clock tick draw identical names. While both
+/// directories exist tempfile retries past the clash, but gates on the same
+/// owner paths run one after the other: the second worker then recreates the
+/// first worker's just-deleted path, and a child that escaped the first gate
+/// (#361) would write into the second gate's database while both logs name
+/// the same file (#430). Concurrent workers are distinct live processes, so
+/// their ids cannot collide however their generators were seeded.
+fn isolated_broker_db_dir(run_dir: &Path, owner_pid: u32) -> std::io::Result<tempfile::TempDir> {
+    tempfile::Builder::new()
+        .prefix(&format!("broker-db-{owner_pid}-"))
+        .tempdir_in(run_dir)
+}
+
 fn run_gate_command(
     command: &str,
     context: GateCommandContext<'_>,
@@ -2472,9 +2490,7 @@ fn run_gate_command(
     // repository database through the normal worktree resolution (#232).
     // Keep the database in a unique temporary directory so the isolation is
     // both per gate and automatically reclaimed when the child exits.
-    let isolated_broker_db = tempfile::Builder::new()
-        .prefix("broker-db-")
-        .tempdir_in(context.run_dir)?;
+    let isolated_broker_db = isolated_broker_db_dir(context.run_dir, std::process::id())?;
     let isolated_broker_db_path = isolated_broker_db.path().canonicalize()?.join("broker.db");
     let isolated_broker_scope = crate::gate_database::for_child(
         context.cwd,
@@ -2872,6 +2888,36 @@ fn preserve_failed_gate_log(log_path: &Path, status: GateStatus) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Allocate, record the directory name, and delete it again -- what a
+    /// finished gate leaves behind for the next one on the same owner paths.
+    fn released_broker_db_name(run_dir: &Path, seed: u64, owner_pid: u32) -> std::ffi::OsString {
+        fastrand::seed(seed);
+        let directory = isolated_broker_db_dir(run_dir, owner_pid).unwrap();
+        directory.path().file_name().unwrap().to_owned()
+    }
+
+    /// The mechanism behind #430: fastrand has no OS entropy, so two workers
+    /// seeded in the same clock tick draw the same tempfile names, and a
+    /// deleted directory's name comes straight back.
+    #[test]
+    fn identical_seeds_repeat_the_same_broker_database_directory() {
+        let run_dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            released_broker_db_name(run_dir.path(), 430, 100),
+            released_broker_db_name(run_dir.path(), 430, 100),
+        );
+    }
+
+    #[test]
+    fn identically_seeded_workers_get_distinct_broker_database_directories() {
+        let run_dir = tempfile::tempdir().unwrap();
+        assert_ne!(
+            released_broker_db_name(run_dir.path(), 430, 100),
+            released_broker_db_name(run_dir.path(), 430, 200),
+            "a second worker recreated the first worker's database directory"
+        );
+    }
 
     #[test]
     fn the_environment_header_names_load_cpus_and_free_disk_or_says_unknown() {
