@@ -131,6 +131,7 @@ pub use representation::{
     SessionContent, content_at as representation_content_at, find_landing, landing_base,
     plan_digest as representation_plan_digest, session_content, work_landed,
 };
+mod pr_overlap;
 mod repository_contract;
 mod resources;
 mod retention;
@@ -303,6 +304,7 @@ pub use pr::{
     PrActivityItem, PrCheckOptions, PrCheckReport, PrCheckRun, PrDecision, PrDecisionStatus,
     PrDispatchReport, PrDispatchStatus, PrError, PrMarker, PrSummary,
 };
+pub use pr_overlap::{PrOverlap, PrOverlapCheck};
 pub use pr_projection::{
     COMMENT_MARKER, OwnedComment, PR_PROJECTION_SCHEMA_VERSION, PrProjectionAction,
     PrProjectionError, PrProjectionFacts, PrProjectionPolicy, ProjectedReview,

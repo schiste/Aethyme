@@ -78,18 +78,24 @@ pub struct SessionPushReport {
     /// Uncommitted files left in the worktree; only commits are pushed.
     pub uncommitted_files: u32,
     pub pr: Option<SessionPullRequest>,
+    /// Open pull requests whose change overlaps this session's: same files,
+    /// and whether the changed lines overlap or nearly touch. Advisory only.
+    pub pr_overlaps: Vec<crate::PrOverlap>,
+    /// Open pull requests whose change could not be read, so their overlap
+    /// is unknown rather than absent.
+    pub pr_overlaps_unknown: Vec<i64>,
 }
 
 /// The remote and default branch the main checkout tracks, and the commit its
 /// remote-tracking ref points at.
-struct TrackedDefault {
-    remote: String,
-    branch: String,
-    tracking_ref: String,
-    commit: String,
+pub(crate) struct TrackedDefault {
+    pub(crate) remote: String,
+    pub(crate) branch: String,
+    pub(crate) tracking_ref: String,
+    pub(crate) commit: String,
 }
 
-fn tracked_default(repo: &GitRepo) -> Option<TrackedDefault> {
+pub(crate) fn tracked_default(repo: &GitRepo) -> Option<TrackedDefault> {
     let (upstream, commit) = repo.tracking_upstream()?;
     let (remote, branch) = upstream
         .strip_prefix("refs/remotes/")
@@ -324,6 +330,17 @@ impl Broker {
             None
         };
 
+        // Advisory and best-effort: a listing or diff that cannot be read
+        // degrades to "unknown" and never fails a push that already happened.
+        let overlap = self.check_pr_overlaps_for_push(
+            session_id,
+            &session.branch,
+            &head,
+            &target.display_slug,
+            &main_root,
+            crate::clock::epoch_ms(),
+        );
+
         let payload = serde_json::json!({
             "session_id": session_id,
             "branch": session.branch,
@@ -346,6 +363,8 @@ impl Broker {
             commits_pushed: u32::try_from(new_commits).unwrap_or(u32::MAX),
             uncommitted_files: u32::try_from(uncommitted_files).unwrap_or(u32::MAX),
             pr,
+            pr_overlaps: overlap.overlaps,
+            pr_overlaps_unknown: overlap.unknown_prs,
         })
     }
 

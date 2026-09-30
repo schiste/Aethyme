@@ -2008,6 +2008,26 @@ impl GitRepo {
         result
     }
 
+    /// The committed change `from..to` as a zero-context unified diff, with
+    /// rename detection off so a moved file reads as a removal plus an
+    /// addition. Colour and external diff drivers are disabled explicitly: a
+    /// decorated diff cannot be parsed into line ranges.
+    pub fn unified_diff_zero(&self, from: &str, to: &str) -> Result<String, GitError> {
+        run_git(
+            &self.root,
+            &[
+                "diff",
+                "--no-color",
+                "--no-ext-diff",
+                "--no-renames",
+                "-U0",
+                from,
+                to,
+                "--",
+            ],
+        )
+    }
+
     /// Tracked-file changes (committed + staged + unstaged) against
     /// `base`, plus untracked files: the diff surface implicit leases are
     /// derived from. NUL-separated output because shim-decorated
