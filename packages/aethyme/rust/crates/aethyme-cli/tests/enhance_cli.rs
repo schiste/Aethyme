@@ -84,7 +84,7 @@ fn agents_document_includes_broker_protocol_only_when_configured() {
     let agents = read(repo.join("AGENTS.md"));
     for needle in [
         "## Broker Coordination: before and after an edit",
-        "aethyme broker start --task \"<task>\"",
+        "aethyme broker start --task \"<task>\" [--short-name \"<label>\"]",
         "work only in the worktree it",
         "Never edit another session's worktree.",
         "aethyme broker submit --session <id>",
@@ -107,7 +107,7 @@ fn agents_document_includes_broker_protocol_only_when_configured() {
     let broker_reference = read(repo.join(".codex/skills/aethyme/references/broker.md"));
     for moved in [
         "aethyme broker status --json",
-        "broker start --task \"<your task>\" --path <planned-path>",
+        "broker start --task \"<your task>\" --short-name \"<short name>\" --path <planned-path>",
         "aethyme broker advanced leases claim",
         "AETHYME_TEST_DB_SUFFIX",
         "aethyme broker finish cleanup --all-cleaned --apply",

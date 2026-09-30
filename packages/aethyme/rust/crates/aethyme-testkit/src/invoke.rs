@@ -119,6 +119,11 @@ impl Invoke {
         command
             .args(&self.args)
             .env("AETHYME_ROOT", package_root())
+            // Broker lifecycle tests must never reach the developer's Chau7 app.
+            .env(
+                "AETHYME_CHAU7_MCP_BRIDGE",
+                "/__aethyme_test_no_chau7_bridge__",
+            )
             .stdin(if self.stdin.is_some() {
                 Stdio::piped()
             } else {

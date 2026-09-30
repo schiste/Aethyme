@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
+mod common;
 
 fn git(repo: &Path, args: &[&str]) {
     let output = Command::new("git")
@@ -43,8 +44,7 @@ fn fixture(retention: &str) -> (tempfile::TempDir, tempfile::TempDir) {
 }
 
 fn run(repo: &Path, container: &Path, args: &[&str]) -> Output {
-    Command::new(CLI)
-        .args(args)
+    common::broker_cli(CLI, args)
         .current_dir(repo)
         .env("AETHYME_WORKTREE_ROOT", container)
         .output()
@@ -326,12 +326,14 @@ fn a_reviewed_worktree_that_became_active_is_skipped() {
     let plan = reclaim_plan_json(repo.path(), container.path());
     let digest = plan["digest"].as_str().unwrap().to_string();
 
-    let adopted = Command::new(CLI)
-        .args(["start", "--adopt", "--task", "resume work", "--json"])
-        .current_dir(&worktree)
-        .env("AETHYME_WORKTREE_ROOT", container.path())
-        .output()
-        .unwrap();
+    let adopted = common::broker_cli(
+        CLI,
+        &["start", "--adopt", "--task", "resume work", "--json"],
+    )
+    .current_dir(&worktree)
+    .env("AETHYME_WORKTREE_ROOT", container.path())
+    .output()
+    .unwrap();
     assert!(
         adopted.status.success(),
         "adopt: {}",

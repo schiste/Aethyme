@@ -28,6 +28,7 @@ pub mod attribution;
 mod blockers;
 mod bounded_output;
 mod broker;
+mod chau7_mcp;
 mod chau7_tabs;
 mod cleanup_audit;
 mod cleanup_resolve;
@@ -491,13 +492,14 @@ pub use types::{
     AdvisoryResolutionState, AdvisorySeverity, CoordinatedOperation,
     DEFAULT_OPERATION_HISTORY_LIMIT, EntryExposureResolutionKind, EntryExposureState,
     EntryPathExposure, Event, GateDef, GateEnvironment, GateFailureClass, GateResult, GateStatus,
-    Lease, LeaseKind, MAX_OPERATION_HISTORY_LIMIT, MERGE_QUEUE_HISTORY_SCHEMA_VERSION,
-    MergeQueueEntry, MergeQueueHistoryPage, MergeQueueStatusCount, MergeStatus, NewAdvisory,
-    NewCoordinatedOperation, NewGateResult, NewPrWatchState, NewSession, OperationEffect,
-    OperationHistoryPage, OperationHistoryQuery, OperationIdentityProvenance, OperationProvider,
-    OperationStatus, PrWatchState, ScopeKind, ScopeOperation, ScopeSource, Session,
-    SessionCleanupState, SessionContext, SessionNote, SessionNoteList, SessionOrigin, SessionScope,
-    SessionStatus,
+    Lease, LeaseKind, MAX_OPERATION_HISTORY_LIMIT, MAX_SESSION_SHORT_NAME_CHARS,
+    MERGE_QUEUE_HISTORY_SCHEMA_VERSION, MergeQueueEntry, MergeQueueHistoryPage,
+    MergeQueueStatusCount, MergeStatus, NewAdvisory, NewCoordinatedOperation, NewGateResult,
+    NewPrWatchState, NewSession, OperationEffect, OperationHistoryPage, OperationHistoryQuery,
+    OperationIdentityProvenance, OperationProvider, OperationStatus, PrWatchState, ScopeKind,
+    ScopeOperation, ScopeSource, Session, SessionCleanupState, SessionContext, SessionNote,
+    SessionNoteList, SessionOrigin, SessionScope, SessionStatus, derive_session_short_name,
+    validate_session_short_name,
 };
 pub use unpushed::{UnpublishedIntegrationWork, UnpushedSessionWork, UnpushedWorkReport};
 pub use update::{

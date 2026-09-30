@@ -19,7 +19,7 @@ lists its forms.
 ## start
 
 ```bash
-aethyme broker start --task "Add rate limiting to the upload API" --agent "Ada <ada@example.com>"
+aethyme broker start --task "Add rate limiting to the upload API" --short-name "Rate limiting" --agent "Ada <ada@example.com>"
 ```
 
 Prints the session id and the worktree path. Run one agent per session, in
@@ -94,11 +94,11 @@ Two agents, one repository.
 
 ```bash
 # Agent A's task
-aethyme broker start --task "Add rate limiting to the upload API" --path src/upload/
+aethyme broker start --task "Add rate limiting to the upload API" --short-name "Rate limiting" --path src/upload/
 #   -> session 12, worktree .../upload-rate-limit
 
 # Agent B's task, started while A works
-aethyme broker start --task "Rename the upload size setting"
+aethyme broker start --task "Rename the upload size setting" --short-name "Upload size"
 #   -> session 13
 
 aethyme broker status

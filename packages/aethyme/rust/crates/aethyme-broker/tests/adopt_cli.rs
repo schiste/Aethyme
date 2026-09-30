@@ -4,6 +4,7 @@ use std::process::{Command, Output};
 use aethyme_broker::Broker;
 
 const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
+mod common;
 
 fn git(repo: &Path, args: &[&str]) {
     git_output(repo, args);
@@ -30,8 +31,7 @@ fn git_output(repo: &Path, args: &[&str]) -> String {
 }
 
 fn run(repo: &Path, args: &[&str]) -> Output {
-    Command::new(CLI)
-        .args(args)
+    common::broker_cli(CLI, args)
         .current_dir(repo)
         .output()
         .unwrap()
@@ -132,6 +132,8 @@ fn start_cli_records_chau7_session_context_for_status_and_json() {
             "Aethyme",
             "--tab-name",
             "Fix auth",
+            "--short-name",
+            "Auth flow",
             "--ai-provider",
             "claude",
             "--json",
@@ -140,10 +142,123 @@ fn start_cli_records_chau7_session_context_for_status_and_json() {
     let report: serde_json::Value = serde_json::from_str(&started).unwrap();
     assert_eq!(report["repository_name"], "Aethyme");
     assert_eq!(report["tab_name"], "Fix auth");
+    assert_eq!(report["short_name"], "Auth flow");
     assert_eq!(report["ai_provider"], "claude");
+    assert_eq!(report["tab_rename"]["status"], "pending");
 
     let status = stdout(&run(tmp.path(), &["status"]));
     assert!(status.contains("Aethyme / Fix auth / claude"), "{status}");
+}
+
+/// Run the CLI exactly as given: [`run`] adds a short name to every start.
+fn run_verbatim(repo: &Path, args: &[&str]) -> Output {
+    Command::new(CLI)
+        .args(args)
+        .current_dir(repo)
+        .env("AETHYME_CHAU7_MCP_BRIDGE", common::disabled_bridge_path())
+        .output()
+        .unwrap()
+}
+
+/// Callers written before short names existed keep working: the session is
+/// named after its task.
+#[test]
+fn start_without_a_short_name_derives_one_from_the_task() {
+    let tmp = fixture();
+    let started = stdout(&run_verbatim(
+        tmp.path(),
+        &["start", "--task", "Fix auth token refresh", "--json"],
+    ));
+    let started: serde_json::Value = serde_json::from_str(&started).unwrap();
+    assert_eq!(started["short_name"], "Fix auth token refresh");
+}
+
+#[test]
+fn an_invalid_short_name_is_refused_before_start_creates_broker_state() {
+    let tmp = fixture();
+    let output = run_verbatim(
+        tmp.path(),
+        &["start", "--task", "labelled", "--short-name", "   "],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(!output.status.success());
+    assert!(stderr.contains("short name must not be empty"), "{stderr}");
+    assert!(
+        !tmp.path().join(aethyme_broker::BROKER_DB_RELPATH).exists(),
+        "short-name validation must precede broker database creation"
+    );
+}
+
+/// `--reuse` without a name keeps the one the session already has rather
+/// than renaming it after the follow-up task.
+#[test]
+fn reuse_without_a_short_name_keeps_the_stored_name() {
+    let tmp = fixture();
+    stdout(&run_verbatim(
+        tmp.path(),
+        &[
+            "start",
+            "--adopt",
+            "--task",
+            "first",
+            "--short-name",
+            "Chosen",
+            "--json",
+        ],
+    ));
+    let reused = stdout(&run_verbatim(
+        tmp.path(),
+        &[
+            "start",
+            "--reuse",
+            "--task",
+            "a different follow-up",
+            "--json",
+        ],
+    ));
+    let reused: serde_json::Value = serde_json::from_str(&reused).unwrap();
+    assert_eq!(reused["short_name"], "Chosen");
+}
+
+#[test]
+fn reuse_persists_a_new_short_name_but_keeps_tab_attribution() {
+    let tmp = fixture();
+    let created = stdout(&run(
+        tmp.path(),
+        &[
+            "start",
+            "--adopt",
+            "--task",
+            "first",
+            "--tab-name",
+            "Original tab",
+            "--short-name",
+            "Initial",
+            "--json",
+        ],
+    ));
+    let created: serde_json::Value = serde_json::from_str(&created).unwrap();
+    assert_eq!(created["short_name"], "Initial");
+    assert_eq!(created["tab_name"], "Original tab");
+
+    let reused = stdout(&run(
+        tmp.path(),
+        &[
+            "start",
+            "--reuse",
+            "--task",
+            "follow-up",
+            "--tab-name",
+            "Current title",
+            "--short-name",
+            "Follow up",
+            "--json",
+        ],
+    ));
+    let reused: serde_json::Value = serde_json::from_str(&reused).unwrap();
+    assert_eq!(reused["short_name"], "Follow up");
+    assert_eq!(reused["tab_name"], "Original tab");
 }
 
 #[test]
@@ -603,7 +718,16 @@ fn adopt_cli_syncs_reuse_to_integration_and_exposes_the_exact_transition() {
 #[test]
 fn adopt_cli_requires_reuse_for_integration_sync() {
     let tmp = fixture();
-    let output = run(tmp.path(), &["start", "--adopt", "--sync-integration"]);
+    let output = run(
+        tmp.path(),
+        &[
+            "start",
+            "--adopt",
+            "--short-name",
+            "Existing worktree",
+            "--sync-integration",
+        ],
+    );
     assert!(!output.status.success());
     assert!(
         String::from_utf8_lossy(&output.stderr).contains("--sync-integration requires --reuse")

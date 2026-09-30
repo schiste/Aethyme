@@ -15,6 +15,7 @@ use aethyme_broker::{BROKER_DB_RELPATH, GitRepo, SCHEMA_VERSION};
 const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
 const CHILD_MODE: &str = "AETHYME_TEST_GATE_CHILD";
 const CHILD_RECORD: &str = "AETHYME_TEST_GATE_CHILD_RECORD";
+mod common;
 
 fn git(repo: &Path, args: &[&str]) {
     let output = Command::new("git")
@@ -30,8 +31,7 @@ fn git(repo: &Path, args: &[&str]) {
 }
 
 fn run(repo: &Path, args: &[&str]) -> Output {
-    Command::new(CLI)
-        .args(args)
+    common::broker_cli(CLI, args)
         .current_dir(repo)
         .env_remove(aethyme_broker::BROKER_DB_ENV)
         .env_remove("AETHYME_GATE_BROKER_DATABASES")

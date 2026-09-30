@@ -4,6 +4,7 @@ use std::process::{Command, Output};
 use aethyme_broker::Broker;
 
 const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
+mod common;
 
 fn git(repo: &Path, args: &[&str]) {
     let output = Command::new("git")
@@ -32,8 +33,7 @@ fn fixture_at(repo: &Path) {
 }
 
 fn run(repo: &Path, state: &Path, args: &[&str]) -> Output {
-    Command::new(CLI)
-        .args(args)
+    common::broker_cli(CLI, args)
         .current_dir(repo)
         .env("AETHYME_HOST_STATE_DIR", state)
         .env_remove("AETHYME_WORKTREE_ROOT")
@@ -42,8 +42,7 @@ fn run(repo: &Path, state: &Path, args: &[&str]) -> Output {
 }
 
 fn run_with_root(repo: &Path, root: &Path, args: &[&str]) -> Output {
-    Command::new(CLI)
-        .args(args)
+    common::broker_cli(CLI, args)
         .current_dir(repo)
         .env("AETHYME_WORKTREE_ROOT", root)
         .output()

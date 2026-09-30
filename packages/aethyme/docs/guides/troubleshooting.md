@@ -54,7 +54,7 @@ Recover with released binaries only:
    broker sessions, copy `.aethyme/broker.db*` aside as evidence, and wait
    for the migration to ship in a release -- or move the database aside and
    let the released binary recreate it, re-adopting live worktrees with
-   `aethyme broker start --adopt`.
+   `aethyme broker start --adopt --task "Resume work" --short-name "Resume work"`.
 
 ## Aethyme Behaves In Ways Its Version Cannot Explain
 

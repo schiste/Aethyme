@@ -28,7 +28,11 @@ fn command(repo: &Path) -> Command {
     command
         .current_dir(repo)
         .env_remove("AETHYME_ROOT")
-        .env("XDG_CONFIG_HOME", repo.join("empty-config"));
+        .env("XDG_CONFIG_HOME", repo.join("empty-config"))
+        .env(
+            "AETHYME_CHAU7_MCP_BRIDGE",
+            "/__aethyme_test_no_chau7_bridge__",
+        );
     command
 }
 
@@ -851,7 +855,14 @@ fn homebrew_upgrade_mid_session_preserves_commit_and_recovery_lanes() {
     );
 
     for args in [
-        &["broker", "start", "--task", "must stay blocked"][..],
+        &[
+            "broker",
+            "start",
+            "--task",
+            "must stay blocked",
+            "--short-name",
+            "Blocked",
+        ][..],
         &["broker", "advanced", "ship", "execute"][..],
     ] {
         let blocked = run(&repo, args);
@@ -1064,8 +1075,16 @@ fn older_repository_allows_diagnostics_recovery_and_only_pinned_continuation() {
 
     for args in [
         &["broker", "submit", "--session", "9999"][..],
-        &["broker", "start", "--task", "work"][..],
-        &["broker", "start", "--reuse", "--task", "work"][..],
+        &["broker", "start", "--task", "work", "--short-name", "Work"][..],
+        &[
+            "broker",
+            "start",
+            "--reuse",
+            "--task",
+            "work",
+            "--short-name",
+            "Work",
+        ][..],
         &["broker", "advanced", "ship", "execute"][..],
     ] {
         let output = run(&repo, args);
@@ -1192,7 +1211,17 @@ fn repository_compatibility_states_preserve_refusal_remediation() {
             String::from_utf8_lossy(&diagnostic.stderr)
         );
 
-        let mutation = run(&repo, &["broker", "start", "--task", "blocked"]);
+        let mutation = run(
+            &repo,
+            &[
+                "broker",
+                "start",
+                "--task",
+                "blocked",
+                "--short-name",
+                "Blocked",
+            ],
+        );
         assert!(!mutation.status.success());
         let stderr = String::from_utf8_lossy(&mutation.stderr);
         assert!(stderr.contains(expected), "expected {expected:?}: {stderr}");

@@ -15,7 +15,8 @@ Hot path:
                               bounded source spans for Explore targets
 
 Agent broker:
-  broker start --task <text>  create an isolated worktree + session
+  broker start --task <text> --short-name <name>
+                              create an isolated worktree + session
   broker status               sessions, overlaps, queue, integration, readiness
   broker submit --session <id>
                               simulate, gate, and promote a session

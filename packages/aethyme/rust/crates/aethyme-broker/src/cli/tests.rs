@@ -319,6 +319,8 @@ fn parse_accepts_chau7_session_identity_flags() {
         "Aethyme",
         "--tab-name",
         "Fix auth",
+        "--short-name",
+        "Fix auth",
         "--ai-provider",
         "claude",
     ]))
@@ -328,12 +330,92 @@ fn parse_accepts_chau7_session_identity_flags() {
     assert_eq!(parsed.tab_name.as_deref(), Some("Fix auth"));
     assert_eq!(parsed.ai_provider.as_deref(), Some("claude"));
     assert_eq!(
-        super::session_context(&parsed),
+        super::session_context(&parsed)
+            .unwrap_or_else(|_| panic!("short-name context should validate")),
         crate::SessionContext::new(
             Some("Aethyme".into()),
             Some("Fix auth".into()),
             Some("claude".into())
         )
+        .with_short_name(Some("Fix auth".into()))
+    );
+}
+
+/// Callers written before short names existed must keep working: a missing
+/// `--short-name` names a new session after its task.
+#[test]
+fn a_missing_short_name_is_derived_from_the_task() {
+    let parsed = super::parse(&args(&["start", "--task", "Fix auth token refresh"]))
+        .unwrap_or_else(|_| panic!("start without --short-name should parse"));
+    assert_eq!(
+        super::session_context(&parsed)
+            .unwrap_or_else(|_| panic!("a missing short name must not be an error"))
+            .short_name
+            .as_deref(),
+        Some("Fix auth token refresh")
+    );
+}
+
+/// `--reuse` without a name passes none, so the store keeps the stored name
+/// instead of replacing it with one derived from the follow-up task.
+#[test]
+fn reuse_without_a_short_name_keeps_the_stored_one() {
+    let parsed = super::parse(&args(&["start", "--reuse", "--task", "follow-up"]))
+        .unwrap_or_else(|_| panic!("reuse should parse"));
+    assert_eq!(
+        super::session_context(&parsed)
+            .unwrap_or_else(|_| panic!("reuse without a short name must not be an error"))
+            .short_name,
+        None
+    );
+}
+
+#[test]
+fn derived_short_names_fit_the_limit_at_a_word_boundary() {
+    let long = "Implement broker short names and Chau7 tab renaming for sessions";
+    let derived = crate::derive_session_short_name(long)
+        .unwrap_or_else(|| panic!("a long task still yields a name"));
+    assert_eq!(derived, "Implement broker short names and Chau7 tab");
+    assert!(derived.chars().count() <= crate::MAX_SESSION_SHORT_NAME_CHARS);
+    assert!(crate::validate_session_short_name(&derived).is_ok());
+
+    let one_word = "x".repeat(60);
+    assert_eq!(
+        crate::derive_session_short_name(&one_word).map(|name| name.chars().count()),
+        Some(crate::MAX_SESSION_SHORT_NAME_CHARS)
+    );
+    assert_eq!(crate::derive_session_short_name(" \n\t\u{7f} "), None);
+}
+
+#[test]
+fn session_creation_context_validates_an_explicit_short_name() {
+    let too_long = "x".repeat(49);
+    for invalid in ["   ", "line\nbreak", "a\u{7f}b", too_long.as_str()] {
+        let parsed = super::parse(&args(&[
+            "start",
+            "--task",
+            "implementation",
+            "--short-name",
+            invalid,
+        ]))
+        .unwrap_or_else(|_| panic!("short-name option should parse"));
+        assert!(super::session_context(&parsed).is_err(), "{invalid:?}");
+    }
+
+    let parsed = super::parse(&args(&[
+        "start",
+        "--task",
+        "implementation",
+        "--short-name",
+        "  compact label  ",
+    ]))
+    .unwrap_or_else(|_| panic!("short-name option should parse"));
+    assert_eq!(
+        super::session_context(&parsed)
+            .unwrap_or_else(|_| panic!("valid short name should be accepted"))
+            .short_name
+            .as_deref(),
+        Some("compact label")
     );
 }
 

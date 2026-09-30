@@ -111,7 +111,7 @@ and removes it afterwards (v0.8.3: `aethyme broker quick-test`).
 
 ```bash
 aethyme broker status
-aethyme broker start --task "Fix the flaky login test" --agent "Your Name <you@example.com>"
+aethyme broker start --task "Fix the flaky login test" --short-name "Login test" --agent "Your Name <you@example.com>"
 ```
 
 `start` creates an isolated worktree and a session, and prints the session id
@@ -130,8 +130,8 @@ unsubmitted. Note the time: your first successful `submit` is one of the pilot
 metrics.
 
 If an agent is already working in its own worktree, register it instead of
-creating a new one: `aethyme broker start --adopt --task "..."`
-(v0.8.3: `aethyme broker adopt --task "..."`).
+creating a new one: `aethyme broker start --adopt --task "..." --short-name "..."`
+(v0.8.3: `aethyme broker adopt --task "..." --short-name "..."`).
 
 ## 6. Start the metrics export
 

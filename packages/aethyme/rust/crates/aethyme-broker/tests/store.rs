@@ -73,7 +73,8 @@ fn session_context_round_trips_and_can_be_enriched_from_chau7() {
                 Some(" Aethyme ".into()),
                 Some("Fix auth".into()),
                 Some("claude".into()),
-            ),
+            )
+            .with_short_name(Some("Auth flow".into())),
             &[],
         )
         .unwrap();
@@ -81,6 +82,7 @@ fn session_context_round_trips_and_can_be_enriched_from_chau7() {
     assert_eq!(session.repository_name.as_deref(), Some("Aethyme"));
     assert_eq!(session.tab_name.as_deref(), Some("Fix auth"));
     assert_eq!(session.ai_provider.as_deref(), Some("claude"));
+    assert_eq!(session.short_name.as_deref(), Some("Auth flow"));
     assert_eq!(
         session.context_label().as_deref(),
         Some("Aethyme / Fix auth / claude")
@@ -99,15 +101,30 @@ fn session_context_round_trips_and_can_be_enriched_from_chau7() {
         )
         .unwrap();
     assert_eq!(enriched.repository_name.as_deref(), Some("Aethyme"));
-    assert_eq!(enriched.tab_name.as_deref(), Some("Fix auth (renamed)"));
+    assert_eq!(enriched.tab_name.as_deref(), Some("Fix auth"));
     assert_eq!(enriched.ai_provider.as_deref(), Some("codex"));
+    assert_eq!(enriched.short_name.as_deref(), Some("Auth flow"));
     assert_eq!(enriched.status, SessionStatus::Active);
     assert_eq!(enriched.last_activity_at, last_activity_at);
+
+    let reused = store
+        .reuse_session_with_context_and_leases(
+            session.id,
+            None,
+            None,
+            None,
+            &SessionContext::new(None, Some("Fix auth (renamed)".into()), None)
+                .with_short_name(Some("Auth refresh".into())),
+            &[],
+        )
+        .unwrap();
+    assert_eq!(reused.short_name.as_deref(), Some("Auth refresh"));
+    assert_eq!(reused.tab_name.as_deref(), Some("Fix auth"));
 
     let context_events = store
         .events_after_filtered(0, i64::MAX, Some("session.context_updated"))
         .unwrap();
-    assert_eq!(context_events.len(), 2);
+    assert_eq!(context_events.len(), 3);
     assert!(
         context_events
             .iter()

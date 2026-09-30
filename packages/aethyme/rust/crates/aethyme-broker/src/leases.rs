@@ -26,7 +26,7 @@ pub(crate) fn planned_lease_next_actions(
     )];
     if status == SessionStatus::Stale {
         actions.push(format!(
-            "aethyme broker start --adopt {worktree} --replace-stale --path {path}"
+            "aethyme broker start --adopt {worktree} --replace-stale --short-name \"<short name>\" --path {path}"
         ));
     }
     actions.push(format!(

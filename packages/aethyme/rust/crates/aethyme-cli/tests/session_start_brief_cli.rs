@@ -58,6 +58,10 @@ impl Fixture {
             .env("AETHYME_HOST_CACHE_DIR", self.tmp.path().join("cache"))
             .env("AETHYME_HOST_STATE_DIR", self.tmp.path().join("host-state"))
             .env("AETHYME_UPDATE_CHECK", "off")
+            .env(
+                "AETHYME_CHAU7_MCP_BRIDGE",
+                "/__aethyme_test_no_chau7_bridge__",
+            )
             .env_remove("AETHYME_REPO")
             .env_remove("AETHYME_AGENT")
             .env_remove("AETHYME_BROKER_DB")
@@ -69,7 +73,15 @@ impl Fixture {
     fn start(&self) -> (i64, PathBuf) {
         let output = self
             .command(&self.repo)
-            .args(["broker", "start", "--task", "brief fixture", "--json"])
+            .args([
+                "broker",
+                "start",
+                "--task",
+                "brief fixture",
+                "--short-name",
+                "Brief fixture",
+                "--json",
+            ])
             .stdin(Stdio::null())
             .output()
             .unwrap();

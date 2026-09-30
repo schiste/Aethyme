@@ -905,7 +905,7 @@ fn protected_branches(checkout: &GitRepo) -> BTreeSet<String> {
 
 fn adopt_command(worktree: &str, staged: &[String]) -> String {
     let mut command = format!(
-        "aethyme broker start --adopt {} --task \"<task>\"",
+        "aethyme broker start --adopt {} --task \"<task>\" --short-name \"<short name>\"",
         sh_quote(worktree)
     );
     for path in staged {

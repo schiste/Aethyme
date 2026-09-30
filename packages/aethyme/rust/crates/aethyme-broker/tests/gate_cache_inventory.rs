@@ -19,6 +19,7 @@ use std::time::{Duration, SystemTime};
 use aethyme_broker::{Broker, FinishOptions};
 
 const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
+mod common;
 const DAY: Duration = Duration::from_secs(86_400);
 
 fn git(repo: &Path, args: &[&str]) {
@@ -111,8 +112,7 @@ impl World {
     }
 
     fn run_in(&self, cwd: &Path, args: &[&str]) -> Output {
-        Command::new(CLI)
-            .args(args)
+        common::broker_cli(CLI, args)
             .current_dir(cwd)
             .env("AETHYME_HOST_CACHE_DIR", &self.cache)
             .env("AETHYME_HOST_STATE_DIR", &self.state)

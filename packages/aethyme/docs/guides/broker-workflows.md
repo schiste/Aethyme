@@ -199,7 +199,7 @@ working:
 ```bash
 aethyme broker advanced integration status
 cd /path/to/the/session-worktree
-aethyme broker start --reuse --task "Address review feedback" --json
+aethyme broker start --reuse --task "Address review feedback" --short-name "Review fixes" --json
 ```
 
 The adoption report says what actually happened with `outcome`: `created`
@@ -215,7 +215,7 @@ follow-up at the current integration tip, request guarded synchronization:
 
 ```bash
 aethyme broker start --reuse --sync-integration \
-  --task "Address review feedback"
+  --task "Address review feedback" --short-name "Review fixes"
 ```
 
 `--sync-integration` requires `--reuse`. It checks that the session worktree is
@@ -1136,7 +1136,7 @@ aethyme broker finish --session 110
 aethyme broker advanced handoff --session 110 --json
 
 cd /path/to/the/session-worktree
-aethyme broker start --reuse --sync-integration --task "Follow-up work"
+aethyme broker start --reuse --sync-integration --task "Follow-up work" --short-name "Follow-up"
 aethyme broker advanced leases plan src/broker.rs --session 111
 aethyme broker advanced leases claim src/broker.rs --session 111
 # edit and commit

@@ -37,7 +37,7 @@ Use this as the daily operator loop when agents work concurrently.
 
 ```bash
 aethyme broker status
-aethyme broker start --task "Describe the task"
+aethyme broker start --task "Describe the task" --short-name "Short label"
 aethyme broker advanced leases claim <path> --session <id>
 aethyme broker advanced exec --session <id> -- <command>
 aethyme broker advanced git --session <id> [--repo <owner/name>] [--reason <text>] -- <git-args>

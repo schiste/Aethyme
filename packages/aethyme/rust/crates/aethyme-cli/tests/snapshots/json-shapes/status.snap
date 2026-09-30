@@ -56,6 +56,7 @@
         "repository_schema": "null"
       },
       "repository_name": "null",
+      "short_name": "string",
       "status": "string",
       "tab_name": "null",
       "task": "string",

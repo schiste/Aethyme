@@ -195,7 +195,7 @@ fn v1_constructor_payload_field_names_are_frozen() {
             Some("Fix auth".into()),
             Some("claude".into()),
         )),
-        &["ai_provider", "repository_name", "tab_name"],
+        &["ai_provider", "repository_name", "short_name", "tab_name"],
         "session.context_updated",
     );
     assert_keys(

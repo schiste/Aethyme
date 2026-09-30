@@ -84,6 +84,7 @@ pub fn session_context_updated_payload(context: &crate::SessionContext) -> Strin
         "repository_name": context.repository_name,
         "tab_name": context.tab_name,
         "ai_provider": context.ai_provider,
+        "short_name": context.short_name,
     })
     .to_string()
 }

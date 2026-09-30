@@ -9,7 +9,7 @@
 use std::path::Path;
 use std::process::Command;
 
-use aethyme_broker::{Broker, MergeStatus, SessionStatus};
+use aethyme_broker::{AdoptMode, AdoptOptions, Broker, MergeStatus, SessionContext, SessionStatus};
 
 fn sh(cwd: &Path, args: &[&str]) {
     let status = Command::new("git")
@@ -72,9 +72,36 @@ fn v0_three_agents_end_to_end() {
     }
     let alice_wt = root.join(".aethyme/worktrees/alice");
     let bob_wt = root.join(".aethyme/worktrees/bob");
-    let alice = broker.adopt(&alice_wt, Some("refactor auth")).unwrap();
-    let bob = broker.adopt(&bob_wt, Some("also touches auth")).unwrap();
-    let carol = broker.start_agent("update api", "true", None).unwrap();
+    let alice = broker
+        .adopt_with_options_and_context(
+            &alice_wt,
+            Some("refactor auth"),
+            AdoptOptions::new(AdoptMode::New),
+            None,
+            SessionContext::default().with_short_name(Some("alice".into())),
+        )
+        .unwrap()
+        .session;
+    let bob = broker
+        .adopt_with_options_and_context(
+            &bob_wt,
+            Some("also touches auth"),
+            AdoptOptions::new(AdoptMode::New),
+            None,
+            SessionContext::default().with_short_name(Some("bob".into())),
+        )
+        .unwrap()
+        .session;
+    let carol = broker
+        .start_agent_report_with_context(
+            "update api",
+            "true",
+            None,
+            SessionContext::default().with_short_name(Some("carol".into())),
+            None,
+        )
+        .unwrap()
+        .session;
     let carol_wt = std::path::PathBuf::from(&carol.worktree_path);
 
     // ── work happens ─────────────────────────────────────────────────
@@ -91,7 +118,12 @@ fn v0_three_agents_end_to_end() {
 
     // ── alice submits: clean, gated, verified → auto-promoted ────────
     let alice_out = broker.submit(alice.id).unwrap();
-    assert_eq!(alice_out.entry.status, MergeStatus::Promoted);
+    assert_eq!(
+        alice_out.entry.status,
+        MergeStatus::Promoted,
+        "gate outcomes: {:#?}",
+        alice_out.gate_outcomes
+    );
     assert!(
         alice_out.promoted,
         "verified promotes immediately by default"

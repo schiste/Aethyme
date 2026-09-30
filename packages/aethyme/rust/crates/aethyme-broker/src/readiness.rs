@@ -607,7 +607,7 @@ fn coordination_dimension(state: &BrokerStateInspection) -> ReadinessDimension {
             )],
             vec![action(
                 "Create the first isolated session when work begins",
-                Some("aethyme broker start --task \"<task>\""),
+                Some("aethyme broker start --task \"<task>\" --short-name \"<short name>\""),
             )],
         ),
         BrokerStateInspection::Ready { live_sessions, .. } => dimension_with(

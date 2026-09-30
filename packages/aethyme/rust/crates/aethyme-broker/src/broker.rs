@@ -361,7 +361,7 @@ pub enum BrokerOpError {
     #[error("invalid coordinated operation: {reason}")]
     InvalidCoordinatedOperation { reason: String },
     #[error(
-        "session {session_id} is closed and cannot authorize coordinated operations; start a new session with `aethyme broker start --task <text>` or adopt an active worktree with `aethyme broker start --adopt --task <text>`"
+        "session {session_id} is closed and cannot authorize coordinated operations; start a new session with `aethyme broker start --task <text> --short-name <name>` or adopt an active worktree with `aethyme broker start --adopt --task <text> --short-name <name>`"
     )]
     ClosedSessionOperation { session_id: i64 },
     /// `broker push` declined before anything was sent: the repository has
@@ -577,10 +577,10 @@ pub enum BrokerOpError {
     #[error(
         "session {id} ({status}) already exists for this worktree{task}. Options:\n  \
          aethyme broker submit --session {id}        submit its committed work\n  \
-         aethyme broker start --reuse --task \"...\"   point it at a follow-up task\n  \
+         aethyme broker start --reuse --task \"...\" --short-name \"<name>\"   point it at a follow-up task\n  \
          aethyme broker finish --session {id}        close it; removes a broker-created checkout when safe\n  \
          aethyme broker finish close --session {id}  close it but keep the checkout on disk\n  \
-         aethyme broker start --replace-stale        close it and register fresh"
+         aethyme broker start --replace-stale --task \"...\" --short-name \"<name>\"   close it and register fresh"
     )]
     SessionExistsForWorktree {
         id: i64,
@@ -1905,7 +1905,7 @@ fn checkpoint_recovery_actions(
     actions.push(CheckpointRecoveryAction {
         kind: "start_clean_replay_session".into(),
         command: format!(
-            "aethyme broker start --task \"recover session {} from {}\"",
+                    "aethyme broker start --task \"recover session {} from {}\" --short-name \"Recovery\"",
             plan.session_id, plan.preservation_branch
         ),
         description:
@@ -5236,7 +5236,7 @@ impl Broker {
             format!("  1. git branch {preserve_branch} {session_head}"),
             format!("  2. git reset --hard {target}"),
             format!(
-                "  3. aethyme broker start --reuse --sync-integration --task \"continue preserved session {}\"",
+                "  3. aethyme broker start --reuse --sync-integration --task \"continue preserved session {}\" --short-name \"Continue\"",
                 session.id
             ),
             format!("  4. {cherry_pick}"),
@@ -6264,7 +6264,7 @@ impl Broker {
                 ],
                 commands: vec![
                     format!("git log --oneline {}..{branch}", integration_head),
-                    "aethyme broker start --task \"replay local default-branch work\"".into(),
+                    "aethyme broker start --task \"replay local default-branch work\" --short-name \"Replay work\"".into(),
                 ],
             });
         }
@@ -11366,6 +11366,7 @@ mod tests {
             repository_name: None,
             tab_name: None,
             ai_provider: None,
+            short_name: None,
             created_at: 0,
             updated_at: 0,
             last_activity_at: 0,

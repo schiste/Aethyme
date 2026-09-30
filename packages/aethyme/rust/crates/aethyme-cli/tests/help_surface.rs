@@ -11,7 +11,7 @@ fn top_level_help_names_the_normal_broker_lifecycle() {
     // Explicitly requested help is the command's output: stdout, exit 0.
     let help = String::from_utf8(output.stdout).expect("UTF-8 help");
     for command in [
-        "broker start --task <text>",
+        "broker start --task <text> --short-name <name>",
         "broker submit --session <id>",
         "broker status",
         "broker finish --session <id>",
