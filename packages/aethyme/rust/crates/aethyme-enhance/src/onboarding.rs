@@ -180,7 +180,7 @@ pub fn build_onboarding_artifact(repo_path: &Path) -> Result<Value, String> {
                 .map(|workspace| workspace_value(workspace, true))
                 .unwrap_or(Value::Null),
         ),
-        ("commands", Value::Array(commands.clone())),
+        ("commands", Value::Array(commands)),
         ("primary_commands", primary_commands),
         ("areas", Value::Array(areas)),
         ("entrypoints", Value::Array(entrypoints)),

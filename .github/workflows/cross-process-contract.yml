@@ -62,7 +62,7 @@ jobs:
           # state; an unreviewed schema migration must be disposable (#232).
           AETHYME_BROKER_DB: ${{ runner.temp }}/aethyme-broker-contract-check.db
         run: |
-          cargo run --quiet \
+          cargo run --locked --quiet \
             --manifest-path packages/aethyme/rust/Cargo.toml \
             -p aethyme-cli --bin aethyme -- \
             broker check-contract \

@@ -1714,6 +1714,11 @@ struct GraphRefreshLock {
 #[cfg(unix)]
 impl Drop for GraphRefreshLock {
     fn drop(&mut self) {
+        // SAFETY: `self.file` is still owned by `self` for the duration of
+        // `drop`, so the descriptor is valid. `flock` takes it by value and
+        // dereferences nothing. Discarding the result is deliberate: an unlock
+        // failure cannot be acted on here, and closing the descriptor releases
+        // the lock.
         let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
     }
 }
@@ -2049,6 +2054,10 @@ fn acquire_refresh_lock(repository: &GitRepo) -> Result<GraphRefreshLock, String
         .map_err(|error| format!("open graph refresh lock: {error}"))?;
     #[cfg(unix)]
     {
+        // SAFETY: `file` is a live `File` opened above and still owned here,
+        // so `as_raw_fd` yields a valid descriptor. `flock` takes the descriptor
+        // by value and only sets an advisory lock on it; it dereferences
+        // nothing and cannot invalidate the borrow.
         let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if result != 0 {
             return Err("another graph refresh or recovery holds the repository lock".into());

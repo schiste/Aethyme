@@ -771,6 +771,11 @@ struct UpgradeLock {
 #[cfg(unix)]
 impl Drop for UpgradeLock {
     fn drop(&mut self) {
+        // SAFETY: `self.file` is still owned by `self` for the duration of
+        // `drop`, so the descriptor is valid. `flock` takes it by value and
+        // dereferences nothing. Discarding the result is deliberate: an unlock
+        // failure cannot be acted on here, and closing the descriptor releases
+        // the lock.
         let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
     }
 }
@@ -1453,6 +1458,10 @@ fn acquire_upgrade_lock(repo: &Path) -> Result<UpgradeLock, String> {
     set_private_file_mode(&lock_path)?;
     #[cfg(unix)]
     {
+        // SAFETY: `file` is a live `File` opened above and still owned here,
+        // so `as_raw_fd` yields a valid descriptor. `flock` takes the descriptor
+        // by value and only sets an advisory lock on it; it dereferences
+        // nothing and cannot invalidate the borrow.
         let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if result != 0 {
             return Err(

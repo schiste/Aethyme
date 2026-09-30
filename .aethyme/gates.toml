@@ -89,7 +89,7 @@ triggers = ["packages/aethyme-eval/**"]
 # otherwise, and names the suites this command must keep. Every suite here
 # also runs under `cargo-test`, so nothing is lost if this gate is removed.
 name = "fast-guards"
-command = 'export CHAU7_CTO_OPTIM_ACTIVE=1 CARGO_INCREMENTAL=0 CARGO_PROFILE_TEST_DEBUG=1 CARGO_TARGET_DIR="$AETHYME_GATE_CACHE_DIR" && cargo test --workspace --quiet --manifest-path packages/aethyme/rust/Cargo.toml --test help_snapshots --test help_surface --test help_everywhere --test broker_discarded_results --test deprecated_spelling_callers --test docs_hygiene --test no_eval_tuning --test pr_template --test grammar_provenance --test gate_policy'
+command = 'export CHAU7_CTO_OPTIM_ACTIVE=1 CARGO_INCREMENTAL=0 CARGO_PROFILE_TEST_DEBUG=1 CARGO_TARGET_DIR="$AETHYME_GATE_CACHE_DIR" && cargo test --locked --workspace --examples --quiet --manifest-path packages/aethyme/rust/Cargo.toml --test help_snapshots --test help_surface --test help_everywhere --test broker_discarded_results --test deprecated_spelling_callers --test docs_hygiene --test no_eval_tuning --test pr_template --test grammar_provenance --test gate_policy'
 cost = 2
 timeout_seconds = 2400
 resource_wait_seconds = 900
@@ -112,7 +112,7 @@ name = "cargo-test"
 # 2026-09-29: --no-fail-fast. Without it the run stops at the first failing
 # test binary, so a change breaking several suites surfaced one per submit:
 # session 716 took 10 submits and 5 h 45 m, each revealing a new binary (#411).
-command = 'export CHAU7_CTO_OPTIM_ACTIVE=1 CARGO_INCREMENTAL=0 CARGO_PROFILE_TEST_DEBUG=1 CARGO_TARGET_DIR="$AETHYME_GATE_CACHE_DIR" && cargo test --workspace --quiet --no-fail-fast --manifest-path packages/aethyme/rust/Cargo.toml'
+command = 'export CHAU7_CTO_OPTIM_ACTIVE=1 CARGO_INCREMENTAL=0 CARGO_PROFILE_TEST_DEBUG=1 CARGO_TARGET_DIR="$AETHYME_GATE_CACHE_DIR" && cargo test --locked --workspace --examples --quiet --no-fail-fast --manifest-path packages/aethyme/rust/Cargo.toml'
 cost = 3
 # 2026-09-26: raised from 1200. A full workspace run took 1056 s on a passing
 # gate that day and hit 1200 four times (sessions 677, 684, 621) while other
@@ -217,7 +217,7 @@ max_bytes = 12884901888
 # COUPLING: the suite also runs under `cargo-test`, so nothing here is lost
 # when Rust changes; this gate only adds the config-only path.
 name = "gate-policy"
-command = 'export CHAU7_CTO_OPTIM_ACTIVE=1 CARGO_INCREMENTAL=0 CARGO_PROFILE_TEST_DEBUG=1 CARGO_TARGET_DIR="$AETHYME_GATE_CACHE_DIR" && cargo test --quiet --manifest-path packages/aethyme/rust/Cargo.toml -p aethyme-broker --test gate_policy'
+command = 'export CHAU7_CTO_OPTIM_ACTIVE=1 CARGO_INCREMENTAL=0 CARGO_PROFILE_TEST_DEBUG=1 CARGO_TARGET_DIR="$AETHYME_GATE_CACHE_DIR" && cargo test --locked --quiet --manifest-path packages/aethyme/rust/Cargo.toml -p aethyme-broker --test gate_policy'
 cost = 1
 timeout_seconds = 600
 resource_wait_seconds = 900
@@ -250,7 +250,7 @@ max_bytes = 12884901888
 # test rather than taken from PATH — a gate that validated a diff using
 # a stale installed binary would be checking the wrong code.
 name = "cross-process-contract"
-command = 'export CHAU7_CTO_OPTIM_ACTIVE=1 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=1 CARGO_TARGET_DIR="$AETHYME_GATE_CACHE_DIR" && BASE="$(git merge-base HEAD aethyme/integration 2>/dev/null || git rev-parse HEAD~1)" && BODY="$(mktemp)" && git log --format=%B "$BASE"..HEAD > "$BODY" && cargo run --quiet --manifest-path packages/aethyme/rust/Cargo.toml -p aethyme-cli --bin aethyme -- broker check-contract --base "$BASE" --pr-body "$BODY"'
+command = 'export CHAU7_CTO_OPTIM_ACTIVE=1 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=1 CARGO_TARGET_DIR="$AETHYME_GATE_CACHE_DIR" && BASE="$(git merge-base HEAD aethyme/integration 2>/dev/null || git rev-parse HEAD~1)" && BODY="$(mktemp)" && git log --format=%B "$BASE"..HEAD > "$BODY" && cargo run --locked --quiet --manifest-path packages/aethyme/rust/Cargo.toml -p aethyme-cli --bin aethyme -- broker check-contract --base "$BASE" --pr-body "$BODY"'
 cost = 1
 cache = false
 timeout_seconds = 300

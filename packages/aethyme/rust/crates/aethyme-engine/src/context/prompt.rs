@@ -928,16 +928,10 @@ fn describe_manifest(root: &Path, path: &str) -> String {
 
     let name = path.rsplit('/').next().unwrap_or(path);
     match name {
-        "composer.json" => {
-            let desc = extract_json_field(&content, "description")
-                .unwrap_or_else(|| "PHP dependencies".to_string());
-            desc.to_string()
-        }
-        "package.json" => {
-            let desc = extract_json_field(&content, "description")
-                .unwrap_or_else(|| "JS/Node dependencies".to_string());
-            desc.to_string()
-        }
+        "composer.json" => extract_json_field(&content, "description")
+            .unwrap_or_else(|| "PHP dependencies".to_string()),
+        "package.json" => extract_json_field(&content, "description")
+            .unwrap_or_else(|| "JS/Node dependencies".to_string()),
         "Cargo.toml" => "Rust project manifest".to_string(),
         "pyproject.toml" | "setup.py" | "setup.cfg" => "Python project manifest".to_string(),
         "Gemfile" => "Ruby dependencies".to_string(),

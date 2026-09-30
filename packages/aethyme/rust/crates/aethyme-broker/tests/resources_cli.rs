@@ -408,6 +408,9 @@ fn supervised_run_forwards_termination_to_the_child_group_and_releases() {
     );
     let leases: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
     assert_eq!(leases.as_array().map(Vec::len), Some(1));
+    // SAFETY: `kill` takes the pid and signal by value and dereferences nothing
+    // this crate owns, so `child.id() as i32` is the only requirement. The
+    // target is the child this test just spawned.
     unsafe {
         libc::kill(child.id() as i32, libc::SIGTERM);
     }

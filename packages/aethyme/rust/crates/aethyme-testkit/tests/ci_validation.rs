@@ -38,7 +38,11 @@ fn pr_and_main_have_one_automatic_full_workspace_owner() {
     );
     let rust = block(&oss, "  rust-tests:");
     assert!(rust.contains(&"    if: github.event_name == 'pull_request'"));
-    assert!(rust.contains(&"        run: cargo test --locked --workspace"));
+    // `--examples` is required, not incidental: cargo does not run `#[test]`
+    // functions inside an `examples/` target unless it is passed, so without
+    // it the release-manifest assertions in
+    // `crates/aethyme-broker/examples/release_manifest.rs` never execute.
+    assert!(rust.contains(&"        run: cargo test --locked --workspace --examples"));
     // No second condition can silently skip a step within this job.
     assert_eq!(
         rust.iter()

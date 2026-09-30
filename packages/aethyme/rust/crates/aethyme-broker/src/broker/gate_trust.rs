@@ -261,8 +261,41 @@ pub(crate) fn forget_record(path: &Path) {
 }
 
 /// Whether the test-only escape is set.
+///
+/// The escape is read here and in [`test_escape_enabled_for_a_repository`],
+/// and the two are deliberately different. Two call sites depend on it and
+/// they are not the same question:
+///
+/// - **Running this repository's own gates** (`require_trusted`). A fresh CI
+///   runner has no trust record and no gate history, so
+///   `.github/workflows/aethyme-gates.yml:60-65` sets the escape to run the
+///   gates this repository defines on its own `main` branch. That is a real
+///   checkout, not a temp fixture, so this predicate cannot require an
+///   ephemeral path — doing so would break the release gate.
+/// - **Recording new trust** (`broker advanced trust`). Nothing in CI calls
+///   this; it exists for a human approving a policy, and the escape
+///   substitutes for the interactive prompt. That is a stronger act than
+///   running an already-trusted policy, so
+///   [`test_escape_enabled_for_a_repository`] restricts it to a throwaway
+///   repository under the system temporary directory. An environment variable
+///   is not authorization to approve commands for a real checkout, and
+///   `.cargo/config.toml` applies `[env]` to every `cargo run` and
+///   `cargo build` at or below the repository root — not only to `cargo test`.
 pub(crate) fn test_escape_enabled() -> bool {
     std::env::var(TEST_ESCAPE_ENV).is_ok_and(|value| value == "1")
+}
+
+/// [`test_escape_enabled`], narrowed to a throwaway repository.
+///
+/// The test suite's fixtures write their own `gates.toml` and must not litter
+/// host state with a trust record each, which is what
+/// `tests/gate_trust_cli.rs` needs. Every such fixture is a
+/// `tempfile::tempdir()`.
+///
+/// [`host_state::path_is_ephemeral`] is the same predicate the verification
+/// slot uses to decide a repository is a fixture rather than durable state.
+pub(crate) fn test_escape_enabled_for_a_repository(main_root: &Path) -> bool {
+    test_escape_enabled() && crate::host_state::path_is_ephemeral(main_root)
 }
 
 /// How an enforcement check was satisfied.
@@ -541,6 +574,60 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recording_trust_escapes_the_prompt_only_for_a_throwaway_repository() {
+        let fixture = tempfile::tempdir().unwrap();
+        // A checkout is not one. `.cargo/config.toml` exports the escape for
+        // every `cargo run` and `cargo build` at or below the repository root,
+        // so without this restriction a developer's own build would approve
+        // whatever commands a repository's gates.toml declares.
+        let durable = tempfile::TempDir::new_in(std::env::current_dir().unwrap()).unwrap();
+
+        let previous = std::env::var_os(TEST_ESCAPE_ENV);
+        struct Restore(Option<std::ffi::OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                // SAFETY: `set_var`/`remove_var` are unsafe because the
+                // environment is process-global and unsynchronised. This test
+                // is single-threaded and the guard restores the value, so no
+                // other thread observes the window.
+                match self.0.take() {
+                    // SAFETY: as above — single-threaded test.
+                    Some(value) => unsafe { std::env::set_var(TEST_ESCAPE_ENV, value) },
+                    // SAFETY: as above — single-threaded test.
+                    None => unsafe { std::env::remove_var(TEST_ESCAPE_ENV) },
+                }
+            }
+        }
+        let _restore = Restore(previous);
+        // SAFETY: as above.
+        unsafe { std::env::set_var(TEST_ESCAPE_ENV, "1") };
+
+        assert!(
+            test_escape_enabled_for_a_repository(fixture.path()),
+            "a throwaway repository keeps the escape the suite depends on"
+        );
+        assert!(
+            !test_escape_enabled_for_a_repository(durable.path()),
+            "a durable checkout must never have trust recorded for it from an env var"
+        );
+
+        // Running an already-trusted policy keeps the unrestricted escape,
+        // because the release gate lane needs it in a real checkout.
+        assert!(
+            test_escape_enabled(),
+            "the gate-execution escape stays available to CI in a real checkout"
+        );
+
+        // SAFETY: as above.
+        // SAFETY: single-threaded test, as above.
+        unsafe { std::env::remove_var(TEST_ESCAPE_ENV) };
+        assert!(
+            !test_escape_enabled_for_a_repository(fixture.path()),
+            "without the variable, the escape is off even for a fixture"
+        );
+    }
 
     #[test]
     fn the_digest_follows_commands_and_ignores_gate_order() {

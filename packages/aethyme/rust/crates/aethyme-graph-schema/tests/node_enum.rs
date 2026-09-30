@@ -129,7 +129,7 @@ fn from_impl_works_for_each_variant() {
 #[test]
 fn node_serde_round_trip_through_json() {
     let f = sample_function();
-    let n: Node = f.clone().into();
+    let n: Node = f.into();
     let json = serde_json::to_string(&n).unwrap();
     // Externally tagged shape: variant name is the field key.
     assert!(

@@ -161,7 +161,7 @@ jobs:
           workspaces: packages/aethyme/rust
 
       - name: Run Rust tests
-        run: cargo test --locked --workspace
+        run: cargo test --locked --workspace --examples
 
   # ── Lint ────────────────────────────────────────────────────────────────
   # The workspace is fmt-clean and clippy-clean with zero warnings; this job

@@ -30,3 +30,6 @@ serde = { version = "1", features = ["derive"] }
 # call rather than an in-memory fake. tempfile = "3" matches the rest
 # of the workspace.
 tempfile = "3"
+
+[lints]
+workspace = true

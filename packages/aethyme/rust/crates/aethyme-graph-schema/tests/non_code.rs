@@ -77,7 +77,7 @@ fn docstring_id_is_stable_for_target() {
     let d2 = Docstring::new(
         "aethyme",
         "src/x.py",
-        target.clone(),
+        target,
         SourceRange::new(50, 60).unwrap(),
         "hashB",
     )

@@ -216,6 +216,9 @@ fn a_running_agent_keeps_its_worktree_however_long_it_has_been_quiet() {
         .any(|item| item.session_id == session.id);
 
     // Kill before asserting so a failure does not leave the child behind.
+    // SAFETY: `kill` takes the pid and signal by value and dereferences nothing
+    // this crate owns, so `pid as libc::pid_t` is the only requirement. The
+    // target is the child this test just spawned.
     unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
     assert!(
         !reaped,

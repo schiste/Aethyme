@@ -35,9 +35,7 @@ pub fn run_facts(args: &[String]) -> Result<(), String> {
         path.canonicalize().map_err(|e| e.to_string())?
     };
     // Facts remain map-based (same as the engine CLI arms they mirror).
-    let map = RepositoryMap::build_with_fragment_preference(&repo, false, |_| {})
-        .map_err(|e| e.to_string())?
-        .0;
+    let map = RepositoryMap::build_with_fragment_preference(&repo, false, |_| {})?.0;
 
     match subcommand.as_str() {
         "public-functions" => {

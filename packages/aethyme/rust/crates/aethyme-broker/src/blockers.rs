@@ -1186,6 +1186,9 @@ pub(crate) fn process_alive(pid: i64) -> bool {
     if pid <= 0 {
         return false;
     }
+    // SAFETY: `kill` with signal 0 checks existence and permission without
+    // delivering a signal, taking the pid by value. It dereferences no pointer
+    // this crate owns, so `pid` only has to be a valid i32.
     if unsafe { libc::kill(pid, 0) } == 0 {
         return true;
     }

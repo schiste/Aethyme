@@ -313,7 +313,7 @@ pub(crate) fn verify_checkout_without_mutation(
     let commit = checkout.commit_tree(
         &tree,
         &[&head],
-        "broker: materialize exact graph-integrity verification tree",
+        "chore(broker): materialize exact graph-integrity verification tree",
         &crate::attribution::Attribution::broker_only(),
     )?;
     let mut slot =

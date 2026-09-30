@@ -133,3 +133,6 @@ tempfile = "3"
 # Node values (e.g., to assert visibility="private" without exposing
 # accessors on every per-kind struct just for testing).
 serde_json = "1"
+
+[lints]
+workspace = true

@@ -140,7 +140,7 @@ pub fn graph_fragment_set_digest<'a>(
 
 fn filesystem_fragment_set_digest(repo_root: &Path) -> Result<String, GraphManifestError> {
     let graph_root = repo_root.join(".aethyme/graph");
-    let mut pending = vec![graph_root.clone()];
+    let mut pending = vec![graph_root];
     let mut files = Vec::new();
     while let Some(directory) = pending.pop() {
         let entries = std::fs::read_dir(&directory).map_err(|source| GraphManifestError::Io {

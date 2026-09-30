@@ -416,7 +416,10 @@ pub(super) fn run_trust_command(parsed: &Parsed) -> Result<(), UsageError> {
         .filter(|source| !source.trusted)
         .cloned()
         .collect::<Vec<_>>();
-    let escape = gate_trust::test_escape_enabled();
+    // Recording trust substitutes for the interactive prompt, so the escape is
+    // honoured only for a throwaway repository. `status.repository` is the
+    // checkout whose commands are about to be approved.
+    let escape = gate_trust::test_escape_enabled_for_a_repository(Path::new(&status.repository));
     if !pending.is_empty() && !escape {
         use std::io::IsTerminal as _;
         if !std::io::stdin().is_terminal() {

@@ -937,6 +937,10 @@ fn daemon_stop_action(repo: &Path) -> Result<(), String> {
         eprintln!("engine daemon: stale pidfile cleaned");
         return Ok(());
     };
+    // SAFETY: `kill` takes the pid and signal by value and dereferences no
+    // pointer this crate owns, so `pid` only has to be a valid i32 — which
+    // `parse` produced above. The target is this tool's own daemon, read from
+    // its pidfile, and the ESRCH case below handles an already-exited process.
     let result = unsafe { libc::kill(pid, libc::SIGTERM) };
     if result == 0 {
         let _ = std::fs::remove_file(&pidfile);

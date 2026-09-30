@@ -1866,7 +1866,7 @@ fn promote_commit_credits_the_human_the_agent_and_the_broker() {
     let body = show(tmp.path(), "%B", &merge_commit);
     assert!(
         body.starts_with(&format!(
-            "broker: promote session {} (teach the broker to share credit)",
+            "chore(broker): promote session {} (teach the broker to share credit)",
             session.id
         )),
         "{body}"

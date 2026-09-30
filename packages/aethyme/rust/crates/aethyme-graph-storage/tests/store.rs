@@ -46,7 +46,7 @@ fn write_test_fragment(tmp: &std::path::Path) {
     );
     let frag = Fragment::new(
         "src/x.py",
-        vec![Node::Function(f1.clone()), Node::Function(f2.clone())],
+        vec![Node::Function(f1), Node::Function(f2)],
         vec![edge],
     )
     .unwrap();

@@ -569,8 +569,9 @@ mod tests {
         let stats = index.finish(None);
         assert_eq!((stats.parsed, stats.hits), (0, 1));
 
-        // A changed stamp re-parses.
-        let index = SymbolIndex::open(&canonical, Some(location.clone()));
+        // A changed stamp re-parses. `location` is not read after this point,
+        // so the final open can take it.
+        let index = SymbolIndex::open(&canonical, Some(location));
         let changed = "x = 1\n";
         assert!(
             index

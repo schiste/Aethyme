@@ -1615,7 +1615,7 @@ mod tests {
             reason: "r".into(),
         };
         let results = vec![
-            ("query-a".to_string(), vec![hit.clone()]),
+            ("query-a".to_string(), vec![hit]),
             ("query-b".to_string(), vec![]),
         ];
         let rendered = search_hits_by_query(&results);

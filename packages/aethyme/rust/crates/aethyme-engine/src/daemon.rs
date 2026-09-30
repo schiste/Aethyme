@@ -147,6 +147,10 @@ pub fn start_detached(
         if let Ok(pid_str) = std::fs::read_to_string(&pidfile)
             && let Ok(pid) = pid_str.trim().parse::<i32>()
         {
+            // SAFETY: `kill` with signal 0 performs the existence and
+            // permission check without delivering a signal, and it takes the
+            // pid by value. It dereferences no pointer this crate owns, so
+            // `pid` only has to be a valid i32, which `parse` just produced.
             let alive = unsafe { libc::kill(pid, 0) };
             if alive == 0 {
                 return Ok(StartOutcome::AlreadyRunning(pid));
@@ -181,6 +185,10 @@ pub fn start_detached(
         .stderr(std::process::Stdio::from(log_stderr));
 
     use std::os::unix::process::CommandExt;
+    // SAFETY: `pre_exec` is documented as safe to call with a closure that is
+    // async-signal-safe, and this one only calls `setsid` and converts errno
+    // into an `io::Error` — no allocation, no locking, no Rust destructors
+    // running between fork and exec.
     unsafe {
         cmd.pre_exec(|| {
             if libc::setsid() < 0 {

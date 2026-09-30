@@ -36,3 +36,6 @@ tempfile = "3"
 
 [features]
 dhat-heap = ["dep:dhat"]
+
+[lints]
+workspace = true
