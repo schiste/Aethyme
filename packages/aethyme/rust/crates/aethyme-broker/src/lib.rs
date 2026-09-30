@@ -239,7 +239,10 @@ pub use gates::{
     select_gates, verify_gate_scope_manifest,
 };
 pub use gc::{GC_PLAN_SCHEMA_VERSION, UNCLASSIFIED_ARTIFACT_REPORT_THRESHOLD_BYTES};
-pub use git::{CherrySide, GitError, GitRepo, LoggedCommit, MergeSimulation, RemoteDefaultBranch};
+pub use git::{
+    CherrySide, GitError, GitRepo, LoggedCommit, MergeSimulation, RemoteDefaultBranch,
+    UncommittedSummary,
+};
 pub use github_target::{
     GithubApiTargetEvidence, GithubTargetError, ResolvedGithubTarget, resolve_github_target,
 };
@@ -462,6 +465,7 @@ pub use session_abandonment::{
 };
 pub use session_push::{
     SESSION_PUSH_POLICY_KEY, SessionPullRequest, SessionPushReport, SessionPushState,
+    UncommittedCounts,
 };
 pub use ship::{
     DeliveryCheck, DeliveryChecksSummary, DeliveryExecutionReport, DeliveryExecutionState,

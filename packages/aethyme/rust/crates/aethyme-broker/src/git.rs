@@ -849,6 +849,50 @@ fn run_git_command_output(
     }
     Ok(output)
 }
+/// Uncommitted work in a checkout, counted the way `git status` shows it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UncommittedSummary {
+    /// Tracked paths with staged or unstaged changes.
+    pub modified: Vec<String>,
+    /// Untracked entries; an untracked directory is one entry, not its files.
+    pub untracked: Vec<String>,
+}
+
+impl UncommittedSummary {
+    pub fn is_empty(&self) -> bool {
+        self.modified.is_empty() && self.untracked.is_empty()
+    }
+
+    /// Modified paths plus untracked entries.
+    pub fn len(&self) -> usize {
+        self.modified.len() + self.untracked.len()
+    }
+
+    /// A short human description, e.g. `3 modified, 1 untracked (target/)`.
+    pub fn describe(&self, max_paths: usize) -> String {
+        let mut parts = Vec::new();
+        if !self.modified.is_empty() {
+            parts.push(format!("{} modified", self.modified.len()));
+        }
+        if !self.untracked.is_empty() {
+            parts.push(format!("{} untracked", self.untracked.len()));
+        }
+        let shown = self
+            .modified
+            .iter()
+            .chain(&self.untracked)
+            .take(max_paths)
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let more = self.len().saturating_sub(shown.len());
+        let mut sample = shown.join(", ");
+        if more > 0 {
+            sample.push_str(&format!(", +{more} more"));
+        }
+        format!("{} ({sample})", parts.join(", "))
+    }
+}
+
 /// Result of a `git merge-tree --write-tree` simulation.
 #[derive(Debug)]
 pub struct MergeSimulation {
@@ -2209,6 +2253,29 @@ impl GitRepo {
         let mut args = vec!["diff", "--name-only", "-z", "HEAD", "--"];
         args.extend(paths.iter().map(String::as_str));
         Ok(parse_nul_paths(&run_git(&self.root, &args)?))
+    }
+
+    /// Uncommitted work as `git status` shows it by default: each changed
+    /// tracked path, and each untracked directory as a single entry.
+    ///
+    /// For reporting only. [`GitRepo::dirty_paths`] lists every untracked
+    /// file because it decides whether a worktree may be removed; a count
+    /// meant for a person must not turn one untracked build folder into
+    /// thousands of "uncommitted files" that bury the edits worth seeing.
+    pub fn uncommitted_summary(&self) -> Result<UncommittedSummary, GitError> {
+        require_trustworthy_porcelain()?;
+        let mut summary = UncommittedSummary::default();
+        for (xy, path) in parse_porcelain_entries(&run_git(
+            &self.root,
+            &["status", "--porcelain", "--untracked-files=normal"],
+        )?) {
+            match xy {
+                [b'?', b'?'] => summary.untracked.push(path),
+                [b'!', b'!'] => {}
+                _ => summary.modified.push(path),
+            }
+        }
+        Ok(summary)
     }
 
     pub fn untracked_paths(&self) -> Result<Vec<String>, GitError> {
