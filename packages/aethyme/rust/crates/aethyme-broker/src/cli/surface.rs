@@ -61,6 +61,12 @@ const MERGED_FORMS: &[(&str, &str, &[&str])] = &[
     ("gc", "reap", &["resources", "reap"]),
 ];
 
+/// The `(verb, word)` sub-forms public verbs accept, such as `("gc", "reclaim")`.
+/// Exposed so surface tests enumerate the forms instead of copying them.
+pub fn public_forms() -> impl Iterator<Item = (&'static str, &'static str)> {
+    MERGED_FORMS.iter().map(|(verb, word, _)| (*verb, *word))
+}
+
 /// Verbs reachable as `aethyme broker advanced <verb>`, with the one-line
 /// summary `broker advanced --help` prints.
 pub const ADVANCED_VERBS: &[(&str, &str)] = &[

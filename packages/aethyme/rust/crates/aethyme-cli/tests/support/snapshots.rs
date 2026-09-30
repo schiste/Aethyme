@@ -26,19 +26,9 @@ pub fn assert_snapshots(group: &str, entries: &[(String, String)]) {
     let dir = snapshot_dir(group);
     if updating() {
         std::fs::create_dir_all(&dir).expect("create snapshot dir");
-        if let Ok(read) = std::fs::read_dir(&dir) {
-            for entry in read.flatten() {
-                let path = entry.path();
-                let stem = path
-                    .file_stem()
-                    .map(|stem| stem.to_string_lossy().to_string())
-                    .unwrap_or_default();
-                if path.extension().is_some_and(|ext| ext == "snap")
-                    && !entries.iter().any(|(name, _)| *name == stem)
-                {
-                    std::fs::remove_file(&path).expect("remove stale snapshot");
-                }
-            }
+        for orphan in orphaned_snapshots(&dir, entries) {
+            std::fs::remove_file(dir.join(format!("{orphan}.snap")))
+                .expect("remove stale snapshot");
         }
         for (name, body) in entries {
             std::fs::write(dir.join(format!("{name}.snap")), body).expect("write snapshot");
@@ -59,12 +49,35 @@ pub fn assert_snapshots(group: &str, entries: &[(String, String)]) {
             Err(_) => problems.push(format!("{name}: no snapshot at {}", path.display())),
         }
     }
+    // A stored snapshot no entry produced verifies nothing, and the next
+    // update run would delete it silently. `broker push` shipped that way.
+    for orphan in orphaned_snapshots(&dir, entries) {
+        problems.push(format!(
+            "{orphan}: snapshot is not produced by this suite; register its command or delete it"
+        ));
+    }
     assert!(
         problems.is_empty(),
-        "{} snapshot(s) changed; rerun with AETHYME_UPDATE_SNAPSHOTS=1 if intended:\n{}",
+        "{} snapshot problem(s); rerun with AETHYME_UPDATE_SNAPSHOTS=1 if intended:\n{}",
         problems.len(),
         problems.join("\n\n")
     );
+}
+
+/// Stems of `.snap` files in `dir` that no entry produces, sorted.
+fn orphaned_snapshots(dir: &std::path::Path, entries: &[(String, String)]) -> Vec<String> {
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut orphans: Vec<String> = read
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "snap"))
+        .filter_map(|path| Some(path.file_stem()?.to_string_lossy().into_owned()))
+        .filter(|stem| !entries.iter().any(|(name, _)| name == stem))
+        .collect();
+    orphans.sort();
+    orphans
 }
 
 fn first_lines(text: &str) -> String {

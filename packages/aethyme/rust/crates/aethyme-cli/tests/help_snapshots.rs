@@ -12,6 +12,11 @@ use std::process::{Command, Stdio};
 
 use support::snapshots::assert_snapshots;
 
+// Broker verbs come from the tables `broker --help` and `broker advanced
+// --help` print, not from a copy: a copied list missed `broker push` when it
+// became a public verb, and its snapshot went unverified.
+use aethyme_broker::cli::{ADVANCED_VERBS, PUBLIC_VERBS, public_forms};
+
 const TOP_LEVEL: &[&str] = &[
     "explore",
     "verify-targets",
@@ -35,61 +40,6 @@ const TOP_LEVEL: &[&str] = &[
     "ai-ready",
     "quality",
     "autofix",
-];
-
-const BROKER: &[&str] = &["start", "status", "submit", "finish", "gc", "unblock"];
-
-const BROKER_ADVANCED: &[&str] = &[
-    "leases",
-    "git",
-    "gh",
-    "operations",
-    "exec",
-    "ship",
-    "review",
-    "gates",
-    "hooks",
-    "trust",
-    "agents",
-    "handoff",
-    "queue",
-    "integration",
-    "main",
-    "representation",
-    "checkpoint",
-    "repair",
-    "resources",
-    "console",
-    "advisories",
-    "exposures",
-    "note",
-    "watch",
-    "deliveries",
-    "pr",
-    "report",
-    "quality-report",
-    "external-events",
-    "events",
-    "metrics",
-    "worktree-root",
-    "worktrees",
-    "scaffold",
-    "quick-test",
-    "verify-loop",
-    "check-contract",
-];
-
-const PUBLIC_FORMS: &[&str] = &[
-    "status readiness",
-    "status doctor",
-    "submit prepare",
-    "submit promote",
-    "submit promotion-record",
-    "finish close",
-    "finish cleanup",
-    "gc reclaim",
-    "gc storage",
-    "gc reap",
 ];
 
 fn git(repo: &Path, args: &[&str]) {
@@ -148,21 +98,18 @@ fn help_surface_matches_snapshots() {
         invocations.push(vec![command, "--help"]);
     }
     invocations.push(vec!["broker"]);
-    for subcommand in BROKER {
-        invocations.push(vec!["broker", subcommand, "--help"]);
+    for (verb, _) in PUBLIC_VERBS {
+        invocations.push(vec!["broker", verb, "--help"]);
     }
-    for subcommand in BROKER_ADVANCED {
-        invocations.push(vec!["broker", "advanced", subcommand, "--help"]);
+    for (verb, _) in ADVANCED_VERBS {
+        invocations.push(vec!["broker", "advanced", verb, "--help"]);
     }
 
     // The Phase 4 surface: `advanced`, and the public verbs' merged forms.
     invocations.push(vec!["broker", "advanced", "--help"]);
     invocations.push(vec!["broker", "advanced"]);
-    for form in PUBLIC_FORMS {
-        let mut args: Vec<&str> = vec!["broker"];
-        args.extend(form.split(' '));
-        args.push("--help");
-        invocations.push(args);
+    for (verb, word) in public_forms() {
+        invocations.push(vec!["broker", verb, word, "--help"]);
     }
 
     let mut entries: Vec<(String, String)> = Vec::new();

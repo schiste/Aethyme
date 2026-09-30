@@ -48,7 +48,7 @@ use telemetry::*;
 use watch::*;
 
 pub use surface::{
-    ADVANCED_VERBS, PUBLIC_VERBS, REMOVED_SPELLING_RELEASE, Resolution, help_text,
+    ADVANCED_VERBS, PUBLIC_VERBS, REMOVED_SPELLING_RELEASE, Resolution, help_text, public_forms,
     removed_spelling_message, resolve, wants_help,
 };
 
