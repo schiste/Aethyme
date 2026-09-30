@@ -120,6 +120,22 @@ cost = 3
 # stop a hung gate, not to time a healthy one under load.
 timeout_seconds = 2400
 resource_wait_seconds = 900
+# 2026-09-30: a real capacity slot, not just a load-average poll. The
+# `resources` table and the `Capacity` pool underneath it have existed since
+# the resource coordinator landed, and no gate declared one, so the only thing
+# bounding concurrent CPU was `max_load_per_cpu` on this gate — which can only
+# *delay*, and after `resource_wait_seconds` runs the gate anyway. That is a
+# poll, not a limit: it cannot refuse, has no queue and no fairness, and the
+# five cheaper cargo gates were not even polled.
+#
+# This is the full workspace suite, so it is the one that actually moves the
+# load average. `limit = 1` admits exactly one at a time, which is what
+# `cargo test --workspace` wants anyway: it saturates every core, so running two
+# at once halves each one's throughput and inflates both toward
+# `timeout_seconds`. The admission path is unchanged — it is the same
+# `acquire_with_wait` the managed cache already uses, so a contended gate
+# waits, reports progress, and then fails loudly with the pool's occupancy
+# rather than silently oversubscribing the host.
 triggers = [
     "**/*.rs",
     "**/Cargo.toml",
@@ -151,6 +167,18 @@ triggers = [
 [gate.managed_cache]
 key = "rust-workspace-v3"
 max_bytes = 12884901888
+
+# Capacity for the full workspace suite. Placed after `triggers` deliberately:
+# a TOML table header ends the enclosing table, so a `[[gate.resources]]`
+# block written before `triggers` would silently reparent the remaining
+# gate-level keys onto the resources entry and the gate would lose its
+# triggers.
+[[gate.resources]]
+key = "workspace"
+kind = "capacity"
+pool = "cpu-workspace"
+units = 1
+limit = 1
 
 [[gate]]
 # Shell/jq-only changes must exercise the trust/privacy contracts they change,
