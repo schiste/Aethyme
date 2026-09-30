@@ -464,6 +464,11 @@ blocked.
    `aethyme broker finish` refuses to close a session while its commits are
    unpushed. If the work should genuinely not be kept, say so explicitly with
    `aethyme broker finish --session <id> --abandon --reason "<why>"`.
+   When `broker status` shows `coordination.land-shared-edit-first`, another
+   session changes the same lines or symbol as yours: follow it -- the named
+   session lands only the shared edit as its own small PR, then both rebase
+   on the default branch -- rather than waiting or building on the other
+   session's unmerged branch.
    Without the policy, pushing stays a separately authorized action (step 9).
 
 5. **Gate resources are per worker**. Broker gate runs take path-scoped owner
@@ -1064,6 +1069,7 @@ mod tests {
             "it does not authorize\n   merging, marking a PR ready, or pushing any other ref",
             "--abandon --reason",
             "`[promote] mode = \"verify-only\"`",
+            "`coordination.land-shared-edit-first`",
         ] {
             assert!(reference.contains(needle), "missing {needle:?}");
         }

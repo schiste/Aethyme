@@ -145,6 +145,7 @@ mod review_trigger;
 mod schema;
 mod session_abandonment;
 mod session_push;
+mod shared_edit_advice;
 mod ship;
 mod storage;
 mod store;

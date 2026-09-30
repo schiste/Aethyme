@@ -6574,6 +6574,14 @@ impl Broker {
         advice.extend(overlap_pair_advice(&overlap_pairs));
         // Cached listing and local refs only: `status` never calls GitHub.
         advice.extend(self.pr_overlap_advice(now_ms));
+        // Two sessions on one target: landing the shared edit first keeps
+        // both on the default branch instead of chaining one onto the other.
+        advice.extend(crate::shared_edit_advice::shared_edit_advice(
+            &self.repo,
+            &agents,
+            &overlaps,
+            &scope_overlaps,
+        ));
 
         Ok(StatusView {
             publication_baseline_ref: baseline_ref,
