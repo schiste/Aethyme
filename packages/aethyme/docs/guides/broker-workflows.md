@@ -968,6 +968,35 @@ Without the policy, the generated instructions keep the conservative default:
 submitting never authorizes publishing, and delivery goes through the
 reviewed `broker advanced ship` workflow.
 
+## Where A New Session Starts
+
+Without `--base`, `broker start` cuts the session branch from the first of:
+
+1. The integration branch, when `[promote]` promotes (`auto` or `manual`) and
+   integration contains the fetched default branch's tip.
+2. The fetched default branch (`origin/HEAD`'s target, else the main
+   checkout's upstream). This is always the base under
+   `mode = "verify-only"`, and the base whenever integration has fallen
+   behind upstream.
+3. The local default branch, then `main` or `master`, when nothing has been
+   fetched.
+
+A session never starts from an integration branch that is behind upstream:
+one repository's integration stopped moving while upstream merged 2,101
+commits, and every session cut from it started three days stale. `start`
+names what it skipped in `start_base.bypassed_integration` (`reason`,
+`behind_default_commits`, `ahead_default_commits`, and a `recovery_command`
+when integration is behind), prints a warning, and `broker status` keeps an
+`integration.behind-upstream` row until integration is reconciled with
+`aethyme broker advanced integration reconcile --upstream <ref>`. `start` never
+fetches, so "upstream" is as fresh as the last fetch.
+
+`[promote]` is read with the same trust rule as the push policy: the
+`.aethyme/config.toml` committed on the fetched default branch wins, and the
+main checkout's working-tree file is used only when the default branch commits
+none. A merged `mode = "verify-only"` therefore takes effect without anyone
+pulling it into the main checkout.
+
 ## Finish With A Durable Handoff
 
 Use `finish`, rather than the lower-level `close`, for the normal end of a

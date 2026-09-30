@@ -130,7 +130,7 @@ pub(crate) struct TrackedDefault {
 }
 
 pub(crate) fn tracked_default(repo: &GitRepo) -> Option<TrackedDefault> {
-    let (upstream, commit) = repo.tracking_upstream()?;
+    let (upstream, commit) = repo.upstream_default()?;
     let (remote, branch) = upstream
         .strip_prefix("refs/remotes/")
         .unwrap_or(&upstream)

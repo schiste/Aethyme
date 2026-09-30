@@ -88,12 +88,27 @@ pub struct PromoteConfig {
 }
 
 impl PromoteConfig {
+    /// Load `[promote]` with the same trust rule as the push policy.
+    ///
+    /// The configuration committed on the fetched default branch wins when it
+    /// exists; the main checkout's working-tree file is the fallback. Reading
+    /// only the working tree meant a merged `mode = "verify-only"` did nothing
+    /// in any repository whose main checkout had not pulled it, or had a
+    /// feature branch checked out -- the policy on the default branch said one
+    /// thing and the broker did another. As fresh as the last fetch; never
+    /// fetches.
     pub fn load(main_root: &Path) -> Self {
+        let text = committed_config_text(main_root)
+            .or_else(|| std::fs::read_to_string(main_root.join(".aethyme/config.toml")).ok());
+        Self::from_text(text.as_deref())
+    }
+
+    fn from_text(text: Option<&str>) -> Self {
         let mut config = Self {
             branch: DEFAULT_INTEGRATION_BRANCH.to_string(),
             mode: PromoteMode::Auto,
         };
-        let Ok(text) = std::fs::read_to_string(main_root.join(".aethyme/config.toml")) else {
+        let Some(text) = text else {
             return config;
         };
         let Ok(value) = text.parse::<toml::Value>() else {
@@ -117,6 +132,38 @@ impl PromoteConfig {
         }
         config
     }
+}
+
+/// The commit a session's own changes start after.
+///
+/// Its merge-base with integration, unless its merge-base with the fetched
+/// default branch is more recent. That happens exactly when the session was cut
+/// from upstream because integration had fallen behind: measured from
+/// integration alone, everything upstream merged since would count as the
+/// session's own diff and flood the lease and overlap reports.
+pub(crate) fn session_baseline(
+    checkout: &GitRepo,
+    integration: &str,
+    upstream: Option<&str>,
+) -> Option<String> {
+    let from_integration = checkout.merge_base(integration, "HEAD").ok()?;
+    if let Some(from_upstream) = upstream.and_then(|tip| checkout.merge_base(tip, "HEAD").ok())
+        && from_upstream != from_integration
+        && checkout.is_ancestor(&from_integration, &from_upstream)
+    {
+        return Some(from_upstream);
+    }
+    Some(from_integration)
+}
+
+/// `.aethyme/config.toml` as committed on the fetched default branch, if there
+/// is one and it holds the file.
+fn committed_config_text(main_root: &Path) -> Option<String> {
+    let repo = GitRepo::discover(main_root).ok()?;
+    let (_, commit) = repo.upstream_default()?;
+    repo.file_at_commit(&commit, ".aethyme/config.toml")
+        .ok()
+        .flatten()
 }
 
 /// Result of one submit: the queue entry after simulate (+ gates when
@@ -1646,7 +1693,11 @@ impl Broker {
     /// integration branch.
     pub fn session_change_base(&mut self, session_checkout: &GitRepo) -> Option<String> {
         let integration = self.integration_tip()?;
-        session_checkout.merge_base(&integration, "HEAD").ok()
+        let upstream = self
+            .repo_handle()
+            .upstream_default()
+            .map(|(_, commit)| commit);
+        session_baseline(session_checkout, &integration, upstream.as_deref())
     }
 
     /// The integration branch's current commit, without creating or
