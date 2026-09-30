@@ -1,16 +1,22 @@
 exit: 0
 --- stdout
-  aethyme broker finish --session <id> [--keep-worktree] [--json]
+  aethyme broker finish --session <id> [--keep-worktree] [--abandon --reason <why>] [--json]
       Higher-level lifecycle close: closes only when the session has no
-      dirty WIP and no committed work waiting for submit/promotion. If it
+      dirty WIP and no committed work waiting for submit/promotion. Where
+      the repository sets [delivery] push_session_branches, also refuses
+      while HEAD has commits no remote holds; --abandon --reason closes
+      anyway and records a broker.session.abandoned_unpushed event. If it
       is not safe, prints the next command; suggests cleanup only when
       cleanup would pass without --force. Successful closure atomically
       persists a redacted session.finished handoff with delivery, pending
       work, leases, last-gate provenance, and the recommended next action.
-  aethyme broker finish close --session <id> [--json]
+  aethyme broker finish close --session <id> [--abandon --reason <why>] [--json]
       Low-level close. Retains the checkout and branch; policy may reclaim
       known ignored build artifacts. Does not check whether commits were
-      submitted. Prefer finish for normal lifecycle use.
+      submitted. Where the repository sets [delivery] push_session_branches,
+      refuses while the session holds commits no remote has, unless
+      --abandon --reason records that they are being left behind. Prefer
+      finish for normal lifecycle use.
   aethyme broker finish cleanup <session-id> [--force] [--json]
   aethyme broker finish cleanup --all-cleaned [--apply --confirm <sha256>] [--json]
       Remove one session worktree, or inventory all retained broker-owned

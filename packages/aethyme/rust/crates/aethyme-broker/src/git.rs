@@ -1400,6 +1400,22 @@ impl GitRepo {
         .collect())
     }
 
+    /// Earliest committer time among `commits`, Unix epoch milliseconds, in
+    /// one Git process however many commits are named.
+    pub fn oldest_commit_time_ms(&self, commits: &[&str]) -> Option<i64> {
+        if commits.is_empty() {
+            return None;
+        }
+        let mut args = vec!["log", "--no-walk=unsorted", "--format=%ct"];
+        args.extend_from_slice(commits);
+        run_git(&self.root, &args)
+            .ok()?
+            .lines()
+            .filter_map(|seconds| seconds.trim().parse::<i64>().ok())
+            .min()
+            .map(|seconds| seconds * 1000)
+    }
+
     /// First-parent commits reachable from `head` but not `excluded`,
     /// oldest first. Submission provenance uses only this layer so a
     /// broker promotion merge and its submitted second parent do not
@@ -2297,6 +2313,19 @@ impl GitRepo {
     /// "what exists only on this machine", not "what the remote has now".
     pub fn commits_not_on_remotes(&self, head: &str) -> Result<Vec<LoggedCommit>, GitError> {
         self.logged_commits(&[head, "--not", "--remotes"])
+    }
+
+    /// [`GitRepo::commits_not_on_remotes`] without merges and without any
+    /// commit `excluded` reaches: the commits a session made itself rather
+    /// than inherited from its base.
+    pub fn own_commits_not_on_remotes(
+        &self,
+        head: &str,
+        excluded: &[&str],
+    ) -> Result<Vec<LoggedCommit>, GitError> {
+        let mut range = vec!["--no-merges", head, "--not", "--remotes"];
+        range.extend_from_slice(excluded);
+        self.logged_commits(&range)
     }
 
     /// Commits reachable from `head` but not from `base`, newest first.

@@ -354,7 +354,16 @@ fn a_closed_session_cannot_push() {
     fixture.authorize(true);
     let (session, _) = fixture.session_with_commit();
     let branch = fixture.broker().store().session(session).unwrap().branch;
-    let closed = fixture.run(&["finish", "close", "--session", &session.to_string()]);
+    // Under the push lane an unpushed session only closes on the record.
+    let closed = fixture.run(&[
+        "finish",
+        "close",
+        "--session",
+        &session.to_string(),
+        "--abandon",
+        "--reason",
+        "testing that a closed session cannot push",
+    ]);
     assert!(closed.status.success(), "{}", stderr(&closed));
 
     let refused = fixture.push(session, &[]);

@@ -549,6 +549,7 @@ pub(super) fn run_doctor(parsed: Parsed) -> Result<(), UsageError> {
                 out!("  run: {command}");
             }
         }
+        render_unpushed_work(&report.unpushed_work);
         if let Some(repair) = &report.version_repair {
             out!(
                 "version repair: {} — {}",
@@ -786,4 +787,54 @@ pub(super) fn run_certify_scaffold(parsed: Parsed, subcommand: &str) -> Result<(
         return Err(UsageError::Message("certification failed".into()));
     }
     Ok(())
+}
+
+/// Doctor's view of committed work only this machine holds. Status carries
+/// the same facts as advice rows; doctor lists them because it is where an
+/// operator looks when asking "is anything at risk here?".
+fn render_unpushed_work(report: &crate::UnpushedWorkReport) {
+    if report.is_empty() {
+        return;
+    }
+    let now = crate::clock::epoch_ms();
+    let age =
+        |at: Option<i64>| crate::unpushed::describe_age(now.saturating_sub(at.unwrap_or(now)));
+    out!(
+        "unpushed work: {} {} with commits on no remote{}",
+        report.sessions.len(),
+        plural(report.sessions.len(), "session", "sessions"),
+        if report.push_session_branches {
+            ""
+        } else {
+            " (push lane not enabled: [delivery] push_session_branches)"
+        }
+    );
+    for work in &report.sessions {
+        out!(
+            "  session {} {}: {} {}, oldest {} old [{}]",
+            work.session_id,
+            work.branch,
+            work.unpushed_commits,
+            plural(work.unpushed_commits as usize, "commit", "commits"),
+            age(work.oldest_unpushed_at_ms),
+            work.severity.as_str()
+        );
+        out!("    run: {}", work.command);
+    }
+    if let Some(integration) = &report.integration {
+        out!(
+            "  {}: {} {} {} lacks ({} on no remote), oldest {} old [{}]",
+            integration.branch,
+            integration.unpublished_commits,
+            plural(
+                integration.unpublished_commits as usize,
+                "commit",
+                "commits"
+            ),
+            integration.upstream_ref,
+            integration.on_no_remote,
+            age(integration.oldest_unpublished_at_ms),
+            integration.severity.as_str()
+        );
+    }
 }

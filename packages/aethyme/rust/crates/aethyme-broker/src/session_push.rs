@@ -151,6 +151,14 @@ fn branch_refusal(branch: &str, default_branch: &str) -> Option<String> {
 /// which the pushing agent could have edited. This is the same rule `ship`
 /// applies to its delivery policy (a copy of the default branch), taken from
 /// the last fetch rather than a network read.
+/// [`push_authorized`] for readers that only report or tighten: `status`,
+/// `doctor`, `finish`. No tracked default branch, or a policy that cannot be
+/// read, means "not opted in" rather than an error, so those commands keep
+/// working in a repository `broker push` would refuse.
+pub(crate) fn session_push_enabled(repo: &GitRepo) -> bool {
+    tracked_default(repo).is_some_and(|default| push_authorized(repo, &default).unwrap_or(false))
+}
+
 fn push_authorized(repo: &GitRepo, default: &TrackedDefault) -> Result<bool, BrokerOpError> {
     let Some(text) = repo.file_at_commit(&default.commit, ".aethyme/config.toml")? else {
         return Ok(false);
