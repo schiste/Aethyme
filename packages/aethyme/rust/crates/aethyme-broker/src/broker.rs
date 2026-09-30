@@ -171,6 +171,27 @@ pub enum BrokerOpError {
          it prints (the digest passed, {actual}, is stale)"
     )]
     CleanupConfirmationMismatch { actual: String },
+    #[error("cannot resolve session {id}: {reason}")]
+    CleanupResolveRefused { id: i64, reason: String },
+    #[error("cleanup resolve confirmation must be a full SHA-256 digest")]
+    CleanupResolveConfirmationNotSha256,
+    /// See [`BrokerOpError::CleanupConfirmationMismatch`] for why no digest is
+    /// offered here (issue #142).
+    #[error(
+        "the reviewed resolve plan for session {id} no longer matches its worktree, so nothing \
+         was archived or removed; review a new plan with `aethyme broker finish cleanup resolve \
+         {id} --archive` and confirm the digest it prints (the digest passed, {actual}, is stale)"
+    )]
+    CleanupResolveConfirmationMismatch { id: i64, actual: String },
+    #[error(
+        "the recovery archive for session {id} failed verification, so its worktree was left in \
+         place: {reason} (incomplete archive: {path})"
+    )]
+    RecoveryArchiveUnverified {
+        id: i64,
+        path: String,
+        reason: String,
+    },
     #[error("GC confirmation must be a full SHA-256 digest")]
     GcConfirmationNotSha256,
     /// The reviewed plan no longer describes current state. The freshly computed
@@ -8132,6 +8153,21 @@ impl Broker {
 
         let session_head = checkout.head_commit()?;
         let session = self.store.session(session_id)?;
+        let delivery_targets = self.cleanup_delivery_targets()?;
+        let (provenance, reason) =
+            self.cleanup_provenance(&session, &session_head, &delivery_targets)?;
+        let disposition = match provenance.representation {
+            CleanupRepresentation::Represented => CleanupDisposition::Eligible,
+            CleanupRepresentation::Pending => CleanupDisposition::PendingCommits,
+            CleanupRepresentation::Unproven => CleanupDisposition::UnprovenProvenance,
+        };
+        Ok((disposition, reason, Some(provenance)))
+    }
+
+    /// The commits cleanup judges a session's work against: the primary
+    /// checkout's HEAD, the integration tip and the configured upstream,
+    /// sorted and deduplicated.
+    pub(crate) fn cleanup_delivery_targets(&self) -> Result<Vec<String>, BrokerOpError> {
         let mut delivery_targets = vec![self.repo.head_commit()?];
         if let Some(integration) = self.integration_tip() {
             delivery_targets.push(integration);
@@ -8141,14 +8177,7 @@ impl Broker {
         }
         delivery_targets.sort();
         delivery_targets.dedup();
-        let (provenance, reason) =
-            self.cleanup_provenance(&session, &session_head, &delivery_targets)?;
-        let disposition = match provenance.representation {
-            CleanupRepresentation::Represented => CleanupDisposition::Eligible,
-            CleanupRepresentation::Pending => CleanupDisposition::PendingCommits,
-            CleanupRepresentation::Unproven => CleanupDisposition::UnprovenProvenance,
-        };
-        Ok((disposition, reason, Some(provenance)))
+        Ok(delivery_targets)
     }
 
     /// Whether a session's work is represented on a delivery target.
@@ -9014,7 +9043,11 @@ impl Broker {
     /// `--force` does either. Checked immediately before removal, because
     /// adoption takes no GC lock; paths are compared canonically, and a live
     /// checkout nested inside the directory counts too.
-    fn refuse_live_checkout(&self, session_id: i64, worktree: &Path) -> Result<(), BrokerOpError> {
+    pub(crate) fn refuse_live_checkout(
+        &self,
+        session_id: i64,
+        worktree: &Path,
+    ) -> Result<(), BrokerOpError> {
         let canonical =
             |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         let root = canonical(worktree);

@@ -639,6 +639,15 @@ Usage:
       by default; --apply revalidates and removes only clean worktrees whose
       session work is represented on main, integration, or configured upstream.
       Adopted worktrees are never included in the bulk sweep.
+  aethyme broker cleanup resolve <session-id> --archive [--confirm <sha256>] [--json]
+      Preserve, then remove, a closed session's worktree that cleanup refuses
+      because it is dirty, holds pending commits, or cannot be proved landed.
+      Without --confirm it prints what would be archived and a digest. With it,
+      it writes a recovery archive under the host state directory (a bundle of
+      commits no delivery target holds, staged and unstaged patches, untracked
+      files Git does not ignore, a manifest and restore steps), reads every part
+      back, and only then removes the worktree. A verification failure leaves
+      the worktree in place. Discarding stays `cleanup <session-id> --force`.
   aethyme broker cleanup audit [--repo <path>] [--detail] [--json]
       Read-only, repository-scoped audit of every retained worktree, branch,
       Git worktree registration and unowned worktree-root directory. Judges
@@ -949,6 +958,7 @@ struct Parsed {
     replace_stale: bool,
     all: bool,
     all_cleaned: bool,
+    archive: bool,
     keep_worktree: bool,
     chau7: bool,
     fix_version: bool,
@@ -1057,6 +1067,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         replace_stale: false,
         all: false,
         all_cleaned: false,
+        archive: false,
         keep_worktree: false,
         chau7: false,
         fix_version: false,
@@ -1130,6 +1141,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
             "--adopt" => parsed.adopt = true,
             "--all" => parsed.all = true,
             "--all-cleaned" => parsed.all_cleaned = true,
+            "--archive" => parsed.archive = true,
             "--keep-worktree" => parsed.keep_worktree = true,
             "--chau7" => parsed.chau7 = true,
             "--fix-version" => parsed.fix_version = true,

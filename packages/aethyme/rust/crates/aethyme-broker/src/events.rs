@@ -33,6 +33,9 @@ pub const BROKER_GC_ARTIFACTS_SWEPT: &str = "broker.gc.artifacts-swept";
 /// Dead shared preparation-cache entries reclaimed without an operator.
 pub const BROKER_GC_PREPARATION_SWEPT: &str = "broker.gc.preparation-swept";
 pub const BROKER_COMMAND_SUCCEEDED: &str = "broker.command.succeeded";
+/// A closed session's uncommitted or unlanded work was written to a verified
+/// recovery archive before its worktree was removed.
+pub const BROKER_CLEANUP_ARCHIVED: &str = "broker.cleanup.archived";
 // session.<status> transition kinds are derived from SessionStatus::as_str
 // (active/idle/stale/exited/cleaned) by the store.
 pub const LEASE_CLAIMED: &str = "lease.claimed";
