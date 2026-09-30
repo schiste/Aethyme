@@ -515,7 +515,7 @@ pub const CONFIG_SCHEMA_VERSION: i64 = 1;
 /// FAIL — configs written for a newer schema must keep working here.
 const CONFIG_KNOWN_KEYS: &[(&str, &[&str])] = &[
     ("promote", &["mode", "branch"]),
-    ("delivery", &["default"]),
+    ("delivery", &["default", "push_session_branches"]),
     ("leases", &["ignore", "routing"]),
     ("graph", &["authority", "repository"]),
     ("review", &["trigger", "routing", "reporting", "projection"]),
@@ -1015,6 +1015,7 @@ const CONFIG_TEMPLATE: &str = "\
 #   [promote] mode    \"auto\" | \"manual\" | \"verify-only\"
 #   [promote] branch  integration branch name
 #   [delivery] default \"pull_request\" | \"local_main_merge\"
+#   [delivery] push_session_branches  true | false (authorizes `broker push`)
 #   [leases]  ignore  paths never leased (trailing / = directory prefix)
 #   [leases.routing] category = [\"path/\", \"exact/file\"]
 # Unknown keys are ignored at runtime; `aethyme certify` warns on them.
@@ -1266,5 +1267,28 @@ fn validate_gates(main_root: &Path) -> Check {
             status: CheckStatus::Fail,
             detail: format!("gates.toml invalid: {err}"),
         },
+    }
+}
+
+#[cfg(test)]
+mod config_key_tests {
+    use super::unknown_config_keys;
+
+    fn unknown(text: &str) -> Vec<String> {
+        unknown_config_keys(&text.parse::<toml::Value>().unwrap())
+    }
+
+    /// `broker push` reads this key; certify must not call it unknown.
+    #[test]
+    fn push_session_branches_is_a_known_delivery_key() {
+        assert!(unknown("[delivery]\npush_session_branches = true\n").is_empty());
+        assert!(
+            unknown("[delivery]\ndefault = \"pull_request\"\npush_session_branches = false\n")
+                .is_empty()
+        );
+        assert_eq!(
+            unknown("[delivery]\npush_everything = true\n"),
+            ["delivery.push_everything"]
+        );
     }
 }

@@ -1,6 +1,6 @@
 exit: 0
 --- stdout
-aethyme broker advanced — the full broker surface beyond the six public verbs
+aethyme broker advanced — the full broker surface beyond the public verbs
 
 Usage: aethyme broker advanced <verb> [args...]
 
