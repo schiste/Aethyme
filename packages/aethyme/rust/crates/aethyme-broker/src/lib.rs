@@ -79,6 +79,7 @@ mod pr;
 mod pr_link;
 mod pr_monitoring;
 mod scopes;
+mod unpushed;
 mod worktree_report;
 pub use pr_monitoring::{
     activate as activate_pr_monitoring, active_sessions as pr_monitoring_sessions,
@@ -142,6 +143,7 @@ mod review_report;
 mod review_trigger;
 mod schema;
 mod session_abandonment;
+mod session_push;
 mod ship;
 mod storage;
 mod store;
@@ -235,7 +237,7 @@ pub use gates::{
     select_gates, verify_gate_scope_manifest,
 };
 pub use gc::{GC_PLAN_SCHEMA_VERSION, UNCLASSIFIED_ARTIFACT_REPORT_THRESHOLD_BYTES};
-pub use git::{CherrySide, GitError, GitRepo, MergeSimulation, RemoteDefaultBranch};
+pub use git::{CherrySide, GitError, GitRepo, LoggedCommit, MergeSimulation, RemoteDefaultBranch};
 pub use github_target::{
     GithubApiTargetEvidence, GithubTargetError, ResolvedGithubTarget, resolve_github_target,
 };
@@ -453,6 +455,9 @@ pub use session_abandonment::{
     AbandonmentDecision, AbandonmentVerdict, SessionActivity, abandoned as abandoned_sessions,
     decide as decide_abandonment, survey as survey_abandonment,
 };
+pub use session_push::{
+    SESSION_PUSH_POLICY_KEY, SessionPullRequest, SessionPushReport, SessionPushState,
+};
 pub use ship::{
     DeliveryCheck, DeliveryChecksSummary, DeliveryExecutionReport, DeliveryExecutionState,
     DeliveryPullRequest, PUBLICATION_POLICY_SCHEMA_VERSION, PullRequestDeliveryReport,
@@ -484,6 +489,7 @@ pub use types::{
     ScopeOperation, ScopeSource, Session, SessionCleanupState, SessionContext, SessionNote,
     SessionNoteList, SessionOrigin, SessionScope, SessionStatus, validate_session_short_name,
 };
+pub use unpushed::{UnpublishedIntegrationWork, UnpushedSessionWork, UnpushedWorkReport};
 pub use update::{
     INSTALL_RECEIPT_FILENAME, INSTALL_RECEIPT_SCHEMA_VERSION, InstallReceipt, InstallationMethod,
     InstallationProvenance, UPDATE_PLAN_SCHEMA_VERSION, UpdateAction, UpdateArchive, UpdateChannel,

@@ -1,0 +1,12 @@
+exit: 0
+--- stdout
+  aethyme broker push --session <id> [--pr] [--json]
+      Publish this session's own agent/* branch to the default branch's
+      remote, and nothing else. Commit, then push, as often as you like:
+      work that exists only in a worktree is lost with it. A branch that only
+      moves forward is pushed plainly; a rebased one is replaced only with a
+      lease on the oid this broker last pushed for the session. Requires
+      `[delivery] push_session_branches = true` in .aethyme/config.toml on
+      the default branch. --pr also opens a draft pull request when none is
+      open for the branch (never marks it ready, never merges).
+--- stderr

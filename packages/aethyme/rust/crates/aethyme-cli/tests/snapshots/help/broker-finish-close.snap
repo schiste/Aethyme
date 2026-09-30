@@ -1,7 +1,10 @@
 exit: 0
 --- stdout
-  aethyme broker finish close --session <id> [--json]
+  aethyme broker finish close --session <id> [--abandon --reason <why>] [--json]
       Low-level close. Retains the checkout and branch; policy may reclaim
       known ignored build artifacts. Does not check whether commits were
-      submitted. Prefer finish for normal lifecycle use.
+      submitted. Where the repository sets [delivery] push_session_branches,
+      refuses while the session holds commits no remote has, unless
+      --abandon --reason records that they are being left behind. Prefer
+      finish for normal lifecycle use.
 --- stderr

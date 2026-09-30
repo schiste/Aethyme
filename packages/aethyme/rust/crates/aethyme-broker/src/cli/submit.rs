@@ -689,6 +689,57 @@ pub(super) fn run_submit(parsed: Parsed) -> Result<(), UsageError> {
 }
 
 /// `broker repair`.
+/// `broker push`: publish the session's own branch, optionally with a draft PR.
+pub(super) fn run_push(parsed: Parsed) -> Result<(), UsageError> {
+    let session = parsed
+        .session
+        .ok_or(UsageError::Message("push requires --session <id>".into()))?;
+    let mut broker = open_broker(parsed.read_only_snapshot)?;
+    let report = match broker.push_session(session, parsed.open_pr) {
+        Ok(report) => report,
+        Err(crate::BrokerOpError::CoordinatedOperationBlocked { recovery, .. }) => {
+            return Err(UsageError::Exit {
+                message: recovery.to_string(),
+                code: crate::exit_status::OUTCOME_UNKNOWN,
+            });
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if parsed.json {
+        out!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+    let previous = report
+        .previous_remote_oid
+        .as_deref()
+        .map_or("new branch".to_string(), |oid| {
+            format!("was {}", &oid[..oid.len().min(12)])
+        });
+    out!(
+        "Pushed {} to {}/{} at {} ({previous}; {} commit(s) not on the remote before)",
+        report.branch,
+        report.remote,
+        report.branch,
+        &report.pushed_oid[..report.pushed_oid.len().min(12)],
+        report.commits_pushed
+    );
+    if report.uncommitted_files > 0 {
+        out!(
+            "  {} uncommitted file(s) not pushed; commit them and push again",
+            report.uncommitted_files
+        );
+    }
+    match &report.pr {
+        Some(pr) if pr.created => out!("  Opened draft pull request #{} {}", pr.number, pr.url),
+        Some(pr) => out!("  Pull request #{} {} ({})", pr.number, pr.url, pr.state),
+        None => out!(
+            "  Open a draft pull request with: aethyme broker push --session {} --pr",
+            report.session_id
+        ),
+    }
+    Ok(())
+}
+
 pub(super) fn run_repair(parsed: Parsed) -> Result<(), UsageError> {
     let session = parsed
         .session

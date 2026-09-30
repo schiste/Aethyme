@@ -1,4 +1,4 @@
-//! The public broker verb surface: six verbs, `advanced`, and the deprecation
+//! The public broker verb surface: the public verbs, `advanced`, and the deprecation
 //! window for every older spelling.
 //!
 //! This module only translates spellings. Each public form resolves to the
@@ -17,7 +17,7 @@ pub fn removed_spelling_message(old: &str, new: &str) -> String {
     format!("'{old}' was removed in {REMOVED_SPELLING_RELEASE}; use '{new}'")
 }
 
-/// The six verbs `aethyme broker --help` lists.
+/// The verbs `aethyme broker --help` lists.
 pub const PUBLIC_VERBS: &[(&str, &str)] = &[
     (
         "start",
@@ -30,6 +30,10 @@ pub const PUBLIC_VERBS: &[(&str, &str)] = &[
     (
         "submit",
         "simulate, gate and promote a session; preparation and promotion recovery",
+    ),
+    (
+        "push",
+        "publish this session's own branch as you work; --pr opens a draft PR",
     ),
     (
         "finish",
@@ -367,7 +371,7 @@ pub(super) fn public_help() -> String {
 
 pub(super) fn advanced_help() -> String {
     let mut text = String::from(
-        "aethyme broker advanced — the full broker surface beyond the six public verbs\n\n\
+        "aethyme broker advanced — the full broker surface beyond the public verbs\n\n\
          Usage: aethyme broker advanced <verb> [args...]\n\n\
          Verbs:\n",
     );

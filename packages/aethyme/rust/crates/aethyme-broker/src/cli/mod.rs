@@ -116,13 +116,19 @@ Usage:
       --replace-stale closes it and registers fresh; policy may reclaim known ignored build artifacts;
       neither flag = error listing your options. Every --path is validated
       and claimed explicitly in the same transaction as create/reuse.
-  aethyme broker close --session <id> [--json]
+  aethyme broker close --session <id> [--abandon --reason <why>] [--json]
       Low-level close. Retains the checkout and branch; policy may reclaim
       known ignored build artifacts. Does not check whether commits were
-      submitted. Prefer finish for normal lifecycle use.
-  aethyme broker finish --session <id> [--keep-worktree] [--json]
+      submitted. Where the repository sets [delivery] push_session_branches,
+      refuses while the session holds commits no remote has, unless
+      --abandon --reason records that they are being left behind. Prefer
+      finish for normal lifecycle use.
+  aethyme broker finish --session <id> [--keep-worktree] [--abandon --reason <why>] [--json]
       Higher-level lifecycle close: closes only when the session has no
-      dirty WIP and no committed work waiting for submit/promotion. If it
+      dirty WIP and no committed work waiting for submit/promotion. Where
+      the repository sets [delivery] push_session_branches, also refuses
+      while HEAD has commits no remote holds; --abandon --reason closes
+      anyway and records a broker.session.abandoned_unpushed event. If it
       is not safe, prints the next command; suggests cleanup only when
       cleanup would pass without --force. Successful closure atomically
       persists a redacted session.finished handoff with delivery, pending
@@ -532,6 +538,15 @@ Usage:
       Executed and cached gate results identify the proven tree hash.
       --no-cache bypasses merged-tree cache lookup for this submission,
       but stores each fresh result for later normal reuse.
+  aethyme broker push --session <id> [--pr] [--json]
+      Publish this session's own agent/* branch to the default branch's
+      remote, and nothing else. Commit, then push, as often as you like:
+      work that exists only in a worktree is lost with it. A branch that only
+      moves forward is pushed plainly; a rebased one is replaced only with a
+      lease on the oid this broker last pushed for the session. Requires
+      `[delivery] push_session_branches = true` in .aethyme/config.toml on
+      the default branch. --pr also opens a draft pull request when none is
+      open for the branch (never marks it ready, never merges).
   aethyme broker repair --session <id> [--json]
       Conflict-scoped recovery: apply the documented local rebase path for
       the latest submit conflict, or rebase onto promoted integration work
@@ -898,6 +913,7 @@ struct Parsed {
     short_name: Option<String>,
     ai_provider: Option<String>,
     pr_number: Option<i64>,
+    open_pr: bool,
     session: Option<i64>,
     to_session: Option<i64>,
     note_id: Option<i64>,
@@ -963,6 +979,7 @@ struct Parsed {
     all: bool,
     all_cleaned: bool,
     archive: bool,
+    abandon: bool,
     keep_worktree: bool,
     chau7: bool,
     fix_version: bool,
@@ -1014,6 +1031,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         short_name: None,
         ai_provider: None,
         pr_number: None,
+        open_pr: false,
         session: None,
         to_session: None,
         note_id: None,
@@ -1073,6 +1091,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         all: false,
         all_cleaned: false,
         archive: false,
+        abandon: false,
         keep_worktree: false,
         chau7: false,
         fix_version: false,
@@ -1147,7 +1166,9 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
             "--all" => parsed.all = true,
             "--all-cleaned" => parsed.all_cleaned = true,
             "--archive" => parsed.archive = true,
+            "--abandon" => parsed.abandon = true,
             "--keep-worktree" => parsed.keep_worktree = true,
+            "--open-pr" => parsed.open_pr = true,
             "--chau7" => parsed.chau7 = true,
             "--fix-version" => parsed.fix_version = true,
             "--with-gate" => parsed.with_gate = true,
@@ -1673,7 +1694,28 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
     let Some(subcommand) = args.first() else {
         return Err(UsageError::Help);
     };
-    let mut parsed = parse(&args[1..]).map_err(|error| {
+    // Everywhere else `--pr` takes a pull-request number; for `push` it is a
+    // switch. Translating it here keeps the one context-free parser.
+    let rest: Vec<String> = if subcommand == "push" {
+        let separator = args
+            .iter()
+            .position(|arg| arg == "--")
+            .unwrap_or(args.len());
+        args[1..]
+            .iter()
+            .enumerate()
+            .map(|(index, arg)| {
+                if arg == "--pr" && index + 1 < separator {
+                    "--open-pr".to_string()
+                } else {
+                    arg.clone()
+                }
+            })
+            .collect()
+    } else {
+        args[1..].to_vec()
+    };
+    let mut parsed = parse(&rest).map_err(|error| {
         if subcommand == "operations" && args.get(1).map(String::as_str) == Some("reconcile") {
             match error {
                 UsageError::Message(message) if !message.contains(OPERATIONS_RECONCILE_USAGE) => {
@@ -1726,6 +1768,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
         "pr" => run_pr(parsed)?,
         "hooks" => run_hooks(parsed)?,
         "submit" => run_submit(parsed)?,
+        "push" => run_push(parsed)?,
         "repair" => run_repair(parsed)?,
         "representation" => run_representation(parsed)?,
         "main" => run_main_reconcile(parsed)?,

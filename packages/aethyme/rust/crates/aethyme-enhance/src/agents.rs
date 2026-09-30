@@ -308,6 +308,32 @@ fn render_broker_protocol_compact(repo: &Path) -> String {
     // The heading keeps "Broker Coordination": `certify`'s agents-protocol
     // check, local-only deploy verification and the upgrade classifier all
     // recognize a broker-configured policy by that phrase.
+    if pushes_session_branches(repo) {
+        // Work that lives only in a worktree is lost with it, and a local
+        // integration branch nobody publishes grows unnoticed: one repository
+        // held 74 unpublished commits over five weeks. Where the repository
+        // authorizes it, the session branch is the unit of delivery, so the
+        // agent pushes it as it goes rather than at the end.
+        return r#"## Broker Coordination: before and after an edit
+
+Other agents may be working in sibling worktrees.
+
+1. `aethyme broker start --task "<task>"`, then work only in the worktree it
+   reports. Never edit another session's worktree.
+2. Commit early and small, and after each commit run
+   `aethyme broker push --session <id>`. Once there is a first meaningful
+   commit, open a draft PR with `aethyme broker push --session <id> --pr`, and
+   keep pushing until it is ready. Never leave work only in the worktree.
+3. When done: `aethyme broker submit --session <id>`, then
+   `aethyme broker finish --session <id>` (it refuses while commits are unpushed).
+
+This repository's `push_session_branches` policy authorizes pushing your own
+session branch and opening a draft PR; nothing else. Other remote or shared Git
+and GitHub writes go through `aethyme broker advanced git` and
+`aethyme broker advanced gh`. If `.aethyme/broker-action-required.md` appears,
+read it first. Leases, gates, advisories and recovery: `references/broker.md`."#
+            .to_string();
+    }
     r#"## Broker Coordination: before and after an edit
 
 Other agents may be working in sibling worktrees.
@@ -320,8 +346,30 @@ Other agents may be working in sibling worktrees.
 Remote or shared Git and GitHub writes go through `aethyme broker advanced git`
 and `aethyme broker advanced gh`; editing or submitting never authorizes
 publishing. If `.aethyme/broker-action-required.md` appears, read it first.
-Leases, gates, advisories and recovery: `references/broker.md`."#
+Leases, gates, advisories and recovery: `references/broker.md`. Maintainers can
+let agents push session branches and open draft PRs by setting
+`[delivery] push_session_branches = true` in `.aethyme/config.toml`."#
         .to_string()
+}
+
+/// Whether `.aethyme/config.toml` sets `[delivery] push_session_branches =
+/// true`.
+///
+/// Anything else -- no file, invalid TOML, a missing key, a non-boolean --
+/// reads as false. The policy grants a publication authority, so an
+/// unreadable declaration must not grant it; the broker applies the same
+/// rule before pushing.
+fn pushes_session_branches(repo: &Path) -> bool {
+    std::fs::read_to_string(repo.join(".aethyme/config.toml"))
+        .ok()
+        .and_then(|text| text.parse::<toml::Value>().ok())
+        .and_then(|config| {
+            config
+                .get("delivery")?
+                .get("push_session_branches")?
+                .as_bool()
+        })
+        .unwrap_or(false)
 }
 
 pub(crate) fn render_broker_reference() -> String {
@@ -387,6 +435,37 @@ blocked.
    verified and integrated. Never switch branches inside someone else's
    worktree; never edit files outside your own worktree.
 
+   **If `.aethyme/config.toml`, as committed on the default branch, sets
+   `[delivery] push_session_branches = true`, push your session branch as you
+   go.** Work that exists only in a worktree
+   is lost with it, and nobody can review what was never pushed. After each
+   commit:
+
+   ```bash
+   aethyme broker push --session <your-session-id>
+   ```
+
+   This pushes your own session branch (`agent/<slug>`) to the default
+   branch's remote and touches no other ref. A fast-forward is pushed plainly;
+   a branch you rewrote (for example after a rebase) is pushed only under a
+   lease on the commit the broker last pushed for your session. Uncommitted
+   files are reported, not pushed, so commit before you push. Once there is a first meaningful commit, open a draft
+   pull request, and keep pushing to it until it is ready for review:
+
+   ```bash
+   aethyme broker push --session <your-session-id> --pr
+   ```
+
+   `--pr` opens a draft PR, or reports the one already open. The policy is
+   the authorization for exactly these two things -- pushing your own session
+   branch and opening a draft PR -- and nothing more: it does not authorize
+   merging, marking a PR ready, or pushing any other ref. `broker status` and
+   `broker doctor` report sessions with unpushed commits, and
+   `aethyme broker finish` refuses to close a session while its commits are
+   unpushed. If the work should genuinely not be kept, say so explicitly with
+   `aethyme broker finish --session <id> --abandon --reason "<why>"`.
+   Without the policy, pushing stays a separately authorized action (step 9).
+
 5. **Gate resources are per worker**. Broker gate runs take path-scoped owner
    locks and export `AETHYME_GATE_WORKER_ID` plus `AETHYME_TEST_DB_SUFFIX`.
    Gate commands that need a test database, cache namespace, or similar
@@ -438,7 +517,11 @@ blocked.
    Prefer this reviewed broker ship workflow over a raw push. Never infer
    publication authority from permission to edit, submit, or promote.
    Without publication authority, stop after submit and report the promoted
-   entry.
+   entry. Under `push_session_branches` (step 4), your pushed session branch
+   and its draft PR are the delivery: report the PR rather than a promoted
+   entry. Repositories that deliver through pull requests usually also set
+   `[promote] mode = "verify-only"`, so verified work does not pile up
+   unpublished on the local integration branch.
    Report the outcome (verified / rejected / conflict) in your summary.
    Afterwards, finish the session with
    `aethyme broker finish --session <id>`, or point it at a follow-up task
@@ -904,6 +987,86 @@ mod tests {
             );
         }
         std::fs::remove_dir_all(&repo).unwrap();
+    }
+
+    fn broker_repo_with_config(tag: &str, config: &str) -> PathBuf {
+        let repo = fixture_repo(tag);
+        std::fs::create_dir_all(repo.join(".aethyme")).unwrap();
+        std::fs::write(repo.join(".aethyme/gates.toml"), "[[gate]]\n").unwrap();
+        std::fs::write(repo.join(".aethyme/config.toml"), config).unwrap();
+        repo
+    }
+
+    #[test]
+    fn push_policy_turns_the_protocol_into_push_as_you_go() {
+        let repo = broker_repo_with_config(
+            "push-on",
+            "schema = 1\n[delivery]\npush_session_branches = true\n",
+        );
+        let doc = render_agents_document(Some(&repo)).unwrap();
+        for needle in [
+            "## Broker Coordination: before and after an edit",
+            "Commit early and small, and after each commit run\n   `aethyme broker push --session <id>`",
+            "open a draft PR with `aethyme broker push --session <id> --pr`",
+            "keep pushing until it is ready. Never leave work only in the worktree.",
+            "`aethyme broker finish --session <id>` (it refuses while commits are unpushed)",
+            "authorizes pushing your own\nsession branch and opening a draft PR; nothing else.",
+            "`aethyme broker advanced git`",
+            "`references/broker.md`",
+        ] {
+            assert!(doc.contains(needle), "missing {needle:?}:\n{doc}");
+        }
+        // The blanket refusal would contradict the policy it now describes.
+        assert!(!doc.contains("editing or submitting never authorizes"));
+        let tokens = doc.len() / 4;
+        assert!(
+            tokens <= GENERATED_POLICY_MAX_TOKENS,
+            "{tokens} tokens:\n{doc}"
+        );
+        std::fs::remove_dir_all(&repo).unwrap();
+    }
+
+    /// Only an explicit `true` grants the push authority; anything else keeps
+    /// the default protocol and its pointer to the opt-in.
+    #[test]
+    fn push_policy_is_granted_only_by_an_explicit_true() {
+        for (tag, config) in [
+            ("push-off", "[delivery]\npush_session_branches = false\n"),
+            (
+                "push-string",
+                "[delivery]\npush_session_branches = \"true\"\n",
+            ),
+            ("push-absent", "[delivery]\ndefault = \"pull_request\"\n"),
+            ("push-invalid", "[delivery\npush_session_branches = true\n"),
+        ] {
+            let repo = broker_repo_with_config(tag, config);
+            let doc = render_agents_document(Some(&repo)).unwrap();
+            assert!(
+                doc.contains("editing or submitting never authorizes\npublishing"),
+                "{tag}:\n{doc}"
+            );
+            assert!(
+                doc.contains("`[delivery] push_session_branches = true` in `.aethyme/config.toml`"),
+                "{tag}: missing opt-in pointer:\n{doc}"
+            );
+            assert!(!doc.contains("aethyme broker push"), "{tag}:\n{doc}");
+            std::fs::remove_dir_all(&repo).unwrap();
+        }
+    }
+
+    #[test]
+    fn broker_reference_documents_the_push_lane_and_its_limits() {
+        let reference = render_broker_reference();
+        for needle in [
+            "[delivery] push_session_branches = true",
+            "aethyme broker push --session <your-session-id>\n",
+            "aethyme broker push --session <your-session-id> --pr",
+            "it does not authorize\n   merging, marking a PR ready, or pushing any other ref",
+            "--abandon --reason",
+            "`[promote] mode = \"verify-only\"`",
+        ] {
+            assert!(reference.contains(needle), "missing {needle:?}");
+        }
     }
 
     #[test]

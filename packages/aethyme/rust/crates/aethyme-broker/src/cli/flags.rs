@@ -313,6 +313,7 @@ pub(super) const FLAG_RULES: &[(&str, &[&str])] = &[
     ("watch pr batches", &["--id", "--all"]),
     ("watch pr ack", &["--id", "--outcome", "--reason"]),
     ("submit", &["--session", "--no-cache", "--verify-only"]),
+    ("push", &["--session", "--pr", "--open-pr"]),
     ("repair", &["--session"]),
     ("checkpoint plan", &["--session"]),
     ("checkpoint apply", &["--session", "--confirm"]),
@@ -359,8 +360,11 @@ pub(super) const FLAG_RULES: &[(&str, &[&str])] = &[
     ("certify", &[]),
     ("scaffold", &[]),
     ("handoff", &["--session", "--worktree"]),
-    ("finish", &["--session", "--keep-worktree"]),
-    ("close", &["--session"]),
+    (
+        "finish",
+        &["--session", "--keep-worktree", "--abandon", "--reason"],
+    ),
+    ("close", &["--session", "--abandon", "--reason"]),
     (
         "cleanup",
         &[

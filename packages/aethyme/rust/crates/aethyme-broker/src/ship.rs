@@ -87,7 +87,10 @@ impl RepositoryDeliveryModeSource {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 struct RepositoryDeliveryConfigTable {
-    default: String,
+    #[serde(default)]
+    default: Option<String>,
+    #[serde(default)]
+    push_session_branches: bool,
 }
 
 /// Typed `[delivery]` configuration. The parser is deliberately strict even
@@ -97,7 +100,14 @@ struct RepositoryDeliveryConfigTable {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct RepositoryDeliveryConfig {
     pub schema_version: u32,
-    pub default: RepositoryDeliveryMode,
+    /// Route for delivering a promoted prefix. `None` when the table only
+    /// configures session-branch pushes; ship then behaves as if no delivery
+    /// route were configured.
+    pub default: Option<RepositoryDeliveryMode>,
+    /// Durable, repository-level authorization for `broker push`: a session
+    /// may publish its own `agent/*` branch, and nothing else, without a
+    /// per-command `--reason`. Absent means false.
+    pub push_session_branches: bool,
 }
 
 impl RepositoryDeliveryConfig {
@@ -114,7 +124,12 @@ impl RepositoryDeliveryConfig {
             .map_err(|error| format!("[delivery] policy is invalid: {error}"))?;
         Ok(Some(Self {
             schema_version: REPOSITORY_DELIVERY_POLICY_SCHEMA_VERSION,
-            default: RepositoryDeliveryMode::parse(&table.default)?,
+            default: table
+                .default
+                .as_deref()
+                .map(RepositoryDeliveryMode::parse)
+                .transpose()?,
+            push_session_branches: table.push_session_branches,
         }))
     }
 
@@ -1312,7 +1327,7 @@ fn repository_delivery_selection(
 
     if configured
         .as_ref()
-        .is_some_and(|config| config.default == RepositoryDeliveryMode::PullRequest)
+        .is_some_and(|config| config.default == Some(RepositoryDeliveryMode::PullRequest))
         && delivery_override == Some(RepositoryDeliveryMode::LocalMainMerge)
     {
         return Err(BrokerOpError::ShipDeliveryOverrideUnsafe {
@@ -1328,7 +1343,7 @@ fn repository_delivery_selection(
             format!("explicit --delivery {} override", mode.as_str()),
             false,
         ),
-        None => match configured.as_ref().map(|config| config.default) {
+        None => match configured.as_ref().and_then(|config| config.default) {
             Some(mode) => (
                 mode,
                 RepositoryDeliveryModeSource::TrustedConfig,
@@ -1356,7 +1371,7 @@ fn repository_delivery_selection(
     Ok(RepositoryDeliverySelection {
         mode,
         source,
-        configured_mode: configured.map(|config| config.default),
+        configured_mode: configured.and_then(|config| config.default),
         recommended_mode,
         divergence_reasons,
         trusted_config_ref,
@@ -3149,7 +3164,8 @@ mod tests {
             RepositoryDeliveryConfig::from_config_text("[delivery]\ndefault = \"pull_request\"\n")
                 .unwrap()
                 .expect("delivery policy");
-        assert_eq!(config.default, RepositoryDeliveryMode::PullRequest);
+        assert_eq!(config.default, Some(RepositoryDeliveryMode::PullRequest));
+        assert!(!config.push_session_branches);
         assert_eq!(
             config.schema_version,
             REPOSITORY_DELIVERY_POLICY_SCHEMA_VERSION
@@ -3161,6 +3177,25 @@ mod tests {
         assert!(
             RepositoryDeliveryConfig::from_config_text(
                 "[delivery]\ndefault = \"pull_request\"\nallow_force = true\n"
+            )
+            .is_err()
+        );
+    }
+
+    /// A repository can authorize session-branch pushes without choosing a
+    /// ship route, and doing so must not select one.
+    #[test]
+    fn delivery_config_accepts_push_session_branches_without_a_route() {
+        let config = RepositoryDeliveryConfig::from_config_text(
+            "[delivery]\npush_session_branches = true\n",
+        )
+        .unwrap()
+        .expect("delivery policy");
+        assert!(config.push_session_branches);
+        assert_eq!(config.default, None);
+        assert!(
+            RepositoryDeliveryConfig::from_config_text(
+                "[delivery]\npush_session_branches = \"yes\"\n"
             )
             .is_err()
         );

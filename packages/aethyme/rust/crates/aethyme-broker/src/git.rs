@@ -858,6 +858,15 @@ pub struct MergeSimulation {
     pub conflicts: Vec<String>,
 }
 
+/// One commit from a `git log` walk.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct LoggedCommit {
+    pub sha: String,
+    /// Committer time, Unix epoch milliseconds.
+    pub committed_at_ms: i64,
+    pub subject: String,
+}
+
 /// Default branch advertised by a configured Git remote.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteDefaultBranch {
@@ -1389,6 +1398,22 @@ impl GitRepo {
         .lines()
         .map(str::to_string)
         .collect())
+    }
+
+    /// Earliest committer time among `commits`, Unix epoch milliseconds, in
+    /// one Git process however many commits are named.
+    pub fn oldest_commit_time_ms(&self, commits: &[&str]) -> Option<i64> {
+        if commits.is_empty() {
+            return None;
+        }
+        let mut args = vec!["log", "--no-walk=unsorted", "--format=%ct"];
+        args.extend_from_slice(commits);
+        run_git(&self.root, &args)
+            .ok()?
+            .lines()
+            .filter_map(|seconds| seconds.trim().parse::<i64>().ok())
+            .min()
+            .map(|seconds| seconds * 1000)
     }
 
     /// First-parent commits reachable from `head` but not `excluded`,
@@ -2281,6 +2306,49 @@ impl GitRepo {
             &["rev-list", "--count", &format!("{base}..HEAD")],
         )?;
         Ok(count.parse().unwrap_or(0))
+    }
+
+    /// Commits reachable from `head` that no remote-tracking ref holds, newest
+    /// first. Read-only and as fresh as the last fetch or push: it answers
+    /// "what exists only on this machine", not "what the remote has now".
+    pub fn commits_not_on_remotes(&self, head: &str) -> Result<Vec<LoggedCommit>, GitError> {
+        self.logged_commits(&[head, "--not", "--remotes"])
+    }
+
+    /// [`GitRepo::commits_not_on_remotes`] without merges and without any
+    /// commit `excluded` reaches: the commits a session made itself rather
+    /// than inherited from its base.
+    pub fn own_commits_not_on_remotes(
+        &self,
+        head: &str,
+        excluded: &[&str],
+    ) -> Result<Vec<LoggedCommit>, GitError> {
+        let mut range = vec!["--no-merges", head, "--not", "--remotes"];
+        range.extend_from_slice(excluded);
+        self.logged_commits(&range)
+    }
+
+    /// Commits reachable from `head` but not from `base`, newest first.
+    pub fn commits_between(&self, base: &str, head: &str) -> Result<Vec<LoggedCommit>, GitError> {
+        self.logged_commits(&[&format!("{base}..{head}")])
+    }
+
+    fn logged_commits(&self, range: &[&str]) -> Result<Vec<LoggedCommit>, GitError> {
+        let mut args = vec!["log", "--format=%H%x1f%ct%x1f%s"];
+        args.extend_from_slice(range);
+        Ok(run_git(&self.root, &args)?
+            .lines()
+            .filter_map(|line| {
+                let mut fields = line.splitn(3, '\u{1f}');
+                let sha = fields.next()?.to_string();
+                let seconds = fields.next()?.parse::<i64>().ok()?;
+                Some(LoggedCommit {
+                    sha,
+                    committed_at_ms: seconds.saturating_mul(1000),
+                    subject: fields.next().unwrap_or_default().to_string(),
+                })
+            })
+            .collect())
     }
 
     /// Commits reachable from `to` but not from `from`. Used by status

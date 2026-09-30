@@ -47,6 +47,20 @@ pub(crate) const WORKTREE_ROOT_MARKER: &str = ".aethyme-worktree-root.json";
 
 #[derive(Debug, thiserror::Error)]
 pub enum BrokerOpError {
+    /// The repository opted into the push lane and the session holds commits
+    /// no remote has, so closing it would leave the only copy in a worktree
+    /// the broker is about to stop tracking.
+    #[error(
+        "session {session_id} has {unpushed_commits} commit(s) on no remote ({branch} at {head}); \
+         push them with `aethyme broker push --session {session_id}`, or close anyway with \
+         `--abandon --reason \"<why>\"`"
+    )]
+    UnpushedSessionWork {
+        session_id: i64,
+        branch: String,
+        head: String,
+        unpushed_commits: u32,
+    },
     #[error("main reconciliation is unavailable: {reason}")]
     MainReconcileUnavailable { reason: String },
     /// Representation asks a different question from reconciliation -- whether
@@ -350,6 +364,23 @@ pub enum BrokerOpError {
         "session {session_id} is closed and cannot authorize coordinated operations; start a new session with `aethyme broker start --task <text> --short-name <name>` or adopt an active worktree with `aethyme broker start --adopt --task <text> --short-name <name>`"
     )]
     ClosedSessionOperation { session_id: i64 },
+    /// `broker push` declined before anything was sent: the repository has
+    /// not authorized session-branch pushes, the branch is not a session
+    /// branch, or the remote holds work this session never pushed.
+    #[error("broker push refused: {reason}")]
+    SessionPushRefused { reason: String },
+    #[error(
+        "broker push {phase} failed (operation {operation_id}, {status}){}",
+        if stderr.is_empty() { String::new() } else { format!(": {stderr}") }
+    )]
+    SessionPushFailed {
+        phase: &'static str,
+        operation_id: i64,
+        status: &'static str,
+        stderr: String,
+    },
+    #[error("session {session_id}'s branch {branch} does not exist in this repository")]
+    SessionBranchMissing { session_id: i64, branch: String },
     #[error("{recovery}")]
     CoordinatedOperationBlocked {
         repository: String,
@@ -855,6 +886,10 @@ pub struct DoctorReport {
     /// Present when live sessions can still submit and move integration.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub integration_movement: Option<IntegrationMovementNotice>,
+    /// Committed work only this machine holds. Reported, never counted
+    /// against [`Self::healthy`]: an unpushed commit is not a broken broker.
+    #[serde(skip_serializing_if = "crate::UnpushedWorkReport::is_empty")]
+    pub unpushed_work: crate::UnpushedWorkReport,
 }
 
 impl DoctorReport {
@@ -1215,6 +1250,10 @@ pub struct StatusView {
     /// is never mistaken for a complete answer.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blocker_sources_unavailable: Vec<crate::BlockerSourceError>,
+    /// Committed work only this machine holds: live sessions' unpushed
+    /// commits and integration commits upstream lacks. Omitted when empty.
+    #[serde(skip_serializing_if = "crate::UnpushedWorkReport::is_empty")]
+    pub unpushed_work: crate::UnpushedWorkReport,
 }
 
 /// How many refused reviews `broker status` carries.
@@ -1953,6 +1992,11 @@ pub struct FinishReport {
     pub leases_held: Vec<FinishLease>,
     pub last_gate: Option<FinishGateRun>,
     pub last_graph_integrity: Option<FinishGraphIntegrity>,
+    /// Commits on HEAD that no remote holds. Present only when the repository
+    /// opted into the push lane (`[delivery] push_session_branches`) and
+    /// finish reached that check.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unpushed_commits: Option<u32>,
     pub cleanup_safe: bool,
     pub cleanup: FinishCleanupReport,
     pub recommended_next_action: Option<String>,
@@ -3042,6 +3086,73 @@ impl Broker {
     /// Close broker state without removing the worktree. Policy-eligible,
     /// ignored build artifacts may be reclaimed while the checkout is retained.
     pub fn close(&mut self, session_id: i64) -> Result<(), BrokerOpError> {
+        let session = self.store.session(session_id)?;
+        if let Some((head, unpushed_commits)) = self.unpushed_close_check(&session) {
+            return Err(BrokerOpError::UnpushedSessionWork {
+                session_id,
+                branch: session.branch,
+                head,
+                unpushed_commits,
+            });
+        }
+        self.close_unchecked(session_id)
+    }
+
+    /// [`Broker::close`] for a session whose unpushed commits the caller has
+    /// decided to leave behind. The decision and its reason are recorded, so
+    /// the work is abandoned on the record rather than silently.
+    pub fn close_abandoning_unpushed(
+        &mut self,
+        session_id: i64,
+        reason: &str,
+    ) -> Result<(), BrokerOpError> {
+        let session = self.store.session(session_id)?;
+        if let Some((head, unpushed_commits)) = self.unpushed_close_check(&session) {
+            self.record_abandoned_unpushed(&session, &head, unpushed_commits, reason)?;
+        }
+        self.close_unchecked(session_id)
+    }
+
+    /// Commits only this session's worktree holds, when the repository opted
+    /// into the push lane and has a remote to push to; `None` otherwise.
+    fn unpushed_close_check(&self, session: &Session) -> Option<(String, u32)> {
+        if !crate::session_push::session_push_enabled(&self.repo)
+            || self.repo.remotes().unwrap_or_default().is_empty()
+        {
+            return None;
+        }
+        let upstream = self
+            .publication_baseline()
+            .ok()
+            .map(|(reference, _)| reference)
+            .filter(|reference| reference.starts_with("refs/remotes/"));
+        let (head, work) = self.session_off_remote_work(session, upstream.as_deref())?;
+        (work.commits > 0).then_some((head, work.commits))
+    }
+
+    fn record_abandoned_unpushed(
+        &mut self,
+        session: &Session,
+        head: &str,
+        unpushed_commits: u32,
+        reason: &str,
+    ) -> Result<(), BrokerOpError> {
+        let payload = crate::events::session_abandoned_unpushed_payload(
+            session.id,
+            &session.branch,
+            head,
+            unpushed_commits,
+            reason,
+        );
+        self.store.append_event(
+            crate::events::BROKER_SESSION_ABANDONED_UNPUSHED,
+            Some(session.id),
+            Some(&payload),
+        )?;
+        Ok(())
+    }
+
+    fn close_unchecked(&mut self, session_id: i64) -> Result<(), BrokerOpError> {
         self.store
             .set_session_status(session_id, SessionStatus::Closed, None)?;
         // Closing must not fail because a best-effort artifact sweep did;
@@ -6411,6 +6522,10 @@ impl Broker {
         if let Some(unblock) = crate::blockers::status_advice(&blocker_report.blockers) {
             advice.push(unblock);
         }
+        // A status that cannot read refs still reports everything else; the
+        // unpushed count is context, not a precondition for any command.
+        let unpushed_work = self.unpushed_work(now_ms).unwrap_or_default();
+        advice.extend(unpushed_work_advice(&unpushed_work, now_ms));
 
         Ok(StatusView {
             publication_baseline_ref: baseline_ref,
@@ -6444,6 +6559,7 @@ impl Broker {
             review_refusals,
             blockers: blocker_report.blockers,
             blocker_sources_unavailable: blocker_report.unavailable,
+            unpushed_work,
         })
     }
 
@@ -6726,6 +6842,120 @@ impl Broker {
         Ok(("HEAD".to_string(), self.repo.head_commit()?))
     }
 
+    /// Unpushed work across live sessions and the integration branch.
+    ///
+    /// Empty when the repository has no remote: there is nowhere to push to,
+    /// so every commit would count and the number would mean nothing.
+    pub fn unpushed_work(&self, now_ms: i64) -> Result<crate::UnpushedWorkReport, BrokerOpError> {
+        let push_session_branches = crate::session_push::session_push_enabled(&self.repo);
+        let mut report = crate::UnpushedWorkReport {
+            push_session_branches,
+            ..Default::default()
+        };
+        if self.repo.remotes().unwrap_or_default().is_empty() {
+            return Ok(report);
+        }
+        let (baseline_ref, _) = self.publication_baseline()?;
+        let upstream = baseline_ref
+            .starts_with("refs/remotes/")
+            .then_some(baseline_ref.as_str());
+        for session in self.store.live_sessions()? {
+            let Some((head, work)) = self.session_off_remote_work(&session, upstream) else {
+                continue;
+            };
+            if work.commits == 0 {
+                continue;
+            }
+            let age = now_ms.saturating_sub(work.oldest_at_ms.unwrap_or(now_ms));
+            report.sessions.push(crate::UnpushedSessionWork {
+                session_id: session.id,
+                branch: session.branch.clone(),
+                head,
+                unpushed_commits: work.commits,
+                oldest_unpushed_at_ms: work.oldest_at_ms,
+                severity: crate::unpushed::session_severity(age, push_session_branches),
+                command: format!("aethyme broker push --session {}", session.id),
+            });
+        }
+        if let (Some(upstream), Ok((branch, head))) = (upstream, self.integration_head_snapshot()) {
+            let unpublished = self
+                .repo
+                .cherry_marked(upstream, &head, crate::CherrySide::Right);
+            let off_remote =
+                crate::unpushed::off_remote_work(&self.repo, &head, &[], Some(upstream));
+            if let (Ok(unpublished), Ok(off_remote)) = (unpublished, off_remote) {
+                let pending = unpublished
+                    .iter()
+                    .filter(|(_, equivalent)| !equivalent)
+                    .map(|(commit, _)| commit.as_str())
+                    .collect::<Vec<_>>();
+                if !pending.is_empty() {
+                    let oldest = self.repo.oldest_commit_time_ms(&pending);
+                    let age = now_ms.saturating_sub(oldest.unwrap_or(now_ms));
+                    report.integration = Some(crate::UnpublishedIntegrationWork {
+                        branch,
+                        head,
+                        upstream_ref: upstream.to_string(),
+                        unpublished_commits: u32::try_from(pending.len()).unwrap_or(u32::MAX),
+                        on_no_remote: off_remote.commits,
+                        oldest_unpublished_at_ms: oldest,
+                        severity: crate::unpushed::integration_severity(age),
+                    });
+                }
+            }
+        }
+        Ok(report)
+    }
+
+    /// The session's head and the commits it made that no remote holds.
+    ///
+    /// "Made" is measured from the session's own bases, not from integration.
+    /// A session inherits whatever its base carried, and counting another
+    /// session's unpublished promotions against every session built on top
+    /// of them is how one five-week backlog read as dozens of stranded
+    /// worktrees; integration reports that backlog itself. Excluding
+    /// integration's tip would do the same today, because promotion replays
+    /// a session's commits under new SHAs -- but only for as long as it
+    /// does: once integration reaches the session's head any other way (a
+    /// fast-forward, a hand merge), the session's own unpushed commits would
+    /// vanish from the count. The session's bases do not depend on how
+    /// integration moves: the immutable start base and, after a
+    /// `start --reuse`, the reuse base -- `diff_base`, unless acceptance has
+    /// since overwritten it with this session's own head.
+    fn session_off_remote_work(
+        &self,
+        session: &Session,
+        upstream: Option<&str>,
+    ) -> Option<(String, crate::unpushed::OffRemoteWork)> {
+        let worktree = Path::new(&session.worktree_path);
+        if !worktree.exists() {
+            return None;
+        }
+        let checkout = GitRepo::discover(worktree).ok()?;
+        let head = checkout.head_commit().ok()?;
+        let mut excluded = Vec::new();
+        if let Some(base) = session.adoption_base.as_deref() {
+            excluded.push(base.to_string());
+        }
+        if let Some(base) = session.diff_base.as_deref()
+            && session.accepted_session_head.as_deref() != Some(base)
+        {
+            excluded.push(base.to_string());
+        }
+        if excluded.is_empty()
+            && let Ok((_, integration)) = self.integration_head_snapshot()
+        {
+            excluded.push(integration);
+        }
+        let excluded = excluded
+            .iter()
+            .map(String::as_str)
+            .filter(|base| *base != "HEAD" && checkout.resolve_ref(base).is_some())
+            .collect::<Vec<_>>();
+        let work = crate::unpushed::off_remote_work(&checkout, &head, &excluded, upstream).ok()?;
+        Some((head, work))
+    }
+
     pub(crate) fn default_branch_tip(&self) -> Result<(String, String, String), BrokerOpError> {
         let repo = self.repo_handle();
         let head_ref = repo.symbolic_ref("refs/remotes/origin/HEAD").ok_or_else(|| {
@@ -6992,6 +7222,7 @@ impl Broker {
         let version_repair = fix_version.then(|| self.repair_local_cli_version(&version));
         let integration_movement =
             self.integration_movement_notice_from_sessions(&live_sessions)?;
+        let unpushed_work = self.unpushed_work(now_ms()).unwrap_or_default();
 
         Ok(DoctorReport {
             integrity,
@@ -7002,6 +7233,7 @@ impl Broker {
             purged_stale_leases,
             retention,
             integration_movement,
+            unpushed_work,
         })
     }
 
@@ -7587,7 +7819,28 @@ impl Broker {
         session_id: i64,
         options: FinishOptions,
     ) -> Result<FinishReport, BrokerOpError> {
-        let mut report = self.finish_with_options_inner(session_id, options)?;
+        self.finish_with_abandon(session_id, options, None)
+    }
+
+    /// [`Broker::finish_with_options`] that closes even when the session
+    /// holds commits no remote has, recording that they were abandoned and
+    /// why. Every other finish check still applies.
+    pub fn finish_abandoning_unpushed(
+        &mut self,
+        session_id: i64,
+        options: FinishOptions,
+        reason: &str,
+    ) -> Result<FinishReport, BrokerOpError> {
+        self.finish_with_abandon(session_id, options, Some(reason))
+    }
+
+    fn finish_with_abandon(
+        &mut self,
+        session_id: i64,
+        options: FinishOptions,
+        abandon_reason: Option<&str>,
+    ) -> Result<FinishReport, BrokerOpError> {
+        let mut report = self.finish_with_options_inner(session_id, options, abandon_reason)?;
         // The snapshot is taken while the session is still open, because a
         // blocked finish needs it to explain what is held. Cleanup is what
         // actually removes the leases, so only a completed cleanup makes the
@@ -7640,6 +7893,7 @@ impl Broker {
         &mut self,
         session_id: i64,
         options: FinishOptions,
+        abandon_reason: Option<&str>,
     ) -> Result<FinishReport, BrokerOpError> {
         let session = self.store.session(session_id)?;
         let worktree_path = PathBuf::from(&session.worktree_path);
@@ -7673,6 +7927,7 @@ impl Broker {
             leases_held: self.finish_leases(session_id, at_ms)?,
             last_gate: self.finish_last_gate(session_id)?,
             last_graph_integrity: self.finish_last_graph_integrity(session_id)?,
+            unpushed_commits: None,
             cleanup_safe: false,
             cleanup: FinishCleanupReport::default(),
             recommended_next_action: None,
@@ -7821,6 +8076,11 @@ impl Broker {
             report
                 .next_commands
                 .push(format!("git -C {} commit", session.worktree_path));
+            if crate::session_push::session_push_enabled(&self.repo) {
+                report
+                    .next_commands
+                    .push(format!("aethyme broker push --session {session_id}"));
+            }
             self.finalize_finish_report(&mut report);
             return Ok(report);
         }
@@ -7945,6 +8205,40 @@ impl Broker {
             ));
             self.finalize_finish_report(&mut report);
             return Ok(report);
+        }
+
+        // Under the push lane a session is not done while its commits exist
+        // only here: closing it is what turned 94 worktrees into the sole
+        // copies of their work (see `unpushed`). Abandoning stays possible,
+        // but only on the record.
+        if let Some((unpushed_head, unpushed)) = self.unpushed_close_check(&session) {
+            report.unpushed_commits = Some(unpushed);
+            match abandon_reason {
+                None => {
+                    report.warnings.push(format!(
+                        "HEAD has {unpushed} {} on no remote; push the session branch before \
+                         finish, or abandon them explicitly with a reason",
+                        plural_word(unpushed as usize, "commit", "commits")
+                    ));
+                    report
+                        .next_commands
+                        .push(format!("aethyme broker push --session {session_id}"));
+                    report.next_commands.push(format!(
+                        "aethyme broker finish --session {session_id} --abandon --reason \"<why>\""
+                    ));
+                    self.finalize_finish_report(&mut report);
+                    return Ok(report);
+                }
+                Some(reason) => {
+                    self.record_abandoned_unpushed(&session, &unpushed_head, unpushed, reason)?;
+                    report.warnings.push(format!(
+                        "closed with {unpushed} unpushed {} abandoned: {reason}",
+                        plural_word(unpushed as usize, "commit", "commits")
+                    ));
+                }
+            }
+        } else if crate::session_push::session_push_enabled(&self.repo) {
+            report.unpushed_commits = Some(0);
         }
 
         report.status = FinishStatus::Closed;
@@ -9873,6 +10167,86 @@ fn integration_live_sessions(sessions: Vec<Session>) -> Vec<IntegrationLiveSessi
         .collect()
 }
 
+/// One advice row per session holding unpushed commits, plus one for an
+/// integration branch running ahead of upstream.
+fn unpushed_work_advice(report: &crate::UnpushedWorkReport, now_ms: i64) -> Vec<StatusAdvice> {
+    let age = |at: Option<i64>| {
+        crate::unpushed::describe_age(now_ms.saturating_sub(at.unwrap_or(now_ms)))
+    };
+    let mut advice = report
+        .sessions
+        .iter()
+        .map(|work| {
+            let mut commands = vec![work.command.clone()];
+            if !report.push_session_branches {
+                // Without the repository opt-in the push command refuses, so
+                // naming only it would be a dead end.
+                commands.push(
+                    "opt in: commit `push_session_branches = true` under [delivery] in \
+                     .aethyme/config.toml on the default branch"
+                        .into(),
+                );
+            }
+            StatusAdvice {
+                id: "session.unpushed-commits",
+                severity: work.severity,
+                reason: "committed session work exists only in this worktree",
+                summary: format!(
+                    "session {} has {} {} on no remote; the oldest is {} old. Push the session \
+                     branch so the work survives this worktree and this disk",
+                    work.session_id,
+                    work.unpushed_commits,
+                    plural_word(work.unpushed_commits as usize, "commit", "commits"),
+                    age(work.oldest_unpushed_at_ms),
+                ),
+                session_id: Some(work.session_id),
+                queue_entry_id: None,
+                evidence: vec![
+                    format!("branch {}", work.branch),
+                    format!("head {}", short_commit(&work.head)),
+                ],
+                commands,
+            }
+        })
+        .collect::<Vec<_>>();
+    if let Some(integration) = &report.integration {
+        advice.push(StatusAdvice {
+            id: "integration.unpublished-work",
+            severity: integration.severity,
+            reason: "integration holds promoted work upstream lacks",
+            summary: format!(
+                "{} carries {} {} {} lacks ({} on no remote at all); the oldest is {} old. Ship \
+                 it, or, if this repository delivers through pull requests, set \
+                 [promote] mode = \"verify-only\" so submit stops accumulating work here",
+                integration.branch,
+                integration.unpublished_commits,
+                plural_word(
+                    integration.unpublished_commits as usize,
+                    "commit",
+                    "commits"
+                ),
+                integration.upstream_ref,
+                integration.on_no_remote,
+                age(integration.oldest_unpublished_at_ms),
+            ),
+            session_id: None,
+            queue_entry_id: None,
+            evidence: vec![
+                format!("{} {}", integration.branch, short_commit(&integration.head)),
+                format!("upstream {}", integration.upstream_ref),
+            ],
+            commands: vec![
+                format!(
+                    "git log --oneline --cherry-pick --right-only {}...{}",
+                    integration.upstream_ref, integration.branch
+                ),
+                "aethyme broker advanced ship plan --entry <promoted-entry-id>".into(),
+            ],
+        });
+    }
+    advice
+}
+
 fn dirty_worktree_advice(agent: &AgentView, dirty: &[String]) -> StatusAdvice {
     let summary = format!(
         "session {} has {} uncommitted change(s); commit through the managed pre-commit lane before submit because only committed work integrates",
@@ -10781,6 +11155,7 @@ mod tests {
                 blockers: 0,
             },
             integration_movement: None,
+            unpushed_work: Default::default(),
         }
     }
 
