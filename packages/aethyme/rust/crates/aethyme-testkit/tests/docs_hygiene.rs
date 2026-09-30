@@ -160,6 +160,69 @@ fn internal_links_valid() {
     );
 }
 
+/// The same link contract, applied above `packages/aethyme`.
+///
+/// `internal_links_valid` covers `packages/aethyme/docs` only, which is why a
+/// root `README.md`, `AGENTS.md`, `CLAUDE.md`, `CONTRIBUTING.md` and the
+/// top-level `docs/*.md` could carry a link to a path that no longer exists
+/// without any check noticing. `docs/broker-packets.md` in particular shows a
+/// gate failure packet naming `pytest-local`, a gate removed in the
+/// python-retirement, as its worked example.
+///
+/// Scoped to a fixed list rather than every `*.md` in the repository, because
+/// the point is the hand-maintained entry points a reader is sent to first.
+/// `.claude/` and `.codex/` are generated and carry their own contract.
+#[test]
+fn internal_links_valid_at_the_repository_root() {
+    let root = aethyme_testkit::repo_root();
+    let mut broken = Vec::new();
+    let mut checked = 0usize;
+    for name in [
+        "README.md",
+        "AGENTS.md",
+        "CLAUDE.md",
+        "CONTRIBUTING.md",
+        "GOVERNANCE.md",
+        "SECURITY.md",
+        "UPGRADING.md",
+        "docs/broker-packets.md",
+        "docs/dogfood.md",
+        "docs/events-contract.md",
+        "docs/json-contracts.md",
+        "docs/product-surface.md",
+        "docs/aethyme-local-agent-broker.md",
+    ] {
+        let path = root.join(name);
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        checked += 1;
+        for (link, line) in extract_links(&text) {
+            if is_external(&link) || is_anchor(&link) {
+                continue;
+            }
+            // Strip any `#anchor` or `:line` suffix before resolving, so
+            // `docs/foo.md#section` and `file.rs:12` both resolve to the file.
+            let target = link.split(['#', ':']).next().unwrap_or(&link);
+            if target.is_empty() {
+                continue;
+            }
+            // Relative to the file holding the link, matching how Markdown
+            // resolves it and how `internal_links_valid` above does it.
+            let parent = path.parent().expect("documentation file has a parent");
+            if !parent.join(target).exists() {
+                broken.push(format!("  {name}:{line} -> {link}"));
+            }
+        }
+    }
+    assert!(checked > 0, "found no root documentation to check");
+    assert!(
+        broken.is_empty(),
+        "Found broken internal links outside packages/aethyme/docs:\n{}",
+        broken.join("\n")
+    );
+}
+
 #[test]
 fn no_absolute_github_links() {
     let mut absolute = Vec::new();
