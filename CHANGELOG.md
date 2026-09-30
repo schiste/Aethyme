@@ -4,9 +4,11 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
-## [0.8.10] - 2026-09-30
+## [0.8.11] - 2026-09-30
 
 Push-early delivery, safer worktree cleanup, and quieter multi-agent coordination.
+
+v0.8.10 was tagged but never published: its release stopped at the gate check before building. Everything listed here ships for the first time in v0.8.11.
 
 ### Added
 
@@ -32,6 +34,7 @@ Push-early delivery, safer worktree cleanup, and quieter multi-agent coordinatio
 
 ### Fixed
 
+- `broker start` no longer cuts sessions from an integration branch that has fallen behind the fetched default branch, and never from integration under `[promote] mode = "verify-only"`; it warns and reports the reconcile command instead. `[promote]` is read from the configuration committed on the default branch, like the push setting (#450).
 - `AETHYME_TRUST_NONINTERACTIVE_FOR_TESTS` can no longer record gate trust for a real checkout (#435).
 - Concurrent gate workers always receive distinct broker database directories (#438, fixes #430).
 - Release-manifest tests that were compiled but never run now run (#435).
