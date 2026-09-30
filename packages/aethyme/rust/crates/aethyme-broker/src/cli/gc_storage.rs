@@ -70,6 +70,25 @@ pub(super) fn render_storage_plan(plan: &crate::StoragePlan, detail: bool) {
             }
         }
     }
+    for group in &plan.recovery_archives {
+        out!(
+            "  recovery archives: {} ({} archive(s), {} by the broker, {}{}; `aethyme broker gc plan` in the owning repository proposes expired broker archives)",
+            group.path.display(),
+            group.archive_count,
+            group.broker_archive_count,
+            group
+                .estimated_bytes
+                .map(human_bytes)
+                .unwrap_or_else(|| "unknown bytes".into()),
+            group
+                .oldest_created_at_ms
+                .map(|oldest| format!(
+                    ", oldest {} days",
+                    plan.evaluated_at.saturating_sub(oldest) / 86_400_000
+                ))
+                .unwrap_or_default(),
+        );
+    }
     for checkout in &plan.primary_checkouts {
         out!(
             "  primary checkout: {} ({}, {} artifact(s))",
@@ -385,6 +404,35 @@ pub(super) fn render_gc_plan(plan: &crate::GcPlan, detail: bool) {
             orphan.repository_root
         );
     });
+    render_capped(&plan.recovery_archives, GC_LIST_CAP, detail, |archive| {
+        out!(
+            "  recovery archive: {} (session {}, {} days old, {}) — {}",
+            archive.path,
+            archive.session_id,
+            plan.evaluated_at.saturating_sub(archive.created_at_ms) / 86_400_000,
+            human_bytes(archive.estimated_bytes),
+            archive.reason,
+        );
+    });
+    if let Some(inventory) = &plan.recovery_archive_inventory {
+        out!(
+            "  recovery archives: {} in {} ({}), {} proposed{}",
+            inventory.count,
+            inventory.root,
+            human_bytes(inventory.estimated_bytes),
+            plan.recovery_archives.len(),
+            inventory
+                .oldest_created_at_ms
+                .map(|oldest| format!(
+                    ", oldest {} days",
+                    plan.evaluated_at.saturating_sub(oldest) / 86_400_000
+                ))
+                .unwrap_or_default(),
+        );
+        render_capped(&inventory.unowned, GC_LIST_CAP, detail, |unowned| {
+            out!("    kept, not the broker's to remove: {unowned}");
+        });
+    }
     render_capped(&plan.checkpoint_pin_releases, GC_LIST_CAP, detail, |pin| {
         out!(
             "  checkpoint pin: session {} queue {} ({}; releasing broker metadata does not remove committed work)",
@@ -469,6 +517,7 @@ pub(super) fn render_gc_plan(plan: &crate::GcPlan, detail: bool) {
         && plan.gate_caches.is_empty()
         && plan.checkpoint_pin_releases.is_empty()
         && plan.publication_exposure_expiries.is_empty()
+        && plan.recovery_archives.is_empty()
     {
         out!("  apply: nothing eligible");
     } else {
@@ -506,6 +555,9 @@ pub(super) fn render_gc_apply(report: &crate::GcApplyReport) {
         report.publication_exposures_expired.len(),
         human_bytes(report.reclaimed_bytes),
     );
+    for archive in &report.recovery_archives_removed {
+        out!("  recovery archive removed: {archive}");
+    }
     for failure in &report.failures {
         out!("  retained: {failure}");
     }

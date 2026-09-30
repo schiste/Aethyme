@@ -33,6 +33,7 @@ const RETENTION_POLICY_FIELDS: &[&str] = &[
     "startup_budget_ms",
     "routine_size_budget_ms",
     "size_record_ttl_hours",
+    "recovery_archive_days",
     "gate_cache_bytes_budget",
 ];
 
@@ -140,6 +141,15 @@ pub struct RetentionPolicy {
     /// How long a recorded directory size is treated as current. Past this, a
     /// routine check prefers to spend its measurement budget refreshing it.
     pub size_record_ttl_hours: u32,
+    /// Days a recovery archive written by `finish cleanup resolve --archive`
+    /// is kept before `gc plan` proposes it. `0` keeps every archive.
+    ///
+    /// Archives hold work that exists nowhere else by construction, so this
+    /// only ever makes one a *reviewed* candidate: nothing removes an archive
+    /// without an operator confirming the plan that names it. An archive
+    /// whose commits have since landed and that holds no uncommitted changes
+    /// is proposed before this age, because nothing in it is unique any more.
+    pub recovery_archive_days: u32,
     /// Bytes of *older* gate cache entries `gc plan` leaves in place (#295).
     /// The most recently used entry of each kind and every entry a running
     /// gate holds are kept outside this budget. Older idle entries are kept
@@ -171,6 +181,7 @@ impl Default for RetentionPolicy {
             startup_budget_ms: 25,
             routine_size_budget_ms: 200,
             size_record_ttl_hours: 24,
+            recovery_archive_days: 30,
             // Half the free space a gate demands before it starts. One warm
             // cargo target for this workspace is 2-8 GiB, so the budget keeps
             // a typical cache warm while an overgrown one -- the 7.7 GiB entry
@@ -227,6 +238,13 @@ impl RetentionPolicy {
                     constraint: "must be between 0 (no grace period) and 36500 days",
                 });
             }
+        }
+        if self.recovery_archive_days > 36_500 {
+            return Err(RetentionConfigError::InvalidValue {
+                field: "recovery_archive_days",
+                value: self.recovery_archive_days.to_string(),
+                constraint: "must be between 0 (keep every archive) and 36500 days",
+            });
         }
         // 0 disables the lane. The ceiling is a year: a longer window is
         // indistinguishable from the unbounded hold this field exists to
@@ -639,6 +657,43 @@ pub struct GcOrphanCandidate {
     pub reason: String,
 }
 
+/// A recovery archive `finish cleanup resolve --archive` wrote for this
+/// repository, past `recovery_archive_days` or no longer holding anything
+/// unique. Only a reviewed `gc apply` removes one.
+///
+/// Every field is fixed when the archive is written, so a plan's digest does
+/// not drift with the calendar: the age an operator sees is derived from
+/// `created_at_ms` and the plan's evaluation time.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct GcRecoveryArchiveCandidate {
+    pub path: String,
+    pub session_id: i64,
+    pub head: String,
+    pub created_at_ms: i64,
+    /// Every commit reached a delivery target and the archive holds no
+    /// staged, unstaged or untracked changes: nothing in it exists only here.
+    pub landed: bool,
+    pub estimated_bytes: u64,
+    pub reason: String,
+}
+
+/// Every archive under this repository's recovery archive directory, whether
+/// or not a plan proposes it, so archives are never invisible. Reporting
+/// only; not part of the digest.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct RecoveryArchiveInventory {
+    pub root: String,
+    pub count: usize,
+    pub estimated_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oldest_created_at_ms: Option<i64>,
+    /// Archives the broker cannot vouch for -- no readable broker manifest,
+    /// another repository's, or a session this repository never recorded --
+    /// each with the reason. Reported, never proposed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unowned: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct GcBlocker {
     pub kind: String,
@@ -728,6 +783,9 @@ pub struct GcPlan {
     #[serde(default)]
     pub gate_caches: Vec<GcGateCacheCandidate>,
     pub blockers: Vec<GcBlocker>,
+    /// Recovery archives a reviewed `gc apply` may remove. Omitted when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recovery_archives: Vec<GcRecoveryArchiveCandidate>,
     /// Closed-session checkpoint pins that a reviewed `gc apply` may release.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub checkpoint_pin_releases: Vec<GcCheckpointPinRelease>,
@@ -814,6 +872,9 @@ pub struct GcPlan {
     /// proposes them. Reporting only; not part of the digest.
     #[serde(default)]
     pub closed_worktrees: ClosedWorktreeSummary,
+    /// This repository's recovery archives. `None` when it has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_archive_inventory: Option<RecoveryArchiveInventory>,
 }
 
 /// Closed sessions whose checkout is still on disk.
@@ -902,6 +963,9 @@ pub struct GcApplyReport {
     pub gate_caches_reclaimed: Vec<String>,
     pub checkpoint_pins_released: Vec<i64>,
     pub publication_exposures_expired: Vec<i64>,
+    /// Recovery archives removed, as paths.
+    #[serde(default)]
+    pub recovery_archives_removed: Vec<String>,
     pub reclaimed_bytes: u64,
     pub failures: Vec<String>,
     pub recovery_action: Option<String>,
@@ -976,6 +1040,9 @@ impl GcPlan {
             // caches were inventoried.
             #[serde(skip_serializing_if = "<[_]>::is_empty")]
             gate_caches: &'a [GcGateCacheCandidate],
+            // Omitted when empty for the same reason as gate caches.
+            #[serde(skip_serializing_if = "<[_]>::is_empty")]
+            recovery_archives: &'a [GcRecoveryArchiveCandidate],
             blockers: &'a [GcBlocker],
             checkpoint_pin_releases: &'a [GcCheckpointPinRelease],
             publication_exposure_expiries: &'a [GcPublicationExposureExpiry],
@@ -989,6 +1056,7 @@ impl GcPlan {
             artifacts: &self.artifacts,
             orphans: &self.orphans,
             gate_caches: &self.gate_caches,
+            recovery_archives: &self.recovery_archives,
             blockers: &self.blockers,
             checkpoint_pin_releases: &self.checkpoint_pin_releases,
             publication_exposure_expiries: &self.publication_exposure_expiries,

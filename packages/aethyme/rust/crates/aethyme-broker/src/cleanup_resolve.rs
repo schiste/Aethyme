@@ -41,7 +41,7 @@ const BUNDLE_FILE: &str = "commits.bundle";
 const STAGED_PATCH_FILE: &str = "staged.patch";
 const UNSTAGED_PATCH_FILE: &str = "unstaged.patch";
 const UNTRACKED_DIRECTORY: &str = "untracked";
-const MANIFEST_FILE: &str = "manifest.json";
+pub(crate) const MANIFEST_FILE: &str = "manifest.json";
 const README_FILE: &str = "README.md";
 
 /// One untracked path the archive preserves.
@@ -440,6 +440,182 @@ impl Broker {
             archive,
             worktree_removed,
             cleanup_error,
+        })
+    }
+}
+
+/// The parts of a stored `manifest.json` expiry needs, read owned. An
+/// archive whose manifest does not parse into this is reported, never
+/// proposed: the broker cannot say whose work it holds.
+#[derive(serde::Deserialize)]
+struct StoredManifest {
+    schema_version: u32,
+    created_at_ms: i64,
+    repository: String,
+    session_id: i64,
+    branch_ref: String,
+    head: String,
+    staged_patch: StoredPatch,
+    unstaged_patch: StoredPatch,
+    #[serde(default)]
+    untracked_files: Vec<serde_json::Value>,
+}
+
+#[derive(serde::Deserialize)]
+struct StoredPatch {
+    bytes: u64,
+}
+
+/// An archive the broker can vouch for: this repository wrote it, for a
+/// session this repository records.
+pub(crate) struct OwnedRecoveryArchive {
+    pub path: PathBuf,
+    pub session_id: i64,
+    pub head: String,
+    pub created_at_ms: i64,
+    /// Staged, unstaged or untracked changes -- work no commit carries, so no
+    /// delivery target can ever hold it.
+    pub holds_uncommitted: bool,
+}
+
+/// This repository's archive directory and what is in it.
+pub(crate) struct RecoveryArchiveScan {
+    pub root: PathBuf,
+    pub owned: Vec<OwnedRecoveryArchive>,
+    /// Everything else, with why the broker cannot vouch for it.
+    pub unowned: Vec<(PathBuf, String)>,
+}
+
+fn same_path(left: &Path, right: &Path) -> bool {
+    let canonical =
+        |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    canonical(left) == canonical(right)
+}
+
+impl Broker {
+    /// Prove `dir` is a complete recovery archive this repository's broker
+    /// wrote, or say why not. Used both to propose an archive and, again, to
+    /// remove one, so nothing is deleted on evidence checked only at review.
+    pub(crate) fn owned_recovery_archive(
+        &self,
+        dir: &Path,
+    ) -> Result<OwnedRecoveryArchive, String> {
+        let root = self
+            .recovery_archive_root()
+            .map_err(|error| format!("no recovery archive root: {error}"))?;
+        let metadata =
+            std::fs::symlink_metadata(dir).map_err(|error| format!("cannot read: {error}"))?;
+        if !metadata.is_dir() {
+            return Err("not a directory".into());
+        }
+        if dir
+            .extension()
+            .is_some_and(|extension| extension == "partial")
+        {
+            return Err("an archive that was never completed".into());
+        }
+        if !dir.parent().is_some_and(|parent| same_path(parent, &root)) {
+            return Err(format!("not directly under {}", root.display()));
+        }
+        let manifest_path = dir.join(MANIFEST_FILE);
+        let manifest_metadata = std::fs::symlink_metadata(&manifest_path)
+            .map_err(|_| "no broker manifest; made outside the broker".to_string())?;
+        if !manifest_metadata.is_file() {
+            return Err("manifest is not a regular file".into());
+        }
+        let bytes = std::fs::read(&manifest_path)
+            .map_err(|error| format!("cannot read manifest: {error}"))?;
+        let manifest: StoredManifest = serde_json::from_slice(&bytes)
+            .map_err(|error| format!("unreadable manifest: {error}"))?;
+        if manifest.schema_version != CLEANUP_RESOLVE_SCHEMA_VERSION {
+            return Err(format!(
+                "manifest schema {} is not {CLEANUP_RESOLVE_SCHEMA_VERSION}",
+                manifest.schema_version
+            ));
+        }
+        if !same_path(Path::new(&manifest.repository), self.main_root()) {
+            return Err(format!(
+                "manifest names another repository: {}",
+                manifest.repository
+            ));
+        }
+        let session = self
+            .store_ref()
+            .session(manifest.session_id)
+            .map_err(|_| format!("session {} is not recorded here", manifest.session_id))?;
+        let short = |branch: &str| branch.trim_start_matches("refs/heads/").to_owned();
+        if short(&session.branch) != short(&manifest.branch_ref) {
+            return Err(format!(
+                "session {} ran on {}, not {}",
+                manifest.session_id, session.branch, manifest.branch_ref
+            ));
+        }
+        Ok(OwnedRecoveryArchive {
+            path: dir.to_path_buf(),
+            session_id: manifest.session_id,
+            head: manifest.head,
+            created_at_ms: manifest.created_at_ms,
+            holds_uncommitted: manifest.staged_patch.bytes > 0
+                || manifest.unstaged_patch.bytes > 0
+                || !manifest.untracked_files.is_empty(),
+        })
+    }
+
+    /// Whether nothing in `archive` exists only in it: its head reached the
+    /// primary checkout or the upstream branch, and it holds no uncommitted
+    /// changes. A head whose objects are gone cannot be shown to have landed,
+    /// so it has not.
+    pub(crate) fn recovery_archive_landed(&self, archive: &OwnedRecoveryArchive) -> bool {
+        if archive.holds_uncommitted {
+            return false;
+        }
+        let repo = self.repo_handle();
+        let mut targets = Vec::new();
+        if let Ok(primary) = repo.head_commit() {
+            targets.push(primary);
+        }
+        if let Some((_upstream, head)) = repo.tracking_upstream() {
+            targets.push(head);
+        }
+        targets.iter().any(|target| {
+            matches!(
+                crate::work_landed(repo, &archive.head, target),
+                Ok(crate::LandingVerdict::Landed { .. })
+            )
+        })
+    }
+
+    /// Every archive under this repository's recovery archive directory,
+    /// split into the ones the broker can vouch for and the rest (with why).
+    pub(crate) fn recovery_archives(&self) -> Result<RecoveryArchiveScan, BrokerOpError> {
+        let root = self.recovery_archive_root()?;
+        let mut owned = Vec::new();
+        let mut unowned = Vec::new();
+        let Ok(entries) = std::fs::read_dir(&root) else {
+            return Ok(RecoveryArchiveScan {
+                root,
+                owned,
+                unowned,
+            });
+        };
+        let mut paths = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                std::fs::symlink_metadata(path).is_ok_and(|metadata| !metadata.is_file())
+            })
+            .collect::<Vec<_>>();
+        paths.sort();
+        for path in paths {
+            match self.owned_recovery_archive(&path) {
+                Ok(archive) => owned.push(archive),
+                Err(reason) => unowned.push((path, reason)),
+            }
+        }
+        Ok(RecoveryArchiveScan {
+            root,
+            owned,
+            unowned,
         })
     }
 }

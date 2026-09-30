@@ -762,3 +762,63 @@ fn a_root_holding_anything_but_bookkeeping_is_not_empty() {
         assert!(root_path.exists());
     }
 }
+
+/// Recovery archives beside the worktree container are listed so they are
+/// never invisible, and a hand-made kit is told apart from a broker archive.
+/// Listing them authorizes nothing: the digest ignores them.
+#[test]
+fn storage_plan_lists_recovery_archives_without_proposing_them() {
+    let (repo, _unused) = fixture();
+    let host = tempfile::tempdir().unwrap();
+    let container = host.path().join("worktrees");
+    std::fs::create_dir_all(&container).unwrap();
+    let before = json(run(
+        repo.path(),
+        &container,
+        &["gc", "storage", "plan", "--json"],
+    ));
+
+    let archives = host.path().join("recovery-archives");
+    let broker_archive = archives.join("owner-key/12-0123456789ab-1790000000000");
+    std::fs::create_dir_all(&broker_archive).unwrap();
+    std::fs::write(
+        broker_archive.join("manifest.json"),
+        serde_json::json!({
+            "schema_version": 1,
+            "created_at_ms": 1_790_000_000_000_i64,
+            "session_id": 12,
+            "head": "0123456789abcdef0123456789abcdef01234567",
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let manual = archives.join("mockup-temporal/20260921T071003Z");
+    std::fs::create_dir_all(&manual).unwrap();
+    std::fs::write(manual.join("manifest.json"), r#"{"worktrees": []}"#).unwrap();
+
+    let plan = json(run(
+        repo.path(),
+        &container,
+        &["gc", "storage", "plan", "--json"],
+    ));
+    let groups = plan["recovery_archives"].as_array().unwrap();
+    assert_eq!(groups.len(), 2, "{plan}");
+    let group = |suffix: &str| {
+        groups
+            .iter()
+            .find(|group| group["path"].as_str().unwrap().ends_with(suffix))
+            .unwrap()
+    };
+    assert_eq!(group("mockup-temporal")["archive_count"], 1);
+    assert_eq!(group("mockup-temporal")["broker_archive_count"], 0);
+    assert_eq!(group("owner-key")["broker_archive_count"], 1);
+    assert_eq!(
+        group("owner-key")["oldest_created_at_ms"],
+        1_790_000_000_000_i64
+    );
+    assert_eq!(
+        plan["digest"], before["digest"],
+        "listing authorizes nothing"
+    );
+    assert!(broker_archive.exists() && manual.exists());
+}
