@@ -1112,6 +1112,10 @@ fn acquire_enrollment_lock(common_dir: &Path) -> Result<EnrollmentLock, String> 
     #[cfg(unix)]
     {
         use std::os::fd::AsRawFd;
+        // SAFETY: `file` is a live `File` opened above and still owned here,
+        // so `as_raw_fd` yields a valid descriptor. `flock` takes the descriptor
+        // by value and only sets an advisory lock on it; it dereferences
+        // nothing and cannot invalidate the borrow.
         let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if result != 0 {
             return Err("another first-enrollment execution holds the repository lock".into());

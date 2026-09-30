@@ -85,7 +85,7 @@ fn statement_id_includes_position_and_kind_tag() {
     // but different positions must produce different NodeIds.
     let f = function_id();
     let s1 = Statement::new("aethyme", "src/x.py", "assign", range(), f.clone(), 0).unwrap();
-    let s2 = Statement::new("aethyme", "src/x.py", "assign", range(), f.clone(), 1).unwrap();
+    let s2 = Statement::new("aethyme", "src/x.py", "assign", range(), f, 1).unwrap();
     assert_ne!(s1.id(), s2.id());
     assert_eq!(s1.kind_tag(), "assign");
     assert_eq!(s1.position_in_body(), 0);

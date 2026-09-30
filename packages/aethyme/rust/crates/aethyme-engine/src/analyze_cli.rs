@@ -66,9 +66,8 @@ pub fn run(args: &[String]) -> Result<(), String> {
         format = "full-json".to_string();
     }
 
-    let map = RepositoryMap::build_with_fragment_preference(&repo, false, |_| {})
-        .map_err(|e| e.to_string())?
-        .0;
+    let map = RepositoryMap::build_with_fragment_preference(&repo, false, |_| {})?.0;
+
     let answer = analyze_dead_code(&map, &scope, &roots, include_methods);
     let raw = serde_json::to_string(&answer).map_err(|e| e.to_string())?;
     let payload: Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;

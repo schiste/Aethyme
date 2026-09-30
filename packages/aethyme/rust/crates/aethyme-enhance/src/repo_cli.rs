@@ -578,7 +578,7 @@ fn run_experience_telemetry(rest: &[String]) -> u8 {
     let empty = Value::object();
     let freshness = match report.get("freshness") {
         Some(v) if v.truthy() => v.clone(),
-        _ => empty.clone(),
+        _ => empty,
     };
     if report.get("kpis").map(Value::truthy).unwrap_or(false) {
         let kpis = report.get("kpis").expect("checked above");

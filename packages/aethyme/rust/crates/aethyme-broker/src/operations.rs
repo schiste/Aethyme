@@ -1017,6 +1017,10 @@ impl RepositoryWriteLock {
             })?;
         // Try without blocking first, so the uncontended path stays a single
         // syscall and the holder lookup only runs when it can actually help.
+        // SAFETY: `file` is a live `File` opened above and still owned here, so
+        // `as_raw_fd` yields a valid descriptor. `flock` takes the descriptor by
+        // value and only sets an advisory lock on it; it dereferences nothing
+        // and cannot invalidate the borrow.
         let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if rc == 0 {
             return Ok(Self {
@@ -1053,6 +1057,8 @@ impl RepositoryWriteLock {
         match queue_wait {
             QueueWait::Refuse => unreachable!("refused above"),
             QueueWait::Forever => {
+                // SAFETY: as above — `file` is a live, owned `File`, and `flock`
+                // takes the descriptor by value without dereferencing it.
                 let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
                 if rc != 0 {
                     return Err(BrokerOpError::OperationIo {
@@ -1066,6 +1072,7 @@ impl RepositoryWriteLock {
             QueueWait::Seconds(seconds) => {
                 let deadline = waited + std::time::Duration::from_secs(seconds);
                 loop {
+                    // SAFETY: as above — `file` is a live, owned `File`.
                     let rc =
                         unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
                     if rc == 0 {
@@ -1117,6 +1124,9 @@ pub(crate) fn process_is_gone(pid: i64) -> bool {
     if pid <= 0 {
         return false;
     }
+    // SAFETY: `kill` with signal 0 checks existence and permission without
+    // delivering a signal, and takes the pid by value. It dereferences no
+    // pointer this crate owns, so `pid` only has to be a valid i32.
     if unsafe { libc::kill(pid, 0) } == 0 {
         return false;
     }
@@ -1340,6 +1350,11 @@ fn coordination_wait_details(
 
 impl Drop for RepositoryWriteLock {
     fn drop(&mut self) {
+        // SAFETY: `self.file` is still owned by `self` for the duration of
+        // `drop`, so the descriptor is valid. `flock` takes it by value and
+        // dereferences nothing. Discarding the result is deliberate: an
+        // unlock failure cannot be acted on here, and the descriptor closes
+        // on drop anyway, which releases the lock.
         let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
     }
 }

@@ -597,7 +597,7 @@ fn flatten_use_tree(
         .unwrap_or_default();
 
     let combined = if prefix.is_empty() {
-        path_text.clone()
+        path_text
     } else if path_text.is_empty() {
         prefix.to_string()
     } else {

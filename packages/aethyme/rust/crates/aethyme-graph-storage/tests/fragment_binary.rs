@@ -1,4 +1,11 @@
 //! Integration tests for Fragment construction + binary encoding.
+//
+// `redundant_clone` fires on every element of the orderings below, but the
+// clones are the assertion: these tests exist to prove that encoding is
+// order-independent, which requires building each ordering from the same
+// values. Moving instead of cloning would consume them after the first
+// call and the remaining orderings would not compile.
+#![allow(clippy::redundant_clone)]
 
 use aethyme_graph_schema::{
     Class, Confidence, Edge, EdgeAttributes, EdgeSite, Function, Node, NodeId, ParameterSignature,
@@ -69,6 +76,8 @@ fn fragment_dedupes_duplicate_node_ids_silently() {
     // that hash to the same NodeId; the indexer doesn't always
     // know in advance, so Fragment silently keeps the first.
     let f = sample_function();
+    // Both clones are load-bearing: the point of the test is two nodes that
+    // hash to the same NodeId, so `f` must be copied rather than moved.
     let nodes = vec![Node::Function(f.clone()), Node::Function(f.clone())];
     let frag = Fragment::new("src/cli.py", nodes, vec![]).unwrap();
     assert_eq!(frag.node_count(), 1);

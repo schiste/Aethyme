@@ -271,7 +271,7 @@ fn with_py_suffix(base: &str, want: &str) -> PathBuf {
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default();
     let stem = if current.is_empty() {
-        name.clone()
+        name
     } else {
         name[..name.len() - current.len()].to_string()
     };

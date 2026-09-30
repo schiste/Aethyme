@@ -66,11 +66,7 @@ fn dispatch(subcommand: &str, rest: &[String]) -> Result<(), String> {
 }
 
 fn build_map(repo: &Path) -> Result<RepositoryMap, String> {
-    Ok(
-        RepositoryMap::build_with_fragment_preference(repo, false, |_| {})
-            .map_err(|e| e.to_string())?
-            .0,
-    )
+    Ok(RepositoryMap::build_with_fragment_preference(repo, false, |_| {})?.0)
 }
 
 fn store_path(repo: &Path) -> PathBuf {
@@ -231,6 +227,10 @@ fn engine_info(rest: &[String]) -> Result<(), String> {
     let daemon_running = std::fs::read_to_string(&daemon_pidfile)
         .ok()
         .and_then(|s| s.trim().parse::<i32>().ok())
+        // SAFETY: `kill` with signal 0 checks for existence and permission
+        // without delivering anything, and it takes the pid by value. It
+        // dereferences no pointer this crate owns, so the only requirement is
+        // a valid i32, which `parse` produced on the line above.
         .map(|pid| unsafe { libc::kill(pid, 0) == 0 })
         .unwrap_or(false);
     let ready = store_present;

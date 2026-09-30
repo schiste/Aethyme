@@ -933,8 +933,18 @@ struct BlockedSignals {
 #[cfg(unix)]
 impl BlockedSignals {
     fn new() -> std::io::Result<Self> {
+        // SAFETY: `libc::sigset_t` is a plain-old-data C struct of integers, so
+        // every bit pattern is valid for it and `zeroed` is the empty set. Both
+        // locals stay in scope and exclusively borrowed until the calls below
+        // return.
         let mut watched = unsafe { std::mem::zeroed() };
+        // SAFETY: as above — `sigset_t` is POD.
         let mut previous = unsafe { std::mem::zeroed() };
+        // SAFETY: `watched` and `previous` are live, writable, correctly
+        // aligned `sigset_t`s that outlive these calls. The `sig*` functions
+        // take them by pointer and only read or fill the set, and
+        // `pthread_sigmask` stores the previous mask through `previous` before
+        // returning.
         unsafe {
             libc::sigemptyset(&mut watched);
             libc::sigaddset(&mut watched, libc::SIGINT);
@@ -948,17 +958,27 @@ impl BlockedSignals {
     }
 
     fn pending(&self) -> Option<i32> {
+        // SAFETY: `libc::sigset_t` is POD; `zeroed` is the empty set and
+        // `pending` is a live, writable local.
         let mut pending = unsafe { std::mem::zeroed() };
+        // SAFETY: `pending` is a live, writable, correctly aligned `sigset_t`
+        // that outlives the call; `sigpending` only fills it.
         if unsafe { libc::sigpending(&mut pending) } != 0 {
             return None;
         }
         let has_watched = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP]
             .into_iter()
+            // SAFETY: `pending` is a live, correctly aligned `sigset_t` and
+            // `signal` is a valid `c_int` constant; `sigismember` only reads the
+            // set and returns membership.
             .any(|signal| unsafe { libc::sigismember(&pending, signal) } == 1);
         if !has_watched {
             return None;
         }
         let mut signal = 0;
+        // SAFETY: `self.watched` is a live `sigset_t` owned by `self`, and
+        // `signal` is a live, writable `c_int` local. `sigwait` only reads the
+        // set and writes the delivered signal number through `signal`.
         (unsafe { libc::sigwait(&self.watched, &mut signal) } == 0).then_some(signal)
     }
 }
@@ -966,6 +986,10 @@ impl BlockedSignals {
 #[cfg(unix)]
 impl Drop for BlockedSignals {
     fn drop(&mut self) {
+        // SAFETY: `self.previous` is a live `sigset_t` recorded by `new`, and
+        // the third argument is an explicit null out-pointer, which
+        // `pthread_sigmask` documents as allowed when oldset is null. Restoring
+        // the mask in `drop` touches only this thread's mask.
         unsafe {
             libc::pthread_sigmask(libc::SIG_SETMASK, &self.previous, std::ptr::null_mut());
         }
@@ -1003,6 +1027,10 @@ fn spawn_resource_process(
     {
         let previous = signals.previous;
         process.process_group(0);
+        // SAFETY: the closure runs in the child between fork and exec. It
+        // restores the signal mask that `BlockedSignals::new` recorded in the
+        // parent and converts errno into an `io::Error`; it allocates, locks
+        // nothing, and runs no Rust destructor, so it is async-signal-safe.
         unsafe {
             process.pre_exec(move || {
                 if libc::pthread_sigmask(libc::SIG_SETMASK, &previous, std::ptr::null_mut()) != 0 {
@@ -1049,6 +1077,10 @@ where
             event(&format!(
                 "forwarding signal {signal} to supervised process group"
             ));
+            // SAFETY: `process_group(0)` was called before spawn, so the child
+            // leads a new process group whose id is its pid, and `child` is
+            // still live here. `killpg` takes both by value and dereferences
+            // nothing this crate owns.
             unsafe {
                 libc::killpg(process.child.id() as i32, signal);
             }
@@ -1075,6 +1107,8 @@ where
                     ));
                     grant.lease.state = HostLeaseState::Quarantined;
                     #[cfg(unix)]
+                    // SAFETY: as above — the child leads the process group
+                    // created before spawn and is still live at this point.
                     unsafe {
                         libc::killpg(process.child.id() as i32, libc::SIGTERM);
                     }
@@ -1631,6 +1665,9 @@ fn holder_process_is_gone(pid: i64) -> bool {
     if pid <= 0 {
         return false;
     }
+    // SAFETY: `kill` with signal 0 checks existence and permission without
+    // delivering a signal, taking the pid by value. It dereferences no pointer
+    // this crate owns, so `pid` only has to be a valid i32.
     if unsafe { libc::kill(pid, 0) } == 0 {
         return false;
     }

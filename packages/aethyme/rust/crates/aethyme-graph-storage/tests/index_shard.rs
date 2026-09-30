@@ -1,4 +1,11 @@
 //! Integration tests for per-module NDJSON index shards.
+//
+// `redundant_clone` fires on every element of the orderings below, but the
+// clones are the assertion: these tests exist to prove that encoding is
+// order-independent, which requires building each ordering from the same
+// values. Moving instead of cloning would consume them after the first
+// call and the remaining orderings would not compile.
+#![allow(clippy::redundant_clone)]
 
 use aethyme_graph_schema::{NodeId, NodeKind};
 use aethyme_graph_storage::{
@@ -34,7 +41,7 @@ fn write_then_read_round_trips() {
     // Read order should match the canonical sort order, not the
     // input order.
     assert_eq!(back.len(), records.len());
-    let mut expected = records.clone();
+    let mut expected = records;
     expected.sort_by(|a, b| {
         a.module
             .cmp(&b.module)

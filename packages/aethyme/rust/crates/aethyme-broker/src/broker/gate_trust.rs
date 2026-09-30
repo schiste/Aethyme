@@ -588,9 +588,14 @@ mod tests {
         struct Restore(Option<std::ffi::OsString>);
         impl Drop for Restore {
             fn drop(&mut self) {
-                // SAFETY: single-threaded test; the guard restores the value.
+                // SAFETY: `set_var`/`remove_var` are unsafe because the
+                // environment is process-global and unsynchronised. This test
+                // is single-threaded and the guard restores the value, so no
+                // other thread observes the window.
                 match self.0.take() {
+                    // SAFETY: as above — single-threaded test.
                     Some(value) => unsafe { std::env::set_var(TEST_ESCAPE_ENV, value) },
+                    // SAFETY: as above — single-threaded test.
                     None => unsafe { std::env::remove_var(TEST_ESCAPE_ENV) },
                 }
             }
@@ -616,6 +621,7 @@ mod tests {
         );
 
         // SAFETY: as above.
+        // SAFETY: single-threaded test, as above.
         unsafe { std::env::remove_var(TEST_ESCAPE_ENV) };
         assert!(
             !test_escape_enabled_for_a_repository(fixture.path()),

@@ -41,3 +41,6 @@ aethyme-graph-schema = { path = "../aethyme-graph-schema" }
 # filesystem operations against an ephemeral directory. Avoids
 # polluting the developer's working tree with test artifacts.
 tempfile = "3"
+
+[lints]
+workspace = true

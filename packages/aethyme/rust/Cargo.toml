@@ -15,3 +15,30 @@ resolver = "2"
 
 [workspace.package]
 version = "0.8.9"
+
+# Workspace lint floor. Every crate opts in with `[lints] workspace = true`.
+#
+# This is a ratchet, not a cleanup: it sets the floor to what the tree satisfies
+# today so the next change cannot regress below it. It is deliberately narrow.
+# `unwrap_used` and friends are NOT enabled — the tree has ~1,300 `unwrap` calls,
+# so that would be a mass rewrite rather than a guard rail, and whether an unwrap
+# is correct belongs to the crate that owns the call, not to a global default.
+[workspace.lints.clippy]
+# Debugging leftovers must not reach a release.
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+
+# `undocumented_unsafe_blocks` and `redundant_clone` are the ratchet proper. The
+# whole tree satisfies `undocumented_unsafe_blocks` today only because this change
+# adds the missing SAFETY comments (graph-storage `flock`, quality `localtime_r`,
+# engine `kill`/`pre_exec`) and turns it on; the broker and engine test fixtures
+# that cannot satisfy it carry a scoped `#[allow]` in place, each with the reason
+# inline. `redundant_clone` is left off globally because the permutation tests
+# in aethyme-graph-storage clone on purpose and because ~40 remaining clones live
+# in aethyme-broker; it is enabled per-file where it applies and is a follow-up.
+#
+# Turning `undocumented_unsafe_blocks` on here is the highest-value line in the
+# manifest: the tree has ~45 `unsafe` blocks and this makes an undocumented one a
+# build failure rather than something a reviewer has to catch.
+undocumented_unsafe_blocks = "deny"

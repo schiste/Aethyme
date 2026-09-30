@@ -340,8 +340,15 @@ fn local_compact_timestamp() -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
+    // SAFETY: `libc::tm` is a plain-old-data C struct of integers, so every
+    // bit pattern is a valid value for it and zeroed is the all-zero struct.
+    // `localtime_r` fills the fields below before they are read.
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     let time = secs as libc::time_t;
+    // SAFETY: `time` is a live `time_t` for the duration of the call and `tm` is
+    // a live, writable, correctly aligned `libc::tm`. `localtime_r` stores
+    // through the out-pointer only, and both stay in scope and exclusively
+    // borrowed until it returns.
     unsafe {
         libc::localtime_r(&time, &mut tm);
     }
