@@ -585,6 +585,15 @@ pub(super) fn run_submit(parsed: Parsed) -> Result<(), UsageError> {
                 out!("  {reason}");
             }
         }
+        for warning in &outcome.lease_warnings {
+            eprintln!(
+                "⚠ lease overlap ({}): session {} holds {}; {}",
+                warning.severity.as_deref().unwrap_or("low"),
+                warning.session_id,
+                warning.path,
+                warning.reason.as_deref().unwrap_or("not blocking")
+            );
+        }
         if outcome.no_changes {
             // "Nothing pending" is the right summary only when nothing was
             // set aside. Commits that predate the recorded baseline are not

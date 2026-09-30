@@ -42,6 +42,10 @@ part of the contract.
 {
   "agents": [ Session + { "activity_at", "derived_status", "pid_alive" } ],
   "overlaps": [ { "session_a", "session_b", "path" } ],
+  "overlap_pairs": [
+    { "session_a", "session_b", "severity": "low"|"high", "paths_count",
+      "conflicting_paths", "sample_paths", "classified", "reason" }
+  ],
   "promoted_conflicts": [
     { "session_id", "path", "session_path", "promoted_path" }
   ],
@@ -274,6 +278,10 @@ matching `gate_caches_reclaimed` count.
   "commands": [ { "command", "count", "total_ms" } ]
 }
 ```
+
+`overlaps_warned` counts `lease.overlap` events. Since 2026-09-30 one event
+is one session pair starting to overlap or changing severity; earlier events
+were one per overlapping path, so totals spanning that date mix both units.
 
 ### `submit --json`
 

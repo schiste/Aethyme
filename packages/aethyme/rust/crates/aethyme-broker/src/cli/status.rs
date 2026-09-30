@@ -300,7 +300,7 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
             );
             out!("  inspect: aethyme broker advanced advisories metrics");
         }
-        print_overlap_warnings(&status.overlaps);
+        print_overlap_warnings(&status.overlap_pairs);
         print_promoted_conflict_warnings(&status.promoted_conflicts);
     }
     Ok(())

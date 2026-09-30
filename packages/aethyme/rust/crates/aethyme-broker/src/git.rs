@@ -2112,6 +2112,85 @@ impl GitRepo {
     /// Untracked paths from porcelain status. Used for the adoption-time
     /// foreign-file snapshot; keeping the status grammar here prevents
     /// output decoration from becoming "foreign" broker state.
+    /// A commit holding this checkout's tracked working content for `paths`
+    /// on top of HEAD, or `None` when none of them differs from HEAD.
+    ///
+    /// Nothing is stashed and no ref moves. The content is staged into a
+    /// private copy of the index, because every index-writing command --
+    /// `git stash create` included, even under `GIT_OPTIONAL_LOCKS=0` --
+    /// refreshes the checkout's real index, and the broker reads that
+    /// file's mtime as evidence the session's agent is working. Classifying
+    /// another session's edits must not make an idle session look active.
+    pub fn working_state_commit(&self, paths: &[String]) -> Result<Option<String>, GitError> {
+        let dirty = self.dirty_tracked_among(paths)?;
+        if dirty.is_empty() {
+            return Ok(None);
+        }
+        let real_index = run_git(&self.root, &["rev-parse", "--git-path", "index"])?;
+        let real_index = self.root.join(real_index.trim());
+        let scratch = tempfile::NamedTempFile::new().map_err(|source| GitError::Spawn {
+            args: "working state index".into(),
+            source,
+        })?;
+        std::fs::copy(&real_index, scratch.path()).map_err(|source| GitError::Spawn {
+            args: "working state index".into(),
+            source,
+        })?;
+        let index = scratch.path().to_string_lossy().into_owned();
+        let mut add = vec!["add", "-u", "--"];
+        add.extend(dirty.iter().map(String::as_str));
+        run_git_with_index(&self.root, &index, &add)?;
+        let tree = run_git_with_index(&self.root, &index, &["write-tree"])?;
+        let output = git_command()
+            .args([
+                "commit-tree",
+                tree.trim(),
+                "-p",
+                "HEAD",
+                "-m",
+                "aethyme: working state for overlap classification",
+            ])
+            .env("GIT_AUTHOR_NAME", "aethyme")
+            .env("GIT_AUTHOR_EMAIL", "aethyme@localhost")
+            .env("GIT_COMMITTER_NAME", "aethyme")
+            .env("GIT_COMMITTER_EMAIL", "aethyme@localhost")
+            .current_dir(&self.root)
+            .output()
+            .map_err(|source| GitError::Spawn {
+                args: "commit-tree".into(),
+                source,
+            })?;
+        if !output.status.success() {
+            return Err(GitError::Git {
+                args: "commit-tree".into(),
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            });
+        }
+        Ok(Some(
+            String::from_utf8_lossy(&output.stdout).trim().to_string(),
+        ))
+    }
+
+    /// Untracked, non-ignored paths via `ls-files`, which never writes the
+    /// index (unlike `status`, which may refresh it).
+    pub fn untracked_paths_readonly(&self) -> Result<Vec<String>, GitError> {
+        Ok(parse_nul_paths(&run_git(
+            &self.root,
+            &["ls-files", "--others", "--exclude-standard", "-z"],
+        )?))
+    }
+
+    /// Tracked paths whose working content differs from HEAD, limited to
+    /// `paths`. Untracked files are not included.
+    pub fn dirty_tracked_among(&self, paths: &[String]) -> Result<Vec<String>, GitError> {
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut args = vec!["diff", "--name-only", "-z", "HEAD", "--"];
+        args.extend(paths.iter().map(String::as_str));
+        Ok(parse_nul_paths(&run_git(&self.root, &args)?))
+    }
+
     pub fn untracked_paths(&self) -> Result<Vec<String>, GitError> {
         Ok(parse_porcelain_entries(&run_git(
             &self.root,

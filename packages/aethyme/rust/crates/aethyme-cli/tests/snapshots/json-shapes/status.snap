@@ -133,6 +133,7 @@
       "state": "string"
     }
   ],
+  "overlap_pairs": [],
   "overlaps": [],
   "promoted_conflicts": [],
   "publication_baseline_head": "string",

@@ -1005,12 +1005,14 @@ pub(super) fn run_agents(parsed: Parsed) -> Result<(), UsageError> {
     } else {
         (broker.refresh_leases()?, broker.agents(now_ms())?)
     };
+    let overlap_pairs = broker.overlap_pairs_snapshot(&overlaps);
     if parsed.json {
         out!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
                 "agents": views,
                 "overlaps": overlaps,
+                "overlap_pairs": overlap_pairs,
             }))?
         );
     } else if views.is_empty() {
@@ -1033,7 +1035,7 @@ pub(super) fn run_agents(parsed: Parsed) -> Result<(), UsageError> {
                 view.session.task.as_deref().unwrap_or("-"),
             );
         }
-        print_overlap_warnings(&overlaps);
+        print_overlap_warnings(&overlap_pairs);
     }
     Ok(())
 }

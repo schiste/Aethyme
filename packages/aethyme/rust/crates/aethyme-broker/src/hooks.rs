@@ -996,8 +996,12 @@ pub fn conflict_radar(cwd: &Path) -> Result<Vec<String>, HooksError> {
     // the files it just committed. Worktree paths are stored exactly as
     // `GitRepo::root()` renders them, so string equality is the match.
     let own_worktree = checkout.root().to_string_lossy().into_owned();
-    let sessions: HashMap<i64, crate::types::Session> = store
-        .live_sessions()?
+    let live = store.live_sessions()?;
+    let own_session = live
+        .iter()
+        .find(|session| session.worktree_path == own_worktree)
+        .map(|session| session.id);
+    let sessions: HashMap<i64, crate::types::Session> = live
         .into_iter()
         .filter(|session| session.worktree_path != own_worktree)
         .map(|session| (session.id, session))
@@ -1018,19 +1022,69 @@ pub fn conflict_radar(cwd: &Path) -> Result<Vec<String>, HooksError> {
         }
     }
 
+    // Conflicting sessions first; a shared file list is capped, because a
+    // pair carrying the same inherited diff can share over a thousand files.
+    let mut ranked: Vec<(bool, i64, Vec<String>, Vec<String>)> = per_session
+        .into_iter()
+        .map(|(session_id, files)| {
+            let conflicting: Vec<String> = own_session
+                .and_then(|own| {
+                    crate::overlap_pairs::cached_conflicting_paths(&store, own, session_id)
+                })
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|path| files.contains(path))
+                .collect();
+            (
+                !conflicting.is_empty(),
+                session_id,
+                conflicting,
+                files.into_iter().collect(),
+            )
+        })
+        .collect();
+    ranked.sort_by(|left, right| right.0.cmp(&left.0).then(left.1.cmp(&right.1)));
+
     let mut warnings = Vec::new();
-    for (session_id, files) in per_session {
+    for (conflicts, session_id, conflicting, files) in ranked {
         let task = sessions[&session_id]
             .task
             .as_deref()
             .map(|task| format!(" ({task:?})"))
             .unwrap_or_default();
-        let files: Vec<String> = files.into_iter().collect();
-        warnings.push(format!(
-            "⚠ aethyme conflict radar: session {session_id}{task} is also editing files \
-             this commit touches: {}",
-            files.join(", ")
-        ));
+        let shown: Vec<&String> = if conflicts {
+            conflicting.iter()
+        } else {
+            files.iter()
+        }
+        .take(crate::overlap_pairs::OVERLAP_SAMPLE_PATHS)
+        .collect();
+        let total = if conflicts {
+            conflicting.len()
+        } else {
+            files.len()
+        };
+        let more = if total > shown.len() {
+            format!(" (+{} more)", total - shown.len())
+        } else {
+            String::new()
+        };
+        let list = shown
+            .iter()
+            .map(|path| path.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        warnings.push(if conflicts {
+            format!(
+                "⚠ aethyme conflict radar: session {session_id}{task} would conflict with \
+                 this commit on: {list}{more}"
+            )
+        } else {
+            format!(
+                "⚠ aethyme conflict radar: session {session_id}{task} is also editing files \
+                 this commit touches: {list}{more}"
+            )
+        });
     }
     Ok(warnings)
 }

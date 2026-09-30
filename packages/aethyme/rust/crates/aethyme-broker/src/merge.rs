@@ -173,6 +173,10 @@ pub struct SubmitOutcome {
     /// for this outcome.
     pub no_changes: bool,
     pub promoted: bool,
+    /// Other sessions' leases on this submission's paths that did not block
+    /// it, each with the severity and reason it was judged by.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lease_warnings: Vec<crate::LeaseBlocker>,
 }
 
 /// Whether a commit belongs to the session's recorded work boundary.
@@ -472,7 +476,9 @@ impl Broker {
             self.store()
                 .set_merge_status(stale_id, MergeStatus::Superseded, None, None)?;
         }
-        self.simulate_and_gate_with_policy(entry.id, cache_policy, intent)
+        let mut outcome = self.simulate_and_gate_with_policy(entry.id, cache_policy, intent)?;
+        outcome.lease_warnings = ownership.warned_leases;
+        Ok(outcome)
     }
 
     /// Whether `commit` is a promotion this session produced that no promoted
@@ -600,6 +606,7 @@ impl Broker {
                 graph_integrity: None,
                 gate_verification: SubmissionGateVerification::not_run(),
                 no_changes: false,
+                lease_warnings: Vec::new(),
                 promoted: false,
                 promotion_suppressed: None,
             });
@@ -653,6 +660,7 @@ impl Broker {
                     graph_integrity: None,
                     gate_verification: SubmissionGateVerification::not_run(),
                     no_changes: true,
+                    lease_warnings: Vec::new(),
                     promoted: true,
                     promotion_suppressed: None,
                 });
@@ -673,6 +681,7 @@ impl Broker {
                 graph_integrity: None,
                 gate_verification: SubmissionGateVerification::not_run(),
                 no_changes: true,
+                lease_warnings: Vec::new(),
                 promoted: false,
                 promotion_suppressed: None,
             });
@@ -904,6 +913,7 @@ impl Broker {
             graph_integrity: Some(graph_integrity),
             gate_verification,
             no_changes: false,
+            lease_warnings: Vec::new(),
             promoted,
             promotion_suppressed,
         })
