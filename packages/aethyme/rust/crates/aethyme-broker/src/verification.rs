@@ -149,6 +149,41 @@ impl ExactTreeVerificationSlot {
         Self::acquire_at(main_root, plan_slot_placement(main_root, namespace))
     }
 
+    /// A slot keyed by the exact tree it verifies, so two verifications of
+    /// *different* trees do not contend.
+    ///
+    /// The reason this is safe is the module's own: a slot exists to be a
+    /// stable, complete checkout that is not nested inside another one, so a
+    /// build tool walking upward for a workspace manifest cannot resolve to
+    /// someone else's tree. Every one of those properties is per-tree. Nothing
+    /// about the placement requires that verifications of two different trees
+    /// share a directory — only that two verifications of the *same* tree do,
+    /// and the key below guarantees exactly that.
+    ///
+    /// Before this, the merge path took one repository-wide `"merge-sim"`
+    /// slot, so promotion was strictly serial: measured at a flat ~8.6
+    /// submissions per hour regardless of how many sessions were submitting,
+    /// because gates ran sequentially inside the single lock. Two sessions
+    /// verifying different merged trees have no reason to exclude each other.
+    ///
+    /// The key is the full commit, not a prefix, so a collision would have to
+    /// be a genuine SHA-1/SHA-256 collision rather than an abbreviation.
+    pub(crate) fn acquire_for_tree(
+        main_root: &Path,
+        namespace: &str,
+        commit: &str,
+    ) -> Result<Self, BrokerOpError> {
+        let key = crate::report::sha256_hex(commit.as_bytes());
+        // Two levels so a repository that verifies many distinct trees does
+        // not put every slot directory in one directory, and so the 256-bit
+        // space is split rather than enumerated linearly.
+        let shard = &key[..2];
+        Self::acquire_at(
+            main_root,
+            plan_slot_placement(main_root, &format!("{namespace}-{shard}/{key}")),
+        )
+    }
+
     /// Take the lock on an already chosen placement.
     fn acquire_at(main_root: &Path, placement: SlotPlacement) -> Result<Self, BrokerOpError> {
         std::fs::create_dir_all(&placement.directory).map_err(|source| BrokerError::Io {
@@ -303,6 +338,53 @@ mod tests {
         assert_ne!(
             plan_slot_placement_in(&fx.main, "merge-sim", Some(&fx.host), &fx.temp).directory,
             plan_slot_placement_in(&fx.main, "graph-integrity", Some(&fx.host), &fx.temp).directory
+        );
+    }
+
+    /// The property the parallel merge path depends on: two different trees get
+    /// two different slots, so their verifications never serialize on each
+    /// other, while the same tree always lands on the same slot so build tools
+    /// still see a stable path.
+    #[test]
+    fn a_tree_keyed_slot_separates_different_trees_and_repeats_the_same_one() {
+        let fx = fixture();
+        let place = |commit: &str| {
+            plan_slot_placement(
+                &fx.main,
+                &format!(
+                    "merge-sim-{}/{}",
+                    &crate::report::sha256_hex(commit.as_bytes())[..2],
+                    crate::report::sha256_hex(commit.as_bytes())
+                ),
+            )
+            .directory
+        };
+        let a = place(&"a".repeat(40));
+        let b = place(&"b".repeat(40));
+        assert_ne!(a, b, "two trees must not share a slot");
+        assert_eq!(
+            a,
+            place(&"a".repeat(40)),
+            "one tree must keep a stable path"
+        );
+        // Still keyed under the caller's namespace, so this cannot collide
+        // with the graph-integrity or gate-doctor-probe slots.
+        assert!(a.to_string_lossy().contains("merge-sim-"), "{a:?}");
+    }
+
+    /// The shard prefix must actually partition, or every slot for a repository
+    /// lands in one directory again.
+    #[test]
+    fn the_shard_prefix_partitions_across_more_than_one_directory() {
+        let shard = |commit: &str| {
+            let key = crate::report::sha256_hex(commit.as_bytes());
+            key[..2].to_string()
+        };
+        let shards: std::collections::BTreeSet<String> =
+            (0u8..64).map(|n| shard(&format!("{n}"))).collect();
+        assert!(
+            shards.len() > 1,
+            "all commits landed in one shard: {shards:?}"
         );
     }
 
