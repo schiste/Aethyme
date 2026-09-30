@@ -176,6 +176,9 @@ pub enum SubmissionGateVerificationStatus {
     NoGatesTriggered,
     Passed,
     Failed,
+    /// A selected gate could not judge the change because the host could not
+    /// run it -- contended, out of disk, or killed. Not a verdict on the diff.
+    Deferred,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -863,15 +866,34 @@ impl Broker {
         drop(verification_slot);
         let gate_outcomes = gate_outcomes?;
 
-        let all_pass = graph_integrity.allows_promotion()
-            && gate_outcomes
-                .iter()
-                .all(|o| o.status == crate::types::GateStatus::Pass);
+        // A gate that never got to judge the change is not a verdict on the
+        // change. `ResourceContention`, `Environment` and `Timeout` describe the
+        // host -- a busy CPU, a full disk, a killed process -- and the broker
+        // already classifies them, records them, and raises advisories from
+        // them (`recommendations.rs` reads the same field). Collapsing them into
+        // `Rejected` says to the agent that its correct work is broken, which
+        // is both untrue and the kind of untrustworthy signal agents respond to
+        // by ignoring. Measured over 30 days: 34% of all gate failures on this
+        // repository carry one of these classes, and 40% of submits failed.
+        //
+        // So they are separated here. The finding is still printed, still
+        // recorded in the entry's details, and still visible -- the outcome is
+        // `Deferred`, not silent success.
+        let (deferred, all_pass) = {
+            let deferred = gate_outcomes.iter().any(|o| o.is_host_fault());
+            let passed = graph_integrity.allows_promotion()
+                && gate_outcomes
+                    .iter()
+                    .all(|o| o.status == crate::types::GateStatus::Pass);
+            (deferred, passed)
+        };
         let gate_verification = SubmissionGateVerification {
             status: if !gate_configuration_present {
                 SubmissionGateVerificationStatus::NoConfiguration
             } else if gate_outcomes.is_empty() {
                 SubmissionGateVerificationStatus::NoGatesTriggered
+            } else if deferred {
+                SubmissionGateVerificationStatus::Deferred
             } else if all_pass {
                 SubmissionGateVerificationStatus::Passed
             } else {
@@ -899,7 +921,18 @@ impl Broker {
                 "cached": o.cached,
             })).collect::<Vec<_>>(),
         });
-        if all_pass {
+        if deferred {
+            // The host could not judge the change. Leave the entry submitted so
+            // a later `submit` re-simulates it, and say exactly which gate
+            // could not run -- the operator's next action is to free the
+            // resource, not to edit code that has not been shown to be wrong.
+            self.store().set_merge_status(
+                entry.id,
+                MergeStatus::Submitted,
+                Some(&simulation.tree),
+                Some(&details.to_string()),
+            )?;
+        } else if all_pass {
             self.store().set_merge_status(
                 entry.id,
                 MergeStatus::Verified,

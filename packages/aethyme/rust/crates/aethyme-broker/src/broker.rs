@@ -7223,7 +7223,16 @@ impl Broker {
                 continue;
             };
             match entry.status {
-                MergeStatus::Rejected => advice.push(rejected_submit_advice(agent, entry)),
+                // A deferred entry is left `Submitted` rather than `Rejected`,
+                // because the gate never judged it. It still needs the advice:
+                // without it, `status` says nothing about a submission that
+                // silently failed to be verified, and the agent has no other
+                // signal that the work is sitting unjudged.
+                MergeStatus::Rejected | MergeStatus::Submitted => {
+                    if unverified_submit_advice(agent, entry) {
+                        advice.push(rejected_submit_advice(agent, entry));
+                    }
+                }
                 MergeStatus::Conflict => advice.push(conflict_submit_advice(agent, entry)),
                 _ => {}
             }
@@ -9677,6 +9686,22 @@ pub(crate) fn plural_word(
     plural: &'static str,
 ) -> &'static str {
     if count == 1 { singular } else { plural }
+}
+
+/// Whether a `Submitted` entry is one a deferred submit left behind, rather
+/// than one still legitimately in flight.
+///
+/// A submitted entry is the normal state of a queue entry that has not been
+/// judged yet, so it must not raise advice on its own. It only warrants it when
+/// it carries a gate that did not pass — which, after a deferral, means the
+/// host could not run a gate and the entry is waiting on the operator.
+fn unverified_submit_advice(_agent: &AgentView, entry: &MergeQueueEntry) -> bool {
+    if entry.status == MergeStatus::Rejected {
+        return true;
+    }
+    gate_failures(entry.details_json.as_deref())
+        .iter()
+        .any(|failure| failure.status != crate::GateStatus::Pass.as_str())
 }
 
 fn rejected_submit_advice(agent: &AgentView, entry: &MergeQueueEntry) -> StatusAdvice {

@@ -550,6 +550,16 @@ pub(super) fn run_submit(parsed: Parsed) -> Result<(), UsageError> {
                 "verification: {} selected gate(s) did not all pass",
                 outcome.gate_verification.selected_gates
             ),
+            // Deliberately not phrased as a failure. The gate never judged the
+            // change, so the next action is to free the host resource and
+            // resubmit -- not to edit code that has not been shown to be wrong.
+            crate::SubmissionGateVerificationStatus::Deferred => out!(
+                "verification: deferred — a selected gate could not run on this host \
+                 (contention, disk, or timeout); the change was not judged. Free the \
+                 resource, then `aethyme broker submit --session {}` again without \
+                 changing code",
+                outcome.entry.session_id
+            ),
         }
         if !outcome.no_changes {
             out!("gate wall time: {}ms", gate_wall_ms);
@@ -627,7 +637,9 @@ pub(super) fn run_submit(parsed: Parsed) -> Result<(), UsageError> {
             }
             return Ok(());
         }
-        if outcome.entry.status.as_str() == "rejected" {
+        if outcome.entry.status.as_str() == "rejected"
+            || outcome.gate_verification.status == crate::SubmissionGateVerificationStatus::Deferred
+        {
             if let Ok(info) = broker.store().session(outcome.entry.session_id)
                 && std::path::Path::new(&info.worktree_path) == broker.main_root()
             {
@@ -636,8 +648,18 @@ pub(super) fn run_submit(parsed: Parsed) -> Result<(), UsageError> {
                      the broker cannot hold it back. Fix forward on main and resubmit."
                 );
             }
-            let code =
-                crate::exit_status::for_submission(outcome.entry.status, &outcome.gate_outcomes);
+            // A deferred entry is `Submitted`, so `for_submission` would call it
+            // a success. It is not: the change was not judged, and an agent
+            // that sees exit 0 has been told its work landed when nothing was
+            // verified. The environmental code is the one that already means
+            // "free the resource and resubmit".
+            let code = if outcome.gate_verification.status
+                == crate::SubmissionGateVerificationStatus::Deferred
+            {
+                crate::exit_status::ENVIRONMENT
+            } else {
+                crate::exit_status::for_submission(outcome.entry.status, &outcome.gate_outcomes)
+            };
             return Err(UsageError::Exit {
                 message: if code == crate::exit_status::ENVIRONMENT {
                     "gates could not run on this host (resource contention or \
@@ -688,7 +710,17 @@ pub(super) fn run_submit(parsed: Parsed) -> Result<(), UsageError> {
     }
     // `--json` used to exit 0 for a rejected or conflicted entry, so a
     // caller reading only the exit code saw a failed gate as success.
-    let code = crate::exit_status::for_submission(outcome.entry.status, &outcome.gate_outcomes);
+    //
+    // A deferred entry is `Submitted`, so `for_submission` calls it a success.
+    // It is not: the change was never judged, and exit 0 would tell an agent
+    // its work landed. ENVIRONMENT is the code that already means "free the
+    // resource and resubmit".
+    let code =
+        if outcome.gate_verification.status == crate::SubmissionGateVerificationStatus::Deferred {
+            crate::exit_status::ENVIRONMENT
+        } else {
+            crate::exit_status::for_submission(outcome.entry.status, &outcome.gate_outcomes)
+        };
     if code != crate::exit_status::SUCCESS {
         return Err(UsageError::SilentExit(code));
     }

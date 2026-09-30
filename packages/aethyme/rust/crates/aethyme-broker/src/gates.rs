@@ -686,6 +686,35 @@ pub struct GateRunOutcome {
     pub environment: GateEnvironment,
 }
 
+impl GateRunOutcome {
+    /// Whether this outcome describes the *host* failing to judge the change
+    /// rather than the change failing the gate.
+    ///
+    /// `TestFailure` and `BuildFailure` are verdicts on the tree: something
+    /// about the code made the command exit non-zero, and an agent can act on
+    /// that. `ResourceContention`, `Environment` and `Timeout` are not — the
+    /// gate was refused before it ran, the host ran out of something, or the
+    /// command was killed. Reporting those as a failed verification tells an
+    /// agent its correct work is broken, which is both untrue and corrosive: a
+    /// signal that cries wolf often enough stops being read.
+    ///
+    /// `CachedPriorFail` and `Unknown` are treated as verdicts deliberately. A
+    /// cached prior failure is a real result being replayed, and `Unknown`
+    /// means the broker could not classify it, so treating it as a host fault
+    /// would let an unclassifiable failure silently become a deferral that
+    /// never resolves.
+    pub fn is_host_fault(&self) -> bool {
+        matches!(
+            self.failure_class,
+            Some(
+                GateFailureClass::ResourceContention
+                    | GateFailureClass::Environment
+                    | GateFailureClass::Timeout
+            )
+        )
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ManagedGateCacheProvenance {
     pub key: String,
@@ -3473,6 +3502,60 @@ mod tests {
 
     /// The control: a gate that genuinely ran and failed must keep reporting a
     /// test failure, because that is the one verdict the tree-hash cache
+    /// reuses. A fix for #167/#168 that reclassified real failures would make
+    /// every gate re-run forever.
+    /// A gate that never got to judge the change must not be reported as a
+    /// verdict on the change. This is the distinction the submit path now
+    /// branches on, so it is pinned here against the classes it claims.
+    #[test]
+    fn only_host_fault_classes_are_treated_as_deferrable() {
+        let outcome = |status, class| GateRunOutcome {
+            gate: "g".into(),
+            tree_hash: "t".into(),
+            definition_hash: "d".into(),
+            resource_lease: None,
+            managed_cache: None,
+            broker_database: None,
+            status,
+            failure_class: class,
+            log_path: None,
+            cached: false,
+            exit_code: Some(1),
+            duration_ms: Some(1),
+            wait_duration_ms: None,
+            first_output_ms: None,
+            output_bytes: None,
+            environment: GateEnvironment::default(),
+        };
+
+        for class in [
+            GateFailureClass::ResourceContention,
+            GateFailureClass::Environment,
+            GateFailureClass::Timeout,
+        ] {
+            assert!(
+                outcome(GateStatus::Error, Some(class)).is_host_fault(),
+                "{class:?} describes the host, not the change"
+            );
+        }
+        // Verdicts on the tree, and the two classes that must not become an
+        // unresolvable deferral, are all treated as real failures.
+        for (status, class) in [
+            (GateStatus::Fail, Some(GateFailureClass::TestFailure)),
+            (GateStatus::Fail, Some(GateFailureClass::BuildFailure)),
+            (GateStatus::Error, Some(GateFailureClass::CachedPriorFail)),
+            (GateStatus::Error, Some(GateFailureClass::Unknown)),
+            (GateStatus::Error, None),
+        ] {
+            assert!(
+                !outcome(status, class).is_host_fault(),
+                "{class:?} must stay a verdict, not a deferral"
+            );
+        }
+    }
+
+    /// A gate that ran and reported a failing test is a test failure, not an
+    /// environment problem — and that is the one verdict the tree-hash cache
     /// reuses. A fix for #167/#168 that reclassified real failures would make
     /// every gate re-run forever.
     #[test]
