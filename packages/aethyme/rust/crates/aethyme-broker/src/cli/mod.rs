@@ -682,12 +682,15 @@ Usage:
       Restore the promoted record for every recoverable candidate in the
       reviewed plan. Re-proves each precondition, writes only status and
       commit details, and rebuilds the missing path exposures.
-  aethyme broker reclaim plan [--json]
-  aethyme broker reclaim apply --confirm <sha256> [--json]
+  aethyme broker reclaim plan [--session <id>] [--json]
+  aethyme broker reclaim apply --confirm <sha256> [--session <id>] [--json]
       Report regenerable build output (target, node_modules, .venv, build,
       dist) in session worktrees, and remove only what was reviewed. An active
-      session's artefacts are listed but never removed. Nothing here is
-      recreated for you: a reclaimed worktree pays a cold build next time.
+      session's artefacts are listed but never removed. Apply removes each
+      reviewed path that is still reclaimable and leaves anything new for a
+      later plan. --session scopes both to one session's worktree. Nothing
+      here is recreated for you: a reclaimed worktree pays a cold build next
+      time.
   aethyme broker gc plan [--include-active-gate-cache] [--json]
       Report exact retention-eligible rows, runtime files, represented
       worktrees/refs, finished sessions' build caches, this repository's gate

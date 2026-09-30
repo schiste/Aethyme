@@ -557,6 +557,29 @@ pub(super) fn run_reclaim(parsed: Parsed) -> Result<(), UsageError> {
         .map(|session| std::path::PathBuf::from(session.worktree_path))
         .collect();
     crate::reclaim::protect_unrecorded_worktrees(&mut candidates, &recorded);
+    // One session's worktree, so a plan can be reviewed and applied without
+    // waiting on every other worktree in the root to hold still.
+    if let Some(session_id) = parsed.session {
+        let session = broker
+            .store()
+            .live_sessions()?
+            .into_iter()
+            .chain(broker.store().cleaned_sessions()?)
+            .find(|session| session.id == session_id)
+            .ok_or_else(|| {
+                UsageError::Message(format!(
+                    "session {session_id} is not a session of this repository"
+                ))
+            })?;
+        candidates = crate::reclaim::scope_to_worktree(
+            candidates,
+            std::path::Path::new(&session.worktree_path),
+        );
+    }
+    let session_flag = parsed
+        .session
+        .map(|id| format!(" --session {id}"))
+        .unwrap_or_default();
     let digest = crate::reclaim::plan_digest(&root, &candidates);
     let plan = crate::ReclaimPlan {
         digest: digest.clone(),
@@ -600,7 +623,7 @@ pub(super) fn run_reclaim(parsed: Parsed) -> Result<(), UsageError> {
                     out!("Nothing to reclaim.");
                 } else {
                     out!(
-                        "Apply with: aethyme broker gc reclaim apply --confirm {}",
+                        "Apply with: aethyme broker gc reclaim apply --confirm {}{session_flag}",
                         plan.digest
                     );
                 }
@@ -610,40 +633,49 @@ pub(super) fn run_reclaim(parsed: Parsed) -> Result<(), UsageError> {
             let confirm = parsed.confirm.as_deref().ok_or_else(|| {
                 UsageError::Message("reclaim apply requires --confirm <sha256>".into())
             })?;
-            // Re-derived from a fresh scan, so a plan whose decision set moved
-            // is refused rather than applied to a different set than was reviewed.
-            if confirm != plan.digest {
-                let (changes, snapshot_error) = match crate::reclaim::load_snapshot(&root, confirm)
-                {
-                    Ok(Some((_, reviewed))) => (
-                        crate::reclaim::decision_changes(
-                            &reviewed,
-                            &crate::reclaim::decisions(&plan.candidates),
-                        ),
-                        None,
-                    ),
-                    Ok(None) => (Vec::new(), None),
-                    Err(error) => (Vec::new(), Some(error.to_string())),
-                };
-                let detail = if changes.is_empty() {
-                    match snapshot_error {
-                        Some(error) => format!(
-                            "the saved review could not be read ({error}); no decision diff can be established"
-                        ),
-                        None => {
-                            "the saved review is unavailable; no decision diff can be established"
-                                .into()
+            // The confirmation authorizes what was reviewed. When the fresh
+            // scan decides exactly the same, apply it as is. Otherwise the
+            // verified saved review names the authorized paths, and each is
+            // removed only if the fresh scan still finds it reclaimable; a
+            // change anywhere else in the root no longer voids the review.
+            let mut not_reviewed = Vec::new();
+            let mut withdrawn = Vec::new();
+            let plan = if confirm == plan.digest {
+                plan
+            } else {
+                match crate::reclaim::load_snapshot(&root, confirm) {
+                    Ok(Some((_, reviewed))) => {
+                        let scope = crate::reclaim::restrict_to_review(&plan.candidates, &reviewed);
+                        not_reviewed = scope.not_reviewed;
+                        withdrawn = scope.withdrawn;
+                        crate::ReclaimPlan {
+                            digest: confirm.to_string(),
+                            root: plan.root,
+                            reclaimable_bytes: crate::reclaimable_bytes(&scope.candidates),
+                            total_bytes: plan.total_bytes,
+                            candidates: scope.candidates,
                         }
                     }
-                } else {
-                    format!("changes since review: {}", capped_join(&changes, 8))
-                };
-                return Err(UsageError::Message(format!(
-                    "confirmation does not match the current plan; re-run `aethyme broker gc reclaim plan` and review it again (reviewed {}, current {}); {}",
-                    confirm, plan.digest, detail
-                )));
-            }
-            let outcome = crate::apply_reclaim(&plan);
+                    // Without a verified review there is nothing to narrow
+                    // to, so only an exact match authorizes deletion.
+                    unreadable => {
+                        let detail = match unreadable {
+                            Err(error) => format!(
+                                "the saved review could not be read ({error}); no reviewed decision set can be established"
+                            ),
+                            _ => "the saved review is unavailable; no reviewed decision set can be established".into(),
+                        };
+                        return Err(UsageError::Message(format!(
+                            "confirmation does not match the current plan; re-run `aethyme broker gc reclaim plan{session_flag}` and review it again (reviewed {}, current {}); {}",
+                            confirm, plan.digest, detail
+                        )));
+                    }
+                }
+            };
+            let mut outcome = crate::apply_reclaim(&plan);
+            withdrawn.append(&mut outcome.skipped);
+            outcome.skipped = withdrawn;
+            outcome.not_reviewed = not_reviewed;
             if parsed.json {
                 out!("{}", serde_json::to_string_pretty(&outcome)?);
             } else {
@@ -659,6 +691,12 @@ pub(super) fn run_reclaim(parsed: Parsed) -> Result<(), UsageError> {
                 );
                 for skipped in &outcome.skipped {
                     out!("  skipped: {skipped}");
+                }
+                for path in &outcome.not_reviewed {
+                    out!(
+                        "  not reviewed, left in place: {} (re-run `aethyme broker gc reclaim plan{session_flag}` to include it)",
+                        path.display()
+                    );
                 }
             }
         }

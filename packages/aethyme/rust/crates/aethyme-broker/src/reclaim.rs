@@ -12,7 +12,7 @@
 //! real cost. So this reports candidates and only removes what an operator
 //! reviewed, following the same digest-bound plan/apply contract as `gc`.
 
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -72,43 +72,86 @@ pub fn plan_digest(root: &Path, candidates: &[ReclaimCandidate]) -> String {
     decision_digest(root, &decisions(candidates))
 }
 
-/// Describe the decision changes between the plan the operator reviewed and
-/// the fresh scan used for apply. Byte-only changes intentionally produce no
-/// entries because they do not alter what will be deleted.
-pub fn decision_changes(reviewed: &[ReclaimDecision], current: &[ReclaimDecision]) -> Vec<String> {
-    let reviewed = reviewed
-        .iter()
-        .map(|decision| (decision.path.clone(), decision.reclaimable))
-        .collect::<BTreeMap<_, _>>();
-    let current = current
-        .iter()
-        .map(|decision| (decision.path.clone(), decision.reclaimable))
-        .collect::<BTreeMap<_, _>>();
-    let mut paths = reviewed.keys().cloned().collect::<Vec<_>>();
-    paths.extend(
-        current
-            .keys()
-            .filter(|path| !reviewed.contains_key(*path))
-            .cloned(),
-    );
-    paths.sort();
+/// A fresh scan narrowed to what a review authorized.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewedScope {
+    /// The fresh candidates, with every one the review did not mark
+    /// reclaimable demoted to kept.
+    pub candidates: Vec<ReclaimCandidate>,
+    /// Reviewed-reclaimable paths this apply will not remove, and why.
+    pub withdrawn: Vec<String>,
+    /// Reclaimable in the fresh scan but absent from the review.
+    pub not_reviewed: Vec<PathBuf>,
+}
 
-    paths
+/// Narrow a fresh scan to the decisions an operator reviewed.
+///
+/// A confirmation authorizes the reviewed reclaimable paths, and nothing else.
+/// The fresh scan still decides whether each of them may go *now*: a reviewed
+/// path is removed only if it is also reclaimable today, so a session that
+/// became active, a directory Git now tracks, or a worktree no session records
+/// any more keeps it. What changed elsewhere in the root -- another session's
+/// build creating a `target/`, a kept candidate appearing or vanishing -- no
+/// longer voids the review, which on a machine with many concurrent agents
+/// made a reviewed plan nearly impossible to apply.
+pub fn restrict_to_review(
+    current: &[ReclaimCandidate],
+    reviewed: &[ReclaimDecision],
+) -> ReviewedScope {
+    let authorized = reviewed
+        .iter()
+        .filter(|decision| decision.reclaimable)
+        .map(|decision| decision.path.clone())
+        .collect::<BTreeSet<_>>();
+    let mut not_reviewed = Vec::new();
+    let candidates = current
+        .iter()
+        .cloned()
+        .map(|mut candidate| {
+            if candidate.reclaimable && !authorized.contains(&candidate.path) {
+                candidate.reclaimable = false;
+                candidate.reason = "not in the reviewed plan".into();
+                not_reviewed.push(candidate.path.clone());
+            }
+            candidate
+        })
+        .collect::<Vec<_>>();
+    let withdrawn = authorized
+        .iter()
+        .filter_map(
+            |path| match candidates.iter().find(|candidate| &candidate.path == path) {
+                None => Some(format!("{}: no longer present", path.display())),
+                Some(candidate) if !candidate.reclaimable => Some(format!(
+                    "{}: now kept ({})",
+                    path.display(),
+                    candidate.reason
+                )),
+                Some(_) => None,
+            },
+        )
+        .collect();
+    not_reviewed.sort();
+    ReviewedScope {
+        candidates,
+        withdrawn,
+        not_reviewed,
+    }
+}
+
+/// Keep only the candidates inside one worktree, so a plan can be reviewed
+/// and applied for a single session.
+pub fn scope_to_worktree(
+    candidates: Vec<ReclaimCandidate>,
+    worktree: &Path,
+) -> Vec<ReclaimCandidate> {
+    let canonical = std::fs::canonicalize(worktree).ok();
+    candidates
         .into_iter()
-        .filter_map(|path| match (reviewed.get(&path), current.get(&path)) {
-            (None, Some(reclaimable)) => Some(format!(
-                "added candidate {} ({})",
-                path.display(),
-                if *reclaimable { "reclaimable" } else { "kept" }
-            )),
-            (Some(_), None) => Some(format!("removed candidate {}", path.display())),
-            (Some(reviewed), Some(current)) if reviewed != current => Some(format!(
-                "{} changed from {} to {}",
-                path.display(),
-                if *reviewed { "reclaimable" } else { "kept" },
-                if *current { "reclaimable" } else { "kept" }
-            )),
-            _ => None,
+        .filter(|candidate| {
+            candidate.worktree == worktree
+                || canonical.as_ref().is_some_and(|wanted| {
+                    std::fs::canonicalize(&candidate.worktree).is_ok_and(|found| &found == wanted)
+                })
         })
         .collect()
 }
@@ -147,8 +190,9 @@ fn ensure_regular_snapshot(path: &Path) -> io::Result<()> {
 /// Save a reviewed decision set beside the host-scoped worktree root.
 ///
 /// The digest is part of the filename so concurrent operators do not overwrite
-/// one another's review evidence. The caller supplies the exact digest again
-/// when loading the snapshot for a mismatch explanation.
+/// one another's review evidence. An apply whose fresh scan no longer hashes to
+/// the confirmed digest loads this snapshot to learn which paths were reviewed
+/// reclaimable (see [`restrict_to_review`]).
 pub fn save_snapshot(root: &Path, digest: &str, candidates: &[ReclaimCandidate]) -> io::Result<()> {
     std::fs::create_dir_all(root)?;
     let decisions = decisions(candidates);
@@ -175,8 +219,13 @@ pub fn save_snapshot(root: &Path, digest: &str, candidates: &[ReclaimCandidate])
     })
 }
 
-/// Load and verify the saved decision set for a failed confirmation. Invalid
-/// or tampered snapshots are not used to manufacture a misleading diff.
+/// Load and verify the saved decision set for a confirmation the fresh scan no
+/// longer matches. An invalid or tampered snapshot authorizes nothing.
+///
+/// Verification binds the file to the confirmed digest: the decisions must
+/// hash to it under this root. A forged snapshot therefore needs a different
+/// digest, which the operator did not confirm. Even an authentic one only
+/// narrows: every path it names is re-proved reclaimable by a fresh scan.
 pub fn load_snapshot(
     root: &Path,
     digest: &str,
@@ -257,7 +306,16 @@ pub fn is_artefact_directory_with_extras(name: &str, extras: &[String]) -> bool 
 /// stale session is named in the plan an operator reviews, so nothing is
 /// deleted without someone seeing whose it was.
 pub fn classify(path: &Path, worktree: &Path, bytes: u64, active: &[PathBuf]) -> ReclaimCandidate {
-    let is_active = active.iter().any(|candidate| candidate == worktree);
+    // A session row and a scan can spell one directory differently: `start
+    // --adopt` records the canonical `/private/var/...` where the scan walks
+    // `/var/...` on macOS. Exact comparison alone let an adopted, working
+    // session's build output be proposed for deletion.
+    let is_active = active.iter().any(|candidate| candidate == worktree)
+        || std::fs::canonicalize(worktree).is_ok_and(|worktree| {
+            active
+                .iter()
+                .any(|candidate| std::fs::canonicalize(candidate).is_ok_and(|c| c == worktree))
+        });
     ReclaimCandidate {
         path: path.to_path_buf(),
         worktree: worktree.to_path_buf(),
@@ -351,6 +409,25 @@ mod tests {
         );
     }
 
+    /// `start --adopt` records the canonical spelling of a worktree the scan
+    /// reaches through a symlink (`/var` versus `/private/var` on macOS).
+    #[test]
+    fn an_active_session_recorded_under_another_spelling_is_still_protected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir_all(real.join("s/target")).unwrap();
+        let alias = tmp.path().join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+
+        let candidate = classify(
+            &alias.join("s/target"),
+            &alias.join("s"),
+            8,
+            &[real.join("s")],
+        );
+        assert!(!candidate.reclaimable, "{candidate:?}");
+    }
+
     #[test]
     fn only_reclaimable_candidates_count_toward_the_total() {
         let candidates = vec![
@@ -394,36 +471,74 @@ mod tests {
         );
     }
 
+    fn reviewed(path: &str, reclaimable: bool) -> ReclaimDecision {
+        ReclaimDecision {
+            path: p(path),
+            reclaimable,
+        }
+    }
+
+    /// Another session's build creating a kept `target/` after review used to
+    /// void every reviewed deletion.
     #[test]
-    fn decision_changes_name_added_removed_and_reclassified_candidates() {
-        let reviewed = vec![
-            ReclaimDecision {
-                path: p("/w/a/target"),
-                reclaimable: true,
-            },
-            ReclaimDecision {
-                path: p("/w/b/target"),
-                reclaimable: true,
-            },
-        ];
+    fn an_unrelated_change_does_not_withdraw_a_reviewed_deletion() {
         let current = vec![
-            ReclaimDecision {
-                path: p("/w/a/target"),
-                reclaimable: false,
-            },
-            ReclaimDecision {
-                path: p("/w/c/target"),
-                reclaimable: true,
-            },
+            classify(&p("/w/done/target"), &p("/w/done"), 8, &[]),
+            classify(&p("/w/live/target"), &p("/w/live"), 8, &[p("/w/live")]),
         ];
-        assert_eq!(
-            decision_changes(&reviewed, &current),
-            vec![
-                "/w/a/target changed from reclaimable to kept",
-                "removed candidate /w/b/target",
-                "added candidate /w/c/target (reclaimable)",
-            ]
+        let scope = restrict_to_review(&current, &[reviewed("/w/done/target", true)]);
+        assert_eq!(reclaimable_bytes(&scope.candidates), 8);
+        assert!(scope.candidates[0].reclaimable);
+        assert!(scope.withdrawn.is_empty(), "{:?}", scope.withdrawn);
+        assert!(scope.not_reviewed.is_empty());
+    }
+
+    /// The review authorizes; the fresh scan still decides whether now is safe.
+    #[test]
+    fn a_reviewed_path_the_fresh_scan_keeps_is_withdrawn() {
+        let current = vec![classify(&p("/w/s/target"), &p("/w/s"), 8, &[p("/w/s")])];
+        let scope = restrict_to_review(&current, &[reviewed("/w/s/target", true)]);
+        assert_eq!(reclaimable_bytes(&scope.candidates), 0);
+        assert_eq!(scope.withdrawn.len(), 1);
+        assert!(
+            scope.withdrawn[0].contains("now kept"),
+            "{:?}",
+            scope.withdrawn
         );
+    }
+
+    #[test]
+    fn a_reviewed_path_that_vanished_is_reported_not_retried() {
+        let scope = restrict_to_review(&[], &[reviewed("/w/s/target", true)]);
+        assert!(scope.candidates.is_empty());
+        assert_eq!(scope.withdrawn, vec!["/w/s/target: no longer present"]);
+    }
+
+    /// Nobody reviewed a path that appeared afterwards, however reclaimable.
+    #[test]
+    fn a_path_the_review_did_not_mark_reclaimable_is_never_authorized() {
+        let current = vec![
+            classify(&p("/w/new/target"), &p("/w/new"), 8, &[]),
+            classify(&p("/w/was-kept/target"), &p("/w/was-kept"), 8, &[]),
+        ];
+        let scope = restrict_to_review(&current, &[reviewed("/w/was-kept/target", false)]);
+        assert_eq!(reclaimable_bytes(&scope.candidates), 0);
+        assert_eq!(
+            scope.not_reviewed,
+            vec![p("/w/new/target"), p("/w/was-kept/target")]
+        );
+        assert!(scope.withdrawn.is_empty());
+    }
+
+    #[test]
+    fn scoping_keeps_only_the_named_worktree() {
+        let candidates = vec![
+            classify(&p("/w/a/target"), &p("/w/a"), 8, &[]),
+            classify(&p("/w/b/target"), &p("/w/b"), 8, &[]),
+        ];
+        let scoped = scope_to_worktree(candidates, &p("/w/a"));
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].path, p("/w/a/target"));
     }
 
     #[test]
@@ -504,6 +619,9 @@ pub struct ReclaimOutcome {
     pub removed: Vec<PathBuf>,
     pub reclaimed_bytes: u64,
     pub skipped: Vec<String>,
+    /// Reclaimable now, but not in the reviewed plan, so left in place. A
+    /// later plan includes them.
+    pub not_reviewed: Vec<PathBuf>,
 }
 
 /// Directory size, following no symlinks.
@@ -690,6 +808,7 @@ pub fn apply(plan: &ReclaimPlan) -> ReclaimOutcome {
         removed: Vec::new(),
         reclaimed_bytes: 0,
         skipped: Vec::new(),
+        not_reviewed: Vec::new(),
     };
     for candidate in &plan.candidates {
         if !candidate.reclaimable {

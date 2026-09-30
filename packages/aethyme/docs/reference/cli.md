@@ -1162,15 +1162,26 @@ that command if the plan would remove an item the audit retains. `--repo
 `broker gc reclaim plan` inventories regenerable build directories inside this
 repository's broker worktree root and saves the reviewed decision set under a
 digest-keyed host-state filename. A snapshot write failure is reported as a
-warning and does not suppress the plan; the digest is still recomputed at apply
-time, so deletion safety does not depend on the diagnostic snapshot.
-`broker gc reclaim apply --confirm <sha256>` re-scans and removes only the exact
+warning and does not suppress the plan. Without the snapshot, apply falls back
+to requiring the exact current digest, so a failed write costs flexibility, not
+safety.
+`broker gc reclaim apply --confirm <sha256>` re-scans and removes only
 reviewed paths that are still reclaimable. The digest binds the root and the
 sorted candidate paths plus their kept/reclaimable decisions; measured byte
 counts remain visible in the plan but are deliberately excluded, so a build
-that grows while an operator reviews the plan does not invalidate it. If a
-path is added, removed, or changes reclaimability, apply refuses and names the
-decision changes when the saved review is available.
+that grows while an operator reviews the plan does not invalidate it. When the
+fresh scan no longer hashes to the confirmed digest -- another session's build
+created a `target/`, a kept candidate appeared or vanished -- apply loads the
+saved review for that digest and removes each path it marked reclaimable that
+the fresh scan also finds reclaimable. A reviewed path that is now kept (its
+session became active, Git now tracks files under it) or gone is reported
+under `skipped`; a reclaimable path the review did not include is left in
+place and reported under `not_reviewed`. The saved review only narrows: it can
+never authorize a path the fresh scan keeps. Without a readable, verified
+review, only an exact digest match authorizes deletion.
+
+`--session <id>` scopes a plan to that session's worktree, so one worktree can
+be reviewed and applied on its own; pass the same flag to apply.
 
 `broker gc` applies one declared retention policy across terminal events,
 gate results and their broker-owned logs, terminal merge-queue history,
