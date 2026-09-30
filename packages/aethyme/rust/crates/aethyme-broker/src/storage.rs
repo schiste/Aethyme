@@ -97,6 +97,7 @@ pub enum StorageCandidateKind {
     StrayDirectory,
     PrimaryArtifact,
     PreparationEntry,
+    EmptyRoot,
 }
 
 impl StorageCandidateKind {
@@ -106,6 +107,7 @@ impl StorageCandidateKind {
             Self::StrayDirectory => "stray_directory",
             Self::PrimaryArtifact => "primary_artifact",
             Self::PreparationEntry => "preparation_entry",
+            Self::EmptyRoot => "empty_root",
         }
     }
 }
@@ -132,8 +134,15 @@ pub struct StorageReconciliation {
     pub on_disk_count: usize,
     pub git_registered_count: usize,
     pub ledger_claimed_count: usize,
-    /// The union of the three sets. `missing_from` is empty only when all
-    /// three sources agree about the path.
+    /// Worktrees the session ledger records as removed on purpose: every
+    /// session naming the path finished its cleanup, and neither the disk nor
+    /// Git still has it. That is the correct end state of a finished session,
+    /// not drift, so these paths are counted here and left out of `entries`
+    /// and `ledger_claimed_count`.
+    #[serde(default)]
+    pub retired_count: usize,
+    /// The union of the three sets, less retired worktrees. `missing_from` is
+    /// empty only when all three sources agree about the path.
     pub entries: Vec<StorageEntry>,
 }
 
@@ -162,6 +171,14 @@ pub struct StorageRoot {
     pub on_disk_directory_count: usize,
     pub git_registered_count: usize,
     pub ledger_claimed_count: usize,
+    /// See [`StorageReconciliation::retired_count`].
+    #[serde(default)]
+    pub retired_count: usize,
+    /// True when the root holds nothing but the broker's own bookkeeping --
+    /// its ownership marker, the build defaults it writes, reclaim review
+    /// snapshots -- and no worktree, stray directory or other file.
+    #[serde(default)]
+    pub empty: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub estimated_bytes: Option<u64>,
     pub sized: bool,
@@ -199,6 +216,8 @@ pub struct StorageSummary {
     pub owner_missing_count: usize,
     pub orphan_root_count: usize,
     pub stray_directory_count: usize,
+    #[serde(default)]
+    pub empty_root_count: usize,
     pub candidate_count: usize,
     pub primary_checkout_count: usize,
     pub primary_artifact_count: usize,
@@ -353,6 +372,17 @@ struct DiskObservation {
 struct OwnerSources {
     git_registered: BTreeSet<PathBuf>,
     ledger_claimed: BTreeMap<PathBuf, Vec<i64>>,
+    /// Claimed paths whose every claiming session finished its cleanup.
+    retired: BTreeSet<PathBuf>,
+}
+
+impl OwnerSources {
+    /// Whether some session still holds, or means to keep, a worktree here.
+    fn has_unretired_claim(&self) -> bool {
+        self.ledger_claimed
+            .keys()
+            .any(|path| !self.retired.contains(path))
+    }
 }
 
 /// Build the host inventory for the repository containing `path_inside_repo`.
@@ -603,6 +633,8 @@ fn inspect_root(
             on_disk_directory_count: 0,
             git_registered_count: 0,
             ledger_claimed_count: 0,
+            retired_count: 0,
+            empty: false,
             sized: estimated_bytes.is_some(),
             estimated_bytes,
             reconciliation: empty_reconciliation(),
@@ -619,6 +651,7 @@ fn inspect_root(
         return StorageRoot {
             age_days: age_days(&path, evaluated_at),
             blockers: vec![foreign_worktree_blocker(&path)],
+            empty: false,
             estimated_bytes,
             filesystem_kind,
             git_registered_count: 0,
@@ -632,6 +665,7 @@ fn inspect_root(
             reconciliation: empty_reconciliation(),
             repository_key: None,
             repository_root: None,
+            retired_count: 0,
             sized: estimated_bytes.is_some(),
             worktree_count: 0,
         };
@@ -661,6 +695,7 @@ fn inspect_root(
     });
 
     let mut disk = BTreeMap::new();
+    let mut bookkeeping_only = true;
     match std::fs::read_dir(&path) {
         Ok(entries) => {
             for entry in entries {
@@ -673,8 +708,10 @@ fn inspect_root(
                 };
                 let child = entry.path();
                 if is_infrastructure(entry.file_name().as_ref()) {
+                    bookkeeping_only &= is_broker_bookkeeping(&child);
                     continue;
                 }
+                bookkeeping_only = false;
                 if !is_real_directory(&child) {
                     blockers.push(format!(
                         "{} is not a real directory and is never swept",
@@ -693,7 +730,10 @@ fn inspect_root(
                 );
             }
         }
-        Err(error) => blockers.push(format!("cannot enumerate root: {error}")),
+        Err(error) => {
+            bookkeeping_only = false;
+            blockers.push(format!("cannot enumerate root: {error}"));
+        }
     }
 
     let mut owner_sources = None;
@@ -728,6 +768,17 @@ fn inspect_root(
             entry.session_ids = session_ids.clone();
         }
     }
+    // A finished session's row outlives its worktree by design. Reporting it
+    // as "missing from disk and Git" made every fully cleaned repository look
+    // broken, and buried real drift under the record of normal cleanup.
+    let mut retired_count = 0;
+    if let Some(sources) = &owner_sources {
+        entries.retain(|path, entry| {
+            let retired = !entry.on_disk && !entry.git_registered && sources.retired.contains(path);
+            retired_count += usize::from(retired);
+            !retired
+        });
+    }
     let entries = entries
         .into_iter()
         .map(|(path, entry)| entry.finish(path))
@@ -738,9 +789,10 @@ fn inspect_root(
         git_registered_count: owner_sources
             .as_ref()
             .map_or(0, |sources| sources.git_registered.len()),
-        ledger_claimed_count: owner_sources
-            .as_ref()
-            .map_or(0, |sources| sources.ledger_claimed.len()),
+        ledger_claimed_count: owner_sources.as_ref().map_or(0, |sources| {
+            sources.ledger_claimed.len().saturating_sub(retired_count)
+        }),
+        retired_count,
         entries,
     };
     let estimated_bytes = observed_size(&path, scan, records);
@@ -780,6 +832,8 @@ fn inspect_root(
         on_disk_directory_count: disk.len(),
         git_registered_count: reconciliation.git_registered_count,
         ledger_claimed_count: reconciliation.ledger_claimed_count,
+        retired_count: reconciliation.retired_count,
+        empty: bookkeeping_only && disk.is_empty(),
         estimated_bytes,
         sized,
         reconciliation,
@@ -1322,6 +1376,30 @@ fn candidates_for_root(
     if root.owner_exists != Some(true) || !root.blockers.is_empty() {
         return Vec::new();
     }
+    // Nothing but bookkeeping, and no session holds or keeps a worktree here:
+    // the repository's last worktree is gone, and only a host-level sweep ever
+    // looks at the root again. The grace period is the orphan one, which keeps
+    // a root out of review while a `broker start` may still be filling it; the
+    // next start rewrites the marker and build defaults if the root is gone.
+    if root.empty && root.reconciliation.entries.is_empty() {
+        if root
+            .age_days
+            .is_some_and(|age| age >= orphan_worktree_roots_days)
+        {
+            return vec![StorageCandidate {
+                kind: StorageCandidateKind::EmptyRoot,
+                path: root.path.clone(),
+                root_path: root.path.clone(),
+                repository_key,
+                repository_root,
+                git_marker: false,
+                estimated_bytes: root.estimated_bytes,
+                reason: "no worktree remains and no session keeps one here; the root holds only broker bookkeeping, which the next `broker start` rewrites".into(),
+                marker_sha256,
+            }];
+        }
+        return Vec::new();
+    }
     root.reconciliation
         .entries
         .iter()
@@ -1450,6 +1528,10 @@ fn summarise(
             .iter()
             .filter(|candidate| candidate.kind == StorageCandidateKind::StrayDirectory)
             .count(),
+        empty_root_count: candidates
+            .iter()
+            .filter(|candidate| candidate.kind == StorageCandidateKind::EmptyRoot)
+            .count(),
         candidate_count: candidates.len(),
         primary_checkout_count: primary_checkouts.len(),
         primary_artifact_count: primary_checkouts
@@ -1517,6 +1599,7 @@ fn inspect_owner(owner: &Path, host_root: &Path) -> Result<OwnerSources, String>
         )
     })?;
     let mut ledger_claimed = BTreeMap::<PathBuf, Vec<i64>>::new();
+    let mut all_cleaned = BTreeMap::<PathBuf, bool>::new();
     let mut sessions = store
         .live_sessions()
         .map_err(|error| format!("live session ledger cannot be read: {error}"))?;
@@ -1528,21 +1611,32 @@ fn inspect_owner(owner: &Path, host_root: &Path) -> Result<OwnerSources, String>
     for session in sessions {
         let path = normalise_absolute(Path::new(&session.worktree_path), owner);
         if is_direct_child(&path, host_root) {
+            // One live or retained claim is enough to keep the path loud: a
+            // directory can be reused by a later session.
+            let cleaned = session.cleanup_state == crate::SessionCleanupState::Cleaned;
+            *all_cleaned.entry(path.clone()).or_insert(true) &= cleaned;
             ledger_claimed.entry(path).or_default().push(session.id);
         }
     }
     for session_ids in ledger_claimed.values_mut() {
         session_ids.sort_unstable();
     }
+    let retired = all_cleaned
+        .into_iter()
+        .filter_map(|(path, cleaned)| cleaned.then_some(path))
+        .collect();
     Ok(OwnerSources {
         git_registered,
         ledger_claimed,
+        retired,
     })
 }
 
 fn apply_candidate(candidate: &StorageCandidate, storage_root: &Path) -> Result<u64, String> {
     let current_marker_root = match candidate.kind {
-        StorageCandidateKind::OrphanRoot => candidate.path.as_path(),
+        StorageCandidateKind::OrphanRoot | StorageCandidateKind::EmptyRoot => {
+            candidate.path.as_path()
+        }
         StorageCandidateKind::StrayDirectory => candidate.root_path.as_path(),
         StorageCandidateKind::PrimaryArtifact => {
             return Err("primary artifacts use the primary-checkout apply lane".into());
@@ -1602,6 +1696,19 @@ fn apply_candidate(candidate: &StorageCandidate, storage_root: &Path) -> Result<
                 return Err("stray directory disappeared or is no longer a real directory".into());
             }
             remove_candidate_tree(&candidate.path, None)
+        }
+        StorageCandidateKind::EmptyRoot => {
+            if !is_real_directory(&candidate.repository_root) {
+                return Err("owning repository disappeared; review a new plan".into());
+            }
+            let sources = inspect_owner(&candidate.repository_root, &candidate.path)?;
+            if !sources.git_registered.is_empty() {
+                return Err("Git worktree registration appeared".into());
+            }
+            if sources.has_unretired_claim() {
+                return Err("a session now claims a worktree under this root".into());
+            }
+            remove_empty_root(&candidate.path)
         }
         StorageCandidateKind::PrimaryArtifact => {
             unreachable!("primary artifacts are rejected before host-root matching")
@@ -1670,6 +1777,91 @@ fn remove_candidate_tree(path: &Path, witness: Option<&str>) -> Result<u64, Stri
         Ok(TreeRemoval::Interrupted) => Err("directory removal was interrupted".into()),
         Err(error) => Err(error.to_string()),
     }
+}
+
+/// Whether a dotted root entry is something the broker itself wrote there.
+///
+/// Exact matches only. An operator who edited the build defaults, or anything
+/// else that left a file here, has put content in the root that no plan was
+/// written to judge, so the root stops being empty.
+fn is_broker_bookkeeping(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    if name == WORKTREE_ROOT_MARKER
+        || name == ".DS_Store"
+        || (name.starts_with(".aethyme-reclaim-plan-") && name.ends_with(".json"))
+    {
+        return is_regular_file(path);
+    }
+    if name != ".cargo" || !is_real_directory(path) {
+        return false;
+    }
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return false;
+    };
+    entries.flatten().all(|entry| {
+        let child = entry.path();
+        match entry.file_name().to_str() {
+            Some(".DS_Store") => is_regular_file(&child),
+            Some("config.toml") => {
+                is_regular_file(&child)
+                    && std::fs::read(&child)
+                        .is_ok_and(|bytes| bytes == crate::broker::WORKTREE_CARGO_CONFIG.as_bytes())
+            }
+            _ => false,
+        }
+    })
+}
+
+/// Remove a reviewed empty root, re-proving that it still holds only broker
+/// bookkeeping.
+///
+/// Entry by entry rather than as a tree, and the directory itself with
+/// `remove_dir`: a worktree a concurrent `broker start` adds after the check
+/// makes that final step fail rather than be deleted with the root. The marker
+/// goes last so an interrupted removal leaves a root that still names its owner.
+fn remove_empty_root(root: &Path) -> Result<u64, String> {
+    if !is_real_directory(root) {
+        return Err("root is no longer a real directory".into());
+    }
+    let entries = std::fs::read_dir(root)
+        .map_err(|error| format!("cannot enumerate root: {error}"))?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("cannot enumerate root: {error}"))?;
+    if let Some(unexpected) = entries.iter().find(|path| !is_broker_bookkeeping(path)) {
+        return Err(format!(
+            "root now holds {}, which is not broker bookkeeping",
+            unexpected.display()
+        ));
+    }
+    let mut freed = 0_u64;
+    let mut remove_file = |path: &Path| -> Result<(), String> {
+        freed += std::fs::symlink_metadata(path).map_or(0, |metadata| metadata.len());
+        std::fs::remove_file(path).map_err(|error| format!("{}: {error}", path.display()))
+    };
+    let (marker, rest): (Vec<_>, Vec<_>) = entries
+        .into_iter()
+        .partition(|path| path.file_name() == Some(WORKTREE_ROOT_MARKER.as_ref()));
+    for path in rest {
+        if is_real_directory(&path) {
+            for child in std::fs::read_dir(&path)
+                .map_err(|error| format!("{}: {error}", path.display()))?
+                .flatten()
+            {
+                remove_file(&child.path())?;
+            }
+            std::fs::remove_dir(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+        } else {
+            remove_file(&path)?;
+        }
+    }
+    for path in marker {
+        remove_file(&path)?;
+    }
+    std::fs::remove_dir(root).map_err(|error| format!("{}: {error}", root.display()))?;
+    Ok(freed)
 }
 
 fn storage_container(main_root: &Path) -> Result<PathBuf, StorageError> {
@@ -1877,6 +2069,7 @@ fn empty_reconciliation() -> StorageReconciliation {
         on_disk_count: 0,
         git_registered_count: 0,
         ledger_claimed_count: 0,
+        retired_count: 0,
         entries: Vec::new(),
     }
 }
@@ -2246,6 +2439,31 @@ mod tests {
     fn incomplete_storage_totals_remain_unknown() {
         assert_eq!(sized_sum([Some(1), Some(2)].into_iter()), Some(3));
         assert_eq!(sized_sum([Some(1), None].into_iter()), None);
+    }
+
+    /// Between review and apply a `broker start` may put a worktree in the
+    /// root. The removal re-checks and leaves everything in place.
+    #[test]
+    fn removing_an_empty_root_refuses_content_that_appeared_after_review() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        std::fs::create_dir_all(root.join(".cargo")).unwrap();
+        std::fs::write(root.join(WORKTREE_ROOT_MARKER), "{}\n").unwrap();
+        std::fs::write(
+            root.join(".cargo/config.toml"),
+            crate::broker::WORKTREE_CARGO_CONFIG,
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("new-session")).unwrap();
+
+        let error = remove_empty_root(&root).unwrap_err();
+        assert!(error.contains("new-session"), "{error}");
+        assert!(root.join(WORKTREE_ROOT_MARKER).is_file());
+        assert!(root.join(".cargo/config.toml").is_file());
+
+        std::fs::remove_dir(root.join("new-session")).unwrap();
+        assert!(remove_empty_root(&root).unwrap() > 0);
+        assert!(!root.exists());
     }
 
     #[test]

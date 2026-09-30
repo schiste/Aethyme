@@ -51,6 +51,12 @@ pub(super) fn render_storage_plan(plan: &crate::StoragePlan, detail: bool) {
         for blocker in &root.blockers {
             out!("    blocker: {blocker}");
         }
+        if detail && root.retired_count > 0 {
+            out!(
+                "    retired: {} worktree(s) removed by finished sessions",
+                root.retired_count
+            );
+        }
         if detail {
             for entry in &root.reconciliation.entries {
                 if !entry.missing_from.is_empty() {

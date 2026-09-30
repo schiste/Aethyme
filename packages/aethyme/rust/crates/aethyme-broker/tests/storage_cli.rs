@@ -1,6 +1,6 @@
 //! Host-scoped storage inventory and reviewed reclamation.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use aethyme_broker::Broker;
@@ -582,4 +582,183 @@ fn a_worktree_placed_at_the_root_level_is_never_reconciled_as_a_root() {
     assert_eq!(plan["summary"]["candidate_count"], 0, "{plan:#}");
     assert!(checkout.join("docs/guide.md").exists());
     assert!(checkout.join("src/lib.rs").exists());
+}
+
+/// Start a session through the CLI and finish it; returns its worktree.
+fn start_and_finish(repo: &Path, container: &Path, task: &str, finish: &[&str]) -> PathBuf {
+    let started = run(repo, container, &["start", "--task", task, "--json"]);
+    let session = json(started);
+    let worktree = PathBuf::from(session["worktree_path"].as_str().unwrap());
+    let id = session["id"].as_i64().unwrap().to_string();
+    let mut args = vec!["finish", "--session", id.as_str()];
+    args.extend_from_slice(finish);
+    let finished = run(repo, container, &args);
+    assert!(
+        finished.status.success(),
+        "finish: {}",
+        String::from_utf8_lossy(&finished.stderr)
+    );
+    worktree
+}
+
+/// The only root in the fixture container that belongs to the fixture repo.
+fn own_root(plan: &serde_json::Value) -> serde_json::Value {
+    let roots = plan["roots"].as_array().unwrap();
+    let owned = roots
+        .iter()
+        .filter(|root| root["owner_exists"] == true)
+        .collect::<Vec<_>>();
+    assert_eq!(owned.len(), 1, "{plan}");
+    owned[0].clone()
+}
+
+/// map-coloring and map-generator: every session finished and cleaned up, no
+/// worktree left. Each finished session's ledger row used to be reported as
+/// a worktree missing from disk and Git.
+#[test]
+fn worktrees_removed_by_finished_sessions_are_retired_not_missing() {
+    let (repo, container) = fixture();
+    for task in ["first finished task", "second finished task"] {
+        let worktree = start_and_finish(repo.path(), container.path(), task, &[]);
+        assert!(!worktree.exists(), "finish should remove {worktree:?}");
+    }
+
+    let plan = json(run(
+        repo.path(),
+        container.path(),
+        &["gc", "storage", "--json"],
+    ));
+    let root = own_root(&plan);
+    assert_eq!(root["retired_count"], 2, "{root}");
+    assert_eq!(root["ledger_claimed_count"], 0, "{root}");
+    assert_eq!(root["reconciliation"]["retired_count"], 2, "{root}");
+    assert!(
+        root["reconciliation"]["entries"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "retired worktrees are not drift: {root}"
+    );
+
+    let detail = run(
+        repo.path(),
+        container.path(),
+        &["gc", "storage", "--detail"],
+    );
+    let text = String::from_utf8_lossy(&detail.stdout);
+    assert!(!text.contains("drift:"), "{text}");
+    assert!(text.contains("retired: 2 worktree(s)"), "{text}");
+}
+
+/// A session that kept its worktree has not retired it: if that checkout
+/// disappears, something other than cleanup removed it.
+#[test]
+fn a_kept_worktree_that_disappears_is_still_reported_missing() {
+    let (repo, container) = fixture();
+    let worktree = start_and_finish(
+        repo.path(),
+        container.path(),
+        "kept worktree",
+        &["--keep-worktree"],
+    );
+    let canonical = std::fs::canonicalize(&worktree).unwrap();
+    git(
+        repo.path(),
+        &["worktree", "remove", "--force", worktree.to_str().unwrap()],
+    );
+
+    let plan = json(run(
+        repo.path(),
+        container.path(),
+        &["gc", "storage", "--json"],
+    ));
+    let root = own_root(&plan);
+    assert_eq!(root["retired_count"], 0, "{root}");
+    let entry = root["reconciliation"]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["path"] == canonical.to_str().unwrap())
+        .cloned()
+        .unwrap_or_else(|| panic!("kept worktree was not reported: {root}"));
+    assert_eq!(
+        entry["missing_from"],
+        serde_json::json!(["disk", "git_registration"])
+    );
+    assert!(
+        plan["candidates"].as_array().unwrap().is_empty(),
+        "a root a session still claims is never empty: {plan}"
+    );
+}
+
+/// The last worktree is gone and only bookkeeping remains: the root becomes a
+/// reviewed candidate, and the next `broker start` recreates it.
+#[test]
+fn an_empty_root_is_a_reviewed_candidate_and_the_next_start_recreates_it() {
+    let (repo, container) = fixture();
+    start_and_finish(repo.path(), container.path(), "only task", &[]);
+    let plan = json(run(
+        repo.path(),
+        container.path(),
+        &["gc", "storage", "--json"],
+    ));
+    let root = own_root(&plan);
+    assert_eq!(root["empty"], true, "{root}");
+    let root_path = PathBuf::from(root["path"].as_str().unwrap());
+    assert!(root_path.join(".cargo/config.toml").is_file());
+    let candidates = plan["candidates"].as_array().unwrap();
+    assert_eq!(candidates.len(), 1, "{plan}");
+    assert_eq!(candidates[0]["kind"], "empty_root");
+    assert_eq!(plan["summary"]["empty_root_count"], 1);
+
+    let digest = plan["digest"].as_str().unwrap();
+    let applied = json(run(
+        repo.path(),
+        container.path(),
+        &["gc", "storage", "apply", "--confirm", digest, "--json"],
+    ));
+    assert_eq!(applied["complete"], true, "{applied}");
+    assert!(!root_path.exists(), "the empty root should be removed");
+
+    let started = json(run(
+        repo.path(),
+        container.path(),
+        &["start", "--task", "after the sweep", "--json"],
+    ));
+    let worktree = PathBuf::from(started["worktree_path"].as_str().unwrap());
+    assert!(worktree.is_dir(), "start must recreate the root: {started}");
+    assert!(root_path.join(".aethyme-worktree-root.json").is_file());
+    assert!(root_path.join(".cargo/config.toml").is_file());
+}
+
+/// Anything the broker did not write there -- including build defaults an
+/// operator edited -- is content no plan judged, so the root is not empty.
+#[test]
+fn a_root_holding_anything_but_bookkeeping_is_not_empty() {
+    for extra in ["notes", "edited-cargo-config"] {
+        let (repo, container) = fixture();
+        start_and_finish(repo.path(), container.path(), "only task", &[]);
+        let root = own_root(&json(run(
+            repo.path(),
+            container.path(),
+            &["gc", "storage", "--json"],
+        )));
+        let root_path = PathBuf::from(root["path"].as_str().unwrap());
+        match extra {
+            "notes" => std::fs::write(root_path.join(".notes"), "mine\n").unwrap(),
+            _ => std::fs::write(root_path.join(".cargo/config.toml"), "[build]\n").unwrap(),
+        }
+
+        let plan = json(run(
+            repo.path(),
+            container.path(),
+            &["gc", "storage", "--json"],
+        ));
+        assert_eq!(own_root(&plan)["empty"], false, "{extra}: {plan}");
+        assert!(
+            plan["candidates"].as_array().unwrap().is_empty(),
+            "{extra}: {plan}"
+        );
+        assert!(root_path.exists());
+    }
 }

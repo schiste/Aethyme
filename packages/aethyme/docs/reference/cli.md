@@ -1487,6 +1487,13 @@ session IDs, and bounded byte estimates. Existing repository-local `gc` and
 an owner has been deleted, the invoking repository's orphan grace setting is
 used and is reported in the plan.
 
+A worktree that a finished session removed on purpose is not drift. When every
+session that names a path has completed its cleanup and neither the disk nor
+Git still has the path, the root reports it in `retired_count` (on the root and
+its `reconciliation`) instead of listing it in `entries` or counting it in
+`ledger_claimed_count`. A path a live or retained session still names stays in
+`entries` and is reported missing if it disappears.
+
 The same plan also reports regenerable top-level artifact directories in every
 enrolled primary checkout it can discover. The primary-checkout section is
 separate from host worktree-root reconciliation: it lists each checkout's
@@ -1500,7 +1507,13 @@ The inventory and `storage plan` are read-only. A directory that is absent from
 both Git registrations and the session ledger is reported as a possible stray,
 but it is not eligible unless the owning root has valid marker evidence. A
 valid marker whose owner is gone becomes an orphan candidate only after the
-reported grace period. Unmarked roots, non-directory entries, unreadable
+reported grace period. A root whose owner still exists becomes an
+`empty_root` candidate, after the same grace period, when it holds no worktree
+or other directory, no session keeps a worktree in it, and its only contents are
+the broker's own bookkeeping: the ownership marker, the unedited
+`.cargo/config.toml` build defaults, reclaim review snapshots and `.DS_Store`.
+The root reports this as `empty`. The next `broker start` recreates the root,
+its marker and its build defaults. Unmarked roots, non-directory entries, unreadable
 ledgers, and any ownership disagreement remain blockers. Apply only the exact
 reviewed digest:
 
