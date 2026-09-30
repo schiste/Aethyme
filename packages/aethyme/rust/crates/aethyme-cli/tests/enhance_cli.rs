@@ -84,7 +84,7 @@ fn agents_document_includes_broker_protocol_only_when_configured() {
     let agents = read(repo.join("AGENTS.md"));
     for needle in [
         "## Broker Coordination: before and after an edit",
-        "aethyme broker start --task \"<task>\" --short-name \"<short name>\"",
+        "aethyme broker start --task \"<task>\" [--short-name \"<label>\"]",
         "work only in the worktree it",
         "Never edit another session's worktree.",
         "aethyme broker submit --session <id>",

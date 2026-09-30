@@ -487,7 +487,8 @@ pub use types::{
     NewPrWatchState, NewSession, OperationEffect, OperationHistoryPage, OperationHistoryQuery,
     OperationIdentityProvenance, OperationProvider, OperationStatus, PrWatchState, ScopeKind,
     ScopeOperation, ScopeSource, Session, SessionCleanupState, SessionContext, SessionNote,
-    SessionNoteList, SessionOrigin, SessionScope, SessionStatus, validate_session_short_name,
+    SessionNoteList, SessionOrigin, SessionScope, SessionStatus, derive_session_short_name,
+    validate_session_short_name,
 };
 pub use unpushed::{UnpublishedIntegrationWork, UnpushedSessionWork, UnpushedWorkReport};
 pub use update::{

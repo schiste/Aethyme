@@ -14,7 +14,7 @@ Orientation: `.claude/skills/repo-onboarding/SKILL.md`, then `.claude/skills/rep
 
 Other agents may be working in sibling worktrees.
 
-1. `aethyme broker start --task "<task>" --short-name "<short name>"`, then work only in the worktree it
+1. `aethyme broker start --task "<task>" [--short-name "<label>"]`, then work only in the worktree it
    reports. Never edit another session's worktree.
 2. When done: `aethyme broker submit --session <id>`, then
    `aethyme broker finish --session <id>`.

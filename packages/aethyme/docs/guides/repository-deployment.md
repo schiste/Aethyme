@@ -197,7 +197,8 @@ aethyme deploy verify --repo .
 The command is read-only. It fails when the repository is configured for the
 broker but its mandatory agent protocol is missing or invalid. Normal agent
 work then begins with `aethyme broker status --json` followed by
-`aethyme broker start --task "..." --short-name "..."`, as required by the committed root policy.
+`aethyme broker start --task "..."` (optionally with `--short-name "..."`), as
+required by the committed root policy.
 Missing optional `.claude/` integrations are warnings rather than failures, so
 a clean clone can verify portable canonical policy before local activation.
 

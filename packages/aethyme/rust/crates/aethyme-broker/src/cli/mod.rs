@@ -106,7 +106,7 @@ Usage:
       Inspect exact-HEAD gate quality without changing enforced selection.
       --probe explicitly runs all or one selected gate in a disposable
       detached worktree with ephemeral cache evidence and mutation capture.
-  aethyme broker adopt [<path>] [--task <text>] --short-name <name> [--path <repo-path>]... [--agent <name-and-email>] [--repo-name <name>] [--tab-name <name>] [--ai-provider <provider>] [--reuse [--sync-integration]|--replace-stale] [--json]
+  aethyme broker adopt [<path>] [--task <text>] [--short-name <name>] [--path <repo-path>]... [--agent <name-and-email>] [--repo-name <name>] [--tab-name <name>] [--ai-provider <provider>] [--reuse [--sync-integration]|--replace-stale] [--json]
       Register an existing worktree (attach-first). Defaults to the
       current directory. If the worktree already has a session:
       --reuse points it at a follow-up task with a fresh baseline and
@@ -184,13 +184,13 @@ Usage:
       Resolve retained ambiguity explicitly. Assignment requires --session;
       unsupported or repository-mismatched events can only be ignored. The
       reason is stored as a SHA-256 digest, never as text.
-  aethyme broker start --task <text> --short-name <name> [--base <ref>] [--pull-request <number>] [--path <repo-path>]... [--agent <name-and-email>] [--repo-name <name>] [--tab-name <name>] [--ai-provider <provider>] [--json]
+  aethyme broker start --task <text> [--short-name <name>] [--base <ref>] [--pull-request <number>] [--path <repo-path>]... [--agent <name-and-email>] [--repo-name <name>] [--tab-name <name>] [--ai-provider <provider>] [--json]
       Create a broker-managed worktree + branch and register a session,
       atomically claiming every reviewed --path, but do not spawn a process.
       Prefer this over adopting the main
       checkout for agent work; it isolates the git index and worktree.
       --agent as in adopt (see above).
-  aethyme broker start-agent --task <text> --cmd <command> --short-name <name> [--pull-request <number>] [--agent <identity>] [--repo-name <name>] [--tab-name <name>] [--ai-provider <provider>] [--json]
+  aethyme broker start-agent --task <text> --cmd <command> [--short-name <name>] [--pull-request <number>] [--agent <identity>] [--repo-name <name>] [--tab-name <name>] [--ai-provider <provider>] [--json]
       Create a worktree + branch and spawn <command> in it (sh -c),
       logging to .aethyme/logs/.
   aethyme broker prepare status --session <id> [--json]

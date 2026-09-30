@@ -405,12 +405,13 @@ stashing multi-worktree changes.
   pull-request reviews must use the routed review adapter, which provisions and
   verifies the exact pull-request head. Ordinary task text is not inspected for
   review-looking phrases.
-- `aethyme broker start --adopt [<path>] --task "..." --short-name <name> [--path <repo-path>]... [--agent "<Name> <email>"] [--repo-name <name>] [--tab-name <name>] [--ai-provider <provider>] [--json]`
-- `aethyme broker start --reuse --task "..." --short-name <name> [--sync-integration] [--json]` — point this worktree's existing session at a follow-up task (formerly `adopt --reuse`); `start --replace-stale` replaces a stale registration (formerly `adopt --replace-stale`).
+- `aethyme broker start --adopt [<path>] --task "..." [--short-name <name>] [--path <repo-path>]... [--agent "<Name> <email>"] [--repo-name <name>] [--tab-name <name>] [--ai-provider <provider>] [--json]`
+- `aethyme broker start --reuse --task "..." [--short-name <name>] [--sync-integration] [--json]` — point this worktree's existing session at a follow-up task (formerly `adopt --reuse`); `start --replace-stale` replaces a stale registration (formerly `adopt --replace-stale`).
 
-Every session registration and reuse requires `--short-name`: a concise label
-of at most 48 characters, trimmed of surrounding whitespace and without
-control characters. When Chau7 is available, the broker names the matching tab
+`--short-name` is an optional concise label of at most 48 characters, trimmed
+of surrounding whitespace and without control characters. When it is omitted,
+a new session takes the task's leading words, cut at a word boundary to fit
+the limit; `--reuse` without it keeps the session's existing name. When Chau7 is available, the broker names the matching tab
 `<session-id> - <short-name>`; a missing tab leaves the session registered
 with a pending rename, while ambiguous or mismatched identity is refused with
 a reason.
@@ -841,7 +842,8 @@ baseline. Reuse may update its task and activity, but cannot absorb pending
 commits into a new baseline. Close the completed session before adopting a new
 identity when a genuinely fresh ownership boundary is required.
 
-Every registration and reuse requires `--short-name`, the concise tab label.
+Registration and reuse accept an optional `--short-name`, the concise tab label;
+without it a new session's label is derived from its task.
 Session registration also accepts optional human-facing context for host
 integrations: `--repo-name`, `--tab-name`, and `--ai-provider`. The equivalent
 environment fallbacks are `AETHYME_SESSION_REPO_NAME`,

@@ -480,6 +480,34 @@ pub fn validate_session_short_name(value: &str) -> Result<String, &'static str> 
     Ok(value.to_string())
 }
 
+/// Short name for a session whose agent did not supply one: the task's leading
+/// words, cut at a word boundary to fit [`MAX_SESSION_SHORT_NAME_CHARS`].
+///
+/// Deterministic, so the same task always names its tab the same way. `None`
+/// when nothing usable remains; the session then keeps no short name and its
+/// tab is left untitled rather than given a placeholder.
+pub fn derive_session_short_name(task: &str) -> Option<String> {
+    let mut name = String::new();
+    for word in task
+        .split_whitespace()
+        .map(|word| word.chars().filter(|c| !c.is_control()).collect::<String>())
+        .filter(|word| !word.is_empty())
+    {
+        let separator = usize::from(!name.is_empty());
+        if name.chars().count() + separator + word.chars().count() > MAX_SESSION_SHORT_NAME_CHARS {
+            if name.is_empty() {
+                name = word.chars().take(MAX_SESSION_SHORT_NAME_CHARS).collect();
+            }
+            break;
+        }
+        if separator == 1 {
+            name.push(' ');
+        }
+        name.push_str(&word);
+    }
+    validate_session_short_name(&name).ok()
+}
+
 fn normalize_context_value(value: Option<String>) -> Option<String> {
     value
         .map(|value| value.trim().to_string())

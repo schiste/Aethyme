@@ -22,16 +22,21 @@ pub(super) fn session_context_value(
 }
 
 pub(super) fn session_context(parsed: &Parsed) -> Result<crate::SessionContext, UsageError> {
-    let short_name = parsed
-        .short_name
-        .as_deref()
-        .ok_or_else(|| {
-            UsageError::Message("session registration or reuse requires --short-name".into())
-        })
-        .and_then(|value| {
+    // Optional: every caller written before short names existed must keep
+    // working. An explicit value is validated; without one a new session
+    // takes its name from the task, while `--reuse` passes none so the store
+    // keeps the name the session already has.
+    let short_name = match parsed.short_name.as_deref() {
+        Some(value) => Some(
             crate::validate_session_short_name(value)
-                .map_err(|message| UsageError::Message(message.into()))
-        })?;
+                .map_err(|message| UsageError::Message(message.into()))?,
+        ),
+        None if parsed.reuse => None,
+        None => parsed
+            .task
+            .as_deref()
+            .and_then(crate::derive_session_short_name),
+    };
     Ok(crate::SessionContext::new(
         session_context_value(
             parsed.repo_name.as_ref(),
@@ -54,7 +59,7 @@ pub(super) fn session_context(parsed: &Parsed) -> Result<crate::SessionContext, 
             ],
         ),
     )
-    .with_short_name(Some(short_name)))
+    .with_short_name(short_name))
 }
 
 #[derive(serde::Serialize)]

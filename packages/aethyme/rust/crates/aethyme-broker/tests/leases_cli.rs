@@ -145,7 +145,7 @@ fn lease_plan_cli_renders_structured_and_text_results_without_mutation() {
             .any(|action| action
                 .as_str()
                 .unwrap()
-                .contains("--reuse --short-name \"<short name>\" --path README.md"))
+                .contains("--reuse --path README.md"))
     );
     assert_eq!(report["paths"][1]["path"], "src/new.rs");
     assert_eq!(report["paths"][1]["conflicts"][0]["relation"], "directory");

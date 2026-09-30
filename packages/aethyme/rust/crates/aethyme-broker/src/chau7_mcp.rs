@@ -208,10 +208,10 @@ fn resolve_target_tab_id(
                 "tab name {expected_name:?} matches multiple Chau7 tabs"
             )));
         }
-        if let Some(tab) = matches.first() {
-            if !matched_ids.iter().any(|id| id == &tab.tab_id) {
-                matched_ids.push(tab.tab_id.clone());
-            }
+        if let Some(tab) = matches.first()
+            && !matched_ids.iter().any(|id| id == &tab.tab_id)
+        {
+            matched_ids.push(tab.tab_id.clone());
         }
     }
 

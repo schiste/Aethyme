@@ -338,7 +338,7 @@ read it first. Leases, gates, advisories and recovery: `references/broker.md`."#
 
 Other agents may be working in sibling worktrees.
 
-1. `aethyme broker start --task "<task>" --short-name "<short name>"`, then work only in the worktree it
+1. `aethyme broker start --task "<task>" [--short-name "<label>"]`, then work only in the worktree it
    reports. Never edit another session's worktree.
 2. When done: `aethyme broker submit --session <id>`, then
    `aethyme broker finish --session <id>`.
@@ -939,7 +939,7 @@ mod tests {
         let doc = render_agents_document(Some(&repo)).unwrap();
         for needle in [
             "## Broker Coordination: before and after an edit",
-            "`aethyme broker start --task \"<task>\" --short-name \"<short name>\"`",
+            "`aethyme broker start --task \"<task>\" [--short-name \"<label>\"]`",
             "work only in the worktree it\n   reports",
             "Never edit another session's worktree.",
             "`aethyme broker submit --session <id>`",
