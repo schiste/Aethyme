@@ -267,8 +267,14 @@ impl McpStdioClient {
         {
             Ok(reader) => reader,
             Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                crate::warn_unrecorded(
+                    "terminate Chau7 MCP bridge after reader startup failed",
+                    child.kill(),
+                );
+                crate::warn_unrecorded(
+                    "reap Chau7 MCP bridge after reader startup failed",
+                    child.wait(),
+                );
                 return Err(format!("could not start the Chau7 MCP reader: {error}"));
             }
         };
@@ -437,7 +443,12 @@ fn read_responses(stdout: impl std::io::Read, sender: mpsc::Sender<Result<String
                 }
             }
             Err(error) => {
-                let _ = sender.send(Err(format!("could not read Chau7 MCP response: {error}")));
+                if sender
+                    .send(Err(format!("could not read Chau7 MCP response: {error}")))
+                    .is_err()
+                {
+                    return;
+                }
                 break;
             }
         }
@@ -457,14 +468,17 @@ impl Drop for McpStdioClient {
                 Ok(None) | Err(_) => {
                     // This terminates only the bridge child created above; the
                     // Chau7 application remains owned by the user.
-                    let _ = self.child.kill();
-                    let _ = self.child.wait();
+                    crate::warn_unrecorded("terminate Chau7 MCP bridge", self.child.kill());
+                    crate::warn_unrecorded("reap Chau7 MCP bridge", self.child.wait());
                     break;
                 }
             }
         }
         if let Some(reader) = self.reader.take() {
-            let _ = reader.join();
+            crate::warn_unrecorded(
+                "join Chau7 MCP response reader",
+                reader.join().map_err(|_| "reader thread panicked"),
+            );
         }
     }
 }
