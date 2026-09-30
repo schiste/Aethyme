@@ -922,6 +922,45 @@ it cannot refresh an expiry or acknowledge ownership. Keep provider-specific
 labels and queue payloads in adapters; use the exported schema as their
 idempotent input rather than extending the broker's lease storage.
 
+## Push Session Branches As You Go
+
+Work that exists only in a session worktree is lost with the worktree, and
+nobody can review a branch that was never pushed. On one machine, a survey of
+broker worktrees found 94 holding work that existed nowhere else, and one
+repository's local integration branch held 74 commits that had not been
+published in five weeks. A repository that delivers through pull requests
+should make the session branch the unit of delivery and push it continuously:
+
+```toml
+# .aethyme/config.toml
+[promote]
+mode = "verify-only"   # verify on submit, keep nothing unpublished locally
+
+[delivery]
+default = "pull_request"
+push_session_branches = true
+```
+
+With `push_session_branches = true`, the generated agent instructions tell
+agents to commit early and small, and after each commit:
+
+```bash
+aethyme broker push --session 111          # push the session's own agent/<slug> branch
+aethyme broker push --session 111 --pr     # once there is a first meaningful commit: open a draft PR
+```
+
+The policy is the authorization for exactly those two actions. It never
+authorizes merging, marking a PR ready, or pushing any other ref; those remain
+explicit, separately authorized operations through `broker advanced git` and
+`broker advanced gh`. `broker status` and `broker doctor` report sessions with
+unpushed commits, and `finish` refuses to close one while its commits are
+unpushed unless the agent records why the work should not be kept with
+`--abandon --reason "<why>"`.
+
+Without the policy, the generated instructions keep the conservative default:
+submitting never authorizes publishing, and delivery goes through the
+reviewed `broker advanced ship` workflow.
+
 ## Finish With A Durable Handoff
 
 Use `finish`, rather than the lower-level `close`, for the normal end of a

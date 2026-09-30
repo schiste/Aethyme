@@ -1015,6 +1015,7 @@ const CONFIG_TEMPLATE: &str = "\
 #   [promote] mode    \"auto\" | \"manual\" | \"verify-only\"
 #   [promote] branch  integration branch name
 #   [delivery] default \"pull_request\" | \"local_main_merge\"
+#   [delivery] push_session_branches  true | false (default false)
 #   [leases]  ignore  paths never leased (trailing / = directory prefix)
 #   [leases.routing] category = [\"path/\", \"exact/file\"]
 # Unknown keys are ignored at runtime; `aethyme certify` warns on them.
@@ -1037,6 +1038,15 @@ mode = \"auto\"
 # legacy direct-ship behavior in existing repositories.
 # [delivery]
 # default = \"pull_request\"
+#
+# `push_session_branches = true` authorizes agents to push their own session
+# branch (`aethyme broker push`) and open a draft pull request
+# (`aethyme broker push --pr`) while they work, so no work exists only in a
+# worktree. It authorizes nothing else: no merging and no other refs. For a
+# repository that delivers through pull requests, pair it with
+# `[promote] mode = \"verify-only\"` so verified work does not accumulate,
+# unpublished, on the local integration branch.
+# push_session_branches = true
 
 # [leases]
 # ignore = [\"generated/\"]   # entries ending in / are directory prefixes
@@ -1266,5 +1276,39 @@ fn validate_gates(main_root: &Path) -> Check {
             status: CheckStatus::Fail,
             detail: format!("gates.toml invalid: {err}"),
         },
+    }
+}
+
+#[cfg(test)]
+mod config_template_tests {
+    use super::CONFIG_TEMPLATE;
+
+    /// The template is a file maintainers edit by uncommenting lines, so both
+    /// the shipped form and the push-as-you-go form must stay valid TOML.
+    #[test]
+    fn the_template_documents_push_session_branches_as_an_opt_in() {
+        let shipped: toml::Value = CONFIG_TEMPLATE.parse().expect("shipped template parses");
+        assert!(
+            shipped.get("delivery").is_none(),
+            "the policy must stay opt-in: {shipped:?}"
+        );
+        assert!(CONFIG_TEMPLATE.contains("#   [delivery] push_session_branches  true | false"));
+        assert!(CONFIG_TEMPLATE.contains("`[promote] mode = \"verify-only\"`"));
+
+        let opted_in = CONFIG_TEMPLATE
+            .replace("# [delivery]\n", "[delivery]\n")
+            .replace(
+                "# default = \"pull_request\"\n",
+                "default = \"pull_request\"\n",
+            )
+            .replace(
+                "# push_session_branches = true\n",
+                "push_session_branches = true\n",
+            );
+        let opted_in: toml::Value = opted_in.parse().expect("uncommented template parses");
+        assert_eq!(
+            opted_in["delivery"]["push_session_branches"].as_bool(),
+            Some(true)
+        );
     }
 }
