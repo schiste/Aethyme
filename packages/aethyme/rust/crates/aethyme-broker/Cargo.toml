@@ -58,3 +58,5 @@ semver = "1"
 # binary compiled in a different merge worktree.
 [dev-dependencies]
 aethyme-testkit = { path = "../aethyme-testkit" }
+# Seeds tempfile's generator in a test to reproduce the #430 name collision.
+fastrand = "2"
