@@ -399,7 +399,12 @@ impl Broker {
             return PrOverlapCheck::default();
         };
         if let Ok(text) = serde_json::to_string(&listing) {
-            let _ = self.store_ref().meta_set(OPEN_PRS_KEY, &text);
+            // The cache only saves the next command a `gh` call; the check
+            // this push reports is already computed.
+            crate::warn_unrecorded(
+                "cache the open pull request listing",
+                self.store_ref().meta_set(OPEN_PRS_KEY, &text),
+            );
         }
         let Some(session_ranges) = self.ranges_for_head(&default, head) else {
             return PrOverlapCheck {
@@ -436,7 +441,10 @@ impl Broker {
                             ranges: ranges.clone(),
                         })
                     {
-                        let _ = self.store_ref().meta_set(&ranges_key(pr.number), &text);
+                        crate::warn_unrecorded(
+                            "cache an open pull request's changed lines",
+                            self.store_ref().meta_set(&ranges_key(pr.number), &text),
+                        );
                     }
                     fresh
                 }
