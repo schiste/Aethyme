@@ -78,6 +78,7 @@ mod pr;
 mod pr_link;
 mod pr_monitoring;
 mod scopes;
+mod unpushed;
 mod worktree_report;
 pub use pr_monitoring::{
     activate as activate_pr_monitoring, active_sessions as pr_monitoring_sessions,
@@ -483,6 +484,7 @@ pub use types::{
     SessionCleanupState, SessionContext, SessionNote, SessionNoteList, SessionOrigin, SessionScope,
     SessionStatus,
 };
+pub use unpushed::{UnpublishedIntegrationWork, UnpushedSessionWork, UnpushedWorkReport};
 pub use update::{
     INSTALL_RECEIPT_FILENAME, INSTALL_RECEIPT_SCHEMA_VERSION, InstallReceipt, InstallationMethod,
     InstallationProvenance, UPDATE_PLAN_SCHEMA_VERSION, UpdateAction, UpdateArchive, UpdateChannel,

@@ -602,7 +602,7 @@ continues to expose the complete local `log_path` without embedding log data.
 - `aethyme broker advanced leases export (--session <id> | --entry <id>) [--limit <n>] [--json]`
 - `aethyme broker submit --session <id> [--no-cache] [--json]`
 - `aethyme broker advanced repair --session <id> [--json]`
-- `aethyme broker finish --session <id> [--json]`
+- `aethyme broker finish --session <id> [--keep-worktree] [--abandon --reason <why>] [--json]`
 - `aethyme broker advanced representation scan --session <id> [--json]`
 - `aethyme broker advanced representation status --session <id> [--json]`
 - `aethyme broker advanced representation record --session <id> --confirm <sha256> [--json]`
@@ -1094,6 +1094,40 @@ then reclaims a represented broker-owned spawned worktree and its exact checked
 branch by default. It reports exact reclaimed bytes and whether each artifact
 was removed. Use `--keep-worktree` to close the session without physical
 cleanup; `broker finish close` also remains state-only.
+
+### Unpushed work
+
+`broker status` and `broker doctor` report committed work that exists only on
+this machine, read from local refs without fetching:
+
+- **Per live session:** commits reachable from the session's HEAD that no
+  remote-tracking ref holds and that the session did not inherit from its start
+  or reuse base, less any whose patch is already upstream (a squash- or
+  rebase-merged pull request lands the same patch under another SHA). Each
+  appears as a `session.unpushed-commits` advice row naming
+  `aethyme broker push --session <id>`, and in `unpushed_work.sessions[]`.
+- **For the integration branch:** commits upstream lacks, less patch
+  equivalents, with how many exist on no remote at all
+  (`integration.unpublished-work`, `unpushed_work.integration`). The advice
+  names shipping, or `[promote] mode = "verify-only"` for a repository that
+  delivers through pull requests, where integration would otherwise
+  accumulate work nobody publishes.
+
+Severity follows the age of the oldest unpushed commit. Without the push lane
+the session count is context only: `info`, then `notice` after a day. With
+`[delivery] push_session_branches = true` it is `info` for four hours (one
+working block), `warning` until a day (the author's context is gone and the
+idle-session artifact sweep window has passed), then `blocked`, because finish
+refuses. Integration tops out at `warning` after a day: nothing is blocked by
+it.
+
+Under the push lane, `finish` and `finish close` refuse while the session
+holds such commits, naming `aethyme broker push --session <id>`; `finish`
+reports the count as `unpushed_commits`. `--abandon --reason "<why>"` closes
+anyway and records a `broker.session.abandoned_unpushed` event with the branch,
+head, count and reason. `--abandon` without a reason, or a reason without
+`--abandon`, is refused. A repository with no remote is never refused: there
+is nowhere to push to.
 
 Work that reaches the default branch through a reviewed pull request is
 delivered, but leaves no promoted queue entry, and a squash merge rewrites the

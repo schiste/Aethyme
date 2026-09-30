@@ -1391,6 +1391,49 @@ impl GitRepo {
         .collect())
     }
 
+    /// Non-merge commits reachable from `head` but from no remote-tracking
+    /// ref and none of `excluded`, newest first, each with its committer time
+    /// in Unix epoch milliseconds. Reads only local refs: it answers "what
+    /// would a push add", as of the last fetch.
+    pub fn commits_off_remotes(
+        &self,
+        head: &str,
+        excluded: &[&str],
+    ) -> Result<Vec<(String, i64)>, GitError> {
+        let mut args = vec![
+            "log",
+            "--no-merges",
+            "--format=%H %ct",
+            head,
+            "--not",
+            "--remotes",
+        ];
+        args.extend_from_slice(excluded);
+        Ok(run_git(&self.root, &args)?
+            .lines()
+            .filter_map(|line| {
+                let (commit, seconds) = line.split_once(' ')?;
+                Some((commit.to_string(), seconds.parse::<i64>().ok()? * 1000))
+            })
+            .collect())
+    }
+
+    /// Earliest committer time among `commits`, Unix epoch milliseconds, in
+    /// one Git process however many commits are named.
+    pub fn oldest_commit_time_ms(&self, commits: &[&str]) -> Option<i64> {
+        if commits.is_empty() {
+            return None;
+        }
+        let mut args = vec!["log", "--no-walk=unsorted", "--format=%ct"];
+        args.extend_from_slice(commits);
+        run_git(&self.root, &args)
+            .ok()?
+            .lines()
+            .filter_map(|seconds| seconds.trim().parse::<i64>().ok())
+            .min()
+            .map(|seconds| seconds * 1000)
+    }
+
     /// First-parent commits reachable from `head` but not `excluded`,
     /// oldest first. Submission provenance uses only this layer so a
     /// broker promotion merge and its submitted second parent do not

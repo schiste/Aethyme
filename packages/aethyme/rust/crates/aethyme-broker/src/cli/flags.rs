@@ -356,8 +356,11 @@ pub(super) const FLAG_RULES: &[(&str, &[&str])] = &[
     ("certify", &[]),
     ("scaffold", &[]),
     ("handoff", &["--session", "--worktree"]),
-    ("finish", &["--session", "--keep-worktree"]),
-    ("close", &["--session"]),
+    (
+        "finish",
+        &["--session", "--keep-worktree", "--abandon", "--reason"],
+    ),
+    ("close", &["--session", "--abandon", "--reason"]),
     (
         "cleanup",
         &[

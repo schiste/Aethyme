@@ -36,6 +36,9 @@ pub const BROKER_COMMAND_SUCCEEDED: &str = "broker.command.succeeded";
 /// A closed session's uncommitted or unlanded work was written to a verified
 /// recovery archive before its worktree was removed.
 pub const BROKER_CLEANUP_ARCHIVED: &str = "broker.cleanup.archived";
+/// A session was closed with committed work no remote holds, on an explicit
+/// `--abandon --reason` under the push lane.
+pub const BROKER_SESSION_ABANDONED_UNPUSHED: &str = "broker.session.abandoned_unpushed";
 // session.<status> transition kinds are derived from SessionStatus::as_str
 // (active/idle/stale/exited/cleaned) by the store.
 pub const LEASE_CLAIMED: &str = "lease.claimed";
@@ -77,6 +80,23 @@ pub fn session_context_updated_payload(context: &crate::SessionContext) -> Strin
         "repository_name": context.repository_name,
         "tab_name": context.tab_name,
         "ai_provider": context.ai_provider,
+    })
+    .to_string()
+}
+
+pub fn session_abandoned_unpushed_payload(
+    session_id: i64,
+    branch: &str,
+    head: &str,
+    unpushed_commits: u32,
+    reason: &str,
+) -> String {
+    json!({
+        "session_id": session_id,
+        "branch": branch,
+        "head": head,
+        "unpushed_commits": unpushed_commits,
+        "reason": reason,
     })
     .to_string()
 }

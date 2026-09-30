@@ -116,13 +116,19 @@ Usage:
       --replace-stale closes it and registers fresh; policy may reclaim known ignored build artifacts;
       neither flag = error listing your options. Every --path is validated
       and claimed explicitly in the same transaction as create/reuse.
-  aethyme broker close --session <id> [--json]
+  aethyme broker close --session <id> [--abandon --reason <why>] [--json]
       Low-level close. Retains the checkout and branch; policy may reclaim
       known ignored build artifacts. Does not check whether commits were
-      submitted. Prefer finish for normal lifecycle use.
-  aethyme broker finish --session <id> [--keep-worktree] [--json]
+      submitted. Where the repository sets [delivery] push_session_branches,
+      refuses while the session holds commits no remote has, unless
+      --abandon --reason records that they are being left behind. Prefer
+      finish for normal lifecycle use.
+  aethyme broker finish --session <id> [--keep-worktree] [--abandon --reason <why>] [--json]
       Higher-level lifecycle close: closes only when the session has no
-      dirty WIP and no committed work waiting for submit/promotion. If it
+      dirty WIP and no committed work waiting for submit/promotion. Where
+      the repository sets [delivery] push_session_branches, also refuses
+      while HEAD has commits no remote holds; --abandon --reason closes
+      anyway and records a broker.session.abandoned_unpushed event. If it
       is not safe, prints the next command; suggests cleanup only when
       cleanup would pass without --force. Successful closure atomically
       persists a redacted session.finished handoff with delivery, pending
@@ -962,6 +968,7 @@ struct Parsed {
     all: bool,
     all_cleaned: bool,
     archive: bool,
+    abandon: bool,
     keep_worktree: bool,
     chau7: bool,
     fix_version: bool,
@@ -1071,6 +1078,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         all: false,
         all_cleaned: false,
         archive: false,
+        abandon: false,
         keep_worktree: false,
         chau7: false,
         fix_version: false,
@@ -1145,6 +1153,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
             "--all" => parsed.all = true,
             "--all-cleaned" => parsed.all_cleaned = true,
             "--archive" => parsed.archive = true,
+            "--abandon" => parsed.abandon = true,
             "--keep-worktree" => parsed.keep_worktree = true,
             "--chau7" => parsed.chau7 = true,
             "--fix-version" => parsed.fix_version = true,

@@ -262,6 +262,7 @@ fn v1_constructor_payload_field_names_are_frozen() {
             changed_paths: Vec::new(),
             recorded_at: 2,
         }),
+        unpushed_commits: None,
         cleanup_safe: false,
         cleanup: FinishCleanupReport::default(),
         recommended_next_action: Some("next".into()),

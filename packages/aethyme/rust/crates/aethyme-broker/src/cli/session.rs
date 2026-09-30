@@ -1071,13 +1071,15 @@ pub(super) fn run_finish(parsed: Parsed) -> Result<(), UsageError> {
     let session = parsed
         .session
         .ok_or(UsageError::Message("finish requires --session <id>".into()))?;
+    let abandon_reason = abandon_reason(&parsed)?;
     let mut broker = open_broker(parsed.read_only_snapshot)?;
-    let report = broker.finish_with_options(
-        session,
-        crate::FinishOptions {
-            keep_worktree: parsed.keep_worktree,
-        },
-    )?;
+    let options = crate::FinishOptions {
+        keep_worktree: parsed.keep_worktree,
+    };
+    let report = match abandon_reason {
+        Some(reason) => broker.finish_abandoning_unpushed(session, options, reason)?,
+        None => broker.finish_with_options(session, options)?,
+    };
     if parsed.json {
         out!("{}", serde_json::to_string_pretty(&report)?);
     } else {
@@ -1089,13 +1091,39 @@ pub(super) fn run_finish(parsed: Parsed) -> Result<(), UsageError> {
     Ok(())
 }
 
+/// `--abandon --reason` as one decision: abandoning unpushed work without
+/// saying why would leave the record as empty as the silent close it replaces,
+/// and a reason without `--abandon` authorizes nothing.
+fn abandon_reason(parsed: &Parsed) -> Result<Option<&str>, UsageError> {
+    let reason = parsed
+        .reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|reason| !reason.is_empty());
+    match (parsed.abandon, reason) {
+        (true, Some(reason)) => Ok(Some(reason)),
+        (true, None) => Err(UsageError::Message(
+            "--abandon requires --reason \"<why>\"; the reason is recorded with the abandoned commits"
+                .into(),
+        )),
+        (false, Some(_)) => Err(UsageError::Message(
+            "--reason is only meaningful with --abandon".into(),
+        )),
+        (false, None) => Ok(None),
+    }
+}
+
 /// `broker close`.
 pub(super) fn run_close(parsed: Parsed) -> Result<(), UsageError> {
     let session = parsed
         .session
         .ok_or(UsageError::Message("close requires --session <id>".into()))?;
+    let abandon_reason = abandon_reason(&parsed)?;
     let mut broker = open_broker(parsed.read_only_snapshot)?;
-    broker.close(session)?;
+    match abandon_reason {
+        Some(reason) => broker.close_abandoning_unpushed(session, reason)?,
+        None => broker.close(session)?,
+    }
     if parsed.json {
         out!("{}", serde_json::json!({ "closed": session }));
     } else {
