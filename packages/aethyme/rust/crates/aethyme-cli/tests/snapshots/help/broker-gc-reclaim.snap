@@ -1,9 +1,12 @@
 exit: 0
 --- stdout
-  aethyme broker gc reclaim plan [--json]
-  aethyme broker gc reclaim apply --confirm <sha256> [--json]
+  aethyme broker gc reclaim plan [--session <id>] [--json]
+  aethyme broker gc reclaim apply --confirm <sha256> [--session <id>] [--json]
       Report regenerable build output (target, node_modules, .venv, build,
       dist) in session worktrees, and remove only what was reviewed. An active
-      session's artefacts are listed but never removed. Nothing here is
-      recreated for you: a reclaimed worktree pays a cold build next time.
+      session's artefacts are listed but never removed. Apply removes each
+      reviewed path that is still reclaimable and leaves anything new for a
+      later plan. --session scopes both to one session's worktree. Nothing
+      here is recreated for you: a reclaimed worktree pays a cold build next
+      time.
 --- stderr

@@ -232,6 +232,147 @@ fn reclaim_confirmation_binds_decisions_not_sizes_and_explains_changes() {
     std::fs::create_dir_all(&added).unwrap();
     std::fs::write(added.join("artifact"), "new\n").unwrap();
 
+    // A candidate that appeared after review changes the digest, but it only
+    // withholds itself: the reviewed path goes, the new one waits for a plan.
+    let applied = run(
+        repo.path(),
+        container.path(),
+        &["gc", "reclaim", "apply", "--confirm", &digest, "--json"],
+    );
+    assert!(
+        applied.status.success(),
+        "reclaim apply: {}",
+        String::from_utf8_lossy(&applied.stderr)
+    );
+    let outcome: serde_json::Value = serde_json::from_slice(&applied.stdout).unwrap();
+    assert!(!target.exists(), "the reviewed candidate should be removed");
+    assert!(
+        added.exists(),
+        "an unreviewed candidate must not be removed"
+    );
+    let not_reviewed = outcome["not_reviewed"].as_array().unwrap();
+    assert_eq!(not_reviewed.len(), 1, "{outcome}");
+    assert!(
+        not_reviewed[0].as_str().unwrap().ends_with("rust/build"),
+        "{outcome}"
+    );
+}
+
+/// A closed session with its checkout kept and Git-ignored build output.
+fn closed_session_with_target(repo: &Path, container: &Path, task: &str) -> (PathBuf, String) {
+    let started = run(repo, container, &["start", "--task", task, "--json"]);
+    assert!(
+        started.status.success(),
+        "start: {}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let session: serde_json::Value = serde_json::from_slice(&started.stdout).unwrap();
+    let worktree = PathBuf::from(session["worktree_path"].as_str().unwrap());
+    let id = session["id"].as_i64().unwrap().to_string();
+    let finished = run(
+        repo,
+        container,
+        &["finish", "--session", &id, "--keep-worktree"],
+    );
+    assert!(
+        finished.status.success(),
+        "finish: {}",
+        String::from_utf8_lossy(&finished.stderr)
+    );
+    let target = worktree.join("rust/target");
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::write(target.join("artifact"), "output\n").unwrap();
+    (worktree, id)
+}
+
+/// Another agent's checkout gaining build output after review used to void
+/// every reviewed deletion.
+#[test]
+fn a_kept_candidate_appearing_after_review_does_not_block_apply() {
+    let (repo, container) = fixture("");
+    let (worktree, _) = closed_session_with_target(repo.path(), container.path(), "reviewed");
+    let plan = reclaim_plan_json(repo.path(), container.path());
+    let digest = plan["digest"].as_str().unwrap().to_string();
+
+    // No session records this directory, so its output is a kept candidate.
+    let stray = worktree.parent().unwrap().join("stray/target");
+    std::fs::create_dir_all(&stray).unwrap();
+    std::fs::write(stray.join("artifact"), "someone else's\n").unwrap();
+    assert_ne!(
+        reclaim_plan_json(repo.path(), container.path())["digest"],
+        plan["digest"],
+        "the fixture must actually change the digest"
+    );
+
+    let applied = run(
+        repo.path(),
+        container.path(),
+        &["gc", "reclaim", "apply", "--confirm", &digest],
+    );
+    assert!(
+        applied.status.success(),
+        "reclaim apply: {}",
+        String::from_utf8_lossy(&applied.stderr)
+    );
+    assert!(!worktree.join("rust/target").exists());
+    assert!(stray.exists(), "a kept candidate is never removed");
+}
+
+/// The review authorizes; whether the path may go now is decided afresh.
+#[test]
+fn a_reviewed_worktree_that_became_active_is_skipped() {
+    let (repo, container) = fixture("");
+    let (worktree, _) = closed_session_with_target(repo.path(), container.path(), "resumed");
+    let plan = reclaim_plan_json(repo.path(), container.path());
+    let digest = plan["digest"].as_str().unwrap().to_string();
+
+    let adopted = Command::new(CLI)
+        .args(["start", "--adopt", "--task", "resume work", "--json"])
+        .current_dir(&worktree)
+        .env("AETHYME_WORKTREE_ROOT", container.path())
+        .output()
+        .unwrap();
+    assert!(
+        adopted.status.success(),
+        "adopt: {}",
+        String::from_utf8_lossy(&adopted.stderr)
+    );
+
+    let applied = run(
+        repo.path(),
+        container.path(),
+        &["gc", "reclaim", "apply", "--confirm", &digest, "--json"],
+    );
+    assert!(
+        applied.status.success(),
+        "reclaim apply: {}",
+        String::from_utf8_lossy(&applied.stderr)
+    );
+    let outcome: serde_json::Value = serde_json::from_slice(&applied.stdout).unwrap();
+    assert!(
+        worktree.join("rust/target").exists(),
+        "an active session's build output must survive"
+    );
+    let skipped = outcome["skipped"].as_array().unwrap();
+    assert_eq!(skipped.len(), 1, "{outcome}");
+    assert!(
+        skipped[0].as_str().unwrap().contains("now kept"),
+        "{outcome}"
+    );
+}
+
+/// Without a saved review there is nothing to narrow to.
+#[test]
+fn a_missing_review_still_requires_the_exact_digest() {
+    let (repo, container) = fixture("");
+    let (worktree, _) = closed_session_with_target(repo.path(), container.path(), "missing");
+    let plan = reclaim_plan_json(repo.path(), container.path());
+    let digest = plan["digest"].as_str().unwrap().to_string();
+    let root = worktree.parent().unwrap();
+    std::fs::remove_file(root.join(format!(".aethyme-reclaim-plan-{digest}.json"))).unwrap();
+    std::fs::create_dir_all(root.join("stray/target")).unwrap();
+    std::fs::write(root.join("stray/target/artifact"), "x\n").unwrap();
+
     let refused = run(
         repo.path(),
         container.path(),
@@ -239,9 +380,106 @@ fn reclaim_confirmation_binds_decisions_not_sizes_and_explains_changes() {
     );
     assert!(!refused.status.success());
     let message = String::from_utf8_lossy(&refused.stderr);
-    assert!(message.contains("added candidate"), "{message}");
-    assert!(message.contains("build"), "{message}");
-    assert!(target.exists(), "a changed plan must not remove candidates");
+    assert!(message.contains("saved review is unavailable"), "{message}");
+    assert!(worktree.join("rust/target").exists());
+}
+
+/// A review edited to name more paths no longer hashes to the confirmed
+/// digest, so it authorizes nothing.
+#[test]
+fn a_tampered_review_authorizes_nothing() {
+    let (repo, container) = fixture("");
+    let (worktree, id) = closed_session_with_target(repo.path(), container.path(), "tampered");
+    let (other, _) = closed_session_with_target(repo.path(), container.path(), "not reviewed");
+    let scoped = run(
+        repo.path(),
+        container.path(),
+        &["gc", "reclaim", "plan", "--json", "--session", &id],
+    );
+    assert!(scoped.status.success());
+    let plan: serde_json::Value = serde_json::from_slice(&scoped.stdout).unwrap();
+    let digest = plan["digest"].as_str().unwrap().to_string();
+    let snapshot = worktree
+        .parent()
+        .unwrap()
+        .join(format!(".aethyme-reclaim-plan-{digest}.json"));
+    // The unscoped plan spells the other path exactly as the scan does.
+    let other_target = reclaim_plan_json(repo.path(), container.path())["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|candidate| candidate["path"].as_str().unwrap().to_owned())
+        .find(|path| path.contains("not-reviewed"))
+        .expect("the unreviewed session's output is a candidate");
+    let mut saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&snapshot).unwrap()).unwrap();
+    // Kept in sorted order, so the digest is the only check that can notice.
+    let decisions = saved["decisions"].as_array_mut().unwrap();
+    decisions.push(serde_json::json!({ "path": other_target, "reclaimable": true }));
+    decisions.sort_by(|left, right| {
+        left["path"]
+            .as_str()
+            .unwrap()
+            .cmp(right["path"].as_str().unwrap())
+    });
+    std::fs::write(&snapshot, serde_json::to_vec(&saved).unwrap()).unwrap();
+
+    let refused = run(
+        repo.path(),
+        container.path(),
+        &["gc", "reclaim", "apply", "--confirm", &digest],
+    );
+    assert!(!refused.status.success());
+    let message = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        message.contains("saved review could not be read"),
+        "{message}"
+    );
+    assert!(worktree.join("rust/target").exists());
+    assert!(other.join("rust/target").exists());
+}
+
+/// One worktree can be reviewed and applied without the others holding still.
+#[test]
+fn a_session_scoped_plan_reviews_and_removes_one_worktree() {
+    let (repo, container) = fixture("");
+    let (first, first_id) = closed_session_with_target(repo.path(), container.path(), "first");
+    let (second, _) = closed_session_with_target(repo.path(), container.path(), "second");
+    let scoped = run(
+        repo.path(),
+        container.path(),
+        &["gc", "reclaim", "plan", "--json", "--session", &first_id],
+    );
+    assert!(
+        scoped.status.success(),
+        "scoped plan: {}",
+        String::from_utf8_lossy(&scoped.stderr)
+    );
+    let plan: serde_json::Value = serde_json::from_slice(&scoped.stdout).unwrap();
+    let candidates = plan["candidates"].as_array().unwrap();
+    assert_eq!(candidates.len(), 1, "{plan}");
+    let digest = plan["digest"].as_str().unwrap().to_string();
+
+    let applied = run(
+        repo.path(),
+        container.path(),
+        &[
+            "gc",
+            "reclaim",
+            "apply",
+            "--confirm",
+            &digest,
+            "--session",
+            &first_id,
+        ],
+    );
+    assert!(
+        applied.status.success(),
+        "scoped apply: {}",
+        String::from_utf8_lossy(&applied.stderr)
+    );
+    assert!(!first.join("rust/target").exists());
+    assert!(second.join("rust/target").exists(), "outside the scope");
 }
 
 #[test]
