@@ -3833,6 +3833,35 @@ impl Broker {
             .unwrap_or(0)
     }
 
+    /// Open sessions whose agent has shown no evidence of work for `window_ms`.
+    ///
+    /// The rule is the one that closes abandoned sessions -- [`decide_abandonment`]
+    /// over the liveness [`Broker::agents_snapshot`] derives -- applied over a
+    /// caller-chosen window, so a live agent process is never included however
+    /// quiet it is. Read-only: nothing is closed and no event is written.
+    pub(crate) fn idle_open_sessions(
+        &self,
+        now_ms: i64,
+        window_ms: i64,
+    ) -> Result<Vec<Session>, BrokerOpError> {
+        Ok(self
+            .agents_snapshot(now_ms)?
+            .into_iter()
+            .filter(|view| !view.derived_status.is_closed())
+            .filter(|view| {
+                let activity = SessionActivity {
+                    session_id: view.session.id,
+                    last_activity_at: view.activity_at,
+                    created_at: view.session.created_at,
+                    agent_alive: view.pid_alive,
+                    closed: false,
+                };
+                decide_abandonment(&activity, now_ms, window_ms).is_abandoned()
+            })
+            .map(|view| view.session)
+            .collect())
+    }
+
     /// Derive current liveness without persisting status transitions. This is
     /// deliberately allowed to inspect PIDs and worktree metadata, but never
     /// changes a session row or appends an event.

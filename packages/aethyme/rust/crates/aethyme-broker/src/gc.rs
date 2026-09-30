@@ -69,6 +69,29 @@ fn is_real_directory(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir())
 }
 
+/// Whether `path` or any entry directly inside it was modified within
+/// `window_ms` of `now`. One `read_dir`: tools that keep writing into a build
+/// directory touch its top level (Cargo's `debug/`, Vite's
+/// `node_modules/.vite`). An unreadable timestamp counts as recent.
+fn modified_within(path: &Path, now: i64, window_ms: i64) -> bool {
+    let recent = |metadata: std::io::Result<std::fs::Metadata>| {
+        metadata
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+            .is_none_or(|since| now.saturating_sub(since.as_millis() as i64) < window_ms)
+    };
+    if recent(std::fs::symlink_metadata(path)) {
+        return true;
+    }
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return true;
+    };
+    entries
+        .flatten()
+        .any(|entry| recent(std::fs::symlink_metadata(entry.path())))
+}
+
 fn days_between(now: i64, earlier: i64) -> u32 {
     u32::try_from(now.saturating_sub(earlier) / 86_400_000).unwrap_or(u32::MAX)
 }
@@ -1609,6 +1632,17 @@ impl Broker {
     /// Reclaim build caches from long-idle closed worktrees without operator
     /// confirmation.
     ///
+    /// Open sessions are included once their agent has shown no evidence of
+    /// work for `idle_session_artifact_hours` -- the abandonment rule over a
+    /// shorter window, because losing build output costs a rebuild while
+    /// abandonment releases the checkout. A session inside the 72-hour
+    /// abandonment window otherwise holds its caches for three days after its
+    /// agent left; observed, 8.3 GiB across three quiet sessions of one
+    /// repository. `gc plan` does not list these: its candidates are
+    /// re-validated at apply against closed sessions, and the reviewed lane for
+    /// an open session's build output is `gc reclaim`, which keeps only
+    /// sessions that are actively working.
+    ///
     /// Deliberately avoids [`Broker::cleanup_plan`]: sizing every retained
     /// worktree is a full stat walk over tens of gigabytes, far too expensive
     /// for a path that runs on every broker open. Discovery here is a bounded
@@ -1677,6 +1711,20 @@ impl Broker {
             .iter()
             .map(|session| PathBuf::from(&session.worktree_path))
             .collect::<Vec<_>>();
+        // Open sessions whose agent has been gone for the idle window. They
+        // stay open and keep their checkout; only their witnessed build output
+        // is swept. The targeted pass after a close is about one closed
+        // session and never widens to these.
+        let idle_window_ms = i64::from(policy.idle_session_artifact_hours) * 3_600_000;
+        let idle_open = if closed_session_id.is_none() && idle_window_ms > 0 {
+            self.idle_open_sessions(now, idle_window_ms)?
+        } else {
+            Vec::new()
+        };
+        let idle_open_ids = idle_open
+            .iter()
+            .map(|session| session.id)
+            .collect::<Vec<_>>();
         let deadline = Instant::now() + Duration::from_millis(budget_ms);
         if closed_session_id.is_none() {
             // The shared preparation cache is content-addressed: an entry no
@@ -1711,28 +1759,47 @@ impl Broker {
             .and_then(|value| value.parse::<i64>().ok())
             .unwrap_or(0);
         let mut last_visited = cursor;
-        let all = self.store().cleaned_sessions()?;
+        let mut all = self.store().cleaned_sessions()?;
         let sessions = match closed_session_id {
             Some(session_id) => all
                 .iter()
                 .filter(|session| session.id == session_id)
                 .cloned()
                 .collect(),
-            None => sweep_order(&all, cursor, |session| session.id),
+            None => {
+                // One id-ordered list, so the cursor resumes across both kinds.
+                all.extend(idle_open);
+                all.sort_by_key(|session| session.id);
+                sweep_order(&all, cursor, |session| session.id)
+            }
         };
+        let mut idle_open_removed = 0usize;
         for session in sessions {
             last_visited = session.id;
-            if live.contains(&session.id) {
-                continue;
-            }
-            let closed_at = session.closed_at.unwrap_or(session.updated_at);
-            if days_between(now, closed_at) < policy.artifact_reclaim_days {
-                continue;
-            }
+            let is_idle_open = idle_open_ids.contains(&session.id);
             let root = PathBuf::from(&session.worktree_path);
-            if !is_real_directory(&root)
+            let sheltered = if is_idle_open {
+                // Its own row is live, so it must not shelter itself; every
+                // other live session still does.
+                let others = live_sessions
+                    .iter()
+                    .filter(|live| live.id != session.id)
+                    .map(|live| PathBuf::from(&live.worktree_path))
+                    .collect::<Vec<_>>();
+                overlaps_live_worktree(&root, &others)
+            } else {
+                if live.contains(&session.id) {
+                    continue;
+                }
+                let closed_at = session.closed_at.unwrap_or(session.updated_at);
+                if days_between(now, closed_at) < policy.artifact_reclaim_days {
+                    continue;
+                }
+                overlaps_live_worktree(&root, &live_worktrees)
+            };
+            if sheltered
+                || !is_real_directory(&root)
                 || !self.is_broker_owned_worktree(&session, &root)
-                || overlaps_live_worktree(&root, &live_worktrees)
             {
                 continue;
             }
@@ -1755,12 +1822,22 @@ impl Broker {
                 if !checkout.path_is_ignored(&relative) {
                     continue;
                 }
+                // The session is open, and a quiet agent is not the only
+                // thing that writes build output: a dev server or a long
+                // build can outlive the agent's last commit. Output touched
+                // inside the idle window is still in use.
+                if is_idle_open && modified_within(&dir, now, idle_window_ms) {
+                    continue;
+                }
                 let deferrable =
                     artifact_witness_for_with_extras(&dir, &policy.artefact_directories)
                         .and_then(ArtifactWitness::deferrable_entry);
                 match remove_condemned_tree(&dir, deferrable, Some(deadline)) {
                     Ok(TreeRemoval::Complete) => {
                         removed.push(dir.to_string_lossy().into_owned());
+                        if is_idle_open {
+                            idle_open_removed += 1;
+                        }
                     }
                     // The budget stopped a removal partway. The directory is
                     // still a recognisable build cache, so the next pass finds
@@ -1814,6 +1891,9 @@ impl Broker {
             let payload = serde_json::json!({
                 "directories": removed.len(),
                 "idle_days": policy.artifact_reclaim_days,
+                "closed_session_directories": removed.len() - idle_open_removed,
+                "idle_open_session_directories": idle_open_removed,
+                "idle_session_artifact_hours": policy.idle_session_artifact_hours,
             })
             .to_string();
             self.store().append_event(
