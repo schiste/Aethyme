@@ -607,12 +607,15 @@ fn cleanup_distinguishes_pending_commits_from_missing_acceptance_provenance() {
     sh(&pending_path, &["commit", "-qm", "pending binary"]);
     broker.close(pending.id).unwrap();
 
+    // An accepted checkpoint whose queue, integration commit and tree
+    // provenance are all missing, for work that reached no delivery target:
+    // nothing can prove it landed, so it must stay unproven.
     let unproven = broker.start_worktree("unproven cleanup", None).unwrap();
     let unproven_path = std::path::PathBuf::from(&unproven.worktree_path);
     std::fs::write(unproven_path.join("renamed-before.txt"), "accepted\n").unwrap();
     sh(&unproven_path, &["add", "renamed-before.txt"]);
     sh(&unproven_path, &["commit", "-qm", "accepted rename source"]);
-    assert!(broker.submit(unproven.id).unwrap().promoted);
+    let unproven_head = rev(&unproven_path, "HEAD");
     broker.close(unproven.id).unwrap();
     drop(broker);
 
@@ -620,27 +623,9 @@ fn cleanup_distinguishes_pending_commits_from_missing_acceptance_provenance() {
     let connection = rusqlite::Connection::open(database).unwrap();
     connection
         .execute(
-            "UPDATE sessions SET accepted_queue_entry_id = NULL WHERE id = ?1",
-            [unproven.id],
-        )
-        .unwrap();
-    // The terminal close path records a released checkpoint pin. Remove that
-    // recovery evidence too so this fixture models genuinely missing
-    // acceptance provenance rather than a stale pin that #196 deliberately
-    // knows how to recover.
-    connection
-        .execute(
-            "DELETE FROM gc_checkpoint_pin_releases WHERE session_id = ?1",
-            [unproven.id],
-        )
-        .unwrap();
-    // Promotion now records the rewritten landing in the representation
-    // ledger. Remove that evidence as well so this fixture still models a
-    // session with genuinely missing acceptance provenance.
-    connection
-        .execute(
-            "DELETE FROM session_representations WHERE session_id = ?1",
-            [unproven.id],
+            "UPDATE sessions SET accepted_session_head = ?1, accepted_queue_entry_id = NULL \
+             WHERE id = ?2",
+            rusqlite::params![unproven_head, unproven.id],
         )
         .unwrap();
     drop(connection);
@@ -680,6 +665,52 @@ fn cleanup_distinguishes_pending_commits_from_missing_acceptance_provenance() {
         CleanupRepresentation::Unproven
     );
     assert!(unproven_item.reason.contains("missing queue"));
+}
+
+/// Deleting a promoted session's acceptance bookkeeping used to leave it
+/// `unproven_provenance` even though its commits sit on the integration
+/// branch. The shared landing check (#408) reads the commits, not the
+/// bookkeeping, so the worktree is eligible and names where the work is.
+#[test]
+fn missing_acceptance_bookkeeping_does_not_strand_work_on_integration() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let session = broker
+        .start_worktree("promoted then forgotten", None)
+        .unwrap();
+    let path = std::path::PathBuf::from(&session.worktree_path);
+    std::fs::write(path.join("landed.txt"), "landed\n").unwrap();
+    sh(&path, &["add", "landed.txt"]);
+    sh(&path, &["commit", "-qm", "landed work"]);
+    assert!(broker.submit(session.id).unwrap().promoted);
+    broker.close(session.id).unwrap();
+    drop(broker);
+
+    let database = tmp.path().join(aethyme_broker::BROKER_DB_RELPATH);
+    let connection = rusqlite::Connection::open(database).unwrap();
+    for statement in [
+        "UPDATE sessions SET accepted_queue_entry_id = NULL WHERE id = ?1",
+        "DELETE FROM gc_checkpoint_pin_releases WHERE session_id = ?1",
+        "DELETE FROM session_representations WHERE session_id = ?1",
+    ] {
+        connection.execute(statement, [session.id]).unwrap();
+    }
+    drop(connection);
+
+    let broker = Broker::open(tmp.path()).unwrap();
+    let plan = broker.cleanup_plan().unwrap();
+    let item = plan
+        .worktrees
+        .iter()
+        .find(|item| item.session_id == session.id)
+        .unwrap();
+    assert_eq!(item.disposition, CleanupDisposition::Eligible, "{item:#?}");
+    assert!(
+        item.reason.contains("represented on delivery target"),
+        "{}",
+        item.reason
+    );
 }
 
 #[test]

@@ -18,6 +18,14 @@ static NEXT_PRIVATE_INDEX_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Errors from git operations. `Git` carries the failing subcommand and
 /// stderr so callers can surface actionable messages verbatim.
+/// Which side of a symmetric `left...right` range [`GitRepo::cherry_marked`]
+/// lists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CherrySide {
+    Left,
+    Right,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum GitError {
     #[error("failed to run git {args}: {source}")]
@@ -1501,6 +1509,121 @@ impl GitRepo {
         )
         .ok()
         .filter(|value| !value.is_empty())
+    }
+
+    /// [`GitRepo::blob_at`] for many `(rev, path)` pairs in one process.
+    ///
+    /// A landing search asks this question for every candidate commit, and
+    /// one `rev-parse` per question made that search too slow for the routine
+    /// cleanup plan behind `broker status`. `cat-file --batch-check` answers
+    /// the whole list in a single spawn, in input order.
+    pub fn blobs_at_many(&self, queries: &[(&str, &str)]) -> Result<Vec<Option<String>>, GitError> {
+        if queries.is_empty() {
+            return Ok(Vec::new());
+        }
+        let args = "cat-file --batch-check=%(objectname) %(objecttype)";
+        let mut child = git_command()
+            .args(["cat-file", "--batch-check=%(objectname) %(objecttype)"])
+            .current_dir(&self.root)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|source| GitError::Spawn {
+                args: args.into(),
+                source,
+            })?;
+        let mut input = String::new();
+        for (rev, path) in queries {
+            input.push_str(rev);
+            input.push(':');
+            input.push_str(path);
+            input.push('\n');
+        }
+        let mut stdin = child.stdin.take().ok_or_else(|| GitError::Git {
+            args: args.into(),
+            stderr: "failed to open cat-file stdin".into(),
+        })?;
+        // Written from a thread: a long query list fills the output pipe
+        // before the input is consumed, and a single thread would deadlock.
+        let writer = std::thread::spawn(move || stdin.write_all(input.as_bytes()));
+        let output = child.wait_with_output().map_err(|source| GitError::Spawn {
+            args: args.into(),
+            source,
+        })?;
+        writer
+            .join()
+            .map_err(|_| GitError::Git {
+                args: args.into(),
+                stderr: "cat-file stdin writer panicked".into(),
+            })?
+            .map_err(|source| GitError::Spawn {
+                args: args.into(),
+                source,
+            })?;
+        if !output.status.success() {
+            return Err(GitError::Git {
+                args: args.into(),
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            });
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let answers = stdout
+            .lines()
+            .map(|line| {
+                // "<oid> blob" for a file; "<input> missing" otherwise. A
+                // tree or submodule at the path is not a blob either.
+                let mut fields = line.rsplitn(2, ' ');
+                let kind = fields.next().unwrap_or_default();
+                let oid = fields.next().unwrap_or_default();
+                (kind == "blob").then(|| oid.to_string())
+            })
+            .collect::<Vec<_>>();
+        if answers.len() != queries.len() {
+            return Err(GitError::Git {
+                args: args.into(),
+                stderr: format!("expected {} answers, read {}", queries.len(), answers.len()),
+            });
+        }
+        Ok(answers)
+    }
+
+    /// Commits on one side of `left...right` with whether Git found a
+    /// patch-equivalent commit on the other side (`--cherry-mark`), newest
+    /// first. Merges are excluded, as `--cherry-mark` does for patch ids.
+    pub fn cherry_marked(
+        &self,
+        left: &str,
+        right: &str,
+        side: CherrySide,
+    ) -> Result<Vec<(String, bool)>, GitError> {
+        let only = match side {
+            CherrySide::Left => "--left-only",
+            CherrySide::Right => "--right-only",
+        };
+        let range = format!("{left}...{right}");
+        Ok(run_git(
+            &self.root,
+            &["rev-list", "--cherry-mark", "--no-merges", only, &range],
+        )?
+        .lines()
+        .filter_map(|line| {
+            let (mark, commit) = line.split_at_checked(1)?;
+            Some((commit.to_string(), mark == "="))
+        })
+        .collect())
+    }
+
+    /// Commits reachable from `to` that descend from `from`, excluding
+    /// `from` itself (`rev-list --ancestry-path from..to`).
+    pub fn descendants_towards(&self, from: &str, to: &str) -> Result<Vec<String>, GitError> {
+        Ok(run_git(
+            &self.root,
+            &["rev-list", "--ancestry-path", &format!("{from}..{to}")],
+        )?
+        .lines()
+        .map(str::to_string)
+        .collect())
     }
 
     pub fn commit_tree_id(&self, commit: &str) -> Result<String, GitError> {

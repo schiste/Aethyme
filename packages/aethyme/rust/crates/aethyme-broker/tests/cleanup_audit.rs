@@ -143,14 +143,11 @@ fn squash_landing_is_in_target_against_upstream_while_local_main_is_stale() {
             landed_by: Some(_),
         })
     ));
-    // Content proof is not a recorded representation, so the cleanup plan
-    // still refuses and the audit says how to make it eligible.
-    assert!(!item.removable);
-    assert!(
-        item.next_action.contains("representation scan"),
-        "{item:#?}"
-    );
-    assert!(audit.apply_command.is_none());
+    // The cleanup plan asks the same landing question (#408), so content
+    // proof on the upstream makes the worktree removable without a separate
+    // recorded representation.
+    assert!(item.removable, "{item:#?}");
+    assert!(audit.apply_command.is_some());
     assert_eq!(audit.summary.by_disposition["in_target"], 1);
 }
 
@@ -194,6 +191,95 @@ fn rebased_delivery_is_recognised_by_patch_identity() {
             ..
         })
     ));
+}
+
+/// #408: the session commit was rebased onto a newer main and merged
+/// through a pull request's merge commit, so it reached main only via a
+/// second parent and with different blobs wherever the base had moved. The
+/// representation scan, the audit and the cleanup plan must give one verdict.
+#[test]
+fn rebased_then_merged_work_gets_one_verdict_from_scan_audit_and_plan() {
+    let (_tmp, publisher, repo) = fixture();
+    let mut broker = Broker::open(&repo).unwrap();
+    let session = broker.start_worktree("rebased then merged", None).unwrap();
+    let worktree = PathBuf::from(&session.worktree_path);
+    let change = commit(
+        &worktree,
+        "shared.txt",
+        "one\ntwo\nthree\nfour\nFIVE\n",
+        "edit the last line",
+    );
+    broker.close(session.id).unwrap();
+
+    // Main moves the same file outside the edit's context, then the rebased
+    // copy lands on a branch that is merged with a merge commit.
+    std::fs::write(
+        publisher.join("shared.txt"),
+        "one\ntwo\nthree\nfour\nfive\n",
+    )
+    .unwrap();
+    commit(&publisher, "top.txt", "top\n", "an unrelated file first");
+    std::fs::write(
+        publisher.join("shared.txt"),
+        "zero\none\ntwo\nthree\nfour\nfive\n",
+    )
+    .unwrap();
+    git(&publisher, &["commit", "-qam", "prepend a line"]);
+    git(&publisher, &["checkout", "-q", "-b", "pr"]);
+    git(
+        &publisher,
+        &["fetch", "-q", repo.to_str().unwrap(), &session.branch],
+    );
+    git(&publisher, &["cherry-pick", &change]);
+    let copy = git_out(&publisher, &["rev-parse", "HEAD"]);
+    git(&publisher, &["checkout", "-q", "main"]);
+    git(
+        &publisher,
+        &[
+            "merge",
+            "-q",
+            "--no-ff",
+            "pr",
+            "-m",
+            "Merge pull request #1",
+        ],
+    );
+    git(&publisher, &["push", "-q", "origin", "main"]);
+    git(&repo, &["fetch", "-q", "origin"]);
+    // Local main follows the upstream, as after a pull.
+    git(&repo, &["merge", "-q", "--ff-only", "origin/main"]);
+
+    let scan = broker.scan_session_representation(session.id).unwrap();
+    let landing = scan.search.landing().expect("the scan finds the landing");
+    assert_eq!(landing.evidence, LandingEvidence::PatchEquivalent);
+    assert_eq!(landing.commit, copy);
+
+    let audit = broker.cleanup_audit().unwrap();
+    let item = item_for(&audit, session.id);
+    assert_eq!(item.disposition, AuditDisposition::InTarget, "{item:#?}");
+    assert!(matches!(
+        item.committed,
+        Some(aethyme_broker::CommittedWork::InTarget {
+            evidence: LandingEvidence::PatchEquivalent,
+            ..
+        })
+    ));
+    assert!(item.removable, "{item:#?}");
+
+    let plan = broker.cleanup_plan().unwrap();
+    let planned = plan
+        .worktrees
+        .iter()
+        .find(|planned| planned.session_id == session.id)
+        .unwrap();
+    assert!(planned.eligible(), "{planned:#?}");
+    assert_eq!(
+        planned
+            .provenance
+            .as_ref()
+            .and_then(|provenance| provenance.represented_by_commit.as_deref()),
+        Some(copy.as_str())
+    );
 }
 
 #[test]

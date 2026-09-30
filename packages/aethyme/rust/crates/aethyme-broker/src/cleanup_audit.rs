@@ -24,7 +24,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use crate::git::{GitRepo, GitWorktreeInfo};
-use crate::representation::{self, LandingOutcome};
+use crate::representation::{self, LandingVerdict};
 use crate::{Broker, BrokerOpError, CleanupPlan, CleanupWorktreePlan, Session, SessionOrigin};
 
 pub const CLEANUP_AUDIT_SCHEMA_VERSION: u32 = 1;
@@ -98,30 +98,7 @@ impl CheckoutState {
     }
 }
 
-/// How a commit reached a ref.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum LandingEvidence {
-    /// The commit is an ancestor (fast-forward or merge delivery).
-    Ancestry,
-    /// A commit on the ref carries the net content (squash delivery).
-    Content,
-    /// Every commit's patch is on the ref under another SHA (rebase delivery).
-    PatchEquivalent,
-    /// The commit changes nothing the ref does not already hold.
-    NoNetChange,
-}
-
-impl LandingEvidence {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Ancestry => "ancestry",
-            Self::Content => "content",
-            Self::PatchEquivalent => "patch equivalence",
-            Self::NoNetChange => "no net change",
-        }
-    }
-}
+pub use crate::representation::LandingEvidence;
 
 /// Where a checkout's committed work is represented.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -377,32 +354,25 @@ impl Broker {
     }
 
     /// How `head` reached `tip`, if it did.
+    ///
+    /// Delegates to [`representation::work_landed`], the predicate the
+    /// representation scan and the cleanup plan also use, so the audit cannot
+    /// call work `in_target` while the scan it recommends calls it absent
+    /// (#408).
     fn landing_evidence(
         &self,
         head: &str,
         tip: &str,
     ) -> Result<Option<(LandingEvidence, Option<String>)>, BrokerOpError> {
-        let repo = self.repo_handle();
-        if repo.is_ancestor(head, tip) {
-            return Ok(Some((LandingEvidence::Ancestry, None)));
-        }
-        let base = repo.merge_base(head, tip)?;
-        let content = representation::session_content(repo, &base, head)?;
-        let search =
-            representation::find_landing(repo, &content, tip, representation::DEFAULT_SEARCH_CAP)?;
-        match search.outcome {
-            LandingOutcome::NothingToRepresent => {
-                return Ok(Some((LandingEvidence::NoNetChange, None)));
-            }
-            LandingOutcome::Landed(landing) => {
-                return Ok(Some((LandingEvidence::Content, Some(landing.commit))));
-            }
-            LandingOutcome::NotFound { .. } => {}
-        }
-        if repo.patch_unique_commit_count(tip, head)? == 0 {
-            return Ok(Some((LandingEvidence::PatchEquivalent, None)));
-        }
-        Ok(None)
+        Ok(
+            match representation::work_landed(self.repo_handle(), head, tip)? {
+                LandingVerdict::Landed {
+                    evidence,
+                    landed_by,
+                } => Some((evidence, landed_by)),
+                LandingVerdict::NotLanded { .. } => None,
+            },
+        )
     }
 
     fn classify_committed(&self, head: &str, target: &AuditTarget) -> CommittedWork {

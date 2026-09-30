@@ -124,9 +124,9 @@ pub use reclaim::{
 };
 pub mod representation;
 pub use representation::{
-    ContentVerdict, Landing, LandingOutcome, LandingSearch, SessionContent,
-    content_at as representation_content_at, find_landing,
-    plan_digest as representation_plan_digest, session_content,
+    ContentVerdict, Landing, LandingEvidence, LandingOutcome, LandingSearch, LandingVerdict,
+    SessionContent, content_at as representation_content_at, find_landing, landing_base,
+    plan_digest as representation_plan_digest, session_content, work_landed,
 };
 mod repository_contract;
 mod resources;
@@ -183,7 +183,7 @@ pub use broker::{
 };
 pub use cleanup_audit::{
     AuditDisposition, AuditItem, AuditOwner, AuditSummary, AuditTarget,
-    CLEANUP_AUDIT_SCHEMA_VERSION, CheckoutState, CleanupAudit, CommittedWork, LandingEvidence,
+    CLEANUP_AUDIT_SCHEMA_VERSION, CheckoutState, CleanupAudit, CommittedWork,
 };
 pub use console::{
     CONSOLE_EXCLUSIVE_KEY, CONSOLE_INTEGRATION_REF, CONSOLE_MARKER_DIGEST_ENV, CONSOLE_MARKER_ENV,
@@ -230,7 +230,7 @@ pub use gates::{
     select_gates, verify_gate_scope_manifest,
 };
 pub use gc::{GC_PLAN_SCHEMA_VERSION, UNCLASSIFIED_ARTIFACT_REPORT_THRESHOLD_BYTES};
-pub use git::{GitError, GitRepo, MergeSimulation, RemoteDefaultBranch};
+pub use git::{CherrySide, GitError, GitRepo, MergeSimulation, RemoteDefaultBranch};
 pub use github_target::{
     GithubApiTargetEvidence, GithubTargetError, ResolvedGithubTarget, resolve_github_target,
 };
