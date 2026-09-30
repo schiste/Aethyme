@@ -235,7 +235,7 @@ From the repository root:
 
 ```bash
 cargo build --manifest-path packages/aethyme/rust/Cargo.toml --workspace
-cargo test --manifest-path packages/aethyme/rust/Cargo.toml --workspace
+cargo test --manifest-path packages/aethyme/rust/Cargo.toml --workspace --examples
 cargo fmt --manifest-path packages/aethyme/rust/Cargo.toml --all -- --check
 cargo clippy --manifest-path packages/aethyme/rust/Cargo.toml --workspace --all-targets
 ```
