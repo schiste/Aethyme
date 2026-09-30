@@ -10188,7 +10188,7 @@ pub(crate) fn slugify(task: &str) -> String {
 /// repository that ships its own `.cargo/config.toml` sits closer to the build
 /// and keeps precedence. Anything explicit still wins -- a `CARGO_PROFILE_*`
 /// environment variable, or the gates' own `CARGO_TARGET_DIR` discipline.
-const WORKTREE_CARGO_CONFIG: &str = "\
+pub(crate) const WORKTREE_CARGO_CONFIG: &str = "\
 # Written once by the Aethyme broker, for the session worktrees beside it.
 #
 # These trees are built a few times and then reclaimed, so they do not pay for
