@@ -83,7 +83,7 @@ fn planned_start_claims_before_any_diff_and_refuses_a_second_rewrite() {
     assert!(error.contains(&first.session.worktree_path), "{error}");
     assert!(
         error.contains("aethyme broker start --adopt")
-            && error.contains("--reuse --path generated/policy.md"),
+            && error.contains("--reuse --short-name \"<short name>\" --path generated/policy.md"),
         "{error}"
     );
     assert!(!error.contains("--reuse --session"), "{error}");
