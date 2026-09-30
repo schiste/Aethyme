@@ -6205,15 +6205,13 @@ impl Broker {
         let scope_overlaps = crate::detect_scope_overlaps(&self.store.active_session_scopes()?);
         let queue = self.store.current_merge_queue()?;
         let terminal_counts = self.store.terminal_merge_queue_counts()?;
-        let mut latest_live_queue = Vec::new();
-        for agent in &agents {
-            if let Some(entry) = self
-                .store
-                .latest_merge_queue_for_session(agent.session.id)?
-            {
-                latest_live_queue.push(entry);
-            }
-        }
+        // One query for every live session rather than one per session: this
+        // is on `status`, which every session runs as its first command.
+        let session_ids = agents
+            .iter()
+            .map(|agent| agent.session.id)
+            .collect::<Vec<i64>>();
+        let latest_live_queue = self.store.latest_merge_queue_for_sessions(&session_ids)?;
         let main_head = self.repo.head_commit()?;
         let (upstream_ref, upstream_head) = self
             .repo
@@ -8521,17 +8519,22 @@ impl Broker {
         session_head: &str,
         target_head: &str,
     ) -> Result<bool, BrokerOpError> {
-        let represented = self.store.merge_queue()?.into_iter().rev().any(|entry| {
-            entry.session_id == session_id
-                && entry.head_commit == session_head
-                && matches!(
-                    entry.status,
-                    MergeStatus::Promoted | MergeStatus::ExternallyLanded
-                )
-                && details_string_value(entry.details_json.as_deref(), "commit")
-                    .is_some_and(|promotion| self.repo.is_ancestor(&promotion, target_head))
-        });
-        Ok(represented)
+        // The queue is read once per call, and this is called once per live
+        // session from `promoted_conflicts`, which is on `status`. It used to
+        // select a few candidate rows by identity and only then shell out; the
+        // selection is pure string work, so doing it before the query keeps
+        // `git merge-base` off the common path entirely.
+        //
+        // `is_ancestor` is a subprocess, so it is only reached for an entry
+        // that actually claims to represent this exact (session, head) — at
+        // most one or two rows, rather than one call per queue entry.
+        let candidate = self
+            .store
+            .latest_representation_for_session(session_id, session_head)?;
+        let Some(promotion) = candidate else {
+            return Ok(false);
+        };
+        Ok(self.repo.is_ancestor(&promotion, target_head))
     }
 
     // ── cleanup ───────────────────────────────────────────────────────
@@ -10608,7 +10611,7 @@ fn details_string_array(details_json: Option<&str>, key: &str) -> Vec<String> {
         .collect()
 }
 
-fn details_string_value(details_json: Option<&str>, key: &str) -> Option<String> {
+pub(crate) fn details_string_value(details_json: Option<&str>, key: &str) -> Option<String> {
     let details_json = details_json?;
     let details = serde_json::from_str::<serde_json::Value>(details_json).ok()?;
     details.get(key)?.as_str().map(str::to_string)
@@ -10852,7 +10855,19 @@ fn worktree_activity_ms(main_root: &Path, session: &Session) -> Option<i64> {
 /// True when the PID exists and is not a zombie (macOS/Linux — the v0
 /// platforms). `kill -0` alone is wrong here: it succeeds on zombies,
 /// and an exited-but-unreaped agent must read as dead.
+///
+/// Reads `/proc/<pid>/stat` where it exists, which is a single `open`/`read`
+/// with no fork. `ps` is the fallback for macOS, where there is no procfs and
+/// `/bin/ps` is the only portable way to see the state. The distinction matters
+/// at fleet scale: `broker status` is every session's first command and calls
+/// this once per live session, so a 40-session status forked 40 `ps`
+/// processes. The repository's own measurements put a 19-session `status` at
+/// 2m54s of wall time.
 pub(crate) fn pid_alive(pid: i64) -> bool {
+    if let Some(state) = procfs_state(pid) {
+        // A zombie still has a `/proc` entry; `kill -0` would report it alive.
+        return state != 'Z' && state != 'X';
+    }
     match Command::new("ps")
         .args(["-o", "state=", "-p", &pid.to_string()])
         .stderr(Stdio::null())
@@ -10864,6 +10879,25 @@ pub(crate) fn pid_alive(pid: i64) -> bool {
         }
         _ => false,
     }
+}
+
+/// The single-letter process state from `/proc/<pid>/stat`, or `None` when
+/// procfs is unavailable (macOS) or the entry cannot be read.
+///
+/// The comm field is parenthesised and may itself contain spaces and
+/// parentheses, so the state is taken from the *last* `)` rather than by
+/// splitting the whole line on whitespace — `ps` shows the same field and has
+/// the same parsing hazard.
+#[cfg(target_os = "linux")]
+fn procfs_state(pid: i64) -> Option<char> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after_comm = stat.rsplit_once(')')?.1;
+    after_comm.trim_start().chars().next()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn procfs_state(_pid: i64) -> Option<char> {
+    None
 }
 
 /// Task → worktree/branch slug: lowercase alphanumerics with dashes,
