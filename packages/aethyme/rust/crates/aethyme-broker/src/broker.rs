@@ -6424,13 +6424,10 @@ impl Broker {
             .remote_tracking_default_branch(&branch, &branch_tip)
             .unwrap_or((branch_ref, branch_tip));
 
-        let base = session.diff_base.clone().ok_or_else(|| {
-            BrokerOpError::RepresentationUnavailable {
-                reason: format!(
-                    "session {session_id} has no recorded diff base, so the commits it owns cannot be bounded"
-                ),
-            }
-        })?;
+        // Where the head diverged from the branch, as the cleanup audit and
+        // plan measure it, so the three cannot disagree about which commits
+        // this checkout holds (#408).
+        let base = crate::landing_base(&checkout, &head, &branch_tip)?;
 
         let content = crate::session_content(&checkout, &base, &head)?;
         let search = crate::find_landing(
@@ -8180,6 +8177,37 @@ impl Broker {
         let Some(evidence) =
             self.recorded_representation_evidence(session, session_head, delivery_targets)?
         else {
+            // The predicate the representation scan and the cleanup audit use
+            // (#408). Without it the audit called rebased-then-merged work
+            // `in_target` while this plan held the same worktree as unproven.
+            // Every positive names fixed commits, so the plan digest over this
+            // reason stays stable until a delivery target moves.
+            for target in delivery_targets {
+                let crate::LandingVerdict::Landed {
+                    evidence,
+                    landed_by,
+                } = crate::work_landed(&self.repo, session_head, target)?
+                else {
+                    continue;
+                };
+                provenance.representation = CleanupRepresentation::Represented;
+                provenance.pending_commit_count = 0;
+                provenance.represented_on = Some(target.clone());
+                let by = landed_by
+                    .as_deref()
+                    .map(|commit| format!(" (landed by {})", short_commit(commit)))
+                    .unwrap_or_default();
+                provenance.represented_by_commit = landed_by;
+                return Ok((
+                    provenance,
+                    format!(
+                        "session head {} is represented on delivery target {} by {}{by}",
+                        short_commit(session_head),
+                        short_commit(target),
+                        evidence.as_str()
+                    ),
+                ));
+            }
             // Last resort, and the one that survives any merge strategy: the
             // commits exist on a remote, so this directory is not where the
             // work lives.

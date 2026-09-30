@@ -206,6 +206,59 @@ fn handoff_by_worktree_returns_the_latest_completed_session() {
     );
     assert!(text.contains("leases: 0 recorded"), "{text}");
     assert!(text.contains("last gate: none recorded"), "{text}");
+    // The worktree's only commit was promoted by the first session, so it is
+    // on the integration branch under the promotion's SHA. The shared landing
+    // check (#408) finds it there; ancestry alone used to report "no".
+    assert!(text.contains("cleanup safe: yes"), "{text}");
+}
+
+/// A second session that adopts a worktree and changes nothing did no work of
+/// its own, but the checkout still holds the first session's commit, which
+/// reached no branch. Measuring from the second session's start would call
+/// that "no net change" and the worktree safe to remove.
+#[test]
+fn adopting_unlanded_work_and_changing_nothing_is_not_cleanup_safe() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let worktree = tmp.path().join(".aethyme/worktrees/unlanded");
+    std::fs::create_dir_all(worktree.parent().unwrap()).unwrap();
+    git(
+        tmp.path(),
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "agent/unlanded",
+            worktree.to_str().unwrap(),
+            "main",
+        ],
+    );
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let first = broker.adopt(&worktree, Some("unlanded work")).unwrap();
+    std::fs::write(worktree.join("only-here.txt"), "only here\n").unwrap();
+    git(&worktree, &["add", "-A"]);
+    git(&worktree, &["commit", "-qm", "never submitted"]);
+    broker.close(first.id).unwrap();
+    let second = broker
+        .adopt(&worktree, Some("looked, changed nothing"))
+        .unwrap();
+    assert!(broker.finish(second.id).unwrap().closed);
+
+    let output = run(
+        tmp.path(),
+        &[
+            "advanced",
+            "handoff",
+            "--worktree",
+            worktree.to_str().unwrap(),
+        ],
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        text.contains(&format!("Session {} handoff", second.id)),
+        "{text}"
+    );
     assert!(text.contains("cleanup safe: no"), "{text}");
 }
 

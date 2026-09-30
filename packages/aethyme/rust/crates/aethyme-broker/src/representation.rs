@@ -23,10 +23,24 @@
 //! content, so a verdict computed against one stays true forever — which is
 //! also what makes it worth recording rather than recomputing.
 //!
+//! Two kinds of evidence count, both about fixed commits:
+//!
+//! - **content**: the earliest commit on the branch holding every blob the
+//!   session produced (a squash or a cherry-pick of the net diff);
+//! - **patch equivalence**: every session commit has a patch-identical commit
+//!   on the branch, and one branch commit has all of them in its history (a
+//!   rebase before merge, which changes every blob the base touched, #408).
+//!
+//! [`work_landed`] is the one entry point for "did this work land": the
+//! representation scan, the cleanup audit and the cleanup plan all ask it, so
+//! they cannot reach opposite verdicts about the same head.
+//!
 //! Deliberately not used as evidence:
 //!
 //! - **ancestry**, which a squash or rebase merge destroys by construction;
 //! - **the branch tip**, for the reason above;
+//! - **a matching subject or author**, which a revert or a reworked commit
+//!   also has;
 //! - **an operator assertion**, for the same reason `already_represented` is
 //!   not a choosable disposition in `main reconcile`: representation is a fact
 //!   about content, and letting it be declared would make the check ceremonial.
@@ -42,6 +56,8 @@ pub const REPRESENTATION_PLAN_SCHEMA_VERSION: u32 = 1;
 /// A cap on the history walk, so a session whose work never landed cannot make
 /// `finish` scan an entire branch. Candidates are already bounded by the
 /// session's base (see [`find_landing`]); this only guards a pathological base.
+/// A search that hits the cap reports itself truncated and skips the
+/// patch-equivalence tier, whose cost grows with the same history.
 pub const DEFAULT_SEARCH_CAP: usize = 2_000;
 
 /// The net content a session produced.
@@ -103,13 +119,44 @@ pub enum LandingOutcome {
     },
 }
 
+/// How work reached a branch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LandingEvidence {
+    /// The head is an ancestor (fast-forward or merge delivery).
+    Ancestry,
+    /// A commit on the branch carries the net content (squash delivery).
+    Content,
+    /// Every session commit's patch is on the branch under another SHA
+    /// (rebase or cherry-pick delivery).
+    PatchEquivalent,
+    /// The head changes nothing the branch does not already hold.
+    NoNetChange,
+}
+
+impl LandingEvidence {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ancestry => "ancestry",
+            Self::Content => "content",
+            Self::PatchEquivalent => "patch equivalence",
+            Self::NoNetChange => "no net change",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Landing {
+    /// The commit that carried the work: the earliest holding the content, or,
+    /// for patch equivalence, the earliest whose history holds every
+    /// equivalent patch.
     pub commit: String,
     pub subject: String,
     /// Candidates examined before this one; 0 means the oldest candidate.
     pub position: usize,
     pub paths: usize,
+    /// Content, or patch equivalence when no single commit holds the content.
+    pub evidence: LandingEvidence,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -186,20 +233,12 @@ pub fn content_at(repo: &GitRepo, content: &SessionContent, target: &str) -> Con
     ContentVerdict::Present
 }
 
-/// How many of the session's paths `target` matches, and the first it does not.
-fn match_depth(repo: &GitRepo, content: &SessionContent, target: &str) -> (usize, Option<String>) {
-    let mut matched = 0usize;
-    for (path, wanted) in &content.paths {
-        if &repo.blob_at(target, path) == wanted {
-            matched += 1;
-        } else {
-            return (matched, Some(path.clone()));
-        }
-    }
-    (matched, None)
-}
+/// Candidates asked about per `cat-file` batch. Most landings are found near
+/// the start of the window, so the search stops long before asking about all
+/// of it; a batch keeps one query list from growing with the whole window.
+const CANDIDATE_BATCH: usize = 64;
 
-/// Find the earliest commit on `branch_tip` that carries the session's content.
+/// Find the earliest commit on `branch_tip` that carries the session's work.
 ///
 /// The candidate set is exactly the commits the default branch gained since the
 /// session's base. That bound is not a budget but a fact: work cannot have
@@ -207,8 +246,11 @@ fn match_depth(repo: &GitRepo, content: &SessionContent, target: &str) -> (usize
 /// commit. It also means the walk is short in the normal case and terminates
 /// without an arbitrary limit.
 ///
-/// The *earliest* match is taken rather than the latest because that is the
-/// commit that carried the work; every later commit merely inherits it.
+/// Content is tried first; the *earliest* match is taken rather than the latest
+/// because that is the commit that carried the work, and every later commit
+/// merely inherits it. When no commit holds the content -- the work was rebased
+/// onto a newer base before it merged, so the base's files differ -- patch
+/// equivalence is tried (see [`patch_landing`]).
 pub fn find_landing(
     repo: &GitRepo,
     content: &SessionContent,
@@ -234,54 +276,259 @@ pub fn find_landing(
         });
     }
 
+    let unavailable = |what: String| BrokerOpError::RepresentationUnavailable { reason: what };
     let candidates = repo
         .commits_between_oldest(&content.base, branch_tip)
-        .map_err(|source| BrokerOpError::RepresentationUnavailable {
-            reason: format!(
+        .map_err(|source| {
+            unavailable(format!(
                 "cannot list commits {}..{}: {source}",
                 short(&content.base),
                 short(branch_tip)
-            ),
+            ))
         })?;
 
     let truncated = candidates.len() > cap;
-    let mut best: Option<Closest> = None;
-    let mut examined = 0usize;
+    let window = &candidates[..candidates.len().min(cap)];
+    let paths = content.paths.iter().collect::<Vec<_>>();
+    let mut best: Option<(String, usize, String)> = None;
 
-    for candidate in candidates.iter().take(cap) {
-        examined += 1;
-        let (matched, missing) = match_depth(repo, content, candidate);
-        let Some(missing_path) = missing else {
-            return Ok(LandingSearch {
-                outcome: LandingOutcome::Landed(Landing {
-                    commit: candidate.clone(),
-                    subject: subject(repo, candidate),
-                    position: examined - 1,
-                    paths: content.paths.len(),
-                }),
-                examined,
-                truncated: false,
-            });
-        };
-        if best
-            .as_ref()
-            .is_none_or(|prev| matched > prev.matched_paths)
+    for (batch_index, batch) in window.chunks(CANDIDATE_BATCH).enumerate() {
+        let queries = batch
+            .iter()
+            .flat_map(|candidate| {
+                paths
+                    .iter()
+                    .map(move |(path, _)| (candidate.as_str(), path.as_str()))
+            })
+            .collect::<Vec<_>>();
+        let blobs = repo
+            .blobs_at_many(&queries)
+            .map_err(|source| unavailable(format!("cannot read candidate content: {source}")))?;
+        for (offset, (candidate, found)) in batch.iter().zip(blobs.chunks(paths.len())).enumerate()
         {
-            best = Some(Closest {
-                commit: candidate.clone(),
-                subject: subject(repo, candidate),
-                matched_paths: matched,
-                missing_path,
-            });
+            let position = batch_index * CANDIDATE_BATCH + offset;
+            // Paths are compared in order and the first mismatch ends the
+            // count, so "closest" means the longest matching prefix.
+            let matched = paths
+                .iter()
+                .zip(found)
+                .take_while(|((_, wanted), found)| *wanted == *found)
+                .count();
+            if matched == paths.len() {
+                return Ok(LandingSearch {
+                    outcome: LandingOutcome::Landed(Landing {
+                        commit: candidate.clone(),
+                        subject: subject(repo, candidate),
+                        position,
+                        paths: paths.len(),
+                        evidence: LandingEvidence::Content,
+                    }),
+                    examined: position + 1,
+                    truncated: false,
+                });
+            }
+            if best.as_ref().is_none_or(|(_, prev, _)| matched > *prev) {
+                best = Some((candidate.clone(), matched, paths[matched].0.clone()));
+            }
         }
+    }
+
+    // A truncated window says nothing about the history beyond it, and the
+    // patch comparison would have to read all of that history.
+    if !truncated
+        && let Some((commit, position)) = patch_landing(repo, content, branch_tip, window)?
+    {
+        return Ok(LandingSearch {
+            outcome: LandingOutcome::Landed(Landing {
+                subject: subject(repo, &commit),
+                commit,
+                position,
+                paths: paths.len(),
+                evidence: LandingEvidence::PatchEquivalent,
+            }),
+            examined: window.len(),
+            truncated: false,
+        });
     }
 
     Ok(LandingSearch {
         outcome: LandingOutcome::NotFound {
-            closest: best.filter(|closest| closest.matched_paths > 0),
+            closest: best.filter(|(_, matched, _)| *matched > 0).map(
+                |(commit, matched_paths, missing_path)| Closest {
+                    subject: subject(repo, &commit),
+                    commit,
+                    matched_paths,
+                    missing_path,
+                },
+            ),
         },
-        examined,
+        examined: window.len(),
         truncated,
+    })
+}
+
+/// The earliest candidate whose history holds a patch-identical copy of every
+/// session commit, if there is one.
+///
+/// This is the rebase-then-merge case (#408): the same patches applied to a
+/// newer base produce different blobs wherever the base differs, so no commit
+/// holds the session's exact content, yet `git patch-id --stable` agrees for
+/// every commit. Three conditions keep the verdict sound rather than likely:
+///
+/// - **every** session commit after the base must be accounted for, either by
+///   an equivalent on the branch or by being on the branch itself -- one
+///   landed commit out of two is not "landed";
+/// - a merge commit in the session has no patch id, and can carry a conflict
+///   resolution no patch describes, so it counts only if that merge itself is
+///   on the branch;
+/// - a single branch commit must have all of them in its history, so the
+///   verdict names one fixed commit that carried the work, as a recorded
+///   representation requires.
+///
+/// `--cherry-mark` compares the session side against the branch commits since
+/// the two diverged, including those reached through a merge's second parent.
+fn patch_landing(
+    repo: &GitRepo,
+    content: &SessionContent,
+    branch_tip: &str,
+    candidates: &[String],
+) -> Result<Option<(String, usize)>, BrokerOpError> {
+    let unavailable = |source: crate::GitError| BrokerOpError::RepresentationUnavailable {
+        reason: format!(
+            "cannot compare patches with {}: {source}",
+            short(branch_tip)
+        ),
+    };
+    let session_commits = repo
+        .commits_between_oldest(&content.base, &content.head)
+        .map_err(unavailable)?;
+    if session_commits.is_empty() {
+        return Ok(None);
+    }
+    // Non-merge session commits not on the branch, and whether each has an
+    // equivalent there. A session commit missing from this list is a merge,
+    // or is on the branch already.
+    let unmerged = repo
+        .cherry_marked(branch_tip, &content.head, crate::git::CherrySide::Right)
+        .map_err(unavailable)?
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+    if session_commits
+        .iter()
+        .any(|commit| unmerged.get(commit) == Some(&false))
+    {
+        return Ok(None);
+    }
+    // The branch commits carrying the equivalents, plus every session commit
+    // that has none -- which the covering search below then requires to be
+    // on the branch itself.
+    let mut carriers = repo
+        .cherry_marked(branch_tip, &content.head, crate::git::CherrySide::Left)
+        .map_err(unavailable)?
+        .into_iter()
+        .filter_map(|(commit, equivalent)| equivalent.then_some(commit))
+        .collect::<Vec<_>>();
+    carriers.extend(
+        session_commits
+            .iter()
+            .filter(|commit| !unmerged.contains_key(*commit))
+            .cloned(),
+    );
+    // The earliest candidate descending from (or equal to) every carrier.
+    let mut covering: Option<std::collections::BTreeSet<String>> = None;
+    for carrier in &carriers {
+        let mut reach = repo
+            .descendants_towards(carrier, branch_tip)
+            .map_err(unavailable)?
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        reach.insert(carrier.clone());
+        covering = Some(match covering {
+            None => reach,
+            Some(previous) => previous.intersection(&reach).cloned().collect(),
+        });
+    }
+    let Some(covering) = covering else {
+        return Ok(None);
+    };
+    Ok(candidates
+        .iter()
+        .position(|candidate| covering.contains(candidate))
+        .map(|position| (candidates[position].clone(), position)))
+}
+
+/// The answer to "did this head's work land on `target`".
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum LandingVerdict {
+    Landed {
+        evidence: LandingEvidence,
+        /// The fixed commit that carried the work; absent for ancestry and
+        /// for a head with no net change, where no single commit is needed.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        landed_by: Option<String>,
+    },
+    NotLanded {
+        examined: usize,
+        /// True when the search stopped at [`DEFAULT_SEARCH_CAP`], so the
+        /// negative is not conclusive.
+        truncated: bool,
+    },
+}
+
+impl LandingVerdict {
+    pub fn is_landed(&self) -> bool {
+        matches!(self, LandingVerdict::Landed { .. })
+    }
+}
+
+/// Where a head's work is measured from: where it diverged from `target`.
+///
+/// Deliberately not the session's recorded start. A worktree can be adopted
+/// by a second session while holding the first one's unlanded commits; the
+/// second session then changed nothing *itself*, and measuring from its start
+/// would call a checkout holding lost-if-removed work "no net change". The
+/// divergence point counts every commit the head holds that `target` lacks,
+/// which is the question both a recording and a removal have to answer.
+pub fn landing_base(repo: &GitRepo, head: &str, target: &str) -> Result<String, BrokerOpError> {
+    Ok(repo.merge_base(head, target)?)
+}
+
+/// Whether `head`'s work landed on `target`: the one predicate behind the
+/// representation scan, the cleanup audit and the cleanup plan (#408).
+///
+/// Tried in order of cost: ancestry, then the content and patch-equivalence
+/// search of [`find_landing`] over at most [`DEFAULT_SEARCH_CAP`] commits the
+/// target gained since the two diverged (see [`landing_base`]). Every positive names
+/// fixed commits, so it stays true as the target advances; a negative only
+/// means nothing proved it.
+pub fn work_landed(
+    repo: &GitRepo,
+    head: &str,
+    target: &str,
+) -> Result<LandingVerdict, BrokerOpError> {
+    if repo.is_ancestor(head, target) {
+        return Ok(LandingVerdict::Landed {
+            evidence: LandingEvidence::Ancestry,
+            landed_by: None,
+        });
+    }
+    let base = landing_base(repo, head, target)?;
+    let content = session_content(repo, &base, head)?;
+    let search = find_landing(repo, &content, target, DEFAULT_SEARCH_CAP)?;
+    Ok(match search.outcome {
+        LandingOutcome::NothingToRepresent => LandingVerdict::Landed {
+            evidence: LandingEvidence::NoNetChange,
+            landed_by: None,
+        },
+        LandingOutcome::Landed(landing) => LandingVerdict::Landed {
+            evidence: landing.evidence,
+            landed_by: Some(landing.commit),
+        },
+        LandingOutcome::NotFound { .. } => LandingVerdict::NotLanded {
+            examined: search.examined,
+            truncated: search.truncated,
+        },
     })
 }
 
@@ -566,6 +813,151 @@ mod tests {
         let full = find_landing(&repo, &content, &tip, DEFAULT_SEARCH_CAP).unwrap();
         assert_eq!(full.examined, 4);
         assert!(!full.truncated);
+    }
+
+    /// Ten lines, so an edit at one end is outside the three lines of diff
+    /// context around an edit at the other: `git patch-id` hashes context,
+    /// and #408's rebase changed the files elsewhere, not beside the edit.
+    const STORE_BASE: &str = "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10\n";
+    const STORE_SESSION: &str = "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nL10\n";
+    const STORE_MAIN: &str = "L1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10\n";
+
+    /// The #408 shape: the session commit was rebased onto a newer main
+    /// before merging, so its parent and every blob the base touched differ,
+    /// and the copy reached main only through a merge's second parent.
+    fn rebased_then_merged() -> (tempfile::TempDir, GitRepo, String, String, String) {
+        let (tmp, repo, _) = seeded();
+        write(tmp.path(), "store.rs", STORE_BASE);
+        let base = commit(tmp.path(), "store");
+        git(tmp.path(), &["checkout", "-q", "-b", "session"]);
+        write(tmp.path(), "store.rs", STORE_SESSION);
+        let head = commit(tmp.path(), "feat: session work");
+
+        git(tmp.path(), &["checkout", "-q", "main"]);
+        write(tmp.path(), "store.rs", STORE_MAIN);
+        commit(tmp.path(), "main edits the same file elsewhere");
+        git(tmp.path(), &["checkout", "-q", "-b", "pr"]);
+        git(tmp.path(), &["cherry-pick", &head]);
+        let copy = git(tmp.path(), &["rev-parse", "HEAD"]);
+        git(tmp.path(), &["checkout", "-q", "main"]);
+        git(
+            tmp.path(),
+            &["merge", "-q", "--no-ff", "pr", "-m", "Merge pull request"],
+        );
+        let tip = git(tmp.path(), &["rev-parse", "HEAD"]);
+        (tmp, repo, base, head, format!("{copy} {tip}"))
+    }
+
+    #[test]
+    fn rebased_then_merged_work_is_found_by_patch_equivalence() {
+        let (_tmp, repo, base, head, refs) = rebased_then_merged();
+        let (copy, tip) = refs.split_once(' ').unwrap();
+        assert_ne!(
+            repo.blob_at(copy, "store.rs"),
+            repo.blob_at(&head, "store.rs"),
+            "the rebase changed the blob, so content alone cannot find it"
+        );
+
+        let content = session_content(&repo, &base, &head).unwrap();
+        let search = find_landing(&repo, &content, tip, DEFAULT_SEARCH_CAP).unwrap();
+        let landing = search.landing().expect("rebased work landed");
+        assert_eq!(landing.evidence, LandingEvidence::PatchEquivalent);
+        assert_eq!(landing.commit, copy, "the copy carried it, not the merge");
+
+        assert_eq!(
+            work_landed(&repo, &head, tip).unwrap(),
+            LandingVerdict::Landed {
+                evidence: LandingEvidence::PatchEquivalent,
+                landed_by: Some(copy.to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn squash_merged_work_is_found_by_content() {
+        let (tmp, repo, _base) = seeded();
+        git(tmp.path(), &["checkout", "-q", "-b", "session"]);
+        write(tmp.path(), "f.rs", "one\n");
+        commit(tmp.path(), "first");
+        write(tmp.path(), "f.rs", "one\ntwo\n");
+        let head = commit(tmp.path(), "second");
+
+        git(tmp.path(), &["checkout", "-q", "main"]);
+        write(tmp.path(), "other.rs", "main moved\n");
+        commit(tmp.path(), "unrelated");
+        write(tmp.path(), "f.rs", "one\ntwo\n");
+        let squash = commit(tmp.path(), "both, squashed (#3)");
+
+        assert_eq!(
+            work_landed(&repo, &head, &squash).unwrap(),
+            LandingVerdict::Landed {
+                evidence: LandingEvidence::Content,
+                landed_by: Some(squash.clone()),
+            }
+        );
+    }
+
+    #[test]
+    fn unlanded_work_is_not_landed() {
+        let (tmp, repo, _base) = seeded();
+        git(tmp.path(), &["checkout", "-q", "-b", "session"]);
+        write(tmp.path(), "f.rs", "mine\n");
+        let head = commit(tmp.path(), "never delivered");
+        git(tmp.path(), &["checkout", "-q", "main"]);
+        write(tmp.path(), "g.rs", "other\n");
+        let tip = commit(tmp.path(), "unrelated");
+
+        assert!(matches!(
+            work_landed(&repo, &head, &tip).unwrap(),
+            LandingVerdict::NotLanded {
+                truncated: false,
+                ..
+            }
+        ));
+    }
+
+    /// One of two rebased commits merged is not the session's work landing.
+    #[test]
+    fn one_of_two_rebased_commits_landing_is_not_landed() {
+        let (tmp, repo, _) = seeded();
+        write(tmp.path(), "store.rs", STORE_BASE);
+        commit(tmp.path(), "store");
+        git(tmp.path(), &["checkout", "-q", "-b", "session"]);
+        write(tmp.path(), "store.rs", STORE_SESSION);
+        let first = commit(tmp.path(), "first");
+        write(tmp.path(), "second.rs", "second\n");
+        let head = commit(tmp.path(), "second");
+
+        git(tmp.path(), &["checkout", "-q", "main"]);
+        write(tmp.path(), "store.rs", STORE_MAIN);
+        commit(tmp.path(), "main edits the same file elsewhere");
+        git(tmp.path(), &["cherry-pick", &first]);
+        let tip = git(tmp.path(), &["rev-parse", "HEAD"]);
+
+        assert!(!work_landed(&repo, &head, &tip).unwrap().is_landed());
+    }
+
+    /// A merge in the session can carry a conflict resolution no patch id
+    /// describes. Here both of the session's ordinary commits reached main,
+    /// but the merge joining them changed `side.rs` by hand, and that change
+    /// is on no branch.
+    #[test]
+    fn a_session_holding_a_merge_is_not_landed_by_patch_equivalence() {
+        let (_tmp, repo, base, _head, refs) = rebased_then_merged();
+        let (_copy, _tip) = refs.split_once(' ').unwrap();
+        let root = repo.root().to_path_buf();
+        git(&root, &["checkout", "-q", "-b", "side", &base]);
+        write(&root, "side.rs", "side\n");
+        let side = commit(&root, "side");
+        git(&root, &["checkout", "-q", "main"]);
+        git(&root, &["cherry-pick", &side]);
+        let tip = git(&root, &["rev-parse", "HEAD"]);
+        git(&root, &["checkout", "-q", "session"]);
+        git(&root, &["merge", "-q", "--no-ff", "--no-commit", "side"]);
+        write(&root, "side.rs", "resolved by hand\n");
+        let merged_head = commit(&root, "merge side");
+
+        assert!(!work_landed(&repo, &merged_head, &tip).unwrap().is_landed());
     }
 
     #[test]
