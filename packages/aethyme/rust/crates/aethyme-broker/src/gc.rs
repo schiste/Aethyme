@@ -15,8 +15,9 @@ use crate::{
     Broker, BrokerOpError, GcApplyReport, GcArtifactCandidate, GcBlocker, GcBlockerSummary,
     GcCheckpointPinRelease, GcDeclinedArtifact, GcFileAction, GcFileCandidate,
     GcGateCacheCandidate, GcHealth, GcOrphanCandidate, GcPlan, GcPublicationExposureExpiry,
-    GcRowCandidate, GcWorktreeBlockerSummary, GcWorktreeCandidate, GitRepo, OperationStatus,
-    RetentionPolicy, load_retention_policy, load_retention_policy_report,
+    GcRecoveryArchiveCandidate, GcRowCandidate, GcWorktreeBlockerSummary, GcWorktreeCandidate,
+    GitRepo, OperationStatus, RecoveryArchiveInventory, RetentionPolicy, load_retention_policy,
+    load_retention_policy_report,
 };
 
 pub const GC_PLAN_SCHEMA_VERSION: u32 = 2;
@@ -258,6 +259,35 @@ fn declined_reason(path: &Path, extras: &[String]) -> &'static str {
     }
 }
 
+/// Whether `archive` is a removal candidate now, and why: `(landed, reason)`.
+/// Shared by planning and apply so the rule is re-proved, not remembered.
+fn recovery_archive_disposition(
+    broker: &Broker,
+    archive: &crate::cleanup_resolve::OwnedRecoveryArchive,
+    policy: &RetentionPolicy,
+    now: i64,
+) -> Option<(bool, String)> {
+    if policy.recovery_archive_days == 0 {
+        return None;
+    }
+    if broker.recovery_archive_landed(archive) {
+        return Some((
+            true,
+            "its commits have landed and it holds no uncommitted changes; nothing in it is unique"
+                .into(),
+        ));
+    }
+    (days_between(now, archive.created_at_ms) >= policy.recovery_archive_days).then(|| {
+        (
+            false,
+            format!(
+                "older than recovery_archive_days ({}); contains unlanded work",
+                policy.recovery_archive_days
+            ),
+        )
+    })
+}
+
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -371,6 +401,8 @@ struct GcJournal {
     remaining_checkpoint_pin_releases: Vec<GcCheckpointPinRelease>,
     #[serde(default)]
     remaining_publication_exposure_expiries: Vec<GcPublicationExposureExpiry>,
+    #[serde(default)]
+    remaining_recovery_archives: Vec<GcRecoveryArchiveCandidate>,
     rows_removed: usize,
     files_completed: Vec<String>,
     sessions_cleaned: Vec<i64>,
@@ -384,6 +416,8 @@ struct GcJournal {
     checkpoint_pins_released: Vec<i64>,
     #[serde(default)]
     publication_exposures_expired: Vec<i64>,
+    #[serde(default)]
+    recovery_archives_removed: Vec<String>,
     reclaimed_bytes: u64,
 }
 
@@ -402,6 +436,7 @@ impl From<GcPlan> for GcJournal {
             remaining_gate_caches: plan.gate_caches,
             remaining_checkpoint_pin_releases: plan.checkpoint_pin_releases,
             remaining_publication_exposure_expiries: plan.publication_exposure_expiries,
+            remaining_recovery_archives: plan.recovery_archives,
             rows_removed: 0,
             files_completed: Vec::new(),
             sessions_cleaned: Vec::new(),
@@ -410,6 +445,7 @@ impl From<GcPlan> for GcJournal {
             gate_caches_reclaimed: Vec::new(),
             checkpoint_pins_released: Vec::new(),
             publication_exposures_expired: Vec::new(),
+            recovery_archives_removed: Vec::new(),
             reclaimed_bytes: 0,
         }
     }
@@ -777,6 +813,81 @@ impl Broker {
             (left.session_id, &left.relative_dir).cmp(&(right.session_id, &right.relative_dir))
         });
         (candidates, declined)
+    }
+
+    /// Recovery archives `gc plan` may propose, plus the inventory of every
+    /// archive under this repository's archive directory.
+    ///
+    /// Never autonomous: an archive exists because its work was not proved to
+    /// have landed, so each one is only ever a reviewed candidate. It becomes
+    /// one when its commits have since landed and it holds no uncommitted
+    /// changes (nothing in it is unique), or once it is older than
+    /// `recovery_archive_days`. `0` keeps every archive and proposes none.
+    fn recovery_archive_candidates(
+        &self,
+        evaluated_at: i64,
+        policy: &RetentionPolicy,
+        scan: crate::SizeScan,
+    ) -> Result<
+        (
+            Vec<GcRecoveryArchiveCandidate>,
+            Option<RecoveryArchiveInventory>,
+        ),
+        BrokerOpError,
+    > {
+        let crate::cleanup_resolve::RecoveryArchiveScan {
+            root,
+            owned,
+            unowned,
+        } = self.recovery_archives()?;
+        if owned.is_empty() && unowned.is_empty() {
+            return Ok((Vec::new(), None));
+        }
+        let size = |path: &Path| {
+            if scan.measures() {
+                directory_size_without_following_links(path).unwrap_or(0)
+            } else {
+                0
+            }
+        };
+        let mut inventory = RecoveryArchiveInventory {
+            root: root.to_string_lossy().into_owned(),
+            count: owned.len() + unowned.len(),
+            ..RecoveryArchiveInventory::default()
+        };
+        let mut candidates = Vec::new();
+        for archive in &owned {
+            let bytes = size(&archive.path);
+            inventory.estimated_bytes = inventory.estimated_bytes.saturating_add(bytes);
+            inventory.oldest_created_at_ms = Some(
+                inventory
+                    .oldest_created_at_ms
+                    .map_or(archive.created_at_ms, |oldest| {
+                        oldest.min(archive.created_at_ms)
+                    }),
+            );
+            if let Some((landed, reason)) =
+                recovery_archive_disposition(self, archive, policy, evaluated_at)
+            {
+                candidates.push(GcRecoveryArchiveCandidate {
+                    path: archive.path.to_string_lossy().into_owned(),
+                    session_id: archive.session_id,
+                    head: archive.head.clone(),
+                    created_at_ms: archive.created_at_ms,
+                    landed,
+                    estimated_bytes: bytes,
+                    reason,
+                });
+            }
+        }
+        for (path, reason) in &unowned {
+            inventory.estimated_bytes = inventory.estimated_bytes.saturating_add(size(path));
+            inventory
+                .unowned
+                .push(format!("{}: {reason}", path.to_string_lossy()));
+        }
+        candidates.sort_by(|left, right| left.path.cmp(&right.path));
+        Ok((candidates, Some(inventory)))
     }
 
     /// Host worktree roots whose owning repository is gone.
@@ -1206,6 +1317,8 @@ impl Broker {
             scan,
         );
         let mut orphans = self.orphan_candidates(evaluated_at, &policy, &mut blockers, scan)?;
+        let (recovery_archives, recovery_archive_inventory) =
+            self.recovery_archive_candidates(evaluated_at, &policy, scan)?;
         // Rooted at the per-user cache directory, not at any worktree: that
         // is why no total here ever counted it (#295).
         let mut size_records = crate::measurement::load_size_records(&main_root);
@@ -1501,6 +1614,7 @@ impl Broker {
             artifacts,
             orphans,
             gate_caches,
+            recovery_archives,
             blockers,
             checkpoint_pin_releases,
             publication_exposure_expiries,
@@ -1534,6 +1648,7 @@ impl Broker {
             unmeasured_directory_count,
             sizes_measured_at_ms: cleanup.sizes_measured_at_ms,
             budget_verdict,
+            recovery_archive_inventory,
         };
         if scan.measures() {
             plan.finish_digest()?;
@@ -2400,6 +2515,66 @@ impl Broker {
             write_journal(&journal_path, &journal)?;
         }
 
+        while !journal.remaining_recovery_archives.is_empty() && !check_deadline(deadline) {
+            let candidate = journal.remaining_recovery_archives[0].clone();
+            let dir = PathBuf::from(&candidate.path);
+            if std::fs::symlink_metadata(&dir).is_err() {
+                journal.remaining_recovery_archives.remove(0);
+                write_journal(&journal_path, &journal)?;
+                continue;
+            }
+            // Re-proved rather than remembered: ownership, the head the plan
+            // named, and the age-or-landed rule, all against the journal's
+            // policy and the time of removal.
+            let evidence = self.owned_recovery_archive(&dir).and_then(|archive| {
+                if archive.session_id != candidate.session_id || archive.head != candidate.head {
+                    return Err("names a different session or head than the reviewed plan".into());
+                }
+                recovery_archive_disposition(self, &archive, &journal.policy, now_ms())
+                    .ok_or_else(|| "is no longer old enough and has not landed".to_string())
+            });
+            if let Err(reason) = evidence {
+                failures.push(format!(
+                    "{}: {reason}; review a new GC plan",
+                    candidate.path
+                ));
+                journal.remaining_recovery_archives.remove(0);
+                write_journal(&journal_path, &journal)?;
+                continue;
+            }
+            // The manifest is the ownership evidence, so it goes last.
+            match remove_condemned_tree(&dir, Some(crate::cleanup_resolve::MANIFEST_FILE), deadline)
+            {
+                Ok(TreeRemoval::Complete) => {}
+                Ok(TreeRemoval::Interrupted) => break,
+                Err(error) => {
+                    failures.push(format!("{}: {error}", candidate.path));
+                    journal.remaining_recovery_archives.remove(0);
+                    write_journal(&journal_path, &journal)?;
+                    continue;
+                }
+            }
+            let payload = serde_json::json!({
+                "path": candidate.path,
+                "session_id": candidate.session_id,
+                "head": candidate.head,
+                "landed": candidate.landed,
+                "bytes": candidate.estimated_bytes,
+            })
+            .to_string();
+            self.store().append_event(
+                crate::events::BROKER_GC_RECOVERY_ARCHIVE_REMOVED,
+                Some(candidate.session_id),
+                Some(&payload),
+            )?;
+            journal.reclaimed_bytes = journal
+                .reclaimed_bytes
+                .saturating_add(candidate.estimated_bytes);
+            journal.recovery_archives_removed.push(candidate.path);
+            journal.remaining_recovery_archives.remove(0);
+            write_journal(&journal_path, &journal)?;
+        }
+
         let deadline_reached = check_deadline(deadline)
             && (!journal.remaining_checkpoint_pin_releases.is_empty()
                 || !journal.remaining_publication_exposure_expiries.is_empty()
@@ -2408,7 +2583,8 @@ impl Broker {
                 || !journal.remaining_worktrees.is_empty()
                 || !journal.remaining_artifacts.is_empty()
                 || !journal.remaining_gate_caches.is_empty()
-                || !journal.remaining_orphans.is_empty());
+                || !journal.remaining_orphans.is_empty()
+                || !journal.remaining_recovery_archives.is_empty());
         let complete = journal.remaining_rows.is_empty()
             && journal.remaining_checkpoint_pin_releases.is_empty()
             && journal.remaining_publication_exposure_expiries.is_empty()
@@ -2416,7 +2592,8 @@ impl Broker {
             && journal.remaining_worktrees.is_empty()
             && journal.remaining_artifacts.is_empty()
             && journal.remaining_gate_caches.is_empty()
-            && journal.remaining_orphans.is_empty();
+            && journal.remaining_orphans.is_empty()
+            && journal.remaining_recovery_archives.is_empty();
         let recovery_action =
             (!complete).then(|| format!("aethyme broker gc apply --confirm {}", journal.digest));
         let report = GcApplyReport {
@@ -2431,6 +2608,7 @@ impl Broker {
             gate_caches_reclaimed: journal.gate_caches_reclaimed.clone(),
             checkpoint_pins_released: journal.checkpoint_pins_released.clone(),
             publication_exposures_expired: journal.publication_exposures_expired.clone(),
+            recovery_archives_removed: journal.recovery_archives_removed.clone(),
             reclaimed_bytes: journal.reclaimed_bytes,
             failures,
             recovery_action,
@@ -2446,6 +2624,7 @@ impl Broker {
                 "gate_caches_reclaimed": report.gate_caches_reclaimed.len(),
                 "checkpoint_pins_released": report.checkpoint_pins_released.len(),
                 "publication_exposures_expired": report.publication_exposures_expired.len(),
+                "recovery_archives_removed": report.recovery_archives_removed.len(),
                 "reclaimed_bytes": report.reclaimed_bytes,
             })
             .to_string();

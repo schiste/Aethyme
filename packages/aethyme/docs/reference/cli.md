@@ -1218,8 +1218,23 @@ worktree is removed through the ordinary cleanup path and a
 `broker.cleanup.archived` event records the archive path. Any failure before
 that point leaves the worktree untouched. Ignored files (build output, caches)
 are never archived. Eligible, live, adopted, unsafe-path and inspection-failed
-sessions are refused; discarding stays `cleanup <session-id> --force`. Archives
-are not expired automatically.
+sessions are refused; discarding stays `cleanup <session-id> --force`.
+
+Archives never expire on their own. `broker gc plan` proposes one as a reviewed,
+digest-bound candidate (`recovery_archives[]`) only when this repository's
+broker wrote it -- its `manifest.json` names this repository and a session this
+repository records on the same branch -- and either its commits have since
+landed on the primary checkout or upstream while it holds no staged, unstaged or
+untracked changes, or it is older than `recovery_archive_days` (default 30; `0`
+keeps every archive). An unlanded candidate's reason says "contains unlanded
+work". `gc apply` re-proves ownership, the head and the rule before removing the
+archive (manifest last) and records `broker.gc.recovery-archive-removed`.
+Anything else under the archive directory -- a kit made by hand, another
+repository's archive, an unreadable manifest -- is listed under
+`recovery_archive_inventory.unowned` and never proposed. `broker gc storage
+plan` lists every directory under `<host state>/recovery-archives/` in
+`recovery_archives[]` (count, broker-written count, bytes when measured, oldest
+creation time); that listing is reporting only and outside the storage digest.
 
 `broker gc reclaim plan` inventories regenerable build directories inside this
 repository's broker worktree root and saves the reviewed decision set under a
@@ -1272,6 +1287,7 @@ artefact_directories = [] # e.g. [".pnpm-store"]; additive to built-ins
 startup_budget_ms = 25
 routine_size_budget_ms = 200
 size_record_ttl_hours = 24
+recovery_archive_days = 30 # 0 keeps every recovery archive
 ```
 
 Retention parsing reads `schema_version` before the field set. An older binary
@@ -1282,7 +1298,7 @@ reclamation. A schema version newer than the binary remains an explicit
 ignored or invalid retention keys with the remediation to edit this file.
 
 `artefact_directories` is an additive list of single directory names. It can
-extend the built-in artifact catalog (`target` and `node_modules`) for a
+extend the built-in artifact catalog for a
 repository-specific cache such as `.pnpm-store`; it cannot remove or weaken a
 built-in witness. Configured names must also avoid repository source and control
 roots such as `.git`, `.aethyme`, `src`, `lib`,

@@ -326,6 +326,27 @@ pub struct StoragePlan {
     pub preparation_candidates: Vec<StoragePreparationCandidate>,
     pub summary: StorageSummary,
     pub warnings: Vec<String>,
+    /// Recovery archive directories beside the worktree container, one per
+    /// repository (or per hand-made kit). Reporting only: host storage never
+    /// removes an archive, and these are not part of the digest.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recovery_archives: Vec<StorageRecoveryArchiveGroup>,
+}
+
+/// One directory under `recovery-archives/` and what it holds.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StorageRecoveryArchiveGroup {
+    pub path: PathBuf,
+    pub archive_count: usize,
+    /// Archives carrying a manifest `finish cleanup resolve --archive` wrote.
+    /// The rest were made outside the broker and are never proposed by
+    /// `gc plan`; only a person can decide what they are worth.
+    pub broker_archive_count: usize,
+    /// `None` until the directory has been measured.
+    pub estimated_bytes: Option<u64>,
+    /// The oldest archive's creation time (from its manifest, else the
+    /// directory's modification time).
+    pub oldest_created_at_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -587,6 +608,7 @@ fn build_plan(
         &preparation_entries,
         &preparation_candidates,
     );
+    let recovery_archives = inspect_recovery_archives(&storage_root, scan, records);
     Ok(StoragePlan {
         schema_version: STORAGE_PLAN_SCHEMA_VERSION,
         evaluated_at,
@@ -601,7 +623,80 @@ fn build_plan(
         preparation_candidates,
         summary,
         warnings,
+        recovery_archives,
     })
+}
+
+/// Group every directory under `<host>/recovery-archives/` for reporting.
+fn inspect_recovery_archives(
+    storage_root: &Path,
+    scan: crate::SizeScan,
+    records: &mut crate::measurement::SizeRecords,
+) -> Vec<StorageRecoveryArchiveGroup> {
+    #[derive(serde::Deserialize)]
+    struct BrokerManifest {
+        #[allow(dead_code)]
+        session_id: i64,
+        #[allow(dead_code)]
+        head: String,
+        created_at_ms: i64,
+    }
+    let Some(root) = storage_root
+        .parent()
+        .map(|base| base.join("recovery-archives"))
+    else {
+        return Vec::new();
+    };
+    let Ok(groups) = std::fs::read_dir(&root) else {
+        return Vec::new();
+    };
+    let is_dir = |path: &Path| std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir());
+    let mut found = Vec::new();
+    for group in groups.flatten().map(|entry| entry.path()) {
+        if !is_dir(&group) {
+            continue;
+        }
+        let mut entry = StorageRecoveryArchiveGroup {
+            path: group.clone(),
+            archive_count: 0,
+            broker_archive_count: 0,
+            estimated_bytes: observed_size(&group, scan, records),
+            oldest_created_at_ms: None,
+        };
+        for archive in std::fs::read_dir(&group)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| is_dir(path))
+        {
+            entry.archive_count += 1;
+            let manifest = std::fs::read(archive.join("manifest.json"))
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<BrokerManifest>(&bytes).ok());
+            let created = match &manifest {
+                Some(manifest) => {
+                    entry.broker_archive_count += 1;
+                    Some(manifest.created_at_ms)
+                }
+                None => std::fs::metadata(&archive)
+                    .and_then(|meta| meta.modified())
+                    .ok()
+                    .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|since| since.as_millis() as i64),
+            };
+            if let Some(created) = created {
+                entry.oldest_created_at_ms = Some(
+                    entry
+                        .oldest_created_at_ms
+                        .map_or(created, |oldest| oldest.min(created)),
+                );
+            }
+        }
+        found.push(entry);
+    }
+    found.sort_by(|left, right| left.path.cmp(&right.path));
+    found
 }
 
 fn inspect_root(

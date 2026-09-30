@@ -36,6 +36,8 @@ pub const BROKER_COMMAND_SUCCEEDED: &str = "broker.command.succeeded";
 /// A closed session's uncommitted or unlanded work was written to a verified
 /// recovery archive before its worktree was removed.
 pub const BROKER_CLEANUP_ARCHIVED: &str = "broker.cleanup.archived";
+/// A reviewed `gc apply` removed one recovery archive.
+pub const BROKER_GC_RECOVERY_ARCHIVE_REMOVED: &str = "broker.gc.recovery-archive-removed";
 /// `broker push` published a session's own branch (and maybe opened a draft PR).
 pub const BROKER_SESSION_PUSHED: &str = "broker.session.pushed";
 /// A session was closed with committed work no remote holds, on an explicit
