@@ -705,7 +705,11 @@ impl Broker {
             .and_then(crate::attribution::Identity::parse);
         let attribution = crate::attribution::for_promote(&self.main_root_path(), agent);
         let mut verification_message = format!(
-            "broker: promote session {} ({}){}",
+            // The subject is a conventional commit so that
+            // `aethyme repo lint-commit-message` accepts a broker promotion.
+            // `chore` is honest: the substantive change is the session's own
+            // commits, which the merge carries, not this integration commit.
+            "chore(broker): promote session {} ({}){}",
             session.id,
             session.task.as_deref().unwrap_or("no task"),
             attribution.trailer_block()
@@ -1021,7 +1025,7 @@ impl Broker {
                 &simulation.tree,
                 &[&current],
                 &format!(
-                    "broker: replay {} for session {}",
+                    "chore(broker): replay {} for session {}",
                     &commit.commit[..12],
                     plan.session_id
                 ),

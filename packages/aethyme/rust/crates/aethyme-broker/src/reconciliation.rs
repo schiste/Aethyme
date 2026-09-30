@@ -958,7 +958,7 @@ impl Broker {
                     &simulation.tree,
                     &[&rebuilt],
                     &format!(
-                        "broker: reconcile pending queue entry {} (session {})",
+                        "chore(broker): reconcile pending queue entry {} (session {})",
                         candidate.entry.id, candidate.entry.session_id
                     ),
                     &crate::attribution::Attribution::broker_only(),
@@ -1017,7 +1017,7 @@ impl Broker {
                         &simulation.tree,
                         &[&rebuilt],
                         &format!(
-                            "broker: preserve unrecorded integration commit {}",
+                            "chore(broker): preserve unrecorded integration commit {}",
                             planned.commit
                         ),
                         &crate::attribution::Attribution::broker_only(),
