@@ -1184,6 +1184,15 @@ pub struct CleanupRetention {
     pub sizes_measured_at_ms: Option<i64>,
     pub oldest_closed_age_days: u64,
     pub closed_worktrees_policy_days: u32,
+    /// Free bytes on the volume holding this repository, read once.
+    ///
+    /// The retained-bytes budget above is per repository and the volume is
+    /// shared, so this is the only reading on `CleanupRetention` that can say
+    /// whether work can actually run here. It is measured here rather than at
+    /// the advice site so that `severity` and the evidence line reporting
+    /// "host free space" are two renderings of one `statvfs` and cannot
+    /// disagree — which is the failure the escalation below exists to remove.
+    pub host_available_bytes: Option<u64>,
     pub severity: StatusAdviceSeverity,
     /// Config warnings/errors are carried with the retention picture so
     /// status can explain a bad file without failing before it can report it.
@@ -6409,15 +6418,39 @@ impl Broker {
         }
         if cleanup_retention.broker_owned_worktree_count > 0 {
             let count = cleanup_retention.broker_owned_worktree_count;
+            let required = crate::disk_headroom::DEFAULT_GATE_HEADROOM_BYTES;
+            // The same threshold `severity` escalated on. A backlog is worth
+            // housekeeping advice; a volume with no room for a gate build is a
+            // reason nothing runs here at all, and the summary must not lead
+            // with the tidier of the two.
+            let host_starved = cleanup_retention
+                .host_available_bytes
+                .is_some_and(|available| available < required);
             advice.push(StatusAdvice {
                 id: "cleanup.retained-worktrees",
                 severity: cleanup_retention.severity,
-                reason: "closed broker-owned worktrees are retained until explicit cleanup",
+                reason: if host_starved {
+                    "the host has less free space than a gate needs to start"
+                } else {
+                    "closed broker-owned worktrees are retained until explicit cleanup"
+                },
                 // An unmeetable budget is a different situation from a
                 // backlog and must not be advised as one: telling an operator
                 // to run cleanup when cleanup provably cannot close the gap is
                 // how a budget stays a gauge (#176).
-                summary: if cleanup_retention.over_retained_bytes_budget
+                summary: if host_starved {
+                    format!(
+                        "the host has {} free and a gate needs {} to start, so no gate can \
+                         run here; reclaiming the {count} retained {} below is what clears it",
+                        crate::disk_headroom::format_gibibytes(
+                            cleanup_retention
+                                .host_available_bytes
+                                .unwrap_or_default()
+                        ),
+                        crate::disk_headroom::format_gibibytes(required),
+                        plural_word(count, "worktree", "worktrees")
+                    )
+                } else if cleanup_retention.over_retained_bytes_budget
                     && !cleanup_retention.clears_retained_bytes_budget
                 {
                     format!(
@@ -6448,24 +6481,22 @@ impl Broker {
                     // The budget above is per repository; the disk is not.
                     // Every enrolled repository can sit inside its own budget
                     // while the shared volume is full, so the number that
-                    // decides whether work can run belongs next to it.
-                    {
-                        let available = crate::available_bytes(self.main_root());
-                        let required = crate::disk_headroom::DEFAULT_GATE_HEADROOM_BYTES;
-                        match available {
-                            Some(available) if available < required => format!(
-                                "host free space: {} of {} a gate needs to start \
-                                 -- sweeps widen and run hourly until it clears",
-                                crate::disk_headroom::format_gibibytes(available),
-                                crate::disk_headroom::format_gibibytes(required)
-                            ),
-                            Some(available) => format!(
-                                "host free space: {} (this budget is per repository; \
-                                 the volume is shared)",
-                                crate::disk_headroom::format_gibibytes(available)
-                            ),
-                            None => "host free space: unknown".to_string(),
-                        }
+                    // decides whether work can run belongs next to it — and it
+                    // is the same reading `severity` was derived from, so this
+                    // line and the advisory's level cannot disagree.
+                    match cleanup_retention.host_available_bytes {
+                        Some(available) if available < required => format!(
+                            "host free space: {} of {} a gate needs to start \
+                             -- sweeps widen and run hourly until it clears",
+                            crate::disk_headroom::format_gibibytes(available),
+                            crate::disk_headroom::format_gibibytes(required)
+                        ),
+                        Some(available) => format!(
+                            "host free space: {} (this budget is per repository; \
+                             the volume is shared)",
+                            crate::disk_headroom::format_gibibytes(available)
+                        ),
+                        None => "host free space: unknown".to_string(),
                     },
                     format!(
                         "blocked/budget bytes: {}/{}{}",
@@ -9445,12 +9476,16 @@ impl Broker {
         let oldest_closed_age_days = oldest_closed_at
             .map(|closed_at| now_ms.saturating_sub(closed_at).max(0) as u64 / 86_400_000)
             .unwrap_or(0);
+        // One reading, consumed by both the severity below and the evidence
+        // line in the advice that reports it.
+        let host_available_bytes = crate::available_bytes(self.main_root());
         let severity = cleanup_retention_severity(
             plan.retained_worktree_count,
             plan.estimated_retained_bytes,
             oldest_closed_age_days,
             policy.closed_worktrees_days,
             policy.retained_bytes_budget,
+            host_available_bytes,
         );
         let estimated_blocked_bytes = plan
             .estimated_retained_bytes
@@ -9492,6 +9527,7 @@ impl Broker {
             sizes_measured_at_ms: plan.sizes_measured_at_ms,
             oldest_closed_age_days,
             closed_worktrees_policy_days: policy.closed_worktrees_days,
+            host_available_bytes,
             severity,
             retention_config,
             reconciliation: self.reconcile_worktree_directories(false)?,
@@ -9862,13 +9898,42 @@ fn dirty_session_count(agents: &[AgentView]) -> usize {
         .count()
 }
 
+/// Severity for the retained-worktree advisory.
+///
+/// The retention signals below are all per repository: how many closed
+/// worktrees remain, how many bytes against a per-repository budget, how old
+/// the oldest is. None of them can see the volume, and the volume is shared --
+/// every enrolled repository can sit inside its own budget while the host has
+/// less free space than a gate needs to start.
+///
+/// When that is the state, the advice was reporting a `notice` or a `warning`
+/// about housekeeping while the same advice's own evidence line read "host
+/// free space: 2.1 GiB of 8.0 GiB a gate needs to start". Gates were refusing
+/// and the severity said there was nothing to interrupt for. The disk fact
+/// therefore escalates to `blocked`, taken from the same
+/// [`SweepUrgency`] the autonomous sweep escalates on, so the gate refusal,
+/// the sweep urgency and this advice can no longer describe three different
+/// states of one disk.
+///
+/// Unknown headroom does not escalate, for the reason `refusal` fails open: a
+/// `statvfs` that could not be read is not evidence of a full disk.
 fn cleanup_retention_severity(
     retained_worktrees: usize,
     retained_bytes: u64,
     oldest_age_days: u64,
     policy_days: u32,
     retained_bytes_budget: u64,
+    host_available_bytes: Option<u64>,
 ) -> StatusAdviceSeverity {
+    if matches!(
+        crate::disk_headroom::sweep_urgency(
+            host_available_bytes,
+            crate::disk_headroom::DEFAULT_GATE_HEADROOM_BYTES
+        ),
+        crate::disk_headroom::SweepUrgency::Pressured
+    ) {
+        return StatusAdviceSeverity::Blocked;
+    }
     if retained_worktrees >= 5
         || (retained_bytes_budget > 0 && retained_bytes >= retained_bytes_budget)
         || oldest_age_days >= u64::from(policy_days)
@@ -11314,26 +11379,31 @@ mod tests {
 
     #[test]
     fn cleanup_retention_severity_scales_by_count_bytes_and_policy_age() {
+        // Comfortably above the gate headroom, so these five cases are about
+        // the retention signals alone. The volume is exercised separately by
+        // `cleanup_retention_severity_escalates_on_the_threshold_gates_refuse_on`.
+        const ROOMY: Option<u64> = Some(512 * 1024 * 1024 * 1024);
         assert_eq!(
-            super::cleanup_retention_severity(1, 1024, 1, 7, 1_073_741_824),
+            super::cleanup_retention_severity(1, 1024, 1, 7, 1_073_741_824, ROOMY),
             super::StatusAdviceSeverity::Notice
         );
         assert_eq!(
-            super::cleanup_retention_severity(5, 1024, 1, 7, 1_073_741_824),
+            super::cleanup_retention_severity(5, 1024, 1, 7, 1_073_741_824, ROOMY),
             super::StatusAdviceSeverity::Warning
         );
         assert_eq!(
-            super::cleanup_retention_severity(1, 1024, 1, 7, 1024),
+            super::cleanup_retention_severity(1, 1024, 1, 7, 1024, ROOMY),
             super::StatusAdviceSeverity::Warning
         );
         assert_eq!(
-            super::cleanup_retention_severity(1, 1024, 7, 7, 0),
+            super::cleanup_retention_severity(1, 1024, 7, 7, 0, ROOMY),
             super::StatusAdviceSeverity::Warning
         );
         assert_eq!(
-            super::cleanup_retention_severity(1, u64::MAX, 1, 7, 0),
+            super::cleanup_retention_severity(1, u64::MAX, 1, 7, 0, ROOMY),
             super::StatusAdviceSeverity::Notice
         );
+
         let mut retention = super::CleanupRetention {
             closed_worktrees: Default::default(),
             reconciliation: crate::WorktreeReconciliation {
@@ -11361,6 +11431,10 @@ mod tests {
             sizes_measured_at_ms: None,
             oldest_closed_age_days: 1,
             closed_worktrees_policy_days: 7,
+            // The cases below are about the per-repository budget, so the
+            // volume is roomy. The starved case is pinned by
+            // `cleanup_retention_severity_escalates_on_the_threshold_gates_refuse_on`.
+            host_available_bytes: None,
             severity: super::StatusAdviceSeverity::Warning,
             retention_config: Default::default(),
         };
@@ -11390,6 +11464,48 @@ mod tests {
         // Within budget there is nothing to warn about at all.
         retention.over_retained_bytes_budget = false;
         assert!(super::cleanup_retention_warning(&retention).is_none());
+    }
+
+    /// The per-repository signals are all healthy in every case here — one
+    /// retained worktree, far inside a 1 GiB budget, one day old against a
+    /// seven-day policy. The only thing wrong is the shared volume, which is
+    /// the one thing those signals cannot see.
+    ///
+    /// Pinned because the previous behaviour was the bug: this reported a
+    /// `notice` about housekeeping while gates on the same host were refusing
+    /// to start for lack of disk, and the advice's own evidence line said so
+    /// in passing.
+    #[test]
+    fn cleanup_retention_severity_escalates_on_the_threshold_gates_refuse_on() {
+        let healthy = 1_073_741_824;
+        let required = crate::disk_headroom::DEFAULT_GATE_HEADROOM_BYTES;
+        let healthy_signal = |available: Option<u64>| {
+            super::cleanup_retention_severity(1, 1024, 1, 7, healthy, available)
+        };
+
+        // One byte under the headroom a gate refuses on is enough, whatever the
+        // retention picture says.
+        assert_eq!(
+            healthy_signal(Some(required - 1)),
+            super::StatusAdviceSeverity::Blocked
+        );
+        // Exactly at it is not: the gate starts, so this must not claim blocked.
+        assert_eq!(
+            healthy_signal(Some(required)),
+            super::StatusAdviceSeverity::Notice
+        );
+        assert_eq!(
+            healthy_signal(Some(required * 2)),
+            super::StatusAdviceSeverity::Notice
+        );
+        // Unknown headroom fails open, for the same reason `refusal` does: a
+        // `statvfs` that could not be read is not evidence of a full disk.
+        assert_eq!(healthy_signal(None), super::StatusAdviceSeverity::Notice);
+        // And it escalates *past* a warning, not instead of one.
+        assert_eq!(
+            super::cleanup_retention_severity(99, u64::MAX, 99, 7, 1, Some(0)),
+            super::StatusAdviceSeverity::Blocked
+        );
     }
 
     fn doctor_report(
