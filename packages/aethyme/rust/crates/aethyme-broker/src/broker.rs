@@ -8111,10 +8111,25 @@ impl Broker {
         };
 
         if !report.dirty_paths.is_empty() {
+            // `dirty_paths` lists every untracked file because cleanup safety
+            // depends on it; the warning counts the way `git status` does, so
+            // one untracked build folder reads as one entry, not thousands.
+            let uncommitted = checkout
+                .uncommitted_summary()
+                .ok()
+                .filter(|summary| !summary.is_empty())
+                .map_or_else(
+                    || {
+                        format!(
+                            "{} uncommitted or untracked {}",
+                            report.dirty_paths.len(),
+                            plural_word(report.dirty_paths.len(), "path", "paths")
+                        )
+                    },
+                    |summary| format!("uncommitted changes: {}", summary.describe(5)),
+                );
             report.warnings.push(format!(
-                "worktree has {} uncommitted or untracked {}; commit through the managed pre-commit lane before finish",
-                report.dirty_paths.len(),
-                plural_word(report.dirty_paths.len(), "path", "paths")
+                "worktree has {uncommitted}; commit through the managed pre-commit lane before finish"
             ));
             report
                 .next_commands

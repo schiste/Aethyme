@@ -75,8 +75,11 @@ pub struct SessionPushReport {
     pub previous_remote_oid: Option<String>,
     /// Commits the push made available that no remote held before.
     pub commits_pushed: u32,
-    /// Uncommitted files left in the worktree; only commits are pushed.
+    /// Uncommitted entries left in the worktree; only commits are pushed.
+    /// `uncommitted.modified + uncommitted.untracked_entries`: an untracked
+    /// directory counts once, as `git status` shows it.
     pub uncommitted_files: u32,
+    pub uncommitted: UncommittedCounts,
     pub pr: Option<SessionPullRequest>,
     /// Open pull requests whose change overlaps this session's: same files,
     /// and whether the changed lines overlap or nearly touch. Advisory only.
@@ -84,6 +87,37 @@ pub struct SessionPushReport {
     /// Open pull requests whose change could not be read, so their overlap
     /// is unknown rather than absent.
     pub pr_overlaps_unknown: Vec<i64>,
+}
+
+/// How many paths `broker push` left behind, and a few of them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct UncommittedCounts {
+    /// Tracked paths with staged or unstaged changes.
+    pub modified: u32,
+    /// Untracked entries; an untracked directory is one entry.
+    pub untracked_entries: u32,
+    /// Up to [`UNCOMMITTED_SAMPLE`] paths, modified first.
+    pub sample: Vec<String>,
+}
+
+/// How many uncommitted paths a push report names.
+pub const UNCOMMITTED_SAMPLE: usize = 5;
+
+impl From<&crate::UncommittedSummary> for UncommittedCounts {
+    fn from(summary: &crate::UncommittedSummary) -> Self {
+        let count = |paths: &Vec<String>| u32::try_from(paths.len()).unwrap_or(u32::MAX);
+        Self {
+            modified: count(&summary.modified),
+            untracked_entries: count(&summary.untracked),
+            sample: summary
+                .modified
+                .iter()
+                .chain(&summary.untracked)
+                .take(UNCOMMITTED_SAMPLE)
+                .cloned()
+                .collect(),
+        }
+    }
 }
 
 /// The remote and default branch the main checkout tracks, and the commit its
@@ -250,12 +284,12 @@ impl Broker {
             default.remote, session.branch
         ));
         let new_commits = repo.commits_not_on_remotes(&head)?.len();
-        let uncommitted_files = Path::new(&session.worktree_path)
+        let uncommitted = Path::new(&session.worktree_path)
             .is_dir()
             .then(|| GitRepo::discover(Path::new(&session.worktree_path)).ok())
             .flatten()
-            .and_then(|worktree| worktree.dirty_paths().ok())
-            .map_or(0, |paths| paths.len());
+            .and_then(|worktree| worktree.uncommitted_summary().ok())
+            .unwrap_or_default();
         let recorded = self.store().meta_get(&pushed_oid_key(session_id))?;
         let repo = self.repo_handle();
 
@@ -361,7 +395,8 @@ impl Broker {
             pushed_oid: head,
             previous_remote_oid: recorded.or(tracking),
             commits_pushed: u32::try_from(new_commits).unwrap_or(u32::MAX),
-            uncommitted_files: u32::try_from(uncommitted_files).unwrap_or(u32::MAX),
+            uncommitted_files: u32::try_from(uncommitted.len()).unwrap_or(u32::MAX),
+            uncommitted: UncommittedCounts::from(&uncommitted),
             pr,
             pr_overlaps: overlap.overlaps,
             pr_overlaps_unknown: overlap.unknown_prs,

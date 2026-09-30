@@ -218,6 +218,48 @@ impl Fixture {
     }
 }
 
+/// The first real pushes reported 3,687-5,171 "uncommitted files": every
+/// file of one untracked build folder, counted separately. The count exists
+/// to show uncommitted work, so it counts as `git status` shows it.
+#[test]
+fn an_untracked_folder_counts_once_and_ignored_files_not_at_all() {
+    let fixture = Fixture::new();
+    fixture.authorize(true);
+    let (session, worktree) = fixture.session_with_commit();
+    fixture.commit(&worktree, ".gitignore", "ignored-build/\n", "chore: ignore");
+    let build = worktree.join("target/debug");
+    std::fs::create_dir_all(&build).unwrap();
+    for index in 0..1_000 {
+        std::fs::write(build.join(format!("object-{index}.o")), "x").unwrap();
+    }
+    std::fs::create_dir_all(worktree.join("ignored-build")).unwrap();
+    std::fs::write(worktree.join("ignored-build/cache.bin"), "x").unwrap();
+    std::fs::write(worktree.join("feature.txt"), "edited\n").unwrap();
+
+    let report = json(&fixture.push(session, &[]));
+    assert_eq!(report["uncommitted"]["modified"], 1, "{report}");
+    assert_eq!(report["uncommitted"]["untracked_entries"], 1, "{report}");
+    assert_eq!(report["uncommitted_files"], 2, "{report}");
+    assert_eq!(
+        report["uncommitted"]["sample"],
+        serde_json::json!(["feature.txt", "target/"]),
+        "{report}"
+    );
+
+    let id = session.to_string();
+    let human = fixture.run(&["push", "--session", id.as_str()]);
+    assert!(human.status.success(), "{human:?}");
+    let human = String::from_utf8_lossy(&human.stdout);
+    let human_line = human
+        .lines()
+        .find(|line| line.contains("Not pushed"))
+        .unwrap_or_else(|| panic!("no uncommitted line in: {human}"));
+    assert!(
+        human_line.contains("1 modified, 1 untracked (feature.txt, target/)"),
+        "{human_line}"
+    );
+}
+
 fn json(output: &Output) -> serde_json::Value {
     assert!(
         output.status.success(),

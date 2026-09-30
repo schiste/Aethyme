@@ -437,14 +437,12 @@ pub(super) fn run_submit(parsed: Parsed) -> Result<(), UsageError> {
     {
         let plan = broker.submission_plan(session)?;
         render_submission_plan(&plan, &checkout);
-        if let Ok(dirty) = checkout.dirty_paths()
-            && !dirty.is_empty()
+        if let Ok(uncommitted) = checkout.uncommitted_summary()
+            && !uncommitted.is_empty()
         {
             out!(
-                "  ⚠ {} uncommitted change(s) NOT included \
-                 (only committed work integrates), e.g. {}",
-                dirty.len(),
-                dirty.first().map(String::as_str).unwrap_or("")
+                "  ⚠ uncommitted changes NOT included (only committed work integrates): {}",
+                uncommitted.describe(5)
             );
         }
     }
@@ -733,9 +731,26 @@ pub(super) fn run_push(parsed: Parsed) -> Result<(), UsageError> {
         report.commits_pushed
     );
     if report.uncommitted_files > 0 {
+        let counts = &report.uncommitted;
+        let mut parts = Vec::new();
+        if counts.modified > 0 {
+            parts.push(format!("{} modified", counts.modified));
+        }
+        if counts.untracked_entries > 0 {
+            parts.push(format!("{} untracked", counts.untracked_entries));
+        }
+        let more = report
+            .uncommitted_files
+            .saturating_sub(u32::try_from(counts.sample.len()).unwrap_or(u32::MAX));
+        let more = if more > 0 {
+            format!(", +{more} more")
+        } else {
+            String::new()
+        };
         out!(
-            "  {} uncommitted file(s) not pushed; commit them and push again",
-            report.uncommitted_files
+            "  Not pushed: {} ({}{more}); commit them and push again",
+            parts.join(", "),
+            counts.sample.join(", ")
         );
     }
     for overlap in &report.pr_overlaps {
