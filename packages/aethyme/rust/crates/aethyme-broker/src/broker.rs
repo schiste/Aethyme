@@ -800,6 +800,9 @@ pub enum SessionStartBaseEvidence {
     /// The operator named the base with `--base <ref>`, so no inference ran.
     ExplicitBase,
     IntegrationTip,
+    /// The fetched upstream default branch (`refs/remotes/<remote>/<branch>`):
+    /// used when promotion is off, or when integration has fallen behind it.
+    FetchedDefaultBranch,
     RemoteDefaultBranch,
     ConventionalMain,
     ConventionalMaster,
@@ -810,6 +813,7 @@ impl SessionStartBaseEvidence {
         match self {
             Self::ExplicitBase => "explicit --base",
             Self::IntegrationTip => "integration tip",
+            Self::FetchedDefaultBranch => "fetched default branch, as of the last fetch",
             Self::RemoteDefaultBranch => "remote default branch",
             Self::ConventionalMain => "conventional main branch",
             Self::ConventionalMaster => "conventional master branch",
@@ -844,6 +848,39 @@ pub struct SessionStartBase {
     pub ahead_default_commits: Option<u64>,
     /// The ref the comparison used, so the number can be checked.
     pub default_ref: Option<String>,
+    /// The integration branch this start deliberately did not use, and why.
+    /// Absent when integration was used or does not exist.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bypassed_integration: Option<BypassedIntegration>,
+}
+
+/// Why a start cut from the fetched default branch instead of integration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IntegrationBypassReason {
+    /// `[promote] mode = "verify-only"`: integration never moves, so it is
+    /// never a current base.
+    VerifyOnly,
+    /// Integration does not contain the fetched default branch's tip. A branch
+    /// cut from it would start behind everything merged upstream since
+    /// integration last moved.
+    BehindUpstream,
+}
+
+/// The integration branch a start bypassed. See
+/// [`SessionStartBase::bypassed_integration`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct BypassedIntegration {
+    pub ref_name: String,
+    pub commit: String,
+    pub reason: IntegrationBypassReason,
+    /// Commits the fetched default branch has that integration lacks.
+    pub behind_default_commits: Option<u64>,
+    /// Commits integration carries that the fetched default branch lacks.
+    pub ahead_default_commits: Option<u64>,
+    /// How to bring integration back in line, when it has fallen behind.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovery_command: Option<String>,
 }
 
 /// A session enriched with liveness derived at read time — what
@@ -3654,9 +3691,50 @@ impl Broker {
         Ok(())
     }
 
+    /// A `status` row when a promoting integration branch no longer contains
+    /// the fetched default branch's tip. New sessions start from upstream in
+    /// that state (see [`Self::select_session_start_base`]), but promotion and
+    /// submit still target integration, so it needs reconciling. Silent in
+    /// verify-only repositories, where integration is not used as a base.
+    fn integration_behind_upstream_advice(&self) -> Option<StatusAdvice> {
+        let promote = PromoteConfig::load(&self.main_root);
+        if promote.mode == crate::merge::PromoteMode::VerifyOnly {
+            return None;
+        }
+        let integration_ref = format!("refs/heads/{}", promote.branch);
+        let integration = self.repo.resolve_ref(&integration_ref)?;
+        let (upstream_ref, upstream) = self.repo.upstream_default()?;
+        if self.repo.is_ancestor(&upstream, &integration) {
+            return None;
+        }
+        let (behind, ahead, _) = self.start_base_drift(&integration);
+        let behind = behind.unwrap_or(0);
+        let ahead = ahead.unwrap_or(0);
+        Some(StatusAdvice {
+            id: "integration.behind-upstream",
+            severity: StatusAdviceSeverity::Warning,
+            reason: "integration no longer contains the default branch",
+            summary: format!(
+                "{} is {behind} commit(s) behind {upstream_ref} and {ahead} ahead. New \
+                 sessions start from {upstream_ref} instead; reconcile integration so \
+                 submit and promotion stop targeting an old tree",
+                promote.branch
+            ),
+            session_id: None,
+            queue_entry_id: None,
+            evidence: vec![
+                format!("{} {}", promote.branch, short_commit(&integration)),
+                format!("{upstream_ref} {}", short_commit(&upstream)),
+            ],
+            commands: vec![format!(
+                "aethyme broker advanced integration reconcile --upstream {upstream_ref}"
+            )],
+        })
+    }
+
     /// Compare a chosen start base against the fetched default branch.
     fn start_base_drift(&self, commit: &str) -> (Option<u64>, Option<u64>, Option<String>) {
-        let Some((upstream_ref, upstream_head)) = self.repo.tracking_upstream() else {
+        let Some((upstream_ref, upstream_head)) = self.repo.upstream_default() else {
             return (None, None, None);
         };
         let behind = self.repo.commit_count_between(commit, &upstream_head).ok();
@@ -3670,6 +3748,14 @@ impl Broker {
     /// ref, so guessing on their behalf would be worse than failing. It is
     /// still measured against the default branch, because naming a base does
     /// not make its inherited commits stop landing in a pull request (#290).
+    ///
+    /// Without `--base`, integration is the base only when it is current: the
+    /// promote mode promotes, and integration contains the fetched default
+    /// branch's tip. Otherwise the session is cut from the fetched default
+    /// branch, and the bypassed integration is reported. Choosing integration
+    /// whenever it existed cut sessions 2,101 commits behind upstream in one
+    /// repository, where it had stopped moving three days earlier. Nothing here
+    /// fetches: the upstream is as fresh as the last fetch.
     fn select_session_start_base(
         &self,
         explicit: Option<&str>,
@@ -3691,23 +3777,68 @@ impl Broker {
                 behind_default_commits,
                 ahead_default_commits,
                 default_ref,
+                bypassed_integration: None,
             });
         }
-        let integration_branch = PromoteConfig::load(&self.main_root).branch;
-        let integration_ref = format!("refs/heads/{integration_branch}");
-        if let Some(commit) = self.repo.resolve_ref(&integration_ref) {
+        let promote = PromoteConfig::load(&self.main_root);
+        let verify_only = promote.mode == crate::merge::PromoteMode::VerifyOnly;
+        let integration_ref = format!("refs/heads/{}", promote.branch);
+        let integration = self.repo.resolve_ref(&integration_ref);
+        let upstream = self.repo.upstream_default();
+        if let Some(commit) = &integration
+            && !verify_only
+            && upstream
+                .as_ref()
+                .is_none_or(|(_, tip)| self.repo.is_ancestor(tip, commit))
+        {
             let (behind_default_commits, ahead_default_commits, default_ref) =
-                self.start_base_drift(&commit);
+                self.start_base_drift(commit);
             return Ok(SessionStartBase {
                 ref_name: integration_ref,
-                commit,
+                commit: commit.clone(),
                 evidence: SessionStartBaseEvidence::IntegrationTip,
                 behind_default_commits,
                 ahead_default_commits,
                 default_ref,
+                bypassed_integration: None,
             });
         }
 
+        if let Some((upstream_ref, upstream_commit)) = upstream {
+            let bypassed_integration = integration.map(|commit| {
+                let (behind_default_commits, ahead_default_commits, _) =
+                    self.start_base_drift(&commit);
+                let behind = !verify_only;
+                BypassedIntegration {
+                    ref_name: integration_ref,
+                    commit,
+                    reason: if behind {
+                        IntegrationBypassReason::BehindUpstream
+                    } else {
+                        IntegrationBypassReason::VerifyOnly
+                    },
+                    behind_default_commits,
+                    ahead_default_commits,
+                    recovery_command: behind.then(|| {
+                        format!(
+                            "aethyme broker advanced integration reconcile --upstream {upstream_ref}"
+                        )
+                    }),
+                }
+            });
+            return Ok(SessionStartBase {
+                ref_name: format!("refs/remotes/{upstream_ref}"),
+                commit: upstream_commit,
+                evidence: SessionStartBaseEvidence::FetchedDefaultBranch,
+                behind_default_commits: Some(0),
+                ahead_default_commits: Some(0),
+                default_ref: Some(upstream_ref),
+                bypassed_integration,
+            });
+        }
+        // No fetched default branch: a promoting integration was taken above
+        // (there is nothing to be behind), so only a verify-only repository or
+        // one without integration reaches its local default branch here.
         if let Some(remote_head) = self.repo.symbolic_ref("refs/remotes/origin/HEAD")
             && let Some(branch_name) = remote_head.strip_prefix("refs/remotes/origin/")
         {
@@ -3720,6 +3851,7 @@ impl Broker {
                     behind_default_commits: None,
                     ahead_default_commits: None,
                     default_ref: None,
+                    bypassed_integration: None,
                 });
             }
         }
@@ -3731,17 +3863,19 @@ impl Broker {
                 ref_name: "refs/heads/main".into(),
                 commit,
                 evidence: SessionStartBaseEvidence::ConventionalMain,
-                        behind_default_commits: None,
-                        ahead_default_commits: None,
-                        default_ref: None,
+                behind_default_commits: None,
+                ahead_default_commits: None,
+                default_ref: None,
+                bypassed_integration: None,
             }),
             (None, Some(commit)) => Ok(SessionStartBase {
                 ref_name: "refs/heads/master".into(),
                 commit,
                 evidence: SessionStartBaseEvidence::ConventionalMaster,
-                        behind_default_commits: None,
-                        ahead_default_commits: None,
-                        default_ref: None,
+                behind_default_commits: None,
+                ahead_default_commits: None,
+                default_ref: None,
+                bypassed_integration: None,
             }),
             (Some(_), Some(_)) => Err(BrokerOpError::StartBaseUnavailable {
                 reason: "both refs/heads/main and refs/heads/master exist, but origin/HEAD does not select one".into(),
@@ -4205,6 +4339,7 @@ impl Broker {
         // The integration tip is the same for every session; resolving it
         // inside the loop cost one git subprocess per live session.
         let integration = self.integration_tip();
+        let upstream = self.repo.upstream_default().map(|(_, commit)| commit);
         for session in self.store.live_sessions()? {
             if !matches!(
                 session.status,
@@ -4220,7 +4355,7 @@ impl Broker {
             // value inflates the diff with everyone else's promoted work.
             let base = integration
                 .as_ref()
-                .and_then(|tip| checkout.merge_base(tip, "HEAD").ok())
+                .and_then(|tip| crate::merge::session_baseline(&checkout, tip, upstream.as_deref()))
                 .or_else(|| session.diff_base.clone())
                 .unwrap_or_else(|| "HEAD".to_string());
             let Ok(changed) = checkout.changed_files(&base) else {
@@ -6571,6 +6706,7 @@ impl Broker {
         // unpushed count is context, not a precondition for any command.
         let unpushed_work = self.unpushed_work(now_ms).unwrap_or_default();
         advice.extend(unpushed_work_advice(&unpushed_work, now_ms));
+        advice.extend(self.integration_behind_upstream_advice());
         advice.extend(overlap_pair_advice(&overlap_pairs));
         // Cached listing and local refs only: `status` never calls GitHub.
         advice.extend(self.pr_overlap_advice(now_ms));

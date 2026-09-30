@@ -1012,6 +1012,27 @@ impl GitRepo {
         Some((upstream, commit))
     }
 
+    /// The fetched default branch, as `(<remote>/<branch>, commit)`.
+    ///
+    /// Prefers `refs/remotes/origin/HEAD`, which names the remote's default
+    /// branch whatever the main checkout has checked out. `@{upstream}` alone
+    /// answers for the *current* branch, so a main checkout left on a feature
+    /// branch measured every start base against that feature branch. Falls
+    /// back to `@{upstream}` when `origin/HEAD` is not set. Read-only: this is
+    /// as fresh as the last fetch, and never fetches.
+    pub fn upstream_default(&self) -> Option<(String, String)> {
+        if let Some(target) = self.symbolic_ref("refs/remotes/origin/HEAD")
+            && let Some(commit) = self.resolve_ref(&target)
+        {
+            let short = target
+                .strip_prefix("refs/remotes/")
+                .unwrap_or(&target)
+                .to_string();
+            return Some((short, commit));
+        }
+        self.tracking_upstream()
+    }
+
     pub fn head_commit(&self) -> Result<String, GitError> {
         run_git(&self.root, &["rev-parse", "HEAD"])
     }

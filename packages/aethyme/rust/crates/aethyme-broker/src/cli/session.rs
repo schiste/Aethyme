@@ -105,6 +105,33 @@ pub(super) fn render_start_base(base: &crate::SessionStartBase) {
         base.evidence.as_str()
     );
     let default_ref = || base.default_ref.as_deref().unwrap_or("the default branch");
+    if let Some(bypassed) = &base.bypassed_integration {
+        let counts = format!(
+            "{} commit(s) behind and {} ahead",
+            bypassed.behind_default_commits.unwrap_or(0),
+            bypassed.ahead_default_commits.unwrap_or(0)
+        );
+        match bypassed.reason {
+            crate::IntegrationBypassReason::BehindUpstream => {
+                out!(
+                    "warning: {} is {counts} of {}; started from {} instead, so this \
+                     session does not inherit the gap",
+                    bypassed.ref_name,
+                    default_ref(),
+                    default_ref()
+                );
+                if let Some(command) = &bypassed.recovery_command {
+                    out!("         bring integration back in line with `{command}`");
+                }
+            }
+            crate::IntegrationBypassReason::VerifyOnly => out!(
+                "note: [promote] mode is verify-only, so the session starts from {} rather \
+                 than {} ({counts})",
+                default_ref(),
+                bypassed.ref_name
+            ),
+        }
+    }
     // Integration is normally ahead of the default branch. Behind means it
     // stopped following, and every session cut from it inherits the gap —
     // silently, because the line above looks identical either way.
