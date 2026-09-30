@@ -6,6 +6,7 @@ use std::process::{Command, Output};
 use aethyme_broker::Broker;
 
 const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
+mod common;
 
 fn git(repo: &Path, args: &[&str]) {
     let output = Command::new("git")
@@ -60,8 +61,7 @@ fn enroll(repo: &Path) {
 }
 
 fn run(repo: &Path, container: &Path, args: &[&str]) -> Output {
-    Command::new(CLI)
-        .args(args)
+    common::broker_cli(CLI, args)
         .current_dir(repo)
         .env("AETHYME_WORKTREE_ROOT", container)
         .output()

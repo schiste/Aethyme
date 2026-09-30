@@ -1409,6 +1409,7 @@ mod tests {
             repository_name: None,
             tab_name: None,
             ai_provider: None,
+            short_name: None,
         }
     }
 

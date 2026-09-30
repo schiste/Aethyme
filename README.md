@@ -15,7 +15,7 @@ live in `.aethyme/`; the optional graph store is derived locally.
 
 | Surface | What it provides | Start with |
 | --- | --- | --- |
-| **Coordinate** | Sessions, worktrees, leases, gates, merge simulation, integration, handoffs, and guarded Git/GitHub operations. | `aethyme broker start --task "..."` |
+| **Coordinate** | Sessions, worktrees, leases, gates, merge simulation, integration, handoffs, and guarded Git/GitHub operations. | `aethyme broker start --task "..." --short-name "..."` |
 | **Explore** | Deterministic repository orientation, bounded evidence, task context, graph queries, and verification targets. | `aethyme explore --repo . --request "..."` |
 | **Improve** | Readiness checks, repository-quality inspection, scorecards, and controlled autofixes. | `aethyme broker status readiness` |
 
@@ -156,7 +156,7 @@ integration tip was tested and detects movement during the check.
 
 ```bash
 aethyme broker status
-aethyme broker start --task "Describe the task"
+aethyme broker start --task "Describe the task" --short-name "Short label"
 # Change into the worktree printed by `broker start`.
 aethyme broker advanced leases claim path/to/area --session <id>
 # Edit, test, and commit in that worktree.
@@ -164,7 +164,7 @@ aethyme broker submit --session <id>
 aethyme broker finish --session <id>
 ```
 
-Use `aethyme broker start --adopt --task "..."` for an existing dedicated worktree.
+Use `aethyme broker start --adopt --task "..." --short-name "Short label"` for an existing dedicated worktree. Every new registration and reuse needs a concise `--short-name`; Chau7 tabs with a matching identity are renamed to `<session-id> - <short-name>`. If Chau7 is unavailable or cannot identify one tab safely, the session remains registered and the CLI reports the rename result.
 Run broad commands through `aethyme broker advanced exec --session <id> -- ...`; use
 `aethyme broker advanced git` and `aethyme broker advanced gh` for coordinated Git or GitHub
 mutations. Only committed work can be submitted.

@@ -4,6 +4,7 @@ use std::process::{Command, Output};
 use aethyme_broker::{Broker, LeaseRoutingExportOptions, SessionContext};
 
 const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
+mod common;
 
 fn git(repo: &Path, args: &[&str]) {
     let output = Command::new("git")
@@ -23,8 +24,7 @@ fn git(repo: &Path, args: &[&str]) {
 }
 
 fn run(repo: &Path, args: &[&str]) -> Output {
-    Command::new(CLI)
-        .args(args)
+    common::broker_cli(CLI, args)
         .current_dir(repo)
         .output()
         .unwrap()

@@ -2,6 +2,7 @@ use std::path::Path;
 use std::process::{Command, Output};
 
 const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
+mod common;
 
 fn git(repo: &Path, args: &[&str]) {
     let output = Command::new("git")
@@ -21,8 +22,7 @@ fn git(repo: &Path, args: &[&str]) {
 }
 
 fn run(repo: &Path, state: &Path, args: &[&str]) -> Output {
-    Command::new(CLI)
-        .args(args)
+    common::broker_cli(CLI, args)
         .current_dir(repo)
         .env("AETHYME_HOST_STATE_DIR", state)
         .output()

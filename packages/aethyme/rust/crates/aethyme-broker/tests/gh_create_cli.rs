@@ -14,6 +14,7 @@ use std::path::Path;
 use std::process::{Command, Output};
 
 const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
+mod common;
 
 /// A `gh` whose every answer comes from the environment, and which records
 /// what it was asked so a test can assert what was *not* sent.
@@ -129,8 +130,7 @@ impl Fixture {
     }
 
     fn run(&self, args: &[&str]) -> Output {
-        Command::new(CLI)
-            .args(args)
+        common::broker_cli(CLI, args)
             .current_dir(self.repo.path())
             .env("AETHYME_HOST_STATE_DIR", self.state.path())
             .env(

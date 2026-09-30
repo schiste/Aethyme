@@ -14,6 +14,7 @@ use aethyme_broker::{GitRepo, hooks};
 const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
 const ESCAPE: &str = "AETHYME_TRUST_NONINTERACTIVE_FOR_TESTS";
 const REFUSED: i32 = 3;
+mod common;
 
 struct Fixture {
     repo: tempfile::TempDir,
@@ -94,7 +95,11 @@ impl Fixture {
     }
 
     fn run(&self, cwd: &Path, args: &[&str]) -> Output {
-        self.command(CLI, cwd).args(args).output().unwrap()
+        self.command(CLI, cwd)
+            .env("AETHYME_CHAU7_MCP_BRIDGE", common::disabled_bridge_path())
+            .args(common::test_session_args(args))
+            .output()
+            .unwrap()
     }
 
     /// `broker trust` through the test-only escape: no terminal, no prompt.

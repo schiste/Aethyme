@@ -85,7 +85,7 @@ running `aethyme deploy` blind.
 
 ```bash
 aethyme broker status
-aethyme broker start --task "Describe the task"
+aethyme broker start --task "Describe the task" --short-name "Short label"
 # Change into the worktree printed by `broker start`, then edit and commit.
 aethyme broker advanced leases claim path/to/area --session <id>
 aethyme broker submit --session <id>

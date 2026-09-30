@@ -23,7 +23,7 @@ use rusqlite::Connection;
 use crate::error::BrokerError;
 
 /// Current database schema version (== `MIGRATIONS.len()`).
-pub const SCHEMA_VERSION: i64 = 43;
+pub const SCHEMA_VERSION: i64 = 44;
 
 /// The oldest schema version whose binaries can safely use a database at
 /// [`SCHEMA_VERSION`]. Before this existed every newer database locked out
@@ -32,6 +32,8 @@ pub const SCHEMA_VERSION: i64 = 43;
 /// Migrations declared compatible (left at the previous minimum):
 /// - v43: nullable machine-environment columns on `gate_results`. A v42
 ///   writer names its columns explicitly, so its rows simply leave them NULL.
+/// - v44: nullable session short names; older binaries continue to ignore the
+///   additional column.
 pub const MIN_COMPATIBLE_SCHEMA: i64 = 42;
 
 /// Whether this binary may use a database at `found`, a version newer than
@@ -1293,6 +1295,9 @@ ALTER TABLE gate_results ADD COLUMN load_avg_1m_end REAL;
 ALTER TABLE gate_results ADD COLUMN cpu_count INTEGER;
 ALTER TABLE gate_results ADD COLUMN free_disk_bytes_start INTEGER;
 ";
+const MIGRATION_V44: &str = "
+ALTER TABLE sessions ADD COLUMN short_name TEXT;
+";
 const MIGRATIONS: &[&str] = &[
     MIGRATION_V1,
     MIGRATION_V2,
@@ -1337,6 +1342,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_V41,
     MIGRATION_V42,
     MIGRATION_V43,
+    MIGRATION_V44,
 ];
 
 pub(crate) fn current_version(conn: &Connection) -> Result<i64, BrokerError> {
@@ -1517,7 +1523,7 @@ mod tests {
             .unwrap();
 
         migrate(&conn).unwrap();
-        assert_eq!(current_version(&conn).unwrap(), 43);
+        assert_eq!(current_version(&conn).unwrap(), SCHEMA_VERSION);
 
         // The row written before the migration keeps its data and has no
         // environment: NULL, never a fabricated zero.
@@ -1571,17 +1577,17 @@ mod tests {
     }
 
     #[test]
-    fn v43_is_declared_compatible_so_a_v42_binary_keeps_using_the_database() {
-        // The declaration itself: v43 did not raise the minimum. Raising it
-        // would lock every 0.8.2+ binary and plugin hook out of this
-        // repository's database (0.8.0/0.8.1 predate the check and already
-        // refuse any newer schema), so doing so must be a deliberate edit.
-        assert_eq!(SCHEMA_VERSION, 43);
+    fn additive_v44_is_declared_compatible_so_a_v42_binary_keeps_using_the_database() {
+        // The declaration itself: v44 adds only a nullable column and does
+        // not raise the minimum. Raising it would lock existing binaries and
+        // plugin hooks out of this repository's database, so doing so must be
+        // a deliberate edit.
+        assert_eq!(SCHEMA_VERSION, 44);
         assert_eq!(MIN_COMPATIBLE_SCHEMA, 42);
 
-        // A database this binary migrated to v43 ...
+        // A database this binary migrated to v44 ...
         let conn = migrated();
-        assert_eq!(current_version(&conn).unwrap(), 43);
+        assert_eq!(current_version(&conn).unwrap(), 44);
 
         // ... is accepted by a binary whose SCHEMA_VERSION is 42, through the
         // compatibility path rather than the equal-version one ...
@@ -1815,21 +1821,26 @@ mod tests {
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
-        for expected in ["repository_name", "tab_name", "ai_provider"] {
+        for expected in ["repository_name", "tab_name", "ai_provider", "short_name"] {
             assert!(
                 columns.iter().any(|column| column == expected),
                 "{expected}"
             );
         }
-        let context: (Option<String>, Option<String>, Option<String>) = conn
+        let context: (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = conn
             .query_row(
-                "SELECT repository_name, tab_name, ai_provider
+                "SELECT repository_name, tab_name, ai_provider, short_name
                  FROM sessions WHERE branch = 'agent/legacy'",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .unwrap();
-        assert_eq!(context, (None, None, None));
+        assert_eq!(context, (None, None, None, None));
         assert_eq!(current_version(&conn).unwrap(), SCHEMA_VERSION);
     }
 

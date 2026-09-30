@@ -10,6 +10,7 @@ use aethyme_broker::{
 };
 
 const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
+mod common;
 
 fn git(repo: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
@@ -199,9 +200,8 @@ exit 64
         let decision = decision
             .map(|value| format!("\"{value}\""))
             .unwrap_or_else(|| "null".into());
-        let mut command = Command::new(CLI);
+        let mut command = common::broker_cli(CLI, args);
         command
-            .args(args)
             .current_dir(self.root.path())
             .env("PATH", path)
             .env("AETHYME_HOST_STATE_DIR", &self.host_state)

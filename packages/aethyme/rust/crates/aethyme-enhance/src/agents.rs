@@ -312,7 +312,7 @@ fn render_broker_protocol_compact(repo: &Path) -> String {
 
 Other agents may be working in sibling worktrees.
 
-1. `aethyme broker start --task "<task>"`, then work only in the worktree it
+1. `aethyme broker start --task "<task>" --short-name "<short name>"`, then work only in the worktree it
    reports. Never edit another session's worktree.
 2. When done: `aethyme broker submit --session <id>`, then
    `aethyme broker finish --session <id>`.
@@ -348,12 +348,12 @@ blocked.
 
    ```bash
    aethyme broker status --json    # who is working on what
-   aethyme broker start --task "<your task>" --path <planned-path>
+   aethyme broker start --task "<your task>" --short-name "<short name>" --path <planned-path>
    ```
 
    `cd` into the reported worktree before editing. If you are already in a
    dedicated worktree, use
-   `aethyme broker start --adopt --task "<your task>" --path <planned-path>` instead.
+   `aethyme broker start --adopt --task "<your task>" --short-name "<short name>" --path <planned-path>` instead.
    Repeat `--path` for every file or trailing-slash directory known up front.
    The broker validates the whole set first, then creates the session plus
    explicit leases atomically. Omit `--path` only when no target is known yet.
@@ -442,7 +442,7 @@ blocked.
    Report the outcome (verified / rejected / conflict) in your summary.
    Afterwards, finish the session with
    `aethyme broker finish --session <id>`, or point it at a follow-up task
-   with `aethyme broker start --reuse --task "..."`. `finish` closes broker
+   with `aethyme broker start --reuse --task "..." --short-name "<short name>"`. `finish` closes broker
    state but deliberately leaves the worktree available for review or reuse.
    When it reports cleanup is safe, reclaim that exact worktree with
    `aethyme broker finish cleanup <id>`. Operators can periodically review all
@@ -856,7 +856,7 @@ mod tests {
         let doc = render_agents_document(Some(&repo)).unwrap();
         for needle in [
             "## Broker Coordination: before and after an edit",
-            "`aethyme broker start --task \"<task>\"`",
+            "`aethyme broker start --task \"<task>\" --short-name \"<short name>\"`",
             "work only in the worktree it\n   reports",
             "Never edit another session's worktree.",
             "`aethyme broker submit --session <id>`",

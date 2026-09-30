@@ -15,6 +15,10 @@ fn aethyme(cwd: &Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_aethyme"))
         .args(args)
         .current_dir(cwd)
+        .env(
+            "AETHYME_CHAU7_MCP_BRIDGE",
+            "/__aethyme_test_no_chau7_bridge__",
+        )
         .output()
         .expect("run aethyme")
 }
@@ -63,7 +67,16 @@ fn report_only_commands_do_not_append_metrics() {
         "[[gate]]\nname = \"noop\"\ncommand = \"true\"\ncost = 1\ntriggers = [\"**/*\"]\n",
     )
     .expect("write fixture gate");
-    let adopt_args = ["broker", "start", "--adopt", "--task", "fixture", "--json"];
+    let adopt_args = [
+        "broker",
+        "start",
+        "--adopt",
+        "--task",
+        "fixture",
+        "--short-name",
+        "Fixture",
+        "--json",
+    ];
     assert_success(&aethyme(temp.path(), &adopt_args), &adopt_args);
 
     let metrics_path = temp.path().join(".aethyme/logs/command-metrics.jsonl");

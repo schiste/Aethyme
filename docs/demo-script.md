@@ -85,7 +85,7 @@ gates.toml OK — 1 gate(s), cheap-first:
 
 This scene uses hand-made worktrees to show the attach path: the worktrees
 are ordinary `git worktree` checkouts, and `adopt` registers them as
-sessions. In normal agent use, `aethyme broker start --task "..."` creates
+sessions. In normal agent use, `aethyme broker start --task "..." --short-name "..."` creates
 and registers the isolated worktree in one step; `adopt` remains the path
 when a vendor tool already made the checkout.
 
@@ -94,9 +94,9 @@ git worktree add -q -b agent/alpha .aethyme/worktrees/alpha main
 git worktree add -q -b agent/beta  .aethyme/worktrees/beta  main
 
 cd "$DEMO/.aethyme/worktrees/alpha"
-aethyme broker start --adopt --task "Make the greeting French"
+aethyme broker start --adopt --task "Make the greeting French" --short-name "French greeting"
 cd "$DEMO/.aethyme/worktrees/beta"
-aethyme broker start --adopt --task "Make the greeting shout"
+aethyme broker start --adopt --task "Make the greeting shout" --short-name "Loud greeting"
 aethyme broker advanced agents
 ```
 
@@ -135,7 +135,7 @@ gate py-compile started (cost 1)
 gate py-compile           pass in 161ms
 gate wall time: 161ms
 entry 1 → promoted (auto-promoted)
-What now: aethyme/integration is at a51f7e2a42df and contains this work. Your checkout and branches are untouched — keep working, or start a follow-up with `aethyme broker start --reuse --task "..."`, or finish with `aethyme broker finish close --session 1`.
+What now: aethyme/integration is at a51f7e2a42df and contains this work. Your checkout and branches are untouched — keep working, or start a follow-up with `aethyme broker start --reuse --task "..." --short-name "..."`, or finish with `aethyme broker finish close --session 1`.
 ```
 
 ## Scene 4 — beta is rejected in milliseconds
@@ -234,7 +234,7 @@ gate py-compile started (cost 1)
 gate py-compile           pass in 93ms
 gate wall time: 93ms
 entry 3 → promoted (auto-promoted)
-What now: aethyme/integration is at a6330f1a40c5 and contains this work. Your checkout and branches are untouched — keep working, or start a follow-up with `aethyme broker start --reuse --task "..."`, or finish with `aethyme broker finish close --session 2`.
+What now: aethyme/integration is at a6330f1a40c5 and contains this work. Your checkout and branches are untouched — keep working, or start a follow-up with `aethyme broker start --reuse --task "..." --short-name "..."`, or finish with `aethyme broker finish close --session 2`.
 ```
 
 ## Scene 6 — the whole picture

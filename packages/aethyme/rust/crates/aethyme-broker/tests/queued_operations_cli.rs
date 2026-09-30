@@ -8,6 +8,7 @@ use std::path::Path;
 use std::process::{Command, Output};
 
 const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
+mod common;
 
 fn git(repo: &Path, args: &[&str]) {
     let output = Command::new("git")
@@ -23,8 +24,8 @@ fn git(repo: &Path, args: &[&str]) {
 }
 
 fn run(repo: &Path, state: &Path, path: Option<&Path>, args: &[&str]) -> Output {
-    let mut command = Command::new(CLI);
-    command.args(args).current_dir(repo);
+    let mut command = common::broker_cli(CLI, args);
+    command.current_dir(repo);
     command.env("AETHYME_HOST_STATE_DIR", state);
     if let Some(path) = path {
         let existing = std::env::var("PATH").unwrap_or_default();

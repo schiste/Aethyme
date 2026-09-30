@@ -43,6 +43,7 @@
     "repository_schema": "null"
   },
   "repository_name": "null",
+  "short_name": "string",
   "start_base": {
     "ahead_default_commits": "null",
     "behind_default_commits": "null",
@@ -53,6 +54,10 @@
   },
   "status": "string",
   "tab_name": "null",
+  "tab_rename": {
+    "reason": "string",
+    "status": "string"
+  },
   "task": "string",
   "updated_at": "integer",
   "worktree_path": "string",

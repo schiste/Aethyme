@@ -36,6 +36,10 @@ fn aethyme(cwd: &Path, args: &[&str]) -> Output {
         .current_dir(cwd)
         .env_remove("AETHYME_REPO")
         .env_remove("AETHYME_AGENT")
+        .env(
+            "AETHYME_CHAU7_MCP_BRIDGE",
+            "/__aethyme_test_no_chau7_bridge__",
+        )
         .stdin(Stdio::null())
         .output()
         .expect("run aethyme")
@@ -85,7 +89,15 @@ fn session_lifecycle_json_shapes_match_snapshots() {
 
     let started = json(
         &repo,
-        &["broker", "start", "--task", "shape fixture", "--json"],
+        &[
+            "broker",
+            "start",
+            "--task",
+            "shape fixture",
+            "--short-name",
+            "Shape",
+            "--json",
+        ],
     );
     entries.push(("start".to_string(), shape(&started)));
     let session = started["id"]
@@ -139,6 +151,8 @@ fn session_lifecycle_json_shapes_match_snapshots() {
             "--adopt",
             "--task",
             "adopt fixture",
+            "--short-name",
+            "Adopt fixture",
             "--json",
         ],
     );

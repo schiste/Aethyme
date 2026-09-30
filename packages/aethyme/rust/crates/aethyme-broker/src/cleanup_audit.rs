@@ -817,7 +817,7 @@ impl Broker {
                 "not owned by a broker session, so broker cleanup never removes it (#257)".into(),
             ),
             next_action: format!(
-                "decide by hand: `git -C '{path}' status --short` and `git -C '{path}' log --oneline {}..HEAD`; adopt it with `aethyme broker start --adopt` to bring it under broker cleanup",
+                "decide by hand: `git -C '{path}' status --short` and `git -C '{path}' log --oneline {}..HEAD`; adopt it with `aethyme broker start --adopt --task \"Resume work\" --short-name \"Resumed work\"` to bring it under broker cleanup",
                 short(&target.proof_commit)
             ),
         }

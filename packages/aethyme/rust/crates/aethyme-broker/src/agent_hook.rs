@@ -505,7 +505,7 @@ fn render_start(facts: &StartFacts) -> String {
             }
             None => {
                 lines.push(
-                    "Next: aethyme broker start --task \"<task>\" (then work only in the worktree it reports)"
+                    "Next: aethyme broker start --task \"<task>\" --short-name \"<short name>\" (then work only in the worktree it reports)"
                         .to_string(),
                 );
             }
@@ -523,7 +523,7 @@ fn render_start(facts: &StartFacts) -> String {
             "Aethyme: session {}{task} is finished; this worktree is no longer registered for new work.",
             session.id
         ));
-        lines.push("Next: aethyme broker start --reuse --task \"<follow-up task>\"".to_string());
+        lines.push("Next: aethyme broker start --reuse --task \"<follow-up task>\" --short-name \"<short name>\"".to_string());
         return lines.join("\n");
     }
 
@@ -800,7 +800,7 @@ mod tests {
         assert!(text.contains("not a broker session"), "{text}");
         assert!(text.contains("1 live session (3: other work)"), "{text}");
         assert!(
-            next_line(&text).starts_with("aethyme broker start --task \"<task>\""),
+            next_line(&text).starts_with("aethyme broker start --task \"<task>\" --short-name"),
             "{text}"
         );
     }
@@ -826,7 +826,8 @@ mod tests {
             ..StartFacts::default()
         });
         assert!(
-            next_line(&text).starts_with("aethyme broker start --reuse --task"),
+            next_line(&text).starts_with("aethyme broker start --reuse --task")
+                && next_line(&text).contains("--short-name"),
             "{text}"
         );
     }

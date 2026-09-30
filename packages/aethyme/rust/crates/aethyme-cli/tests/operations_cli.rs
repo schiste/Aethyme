@@ -29,6 +29,8 @@ fn repo() -> (tempfile::TempDir, i64) {
         "--adopt",
         "--task",
         "operation test",
+        "--short-name",
+        "Operations",
         "--json",
     ])
     .cwd(tmp.path())

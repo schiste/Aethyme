@@ -22,11 +22,11 @@ pub(crate) fn planned_lease_next_actions(
     let worktree = shell_quote(worktree_path);
     let path = shell_quote(requested_path);
     let mut actions = vec![format!(
-        "aethyme broker start --adopt {worktree} --reuse --path {path}"
+        "aethyme broker start --adopt {worktree} --reuse --short-name \"<short name>\" --path {path}"
     )];
     if status == SessionStatus::Stale {
         actions.push(format!(
-            "aethyme broker start --adopt {worktree} --replace-stale --path {path}"
+            "aethyme broker start --adopt {worktree} --replace-stale --short-name \"<short name>\" --path {path}"
         ));
     }
     actions.push(format!(

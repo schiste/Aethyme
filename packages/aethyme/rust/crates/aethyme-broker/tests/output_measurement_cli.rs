@@ -8,6 +8,7 @@ use std::path::Path;
 use std::process::{Command, Output};
 
 const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
+mod common;
 
 fn git(repo: &Path, args: &[&str]) {
     let out = Command::new(args.first().map(|_| "git").unwrap_or("git"))
@@ -23,8 +24,8 @@ fn git(repo: &Path, args: &[&str]) {
 }
 
 fn run(repo: &Path, measure: Option<&str>, args: &[&str]) -> Output {
-    let mut cmd = Command::new(CLI);
-    cmd.args(args).current_dir(repo);
+    let mut cmd = common::broker_cli(CLI, args);
+    cmd.current_dir(repo);
     match measure {
         Some(value) => cmd.env("AETHYME_MEASURE_OUTPUT", value),
         None => cmd.env_remove("AETHYME_MEASURE_OUTPUT"),

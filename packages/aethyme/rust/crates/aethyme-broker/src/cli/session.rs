@@ -21,8 +21,18 @@ pub(super) fn session_context_value(
         .or_else(|| environment.iter().find_map(|name| std::env::var(name).ok()))
 }
 
-pub(super) fn session_context(parsed: &Parsed) -> crate::SessionContext {
-    crate::SessionContext::new(
+pub(super) fn session_context(parsed: &Parsed) -> Result<crate::SessionContext, UsageError> {
+    let short_name = parsed
+        .short_name
+        .as_deref()
+        .ok_or_else(|| {
+            UsageError::Message("session registration or reuse requires --short-name".into())
+        })
+        .and_then(|value| {
+            crate::validate_session_short_name(value)
+                .map_err(|message| UsageError::Message(message.into()))
+        })?;
+    Ok(crate::SessionContext::new(
         session_context_value(
             parsed.repo_name.as_ref(),
             &[
@@ -44,6 +54,35 @@ pub(super) fn session_context(parsed: &Parsed) -> crate::SessionContext {
             ],
         ),
     )
+    .with_short_name(Some(short_name)))
+}
+
+#[derive(serde::Serialize)]
+struct SessionActionOutput<'a, T: serde::Serialize> {
+    #[serde(flatten)]
+    report: &'a T,
+    tab_rename: &'a crate::chau7_mcp::SessionTabRename,
+}
+
+fn render_tab_rename(outcome: &crate::chau7_mcp::SessionTabRename) {
+    match outcome {
+        crate::chau7_mcp::SessionTabRename::Renamed { title, .. } => {
+            out!("Chau7 tab title set to {title:?}.");
+        }
+        crate::chau7_mcp::SessionTabRename::Pending { reason } => {
+            out!("Warning: Chau7 tab rename pending: {reason}");
+        }
+        crate::chau7_mcp::SessionTabRename::Refused { reason } => {
+            out!("Warning: Chau7 tab rename refused: {reason}");
+        }
+    }
+}
+
+fn session_action_json<T: serde::Serialize>(
+    report: &T,
+    tab_rename: &crate::chau7_mcp::SessionTabRename,
+) -> Result<String, serde_json::Error> {
+    serde_json::to_string_pretty(&SessionActionOutput { report, tab_rename })
 }
 
 /// The base a session's branch was cut from, and what that base carries
@@ -682,6 +721,7 @@ pub(super) fn run_worktree_root(parsed: Parsed) -> Result<(), UsageError> {
 
 /// `broker adopt`.
 pub(super) fn run_adopt(parsed: Parsed) -> Result<(), UsageError> {
+    let context = session_context(&parsed)?;
     let mut broker = open_broker(parsed.read_only_snapshot)?;
     let path = parsed
         .positional
@@ -704,8 +744,15 @@ pub(super) fn run_adopt(parsed: Parsed) -> Result<(), UsageError> {
         ));
     }
     warn_stale_broker_binary(&broker);
+    let previous_session = if mode == crate::AdoptMode::Reuse {
+        let canonical_path = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        broker
+            .store()
+            .session_for_worktree(canonical_path.to_string_lossy().as_ref())?
+    } else {
+        None
+    };
     let agent_identity = session_agent_identity(parsed.agent.as_deref());
-    let context = session_context(&parsed);
     let report = broker.adopt_with_options_and_context(
         &path,
         parsed.task.as_deref(),
@@ -717,6 +764,16 @@ pub(super) fn run_adopt(parsed: Parsed) -> Result<(), UsageError> {
         agent_identity.as_deref(),
         context,
     )?;
+    let tab_rename = crate::chau7_mcp::rename_session_tab(
+        &report.session,
+        previous_session
+            .as_ref()
+            .and_then(|session| session.short_name.as_deref()),
+        broker
+            .main_root()
+            .file_name()
+            .and_then(|name| name.to_str()),
+    );
     for renamed in &report.renamed_targets {
         out!(
             "Renamed target: {} is now {}{}",
@@ -741,7 +798,7 @@ pub(super) fn run_adopt(parsed: Parsed) -> Result<(), UsageError> {
             &parsed.declared_scopes,
             true,
         )?;
-        out!("{}", serde_json::to_string_pretty(&report)?);
+        out!("{}", session_action_json(&report, &tab_rename)?);
     } else {
         match report.outcome {
             crate::AdoptOutcome::Created => out!(
@@ -763,6 +820,7 @@ pub(super) fn run_adopt(parsed: Parsed) -> Result<(), UsageError> {
                 session.branch
             ),
         }
+        render_tab_rename(&tab_rename);
         capture_declared_scopes(
             &mut broker,
             session.id,
@@ -847,7 +905,7 @@ pub(super) fn run_adopt(parsed: Parsed) -> Result<(), UsageError> {
 /// `broker start`.
 pub(super) fn run_start(parsed: Parsed) -> Result<(), UsageError> {
     Broker::reject_integration_based_review_task(parsed.pull_request)?;
-    let context = session_context(&parsed);
+    let context = session_context(&parsed)?;
     let task = parsed
         .task
         .ok_or(UsageError::Message("start requires --task".into()))?;
@@ -861,6 +919,14 @@ pub(super) fn run_start(parsed: Parsed) -> Result<(), UsageError> {
         context,
         parsed.base.as_deref(),
     )?;
+    let tab_rename = crate::chau7_mcp::rename_session_tab(
+        &report.session,
+        None,
+        broker
+            .main_root()
+            .file_name()
+            .and_then(|name| name.to_str()),
+    );
     let session = &report.session;
     if parsed.json {
         capture_declared_scopes(
@@ -870,7 +936,7 @@ pub(super) fn run_start(parsed: Parsed) -> Result<(), UsageError> {
             &parsed.declared_scopes,
             true,
         )?;
-        out!("{}", serde_json::to_string_pretty(&report)?);
+        out!("{}", session_action_json(&report, &tab_rename)?);
     } else {
         out!(
             "Started session {} — worktree {} on branch {}",
@@ -878,6 +944,7 @@ pub(super) fn run_start(parsed: Parsed) -> Result<(), UsageError> {
             session.worktree_path,
             session.branch
         );
+        render_tab_rename(&tab_rename);
         capture_declared_scopes(
             &mut broker,
             session.id,
@@ -897,7 +964,7 @@ pub(super) fn run_start(parsed: Parsed) -> Result<(), UsageError> {
 /// `broker start-agent`.
 pub(super) fn run_start_agent(parsed: Parsed) -> Result<(), UsageError> {
     Broker::reject_integration_based_review_task(parsed.pull_request)?;
-    let context = session_context(&parsed);
+    let context = session_context(&parsed)?;
     let task = parsed
         .task
         .ok_or(UsageError::Message("start-agent requires --task".into()))?;
@@ -914,9 +981,17 @@ pub(super) fn run_start_agent(parsed: Parsed) -> Result<(), UsageError> {
         context,
         parsed.base.as_deref(),
     )?;
+    let tab_rename = crate::chau7_mcp::rename_session_tab(
+        &report.session,
+        None,
+        broker
+            .main_root()
+            .file_name()
+            .and_then(|name| name.to_str()),
+    );
     let session = &report.session;
     if parsed.json {
-        out!("{}", serde_json::to_string_pretty(&report)?);
+        out!("{}", session_action_json(&report, &tab_rename)?);
     } else {
         out!(
             "Started session {} (pid {}) — worktree {} on branch {}\nLog: {}",
@@ -926,6 +1001,7 @@ pub(super) fn run_start_agent(parsed: Parsed) -> Result<(), UsageError> {
             session.branch,
             session.log_path.as_deref().unwrap_or("-"),
         );
+        render_tab_rename(&tab_rename);
         render_start_base(&report.start_base);
         render_worktree_placement(&report.worktree_placement);
     }
@@ -1014,7 +1090,9 @@ pub(super) fn run_agents(parsed: Parsed) -> Result<(), UsageError> {
             }))?
         );
     } else if views.is_empty() {
-        out!("No live sessions. Start one with `aethyme broker start --task \"...\"`.");
+        out!(
+            "No live sessions. Start one with `aethyme broker start --task \"...\" --short-name \"<short name>\"`."
+        );
     } else {
         out!(
             "{:<4} {:<8} {:<8} {:<24} TASK",
@@ -1101,7 +1179,7 @@ pub(super) fn run_close(parsed: Parsed) -> Result<(), UsageError> {
     } else {
         out!(
             "Session {session} closed; checkout and branch remain available. Policy may reclaim known ignored build artifacts. \
-             Next task on the same worktree: `aethyme broker start --adopt --task \"...\"`."
+             Next task on the same worktree: `aethyme broker start --adopt --task \"...\" --short-name \"<short name>\"`."
         );
     }
     Ok(())

@@ -319,6 +319,8 @@ fn parse_accepts_chau7_session_identity_flags() {
         "Aethyme",
         "--tab-name",
         "Fix auth",
+        "--short-name",
+        "Fix auth",
         "--ai-provider",
         "claude",
     ]))
@@ -328,12 +330,50 @@ fn parse_accepts_chau7_session_identity_flags() {
     assert_eq!(parsed.tab_name.as_deref(), Some("Fix auth"));
     assert_eq!(parsed.ai_provider.as_deref(), Some("claude"));
     assert_eq!(
-        super::session_context(&parsed),
+        super::session_context(&parsed)
+            .unwrap_or_else(|_| panic!("short-name context should validate")),
         crate::SessionContext::new(
             Some("Aethyme".into()),
             Some("Fix auth".into()),
             Some("claude".into())
         )
+        .with_short_name(Some("Fix auth".into()))
+    );
+}
+
+#[test]
+fn session_creation_context_requires_a_valid_short_name() {
+    let missing = super::parse(&args(&["start", "--task", "implementation"]))
+        .unwrap_or_else(|_| panic!("missing short name should parse before validation"));
+    assert!(super::session_context(&missing).is_err());
+
+    let too_long = "x".repeat(49);
+    for invalid in ["   ", "line\nbreak", "a\u{7f}b", too_long.as_str()] {
+        let parsed = super::parse(&args(&[
+            "start",
+            "--task",
+            "implementation",
+            "--short-name",
+            invalid,
+        ]))
+        .unwrap_or_else(|_| panic!("short-name option should parse"));
+        assert!(super::session_context(&parsed).is_err(), "{invalid:?}");
+    }
+
+    let parsed = super::parse(&args(&[
+        "start",
+        "--task",
+        "implementation",
+        "--short-name",
+        "  compact label  ",
+    ]))
+    .unwrap_or_else(|_| panic!("short-name option should parse"));
+    assert_eq!(
+        super::session_context(&parsed)
+            .unwrap_or_else(|_| panic!("valid short name should be accepted"))
+            .short_name
+            .as_deref(),
+        Some("compact label")
     );
 }
 

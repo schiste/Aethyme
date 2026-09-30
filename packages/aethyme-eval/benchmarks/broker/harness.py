@@ -183,7 +183,7 @@ when a broker submission of it is verified and promoted to the local
 
 For each task:
 1. From {repo}, start a session:
-       aethyme broker start --task "<task-id>: <title>" --agent "{agent}" --json
+       aethyme broker start --task "<task-id>: <title>" --short-name "Benchmark" --agent "{agent}" --json
    It creates an isolated worktree and prints its path and session id.
    `cd` into that worktree and work only there.
 2. Implement the task, run the test command, and commit. Only committed work

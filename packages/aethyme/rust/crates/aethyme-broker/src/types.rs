@@ -431,7 +431,11 @@ pub struct SessionContext {
     pub repository_name: Option<String>,
     pub tab_name: Option<String>,
     pub ai_provider: Option<String>,
+    pub short_name: Option<String>,
 }
+
+/// Maximum number of Unicode scalar values in a broker session short name.
+pub const MAX_SESSION_SHORT_NAME_CHARS: usize = 48;
 
 impl SessionContext {
     pub fn new(
@@ -443,12 +447,37 @@ impl SessionContext {
             repository_name: normalize_context_value(repository_name),
             tab_name: normalize_context_value(tab_name),
             ai_provider: normalize_context_value(ai_provider),
+            short_name: None,
         }
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.repository_name.is_none() && self.tab_name.is_none() && self.ai_provider.is_none()
+    pub fn with_short_name(mut self, short_name: Option<String>) -> Self {
+        self.short_name = normalize_context_value(short_name);
+        self
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.repository_name.is_none()
+            && self.tab_name.is_none()
+            && self.ai_provider.is_none()
+            && self.short_name.is_none()
+    }
+}
+
+/// Validate and normalize an agent-supplied short name before any session
+/// registration or update can have side effects.
+pub fn validate_session_short_name(value: &str) -> Result<String, &'static str> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("session short name must not be empty");
+    }
+    if value.chars().count() > MAX_SESSION_SHORT_NAME_CHARS {
+        return Err("session short name must be at most 48 characters");
+    }
+    if value.chars().any(char::is_control) {
+        return Err("session short name must not contain control characters");
+    }
+    Ok(value.to_string())
 }
 
 fn normalize_context_value(value: Option<String>) -> Option<String> {
@@ -491,10 +520,13 @@ pub struct Session {
     pub agent_identity: Option<String>,
     /// Human-facing repository name supplied by the broker or its host.
     pub repository_name: Option<String>,
-    /// Human-facing Chau7 tab name, when the session is associated with one.
+    /// Chau7 tab name supplied at registration, retained as the stable hook
+    /// attribution alias after the visible tab title is broker-managed.
     pub tab_name: Option<String>,
     /// AI provider reported by the host integration, when known.
     pub ai_provider: Option<String>,
+    /// Agent-supplied concise name used for the Chau7 tab title.
+    pub short_name: Option<String>,
     /// Unix epoch milliseconds.
     pub created_at: i64,
     pub updated_at: i64,
@@ -507,6 +539,7 @@ impl Session {
             repository_name: self.repository_name.clone(),
             tab_name: self.tab_name.clone(),
             ai_provider: self.ai_provider.clone(),
+            short_name: self.short_name.clone(),
         }
     }
 

@@ -652,7 +652,7 @@ pub(super) fn run_submit(parsed: Parsed) -> Result<(), UsageError> {
             out!(
                 "What now: aethyme/integration is at {integration} and contains this work. \
                  Your checkout and branches are untouched — keep working, or start \
-                 a follow-up with `aethyme broker start --reuse --task \"...\"`, or \
+                 a follow-up with `aethyme broker start --reuse --task \"...\" --short-name \"<short name>\"`, or \
                  finish safely with `aethyme broker finish --session {}`.",
                 outcome.entry.session_id,
             );

@@ -446,9 +446,12 @@ impl BrokerStore {
             "UPDATE sessions SET task = COALESCE(?2, task), diff_base = COALESCE(?3, diff_base),
                                  agent_identity = COALESCE(?4, agent_identity),
                                  repository_name = COALESCE(?5, repository_name),
-                                 tab_name = COALESCE(?6, tab_name),
+                                 tab_name = CASE WHEN short_name IS NULL
+                                                 THEN COALESCE(?6, tab_name)
+                                                 ELSE tab_name END,
                                  ai_provider = COALESCE(?7, ai_provider),
-                                 status = 'active', last_activity_at = ?8, updated_at = ?8
+                                 short_name = COALESCE(?8, short_name),
+                                 status = 'active', last_activity_at = ?9, updated_at = ?9
              WHERE id = ?1 AND status != 'cleaned'",
             params![
                 id,
@@ -458,6 +461,7 @@ impl BrokerStore {
                 context.repository_name,
                 context.tab_name,
                 context.ai_provider,
+                context.short_name,
                 now,
             ],
         )?;
@@ -549,15 +553,18 @@ impl BrokerStore {
         let changed = tx.execute(
             "UPDATE sessions
              SET repository_name = COALESCE(?2, repository_name),
-                 tab_name = COALESCE(?3, tab_name),
+                 tab_name = CASE WHEN short_name IS NULL
+                                 THEN COALESCE(?3, tab_name) ELSE tab_name END,
                  ai_provider = COALESCE(?4, ai_provider),
-                 updated_at = ?5
+                 short_name = COALESCE(?5, short_name),
+                 updated_at = ?6
              WHERE id = ?1",
             params![
                 id,
                 context.repository_name,
                 context.tab_name,
                 context.ai_provider,
+                context.short_name,
                 now,
             ],
         )?;
@@ -5744,11 +5751,11 @@ fn insert_session(
                                deployment_state_digest, aethyme_version,
                                gate_definition_digest, repository_contract_backfilled,
                                pid, command, log_path, agent_identity, repository_name,
-                               tab_name, ai_provider, created_at,
+                               tab_name, ai_provider, short_name, created_at,
                                updated_at, last_activity_at)
          VALUES (?1, ?2, ?3, 'active', ?4, ?5, COALESCE(?6, ?5),
                  COALESCE(?7, ?6, ?5), ?8, ?9, ?10, ?11, ?12, ?13,
-                 ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?20, ?20)",
+                 ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?21, ?21)",
         params![
             new.worktree_path,
             new.branch,
@@ -5769,6 +5776,7 @@ fn insert_session(
             context.repository_name,
             context.tab_name,
             context.ai_provider,
+            context.short_name,
             now,
         ],
     );
@@ -5955,7 +5963,7 @@ const SESSION_SELECT: &str = "SELECT id, worktree_path, branch, origin, status, 
      accepted_at, repository_schema, deployment_state_digest, aethyme_version, \
      gate_definition_digest, repository_contract_backfilled, pid, command, log_path, \
      exit_code, created_at, updated_at, last_activity_at, cleanup_state, closed_at, \
-     cleanup_completed_at, agent_identity, repository_name, tab_name, ai_provider \
+     cleanup_completed_at, agent_identity, repository_name, tab_name, ai_provider, short_name \
      FROM sessions";
 
 const LEASE_SELECT: &str =
@@ -6057,6 +6065,7 @@ fn session_from_row(row: &rusqlite::Row<'_>) -> RowResult<Session> {
             repository_name: row.get(30)?,
             tab_name: row.get(31)?,
             ai_provider: row.get(32)?,
+            short_name: row.get(33)?,
             task: row.get(5)?,
             diff_base: row.get(6)?,
             adoption_base: row.get(7)?,
