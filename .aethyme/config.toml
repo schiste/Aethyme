@@ -287,3 +287,6 @@ reserved = ["skip-review"]
 # `aethyme graph refresh` when you need the store; nothing in CI reads them.
 authority = "disabled"
 repository = "schiste/Aethyme"
+
+[delivery]
+push_session_branches = true
