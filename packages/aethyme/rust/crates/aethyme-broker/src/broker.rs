@@ -6572,6 +6572,8 @@ impl Broker {
         let unpushed_work = self.unpushed_work(now_ms).unwrap_or_default();
         advice.extend(unpushed_work_advice(&unpushed_work, now_ms));
         advice.extend(overlap_pair_advice(&overlap_pairs));
+        // Cached listing and local refs only: `status` never calls GitHub.
+        advice.extend(self.pr_overlap_advice(now_ms));
 
         Ok(StatusView {
             publication_baseline_ref: baseline_ref,

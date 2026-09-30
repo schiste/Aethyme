@@ -738,6 +738,25 @@ pub(super) fn run_push(parsed: Parsed) -> Result<(), UsageError> {
             report.uncommitted_files
         );
     }
+    for overlap in &report.pr_overlaps {
+        out!(
+            "  {} open PR #{} {}: {}",
+            if overlap.conflicting_hunks {
+                "Warning: changes the same lines as"
+            } else {
+                "Touches the same files as"
+            },
+            overlap.pr,
+            overlap.url,
+            overlap.files.join(", ")
+        );
+    }
+    if !report.pr_overlaps_unknown.is_empty() {
+        out!(
+            "  Overlap unknown for {} open PR(s) whose change could not be read",
+            report.pr_overlaps_unknown.len()
+        );
+    }
     match &report.pr {
         Some(pr) if pr.created => out!("  Opened draft pull request #{} {}", pr.number, pr.url),
         Some(pr) => out!("  Pull request #{} {} ({})", pr.number, pr.url, pr.state),

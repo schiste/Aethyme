@@ -602,7 +602,7 @@ continues to expose the complete local `log_path` without embedding log data.
 - `aethyme broker advanced leases plan <paths...> [--session <id>] [--json]`
 - `aethyme broker advanced leases export (--session <id> | --entry <id>) [--limit <n>] [--json]`
 - `aethyme broker submit --session <id> [--no-cache] [--json]`
-- `aethyme broker push --session <id> [--pr] [--json]` — publish the session's own `agent/*` branch to the default branch's remote (and nothing else); `--pr` opens a draft pull request when none is open. Authorized by `[delivery] push_session_branches = true` in `.aethyme/config.toml` on the default branch; a fast-forward is pushed plainly, a rewritten branch only under a lease on the oid this broker last pushed for the session.
+- `aethyme broker push --session <id> [--pr] [--json]` — publish the session's own `agent/*` branch to the default branch's remote (and nothing else); `--pr` opens a draft pull request when none is open. Authorized by `[delivery] push_session_branches = true` in `.aethyme/config.toml` on the default branch; a fast-forward is pushed plainly, a rewritten branch only under a lease on the oid this broker last pushed for the session. After pushing it compares the session's change with the repository's open pull requests and reports `pr_overlaps` (see [Overlap with open pull requests](#overlap-with-open-pull-requests)); this never fails the push.
 - `aethyme broker advanced repair --session <id> [--json]`
 - `aethyme broker finish --session <id> [--keep-worktree] [--abandon --reason <why>] [--json]`
 - `aethyme broker advanced representation scan --session <id> [--json]`
@@ -1132,6 +1132,35 @@ anyway and records a `broker.session.abandoned_unpushed` event with the branch,
 head, count and reason. `--abandon` without a reason, or a reason without
 `--abandon`, is refused. A repository with no remote is never refused: there
 is nowhere to push to.
+
+### Overlap with open pull requests
+
+Leases compare live sessions. Once sessions push their branches and open pull
+requests, in-flight work outlives the session that wrote it, so `broker push`
+also compares the session's committed change with every open pull request
+against the default branch, excluding the session's own:
+
+- **What is compared:** changed line ranges (old side of `merge-base..head`,
+  zero context), not paths. Changes whose lines overlap or lie within three
+  lines of each other are `conflicting_hunks: true` -- the shape Git conflicts
+  on. The same file changed elsewhere is reported with `conflicting_hunks:
+  false`. A created, deleted, renamed or binary file counts as a whole-file
+  change.
+- **Where PR changes come from:** the PR's fetched remote-tracking ref when it
+  is at the head GitHub reports, otherwise `gh pr diff` (at most 8 per push).
+  One `gh pr list` (at most 30 open PRs) is reused for 10 minutes. Results are
+  cached in broker `meta` keyed by each PR's head.
+- **Output:** `broker push --json` gains `pr_overlaps` (`pr`, `url`, `files`,
+  `conflicting_hunks`) and `pr_overlaps_unknown` (PR numbers whose change could
+  not be read). `broker status` adds a `session.pr-overlap` advice row per live
+  session -- `warning` for conflicting hunks ("rebase after #N merges, or
+  coordinate with #N"), `info` for the same files on different lines -- and
+  `broker start`/`adopt` print a one-line heads-up when a session that already
+  has commits overlaps an open PR.
+
+`status`, `start` and `adopt` read only the cached listing and local refs; they
+never call GitHub, and ignore a listing older than a day. Nothing here blocks a
+command or writes to GitHub.
 
 Work that reaches the default branch through a reviewed pull request is
 delivered, but leaves no promoted queue entry, and a squash merge rewrites the
