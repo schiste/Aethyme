@@ -36,6 +36,8 @@ pub const BROKER_COMMAND_SUCCEEDED: &str = "broker.command.succeeded";
 /// A closed session's uncommitted or unlanded work was written to a verified
 /// recovery archive before its worktree was removed.
 pub const BROKER_CLEANUP_ARCHIVED: &str = "broker.cleanup.archived";
+/// `broker push` published a session's own branch (and maybe opened a draft PR).
+pub const BROKER_SESSION_PUSHED: &str = "broker.session.pushed";
 // session.<status> transition kinds are derived from SessionStatus::as_str
 // (active/idle/stale/exited/cleaned) by the store.
 pub const LEASE_CLAIMED: &str = "lease.claimed";

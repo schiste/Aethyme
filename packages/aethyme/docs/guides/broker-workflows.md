@@ -949,6 +949,13 @@ aethyme broker push --session 111          # push the session's own agent/<slug>
 aethyme broker push --session 111 --pr     # once there is a first meaningful commit: open a draft PR
 ```
 
+The broker reads the policy from `.aethyme/config.toml` as committed on the
+default branch, so an agent cannot grant itself the authority by editing its
+own worktree. `push` publishes only the session's own `agent/*` branch, to the
+default branch's remote: a fast-forward is pushed plainly, and a rewritten
+branch only under a lease on the commit the broker last pushed for that
+session. Uncommitted files are reported, not pushed.
+
 The policy is the authorization for exactly those two actions. It never
 authorizes merging, marking a PR ready, or pushing any other ref; those remain
 explicit, separately authorized operations through `broker advanced git` and

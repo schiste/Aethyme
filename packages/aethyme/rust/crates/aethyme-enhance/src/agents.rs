@@ -435,8 +435,9 @@ blocked.
    verified and integrated. Never switch branches inside someone else's
    worktree; never edit files outside your own worktree.
 
-   **If `.aethyme/config.toml` sets `[delivery] push_session_branches = true`,
-   push your session branch as you go.** Work that exists only in a worktree
+   **If `.aethyme/config.toml`, as committed on the default branch, sets
+   `[delivery] push_session_branches = true`, push your session branch as you
+   go.** Work that exists only in a worktree
    is lost with it, and nobody can review what was never pushed. After each
    commit:
 
@@ -444,8 +445,11 @@ blocked.
    aethyme broker push --session <your-session-id>
    ```
 
-   This pushes your own session branch (`agent/<slug>`) with a lease and
-   touches no other ref. Once there is a first meaningful commit, open a draft
+   This pushes your own session branch (`agent/<slug>`) to the default
+   branch's remote and touches no other ref. A fast-forward is pushed plainly;
+   a branch you rewrote (for example after a rebase) is pushed only under a
+   lease on the commit the broker last pushed for your session. Uncommitted
+   files are reported, not pushed, so commit before you push. Once there is a first meaningful commit, open a draft
    pull request, and keep pushing to it until it is ready for review:
 
    ```bash

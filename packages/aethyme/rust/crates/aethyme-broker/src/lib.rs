@@ -141,6 +141,7 @@ mod review_report;
 mod review_trigger;
 mod schema;
 mod session_abandonment;
+mod session_push;
 mod ship;
 mod storage;
 mod store;
@@ -234,7 +235,7 @@ pub use gates::{
     select_gates, verify_gate_scope_manifest,
 };
 pub use gc::{GC_PLAN_SCHEMA_VERSION, UNCLASSIFIED_ARTIFACT_REPORT_THRESHOLD_BYTES};
-pub use git::{CherrySide, GitError, GitRepo, MergeSimulation, RemoteDefaultBranch};
+pub use git::{CherrySide, GitError, GitRepo, LoggedCommit, MergeSimulation, RemoteDefaultBranch};
 pub use github_target::{
     GithubApiTargetEvidence, GithubTargetError, ResolvedGithubTarget, resolve_github_target,
 };
@@ -451,6 +452,9 @@ pub use scopes::{
 pub use session_abandonment::{
     AbandonmentDecision, AbandonmentVerdict, SessionActivity, abandoned as abandoned_sessions,
     decide as decide_abandonment, survey as survey_abandonment,
+};
+pub use session_push::{
+    SESSION_PUSH_POLICY_KEY, SessionPullRequest, SessionPushReport, SessionPushState,
 };
 pub use ship::{
     DeliveryCheck, DeliveryChecksSummary, DeliveryExecutionReport, DeliveryExecutionState,

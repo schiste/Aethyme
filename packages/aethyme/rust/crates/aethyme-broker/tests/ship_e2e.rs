@@ -701,6 +701,37 @@ fn ship_plan_reads_the_delivery_policy_from_the_remote_default_commit() {
     ));
 }
 
+/// `[delivery]` may only authorize `broker push`. That must neither break a
+/// ship plan nor select a route: the plan behaves as if no route were set.
+#[test]
+fn a_push_only_delivery_table_keeps_the_unconfigured_ship_route() {
+    let fixture = Fixture::new();
+    std::fs::create_dir_all(fixture.repo.join(".aethyme")).unwrap();
+    std::fs::write(
+        fixture.repo.join(".aethyme/config.toml"),
+        "[delivery]\npush_session_branches = true\n",
+    )
+    .unwrap();
+    git(&fixture.repo, &["add", "-f", ".aethyme/config.toml"]);
+    git(
+        &fixture.repo,
+        &["commit", "-qm", "authorize session pushes"],
+    );
+    git(&fixture.repo, &["push", "-q", "origin", "main"]);
+    let (entry_id, _, _) = fixture.promoted_entry();
+    let mut broker = fixture.broker();
+
+    let plan = broker.ship_plan(entry_id).unwrap();
+
+    assert_ne!(
+        plan.delivery.source,
+        RepositoryDeliveryModeSource::TrustedConfig,
+        "a push-only table must not count as a configured route"
+    );
+    assert_eq!(plan.delivery.configured_mode, None);
+    assert_eq!(plan.plan_digest.len(), 64);
+}
+
 #[test]
 fn ship_plan_reads_publication_policy_from_the_remote_default_commit() {
     let fixture = Fixture::new();

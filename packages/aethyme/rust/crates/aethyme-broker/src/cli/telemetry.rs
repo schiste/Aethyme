@@ -48,6 +48,7 @@ pub(super) const KNOWN_COMMAND_WORDS: &[&str] = &[
     "pr",
     "check",
     "submit",
+    "push",
     "repair",
     "checkpoint",
     "promotion-record",
