@@ -97,8 +97,8 @@ branch, runs the affected gates on the merged tree, and promotes on success.
 It never pushes. A repository that delivers through pull requests can instead
 let agents push their session branch after each commit and open a draft PR
 (`aethyme broker push --session <id> [--pr]`) by setting
-`[delivery] push_session_branches = true`; see
-[Push Session Branches As You Go](../guides/broker-workflows.md#push-session-branches-as-you-go).
+`[delivery] push_session_branches = true`; see "Push Session Branches As You
+Go" in the [broker workflows guide](../guides/broker-workflows.md).
 See the [broker workflows guide](../guides/broker-workflows.md) for leases,
 gates, handoffs, and recovery.
 
