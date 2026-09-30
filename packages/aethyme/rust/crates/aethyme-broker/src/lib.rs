@@ -22,6 +22,7 @@
 
 mod advisories;
 pub mod agent_hook;
+mod artifact_catalog;
 mod atomic_file;
 pub mod attribution;
 mod blockers;
