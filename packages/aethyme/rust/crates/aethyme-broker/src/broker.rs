@@ -350,6 +350,23 @@ pub enum BrokerOpError {
         "session {session_id} is closed and cannot authorize coordinated operations; start a new session with `aethyme broker start --task <text>` or adopt an active worktree with `aethyme broker start --adopt --task <text>`"
     )]
     ClosedSessionOperation { session_id: i64 },
+    /// `broker push` declined before anything was sent: the repository has
+    /// not authorized session-branch pushes, the branch is not a session
+    /// branch, or the remote holds work this session never pushed.
+    #[error("broker push refused: {reason}")]
+    SessionPushRefused { reason: String },
+    #[error(
+        "broker push {phase} failed (operation {operation_id}, {status}){}",
+        if stderr.is_empty() { String::new() } else { format!(": {stderr}") }
+    )]
+    SessionPushFailed {
+        phase: &'static str,
+        operation_id: i64,
+        status: &'static str,
+        stderr: String,
+    },
+    #[error("session {session_id}'s branch {branch} does not exist in this repository")]
+    SessionBranchMissing { session_id: i64, branch: String },
     #[error("{recovery}")]
     CoordinatedOperationBlocked {
         repository: String,

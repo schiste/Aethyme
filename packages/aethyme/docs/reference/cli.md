@@ -218,8 +218,9 @@ lease planning, and durable finish handoffs, see the
 
 ### Broker verbs and removed spellings
 
-`aethyme broker --help` lists six public verbs: `start`, `status`, `submit`,
-`finish`, `unblock`, and `gc`. Every other broker command is spelled
+`aethyme broker --help` lists seven public verbs: `start`, `status`, `submit`,
+`push`, `finish`, `unblock`, and `gc`. `push` joined the others in 2026-09 so
+publishing a session branch as work progresses is as ordinary as submitting it. Every other broker command is spelled
 `aethyme broker advanced <verb>` (`aethyme broker advanced --help` lists them).
 Each public form resolves to the implementation that already existed, so
 behaviour, flags and `--json` output are unchanged; only the spelling moved.
@@ -601,6 +602,7 @@ continues to expose the complete local `log_path` without embedding log data.
 - `aethyme broker advanced leases plan <paths...> [--session <id>] [--json]`
 - `aethyme broker advanced leases export (--session <id> | --entry <id>) [--limit <n>] [--json]`
 - `aethyme broker submit --session <id> [--no-cache] [--json]`
+- `aethyme broker push --session <id> [--pr] [--json]` — publish the session's own `agent/*` branch to the default branch's remote (and nothing else); `--pr` opens a draft pull request when none is open. Authorized by `[delivery] push_session_branches = true` in `.aethyme/config.toml` on the default branch; a fast-forward is pushed plainly, a rewritten branch only under a lease on the oid this broker last pushed for the session.
 - `aethyme broker advanced repair --session <id> [--json]`
 - `aethyme broker finish --session <id> [--json]`
 - `aethyme broker advanced representation scan --session <id> [--json]`
