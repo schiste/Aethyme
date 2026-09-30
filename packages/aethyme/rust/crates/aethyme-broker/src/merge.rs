@@ -789,10 +789,21 @@ impl Broker {
         let changed = self
             .repo_handle()
             .gate_scope_changed_between(verify_base, &merge_commit)?;
-        let mut verification_slot = crate::verification::ExactTreeVerificationSlot::acquire(
-            &self.main_root_path(),
-            "merge-sim",
-        )?;
+        // Keyed by the exact tree, not by this repository: two sessions
+        // verifying two different merged trees have no reason to exclude each
+        // other. Before this was one repository-wide slot, so promotion was
+        // serial no matter how many sessions were submitting.
+        //
+        // The two other slot users (`graph-integrity`, `gate-doctor-probe`)
+        // keep the repository-scoped slot: each verifies a single tree it has
+        // just chosen, and serialising them against each other is correct --
+        // they are diagnostics, not throughput.
+        let mut verification_slot =
+            crate::verification::ExactTreeVerificationSlot::acquire_for_tree(
+                &self.main_root_path(),
+                "merge-sim",
+                &merge_commit,
+            )?;
         let sim_worktree = verification_slot.materialize(self.repo_handle(), &merge_commit)?;
         // Verification policy comes from the base the change lands on, never
         // from the merged tree: otherwise a session could weaken or delete the
