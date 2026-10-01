@@ -147,6 +147,7 @@ mod review_trigger;
 mod schema;
 mod session_abandonment;
 mod session_push;
+mod session_sync;
 mod shared_edit_advice;
 mod ship;
 mod storage;
@@ -472,6 +473,7 @@ pub use session_push::{
     SESSION_PUSH_POLICY_KEY, SessionPullRequest, SessionPushReport, SessionPushState,
     UncommittedCounts,
 };
+pub use session_sync::{SessionSyncReport, SyncOutcome, SyncStrategy};
 pub use ship::{
     DeliveryCheck, DeliveryChecksSummary, DeliveryExecutionReport, DeliveryExecutionState,
     DeliveryPullRequest, PUBLICATION_POLICY_SCHEMA_VERSION, PullRequestDeliveryReport,

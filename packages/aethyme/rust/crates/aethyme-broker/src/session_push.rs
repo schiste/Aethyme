@@ -40,6 +40,15 @@ fn push_operation_wait() -> QueueWait {
     QueueWait::Seconds(60)
 }
 
+/// How long a default-branch refresh may queue for the repository lock.
+///
+/// Short on purpose: `start` and `sync` run it before an agent begins, and a
+/// busy lane must cost seconds, not the minute a push may wait. Falling back
+/// to the last fetched copy is always safe; the result says so.
+fn fetch_operation_wait() -> QueueWait {
+    QueueWait::Seconds(10)
+}
+
 /// Where a session's branch stands relative to its remote, from local refs.
 ///
 /// Read-only and never fetches, so it is as fresh as the last fetch or push.
@@ -375,11 +384,11 @@ impl Broker {
         // Advisory and best-effort, like the overlap check below: the default
         // branch moved under this session whenever another PR merged, and
         // that is only visible after fetching it.
-        let (default_branch, default_branch_note) = self.default_branch_drift_for_push(
+        let (default_branch, default_branch_note) = self.fetch_and_measure_default_branch(
             session_id,
             &session.branch,
             &default,
-            &target,
+            Some(&target),
             &head,
             &main_root,
         );
@@ -425,34 +434,44 @@ impl Broker {
         })
     }
 
-    /// Fetch exactly the default branch, then compare the pushed head with it.
+    /// Fetch exactly the default branch into its remote-tracking ref through
+    /// the coordinated operation lane, on behalf of `session_id`.
     ///
-    /// The fetch moves only the remote-tracking ref of the default branch, and
-    /// goes through the coordinated operation lane like every other remote
-    /// read that moves a ref. A failed fetch is not a failed push: the
-    /// comparison falls back to the last fetched copy and says so. The result
-    /// is cached so `status` can show it without the network.
-    fn default_branch_drift_for_push(
+    /// The fetch moves only that one remote-tracking ref, like every other
+    /// remote read that moves a ref. `Err` carries a note saying why the
+    /// caller is working from the last fetched copy; a failed fetch is never
+    /// fatal to `push`, `start` or `sync`.
+    pub(crate) fn fetch_default_branch(
         &mut self,
         session_id: i64,
-        branch: &str,
         default: &TrackedDefault,
-        target: &crate::ResolvedRemoteTarget,
-        head: &str,
+        target: Option<&crate::ResolvedRemoteTarget>,
         main_root: &Path,
-    ) -> (Option<crate::DefaultBranchDrift>, Option<String>) {
+    ) -> Result<(), String> {
+        let target = match target {
+            Some(target) => target.clone(),
+            None => self
+                .repo_handle()
+                .resolve_remote_target(&default.remote, None)
+                .map_err(|error| {
+                    format!(
+                        "remote {:?} cannot be resolved ({error}); used the last fetched copy",
+                        default.remote
+                    )
+                })?,
+        };
         let source = format!("refs/heads/{}", default.branch);
         let fetch = self.run_coordinated_operation_at_with_wait(
             CoordinatedCommand {
                 session_id,
                 provider: OperationProvider::Git,
                 repository: None,
-                resolved_target: Some(target.clone()),
+                resolved_target: Some(target),
                 scope: Some(format!("ref:{}", default.tracking_ref)),
                 declared_effect: None,
                 destructive_confirmed: false,
                 authorization_reason: Some(
-                    "refresh the default branch to compare a pushed session with it".into(),
+                    "refresh the default branch to compare a session with it".into(),
                 ),
                 args: vec![
                     "fetch".into(),
@@ -461,19 +480,37 @@ impl Broker {
                 ],
             },
             main_root,
-            push_operation_wait(),
+            fetch_operation_wait(),
         );
-        let mut note = match fetch {
-            Ok(fetch) if fetch.ok() => None,
-            Ok(fetch) => Some(format!(
-                "fetching {} failed (operation {}); compared with the last fetched copy",
+        match fetch {
+            Ok(fetch) if fetch.ok() => Ok(()),
+            Ok(fetch) => Err(format!(
+                "fetching {} failed (operation {}); used the last fetched copy",
                 default.tracking_ref, fetch.operation.id
             )),
-            Err(error) => Some(format!(
-                "fetching {} failed ({error}); compared with the last fetched copy",
+            Err(error) => Err(format!(
+                "fetching {} failed ({error}); used the last fetched copy",
                 default.tracking_ref
             )),
-        };
+        }
+    }
+
+    /// Fetch exactly the default branch, then compare `head` with it.
+    ///
+    /// The result is cached so `status` can show it without the network. A
+    /// failed fetch falls back to the last fetched copy and says so.
+    pub(crate) fn fetch_and_measure_default_branch(
+        &mut self,
+        session_id: i64,
+        branch: &str,
+        default: &TrackedDefault,
+        target: Option<&crate::ResolvedRemoteTarget>,
+        head: &str,
+        main_root: &Path,
+    ) -> (Option<crate::DefaultBranchDrift>, Option<String>) {
+        let mut note = self
+            .fetch_default_branch(session_id, default, target, main_root)
+            .err();
         let repo = self.repo_handle();
         let Some(commit) = repo.resolve_ref(&default.tracking_ref) else {
             return (

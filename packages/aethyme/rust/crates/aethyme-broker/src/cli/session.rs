@@ -97,6 +97,15 @@ fn session_action_json<T: serde::Serialize>(
 /// pull requests from it. `start-agent` is the detached case, where nobody is
 /// watching the terminal -- which is exactly why it cannot be the one surface
 /// that stays silent about an inherited gap (#290).
+fn human_age(seconds: u64) -> String {
+    match seconds {
+        0..=89 => format!("{seconds}s"),
+        90..=5_399 => format!("{}m", seconds / 60),
+        5_400..=172_799 => format!("{}h", seconds / 3_600),
+        _ => format!("{}d", seconds / 86_400),
+    }
+}
+
 pub(super) fn render_start_base(base: &crate::SessionStartBase) {
     out!(
         "Start base: {} at {} ({})",
@@ -105,6 +114,17 @@ pub(super) fn render_start_base(base: &crate::SessionStartBase) {
         base.evidence.as_str()
     );
     let default_ref = || base.default_ref.as_deref().unwrap_or("the default branch");
+    if base.fetched == Some(false) {
+        let age = base
+            .cached_ref_age_seconds
+            .map(|seconds| format!(", last fetched {} ago", human_age(seconds)))
+            .unwrap_or_default();
+        out!(
+            "note: could not refresh {} ({}){age}; the session starts from that cached copy",
+            default_ref(),
+            base.fetch_error.as_deref().unwrap_or("fetch failed")
+        );
+    }
     if let Some(bypassed) = &base.bypassed_integration {
         let counts = format!(
             "{} commit(s) behind and {} ahead",
@@ -853,6 +873,33 @@ pub(super) fn run_adopt(parsed: Parsed) -> Result<(), UsageError> {
             ),
         }
         render_tab_rename(&tab_rename);
+        if let Some(drift) = &report.default_branch
+            && drift.behind > 0
+        {
+            out!(
+                "{}: this worktree is {} commit(s) behind {}{}; catch up with \
+                 `aethyme broker sync --session {}`",
+                if drift.would_conflict {
+                    "warning"
+                } else {
+                    "note"
+                },
+                drift.behind,
+                drift.reference,
+                if drift.would_conflict {
+                    format!(
+                        " and catching up would conflict in {}",
+                        drift.conflicting_paths.join(", ")
+                    )
+                } else {
+                    String::new()
+                },
+                session.id
+            );
+        }
+        if let Some(note) = &report.default_branch_note {
+            out!("note: {note}");
+        }
         capture_declared_scopes(
             &mut broker,
             session.id,

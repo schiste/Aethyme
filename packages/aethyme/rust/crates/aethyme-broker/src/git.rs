@@ -2472,6 +2472,113 @@ impl GitRepo {
         Ok(())
     }
 
+    /// Merge `commit` into the checked-out branch with `message`, never
+    /// opening an editor. A conflict leaves the merge in progress for the
+    /// caller to abort.
+    pub fn merge_commit_no_edit(&self, commit: &str, message: &str) -> Result<(), GitError> {
+        run_git(&self.root, &["merge", "--no-edit", "-m", message, commit])?;
+        Ok(())
+    }
+
+    /// Fetch exactly `refs/heads/<branch>` from `remote` into
+    /// `refs/remotes/<remote>/<branch>`, within `budget`. A read that moves
+    /// one remote-tracking ref; no tags, no other refs.
+    pub fn fetch_branch_into_tracking_ref(
+        &self,
+        remote: &str,
+        branch: &str,
+        budget: Duration,
+    ) -> Result<(), GitError> {
+        let refspec = format!("refs/heads/{branch}:refs/remotes/{remote}/{branch}");
+        let args = ["fetch", "--no-tags", "--quiet", remote, refspec.as_str()];
+        let mut command = Command::new(&git_program().program);
+        command.args(args).current_dir(&self.root);
+        run_git_command(command, &args, budget)?;
+        Ok(())
+    }
+
+    /// Abandon a paused rebase, restoring the branch it started from.
+    pub fn abort_rebase(&self) -> Result<(), GitError> {
+        run_git(&self.root, &["rebase", "--abort"])?;
+        Ok(())
+    }
+
+    /// Abandon a paused merge, restoring the pre-merge state.
+    pub fn abort_merge(&self) -> Result<(), GitError> {
+        run_git(&self.root, &["merge", "--abort"])?;
+        Ok(())
+    }
+
+    /// The Git operation this checkout is paused in, if any: a rebase,
+    /// merge, cherry-pick or revert that stopped for conflicts or editing.
+    pub fn operation_in_progress(&self) -> Option<&'static str> {
+        [
+            ("rebase-merge", "rebase"),
+            ("rebase-apply", "rebase"),
+            ("MERGE_HEAD", "merge"),
+            ("CHERRY_PICK_HEAD", "cherry-pick"),
+            ("REVERT_HEAD", "revert"),
+        ]
+        .into_iter()
+        .find(|(name, _)| {
+            run_git(&self.root, &["rev-parse", "--git-path", name])
+                .ok()
+                .map(|path| {
+                    let path = std::path::PathBuf::from(path);
+                    if path.is_absolute() {
+                        path
+                    } else {
+                        self.root.join(path)
+                    }
+                })
+                .is_some_and(|path| path.exists())
+        })
+        .map(|(_, operation)| operation)
+    }
+
+    /// Seconds since `reference` last moved, from its reflog, falling back
+    /// to the age of `FETCH_HEAD`. `None` when neither is recorded.
+    pub fn ref_age_seconds(&self, reference: &str) -> Option<u64> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_secs();
+        let from_reflog = run_git(
+            &self.root,
+            &[
+                "reflog",
+                "show",
+                "-1",
+                "--date=unix",
+                "--format=%gd",
+                reference,
+            ],
+        )
+        .ok()
+        .and_then(|line| {
+            let start = line.rfind('{')? + 1;
+            let end = line.rfind('}')?;
+            line.get(start..end)?.parse::<u64>().ok()
+        });
+        let moved = from_reflog.or_else(|| {
+            let path = run_git(&self.root, &["rev-parse", "--git-path", "FETCH_HEAD"]).ok()?;
+            let path = std::path::PathBuf::from(path);
+            let path = if path.is_absolute() {
+                path
+            } else {
+                self.root.join(path)
+            };
+            std::fs::metadata(path)
+                .ok()?
+                .modified()
+                .ok()?
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .map(|since| since.as_secs())
+        })?;
+        Some(now.saturating_sub(moved))
+    }
+
     /// Replay exactly `upstream..HEAD` onto `base`. Unlike a plain
     /// `git rebase <base>`, this never lets Git infer an older merge-base
     /// and accidentally include commits that predate the broker session.
