@@ -34,6 +34,7 @@ mod cleanup_audit;
 mod cleanup_resolve;
 mod clock;
 mod disk_headroom;
+mod duplicate_work;
 pub mod exit_status;
 pub use disk_headroom::{
     DEFAULT_GATE_HEADROOM_BYTES, GateCacheUsage, available_bytes, refusal as disk_headroom_refusal,
@@ -215,6 +216,7 @@ pub use delivery::{
     DELIVERY_OUTBOX_SCHEMA_VERSION, DeliveryClaimReport, DeliveryCompletion, DeliveryEnvelope,
     DeliveryError, DeliveryOutboxItem, DeliveryPolicy, DeliveryStatus, DeliverySubscription,
 };
+pub use duplicate_work::{DuplicateWork, DuplicateWorkReason, pr_numbers_in_task};
 pub use error::{BrokerError, PlannedLeaseConflict};
 pub use exposures::{
     AdvisoryReconciliationItem, EXPOSURE_RECONCILIATION_SCHEMA_VERSION,

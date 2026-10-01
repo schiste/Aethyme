@@ -1018,6 +1018,26 @@ delivery path, and the integration branch plays no part:
 Open pull requests are compared separately (`pr_overlaps`); `default_branch`
 covers work that has already merged.
 
+In a verify-only repository a conflicting lease **informs** rather than
+blocks. `broker submit` reports another active session's conflicting explicit
+lease in `lease_warnings`, with the `broker advanced note send` command to
+coordinate, then runs the gates as usual. Submit only verifies against the
+current default branch and promotes nothing; each session delivers through
+its own pull request, so the conflict is resolved when one of them merges.
+Blocking would only stall an agent. `broker advanced exec`'s guard is
+unchanged: it stops an agent from editing paths outside its own leases inside
+its own worktree, which is a different concern.
+
+When several sessions work on the same pull request, `broker start`, `push`
+and `status` say so (`duplicate_work`, `session.duplicate-work`). Decide which
+one continues and finish the others; two agents repairing one PR keep
+conflicting with each other however leases are configured.
+
+Files that every session regenerates, such as generated manifests, conflict in
+nearly every pair of sessions. List them in `[leases] ignore` (exact paths,
+directory prefixes ending in `/`, or bare file names), or stop committing
+them, and resolve the merge-time conflict by regenerating.
+
 ## Where A New Session Starts
 
 Without `--base`, `broker start` cuts the session branch from the first of:

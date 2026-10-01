@@ -833,6 +833,19 @@ pub(super) fn run_push(parsed: Parsed) -> Result<(), UsageError> {
             overlap.files.join(", ")
         );
     }
+    for duplicate in &report.duplicate_work {
+        out!(
+            "  Warning: session {} ({}) also works on {}: {}",
+            duplicate.session_id,
+            duplicate.status.as_str(),
+            match (duplicate.reason, duplicate.pull_request) {
+                (crate::DuplicateWorkReason::SameBranch, _) => "the same branch".to_string(),
+                (_, Some(pr)) => format!("PR #{pr}"),
+                (_, None) => "the same pull request".to_string(),
+            },
+            duplicate.task.as_deref().unwrap_or("(no task)")
+        );
+    }
     if !report.pr_overlaps_unknown.is_empty() {
         out!(
             "  Overlap unknown for {} open PR(s) whose change could not be read",

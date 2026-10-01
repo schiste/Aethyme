@@ -87,6 +87,10 @@ pub struct SessionPushReport {
     /// Open pull requests whose change could not be read, so their overlap
     /// is unknown rather than absent.
     pub pr_overlaps_unknown: Vec<i64>,
+    /// Other sessions that look like the same work: the same branch, the same
+    /// open PR, or a task naming the same PR. Omitted when none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub duplicate_work: Vec<crate::DuplicateWork>,
     /// The pushed head compared with the default branch, fetched just before
     /// the comparison: how far behind it is and whether merging would
     /// conflict. `None` when Git could not answer. Advisory only.
@@ -408,6 +412,7 @@ impl Broker {
             Some(&payload),
         )?;
 
+        let duplicate_work = self.duplicate_work_for(&session);
         Ok(SessionPushReport {
             session_id,
             branch: session.branch,
@@ -420,6 +425,7 @@ impl Broker {
             pr,
             pr_overlaps: overlap.overlaps,
             pr_overlaps_unknown: overlap.unknown_prs,
+            duplicate_work,
             default_branch,
             default_branch_note,
         })
