@@ -88,6 +88,8 @@ that shows which of them GC would reclaim, or `null` when there are none).
 `retention.closed_worktrees`, and `aethyme broker gc plan --json` as
 `closed_worktrees`.
 
+`cleanup_retention.host_available_bytes` and `cleanup_retention.host_volume_probe` (introduced 2026-10-01) report free space where this repository's gates run -- the lower of the broker worktree root and host state, each read at its nearest existing directory -- and the directory read, or `null` when it cannot be read. Below the 8 GiB a gate needs to start, `advice` carries a `host.gate-headroom` row with severity `blocked`, emitted whether or not the repository retains worktrees, with `aethyme broker gc plan` and `aethyme broker gc storage plan` as its commands.
+
 `review_refusals` lists reviews a provider declined and nothing has re-asked
 for since. `class` is `quota_exhausted`, `rate_limited`, `provider_error` or
 `unknown`, and answers whether waiting helps; `text` is the provider's own
