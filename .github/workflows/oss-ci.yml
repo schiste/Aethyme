@@ -182,10 +182,11 @@ jobs:
         with:
           tool: cargo-nextest@0.9.146
 
-      # Test helpers run `cargo build --bin <name>` once per test process to
-      # find the product binaries (aethyme-testkit/src/bins.rs). nextest runs
-      # each test in its own process, so building them once here turns those
-      # calls into no-op freshness checks.
+      # Test helpers would run `cargo build --bin <name>` once per test process
+      # to find the product binaries (aethyme-testkit/src/bins.rs). nextest
+      # runs each test in its own process, so those builds queued on cargo's
+      # lock for minutes each. Build once here; the test step sets
+      # AETHYME_TESTKIT_PREBUILT_BINS=1 to use these binaries directly.
       - name: Build the product binaries
         run: cargo build --locked --workspace --bins
 
@@ -193,6 +194,8 @@ jobs:
       # --examples` stood in for this step until now, but a target flag
       # narrows cargo's selection to examples only: it ran three binaries.
       - name: Run workspace tests
+        env:
+          AETHYME_TESTKIT_PREBUILT_BINS: "1"
         run: cargo nextest run --locked --workspace --profile ci
 
       # nextest runs neither example targets nor doctests. The release-manifest
@@ -346,6 +349,7 @@ jobs:
         if: steps.scope.outputs.args != ''
         env:
           ARGS: ${{ steps.scope.outputs.args }}
+          AETHYME_TESTKIT_PREBUILT_BINS: "1"
         # ARGS is built from crate directory names only; word-splitting is intended.
         # `--no-tests=pass`: a selected crate may have no tests of its own.
         run: |
