@@ -31,14 +31,20 @@ pub fn run(args: &[String]) -> Result<(), CliError> {
     // strict flag parser rejects it as an unknown flag.
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         println!("aethyme analyze — static analysis over the graph");
-        println!("  aethyme analyze dead-code --repo <path> [--scope <prefix>] [--format summary|full-json|eval-json] [--json|--json-output]");
+        println!(
+            "  aethyme analyze dead-code --repo <path> [--scope <prefix>] [--format summary|full-json|eval-json] [--json|--json-output]"
+        );
         return Ok(());
     }
     let Some(subcommand) = args.first() else {
-        return Err(CliError::usage("missing analyze subcommand (dead-code)".to_string()));
+        return Err(CliError::usage(
+            "missing analyze subcommand (dead-code)".to_string(),
+        ));
     };
     if subcommand != "dead-code" {
-        return Err(CliError::usage(format!("unsupported analyze subcommand: {subcommand}")));
+        return Err(CliError::usage(format!(
+            "unsupported analyze subcommand: {subcommand}"
+        )));
     }
     let rest = &args[1..];
 
@@ -48,7 +54,9 @@ pub fn run(args: &[String]) -> Result<(), CliError> {
         })?;
         let path = PathBuf::from(&raw);
         if !path.is_dir() {
-            return Err(CliError::runtime(format!("repository path is not a directory: {raw}")));
+            return Err(CliError::runtime(format!(
+                "repository path is not a directory: {raw}"
+            )));
         }
         path.canonicalize().map_err(|e| e.to_string())?
     };
@@ -57,7 +65,9 @@ pub fn run(args: &[String]) -> Result<(), CliError> {
     })?;
     let boundary = opt(rest, "--boundary").unwrap_or_else(|| "outside-directory".to_string());
     if boundary != "outside-directory" {
-        return Err(CliError::usage(format!("unsupported --boundary: {boundary}")));
+        return Err(CliError::usage(format!(
+            "unsupported --boundary: {boundary}"
+        )));
     }
     let roots: Vec<String> = opt(rest, "--roots")
         .unwrap_or_default()

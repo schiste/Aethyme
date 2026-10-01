@@ -172,13 +172,24 @@ pub enum GraphStoreError {
     Io(std::io::Error),
     Db(redb::Error),
     Encode(bincode::Error),
-    SchemaMismatch { found: u32, expected: u32 },
-    MissingGraphStore { path: PathBuf },
-    IncompatibleRedbFileFormat { path: PathBuf, found: u8 },
+    SchemaMismatch {
+        found: u32,
+        expected: u32,
+    },
+    MissingGraphStore {
+        path: PathBuf,
+    },
+    IncompatibleRedbFileFormat {
+        path: PathBuf,
+        found: u8,
+    },
     /// The store exists and is readable, but was materialized from a
     /// commit other than the repository's current HEAD, so it describes
     /// older source than the working tree.
-    IndexedAtDifferentCommit { indexed: String, head: String },
+    IndexedAtDifferentCommit {
+        indexed: String,
+        head: String,
+    },
 }
 
 impl std::fmt::Display for GraphStoreError {

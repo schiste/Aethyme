@@ -160,11 +160,7 @@ fn command_words(line: &str) -> Option<Vec<String>> {
         })
         .filter(|word| !word.is_empty() && *word != ".")
         .collect();
-    if words.is_empty() {
-        None
-    } else {
-        Some(words)
-    }
+    if words.is_empty() { None } else { Some(words) }
 }
 
 /// Ask the router whether a command path exists.
@@ -278,8 +274,7 @@ fn command_extraction_recognises_documented_forms() {
         ("aethyme graph impact --repo .", &["graph", "impact"]),
     ];
     for (line, expected) in recognized {
-        let expected_words: Vec<String> =
-            expected.iter().map(|word| word.to_string()).collect();
+        let expected_words: Vec<String> = expected.iter().map(|word| word.to_string()).collect();
         assert_eq!(
             command_words(line),
             Some(expected_words),

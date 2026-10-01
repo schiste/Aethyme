@@ -25,12 +25,18 @@ pub fn run_facts(args: &[String]) -> Result<(), CliError> {
     // strict flag parser rejects it as an unknown flag.
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         println!("aethyme facts — derived facts from the graph store");
-        println!("  aethyme facts public-functions --repo <path> --scope <prefix> [--json|--json-output]");
-        println!("  aethyme facts function-usage --repo <path> --target <fn> --boundary <prefix> [--json|--json-output]");
+        println!(
+            "  aethyme facts public-functions --repo <path> --scope <prefix> [--json|--json-output]"
+        );
+        println!(
+            "  aethyme facts function-usage --repo <path> --target <fn> --boundary <prefix> [--json|--json-output]"
+        );
         return Ok(());
     }
     let Some(subcommand) = args.first() else {
-        return Err(CliError::usage("missing facts subcommand (public-functions | function-usage)".to_string()));
+        return Err(CliError::usage(
+            "missing facts subcommand (public-functions | function-usage)".to_string(),
+        ));
     };
     let rest = &args[1..];
     let json_output = rest.iter().any(|a| a == "--json-output");
@@ -39,7 +45,9 @@ pub fn run_facts(args: &[String]) -> Result<(), CliError> {
             .ok_or_else(|| format!("usage: aethyme facts {subcommand} --repo <path> ..."))?;
         let path = PathBuf::from(&raw);
         if !path.is_dir() {
-            return Err(CliError::runtime(format!("repository path is not a directory: {raw}")));
+            return Err(CliError::runtime(format!(
+                "repository path is not a directory: {raw}"
+            )));
         }
         path.canonicalize().map_err(|e| e.to_string())?
     };
@@ -123,7 +131,11 @@ pub fn run_facts(args: &[String]) -> Result<(), CliError> {
                 }
             }
         }
-        other => return Err(CliError::usage(format!("unsupported facts subcommand: {other}"))),
+        other => {
+            return Err(CliError::usage(format!(
+                "unsupported facts subcommand: {other}"
+            )));
+        }
     }
     Ok(())
 }

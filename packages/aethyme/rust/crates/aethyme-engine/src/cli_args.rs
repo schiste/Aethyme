@@ -125,9 +125,7 @@ pub fn parse(command: &str, args: &[String], specs: &[FlagSpec]) -> Result<Parse
                     }
                     None => {
                         let Some(next) = args.get(index + 1) else {
-                            return Err(format!(
-                                "usage: {command}: flag {name} requires a value"
-                            ));
+                            return Err(format!("usage: {command}: flag {name} requires a value"));
                         };
                         index += 2;
                         next.clone()
@@ -211,9 +209,9 @@ impl ParsedArgs {
         let Some(raw) = self.option(name) else {
             return Ok(None);
         };
-        raw.parse::<T>().map(Some).map_err(|_| {
-            format!("usage: {command}: flag {name} expects a number, got {raw:?}")
-        })
+        raw.parse::<T>()
+            .map(Some)
+            .map_err(|_| format!("usage: {command}: flag {name} expects a number, got {raw:?}"))
     }
 
     /// Reject surplus positionals so a typo'd extra argument cannot be
@@ -268,8 +266,7 @@ mod tests {
 
     #[test]
     fn unknown_flag_is_an_error_naming_the_accepted_set() {
-        let error =
-            parse("aethyme graph node", &args(&["--jsn"]), &specs()).unwrap_err();
+        let error = parse("aethyme graph node", &args(&["--jsn"]), &specs()).unwrap_err();
         assert!(error.contains("unknown flag --jsn"), "{error}");
         assert!(error.contains("--json"), "{error}");
         assert!(error.contains("--repo"), "{error}");
@@ -302,8 +299,12 @@ mod tests {
         // Regression: the old `filter(|a| !a.starts_with("--"))` kept
         // flag *values*, so `--repo /r target` yielded two positionals
         // and `/r` was silently accepted as the repo by accident.
-        let parsed = parse("aethyme graph node", &args(&["--repo", "/r", "target"]), &specs())
-            .unwrap();
+        let parsed = parse(
+            "aethyme graph node",
+            &args(&["--repo", "/r", "target"]),
+            &specs(),
+        )
+        .unwrap();
         assert_eq!(parsed.option("--repo"), Some("/r"));
         assert_eq!(parsed.positionals(), &["target".to_string()]);
     }
@@ -340,7 +341,8 @@ mod tests {
             &[FlagSpec::value("--budget-ms")],
         )
         .unwrap();
-        let result: Result<Option<u64>, String> = parsed.parse_number("aethyme explore", "--budget-ms");
+        let result: Result<Option<u64>, String> =
+            parsed.parse_number("aethyme explore", "--budget-ms");
         let error = result.unwrap_err();
         assert!(error.contains("expects a number"), "{error}");
         assert!(error.contains("abc"), "{error}");
@@ -354,14 +356,18 @@ mod tests {
             &[FlagSpec::value("--budget-ms")],
         )
         .unwrap();
-        let value: Option<u64> = parsed.parse_number("aethyme explore", "--budget-ms").unwrap();
+        let value: Option<u64> = parsed
+            .parse_number("aethyme explore", "--budget-ms")
+            .unwrap();
         assert_eq!(value, Some(2500));
     }
 
     #[test]
     fn absent_number_is_none_not_an_error() {
         let parsed = parse("aethyme explore", &args(&[]), &specs()).unwrap();
-        let value: Option<u64> = parsed.parse_number("aethyme explore", "--budget-ms").unwrap();
+        let value: Option<u64> = parsed
+            .parse_number("aethyme explore", "--budget-ms")
+            .unwrap();
         assert_eq!(value, None);
     }
 
@@ -373,7 +379,9 @@ mod tests {
             &specs(),
         )
         .unwrap();
-        let error = parsed.expect_max_positionals("aethyme graph node", 2).unwrap_err();
+        let error = parsed
+            .expect_max_positionals("aethyme graph node", 2)
+            .unwrap_err();
         assert!(error.contains("at most 2"), "{error}");
         assert!(error.contains("extra"), "{error}");
     }

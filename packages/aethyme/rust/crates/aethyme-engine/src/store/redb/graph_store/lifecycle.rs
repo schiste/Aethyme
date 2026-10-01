@@ -23,10 +23,7 @@ pub enum Freshness {
     /// The store was built from the current HEAD.
     Current,
     /// The store was built from an earlier commit.
-    Stale {
-        indexed: String,
-        head: String,
-    },
+    Stale { indexed: String, head: String },
     /// Either side of the comparison is unavailable.
     Unknown,
 }
@@ -418,10 +415,7 @@ impl ReadOnlyGraphStore {
     /// Turning that into a hard failure by default would make the graph
     /// unusable between edits, so callers choose: refuse, warn, or
     /// ignore.
-    pub fn open_fresh(
-        repo_root: &Path,
-        policy: FreshnessPolicy,
-    ) -> Result<Self, GraphStoreError> {
+    pub fn open_fresh(repo_root: &Path, policy: FreshnessPolicy) -> Result<Self, GraphStoreError> {
         let store = Self::open(repo_root)?;
         match store.freshness(repo_root)? {
             Freshness::Current => Ok(store),

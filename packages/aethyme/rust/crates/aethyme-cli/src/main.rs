@@ -316,15 +316,15 @@ fn main() -> ExitCode {
         }
         "graph" => match aethyme_engine::graph_cli::run(&args[1..]) {
             Ok(()) => ExitCode::SUCCESS,
-            Err(error) => report_cli_error(error)
+            Err(error) => report_cli_error(error),
         },
         "analyze" => match aethyme_engine::analyze_cli::run(&args[1..]) {
             Ok(()) => ExitCode::SUCCESS,
-            Err(error) => report_cli_error(error)
+            Err(error) => report_cli_error(error),
         },
         "facts" => match aethyme_engine::facts_cli::run_facts(&args[1..]) {
             Ok(()) => ExitCode::SUCCESS,
-            Err(error) => report_cli_error(error)
+            Err(error) => report_cli_error(error),
         },
         "intents" => match aethyme_engine::facts_cli::run_intents(&args[1..]) {
             Ok(()) => ExitCode::SUCCESS,
@@ -360,11 +360,11 @@ fn main() -> ExitCode {
         },
         "task" => match aethyme_engine::task_cli::run(&args[1..]) {
             Ok(()) => ExitCode::SUCCESS,
-            Err(error) => report_cli_error(error)
+            Err(error) => report_cli_error(error),
         },
         "query" => match aethyme_engine::query_cli::run(&args[1..]) {
             Ok(()) => ExitCode::SUCCESS,
-            Err(error) => report_cli_error(error)
+            Err(error) => report_cli_error(error),
         },
         "root" => run_root_subcommand(&args[1..]),
         // The agent-surface hook entry point the Aethyme plugin shims

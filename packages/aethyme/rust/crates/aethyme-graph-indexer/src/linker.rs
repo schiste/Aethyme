@@ -316,9 +316,7 @@ fn split_import_path(import_path: &str) -> (&str, &str) {
     let dotted = import_path.rfind('.');
     let scoped = import_path.rfind("::");
     let (module_part, rest) = match (dotted, scoped) {
-        (Some(dot), Some(double_colon)) if double_colon > dot => {
-            import_path.split_at(double_colon)
-        }
+        (Some(dot), Some(double_colon)) if double_colon > dot => import_path.split_at(double_colon),
         (Some(dot), _) => import_path.split_at(dot),
         (None, Some(double_colon)) => import_path.split_at(double_colon),
         (None, None) => ("", import_path),

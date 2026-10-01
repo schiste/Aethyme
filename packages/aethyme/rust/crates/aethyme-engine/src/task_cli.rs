@@ -30,8 +30,12 @@ pub fn run(args: &[String]) -> Result<(), CliError> {
     // strict flag parser rejects it as an unknown flag.
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         println!("aethyme task — task-scoped context from the graph store");
-        for subcommand in ["pack", "context", "anchors", "scope", "next", "expand", "explain"] {
-            println!("  aethyme task {subcommand} --repo <path> [--task <text>] [--json|--json-output]");
+        for subcommand in [
+            "pack", "context", "anchors", "scope", "next", "expand", "explain",
+        ] {
+            println!(
+                "  aethyme task {subcommand} --repo <path> [--task <text>] [--json|--json-output]"
+            );
         }
         return Ok(());
     }
@@ -48,7 +52,9 @@ pub fn run(args: &[String]) -> Result<(), CliError> {
             .ok_or_else(|| format!("usage: aethyme task {subcommand} --repo <path> ..."))?;
         let path = PathBuf::from(&raw);
         if !path.is_dir() {
-            return Err(CliError::runtime(format!("repository path is not a directory: {raw}")));
+            return Err(CliError::runtime(format!(
+                "repository path is not a directory: {raw}"
+            )));
         }
         path.canonicalize().map_err(|e| e.to_string())?
     };
@@ -160,7 +166,11 @@ pub fn run(args: &[String]) -> Result<(), CliError> {
                 opt_value(rest, "--task").unwrap_or_else(|| "Explain this repo".to_string());
             println!("{}", render_explain(&repo, &task_value)?);
         }
-        other => return Err(CliError::usage(format!("unsupported task subcommand: {other}"))),
+        other => {
+            return Err(CliError::usage(format!(
+                "unsupported task subcommand: {other}"
+            )));
+        }
     }
     Ok(())
 }

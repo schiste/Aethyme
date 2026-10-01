@@ -341,7 +341,12 @@ fn call_targets(result: &aethyme_graph_indexer::LanguageIndexResult) -> Vec<Stri
         .additional_edges
         .iter()
         .filter(|edge| edge.kind() == aethyme_graph_schema::EdgeKind::Calls)
-        .filter_map(|edge| result.additional_nodes.iter().find(|node| node.id() == edge.dst_id()))
+        .filter_map(|edge| {
+            result
+                .additional_nodes
+                .iter()
+                .find(|node| node.id() == edge.dst_id())
+        })
         .filter_map(|node| match node {
             aethyme_graph_schema::Node::UnresolvedSymbol(p) => Some(p.name().to_string()),
             _ => None,

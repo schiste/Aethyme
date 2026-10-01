@@ -51,8 +51,15 @@ const NON_REFERENCE_ROOTS: &[&str] = &["self", "super", "Self", "crate", "std", 
 /// paths are matched, so a qualified `Foo::new()` is never filtered.
 const PRELUDE_CALLS: &[&str] = &[
     // `Result` / `Option` constructors, by far the most frequent.
-    "Ok", "Err", "Some", "None", // Core intrinsics.
-    "drop", "todo", "unimplemented", "unreachable", "panic",
+    "Ok",
+    "Err",
+    "Some",
+    "None", // Core intrinsics.
+    "drop",
+    "todo",
+    "unimplemented",
+    "unreachable",
+    "panic",
 ];
 
 /// Collect call targets in `body`, keyed by the callee name the linker

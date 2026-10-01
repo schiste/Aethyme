@@ -174,7 +174,10 @@ fn missing_language_parser_is_visible_as_an_unsupported_gap() {
 fn javascript_files_are_indexed_through_the_default_registry() {
     let temporary = tempfile::tempdir().unwrap();
     let sources = [
-        ("app.js", "function beta() { return 2; }\nmodule.exports = beta;\n"),
+        (
+            "app.js",
+            "function beta() { return 2; }\nmodule.exports = beta;\n",
+        ),
         ("widget.jsx", "class Gamma { render() { return null; } }\n"),
         ("legacy.cjs", "function delta() { return 4; }\n"),
         ("modern.mjs", "function epsilon() { return 5; }\n"),

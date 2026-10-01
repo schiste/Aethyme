@@ -1341,8 +1341,7 @@ fn same_file_method_call_resolves_to_module_function_with_redb_parity() {
     // assertion is *which* symbol was resolved, not its id spelling.
     let resolved_id = &expected.items[0].id;
     assert!(
-        resolved_id.starts_with("fn:")
-            && resolved_id.contains(":src/auth/token.py:load_token"),
+        resolved_id.starts_with("fn:") && resolved_id.contains(":src/auth/token.py:load_token"),
         "callee must be load_token in src/auth/token.py, got {resolved_id}"
     );
     assert_eq!(

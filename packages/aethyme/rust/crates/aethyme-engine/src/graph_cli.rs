@@ -123,7 +123,8 @@ pub fn run(args: &[String]) -> Result<(), CliError> {
                 "repository path is not a directory: {repo_raw}"
             )));
         }
-        path.canonicalize().map_err(|e| CliError::runtime(e.to_string()))?
+        path.canonicalize()
+            .map_err(|e| CliError::runtime(e.to_string()))?
     };
     // With `--repo` the target becomes the first positional; with the
     // repo given positionally it is the second.
@@ -151,8 +152,8 @@ pub fn run(args: &[String]) -> Result<(), CliError> {
         return Ok(());
     }
 
-    let payload: Value = serde_json::from_str(&raw_json)
-        .map_err(|e| CliError::runtime(e.to_string()))?;
+    let payload: Value =
+        serde_json::from_str(&raw_json).map_err(|e| CliError::runtime(e.to_string()))?;
     let rendered = match subcommand.as_str() {
         "node" => render_node(&payload),
         "expand" => render_expand(&payload),
@@ -201,8 +202,8 @@ fn render_subcommand_json(
             Ok(crate::json::graph_expand_view(&view))
         }
         "overview" => {
-            let view = graph_overview_view_redb(store)
-                .map_err(|e| CliError::runtime(e.to_string()))?;
+            let view =
+                graph_overview_view_redb(store).map_err(|e| CliError::runtime(e.to_string()))?;
             Ok(crate::json::repo_overview_view(&view))
         }
         other => Err(CliError::usage(format!(

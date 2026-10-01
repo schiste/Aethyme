@@ -38,14 +38,18 @@ pub fn run(args: &[String]) -> Result<(), CliError> {
         return Ok(());
     }
     let Some(subcommand) = args.first() else {
-        return Err(CliError::usage("missing query subcommand (symbol | deps | impact)".to_string()));
+        return Err(CliError::usage(
+            "missing query subcommand (symbol | deps | impact)".to_string(),
+        ));
     };
     let rest = &args[1..];
     match subcommand.as_str() {
         "symbol" => run_symbol(rest),
         "deps" => run_deps(rest),
         "impact" => run_impact(rest),
-        other => Err(CliError::usage(format!("unsupported query subcommand: {other}"))),
+        other => Err(CliError::usage(format!(
+            "unsupported query subcommand: {other}"
+        ))),
     }
 }
 

@@ -1164,22 +1164,19 @@ fn open_fresh_refuses_a_store_built_from_an_older_commit() {
     );
 
     // Ignore still opens, and still reports the staleness to the caller.
-    let permissive =
-        ReadOnlyGraphStore::open_fresh(&root, super::super::FreshnessPolicy::Ignore)
-            .expect("Ignore policy opens a stale store");
+    let permissive = ReadOnlyGraphStore::open_fresh(&root, super::super::FreshnessPolicy::Ignore)
+        .expect("Ignore policy opens a stale store");
     assert!(matches!(
         permissive.freshness(&root).expect("freshness"),
         super::super::Freshness::Stale { .. }
     ));
 
     // The error message must name runnable commands.
-    let message = match ReadOnlyGraphStore::open_fresh(
-        &root,
-        super::super::FreshnessPolicy::RefuseStale,
-    ) {
-        Err(error) => error.to_string(),
-        Ok(_) => panic!("expected refusal"),
-    };
+    let message =
+        match ReadOnlyGraphStore::open_fresh(&root, super::super::FreshnessPolicy::RefuseStale) {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("expected refusal"),
+        };
     assert!(message.contains("aethyme graph refresh plan --repo"));
     assert!(!message.contains("aethyme-engine-cli"));
 

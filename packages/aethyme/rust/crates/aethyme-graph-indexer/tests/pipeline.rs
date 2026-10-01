@@ -218,8 +218,16 @@ fn deleting_a_source_file_removes_its_fragment_and_shard() {
         .unwrap();
 
     std::fs::create_dir_all(tmp.path().join("src")).unwrap();
-    std::fs::write(tmp.path().join("src/keep.py"), "def keep():\n    return 1\n").unwrap();
-    std::fs::write(tmp.path().join("src/gone.py"), "def gone():\n    return 2\n").unwrap();
+    std::fs::write(
+        tmp.path().join("src/keep.py"),
+        "def keep():\n    return 1\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join("src/gone.py"),
+        "def gone():\n    return 2\n",
+    )
+    .unwrap();
 
     let first = index_repo_to_disk(&ctx, &WalkOptions::default()).unwrap();
     let gone_fragment = tmp.path().join(".aethyme/graph/src/gone.py.bin");
@@ -251,7 +259,11 @@ fn pruning_leaves_unrelated_files_in_the_graph_tree() {
     let ctx = IndexerContext::new("prune-scope-test", tmp.path().to_path_buf(), "0.1.0").unwrap();
 
     std::fs::create_dir_all(tmp.path().join("src")).unwrap();
-    std::fs::write(tmp.path().join("src/only.py"), "def only():\n    return 1\n").unwrap();
+    std::fs::write(
+        tmp.path().join("src/only.py"),
+        "def only():\n    return 1\n",
+    )
+    .unwrap();
     index_repo_to_disk(&ctx, &WalkOptions::default()).unwrap();
 
     let marker = tmp.path().join(".aethyme/graph/NOTES.txt");

@@ -1855,8 +1855,7 @@ mod tests {
 
         let map = RepositoryMap::build(&root).expect("build repository map");
 
-        let named_m: Vec<&FunctionNode> =
-            map.functions.iter().filter(|f| f.name == "m").collect();
+        let named_m: Vec<&FunctionNode> = map.functions.iter().filter(|f| f.name == "m").collect();
         assert_eq!(
             named_m.len(),
             2,
@@ -1900,8 +1899,7 @@ mod tests {
 
         let map = RepositoryMap::build(&root).expect("build repository map");
 
-        let things: Vec<&ClassNode> =
-            map.classes.iter().filter(|c| c.name == "Thing").collect();
+        let things: Vec<&ClassNode> = map.classes.iter().filter(|c| c.name == "Thing").collect();
         assert_eq!(things.len(), 2, "both `Thing` declarations must survive");
         assert_ne!(
             things[0].id, things[1].id,

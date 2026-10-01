@@ -800,8 +800,16 @@ fn rust_ambiguous_call_fails_closed_rather_than_guessing() {
     // an agent that verifies spans, while a confidently wrong edge is
     // not.
     let tmp = tempfile::tempdir().unwrap();
-    write(tmp.path(), "src/one.rs", b"pub fn helper() -> u32 {\n    1\n}\n");
-    write(tmp.path(), "src/two.rs", b"pub fn helper() -> u32 {\n    2\n}\n");
+    write(
+        tmp.path(),
+        "src/one.rs",
+        b"pub fn helper() -> u32 {\n    1\n}\n",
+    );
+    write(
+        tmp.path(),
+        "src/two.rs",
+        b"pub fn helper() -> u32 {\n    2\n}\n",
+    );
     write(
         tmp.path(),
         "src/api.rs",

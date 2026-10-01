@@ -316,7 +316,7 @@ pub fn index_repo_to_disk_with(
     }
 
     // Captured before this pass rewrites `units.ndjson`, so pruning can tell
-// what the previous run owned.
+    // what the previous run owned.
     let previously_indexed = previously_indexed_paths(ctx.repo_root());
 
     let serialization_started = Instant::now();
@@ -361,11 +361,8 @@ pub fn index_repo_to_disk_with(
     // directory before rebuilding, so the divergence was invisible on
     // that path; only a direct `index_repo_to_disk` accumulated stale
     // artifacts. Pruning here makes both paths behave the same.
-    let stale_artifacts = prune_stale_artifacts(
-        ctx.repo_root(),
-        &previously_indexed,
-        &currently_indexed,
-    );
+    let stale_artifacts =
+        prune_stale_artifacts(ctx.repo_root(), &previously_indexed, &currently_indexed);
 
     let coverage = assemble(ctx, &walk, &observations, &built_fragments);
     let coverage_paths = if ctx.source_revision().is_some() {
@@ -452,7 +449,8 @@ impl std::error::Error for BuildFragmentError {}
 /// rewrites it, which is why the caller captures the set up front.
 fn previously_indexed_paths(repo_root: &std::path::Path) -> std::collections::HashSet<String> {
     let mut paths = std::collections::HashSet::new();
-    let Ok(contents) = std::fs::read_to_string(repo_root.join(".aethyme/graph/units.ndjson")) else {
+    let Ok(contents) = std::fs::read_to_string(repo_root.join(".aethyme/graph/units.ndjson"))
+    else {
         return paths;
     };
     for line in contents.lines() {
