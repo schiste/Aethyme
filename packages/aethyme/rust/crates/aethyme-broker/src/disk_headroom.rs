@@ -41,6 +41,20 @@ pub fn available_bytes(path: &std::path::Path) -> Option<u64> {
     }
 }
 
+/// [`available_bytes`] for a directory that may not exist yet, read at its
+/// nearest existing ancestor -- the same volume it will be created on.
+///
+/// A directory is often named before it is created: a repository's broker
+/// worktree root does not exist until its first session. `statvfs` on a
+/// missing path fails, and a failure reads as unknown, which never escalates
+/// -- so measuring the missing path itself would stay silent on exactly the
+/// host that has not started a session yet.
+pub fn available_bytes_at_or_above(path: &std::path::Path) -> Option<u64> {
+    path.ancestors()
+        .filter(|ancestor| ancestor.exists())
+        .find_map(available_bytes)
+}
+
 /// How hard the autonomous sweep should work right now.
 ///
 /// Derived from the same fact the gate refuses on, so the two cannot disagree
