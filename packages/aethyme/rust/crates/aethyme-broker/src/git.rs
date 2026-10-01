@@ -3678,6 +3678,28 @@ impl GitRepo {
         )
     }
 
+    /// Zero-context patch of `path` from `base` to the working tree, so
+    /// uncommitted edits count. Read by the agent hook to describe where
+    /// another session is changing a file; only the `@@` headers are used.
+    pub(crate) fn working_zero_context_diff(
+        &self,
+        base: &str,
+        path: &str,
+    ) -> Result<String, GitError> {
+        run_git(
+            &self.root,
+            &[
+                "diff",
+                "--no-color",
+                "--no-ext-diff",
+                "--unified=0",
+                base,
+                "--",
+                path,
+            ],
+        )
+    }
+
     /// Commit time, in seconds, of the oldest commit in `base..head` that
     /// touches `path`; `None` when no commit in the range does.
     pub(crate) fn first_commit_time_touching(

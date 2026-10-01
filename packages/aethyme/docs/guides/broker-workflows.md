@@ -939,6 +939,30 @@ it cannot refresh an expiry or acknowledge ownership. Keep provider-specific
 labels and queue payloads in adapters; use the exported schema as their
 idempotent input rather than extending the broker's lease storage.
 
+## Coordinating Through Leases and Notes
+
+Leases describe who is changing what. They are a coordination channel, not a
+lock: nothing an agent edits is refused because another session leases it.
+
+With the Aethyme plugin installed (Claude Code or Codex), the broker speaks at
+the agent's turn boundaries, for no tokens when there is nothing to say:
+
+- **Before an edit** (`PreToolUse`), when another live session is changing the
+  same file, the agent is told which session (id, short name, task), where
+  (line ranges, and the function Git names for each hunk), whether Git would
+  conflict with its own change at the last overlap check, and the exact
+  `aethyme broker advanced note send --session <me> --to-session <them>
+  --message "…"` command. It hears this once per change of the other session.
+- **Notes** from other sessions arrive at the next prompt (`UserPromptSubmit`)
+  or right after the next tool call (`PostToolUse`), each with the command to
+  reply. An agent idle at its prompt gets them at its next turn or broker
+  command.
+- **At session start**, one line names the live sessions changing files this
+  session leases.
+
+Stale, exited and finished sessions are never reported: only active and idle
+ones are still in the file.
+
 ## Push Session Branches As You Go
 
 Work that exists only in a session worktree is lost with the worktree, and
