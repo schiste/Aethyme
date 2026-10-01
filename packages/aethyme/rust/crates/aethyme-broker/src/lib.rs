@@ -82,6 +82,7 @@ mod pr;
 mod pr_link;
 mod pr_monitoring;
 mod scopes;
+pub mod session_guidance;
 mod unpushed;
 pub mod worktree_location;
 mod worktree_report;

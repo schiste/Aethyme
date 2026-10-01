@@ -319,7 +319,8 @@ fn render_broker_protocol_compact(repo: &Path) -> String {
 Other agents may be working in sibling worktrees.
 
 1. `aethyme broker start --task "<task>"`, then work only in the worktree it
-   reports. Never edit another session's worktree.
+   reports and follow the working agreement it prints. Never edit another
+   session's worktree.
 2. Commit early and small, and after each commit run
    `aethyme broker push --session <id>`. Once there is a first meaningful
    commit, open a draft PR with `aethyme broker push --session <id> --pr`, and
@@ -341,7 +342,8 @@ read it first. Leases, gates, advisories and recovery: `references/broker.md`."#
 Other agents may be working in sibling worktrees.
 
 1. `aethyme broker start --task "<task>" [--short-name "<label>"]`, then work only in the worktree it
-   reports. Never edit another session's worktree.
+   reports and follow the working agreement it prints. Never edit another
+   session's worktree.
 2. When done: `aethyme broker submit --session <id>`, then
    `aethyme broker finish --session <id>`.
 
@@ -962,7 +964,8 @@ mod tests {
             "## Broker Coordination: before and after an edit",
             "`aethyme broker start --task \"<task>\" [--short-name \"<label>\"]`",
             "work only in the worktree it\n   reports",
-            "Never edit another session's worktree.",
+            "follow the working agreement it prints.",
+            "Never edit another\n   session's worktree.",
             "`aethyme broker submit --session <id>`",
             "`aethyme broker finish --session <id>`",
             "`aethyme broker advanced git`",
@@ -1045,6 +1048,32 @@ mod tests {
             "{tokens} tokens:\n{doc}"
         );
         std::fs::remove_dir_all(&repo).unwrap();
+    }
+
+    /// `broker start` prints the repository's working agreement; the generated
+    /// protocol points agents at it in both variants rather than repeating it.
+    #[test]
+    fn the_protocol_points_agents_at_the_working_agreement() {
+        for (tag, config) in [
+            (
+                "agreement-push",
+                "schema = 1\n[delivery]\npush_session_branches = true\n",
+            ),
+            ("agreement-default", "schema = 1\n"),
+        ] {
+            let repo = broker_repo_with_config(tag, config);
+            let doc = render_agents_document(Some(&repo)).unwrap();
+            assert!(
+                doc.contains("reports and follow the working agreement it prints."),
+                "{tag}: missing the working-agreement pointer:\n{doc}"
+            );
+            // The agreement itself lives in `broker start` output only.
+            assert!(
+                !doc.contains("shared component, helper or pattern"),
+                "{tag}:\n{doc}"
+            );
+            std::fs::remove_dir_all(&repo).unwrap();
+        }
     }
 
     /// Only an explicit `true` grants the push authority; anything else keeps
