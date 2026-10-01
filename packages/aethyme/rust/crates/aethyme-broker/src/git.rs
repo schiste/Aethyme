@@ -1693,13 +1693,53 @@ impl GitRepo {
         .filter(|value| !value.is_empty())
     }
 
-    /// [`GitRepo::blob_at`] for many `(rev, path)` pairs in one process.
+    /// [`GitRepo::blob_at`] for many `(rev, path)` pairs, answered in input
+    /// order and with exactly its answers.
     ///
     /// A landing search asks this question for every candidate commit, and
     /// one `rev-parse` per question made that search too slow for the routine
     /// cleanup plan behind `broker status`. `cat-file --batch-check` answers
-    /// the whole list in a single spawn, in input order.
-    pub fn blobs_at_many(&self, queries: &[(&str, &str)]) -> Result<Vec<Option<String>>, GitError> {
+    /// the whole list in a single spawn.
+    ///
+    /// The answer is the object id at the path whatever its kind, as
+    /// `rev-parse` gives it: a gitlink answers its submodule commit and a
+    /// directory its tree. Answering only blobs made two different submodule
+    /// pointers both `None`, so a session that only moved one compared equal
+    /// to its own base and read as already represented.
+    ///
+    /// The batch protocol is line-delimited, and NUL-delimited output (`-Z`)
+    /// needs Git 2.42, above [`crate::MINIMUM_GIT_VERSION`]. A query holding a
+    /// newline would be split in two, and Git strips a trailing carriage
+    /// return from each line, so those rare queries are read one at a time.
+    pub fn objects_at_many(
+        &self,
+        queries: &[(&str, &str)],
+    ) -> Result<Vec<Option<String>>, GitError> {
+        let line_safe = |text: &str| !text.contains(['\n', '\r']);
+        let (batched, single): (Vec<usize>, Vec<usize>) = (0..queries.len())
+            .partition(|&index| line_safe(queries[index].0) && line_safe(queries[index].1));
+        let mut answers = vec![None; queries.len()];
+        for index in single {
+            let (rev, path) = queries[index];
+            answers[index] = self.blob_at(rev, path);
+        }
+        let read = self.batch_check_objects(
+            &batched
+                .iter()
+                .map(|&index| queries[index])
+                .collect::<Vec<_>>(),
+        )?;
+        for (index, answer) in batched.into_iter().zip(read) {
+            answers[index] = answer;
+        }
+        Ok(answers)
+    }
+
+    /// One `cat-file --batch-check` over queries that hold no line breaks.
+    fn batch_check_objects(
+        &self,
+        queries: &[(&str, &str)],
+    ) -> Result<Vec<Option<String>>, GitError> {
         if queries.is_empty() {
             return Ok(Vec::new());
         }
@@ -1753,12 +1793,14 @@ impl GitRepo {
         let answers = stdout
             .lines()
             .map(|line| {
-                // "<oid> blob" for a file; "<input> missing" otherwise. A
-                // tree or submodule at the path is not a blob either.
+                // "<oid> <kind>" for an entry, "<input> missing" (or
+                // "ambiguous") when the path does not resolve. The input is
+                // echoed only on those, so the last field is always the kind.
                 let mut fields = line.rsplitn(2, ' ');
                 let kind = fields.next().unwrap_or_default();
                 let oid = fields.next().unwrap_or_default();
-                (kind == "blob").then(|| oid.to_string())
+                matches!(kind, "blob" | "tree" | "submodule" | "commit" | "tag")
+                    .then(|| oid.to_string())
             })
             .collect::<Vec<_>>();
         if answers.len() != queries.len() {
