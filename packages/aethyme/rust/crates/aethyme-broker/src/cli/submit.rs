@@ -583,6 +583,18 @@ pub(super) fn run_submit(parsed: Parsed) -> Result<(), UsageError> {
                 out!("  {reason}");
             }
         }
+        if let Some(base) = &outcome.verified_against {
+            if base.source == crate::VERIFIED_AGAINST_UPSTREAM {
+                out!(
+                    "  verified against {} at {} (verify-only: integration is not used)",
+                    base.reference,
+                    short_commit(&base.commit)
+                );
+            }
+            if let Some(reason) = &base.fallback_reason {
+                eprintln!("⚠ {reason}");
+            }
+        }
         for warning in &outcome.lease_warnings {
             eprintln!(
                 "⚠ lease overlap ({}): session {} holds {}; {}",
@@ -752,6 +764,33 @@ pub(super) fn run_push(parsed: Parsed) -> Result<(), UsageError> {
             parts.join(", "),
             counts.sample.join(", ")
         );
+    }
+    if let Some(drift) = report
+        .default_branch
+        .as_ref()
+        .filter(|drift| drift.behind > 0)
+    {
+        if drift.would_conflict {
+            out!(
+                "  Warning: {} moved {} commit(s) past this branch, and merging it would \
+                 conflict in: {}",
+                drift.reference,
+                drift.behind,
+                drift.conflicting_paths.join(", ")
+            );
+        } else {
+            out!(
+                "  {} moved {} commit(s) past this branch; it still merges cleanly",
+                drift.reference,
+                drift.behind
+            );
+        }
+        if let Some(command) = &drift.suggested_command {
+            out!("  Catch up with: {command}");
+        }
+    }
+    if let Some(note) = &report.default_branch_note {
+        out!("  Note: {note}");
     }
     for overlap in &report.pr_overlaps {
         out!(

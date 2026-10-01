@@ -6705,11 +6705,15 @@ impl Broker {
         // A status that cannot read refs still reports everything else; the
         // unpushed count is context, not a precondition for any command.
         let unpushed_work = self.unpushed_work(now_ms).unwrap_or_default();
-        advice.extend(unpushed_work_advice(&unpushed_work, now_ms));
+        let verify_only =
+            PromoteConfig::load(&self.main_root).mode == crate::merge::PromoteMode::VerifyOnly;
+        advice.extend(unpushed_work_advice(&unpushed_work, now_ms, verify_only));
         advice.extend(self.integration_behind_upstream_advice());
         advice.extend(overlap_pair_advice(&overlap_pairs));
         // Cached listing and local refs only: `status` never calls GitHub.
         advice.extend(self.pr_overlap_advice(now_ms));
+        // The default branch moving under a session: last fetched copy only.
+        advice.extend(self.behind_main_advice());
         // Two sessions on one target: landing the shared edit first keeps
         // both on the default branch instead of chaining one onto the other.
         advice.extend(crate::shared_edit_advice::shared_edit_advice(
@@ -10421,7 +10425,11 @@ fn integration_live_sessions(sessions: Vec<Session>) -> Vec<IntegrationLiveSessi
 
 /// One advice row per session holding unpushed commits, plus one for an
 /// integration branch running ahead of upstream.
-fn unpushed_work_advice(report: &crate::UnpushedWorkReport, now_ms: i64) -> Vec<StatusAdvice> {
+fn unpushed_work_advice(
+    report: &crate::UnpushedWorkReport,
+    now_ms: i64,
+    verify_only: bool,
+) -> Vec<StatusAdvice> {
     let age = |at: Option<i64>| {
         crate::unpushed::describe_age(now_ms.saturating_sub(at.unwrap_or(now_ms)))
     };
@@ -10462,14 +10470,23 @@ fn unpushed_work_advice(report: &crate::UnpushedWorkReport, now_ms: i64) -> Vec<
         })
         .collect::<Vec<_>>();
     if let Some(integration) = &report.integration {
+        // In a verify-only repository nothing adds to integration any more,
+        // but commits promoted before the switch are still work at risk, so
+        // the row stays -- without recommending the mode already in force.
+        let remedy = if verify_only {
+            "This repository is verify-only and no longer uses integration: ship these \
+             commits through a pull request, or confirm they landed and drop them"
+        } else {
+            "Ship it, or, if this repository delivers through pull requests, set \
+             [promote] mode = \"verify-only\" so submit stops accumulating work here"
+        };
         advice.push(StatusAdvice {
             id: "integration.unpublished-work",
             severity: integration.severity,
             reason: "integration holds promoted work upstream lacks",
             summary: format!(
-                "{} carries {} {} {} lacks ({} on no remote at all); the oldest is {} old. Ship \
-                 it, or, if this repository delivers through pull requests, set \
-                 [promote] mode = \"verify-only\" so submit stops accumulating work here",
+                "{} carries {} {} {} lacks ({} on no remote at all); the oldest is {} old. \
+                 {remedy}",
                 integration.branch,
                 integration.unpublished_commits,
                 plural_word(
