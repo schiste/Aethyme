@@ -1326,8 +1326,34 @@ impl GitRepo {
             .filter(|value| !value.is_empty())
     }
 
-    /// True when `ancestor` is reachable from `descendant`
-    /// (`git merge-base --is-ancestor`).
+    /// Every local branch's commit, keyed by full ref name (`refs/heads/...`),
+    /// from one `git for-each-ref`.
+    ///
+    /// For callers that would otherwise resolve one branch per session: the
+    /// cleanup plan behind `broker status` visits every session ever recorded,
+    /// and one `rev-parse` each made status fork hundreds of processes on a
+    /// repository with a long history. `None` means the listing failed, and the
+    /// caller must fall back to resolving each ref rather than read every
+    /// branch as absent.
+    pub fn local_branch_tips(&self) -> Option<BTreeMap<String, String>> {
+        let output = run_git(
+            &self.root,
+            &[
+                "for-each-ref",
+                "--format=%(refname) %(objectname)",
+                "refs/heads/",
+            ],
+        )
+        .ok()?;
+        Some(
+            output
+                .lines()
+                .filter_map(|line| line.trim().split_once(' '))
+                .map(|(name, oid)| (name.to_string(), oid.to_string()))
+                .collect(),
+        )
+    }
+
     /// Remote-tracking refs from which `commit` is reachable.
     ///
     /// Reachability from a pushed ref is what makes a worktree disposable: the
@@ -1387,6 +1413,8 @@ impl GitRepo {
             .map(str::to_string)
     }
 
+    /// True when `ancestor` is reachable from `descendant`
+    /// (`git merge-base --is-ancestor`).
     pub fn is_ancestor(&self, ancestor: &str, descendant: &str) -> bool {
         git_command()
             .args(["merge-base", "--is-ancestor", ancestor, descendant])
@@ -3452,5 +3480,61 @@ impl GitRepo {
             &["log", "--reverse", "--format=%ct", &range, "--", path],
         )?;
         Ok(out.lines().next().and_then(|line| line.trim().parse().ok()))
+    }
+}
+
+#[cfg(test)]
+mod local_branch_tips_tests {
+    use super::*;
+
+    fn run(root: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@example.test")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@example.test")
+            .output()
+            .expect("run git");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// The listing stands in for one `resolve_ref` per session on the cleanup
+    /// plan behind `broker status`, so it must give the same answer: every
+    /// local branch at the commit `resolve_ref` reports, and nothing for a
+    /// branch that does not exist.
+    #[test]
+    fn lists_every_local_branch_at_the_commit_resolve_ref_reports() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        run(root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("a.txt"), "one\n").expect("write");
+        run(root, &["add", "-A"]);
+        run(root, &["commit", "-qm", "first"]);
+        run(root, &["branch", "agent/kept"]);
+        std::fs::write(root.join("a.txt"), "two\n").expect("write");
+        run(root, &["commit", "-qam", "second"]);
+        run(root, &["branch", "agent/moved"]);
+
+        let repo = GitRepo::discover(root).expect("discover");
+        let tips = repo.local_branch_tips().expect("listing");
+        for name in [
+            "refs/heads/main",
+            "refs/heads/agent/kept",
+            "refs/heads/agent/moved",
+        ] {
+            assert_eq!(tips.get(name), repo.resolve_ref(name).as_ref(), "{name}");
+        }
+        assert_ne!(
+            tips["refs/heads/agent/kept"],
+            tips["refs/heads/agent/moved"]
+        );
+        assert_eq!(tips.len(), 3, "{tips:?}");
+        assert!(!tips.contains_key("refs/heads/agent/gone"));
     }
 }

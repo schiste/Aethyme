@@ -1651,6 +1651,35 @@ impl BrokerStore {
         rows.map(|row| row?).collect()
     }
 
+    /// The commit a promoted or externally-landed entry claims for this exact
+    /// session and head, newest first, so the caller can check ancestry.
+    ///
+    /// `broker status` asks this once per live session. Selecting on
+    /// `(session_id, head_commit, status)` in SQL rather than loading the whole
+    /// queue and filtering in Rust keeps the rows read proportional to the
+    /// answer rather than to the queue, which on a busy repository is hundreds
+    /// of rows read once per session.
+    pub fn latest_representation_for_session(
+        &self,
+        session_id: i64,
+        head_commit: &str,
+    ) -> Result<Option<String>, BrokerError> {
+        let details = self
+            .conn
+            .query_row(
+                "SELECT details_json FROM merge_queue
+                 WHERE session_id = ?1
+                   AND head_commit = ?2
+                   AND status IN ('promoted', 'externally_landed')
+                 ORDER BY id DESC
+                 LIMIT 1",
+                rusqlite::params![session_id, head_commit],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?;
+        Ok(details.and_then(|json| crate::broker::details_string_value(json.as_deref(), "commit")))
+    }
+
     pub fn latest_merge_queue_for_session(
         &self,
         session_id: i64,
@@ -1663,6 +1692,42 @@ impl BrokerStore {
             )
             .optional()?
             .transpose()
+    }
+
+    /// The latest queue entry per session, for all of `session_ids` at once.
+    ///
+    /// `broker status` needs this for every live session, and doing it with
+    /// [`Self::latest_merge_queue_for_session`] is one `SELECT ... ORDER BY id
+    /// DESC LIMIT 1` per session on a connection with a 5s busy timeout — an
+    /// N+1 that gets linearly slower exactly when many sessions are live, which
+    /// is when status matters most.
+    ///
+    /// The subquery keeps the "latest per session" semantics without relying on
+    /// SQLite's bare-columns-in-GROUP-BY behaviour, which is only defined for
+    /// a bare column of an aggregate and is not something to depend on for a
+    /// 14-column row. Order is not guaranteed; callers that care sort.
+    pub fn latest_merge_queue_for_sessions(
+        &self,
+        session_ids: &[i64],
+    ) -> Result<Vec<MergeQueueEntry>, BrokerError> {
+        if session_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = std::iter::repeat_n("?", session_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "{MERGE_SELECT} WHERE id IN (\
+               SELECT MAX(id) FROM merge_queue \
+               WHERE session_id IN ({placeholders}) GROUP BY session_id)"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(session_ids), merge_from_row)?;
+        let mut entries = Vec::new();
+        for row in rows {
+            entries.push(row??);
+        }
+        Ok(entries)
     }
 
     pub fn terminal_merge_queue_counts(
