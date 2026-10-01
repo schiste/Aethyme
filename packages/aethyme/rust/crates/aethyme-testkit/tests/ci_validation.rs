@@ -38,17 +38,32 @@ fn pr_and_main_have_one_automatic_full_workspace_owner() {
     );
     let rust = block(&oss, "  rust-tests:");
     assert!(rust.contains(&"    if: github.event_name == 'pull_request'"));
-    // `--examples` is required, not incidental: cargo does not run `#[test]`
-    // functions inside an `examples/` target unless it is passed, so without
-    // it the release-manifest assertions in
-    // `crates/aethyme-broker/examples/release_manifest.rs` never execute.
+    // The workspace suite runs under nextest. `cargo test --workspace
+    // --examples` once stood in for it, but a target flag narrows cargo's
+    // selection to examples only, so it ran three binaries.
+    assert!(rust.contains(&"        run: cargo nextest run --locked --workspace --profile ci"));
+    // nextest runs neither example targets nor doctests, and the
+    // release-manifest assertions in
+    // `crates/aethyme-broker/examples/release_manifest.rs` live in an example.
     assert!(rust.contains(&"        run: cargo test --locked --workspace --examples"));
+    assert!(rust.contains(&"        run: cargo test --locked --workspace --doc"));
     // No second condition can silently skip a step within this job.
     assert_eq!(
         rust.iter()
             .filter(|line| line.trim_start().starts_with("if:"))
             .count(),
         1
+    );
+
+    // The cache warm-up compiles on pushes and never runs tests, so main
+    // keeps exactly one automatic full-workspace owner: Aethyme Gates.
+    let warm = block(&oss, "  warm-rust-cache:");
+    assert!(warm.contains(&"    if: github.event_name == 'push'"));
+    assert!(warm.iter().any(|line| line.contains("--no-run")));
+    assert!(
+        !warm.iter().any(|line| line.contains("--profile ci")
+            || line.trim() == "cargo test --locked --workspace --examples"),
+        "the warm-up job must not run tests"
     );
 
     let gates = workflow("aethyme-gates.yml");

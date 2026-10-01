@@ -737,6 +737,64 @@ pub(super) fn run_submit(parsed: Parsed) -> Result<(), UsageError> {
 
 /// `broker repair`.
 /// `broker push`: publish the session's own branch, optionally with a draft PR.
+/// `broker sync`.
+pub(super) fn run_sync(parsed: Parsed) -> Result<(), UsageError> {
+    let session = parsed
+        .session
+        .ok_or(UsageError::Message("sync requires --session <id>".into()))?;
+    let mut broker = open_broker(parsed.read_only_snapshot)?;
+    let report = broker.sync_session(session)?;
+    let conflict = report.outcome == crate::SyncOutcome::Conflict;
+    if parsed.json {
+        out!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        let short = |oid: &str| oid[..oid.len().min(12)].to_string();
+        match report.outcome {
+            crate::SyncOutcome::AlreadyCurrent => out!(
+                "Session {} is current: {} contains {} at {}",
+                report.session_id,
+                report.branch,
+                report.default_ref,
+                short(&report.default_commit)
+            ),
+            crate::SyncOutcome::Synced => out!(
+                "Synced session {} with {} ({} commit(s) behind): {} {} -> {}",
+                report.session_id,
+                report.default_ref,
+                report.behind_before,
+                match report.strategy {
+                    crate::SyncStrategy::Merge => "merged into published branch",
+                    crate::SyncStrategy::Rebase => "rebased unpublished branch",
+                    crate::SyncStrategy::None => "unchanged",
+                },
+                short(&report.before),
+                short(&report.after)
+            ),
+            crate::SyncOutcome::Conflict => {
+                eprintln!(
+                    "✗ not synced: catching up with {} ({} commit(s) behind) would conflict; \
+                     nothing was changed",
+                    report.default_ref, report.behind_before
+                );
+                for path in &report.conflicts {
+                    eprintln!("  conflict: {path}");
+                }
+                eprintln!("  resolve by hand:");
+                for command in &report.manual_commands {
+                    eprintln!("    {command}");
+                }
+            }
+        }
+        if let Some(note) = &report.fetch_note {
+            out!("  note: {note}");
+        }
+    }
+    if conflict {
+        return Err(UsageError::SilentExit(crate::exit_status::REFUSED));
+    }
+    Ok(())
+}
+
 pub(super) fn run_push(parsed: Parsed) -> Result<(), UsageError> {
     let session = parsed
         .session
@@ -831,6 +889,19 @@ pub(super) fn run_push(parsed: Parsed) -> Result<(), UsageError> {
             overlap.pr,
             overlap.url,
             overlap.files.join(", ")
+        );
+    }
+    for duplicate in &report.duplicate_work {
+        out!(
+            "  Warning: session {} ({}) also works on {}: {}",
+            duplicate.session_id,
+            duplicate.status.as_str(),
+            match (duplicate.reason, duplicate.pull_request) {
+                (crate::DuplicateWorkReason::SameBranch, _) => "the same branch".to_string(),
+                (_, Some(pr)) => format!("PR #{pr}"),
+                (_, None) => "the same pull request".to_string(),
+            },
+            duplicate.task.as_deref().unwrap_or("(no task)")
         );
     }
     if !report.pr_overlaps_unknown.is_empty() {

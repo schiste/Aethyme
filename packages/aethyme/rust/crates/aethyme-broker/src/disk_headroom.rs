@@ -55,6 +55,60 @@ pub fn available_bytes_at_or_above(path: &std::path::Path) -> Option<u64> {
         .find_map(available_bytes)
 }
 
+/// Test-only: the free space, in bytes, every headroom decision for a
+/// throwaway repository reads instead of the host's.
+///
+/// Without it the suite measures the machine it runs on: below 8 GiB free,
+/// gates refuse, `status` grows a `host.gate-headroom` row and a configured
+/// worktree root falls back, so some twenty unrelated tests fail on a full
+/// disk and pass once space is freed. `.cargo/config.toml` sets a generous
+/// value for every test; a test of the refusal itself sets a low one.
+///
+/// Honoured only for a repository under the system temporary directory, the
+/// same narrowing as the gate-trust escape: `.cargo/config.toml` also reaches
+/// `cargo run`, and an environment variable must not be able to admit a gate
+/// on a real checkout whose disk is full.
+pub const TEST_AVAILABLE_BYTES_ENV: &str = "AETHYME_TEST_AVAILABLE_BYTES";
+
+/// Free space for a headroom decision about `path`, made on behalf of the
+/// repository whose checkout is `repository`.
+///
+/// Every broker decision -- admitting a gate, the status headroom row, a
+/// configured worktree root's floor, the sweep's urgency -- reads through
+/// here, so a simulated reading reaches all of them or none.
+pub(crate) fn available_bytes_for(
+    repository: &std::path::Path,
+    path: &std::path::Path,
+) -> Option<u64> {
+    simulated_available_bytes(repository).or_else(|| available_bytes(path))
+}
+
+/// [`available_bytes_at_or_above`] behind the same test seam as
+/// [`available_bytes_for`].
+pub(crate) fn available_bytes_at_or_above_for(
+    repository: &std::path::Path,
+    path: &std::path::Path,
+) -> Option<u64> {
+    simulated_available_bytes(repository).or_else(|| available_bytes_at_or_above(path))
+}
+
+fn simulated_available_bytes(repository: &std::path::Path) -> Option<u64> {
+    simulated_available_bytes_from(
+        std::env::var_os(TEST_AVAILABLE_BYTES_ENV).as_deref(),
+        repository,
+    )
+}
+
+/// [`simulated_available_bytes`] with the environment value supplied, so the
+/// narrowing is tested without mutating the process environment.
+fn simulated_available_bytes_from(
+    value: Option<&std::ffi::OsStr>,
+    repository: &std::path::Path,
+) -> Option<u64> {
+    let bytes = value?.to_str()?.trim().parse().ok()?;
+    crate::host_state::path_is_ephemeral(repository).then_some(bytes)
+}
+
 /// How hard the autonomous sweep should work right now.
 ///
 /// Derived from the same fact the gate refuses on, so the two cannot disagree
@@ -338,6 +392,36 @@ mod tests {
         let quiet =
             refusal_with_gate_cache(Some(0), DEFAULT_GATE_HEADROOM_BYTES, Some(empty)).unwrap();
         assert!(!quiet.contains("gate cache holds"), "{quiet}");
+    }
+
+    /// The simulated reading is for throwaway repositories only: a real
+    /// checkout with a full disk must still be refused, whatever the
+    /// environment says.
+    #[test]
+    fn simulated_free_space_applies_only_to_a_throwaway_repository() {
+        let value = Some(std::ffi::OsStr::new("4096"));
+        let throwaway = tempfile::tempdir().unwrap();
+        assert_eq!(
+            simulated_available_bytes_from(value, throwaway.path()),
+            Some(4096)
+        );
+
+        let checkout = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        assert!(
+            !crate::host_state::path_is_ephemeral(checkout),
+            "this test needs a checkout outside the temporary directory"
+        );
+        assert_eq!(simulated_available_bytes_from(value, checkout), None);
+    }
+
+    #[test]
+    fn an_unset_or_unparsable_simulation_reads_the_real_disk() {
+        let throwaway = tempfile::tempdir().unwrap();
+        assert_eq!(simulated_available_bytes_from(None, throwaway.path()), None);
+        assert_eq!(
+            simulated_available_bytes_from(Some(std::ffi::OsStr::new("lots")), throwaway.path()),
+            None
+        );
     }
 
     #[test]

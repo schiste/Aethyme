@@ -10,6 +10,13 @@
 # `aethyme broker advanced trust`.
 AETHYME_TRUST_NONINTERACTIVE_FOR_TESTS = "1"
 
+# Test-only: the free space (1 TiB) the broker reads for a throwaway
+# repository under the system temp dir, so gate admission, the status
+# headroom row and worktree-root floors do not depend on this host's disk.
+# Ignored for any other repository. Tests of the low-disk paths set their own
+# value. See `aethyme_broker::TEST_AVAILABLE_BYTES_ENV`.
+AETHYME_TEST_AVAILABLE_BYTES = "1099511627776"
+
 # Dev/test builds: keep file:line backtraces for workspace crates but drop the
 # full DWARF that made `target/` several GiB per worktree. `profile.test`
 # inherits from `profile.dev`, so `cargo test` gets the same settings. The

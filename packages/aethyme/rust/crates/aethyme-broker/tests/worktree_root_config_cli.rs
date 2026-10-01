@@ -174,6 +174,26 @@ fn a_root_below_its_free_space_floor_falls_back() {
     fx.assert_default_with_reason(&started, "min_free_bytes");
 }
 
+/// The default floor is the gate headroom, read through the suite's simulated
+/// free space: a drive the test reports as nearly full falls back on any host.
+#[test]
+fn a_root_reported_nearly_full_falls_back_at_the_default_floor() {
+    let fx = fixture();
+    std::fs::create_dir_all(&fx.drive).unwrap();
+    fx.configure_root(&fx.drive);
+
+    let output = common::broker_cli(CLI, &["start", "--task", "drive is nearly full", "--json"])
+        .current_dir(&fx.repo)
+        .env("AETHYME_HOST_STATE_DIR", &fx.host)
+        .env_remove("AETHYME_WORKTREE_ROOT")
+        .env(aethyme_broker::TEST_AVAILABLE_BYTES_ENV, "1024")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let started: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    fx.assert_default_with_reason(&started, "min_free_bytes");
+}
+
 #[test]
 fn a_root_inside_the_repository_falls_back() {
     let fx = fixture();

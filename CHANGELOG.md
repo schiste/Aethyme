@@ -4,6 +4,59 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.14] - 2026-10-01
+
+Fresher coordination notes, quieter verify-only status, faster per-session reclaim.
+
+### Changed
+
+- The edit-time hook note now reflects each other live session's current change to the file being edited, read from its worktree, instead of the lease data recorded by the last broker command; a reverted change no longer warns. Results are cached per file stamp (#485).
+- In `verify-only` repositories, `broker status` and `status doctor` no longer show advice about the integration branch moving: `integration.may-move`, the integration drift rows, `main.external-writes` and the `wait-stable` hints. `integration.unpublished-work` still reports commits left on integration from before the switch. `auto` and `manual` repositories are unchanged (#483).
+- `gc reclaim plan --session` and `apply --session` scan only that session's worktree, so a session plan costs time in proportion to that worktree rather than to the whole worktree root, and `apply` no longer re-measures directory sizes. A confirmation digest now binds its scope: a session plan's digest is refused for a whole-root apply and the reverse. A session whose worktree is gone gets an empty plan instead of an error (#484).
+
+### Fixed
+
+- Tests no longer depend on the host's free disk space: every headroom decision reads one probe, which tests can simulate only for repositories under the system temp directory. Production headroom checks are unchanged (#482).
+
+## [0.8.13] - 2026-10-01
+
+Agents start on current main, catch up with one command, and coordinate instead of blocking each other.
+
+### Added
+
+- `broker start` fetches the default branch before choosing its base, so a new worktree starts from the remote tip; when the remote is unreachable it uses the cached copy and reports its age. `--reuse` and `--adopt` report how far the worktree has drifted (#473).
+- `aethyme broker sync --session <id>` brings a session up to the latest default branch when it is safe: clean tree, no simulated conflicts. It rebases an unpublished branch, merges into a published one, and on a conflict changes nothing and lists the paths (#473).
+- `broker start`, `--reuse` and `--adopt` show a short working agreement, configurable per repository with `[session] guidance` in `.aethyme/config.toml` (`[]` turns it off). The default asks for small targeted commits with explicit staging, one concern per PR, reuse of existing shared components, tests for behaviour changes, and nothing unintended committed or pushed (#474).
+- Through the agent hook, an agent about to edit a file another live session is changing gets a short note naming that session, its task, the lines it changed, whether Git would conflict, and the command to message it. Broker notes are delivered into the recipient's context at its next turn boundary (#477).
+- `start`, `adopt` and `push` warn when another live session works on the same branch or pull request; `status` adds `session.duplicate-work` and `session.mid-merge` rows (#475).
+
+### Changed
+
+- In `verify-only` repositories, lease overlaps never refuse `broker submit`; conflicting overlaps are reported as warnings with a coordination hint. `auto` and `manual` repositories still refuse a real conflict with an actively working session (#475).
+- `[leases]` rules are read from the configuration committed on the default branch, like `[promote]` and `[delivery]`, and an `ignore` entry containing `/` is an exact repository-relative path (#475).
+- CI runs the full workspace suite with cargo-nextest on pull requests and on main, with caches warmed from main (#466). The repository's `cargo-test` gate runs the whole workspace suite again, not only the example tests (#469).
+
+### Fixed
+
+- Worktree lock failures on a configured worktree root are reported instead of discarded (#472).
+- The build is restored after two changes added conflicting `GitRepo::operation_in_progress` methods (#476).
+
+## [0.8.12] - 2026-10-01
+
+Verify-only repositories stop using the integration branch, and worktrees can live on another drive.
+
+### Added
+
+- In `[promote] mode = "verify-only"` repositories, `broker submit` verifies against the fetched default branch instead of the integration branch, and `broker push` fetches the default branch and reports how far the session is behind it and whether merging it would conflict, with the command to catch up. `broker status` adds a per-session `session.behind-main` row and drops integration advice that no longer applies there. `auto` and `manual` repositories keep the integration branch (#462).
+- `[worktrees] root` in `.aethyme/config.toml` places new session worktrees under another directory, such as an external drive, read from the committed default branch like `[promote]`. The configured path is used only when it already exists, is writable, is outside the repository and has at least `worktrees.min_free_bytes` free (default: the 8 GiB a gate needs); otherwise worktrees go to the usual location and `broker start` reports why. Worktrees on an unplugged drive are reported unavailable and are never retired or removed (#465).
+- `broker status` reports a `host.gate-headroom` row when the volume where gates run is below the gate headroom, even when nothing is retained, and points to `gc plan` (#457).
+
+### Changed
+
+- `broker submit` defers instead of rejecting when a gate could not judge the change because of a host fault the broker observed itself (refused resources, a command that never started, its own timeout kill, a full disk). A deferred submit has its own status advice with recovery commands and exits with the environment exit code; a second timeout on the same tree is a verdict (#452).
+- Merge verification uses a pool of stable verification checkouts so independent submissions verify concurrently, and integration only moves by compare-and-swap from the verified base (#456).
+- `broker status` no longer starts one process per session to check liveness on macOS, and reads all session branch tips in one Git call: about half the wall time with nine live sessions (#455).
+
 ## [0.8.11] - 2026-09-30
 
 Push-early delivery, safer worktree cleanup, and quieter multi-agent coordination.

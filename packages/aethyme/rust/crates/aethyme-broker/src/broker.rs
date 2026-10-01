@@ -381,6 +381,10 @@ pub enum BrokerOpError {
     },
     #[error("session {session_id}'s branch {branch} does not exist in this repository")]
     SessionBranchMissing { session_id: i64, branch: String },
+    /// `broker sync` declined before changing anything: the worktree is
+    /// dirty or mid-operation, or there is no default branch to sync with.
+    #[error("broker sync refused: {reason}")]
+    SessionSyncRefused { reason: String },
     #[error("{recovery}")]
     CoordinatedOperationBlocked {
         repository: String,
@@ -719,6 +723,14 @@ pub struct AdoptReport {
     /// for the ordinary case (issue #145).
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub renamed_targets: Vec<crate::RenamedTarget>,
+    /// The session's head compared with the freshly fetched default branch:
+    /// how far it drifted while the worktree sat unused, and whether catching
+    /// up would conflict. Absent when there is no fetched default branch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_branch: Option<crate::DefaultBranchDrift>,
+    /// Why `default_branch` is missing or used the last fetched copy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_branch_note: Option<String>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -863,6 +875,18 @@ pub struct SessionStartBase {
     /// Absent when integration was used or does not exist.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bypassed_integration: Option<BypassedIntegration>,
+    /// Whether `start` refreshed the default branch from its remote before
+    /// settling on this base. `None` when no refresh was attempted, e.g. no
+    /// fetched default branch is configured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fetched: Option<bool>,
+    /// Why the refresh did not happen, when `fetched` is `false`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fetch_error: Option<String>,
+    /// How long ago the default branch's remote-tracking ref last moved,
+    /// when the refresh failed and the base came from that cached copy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cached_ref_age_seconds: Option<u64>,
 }
 
 /// Why a start cut from the fetched default branch instead of integration.
@@ -931,7 +955,8 @@ pub struct DoctorReport {
     pub purged_stale_leases: usize,
     /// Read-only retention candidates and any already-authorized recovery.
     pub retention: crate::GcHealth,
-    /// Present when live sessions can still submit and move integration.
+    /// Present when live sessions can still submit and move integration;
+    /// never in a verify-only repository.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub integration_movement: Option<IntegrationMovementNotice>,
     /// Committed work only this machine holds. Reported, never counted
@@ -1420,6 +1445,8 @@ struct SummaryIntegration {
     main_head: String,
     main_is_ancestor: bool,
     ahead_main_commits: u64,
+    /// False in a verify-only repository, where no session moves integration.
+    promotes: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -2862,6 +2889,29 @@ impl Broker {
         agent_identity: Option<&str>,
         context: SessionContext,
     ) -> Result<AdoptReport, BrokerOpError> {
+        let mut report = self.adopt_with_options_and_context_unrefreshed(
+            worktree,
+            task,
+            options,
+            agent_identity,
+            context,
+        )?;
+        // Refresh the default branch and say how far this checkout drifted
+        // while it sat unused -- the comparison `push` makes (#462).
+        let (drift, note) = self.reused_session_drift(&report.session);
+        report.default_branch = drift;
+        report.default_branch_note = note;
+        Ok(report)
+    }
+
+    fn adopt_with_options_and_context_unrefreshed(
+        &mut self,
+        worktree: &Path,
+        task: Option<&str>,
+        options: AdoptOptions,
+        agent_identity: Option<&str>,
+        context: SessionContext,
+    ) -> Result<AdoptReport, BrokerOpError> {
         let context = self.session_context(context);
         if options.sync_integration && options.mode != AdoptMode::Reuse {
             return Err(BrokerOpError::ReuseSyncRequiresReuse);
@@ -2935,6 +2985,8 @@ impl Broker {
                         integration_sync,
                         planned_explicit_leases,
                         preparation,
+                        default_branch: None,
+                        default_branch_note: None,
                     });
                 }
                 AdoptMode::ReplaceStale => {
@@ -3008,6 +3060,8 @@ impl Broker {
             planned_explicit_leases,
             preparation,
             renamed_targets,
+            default_branch: None,
+            default_branch_note: None,
         })
     }
 
@@ -3450,14 +3504,19 @@ impl Broker {
         let worktree_path = placement.root.join(&slug);
         self.refuse_nested_worktree_path(&worktree_path)?;
         let branch = format!("agent/{slug}");
-        let start_base = self.select_session_start_base(explicit_base)?;
+        let refresh = self.refresh_default_branch_before_start();
+        let mut start_base = self.select_session_start_base(explicit_base)?;
+        refresh.record(&mut start_base);
         let worktree = self
             .repo
             .worktree_add(&worktree_path, &branch, &start_base.commit)?;
         if placement.source == WorktreeRootSource::RepositoryConfig {
-            // Best effort: a lock only protects the registration while the
-            // drive is unplugged, and a failed lock must not fail the start.
-            let _ = self.repo.worktree_lock(&worktree_path);
+            // A failed lock must not fail the start, but it leaves the
+            // registration unprotected while the drive is unplugged, so say so.
+            crate::warn_unrecorded(
+                "lock the worktree on the configured root against pruning",
+                self.repo.worktree_lock(&worktree_path),
+            );
         }
         Ok((slug, branch, start_base, worktree, placement))
     }
@@ -3558,7 +3617,7 @@ impl Broker {
                 self.main_root.display()
             ));
         }
-        match crate::disk_headroom::available_bytes(base) {
+        match crate::disk_headroom::available_bytes_for(&self.main_root, base) {
             Some(free) if free < min_free_bytes => Some(format!(
                 "{} has {} free, below the {} required (worktrees.min_free_bytes)",
                 base.display(),
@@ -3893,7 +3952,9 @@ impl Broker {
     /// branch, and the bypassed integration is reported. Choosing integration
     /// whenever it existed cut sessions 2,101 commits behind upstream in one
     /// repository, where it had stopped moving three days earlier. Nothing here
-    /// fetches: the upstream is as fresh as the last fetch.
+    /// fetches: `create_session_worktree` refreshes the default branch just
+    /// before calling it (see `Broker::refresh_default_branch_before_start`),
+    /// so the fetched tip it reads is current unless that refresh failed.
     fn select_session_start_base(
         &self,
         explicit: Option<&str>,
@@ -3916,6 +3977,9 @@ impl Broker {
                 ahead_default_commits,
                 default_ref,
                 bypassed_integration: None,
+                fetched: None,
+                fetch_error: None,
+                cached_ref_age_seconds: None,
             });
         }
         let promote = PromoteConfig::load(&self.main_root);
@@ -3939,6 +4003,9 @@ impl Broker {
                 ahead_default_commits,
                 default_ref,
                 bypassed_integration: None,
+                fetched: None,
+                fetch_error: None,
+                cached_ref_age_seconds: None,
             });
         }
 
@@ -3972,6 +4039,9 @@ impl Broker {
                 ahead_default_commits: Some(0),
                 default_ref: Some(upstream_ref),
                 bypassed_integration,
+                fetched: None,
+                fetch_error: None,
+                cached_ref_age_seconds: None,
             });
         }
         // No fetched default branch: a promoting integration was taken above
@@ -3990,6 +4060,9 @@ impl Broker {
                     ahead_default_commits: None,
                     default_ref: None,
                     bypassed_integration: None,
+                    fetched: None,
+                    fetch_error: None,
+                    cached_ref_age_seconds: None,
                 });
             }
         }
@@ -4005,6 +4078,9 @@ impl Broker {
                 ahead_default_commits: None,
                 default_ref: None,
                 bypassed_integration: None,
+                fetched: None,
+                fetch_error: None,
+                cached_ref_age_seconds: None,
             }),
             (None, Some(commit)) => Ok(SessionStartBase {
                 ref_name: "refs/heads/master".into(),
@@ -4014,6 +4090,9 @@ impl Broker {
                 ahead_default_commits: None,
                 default_ref: None,
                 bypassed_integration: None,
+                fetched: None,
+                fetch_error: None,
+                cached_ref_age_seconds: None,
             }),
             (Some(_), Some(_)) => Err(BrokerOpError::StartBaseUnavailable {
                 reason: "both refs/heads/main and refs/heads/master exist, but origin/HEAD does not select one".into(),
@@ -4772,6 +4851,14 @@ impl Broker {
         conflicting_leases
             .dedup_by(|a, b| a.session_id == b.session_id && a.path == b.path && a.kind == b.kind);
         let mut warned_leases = Vec::new();
+        // Under verify-only a submit promotes nothing: each session delivers
+        // through its own pull request, so a conflict is resolved when one of
+        // them merges, and refusing here only stalls an agent. The overlap is
+        // still reported, with how to coordinate. `auto` and `manual` keep
+        // the block because they promote onto a shared integration branch.
+        let verify_only = block_only_on_conflicts
+            && crate::merge::PromoteConfig::load(&self.main_root).mode
+                == crate::merge::PromoteMode::VerifyOnly;
         if block_only_on_conflicts && !conflicting_leases.is_empty() {
             let active: std::collections::HashSet<i64> = self
                 .agents(crate::clock::epoch_ms())?
@@ -4794,13 +4881,22 @@ impl Broker {
                     );
                     let holder_active = active.contains(&blocker.session_id);
                     blocker.reason = Some(match (conflicting, holder_active) {
+                        (true, true) if verify_only => format!(
+                            "the holder is actively working and Git reports a conflict with this \
+                             session's edits; this repository delivers through pull requests \
+                             (verify-only), so the conflict is resolved when one of them merges. \
+                             Coordinate: aethyme broker advanced note send --session {session_id} \
+                             --to-session {} --message \"<who lands the shared change first>\", \
+                             or follow the shared-edit advice in aethyme broker status",
+                            blocker.session_id
+                        ),
                         (true, true) => "the holder is actively working and Git reports a conflict with this session's edits".into(),
                         (true, false) => "Git reports a conflict, but the holder is not actively working".into(),
                         (false, _) => pair
                             .map(|pair| pair.reason)
                             .unwrap_or_else(|| "the holder has not edited this path".into()),
                     });
-                    (blocker, conflicting && holder_active)
+                    (blocker, conflicting && holder_active && !verify_only)
                 })
                 .partition(|(_, blocks)| *blocks);
             conflicting_leases = block.into_iter().map(|(blocker, _)| blocker).collect();
@@ -6340,6 +6436,12 @@ impl Broker {
         (integration_branch, integration_head): (String, String),
         now_ms: i64,
     ) -> Result<StatusView, BrokerOpError> {
+        // In a verify-only repository nothing moves integration: submit
+        // verifies against the default branch and sessions start from it. Every
+        // row below that tells an agent integration may move, has drifted, or
+        // needs reconciling is noise there (and some of it is `blocked`), so
+        // the mode is read once and gates all of them.
+        let promotes = PromoteConfig::load(&self.main_root).mode.promotes_at_all();
         let promoted_conflicts = self.promoted_conflicts()?;
         // Declared intent, not yet visible in any diff. Read from the same
         // snapshot as the leases above so both halves of "who else is working
@@ -6411,6 +6513,7 @@ impl Broker {
                 ahead_main_commits: self
                     .repo
                     .commit_count_between(&main_head, &integration_head)?,
+                promotes,
             },
         );
         let mut advice = self.status_advice(
@@ -6419,6 +6522,7 @@ impl Broker {
             &latest_live_queue,
             &integration_branch,
             &integration_head,
+            promotes,
         );
         let integration_contains_upstream = upstream_head
             .as_deref()
@@ -6429,7 +6533,8 @@ impl Broker {
                 .ok(),
             _ => None,
         };
-        if upstream_head.is_some()
+        if promotes
+            && upstream_head.is_some()
             && (main_behind_upstream_commits > 0 || !integration_contains_upstream)
         {
             let upstream = upstream_ref.as_deref().unwrap_or("@{upstream}");
@@ -6512,7 +6617,12 @@ impl Broker {
                 },
                 );
         }
-        if let Some((branch, commits)) = self.external_default_branch_writes(&integration_head) {
+        // "Never passed through submit" is every commit under verify-only,
+        // where landing goes through pull requests and integration stays put.
+        if let Some((branch, commits)) = promotes
+            .then(|| self.external_default_branch_writes(&integration_head))
+            .flatten()
+        {
             let count = commits.len();
             advice.push(StatusAdvice {
                 id: "main.external-writes",
@@ -6865,13 +6975,15 @@ impl Broker {
         // A status that cannot read refs still reports everything else; the
         // unpushed count is context, not a precondition for any command.
         let unpushed_work = self.unpushed_work(now_ms).unwrap_or_default();
-        let verify_only =
-            PromoteConfig::load(&self.main_root).mode == crate::merge::PromoteMode::VerifyOnly;
-        advice.extend(unpushed_work_advice(&unpushed_work, now_ms, verify_only));
+        advice.extend(unpushed_work_advice(&unpushed_work, now_ms, !promotes));
         advice.extend(self.integration_behind_upstream_advice());
         advice.extend(overlap_pair_advice(&overlap_pairs));
         // Cached listing and local refs only: `status` never calls GitHub.
         advice.extend(self.pr_overlap_advice(now_ms));
+        // Several sessions on one PR conflict by construction; name it.
+        advice.extend(self.duplicate_work_advice(&agents));
+        // A worktree stuck mid-merge cannot be classified or submitted.
+        advice.extend(crate::overlap_pairs::mid_operation_advice(&agents));
         // The default branch moving under a session: last fetched copy only.
         advice.extend(self.behind_main_advice());
         // Two sessions on one target: landing the shared edit first keeps
@@ -7369,6 +7481,7 @@ impl Broker {
         queue: &[MergeQueueEntry],
         integration_branch: &str,
         integration_head: &str,
+        promotes: bool,
     ) -> Vec<StatusAdvice> {
         use std::collections::BTreeMap;
 
@@ -7447,7 +7560,7 @@ impl Broker {
             }
         }
 
-        if !agents.is_empty() {
+        if promotes && !agents.is_empty() {
             advice.push(integration_movement_advice(
                 integration_branch,
                 integration_head,
@@ -7606,7 +7719,9 @@ impl Broker {
         &mut self,
         sessions: &[Session],
     ) -> Result<Option<IntegrationMovementNotice>, BrokerOpError> {
-        if sessions.is_empty() {
+        // Verify-only: sessions never submit into integration, so there is no
+        // movement to wait out.
+        if sessions.is_empty() || !PromoteConfig::load(&self.main_root).mode.promotes_at_all() {
             return Ok(None);
         }
         let (branch, head) = self.integration_head()?;
@@ -9765,7 +9880,9 @@ impl Broker {
         } else {
             probes
         };
-        lowest_available(&probes)
+        lowest_available_with(&probes, |probe| {
+            crate::disk_headroom::available_bytes_at_or_above_for(&self.main_root, probe)
+        })
     }
 
     /// Remove a session's worktree and mark it cleaned. Refuses when the
@@ -10180,14 +10297,10 @@ fn dirty_session_count(agents: &[AgentView]) -> usize {
         .count()
 }
 
-/// The probe with the least free space, read at its nearest existing directory.
-fn lowest_available(probes: &[PathBuf]) -> Option<(PathBuf, u64)> {
-    lowest_available_with(probes, crate::disk_headroom::available_bytes_at_or_above)
-}
-
-/// [`lowest_available`] with the reading supplied, so a test can put two
-/// probes on volumes with different free space. Unreadable probes are skipped:
-/// an unknown reading is not evidence of a full disk.
+/// The probe with the least free space, read by `read` -- in production at
+/// its nearest existing directory, and a test can put two probes on volumes
+/// with different free space. Unreadable probes are skipped: an unknown
+/// reading is not evidence of a full disk.
 fn lowest_available_with(
     probes: &[PathBuf],
     read: impl Fn(&Path) -> Option<u64>,
@@ -10462,7 +10575,7 @@ fn status_summary(
         .iter()
         .filter(|agent| agent.derived_status == SessionStatus::Stale)
         .count();
-    let may_move_integration = live_sessions > 0;
+    let may_move_integration = integration.promotes && live_sessions > 0;
 
     let sessions = session_summary_phrase(
         live_sessions,
@@ -10480,7 +10593,9 @@ fn status_summary(
             plural_word(dirty_sessions, "session", "sessions")
         ));
     }
-    notes.push(if active_sessions > 0 {
+    notes.push(if !integration.promotes {
+        "verify-only: submit does not move integration".to_string()
+    } else if active_sessions > 0 {
         "active session may promote new integration work".to_string()
     } else if live_sessions > 0 {
         "live session may promote new integration work".to_string()
@@ -10492,7 +10607,7 @@ fn status_summary(
     if may_move_integration {
         commands.push("aethyme broker advanced integration wait-stable --seconds 30".into());
     }
-    if integration.relation != StatusIntegrationRelation::CurrentWithMain {
+    if integration.promotes && integration.relation != StatusIntegrationRelation::CurrentWithMain {
         commands.push("aethyme broker advanced integration status".into());
     }
 
@@ -11655,6 +11770,7 @@ mod tests {
             main_head: "a".repeat(40),
             main_is_ancestor: true,
             ahead_main_commits: 0,
+            promotes: true,
         }
     }
 
@@ -11775,6 +11891,43 @@ mod tests {
             summary.commands,
             vec!["aethyme broker advanced integration wait-stable --seconds 30"]
         );
+    }
+
+    /// Verify-only: live sessions submit, but nothing they do moves
+    /// integration, so neither the flag nor the commands may say it can.
+    #[test]
+    fn verify_only_summary_does_not_say_sessions_move_integration() {
+        let agent = super::AgentView {
+            session: session(71),
+            activity_at: 0,
+            derived_status: SessionStatus::Active,
+            pid_alive: None,
+        };
+        let integration = super::SummaryIntegration {
+            relation: super::StatusIntegrationRelation::AheadOfMain,
+            ahead_baseline_commits: 3,
+            promotes: false,
+            ..current_summary_integration()
+        };
+
+        let summary = super::status_summary(
+            &[agent],
+            0,
+            super::OverlapPairCounts::default(),
+            0,
+            0,
+            &integration,
+        );
+
+        assert!(!summary.may_move_integration);
+        assert!(
+            summary
+                .message
+                .ends_with("; verify-only: submit does not move integration"),
+            "{}",
+            summary.message
+        );
+        assert!(summary.commands.is_empty(), "{:?}", summary.commands);
     }
 
     #[test]

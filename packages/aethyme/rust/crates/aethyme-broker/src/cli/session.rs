@@ -67,6 +67,46 @@ struct SessionActionOutput<'a, T: serde::Serialize> {
     #[serde(flatten)]
     report: &'a T,
     tab_rename: &'a crate::chau7_mcp::SessionTabRename,
+    /// The repository's working agreement; set by `start`, `--reuse` and
+    /// `--adopt`, the moments an agent is about to begin work.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    guidance: Option<&'a [String]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    guidance_source: Option<crate::session_guidance::GuidanceSource>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    guidance_warning: Option<&'a str>,
+    /// Other sessions that look like the same work; omitted when none.
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    duplicate_work: &'a [crate::DuplicateWork],
+}
+
+/// One warning line per other session that looks like the same work.
+fn render_duplicate_work(session_id: i64, duplicates: &[crate::DuplicateWork]) {
+    for duplicate in duplicates {
+        let target = match (duplicate.reason, duplicate.pull_request) {
+            (crate::DuplicateWorkReason::SameBranch, _) => "the same branch".to_string(),
+            (_, Some(pr)) => format!("PR #{pr}"),
+            (_, None) => "the same pull request".to_string(),
+        };
+        out!(
+            "warning: session {} ({}) also works on {target}{}: {}",
+            duplicate.session_id,
+            duplicate.status.as_str(),
+            if duplicate.reason == crate::DuplicateWorkReason::TaskMentionsPr {
+                " (named in its task)"
+            } else {
+                ""
+            },
+            duplicate.task.as_deref().unwrap_or("(no task)")
+        );
+    }
+    if let Some(first) = duplicates.first() {
+        out!(
+            "         coordinate first: aethyme broker advanced note send --session {session_id} \
+             --to-session {} --message \"<who continues, who stops>\"",
+            first.session_id
+        );
+    }
 }
 
 fn render_tab_rename(outcome: &crate::chau7_mcp::SessionTabRename) {
@@ -86,8 +126,32 @@ fn render_tab_rename(outcome: &crate::chau7_mcp::SessionTabRename) {
 fn session_action_json<T: serde::Serialize>(
     report: &T,
     tab_rename: &crate::chau7_mcp::SessionTabRename,
+    guidance: Option<&crate::session_guidance::SessionGuidance>,
+    duplicate_work: &[crate::DuplicateWork],
 ) -> Result<String, serde_json::Error> {
-    serde_json::to_string_pretty(&SessionActionOutput { report, tab_rename })
+    serde_json::to_string_pretty(&SessionActionOutput {
+        report,
+        tab_rename,
+        guidance: guidance.map(|guidance| guidance.lines.as_slice()),
+        guidance_source: guidance.map(|guidance| guidance.source),
+        guidance_warning: guidance.and_then(|guidance| guidance.warning.as_deref()),
+        duplicate_work,
+    })
+}
+
+/// The working agreement, as a compact numbered block. A disabled agreement
+/// prints nothing; an ignored configuration prints why.
+fn render_guidance(guidance: &crate::session_guidance::SessionGuidance) {
+    if let Some(warning) = &guidance.warning {
+        out!("warning: {warning}");
+    }
+    if guidance.lines.is_empty() {
+        return;
+    }
+    out!("Working agreement:");
+    for (index, line) in guidance.lines.iter().enumerate() {
+        out!("  {}. {line}", index + 1);
+    }
 }
 
 /// The base a session's branch was cut from, and what that base carries
@@ -97,6 +161,15 @@ fn session_action_json<T: serde::Serialize>(
 /// pull requests from it. `start-agent` is the detached case, where nobody is
 /// watching the terminal -- which is exactly why it cannot be the one surface
 /// that stays silent about an inherited gap (#290).
+fn human_age(seconds: u64) -> String {
+    match seconds {
+        0..=89 => format!("{seconds}s"),
+        90..=5_399 => format!("{}m", seconds / 60),
+        5_400..=172_799 => format!("{}h", seconds / 3_600),
+        _ => format!("{}d", seconds / 86_400),
+    }
+}
+
 pub(super) fn render_start_base(base: &crate::SessionStartBase) {
     out!(
         "Start base: {} at {} ({})",
@@ -105,6 +178,17 @@ pub(super) fn render_start_base(base: &crate::SessionStartBase) {
         base.evidence.as_str()
     );
     let default_ref = || base.default_ref.as_deref().unwrap_or("the default branch");
+    if base.fetched == Some(false) {
+        let age = base
+            .cached_ref_age_seconds
+            .map(|seconds| format!(", last fetched {} ago", human_age(seconds)))
+            .unwrap_or_default();
+        out!(
+            "note: could not refresh {} ({}){age}; the session starts from that cached copy",
+            default_ref(),
+            base.fetch_error.as_deref().unwrap_or("fetch failed")
+        );
+    }
     if let Some(bypassed) = &base.bypassed_integration {
         let counts = format!(
             "{} commit(s) behind and {} ahead",
@@ -828,6 +912,7 @@ pub(super) fn run_adopt(parsed: Parsed) -> Result<(), UsageError> {
         );
         out!("  port this session's changes onto the new path before submitting");
     }
+    let guidance = crate::session_guidance::load(broker.main_root());
     let session = &report.session;
     if parsed.json {
         // Scope is recorded in both output modes: `--json` is the form
@@ -839,7 +924,11 @@ pub(super) fn run_adopt(parsed: Parsed) -> Result<(), UsageError> {
             &parsed.declared_scopes,
             true,
         )?;
-        out!("{}", session_action_json(&report, &tab_rename)?);
+        let duplicates = broker.duplicate_work_for(session);
+        out!(
+            "{}",
+            session_action_json(&report, &tab_rename, Some(&guidance), &duplicates)?
+        );
     } else {
         match report.outcome {
             crate::AdoptOutcome::Created => out!(
@@ -862,6 +951,33 @@ pub(super) fn run_adopt(parsed: Parsed) -> Result<(), UsageError> {
             ),
         }
         render_tab_rename(&tab_rename);
+        if let Some(drift) = &report.default_branch
+            && drift.behind > 0
+        {
+            out!(
+                "{}: this worktree is {} commit(s) behind {}{}; catch up with \
+                 `aethyme broker sync --session {}`",
+                if drift.would_conflict {
+                    "warning"
+                } else {
+                    "note"
+                },
+                drift.behind,
+                drift.reference,
+                if drift.would_conflict {
+                    format!(
+                        " and catching up would conflict in {}",
+                        drift.conflicting_paths.join(", ")
+                    )
+                } else {
+                    String::new()
+                },
+                session.id
+            );
+        }
+        if let Some(note) = &report.default_branch_note {
+            out!("note: {note}");
+        }
         capture_declared_scopes(
             &mut broker,
             session.id,
@@ -937,11 +1053,13 @@ pub(super) fn run_adopt(parsed: Parsed) -> Result<(), UsageError> {
             }
             out!("Safe next action: {}", drift.safe_next_action);
         }
+        render_guidance(&guidance);
         render_planned_explicit_leases(&report.planned_explicit_leases);
         render_preparation_status(&report.preparation, false)?;
         if let Some(line) = broker.pr_overlap_heads_up(session) {
             out!("{line}");
         }
+        render_duplicate_work(session.id, &broker.duplicate_work_for(session));
     }
     Ok(())
 }
@@ -971,6 +1089,7 @@ pub(super) fn run_start(parsed: Parsed) -> Result<(), UsageError> {
             .file_name()
             .and_then(|name| name.to_str()),
     );
+    let guidance = crate::session_guidance::load(broker.main_root());
     let session = &report.session;
     if parsed.json {
         capture_declared_scopes(
@@ -980,7 +1099,11 @@ pub(super) fn run_start(parsed: Parsed) -> Result<(), UsageError> {
             &parsed.declared_scopes,
             true,
         )?;
-        out!("{}", session_action_json(&report, &tab_rename)?);
+        let duplicates = broker.duplicate_work_for(session);
+        out!(
+            "{}",
+            session_action_json(&report, &tab_rename, Some(&guidance), &duplicates)?
+        );
     } else {
         out!(
             "Started session {} — worktree {} on branch {}",
@@ -998,11 +1121,13 @@ pub(super) fn run_start(parsed: Parsed) -> Result<(), UsageError> {
         )?;
         render_start_base(&report.start_base);
         render_worktree_placement(&report.worktree_placement);
+        render_guidance(&guidance);
         render_planned_explicit_leases(&report.planned_explicit_leases);
         render_preparation_status(&report.preparation, false)?;
         if let Some(line) = broker.pr_overlap_heads_up(session) {
             out!("{line}");
         }
+        render_duplicate_work(session.id, &broker.duplicate_work_for(session));
         out!("Worktree: cd {}", session.worktree_path);
     }
     Ok(())
@@ -1038,7 +1163,11 @@ pub(super) fn run_start_agent(parsed: Parsed) -> Result<(), UsageError> {
     );
     let session = &report.session;
     if parsed.json {
-        out!("{}", session_action_json(&report, &tab_rename)?);
+        let duplicates = broker.duplicate_work_for(session);
+        out!(
+            "{}",
+            session_action_json(&report, &tab_rename, None, &duplicates)?
+        );
     } else {
         out!(
             "Started session {} (pid {}) — worktree {} on branch {}\nLog: {}",
@@ -1051,6 +1180,7 @@ pub(super) fn run_start_agent(parsed: Parsed) -> Result<(), UsageError> {
         render_tab_rename(&tab_rename);
         render_start_base(&report.start_base);
         render_worktree_placement(&report.worktree_placement);
+        render_duplicate_work(session.id, &broker.duplicate_work_for(session));
     }
     Ok(())
 }
