@@ -276,18 +276,16 @@ impl crate::Broker {
             return Ok(report);
         }
         let applied = match catch_up {
-            CatchUp::Rebase => worktree.rebase_onto(&default_commit).map_err(|error| {
+            CatchUp::Rebase => worktree.rebase_onto(&default_commit).inspect_err(|_| {
                 crate::warn_unrecorded("abort a failed sync rebase", worktree.abort_rebase());
-                error
             }),
             CatchUp::Merge => worktree
                 .merge_commit_no_edit(
                     &default_commit,
                     &format!("Merge {default_ref} into {}", session.branch),
                 )
-                .map_err(|error| {
+                .inspect_err(|_| {
                     crate::warn_unrecorded("abort a failed sync merge", worktree.abort_merge());
-                    error
                 }),
         };
         applied?;
