@@ -89,6 +89,12 @@ blocked.
    `aethyme broker finish` refuses to close a session while its commits are
    unpushed. If the work should genuinely not be kept, say so explicitly with
    `aethyme broker finish --session <id> --abandon --reason "<why>"`.
+   Each push also fetches the default branch and reports how far your branch
+   is behind it and whether merging would conflict, with the command to catch
+   up; `broker status` shows the same as `session.behind-main`. Catch up when
+   it warns, before the pull request reports the conflict. In a repository
+   with `[promote] mode = "verify-only"`, `broker submit` is a pre-flight
+   against the current default branch; the integration branch is not used.
    When `broker status` shows `coordination.land-shared-edit-first`, another
    session changes the same lines or symbol as yours: follow it -- the named
    session lands only the shared edit as its own small PR, then both rebase
