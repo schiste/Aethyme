@@ -36,6 +36,10 @@ pub const PUBLIC_VERBS: &[(&str, &str)] = &[
         "publish this session's own branch as you work; --pr opens a draft PR",
     ),
     (
+        "sync",
+        "catch this session up to the latest default branch when it is safe",
+    ),
+    (
         "finish",
         "close sessions; reclaim ignored build output or clean up retained checkouts",
     ),

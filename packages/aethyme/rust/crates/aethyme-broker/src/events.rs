@@ -40,6 +40,8 @@ pub const BROKER_CLEANUP_ARCHIVED: &str = "broker.cleanup.archived";
 pub const BROKER_GC_RECOVERY_ARCHIVE_REMOVED: &str = "broker.gc.recovery-archive-removed";
 /// `broker push` published a session's own branch (and maybe opened a draft PR).
 pub const BROKER_SESSION_PUSHED: &str = "broker.session.pushed";
+/// `broker sync` rebased or merged a session onto the default branch.
+pub const BROKER_SESSION_SYNCED: &str = "broker.session.synced";
 /// A session was closed with committed work no remote holds, on an explicit
 /// `--abandon --reason` under the push lane.
 pub const BROKER_SESSION_ABANDONED_UNPUSHED: &str = "broker.session.abandoned_unpushed";

@@ -301,6 +301,19 @@ impl Broker {
         serde_json::from_str(&text).ok()
     }
 
+    /// Open PR numbers by head branch, from the cached listing only.
+    pub(crate) fn cached_open_prs_by_head(&self) -> BTreeMap<String, i64> {
+        self.cached_listing()
+            .map(|listing| {
+                listing
+                    .prs
+                    .into_iter()
+                    .map(|pr| (pr.head, pr.number))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     fn cached_ranges(&self, pr: &OpenPr) -> Option<FileRanges> {
         let head_oid = pr.head_oid.as_deref()?;
         let text = self.store_ref().meta_get(&ranges_key(pr.number)).ok()??;

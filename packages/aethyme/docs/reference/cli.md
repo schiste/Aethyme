@@ -668,6 +668,8 @@ continues to expose the complete local `log_path` without embedding log data.
 - `aethyme broker advanced leases export (--session <id> | --entry <id>) [--limit <n>] [--json]`
 - `aethyme broker submit --session <id> [--no-cache] [--json]`
 - `aethyme broker push --session <id> [--pr] [--json]` — publish the session's own `agent/*` branch to the default branch's remote (and nothing else); `--pr` opens a draft pull request when none is open. Authorized by `[delivery] push_session_branches = true` in `.aethyme/config.toml` on the default branch; a fast-forward is pushed plainly, a rewritten branch only under a lease on the oid this broker last pushed for the session. It reports what it left behind the way `git status` shows it: changed tracked paths, and each untracked directory as one entry (JSON `uncommitted.modified`, `uncommitted.untracked_entries`, `uncommitted.sample`). After pushing it compares the session's change with the repository's open pull requests and reports `pr_overlaps` (see [Overlap with open pull requests](#overlap-with-open-pull-requests)), then fetches exactly the default branch and reports `default_branch` (`reference`, `commit`, `head`, `behind`, `ahead`, `would_conflict`, `conflicting_paths` (up to five), `suggested_command`) from a `git merge-tree` simulation; a failed fetch compares the last fetched copy and sets `default_branch_note`. Neither ever fails the push. In a `[promote] mode = "verify-only"` repository, `broker submit` simulates and gates against the fetched default branch instead of the integration branch and reports the base as `verified_against` (`source`, `reference`, `commit`, `fallback_reason`); see [broker workflows](../guides/broker-workflows.md).
+- `aethyme broker sync --session <id> [--json]` — bring a live session up to the default branch, fetched first, when that is safe. It refuses (exit code for refusals, nothing changed) a dirty tree (each untracked directory counts as one entry, ignored files never count), a rebase, merge, cherry-pick or revert already in progress, a closed session, or a repository without a fetched default branch. It simulates the catch-up with `git merge-tree`: when that would conflict it changes nothing, lists up to five conflicting paths and the manual commands, and exits with the refusal code; otherwise it rebases an unpublished branch onto the default branch, or merges the default branch into a published one (a branch already on the remote), so a pull request's history is never rewritten. JSON: `session_id`, `branch`, `outcome` (`already_current`, `synced`, `conflict`), `strategy` (`rebase`, `merge`, `none`), `before`, `after`, `default_ref`, `default_commit`, `behind_before`, `ahead`, `conflicts`, `fetched`, optional `fetch_note` and `manual_commands`. Emits `broker.session.synced` when it changes the branch.
+- `broker start` fetches exactly the default branch from its remote (one ref, at most ten seconds) before choosing the base, so a new worktree starts from the remote's tip. `start_base` gains `fetched`, `fetch_error` and, when the fetch failed and the base came from the cached copy, `cached_ref_age_seconds` (how long ago that copy last moved). `start --reuse` and `start --adopt` refresh it too and report `default_branch` / `default_branch_note`, the comparison `push` makes.
 - `aethyme broker advanced repair --session <id> [--json]`
 - `aethyme broker finish --session <id> [--keep-worktree] [--abandon --reason <why>] [--json]`
 - `aethyme broker advanced representation scan --session <id> [--json]`
@@ -1228,6 +1230,40 @@ against the default branch, excluding the session's own:
 `status`, `start` and `adopt` read only the cached listing and local refs; they
 never call GitHub, and ignore a listing older than a day. Nothing here blocks a
 command or writes to GitHub.
+
+### Duplicate work and sessions stuck mid-merge
+
+Several live sessions repairing one pull request conflict with each other by
+construction. The broker names that, from local facts only, and never blocks:
+
+- **Duplicate work:** `broker start`, `start-agent`, `adopt` (including
+  `--reuse`) and `broker push` report other sessions that work on the same
+  branch (`same_branch`), on the open PR whose head is the other session's
+  branch (`same_pr`, from the listing `broker push` caches), or whose task text
+  names the same PR number (`task_mentions_pr`: `PR #1122`, `PR1122`,
+  `pr-1122`, `pull request 1122` or `#1122`). JSON gains `duplicate_work`
+  (`session_id`, `status`, `task`, `reason`, `pull_request`), omitted when
+  empty. `broker status` adds one `session.duplicate-work` row per pair:
+  `warning` when both sessions are active or idle, `info` when one has gone
+  quiet. Its commands are a coordination note and `broker finish`.
+- **Mid-merge worktrees:** a session whose worktree is part-way through a
+  merge, rebase, cherry-pick or revert, or holds unresolved conflicts, is not
+  merge-simulated. Its overlap pairs stay `classified: false` with the reason
+  `session <id> is mid-<operation> with unresolved conflicts`, and `broker
+  status` adds a `session.mid-merge` warning with `git status`,
+  `--continue` and `--abort` commands. The check reads the worktree's Git
+  directory and runs no Git command.
+- **Verify-only submit:** in a `[promote] mode = "verify-only"` repository, a
+  conflicting explicit lease held by an active session no longer fails the
+  submit ownership audit. It is reported in `lease_warnings` with the
+  coordination command, and submit continues to the gates. `auto` and
+  `manual` repositories still refuse, because they promote onto a shared
+  integration branch. `broker advanced exec`'s guard is unchanged.
+- **`[leases] ignore`:** an entry ending in `/` is a directory prefix, an entry
+  containing `/` is an exact repository-relative path, and any other entry is
+  a file name matched in every directory. The rules are read from
+  `.aethyme/config.toml` as committed on the fetched default branch, else the
+  main checkout's file, like `[promote]`.
 
 Work that reaches the default branch through a reviewed pull request is
 delivered, but leaves no promoted queue entry, and a squash merge rewrites the

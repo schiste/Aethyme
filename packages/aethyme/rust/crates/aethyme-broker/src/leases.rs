@@ -71,24 +71,33 @@ const DEFAULT_IGNORED_FILENAMES: &[&str] = &[
 const DEFAULT_IGNORED_PREFIXES: &[&str] = &[".aethyme/", "node_modules/", "dist/", "build/"];
 
 /// Ignore rules applied before paths become implicit leases. Extra
-/// entries come from `.aethyme/config.toml` (`[leases] ignore = [...]`,
-/// entries ending in `/` are prefixes).
+/// entries come from `.aethyme/config.toml` (`[leases] ignore = [...]`): an
+/// entry ending in `/` is a directory prefix, an entry containing `/` is an
+/// exact repository-relative path, and any other entry is a file name that
+/// matches in every directory.
 #[derive(Debug, Clone, Default)]
 pub struct LeaseIgnoreRules {
     extra_filenames: Vec<String>,
     extra_prefixes: Vec<String>,
+    extra_paths: Vec<String>,
 }
 
 impl LeaseIgnoreRules {
-    /// Load extra rules from `<main_root>/.aethyme/config.toml`. Missing
-    /// or unparseable config degrades to the defaults — ignore rules must
-    /// never make the broker unusable.
+    /// Load extra rules from the repository's `.aethyme/config.toml`, read
+    /// like `[promote]` and `[delivery]`: as committed on the fetched default
+    /// branch, else the main checkout's file. So a merged rule takes effect
+    /// without anyone pulling the main checkout. Missing or unparseable
+    /// config degrades to the defaults — ignore rules must never make the
+    /// broker unusable.
     pub fn load(main_root: &Path) -> Self {
+        crate::merge::repository_config_text(main_root)
+            .map(|text| Self::from_config_text(&text))
+            .unwrap_or_default()
+    }
+
+    /// Parse `[leases] ignore` from a config file's text.
+    pub fn from_config_text(text: &str) -> Self {
         let mut rules = Self::default();
-        let path = main_root.join(".aethyme/config.toml");
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            return rules;
-        };
         let Ok(value) = text.parse::<toml::Value>() else {
             return rules;
         };
@@ -100,6 +109,10 @@ impl LeaseIgnoreRules {
             for entry in entries.iter().filter_map(|entry| entry.as_str()) {
                 if let Some(prefix) = entry.strip_suffix('/') {
                     rules.extra_prefixes.push(format!("{prefix}/"));
+                } else if entry.contains('/') {
+                    rules
+                        .extra_paths
+                        .push(entry.trim_start_matches("./").to_string());
                 } else {
                     rules.extra_filenames.push(entry.to_string());
                 }
@@ -112,6 +125,7 @@ impl LeaseIgnoreRules {
         let filename = repo_relative.rsplit('/').next().unwrap_or(repo_relative);
         if DEFAULT_IGNORED_FILENAMES.contains(&filename)
             || self.extra_filenames.iter().any(|f| f == filename)
+            || self.extra_paths.iter().any(|path| path == repo_relative)
         {
             return true;
         }
@@ -183,6 +197,21 @@ pub fn detect_overlaps(leases: &[Lease]) -> Vec<Overlap> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Mockup's generated files conflict in every pair of sessions that
+    /// touches the design system: they must be ignorable by exact path,
+    /// without ignoring every same-named file elsewhere.
+    #[test]
+    fn ignore_entries_are_prefixes_exact_paths_or_file_names() {
+        let rules = LeaseIgnoreRules::from_config_text(
+            "[leases]\nignore = [\"backend/core/generated/\", \"config/design-system-export.json\", \"i18n-cdn-manifest.json\"]\n",
+        );
+        assert!(rules.is_ignored("backend/core/generated/design-system-manifest.json"));
+        assert!(rules.is_ignored("config/design-system-export.json"));
+        assert!(!rules.is_ignored("other/design-system-export.json"));
+        assert!(rules.is_ignored("public/i18n-cdn-manifest.json"));
+        assert!(!rules.is_ignored("config/design-system-manifest.json"));
+    }
     use crate::types::LeaseKind;
 
     fn lease(session_id: i64, path: &str) -> Lease {
