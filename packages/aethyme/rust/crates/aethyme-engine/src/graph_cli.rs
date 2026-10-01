@@ -54,6 +54,19 @@ fn usage_line(subcommand: &str) -> String {
     }
 }
 
+/// Per-subcommand help for `aethyme graph <subcommand> --help`.
+fn graph_help() -> String {
+    let mut out = String::from("aethyme graph — repository graph lifecycle and navigation\n\n");
+    for subcommand in NAVIGATION_SUBCOMMANDS {
+        out.push_str(&format!("  {}\n", usage_line(subcommand)));
+    }
+    out.push_str(
+        "\nLifecycle subcommands (status, units, materialize, refresh, impact) are \
+         documented by `aethyme graph --help`.\n",
+    );
+    out
+}
+
 /// Require the target positional for subcommands that take one.
 fn require_target<'a>(subcommand: &str, target: Option<&'a str>) -> Result<&'a str, CliError> {
     target.ok_or_else(|| CliError::usage(usage_line(subcommand)))
@@ -61,6 +74,15 @@ fn require_target<'a>(subcommand: &str, target: Option<&'a str>) -> Result<&'a s
 
 /// Run `graph <subcommand> ...`. `args` excludes the leading `graph`.
 pub fn run(args: &[String]) -> Result<(), CliError> {
+    // `--help` must succeed on every subcommand, so it is handled here
+    // rather than by the strict flag parser below. Without this,
+    // `aethyme graph node --help` is an unknown-flag usage error and the
+    // help contract breaks.
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        print!("{}", graph_help());
+        return Ok(());
+    }
+
     let Some(subcommand) = args.first() else {
         return Err(CliError::usage(format!(
             "missing graph subcommand\nnavigation: {}\nlifecycle: status | units | materialize | refresh | impact",
@@ -590,6 +612,40 @@ pub(crate) fn object_key_order(raw: &str, field: &str) -> Vec<String> {
         i += 1;
     }
     keys
+}
+
+/// Regression: the strict flag parser rejects unknown flags, so
+/// `aethyme graph node --help` became an unknown-flag usage error unless
+/// help is short-circuited first. `help_everywhere` covers this across
+/// every command, but it is slow enough that a regression here can slip
+/// through review; this pins the graph front end specifically.
+#[cfg(test)]
+mod help_flag_tests {
+    use super::run;
+
+    fn help_exits_zero(args: &[&str]) {
+        let owned: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
+        assert!(
+            run(&owned).is_ok(),
+            "`aethyme graph {} --help` must succeed",
+            owned.join(" ")
+        );
+    }
+
+    #[test]
+    fn every_navigation_subcommand_accepts_help() {
+        for subcommand in super::NAVIGATION_SUBCOMMANDS {
+            help_exits_zero(&[subcommand, "--help"]);
+            help_exits_zero(&[subcommand, "-h"]);
+        }
+    }
+
+    #[test]
+    fn help_wins_over_a_missing_target() {
+        // `graph node` without a target is a usage error; with `--help`
+        // it must print help instead.
+        help_exits_zero(&["node", "--help"]);
+    }
 }
 
 #[cfg(test)]

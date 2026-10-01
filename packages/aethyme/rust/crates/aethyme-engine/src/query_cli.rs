@@ -28,6 +28,15 @@ const SYMBOL_LIMIT: usize = 20;
 /// `Error: {msg}` shape with exit 1 so scripted consumers see the same
 /// failure surface the Python CLI produced.
 pub fn run(args: &[String]) -> Result<(), CliError> {
+    // `--help` must succeed on every subcommand; handle it before the
+    // strict flag parser rejects it as an unknown flag.
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        println!("aethyme query — direct graph-store lookups");
+        for subcommand in ["symbol", "deps", "impact"] {
+            println!("  aethyme query {subcommand} <repo_path> <query> [--json|--json-output]");
+        }
+        return Ok(());
+    }
     let Some(subcommand) = args.first() else {
         return Err(CliError::usage("missing query subcommand (symbol | deps | impact)".to_string()));
     };

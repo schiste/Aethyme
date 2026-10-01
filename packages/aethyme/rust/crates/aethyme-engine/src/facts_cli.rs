@@ -21,6 +21,14 @@ const INTENTS_CATALOG: &str = include_str!("intents_catalog.json");
 
 /// Run `facts <subcommand> ...`. `args` excludes the leading `facts`.
 pub fn run_facts(args: &[String]) -> Result<(), CliError> {
+    // `--help` must succeed on every subcommand; handle it before the
+    // strict flag parser rejects it as an unknown flag.
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        println!("aethyme facts — derived facts from the graph store");
+        println!("  aethyme facts public-functions --repo <path> --scope <prefix> [--json|--json-output]");
+        println!("  aethyme facts function-usage --repo <path> --target <fn> --boundary <prefix> [--json|--json-output]");
+        return Ok(());
+    }
     let Some(subcommand) = args.first() else {
         return Err(CliError::usage("missing facts subcommand (public-functions | function-usage)".to_string()));
     };

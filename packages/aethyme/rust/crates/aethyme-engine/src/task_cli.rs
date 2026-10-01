@@ -26,6 +26,15 @@ use crate::store::redb::graph_store::GraphStore;
 
 /// Run `task <subcommand> ...`. `args` excludes the leading `task`.
 pub fn run(args: &[String]) -> Result<(), CliError> {
+    // `--help` must succeed on every subcommand; handle it before the
+    // strict flag parser rejects it as an unknown flag.
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        println!("aethyme task — task-scoped context from the graph store");
+        for subcommand in ["pack", "context", "anchors", "scope", "next", "expand", "explain"] {
+            println!("  aethyme task {subcommand} --repo <path> [--task <text>] [--json|--json-output]");
+        }
+        return Ok(());
+    }
     let Some(subcommand) = args.first() else {
         return Err(CliError::usage(
             "missing task subcommand (pack | context | anchors | scope | next | expand | explain)",

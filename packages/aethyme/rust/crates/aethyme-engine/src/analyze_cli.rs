@@ -27,6 +27,13 @@ use crate::map::RepositoryMap;
 
 /// Run `analyze <subcommand> ...`. `args` excludes the leading `analyze`.
 pub fn run(args: &[String]) -> Result<(), CliError> {
+    // `--help` must succeed on every subcommand; handle it before the
+    // strict flag parser rejects it as an unknown flag.
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        println!("aethyme analyze — static analysis over the graph");
+        println!("  aethyme analyze dead-code --repo <path> [--scope <prefix>] [--format summary|full-json|eval-json] [--json|--json-output]");
+        return Ok(());
+    }
     let Some(subcommand) = args.first() else {
         return Err(CliError::usage("missing analyze subcommand (dead-code)".to_string()));
     };

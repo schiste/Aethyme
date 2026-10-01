@@ -94,7 +94,7 @@ Core commands for that path:
 - `aethyme query deps /path/to/repo src/main.py`
 - `aethyme task pack --repo /path/to/repo --task "Explain this repo" --json-output`
 - `aethyme task explain --repo /path/to/repo`
-- `aethyme eval explain-repo --repo /path/to/repo --json-output`
+- `aethyme explore --repo /path/to/repo --request "Explain this repo" --format brief`
 
 ## Current Priorities
 
