@@ -792,6 +792,65 @@ fn porcelain_probe(program: &Path) -> PorcelainProbe {
     }
 }
 
+/// A Git operation a worktree is part-way through, and whether its index
+/// still holds unresolved conflicts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InProgressOperation {
+    /// `merge`, `rebase`, `cherry-pick` or `revert`; `None` when only the
+    /// index records unmerged entries (a conflicted `stash pop`, say).
+    pub operation: Option<&'static str>,
+    pub unresolved_conflicts: bool,
+}
+
+impl InProgressOperation {
+    /// "session 7 is mid-merge with unresolved conflicts", and the like.
+    pub fn describe(self, session_id: i64) -> String {
+        match (self.operation, self.unresolved_conflicts) {
+            (Some(operation), true) => {
+                format!("session {session_id} is mid-{operation} with unresolved conflicts")
+            }
+            (Some(operation), false) => format!("session {session_id} is mid-{operation}"),
+            (None, _) => format!("session {session_id} has unresolved conflicts"),
+        }
+    }
+}
+
+/// The operation `worktree` is in the middle of, read from its Git directory
+/// without running Git, so `status` can check every session without forking.
+pub fn worktree_operation_in_progress(worktree: &Path) -> Option<&'static str> {
+    let git_dir = worktree_git_dir(worktree)?;
+    [
+        ("MERGE_HEAD", "merge"),
+        ("rebase-merge", "rebase"),
+        ("rebase-apply", "rebase"),
+        ("CHERRY_PICK_HEAD", "cherry-pick"),
+        ("REVERT_HEAD", "revert"),
+    ]
+    .into_iter()
+    .find(|(marker, _)| git_dir.join(marker).exists())
+    .map(|(_, operation)| operation)
+}
+
+/// A worktree's own Git directory: `.git` itself, or the directory a linked
+/// worktree's `.git` file points to.
+fn worktree_git_dir(worktree: &Path) -> Option<PathBuf> {
+    let dot_git = worktree.join(".git");
+    if std::fs::symlink_metadata(&dot_git).ok()?.is_dir() {
+        return Some(dot_git);
+    }
+    let text = std::fs::read_to_string(&dot_git).ok()?;
+    let target = PathBuf::from(
+        text.lines()
+            .find_map(|line| line.strip_prefix("gitdir:"))?
+            .trim(),
+    );
+    Some(if target.is_absolute() {
+        target
+    } else {
+        worktree.join(target)
+    })
+}
+
 fn run_git(cwd: &Path, args: &[&str]) -> Result<String, GitError> {
     run_git_inner(cwd, None, args)
 }
@@ -917,6 +976,11 @@ pub struct RemoteDefaultBranch {
     pub ref_name: String,
     pub sha: String,
 }
+
+/// Reason the broker records on worktrees it locks on a configured, possibly
+/// removable root; only a lock with exactly this reason is released by it.
+pub const BROKER_WORKTREE_LOCK_REASON: &str =
+    "aethyme: worktree on a configured, possibly removable root";
 
 /// A handle on one git checkout (the main repository or a linked
 /// worktree). Constructed via [`GitRepo::discover`].
@@ -2234,6 +2298,22 @@ impl GitRepo {
     /// refreshes the checkout's real index, and the broker reads that
     /// file's mtime as evidence the session's agent is working. Classifying
     /// another session's edits must not make an idle session look active.
+    /// Whether this checkout is part-way through a merge, rebase,
+    /// cherry-pick or revert, or holds unmerged index entries. Building a
+    /// tree from such an index fails, so callers check this first.
+    pub fn operation_in_progress(&self) -> Result<Option<InProgressOperation>, GitError> {
+        let operation = worktree_operation_in_progress(&self.root);
+        let unresolved_conflicts = !run_git(&self.root, &["ls-files", "--unmerged"])?
+            .trim()
+            .is_empty();
+        Ok(
+            (operation.is_some() || unresolved_conflicts).then_some(InProgressOperation {
+                operation,
+                unresolved_conflicts,
+            }),
+        )
+    }
+
     pub fn working_state_commit(&self, paths: &[String]) -> Result<Option<String>, GitError> {
         let dirty = self.dirty_tracked_among(paths)?;
         if dirty.is_empty() {
@@ -2472,6 +2552,86 @@ impl GitRepo {
         Ok(())
     }
 
+    /// Merge `commit` into the checked-out branch with `message`, never
+    /// opening an editor. A conflict leaves the merge in progress for the
+    /// caller to abort.
+    pub fn merge_commit_no_edit(&self, commit: &str, message: &str) -> Result<(), GitError> {
+        run_git(&self.root, &["merge", "--no-edit", "-m", message, commit])?;
+        Ok(())
+    }
+
+    /// Fetch exactly `refs/heads/<branch>` from `remote` into
+    /// `refs/remotes/<remote>/<branch>`, within `budget`. A read that moves
+    /// one remote-tracking ref; no tags, no other refs.
+    pub fn fetch_branch_into_tracking_ref(
+        &self,
+        remote: &str,
+        branch: &str,
+        budget: Duration,
+    ) -> Result<(), GitError> {
+        let refspec = format!("refs/heads/{branch}:refs/remotes/{remote}/{branch}");
+        let args = ["fetch", "--no-tags", "--quiet", remote, refspec.as_str()];
+        let mut command = Command::new(&git_program().program);
+        command.args(args).current_dir(&self.root);
+        run_git_command(command, &args, budget)?;
+        Ok(())
+    }
+
+    /// Abandon a paused rebase, restoring the branch it started from.
+    pub fn abort_rebase(&self) -> Result<(), GitError> {
+        run_git(&self.root, &["rebase", "--abort"])?;
+        Ok(())
+    }
+
+    /// Abandon a paused merge, restoring the pre-merge state.
+    pub fn abort_merge(&self) -> Result<(), GitError> {
+        run_git(&self.root, &["merge", "--abort"])?;
+        Ok(())
+    }
+
+    /// Seconds since `reference` last moved, from its reflog, falling back
+    /// to the age of `FETCH_HEAD`. `None` when neither is recorded.
+    pub fn ref_age_seconds(&self, reference: &str) -> Option<u64> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_secs();
+        let from_reflog = run_git(
+            &self.root,
+            &[
+                "reflog",
+                "show",
+                "-1",
+                "--date=unix",
+                "--format=%gd",
+                reference,
+            ],
+        )
+        .ok()
+        .and_then(|line| {
+            let start = line.rfind('{')? + 1;
+            let end = line.rfind('}')?;
+            line.get(start..end)?.parse::<u64>().ok()
+        });
+        let moved = from_reflog.or_else(|| {
+            let path = run_git(&self.root, &["rev-parse", "--git-path", "FETCH_HEAD"]).ok()?;
+            let path = std::path::PathBuf::from(path);
+            let path = if path.is_absolute() {
+                path
+            } else {
+                self.root.join(path)
+            };
+            std::fs::metadata(path)
+                .ok()?
+                .modified()
+                .ok()?
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .map(|since| since.as_secs())
+        })?;
+        Some(now.saturating_sub(moved))
+    }
+
     /// Replay exactly `upstream..HEAD` onto `base`. Unlike a plain
     /// `git rebase <base>`, this never lets Git infer an older merge-base
     /// and accidentally include commits that predate the broker session.
@@ -2638,7 +2798,59 @@ impl GitRepo {
     /// deleted without a dirty check -- but no dirty check exists for it: the
     /// gitdir that would answer the question is what went missing, and the
     /// alternative is a directory nothing can ever remove.
+    /// Lock a worktree so `git worktree prune` -- including the automatic one
+    /// `git gc` runs -- keeps its registration while its directory is
+    /// unreachable, as it is when it lives on a drive that is unplugged.
+    pub fn worktree_lock(&self, worktree: &Path) -> Result<(), GitError> {
+        let path = worktree.to_str().unwrap_or_default();
+        run_git(
+            &self.root,
+            &[
+                "worktree",
+                "lock",
+                "--reason",
+                BROKER_WORKTREE_LOCK_REASON,
+                path,
+            ],
+        )
+        .map(|_| ())
+    }
+
+    /// The lock reason of the worktree registered at `worktree`, if locked.
+    fn worktree_lock_reason(&self, worktree: &Path) -> Option<String> {
+        let listing = run_git(&self.root, &["worktree", "list", "--porcelain"]).ok()?;
+        let wanted = worktree
+            .canonicalize()
+            .unwrap_or_else(|_| worktree.to_path_buf());
+        let mut current: Option<PathBuf> = None;
+        for line in listing.lines() {
+            if let Some(path) = line.strip_prefix("worktree ") {
+                let path = PathBuf::from(path);
+                current = Some(path.canonicalize().unwrap_or(path));
+            } else if current.as_deref() == Some(wanted.as_path()) {
+                if line == "locked" {
+                    return Some(String::new());
+                }
+                if let Some(reason) = line.strip_prefix("locked ") {
+                    return Some(reason.to_string());
+                }
+            }
+        }
+        None
+    }
+
     pub fn worktree_remove(&self, worktree: &Path, force: bool) -> Result<(), GitError> {
+        // A locked worktree refuses removal. Release only the lock the broker
+        // itself placed on a removable root; a lock someone else set is their
+        // protection, and the removal must keep failing on it.
+        if self.worktree_lock_reason(worktree).as_deref() == Some(BROKER_WORKTREE_LOCK_REASON) {
+            // The removal below cannot succeed on a locked worktree, so a
+            // failed unlock is the error to report, not a detail to drop.
+            run_git(
+                &self.root,
+                &["worktree", "unlock", worktree.to_str().unwrap_or_default()],
+            )?;
+        }
         let path = worktree.to_str().unwrap_or_default();
         let args: Vec<&str> = if force {
             vec!["worktree", "remove", "--force", path]
@@ -3443,6 +3655,26 @@ mod timeout_tests {
 
 /// Hunk-level views of one path, for telling two sessions' edits apart.
 impl GitRepo {
+    /// A handle on a checkout whose top level is already known, such as a
+    /// session worktree the broker created. Skips the `rev-parse` that
+    /// [`GitRepo::discover`] spends, which matters on the agent hook's
+    /// per-edit path; a wrong root only makes later Git calls fail.
+    pub(crate) fn at_known_root(root: &Path) -> Self {
+        Self {
+            root: root.to_path_buf(),
+        }
+    }
+
+    /// Whether `path` exists in the working tree as an untracked,
+    /// non-ignored file: a new file no diff against a commit reports.
+    pub(crate) fn path_is_untracked(&self, path: &str) -> Result<bool, GitError> {
+        let listed = run_git(
+            &self.root,
+            &["ls-files", "--others", "--exclude-standard", "--", path],
+        )?;
+        Ok(!listed.trim().is_empty())
+    }
+
     /// Zero-context patch of `path` from `base` to `head`. Callers parse only
     /// the `@@` headers, so the old-side line ranges are the whole answer.
     pub(crate) fn zero_context_diff(
@@ -3460,6 +3692,28 @@ impl GitRepo {
                 "--unified=0",
                 base,
                 head,
+                "--",
+                path,
+            ],
+        )
+    }
+
+    /// Zero-context patch of `path` from `base` to the working tree, so
+    /// uncommitted edits count. Read by the agent hook to describe where
+    /// another session is changing a file; only the `@@` headers are used.
+    pub(crate) fn working_zero_context_diff(
+        &self,
+        base: &str,
+        path: &str,
+    ) -> Result<String, GitError> {
+        run_git(
+            &self.root,
+            &[
+                "diff",
+                "--no-color",
+                "--no-ext-diff",
+                "--unified=0",
+                base,
                 "--",
                 path,
             ],

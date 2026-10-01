@@ -519,6 +519,8 @@ const CONFIG_KNOWN_KEYS: &[(&str, &[&str])] = &[
     ("leases", &["ignore", "routing"]),
     ("graph", &["authority", "repository"]),
     ("review", &["trigger", "routing", "reporting", "projection"]),
+    ("worktrees", &["root", "min_free_bytes"]),
+    ("session", &["guidance"]),
 ];
 
 fn check_enrollment_visibility(repo: &crate::GitRepo, checkout_root: &Path) -> Vec<Check> {
@@ -1018,6 +1020,9 @@ const CONFIG_TEMPLATE: &str = "\
 #   [delivery] push_session_branches  true | false (default false; authorizes `broker push`)
 #   [leases]  ignore  paths never leased (trailing / = directory prefix)
 #   [leases.routing] category = [\"path/\", \"exact/file\"]
+#   [worktrees] root  absolute directory for session worktrees (default: per-user host state)
+#   [worktrees] min_free_bytes  free space the root must keep (default: gate headroom)
+#   [session] guidance  working agreement `broker start` shows (default built in; [] disables)
 # Unknown keys are ignored at runtime; `aethyme certify` warns on them.
 
 schema = 1
@@ -1047,6 +1052,30 @@ mode = \"auto\"
 # `[promote] mode = \"verify-only\"` so verified work does not accumulate,
 # unpublished, on the local integration branch.
 # push_session_branches = true
+
+# Where session worktrees are created. The default is the per-user host-state
+# directory. A root set here supersedes it only while it already exists (it is
+# never created, so an unplugged drive is never replaced by an empty
+# directory), is outside the repository and has min_free_bytes free; otherwise
+# `broker start` uses the default and says why. The key is committed, so a
+# machine without this path keeps the default.
+# [worktrees]
+# root = \"/Volumes/External/aethyme-worktrees\"
+# min_free_bytes = 8589934592
+
+# The working agreement `broker start` prints for every new or reused session:
+# at most 6 single-line entries of up to 240 characters. Leave it absent for
+# the built-in default (shown below; its first line mentions `broker push` only
+# when push_session_branches is enabled), or set `guidance = []` to show none.
+# [session]
+# guidance = [
+#   \"Commit one small, coherent step at a time: stage explicit paths only (never `git add -A` or `git add .`), check `git diff --cached` before each commit, then `aethyme broker push`; open a draft PR after the first meaningful commit.\",
+#   \"Keep each PR to one concern that a reviewer can read in one sitting; split unrelated changes into separate sessions.\",
+#   \"Before writing new code, look for an existing shared component, helper or pattern, and reuse or extend it (`aethyme explore --request \\\"where is …\\\"`). Don't add a parallel path, and don't leave duplicated logic behind.\",
+#   \"Keep each function and module focused on one responsibility, behind a narrow interface; prefer the simple, direct version over a speculative abstraction.\",
+#   \"Every behaviour change ships with a test that fails without it.\",
+#   \"Before finishing: nothing unintended committed or pushed, tree clean, branch pushed, PR up to date, and the remaining risks stated in the PR.\",
+# ]
 
 # [leases]
 # ignore = [\"generated/\"]   # entries ending in / are directory prefixes
@@ -1336,5 +1365,17 @@ mod config_key_tests {
             unknown("[delivery]\npush_everything = true\n"),
             ["delivery.push_everything"]
         );
+    }
+
+    #[test]
+    fn session_guidance_is_a_known_key() {
+        assert!(unknown("[session]\nguidance = [\"Commit often.\"]\n").is_empty());
+        assert_eq!(unknown("[session]\nhints = []\n"), ["session.hints"]);
+    }
+
+    #[test]
+    fn worktrees_root_and_floor_are_known_keys() {
+        assert!(unknown("[worktrees]\nroot = \"/Volumes/T7/wt\"\nmin_free_bytes = 1\n").is_empty());
+        assert_eq!(unknown("[worktrees]\npath = \"/x\"\n"), ["worktrees.path"]);
     }
 }

@@ -48,10 +48,16 @@ pub fn decisions(candidates: &[ReclaimCandidate]) -> Vec<ReclaimDecision> {
     decisions
 }
 
-fn decision_digest(root: &Path, decisions: &[ReclaimDecision]) -> String {
+fn decision_digest(root: &Path, scope: Option<&Path>, decisions: &[ReclaimDecision]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"aethyme-reclaim-plan-v1\0");
     hasher.update(root.as_os_str().as_encoded_bytes());
+    // A whole-root plan hashes as it always has, so its saved reviews stay
+    // valid; a one-worktree plan also commits to which worktree it covers.
+    if let Some(scope) = scope {
+        hasher.update(b"\0scope\0");
+        hasher.update(scope.as_os_str().as_encoded_bytes());
+    }
     for decision in decisions {
         hasher.update(b"\n");
         hasher.update(decision.path.as_os_str().as_encoded_bytes());
@@ -68,8 +74,13 @@ fn decision_digest(root: &Path, decisions: &[ReclaimDecision]) -> String {
 /// whether each is reclaimable. A candidate's measured size is displayed in a
 /// plan but is not authorization-bearing, so an active build can grow without
 /// invalidating an otherwise unchanged review.
-pub fn plan_digest(root: &Path, candidates: &[ReclaimCandidate]) -> String {
-    decision_digest(root, &decisions(candidates))
+///
+/// `scope` is the one worktree a session-scoped plan covers. It is part of
+/// what the digest authorizes: such a plan was scanned from that worktree
+/// alone, so it says nothing about the rest of the root, and a whole-root
+/// plan was not reviewed as being about one session.
+pub fn plan_digest(root: &Path, scope: Option<&Path>, candidates: &[ReclaimCandidate]) -> String {
+    decision_digest(root, scope, &decisions(candidates))
 }
 
 /// A fresh scan narrowed to what a review authorized.
@@ -138,22 +149,23 @@ pub fn restrict_to_review(
     }
 }
 
-/// Keep only the candidates inside one worktree, so a plan can be reviewed
-/// and applied for a single session.
-pub fn scope_to_worktree(
-    candidates: Vec<ReclaimCandidate>,
-    worktree: &Path,
-) -> Vec<ReclaimCandidate> {
-    let canonical = std::fs::canonicalize(worktree).ok();
-    candidates
-        .into_iter()
-        .filter(|candidate| {
-            candidate.worktree == worktree
-                || canonical.as_ref().is_some_and(|wanted| {
-                    std::fs::canonicalize(&candidate.worktree).is_ok_and(|found| &found == wanted)
-                })
-        })
-        .collect()
+/// The worktree directory directly under `root` that is `worktree`, spelled
+/// as a scan of `root` spells it, so a one-worktree plan names exactly the
+/// paths the whole-root plan would.
+///
+/// `None` when `worktree` is not a direct child of `root`: such a worktree is
+/// outside what this command may delete from, as it is for a whole-root scan.
+pub fn worktree_in_root(root: &Path, worktree: &Path) -> Option<PathBuf> {
+    let base = root.join(worktree.file_name()?);
+    if !base.is_dir() {
+        return None;
+    }
+    // Session rows and a scan can spell one directory differently, e.g.
+    // macOS `/var/...` versus `/private/var/...`.
+    let same = base == worktree
+        || std::fs::canonicalize(&base)
+            .is_ok_and(|found| std::fs::canonicalize(worktree).is_ok_and(|wanted| found == wanted));
+    same.then_some(base)
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -161,7 +173,20 @@ struct ReclaimPlanSnapshot {
     schema_version: u8,
     digest: String,
     root: PathBuf,
+    /// The one worktree a session-scoped review covered; absent for the
+    /// whole root, which is how every earlier snapshot reads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    scope: Option<PathBuf>,
     decisions: Vec<ReclaimDecision>,
+}
+
+/// A saved review, verified against the digest an operator confirmed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewedPlan {
+    pub digest: String,
+    /// The one worktree the review covered, or `None` for the whole root.
+    pub scope: Option<PathBuf>,
+    pub decisions: Vec<ReclaimDecision>,
 }
 
 fn snapshot_path(root: &Path, digest: &str) -> io::Result<PathBuf> {
@@ -193,10 +218,15 @@ fn ensure_regular_snapshot(path: &Path) -> io::Result<()> {
 /// one another's review evidence. An apply whose fresh scan no longer hashes to
 /// the confirmed digest loads this snapshot to learn which paths were reviewed
 /// reclaimable (see [`restrict_to_review`]).
-pub fn save_snapshot(root: &Path, digest: &str, candidates: &[ReclaimCandidate]) -> io::Result<()> {
+pub fn save_snapshot(
+    root: &Path,
+    scope: Option<&Path>,
+    digest: &str,
+    candidates: &[ReclaimCandidate],
+) -> io::Result<()> {
     std::fs::create_dir_all(root)?;
     let decisions = decisions(candidates);
-    if decision_digest(root, &decisions) != digest {
+    if decision_digest(root, scope, &decisions) != digest {
         return Err(io::Error::other(
             "reclaim plan snapshot digest does not match its decision set",
         ));
@@ -211,6 +241,7 @@ pub fn save_snapshot(root: &Path, digest: &str, candidates: &[ReclaimCandidate])
         schema_version: RECLAIM_PLAN_SCHEMA_VERSION,
         digest: digest.to_string(),
         root: root.to_path_buf(),
+        scope: scope.map(Path::to_path_buf),
         decisions,
     };
     let bytes = serde_json::to_vec_pretty(&snapshot).map_err(io::Error::other)?;
@@ -226,10 +257,8 @@ pub fn save_snapshot(root: &Path, digest: &str, candidates: &[ReclaimCandidate])
 /// hash to it under this root. A forged snapshot therefore needs a different
 /// digest, which the operator did not confirm. Even an authentic one only
 /// narrows: every path it names is re-proved reclaimable by a fresh scan.
-pub fn load_snapshot(
-    root: &Path,
-    digest: &str,
-) -> io::Result<Option<(String, Vec<ReclaimDecision>)>> {
+/// The scope is hashed too, so the returned scope is the one reviewed.
+pub fn load_snapshot(root: &Path, digest: &str) -> io::Result<Option<ReviewedPlan>> {
     let path = snapshot_path(root, digest)?;
     let metadata = match std::fs::symlink_metadata(&path) {
         Ok(metadata) => metadata,
@@ -247,14 +276,18 @@ pub fn load_snapshot(
     if snapshot.schema_version != RECLAIM_PLAN_SCHEMA_VERSION
         || snapshot.root != root
         || snapshot.decisions != decisions_sorted(&snapshot.decisions)
-        || decision_digest(root, &snapshot.decisions) != snapshot.digest
+        || decision_digest(root, snapshot.scope.as_deref(), &snapshot.decisions) != snapshot.digest
     {
         return Err(io::Error::other(format!(
             "reclaim plan snapshot is invalid: {}",
             path.display()
         )));
     }
-    Ok(Some((snapshot.digest, snapshot.decisions)))
+    Ok(Some(ReviewedPlan {
+        digest: snapshot.digest,
+        scope: snapshot.scope,
+        decisions: snapshot.decisions,
+    }))
 }
 
 fn decisions_sorted(decisions: &[ReclaimDecision]) -> Vec<ReclaimDecision> {
@@ -448,8 +481,8 @@ mod tests {
             classify(&p("/w/b/target"), &p("/w/b"), 7, &[p("/w/b")]),
         ];
         assert_eq!(
-            plan_digest(&p("/w"), &first),
-            plan_digest(&p("/w"), &second)
+            plan_digest(&p("/w"), None, &first),
+            plan_digest(&p("/w"), None, &second)
         );
     }
 
@@ -462,12 +495,12 @@ mod tests {
         ];
         let kept = vec![classify(&p("/w/a/target"), &p("/w/a"), 100, &[p("/w/a")])];
         assert_ne!(
-            plan_digest(&p("/w"), &original),
-            plan_digest(&p("/w"), &added)
+            plan_digest(&p("/w"), None, &original),
+            plan_digest(&p("/w"), None, &added)
         );
         assert_ne!(
-            plan_digest(&p("/w"), &original),
-            plan_digest(&p("/w"), &kept)
+            plan_digest(&p("/w"), None, &original),
+            plan_digest(&p("/w"), None, &kept)
         );
     }
 
@@ -530,15 +563,47 @@ mod tests {
         assert!(scope.withdrawn.is_empty());
     }
 
+    /// A one-session review is not a whole-root review of the same
+    /// decisions, and neither is it another session's.
     #[test]
-    fn scoping_keeps_only_the_named_worktree() {
-        let candidates = vec![
-            classify(&p("/w/a/target"), &p("/w/a"), 8, &[]),
-            classify(&p("/w/b/target"), &p("/w/b"), 8, &[]),
-        ];
-        let scoped = scope_to_worktree(candidates, &p("/w/a"));
-        assert_eq!(scoped.len(), 1);
-        assert_eq!(scoped[0].path, p("/w/a/target"));
+    fn the_scope_is_part_of_what_a_digest_authorizes() {
+        let candidates = vec![classify(&p("/w/a/target"), &p("/w/a"), 8, &[])];
+        let whole = plan_digest(&p("/w"), None, &candidates);
+        let scoped = plan_digest(&p("/w"), Some(&p("/w/a")), &candidates);
+        assert_ne!(whole, scoped);
+        assert_ne!(scoped, plan_digest(&p("/w"), Some(&p("/w/b")), &candidates));
+    }
+
+    #[test]
+    fn a_scoped_snapshot_round_trips_its_scope() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        let worktree = root.join("s");
+        let candidates = vec![classify(&worktree.join("target"), &worktree, 42, &[])];
+        let digest = plan_digest(&root, Some(&worktree), &candidates);
+
+        save_snapshot(&root, Some(&worktree), &digest, &candidates).unwrap();
+
+        let reviewed = load_snapshot(&root, &digest).unwrap().unwrap();
+        assert_eq!(reviewed.scope, Some(worktree));
+        assert!(
+            save_snapshot(&root, None, &digest, &candidates).is_err(),
+            "a scoped digest must not be saved as a whole-root review"
+        );
+    }
+
+    #[test]
+    fn a_worktree_is_resolved_only_as_a_direct_child_of_the_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        std::fs::create_dir_all(root.join("s/nested")).unwrap();
+        assert_eq!(
+            worktree_in_root(&root, &root.join("s")),
+            Some(root.join("s"))
+        );
+        assert_eq!(worktree_in_root(&root, &root.join("s/nested")), None);
+        assert_eq!(worktree_in_root(&root, &root.join("gone")), None);
+        assert_eq!(worktree_in_root(&root, &tmp.path().join("s")), None);
     }
 
     #[test]
@@ -546,19 +611,20 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("root");
         let candidates = vec![classify(&root.join("s/target"), &root.join("s"), 42, &[])];
-        let digest = plan_digest(&root, &candidates);
+        let digest = plan_digest(&root, None, &candidates);
 
-        save_snapshot(&root, &digest, &candidates).unwrap();
+        save_snapshot(&root, None, &digest, &candidates).unwrap();
 
         assert_eq!(
             load_snapshot(&root, &digest).unwrap(),
-            Some((
+            Some(ReviewedPlan {
                 digest,
-                vec![ReclaimDecision {
+                scope: None,
+                decisions: vec![ReclaimDecision {
                     path: root.join("s/target"),
                     reclaimable: true,
-                }]
-            ))
+                }],
+            })
         );
     }
 
@@ -568,11 +634,11 @@ mod tests {
         let root = tmp.path().join("root");
         let first = classify(&root.join("first/target"), &root.join("first"), 42, &[]);
         let second = classify(&root.join("second/target"), &root.join("second"), 84, &[]);
-        let first_digest = plan_digest(&root, std::slice::from_ref(&first));
-        let second_digest = plan_digest(&root, std::slice::from_ref(&second));
+        let first_digest = plan_digest(&root, None, std::slice::from_ref(&first));
+        let second_digest = plan_digest(&root, None, std::slice::from_ref(&second));
 
-        save_snapshot(&root, &first_digest, &[first]).unwrap();
-        save_snapshot(&root, &second_digest, &[second]).unwrap();
+        save_snapshot(&root, None, &first_digest, &[first]).unwrap();
+        save_snapshot(&root, None, &second_digest, &[second]).unwrap();
 
         assert!(load_snapshot(&root, &first_digest).unwrap().is_some());
         assert!(load_snapshot(&root, &second_digest).unwrap().is_some());
@@ -608,6 +674,9 @@ mod tests {
 pub struct ReclaimPlan {
     pub digest: String,
     pub root: PathBuf,
+    /// The one worktree a session-scoped plan covers; absent for the root.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope: Option<PathBuf>,
     pub candidates: Vec<ReclaimCandidate>,
     pub reclaimable_bytes: u64,
     pub total_bytes: u64,
@@ -630,7 +699,7 @@ pub struct ReclaimOutcome {
 /// is about to justify a deletion.
 pub fn directory_bytes(path: &Path) -> u64 {
     let mut total = 0;
-    let Ok(entries) = std::fs::read_dir(path) else {
+    let Ok(entries) = read_dir(path) else {
         return 0;
     };
     for entry in entries.flatten() {
@@ -664,6 +733,28 @@ pub fn scan_with_extra_directories(
     active: &[PathBuf],
     extras: &[String],
 ) -> Vec<ReclaimCandidate> {
+    scan_root(root, active, extras, Sizing::Measure)
+}
+
+/// Whether a scan measures each candidate's size.
+///
+/// Measuring walks every file under every candidate -- a `node_modules` or a
+/// `target/` holds hundreds of thousands -- and dominates a scan. A plan
+/// shows the sizes an operator reviews; an apply never reports them (it
+/// credits what the removal actually freed), so it skips the walk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sizing {
+    Measure,
+    Skip,
+}
+
+/// Scan every worktree directly under `root`.
+pub fn scan_root(
+    root: &Path,
+    active: &[PathBuf],
+    extras: &[String],
+    sizing: Sizing,
+) -> Vec<ReclaimCandidate> {
     let mut found = Vec::new();
     let Ok(worktrees) = std::fs::read_dir(root) else {
         return found;
@@ -673,17 +764,33 @@ pub fn scan_with_extra_directories(
         if !base.is_dir() {
             continue;
         }
-        let checkout = own_checkout(&base);
-        collect(
-            &base,
-            &base,
-            checkout.as_ref(),
-            active,
-            extras,
-            &mut found,
-            0,
-        );
+        found.extend(scan_worktree(&base, active, extras, sizing));
     }
+    found.sort_by_key(|candidate| std::cmp::Reverse(candidate.bytes));
+    found
+}
+
+/// Scan one worktree, and nothing else under its root.
+///
+/// A plan for one session used to scan and size the whole root and then
+/// filter: with dozens of worktrees full of `node_modules`, one session's
+/// plan took tens of minutes, and its apply paid the same again.
+pub fn scan_worktree(
+    worktree: &Path,
+    active: &[PathBuf],
+    extras: &[String],
+    sizing: Sizing,
+) -> Vec<ReclaimCandidate> {
+    let mut found = Vec::new();
+    let checkout = own_checkout(worktree);
+    let walk = Walk {
+        worktree,
+        checkout: checkout.as_ref(),
+        active,
+        extras,
+        sizing,
+    };
+    walk.collect(worktree, &mut found, 0);
     found.sort_by_key(|candidate| std::cmp::Reverse(candidate.bytes));
     found
 }
@@ -751,51 +858,71 @@ pub fn protect_unrecorded_worktrees(candidates: &mut [ReclaimCandidate], recorde
     }
 }
 
-fn collect(
-    dir: &Path,
-    worktree: &Path,
-    checkout: Option<&crate::git::GitRepo>,
-    active: &[PathBuf],
-    extras: &[String],
-    found: &mut Vec<ReclaimCandidate>,
-    depth: usize,
-) {
-    // Build trees are shallow relative to a repository; this bounds the walk on
-    // a directory whose whole problem is that it is enormous.
-    if depth > 6 {
-        return;
-    }
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let Ok(kind) = entry.file_type() else {
-            continue;
-        };
-        if !kind.is_dir() || kind.is_symlink() {
-            continue;
+/// What stays fixed while one worktree is walked.
+struct Walk<'a> {
+    worktree: &'a Path,
+    checkout: Option<&'a crate::git::GitRepo>,
+    active: &'a [PathBuf],
+    extras: &'a [String],
+    sizing: Sizing,
+}
+
+impl Walk<'_> {
+    fn collect(&self, dir: &Path, found: &mut Vec<ReclaimCandidate>, depth: usize) {
+        // Build trees are shallow relative to a repository; this bounds the
+        // walk on a directory whose whole problem is that it is enormous.
+        if depth > 6 {
+            return;
         }
-        let path = entry.path();
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-            continue;
+        let Ok(entries) = read_dir(dir) else {
+            return;
         };
-        if name == ".git" {
-            continue;
-        }
-        if is_artefact_directory_with_extras(name, extras) {
-            let bytes = directory_bytes(&path);
-            let mut candidate = classify(&path, worktree, bytes, active);
-            if candidate.reclaimable
-                && let Some(reason) = git_protection(checkout, worktree, &path)
-            {
-                candidate.reclaimable = false;
-                candidate.reason = reason;
+        for entry in entries.flatten() {
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if !kind.is_dir() || kind.is_symlink() {
+                continue;
             }
-            found.push(candidate);
-            continue;
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if name == ".git" {
+                continue;
+            }
+            if is_artefact_directory_with_extras(name, self.extras) {
+                let bytes = match self.sizing {
+                    Sizing::Measure => directory_bytes(&path),
+                    Sizing::Skip => 0,
+                };
+                let mut candidate = classify(&path, self.worktree, bytes, self.active);
+                if candidate.reclaimable
+                    && let Some(reason) = git_protection(self.checkout, self.worktree, &path)
+                {
+                    candidate.reclaimable = false;
+                    candidate.reason = reason;
+                }
+                found.push(candidate);
+                continue;
+            }
+            self.collect(&path, found, depth + 1);
         }
-        collect(&path, worktree, checkout, active, extras, found, depth + 1);
     }
+}
+
+/// `read_dir`, recording each directory a test scan opens.
+fn read_dir(path: &Path) -> io::Result<std::fs::ReadDir> {
+    #[cfg(test)]
+    WALKED.with(|walked| walked.borrow_mut().push(path.to_path_buf()));
+    std::fs::read_dir(path)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Directories this thread's scans opened, so a test can prove what a
+    /// scan did not walk -- the filtered result alone cannot show that.
+    static WALKED: std::cell::RefCell<Vec<PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// Remove the reviewed candidates, re-proving containment for each.
@@ -942,6 +1069,53 @@ mod scan_tests {
         assert!(scan(tmp.path(), &[]).is_empty());
     }
 
+    /// The cost being removed: a one-session plan walked every worktree.
+    #[test]
+    fn a_worktree_scan_never_walks_another_worktree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mine = tmp.path().join("mine");
+        let other = tmp.path().join("other");
+        write(&mine.join("target/debug/a"), 8);
+        write(&other.join("target/debug/b"), 8);
+        write(&other.join("pkg/node_modules/c/index.js"), 8);
+        WALKED.with(|walked| walked.borrow_mut().clear());
+
+        let found = scan_worktree(&mine, &[], &[], Sizing::Measure);
+
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].path, mine.join("target"));
+        assert_eq!(found[0].bytes, 8);
+        let walked = WALKED.with(|walked| walked.borrow().clone());
+        assert!(walked.iter().any(|path| path.starts_with(&mine)));
+        let strays: Vec<_> = walked
+            .iter()
+            .filter(|path| !path.starts_with(&mine))
+            .collect();
+        assert!(strays.is_empty(), "walked outside the worktree: {strays:?}");
+    }
+
+    /// An apply decides from the same candidates without walking their files.
+    #[test]
+    fn an_unsized_scan_finds_the_same_candidates_without_walking_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wt = tmp.path().join("s");
+        write(&wt.join("target/debug/deep/a"), 64);
+        let sized = scan_worktree(&wt, &[], &[], Sizing::Measure);
+        WALKED.with(|walked| walked.borrow_mut().clear());
+
+        let unsized_scan = scan_worktree(&wt, &[], &[], Sizing::Skip);
+
+        assert_eq!(decisions(&unsized_scan), decisions(&sized));
+        assert_eq!(unsized_scan[0].bytes, 0);
+        let walked = WALKED.with(|walked| walked.borrow().clone());
+        assert!(
+            !walked
+                .iter()
+                .any(|path| path.starts_with(wt.join("target"))),
+            "an unsized scan walked into a candidate: {walked:?}"
+        );
+    }
+
     #[test]
     fn apply_removes_only_reclaimable_candidates() {
         let tmp = tempfile::tempdir().unwrap();
@@ -955,6 +1129,7 @@ mod scan_tests {
         let plan = ReclaimPlan {
             digest: "test".into(),
             root: tmp.path().to_path_buf(),
+            scope: None,
             reclaimable_bytes: reclaimable_bytes(&candidates),
             total_bytes: candidates.iter().map(|c| c.bytes).sum(),
             candidates,
@@ -978,6 +1153,7 @@ mod scan_tests {
         let plan = ReclaimPlan {
             digest: "test".into(),
             root: root.clone(),
+            scope: None,
             candidates: vec![classify(&outside, &root, 10, &[])],
             reclaimable_bytes: 10,
             total_bytes: 10,
@@ -1008,6 +1184,7 @@ mod scan_tests {
         let outcome = apply(&ReclaimPlan {
             digest: "test".into(),
             root: tmp.path().to_path_buf(),
+            scope: None,
             candidates: vec![candidate],
             reclaimable_bytes: 4096,
             total_bytes: 4096,

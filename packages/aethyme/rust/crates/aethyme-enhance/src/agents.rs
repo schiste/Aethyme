@@ -319,12 +319,14 @@ fn render_broker_protocol_compact(repo: &Path) -> String {
 Other agents may be working in sibling worktrees.
 
 1. `aethyme broker start --task "<task>"`, then work only in the worktree it
-   reports. Never edit another session's worktree.
+   reports and follow the working agreement it prints. Never edit another
+   session's worktree.
 2. Commit early and small, and after each commit run
    `aethyme broker push --session <id>`. Once there is a first meaningful
    commit, open a draft PR with `aethyme broker push --session <id> --pr`, and
-   keep pushing until it is ready; catch up when push warns that the default
-   branch moved and conflicts. Never leave work only in the worktree.
+   keep pushing until it is ready. Run `aethyme broker sync --session <id>`
+   before resuming a reused session and whenever push reports the branch is
+   behind the default branch. Never leave work only in the worktree.
 3. When done: `aethyme broker submit --session <id>`, then
    `aethyme broker finish --session <id>` (it refuses while commits are unpushed).
 
@@ -340,7 +342,8 @@ read it first. Leases, gates, advisories and recovery: `references/broker.md`."#
 Other agents may be working in sibling worktrees.
 
 1. `aethyme broker start --task "<task>" [--short-name "<label>"]`, then work only in the worktree it
-   reports. Never edit another session's worktree.
+   reports and follow the working agreement it prints. Never edit another
+   session's worktree.
 2. When done: `aethyme broker submit --session <id>`, then
    `aethyme broker finish --session <id>`.
 
@@ -409,6 +412,10 @@ blocked.
    If `status` shows another session holding leases on the files you plan
    to change, prefer working elsewhere first or say so in your report —
    overlapping edits will conflict at merge time.
+   When you edit a file another live session is changing, the broker tells you
+   in context who, where and whether Git would conflict, never blocking the
+   edit; `aethyme broker advanced note send --to-session <id>` reaches that
+   agent, and its notes reach you at your next turn.
 
 2. **Lease additional shared files before the diff exists**. Prefer the
    atomic `start --path` / `start --adopt --path` declaration above for initial intent. If the
@@ -467,8 +474,12 @@ blocked.
    `aethyme broker finish --session <id> --abandon --reason "<why>"`.
    Each push also fetches the default branch and reports how far your branch
    is behind it and whether merging would conflict, with the command to catch
-   up; `broker status` shows the same as `session.behind-main`. Catch up when
-   it warns, before the pull request reports the conflict. In a repository
+   up; `broker status` shows the same as `session.behind-main`. Catch up with
+   `aethyme broker sync --session <id>` when it warns, before the pull request
+   reports the conflict: it rebases an unpublished branch or merges the default
+   branch into a published one, and changes nothing if that would conflict.
+   `broker start` and `start --reuse` refresh the default branch first, so a
+   new worktree starts from the latest fetched tip. In a repository
    with `[promote] mode = "verify-only"`, `broker submit` is a pre-flight
    against the current default branch; the integration branch is not used.
    When `broker status` shows `coordination.land-shared-edit-first`, another
@@ -953,7 +964,8 @@ mod tests {
             "## Broker Coordination: before and after an edit",
             "`aethyme broker start --task \"<task>\" [--short-name \"<label>\"]`",
             "work only in the worktree it\n   reports",
-            "Never edit another session's worktree.",
+            "follow the working agreement it prints.",
+            "Never edit another\n   session's worktree.",
             "`aethyme broker submit --session <id>`",
             "`aethyme broker finish --session <id>`",
             "`aethyme broker advanced git`",
@@ -1020,7 +1032,7 @@ mod tests {
             "## Broker Coordination: before and after an edit",
             "Commit early and small, and after each commit run\n   `aethyme broker push --session <id>`",
             "open a draft PR with `aethyme broker push --session <id> --pr`",
-            "keep pushing until it is ready; catch up when push warns that the default\n   branch moved and conflicts. Never leave work only in the worktree.",
+            "keep pushing until it is ready. Run `aethyme broker sync --session <id>`\n   before resuming a reused session and whenever push reports the branch is\n   behind the default branch. Never leave work only in the worktree.",
             "`aethyme broker finish --session <id>` (it refuses while commits are unpushed)",
             "authorizes pushing your own\nsession branch and opening a draft PR; nothing else.",
             "`aethyme broker advanced git`",
@@ -1036,6 +1048,32 @@ mod tests {
             "{tokens} tokens:\n{doc}"
         );
         std::fs::remove_dir_all(&repo).unwrap();
+    }
+
+    /// `broker start` prints the repository's working agreement; the generated
+    /// protocol points agents at it in both variants rather than repeating it.
+    #[test]
+    fn the_protocol_points_agents_at_the_working_agreement() {
+        for (tag, config) in [
+            (
+                "agreement-push",
+                "schema = 1\n[delivery]\npush_session_branches = true\n",
+            ),
+            ("agreement-default", "schema = 1\n"),
+        ] {
+            let repo = broker_repo_with_config(tag, config);
+            let doc = render_agents_document(Some(&repo)).unwrap();
+            assert!(
+                doc.contains("reports and follow the working agreement it prints."),
+                "{tag}: missing the working-agreement pointer:\n{doc}"
+            );
+            // The agreement itself lives in `broker start` output only.
+            assert!(
+                !doc.contains("shared component, helper or pattern"),
+                "{tag}:\n{doc}"
+            );
+            std::fs::remove_dir_all(&repo).unwrap();
+        }
     }
 
     /// Only an explicit `true` grants the push authority; anything else keeps

@@ -1,0 +1,11 @@
+exit: 0
+--- stdout
+  aethyme broker sync --session <id> [--json]
+      Bring this session up to the freshly fetched default branch when it
+      is safe: the tree must be clean and nothing in progress. An unpushed
+      branch is rebased; a published one has the default branch merged in,
+      so a pull request's history is never rewritten. If catching up would
+      conflict, nothing changes and the conflicting paths are listed. Run
+      it before resuming a reused session and whenever `push` reports the
+      branch is behind the default branch.
+--- stderr
