@@ -4,6 +4,20 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.14] - 2026-10-01
+
+Fresher coordination notes, quieter verify-only status, faster per-session reclaim.
+
+### Changed
+
+- The edit-time hook note now reflects each other live session's current change to the file being edited, read from its worktree, instead of the lease data recorded by the last broker command; a reverted change no longer warns. Results are cached per file stamp (#485).
+- In `verify-only` repositories, `broker status` and `status doctor` no longer show advice about the integration branch moving: `integration.may-move`, the integration drift rows, `main.external-writes` and the `wait-stable` hints. `integration.unpublished-work` still reports commits left on integration from before the switch. `auto` and `manual` repositories are unchanged (#483).
+- `gc reclaim plan --session` and `apply --session` scan only that session's worktree, so a session plan costs time in proportion to that worktree rather than to the whole worktree root, and `apply` no longer re-measures directory sizes. A confirmation digest now binds its scope: a session plan's digest is refused for a whole-root apply and the reverse. A session whose worktree is gone gets an empty plan instead of an error (#484).
+
+### Fixed
+
+- Tests no longer depend on the host's free disk space: every headroom decision reads one probe, which tests can simulate only for repositories under the system temp directory. Production headroom checks are unchanged (#482).
+
 ## [0.8.13] - 2026-10-01
 
 Agents start on current main, catch up with one command, and coordinate instead of blocking each other.
