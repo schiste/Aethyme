@@ -29,6 +29,12 @@ use crate::types::{AdvisoryEvidence, AdvisorySeverity, MergeQueueEntry, MergeSta
 pub const DEFAULT_INTEGRATION_BRANCH: &str = "aethyme/integration";
 pub const ACTION_REQUIRED_RELPATH: &str = ".aethyme/broker-action-required.md";
 
+/// How many merge verifications may run at once in one repository. Each slot
+/// is a full checkout, and gates that share a build cache still serialise on
+/// its resource lease, so this bounds disk and contention rather than promising
+/// that many times the throughput.
+const MERGE_VERIFICATION_SLOTS: usize = 4;
+
 /// What a repository does with work that passes verification.
 ///
 /// `VerifyOnly` exists because promotion is not universal. Where a repository
@@ -789,9 +795,20 @@ impl Broker {
         let changed = self
             .repo_handle()
             .gate_scope_changed_between(verify_base, &merge_commit)?;
-        let mut verification_slot = crate::verification::ExactTreeVerificationSlot::acquire(
+        // One of a small pool of stable slots, not one repository-wide slot:
+        // two sessions verifying different merged trees have no reason to
+        // exclude each other, and a single slot made verification serial no
+        // matter how many sessions were submitting. Promotion stays safe
+        // because `promote` advances the ref only from the base it verified.
+        //
+        // The two other slot users (`graph-integrity`, `gate-doctor-probe`)
+        // keep the repository-scoped slot: each verifies a single tree it has
+        // just chosen, and serialising them against each other is correct --
+        // they are diagnostics, not throughput.
+        let mut verification_slot = crate::verification::ExactTreeVerificationSlot::acquire_pooled(
             &self.main_root_path(),
             "merge-sim",
+            MERGE_VERIFICATION_SLOTS,
         )?;
         let sim_worktree = verification_slot.materialize(self.repo_handle(), &merge_commit)?;
         // Verification policy comes from the base the change lands on, never
@@ -1425,6 +1442,19 @@ impl Broker {
     /// Advance the integration branch to a verified entry's merge commit,
     /// then re-simulate every other non-terminal entry whose base moved.
     /// Publication is a separate, explicit `broker ship` operation.
+    /// Re-simulate an entry whose verified base is no longer the integration
+    /// tip, and promote it if it still verifies.
+    fn reverify_and_promote(&mut self, entry_id: i64) -> Result<(), BrokerOpError> {
+        let outcome = self.simulate_and_gate(entry_id)?;
+        if outcome.entry.status != MergeStatus::Verified {
+            return Err(BrokerOpError::NotVerified {
+                entry: entry_id,
+                status: outcome.entry.status.as_str(),
+            });
+        }
+        self.promote(entry_id)
+    }
+
     pub fn promote(&mut self, entry_id: i64) -> Result<(), BrokerOpError> {
         let entry = self.queue_entry(entry_id)?;
         if entry.status != MergeStatus::Verified {
@@ -1453,14 +1483,7 @@ impl Broker {
         if current_base != base_at_verify {
             // Base moved since verification: verification is stale —
             // re-simulate instead of promoting a stale merge.
-            let outcome = self.simulate_and_gate(entry_id)?;
-            if outcome.entry.status != MergeStatus::Verified {
-                return Err(BrokerOpError::NotVerified {
-                    entry: entry_id,
-                    status: outcome.entry.status.as_str(),
-                });
-            }
-            return self.promote(entry_id);
+            return self.reverify_and_promote(entry_id);
         }
 
         // Capture the exact promoted path set before moving the ref. This is
@@ -1469,8 +1492,15 @@ impl Broker {
         let promoted_paths = self
             .repo_handle()
             .changed_between(&current_base, &merge_commit)?;
-        self.repo_handle()
-            .update_branch_ref(&branch, &merge_commit)?;
+        // The check above and this update are not atomic, and merge
+        // verifications run concurrently: two entries verified against the
+        // same base can both pass the check. An unconditional update would let
+        // the second silently overwrite the first while the first stays
+        // recorded as promoted. Moving the ref only from the verified base
+        // turns that race into one more stale verification.
+        if !advance_branch_from(self.repo_handle(), &branch, &current_base, &merge_commit)? {
+            return self.reverify_and_promote(entry_id);
+        }
         self.store().record_merge_promotion(
             entry_id,
             &merge_commit,
@@ -1725,6 +1755,28 @@ impl Broker {
     }
 }
 
+/// Move `branch` from `expected` to `commit`, and only from `expected`.
+///
+/// `Ok(false)` means the branch had already moved away from `expected`, so the
+/// caller's verification is stale. Any other failure is an error.
+fn advance_branch_from(
+    repo: &GitRepo,
+    branch: &str,
+    expected: &str,
+    commit: &str,
+) -> Result<bool, BrokerOpError> {
+    match repo.update_branch_ref_checked(branch, commit, expected) {
+        Ok(()) => Ok(true),
+        Err(error) => {
+            if repo.resolve_ref(&format!("refs/heads/{branch}")).as_deref() == Some(expected) {
+                Err(error.into())
+            } else {
+                Ok(false)
+            }
+        }
+    }
+}
+
 /// Remove a stale action-required drop once the session's work promotes
 /// (#41 follow-on, reported by agent A4: the file survived success with
 /// outdated blocking info). Best-effort — the worktree may be gone.
@@ -1795,4 +1847,57 @@ fn write_action_required(
         .map_or(Ok(()), std::fs::create_dir_all)
         .and_then(|()| std::fs::write(&path, body));
     crate::warn_unrecorded(&format!("write {}", path.display()), written);
+}
+
+#[cfg(test)]
+mod promotion_ref_tests {
+    use super::*;
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.test")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.test")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {args:?}");
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    fn commit(dir: &Path, name: &str) -> String {
+        std::fs::write(dir.join(name), name).unwrap();
+        git(dir, &["add", name]);
+        git(dir, &["commit", "-q", "-m", name]);
+        git(dir, &["rev-parse", "HEAD"])
+    }
+
+    /// Two promotions verified against the same base: the first advances
+    /// integration, and the second must see that its base moved instead of
+    /// overwriting the first promotion.
+    #[test]
+    fn a_second_promotion_from_the_same_base_does_not_overwrite_the_first() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        git(dir, &["init", "-q", "-b", "main"]);
+        let base = commit(dir, "base");
+        git(dir, &["branch", "integration", &base]);
+        let first = commit(dir, "first");
+        git(dir, &["reset", "-q", "--hard", &base]);
+        let second = commit(dir, "second");
+        let repo = GitRepo::discover(dir).unwrap();
+
+        assert!(advance_branch_from(&repo, "integration", &base, &first).unwrap());
+        assert!(
+            !advance_branch_from(&repo, "integration", &base, &second).unwrap(),
+            "the second promotion did not notice its base had moved"
+        );
+        assert_eq!(
+            git(dir, &["rev-parse", "integration"]),
+            first,
+            "the first promotion was overwritten"
+        );
+    }
 }
