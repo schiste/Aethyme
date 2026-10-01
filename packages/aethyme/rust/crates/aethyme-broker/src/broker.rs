@@ -955,7 +955,8 @@ pub struct DoctorReport {
     pub purged_stale_leases: usize,
     /// Read-only retention candidates and any already-authorized recovery.
     pub retention: crate::GcHealth,
-    /// Present when live sessions can still submit and move integration.
+    /// Present when live sessions can still submit and move integration;
+    /// never in a verify-only repository.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub integration_movement: Option<IntegrationMovementNotice>,
     /// Committed work only this machine holds. Reported, never counted
@@ -1444,6 +1445,8 @@ struct SummaryIntegration {
     main_head: String,
     main_is_ancestor: bool,
     ahead_main_commits: u64,
+    /// False in a verify-only repository, where no session moves integration.
+    promotes: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -6433,6 +6436,12 @@ impl Broker {
         (integration_branch, integration_head): (String, String),
         now_ms: i64,
     ) -> Result<StatusView, BrokerOpError> {
+        // In a verify-only repository nothing moves integration: submit
+        // verifies against the default branch and sessions start from it. Every
+        // row below that tells an agent integration may move, has drifted, or
+        // needs reconciling is noise there (and some of it is `blocked`), so
+        // the mode is read once and gates all of them.
+        let promotes = PromoteConfig::load(&self.main_root).mode.promotes_at_all();
         let promoted_conflicts = self.promoted_conflicts()?;
         // Declared intent, not yet visible in any diff. Read from the same
         // snapshot as the leases above so both halves of "who else is working
@@ -6504,6 +6513,7 @@ impl Broker {
                 ahead_main_commits: self
                     .repo
                     .commit_count_between(&main_head, &integration_head)?,
+                promotes,
             },
         );
         let mut advice = self.status_advice(
@@ -6512,6 +6522,7 @@ impl Broker {
             &latest_live_queue,
             &integration_branch,
             &integration_head,
+            promotes,
         );
         let integration_contains_upstream = upstream_head
             .as_deref()
@@ -6522,7 +6533,8 @@ impl Broker {
                 .ok(),
             _ => None,
         };
-        if upstream_head.is_some()
+        if promotes
+            && upstream_head.is_some()
             && (main_behind_upstream_commits > 0 || !integration_contains_upstream)
         {
             let upstream = upstream_ref.as_deref().unwrap_or("@{upstream}");
@@ -6605,7 +6617,12 @@ impl Broker {
                 },
                 );
         }
-        if let Some((branch, commits)) = self.external_default_branch_writes(&integration_head) {
+        // "Never passed through submit" is every commit under verify-only,
+        // where landing goes through pull requests and integration stays put.
+        if let Some((branch, commits)) = promotes
+            .then(|| self.external_default_branch_writes(&integration_head))
+            .flatten()
+        {
             let count = commits.len();
             advice.push(StatusAdvice {
                 id: "main.external-writes",
@@ -6958,9 +6975,7 @@ impl Broker {
         // A status that cannot read refs still reports everything else; the
         // unpushed count is context, not a precondition for any command.
         let unpushed_work = self.unpushed_work(now_ms).unwrap_or_default();
-        let verify_only =
-            PromoteConfig::load(&self.main_root).mode == crate::merge::PromoteMode::VerifyOnly;
-        advice.extend(unpushed_work_advice(&unpushed_work, now_ms, verify_only));
+        advice.extend(unpushed_work_advice(&unpushed_work, now_ms, !promotes));
         advice.extend(self.integration_behind_upstream_advice());
         advice.extend(overlap_pair_advice(&overlap_pairs));
         // Cached listing and local refs only: `status` never calls GitHub.
@@ -7466,6 +7481,7 @@ impl Broker {
         queue: &[MergeQueueEntry],
         integration_branch: &str,
         integration_head: &str,
+        promotes: bool,
     ) -> Vec<StatusAdvice> {
         use std::collections::BTreeMap;
 
@@ -7544,7 +7560,7 @@ impl Broker {
             }
         }
 
-        if !agents.is_empty() {
+        if promotes && !agents.is_empty() {
             advice.push(integration_movement_advice(
                 integration_branch,
                 integration_head,
@@ -7703,7 +7719,9 @@ impl Broker {
         &mut self,
         sessions: &[Session],
     ) -> Result<Option<IntegrationMovementNotice>, BrokerOpError> {
-        if sessions.is_empty() {
+        // Verify-only: sessions never submit into integration, so there is no
+        // movement to wait out.
+        if sessions.is_empty() || !PromoteConfig::load(&self.main_root).mode.promotes_at_all() {
             return Ok(None);
         }
         let (branch, head) = self.integration_head()?;
@@ -10559,7 +10577,7 @@ fn status_summary(
         .iter()
         .filter(|agent| agent.derived_status == SessionStatus::Stale)
         .count();
-    let may_move_integration = live_sessions > 0;
+    let may_move_integration = integration.promotes && live_sessions > 0;
 
     let sessions = session_summary_phrase(
         live_sessions,
@@ -10577,7 +10595,9 @@ fn status_summary(
             plural_word(dirty_sessions, "session", "sessions")
         ));
     }
-    notes.push(if active_sessions > 0 {
+    notes.push(if !integration.promotes {
+        "verify-only: submit does not move integration".to_string()
+    } else if active_sessions > 0 {
         "active session may promote new integration work".to_string()
     } else if live_sessions > 0 {
         "live session may promote new integration work".to_string()
@@ -10589,7 +10609,7 @@ fn status_summary(
     if may_move_integration {
         commands.push("aethyme broker advanced integration wait-stable --seconds 30".into());
     }
-    if integration.relation != StatusIntegrationRelation::CurrentWithMain {
+    if integration.promotes && integration.relation != StatusIntegrationRelation::CurrentWithMain {
         commands.push("aethyme broker advanced integration status".into());
     }
 
@@ -11752,6 +11772,7 @@ mod tests {
             main_head: "a".repeat(40),
             main_is_ancestor: true,
             ahead_main_commits: 0,
+            promotes: true,
         }
     }
 
@@ -11872,6 +11893,43 @@ mod tests {
             summary.commands,
             vec!["aethyme broker advanced integration wait-stable --seconds 30"]
         );
+    }
+
+    /// Verify-only: live sessions submit, but nothing they do moves
+    /// integration, so neither the flag nor the commands may say it can.
+    #[test]
+    fn verify_only_summary_does_not_say_sessions_move_integration() {
+        let agent = super::AgentView {
+            session: session(71),
+            activity_at: 0,
+            derived_status: SessionStatus::Active,
+            pid_alive: None,
+        };
+        let integration = super::SummaryIntegration {
+            relation: super::StatusIntegrationRelation::AheadOfMain,
+            ahead_baseline_commits: 3,
+            promotes: false,
+            ..current_summary_integration()
+        };
+
+        let summary = super::status_summary(
+            &[agent],
+            0,
+            super::OverlapPairCounts::default(),
+            0,
+            0,
+            &integration,
+        );
+
+        assert!(!summary.may_move_integration);
+        assert!(
+            summary
+                .message
+                .ends_with("; verify-only: submit does not move integration"),
+            "{}",
+            summary.message
+        );
+        assert!(summary.commands.is_empty(), "{:?}", summary.commands);
     }
 
     #[test]

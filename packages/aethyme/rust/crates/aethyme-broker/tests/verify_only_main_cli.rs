@@ -339,3 +339,128 @@ fn status_reports_the_session_behind_main_from_fetched_refs_only() {
         "integration is unused in a verify-only repository: {status}"
     );
 }
+
+/// Every status row that tells an agent integration may move, has drifted
+/// from the default branch, or was bypassed by commits on it. Each group is
+/// one condition; drift reports exactly one of its three ids.
+const INTEGRATION_MOVEMENT_ADVICE: &[(&str, &[&str])] = &[
+    (
+        "live sessions may move integration",
+        &["integration.may-move"],
+    ),
+    (
+        "integration does not contain the default branch",
+        &[
+            "integration.upstream-main-ahead",
+            "integration.fast-forward-available",
+            "integration.stale-promotions",
+        ],
+    ),
+    (
+        "new sessions bypass a stale integration",
+        &["integration.behind-upstream"],
+    ),
+    (
+        "default-branch commits never passed through submit",
+        &["main.external-writes"],
+    ),
+];
+
+impl Fixture {
+    /// Two live sessions, a pull request merged on the provider, a local
+    /// default branch fast-forwarded to it, and an integration branch holding
+    /// one promoted commit of its own: every integration-movement condition
+    /// holds. The commit of its own matters -- a promoting broker
+    /// fast-forwards an integration branch that is merely behind, which would
+    /// clear the drift rows before `status` could report them.
+    fn with_integration_left_behind(mode: &str) -> Self {
+        let fixture = Self::new(mode);
+        git(&fixture.repo, &["checkout", "-q", "aethyme/integration"]);
+        std::fs::write(fixture.repo.join("promoted.txt"), "promoted\n").unwrap();
+        git(&fixture.repo, &["add", "promoted.txt"]);
+        git(&fixture.repo, &["commit", "-qm", "feat: promoted earlier"]);
+        git(&fixture.repo, &["checkout", "-q", "main"]);
+        fixture.session_changing("tracked.txt", "session\n");
+        fixture.session_changing("other.txt", "session\n");
+        fixture.land_on_origin("tracked.txt", "upstream\n");
+        git(&fixture.repo, &["merge", "-q", "--ff-only", "origin/main"]);
+        git(
+            &fixture.repo,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        );
+        fixture
+    }
+}
+
+fn names_wait_stable(commands: &serde_json::Value) -> bool {
+    commands
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|command| command.as_str().unwrap_or_default().contains("wait-stable"))
+}
+
+#[test]
+fn verify_only_status_tells_no_session_that_integration_moves() {
+    let fixture = Fixture::with_integration_left_behind("verify-only");
+
+    let status = fixture.status_offline();
+
+    for (condition, ids) in INTEGRATION_MOVEMENT_ADVICE {
+        for id in *ids {
+            assert!(
+                advice_rows(&status, id).is_empty(),
+                "{condition}: {id} in a verify-only repository: {status:#}"
+            );
+        }
+    }
+    let summary = &status["summary"];
+    assert_eq!(summary["may_move_integration"], false, "{summary:#}");
+    assert!(!names_wait_stable(&summary["commands"]), "{summary:#}");
+    assert!(
+        summary["message"]
+            .as_str()
+            .unwrap()
+            .contains("verify-only: submit does not move integration"),
+        "{summary:#}"
+    );
+
+    // Work promoted before the switch is still at risk, so that row stays --
+    // without sending anyone to wait on integration.
+    let unpublished = advice_rows(&status, "integration.unpublished-work");
+    assert_eq!(unpublished.len(), 1, "{status:#}");
+    assert!(
+        !names_wait_stable(&unpublished[0]["commands"]),
+        "{status:#}"
+    );
+
+    let doctor = json(&fixture.run(&["status", "doctor", "--json"], &fixture.remote));
+    assert!(doctor.get("integration_movement").is_none(), "{doctor:#}");
+}
+
+/// The same repository promoting: every condition is real there, so every
+/// row still appears. Without this the test above would pass on a fixture
+/// that never raised any of them.
+#[test]
+fn a_promoting_repository_still_reports_integration_movement() {
+    let fixture = Fixture::with_integration_left_behind("auto");
+
+    let status = fixture.status_offline();
+
+    for (condition, ids) in INTEGRATION_MOVEMENT_ADVICE {
+        assert!(
+            ids.iter().any(|id| !advice_rows(&status, id).is_empty()),
+            "{condition}: none of {ids:?} in an auto repository: {status:#}"
+        );
+    }
+    let summary = &status["summary"];
+    assert_eq!(summary["may_move_integration"], true, "{summary:#}");
+    assert!(names_wait_stable(&summary["commands"]), "{summary:#}");
+
+    let doctor = json(&fixture.run(&["status", "doctor", "--json"], &fixture.remote));
+    assert!(doctor["integration_movement"].is_object(), "{doctor:#}");
+}
