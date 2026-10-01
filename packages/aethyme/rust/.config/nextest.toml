@@ -18,5 +18,7 @@ fail-fast = false
 retries = 1
 # Print failure output where it happened and again in the final summary.
 failure-output = "immediate-final"
-# Flag tests that run for more than a minute so slow tests stay visible.
-slow-timeout = { period = "60s" }
+# Flag a test after each minute and kill it after five, so a hanging test
+# fails the run with its name instead of holding the job until GitHub's
+# timeout (the first run of this profile sat in one step for over an hour).
+slow-timeout = { period = "60s", terminate-after = 5 }
