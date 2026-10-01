@@ -265,7 +265,35 @@ pub struct SubmitOutcome {
     /// it, each with the severity and reason it was judged by.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub lease_warnings: Vec<crate::LeaseBlocker>,
+    /// The commit this submission was simulated and gated against.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified_against: Option<VerificationBase>,
 }
+
+/// What a submission is simulated and gated against.
+///
+/// A promoting repository verifies against its integration branch, because
+/// that is what a verified entry is promoted onto. A verify-only repository
+/// promotes nothing and delivers each session through its own pull request,
+/// so the only base that predicts the merge is the fetched default branch;
+/// integration is not consulted there at all.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct VerificationBase {
+    /// `upstream` (the fetched default branch) or `integration`.
+    pub source: &'static str,
+    /// The ref verified against, e.g. `origin/main` or `aethyme/integration`.
+    pub reference: String,
+    pub commit: String,
+    /// Why a verify-only repository fell back to integration: it has no
+    /// fetched default branch to verify against.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallback_reason: Option<String>,
+}
+
+/// [`VerificationBase::source`] for the fetched default branch.
+pub const VERIFIED_AGAINST_UPSTREAM: &str = "upstream";
+/// [`VerificationBase::source`] for the integration branch.
+pub const VERIFIED_AGAINST_INTEGRATION: &str = "integration";
 
 /// Whether a commit belongs to the session's recorded work boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -470,6 +498,42 @@ impl Broker {
         Ok((config.branch, head))
     }
 
+    /// The base a submission is simulated and gated against.
+    ///
+    /// Verify-only repositories verify against the fetched default branch and
+    /// never touch the integration branch: nothing is promoted there, and a
+    /// pull request merged on the provider leaves integration behind, so it
+    /// would verify the change against an old copy of the default branch.
+    /// Without a fetched default branch they fall back to integration, and the
+    /// outcome says why. Promoting repositories keep integration, which is
+    /// what a verified entry is promoted onto. Never fetches.
+    pub(crate) fn submission_base(&mut self) -> Result<VerificationBase, BrokerOpError> {
+        let config = PromoteConfig::load(&self.main_root_path());
+        let mut fallback_reason = None;
+        if config.mode == PromoteMode::VerifyOnly {
+            if let Some((reference, commit)) = self.repo_handle().upstream_default() {
+                return Ok(VerificationBase {
+                    source: VERIFIED_AGAINST_UPSTREAM,
+                    reference,
+                    commit,
+                    fallback_reason: None,
+                });
+            }
+            fallback_reason = Some(
+                "no fetched default branch to verify against; verified against the \
+                 integration branch instead (set the main checkout's upstream or fetch it)"
+                    .to_string(),
+            );
+        }
+        let (reference, commit) = self.integration_head()?;
+        Ok(VerificationBase {
+            source: VERIFIED_AGAINST_INTEGRATION,
+            reference,
+            commit,
+            fallback_reason,
+        })
+    }
+
     /// Submit a session's committed head for promotion: queue (idempotent
     /// per head), simulate, gate on the merged tree, and auto-promote if
     /// configured. Uncommitted changes are NOT included — the head commit
@@ -513,7 +577,7 @@ impl Broker {
                 report: Box::new(ownership),
             });
         }
-        let (_branch, base) = self.integration_head()?;
+        let base = self.submission_base()?.commit;
         // The base's gates judge this submission. Refuse an untrusted policy
         // before any queue row exists, so the refusal leaves no residue.
         self.require_trusted_policy_at_commit(&base, Some(session_id))?;
@@ -634,7 +698,26 @@ impl Broker {
             self.repo_handle()
                 .resolve_ref(&format!("refs/heads/{branch}"))
         };
-        let (_branch, base) = self.integration_head()?;
+        let verification = self.submission_base()?;
+        // The follows-main refresh only concerns integration. Verified against
+        // the default branch, the base is the base: nothing was refreshed.
+        let pre_refresh =
+            pre_refresh.filter(|_| verification.source == VERIFIED_AGAINST_INTEGRATION);
+        let base = verification.commit.clone();
+        let mut outcome =
+            self.simulate_and_gate_against(entry_id, cache_policy, intent, base, pre_refresh)?;
+        outcome.verified_against = Some(verification);
+        Ok(outcome)
+    }
+
+    fn simulate_and_gate_against(
+        &mut self,
+        entry_id: i64,
+        cache_policy: crate::gates::CachePolicy,
+        intent: PromotionIntent,
+        base: String,
+        pre_refresh: Option<String>,
+    ) -> Result<SubmitOutcome, BrokerOpError> {
         let entry = self
             .store()
             .merge_queue()?
@@ -695,6 +778,7 @@ impl Broker {
                 gate_verification: SubmissionGateVerification::not_run(),
                 no_changes: false,
                 lease_warnings: Vec::new(),
+                verified_against: None,
                 promoted: false,
                 promotion_suppressed: None,
             });
@@ -749,6 +833,7 @@ impl Broker {
                     gate_verification: SubmissionGateVerification::not_run(),
                     no_changes: true,
                     lease_warnings: Vec::new(),
+                    verified_against: None,
                     promoted: true,
                     promotion_suppressed: None,
                 });
@@ -770,6 +855,7 @@ impl Broker {
                 gate_verification: SubmissionGateVerification::not_run(),
                 no_changes: true,
                 lease_warnings: Vec::new(),
+                verified_against: None,
                 promoted: false,
                 promotion_suppressed: None,
             });
@@ -1056,6 +1142,7 @@ impl Broker {
             gate_verification,
             no_changes: false,
             lease_warnings: Vec::new(),
+            verified_against: None,
             promoted,
             promotion_suppressed,
         })

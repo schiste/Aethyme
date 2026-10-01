@@ -87,6 +87,14 @@ pub struct SessionPushReport {
     /// Open pull requests whose change could not be read, so their overlap
     /// is unknown rather than absent.
     pub pr_overlaps_unknown: Vec<i64>,
+    /// The pushed head compared with the default branch, fetched just before
+    /// the comparison: how far behind it is and whether merging would
+    /// conflict. `None` when Git could not answer. Advisory only.
+    pub default_branch: Option<crate::DefaultBranchDrift>,
+    /// Why `default_branch` is missing or may be stale, e.g. the fetch failed
+    /// and the comparison used the last fetched copy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_branch_note: Option<String>,
 }
 
 /// How many paths `broker push` left behind, and a few of them.
@@ -364,6 +372,18 @@ impl Broker {
             None
         };
 
+        // Advisory and best-effort, like the overlap check below: the default
+        // branch moved under this session whenever another PR merged, and
+        // that is only visible after fetching it.
+        let (default_branch, default_branch_note) = self.default_branch_drift_for_push(
+            session_id,
+            &session.branch,
+            &default,
+            &target,
+            &head,
+            &main_root,
+        );
+
         // Advisory and best-effort: a listing or diff that cannot be read
         // degrades to "unknown" and never fails a push that already happened.
         let overlap = self.check_pr_overlaps_for_push(
@@ -400,7 +420,87 @@ impl Broker {
             pr,
             pr_overlaps: overlap.overlaps,
             pr_overlaps_unknown: overlap.unknown_prs,
+            default_branch,
+            default_branch_note,
         })
+    }
+
+    /// Fetch exactly the default branch, then compare the pushed head with it.
+    ///
+    /// The fetch moves only the remote-tracking ref of the default branch, and
+    /// goes through the coordinated operation lane like every other remote
+    /// read that moves a ref. A failed fetch is not a failed push: the
+    /// comparison falls back to the last fetched copy and says so. The result
+    /// is cached so `status` can show it without the network.
+    fn default_branch_drift_for_push(
+        &mut self,
+        session_id: i64,
+        branch: &str,
+        default: &TrackedDefault,
+        target: &crate::ResolvedRemoteTarget,
+        head: &str,
+        main_root: &Path,
+    ) -> (Option<crate::DefaultBranchDrift>, Option<String>) {
+        let source = format!("refs/heads/{}", default.branch);
+        let fetch = self.run_coordinated_operation_at_with_wait(
+            CoordinatedCommand {
+                session_id,
+                provider: OperationProvider::Git,
+                repository: None,
+                resolved_target: Some(target.clone()),
+                scope: Some(format!("ref:{}", default.tracking_ref)),
+                declared_effect: None,
+                destructive_confirmed: false,
+                authorization_reason: Some(
+                    "refresh the default branch to compare a pushed session with it".into(),
+                ),
+                args: vec![
+                    "fetch".into(),
+                    default.remote.clone(),
+                    format!("{source}:{}", default.tracking_ref),
+                ],
+            },
+            main_root,
+            push_operation_wait(),
+        );
+        let mut note = match fetch {
+            Ok(fetch) if fetch.ok() => None,
+            Ok(fetch) => Some(format!(
+                "fetching {} failed (operation {}); compared with the last fetched copy",
+                default.tracking_ref, fetch.operation.id
+            )),
+            Err(error) => Some(format!(
+                "fetching {} failed ({error}); compared with the last fetched copy",
+                default.tracking_ref
+            )),
+        };
+        let repo = self.repo_handle();
+        let Some(commit) = repo.resolve_ref(&default.tracking_ref) else {
+            return (
+                None,
+                Some(format!("{} is not fetched", default.tracking_ref)),
+            );
+        };
+        let reference = format!("{}/{}", default.remote, default.branch);
+        let catch_up = crate::main_drift::CatchUp::for_branch(repo, &default.remote, branch);
+        let drift = crate::main_drift::measure(repo, &reference, &commit, head, catch_up);
+        match &drift {
+            Some(drift) => {
+                if let Ok(raw) = serde_json::to_string(drift) {
+                    crate::warn_unrecorded(
+                        "cache the default-branch comparison",
+                        self.store()
+                            .meta_set(&crate::main_drift::cache_key(session_id), &raw),
+                    );
+                }
+            }
+            None => {
+                note.get_or_insert_with(|| {
+                    format!("could not compare the session with {reference}")
+                });
+            }
+        }
+        (drift, note)
     }
 
     /// Find the open pull request for the session branch, or open a draft.

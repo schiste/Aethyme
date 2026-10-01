@@ -325,9 +325,21 @@ were one per overlapping path, so totals spanning that date mix both units.
                        "load_avg_1m_end", "cpu_count",
                        "free_disk_bytes_start" } ],
   "no_changes": true|false,
-  "promoted": true|false
+  "promoted": true|false,
+  "verified_against": {                      // omitted when not recorded
+    "source": "upstream" | "integration",
+    "reference": "origin/main" | "aethyme/integration",
+    "commit": "<full commit>",
+    "fallback_reason": "..."                 // omitted unless a verify-only
+  }                                          // repository fell back to integration
 }
 ```
+
+`verified_against` (introduced 2026-10-01) names what the submission was
+simulated and gated against. A `[promote] mode = "verify-only"` repository
+verifies against the fetched default branch (`source: "upstream"`) and does not
+touch the integration branch; a promoting repository keeps verifying against
+integration. `submission_plan.integration_head` holds the same commit.
 
 The four machine-environment fields in `gate_outcomes` (introduced
 2026-09-26, schema 43) describe the machine an executed gate ran on:

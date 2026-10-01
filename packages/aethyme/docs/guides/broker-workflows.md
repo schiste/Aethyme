@@ -978,6 +978,39 @@ Without the policy, the generated instructions keep the conservative default:
 submitting never authorizes publishing, and delivery goes through the
 reviewed `broker advanced ship` workflow.
 
+### Verify-only repositories do not use integration
+
+Under `mode = "verify-only"` each session branch and its pull request are the
+delivery path, and the integration branch plays no part:
+
+- **`broker submit` is a pre-flight against the current default branch.** It
+  simulates the merge onto the fetched default branch and gates that tree,
+  never the integration branch, which nothing advances in this mode once a
+  pull request merges on the provider. `submit --json` reports the base as
+  `verified_against` (`source`: `upstream`, `reference`, `commit`). Without a
+  fetched default branch it falls back to integration and says why in
+  `verified_against.fallback_reason`.
+- **`broker push` reports when the default branch moved.** Each push fetches
+  exactly the default branch, then reports `default_branch` (`behind`,
+  `ahead`, `would_conflict`, `conflicting_paths`, `suggested_command`) from a
+  `git merge-tree` simulation that touches no worktree. A branch already on
+  the remote is caught up by merging (`git fetch origin && git merge
+  origin/main`), because rebasing a published branch rewrites what its pull
+  request shows; an unpublished one by rebasing. A failed fetch never fails
+  the push: the last fetched copy is compared and `default_branch_note` says
+  so. This applies in every promote mode.
+- **`broker status` shows `session.behind-main`** per live session: `info`
+  while the branch still merges cleanly, `warning` when it would conflict. It
+  uses only fetched refs and the verdict cached by the last push or status,
+  re-measuring at most three sessions per call.
+- **Integration rows go quiet.** `integration.behind-upstream` is not shown.
+  `integration.unpublished-work` is still shown when integration holds
+  commits from before the switch, because that is work at risk, but it no
+  longer recommends the mode already in force.
+
+Open pull requests are compared separately (`pr_overlaps`); `default_branch`
+covers work that has already merged.
+
 ## Where A New Session Starts
 
 Without `--base`, `broker start` cuts the session branch from the first of:
