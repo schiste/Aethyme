@@ -1074,3 +1074,153 @@ fn missing_store_error_names_runnable_aethyme_commands() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// Regression: the store recorded the commit it was materialized from,
+/// but nothing on the query path read it. A commit that changed source
+/// left every navigation command serving the previous commit's graph,
+/// with no warning and a success exit code.
+///
+/// `open_fresh` is the opt-in gate; this pins that it actually refuses a
+/// store built from an older commit, and that `Freshness::Unknown`
+/// (no git checkout, or no recorded commit) stays permissive rather
+/// than blocking on absent evidence.
+#[test]
+fn open_fresh_refuses_a_store_built_from_an_older_commit() {
+    let root = std::env::temp_dir().join("aethyme_freshness_gate_test");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join(".aethyme")).expect("create repo");
+    std::fs::write(root.join("seed.txt"), "seed").expect("write seed");
+    std::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&root)
+        .output()
+        .expect("git init");
+    std::process::Command::new("git")
+        .args(["config", "user.email", "test@example.invalid"])
+        .current_dir(&root)
+        .output()
+        .expect("git config email");
+    std::process::Command::new("git")
+        .args(["config", "user.name", "Test"])
+        .current_dir(&root)
+        .output()
+        .expect("git config name");
+    std::process::Command::new("git")
+        .args(["add", "-A"])
+        .current_dir(&root)
+        .output()
+        .expect("git add");
+    std::process::Command::new("git")
+        .args(["commit", "-qm", "first"])
+        .current_dir(&root)
+        .output()
+        .expect("git commit");
+
+    // Materialize the store bound to HEAD, then move HEAD forward.
+    let first_head = String::from_utf8(
+        std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&root)
+            .output()
+            .expect("rev-parse")
+            .stdout,
+    )
+    .expect("utf8")
+    .trim()
+    .to_string();
+
+    let store = GraphStore::open(&root).expect("open store");
+    aethyme_engine_store_seed(&store, &first_head);
+    drop(store);
+
+    // Same commit: current.
+    assert_eq!(
+        ReadOnlyGraphStore::open_fresh(&root, super::super::FreshnessPolicy::RefuseStale)
+            .expect("fresh store opens")
+            .freshness(&root)
+            .expect("freshness"),
+        super::super::Freshness::Current
+    );
+
+    // Advance HEAD. The store is now stale but still readable.
+    std::fs::write(root.join("second.txt"), "second").expect("write second");
+    std::process::Command::new("git")
+        .args(["add", "-A"])
+        .current_dir(&root)
+        .output()
+        .expect("git add 2");
+    std::process::Command::new("git")
+        .args(["commit", "-qm", "second"])
+        .current_dir(&root)
+        .output()
+        .expect("git commit 2");
+
+    assert!(
+        matches!(
+            ReadOnlyGraphStore::open_fresh(&root, super::super::FreshnessPolicy::RefuseStale),
+            Err(GraphStoreError::IndexedAtDifferentCommit { .. })
+        ),
+        "a store built from an older commit must be refused under RefuseStale"
+    );
+
+    // Ignore still opens, and still reports the staleness to the caller.
+    let permissive =
+        ReadOnlyGraphStore::open_fresh(&root, super::super::FreshnessPolicy::Ignore)
+            .expect("Ignore policy opens a stale store");
+    assert!(matches!(
+        permissive.freshness(&root).expect("freshness"),
+        super::super::Freshness::Stale { .. }
+    ));
+
+    // The error message must name runnable commands.
+    let message = match ReadOnlyGraphStore::open_fresh(
+        &root,
+        super::super::FreshnessPolicy::RefuseStale,
+    ) {
+        Err(error) => error.to_string(),
+        Ok(_) => panic!("expected refusal"),
+    };
+    assert!(message.contains("aethyme graph refresh plan --repo"));
+    assert!(!message.contains("aethyme-engine-cli"));
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Record a source commit on an open store so freshness has something to
+/// compare. `publish_staging` is the production path that writes this
+/// field; the test needs only the metadata write.
+fn aethyme_engine_store_seed(store: &GraphStore, commit: &str) {
+    let mut metadata = store
+        .repo_metadata()
+        .expect("metadata")
+        .unwrap_or_else(|| RepoMetadata {
+            root_path: store.path().display().to_string(),
+            commit_hash: None,
+            indexed_at_unix: 0,
+            file_count: 0,
+            languages: Vec::new(),
+        });
+    metadata.commit_hash = Some(commit.to_string());
+    store.set_repo_metadata(&metadata).expect("set metadata");
+}
+
+/// Outside a git checkout the comparison cannot be made, so it must stay
+/// permissive rather than blocking on absent evidence.
+#[test]
+fn freshness_is_unknown_without_a_git_checkout_and_stays_permissive() {
+    let root = std::env::temp_dir().join("aethyme_freshness_unknown_test");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join(".aethyme")).expect("create repo");
+    let store = GraphStore::open(&root).expect("open");
+    drop(store);
+
+    assert_eq!(
+        ReadOnlyGraphStore::open_fresh(&root, super::super::FreshnessPolicy::RefuseStale)
+            .expect("Unknown freshness must not block the open")
+            .freshness(&root)
+            .expect("freshness"),
+        super::super::Freshness::Unknown
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}

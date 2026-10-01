@@ -208,9 +208,26 @@ pub(super) fn graph_store_observability(repo: &Path) -> serde_json::Value {
     let fragments_path = repo.join(".aethyme").join("graph");
     let store_modified = modified_unix_secs(&store_path);
     let newest_fragment = newest_fragment_modified_unix_secs(&fragments_path);
-    let stale = match (store_modified, newest_fragment) {
-        (Some(store), Some(fragment)) => Some(fragment > store),
-        _ => None,
+
+    // Freshness is decided by comparing the commit the store was
+    // materialized from against the repository's current HEAD.
+    //
+    // The previous check compared the store's mtime against the newest
+    // fragment's mtime at one-second granularity, and only against the
+    // newest fragment. It reported `stale: false` for a store that was
+    // in fact one commit behind: the store had simply been written
+    // after the fragments, which is true whenever the fragments have
+    // not changed since. A mtime comparison cannot detect "HEAD moved
+    // but the fragments were not regenerated", which is the exact
+    // situation this field is supposed to warn about.
+    let indexed_commit = read_store_commit(&store_path);
+    let head_commit = read_head_commit(repo);
+    let stale = match (indexed_commit.as_deref(), head_commit.as_deref()) {
+        (Some(indexed), Some(head)) => Some(indexed != head),
+        // Without both hashes the honest answer is "unknown", not
+        // "fresh". Reporting `fresh` from absent evidence is what made
+        // the old heuristic actively misleading.
+        (Some(_), None) | (None, Some(_)) | (None, None) => None,
     };
     let status = match stale {
         Some(true) => "stale",
@@ -225,8 +242,11 @@ pub(super) fn graph_store_observability(repo: &Path) -> serde_json::Value {
         "exists": store_path.is_file(),
         "fragments_exist": fragments_path.is_dir(),
         "stale": stale,
+        "indexed_commit": indexed_commit,
+        "head_commit": head_commit,
         "store_modified_unix": store_modified,
         "newest_fragment_modified_unix": newest_fragment,
+        "freshness_basis": "indexed_commit_vs_head",
     });
     let surface_flow_graph = surface_flow_coverage(repo, &fragments_path);
     let completeness = surface_flow_graph
@@ -251,10 +271,16 @@ pub(super) fn graph_store_observability(repo: &Path) -> serde_json::Value {
         "graph_freshness": {
             "backend": "redb",
             "status": status,
+            // `fresh` is a positive claim about currency. Only make it
+            // when the commit comparison actually established it;
+            // "unknown" must not be rounded up to "fresh".
             "fresh": status == "fresh",
             "exists": store_path.is_file(),
             "fragments_exist": fragments_path.is_dir(),
             "stale": stale,
+            "indexed_commit": indexed_commit,
+            "head_commit": head_commit,
+            "freshness_basis": "indexed_commit_vs_head",
             "store_modified_unix": store_modified,
             "newest_fragment_modified_unix": newest_fragment,
             "source_of_truth": "graph_fragments",
@@ -700,6 +726,39 @@ pub(super) fn normalized_path(path: &Path) -> String {
         .map(|component| component.as_os_str().to_string_lossy())
         .collect::<Vec<_>>()
         .join("/")
+}
+
+/// The commit the graph store was materialized from.
+///
+/// Recorded in the store's `RepoMetadata` at publish time and read back
+/// through the read-only handle. `None` means the store predates this
+/// field or is unreadable, which is reported as unknown freshness rather
+/// than assumed fresh.
+pub(super) fn read_store_commit(store_path: &Path) -> Option<String> {
+    if !store_path.is_file() {
+        return None;
+    }
+    let store = GraphStore::open_read_only(store_path.parent()?).ok()?;
+    store.repo_metadata().ok()??.commit_hash
+}
+
+/// The repository's current HEAD, or `None` outside a git checkout or
+/// when git is unavailable.
+pub(super) fn read_head_commit(repo: &Path) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(repo)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let head = String::from_utf8(output.stdout).ok()?;
+    let head = head.trim();
+    if head.is_empty() {
+        return None;
+    }
+    Some(head.to_string())
 }
 
 pub(super) fn modified_unix_secs(path: &Path) -> Option<u64> {

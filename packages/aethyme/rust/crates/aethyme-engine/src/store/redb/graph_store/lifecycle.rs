@@ -3,6 +3,53 @@
 
 use super::*;
 
+/// How a read path should react to a store built from an older commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FreshnessPolicy {
+    /// Fail the open with [`GraphStoreError::IndexedAtDifferentCommit`].
+    ///
+    /// Appropriate for consumers that will act on the answer, such as a
+    /// gate or an automated edit planner, where a graph describing
+    /// yesterday's code is worse than no graph.
+    RefuseStale,
+    /// Open anyway. The caller is expected to surface the freshness
+    /// result in its own output.
+    Ignore,
+}
+
+/// Outcome of comparing the store's recorded commit against HEAD.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Freshness {
+    /// The store was built from the current HEAD.
+    Current,
+    /// The store was built from an earlier commit.
+    Stale {
+        indexed: String,
+        head: String,
+    },
+    /// Either side of the comparison is unavailable.
+    Unknown,
+}
+
+/// Read the repository's current HEAD, or `None` outside a git checkout.
+fn current_head_commit(repo_root: &Path) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(repo_root)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let head = String::from_utf8(output.stdout).ok()?;
+    let head = head.trim();
+    if head.is_empty() {
+        None
+    } else {
+        Some(head.to_string())
+    }
+}
+
 impl GraphStore {
     /// Open or create the graph store for a repository. Verifies / writes the
     /// schema version sentinel and ensures every table exists so downstream
@@ -352,6 +399,65 @@ impl ReadOnlyGraphStore {
         let db = open_read_only_database(&db_path)?;
         verify_schema_read_only(&db)?;
         Ok(Self { db, db_path })
+    }
+
+    /// Open a store and fail when it was built from a different commit
+    /// than the repository's current HEAD.
+    ///
+    /// The store records its source commit at publish time, but nothing
+    /// on the query path consulted it: `RepoMetadata::commit_hash` was
+    /// read only by the broker and the refresh CLI. Roughly forty engine
+    /// entry points opened the store and queried it with no freshness
+    /// check, so a commit that changed code left every navigation
+    /// command serving the previous commit's graph with no warning and a
+    /// success exit code.
+    ///
+    /// This is opt-in via [`FreshnessPolicy`] rather than the default
+    /// because a store legitimately trails HEAD in normal use — a
+    /// developer commits source and has not re-run `graph refresh` yet.
+    /// Turning that into a hard failure by default would make the graph
+    /// unusable between edits, so callers choose: refuse, warn, or
+    /// ignore.
+    pub fn open_fresh(
+        repo_root: &Path,
+        policy: FreshnessPolicy,
+    ) -> Result<Self, GraphStoreError> {
+        let store = Self::open(repo_root)?;
+        match store.freshness(repo_root)? {
+            Freshness::Current => Ok(store),
+            Freshness::Unknown => match policy {
+                // Absent evidence is not evidence of staleness, so an
+                // unknown comparison stays permissive and is surfaced
+                // through the observability payload instead.
+                FreshnessPolicy::RefuseStale | FreshnessPolicy::Ignore => Ok(store),
+            },
+            Freshness::Stale { indexed, head } => match policy {
+                FreshnessPolicy::Ignore => Ok(store),
+                FreshnessPolicy::RefuseStale => {
+                    Err(GraphStoreError::IndexedAtDifferentCommit { indexed, head })
+                }
+            },
+        }
+    }
+
+    /// Compare the store's recorded commit against the repository HEAD.
+    ///
+    /// Returns [`Freshness::Unknown`] when either side is unavailable —
+    /// a store built before commit recording, or a directory that is not
+    /// a git checkout — so callers can distinguish "cannot tell" from
+    /// "told you it is current".
+    pub fn freshness(&self, repo_root: &Path) -> Result<Freshness, GraphStoreError> {
+        let Some(indexed) = self.repo_metadata()?.and_then(|meta| meta.commit_hash) else {
+            return Ok(Freshness::Unknown);
+        };
+        let Some(head) = current_head_commit(repo_root) else {
+            return Ok(Freshness::Unknown);
+        };
+        if indexed == head {
+            Ok(Freshness::Current)
+        } else {
+            Ok(Freshness::Stale { indexed, head })
+        }
     }
 
     /// Path to the DB file on disk.

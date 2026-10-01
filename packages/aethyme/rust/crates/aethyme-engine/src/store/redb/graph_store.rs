@@ -175,6 +175,10 @@ pub enum GraphStoreError {
     SchemaMismatch { found: u32, expected: u32 },
     MissingGraphStore { path: PathBuf },
     IncompatibleRedbFileFormat { path: PathBuf, found: u8 },
+    /// The store exists and is readable, but was materialized from a
+    /// commit other than the repository's current HEAD, so it describes
+    /// older source than the working tree.
+    IndexedAtDifferentCommit { indexed: String, head: String },
 }
 
 impl std::fmt::Display for GraphStoreError {
@@ -207,6 +211,16 @@ impl std::fmt::Display for GraphStoreError {
                  aethyme graph materialize --repo <repo>\n\
                  If that reports a fragment mismatch, run `aethyme graph refresh plan --repo <repo>` and follow its `next:` line.",
                 path.display()
+            ),
+            Self::IndexedAtDifferentCommit { indexed, head } => write!(
+                f,
+                "graph store was built from commit {} but HEAD is now {}; it describes older source.\n  \
+                 Results may omit symbols added since. Refresh it with:\n  \
+                 aethyme graph refresh plan --repo <repo>\n  \
+                 aethyme graph refresh execute --repo <repo> --confirm <plan-sha256>\n  \
+                 aethyme graph materialize --repo <repo>",
+                short_commit(indexed),
+                short_commit(head)
             ),
         }
     }
@@ -317,6 +331,7 @@ pub struct IncompatibleGraphStore {
 }
 
 mod lifecycle;
+pub use lifecycle::{Freshness, FreshnessPolicy};
 mod listing;
 mod nodes;
 mod queries;
@@ -337,3 +352,10 @@ use nodes::*;
 use relations::*;
 use surface_flow::*;
 use symbols::*;
+
+/// Abbreviate a commit hash for display, tolerating short or non-hash
+/// values so the message never panics on malformed metadata.
+fn short_commit(commit: &str) -> &str {
+    let trimmed = commit.trim();
+    &trimmed[..trimmed.len().min(12)]
+}
