@@ -2043,8 +2043,11 @@ fn run_selections(
             short_tree_hash(&tree)
         ));
         // Sampled once, here, and handed to the headroom check so the free
-        // space recorded is the free space the gate was admitted on.
-        let available = crate::available_bytes(checkout.root());
+        // space recorded is the free space the gate was admitted on. The
+        // checkout stands in for its repository: a gate checkout lies under
+        // the temporary directory exactly when its repository does, because
+        // durable host state is withheld from throwaway repositories.
+        let available = crate::disk_headroom::available_bytes_for(checkout.root(), checkout.root());
         let mut environment = GateEnvironment {
             load_avg_1m_start: load_average_1m(),
             load_avg_1m_end: None,
