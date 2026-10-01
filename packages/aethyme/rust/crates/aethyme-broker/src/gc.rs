@@ -1790,7 +1790,7 @@ impl Broker {
         // React to the fact the gate refuses on, rather than sweeping at one
         // fixed rate whether the volume is comfortable or already out of room.
         let urgency = crate::disk_headroom::sweep_urgency(
-            crate::available_bytes(&main_root),
+            crate::disk_headroom::available_bytes_for(&main_root, &main_root),
             crate::disk_headroom::DEFAULT_GATE_HEADROOM_BYTES,
         );
         let budget_ms = policy
