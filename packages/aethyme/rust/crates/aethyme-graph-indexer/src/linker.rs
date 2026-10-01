@@ -715,7 +715,7 @@ fn symbol_record_to_resolved(record: &SymbolRecord) -> ResolvedRecord {
 /// crossing the linker's "input is only the on-disk graph store"
 /// boundary (the linker doesn't depend on the indexer's filesystem
 /// walker — it works purely off what's been written).
-fn synthesize_module_name(source_path: &str) -> String {
+pub(crate) fn synthesize_module_name(source_path: &str) -> String {
     let without_ext = source_path
         .rsplit_once('.')
         .map(|(stem, _)| stem)
