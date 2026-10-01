@@ -215,6 +215,50 @@ fn an_edit_on_a_file_another_live_session_changes_is_announced_once_per_change()
     );
 }
 
+/// The case the lease table alone misses: the other agent commits its change
+/// and runs no broker command, so no lease refresh has recorded the file. The
+/// edit-time note still names the session, because the hook reads the other
+/// worktree's current state rather than the last refresh.
+#[test]
+fn a_change_committed_since_the_last_lease_refresh_is_announced() {
+    let fixture = Fixture::new();
+    let (other, other_tree) = fixture.start("Rewrite the shared header", "header");
+    let (_me, my_tree) = fixture.start("Add a footer", "footer");
+    fixture.refresh();
+    // Asked once while nothing is changed, so the hook has remembered the
+    // answer "not changed" for this file; the change below must override it.
+    let before = fixture.hook(&my_tree, "PreToolUse", &edit(&my_tree.join("shared.txt")));
+    assert!(before.is_empty(), "nothing is changing yet: {before}");
+
+    change_lines(&other_tree, "shared.txt", &[2]);
+    git(&other_tree, &["add", "shared.txt"]);
+    git(&other_tree, &["commit", "-qm", "header"]);
+
+    let text = context(&fixture.hook(&my_tree, "PreToolUse", &edit(&my_tree.join("shared.txt"))));
+    assert!(
+        text.contains(&format!("session {other} (header)")),
+        "{text}"
+    );
+    assert!(text.contains("`shared.txt` (line 2"), "{text}");
+}
+
+/// The other direction: a lease refresh recorded the change, then the other
+/// agent reverted it. Its implicit lease still names the file until the next
+/// refresh, but nobody is changing the file, so the edit is not interrupted.
+#[test]
+fn a_change_reverted_since_the_last_lease_refresh_is_not_announced() {
+    let fixture = Fixture::new();
+    let (_other, other_tree) = fixture.start("Try a parser tweak", "tweak");
+    let (_me, my_tree) = fixture.start("Parser feature", "feature");
+    change_lines(&other_tree, "shared.txt", &[5]);
+    fixture.refresh();
+
+    git(&other_tree, &["checkout", "--", "shared.txt"]);
+
+    let text = fixture.hook(&my_tree, "PreToolUse", &edit(&my_tree.join("shared.txt")));
+    assert!(text.is_empty(), "a reverted change is not reported: {text}");
+}
+
 #[test]
 fn codex_apply_patch_edits_get_the_same_note() {
     let fixture = Fixture::new();
@@ -367,15 +411,26 @@ fn pre_tool_use_latency_with_several_live_sessions() {
         change_lines(&tree, "shared.txt", &[n + 1]);
     }
     let (_me, my_tree) = fixture.start("measured", "measured");
-    fixture.refresh();
+    let runs: u32 = 5;
+    let mean = |event: &serde_json::Value| {
+        let started = std::time::Instant::now();
+        for _ in 0..runs {
+            fixture.hook(&my_tree, "PreToolUse", event);
+        }
+        started.elapsed() / runs
+    };
+    // The same process spawn and broker open with no file to check: the
+    // floor the coordination cost sits on, measured under the same load.
+    let floor = mean(&serde_json::json!({"tool_name": "Bash", "tool_input": {"command": "ls"}}));
+    // No refresh: every peer's change is read from its worktree, which is
+    // the expensive case the first edit of a file pays.
     let event = edit(&my_tree.join("shared.txt"));
     let started = std::time::Instant::now();
-    let runs = 5;
-    for _ in 0..runs {
-        fixture.hook(&my_tree, "PreToolUse", &event);
-    }
+    fixture.hook(&my_tree, "PreToolUse", &event);
+    let cold = started.elapsed();
+    let warm = mean(&event);
     eprintln!(
-        "PreToolUse with 4 live peers on one file: {:?} per call (includes process spawn)",
-        started.elapsed() / runs
+        "PreToolUse with 4 live peers on one file: no-target floor {floor:?}, first call \
+         {cold:?}, then {warm:?} per call (all include process spawn)"
     );
 }
