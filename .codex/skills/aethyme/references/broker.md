@@ -33,6 +33,10 @@ blocked.
    If `status` shows another session holding leases on the files you plan
    to change, prefer working elsewhere first or say so in your report —
    overlapping edits will conflict at merge time.
+   When you edit a file another live session is changing, the broker tells you
+   in context who, where and whether Git would conflict, never blocking the
+   edit; `aethyme broker advanced note send --to-session <id>` reaches that
+   agent, and its notes reach you at your next turn.
 
 2. **Lease additional shared files before the diff exists**. Prefer the
    atomic `start --path` / `start --adopt --path` declaration above for initial intent. If the
@@ -91,8 +95,12 @@ blocked.
    `aethyme broker finish --session <id> --abandon --reason "<why>"`.
    Each push also fetches the default branch and reports how far your branch
    is behind it and whether merging would conflict, with the command to catch
-   up; `broker status` shows the same as `session.behind-main`. Catch up when
-   it warns, before the pull request reports the conflict. In a repository
+   up; `broker status` shows the same as `session.behind-main`. Catch up with
+   `aethyme broker sync --session <id>` when it warns, before the pull request
+   reports the conflict: it rebases an unpublished branch or merges the default
+   branch into a published one, and changes nothing if that would conflict.
+   `broker start` and `start --reuse` refresh the default branch first, so a
+   new worktree starts from the latest fetched tip. In a repository
    with `[promote] mode = "verify-only"`, `broker submit` is a pre-flight
    against the current default branch; the integration branch is not used.
    When `broker status` shows `coordination.land-shared-edit-first`, another
