@@ -160,3 +160,91 @@ fn missing_language_parser_is_visible_as_an_unsupported_gap() {
     );
     assert!(!summary.coverage.report.safe_to_use);
 }
+
+/// Regression: every JavaScript extension resolved to the canonical
+/// tag `javascript` while the only oxc indexer registered itself under
+/// `typescript`. No indexer matched `javascript`, so `.js`/`.jsx`/
+/// `.cjs`/`.mjs` files were reported `parser_unavailable`, produced no
+/// nodes at all, and every JavaScript symbol was absent from the graph.
+///
+/// The per-language tests construct their indexer directly and so never
+/// exercise registry lookup; this test goes through `default_registry`
+/// via `index_repo_to_disk`, which is the path that was broken.
+#[test]
+fn javascript_files_are_indexed_through_the_default_registry() {
+    let temporary = tempfile::tempdir().unwrap();
+    let sources = [
+        ("app.js", "function beta() { return 2; }\nmodule.exports = beta;\n"),
+        ("widget.jsx", "class Gamma { render() { return null; } }\n"),
+        ("legacy.cjs", "function delta() { return 4; }\n"),
+        ("modern.mjs", "function epsilon() { return 5; }\n"),
+    ];
+    for (relative, source) in sources {
+        fs::write(temporary.path().join(relative), source).unwrap();
+    }
+
+    let summary = index_repo_to_disk(&context(temporary.path()), &WalkOptions::default()).unwrap();
+    let report = &summary.coverage.report;
+    let units = read_units(temporary.path()).unwrap();
+
+    let javascript = report
+        .by_language
+        .get("javascript")
+        .expect("javascript bucket missing from coverage");
+    assert_eq!(
+        javascript.files, 4,
+        "all four JavaScript extensions must be discovered"
+    );
+    assert_eq!(
+        javascript.parsed, 4,
+        "every JavaScript file must reach a parser: {javascript:?}"
+    );
+    assert_eq!(
+        javascript.unsupported, 0,
+        "no JavaScript file may be reported parser_unavailable"
+    );
+
+    // The substantive assertion: symbols exist, not just file rows.
+    let names: Vec<&str> = units
+        .iter()
+        .filter_map(|unit| unit.symbol_identity.as_deref())
+        .collect();
+    for expected in ["beta", "Gamma", "delta", "epsilon"] {
+        assert!(
+            names.contains(&expected),
+            "expected JavaScript symbol {expected:?} in indexed units, found {names:?}"
+        );
+    }
+
+    assert!(
+        report.safe_to_use,
+        "a repository of JavaScript sources must not report coverage gaps: {:?}",
+        report.gaps
+    );
+}
+
+/// The alias must share one indexer instance, so both tags report the
+/// same parser identity rather than degrading to `unavailable`.
+#[test]
+fn aliased_language_tags_share_one_parser_identity() {
+    let temporary = tempfile::tempdir().unwrap();
+    fs::write(
+        temporary.path().join("app.js"),
+        "export function beta() { return 2; }\n",
+    )
+    .unwrap();
+
+    let summary = index_repo_to_disk(&context(temporary.path()), &WalkOptions::default()).unwrap();
+    let report = &summary.coverage.report;
+
+    assert!(
+        report.by_parser.contains_key("oxc_parser"),
+        "javascript must be attributed to the oxc parser: {:?}",
+        report.by_parser
+    );
+    assert!(
+        !report.by_parser.contains_key("unavailable"),
+        "no file may fall back to the unavailable parser: {:?}",
+        report.by_parser
+    );
+}

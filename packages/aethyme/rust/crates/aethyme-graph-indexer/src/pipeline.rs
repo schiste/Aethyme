@@ -72,7 +72,11 @@ pub fn build_fragment(
 pub fn default_registry() -> LanguageRegistry {
     let mut registry = LanguageRegistry::new();
     registry.register(PythonIndexer::new());
-    registry.register(TypeScriptIndexer::new());
+    // The walker classifies `.js`/`.jsx`/`.cjs`/`.mjs` as `javascript`
+    // (see `language_map::infer_language_from_extension`), so the oxc
+    // indexer has to answer to that tag too or every JavaScript file
+    // falls through as `parser_unavailable`.
+    registry.register_alias(TypeScriptIndexer::new(), "javascript");
     registry.register(RustIndexer::new());
     // PhpIndexer construction can fail (tree-sitter `set_language`
     // returns Result). For the default registry we ignore the
