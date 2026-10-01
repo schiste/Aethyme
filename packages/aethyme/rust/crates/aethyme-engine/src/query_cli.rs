@@ -13,6 +13,7 @@
 //! the router binary stays a thin shell and the eventual `aethyme-cli`
 //! crate move is mechanical.
 
+use crate::cli_error::CliError;
 use std::path::PathBuf;
 
 use crate::graph::neighborhood::impact_frontier_redb;
@@ -26,16 +27,16 @@ const SYMBOL_LIMIT: usize = 20;
 /// Errors are returned as messages; the router prints them in Click's
 /// `Error: {msg}` shape with exit 1 so scripted consumers see the same
 /// failure surface the Python CLI produced.
-pub fn run(args: &[String]) -> Result<(), String> {
+pub fn run(args: &[String]) -> Result<(), CliError> {
     let Some(subcommand) = args.first() else {
-        return Err("missing query subcommand (symbol | deps | impact)".to_string());
+        return Err(CliError::usage("missing query subcommand (symbol | deps | impact)".to_string()));
     };
     let rest = &args[1..];
     match subcommand.as_str() {
         "symbol" => run_symbol(rest),
         "deps" => run_deps(rest),
         "impact" => run_impact(rest),
-        other => Err(format!("unsupported query subcommand: {other}")),
+        other => Err(CliError::usage(format!("unsupported query subcommand: {other}"))),
     }
 }
 
@@ -48,7 +49,7 @@ fn repo_arg(rest: &[String], usage: &str) -> Result<PathBuf, String> {
     path.canonicalize().map_err(|e| e.to_string())
 }
 
-fn run_symbol(rest: &[String]) -> Result<(), String> {
+fn run_symbol(rest: &[String]) -> Result<(), CliError> {
     let usage = "usage: aethyme query symbol <repo_path> <query> [--json-output]";
     let repo = repo_arg(rest, usage)?;
     let query = rest
@@ -81,7 +82,7 @@ fn run_symbol(rest: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn run_deps(rest: &[String]) -> Result<(), String> {
+fn run_deps(rest: &[String]) -> Result<(), CliError> {
     let usage = "usage: aethyme query deps <repo_path> <target-file>";
     let repo = repo_arg(rest, usage)?;
     let target = rest.get(1).ok_or_else(|| usage.to_string())?;
@@ -98,7 +99,7 @@ fn run_deps(rest: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn run_impact(rest: &[String]) -> Result<(), String> {
+fn run_impact(rest: &[String]) -> Result<(), CliError> {
     let usage = "usage: aethyme query impact <repo_path> <target>";
     let repo = repo_arg(rest, usage)?;
     let target = rest.get(1).ok_or_else(|| usage.to_string())?;

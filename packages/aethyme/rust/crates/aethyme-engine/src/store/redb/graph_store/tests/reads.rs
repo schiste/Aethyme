@@ -1004,7 +1004,12 @@ fn incompatible_redb_file_format_is_reported() {
         Ok(_) => panic!("expected old redb format to fail"),
         Err(err) => err.to_string(),
     };
-    assert!(message.contains("aethyme-engine-cli index --repo <repo>"));
+    // The recovery advice must name a command the user-facing `aethyme`
+    // binary actually serves. It previously pointed at
+    // `aethyme-engine-cli index --repo <repo>`, which fails when graph
+    // authority is disabled and is not the documented path.
+    assert!(message.contains("aethyme graph materialize --repo <repo>"));
+    assert!(!message.contains("aethyme-engine-cli"));
     assert!(message.contains(".aethyme/graph/"));
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -1030,6 +1035,42 @@ fn reset_replaces_incompatible_graph_store_without_touching_fragments() {
         std::fs::read(&fragment_marker).expect("fragment marker"),
         b"source-of-truth"
     );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The missing-store message is the first thing a user or agent sees
+/// when graph commands fail in the default posture, and it is the only
+/// guidance they get. It previously pointed at
+/// `aethyme-engine-cli index --repo <repo>`, which is not served by the
+/// user-facing `aethyme` binary, fails outright when graph authority
+/// is disabled, and names a further uninstalled binary in its own error.
+/// This pins that the advice names commands that exist.
+#[test]
+fn missing_store_error_names_runnable_aethyme_commands() {
+    let root = std::env::temp_dir().join("aethyme_missing_store_message_test");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("create repo root");
+
+    let message = match ReadOnlyGraphStore::open(&root) {
+        Ok(_) => panic!("expected MissingGraphStore for a repo with no graph store"),
+        Err(error) => error.to_string(),
+    };
+
+    assert!(
+        !message.contains("aethyme-engine-cli"),
+        "recovery advice must not point at a binary the user-facing CLI does not serve: {message}"
+    );
+    for expected in [
+        "aethyme graph status --repo",
+        "aethyme graph refresh plan --repo",
+        "aethyme graph materialize --repo",
+    ] {
+        assert!(
+            message.contains(expected),
+            "recovery advice must name {expected}: {message}"
+        );
+    }
 
     let _ = std::fs::remove_dir_all(&root);
 }

@@ -9,6 +9,7 @@
 //! bytes are unchanged; `--request` splices the same two trailing keys
 //! Python appended.
 
+use crate::cli_error::CliError;
 use std::path::PathBuf;
 
 use serde_json::Value;
@@ -19,9 +20,9 @@ use crate::map::RepositoryMap;
 const INTENTS_CATALOG: &str = include_str!("intents_catalog.json");
 
 /// Run `facts <subcommand> ...`. `args` excludes the leading `facts`.
-pub fn run_facts(args: &[String]) -> Result<(), String> {
+pub fn run_facts(args: &[String]) -> Result<(), CliError> {
     let Some(subcommand) = args.first() else {
-        return Err("missing facts subcommand (public-functions | function-usage)".to_string());
+        return Err(CliError::usage("missing facts subcommand (public-functions | function-usage)".to_string()));
     };
     let rest = &args[1..];
     let json_output = rest.iter().any(|a| a == "--json-output");
@@ -30,7 +31,7 @@ pub fn run_facts(args: &[String]) -> Result<(), String> {
             .ok_or_else(|| format!("usage: aethyme facts {subcommand} --repo <path> ..."))?;
         let path = PathBuf::from(&raw);
         if !path.is_dir() {
-            return Err(format!("repository path is not a directory: {raw}"));
+            return Err(CliError::runtime(format!("repository path is not a directory: {raw}")));
         }
         path.canonicalize().map_err(|e| e.to_string())?
     };
@@ -114,7 +115,7 @@ pub fn run_facts(args: &[String]) -> Result<(), String> {
                 }
             }
         }
-        other => return Err(format!("unsupported facts subcommand: {other}")),
+        other => return Err(CliError::usage(format!("unsupported facts subcommand: {other}"))),
     }
     Ok(())
 }

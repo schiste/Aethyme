@@ -21,88 +21,116 @@ use std::path::PathBuf;
 
 use serde_json::Value;
 
+use crate::cli_args::{self, FlagSpec};
+use crate::cli_error::CliError;
 use crate::graph::navigation::{
-    callees_view_redb, callers_view_redb, children_view_redb, configs_view_redb, docs_view_redb,
-    graph_expand_view_redb, graph_overview_view_redb, node_view_redb, parents_view_redb,
+    GraphRelationView, callees_view_redb, callers_view_redb, children_view_redb, configs_view_redb,
+    docs_view_redb, graph_expand_view_redb, graph_overview_view_redb, node_view_redb,
+    parents_view_redb,
 };
-use crate::store::redb::graph_store::GraphStore;
+use crate::store::redb::graph_store::{GraphStore, GraphStoreError, ReadOnlyGraphStore};
+
+/// Navigation subcommands handled here. The lifecycle subcommands
+/// (`status`, `units`, `materialize`, `refresh`, `impact`) are routed
+/// by the CLI before this function is reached; they are named in the
+/// usage message so a caller that mistypes one is told what exists
+/// rather than being sent to rebuild a graph store it did not need.
+const NAVIGATION_SUBCOMMANDS: &[&str] = &[
+    "node", "children", "parents", "callers", "callees", "docs", "configs", "expand", "overview",
+];
+
+/// Subcommands that require a `<target>` positional. The previous code
+/// printed one usage line for all nine, which was wrong for eight of
+/// them: only `overview` takes no target.
+const TARGET_SUBCOMMANDS: &[&str] = &[
+    "node", "children", "parents", "callers", "callees", "docs", "configs", "expand",
+];
+
+fn usage_line(subcommand: &str) -> String {
+    if TARGET_SUBCOMMANDS.contains(&subcommand) {
+        format!("usage: aethyme graph {subcommand} <repo_path> <target> [--json|--json-output]")
+    } else {
+        format!("usage: aethyme graph {subcommand} <repo_path> [--json|--json-output]")
+    }
+}
+
+/// Require the target positional for subcommands that take one.
+fn require_target<'a>(subcommand: &str, target: Option<&'a str>) -> Result<&'a str, CliError> {
+    target.ok_or_else(|| CliError::usage(usage_line(subcommand)))
+}
 
 /// Run `graph <subcommand> ...`. `args` excludes the leading `graph`.
-pub fn run(args: &[String]) -> Result<(), String> {
+pub fn run(args: &[String]) -> Result<(), CliError> {
     let Some(subcommand) = args.first() else {
-        return Err(
-            "missing graph subcommand (node | children | parents | callers | callees | docs | configs | expand | overview)"
-                .to_string(),
-        );
+        return Err(CliError::usage(format!(
+            "missing graph subcommand\nnavigation: {}\nlifecycle: status | units | materialize | refresh | impact",
+            NAVIGATION_SUBCOMMANDS.join(" | ")
+        )));
     };
+    // Validate the subcommand before touching the filesystem. Opening
+    // the store first meant a typo such as `graph nodez` reported a
+    // missing graph store, sending the caller to build one it did not
+    // need.
+    if !NAVIGATION_SUBCOMMANDS.contains(&subcommand.as_str()) {
+        return Err(CliError::usage(format!(
+            "unsupported graph subcommand: {subcommand}\nnavigation: {}\nlifecycle: status | units | materialize | refresh | impact",
+            NAVIGATION_SUBCOMMANDS.join(" | ")
+        )));
+    }
+
     let rest = &args[1..];
-    let json_output = rest.iter().any(|a| a == "--json-output");
-    let positionals: Vec<&String> = rest.iter().filter(|a| !a.starts_with("--")).collect();
+    let mut specs = cli_args::json_specs().to_vec();
+    specs.push(FlagSpec::value("--repo"));
+    let parsed = cli_args::parse(&format!("aethyme graph {subcommand}"), rest, &specs)?;
+    let json_output = parsed.wants_json();
 
+    // `--repo` is accepted as an alternative to the positional. The
+    // positional wins when both are present, preserving the
+    // pre-existing `<repo_path> <target>` form.
+    let repo_raw = match parsed.positional(0) {
+        Some(raw) => raw.clone(),
+        None => parsed
+            .option("--repo")
+            .map(str::to_string)
+            .ok_or_else(|| CliError::usage(usage_line(subcommand)))?,
+    };
     let repo = {
-        let raw = positionals.first().ok_or_else(|| {
-            format!("usage: aethyme graph {subcommand} <repo_path> [target] [--json-output]")
-        })?;
-        let path = PathBuf::from(raw);
+        let path = PathBuf::from(&repo_raw);
         if !path.is_dir() {
-            return Err(format!("repository path is not a directory: {raw}"));
+            return Err(CliError::runtime(format!(
+                "repository path is not a directory: {repo_raw}"
+            )));
         }
-        path.canonicalize().map_err(|e| e.to_string())?
+        path.canonicalize().map_err(|e| CliError::runtime(e.to_string()))?
     };
-    let store = GraphStore::open_read_only(&repo).map_err(|e| e.to_string())?;
+    // With `--repo` the target becomes the first positional; with the
+    // repo given positionally it is the second.
+    let target_index = usize::from(parsed.positional(0).is_some());
+    if TARGET_SUBCOMMANDS.contains(&subcommand.as_str()) {
+        parsed.expect_max_positionals(&format!("aethyme graph {subcommand}"), target_index + 1)?;
+    }
+    let store = GraphStore::open_read_only(&repo).map_err(|e| CliError::runtime(e.to_string()))?;
 
-    let target = || -> Result<&String, String> {
-        positionals.get(1).copied().ok_or_else(|| {
-            format!("usage: aethyme graph {subcommand} <repo_path> <target> [--json-output]")
-        })
+    let target_arg: Option<&str> = if TARGET_SUBCOMMANDS.contains(&subcommand.as_str()) {
+        Some(
+            parsed
+                .positional(target_index)
+                .ok_or_else(|| CliError::usage(usage_line(subcommand)))?
+                .as_str(),
+        )
+    } else {
+        None
     };
 
-    let raw_json = match subcommand.as_str() {
-        "node" => {
-            let t = target()?;
-            let view = node_view_redb(&store, t)
-                .map_err(|e| e.to_string())?
-                .ok_or_else(|| format!("node not found: {t}"))?;
-            crate::json::graph_node_view(&view)
-        }
-        "children" => crate::json::graph_relation(
-            &children_view_redb(&store, target()?).map_err(|e| e.to_string())?,
-        ),
-        "parents" => crate::json::graph_relation(
-            &parents_view_redb(&store, target()?).map_err(|e| e.to_string())?,
-        ),
-        "callers" => crate::json::graph_relation(
-            &callers_view_redb(&store, target()?).map_err(|e| e.to_string())?,
-        ),
-        "callees" => crate::json::graph_relation(
-            &callees_view_redb(&store, target()?).map_err(|e| e.to_string())?,
-        ),
-        "docs" => crate::json::graph_relation(
-            &docs_view_redb(&store, target()?).map_err(|e| e.to_string())?,
-        ),
-        "configs" => crate::json::graph_relation(
-            &configs_view_redb(&store, target()?).map_err(|e| e.to_string())?,
-        ),
-        "expand" => {
-            let t = target()?;
-            let view = graph_expand_view_redb(&store, t)
-                .map_err(|e| e.to_string())?
-                .ok_or_else(|| format!("node not found: {t}"))?;
-            crate::json::graph_expand_view(&view)
-        }
-        "overview" => {
-            let view = graph_overview_view_redb(&store).map_err(|e| e.to_string())?;
-            crate::json::repo_overview_view(&view)
-        }
-        other => return Err(format!("unsupported graph subcommand: {other}")),
-    };
+    let raw_json = render_subcommand_json(&store, subcommand, target_arg)?;
 
     if json_output {
         println!("{}", pretty_json(&raw_json));
         return Ok(());
     }
 
-    let payload: Value = serde_json::from_str(&raw_json).map_err(|e| e.to_string())?;
+    let payload: Value = serde_json::from_str(&raw_json)
+        .map_err(|e| CliError::runtime(e.to_string()))?;
     let rendered = match subcommand.as_str() {
         "node" => render_node(&payload),
         "expand" => render_expand(&payload),
@@ -111,6 +139,82 @@ pub fn run(args: &[String]) -> Result<(), String> {
     };
     print!("{rendered}");
     Ok(())
+}
+
+/// Render one `graph <subcommand>` invocation as the engine JSON.
+///
+/// `target` is the resolved target for subcommands that take one and
+/// `None` for `overview`.
+fn render_subcommand_json(
+    store: &ReadOnlyGraphStore,
+    subcommand: &str,
+    target: Option<&str>,
+) -> Result<String, CliError> {
+    let target = require_target(subcommand, target);
+    match subcommand {
+        "node" => {
+            let t = target?;
+            let view = node_view_redb(store, t)
+                .map_err(|e| CliError::runtime(e.to_string()))?
+                .ok_or_else(|| CliError::runtime(format!("node not found: {t}")))?;
+            Ok(crate::json::graph_node_view(&view))
+        }
+        // The relation subcommands used to render an empty list for an
+        // unresolvable target and exit 0, so a typo'd symbol was
+        // indistinguishable from a symbol with genuinely no callers.
+        // Resolving first reports not-found instead; a node that does
+        // resolve but has no such relation still exits 0 with an empty
+        // `items`.
+        "children" => relation_json(store, subcommand, target?, children_view_redb),
+        "parents" => relation_json(store, subcommand, target?, parents_view_redb),
+        "callers" => relation_json(store, subcommand, target?, callers_view_redb),
+        "callees" => relation_json(store, subcommand, target?, callees_view_redb),
+        "docs" => relation_json(store, subcommand, target?, docs_view_redb),
+        "configs" => relation_json(store, subcommand, target?, configs_view_redb),
+        "expand" => {
+            let t = target?;
+            let view = graph_expand_view_redb(store, t)
+                .map_err(|e| CliError::runtime(e.to_string()))?
+                .ok_or_else(|| CliError::runtime(format!("node not found: {t}")))?;
+            Ok(crate::json::graph_expand_view(&view))
+        }
+        "overview" => {
+            let view = graph_overview_view_redb(store)
+                .map_err(|e| CliError::runtime(e.to_string()))?;
+            Ok(crate::json::repo_overview_view(&view))
+        }
+        other => Err(CliError::usage(format!(
+            "unsupported graph subcommand: {other}"
+        ))),
+    }
+}
+
+/// Resolve `target`, then run one relation view and render it as JSON.
+///
+/// The resolution step is what separates "no such node" from "this node
+/// has no such relation". The engine's relation views return an empty
+/// item list for an unresolvable target so library callers can treat
+/// "absent" and "empty" uniformly; a CLI caller cannot, because an
+/// agent scripting the command needs to tell a typo from a genuine
+/// empty result.
+fn relation_json(
+    store: &ReadOnlyGraphStore,
+    subcommand: &str,
+    target: &str,
+    view: fn(&ReadOnlyGraphStore, &str) -> Result<GraphRelationView, GraphStoreError>,
+) -> Result<String, CliError> {
+    if node_view_redb(store, target)
+        .map_err(|e| CliError::runtime(e.to_string()))?
+        .is_none()
+    {
+        return Err(CliError::runtime(format!(
+            "node not found: {target}\n\
+             a `{subcommand}` relation needs a real node; \
+             look one up with `aethyme query symbol <name>`"
+        )));
+    }
+    let view = view(store, target).map_err(|e| CliError::runtime(e.to_string()))?;
+    Ok(crate::json::graph_relation(&view))
 }
 
 // ── Text renderers (ports of the Click renderers, dict-driven) ────────

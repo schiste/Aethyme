@@ -191,12 +191,21 @@ impl std::fmt::Display for GraphStoreError {
             }
             Self::MissingGraphStore { path } => write!(
                 f,
-                "graph store at {} is missing; rebuild it from committed fragments with `aethyme-engine-cli index --repo <repo>`. Query commands are read-only and will not create it.",
+                "graph store at {} is missing.\n\
+                 Query commands are read-only and will not create it. To build one:\n  \
+                 aethyme graph status --repo <repo>            # reports which posture applies\n  \
+                 aethyme graph refresh plan --repo <repo>       # if graph authority is disabled, \
+                 enroll first: aethyme deploy --repo <repo> --with-graph\n  \
+                 aethyme graph refresh execute --repo <repo> --confirm <plan-sha256>\n  \
+                 aethyme graph materialize --repo <repo>\n\
+                 `aethyme graph status` names the next action for the current state.",
                 path.display()
             ),
             Self::IncompatibleRedbFileFormat { path, found } => write!(
                 f,
-                "graph store at {} uses old redb file format v{found}; regenerate it from committed fragments with `aethyme-engine-cli index --repo <repo>`. The `.aethyme/graph/` fragments are not modified.",
+                "graph store at {} uses old redb file format v{found}; it must be regenerated. The `.aethyme/graph/` fragments are not modified.\n  \
+                 aethyme graph materialize --repo <repo>\n\
+                 If that reports a fragment mismatch, run `aethyme graph refresh plan --repo <repo>` and follow its `next:` line.",
                 path.display()
             ),
         }

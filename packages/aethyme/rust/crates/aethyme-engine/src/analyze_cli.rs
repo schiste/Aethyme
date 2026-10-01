@@ -16,6 +16,7 @@
 //! cache keys and shelled `git status` for dirty state, output the
 //! CTO wrapper corrupts in Chau7 tabs (chau7#77).
 
+use crate::cli_error::CliError;
 use std::path::PathBuf;
 
 use serde_json::Value;
@@ -25,12 +26,12 @@ use crate::graph_cli::pretty_json;
 use crate::map::RepositoryMap;
 
 /// Run `analyze <subcommand> ...`. `args` excludes the leading `analyze`.
-pub fn run(args: &[String]) -> Result<(), String> {
+pub fn run(args: &[String]) -> Result<(), CliError> {
     let Some(subcommand) = args.first() else {
-        return Err("missing analyze subcommand (dead-code)".to_string());
+        return Err(CliError::usage("missing analyze subcommand (dead-code)".to_string()));
     };
     if subcommand != "dead-code" {
-        return Err(format!("unsupported analyze subcommand: {subcommand}"));
+        return Err(CliError::usage(format!("unsupported analyze subcommand: {subcommand}")));
     }
     let rest = &args[1..];
 
@@ -40,7 +41,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
         })?;
         let path = PathBuf::from(&raw);
         if !path.is_dir() {
-            return Err(format!("repository path is not a directory: {raw}"));
+            return Err(CliError::runtime(format!("repository path is not a directory: {raw}")));
         }
         path.canonicalize().map_err(|e| e.to_string())?
     };
@@ -49,7 +50,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
     })?;
     let boundary = opt(rest, "--boundary").unwrap_or_else(|| "outside-directory".to_string());
     if boundary != "outside-directory" {
-        return Err(format!("unsupported --boundary: {boundary}"));
+        return Err(CliError::usage(format!("unsupported --boundary: {boundary}")));
     }
     let roots: Vec<String> = opt(rest, "--roots")
         .unwrap_or_default()
@@ -173,7 +174,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
                 }
             }
         }
-        other => return Err(format!("unsupported --format: {other}")),
+        other => return Err(CliError::usage(format!("unsupported --format: {other}"))),
     }
     Ok(())
 }
