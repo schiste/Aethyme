@@ -4775,6 +4775,14 @@ impl Broker {
         conflicting_leases
             .dedup_by(|a, b| a.session_id == b.session_id && a.path == b.path && a.kind == b.kind);
         let mut warned_leases = Vec::new();
+        // Under verify-only a submit promotes nothing: each session delivers
+        // through its own pull request, so a conflict is resolved when one of
+        // them merges, and refusing here only stalls an agent. The overlap is
+        // still reported, with how to coordinate. `auto` and `manual` keep
+        // the block because they promote onto a shared integration branch.
+        let verify_only = block_only_on_conflicts
+            && crate::merge::PromoteConfig::load(&self.main_root).mode
+                == crate::merge::PromoteMode::VerifyOnly;
         if block_only_on_conflicts && !conflicting_leases.is_empty() {
             let active: std::collections::HashSet<i64> = self
                 .agents(crate::clock::epoch_ms())?
@@ -4797,13 +4805,22 @@ impl Broker {
                     );
                     let holder_active = active.contains(&blocker.session_id);
                     blocker.reason = Some(match (conflicting, holder_active) {
+                        (true, true) if verify_only => format!(
+                            "the holder is actively working and Git reports a conflict with this \
+                             session's edits; this repository delivers through pull requests \
+                             (verify-only), so the conflict is resolved when one of them merges. \
+                             Coordinate: aethyme broker advanced note send --session {session_id} \
+                             --to-session {} --message \"<who lands the shared change first>\", \
+                             or follow the shared-edit advice in aethyme broker status",
+                            blocker.session_id
+                        ),
                         (true, true) => "the holder is actively working and Git reports a conflict with this session's edits".into(),
                         (true, false) => "Git reports a conflict, but the holder is not actively working".into(),
                         (false, _) => pair
                             .map(|pair| pair.reason)
                             .unwrap_or_else(|| "the holder has not edited this path".into()),
                     });
-                    (blocker, conflicting && holder_active)
+                    (blocker, conflicting && holder_active && !verify_only)
                 })
                 .partition(|(_, blocks)| *blocks);
             conflicting_leases = block.into_iter().map(|(blocker, _)| blocker).collect();
@@ -6875,6 +6892,10 @@ impl Broker {
         advice.extend(overlap_pair_advice(&overlap_pairs));
         // Cached listing and local refs only: `status` never calls GitHub.
         advice.extend(self.pr_overlap_advice(now_ms));
+        // Several sessions on one PR conflict by construction; name it.
+        advice.extend(self.duplicate_work_advice(&agents));
+        // A worktree stuck mid-merge cannot be classified or submitted.
+        advice.extend(crate::overlap_pairs::mid_operation_advice(&agents));
         // The default branch moving under a session: last fetched copy only.
         advice.extend(self.behind_main_advice());
         // Two sessions on one target: landing the shared edit first keeps

@@ -67,6 +67,38 @@ struct SessionActionOutput<'a, T: serde::Serialize> {
     #[serde(flatten)]
     report: &'a T,
     tab_rename: &'a crate::chau7_mcp::SessionTabRename,
+    /// Other sessions that look like the same work; omitted when none.
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    duplicate_work: &'a [crate::DuplicateWork],
+}
+
+/// One warning line per other session that looks like the same work.
+fn render_duplicate_work(session_id: i64, duplicates: &[crate::DuplicateWork]) {
+    for duplicate in duplicates {
+        let target = match (duplicate.reason, duplicate.pull_request) {
+            (crate::DuplicateWorkReason::SameBranch, _) => "the same branch".to_string(),
+            (_, Some(pr)) => format!("PR #{pr}"),
+            (_, None) => "the same pull request".to_string(),
+        };
+        out!(
+            "warning: session {} ({}) also works on {target}{}: {}",
+            duplicate.session_id,
+            duplicate.status.as_str(),
+            if duplicate.reason == crate::DuplicateWorkReason::TaskMentionsPr {
+                " (named in its task)"
+            } else {
+                ""
+            },
+            duplicate.task.as_deref().unwrap_or("(no task)")
+        );
+    }
+    if let Some(first) = duplicates.first() {
+        out!(
+            "         coordinate first: aethyme broker advanced note send --session {session_id} \
+             --to-session {} --message \"<who continues, who stops>\"",
+            first.session_id
+        );
+    }
 }
 
 fn render_tab_rename(outcome: &crate::chau7_mcp::SessionTabRename) {
@@ -86,8 +118,13 @@ fn render_tab_rename(outcome: &crate::chau7_mcp::SessionTabRename) {
 fn session_action_json<T: serde::Serialize>(
     report: &T,
     tab_rename: &crate::chau7_mcp::SessionTabRename,
+    duplicate_work: &[crate::DuplicateWork],
 ) -> Result<String, serde_json::Error> {
-    serde_json::to_string_pretty(&SessionActionOutput { report, tab_rename })
+    serde_json::to_string_pretty(&SessionActionOutput {
+        report,
+        tab_rename,
+        duplicate_work,
+    })
 }
 
 /// The base a session's branch was cut from, and what that base carries
@@ -839,7 +876,11 @@ pub(super) fn run_adopt(parsed: Parsed) -> Result<(), UsageError> {
             &parsed.declared_scopes,
             true,
         )?;
-        out!("{}", session_action_json(&report, &tab_rename)?);
+        let duplicates = broker.duplicate_work_for(session);
+        out!(
+            "{}",
+            session_action_json(&report, &tab_rename, &duplicates)?
+        );
     } else {
         match report.outcome {
             crate::AdoptOutcome::Created => out!(
@@ -942,6 +983,7 @@ pub(super) fn run_adopt(parsed: Parsed) -> Result<(), UsageError> {
         if let Some(line) = broker.pr_overlap_heads_up(session) {
             out!("{line}");
         }
+        render_duplicate_work(session.id, &broker.duplicate_work_for(session));
     }
     Ok(())
 }
@@ -980,7 +1022,11 @@ pub(super) fn run_start(parsed: Parsed) -> Result<(), UsageError> {
             &parsed.declared_scopes,
             true,
         )?;
-        out!("{}", session_action_json(&report, &tab_rename)?);
+        let duplicates = broker.duplicate_work_for(session);
+        out!(
+            "{}",
+            session_action_json(&report, &tab_rename, &duplicates)?
+        );
     } else {
         out!(
             "Started session {} — worktree {} on branch {}",
@@ -1003,6 +1049,7 @@ pub(super) fn run_start(parsed: Parsed) -> Result<(), UsageError> {
         if let Some(line) = broker.pr_overlap_heads_up(session) {
             out!("{line}");
         }
+        render_duplicate_work(session.id, &broker.duplicate_work_for(session));
         out!("Worktree: cd {}", session.worktree_path);
     }
     Ok(())
@@ -1038,7 +1085,11 @@ pub(super) fn run_start_agent(parsed: Parsed) -> Result<(), UsageError> {
     );
     let session = &report.session;
     if parsed.json {
-        out!("{}", session_action_json(&report, &tab_rename)?);
+        let duplicates = broker.duplicate_work_for(session);
+        out!(
+            "{}",
+            session_action_json(&report, &tab_rename, &duplicates)?
+        );
     } else {
         out!(
             "Started session {} (pid {}) — worktree {} on branch {}\nLog: {}",
@@ -1051,6 +1102,7 @@ pub(super) fn run_start_agent(parsed: Parsed) -> Result<(), UsageError> {
         render_tab_rename(&tab_rename);
         render_start_base(&report.start_base);
         render_worktree_placement(&report.worktree_placement);
+        render_duplicate_work(session.id, &broker.duplicate_work_for(session));
     }
     Ok(())
 }

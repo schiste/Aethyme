@@ -1211,6 +1211,40 @@ against the default branch, excluding the session's own:
 never call GitHub, and ignore a listing older than a day. Nothing here blocks a
 command or writes to GitHub.
 
+### Duplicate work and sessions stuck mid-merge
+
+Several live sessions repairing one pull request conflict with each other by
+construction. The broker names that, from local facts only, and never blocks:
+
+- **Duplicate work:** `broker start`, `start-agent`, `adopt` (including
+  `--reuse`) and `broker push` report other sessions that work on the same
+  branch (`same_branch`), on the open PR whose head is the other session's
+  branch (`same_pr`, from the listing `broker push` caches), or whose task text
+  names the same PR number (`task_mentions_pr`: `PR #1122`, `PR1122`,
+  `pr-1122`, `pull request 1122` or `#1122`). JSON gains `duplicate_work`
+  (`session_id`, `status`, `task`, `reason`, `pull_request`), omitted when
+  empty. `broker status` adds one `session.duplicate-work` row per pair:
+  `warning` when both sessions are active or idle, `info` when one has gone
+  quiet. Its commands are a coordination note and `broker finish`.
+- **Mid-merge worktrees:** a session whose worktree is part-way through a
+  merge, rebase, cherry-pick or revert, or holds unresolved conflicts, is not
+  merge-simulated. Its overlap pairs stay `classified: false` with the reason
+  `session <id> is mid-<operation> with unresolved conflicts`, and `broker
+  status` adds a `session.mid-merge` warning with `git status`,
+  `--continue` and `--abort` commands. The check reads the worktree's Git
+  directory and runs no Git command.
+- **Verify-only submit:** in a `[promote] mode = "verify-only"` repository, a
+  conflicting explicit lease held by an active session no longer fails the
+  submit ownership audit. It is reported in `lease_warnings` with the
+  coordination command, and submit continues to the gates. `auto` and
+  `manual` repositories still refuse, because they promote onto a shared
+  integration branch. `broker advanced exec`'s guard is unchanged.
+- **`[leases] ignore`:** an entry ending in `/` is a directory prefix, an entry
+  containing `/` is an exact repository-relative path, and any other entry is
+  a file name matched in every directory. The rules are read from
+  `.aethyme/config.toml` as committed on the fetched default branch, else the
+  main checkout's file, like `[promote]`.
+
 Work that reaches the default branch through a reviewed pull request is
 delivered, but leaves no promoted queue entry, and a squash merge rewrites the
 SHA so ancestry cannot see it either. Such a session used to be unfinishable:

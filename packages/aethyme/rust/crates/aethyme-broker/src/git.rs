@@ -792,6 +792,65 @@ fn porcelain_probe(program: &Path) -> PorcelainProbe {
     }
 }
 
+/// A Git operation a worktree is part-way through, and whether its index
+/// still holds unresolved conflicts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InProgressOperation {
+    /// `merge`, `rebase`, `cherry-pick` or `revert`; `None` when only the
+    /// index records unmerged entries (a conflicted `stash pop`, say).
+    pub operation: Option<&'static str>,
+    pub unresolved_conflicts: bool,
+}
+
+impl InProgressOperation {
+    /// "session 7 is mid-merge with unresolved conflicts", and the like.
+    pub fn describe(self, session_id: i64) -> String {
+        match (self.operation, self.unresolved_conflicts) {
+            (Some(operation), true) => {
+                format!("session {session_id} is mid-{operation} with unresolved conflicts")
+            }
+            (Some(operation), false) => format!("session {session_id} is mid-{operation}"),
+            (None, _) => format!("session {session_id} has unresolved conflicts"),
+        }
+    }
+}
+
+/// The operation `worktree` is in the middle of, read from its Git directory
+/// without running Git, so `status` can check every session without forking.
+pub fn worktree_operation_in_progress(worktree: &Path) -> Option<&'static str> {
+    let git_dir = worktree_git_dir(worktree)?;
+    [
+        ("MERGE_HEAD", "merge"),
+        ("rebase-merge", "rebase"),
+        ("rebase-apply", "rebase"),
+        ("CHERRY_PICK_HEAD", "cherry-pick"),
+        ("REVERT_HEAD", "revert"),
+    ]
+    .into_iter()
+    .find(|(marker, _)| git_dir.join(marker).exists())
+    .map(|(_, operation)| operation)
+}
+
+/// A worktree's own Git directory: `.git` itself, or the directory a linked
+/// worktree's `.git` file points to.
+fn worktree_git_dir(worktree: &Path) -> Option<PathBuf> {
+    let dot_git = worktree.join(".git");
+    if std::fs::symlink_metadata(&dot_git).ok()?.is_dir() {
+        return Some(dot_git);
+    }
+    let text = std::fs::read_to_string(&dot_git).ok()?;
+    let target = PathBuf::from(
+        text.lines()
+            .find_map(|line| line.strip_prefix("gitdir:"))?
+            .trim(),
+    );
+    Some(if target.is_absolute() {
+        target
+    } else {
+        worktree.join(target)
+    })
+}
+
 fn run_git(cwd: &Path, args: &[&str]) -> Result<String, GitError> {
     run_git_inner(cwd, None, args)
 }
@@ -2239,6 +2298,22 @@ impl GitRepo {
     /// refreshes the checkout's real index, and the broker reads that
     /// file's mtime as evidence the session's agent is working. Classifying
     /// another session's edits must not make an idle session look active.
+    /// Whether this checkout is part-way through a merge, rebase,
+    /// cherry-pick or revert, or holds unmerged index entries. Building a
+    /// tree from such an index fails, so callers check this first.
+    pub fn operation_in_progress(&self) -> Result<Option<InProgressOperation>, GitError> {
+        let operation = worktree_operation_in_progress(&self.root);
+        let unresolved_conflicts = !run_git(&self.root, &["ls-files", "--unmerged"])?
+            .trim()
+            .is_empty();
+        Ok(
+            (operation.is_some() || unresolved_conflicts).then_some(InProgressOperation {
+                operation,
+                unresolved_conflicts,
+            }),
+        )
+    }
+
     pub fn working_state_commit(&self, paths: &[String]) -> Result<Option<String>, GitError> {
         let dirty = self.dirty_tracked_among(paths)?;
         if dirty.is_empty() {
