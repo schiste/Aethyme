@@ -269,7 +269,7 @@ the code without parsing output. They apply with or without `--json`.
 | 3 | Refused: a policy, lease, confirmation or state precondition blocked the request, or a submission conflicted. Nothing changed. | Fix the precondition, then retry |
 | 4 | Verification failed: a gate or graph-integrity check did not pass | Fix the code; the gate output names the failure |
 | 5 | Outcome unknown: a remote write may or may not have happened | Inspect external state, then `broker advanced operations reconcile`. Never retry blindly. |
-| 6 | Environment: a missing tool, path or remote base, or host I/O failure | Fix the host, then retry |
+| 6 | Environment: a missing tool, path or remote base, or host I/O failure; also a `submit` deferred because the host stopped a gate before it judged the change | Fix the host, then retry without changing code |
 
 Before 2026-09-23, `submit --json` exited 0 for rejected and conflicted
 entries, and every refusal exited 1. Some subcommands keep their own

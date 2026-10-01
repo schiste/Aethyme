@@ -12,6 +12,20 @@ pub(super) fn queue_status_is_current(status: crate::MergeStatus) -> bool {
     )
 }
 
+/// The exit code for a submission, text or `--json`.
+///
+/// A deferred entry is `Submitted`, so `for_submission` alone would call it a
+/// success. It is not: the change was never judged, and exit 0 would tell an
+/// agent its work was verified. ENVIRONMENT already means "free the resource
+/// and retry without changing code".
+fn submission_exit_code(outcome: &crate::SubmitOutcome) -> u8 {
+    if outcome.gate_verification.status == crate::SubmissionGateVerificationStatus::Deferred {
+        crate::exit_status::ENVIRONMENT
+    } else {
+        crate::exit_status::for_submission(outcome.entry.status, &outcome.gate_outcomes)
+    }
+}
+
 pub(super) fn render_queue_history(page: &crate::MergeQueueHistoryPage) {
     if page.entries.is_empty() {
         out!("No terminal merge-queue entries in this page.");
@@ -555,8 +569,8 @@ pub(super) fn run_submit(parsed: Parsed) -> Result<(), UsageError> {
             // resubmit -- not to edit code that has not been shown to be wrong.
             crate::SubmissionGateVerificationStatus::Deferred => out!(
                 "verification: deferred — a selected gate could not run on this host \
-                 (contention, disk, or timeout); the change was not judged. Free the \
-                 resource, then `aethyme broker submit --session {}` again without \
+                 (resources, disk, or its first timeout); the change was not judged. Free \
+                 the resource, then `aethyme broker submit --session {}` again without \
                  changing code",
                 outcome.entry.session_id
             ),
@@ -640,7 +654,10 @@ pub(super) fn run_submit(parsed: Parsed) -> Result<(), UsageError> {
         if outcome.entry.status.as_str() == "rejected"
             || outcome.gate_verification.status == crate::SubmissionGateVerificationStatus::Deferred
         {
-            if let Ok(info) = broker.store().session(outcome.entry.session_id)
+            // "Fix forward" only follows a verdict. A deferred change was never
+            // judged, so there is nothing yet to fix.
+            if outcome.entry.status.as_str() == "rejected"
+                && let Ok(info) = broker.store().session(outcome.entry.session_id)
                 && std::path::Path::new(&info.worktree_path) == broker.main_root()
             {
                 eprintln!(
@@ -648,18 +665,7 @@ pub(super) fn run_submit(parsed: Parsed) -> Result<(), UsageError> {
                      the broker cannot hold it back. Fix forward on main and resubmit."
                 );
             }
-            // A deferred entry is `Submitted`, so `for_submission` would call it
-            // a success. It is not: the change was not judged, and an agent
-            // that sees exit 0 has been told its work landed when nothing was
-            // verified. The environmental code is the one that already means
-            // "free the resource and resubmit".
-            let code = if outcome.gate_verification.status
-                == crate::SubmissionGateVerificationStatus::Deferred
-            {
-                crate::exit_status::ENVIRONMENT
-            } else {
-                crate::exit_status::for_submission(outcome.entry.status, &outcome.gate_outcomes)
-            };
+            let code = submission_exit_code(&outcome);
             return Err(UsageError::Exit {
                 message: if code == crate::exit_status::ENVIRONMENT {
                     "gates could not run on this host (resource contention or \
@@ -710,17 +716,7 @@ pub(super) fn run_submit(parsed: Parsed) -> Result<(), UsageError> {
     }
     // `--json` used to exit 0 for a rejected or conflicted entry, so a
     // caller reading only the exit code saw a failed gate as success.
-    //
-    // A deferred entry is `Submitted`, so `for_submission` calls it a success.
-    // It is not: the change was never judged, and exit 0 would tell an agent
-    // its work landed. ENVIRONMENT is the code that already means "free the
-    // resource and resubmit".
-    let code =
-        if outcome.gate_verification.status == crate::SubmissionGateVerificationStatus::Deferred {
-            crate::exit_status::ENVIRONMENT
-        } else {
-            crate::exit_status::for_submission(outcome.entry.status, &outcome.gate_outcomes)
-        };
+    let code = submission_exit_code(&outcome);
     if code != crate::exit_status::SUCCESS {
         return Err(UsageError::SilentExit(code));
     }

@@ -684,34 +684,48 @@ pub struct GateRunOutcome {
     /// cache hit or a result recorded before the command stage.
     #[serde(flatten)]
     pub environment: GateEnvironment,
+    /// The broker itself observed that this gate could not judge the change.
+    /// Serialized only when true. See [`GateRunOutcome::is_host_fault`].
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub host_fault: bool,
 }
 
 impl GateRunOutcome {
-    /// Whether this outcome describes the *host* failing to judge the change
-    /// rather than the change failing the gate.
+    /// Whether the *host*, not the change, stopped this gate from producing a
+    /// verdict -- the only failures a submission may defer instead of reject.
     ///
-    /// `TestFailure` and `BuildFailure` are verdicts on the tree: something
-    /// about the code made the command exit non-zero, and an agent can act on
-    /// that. `ResourceContention`, `Environment` and `Timeout` are not — the
-    /// gate was refused before it ran, the host ran out of something, or the
-    /// command was killed. Reporting those as a failed verification tells an
-    /// agent its correct work is broken, which is both untrue and corrosive: a
-    /// signal that cries wolf often enough stops being read.
-    ///
-    /// `CachedPriorFail` and `Unknown` are treated as verdicts deliberately. A
-    /// cached prior failure is a real result being replayed, and `Unknown`
-    /// means the broker could not classify it, so treating it as a host fault
-    /// would let an unclassifiable failure silently become a deferral that
-    /// never resolves.
+    /// This is deliberately narrower than `failure_class`. That class is partly
+    /// inferred from the command's own log, which is the change's test output:
+    /// a failing test that prints "request timed out", or a deleted script
+    /// reported as "command not found", is classified `Timeout` or
+    /// `Environment` too. Deferring on the class would let such a change be
+    /// deferred forever, with the agent told to resubmit unchanged code. So the
+    /// flag is set only where the broker observed the fault itself: host
+    /// resources were refused, the command never started (disk headroom, spawn
+    /// failure, an invalidated broker database), the broker detected a host
+    /// resource error, the command ran out of disk, or the broker's own
+    /// deadline killed it for the first time on this tree. A second timeout on
+    /// the same tree is a verdict, so a change that hangs is still rejected.
     pub fn is_host_fault(&self) -> bool {
-        matches!(
-            self.failure_class,
-            Some(
-                GateFailureClass::ResourceContention
-                    | GateFailureClass::Environment
-                    | GateFailureClass::Timeout
-            )
-        )
+        self.host_fault && self.status != GateStatus::Pass
+    }
+}
+
+/// Whether the broker, rather than the command's output, shows that a gate run
+/// could not judge the change. The command's log is consulted only for storage
+/// exhaustion, which no test output plausibly fakes and which the broker
+/// already treats as never a verdict (#222).
+fn observed_host_fault(
+    status: &Result<GateCommandOutcome, std::io::Error>,
+    log_path: &Path,
+) -> bool {
+    match status {
+        Err(_) => true,
+        Ok(outcome) if outcome.resource_error.is_some() || outcome.timed_out => true,
+        Ok(outcome) if outcome.exit_code.is_some_and(|code| code != 0) => {
+            log_contains_any(log_path, &["no space left on device"])
+        }
+        Ok(_) => false,
     }
 }
 
@@ -1858,6 +1872,7 @@ fn run_selections(
                 // Not executed now: today's load says nothing about the run
                 // whose verdict is reused, so the cache hit reports none.
                 environment: GateEnvironment::default(),
+                host_fault: false,
             });
             if failed {
                 break;
@@ -1947,6 +1962,8 @@ fn run_selections(
                         output_bytes: Some(0),
                         log_path: Some(log_path.to_string_lossy().into_owned()),
                         environment: GateEnvironment::default(),
+                        // Refused host resources: the command never ran.
+                        host_fault: true,
                     });
                     break;
                 }
@@ -2011,6 +2028,9 @@ fn run_selections(
                     output_bytes: Some(0),
                     log_path: Some(log_path.to_string_lossy().into_owned()),
                     environment: GateEnvironment::default(),
+                    // The managed cache could not be prepared: the command
+                    // never ran.
+                    host_fault: true,
                 });
                 break;
             }
@@ -2091,6 +2111,25 @@ fn run_selections(
             .as_ref()
             .ok()
             .map(|outcome| outcome.output_bytes as i64);
+        let timed_out = status.as_ref().is_ok_and(|outcome| outcome.timed_out);
+        let mut host_fault = observed_host_fault(&status, &log_path);
+        // A deadline kill is the host's fault only the first time. A change
+        // that hangs times out on every run of its tree, and deferring each one
+        // would ask the agent to resubmit unchanged code forever.
+        if host_fault
+            && timed_out
+            && store.gate_timeouts_for_tree(&gate.name, &tree, &gate.definition_hash)? > 0
+        {
+            host_fault = false;
+            crate::warn_unrecorded(
+                "note a repeated timeout in the gate log",
+                append_gate_log(
+                    &log_path,
+                    "aethyme: this gate also timed out on an earlier run of the same tree; \
+                     treating the timeout as a verdict on the change\n",
+                ),
+            );
+        }
         let (gate_status, failure_class, exit_code) =
             classify_gate_result(&gate.command, &log_path, status);
         // Classification reads the log in place, so the rename waits until
@@ -2145,6 +2184,7 @@ fn run_selections(
             output_bytes,
             log_path: Some(log_path.to_string_lossy().into_owned()),
             environment,
+            host_fault,
         });
         if failed {
             break;
@@ -3500,62 +3540,66 @@ mod tests {
         assert!(log.contains("1.4 GiB free"), "{log:?}");
     }
 
-    /// The control: a gate that genuinely ran and failed must keep reporting a
-    /// test failure, because that is the one verdict the tree-hash cache
-    /// reuses. A fix for #167/#168 that reclassified real failures would make
-    /// every gate re-run forever.
-    /// A gate that never got to judge the change must not be reported as a
-    /// verdict on the change. This is the distinction the submit path now
-    /// branches on, so it is pinned here against the classes it claims.
-    #[test]
-    fn only_host_fault_classes_are_treated_as_deferrable() {
-        let outcome = |status, class| GateRunOutcome {
-            gate: "g".into(),
-            tree_hash: "t".into(),
-            definition_hash: "d".into(),
-            resource_lease: None,
-            managed_cache: None,
-            broker_database: None,
-            status,
-            failure_class: class,
-            log_path: None,
-            cached: false,
-            exit_code: Some(1),
-            duration_ms: Some(1),
-            wait_duration_ms: None,
+    fn command_outcome(exit_code: Option<i32>, timed_out: bool) -> GateCommandOutcome {
+        GateCommandOutcome {
+            exit_code,
+            timed_out,
+            resource_error: None,
             first_output_ms: None,
-            output_bytes: None,
-            environment: GateEnvironment::default(),
-        };
-
-        for class in [
-            GateFailureClass::ResourceContention,
-            GateFailureClass::Environment,
-            GateFailureClass::Timeout,
-        ] {
-            assert!(
-                outcome(GateStatus::Error, Some(class)).is_host_fault(),
-                "{class:?} describes the host, not the change"
-            );
-        }
-        // Verdicts on the tree, and the two classes that must not become an
-        // unresolvable deferral, are all treated as real failures.
-        for (status, class) in [
-            (GateStatus::Fail, Some(GateFailureClass::TestFailure)),
-            (GateStatus::Fail, Some(GateFailureClass::BuildFailure)),
-            (GateStatus::Error, Some(GateFailureClass::CachedPriorFail)),
-            (GateStatus::Error, Some(GateFailureClass::Unknown)),
-            (GateStatus::Error, None),
-        ] {
-            assert!(
-                !outcome(status, class).is_host_fault(),
-                "{class:?} must stay a verdict, not a deferral"
-            );
+            output_bytes: 0,
         }
     }
 
-    /// A gate that ran and reported a failing test is a test failure, not an
-    /// environment problem — and that is the one verdict the tree-hash cache
+    /// Only faults the broker observed itself may defer a submission: a gate
+    /// that never started, a host resource error, the broker's own deadline,
+    /// or running out of disk.
+    #[test]
+    fn faults_the_broker_observed_are_host_faults() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("gate.log");
+        std::fs::write(&log, "").unwrap();
+
+        let never_started: Result<GateCommandOutcome, std::io::Error> = Err(
+            std::io::Error::new(std::io::ErrorKind::StorageFull, "1.4 GiB free"),
+        );
+        assert!(observed_host_fault(&never_started, &log));
+        assert!(observed_host_fault(&Ok(command_outcome(None, true)), &log));
+        let mut resource = command_outcome(Some(1), false);
+        resource.resource_error = Some("lease lost".into());
+        assert!(observed_host_fault(&Ok(resource), &log));
+
+        std::fs::write(&log, "error: No space left on device (os error 28)\n").unwrap();
+        assert!(observed_host_fault(&Ok(command_outcome(Some(101), false)), &log));
+    }
+
+    /// The command's log is the change's own test output, so text that merely
+    /// looks like a host problem stays a verdict. Deferring it would ask the
+    /// agent to resubmit unchanged code forever.
+    #[test]
+    fn host_looking_test_output_is_not_a_host_fault() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("gate.log");
+        for (output, code) in [
+            ("assertion failed: request timed out after 5s\n", 1),
+            ("./scripts/check.sh: command not found\n", 127),
+            ("thread panicked: database is locked\n", 101),
+            ("", 124),
+        ] {
+            std::fs::write(&log, output).unwrap();
+            let status = Ok(command_outcome(Some(code), false));
+            let (_, class, _) = classify_gate_result("sh -c test", &log, Ok(command_outcome(Some(code), false)));
+            assert!(class.is_some(), "{output:?} still gets a class for advisories");
+            assert!(
+                !observed_host_fault(&status, &log),
+                "{output:?} (exit {code}) is the change's output, not a host fault"
+            );
+        }
+        // A clean pass is never a host fault.
+        assert!(!observed_host_fault(&Ok(command_outcome(Some(0), false)), &log));
+    }
+
+    /// The control: a gate that genuinely ran and failed must keep reporting a
+    /// test failure, because that is the one verdict the tree-hash cache
     /// reuses. A fix for #167/#168 that reclassified real failures would make
     /// every gate re-run forever.
     #[test]
