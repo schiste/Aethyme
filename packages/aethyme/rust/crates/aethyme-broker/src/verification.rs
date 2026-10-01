@@ -149,39 +149,79 @@ impl ExactTreeVerificationSlot {
         Self::acquire_at(main_root, plan_slot_placement(main_root, namespace))
     }
 
-    /// A slot keyed by the exact tree it verifies, so two verifications of
-    /// *different* trees do not contend.
+    /// One of `size` stable slots, so up to `size` verifications run at once.
     ///
-    /// The reason this is safe is the module's own: a slot exists to be a
-    /// stable, complete checkout that is not nested inside another one, so a
-    /// build tool walking upward for a workspace manifest cannot resolve to
-    /// someone else's tree. Every one of those properties is per-tree. Nothing
-    /// requires two verifications of two different trees to share a directory
-    /// — only that two verifications of the *same* tree do, and the key below
-    /// guarantees exactly that.
+    /// A single repository-wide slot made merge verification strictly serial:
+    /// measured at a flat ~8.6 submissions per hour whatever the number of
+    /// submitting sessions, because gates ran sequentially inside one lock.
+    /// Nothing about a slot requires two *different* verifications to share a
+    /// directory -- each needs a stable, complete, non-nested checkout of its
+    /// own tree.
     ///
-    /// Before this, the merge path took one repository-wide `"merge-sim"`
-    /// slot, so promotion was strictly serial: measured at a flat ~8.6
-    /// submissions per hour regardless of how many sessions were submitting,
-    /// because gates ran sequentially inside the single lock. Two sessions
-    /// verifying different merged trees have no reason to exclude each other.
+    /// A fixed pool rather than one directory per commit, for two reasons.
+    /// Each slot keeps a stable path, which is what lets build tools reuse
+    /// path-sensitive fingerprints from one verification to the next; a fresh
+    /// path per merge commit makes every verification start cold, and a merge
+    /// commit is new on every submission even when the tree is not. And the
+    /// set of directories stays bounded instead of growing by one lock file
+    /// per verification forever.
     ///
-    /// The key is the full commit, not a prefix, so a collision would have to
-    /// be a genuine hash collision rather than an abbreviation.
-    pub(crate) fn acquire_for_tree(
+    /// Slot 0 is the plain `namespace` placement, so the checkout every
+    /// existing installation keeps warm stays the first one used. A free slot
+    /// is taken without waiting; when all are busy this polls until one is
+    /// released. Locks are `flock`s, so a holder that dies releases its slot.
+    pub(crate) fn acquire_pooled(
         main_root: &Path,
         namespace: &str,
-        commit: &str,
+        size: usize,
     ) -> Result<Self, BrokerOpError> {
-        let key = crate::report::sha256_hex(commit.as_bytes());
-        // Two levels so a repository that verifies many distinct trees does not
-        // put every slot directory in one directory, and so the 256-bit space
-        // is split rather than enumerated linearly.
-        let shard = &key[..2];
-        Self::acquire_at(
-            main_root,
-            plan_slot_placement(main_root, &format!("{namespace}-{shard}/{key}")),
-        )
+        let placements = (0..size.max(1))
+            .map(|index| {
+                let name = if index == 0 {
+                    namespace.to_string()
+                } else {
+                    format!("{namespace}-{index}")
+                };
+                plan_slot_placement(main_root, &name)
+            })
+            .collect::<Vec<_>>();
+        loop {
+            for placement in &placements {
+                if let Some(slot) = Self::try_acquire_at(main_root, placement.clone())? {
+                    return Ok(slot);
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+    }
+
+    /// Take the lock on an already chosen placement, or `None` if it is held.
+    fn try_acquire_at(
+        main_root: &Path,
+        placement: SlotPlacement,
+    ) -> Result<Option<Self>, BrokerOpError> {
+        let lock_path = Self::prepare_lock_path(&placement)?;
+        let file = open_lock_file(&lock_path).map_err(|source| BrokerError::Io {
+            path: lock_path.clone(),
+            source,
+        })?;
+        let lock = ExclusiveFileLock::try_acquire(file).map_err(|source| BrokerError::Io {
+            path: lock_path,
+            source,
+        })?;
+        Ok(lock.map(|lock| Self {
+            repository_root: main_root.to_path_buf(),
+            path: placement.directory.join("slot"),
+            _lock: lock,
+        }))
+    }
+
+    fn prepare_lock_path(placement: &SlotPlacement) -> Result<PathBuf, BrokerOpError> {
+        std::fs::create_dir_all(&placement.directory).map_err(|source| BrokerError::Io {
+            path: placement.directory.clone(),
+            source,
+        })?;
+        Ok(placement.directory.join("slot.lock"))
     }
 
     /// Take the lock on an already chosen placement.
@@ -341,43 +381,68 @@ mod tests {
         );
     }
 
-    /// The property the parallel merge path depends on: two different trees get
-    /// two different slots, so their verifications never serialize on each
-    /// other, while the same tree always lands on the same slot so build tools
-    /// still see a stable path.
+    /// A verification that finds slot 0 busy takes another slot instead of
+    /// waiting: this is the whole throughput change. Run on a thread with a
+    /// timeout so a regression to "block on one slot" fails rather than hangs.
     #[test]
-    fn a_tree_keyed_slot_separates_different_trees_and_repeats_the_same_one() {
-        // One fixture for all three placements: the point is that the *tree*
-        // decides the path, so a fresh repository per call would prove nothing.
+    fn a_busy_slot_does_not_block_a_second_verification() {
         let fx = fixture();
-        let place = |commit: &str| {
-            let key = crate::report::sha256_hex(commit.as_bytes());
-            plan_slot_placement(&fx.main, &format!("merge-sim-{}/{}", &key[..2], key)).directory
-        };
-        let a = place(&"a".repeat(40));
-        let b = place(&"b".repeat(40));
-        assert_ne!(a, b, "two trees must not share a slot");
-        assert_eq!(
-            a,
-            place(&"a".repeat(40)),
-            "one tree must keep a stable path"
-        );
-        // Still keyed under the caller's namespace, so this cannot collide with
-        // the graph-integrity or gate-doctor-probe slots.
-        assert!(a.to_string_lossy().contains("merge-sim-"), "{a:?}");
+        let first = ExactTreeVerificationSlot::acquire_pooled(&fx.main, "merge-sim", 2).unwrap();
+        let main = fx.main.clone();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let second = ExactTreeVerificationSlot::acquire_pooled(&main, "merge-sim", 2).unwrap();
+            sender.send(second.path.clone()).unwrap();
+        });
+        let second = receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("a second verification waited for a busy slot while another was free");
+        assert_ne!(first.path, second, "two verifications shared one checkout");
     }
 
-    /// The shard prefix must actually partition, or every slot for a repository
-    /// lands in one directory again.
+    /// Paths are stable and bounded: releasing and re-acquiring lands on the
+    /// same checkout, and slot 0 is the existing single-slot placement, so the
+    /// directory installations already keep warm stays the one used first.
     #[test]
-    fn the_shard_prefix_partitions_across_more_than_one_directory() {
-        let shard = |commit: &str| crate::report::sha256_hex(commit.as_bytes())[..2].to_string();
-        let shards: std::collections::BTreeSet<String> =
-            (0u8..64).map(|n| shard(&format!("{n}"))).collect();
-        assert!(
-            shards.len() > 1,
-            "all commits landed in one shard: {shards:?}"
+    fn pooled_slots_keep_stable_paths_and_slot_zero_is_the_existing_placement() {
+        let fx = fixture();
+        let first = ExactTreeVerificationSlot::acquire_pooled(&fx.main, "merge-sim", 4).unwrap();
+        let path = first.path.clone();
+        drop(first);
+        let again = ExactTreeVerificationSlot::acquire_pooled(&fx.main, "merge-sim", 4).unwrap();
+        assert_eq!(again.path, path, "a released slot was not reused");
+        drop(again);
+        let single = ExactTreeVerificationSlot::acquire(&fx.main, "merge-sim").unwrap();
+        assert_eq!(
+            single.path, path,
+            "slot 0 moved away from the existing placement"
         );
+    }
+
+    /// With every slot busy a verification waits, and takes the slot as soon as
+    /// it is released -- the pool bounds concurrency, it never fails a submit.
+    #[test]
+    fn a_full_pool_waits_for_a_released_slot() {
+        let fx = fixture();
+        let held = ExactTreeVerificationSlot::acquire_pooled(&fx.main, "merge-sim", 1).unwrap();
+        let held_path = held.path.clone();
+        let main = fx.main.clone();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let slot = ExactTreeVerificationSlot::acquire_pooled(&main, "merge-sim", 1).unwrap();
+            sender.send(slot.path.clone()).unwrap();
+        });
+        assert!(
+            receiver
+                .recv_timeout(std::time::Duration::from_millis(600))
+                .is_err(),
+            "a verification entered a slot another one still holds"
+        );
+        drop(held);
+        let path = receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("a released slot was never taken");
+        assert_eq!(path, held_path);
     }
 
     #[test]
