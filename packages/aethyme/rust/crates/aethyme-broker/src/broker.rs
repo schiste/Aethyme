@@ -381,6 +381,10 @@ pub enum BrokerOpError {
     },
     #[error("session {session_id}'s branch {branch} does not exist in this repository")]
     SessionBranchMissing { session_id: i64, branch: String },
+    /// `broker sync` declined before changing anything: the worktree is
+    /// dirty or mid-operation, or there is no default branch to sync with.
+    #[error("broker sync refused: {reason}")]
+    SessionSyncRefused { reason: String },
     #[error("{recovery}")]
     CoordinatedOperationBlocked {
         repository: String,
@@ -719,6 +723,14 @@ pub struct AdoptReport {
     /// for the ordinary case (issue #145).
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub renamed_targets: Vec<crate::RenamedTarget>,
+    /// The session's head compared with the freshly fetched default branch:
+    /// how far it drifted while the worktree sat unused, and whether catching
+    /// up would conflict. Absent when there is no fetched default branch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_branch: Option<crate::DefaultBranchDrift>,
+    /// Why `default_branch` is missing or used the last fetched copy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_branch_note: Option<String>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -863,6 +875,18 @@ pub struct SessionStartBase {
     /// Absent when integration was used or does not exist.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bypassed_integration: Option<BypassedIntegration>,
+    /// Whether `start` refreshed the default branch from its remote before
+    /// settling on this base. `None` when no refresh was attempted, e.g. no
+    /// fetched default branch is configured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fetched: Option<bool>,
+    /// Why the refresh did not happen, when `fetched` is `false`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fetch_error: Option<String>,
+    /// How long ago the default branch's remote-tracking ref last moved,
+    /// when the refresh failed and the base came from that cached copy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cached_ref_age_seconds: Option<u64>,
 }
 
 /// Why a start cut from the fetched default branch instead of integration.
@@ -2862,6 +2886,29 @@ impl Broker {
         agent_identity: Option<&str>,
         context: SessionContext,
     ) -> Result<AdoptReport, BrokerOpError> {
+        let mut report = self.adopt_with_options_and_context_unrefreshed(
+            worktree,
+            task,
+            options,
+            agent_identity,
+            context,
+        )?;
+        // Refresh the default branch and say how far this checkout drifted
+        // while it sat unused -- the comparison `push` makes (#462).
+        let (drift, note) = self.reused_session_drift(&report.session);
+        report.default_branch = drift;
+        report.default_branch_note = note;
+        Ok(report)
+    }
+
+    fn adopt_with_options_and_context_unrefreshed(
+        &mut self,
+        worktree: &Path,
+        task: Option<&str>,
+        options: AdoptOptions,
+        agent_identity: Option<&str>,
+        context: SessionContext,
+    ) -> Result<AdoptReport, BrokerOpError> {
         let context = self.session_context(context);
         if options.sync_integration && options.mode != AdoptMode::Reuse {
             return Err(BrokerOpError::ReuseSyncRequiresReuse);
@@ -2935,6 +2982,8 @@ impl Broker {
                         integration_sync,
                         planned_explicit_leases,
                         preparation,
+                        default_branch: None,
+                        default_branch_note: None,
                     });
                 }
                 AdoptMode::ReplaceStale => {
@@ -3008,6 +3057,8 @@ impl Broker {
             planned_explicit_leases,
             preparation,
             renamed_targets,
+            default_branch: None,
+            default_branch_note: None,
         })
     }
 
@@ -3450,7 +3501,9 @@ impl Broker {
         let worktree_path = placement.root.join(&slug);
         self.refuse_nested_worktree_path(&worktree_path)?;
         let branch = format!("agent/{slug}");
-        let start_base = self.select_session_start_base(explicit_base)?;
+        let refresh = self.refresh_default_branch_before_start();
+        let mut start_base = self.select_session_start_base(explicit_base)?;
+        refresh.record(&mut start_base);
         let worktree = self
             .repo
             .worktree_add(&worktree_path, &branch, &start_base.commit)?;
@@ -3896,7 +3949,9 @@ impl Broker {
     /// branch, and the bypassed integration is reported. Choosing integration
     /// whenever it existed cut sessions 2,101 commits behind upstream in one
     /// repository, where it had stopped moving three days earlier. Nothing here
-    /// fetches: the upstream is as fresh as the last fetch.
+    /// fetches: `create_session_worktree` refreshes the default branch just
+    /// before calling it (see `Broker::refresh_default_branch_before_start`),
+    /// so the fetched tip it reads is current unless that refresh failed.
     fn select_session_start_base(
         &self,
         explicit: Option<&str>,
@@ -3919,6 +3974,9 @@ impl Broker {
                 ahead_default_commits,
                 default_ref,
                 bypassed_integration: None,
+                fetched: None,
+                fetch_error: None,
+                cached_ref_age_seconds: None,
             });
         }
         let promote = PromoteConfig::load(&self.main_root);
@@ -3942,6 +4000,9 @@ impl Broker {
                 ahead_default_commits,
                 default_ref,
                 bypassed_integration: None,
+                fetched: None,
+                fetch_error: None,
+                cached_ref_age_seconds: None,
             });
         }
 
@@ -3975,6 +4036,9 @@ impl Broker {
                 ahead_default_commits: Some(0),
                 default_ref: Some(upstream_ref),
                 bypassed_integration,
+                fetched: None,
+                fetch_error: None,
+                cached_ref_age_seconds: None,
             });
         }
         // No fetched default branch: a promoting integration was taken above
@@ -3993,6 +4057,9 @@ impl Broker {
                     ahead_default_commits: None,
                     default_ref: None,
                     bypassed_integration: None,
+                    fetched: None,
+                    fetch_error: None,
+                    cached_ref_age_seconds: None,
                 });
             }
         }
@@ -4008,6 +4075,9 @@ impl Broker {
                 ahead_default_commits: None,
                 default_ref: None,
                 bypassed_integration: None,
+                fetched: None,
+                fetch_error: None,
+                cached_ref_age_seconds: None,
             }),
             (None, Some(commit)) => Ok(SessionStartBase {
                 ref_name: "refs/heads/master".into(),
@@ -4017,6 +4087,9 @@ impl Broker {
                 ahead_default_commits: None,
                 default_ref: None,
                 bypassed_integration: None,
+                fetched: None,
+                fetch_error: None,
+                cached_ref_age_seconds: None,
             }),
             (Some(_), Some(_)) => Err(BrokerOpError::StartBaseUnavailable {
                 reason: "both refs/heads/main and refs/heads/master exist, but origin/HEAD does not select one".into(),

@@ -111,7 +111,8 @@ pub fn for_broker_error(error: &BrokerOpError) -> u8 {
         | E::ReuseSyncDirty { .. }
         | E::ReuseSyncNotFastForward { .. }
         | E::GatePolicyUntrusted { .. }
-        | E::SessionPushRefused { .. } => REFUSED,
+        | E::SessionPushRefused { .. }
+        | E::SessionSyncRefused { .. } => REFUSED,
         _ => FAILED,
     }
 }

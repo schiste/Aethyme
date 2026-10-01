@@ -1006,6 +1006,17 @@ delivery path, and the integration branch plays no part:
   request shows; an unpublished one by rebasing. A failed fetch never fails
   the push: the last fetched copy is compared and `default_branch_note` says
   so. This applies in every promote mode.
+- **`broker start` starts from the latest default branch.** It fetches
+  exactly the default branch (one ref, at most ten seconds) before choosing
+  the base. If the fetch fails, the session starts from the cached copy and
+  says how old it is (`start_base.cached_ref_age_seconds`). `start --reuse` and `--adopt` fetch
+  too and report how far the worktree drifted (`default_branch`).
+- **`broker sync --session <id>` catches a session up when it is safe.** The
+  tree must be clean and nothing in progress; it fetches, simulates, and then
+  rebases an unpublished branch or merges the default branch into a published
+  one. If catching up would conflict it changes nothing and lists the paths.
+  Run it before resuming a reused session and whenever `push` reports the
+  branch is behind.
 - **`broker status` shows `session.behind-main`** per live session: `info`
   while the branch still merges cleanly, `warning` when it would conflict. It
   uses only fetched refs and the verdict cached by the last push or status,

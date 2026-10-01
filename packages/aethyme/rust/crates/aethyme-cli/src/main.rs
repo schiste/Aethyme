@@ -101,7 +101,9 @@ fn broker_command_capability(args: &[String]) -> repository_upgrade::CommandCapa
         (Some("readiness"), Some("recover")) => CommandCapability::RecoveryWrite,
         (Some("start" | "start-agent"), _) => CommandCapability::NewSession,
         (Some("adopt"), _) => CommandCapability::NewSession,
-        (Some("submit" | "push" | "exec" | "repair"), _) => CommandCapability::SessionContinuation,
+        (Some("submit" | "push" | "sync" | "exec" | "repair"), _) => {
+            CommandCapability::SessionContinuation
+        }
         (Some("hooks"), Some("pre-commit")) => CommandCapability::ManagedPreCommit,
         (Some("hooks"), Some("post-commit")) => CommandCapability::SessionContinuation,
         (Some("leases"), Some("claim" | "release")) => CommandCapability::SessionContinuation,
