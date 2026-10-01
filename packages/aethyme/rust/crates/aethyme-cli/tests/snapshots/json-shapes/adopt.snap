@@ -16,6 +16,10 @@
   "created_at": "integer",
   "diff_base": "string",
   "exit_code": "null",
+  "guidance": [
+    "string"
+  ],
+  "guidance_source": "string",
   "id": "integer",
   "integration_drift": {
     "ahead_commits": "integer",

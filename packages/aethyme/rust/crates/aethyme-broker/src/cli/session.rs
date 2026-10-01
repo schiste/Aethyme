@@ -67,6 +67,14 @@ struct SessionActionOutput<'a, T: serde::Serialize> {
     #[serde(flatten)]
     report: &'a T,
     tab_rename: &'a crate::chau7_mcp::SessionTabRename,
+    /// The repository's working agreement; set by `start`, `--reuse` and
+    /// `--adopt`, the moments an agent is about to begin work.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    guidance: Option<&'a [String]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    guidance_source: Option<crate::session_guidance::GuidanceSource>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    guidance_warning: Option<&'a str>,
 }
 
 fn render_tab_rename(outcome: &crate::chau7_mcp::SessionTabRename) {
@@ -86,8 +94,30 @@ fn render_tab_rename(outcome: &crate::chau7_mcp::SessionTabRename) {
 fn session_action_json<T: serde::Serialize>(
     report: &T,
     tab_rename: &crate::chau7_mcp::SessionTabRename,
+    guidance: Option<&crate::session_guidance::SessionGuidance>,
 ) -> Result<String, serde_json::Error> {
-    serde_json::to_string_pretty(&SessionActionOutput { report, tab_rename })
+    serde_json::to_string_pretty(&SessionActionOutput {
+        report,
+        tab_rename,
+        guidance: guidance.map(|guidance| guidance.lines.as_slice()),
+        guidance_source: guidance.map(|guidance| guidance.source),
+        guidance_warning: guidance.and_then(|guidance| guidance.warning.as_deref()),
+    })
+}
+
+/// The working agreement, as a compact numbered block. A disabled agreement
+/// prints nothing; an ignored configuration prints why.
+fn render_guidance(guidance: &crate::session_guidance::SessionGuidance) {
+    if let Some(warning) = &guidance.warning {
+        out!("warning: {warning}");
+    }
+    if guidance.lines.is_empty() {
+        return;
+    }
+    out!("Working agreement:");
+    for (index, line) in guidance.lines.iter().enumerate() {
+        out!("  {}. {line}", index + 1);
+    }
 }
 
 /// The base a session's branch was cut from, and what that base carries
@@ -828,6 +858,7 @@ pub(super) fn run_adopt(parsed: Parsed) -> Result<(), UsageError> {
         );
         out!("  port this session's changes onto the new path before submitting");
     }
+    let guidance = crate::session_guidance::load(broker.main_root());
     let session = &report.session;
     if parsed.json {
         // Scope is recorded in both output modes: `--json` is the form
@@ -839,7 +870,10 @@ pub(super) fn run_adopt(parsed: Parsed) -> Result<(), UsageError> {
             &parsed.declared_scopes,
             true,
         )?;
-        out!("{}", session_action_json(&report, &tab_rename)?);
+        out!(
+            "{}",
+            session_action_json(&report, &tab_rename, Some(&guidance))?
+        );
     } else {
         match report.outcome {
             crate::AdoptOutcome::Created => out!(
@@ -937,6 +971,7 @@ pub(super) fn run_adopt(parsed: Parsed) -> Result<(), UsageError> {
             }
             out!("Safe next action: {}", drift.safe_next_action);
         }
+        render_guidance(&guidance);
         render_planned_explicit_leases(&report.planned_explicit_leases);
         render_preparation_status(&report.preparation, false)?;
         if let Some(line) = broker.pr_overlap_heads_up(session) {
@@ -971,6 +1006,7 @@ pub(super) fn run_start(parsed: Parsed) -> Result<(), UsageError> {
             .file_name()
             .and_then(|name| name.to_str()),
     );
+    let guidance = crate::session_guidance::load(broker.main_root());
     let session = &report.session;
     if parsed.json {
         capture_declared_scopes(
@@ -980,7 +1016,10 @@ pub(super) fn run_start(parsed: Parsed) -> Result<(), UsageError> {
             &parsed.declared_scopes,
             true,
         )?;
-        out!("{}", session_action_json(&report, &tab_rename)?);
+        out!(
+            "{}",
+            session_action_json(&report, &tab_rename, Some(&guidance))?
+        );
     } else {
         out!(
             "Started session {} — worktree {} on branch {}",
@@ -998,6 +1037,7 @@ pub(super) fn run_start(parsed: Parsed) -> Result<(), UsageError> {
         )?;
         render_start_base(&report.start_base);
         render_worktree_placement(&report.worktree_placement);
+        render_guidance(&guidance);
         render_planned_explicit_leases(&report.planned_explicit_leases);
         render_preparation_status(&report.preparation, false)?;
         if let Some(line) = broker.pr_overlap_heads_up(session) {
@@ -1038,7 +1078,7 @@ pub(super) fn run_start_agent(parsed: Parsed) -> Result<(), UsageError> {
     );
     let session = &report.session;
     if parsed.json {
-        out!("{}", session_action_json(&report, &tab_rename)?);
+        out!("{}", session_action_json(&report, &tab_rename, None)?);
     } else {
         out!(
             "Started session {} (pid {}) — worktree {} on branch {}\nLog: {}",

@@ -199,6 +199,37 @@ missing, unplugged, inside the repository or below its free-space floor, and
 drive are locked, so nothing prunes or cleans them up while it is away. See the
 CLI reference for the rules.
 
+## The Working Agreement
+
+`broker start`, `start --reuse` and `start --adopt` print a short "Working
+agreement" for the agent that is about to begin, and include it as `guidance`
+in `--json`. Without configuration, the built-in default asks agents to:
+
+1. commit one small, coherent step at a time, staging explicit paths only and
+   checking `git diff --cached` first (then push, where the push lane is on);
+2. keep each PR to one reviewable concern;
+3. reuse or extend an existing shared component instead of adding a parallel
+   path;
+4. keep units focused behind narrow interfaces;
+5. test every behaviour change;
+6. finish with nothing unintended committed or pushed, a clean tree, a pushed
+   branch and an up-to-date PR.
+
+A repository replaces it in `.aethyme/config.toml`, read like `[promote]`:
+
+```toml
+[session]
+guidance = [
+  "Run `pnpm lint` before every commit.",
+  "Ask before changing a database migration.",
+]
+```
+
+At most 6 single-line entries of up to 240 characters. `guidance = []` shows
+none. An invalid list prints a warning and the default; it never stops a
+session. The agreement is shown only when a session starts, not repeated in
+generated instructions or `status`, so it costs tokens once per session.
+
 Use reuse when a dedicated broker worktree should continue with a follow-up
 task. Start by checking whether integration advanced while the session was
 working:

@@ -322,6 +322,24 @@ in `worktree_placement.fallback_reason`, when the root
 Because the key is committed, a machine without that path simply keeps the
 default.
 
+### Working agreement
+
+`start`, `start --reuse` and `start --adopt` print the repository's working
+agreement after the start base and worktree placement, and add to `--json`:
+
+- `guidance`: the lines shown, in order;
+- `guidance_source`: `default` (built in), `repository` (`[session] guidance`)
+  or `disabled` (`guidance = []`);
+- `guidance_warning`: present only when a configured list was ignored, with
+  the reason.
+
+`[session] guidance` is read from the committed default branch like
+`[promote]`. It takes at most 6 single-line entries of up to 240 characters;
+an invalid list falls back to the default with a warning. The default's first
+line names `broker push` and a draft PR only when
+`[delivery] push_session_branches = true`. `start-agent`, `status` and other
+commands do not print the agreement.
+
 Worktrees the broker places on the configured root are locked with
 `git worktree lock`, so `git worktree prune` (including the automatic one in
 `git gc`) keeps their registration while the drive is unplugged; the broker
