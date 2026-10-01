@@ -4,6 +4,29 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.13] - 2026-10-01
+
+Agents start on current main, catch up with one command, and coordinate instead of blocking each other.
+
+### Added
+
+- `broker start` fetches the default branch before choosing its base, so a new worktree starts from the remote tip; when the remote is unreachable it uses the cached copy and reports its age. `--reuse` and `--adopt` report how far the worktree has drifted (#473).
+- `aethyme broker sync --session <id>` brings a session up to the latest default branch when it is safe: clean tree, no simulated conflicts. It rebases an unpublished branch, merges into a published one, and on a conflict changes nothing and lists the paths (#473).
+- `broker start`, `--reuse` and `--adopt` show a short working agreement, configurable per repository with `[session] guidance` in `.aethyme/config.toml` (`[]` turns it off). The default asks for small targeted commits with explicit staging, one concern per PR, reuse of existing shared components, tests for behaviour changes, and nothing unintended committed or pushed (#474).
+- Through the agent hook, an agent about to edit a file another live session is changing gets a short note naming that session, its task, the lines it changed, whether Git would conflict, and the command to message it. Broker notes are delivered into the recipient's context at its next turn boundary (#477).
+- `start`, `adopt` and `push` warn when another live session works on the same branch or pull request; `status` adds `session.duplicate-work` and `session.mid-merge` rows (#475).
+
+### Changed
+
+- In `verify-only` repositories, lease overlaps never refuse `broker submit`; conflicting overlaps are reported as warnings with a coordination hint. `auto` and `manual` repositories still refuse a real conflict with an actively working session (#475).
+- `[leases]` rules are read from the configuration committed on the default branch, like `[promote]` and `[delivery]`, and an `ignore` entry containing `/` is an exact repository-relative path (#475).
+- CI runs the full workspace suite with cargo-nextest on pull requests and on main, with caches warmed from main (#466). The repository's `cargo-test` gate runs the whole workspace suite again, not only the example tests (#469).
+
+### Fixed
+
+- Worktree lock failures on a configured worktree root are reported instead of discarded (#472).
+- The build is restored after two changes added conflicting `GitRepo::operation_in_progress` methods (#476).
+
 ## [0.8.12] - 2026-10-01
 
 Verify-only repositories stop using the integration branch, and worktrees can live on another drive.
