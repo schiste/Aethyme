@@ -2589,33 +2589,6 @@ impl GitRepo {
         Ok(())
     }
 
-    /// The Git operation this checkout is paused in, if any: a rebase,
-    /// merge, cherry-pick or revert that stopped for conflicts or editing.
-    pub fn operation_in_progress(&self) -> Option<&'static str> {
-        [
-            ("rebase-merge", "rebase"),
-            ("rebase-apply", "rebase"),
-            ("MERGE_HEAD", "merge"),
-            ("CHERRY_PICK_HEAD", "cherry-pick"),
-            ("REVERT_HEAD", "revert"),
-        ]
-        .into_iter()
-        .find(|(name, _)| {
-            run_git(&self.root, &["rev-parse", "--git-path", name])
-                .ok()
-                .map(|path| {
-                    let path = std::path::PathBuf::from(path);
-                    if path.is_absolute() {
-                        path
-                    } else {
-                        self.root.join(path)
-                    }
-                })
-                .is_some_and(|path| path.exists())
-        })
-        .map(|(_, operation)| operation)
-    }
-
     /// Seconds since `reference` last moved, from its reflog, falling back
     /// to the age of `FETCH_HEAD`. `None` when neither is recorded.
     pub fn ref_age_seconds(&self, reference: &str) -> Option<u64> {

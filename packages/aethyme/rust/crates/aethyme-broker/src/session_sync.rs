@@ -197,7 +197,7 @@ impl crate::Broker {
                 path.display()
             ))
         })?;
-        if let Some(operation) = worktree.operation_in_progress() {
+        if let Some(operation) = crate::git::worktree_operation_in_progress(path) {
             return Err(sync_refused(format!(
                 "a {operation} is already in progress in {}; finish or abort it first",
                 path.display()
