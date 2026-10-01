@@ -918,6 +918,11 @@ pub struct RemoteDefaultBranch {
     pub sha: String,
 }
 
+/// Reason the broker records on worktrees it locks on a configured, possibly
+/// removable root; only a lock with exactly this reason is released by it.
+pub const BROKER_WORKTREE_LOCK_REASON: &str =
+    "aethyme: worktree on a configured, possibly removable root";
+
 /// A handle on one git checkout (the main repository or a linked
 /// worktree). Constructed via [`GitRepo::discover`].
 pub struct GitRepo {
@@ -2745,7 +2750,57 @@ impl GitRepo {
     /// deleted without a dirty check -- but no dirty check exists for it: the
     /// gitdir that would answer the question is what went missing, and the
     /// alternative is a directory nothing can ever remove.
+    /// Lock a worktree so `git worktree prune` -- including the automatic one
+    /// `git gc` runs -- keeps its registration while its directory is
+    /// unreachable, as it is when it lives on a drive that is unplugged.
+    pub fn worktree_lock(&self, worktree: &Path) -> Result<(), GitError> {
+        let path = worktree.to_str().unwrap_or_default();
+        run_git(
+            &self.root,
+            &[
+                "worktree",
+                "lock",
+                "--reason",
+                BROKER_WORKTREE_LOCK_REASON,
+                path,
+            ],
+        )
+        .map(|_| ())
+    }
+
+    /// The lock reason of the worktree registered at `worktree`, if locked.
+    fn worktree_lock_reason(&self, worktree: &Path) -> Option<String> {
+        let listing = run_git(&self.root, &["worktree", "list", "--porcelain"]).ok()?;
+        let wanted = worktree
+            .canonicalize()
+            .unwrap_or_else(|_| worktree.to_path_buf());
+        let mut current: Option<PathBuf> = None;
+        for line in listing.lines() {
+            if let Some(path) = line.strip_prefix("worktree ") {
+                let path = PathBuf::from(path);
+                current = Some(path.canonicalize().unwrap_or(path));
+            } else if current.as_deref() == Some(wanted.as_path()) {
+                if line == "locked" {
+                    return Some(String::new());
+                }
+                if let Some(reason) = line.strip_prefix("locked ") {
+                    return Some(reason.to_string());
+                }
+            }
+        }
+        None
+    }
+
     pub fn worktree_remove(&self, worktree: &Path, force: bool) -> Result<(), GitError> {
+        // A locked worktree refuses removal. Release only the lock the broker
+        // itself placed on a removable root; a lock someone else set is their
+        // protection, and the removal must keep failing on it.
+        if self.worktree_lock_reason(worktree).as_deref() == Some(BROKER_WORKTREE_LOCK_REASON) {
+            let _ = run_git(
+                &self.root,
+                &["worktree", "unlock", worktree.to_str().unwrap_or_default()],
+            );
+        }
         let path = worktree.to_str().unwrap_or_default();
         let args: Vec<&str> = if force {
             vec!["worktree", "remove", "--force", path]

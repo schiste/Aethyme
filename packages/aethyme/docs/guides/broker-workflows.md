@@ -190,7 +190,14 @@ Before starting work, `aethyme broker advanced worktree-root --json` shows the e
 clone-specific root without changing state. A normal `broker start` creates a
 sibling beneath that external root even when invoked from an existing broker
 worktree; it never nests the new checkout below the invoking worktree. Start
-output records the selected root and reports any legacy fallback reason.
+output records the selected root and reports any fallback reason.
+
+To keep worktrees on an external drive, set `[worktrees] root` in
+`.aethyme/config.toml`. The per-user default stays in use whenever that path is
+missing, unplugged, inside the repository or below its free-space floor, and
+`start` says why, so machines without the drive keep working. Worktrees on the
+drive are locked, so nothing prunes or cleans them up while it is away. See the
+CLI reference for the rules.
 
 Use reuse when a dedicated broker worktree should continue with a follow-up
 task. Start by checking whether integration advanced while the session was

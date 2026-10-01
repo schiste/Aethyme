@@ -82,6 +82,7 @@ mod pr_link;
 mod pr_monitoring;
 mod scopes;
 mod unpushed;
+pub mod worktree_location;
 mod worktree_report;
 pub use pr_monitoring::{
     activate as activate_pr_monitoring, active_sessions as pr_monitoring_sessions,

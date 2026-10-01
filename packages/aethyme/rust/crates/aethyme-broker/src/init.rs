@@ -519,6 +519,7 @@ const CONFIG_KNOWN_KEYS: &[(&str, &[&str])] = &[
     ("leases", &["ignore", "routing"]),
     ("graph", &["authority", "repository"]),
     ("review", &["trigger", "routing", "reporting", "projection"]),
+    ("worktrees", &["root", "min_free_bytes"]),
 ];
 
 fn check_enrollment_visibility(repo: &crate::GitRepo, checkout_root: &Path) -> Vec<Check> {
@@ -1018,6 +1019,8 @@ const CONFIG_TEMPLATE: &str = "\
 #   [delivery] push_session_branches  true | false (default false; authorizes `broker push`)
 #   [leases]  ignore  paths never leased (trailing / = directory prefix)
 #   [leases.routing] category = [\"path/\", \"exact/file\"]
+#   [worktrees] root  absolute directory for session worktrees (default: per-user host state)
+#   [worktrees] min_free_bytes  free space the root must keep (default: gate headroom)
 # Unknown keys are ignored at runtime; `aethyme certify` warns on them.
 
 schema = 1
@@ -1047,6 +1050,16 @@ mode = \"auto\"
 # `[promote] mode = \"verify-only\"` so verified work does not accumulate,
 # unpublished, on the local integration branch.
 # push_session_branches = true
+
+# Where session worktrees are created. The default is the per-user host-state
+# directory. A root set here supersedes it only while it already exists (it is
+# never created, so an unplugged drive is never replaced by an empty
+# directory), is outside the repository and has min_free_bytes free; otherwise
+# `broker start` uses the default and says why. The key is committed, so a
+# machine without this path keeps the default.
+# [worktrees]
+# root = \"/Volumes/External/aethyme-worktrees\"
+# min_free_bytes = 8589934592
 
 # [leases]
 # ignore = [\"generated/\"]   # entries ending in / are directory prefixes
@@ -1336,5 +1349,11 @@ mod config_key_tests {
             unknown("[delivery]\npush_everything = true\n"),
             ["delivery.push_everything"]
         );
+    }
+
+    #[test]
+    fn worktrees_root_and_floor_are_known_keys() {
+        assert!(unknown("[worktrees]\nroot = \"/Volumes/T7/wt\"\nmin_free_bytes = 1\n").is_empty());
+        assert_eq!(unknown("[worktrees]\npath = \"/x\"\n"), ["worktrees.path"]);
     }
 }

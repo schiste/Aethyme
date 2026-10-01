@@ -758,6 +758,8 @@ pub struct StartAgentReport {
 #[serde(rename_all = "snake_case")]
 pub enum WorktreeRootSource {
     HostState,
+    /// `[worktrees] root` in the repository's `.aethyme/config.toml`.
+    RepositoryConfig,
     EnvironmentOverride,
     LibraryOverride,
     RepositoryFallback,
@@ -767,6 +769,7 @@ impl WorktreeRootSource {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::HostState => "host state",
+            Self::RepositoryConfig => "repository config",
             Self::EnvironmentOverride => "environment override",
             Self::LibraryOverride => "library override",
             Self::RepositoryFallback => "repository fallback",
@@ -788,6 +791,14 @@ pub struct WorktreeRootPlan {
     pub root_container: Option<PathBuf>,
     pub legacy_fallback_root: PathBuf,
     pub preferred_outside_repository: bool,
+    /// Where new sessions go when the configured root cannot take them: the
+    /// per-user host-state root. Present only for a configured root.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_state_fallback_root: Option<PathBuf>,
+    /// Why the configured root cannot take a new session right now, or why
+    /// the `[worktrees]` configuration was ignored.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preferred_unavailable_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -3496,11 +3507,41 @@ impl Broker {
         let worktree = self
             .repo
             .worktree_add(&worktree_path, &branch, &start_base.commit)?;
+        if placement.source == WorktreeRootSource::RepositoryConfig {
+            // Best effort: a lock only protects the registration while the
+            // drive is unplugged, and a failed lock must not fail the start.
+            let _ = self.repo.worktree_lock(&worktree_path);
+        }
         Ok((slug, branch, start_base, worktree, placement))
     }
 
     pub fn worktree_root_plan(&self) -> Result<WorktreeRootPlan, BrokerOpError> {
         let repository_key = self.repository_worktree_key()?;
+        let host_state_container = crate::host_state::default_host_state_dir()
+            .filter(|_| {
+                // Only the implicit platform default is withheld from ephemeral
+                // repositories; an explicitly named host state directory is a
+                // deliberate choice and is always honoured.
+                crate::host_state::host_state_dir_is_explicit()
+                    || !crate::host_state::path_is_ephemeral(&self.main_root)
+            })
+            .map(|base| base.join("worktrees"));
+        // The configured root is read only when nothing more specific was
+        // asked for. An invalid section must not stop a session from
+        // starting: it is ignored, and the reason is reported.
+        let mut preferred_unavailable_reason = None;
+        let configured_root =
+            match crate::worktree_location::WorktreeLocationConfig::load(&self.main_root) {
+                Ok(config) => {
+                    config.and_then(|config| config.root.clone().map(|root| (root, config)))
+                }
+                Err(error) => {
+                    preferred_unavailable_reason =
+                        Some(format!("[worktrees] configuration ignored: {error}"));
+                    None
+                }
+            };
+        let mut host_state_fallback_root = None;
         let (preferred_root, preferred_source, root_container) =
             if let Some(root) = &self.worktree_root_override {
                 (
@@ -3517,14 +3558,18 @@ impl Broker {
                     Some(WorktreeRootSource::EnvironmentOverride),
                     Some(container),
                 )
-            } else if let Some(base) = crate::host_state::default_host_state_dir().filter(|_| {
-                // Only the implicit platform default is withheld from ephemeral
-                // repositories; an explicitly named host state directory is a
-                // deliberate choice and is always honoured.
-                crate::host_state::host_state_dir_is_explicit()
-                    || !crate::host_state::path_is_ephemeral(&self.main_root)
-            }) {
-                let container = base.join("worktrees");
+            } else if let Some((container, settings)) = configured_root {
+                host_state_fallback_root = host_state_container
+                    .as_ref()
+                    .map(|container| container.join(&repository_key));
+                preferred_unavailable_reason =
+                    self.configured_root_unavailable(&container, settings.min_free_bytes());
+                (
+                    Some(container.join(&repository_key)),
+                    Some(WorktreeRootSource::RepositoryConfig),
+                    Some(container),
+                )
+            } else if let Some(container) = host_state_container {
                 (
                     Some(container.join(&repository_key)),
                     Some(WorktreeRootSource::HostState),
@@ -3545,11 +3590,87 @@ impl Broker {
             root_container,
             legacy_fallback_root: self.legacy_broker_worktree_root(),
             preferred_outside_repository,
+            host_state_fallback_root,
+            preferred_unavailable_reason,
         })
+    }
+
+    /// Why the configured worktree root cannot take a new session now.
+    ///
+    /// The base itself is never created -- only the per-repository directory
+    /// beneath it -- so an unplugged drive is reported, not replaced by an
+    /// empty directory on the startup disk.
+    fn configured_root_unavailable(&self, base: &Path, min_free_bytes: u64) -> Option<String> {
+        if let Some(reason) = crate::worktree_location::base_unavailable_reason(base) {
+            return Some(reason);
+        }
+        if self.path_is_inside_repository(base) {
+            return Some(format!(
+                "{} resolves inside repository {}",
+                base.display(),
+                self.main_root.display()
+            ));
+        }
+        match crate::disk_headroom::available_bytes(base) {
+            Some(free) if free < min_free_bytes => Some(format!(
+                "{} has {} free, below the {} required (worktrees.min_free_bytes)",
+                base.display(),
+                crate::disk_headroom::format_gibibytes(free),
+                crate::disk_headroom::format_gibibytes(min_free_bytes)
+            )),
+            _ => None,
+        }
     }
 
     fn prepare_broker_worktree_root(&self) -> Result<WorktreePlacement, BrokerOpError> {
         let plan = self.worktree_root_plan()?;
+        if plan.preferred_source == Some(WorktreeRootSource::RepositoryConfig)
+            && let Some(root) = &plan.preferred_root
+        {
+            let reason = match &plan.preferred_unavailable_reason {
+                Some(reason) => reason.clone(),
+                None => {
+                    match self.prepare_worktree_root(
+                        root,
+                        WorktreeRootSource::RepositoryConfig,
+                        true,
+                    ) {
+                        Ok(root) => {
+                            return Ok(WorktreePlacement {
+                                root,
+                                source: WorktreeRootSource::RepositoryConfig,
+                                outside_repository: true,
+                                fallback_reason: None,
+                            });
+                        }
+                        Err(error) => error.to_string(),
+                    }
+                }
+            };
+            let reason = format!("configured worktree root is unavailable: {reason}");
+            if let Some(fallback) = &plan.host_state_fallback_root
+                && let Ok(root) =
+                    self.prepare_worktree_root(fallback, WorktreeRootSource::HostState, true)
+            {
+                return Ok(WorktreePlacement {
+                    root,
+                    source: WorktreeRootSource::HostState,
+                    outside_repository: true,
+                    fallback_reason: Some(reason),
+                });
+            }
+            let root = self.prepare_worktree_root(
+                &plan.legacy_fallback_root,
+                WorktreeRootSource::RepositoryFallback,
+                false,
+            )?;
+            return Ok(WorktreePlacement {
+                root,
+                source: WorktreeRootSource::RepositoryFallback,
+                outside_repository: false,
+                fallback_reason: Some(reason),
+            });
+        }
         if let (Some(root), Some(source)) = (&plan.preferred_root, plan.preferred_source) {
             match self.prepare_worktree_root(root, source, true) {
                 Ok(root) => {
@@ -3557,7 +3678,9 @@ impl Broker {
                         root,
                         source,
                         outside_repository: true,
-                        fallback_reason: None,
+                        // Set only when an invalid `[worktrees]` section was
+                        // ignored in favour of this default.
+                        fallback_reason: plan.preferred_unavailable_reason.clone(),
                     });
                 }
                 Err(error)
@@ -4155,9 +4278,13 @@ impl Broker {
     fn broker_owned_worktree_roots(&self) -> Result<Vec<PathBuf>, BrokerOpError> {
         let plan = self.worktree_root_plan()?;
         let mut roots = Vec::new();
-        for root in [plan.preferred_root.clone(), Some(plan.legacy_fallback_root)]
-            .into_iter()
-            .flatten()
+        for root in [
+            plan.preferred_root.clone(),
+            plan.host_state_fallback_root.clone(),
+            Some(plan.legacy_fallback_root),
+        ]
+        .into_iter()
+        .flatten()
         {
             if is_real_directory(&root) && !roots.contains(&root) {
                 roots.push(root);
@@ -9257,41 +9384,53 @@ impl Broker {
                 .get(&session.worktree_path)
                 .map(|record| record.bytes)
         };
-        let (mut disposition, mut reason, provenance) =
-            if !self.is_broker_owned_worktree(session, &worktree_path) {
-                (
-                    CleanupDisposition::UnsafePath,
-                    "spawned session path is outside the broker-owned worktree directory".into(),
-                    None,
+        let unreachable = (!worktree_present)
+            .then(|| {
+                crate::worktree_location::unavailable_configured_location(
+                    &self.main_root,
+                    &worktree_path,
                 )
-            } else if worktree_present && !is_orphaned_worktree_directory(&worktree_path) {
-                match self.cleanup_eligibility(session.id, &worktree_path) {
-                    Ok(result) => result,
-                    Err(error) => (
-                        CleanupDisposition::InspectionFailed,
-                        format!("cleanup inspection failed: {error}"),
-                        None,
-                    ),
-                }
-            } else if let Some(session_head) = branch_tip.as_deref() {
-                // Two states share this path. A worktree that is simply gone, and
-                // one whose removal was interrupted after deregistration (#165):
-                // its files are on disk but git can no longer read them, so the
-                // branch is the only remaining record of what the session did. It
-                // is also the better record -- the interrupted removal already
-                // deleted part of the tree, so the directory describes nothing.
-                self.branch_provenance_disposition(session, session_head)?
-            } else if worktree_present {
-                (
+            })
+            .flatten();
+        let (mut disposition, mut reason, provenance) = if let Some(reason) = unreachable {
+            // An unplugged drive is not a deleted worktree. Proposing cleanup
+            // here would act on a checkout nobody can see, so it stays blocked
+            // until the volume is back.
+            (CleanupDisposition::InspectionFailed, reason, None)
+        } else if !self.is_broker_owned_worktree(session, &worktree_path) {
+            (
+                CleanupDisposition::UnsafePath,
+                "spawned session path is outside the broker-owned worktree directory".into(),
+                None,
+            )
+        } else if worktree_present && !is_orphaned_worktree_directory(&worktree_path) {
+            match self.cleanup_eligibility(session.id, &worktree_path) {
+                Ok(result) => result,
+                Err(error) => (
+                    CleanupDisposition::InspectionFailed,
+                    format!("cleanup inspection failed: {error}"),
+                    None,
+                ),
+            }
+        } else if let Some(session_head) = branch_tip.as_deref() {
+            // Two states share this path. A worktree that is simply gone, and
+            // one whose removal was interrupted after deregistration (#165):
+            // its files are on disk but git can no longer read them, so the
+            // branch is the only remaining record of what the session did. It
+            // is also the better record -- the interrupted removal already
+            // deleted part of the tree, so the directory describes nothing.
+            self.branch_provenance_disposition(session, session_head)?
+        } else if worktree_present {
+            (
                 CleanupDisposition::UnprovenProvenance,
                 "worktree directory is no longer a registered git worktree and its branch is gone, \
                  so nothing records what it held"
                     .into(),
                 None,
             )
-            } else {
-                unreachable!("entries without a worktree or a branch return None above")
-            };
+        } else {
+            unreachable!("entries without a worktree or a branch return None above")
+        };
         if worktree_present
             && let Some(worktree_head) = provenance
                 .as_ref()

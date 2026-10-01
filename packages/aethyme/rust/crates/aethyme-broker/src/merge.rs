@@ -104,9 +104,7 @@ impl PromoteConfig {
     /// thing and the broker did another. As fresh as the last fetch; never
     /// fetches.
     pub fn load(main_root: &Path) -> Self {
-        let text = committed_config_text(main_root)
-            .or_else(|| std::fs::read_to_string(main_root.join(".aethyme/config.toml")).ok());
-        Self::from_text(text.as_deref())
+        Self::from_text(repository_config_text(main_root).as_deref())
     }
 
     fn from_text(text: Option<&str>) -> Self {
@@ -160,6 +158,14 @@ pub(crate) fn session_baseline(
         return Some(from_upstream);
     }
     Some(from_integration)
+}
+
+/// The repository's `.aethyme/config.toml` under the broker's one trust rule:
+/// as committed on the fetched default branch when that exists, else the main
+/// checkout's working-tree file. `[promote]` and `[worktrees]` both read it.
+pub(crate) fn repository_config_text(main_root: &Path) -> Option<String> {
+    committed_config_text(main_root)
+        .or_else(|| std::fs::read_to_string(main_root.join(".aethyme/config.toml")).ok())
 }
 
 /// `.aethyme/config.toml` as committed on the fetched default branch, if there
