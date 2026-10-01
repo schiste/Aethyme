@@ -743,6 +743,15 @@ pub(super) fn run_worktree_root(parsed: Parsed) -> Result<(), UsageError> {
         } else {
             out!("Preferred worktree root: unavailable");
         }
+        if let Some(reason) = &plan.preferred_unavailable_reason {
+            out!("Warning: {reason}");
+        }
+        if let Some(fallback) = &plan.host_state_fallback_root {
+            out!(
+                "Default used while the configured root is unavailable: {}",
+                fallback.display()
+            );
+        }
         out!(
             "Legacy fallback: {} (used only when host state is unavailable)",
             plan.legacy_fallback_root.display()
