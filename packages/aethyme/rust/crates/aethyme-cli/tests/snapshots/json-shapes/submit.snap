@@ -53,5 +53,10 @@
     "session_head": "string",
     "session_id": "integer",
     "warnings": []
+  },
+  "verified_against": {
+    "commit": "string",
+    "reference": "string",
+    "source": "string"
   }
 }

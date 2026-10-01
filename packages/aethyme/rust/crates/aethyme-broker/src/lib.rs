@@ -69,6 +69,7 @@ pub mod install_health;
 mod issue_form;
 mod lease_export;
 mod leases;
+mod main_drift;
 pub mod main_reconcile;
 mod measurement;
 mod merge;
@@ -277,6 +278,7 @@ pub use lease_export::{
     LeaseRoutingExportOptions, LeaseRoutingItem, MAX_LEASE_ROUTING_EXPORT_LIMIT,
 };
 pub use leases::{LeaseIgnoreRules, Overlap, detect_overlaps};
+pub use main_drift::DefaultBranchDrift;
 pub use main_reconcile::{
     MAIN_RECONCILE_SCHEMA_VERSION, MainReconcileApplyReport, MainReconcileCommit,
     MainReconcileDisposition, MainReconcilePlan, MainReconcileResolution,
@@ -289,7 +291,8 @@ pub use merge::{
     ACTION_REQUIRED_RELPATH, PromoteConfig, PromoteMode, PromotionIntent,
     SubmissionCommitOwnership, SubmissionCommitProvenance, SubmissionConflict,
     SubmissionGateVerification, SubmissionGateVerificationStatus, SubmissionIntegrationState,
-    SubmissionPlan, SubmitOutcome,
+    SubmissionPlan, SubmitOutcome, VERIFIED_AGAINST_INTEGRATION, VERIFIED_AGAINST_UPSTREAM,
+    VerificationBase,
 };
 pub use operation_stats::{
     DEFAULT_OPERATION_STATS_LIMIT, HooksOutsideLockStats, MAX_OPERATION_STATS_LIMIT,

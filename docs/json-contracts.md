@@ -325,9 +325,21 @@ were one per overlapping path, so totals spanning that date mix both units.
                        "load_avg_1m_end", "cpu_count",
                        "free_disk_bytes_start" } ],
   "no_changes": true|false,
-  "promoted": true|false
+  "promoted": true|false,
+  "verified_against": {                      // omitted when not recorded
+    "source": "upstream" | "integration",
+    "reference": "origin/main" | "aethyme/integration",
+    "commit": "<full commit>",
+    "fallback_reason": "..."                 // omitted unless a verify-only
+  }                                          // repository fell back to integration
 }
 ```
+
+`verified_against` (introduced 2026-10-01) names what the submission was
+simulated and gated against. A `[promote] mode = "verify-only"` repository
+verifies against the fetched default branch (`source: "upstream"`) and does not
+touch the integration branch; a promoting repository keeps verifying against
+integration. `submission_plan.integration_head` holds the same commit.
 
 The four machine-environment fields in `gate_outcomes` (introduced
 2026-09-26, schema 43) describe the machine an executed gate ran on:
@@ -340,6 +352,16 @@ platform could not report it; all four are `null` for a cache hit (the
 reused verdict's machine state is not re-reported) and for a result recorded
 before the command stage. `broker advanced gates run --json` and
 `broker advanced gates pre-push --json` outcomes carry the same fields.
+
+A gate outcome may also carry `"host_fault": true` (introduced 2026-10-01,
+absent when false): the broker itself observed that the host, not the change,
+stopped the gate -- host resources refused, the command never started, a host
+resource error, the command ran out of disk, or the broker's deadline killed it
+for the first time on that tree. When every gate that did not pass carries it,
+`gate_verification.status` is `deferred`: the entry stays `submitted`
+(`entry.details_json` gains `"deferred": true` and a per-gate `host_fault`),
+nothing is promoted, and the command exits 6. Text in a gate's own log never
+sets the flag.
 
 `submission_plan` preserves deterministic commit order and separates ownership
 from integration state. Full SHAs are never abbreviated in JSON. `conflicts`

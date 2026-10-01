@@ -778,6 +778,7 @@ fn gate_observation_from_event(event: &crate::Event) -> Option<(GateRunOutcome, 
             duration_ms: payload.get("saved_ms").and_then(serde_json::Value::as_i64),
             log_path: None,
             environment: crate::GateEnvironment::default(),
+            host_fault: false,
         },
         event.ts,
     ))
@@ -1464,6 +1465,7 @@ mod tests {
             duration_ms: Some(1200),
             log_path: Some("/private/log/GATE-LOG-SECRET".into()),
             environment: crate::GateEnvironment::default(),
+            host_fault: false,
         }
     }
 
@@ -1638,6 +1640,7 @@ mod tests {
             duration_ms: Some(10),
             log_path: None,
             environment: crate::GateEnvironment::default(),
+            host_fault: false,
         };
         let gates = vec![
             ReportGateObservation {

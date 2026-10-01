@@ -323,7 +323,8 @@ Other agents may be working in sibling worktrees.
 2. Commit early and small, and after each commit run
    `aethyme broker push --session <id>`. Once there is a first meaningful
    commit, open a draft PR with `aethyme broker push --session <id> --pr`, and
-   keep pushing until it is ready. Never leave work only in the worktree.
+   keep pushing until it is ready; catch up when push warns that the default
+   branch moved and conflicts. Never leave work only in the worktree.
 3. When done: `aethyme broker submit --session <id>`, then
    `aethyme broker finish --session <id>` (it refuses while commits are unpushed).
 
@@ -464,6 +465,12 @@ blocked.
    `aethyme broker finish` refuses to close a session while its commits are
    unpushed. If the work should genuinely not be kept, say so explicitly with
    `aethyme broker finish --session <id> --abandon --reason "<why>"`.
+   Each push also fetches the default branch and reports how far your branch
+   is behind it and whether merging would conflict, with the command to catch
+   up; `broker status` shows the same as `session.behind-main`. Catch up when
+   it warns, before the pull request reports the conflict. In a repository
+   with `[promote] mode = "verify-only"`, `broker submit` is a pre-flight
+   against the current default branch; the integration branch is not used.
    When `broker status` shows `coordination.land-shared-edit-first`, another
    session changes the same lines or symbol as yours: follow it -- the named
    session lands only the shared edit as its own small PR, then both rebase
@@ -1013,7 +1020,7 @@ mod tests {
             "## Broker Coordination: before and after an edit",
             "Commit early and small, and after each commit run\n   `aethyme broker push --session <id>`",
             "open a draft PR with `aethyme broker push --session <id> --pr`",
-            "keep pushing until it is ready. Never leave work only in the worktree.",
+            "keep pushing until it is ready; catch up when push warns that the default\n   branch moved and conflicts. Never leave work only in the worktree.",
             "`aethyme broker finish --session <id>` (it refuses while commits are unpushed)",
             "authorizes pushing your own\nsession branch and opening a draft PR; nothing else.",
             "`aethyme broker advanced git`",

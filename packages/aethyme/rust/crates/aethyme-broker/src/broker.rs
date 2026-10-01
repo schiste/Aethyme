@@ -6220,15 +6220,13 @@ impl Broker {
         let scope_overlaps = crate::detect_scope_overlaps(&self.store.active_session_scopes()?);
         let queue = self.store.current_merge_queue()?;
         let terminal_counts = self.store.terminal_merge_queue_counts()?;
-        let mut latest_live_queue = Vec::new();
-        for agent in &agents {
-            if let Some(entry) = self
-                .store
-                .latest_merge_queue_for_session(agent.session.id)?
-            {
-                latest_live_queue.push(entry);
-            }
-        }
+        // One query for every live session rather than one per session: this
+        // is on `status`, which every session runs as its first command.
+        let session_ids = agents
+            .iter()
+            .map(|agent| agent.session.id)
+            .collect::<Vec<i64>>();
+        let latest_live_queue = self.store.latest_merge_queue_for_sessions(&session_ids)?;
         let main_head = self.repo.head_commit()?;
         let (upstream_ref, upstream_head) = self
             .repo
@@ -6740,11 +6738,15 @@ impl Broker {
         // A status that cannot read refs still reports everything else; the
         // unpushed count is context, not a precondition for any command.
         let unpushed_work = self.unpushed_work(now_ms).unwrap_or_default();
-        advice.extend(unpushed_work_advice(&unpushed_work, now_ms));
+        let verify_only =
+            PromoteConfig::load(&self.main_root).mode == crate::merge::PromoteMode::VerifyOnly;
+        advice.extend(unpushed_work_advice(&unpushed_work, now_ms, verify_only));
         advice.extend(self.integration_behind_upstream_advice());
         advice.extend(overlap_pair_advice(&overlap_pairs));
         // Cached listing and local refs only: `status` never calls GitHub.
         advice.extend(self.pr_overlap_advice(now_ms));
+        // The default branch moving under a session: last fetched copy only.
+        advice.extend(self.behind_main_advice());
         // Two sessions on one target: landing the shared edit first keeps
         // both on the default branch instead of chaining one onto the other.
         advice.extend(crate::shared_edit_advice::shared_edit_advice(
@@ -7259,6 +7261,14 @@ impl Broker {
             };
             match entry.status {
                 MergeStatus::Rejected => advice.push(rejected_submit_advice(agent, entry)),
+                // A deferred entry is left `Submitted` rather than `Rejected`,
+                // because no gate judged it. Without its own advice, `status`
+                // would say nothing about work sitting unverified -- but a
+                // `Submitted` entry is also the normal state of one in flight,
+                // so only the explicit marker raises it.
+                MergeStatus::Submitted if submission_was_deferred(entry) => {
+                    advice.push(deferred_submit_advice(agent, entry));
+                }
                 MergeStatus::Conflict => advice.push(conflict_submit_advice(agent, entry)),
                 _ => {}
             }
@@ -8391,6 +8401,21 @@ impl Broker {
                     self.finalize_finish_report(&mut report);
                     return Ok(report);
                 }
+                // A deferred entry is `Submitted` too, but nothing is running
+                // it: "wait for it" would leave the agent waiting forever.
+                MergeStatus::Submitted if submission_was_deferred(entry) => {
+                    report.warnings.push(format!(
+                        "latest submit qid {} was deferred: a gate could not run on this host, \
+                         so the change was not judged; free the resource and resubmit before \
+                         finish",
+                        entry.id
+                    ));
+                    report
+                        .next_commands
+                        .push(format!("aethyme broker submit --session {session_id}"));
+                    self.finalize_finish_report(&mut report);
+                    return Ok(report);
+                }
                 MergeStatus::Submitted | MergeStatus::Simulating => {
                     report.warnings.push(format!(
                         "queue entry {} is still {}; wait for it before finish",
@@ -8556,17 +8581,22 @@ impl Broker {
         session_head: &str,
         target_head: &str,
     ) -> Result<bool, BrokerOpError> {
-        let represented = self.store.merge_queue()?.into_iter().rev().any(|entry| {
-            entry.session_id == session_id
-                && entry.head_commit == session_head
-                && matches!(
-                    entry.status,
-                    MergeStatus::Promoted | MergeStatus::ExternallyLanded
-                )
-                && details_string_value(entry.details_json.as_deref(), "commit")
-                    .is_some_and(|promotion| self.repo.is_ancestor(&promotion, target_head))
-        });
-        Ok(represented)
+        // The queue is read once per call, and this is called once per live
+        // session from `promoted_conflicts`, which is on `status`. It used to
+        // select a few candidate rows by identity and only then shell out; the
+        // selection is pure string work, so doing it before the query keeps
+        // `git merge-base` off the common path entirely.
+        //
+        // `is_ancestor` is a subprocess, so it is only reached for an entry
+        // that actually claims to represent this exact (session, head) — at
+        // most one or two rows, rather than one call per queue entry.
+        let candidate = self
+            .store
+            .latest_representation_for_session(session_id, session_head)?;
+        let Some(promotion) = candidate else {
+            return Ok(false);
+        };
+        Ok(self.repo.is_ancestor(&promotion, target_head))
     }
 
     // ── cleanup ───────────────────────────────────────────────────────
@@ -9116,10 +9146,27 @@ impl Broker {
         scan: crate::SizeScan,
         records: &mut crate::measurement::SizeRecords,
     ) -> Result<Option<CleanupWorktreePlan>, BrokerOpError> {
+        self.cleanup_item_scanned_with_tips(session, scan, records, None)
+    }
+
+    /// [`Self::cleanup_item_scanned`] with every local branch tip already read
+    /// (see [`GitRepo::local_branch_tips`]). A plan visits every session ever
+    /// recorded, most of whose branch and worktree are long gone; looking the
+    /// branch up in one listing lets those return without forking `git`.
+    fn cleanup_item_scanned_with_tips(
+        &self,
+        session: &Session,
+        scan: crate::SizeScan,
+        records: &mut crate::measurement::SizeRecords,
+        branch_tips: Option<&std::collections::BTreeMap<String, String>>,
+    ) -> Result<Option<CleanupWorktreePlan>, BrokerOpError> {
         let worktree_path = PathBuf::from(&session.worktree_path);
         let worktree_present = worktree_path.exists();
         let branch_ref = format!("refs/heads/{}", session.branch);
-        let branch_tip = self.repo.resolve_ref(&branch_ref);
+        let branch_tip = match branch_tips {
+            Some(tips) => tips.get(&branch_ref).cloned(),
+            None => self.repo.resolve_ref(&branch_ref),
+        };
         if !worktree_present && branch_tip.is_none() {
             return Ok(None);
         }
@@ -9280,11 +9327,20 @@ impl Broker {
         let mut retained = crate::MeasuredTotal::default();
         let mut reclaimable = crate::MeasuredTotal::default();
         let mut known = std::collections::BTreeSet::new();
+        // One listing instead of one `rev-parse` per session ever recorded:
+        // this plan is on `broker status`'s path through `cleanup_retention`.
+        let branch_tips = self.repo.local_branch_tips();
         for session in self.store.cleaned_sessions()? {
             if session.origin != SessionOrigin::Spawned {
                 continue;
             }
-            let Some(item) = self.cleanup_item_scanned(&session, scan, &mut records)? else {
+            let Some(item) = self.cleanup_item_scanned_with_tips(
+                &session,
+                scan,
+                &mut records,
+                branch_tips.as_ref(),
+            )?
+            else {
                 continue;
             };
             known.insert(item.worktree_path.clone());
@@ -9751,6 +9807,55 @@ pub(crate) fn plural_word(
     plural: &'static str,
 ) -> &'static str {
     if count == 1 { singular } else { plural }
+}
+
+/// Whether a `Submitted` entry was deferred because the host could not judge
+/// it, rather than still being in flight. Both share the status; only the
+/// marker the submission records tells them apart.
+pub(crate) fn submission_was_deferred(entry: &MergeQueueEntry) -> bool {
+    entry.status == MergeStatus::Submitted
+        && entry
+            .details_json
+            .as_deref()
+            .and_then(|details| serde_json::from_str::<serde_json::Value>(details).ok())
+            .and_then(|details| details.get("deferred").and_then(serde_json::Value::as_bool))
+            .unwrap_or(false)
+}
+
+fn deferred_submit_advice(agent: &AgentView, entry: &MergeQueueEntry) -> StatusAdvice {
+    let failures = gate_failures(entry.details_json.as_deref());
+    let gate_names: Vec<String> = failures
+        .iter()
+        .map(|failure| failure.name.clone())
+        .collect();
+    let summary = format!(
+        "session {} latest submit qid {} was deferred: {} could not run on this host \
+         (resources, disk, or its first timeout), so the change was not judged; free the \
+         resource, then resubmit without changing code",
+        agent.session.id,
+        entry.id,
+        if gate_names.is_empty() {
+            "a selected gate".to_string()
+        } else {
+            gate_names.join(", ")
+        }
+    );
+    let mut evidence = queue_evidence(entry);
+    evidence.extend(failures.iter().map(GateFailure::evidence));
+    StatusAdvice {
+        id: "session.latest-submit-deferred",
+        severity: StatusAdviceSeverity::Blocked,
+        reason: "submit_deferred",
+        summary,
+        session_id: Some(agent.session.id),
+        queue_entry_id: Some(entry.id),
+        evidence,
+        commands: vec![
+            "aethyme broker advanced resources list".into(),
+            "aethyme broker gc plan".into(),
+            format!("aethyme broker submit --session {}", agent.session.id),
+        ],
+    }
 }
 
 fn rejected_submit_advice(agent: &AgentView, entry: &MergeQueueEntry) -> StatusAdvice {
@@ -10574,7 +10679,11 @@ fn integration_live_sessions(sessions: Vec<Session>) -> Vec<IntegrationLiveSessi
 
 /// One advice row per session holding unpushed commits, plus one for an
 /// integration branch running ahead of upstream.
-fn unpushed_work_advice(report: &crate::UnpushedWorkReport, now_ms: i64) -> Vec<StatusAdvice> {
+fn unpushed_work_advice(
+    report: &crate::UnpushedWorkReport,
+    now_ms: i64,
+    verify_only: bool,
+) -> Vec<StatusAdvice> {
     let age = |at: Option<i64>| {
         crate::unpushed::describe_age(now_ms.saturating_sub(at.unwrap_or(now_ms)))
     };
@@ -10615,14 +10724,23 @@ fn unpushed_work_advice(report: &crate::UnpushedWorkReport, now_ms: i64) -> Vec<
         })
         .collect::<Vec<_>>();
     if let Some(integration) = &report.integration {
+        // In a verify-only repository nothing adds to integration any more,
+        // but commits promoted before the switch are still work at risk, so
+        // the row stays -- without recommending the mode already in force.
+        let remedy = if verify_only {
+            "This repository is verify-only and no longer uses integration: ship these \
+             commits through a pull request, or confirm they landed and drop them"
+        } else {
+            "Ship it, or, if this repository delivers through pull requests, set \
+             [promote] mode = \"verify-only\" so submit stops accumulating work here"
+        };
         advice.push(StatusAdvice {
             id: "integration.unpublished-work",
             severity: integration.severity,
             reason: "integration holds promoted work upstream lacks",
             summary: format!(
-                "{} carries {} {} {} lacks ({} on no remote at all); the oldest is {} old. Ship \
-                 it, or, if this repository delivers through pull requests, set \
-                 [promote] mode = \"verify-only\" so submit stops accumulating work here",
+                "{} carries {} {} {} lacks ({} on no remote at all); the oldest is {} old. \
+                 {remedy}",
                 integration.branch,
                 integration.unpublished_commits,
                 plural_word(
@@ -10761,7 +10879,7 @@ fn details_string_array(details_json: Option<&str>, key: &str) -> Vec<String> {
         .collect()
 }
 
-fn details_string_value(details_json: Option<&str>, key: &str) -> Option<String> {
+pub(crate) fn details_string_value(details_json: Option<&str>, key: &str) -> Option<String> {
     let details_json = details_json?;
     let details = serde_json::from_str::<serde_json::Value>(details_json).ok()?;
     details.get(key)?.as_str().map(str::to_string)
@@ -11005,7 +11123,25 @@ fn worktree_activity_ms(main_root: &Path, session: &Session) -> Option<i64> {
 /// True when the PID exists and is not a zombie (macOS/Linux — the v0
 /// platforms). `kill -0` alone is wrong here: it succeeds on zombies,
 /// and an exited-but-unreaped agent must read as dead.
+///
+/// Asks the kernel directly where the platform allows it -- `/proc/<pid>/stat`
+/// on Linux, `proc_pidinfo` on macOS -- so the common case forks nothing. `ps`
+/// is only the fallback for an answer the kernel refused to give (for example
+/// another user's process). The distinction matters at fleet scale: `broker
+/// status` is every session's first command and calls this once per live
+/// session, so a 40-session status forked 40 `ps` processes. The repository's
+/// own measurements put a 19-session `status` at 2m54s of wall time.
 pub(crate) fn pid_alive(pid: i64) -> bool {
+    // PID 0 is the kernel (`kernel_task` on macOS) and negative values name
+    // process groups; neither is ever an agent. Answering here also keeps an
+    // invalid PID off the `ps` fallback: an unprivileged `proc_pidinfo(0)` is
+    // refused with EPERM rather than ESRCH, which would otherwise cost a fork.
+    if pid <= 0 || i32::try_from(pid).is_err() {
+        return false;
+    }
+    if let Some(alive) = kernel_pid_alive(pid) {
+        return alive;
+    }
     match Command::new("ps")
         .args(["-o", "state=", "-p", &pid.to_string()])
         .stderr(Stdio::null())
@@ -11017,6 +11153,64 @@ pub(crate) fn pid_alive(pid: i64) -> bool {
         }
         _ => false,
     }
+}
+
+/// Whether `pid` is a live, non-zombie process, answered by the kernel without
+/// forking. `None` means the kernel did not say, and the caller falls back to
+/// `ps`.
+///
+/// On Linux the state is the field after the parenthesised comm in
+/// `/proc/<pid>/stat`. The comm may itself contain spaces and parentheses, so
+/// the state is taken from the *last* `)` rather than by splitting the whole
+/// line on whitespace. A missing entry is left to `ps` rather than read as
+/// dead, so a procfs mounted with restricted visibility cannot make a live
+/// agent look gone.
+#[cfg(target_os = "linux")]
+fn kernel_pid_alive(pid: i64) -> Option<bool> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let state = stat.rsplit_once(')')?.1.trim_start().chars().next()?;
+    // A zombie still has a `/proc` entry; `kill -0` would report it alive.
+    Some(state != 'Z' && state != 'X')
+}
+
+/// On macOS, `proc_pidinfo(PROC_PIDTBSDINFO)` is the same data `ps` reads,
+/// without the fork. `ESRCH` is a definite "no such process", and is also what
+/// the kernel returns for an exited-but-unreaped child (a zombie that `ps`
+/// still lists with state `Z`), so zombies read as dead here. Any other
+/// failure (`EPERM` for another user's process) is left to `ps`. The `SZOMB`
+/// check covers a bsdinfo record that does describe a zombie.
+#[cfg(target_os = "macos")]
+fn kernel_pid_alive(pid: i64) -> Option<bool> {
+    // From <sys/proc.h>: a process that has exited but not been reaped.
+    const SZOMB: u32 = 5;
+    let pid = i32::try_from(pid).ok()?;
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: `info` is a writable buffer of exactly `size` bytes, and
+    // proc_pidinfo writes at most `size` bytes into it.
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if written != size {
+        let gone =
+            written <= 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+        return gone.then_some(false);
+    }
+    // SAFETY: the buffer was zero-initialized and then fully written, and
+    // proc_bsdinfo is plain integers and byte arrays, valid for any bits.
+    let info = unsafe { info.assume_init() };
+    Some(info.pbi_status != SZOMB)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn kernel_pid_alive(_pid: i64) -> Option<bool> {
+    None
 }
 
 /// Task → worktree/branch slug: lowercase alphanumerics with dashes,
@@ -11800,5 +11994,77 @@ fn derive_scopes_from_task(repo_root: &Path, task: &str) -> (Vec<String>, Option
             Vec::new(),
             Some(format!("task scope could not be resolved: {error}")),
         ),
+    }
+}
+
+#[cfg(test)]
+mod pid_liveness_tests {
+    use super::{kernel_pid_alive, pid_alive};
+
+    /// `broker status` asks this once per live session, so the common answer
+    /// must come from the kernel rather than a `ps` fork. On the supported
+    /// platforms the kernel answers for our own process; a regression to the
+    /// fork-per-session path shows up here as `None`.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn the_kernel_answers_for_a_live_process_without_forking() {
+        let own = i64::from(std::process::id());
+        assert_eq!(kernel_pid_alive(own), Some(true));
+        assert!(pid_alive(own));
+    }
+
+    /// An exited process that has not been reaped is a zombie: it still has a
+    /// process-table entry, so a bare existence check calls it alive. An agent
+    /// in that state is gone. The test first proves the child really is a
+    /// zombie by `ps`'s account, so it cannot pass on an already-reaped PID.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_zombie_is_dead() {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = i64::from(child.id());
+        // Wait for it to exit without reaping it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while kernel_pid_alive(pid) != Some(false) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let state = std::process::Command::new("ps")
+            .args(["-o", "state=", "-p", &pid.to_string()])
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&state.stdout)
+                .trim()
+                .starts_with('Z'),
+            "the child must still be an unreaped zombie for this test to mean anything"
+        );
+        assert_eq!(
+            kernel_pid_alive(pid),
+            Some(false),
+            "zombie must read as dead"
+        );
+        assert!(!pid_alive(pid));
+        child.wait().unwrap();
+    }
+
+    /// A reaped process no longer exists, and the kernel says so definitively
+    /// rather than leaving the question to `ps`.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_reaped_process_is_dead() {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = i64::from(child.id());
+        child.wait().unwrap();
+        assert!(!pid_alive(pid));
+        #[cfg(target_os = "macos")]
+        assert_eq!(kernel_pid_alive(pid), Some(false));
+    }
+
+    /// PID 0 is the kernel itself and negative values name process groups;
+    /// neither is ever an agent.
+    #[test]
+    fn non_agent_pids_are_never_alive() {
+        assert!(!pid_alive(0));
+        assert!(!pid_alive(-1));
+        assert!(!pid_alive(i64::from(i32::MAX) + 1));
     }
 }

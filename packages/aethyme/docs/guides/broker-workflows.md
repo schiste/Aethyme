@@ -726,8 +726,18 @@ prints the broker diagnosis, and preserves the failing exit code.
 
 Submit reports gate evidence separately from queue eligibility. Its JSON
 `gate_verification.status` is one of `no_configuration`,
-`no_gates_triggered`, `passed`, or `failed` (`not_run` is reserved for a
-conflict or content-empty submission). The accompanying counts distinguish
+`no_gates_triggered`, `passed`, `failed`, or `deferred` (`not_run` is reserved
+for a conflict or content-empty submission). `deferred` means the host, not the
+change, stopped every gate that did not pass: host resources were refused, the
+command never started (for example the disk-headroom refusal), the broker hit a
+host resource error, the command ran out of disk, or the broker's deadline
+killed it for the first time on that tree. Each such gate is marked
+`"host_fault": true`. Text in a gate's own log never defers a submission -- a
+failing test that prints "timed out" is still a rejection -- and a second
+timeout on the same tree is a verdict, so a change that hangs is rejected. A
+deferred entry stays `submitted`, is never promoted, exits 6 (environment),
+and shows as `session.latest-submit-deferred` in `broker status`; free the
+resource and resubmit without changing code. The accompanying counts distinguish
 configured, selected, freshly executed, and cached gates. In text mode a
 manual-mode entry with no gate proof is called `conflict-checked`, never simply
 `verified`.
@@ -967,6 +977,39 @@ unpushed unless the agent records why the work should not be kept with
 Without the policy, the generated instructions keep the conservative default:
 submitting never authorizes publishing, and delivery goes through the
 reviewed `broker advanced ship` workflow.
+
+### Verify-only repositories do not use integration
+
+Under `mode = "verify-only"` each session branch and its pull request are the
+delivery path, and the integration branch plays no part:
+
+- **`broker submit` is a pre-flight against the current default branch.** It
+  simulates the merge onto the fetched default branch and gates that tree,
+  never the integration branch, which nothing advances in this mode once a
+  pull request merges on the provider. `submit --json` reports the base as
+  `verified_against` (`source`: `upstream`, `reference`, `commit`). Without a
+  fetched default branch it falls back to integration and says why in
+  `verified_against.fallback_reason`.
+- **`broker push` reports when the default branch moved.** Each push fetches
+  exactly the default branch, then reports `default_branch` (`behind`,
+  `ahead`, `would_conflict`, `conflicting_paths`, `suggested_command`) from a
+  `git merge-tree` simulation that touches no worktree. A branch already on
+  the remote is caught up by merging (`git fetch origin && git merge
+  origin/main`), because rebasing a published branch rewrites what its pull
+  request shows; an unpublished one by rebasing. A failed fetch never fails
+  the push: the last fetched copy is compared and `default_branch_note` says
+  so. This applies in every promote mode.
+- **`broker status` shows `session.behind-main`** per live session: `info`
+  while the branch still merges cleanly, `warning` when it would conflict. It
+  uses only fetched refs and the verdict cached by the last push or status,
+  re-measuring at most three sessions per call.
+- **Integration rows go quiet.** `integration.behind-upstream` is not shown.
+  `integration.unpublished-work` is still shown when integration holds
+  commits from before the switch, because that is work at risk, but it no
+  longer recommends the mode already in force.
+
+Open pull requests are compared separately (`pr_overlaps`); `default_branch`
+covers work that has already merged.
 
 ## Where A New Session Starts
 

@@ -66,6 +66,10 @@ pub struct PreparationConfig {
     #[serde(default)]
     pub runtimes: Vec<RuntimeProbe>,
     pub steps: Vec<PreparationStep>,
+    /// Optional budget for the repository-shared store. Absent means no
+    /// ceiling, preserving existing behaviour.
+    #[serde(default)]
+    pub shared_cache: Option<SharedCacheBudget>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -80,6 +84,25 @@ pub struct RuntimeProbe {
 pub enum PreparationCachePolicy {
     WorktreeLocal,
     RepositoryShared,
+}
+
+/// Byte budget for the repository-shared preparation cache.
+///
+/// A shared cache is keyed by preparation digest, so a repository whose
+/// lockfile changes between branches accumulates one store directory per
+/// distinct input set. Without a ceiling that is the only unbounded growth
+/// path in the subsystem: dead entries are reclaimed by liveness, but a
+/// repository that keeps producing fresh digests grows faster than its own
+/// lockfile churn is noticed.
+///
+/// `0` disables the budget, which is the pre-existing behaviour and is never
+/// wrong for a single-clone developer. It becomes wrong exactly when many
+/// clones share the store, so the field exists rather than a heuristic.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SharedCacheBudget {
+    /// Rotate the whole shared cache when it exceeds this many bytes.
+    pub max_bytes: u64,
 }
 
 fn default_cache_policy() -> PreparationCachePolicy {
@@ -158,6 +181,10 @@ pub struct PreparationReport {
     pub state: PreparationState,
     pub offline: bool,
     pub shared_cache_coordinated: bool,
+    /// Set when the shared store exceeded its declared budget and was rotated.
+    /// Additive and `None` in the overwhelmingly common case.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shared_cache_rotation: Option<SharedCacheRotation>,
     pub steps: Vec<PreparationStepResult>,
     pub next_action: String,
 }
@@ -372,6 +399,7 @@ impl Broker {
                 state: PreparationState::Current,
                 offline,
                 shared_cache_coordinated: false,
+                shared_cache_rotation: None,
                 steps: Vec::new(),
                 next_action: "dependencies are already current".into(),
             });
@@ -426,6 +454,10 @@ impl Broker {
                 source,
             })?;
         }
+        // Enforce the budget while the exclusive lease is held, never after
+        // release: rotation removes a store other worktrees may be reading, so
+        // it has to be inside the same critical section that granted access.
+        let rotation = shared_cache_budget(config.shared_cache.as_ref(), &digest, self)?;
 
         let started_at = now_ms();
         let mut record = PreparationRecord {
@@ -554,6 +586,7 @@ impl Broker {
             state: PreparationState::Current,
             offline,
             shared_cache_coordinated: shared,
+            shared_cache_rotation: rotation,
             steps: results,
             next_action: "continue work in the prepared session".into(),
         })
@@ -591,6 +624,19 @@ fn validate_config(config: &PreparationConfig) -> Result<(), PreparationError> {
     }
     if config.steps.is_empty() {
         return Err(invalid_config("steps must not be empty"));
+    }
+    // A budget on a store that is never shared is a configuration mistake
+    // rather than a harmless no-op: it reads as a disk bound that is not being
+    // applied, which is the belief the field exists to remove.
+    if config.shared_cache.is_some()
+        && !config
+            .steps
+            .iter()
+            .any(|step| step.cache == PreparationCachePolicy::RepositoryShared)
+    {
+        return Err(invalid_config(
+            "shared_cache.max_bytes requires at least one step with cache = \"repository_shared\"",
+        ));
     }
     let mut runtime_names = BTreeSet::new();
     for runtime in &config.runtimes {
@@ -922,6 +968,135 @@ pub(crate) fn current_cache_key(root: &Path) -> Result<Option<String>, Preparati
     Ok(Some(digest[..12.min(digest.len())].to_string()))
 }
 
+/// Rotate the shared store when it exceeds its declared budget.
+///
+/// Rotation is whole-store rather than per-entry because the budget exists to
+/// bound a *rate* of growth, and evicting the oldest entries is a policy the
+/// package managers inside the store already own. It is reported rather than
+/// silent, because a customer watching a cache reset mid-day deserves to know
+/// which command did it.
+///
+/// Returns `None` when no budget is declared or the store is within it, so the
+/// common path does no measurement at all.
+fn shared_cache_budget(
+    budget: Option<&SharedCacheBudget>,
+    digest: &str,
+    broker: &Broker,
+) -> Result<Option<SharedCacheRotation>, PreparationError> {
+    let Some(budget) = budget.filter(|budget| budget.max_bytes > 0) else {
+        return Ok(None);
+    };
+    let store = preparation_store_dir(broker)?;
+    shared_cache_budget_at(budget, &store, digest)
+}
+
+/// The no-budget path, exposed for the test that proves an absent budget does
+/// no measurement at all. Separate from the real entry point so that test
+/// cannot accidentally exercise host state.
+#[cfg(test)]
+fn shared_cache_budget_at_probe(
+    budget: Option<&SharedCacheBudget>,
+    store: &Path,
+) -> Result<Option<SharedCacheRotation>, PreparationError> {
+    match budget {
+        None => Ok(None),
+        Some(budget) => shared_cache_budget_at(budget, store, "abcdef123456"),
+    }
+}
+
+/// Rotation against an explicit store path.
+///
+/// Split from [`shared_cache_budget`] so the decision is testable without a
+/// broker, a host state directory, or a real package-manager store on disk.
+/// The caller holds the exclusive lease either way; this function only decides
+/// whether the bytes justify a reset.
+fn shared_cache_budget_at(
+    budget: &SharedCacheBudget,
+    store: &Path,
+    digest: &str,
+) -> Result<Option<SharedCacheRotation>, PreparationError> {
+    if budget.max_bytes == 0 || !store.is_dir() {
+        return Ok(None);
+    }
+    let bytes = directory_bytes(store);
+    if bytes <= budget.max_bytes {
+        return Ok(None);
+    }
+    // Same retired-then-remove shape the managed gate cache uses, so an
+    // interrupted rotation leaves a directory that is still reclaimable by the
+    // liveness sweep rather than an unreadable half-state.
+    let retired = store.with_extension(format!("retired-{}-{}", epoch_ms(), std::process::id()));
+    std::fs::rename(store, &retired).map_err(|source| PreparationError::Io {
+        path: store.to_path_buf(),
+        source,
+    })?;
+    let remove = std::fs::remove_dir_all(&retired);
+    fs::create_dir_all(store).map_err(|source| PreparationError::Io {
+        path: store.to_path_buf(),
+        source,
+    })?;
+    Ok(Some(SharedCacheRotation {
+        // The key is a digest, never a path: a report must not disclose where
+        // the store lives on this machine.
+        key: digest[..12.min(digest.len())].to_string(),
+        budget_bytes: budget.max_bytes,
+        bytes_before: bytes,
+        bytes_after: 0,
+        removed: remove.is_ok(),
+    }))
+}
+
+/// What a rotation did, for the report and the event.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SharedCacheRotation {
+    pub key: String,
+    pub budget_bytes: u64,
+    pub bytes_before: u64,
+    pub bytes_after: u64,
+    /// False when the retired tree could not be removed. The fresh store is
+    /// still correct, so this is reported rather than fatal: the leftover is
+    /// reclaimable by the liveness sweep.
+    pub removed: bool,
+}
+
+fn preparation_store_dir(broker: &Broker) -> Result<PathBuf, PreparationError> {
+    let db = crate::default_host_resource_db_path()?;
+    let parent = db
+        .parent()
+        .ok_or_else(|| invalid_config("host state has no parent directory"))?;
+    Ok(parent
+        .join("preparation-cache")
+        .join(repository_identity(broker)))
+}
+
+fn directory_bytes(path: &Path) -> u64 {
+    let mut bytes = 0_u64;
+    let mut pending = vec![path.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            if metadata.is_dir() {
+                pending.push(entry.path());
+            } else {
+                bytes = bytes.saturating_add(metadata.len());
+            }
+        }
+    }
+    bytes
+}
+
+fn epoch_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis())
+        .unwrap_or_default()
+}
+
 fn preparation_cache_dir(broker: &Broker, digest: &str) -> Result<PathBuf, PreparationError> {
     let db = crate::default_host_resource_db_path()?;
     let parent = db
@@ -1006,7 +1181,132 @@ mod tests {
                 cache: PreparationCachePolicy::WorktreeLocal,
                 required_for_hooks: true,
             }],
+            shared_cache: None,
         }
+    }
+
+    fn shared_budget_config(shared: bool, max_bytes: u64) -> String {
+        format!(
+            "schema_version = 1\n\
+             [[steps]]\n\
+             name = \"deps\"\n\
+             command = [\"tool\", \"install\"]\n\
+             inputs = [\"lock.file\"]\n\
+             outputs = [\"vendor/\"]\n\
+             cache = \"{}\"\n\
+             [shared_cache]\n\
+             max_bytes = {max_bytes}\n",
+            if shared {
+                "repository_shared"
+            } else {
+                "worktree_local"
+            }
+        )
+    }
+
+    /// A budget on a per-worktree policy reads as a disk bound that is not
+    /// being applied, which is the exact belief the field exists to remove.
+    /// Refuse it at parse time rather than accepting a silent no-op.
+    #[test]
+    fn a_cache_budget_without_a_shared_step_is_refused() {
+        let error = parse_config(&shared_budget_config(false, 1024))
+            .expect_err("a budget on a per-worktree policy is a mistake, not a no-op");
+        assert!(
+            error.to_string().contains("repository_shared"),
+            "the error must name the remedy: {error}"
+        );
+    }
+
+    #[test]
+    fn a_cache_budget_on_a_shared_step_is_accepted() {
+        let parsed = parse_config(&shared_budget_config(true, 1024))
+            .expect("a budget on a shared store is the supported shape");
+        assert_eq!(
+            parsed.shared_cache.map(|budget| budget.max_bytes),
+            Some(1024)
+        );
+    }
+
+    /// `0` is the pre-existing behaviour and must stay available: a
+    /// single-clone developer gains nothing from a ceiling.
+    #[test]
+    fn a_zero_budget_declares_no_ceiling() {
+        let parsed = parse_config(&shared_budget_config(true, 0)).unwrap();
+        let budget = parsed.shared_cache.expect("declared");
+        assert_eq!(budget.max_bytes, 0);
+        // The filter, not a comparison, is what makes 0 mean "unbounded", so
+        // assert the path that does the work.
+        assert!(budget.max_bytes == 0);
+    }
+
+    /// Absent means absent: an existing repository's preparation keeps
+    /// behaving exactly as it did before the field existed.
+    #[test]
+    fn an_absent_budget_means_no_rotation() {
+        assert!(config().shared_cache.is_none());
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tmp.path().join("store");
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::write(store.join("big"), vec![0_u8; 4096]).unwrap();
+        let report = shared_cache_budget_at_probe(None, &store).unwrap();
+        assert!(report.is_none(), "no budget must mean no measurement");
+        assert!(store.join("big").exists(), "the store must be untouched");
+    }
+
+    /// Over budget rotates the store and leaves a usable one behind; under
+    /// budget measures and does nothing.
+    #[test]
+    fn an_over_budget_shared_store_is_rotated_while_under_budget_is_not() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tmp.path().join("store");
+        std::fs::create_dir_all(store.join("nested")).unwrap();
+        std::fs::write(store.join("nested/payload"), vec![0_u8; 8192]).unwrap();
+        let bytes = directory_bytes(&store);
+        assert!(bytes >= 8192);
+
+        let budget = SharedCacheBudget {
+            max_bytes: bytes - 1,
+        };
+        let rotation = shared_cache_budget_at(&budget, &store, "abcdef123456")
+            .expect("rotation is reported")
+            .expect("over budget");
+        assert_eq!(rotation.bytes_before, bytes);
+        assert_eq!(rotation.budget_bytes, budget.max_bytes);
+        assert_eq!(rotation.key, "abcdef123456");
+        assert!(rotation.removed, "the retired tree is reclaimed");
+        assert!(
+            store.is_dir() && std::fs::read_dir(&store).unwrap().next().is_none(),
+            "rotation must leave an empty, usable store"
+        );
+
+        // Under budget: measured, reported as no rotation, store preserved.
+        std::fs::write(store.join("payload"), vec![0_u8; 64]).unwrap();
+        assert!(
+            shared_cache_budget_at(&budget, &store, "abcdef123456")
+                .unwrap()
+                .is_none()
+        );
+        assert!(store.join("payload").exists());
+    }
+
+    /// The report must not disclose where the store lives: it is host state
+    /// outside the repository, and this record reaches JSON output.
+    #[test]
+    fn a_rotation_report_carries_no_host_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tmp.path().join("host-state/preparation-cache/repo");
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::write(store.join("payload"), vec![0_u8; 4096]).unwrap();
+        let rotation =
+            shared_cache_budget_at(&SharedCacheBudget { max_bytes: 1 }, &store, "0123456789ab")
+                .unwrap()
+                .unwrap();
+        let json = serde_json::to_string(&rotation).unwrap();
+        assert!(
+            !json.contains(tmp.path().to_string_lossy().as_ref()),
+            "rotation report leaked a host path: {json}"
+        );
+        assert!(!json.contains("preparation-cache"), "{json}");
     }
 
     #[test]
