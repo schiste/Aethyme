@@ -81,6 +81,8 @@
     "estimated_blocked_bytes": "integer",
     "estimated_reclaimable_bytes": "integer",
     "estimated_retained_bytes": "integer",
+    "host_available_bytes": "integer",
+    "host_volume_probe": "string",
     "oldest_closed_age_days": "integer",
     "over_retained_bytes_budget": "bool",
     "reconciliation": {
