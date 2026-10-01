@@ -9084,10 +9084,27 @@ impl Broker {
         scan: crate::SizeScan,
         records: &mut crate::measurement::SizeRecords,
     ) -> Result<Option<CleanupWorktreePlan>, BrokerOpError> {
+        self.cleanup_item_scanned_with_tips(session, scan, records, None)
+    }
+
+    /// [`Self::cleanup_item_scanned`] with every local branch tip already read
+    /// (see [`GitRepo::local_branch_tips`]). A plan visits every session ever
+    /// recorded, most of whose branch and worktree are long gone; looking the
+    /// branch up in one listing lets those return without forking `git`.
+    fn cleanup_item_scanned_with_tips(
+        &self,
+        session: &Session,
+        scan: crate::SizeScan,
+        records: &mut crate::measurement::SizeRecords,
+        branch_tips: Option<&std::collections::BTreeMap<String, String>>,
+    ) -> Result<Option<CleanupWorktreePlan>, BrokerOpError> {
         let worktree_path = PathBuf::from(&session.worktree_path);
         let worktree_present = worktree_path.exists();
         let branch_ref = format!("refs/heads/{}", session.branch);
-        let branch_tip = self.repo.resolve_ref(&branch_ref);
+        let branch_tip = match branch_tips {
+            Some(tips) => tips.get(&branch_ref).cloned(),
+            None => self.repo.resolve_ref(&branch_ref),
+        };
         if !worktree_present && branch_tip.is_none() {
             return Ok(None);
         }
@@ -9248,11 +9265,20 @@ impl Broker {
         let mut retained = crate::MeasuredTotal::default();
         let mut reclaimable = crate::MeasuredTotal::default();
         let mut known = std::collections::BTreeSet::new();
+        // One listing instead of one `rev-parse` per session ever recorded:
+        // this plan is on `broker status`'s path through `cleanup_retention`.
+        let branch_tips = self.repo.local_branch_tips();
         for session in self.store.cleaned_sessions()? {
             if session.origin != SessionOrigin::Spawned {
                 continue;
             }
-            let Some(item) = self.cleanup_item_scanned(&session, scan, &mut records)? else {
+            let Some(item) = self.cleanup_item_scanned_with_tips(
+                &session,
+                scan,
+                &mut records,
+                branch_tips.as_ref(),
+            )?
+            else {
                 continue;
             };
             known.insert(item.worktree_path.clone());
@@ -10856,17 +10882,23 @@ fn worktree_activity_ms(main_root: &Path, session: &Session) -> Option<i64> {
 /// platforms). `kill -0` alone is wrong here: it succeeds on zombies,
 /// and an exited-but-unreaped agent must read as dead.
 ///
-/// Reads `/proc/<pid>/stat` where it exists, which is a single `open`/`read`
-/// with no fork. `ps` is the fallback for macOS, where there is no procfs and
-/// `/bin/ps` is the only portable way to see the state. The distinction matters
-/// at fleet scale: `broker status` is every session's first command and calls
-/// this once per live session, so a 40-session status forked 40 `ps`
-/// processes. The repository's own measurements put a 19-session `status` at
-/// 2m54s of wall time.
+/// Asks the kernel directly where the platform allows it -- `/proc/<pid>/stat`
+/// on Linux, `proc_pidinfo` on macOS -- so the common case forks nothing. `ps`
+/// is only the fallback for an answer the kernel refused to give (for example
+/// another user's process). The distinction matters at fleet scale: `broker
+/// status` is every session's first command and calls this once per live
+/// session, so a 40-session status forked 40 `ps` processes. The repository's
+/// own measurements put a 19-session `status` at 2m54s of wall time.
 pub(crate) fn pid_alive(pid: i64) -> bool {
-    if let Some(state) = procfs_state(pid) {
-        // A zombie still has a `/proc` entry; `kill -0` would report it alive.
-        return state != 'Z' && state != 'X';
+    // PID 0 is the kernel (`kernel_task` on macOS) and negative values name
+    // process groups; neither is ever an agent. Answering here also keeps an
+    // invalid PID off the `ps` fallback: an unprivileged `proc_pidinfo(0)` is
+    // refused with EPERM rather than ESRCH, which would otherwise cost a fork.
+    if pid <= 0 || i32::try_from(pid).is_err() {
+        return false;
+    }
+    if let Some(alive) = kernel_pid_alive(pid) {
+        return alive;
     }
     match Command::new("ps")
         .args(["-o", "state=", "-p", &pid.to_string()])
@@ -10881,22 +10913,61 @@ pub(crate) fn pid_alive(pid: i64) -> bool {
     }
 }
 
-/// The single-letter process state from `/proc/<pid>/stat`, or `None` when
-/// procfs is unavailable (macOS) or the entry cannot be read.
+/// Whether `pid` is a live, non-zombie process, answered by the kernel without
+/// forking. `None` means the kernel did not say, and the caller falls back to
+/// `ps`.
 ///
-/// The comm field is parenthesised and may itself contain spaces and
-/// parentheses, so the state is taken from the *last* `)` rather than by
-/// splitting the whole line on whitespace — `ps` shows the same field and has
-/// the same parsing hazard.
+/// On Linux the state is the field after the parenthesised comm in
+/// `/proc/<pid>/stat`. The comm may itself contain spaces and parentheses, so
+/// the state is taken from the *last* `)` rather than by splitting the whole
+/// line on whitespace. A missing entry is left to `ps` rather than read as
+/// dead, so a procfs mounted with restricted visibility cannot make a live
+/// agent look gone.
 #[cfg(target_os = "linux")]
-fn procfs_state(pid: i64) -> Option<char> {
+fn kernel_pid_alive(pid: i64) -> Option<bool> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let after_comm = stat.rsplit_once(')')?.1;
-    after_comm.trim_start().chars().next()
+    let state = stat.rsplit_once(')')?.1.trim_start().chars().next()?;
+    // A zombie still has a `/proc` entry; `kill -0` would report it alive.
+    Some(state != 'Z' && state != 'X')
 }
 
-#[cfg(not(target_os = "linux"))]
-fn procfs_state(_pid: i64) -> Option<char> {
+/// On macOS, `proc_pidinfo(PROC_PIDTBSDINFO)` is the same data `ps` reads,
+/// without the fork. `ESRCH` is a definite "no such process", and is also what
+/// the kernel returns for an exited-but-unreaped child (a zombie that `ps`
+/// still lists with state `Z`), so zombies read as dead here. Any other
+/// failure (`EPERM` for another user's process) is left to `ps`. The `SZOMB`
+/// check covers a bsdinfo record that does describe a zombie.
+#[cfg(target_os = "macos")]
+fn kernel_pid_alive(pid: i64) -> Option<bool> {
+    // From <sys/proc.h>: a process that has exited but not been reaped.
+    const SZOMB: u32 = 5;
+    let pid = i32::try_from(pid).ok()?;
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: `info` is a writable buffer of exactly `size` bytes, and
+    // proc_pidinfo writes at most `size` bytes into it.
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if written != size {
+        let gone =
+            written <= 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+        return gone.then_some(false);
+    }
+    // SAFETY: the buffer was zero-initialized and then fully written, and
+    // proc_bsdinfo is plain integers and byte arrays, valid for any bits.
+    let info = unsafe { info.assume_init() };
+    Some(info.pbi_status != SZOMB)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn kernel_pid_alive(_pid: i64) -> Option<bool> {
     None
 }
 
@@ -11605,5 +11676,77 @@ fn derive_scopes_from_task(repo_root: &Path, task: &str) -> (Vec<String>, Option
             Vec::new(),
             Some(format!("task scope could not be resolved: {error}")),
         ),
+    }
+}
+
+#[cfg(test)]
+mod pid_liveness_tests {
+    use super::{kernel_pid_alive, pid_alive};
+
+    /// `broker status` asks this once per live session, so the common answer
+    /// must come from the kernel rather than a `ps` fork. On the supported
+    /// platforms the kernel answers for our own process; a regression to the
+    /// fork-per-session path shows up here as `None`.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn the_kernel_answers_for_a_live_process_without_forking() {
+        let own = i64::from(std::process::id());
+        assert_eq!(kernel_pid_alive(own), Some(true));
+        assert!(pid_alive(own));
+    }
+
+    /// An exited process that has not been reaped is a zombie: it still has a
+    /// process-table entry, so a bare existence check calls it alive. An agent
+    /// in that state is gone. The test first proves the child really is a
+    /// zombie by `ps`'s account, so it cannot pass on an already-reaped PID.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_zombie_is_dead() {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = i64::from(child.id());
+        // Wait for it to exit without reaping it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while kernel_pid_alive(pid) != Some(false) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let state = std::process::Command::new("ps")
+            .args(["-o", "state=", "-p", &pid.to_string()])
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&state.stdout)
+                .trim()
+                .starts_with('Z'),
+            "the child must still be an unreaped zombie for this test to mean anything"
+        );
+        assert_eq!(
+            kernel_pid_alive(pid),
+            Some(false),
+            "zombie must read as dead"
+        );
+        assert!(!pid_alive(pid));
+        child.wait().unwrap();
+    }
+
+    /// A reaped process no longer exists, and the kernel says so definitively
+    /// rather than leaving the question to `ps`.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_reaped_process_is_dead() {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = i64::from(child.id());
+        child.wait().unwrap();
+        assert!(!pid_alive(pid));
+        #[cfg(target_os = "macos")]
+        assert_eq!(kernel_pid_alive(pid), Some(false));
+    }
+
+    /// PID 0 is the kernel itself and negative values name process groups;
+    /// neither is ever an agent.
+    #[test]
+    fn non_agent_pids_are_never_alive() {
+        assert!(!pid_alive(0));
+        assert!(!pid_alive(-1));
+        assert!(!pid_alive(i64::from(i32::MAX) + 1));
     }
 }
