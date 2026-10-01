@@ -41,14 +41,35 @@ fn built() -> &'static Mutex<HashMap<&'static str, PathBuf>> {
     BUILT.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Opt-in: use the binaries a previous `cargo build --bins` produced instead
+/// of building them here. CI sets it in the steps that follow its explicit
+/// build of the same tree, because nextest runs each test in its own process:
+/// the per-process cache below then saves nothing, and roughly a thousand
+/// `cargo build` calls queued on cargo's build lock for minutes each. A missing
+/// binary panics instead of falling back to a build, so a misconfigured job
+/// fails loudly rather than slowly.
+const PREBUILT_BINS_ENV: &str = "AETHYME_TESTKIT_PREBUILT_BINS";
+
 /// Build `name` if needed and return its path.
 ///
-/// Cached per test binary, so a suite with fifty cases pays at most one
-/// `cargo build` per bin. Panics — loudly — when the build fails.
+/// Cached per test process, so under `cargo test` a suite with fifty cases
+/// pays at most one `cargo build` per bin. Panics — loudly — when the build
+/// fails.
 pub fn cargo_bin(name: &'static str) -> PathBuf {
     let mut cache = built().lock().expect("testkit bin cache poisoned");
     if let Some(path) = cache.get(name) {
         return path.clone();
+    }
+
+    if std::env::var_os(PREBUILT_BINS_ENV).is_some_and(|value| value == "1") {
+        let path = target_dir().join("debug").join(name);
+        assert!(
+            path.is_file(),
+            "{PREBUILT_BINS_ENV}=1 but {name} is not built at {}; run `cargo build --bins` first or unset it",
+            path.display()
+        );
+        cache.insert(name, path.clone());
+        return path;
     }
 
     let output = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))

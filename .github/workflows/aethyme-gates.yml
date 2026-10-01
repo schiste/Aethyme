@@ -49,12 +49,45 @@ jobs:
           python-version: "3.12"
 
       - name: Set up Rust
+        id: toolchain
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           toolchain: stable
 
+      # This job is on the release path (a release is tagged only on a commit
+      # whose gates passed) and used to build everything from scratch.
+      # rust-cache keeps third-party dependencies only and rebuilds the
+      # workspace's own crates, so a restore never stands in for compiling the
+      # code under test.
+      - name: Cache the aethyme release build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: packages/aethyme/rust
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
       - name: Build aethyme binary
         run: cargo build --locked --release --manifest-path packages/aethyme/rust/Cargo.toml --bin aethyme
+
+      # The Rust gates build into the broker's managed cache,
+      # `<host cache>/gates/<repository key>/rust-workspace-v3`, where the key
+      # is the SHA-256 of the repository's canonical origin
+      # (`repository_key` in aethyme-broker gates.rs). A wrong key only means
+      # a cold build, never a wrong verdict.
+      - name: Locate the gates' managed build cache
+        run: |
+          set -euo pipefail
+          key="$(printf '%s' "github.com/${GITHUB_REPOSITORY,,}" | sha256sum | cut -c1-64)"
+          echo "GATE_CACHE_DIR=$HOME/.cache/aethyme/gates/$key/rust-workspace-v3" >> "$GITHUB_ENV"
+
+      # Restores now; its post-step saves at the end of a successful job only
+      # when no entry matched the key exactly (a lockfile or toolchain change).
+      - name: Cache the gates' managed build
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.GATE_CACHE_DIR }}
+          key: aethyme-gate-cache-${{ runner.os }}-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('packages/aethyme/rust/Cargo.lock') }}
+          restore-keys: |
+            aethyme-gate-cache-${{ runner.os }}-${{ steps.toolchain.outputs.cachekey }}-
 
       - name: Run all gates
         env:
@@ -64,3 +97,19 @@ jobs:
           # trust decision, made here explicitly.
           AETHYME_TRUST_NONINTERACTIVE_FOR_TESTS: "1"
         run: packages/aethyme/rust/target/release/aethyme broker advanced gates run --all
+
+      # Runs after the gates, before the cache post-step saves. Keep
+      # third-party artifacts only: the workspace's own crates, test binaries
+      # and incremental state are rebuilt on every run anyway, and dropping
+      # them keeps the entry within the repository's cache budget.
+      - name: Keep only third-party artifacts in the gates' cache
+        run: |
+          set -euo pipefail
+          dir="$GATE_CACHE_DIR/debug"
+          [ -d "$dir" ] || exit 0
+          rm -rf "$dir/incremental" "$dir/examples"
+          rm -rf "$dir"/deps/aethyme* "$dir"/deps/libaethyme* "$dir"/.fingerprint/aethyme* "$dir"/build/aethyme*
+          # Test and binary executables (no extension) are workspace outputs.
+          find "$dir" -maxdepth 1 -type f -perm -u+x -delete
+          find "$dir/deps" -maxdepth 1 -type f -perm -u+x ! -name '*.so' ! -name '*.dylib' ! -name '*.rlib' ! -name '*.rmeta' ! -name '*.d' -delete
+          du -sh "$GATE_CACHE_DIR"
