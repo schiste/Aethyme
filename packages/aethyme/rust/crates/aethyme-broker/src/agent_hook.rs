@@ -725,6 +725,13 @@ fn deliver_notes(broker: &mut Broker, session: &Session) -> HookOutcome {
 /// refused edit would only stall it. The hook never claims a lease either:
 /// the point is to surface what the agent did not anticipate.
 ///
+/// "Changing" means now: each other live session's worktree is compared with
+/// its base for the path at the moment of the edit, so a change committed
+/// since the last lease refresh is reported and a reverted one is not. An
+/// explicit claim is reported either way. This session's own leases are not
+/// refreshed: the note is about other sessions, and the next broker command
+/// records this edit for them.
+///
 /// Fires once per (path, other session, other session's change to the
 /// path), so an agent editing the same file repeatedly hears it once, and
 /// again only when the other session's change moves.
@@ -751,47 +758,62 @@ fn on_pre_tool_use(
         return HookOutcome::Silent;
     }
 
+    // The other sessions an edit can collide with. Read from the session
+    // table, not from the lease table: implicit leases are only as fresh as
+    // the last broker command that refreshed them, and an agent that commits
+    // and pushes without running one would otherwise be invisible here.
+    let peers: Vec<Session> = broker
+        .store_ref()
+        .live_sessions()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|other| {
+            other.id != session.id
+                && matches!(
+                    other.status,
+                    crate::SessionStatus::Active | crate::SessionStatus::Idle
+                )
+        })
+        .collect();
+    if peers.is_empty() {
+        return HookOutcome::Silent;
+    }
     let leases = broker.store_ref().active_leases().unwrap_or_default();
     let mut seen = SeenState::load(broker.main_root(), session.id);
+    let mut cache = ChangeCache::load(broker.main_root(), session.id);
     let mut notes = Vec::new();
     for relative in &relatives {
-        let mut holders: Vec<&crate::Lease> = leases
+        if notes.len() >= MAX_PEER_NOTES {
+            break;
+        }
+        let mut candidates: Vec<Candidate<'_>> = peers
             .iter()
-            .filter(|lease| {
-                lease.session_id != session.id
-                    && crate::leases::paths_overlap(&lease.path, relative)
-            })
+            .map(|other| Candidate::new(other, relative, &leases))
             .collect();
-        holders.sort_by_key(|lease| lease.session_id);
-        holders.dedup_by_key(|lease| lease.session_id);
-        for lease in holders {
+        // Decide "already told?" from the other worktree's copy of the file
+        // (modification time and size, no process), and run Git only for a
+        // state this agent has not heard about. A file the other session
+        // merely touched is asked about again; that errs towards telling,
+        // never towards silence.
+        candidates.retain(|candidate| !seen.contains(&candidate.seen_key(relative)));
+        resolve_current_changes(&mut candidates, relative, &mut cache);
+        for candidate in candidates {
             if notes.len() >= MAX_PEER_NOTES {
                 break;
             }
-            let Ok(other) = broker.store_ref().session(lease.session_id) else {
-                continue;
-            };
-            if !matches!(
-                other.status,
-                crate::SessionStatus::Active | crate::SessionStatus::Idle
-            ) {
+            if !candidate.announce() {
                 continue;
             }
-            // Decide "already told?" from the other worktree's copy of the
-            // file (modification time and size, no process), and run Git only
-            // for a change this agent has not heard about. A file the other
-            // session merely touched is re-announced; that errs towards
-            // telling, never towards silence.
-            let key = format!(
-                "{relative}|{}|{}|{}",
-                other.id,
-                lease.path,
-                file_stamp(&other.worktree_path, relative)
+            if !seen.first_time(&candidate.seen_key(relative)) {
+                continue;
+            }
+            let other = candidate.session;
+            let change = describe_change(
+                other,
+                relative,
+                candidate.claimed.as_deref(),
+                candidate.diff.as_deref(),
             );
-            if !seen.first_time(&key) {
-                continue;
-            }
-            let change = describe_change(&other, relative, lease);
             let verdict = crate::overlap_pairs::cached_conflicting_paths(
                 broker.store_ref(),
                 session.id,
@@ -812,10 +834,194 @@ fn on_pre_tool_use(
         }
     }
     seen.save();
+    cache.save();
     if notes.is_empty() {
         return HookOutcome::Silent;
     }
     HookOutcome::Context(notes.join("\n"))
+}
+
+/// One other live session, considered for one path the agent is about to
+/// write.
+struct Candidate<'a> {
+    session: &'a Session,
+    /// The explicit claim covering the path, when the session made one. A
+    /// claim announces what a session is about to do, so it is reported
+    /// whether or not the file has changed yet.
+    claimed: Option<String>,
+    /// Whether the last lease refresh recorded the path as changed. Only
+    /// consulted when the current state cannot be read.
+    implicitly_leased: bool,
+    /// The base the session's change is measured from, when known.
+    base: Option<String>,
+    /// [`file_stamp`] of the path in the session's worktree.
+    stamp: String,
+    /// Whether the session's working tree differs from its base at the path
+    /// right now; `None` when that could not be determined.
+    changed: Option<bool>,
+    /// The `-U0` diff read while deciding `changed`, reused to describe it.
+    diff: Option<String>,
+}
+
+impl<'a> Candidate<'a> {
+    fn new(session: &'a Session, path: &str, leases: &[crate::Lease]) -> Self {
+        let mut claimed = None;
+        let mut implicitly_leased = false;
+        for lease in leases.iter().filter(|lease| {
+            lease.session_id == session.id && crate::leases::paths_overlap(&lease.path, path)
+        }) {
+            if lease.kind == crate::LeaseKind::Explicit {
+                claimed.get_or_insert_with(|| lease.path.clone());
+            } else {
+                implicitly_leased = true;
+            }
+        }
+        Self {
+            session,
+            claimed,
+            implicitly_leased,
+            base: session
+                .diff_base
+                .clone()
+                .or_else(|| session.adoption_base.clone()),
+            stamp: file_stamp(&session.worktree_path, path),
+            changed: None,
+            diff: None,
+        }
+    }
+
+    /// The once-per-change memory key. A claim keys on the claimed path, a
+    /// change on the file itself, as before the change check existed, so an
+    /// upgrade does not repeat notes already delivered.
+    fn seen_key(&self, path: &str) -> String {
+        format!(
+            "{path}|{}|{}|{}",
+            self.session.id,
+            self.claimed.as_deref().unwrap_or(path),
+            self.stamp
+        )
+    }
+
+    fn cache_key(&self, path: &str) -> Option<String> {
+        let base = self.base.as_deref()?;
+        Some(format!("{}|{base}|{path}|{}", self.session.id, self.stamp))
+    }
+
+    /// Whether this session belongs in a note: it claimed the path, or it is
+    /// changing the file now. A change that was reverted stays silent even
+    /// while an old implicit lease still names the file.
+    fn announce(&self) -> bool {
+        self.claimed.is_some() || self.changed.unwrap_or(self.implicitly_leased)
+    }
+}
+
+/// Fill in [`Candidate::changed`] for every candidate whose answer is not
+/// cached, reading each other worktree's current state in parallel.
+///
+/// One Git process per uncached session (two for a file Git does not
+/// track), all at once, so the wall-clock cost is about one process
+/// however many sessions are live. The answer is cached by the file's
+/// stamp and the session's base, which together determine it: a commit
+/// does not change a working-tree diff against the base, and a write to
+/// the file changes the stamp.
+fn resolve_current_changes(candidates: &mut [Candidate<'_>], path: &str, cache: &mut ChangeCache) {
+    let mut pending: Vec<&mut Candidate<'_>> = Vec::new();
+    for candidate in candidates.iter_mut() {
+        if candidate.claimed.is_some() {
+            // Announced either way; the diff is read only if it is described.
+            continue;
+        }
+        match candidate.cache_key(path).and_then(|key| cache.get(&key)) {
+            Some(changed) => candidate.changed = Some(changed),
+            None if candidate.base.is_some() => pending.push(candidate),
+            None => {}
+        }
+    }
+    std::thread::scope(|scope| {
+        for candidate in pending.iter_mut() {
+            scope.spawn(move || {
+                let base = candidate.base.as_deref().unwrap_or("HEAD");
+                let (changed, diff) = current_change(&candidate.session.worktree_path, base, path);
+                candidate.changed = changed;
+                candidate.diff = diff;
+            });
+        }
+    });
+    for candidate in pending {
+        if let (Some(changed), Some(key)) = (candidate.changed, candidate.cache_key(path)) {
+            cache.insert(key, changed);
+        }
+    }
+}
+
+/// Whether `path` in `worktree` differs from `base` right now, committed or
+/// not, and the zero-context diff when it is a tracked change.
+fn current_change(worktree: &str, base: &str, path: &str) -> (Option<bool>, Option<String>) {
+    let repo = crate::GitRepo::at_known_root(std::path::Path::new(worktree));
+    let Ok(diff) = repo.working_zero_context_diff(base, path) else {
+        return (None, None);
+    };
+    if !diff.trim().is_empty() {
+        return (Some(true), Some(diff));
+    }
+    if !std::path::Path::new(worktree).join(path).exists() {
+        return (Some(false), None);
+    }
+    (repo.path_is_untracked(path).ok(), None)
+}
+
+/// Remembered "is this file changed in that session" answers, keyed so a
+/// stale answer cannot be read back (see [`resolve_current_changes`]). Kept
+/// beside [`SeenState`] and, like it, losing the file only costs a Git call.
+struct ChangeCache {
+    path: Option<std::path::PathBuf>,
+    entries: Vec<(String, bool)>,
+    dirty: bool,
+}
+
+/// Remembered answers per session; the oldest are forgotten first. Larger
+/// than [`SEEN_CAPACITY`] because most answers are "not changed", one per
+/// live session per file edited.
+const CHANGE_CACHE_CAPACITY: usize = 2048;
+
+impl ChangeCache {
+    fn load(main_root: &std::path::Path, session_id: i64) -> Self {
+        let path = hook_state_path(main_root, "hook-changes", session_id);
+        let entries = path
+            .as_deref()
+            .and_then(|path| std::fs::read(path).ok())
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default();
+        Self {
+            path,
+            entries,
+            dirty: false,
+        }
+    }
+
+    fn get(&self, key: &str) -> Option<bool> {
+        self.entries
+            .iter()
+            .rev()
+            .find(|(seen, _)| seen == key)
+            .map(|(_, changed)| *changed)
+    }
+
+    fn insert(&mut self, key: String, changed: bool) {
+        self.entries.retain(|(seen, _)| *seen != key);
+        self.entries.push((key, changed));
+        if self.entries.len() > CHANGE_CACHE_CAPACITY {
+            let excess = self.entries.len() - CHANGE_CACHE_CAPACITY;
+            self.entries.drain(..excess);
+        }
+        self.dirty = true;
+    }
+
+    fn save(&self) {
+        if self.dirty {
+            save_hook_state(self.path.as_deref(), &self.entries);
+        }
+    }
 }
 
 /// At most this many other sessions are described per tool call. A file
@@ -831,22 +1037,32 @@ struct PeerChange {
     symbols: Vec<String>,
 }
 
-fn describe_change(other: &Session, path: &str, lease: &crate::Lease) -> PeerChange {
-    let ranges = other
-        .diff_base
-        .as_deref()
-        .or(other.adoption_base.as_deref())
-        .and_then(|base| {
-            let repo = crate::GitRepo::discover(std::path::Path::new(&other.worktree_path)).ok()?;
-            repo.working_zero_context_diff(base, path).ok()
-        })
-        .map(|diff| parse_hunks(&diff))
-        .unwrap_or_default();
+/// `claimed` is the explicit claim that put the session in the note, if any;
+/// `diff` is the zero-context diff already read for `path`, if any.
+fn describe_change(
+    other: &Session,
+    path: &str,
+    claimed: Option<&str>,
+    diff: Option<&str>,
+) -> PeerChange {
+    let ranges = match diff {
+        Some(diff) => parse_hunks(diff),
+        None => other
+            .diff_base
+            .as_deref()
+            .or(other.adoption_base.as_deref())
+            .and_then(|base| {
+                crate::GitRepo::at_known_root(std::path::Path::new(&other.worktree_path))
+                    .working_zero_context_diff(base, path)
+                    .ok()
+            })
+            .map(|diff| parse_hunks(&diff))
+            .unwrap_or_default(),
+    };
     if ranges.0.is_empty() {
-        let where_ = if lease.path == path {
-            "this file".to_string()
-        } else {
-            format!("`{}` (claimed)", lease.path)
+        let where_ = match claimed {
+            Some(claim) if claim != path => format!("`{claim}` (claimed)"),
+            _ => "this file".to_string(),
         };
         return PeerChange {
             where_,
@@ -1044,12 +1260,7 @@ const SEEN_CAPACITY: usize = 256;
 
 impl SeenState {
     fn load(main_root: &std::path::Path, session_id: i64) -> Self {
-        let git_dir = main_root.join(".git");
-        let path = git_dir.is_dir().then(|| {
-            git_dir
-                .join("aethyme")
-                .join(format!("hook-seen-{session_id}.json"))
-        });
+        let path = hook_state_path(main_root, "hook-seen", session_id);
         let keys = path
             .as_deref()
             .and_then(|path| std::fs::read(path).ok())
@@ -1062,8 +1273,12 @@ impl SeenState {
         }
     }
 
+    fn contains(&self, key: &str) -> bool {
+        self.keys.iter().any(|seen| seen == key)
+    }
+
     fn first_time(&mut self, key: &str) -> bool {
-        if self.keys.iter().any(|seen| seen == key) {
+        if self.contains(key) {
             return false;
         }
         self.keys.push(key.to_string());
@@ -1076,23 +1291,44 @@ impl SeenState {
     }
 
     fn save(&self) {
-        let Some(path) = self.path.as_deref().filter(|_| self.dirty) else {
-            return;
-        };
-        if let Some(parent) = path.parent() {
-            crate::warn_unrecorded(
-                "create the hook state directory",
-                std::fs::create_dir_all(parent),
-            );
+        if self.dirty {
+            save_hook_state(self.path.as_deref(), &self.keys);
         }
-        if let Ok(bytes) = serde_json::to_vec(&self.keys) {
-            crate::warn_unrecorded(
-                "record which coordination notes were delivered",
-                crate::atomic_file::with_synced_temporary(path, &bytes, |temporary| {
-                    std::fs::rename(temporary, path)
-                }),
-            );
-        }
+    }
+}
+
+/// `<main checkout>/.git/aethyme/<stem>-<session>.json`, when the main
+/// checkout has a `.git` directory.
+fn hook_state_path(
+    main_root: &std::path::Path,
+    stem: &str,
+    session_id: i64,
+) -> Option<std::path::PathBuf> {
+    let git_dir = main_root.join(".git");
+    git_dir.is_dir().then(|| {
+        git_dir
+            .join("aethyme")
+            .join(format!("{stem}-{session_id}.json"))
+    })
+}
+
+fn save_hook_state(path: Option<&std::path::Path>, value: &impl serde::Serialize) {
+    let Some(path) = path else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        crate::warn_unrecorded(
+            "create the hook state directory",
+            std::fs::create_dir_all(parent),
+        );
+    }
+    if let Ok(bytes) = serde_json::to_vec(value) {
+        crate::warn_unrecorded(
+            "record the agent hook's coordination state",
+            crate::atomic_file::with_synced_temporary(path, &bytes, |temporary| {
+                std::fs::rename(temporary, path)
+            }),
+        );
     }
 }
 
