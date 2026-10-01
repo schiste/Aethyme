@@ -1336,10 +1336,14 @@ fn same_file_method_call_resolves_to_module_function_with_redb_parity() {
 
     assert_eq!(expected.items.len(), 1, "{expected:#?}");
     assert_eq!(expected.items[0].kind, "function");
+    // Match on the identity prefix rather than the whole id: node ids
+    // carry a disambiguating start-line suffix, and the point of this
+    // assertion is *which* symbol was resolved, not its id spelling.
+    let resolved_id = &expected.items[0].id;
     assert!(
-        expected.items[0]
-            .id
-            .ends_with(":src/auth/token.py:load_token")
+        resolved_id.starts_with("fn:")
+            && resolved_id.contains(":src/auth/token.py:load_token"),
+        "callee must be load_token in src/auth/token.py, got {resolved_id}"
     );
     assert_eq!(
         graph_cli_json(tmp.path(), "graph-callees", target),
