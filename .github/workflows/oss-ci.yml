@@ -32,7 +32,18 @@ jobs:
         with:
           toolchain: stable
 
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: packages/aethyme/rust
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # One shared, cached target directory for the three installs: by default
+      # each `cargo install` builds the shared dependencies again in its own
+      # temporary directory.
       - name: Install the router and its sibling binaries
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/packages/aethyme/rust/target
         run: |
           cargo install --path packages/aethyme/rust/crates/aethyme-cli --locked
           cargo install --path packages/aethyme/rust/crates/aethyme-engine --locked
@@ -140,9 +151,74 @@ jobs:
   # own Python by design and its own gate.
   rust-tests:
     name: Rust workspace tests
-    # Main receives the same full workspace coverage through Aethyme Gates.
+    # Main receives the same full workspace coverage through Aethyme Gates;
+    # `warm-rust-cache` below compiles main's tests so this job starts warm.
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: packages/aethyme/rust
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+
+      # Restores the cache `warm-rust-cache` saves from main. Pull requests do
+      # not save: a cache written by a pull request is visible only to that
+      # pull request, and would evict main's.
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: packages/aethyme/rust
+          shared-key: rust-tests
+          save-if: false
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: cargo-nextest@0.9.146
+
+      # Test helpers run `cargo build --bin <name>` once per test process to
+      # find the product binaries (aethyme-testkit/src/bins.rs). nextest runs
+      # each test in its own process, so building them once here turns those
+      # calls into no-op freshness checks.
+      - name: Build the product binaries
+        run: cargo build --locked --workspace --bins
+
+      # Library, binary and integration tests. `cargo test --workspace
+      # --examples` stood in for this step until now, but a target flag
+      # narrows cargo's selection to examples only: it ran three binaries.
+      - name: Run workspace tests
+        run: cargo nextest run --locked --workspace --profile ci
+
+      # nextest runs neither example targets nor doctests. The release-manifest
+      # assertions live in examples (#435) and must keep running.
+      - name: Run example tests
+        run: cargo test --locked --workspace --examples
+
+      - name: Run doctests
+        run: cargo test --locked --workspace --doc
+
+  # ── Cache warm-up ───────────────────────────────────────────────────────
+  # Compiles main's tests on each push so the pull-request test jobs above
+  # and below restore a warm cache instead of starting cold (the macOS job
+  # took 26 min cold and ~7 warm). Builds only; main's test verdict is
+  # Aethyme Gates.
+  warm-rust-cache:
+    name: Warm Rust cache (${{ matrix.os }})
+    if: github.event_name == 'push'
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            key: rust-tests
+          - os: macos-14
+            key: rust-tests-macos
+    runs-on: ${{ matrix.os }}
     defaults:
       run:
         working-directory: packages/aethyme/rust
@@ -159,9 +235,19 @@ jobs:
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: packages/aethyme/rust
+          shared-key: ${{ matrix.key }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Run Rust tests
-        run: cargo test --locked --workspace --examples
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: cargo-nextest@0.9.146
+
+      - name: Compile the workspace tests
+        run: |
+          cargo build --locked --workspace --bins
+          cargo nextest run --locked --workspace --no-run
+          cargo test --locked --workspace --examples --no-run
 
   # ── Lint ────────────────────────────────────────────────────────────────
   # The workspace is fmt-clean and clippy-clean with zero warnings; this job
@@ -186,6 +272,7 @@ jobs:
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: packages/aethyme/rust
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -222,10 +309,18 @@ jobs:
         with:
           toolchain: stable
 
+      # Restores the cache `warm-rust-cache` saves from main.
       - name: Cache Rust build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: packages/aethyme/rust
+          shared-key: rust-tests-macos
+          save-if: false
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: cargo-nextest@0.9.146
 
       - name: Select crates
         id: scope
@@ -243,9 +338,16 @@ jobs:
           echo "args=$args" >> "$GITHUB_OUTPUT"
           echo "selected:${args:- none}"
 
+      - name: Build the product binaries
+        if: steps.scope.outputs.args != ''
+        run: cargo build --locked --workspace --bins
+
       - name: Run tests
         if: steps.scope.outputs.args != ''
         env:
           ARGS: ${{ steps.scope.outputs.args }}
         # ARGS is built from crate directory names only; word-splitting is intended.
-        run: cargo test --locked $ARGS
+        # `--no-tests=pass`: a selected crate may have no tests of its own.
+        run: |
+          # shellcheck disable=SC2086 # ARGS is a list of -p flags
+          cargo nextest run --locked --profile ci --no-tests=pass $ARGS

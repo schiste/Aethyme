@@ -1,0 +1,22 @@
+# cargo-nextest configuration for the packages/aethyme/rust workspace.
+#
+# nextest runs every test in its own process, so tests cannot share
+# in-process state; it also schedules tests across all test binaries at
+# once, which is where most of its speed over `cargo test` comes from.
+# It does not run doctests or example targets: CI runs those with
+# `cargo test --doc` and `cargo test --examples` separately.
+
+[profile.default]
+# Local runs keep nextest's defaults.
+
+[profile.ci]
+# Report every failure in one run instead of stopping at the first.
+fail-fast = false
+# Retry a failing test once. A test that passes on retry is reported as
+# FLAKY rather than hidden, and a test that fails twice still fails the run.
+# This targets known timing-sensitive tests such as the one in #419.
+retries = 1
+# Print failure output where it happened and again in the final summary.
+failure-output = "immediate-final"
+# Flag tests that run for more than a minute so slow tests stay visible.
+slow-timeout = { period = "60s" }
