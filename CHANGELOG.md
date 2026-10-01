@@ -4,6 +4,22 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.12] - 2026-10-01
+
+Verify-only repositories stop using the integration branch, and worktrees can live on another drive.
+
+### Added
+
+- In `[promote] mode = "verify-only"` repositories, `broker submit` verifies against the fetched default branch instead of the integration branch, and `broker push` fetches the default branch and reports how far the session is behind it and whether merging it would conflict, with the command to catch up. `broker status` adds a per-session `session.behind-main` row and drops integration advice that no longer applies there. `auto` and `manual` repositories keep the integration branch (#462).
+- `[worktrees] root` in `.aethyme/config.toml` places new session worktrees under another directory, such as an external drive, read from the committed default branch like `[promote]`. The configured path is used only when it already exists, is writable, is outside the repository and has at least `worktrees.min_free_bytes` free (default: the 8 GiB a gate needs); otherwise worktrees go to the usual location and `broker start` reports why. Worktrees on an unplugged drive are reported unavailable and are never retired or removed (#465).
+- `broker status` reports a `host.gate-headroom` row when the volume where gates run is below the gate headroom, even when nothing is retained, and points to `gc plan` (#457).
+
+### Changed
+
+- `broker submit` defers instead of rejecting when a gate could not judge the change because of a host fault the broker observed itself (refused resources, a command that never started, its own timeout kill, a full disk). A deferred submit has its own status advice with recovery commands and exits with the environment exit code; a second timeout on the same tree is a verdict (#452).
+- Merge verification uses a pool of stable verification checkouts so independent submissions verify concurrently, and integration only moves by compare-and-swap from the verified base (#456).
+- `broker status` no longer starts one process per session to check liveness on macOS, and reads all session branch tips in one Git call: about half the wall time with nine live sessions (#455).
+
 ## [0.8.11] - 2026-09-30
 
 Push-early delivery, safer worktree cleanup, and quieter multi-agent coordination.
