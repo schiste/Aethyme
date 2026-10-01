@@ -3655,6 +3655,26 @@ mod timeout_tests {
 
 /// Hunk-level views of one path, for telling two sessions' edits apart.
 impl GitRepo {
+    /// A handle on a checkout whose top level is already known, such as a
+    /// session worktree the broker created. Skips the `rev-parse` that
+    /// [`GitRepo::discover`] spends, which matters on the agent hook's
+    /// per-edit path; a wrong root only makes later Git calls fail.
+    pub(crate) fn at_known_root(root: &Path) -> Self {
+        Self {
+            root: root.to_path_buf(),
+        }
+    }
+
+    /// Whether `path` exists in the working tree as an untracked,
+    /// non-ignored file: a new file no diff against a commit reports.
+    pub(crate) fn path_is_untracked(&self, path: &str) -> Result<bool, GitError> {
+        let listed = run_git(
+            &self.root,
+            &["ls-files", "--others", "--exclude-standard", "--", path],
+        )?;
+        Ok(!listed.trim().is_empty())
+    }
+
     /// Zero-context patch of `path` from `base` to `head`. Callers parse only
     /// the `@@` headers, so the old-side line ranges are the whole answer.
     pub(crate) fn zero_context_diff(
