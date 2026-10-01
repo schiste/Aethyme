@@ -149,6 +149,81 @@ impl ExactTreeVerificationSlot {
         Self::acquire_at(main_root, plan_slot_placement(main_root, namespace))
     }
 
+    /// One of `size` stable slots, so up to `size` verifications run at once.
+    ///
+    /// A single repository-wide slot made merge verification strictly serial:
+    /// measured at a flat ~8.6 submissions per hour whatever the number of
+    /// submitting sessions, because gates ran sequentially inside one lock.
+    /// Nothing about a slot requires two *different* verifications to share a
+    /// directory -- each needs a stable, complete, non-nested checkout of its
+    /// own tree.
+    ///
+    /// A fixed pool rather than one directory per commit, for two reasons.
+    /// Each slot keeps a stable path, which is what lets build tools reuse
+    /// path-sensitive fingerprints from one verification to the next; a fresh
+    /// path per merge commit makes every verification start cold, and a merge
+    /// commit is new on every submission even when the tree is not. And the
+    /// set of directories stays bounded instead of growing by one lock file
+    /// per verification forever.
+    ///
+    /// Slot 0 is the plain `namespace` placement, so the checkout every
+    /// existing installation keeps warm stays the first one used. A free slot
+    /// is taken without waiting; when all are busy this polls until one is
+    /// released. Locks are `flock`s, so a holder that dies releases its slot.
+    pub(crate) fn acquire_pooled(
+        main_root: &Path,
+        namespace: &str,
+        size: usize,
+    ) -> Result<Self, BrokerOpError> {
+        let placements = (0..size.max(1))
+            .map(|index| {
+                let name = if index == 0 {
+                    namespace.to_string()
+                } else {
+                    format!("{namespace}-{index}")
+                };
+                plan_slot_placement(main_root, &name)
+            })
+            .collect::<Vec<_>>();
+        loop {
+            for placement in &placements {
+                if let Some(slot) = Self::try_acquire_at(main_root, placement.clone())? {
+                    return Ok(slot);
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+    }
+
+    /// Take the lock on an already chosen placement, or `None` if it is held.
+    fn try_acquire_at(
+        main_root: &Path,
+        placement: SlotPlacement,
+    ) -> Result<Option<Self>, BrokerOpError> {
+        let lock_path = Self::prepare_lock_path(&placement)?;
+        let file = open_lock_file(&lock_path).map_err(|source| BrokerError::Io {
+            path: lock_path.clone(),
+            source,
+        })?;
+        let lock = ExclusiveFileLock::try_acquire(file).map_err(|source| BrokerError::Io {
+            path: lock_path,
+            source,
+        })?;
+        Ok(lock.map(|lock| Self {
+            repository_root: main_root.to_path_buf(),
+            path: placement.directory.join("slot"),
+            _lock: lock,
+        }))
+    }
+
+    fn prepare_lock_path(placement: &SlotPlacement) -> Result<PathBuf, BrokerOpError> {
+        std::fs::create_dir_all(&placement.directory).map_err(|source| BrokerError::Io {
+            path: placement.directory.clone(),
+            source,
+        })?;
+        Ok(placement.directory.join("slot.lock"))
+    }
+
     /// Take the lock on an already chosen placement.
     fn acquire_at(main_root: &Path, placement: SlotPlacement) -> Result<Self, BrokerOpError> {
         std::fs::create_dir_all(&placement.directory).map_err(|source| BrokerError::Io {
@@ -304,6 +379,70 @@ mod tests {
             plan_slot_placement_in(&fx.main, "merge-sim", Some(&fx.host), &fx.temp).directory,
             plan_slot_placement_in(&fx.main, "graph-integrity", Some(&fx.host), &fx.temp).directory
         );
+    }
+
+    /// A verification that finds slot 0 busy takes another slot instead of
+    /// waiting: this is the whole throughput change. Run on a thread with a
+    /// timeout so a regression to "block on one slot" fails rather than hangs.
+    #[test]
+    fn a_busy_slot_does_not_block_a_second_verification() {
+        let fx = fixture();
+        let first = ExactTreeVerificationSlot::acquire_pooled(&fx.main, "merge-sim", 2).unwrap();
+        let main = fx.main.clone();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let second = ExactTreeVerificationSlot::acquire_pooled(&main, "merge-sim", 2).unwrap();
+            sender.send(second.path.clone()).unwrap();
+        });
+        let second = receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("a second verification waited for a busy slot while another was free");
+        assert_ne!(first.path, second, "two verifications shared one checkout");
+    }
+
+    /// Paths are stable and bounded: releasing and re-acquiring lands on the
+    /// same checkout, and slot 0 is the existing single-slot placement, so the
+    /// directory installations already keep warm stays the one used first.
+    #[test]
+    fn pooled_slots_keep_stable_paths_and_slot_zero_is_the_existing_placement() {
+        let fx = fixture();
+        let first = ExactTreeVerificationSlot::acquire_pooled(&fx.main, "merge-sim", 4).unwrap();
+        let path = first.path.clone();
+        drop(first);
+        let again = ExactTreeVerificationSlot::acquire_pooled(&fx.main, "merge-sim", 4).unwrap();
+        assert_eq!(again.path, path, "a released slot was not reused");
+        drop(again);
+        let single = ExactTreeVerificationSlot::acquire(&fx.main, "merge-sim").unwrap();
+        assert_eq!(
+            single.path, path,
+            "slot 0 moved away from the existing placement"
+        );
+    }
+
+    /// With every slot busy a verification waits, and takes the slot as soon as
+    /// it is released -- the pool bounds concurrency, it never fails a submit.
+    #[test]
+    fn a_full_pool_waits_for_a_released_slot() {
+        let fx = fixture();
+        let held = ExactTreeVerificationSlot::acquire_pooled(&fx.main, "merge-sim", 1).unwrap();
+        let held_path = held.path.clone();
+        let main = fx.main.clone();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let slot = ExactTreeVerificationSlot::acquire_pooled(&main, "merge-sim", 1).unwrap();
+            sender.send(slot.path.clone()).unwrap();
+        });
+        assert!(
+            receiver
+                .recv_timeout(std::time::Duration::from_millis(600))
+                .is_err(),
+            "a verification entered a slot another one still holds"
+        );
+        drop(held);
+        let path = receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("a released slot was never taken");
+        assert_eq!(path, held_path);
     }
 
     #[test]
