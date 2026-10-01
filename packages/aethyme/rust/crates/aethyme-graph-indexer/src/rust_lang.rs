@@ -21,6 +21,10 @@
 //!   binding name from each `use` statement; Phase 4.6 stage 1 —
 //!   the linker resolves these to concrete nodes when both ends
 //!   of the import live in repo)
+//! - Calls (callable → UnresolvedSymbol placeholder per syntactic
+//!   callee). See `rust_calls` for the extraction rules, the
+//!   `::`-to-dotted normalization, and the deliberate omissions
+//!   (method calls, macro invocations, prelude constructors).
 //!
 //! Deferred for later commits:
 //! - `impl` block methods. v1 emits these as Functions because
@@ -45,6 +49,7 @@ use aethyme_graph_schema::{
 use crate::context::IndexerContext;
 use crate::filesystem::IndexedFile;
 use crate::language::{LanguageIndexError, LanguageIndexResult, LanguageIndexer, LineIndex};
+use crate::rust_calls;
 
 /// Indexer for `.rs` files via ra_ap_syntax.
 pub struct RustIndexer;
@@ -122,7 +127,11 @@ fn walk_top_level_item(
         ast::Item::Fn(f) => {
             if let Some(fn_node) = build_function(repo, source_path, f, line_index, true)? {
                 let id = fn_node.id().clone();
+                // Push the callable before its call placeholders so the
+                // primary node keeps its leading position in the node
+                // list; call edges reference ids, not positions.
                 nodes.push(Node::Function(fn_node));
+                emit_calls_for_fn(f, repo, source_path, &id, line_index, nodes, edges)?;
                 edges.push(structural_edge(
                     EdgeAttributes::Contains,
                     file_id.clone(),
@@ -199,6 +208,15 @@ fn walk_top_level_item(
                         {
                             let id = method.id().clone();
                             nodes.push(Node::Method(method));
+                            emit_calls_for_fn(
+                                &f,
+                                repo,
+                                source_path,
+                                &id,
+                                line_index,
+                                nodes,
+                                edges,
+                            )?;
                             edges.push(structural_edge(
                                 EdgeAttributes::Defines,
                                 trait_id.clone(),
@@ -237,6 +255,7 @@ fn walk_top_level_item(
                     {
                         let id = fn_node.id().clone();
                         nodes.push(Node::Function(fn_node));
+                        emit_calls_for_fn(&f, repo, source_path, &id, line_index, nodes, edges)?;
                         edges.push(structural_edge(
                             EdgeAttributes::Contains,
                             file_id.clone(),
@@ -558,6 +577,31 @@ fn node_construction_err(e: impl std::fmt::Display) -> LanguageIndexError {
     LanguageIndexError::NodeConstruction {
         message: e.to_string(),
     }
+}
+
+// ─── Calls ───────────────────────────────────────────────────────────
+//
+// Each callable body contributes one `UnresolvedSymbol` placeholder plus
+// a `Calls` edge per syntactic callee. The linker rewrites a placeholder
+// to a concrete node when the repository disambiguates it; otherwise
+// the placeholder persists as an `UnresolvedSymbol` node. See
+// `rust_calls` for the extraction rules and the deliberate omissions
+// (method calls and macro invocations).
+
+fn emit_calls_for_fn(
+    f: &ast::Fn,
+    repo: &str,
+    source_path: &str,
+    caller_id: &NodeId,
+    line_index: &LineIndex,
+    nodes: &mut Vec<Node>,
+    edges: &mut Vec<Edge>,
+) -> Result<(), LanguageIndexError> {
+    let Some(body) = f.body() else {
+        return Ok(());
+    };
+    let calls = rust_calls::collect_calls(&body, |offset| line_index.line_at(offset));
+    rust_calls::emit_call_placeholders(repo, source_path, caller_id, calls, nodes, edges)
 }
 
 // ─── Imports (Phase 4.6 stage 1) ─────────────────────────────────────

@@ -27,6 +27,7 @@ pub mod linker;
 pub mod php;
 pub mod pipeline;
 pub mod python;
+mod rust_calls;
 pub mod rust_lang;
 pub mod surface_flow;
 pub mod typescript;

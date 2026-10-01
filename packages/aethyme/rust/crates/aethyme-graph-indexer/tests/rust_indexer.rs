@@ -331,3 +331,127 @@ fn rust_imports_coexist_with_other_extractions() {
     assert!(kinds.contains(&NodeKind::Function));
     assert!(kinds.contains(&NodeKind::Struct));
 }
+
+// ─── Call extraction ─────────────────────────────────────────────────
+
+/// The caller's own name is the target the linker will resolve, so the
+/// test asserts on the emitted placeholder names.
+fn call_targets(result: &aethyme_graph_indexer::LanguageIndexResult) -> Vec<String> {
+    let mut names: Vec<String> = result
+        .additional_edges
+        .iter()
+        .filter(|edge| edge.kind() == aethyme_graph_schema::EdgeKind::Calls)
+        .filter_map(|edge| result.additional_nodes.iter().find(|node| node.id() == edge.dst_id()))
+        .filter_map(|node| match node {
+            aethyme_graph_schema::Node::UnresolvedSymbol(p) => Some(p.name().to_string()),
+            _ => None,
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn extracts_call_edges_within_a_single_file() {
+    // Regression: the Rust indexer emitted only structural edges, so a
+    // same-file `inner()` called by `outer()` produced no call edge at
+    // all and `graph callers` returned nothing for Rust sources.
+    let result = index_source("fn inner() -> u32 { 1 }\nfn outer() -> u32 { inner() }\n");
+    let calls = result
+        .additional_edges
+        .iter()
+        .filter(|edge| edge.kind() == aethyme_graph_schema::EdgeKind::Calls)
+        .count();
+    assert_eq!(calls, 1, "a same-file call must emit one Calls edge");
+    assert_eq!(call_targets(&result), vec!["inner".to_string()]);
+}
+
+#[test]
+fn normalizes_module_qualified_paths_to_dotted_form() {
+    let result = index_source(
+        "mod store { pub fn helper() -> u32 { 1 } }\nfn caller() -> u32 { store::helper() }\n",
+    );
+    // `store::helper` becomes the dotted `store.helper` the linker
+    // splits on; the raw `::` form would never resolve.
+    assert_eq!(call_targets(&result), vec!["store.helper".to_string()]);
+}
+
+#[test]
+fn skips_self_and_super_rooted_calls() {
+    // These name the enclosing item, not a repository symbol. A
+    // placeholder for them could never resolve.
+    let result = index_source(
+        "struct S;\nimpl S {\n    fn a(&self) -> u32 { self.b() }\n    fn b(&self) -> u32 { 1 }\n}\n",
+    );
+    assert!(
+        call_targets(&result).is_empty(),
+        "self-rooted calls must not become placeholders, got {:?}",
+        call_targets(&result)
+    );
+}
+
+#[test]
+fn skips_std_and_crate_rooted_calls() {
+    let result = index_source("fn caller() -> u32 { std::cmp::min(1, 2) }\n");
+    assert!(
+        call_targets(&result).is_empty(),
+        "std-rooted calls are not repository symbols, got {:?}",
+        call_targets(&result)
+    );
+}
+
+#[test]
+fn does_not_emit_method_calls_as_bare_names() {
+    // Resolving `receiver.method()` needs the receiver's inferred type.
+    // Emitting a bare `method` placeholder would let the linker's
+    // name-only fallback bind it to an unrelated same-named symbol, so
+    // method calls are deliberately not extracted.
+    let result = index_source("fn caller(r: &Repo) -> u32 { r.insert(\"x\") }\n");
+    assert!(
+        call_targets(&result).is_empty(),
+        "method calls must not be extracted, got {:?}",
+        call_targets(&result)
+    );
+}
+
+#[test]
+fn records_one_site_per_call_occurrence() {
+    let result = index_source("fn inner() -> u32 { 1 }\nfn outer() -> u32 { inner() + inner() }\n");
+    let call_edge = result
+        .additional_edges
+        .iter()
+        .find(|edge| edge.kind() == aethyme_graph_schema::EdgeKind::Calls)
+        .expect("Calls edge");
+    assert_eq!(
+        call_edge.sites().len(),
+        2,
+        "both call occurrences must be recorded as sites"
+    );
+}
+
+#[test]
+fn emits_no_call_edges_for_a_function_without_calls() {
+    let result = index_source("fn isolated() -> u32 { 42 }\n");
+    assert!(call_targets(&result).is_empty());
+    assert!(
+        !result
+            .additional_edges
+            .iter()
+            .any(|edge| edge.kind() == aethyme_graph_schema::EdgeKind::Calls)
+    );
+}
+
+#[test]
+fn macro_invocations_are_not_call_edges() {
+    // `println!` is a macro, not a call against an indexed symbol.
+    let result = index_source("fn caller() { println!(\"hi\"); }\n");
+    assert!(call_targets(&result).is_empty());
+}
+
+#[test]
+fn nested_calls_in_control_flow_are_extracted() {
+    let result = index_source(
+        "fn inner() -> u32 { 1 }\nfn outer(flag: bool) -> u32 {\n    if flag { inner() } else { 0 }\n}\n",
+    );
+    assert_eq!(call_targets(&result), vec!["inner".to_string()]);
+}

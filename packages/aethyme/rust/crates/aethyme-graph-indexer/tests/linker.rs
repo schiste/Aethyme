@@ -683,5 +683,170 @@ fn repo_without_imports_makes_no_changes() {
     assert_eq!(bytes_before, bytes_after);
 }
 
+// ─── Rust cross-file call resolution ─────────────────────────────────
+//
+// The Rust indexer emits dotted call placeholders
+// (`crate::store::helper` → `store.helper`). These assert the generic
+// linker resolves them against a real repository, which is what makes
+// `graph callers` useful for Rust sources.
+
+#[test]
+fn rust_cross_file_call_resolves_to_the_imported_function() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "src/store.rs",
+        b"pub fn helper() -> u32 {\n    1\n}\n",
+    );
+    write(
+        tmp.path(),
+        "src/api.rs",
+        b"use crate::store::helper;\n\npub fn caller() -> u32 {\n    helper()\n}\n",
+    );
+    index_repo_to_disk(&ctx(tmp.path()), &WalkOptions::default()).unwrap();
+
+    let summary = link_repo(&ctx(tmp.path())).unwrap();
+    assert!(
+        summary.placeholders_resolved > 0,
+        "Rust import and call placeholders must resolve: {summary:?}"
+    );
+
+    let store = read_fragment(tmp.path(), "src/store.rs").unwrap();
+    let helper_id = store
+        .nodes()
+        .iter()
+        .find(|n| n.kind() == NodeKind::Function)
+        .map(|n| n.id().clone())
+        .expect("helper should exist in store.rs");
+
+    let api = read_fragment(tmp.path(), "src/api.rs").unwrap();
+    let call_edge = api
+        .edges()
+        .iter()
+        .find(|e| e.kind() == EdgeKind::Calls)
+        .expect("resolved Calls edge should survive linking");
+    assert_eq!(
+        call_edge.dst_id(),
+        &helper_id,
+        "the call must point at store.rs's helper"
+    );
+
+    let remaining = api
+        .nodes()
+        .iter()
+        .filter(|n| n.kind() == NodeKind::UnresolvedSymbol)
+        .count();
+    assert_eq!(remaining, 0, "no call placeholder should survive");
+}
+
+#[test]
+fn rust_same_file_call_resolves_without_any_import() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "src/a.rs",
+        b"fn inner() -> u32 {\n    1\n}\n\npub fn outer() -> u32 {\n    inner()\n}\n",
+    );
+    index_repo_to_disk(&ctx(tmp.path()), &WalkOptions::default()).unwrap();
+    link_repo(&ctx(tmp.path())).unwrap();
+
+    let fragment = read_fragment(tmp.path(), "src/a.rs").unwrap();
+    // `inner` is the callee, so the Calls edge's destination is the
+    // answer; find the function whose id is neither the call's source
+    // (the caller) nor the file node.
+    let call_edge = fragment
+        .edges()
+        .iter()
+        .find(|e| e.kind() == EdgeKind::Calls)
+        .expect("a same-file call must produce a Calls edge");
+    let target_id = fragment
+        .nodes()
+        .iter()
+        .find(|n| n.kind() == NodeKind::Function && n.id() == call_edge.dst_id())
+        .map(|n| n.id().clone());
+    let Some(target_id) = target_id else {
+        let kinds: Vec<_> = fragment
+            .nodes()
+            .iter()
+            .map(|n| format!("{:?}", n.kind()))
+            .collect();
+        panic!(
+            "call destination must resolve to a Function; node kinds present: {kinds:?}, \
+             call dst = {:?}",
+            call_edge.dst_id()
+        );
+    };
+
+    let call_edges: Vec<_> = fragment
+        .edges()
+        .iter()
+        .filter(|e| e.kind() == EdgeKind::Calls)
+        .collect();
+    assert_eq!(call_edges.len(), 1, "one call edge expected");
+    assert_eq!(call_edges[0].dst_id(), &target_id);
+}
+
+#[test]
+fn rust_ambiguous_call_fails_closed_rather_than_guessing() {
+    // Two modules define `helper`. `api.rs` calls a bare `helper()`.
+    //
+    // The linker deliberately refuses whole-repo name-only resolution
+    // for `Calls` edges (see the module docs: a bare name cannot be
+    // distinguished from a local or callback binding), so the call
+    // stays on its placeholder instead of being bound to one of the two
+    // same-named symbols at high confidence.
+    //
+    // This is the behaviour we want: a missing edge is recoverable by
+    // an agent that verifies spans, while a confidently wrong edge is
+    // not.
+    let tmp = tempfile::tempdir().unwrap();
+    write(tmp.path(), "src/one.rs", b"pub fn helper() -> u32 {\n    1\n}\n");
+    write(tmp.path(), "src/two.rs", b"pub fn helper() -> u32 {\n    2\n}\n");
+    write(
+        tmp.path(),
+        "src/api.rs",
+        b"use crate::one::helper;\n\npub fn caller() -> u32 {\n    helper()\n}\n",
+    );
+    index_repo_to_disk(&ctx(tmp.path()), &WalkOptions::default()).unwrap();
+    link_repo(&ctx(tmp.path())).unwrap();
+
+    let one = read_fragment(tmp.path(), "src/one.rs").unwrap();
+    let two = read_fragment(tmp.path(), "src/two.rs").unwrap();
+    let one_id = one
+        .nodes()
+        .iter()
+        .find(|n| n.kind() == NodeKind::Function)
+        .map(|n| n.id().clone())
+        .unwrap();
+    let two_id = two
+        .nodes()
+        .iter()
+        .find(|n| n.kind() == NodeKind::Function)
+        .map(|n| n.id().clone())
+        .unwrap();
+
+    let api = read_fragment(tmp.path(), "src/api.rs").unwrap();
+    let call_edge = api
+        .edges()
+        .iter()
+        .find(|e| e.kind() == EdgeKind::Calls)
+        .expect("Calls edge should survive");
+    assert_ne!(
+        call_edge.dst_id(),
+        &one_id,
+        "an ambiguous bare call must not bind to an arbitrary same-named symbol"
+    );
+    assert_ne!(call_edge.dst_id(), &two_id);
+
+    // The placeholder survives, so the uncertainty stays visible in the
+    // graph rather than being silently dropped.
+    assert!(
+        api.nodes()
+            .iter()
+            .any(|n| n.kind() == NodeKind::UnresolvedSymbol && n.id() == call_edge.dst_id()),
+        "the unresolved placeholder must be retained"
+    );
+}
+
 // ─── Auto-link inside index_repo_to_disk's binary wrapper ───────────
 // (See cli_binary.rs for end-to-end CLI tests of the --skip-link flag.)

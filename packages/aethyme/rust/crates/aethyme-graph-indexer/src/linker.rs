@@ -299,6 +299,39 @@ struct FragmentResolution {
     was_rewritten: bool,
 }
 
+/// Split an import path into `(module_part, symbol_part)` at the last
+/// separator.
+///
+/// Language indexers emit the source language's own separator: `.` for
+/// Python (`from util import helper` → `util.helper`), `::` for Rust
+/// (`use crate::store::helper` → `crate::store::helper`). Splitting only
+/// on `.` meant every Rust path fell through to the whole-string case,
+/// where `module_part` is empty and the `(module, symbol)` fast path can
+/// never match — so Rust imports resolved only via the name-only
+/// fallback, or not at all when a name was ambiguous.
+fn split_import_path(import_path: &str) -> (&str, &str) {
+    // `::` is checked first: `crate::store::helper` also contains `.`
+    // nowhere, but a mixed path like `a::b.c` must split on the last
+    // separator of either kind, whichever comes last.
+    let dotted = import_path.rfind('.');
+    let scoped = import_path.rfind("::");
+    let (module_part, rest) = match (dotted, scoped) {
+        (Some(dot), Some(double_colon)) if double_colon > dot => {
+            import_path.split_at(double_colon)
+        }
+        (Some(dot), _) => import_path.split_at(dot),
+        (None, Some(double_colon)) => import_path.split_at(double_colon),
+        (None, None) => ("", import_path),
+    };
+    // `split_at` leaves the separator on the front of the symbol part;
+    // strip it so `util.helper` yields the symbol `helper`, not `.helper`.
+    let symbol_part = rest
+        .strip_prefix("::")
+        .or_else(|| rest.strip_prefix('.'))
+        .unwrap_or(rest);
+    (module_part, symbol_part)
+}
+
 fn local_import_bindings(
     fragment: &Fragment,
     placeholders: &HashMap<&NodeId, &Node>,
@@ -498,17 +531,14 @@ impl GlobalSymbolIndex {
         }
 
         if *is_named {
-            // `from M import X`. import_path is `M.X` (possibly with
-            // leading dots for relative imports — we skip those for
-            // now since they need the importing-file's package
-            // context to resolve).
+            // `from M import X` / `use M::X`. import_path uses the
+            // source language's own separator: `.` for Python, `::` for
+            // Rust. Relative Python imports (leading `.`) are skipped —
+            // they need the importing file's package context.
             if import_path.starts_with('.') {
                 return None;
             }
-            let (module_part, symbol_part) = match import_path.rsplit_once('.') {
-                Some(pair) => pair,
-                None => ("", import_path),
-            };
+            let (module_part, symbol_part) = split_import_path(import_path);
             // Fast path: look up (module, symbol). One record only?
             // Resolve. Multiple? Ambiguous → skip.
             if !module_part.is_empty()
@@ -518,6 +548,17 @@ impl GlobalSymbolIndex {
                 && hits.len() == 1
             {
                 return Some(hits[0].clone());
+            }
+            // A `::`-separated path names a file module rather than a
+            // dotted Python package, so retry the module lookup with the
+            // separator normalized. `crate::store::helper` →
+            // `crate.store.helper`, which is how `synthesize_module_name`
+            // renders a module built from a source path.
+            if import_path.contains("::") {
+                let dotted = import_path.replace("::", ".");
+                if let Some(file_rec) = self.module_to_file_node.get(&dotted) {
+                    return Some(file_rec.clone());
+                }
             }
             // Fallback: maybe the imported name is itself a
             // submodule (e.g. `from package import submodule`).
