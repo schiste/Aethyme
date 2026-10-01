@@ -204,8 +204,11 @@ Usage:
       without a declared offline_command.
   aethyme broker worktree-root [--json]
       Resolve the scanner-safe external root used by future broker starts.
-      Read-only: reports the preferred per-user location, repository key,
-      and constrained legacy fallback without creating either directory.
+      Read-only: reports the preferred location, repository key and
+      fallbacks without creating any directory. A [worktrees] root in
+      .aethyme/config.toml supersedes the per-user default while it exists,
+      is outside the repository and has worktrees.min_free_bytes free;
+      otherwise starts use the default and say why.
   aethyme broker agents [--json]
       List live sessions with activity-derived liveness, refreshing
       diff-derived leases and warning on overlapping edits.

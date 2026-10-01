@@ -291,6 +291,45 @@ legacy `.aethyme/worktrees/` location and reports the exact fallback reason in
 text and JSON. Explicit environment overrides fail closed instead of silently
 falling back. Existing legacy sessions remain cleanup-compatible.
 
+#### Putting worktrees on another drive
+
+The default location stays the per-user host-state root above. A repository
+can name another place, for example an external drive, in
+`.aethyme/config.toml`:
+
+```toml
+[worktrees]
+root = "/Volumes/T7/aethyme-worktrees"
+# min_free_bytes = 8589934592   # default: the 8 GiB a gate needs to start
+```
+
+It is read like `[promote]`: from the copy committed on the fetched default
+branch, else the main checkout's working-tree file. `AETHYME_WORKTREE_ROOT` and
+the library override still take precedence, with their existing fail-closed
+behaviour.
+
+The configured root supersedes the default only while it is usable. It is
+never created: a new session uses the default, and `start` says why in text and
+in `worktree_placement.fallback_reason`, when the root
+
+- does not exist, or sits under `/Volumes/<name>` while that volume is not
+  mounted (an unplugged drive is never replaced by an empty directory on the
+  startup disk);
+- resolves inside the repository;
+- has less free space than `worktrees.min_free_bytes`;
+- or the `[worktrees]` section is invalid (for example a relative `root`).
+
+Because the key is committed, a machine without that path simply keeps the
+default.
+
+Worktrees the broker places on the configured root are locked with
+`git worktree lock`, so `git worktree prune` (including the automatic one in
+`git gc`) keeps their registration while the drive is unplugged; the broker
+unlocks a worktree before removing it. While the root is unavailable,
+`finish cleanup` and `gc plan` report such a worktree as `inspection_failed`
+("the configured worktree root ... is unavailable") instead of treating it as
+deleted: its branch and records are kept until the drive is back.
+
 ### Repository readiness
 
 `aethyme broker status readiness` interprets deterministic repository and broker
