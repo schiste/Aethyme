@@ -97,6 +97,23 @@ fn all_tables_exist_on_fresh_db() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// The function and class tables are keyed by the engine's minted node id,
+/// so the id's spelling is part of the on-disk format. A store, or a cached
+/// store artifact, written before an id-format change keeps serving the old
+/// ids, because the materialization cache key only covers the schema
+/// version. This pins the current id format to the current schema version:
+/// when it fails, bump `SCHEMA_VERSION` and update both expectations together.
+#[test]
+fn stored_node_id_format_is_pinned_to_the_schema_version() {
+    let file = sample_file("Repo", "src/a.py", None);
+    let class = sample_class(&file, "Foo");
+    let function = sample_function(&file, "m", None);
+    assert_eq!(
+        (SCHEMA_VERSION, &*class.id, &*function.id),
+        (9, "class:Repo:src/a.py:Foo@7", "fn:Repo:src/a.py:m@12"),
+    );
+}
+
 #[test]
 fn schema_version_is_persisted() {
     let root = tmp_root(function_name!());
