@@ -112,7 +112,12 @@ name = "cargo-test"
 # 2026-09-29: --no-fail-fast. Without it the run stops at the first failing
 # test binary, so a change breaking several suites surfaced one per submit:
 # session 716 took 10 submits and 5 h 45 m, each revealing a new binary (#411).
-command = 'export CHAU7_CTO_OPTIM_ACTIVE=1 CARGO_INCREMENTAL=0 CARGO_PROFILE_TEST_DEBUG=1 CARGO_TARGET_DIR="$AETHYME_GATE_CACHE_DIR" && cargo test --locked --workspace --examples --quiet --no-fail-fast --manifest-path packages/aethyme/rust/Cargo.toml'
+# 2026-10-01: the workspace suite and the example tests are two runs. A single
+# `cargo test --workspace --examples` (8b41bf8f) restricts Cargo to example
+# targets, so from 2026-09-30 this gate ran three example binaries and no
+# library, binary or integration test. Both runs always execute, and the gate
+# fails if either does, so one pass still reports every failing suite.
+command = 'export CHAU7_CTO_OPTIM_ACTIVE=1 CARGO_INCREMENTAL=0 CARGO_PROFILE_TEST_DEBUG=1 CARGO_TARGET_DIR="$AETHYME_GATE_CACHE_DIR" && cargo test --locked --workspace --quiet --no-fail-fast --manifest-path packages/aethyme/rust/Cargo.toml; suite=$?; cargo test --locked --workspace --examples --quiet --no-fail-fast --manifest-path packages/aethyme/rust/Cargo.toml; examples=$?; [ "$suite" -eq 0 ] && [ "$examples" -eq 0 ]'
 cost = 3
 # 2026-09-26: raised from 1200. A full workspace run took 1056 s on a passing
 # gate that day and hit 1200 four times (sessions 677, 684, 621) while other

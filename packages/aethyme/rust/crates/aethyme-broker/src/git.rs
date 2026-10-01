@@ -2796,10 +2796,12 @@ impl GitRepo {
         // itself placed on a removable root; a lock someone else set is their
         // protection, and the removal must keep failing on it.
         if self.worktree_lock_reason(worktree).as_deref() == Some(BROKER_WORKTREE_LOCK_REASON) {
-            let _ = run_git(
+            // The removal below cannot succeed on a locked worktree, so a
+            // failed unlock is the error to report, not a detail to drop.
+            run_git(
                 &self.root,
                 &["worktree", "unlock", worktree.to_str().unwrap_or_default()],
-            );
+            )?;
         }
         let path = worktree.to_str().unwrap_or_default();
         let args: Vec<&str> = if force {
