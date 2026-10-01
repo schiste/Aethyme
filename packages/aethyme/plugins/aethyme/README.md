@@ -89,20 +89,25 @@ codex plugin marketplace remove aethyme
 
 ## What it installs
 
-`hooks/hooks.json` wires four events to one shim, `hooks/aethyme-hook.sh`:
+`hooks/hooks.json` wires five events to one shim, `hooks/aethyme-hook.sh`:
 
 | Event | Broker meaning |
 | --- | --- |
-| `SessionStart` | Register the session. |
-| `UserPromptSubmit` | Mark the session ACTIVE; deliver coordination deltas. |
-| `PreToolUse` | Deny a conflicting write. Never claims a lease. |
+| `SessionStart` | Register the session; name the live sessions changing files it leases. |
+| `UserPromptSubmit` | Mark the session ACTIVE; deliver notes from other sessions. |
+| `PreToolUse` | Before an edit, say which other live session is changing the same file, where, whether Git would conflict, and how to reach it. Never blocks the edit and never claims a lease. Once per change. |
+| `PostToolUse` | Deliver a note from another session at the first turn boundary after a tool call. Read-only and silent unless a note is waiting. |
 | `Stop` | Mark the session idle. |
 
-Two events are deliberately left unwired, for the same reason. `UserPromptSubmit`
-and `Stop` already bracket a turn, so `PostToolUse` would spawn a process per
-tool call to record liveness the turn boundaries already carry; and nothing in
-the coordination model reads `PermissionRequest` at all. An unused hook is not
-free — it is a process spawn on the hottest path in the session.
+`PermissionRequest` stays unwired: nothing in the coordination model reads it,
+and an unused hook is a process spawn on the hottest path in the session.
+`PostToolUse` records no liveness (the turn boundaries already carry it); it
+only checks, read-only, whether a note is waiting.
+
+Codex edits through `apply_patch`: the hook reads the patch's `*** Update File:`,
+`*** Add File:` and `*** Move to:` headers, so the same notes reach Codex agents.
+An agent idle at its prompt runs no hooks; a note reaches it at its next turn
+or broker command.
 
 ## What `SessionStart` says about the installation
 

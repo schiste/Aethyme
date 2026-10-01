@@ -154,13 +154,14 @@ fn decide(
         Some(path) => std::path::PathBuf::from(path),
         None => std::env::current_dir().ok()?,
     };
-    // PostToolUse is accepted and does nothing. A turn is already bounded
-    // by UserPromptSubmit and Stop, so per-tool-call liveness would be a
-    // database write per tool call for information the turn boundaries
-    // already carry. It stays in the enum so a plugin that wires it is a
-    // no-op rather than an error.
+    // PostToolUse is the turn boundary right after a tool call, which is
+    // where a note from another session reaches an agent mid-task. It records
+    // no liveness (a database write per tool call for what UserPromptSubmit
+    // and Stop already carry): a read-only snapshot answers "anything unread?"
+    // and the store is opened for writing only when there is a note to hand
+    // over.
     if event == HookEvent::PostToolUse {
-        return Some(HookOutcome::Silent);
+        return Some(on_post_tool_use(&cwd));
     }
 
     // The installation notice describes the machine, not the repository, so it
@@ -378,8 +379,82 @@ fn on_session_start(
         blocker_count: blockers.len(),
         advisories,
         unintegrated_commits: unintegrated_commits(broker, session),
+        overlap: lease_overlap_summary(broker, session),
     };
     HookOutcome::Context(render_start(&facts))
+}
+
+/// "Sessions 209 (pr-1122) and 220 are changing 3 files you lease: a, b, c
+/// — you'll get details when you edit them." `None` when no live session
+/// overlaps this session's leases, which keeps the brief to its usual size.
+fn lease_overlap_summary(broker: &Broker, session: &Session) -> Option<String> {
+    let leases = broker.store_ref().active_leases().ok()?;
+    let mine: Vec<&str> = leases
+        .iter()
+        .filter(|lease| lease.session_id == session.id)
+        .map(|lease| lease.path.as_str())
+        .collect();
+    if mine.is_empty() {
+        return None;
+    }
+    let mut by_session: std::collections::BTreeMap<i64, std::collections::BTreeSet<String>> =
+        std::collections::BTreeMap::new();
+    for lease in leases.iter().filter(|lease| lease.session_id != session.id) {
+        for path in &mine {
+            if crate::leases::paths_overlap(&lease.path, path) {
+                by_session
+                    .entry(lease.session_id)
+                    .or_default()
+                    .insert((*path).to_string());
+            }
+        }
+    }
+    let mut names = Vec::new();
+    let mut files = std::collections::BTreeSet::new();
+    for (id, paths) in by_session {
+        let Ok(other) = broker.store_ref().session(id) else {
+            continue;
+        };
+        if !matches!(
+            other.status,
+            crate::SessionStatus::Active | crate::SessionStatus::Idle
+        ) {
+            continue;
+        }
+        names.push(match other.short_name.as_deref() {
+            Some(name) => format!("{id} ({name})"),
+            None => id.to_string(),
+        });
+        files.extend(paths);
+    }
+    if names.is_empty() {
+        return None;
+    }
+    let who = match names.len() {
+        1 => format!("Session {}", names[0]),
+        _ => {
+            let last = names.pop().unwrap_or_default();
+            format!("Sessions {} and {last}", names.join(", "))
+        }
+    };
+    let verb = if who.starts_with("Sessions") {
+        "are"
+    } else {
+        "is"
+    };
+    let count = files.len();
+    let sample: Vec<&str> = files.iter().take(3).map(String::as_str).collect();
+    let more = count.saturating_sub(sample.len());
+    let more = if more > 0 {
+        format!(" (+{more} more)")
+    } else {
+        String::new()
+    };
+    let noun = if count == 1 { "file" } else { "files" };
+    Some(format!(
+        "Overlap: {who} {verb} changing {count} {noun} you lease: {}{more}. You'll get details when you edit them.",
+        sample.join(", ")
+    ))
 }
 
 /// The host tab this agent runs in, when the host exports one — the same
@@ -439,6 +514,9 @@ struct StartFacts {
     blocker_count: usize,
     advisories: usize,
     unintegrated_commits: usize,
+    /// One line naming the live sessions changing files this session
+    /// leases, when there are any.
+    overlap: Option<String>,
 }
 
 /// Longest task text quoted in the brief. A task is a label here, not a
@@ -548,6 +626,9 @@ fn render_start(facts: &StartFacts) -> String {
         "State: {}; {blockers}; {advisories}; {commits}.",
         describe_peers(&facts.peers, true)
     ));
+    if let Some(overlap) = &facts.overlap {
+        lines.push(overlap.clone());
+    }
     let next = if let Some(clear) = &facts.first_blocker {
         clear.clone()
     } else if facts.unintegrated_commits > 0 {
@@ -575,7 +656,38 @@ fn on_user_prompt_submit(broker: &mut Broker, session: Option<&Session>) -> Hook
         return HookOutcome::Silent;
     };
     touch(broker, Some(session));
+    deliver_notes(broker, session)
+}
 
+/// Hand a note from another session to this agent at the first turn
+/// boundary after a tool call, instead of waiting for its next prompt or
+/// broker command. Silent, and read-only, when nothing is unread.
+fn on_post_tool_use(cwd: &std::path::Path) -> HookOutcome {
+    let Some(mut snapshot) = Broker::open_snapshot(cwd).ok() else {
+        return HookOutcome::Silent;
+    };
+    let canonical = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    let Some(session) = current_session(&mut snapshot, &canonical) else {
+        return HookOutcome::Silent;
+    };
+    let unread = snapshot
+        .store_ref()
+        .unread_session_notes(session.id)
+        .unwrap_or_default();
+    if unread.is_empty() {
+        return HookOutcome::Silent;
+    }
+    drop(snapshot);
+    let Some(mut broker) = Broker::open(cwd).ok() else {
+        return HookOutcome::Silent;
+    };
+    deliver_notes(&mut broker, &session)
+}
+
+/// Render every unread note for `session`, each with the command that
+/// answers its sender, and acknowledge them so the next turn does not
+/// repeat them. `broker advanced note list --session <id>` still shows them.
+fn deliver_notes(broker: &mut Broker, session: &Session) -> HookOutcome {
     let unread = broker
         .store()
         .unread_session_notes(session.id)
@@ -583,12 +695,18 @@ fn on_user_prompt_submit(broker: &mut Broker, session: Option<&Session>) -> Hook
     if unread.is_empty() {
         return HookOutcome::Silent;
     }
-
-    let mut lines = Vec::with_capacity(unread.len());
+    let mut lines = Vec::with_capacity(unread.len() * 2);
     for note in &unread {
-        lines.push(note.message.clone());
-        // An unacknowledged note is delivered again next turn; say so rather
-        // than let the repeat look like a new event.
+        lines.push(format!(
+            "Note from session {}: {}",
+            note.sender_session_id, note.message
+        ));
+        lines.push(format!(
+            "  reply: aethyme broker advanced note send --session {} --to-session {} --message \"…\"",
+            session.id, note.sender_session_id
+        ));
+        // Delivered is acknowledged: the agent has it in context now, and
+        // re-delivering it every turn would read as a new message.
         crate::warn_unrecorded(
             "acknowledge a delivered session note",
             broker.store().acknowledge_session_note(note.id),
@@ -597,12 +715,19 @@ fn on_user_prompt_submit(broker: &mut Broker, session: Option<&Session>) -> Hook
     HookOutcome::Context(lines.join("\n"))
 }
 
-/// Refuse a write into a path another live session holds.
+/// Tell the agent, before it edits a file, that another live session is
+/// changing the same file: who, what, where, whether Git would conflict, and
+/// the command that reaches that agent.
 ///
-/// Deny only. This hook never claims a lease on the agent's behalf: the
-/// whole purpose of the broker is to surface conflicts the agent did not
-/// anticipate, and a hook that quietly claimed whatever was about to be
-/// touched would convert every such conflict into a silent success.
+/// Informative only, in every promote mode. Leases are a coordination
+/// channel, not a lock: an agent that is told about the other session can
+/// decide to coordinate, land the shared edit first, or carry on, and a
+/// refused edit would only stall it. The hook never claims a lease either:
+/// the point is to surface what the agent did not anticipate.
+///
+/// Fires once per (path, other session, other session's change to the
+/// path), so an agent editing the same file repeatedly hears it once, and
+/// again only when the other session's change moves.
 fn on_pre_tool_use(
     broker: &mut Broker,
     session: Option<&Session>,
@@ -611,46 +736,439 @@ fn on_pre_tool_use(
     let Some(session) = session else {
         return HookOutcome::Silent;
     };
-    let Some(target) = write_target(event_json) else {
+    let targets = write_targets(event_json);
+    if targets.is_empty() {
         return HookOutcome::Silent;
-    };
-    // Leases are repo-relative, but the agent is editing inside its own
-    // worktree, so the session's checkout is the prefix that matters. The
-    // main checkout is the fallback for an agent working there directly.
-    let Some(relative) = repo_relative(&target, &session.worktree_path, broker.main_root()) else {
-        // Outside every checkout we know: not ours to police.
+    }
+    let mut relatives: Vec<String> = targets
+        .iter()
+        .filter_map(|target| repo_relative(target, &session.worktree_path, broker.main_root()))
+        .collect();
+    relatives.sort();
+    relatives.dedup();
+    if relatives.is_empty() {
+        // Outside every checkout we know: nothing to coordinate on.
         return HookOutcome::Silent;
-    };
+    }
 
-    let leases = broker.store().active_leases().unwrap_or_default();
-    let held = leases.iter().find(|lease| {
-        lease.session_id != session.id && crate::leases::paths_overlap(&lease.path, &relative)
-    });
-    let Some(held) = held else {
+    let leases = broker.store_ref().active_leases().unwrap_or_default();
+    let mut seen = SeenState::load(broker.main_root(), session.id);
+    let mut notes = Vec::new();
+    for relative in &relatives {
+        let mut holders: Vec<&crate::Lease> = leases
+            .iter()
+            .filter(|lease| {
+                lease.session_id != session.id
+                    && crate::leases::paths_overlap(&lease.path, relative)
+            })
+            .collect();
+        holders.sort_by_key(|lease| lease.session_id);
+        holders.dedup_by_key(|lease| lease.session_id);
+        for lease in holders {
+            if notes.len() >= MAX_PEER_NOTES {
+                break;
+            }
+            let Ok(other) = broker.store_ref().session(lease.session_id) else {
+                continue;
+            };
+            if !matches!(
+                other.status,
+                crate::SessionStatus::Active | crate::SessionStatus::Idle
+            ) {
+                continue;
+            }
+            // Decide "already told?" from the other worktree's copy of the
+            // file (modification time and size, no process), and run Git only
+            // for a change this agent has not heard about. A file the other
+            // session merely touched is re-announced; that errs towards
+            // telling, never towards silence.
+            let key = format!(
+                "{relative}|{}|{}|{}",
+                other.id,
+                lease.path,
+                file_stamp(&other.worktree_path, relative)
+            );
+            if !seen.first_time(&key) {
+                continue;
+            }
+            let change = describe_change(&other, relative, lease);
+            let verdict = crate::overlap_pairs::cached_conflicting_paths(
+                broker.store_ref(),
+                session.id,
+                other.id,
+            );
+            let peer = PeerSession {
+                id: other.id,
+                short_name: other.short_name.as_deref(),
+                task: other.task.as_deref(),
+            };
+            notes.push(render_peer_note(
+                session.id,
+                &peer,
+                relative,
+                &change,
+                verdict.as_deref(),
+            ));
+        }
+    }
+    seen.save();
+    if notes.is_empty() {
         return HookOutcome::Silent;
-    };
-
-    HookOutcome::Deny(format!(
-        "Aethyme: `{}` is leased by session {}. Editing it here would conflict with work \
-         already in flight. Coordinate with that session, or claim a path you own instead.",
-        held.path, held.session_id
-    ))
+    }
+    HookOutcome::Context(notes.join("\n"))
 }
 
-/// The absolute path a tool call is about to write, when the event names
-/// one. Read-only tools and tools with no path produce `None`, which is
-/// how the common case stays free.
-fn write_target(event_json: &serde_json::Value) -> Option<std::path::PathBuf> {
-    let tool = event_json.get("tool_name")?.as_str()?;
-    if !matches!(tool, "Edit" | "Write" | "NotebookEdit" | "MultiEdit") {
-        return None;
+/// At most this many other sessions are described per tool call. A file
+/// four sessions are editing at once is already the message.
+const MAX_PEER_NOTES: usize = 2;
+
+/// Where another session is changing a file, summarised for one note.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PeerChange {
+    /// "lines 40–88, 120" or a lease-only description.
+    where_: String,
+    /// Function or section names Git reported for the changed hunks.
+    symbols: Vec<String>,
+}
+
+fn describe_change(other: &Session, path: &str, lease: &crate::Lease) -> PeerChange {
+    let ranges = other
+        .diff_base
+        .as_deref()
+        .or(other.adoption_base.as_deref())
+        .and_then(|base| {
+            let repo = crate::GitRepo::discover(std::path::Path::new(&other.worktree_path)).ok()?;
+            repo.working_zero_context_diff(base, path).ok()
+        })
+        .map(|diff| parse_hunks(&diff))
+        .unwrap_or_default();
+    if ranges.0.is_empty() {
+        let where_ = if lease.path == path {
+            "this file".to_string()
+        } else {
+            format!("`{}` (claimed)", lease.path)
+        };
+        return PeerChange {
+            where_,
+            symbols: Vec::new(),
+        };
     }
-    let input = event_json.get("tool_input")?;
-    let path = input
-        .get("file_path")
-        .or_else(|| input.get("notebook_path"))?
-        .as_str()?;
-    Some(std::path::PathBuf::from(path))
+    let (spans, symbols) = ranges;
+    let text = format_spans(&spans);
+    let noun = if spans.len() == 1 && spans[0].0 == spans[0].1 {
+        "line"
+    } else {
+        "lines"
+    };
+    PeerChange {
+        where_: format!("{noun} {text}"),
+        // Git's default hunk context is "the previous line that starts with a
+        // letter", which names a function in code and an arbitrary line in
+        // prose or data. Only code gets symbol names.
+        symbols: if is_code_path(path) {
+            symbols
+        } else {
+            Vec::new()
+        },
+    }
+}
+
+/// "<mtime-ns>:<len>" of `path` in another session's worktree, or "absent".
+/// Changes whenever that session writes the file, which is what makes a
+/// moved change announce again.
+fn file_stamp(worktree: &str, path: &str) -> String {
+    std::fs::metadata(std::path::Path::new(worktree).join(path))
+        .ok()
+        .map(|metadata| {
+            let modified = metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|since| since.as_nanos())
+                .unwrap_or(0);
+            format!("{modified}:{}", metadata.len())
+        })
+        .unwrap_or_else(|| "absent".to_string())
+}
+
+/// Whether Git's hunk context for `path` is likely a function or section
+/// name rather than an arbitrary preceding line.
+fn is_code_path(path: &str) -> bool {
+    let extension = std::path::Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    !matches!(
+        extension.as_str(),
+        "" | "txt"
+            | "md"
+            | "json"
+            | "yml"
+            | "yaml"
+            | "toml"
+            | "lock"
+            | "csv"
+            | "snap"
+            | "html"
+            | "svg"
+    )
+}
+
+/// New-side line spans and hunk function context from a `-U0` patch.
+fn parse_hunks(diff: &str) -> (Vec<(u32, u32)>, Vec<String>) {
+    let mut spans = Vec::new();
+    let mut symbols: Vec<String> = Vec::new();
+    for line in diff.lines() {
+        let Some(rest) = line.strip_prefix("@@ ") else {
+            continue;
+        };
+        let Some(end) = rest.find(" @@") else {
+            continue;
+        };
+        let header = &rest[..end];
+        let context = rest[end + 3..].trim();
+        if let Some(new) = header
+            .split_whitespace()
+            .find_map(|part| part.strip_prefix('+'))
+        {
+            let mut fields = new.splitn(2, ',');
+            let start: u32 = fields.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+            let count: u32 = fields.next().and_then(|s| s.parse().ok()).unwrap_or(1);
+            let start = start.max(1);
+            let last = if count == 0 { start } else { start + count - 1 };
+            spans.push((start, last));
+        }
+        if !context.is_empty() {
+            let symbol: String = context.chars().take(48).collect();
+            if !symbols.contains(&symbol) {
+                symbols.push(symbol);
+            }
+        }
+    }
+    (spans, symbols)
+}
+
+/// "40–88, 120, 131–140" with adjacent spans merged and at most four shown.
+fn format_spans(spans: &[(u32, u32)]) -> String {
+    let mut merged: Vec<(u32, u32)> = Vec::new();
+    for &(start, end) in spans {
+        match merged.last_mut() {
+            Some(last) if start <= last.1 + 1 => last.1 = last.1.max(end),
+            _ => merged.push((start, end)),
+        }
+    }
+    let shown: Vec<String> = merged
+        .iter()
+        .take(4)
+        .map(|(start, end)| {
+            if start == end {
+                start.to_string()
+            } else {
+                format!("{start}–{end}")
+            }
+        })
+        .collect();
+    let more = merged.len().saturating_sub(4);
+    if more > 0 {
+        format!("{} (+{more} more)", shown.join(", "))
+    } else {
+        shown.join(", ")
+    }
+}
+
+/// The other session, as much of it as a note shows.
+struct PeerSession<'a> {
+    id: i64,
+    short_name: Option<&'a str>,
+    task: Option<&'a str>,
+}
+
+/// At most three lines: who and where, the conflict verdict, and the
+/// command that reaches the other agent.
+fn render_peer_note(
+    me: i64,
+    other: &PeerSession<'_>,
+    path: &str,
+    change: &PeerChange,
+    conflicting: Option<&[String]>,
+) -> String {
+    let name = other
+        .short_name
+        .map(|name| format!(" ({name})"))
+        .unwrap_or_default();
+    let task = other
+        .task
+        .map(|task| format!(" working on \"{}\"", preview(task)))
+        .unwrap_or_default();
+    let symbols = if change.symbols.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " in {}",
+            change
+                .symbols
+                .iter()
+                .take(2)
+                .map(|symbol| format!("`{symbol}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    let verdict = match conflicting {
+        Some(paths) if paths.iter().any(|conflict| conflict == path) => {
+            "At the last check Git would conflict with your change to this file."
+        }
+        Some(_) => "At the last check your changes to this file merged cleanly.",
+        None => "Not compared yet: edits to the same lines will conflict.",
+    };
+    format!(
+        "Aethyme: session {}{name}{task} is also changing `{path}` ({}{symbols}). {verdict}\n  \
+         coordinate: aethyme broker advanced note send --session {me} --to-session {} --message \"…\"",
+        other.id, change.where_, other.id
+    )
+}
+
+/// The once-per-change memory of what this session's agent was already
+/// told. A small file in the main checkout's Git directory: never tracked,
+/// never shared, and a PreToolUse hook (read-only on the broker) can write
+/// it. Losing it only repeats a note.
+struct SeenState {
+    path: Option<std::path::PathBuf>,
+    keys: Vec<String>,
+    dirty: bool,
+}
+
+/// Remembered notes per session; the oldest are forgotten first.
+const SEEN_CAPACITY: usize = 256;
+
+impl SeenState {
+    fn load(main_root: &std::path::Path, session_id: i64) -> Self {
+        let git_dir = main_root.join(".git");
+        let path = git_dir.is_dir().then(|| {
+            git_dir
+                .join("aethyme")
+                .join(format!("hook-seen-{session_id}.json"))
+        });
+        let keys = path
+            .as_deref()
+            .and_then(|path| std::fs::read(path).ok())
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default();
+        Self {
+            path,
+            keys,
+            dirty: false,
+        }
+    }
+
+    fn first_time(&mut self, key: &str) -> bool {
+        if self.keys.iter().any(|seen| seen == key) {
+            return false;
+        }
+        self.keys.push(key.to_string());
+        if self.keys.len() > SEEN_CAPACITY {
+            let excess = self.keys.len() - SEEN_CAPACITY;
+            self.keys.drain(..excess);
+        }
+        self.dirty = true;
+        true
+    }
+
+    fn save(&self) {
+        let Some(path) = self.path.as_deref().filter(|_| self.dirty) else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            crate::warn_unrecorded(
+                "create the hook state directory",
+                std::fs::create_dir_all(parent),
+            );
+        }
+        if let Ok(bytes) = serde_json::to_vec(&self.keys) {
+            crate::warn_unrecorded(
+                "record which coordination notes were delivered",
+                crate::atomic_file::with_synced_temporary(path, &bytes, |temporary| {
+                    std::fs::rename(temporary, path)
+                }),
+            );
+        }
+    }
+}
+
+/// The absolute paths a tool call is about to write, when the event names
+/// any. Read-only tools and tools with no path produce nothing, which is
+/// how the common case stays free.
+///
+/// Claude Code's edit tools carry one `file_path` (or `notebook_path`).
+/// Codex's `apply_patch` carries the patch text, whose `*** Update File:`,
+/// `*** Add File:` and `*** Move to:` headers name every file it writes;
+/// relative paths there are relative to the event's `cwd`.
+fn write_targets(event_json: &serde_json::Value) -> Vec<std::path::PathBuf> {
+    let Some(tool) = event_json.get("tool_name").and_then(|tool| tool.as_str()) else {
+        return Vec::new();
+    };
+    let Some(input) = event_json.get("tool_input") else {
+        return Vec::new();
+    };
+    match tool {
+        "Edit" | "Write" | "NotebookEdit" | "MultiEdit" => input
+            .get("file_path")
+            .or_else(|| input.get("notebook_path"))
+            .and_then(|path| path.as_str())
+            .map(|path| vec![std::path::PathBuf::from(path)])
+            .unwrap_or_default(),
+        "apply_patch" | "ApplyPatch" => {
+            let cwd = event_json
+                .get("cwd")
+                .and_then(|cwd| cwd.as_str())
+                .map(std::path::PathBuf::from);
+            let patch = ["input", "patch", "command"]
+                .iter()
+                .find_map(|key| match input.get(*key) {
+                    Some(serde_json::Value::String(text)) => Some(text.clone()),
+                    Some(serde_json::Value::Array(parts)) => Some(
+                        parts
+                            .iter()
+                            .filter_map(|part| part.as_str())
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    ),
+                    _ => None,
+                })
+                .or_else(|| input.as_str().map(str::to_string))
+                .unwrap_or_default();
+            patch_targets(&patch)
+                .into_iter()
+                .map(|path| {
+                    let path = std::path::PathBuf::from(path);
+                    match (&cwd, path.is_absolute()) {
+                        (Some(cwd), false) => cwd.join(path),
+                        _ => path,
+                    }
+                })
+                .collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Files an `apply_patch` envelope writes, in order, without duplicates.
+fn patch_targets(patch: &str) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    for line in patch.lines() {
+        let line = line.trim();
+        let path = ["*** Update File:", "*** Add File:", "*** Move to:"]
+            .iter()
+            .find_map(|prefix| line.strip_prefix(prefix))
+            .map(str::trim);
+        if let Some(path) = path.filter(|path| !path.is_empty())
+            && !found.iter().any(|seen| seen == path)
+        {
+            found.push(path.to_string());
+        }
+    }
+    found
 }
 
 /// Make an absolute tool-call path repo-relative against the session's own
@@ -905,29 +1423,118 @@ mod tests {
             "tool_input": {"file_path": "/wt/s1/a.rs"},
         });
         assert_eq!(
-            write_target(&write),
-            Some(std::path::PathBuf::from("/wt/s1/a.rs"))
+            write_targets(&write),
+            vec![std::path::PathBuf::from("/wt/s1/a.rs")]
         );
 
         let read = serde_json::json!({
             "tool_name": "Read",
             "tool_input": {"file_path": "/wt/s1/a.rs"},
         });
-        assert_eq!(write_target(&read), None);
+        assert!(write_targets(&read).is_empty());
 
         let notebook = serde_json::json!({
             "tool_name": "NotebookEdit",
             "tool_input": {"notebook_path": "/wt/s1/a.ipynb"},
         });
         assert_eq!(
-            write_target(&notebook),
-            Some(std::path::PathBuf::from("/wt/s1/a.ipynb"))
+            write_targets(&notebook),
+            vec![std::path::PathBuf::from("/wt/s1/a.ipynb")]
         );
 
-        assert_eq!(write_target(&serde_json::Value::Null), None);
+        assert!(write_targets(&serde_json::Value::Null).is_empty());
+        assert!(write_targets(&serde_json::json!({"tool_name": "Edit"})).is_empty());
+    }
+
+    /// Codex writes through `apply_patch`; every file its headers name is a
+    /// target, relative paths resolved against the event's `cwd`.
+    #[test]
+    fn codex_apply_patch_names_every_file_it_writes() {
+        let event = serde_json::json!({
+            "tool_name": "apply_patch",
+            "cwd": "/wt/s1",
+            "tool_input": {"command": ["apply_patch", "*** Begin Patch\n*** Update File: src/a.rs\n@@\n-x\n+y\n*** Add File: /abs/b.rs\n+z\n*** Update File: src/a.rs\n*** End Patch"]},
+        });
         assert_eq!(
-            write_target(&serde_json::json!({"tool_name": "Edit"})),
-            None
+            write_targets(&event),
+            vec![
+                std::path::PathBuf::from("/wt/s1/src/a.rs"),
+                std::path::PathBuf::from("/abs/b.rs"),
+            ]
         );
+    }
+
+    /// The new-side spans and Git's function context are what the note
+    /// shows; a pure deletion still points at a line.
+    #[test]
+    fn hunk_headers_become_spans_and_symbols() {
+        let diff = "diff --git a/x b/x\n@@ -10,2 +40,49 @@ fn run_focused(\n@@ -100 +120 @@ fn helper()\n@@ -130,3 +131,0 @@\n";
+        let (spans, symbols) = parse_hunks(diff);
+        assert_eq!(spans, vec![(40, 88), (120, 120), (131, 131)]);
+        assert_eq!(
+            symbols,
+            vec!["fn run_focused(".to_string(), "fn helper()".to_string()]
+        );
+        assert_eq!(format_spans(&spans), "40–88, 120, 131");
+        assert_eq!(format_spans(&[(1, 2), (3, 4), (10, 10)]), "1–4, 10");
+    }
+
+    /// Symbol names come from Git's hunk context, which only means something
+    /// in code.
+    #[test]
+    fn only_code_files_get_symbol_names() {
+        assert!(is_code_path("src/parser.rs"));
+        assert!(is_code_path("scripts/ci/run.mjs"));
+        assert!(!is_code_path("notes.txt"));
+        assert!(!is_code_path("config/manifest.json"));
+        assert!(!is_code_path("Makefile"));
+    }
+
+    /// The note names the other session, where it is changing the file, the
+    /// conflict verdict, and the command that reaches it.
+    #[test]
+    fn a_peer_note_names_the_session_the_lines_the_verdict_and_the_command() {
+        let other = PeerSession {
+            id: 209,
+            short_name: Some("pr-1122"),
+            task: Some("Repair and merge PR1122"),
+        };
+        let change = PeerChange {
+            where_: "lines 40–88".into(),
+            symbols: vec!["fn run_focused(".into()],
+        };
+        let conflicting = vec!["scripts/ci/x.mjs".to_string()];
+        let text = render_peer_note(5, &other, "scripts/ci/x.mjs", &change, Some(&conflicting));
+        assert!(text.contains("session 209 (pr-1122)"), "{text}");
+        assert!(
+            text.contains("`scripts/ci/x.mjs` (lines 40–88 in `fn run_focused(`)"),
+            "{text}"
+        );
+        assert!(text.contains("Git would conflict"), "{text}");
+        assert!(
+            text.contains("note send --session 5 --to-session 209"),
+            "{text}"
+        );
+        assert!(text.lines().count() <= 3, "{text}");
+
+        let clean = render_peer_note(5, &other, "scripts/ci/x.mjs", &change, Some(&[]));
+        assert!(clean.contains("merged cleanly"), "{clean}");
+        let unknown = render_peer_note(5, &other, "scripts/ci/x.mjs", &change, None);
+        assert!(unknown.contains("Not compared yet"), "{unknown}");
+    }
+
+    /// Once per change: the same key is new once, then remembered across a
+    /// reload, and a moved change is a new key.
+    #[test]
+    fn seen_state_delivers_each_change_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
+        let mut seen = SeenState::load(tmp.path(), 5);
+        assert!(seen.first_time("a.rs|209|40–88"));
+        assert!(!seen.first_time("a.rs|209|40–88"));
+        seen.save();
+        let mut reloaded = SeenState::load(tmp.path(), 5);
+        assert!(!reloaded.first_time("a.rs|209|40–88"));
+        assert!(reloaded.first_time("a.rs|209|40–90"));
     }
 }
