@@ -726,8 +726,18 @@ prints the broker diagnosis, and preserves the failing exit code.
 
 Submit reports gate evidence separately from queue eligibility. Its JSON
 `gate_verification.status` is one of `no_configuration`,
-`no_gates_triggered`, `passed`, or `failed` (`not_run` is reserved for a
-conflict or content-empty submission). The accompanying counts distinguish
+`no_gates_triggered`, `passed`, `failed`, or `deferred` (`not_run` is reserved
+for a conflict or content-empty submission). `deferred` means the host, not the
+change, stopped every gate that did not pass: host resources were refused, the
+command never started (for example the disk-headroom refusal), the broker hit a
+host resource error, the command ran out of disk, or the broker's deadline
+killed it for the first time on that tree. Each such gate is marked
+`"host_fault": true`. Text in a gate's own log never defers a submission -- a
+failing test that prints "timed out" is still a rejection -- and a second
+timeout on the same tree is a verdict, so a change that hangs is rejected. A
+deferred entry stays `submitted`, is never promoted, exits 6 (environment),
+and shows as `session.latest-submit-deferred` in `broker status`; free the
+resource and resubmit without changing code. The accompanying counts distinguish
 configured, selected, freshly executed, and cached gates. In text mode a
 manual-mode entry with no gate proof is called `conflict-checked`, never simply
 `verified`.

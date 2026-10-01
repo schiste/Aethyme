@@ -3850,3 +3850,98 @@ fn a_pending_entry_whose_commit_is_missing_still_fails_loudly() {
         "a pending entry with no commit must not be skipped silently: {outcome:#?}"
     );
 }
+
+fn commit_base_gate(root: &Path, gate_toml: &str) {
+    std::fs::write(root.join(".aethyme/gates.toml"), gate_toml).unwrap();
+    sh(root, &["add", "-A"]);
+    sh(root, &["commit", "-qm", "base: gate"]);
+}
+
+/// A gate the broker's own deadline killed never judged the change, so the
+/// submission is deferred rather than rejected -- visible in status and in
+/// finish, and never promoted. The same tree timing out again is evidence
+/// about the change, so the repeat is a rejection: a change that hangs cannot
+/// be deferred forever.
+#[test]
+fn a_first_broker_timeout_defers_the_submission_and_a_repeat_rejects_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    commit_base_gate(
+        tmp.path(),
+        "[[gate]]\nname = \"slow\"\ncommand = \"sleep 5\"\ntimeout_seconds = 1\ntriggers = [\"**/*.py\"]\n",
+    );
+    let wt = agent_worktree(tmp.path(), "slow");
+    let session = broker.adopt(&wt, None).unwrap();
+    commit_edit(&wt, "src/a.py", "a = 3\n");
+
+    let first = broker.submit(session.id).unwrap();
+    assert_eq!(
+        first.gate_verification.status,
+        SubmissionGateVerificationStatus::Deferred
+    );
+    assert_eq!(first.entry.status, MergeStatus::Submitted);
+    assert!(!first.promoted, "a change no gate judged must not promote");
+    assert!(first.gate_outcomes[0].is_host_fault());
+    let details: serde_json::Value =
+        serde_json::from_str(first.entry.details_json.as_deref().unwrap()).unwrap();
+    assert_eq!(details["deferred"], serde_json::Value::Bool(true));
+
+    let status = broker.status(0).unwrap();
+    let advice = status
+        .advice
+        .iter()
+        .find(|item| item.id == "session.latest-submit-deferred")
+        .expect("a deferred submit must surface in status");
+    assert_eq!(advice.severity, StatusAdviceSeverity::Blocked);
+    assert_eq!(advice.queue_entry_id, Some(first.entry.id));
+    assert!(advice.summary.contains("slow"), "{}", advice.summary);
+    assert!(
+        status
+            .advice
+            .iter()
+            .all(|item| item.id != "session.latest-submit-rejected"),
+        "a deferral is not a rejection"
+    );
+    let finish = broker.finish(session.id).unwrap();
+    assert!(
+        finish.warnings.iter().any(|w| w.contains("was deferred")),
+        "finish must not tell the agent to wait for an entry nothing runs: {:?}",
+        finish.warnings
+    );
+
+    let second = broker.submit(session.id).unwrap();
+    assert_eq!(
+        second.gate_verification.status,
+        SubmissionGateVerificationStatus::Failed,
+        "a repeated timeout on the same tree is a verdict"
+    );
+    assert_eq!(second.entry.status, MergeStatus::Rejected);
+    assert!(!second.gate_outcomes[0].is_host_fault());
+}
+
+/// The gate log is the change's own output. A failing test that merely says
+/// "timed out" is classified like a host problem for advisories, but it is
+/// still a rejection: deferring it would ask the agent to resubmit unchanged
+/// code forever.
+#[test]
+fn test_output_that_looks_like_a_host_fault_is_still_a_rejection() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    commit_base_gate(
+        tmp.path(),
+        "[[gate]]\nname = \"flaky-net\"\ncommand = \"echo 'request timed out'; exit 1\"\ntriggers = [\"**/*.py\"]\n",
+    );
+    let wt = agent_worktree(tmp.path(), "net");
+    let session = broker.adopt(&wt, None).unwrap();
+    commit_edit(&wt, "src/a.py", "a = 3\n");
+
+    let outcome = broker.submit(session.id).unwrap();
+    assert_eq!(
+        outcome.gate_verification.status,
+        SubmissionGateVerificationStatus::Failed
+    );
+    assert_eq!(outcome.entry.status, MergeStatus::Rejected);
+    assert!(!outcome.gate_outcomes[0].is_host_fault());
+}

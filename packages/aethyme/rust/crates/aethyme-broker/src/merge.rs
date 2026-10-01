@@ -182,6 +182,41 @@ pub enum SubmissionGateVerificationStatus {
     NoGatesTriggered,
     Passed,
     Failed,
+    /// A selected gate could not judge the change because the host could not
+    /// run it -- contended, out of disk, or killed. Not a verdict on the diff.
+    Deferred,
+}
+
+/// What a submission's gates say about the change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GateVerdict {
+    Passed,
+    /// Every gate that did not pass was stopped by the host, so nothing judged
+    /// the change. See `GateRunOutcome::is_host_fault`.
+    Deferred,
+    Failed,
+}
+
+/// Decide a submission from its gate outcomes. `gates_may_run` is false when
+/// graph integrity refused before any gate ran, which is itself a verdict.
+///
+/// A genuine failure always wins: deferral requires that *every* gate that
+/// did not pass be a host fault, so it can never hide a real one.
+fn gate_verdict(gates_may_run: bool, outcomes: &[crate::gates::GateRunOutcome]) -> GateVerdict {
+    if !gates_may_run {
+        return GateVerdict::Failed;
+    }
+    let mut not_passed = outcomes
+        .iter()
+        .filter(|o| o.status != crate::types::GateStatus::Pass)
+        .peekable();
+    if not_passed.peek().is_none() {
+        GateVerdict::Passed
+    } else if not_passed.all(crate::gates::GateRunOutcome::is_host_fault) {
+        GateVerdict::Deferred
+    } else {
+        GateVerdict::Failed
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -880,15 +915,29 @@ impl Broker {
         drop(verification_slot);
         let gate_outcomes = gate_outcomes?;
 
-        let all_pass = graph_integrity.allows_promotion()
-            && gate_outcomes
-                .iter()
-                .all(|o| o.status == crate::types::GateStatus::Pass);
+        // A gate the host stopped from judging the change is not a verdict on
+        // the change. Collapsing it into `Rejected` tells the agent its correct
+        // work is broken, which is untrue and teaches agents to stop reading
+        // rejections. Measured over 30 days: 34% of all gate failures on this
+        // repository were host faults, and 40% of submits failed.
+        //
+        // The submission is deferred only when *every* gate that did not pass
+        // is a host fault the broker observed itself (see
+        // `GateRunOutcome::is_host_fault`), and only once graph integrity has
+        // allowed gates to run at all. A genuine failure anywhere is still a
+        // rejection, so a deferral can never hide one. The finding is still
+        // printed and recorded in the entry's details -- `Deferred`, not
+        // silent success.
+        let verdict = gate_verdict(graph_integrity.allows_promotion(), &gate_outcomes);
+        let deferred = verdict == GateVerdict::Deferred;
+        let all_pass = verdict == GateVerdict::Passed;
         let gate_verification = SubmissionGateVerification {
             status: if !gate_configuration_present {
                 SubmissionGateVerificationStatus::NoConfiguration
             } else if gate_outcomes.is_empty() {
                 SubmissionGateVerificationStatus::NoGatesTriggered
+            } else if deferred {
+                SubmissionGateVerificationStatus::Deferred
             } else if all_pass {
                 SubmissionGateVerificationStatus::Passed
             } else {
@@ -905,18 +954,43 @@ impl Broker {
                 .filter(|outcome| outcome.cached)
                 .count(),
         };
-        let details = serde_json::json!({
+        let mut details = serde_json::json!({
             "merge_commit": merge_commit,
             "base": base,
-            "gates": gate_outcomes.iter().map(|o| serde_json::json!({
-                "gate": o.gate,
-                "tree_hash": o.tree_hash,
-                "status": o.status,
-                "failure_class": o.failure_class,
-                "cached": o.cached,
-            })).collect::<Vec<_>>(),
+            "gates": gate_outcomes.iter().map(|o| {
+                let mut gate = serde_json::json!({
+                    "gate": o.gate,
+                    "tree_hash": o.tree_hash,
+                    "status": o.status,
+                    "failure_class": o.failure_class,
+                    "cached": o.cached,
+                });
+                // Only when true, like `GateRunOutcome::host_fault`: these
+                // details become the `merge.verified` payload, whose gate
+                // fields are frozen (contract_v1), and a verified entry never
+                // has a host fault.
+                if o.is_host_fault() {
+                    gate["host_fault"] = serde_json::Value::Bool(true);
+                }
+                gate
+            }).collect::<Vec<_>>(),
         });
-        if all_pass {
+        if deferred {
+            // The explicit marker is what `status` and `finish` read to tell a
+            // deferred entry from one still in flight; both are `Submitted`.
+            details["deferred"] = serde_json::Value::Bool(true);
+            // The host could not judge the change. Leave the entry submitted so
+            // a later `submit` -- or the re-simulation that follows another
+            // entry's promotion -- runs it again, and say exactly which gate
+            // could not run: the next action is to free the resource, not to
+            // edit code that has not been shown to be wrong.
+            self.store().set_merge_status(
+                entry.id,
+                MergeStatus::Submitted,
+                Some(&simulation.tree),
+                Some(&details.to_string()),
+            )?;
+        } else if all_pass {
             self.store().set_merge_status(
                 entry.id,
                 MergeStatus::Verified,
@@ -1847,6 +1921,82 @@ fn write_action_required(
         .map_or(Ok(()), std::fs::create_dir_all)
         .and_then(|()| std::fs::write(&path, body));
     crate::warn_unrecorded(&format!("write {}", path.display()), written);
+}
+
+#[cfg(test)]
+mod verdict_tests {
+    use super::{GateVerdict, gate_verdict};
+    use crate::gates::GateRunOutcome;
+    use crate::types::{GateEnvironment, GateFailureClass, GateStatus};
+
+    fn outcome(
+        status: GateStatus,
+        class: Option<GateFailureClass>,
+        host_fault: bool,
+    ) -> GateRunOutcome {
+        GateRunOutcome {
+            gate: "g".into(),
+            tree_hash: "t".into(),
+            definition_hash: "d".into(),
+            resource_lease: None,
+            managed_cache: None,
+            broker_database: None,
+            status,
+            failure_class: class,
+            cached: false,
+            exit_code: None,
+            duration_ms: Some(0),
+            wait_duration_ms: None,
+            first_output_ms: None,
+            output_bytes: None,
+            log_path: None,
+            environment: GateEnvironment::default(),
+            host_fault,
+        }
+    }
+
+    fn pass() -> GateRunOutcome {
+        outcome(GateStatus::Pass, None, false)
+    }
+
+    fn host() -> GateRunOutcome {
+        outcome(
+            GateStatus::Error,
+            Some(GateFailureClass::ResourceContention),
+            true,
+        )
+    }
+
+    fn real() -> GateRunOutcome {
+        outcome(GateStatus::Fail, Some(GateFailureClass::TestFailure), false)
+    }
+
+    #[test]
+    fn a_host_fault_alone_defers() {
+        assert_eq!(gate_verdict(true, &[pass(), host()]), GateVerdict::Deferred);
+    }
+
+    /// The property deferral must never break: a genuine failure anywhere in
+    /// the outcomes is a rejection, whatever else the host did.
+    #[test]
+    fn a_real_failure_is_never_masked_by_a_host_fault() {
+        assert_eq!(gate_verdict(true, &[host(), real()]), GateVerdict::Failed);
+        assert_eq!(gate_verdict(true, &[real(), host()]), GateVerdict::Failed);
+    }
+
+    /// Classified like a host problem from its log, but not observed by the
+    /// broker: still a verdict.
+    #[test]
+    fn a_host_looking_class_without_the_observed_flag_fails() {
+        let inferred = outcome(GateStatus::Error, Some(GateFailureClass::Timeout), false);
+        assert_eq!(gate_verdict(true, &[inferred]), GateVerdict::Failed);
+    }
+
+    #[test]
+    fn passing_gates_pass_and_a_graph_refusal_fails() {
+        assert_eq!(gate_verdict(true, &[pass(), pass()]), GateVerdict::Passed);
+        assert_eq!(gate_verdict(false, &[]), GateVerdict::Failed);
+    }
 }
 
 #[cfg(test)]

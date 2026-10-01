@@ -1262,6 +1262,26 @@ impl BrokerStore {
         result.transpose()
     }
 
+    /// How many earlier runs of this gate definition on this tree timed out.
+    ///
+    /// A first timeout may be the host; a repeated one on an unchanged tree is
+    /// evidence about the change, so the gate runner stops treating it as a
+    /// host fault.
+    pub fn gate_timeouts_for_tree(
+        &self,
+        gate_name: &str,
+        tree_hash: &str,
+        definition_hash: &str,
+    ) -> Result<i64, BrokerError> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM gate_results
+             WHERE gate_name = ?1 AND tree_hash = ?2 AND definition_hash = ?3
+               AND failure_class = 'timeout'",
+            params![gate_name, tree_hash, definition_hash],
+            |row| row.get(0),
+        )?)
+    }
+
     /// Aggregate executed gate runs (pass/fail only): (gate, runs,
     /// total_duration_ms). For the metrics/kill-criterion report.
     pub fn gate_execution_totals(&self) -> Result<Vec<(String, i64, i64)>, BrokerError> {

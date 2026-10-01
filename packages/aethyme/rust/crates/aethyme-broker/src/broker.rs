@@ -7259,6 +7259,14 @@ impl Broker {
             };
             match entry.status {
                 MergeStatus::Rejected => advice.push(rejected_submit_advice(agent, entry)),
+                // A deferred entry is left `Submitted` rather than `Rejected`,
+                // because no gate judged it. Without its own advice, `status`
+                // would say nothing about work sitting unverified -- but a
+                // `Submitted` entry is also the normal state of one in flight,
+                // so only the explicit marker raises it.
+                MergeStatus::Submitted if submission_was_deferred(entry) => {
+                    advice.push(deferred_submit_advice(agent, entry));
+                }
                 MergeStatus::Conflict => advice.push(conflict_submit_advice(agent, entry)),
                 _ => {}
             }
@@ -8385,6 +8393,21 @@ impl Broker {
                             entry.id
                         )
                     });
+                    report
+                        .next_commands
+                        .push(format!("aethyme broker submit --session {session_id}"));
+                    self.finalize_finish_report(&mut report);
+                    return Ok(report);
+                }
+                // A deferred entry is `Submitted` too, but nothing is running
+                // it: "wait for it" would leave the agent waiting forever.
+                MergeStatus::Submitted if submission_was_deferred(entry) => {
+                    report.warnings.push(format!(
+                        "latest submit qid {} was deferred: a gate could not run on this host, \
+                         so the change was not judged; free the resource and resubmit before \
+                         finish",
+                        entry.id
+                    ));
                     report
                         .next_commands
                         .push(format!("aethyme broker submit --session {session_id}"));
@@ -9751,6 +9774,55 @@ pub(crate) fn plural_word(
     plural: &'static str,
 ) -> &'static str {
     if count == 1 { singular } else { plural }
+}
+
+/// Whether a `Submitted` entry was deferred because the host could not judge
+/// it, rather than still being in flight. Both share the status; only the
+/// marker the submission records tells them apart.
+pub(crate) fn submission_was_deferred(entry: &MergeQueueEntry) -> bool {
+    entry.status == MergeStatus::Submitted
+        && entry
+            .details_json
+            .as_deref()
+            .and_then(|details| serde_json::from_str::<serde_json::Value>(details).ok())
+            .and_then(|details| details.get("deferred").and_then(serde_json::Value::as_bool))
+            .unwrap_or(false)
+}
+
+fn deferred_submit_advice(agent: &AgentView, entry: &MergeQueueEntry) -> StatusAdvice {
+    let failures = gate_failures(entry.details_json.as_deref());
+    let gate_names: Vec<String> = failures
+        .iter()
+        .map(|failure| failure.name.clone())
+        .collect();
+    let summary = format!(
+        "session {} latest submit qid {} was deferred: {} could not run on this host \
+         (resources, disk, or its first timeout), so the change was not judged; free the \
+         resource, then resubmit without changing code",
+        agent.session.id,
+        entry.id,
+        if gate_names.is_empty() {
+            "a selected gate".to_string()
+        } else {
+            gate_names.join(", ")
+        }
+    );
+    let mut evidence = queue_evidence(entry);
+    evidence.extend(failures.iter().map(GateFailure::evidence));
+    StatusAdvice {
+        id: "session.latest-submit-deferred",
+        severity: StatusAdviceSeverity::Blocked,
+        reason: "submit_deferred",
+        summary,
+        session_id: Some(agent.session.id),
+        queue_entry_id: Some(entry.id),
+        evidence,
+        commands: vec![
+            "aethyme broker advanced resources list".into(),
+            "aethyme broker gc plan".into(),
+            format!("aethyme broker submit --session {}", agent.session.id),
+        ],
+    }
 }
 
 fn rejected_submit_advice(agent: &AgentView, entry: &MergeQueueEntry) -> StatusAdvice {
