@@ -3614,7 +3614,7 @@ impl Broker {
                 self.main_root.display()
             ));
         }
-        match crate::disk_headroom::available_bytes(base) {
+        match crate::disk_headroom::available_bytes_for(&self.main_root, base) {
             Some(free) if free < min_free_bytes => Some(format!(
                 "{} has {} free, below the {} required (worktrees.min_free_bytes)",
                 base.display(),
@@ -9862,7 +9862,9 @@ impl Broker {
         } else {
             probes
         };
-        lowest_available(&probes)
+        lowest_available_with(&probes, |probe| {
+            crate::disk_headroom::available_bytes_at_or_above_for(&self.main_root, probe)
+        })
     }
 
     /// Remove a session's worktree and mark it cleaned. Refuses when the
@@ -10277,14 +10279,10 @@ fn dirty_session_count(agents: &[AgentView]) -> usize {
         .count()
 }
 
-/// The probe with the least free space, read at its nearest existing directory.
-fn lowest_available(probes: &[PathBuf]) -> Option<(PathBuf, u64)> {
-    lowest_available_with(probes, crate::disk_headroom::available_bytes_at_or_above)
-}
-
-/// [`lowest_available`] with the reading supplied, so a test can put two
-/// probes on volumes with different free space. Unreadable probes are skipped:
-/// an unknown reading is not evidence of a full disk.
+/// The probe with the least free space, read by `read` -- in production at
+/// its nearest existing directory, and a test can put two probes on volumes
+/// with different free space. Unreadable probes are skipped: an unknown
+/// reading is not evidence of a full disk.
 fn lowest_available_with(
     probes: &[PathBuf],
     read: impl Fn(&Path) -> Option<u64>,
