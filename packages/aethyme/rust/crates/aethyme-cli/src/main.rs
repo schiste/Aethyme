@@ -511,17 +511,26 @@ fn run_graph_impact_inner(args: &[String]) -> Result<(), String> {
         .iter()
         .any(|argument| argument == "--json" || argument == "--json-output");
     // `graph impact` is a read-only report inside a group whose other
-    // 13 subcommands never write. `Broker::open` creates `broker.db`
-    // and runs six write/recovery paths (backfill, reap, promotion
-    // recovery, reconciliation recovery, path-exposure backfill, GC
-    // resume), so merely asking for an impact report mutated the
-    // repository. `open_snapshot` is the read-only open, already used
-    // for the same reason elsewhere in the tree.
-    let mut broker = aethyme_broker::Broker::open_snapshot(&repo)
-        .map_err(|error| format!("cannot open broker for {}: {error}", repo.display()))?;
-    let report = broker
-        .graph_impact_report(&revision, changed_files, mode, budget)
-        .map_err(|error| error.to_string())?;
+    // 13 subcommands never write. `Broker::open` creates `broker.db` and
+    // runs the broker's write and recovery paths, so in a repository with
+    // no broker merely asking for an impact report would create one; there
+    // the report is evaluated against a read-only snapshot and recorded
+    // nowhere. Where a broker already exists, the evaluation is recorded in
+    // its append-only event log as `graph.impact_evaluated`, which needs a
+    // writable open: a snapshot rejects the append.
+    let main_root = aethyme_broker::GitRepo::discover(&repo)
+        .and_then(|repository| repository.main_root())
+        .map_err(|error| format!("cannot open repository {}: {error}", repo.display()))?;
+    let report = if main_root.join(aethyme_broker::BROKER_DB_RELPATH).is_file() {
+        aethyme_broker::Broker::open(&repo)
+            .map_err(|error| format!("cannot open broker for {}: {error}", repo.display()))?
+            .graph_impact_report(&revision, changed_files, mode, budget)
+    } else {
+        aethyme_broker::Broker::open_snapshot(&repo)
+            .map_err(|error| format!("cannot open broker for {}: {error}", repo.display()))?
+            .graph_impact_evaluate(&revision, changed_files, mode, budget)
+    }
+    .map_err(|error| error.to_string())?;
     if json {
         println!(
             "{}",
