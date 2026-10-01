@@ -3559,9 +3559,10 @@ mod tests {
         let log = tmp.path().join("gate.log");
         std::fs::write(&log, "").unwrap();
 
-        let never_started: Result<GateCommandOutcome, std::io::Error> = Err(
-            std::io::Error::new(std::io::ErrorKind::StorageFull, "1.4 GiB free"),
-        );
+        let never_started: Result<GateCommandOutcome, std::io::Error> = Err(std::io::Error::new(
+            std::io::ErrorKind::StorageFull,
+            "1.4 GiB free",
+        ));
         assert!(observed_host_fault(&never_started, &log));
         assert!(observed_host_fault(&Ok(command_outcome(None, true)), &log));
         let mut resource = command_outcome(Some(1), false);
@@ -3569,7 +3570,10 @@ mod tests {
         assert!(observed_host_fault(&Ok(resource), &log));
 
         std::fs::write(&log, "error: No space left on device (os error 28)\n").unwrap();
-        assert!(observed_host_fault(&Ok(command_outcome(Some(101), false)), &log));
+        assert!(observed_host_fault(
+            &Ok(command_outcome(Some(101), false)),
+            &log
+        ));
     }
 
     /// The command's log is the change's own test output, so text that merely
@@ -3587,15 +3591,22 @@ mod tests {
         ] {
             std::fs::write(&log, output).unwrap();
             let status = Ok(command_outcome(Some(code), false));
-            let (_, class, _) = classify_gate_result("sh -c test", &log, Ok(command_outcome(Some(code), false)));
-            assert!(class.is_some(), "{output:?} still gets a class for advisories");
+            let (_, class, _) =
+                classify_gate_result("sh -c test", &log, Ok(command_outcome(Some(code), false)));
+            assert!(
+                class.is_some(),
+                "{output:?} still gets a class for advisories"
+            );
             assert!(
                 !observed_host_fault(&status, &log),
                 "{output:?} (exit {code}) is the change's output, not a host fault"
             );
         }
         // A clean pass is never a host fault.
-        assert!(!observed_host_fault(&Ok(command_outcome(Some(0), false)), &log));
+        assert!(!observed_host_fault(
+            &Ok(command_outcome(Some(0), false)),
+            &log
+        ));
     }
 
     /// The control: a gate that genuinely ran and failed must keep reporting a

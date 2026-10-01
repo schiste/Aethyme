@@ -957,14 +957,23 @@ impl Broker {
         let mut details = serde_json::json!({
             "merge_commit": merge_commit,
             "base": base,
-            "gates": gate_outcomes.iter().map(|o| serde_json::json!({
-                "gate": o.gate,
-                "tree_hash": o.tree_hash,
-                "status": o.status,
-                "failure_class": o.failure_class,
-                "cached": o.cached,
-                "host_fault": o.is_host_fault(),
-            })).collect::<Vec<_>>(),
+            "gates": gate_outcomes.iter().map(|o| {
+                let mut gate = serde_json::json!({
+                    "gate": o.gate,
+                    "tree_hash": o.tree_hash,
+                    "status": o.status,
+                    "failure_class": o.failure_class,
+                    "cached": o.cached,
+                });
+                // Only when true, like `GateRunOutcome::host_fault`: these
+                // details become the `merge.verified` payload, whose gate
+                // fields are frozen (contract_v1), and a verified entry never
+                // has a host fault.
+                if o.is_host_fault() {
+                    gate["host_fault"] = serde_json::Value::Bool(true);
+                }
+                gate
+            }).collect::<Vec<_>>(),
         });
         if deferred {
             // The explicit marker is what `status` and `finish` read to tell a
