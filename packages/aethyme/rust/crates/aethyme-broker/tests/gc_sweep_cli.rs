@@ -484,6 +484,89 @@ fn a_session_scoped_plan_reviews_and_removes_one_worktree() {
     assert!(second.join("rust/target").exists(), "outside the scope");
 }
 
+/// A review covers what it scanned. A one-session plan never looked at the
+/// rest of the root, and a whole-root plan was not reviewed as being about one
+/// session, so neither confirmation is accepted for the other scope.
+#[test]
+fn a_reclaim_confirmation_is_refused_for_a_different_scope() {
+    let (repo, container) = fixture("");
+    let (first, first_id) = closed_session_with_target(repo.path(), container.path(), "first");
+    let (second, _) = closed_session_with_target(repo.path(), container.path(), "second");
+    let scoped = run(
+        repo.path(),
+        container.path(),
+        &["gc", "reclaim", "plan", "--json", "--session", &first_id],
+    );
+    assert!(scoped.status.success());
+    let scoped: serde_json::Value = serde_json::from_slice(&scoped.stdout).unwrap();
+    let scoped_digest = scoped["digest"].as_str().unwrap().to_string();
+    assert!(
+        scoped["scope"].as_str().unwrap().ends_with("first"),
+        "{scoped}"
+    );
+    let whole = reclaim_plan_json(repo.path(), container.path());
+    let whole_digest = whole["digest"].as_str().unwrap().to_string();
+    assert!(whole.get("scope").is_none(), "{whole}");
+
+    let unscoped_apply = run(
+        repo.path(),
+        container.path(),
+        &["gc", "reclaim", "apply", "--confirm", &scoped_digest],
+    );
+    assert!(!unscoped_apply.status.success());
+    let message = String::from_utf8_lossy(&unscoped_apply.stderr);
+    assert!(
+        message.contains("but this apply covers the whole worktree root"),
+        "{message}"
+    );
+
+    let scoped_apply = run(
+        repo.path(),
+        container.path(),
+        &[
+            "gc",
+            "reclaim",
+            "apply",
+            "--confirm",
+            &whole_digest,
+            "--session",
+            &first_id,
+        ],
+    );
+    assert!(!scoped_apply.status.success());
+    let message = String::from_utf8_lossy(&scoped_apply.stderr);
+    assert!(
+        message.contains("reviewed the whole worktree root"),
+        "{message}"
+    );
+
+    assert!(first.join("rust/target").exists());
+    assert!(second.join("rust/target").exists());
+}
+
+/// A session whose worktree is already gone has nothing to reclaim; that is
+/// an answer, not a failure, so a loop over sessions keeps going.
+#[test]
+fn a_session_plan_for_a_removed_worktree_has_nothing_to_reclaim() {
+    let (repo, container) = fixture("");
+    let (worktree, id) = closed_session_with_target(repo.path(), container.path(), "removed");
+    std::fs::remove_dir_all(&worktree).unwrap();
+
+    let planned = run(
+        repo.path(),
+        container.path(),
+        &["gc", "reclaim", "plan", "--json", "--session", &id],
+    );
+    assert!(
+        planned.status.success(),
+        "{}",
+        String::from_utf8_lossy(&planned.stderr)
+    );
+    let plan: serde_json::Value = serde_json::from_slice(&planned.stdout).unwrap();
+    assert!(plan["candidates"].as_array().unwrap().is_empty(), "{plan}");
+    assert!(String::from_utf8_lossy(&planned.stderr).contains("nothing to reclaim"));
+}
+
 #[test]
 fn reclaim_confirmation_keeps_digest_mismatch_primary_when_snapshot_is_unreadable() {
     let (repo, container) = fixture("");
