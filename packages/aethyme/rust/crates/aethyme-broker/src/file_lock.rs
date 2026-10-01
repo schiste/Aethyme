@@ -32,6 +32,15 @@ impl ExclusiveFileLock {
         file.lock()?;
         Ok(Self { file })
     }
+
+    /// Lock `file` exclusively if nobody holds it; `None` when it is held.
+    pub(crate) fn try_acquire(file: File) -> io::Result<Option<Self>> {
+        match file.try_lock() {
+            Ok(()) => Ok(Some(Self { file })),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Err(std::fs::TryLockError::Error(error)) => Err(error),
+        }
+    }
 }
 
 impl Drop for ExclusiveFileLock {
