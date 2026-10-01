@@ -594,48 +594,81 @@ pub(super) fn run_reclaim(parsed: Parsed) -> Result<(), UsageError> {
         .filter(|agent| agent.derived_status == crate::SessionStatus::Active)
         .map(|agent| std::path::PathBuf::from(agent.session.worktree_path.clone()))
         .collect();
-    let mut candidates = crate::scan_reclaim_with_extra_directories(
-        &root,
-        &active,
-        &retention_policy.artefact_directories,
-    );
-    // A worktree no session records has no owner who reviewed it, so its
-    // artefacts are reported but kept rather than treated as abandoned.
-    let recorded: Vec<std::path::PathBuf> = broker
+    let recorded_sessions: Vec<_> = broker
         .store()
         .live_sessions()?
         .into_iter()
         .chain(broker.store().cleaned_sessions()?)
+        .collect();
+    // One session's worktree, so a plan can be reviewed and applied without
+    // waiting on every other worktree in the root to hold still -- and
+    // without walking them: only that worktree is scanned.
+    let scope = match parsed.session {
+        None => None,
+        Some(session_id) => {
+            let session = recorded_sessions
+                .iter()
+                .find(|session| session.id == session_id)
+                .ok_or_else(|| {
+                    UsageError::Message(format!(
+                        "session {session_id} is not a session of this repository"
+                    ))
+                })?;
+            let worktree = std::path::PathBuf::from(&session.worktree_path);
+            match crate::reclaim::worktree_in_root(&root, &worktree) {
+                Some(base) => Some((base, true)),
+                // Removed already, or placed on another root: nothing under
+                // this root to reclaim, as the whole-root plan would also say.
+                None => {
+                    eprintln!(
+                        "Note: session {session_id}'s worktree {} is not a directory under {}; nothing to reclaim for it here.",
+                        worktree.display(),
+                        root.display()
+                    );
+                    Some((worktree, false))
+                }
+            }
+        }
+    };
+    // An apply credits what each removal freed and never shows the planned
+    // sizes, so it skips measuring every file under every candidate.
+    let sizing = if action == "apply" {
+        crate::reclaim::Sizing::Skip
+    } else {
+        crate::reclaim::Sizing::Measure
+    };
+    let mut candidates = match &scope {
+        Some((_, false)) => Vec::new(),
+        Some((worktree, true)) => crate::reclaim::scan_worktree(
+            worktree,
+            &active,
+            &retention_policy.artefact_directories,
+            sizing,
+        ),
+        None => crate::reclaim::scan_root(
+            &root,
+            &active,
+            &retention_policy.artefact_directories,
+            sizing,
+        ),
+    };
+    // A worktree no session records has no owner who reviewed it, so its
+    // artefacts are reported but kept rather than treated as abandoned.
+    let recorded: Vec<std::path::PathBuf> = recorded_sessions
+        .into_iter()
         .map(|session| std::path::PathBuf::from(session.worktree_path))
         .collect();
     crate::reclaim::protect_unrecorded_worktrees(&mut candidates, &recorded);
-    // One session's worktree, so a plan can be reviewed and applied without
-    // waiting on every other worktree in the root to hold still.
-    if let Some(session_id) = parsed.session {
-        let session = broker
-            .store()
-            .live_sessions()?
-            .into_iter()
-            .chain(broker.store().cleaned_sessions()?)
-            .find(|session| session.id == session_id)
-            .ok_or_else(|| {
-                UsageError::Message(format!(
-                    "session {session_id} is not a session of this repository"
-                ))
-            })?;
-        candidates = crate::reclaim::scope_to_worktree(
-            candidates,
-            std::path::Path::new(&session.worktree_path),
-        );
-    }
     let session_flag = parsed
         .session
         .map(|id| format!(" --session {id}"))
         .unwrap_or_default();
-    let digest = crate::reclaim::plan_digest(&root, &candidates);
+    let scope = scope.map(|(worktree, _)| worktree);
+    let digest = crate::reclaim::plan_digest(&root, scope.as_deref(), &candidates);
     let plan = crate::ReclaimPlan {
         digest: digest.clone(),
         root: root.clone(),
+        scope: scope.clone(),
         reclaimable_bytes: crate::reclaimable_bytes(&candidates),
         total_bytes: candidates.iter().map(|c| c.bytes).sum(),
         candidates,
@@ -643,8 +676,12 @@ pub(super) fn run_reclaim(parsed: Parsed) -> Result<(), UsageError> {
     let gib = |bytes: u64| format!("{:.1} GiB", bytes as f64 / (1024.0 * 1024.0 * 1024.0));
     match action {
         "plan" => {
-            if let Err(error) = crate::reclaim::save_snapshot(&root, &plan.digest, &plan.candidates)
-            {
+            if let Err(error) = crate::reclaim::save_snapshot(
+                &root,
+                scope.as_deref(),
+                &plan.digest,
+                &plan.candidates,
+            ) {
                 eprintln!(
                     "Warning: cannot save reclaim plan review snapshot; continuing with the \
                      digest-bound plan: {error}"
@@ -696,16 +733,34 @@ pub(super) fn run_reclaim(parsed: Parsed) -> Result<(), UsageError> {
                 plan
             } else {
                 match crate::reclaim::load_snapshot(&root, confirm) {
-                    Ok(Some((_, reviewed))) => {
-                        let scope = crate::reclaim::restrict_to_review(&plan.candidates, &reviewed);
-                        not_reviewed = scope.not_reviewed;
-                        withdrawn = scope.withdrawn;
+                    // A review covers what it scanned: a one-session review
+                    // says nothing about the other worktrees, and a
+                    // whole-root review was not made about one session.
+                    Ok(Some(reviewed)) if reviewed.scope != scope => {
+                        let describe = |scope: &Option<std::path::PathBuf>| match scope {
+                            Some(worktree) => format!("worktree {}", worktree.display()),
+                            None => "the whole worktree root".to_string(),
+                        };
+                        return Err(UsageError::Message(format!(
+                            "confirmation {confirm} reviewed {}, but this apply covers {}; apply it with the same --session it was planned with, or re-run `aethyme broker gc reclaim plan{session_flag}` and review that",
+                            describe(&reviewed.scope),
+                            describe(&scope)
+                        )));
+                    }
+                    Ok(Some(reviewed)) => {
+                        let narrowed = crate::reclaim::restrict_to_review(
+                            &plan.candidates,
+                            &reviewed.decisions,
+                        );
+                        not_reviewed = narrowed.not_reviewed;
+                        withdrawn = narrowed.withdrawn;
                         crate::ReclaimPlan {
                             digest: confirm.to_string(),
                             root: plan.root,
-                            reclaimable_bytes: crate::reclaimable_bytes(&scope.candidates),
+                            scope: plan.scope,
+                            reclaimable_bytes: crate::reclaimable_bytes(&narrowed.candidates),
                             total_bytes: plan.total_bytes,
-                            candidates: scope.candidates,
+                            candidates: narrowed.candidates,
                         }
                     }
                     // Without a verified review there is nothing to narrow
