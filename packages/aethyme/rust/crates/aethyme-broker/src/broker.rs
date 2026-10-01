@@ -3455,9 +3455,12 @@ impl Broker {
             .repo
             .worktree_add(&worktree_path, &branch, &start_base.commit)?;
         if placement.source == WorktreeRootSource::RepositoryConfig {
-            // Best effort: a lock only protects the registration while the
-            // drive is unplugged, and a failed lock must not fail the start.
-            let _ = self.repo.worktree_lock(&worktree_path);
+            // A failed lock must not fail the start, but it leaves the
+            // registration unprotected while the drive is unplugged, so say so.
+            crate::warn_unrecorded(
+                "lock the worktree on the configured root against pruning",
+                self.repo.worktree_lock(&worktree_path),
+            );
         }
         Ok((slug, branch, start_base, worktree, placement))
     }
