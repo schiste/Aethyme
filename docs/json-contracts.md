@@ -91,6 +91,21 @@ that shows which of them GC would reclaim, or `null` when there are none).
 
 `cleanup_retention.host_available_bytes` and `cleanup_retention.host_volume_probe` (introduced 2026-10-01) report free space where this repository's gates run -- the lower of the broker worktree root and host state, each read at its nearest existing directory -- and the directory read, or `null` when it cannot be read. Below the 8 GiB a gate needs to start, `advice` carries a `host.gate-headroom` row with severity `blocked`, emitted whether or not the repository retains worktrees, with `aethyme broker gc plan` and `aethyme broker gc storage plan` as its commands.
 
+`in_flight_submits` (introduced 2026-10-02) lists the `broker submit` runs in
+progress in this repository, oldest first, and is omitted when none is
+running. Each has `session_id`, `pid`, `phase` (`starting`, `auditing lease
+ownership`, `planning the submission`, `simulating the merge`, `waiting for a
+verification slot`, `verifying the merged tree`, `recording the verdict`; may
+gain values), `elapsed_ms`, `phase_elapsed_ms`, `last_progress` (the last gate
+or wait line), `last_progress_age_ms`, `alive` (the submitting process still
+exists), `possibly_stalled` (gone, or no progress for `stall_after_ms`,
+currently five minutes) and, while waiting for a verification slot,
+`position` (`position`, `waiting`, `holders[]` with `session_id`,
+`held_for_ms`, `last_progress`). A submit that is only queued keeps reporting
+and is not stalled. A possibly stalled submit also gets a
+`submit.possibly-stalled` advice row (`warning`). Records live in
+`.aethyme/run/submits/` and a finished submit removes its own.
+
 `review_refusals` lists reviews a provider declined and nothing has re-asked
 for since. `class` is `quota_exhausted`, `rate_limited`, `provider_error` or
 `unknown`, and answers whether waiting helps; `text` is the provider's own

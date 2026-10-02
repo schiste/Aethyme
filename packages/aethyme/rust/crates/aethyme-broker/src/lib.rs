@@ -84,6 +84,10 @@ mod pr;
 mod pr_link;
 mod pr_monitoring;
 mod scopes;
+mod submit_progress;
+pub use submit_progress::{
+    InFlightSubmit, SUBMIT_STALL_AFTER, SlotHolder, SubmitProgressRecord, WaitPosition,
+};
 pub mod session_guidance;
 mod text_redaction;
 mod unpushed;

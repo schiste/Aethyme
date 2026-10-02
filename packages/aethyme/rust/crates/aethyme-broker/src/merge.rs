@@ -573,9 +573,17 @@ impl Broker {
         cache_policy: crate::gates::CachePolicy,
         intent: PromotionIntent,
     ) -> Result<SubmitOutcome, BrokerOpError> {
+        // Recorded from the first step: lease auditing and planning can take
+        // minutes on a busy repository, and a silent submit looks hung.
+        let progress = crate::submit_progress::SubmitProgress::start(
+            &self.main_root_path(),
+            session_id,
+            crate::gates::heartbeat_interval(),
+        );
         let session = self.store().session(session_id)?;
         let checkout = GitRepo::discover(Path::new(&session.worktree_path))?;
         let head = checkout.head_commit()?;
+        progress.phase("auditing lease ownership");
         let ownership = self.audit_submit_ownership(session_id)?;
         if !ownership.ok {
             return Err(BrokerOpError::OwnershipViolation {
@@ -593,6 +601,7 @@ impl Broker {
         // decision cannot leave behind misleading `submitted` residue. The
         // persisted entry is still planned again against the then-current
         // integration tip below, because another process may move that ref.
+        progress.phase("planning the submission");
         let planning = self
             .build_submission_plan(&session, &head, &base)
             .and_then(|plan| self.replay_submission_plan(&plan).map(|_| ()));
@@ -634,7 +643,8 @@ impl Broker {
             self.store()
                 .set_merge_status(stale_id, MergeStatus::Superseded, None, None)?;
         }
-        let mut outcome = self.simulate_and_gate_with_policy(entry.id, cache_policy, intent)?;
+        let mut outcome =
+            self.simulate_and_gate_with_policy(entry.id, cache_policy, intent, Some(&progress))?;
         outcome.lease_warnings = ownership.warned_leases;
         Ok(outcome)
     }
@@ -681,6 +691,7 @@ impl Broker {
             entry_id,
             crate::gates::CachePolicy::Use,
             PromotionIntent::Configured,
+            None,
         )
     }
 
@@ -689,6 +700,7 @@ impl Broker {
         entry_id: i64,
         cache_policy: crate::gates::CachePolicy,
         intent: PromotionIntent,
+        progress: Option<&crate::submit_progress::SubmitProgress>,
     ) -> Result<SubmitOutcome, BrokerOpError> {
         // #42: remember where the integration branch stood BEFORE the
         // follows-main refresh. Gate selection must diff against this —
@@ -710,8 +722,14 @@ impl Broker {
         let pre_refresh =
             pre_refresh.filter(|_| verification.source == VERIFIED_AGAINST_INTEGRATION);
         let base = verification.commit.clone();
-        let mut outcome =
-            self.simulate_and_gate_against(entry_id, cache_policy, intent, base, pre_refresh)?;
+        let mut outcome = self.simulate_and_gate_against(
+            entry_id,
+            cache_policy,
+            intent,
+            base,
+            pre_refresh,
+            progress,
+        )?;
         outcome.verified_against = Some(verification);
         Ok(outcome)
     }
@@ -723,6 +741,7 @@ impl Broker {
         intent: PromotionIntent,
         base: String,
         pre_refresh: Option<String>,
+        progress: Option<&crate::submit_progress::SubmitProgress>,
     ) -> Result<SubmitOutcome, BrokerOpError> {
         let entry = self
             .store()
@@ -738,6 +757,9 @@ impl Broker {
         let mut submission_plan =
             self.build_submission_plan(&session, &entry.head_commit, &base)?;
 
+        if let Some(progress) = progress {
+            progress.phase("simulating the merge");
+        }
         let simulation = self.replay_submission_plan(&submission_plan)?;
         if simulation.conflicts.is_empty() {
             submission_plan.merged_tree_paths = self
@@ -932,11 +954,25 @@ impl Broker {
         // keep the repository-scoped slot: each verifies a single tree it has
         // just chosen, and serialising them against each other is correct --
         // they are diagnostics, not throughput.
-        let mut verification_slot = crate::verification::ExactTreeVerificationSlot::acquire_pooled(
-            &self.main_root_path(),
-            "merge-sim",
-            MERGE_VERIFICATION_SLOTS,
-        )?;
+        if let Some(progress) = progress {
+            progress.phase(crate::submit_progress::PHASE_WAITING_FOR_SLOT);
+        }
+        let main_root = self.main_root_path();
+        let mut verification_slot =
+            crate::verification::ExactTreeVerificationSlot::acquire_pooled_reporting(
+                &main_root,
+                "merge-sim",
+                MERGE_VERIFICATION_SLOTS,
+                crate::gates::heartbeat_interval(),
+                &mut |waited| {
+                    if let Some(progress) = progress {
+                        progress.report_slot_wait(&main_root, waited);
+                    }
+                },
+            )?;
+        if let Some(progress) = progress {
+            progress.phase(crate::submit_progress::PHASE_VERIFYING);
+        }
         let sim_worktree = verification_slot.materialize(self.repo_handle(), &merge_commit)?;
         // Verification policy comes from the base the change lands on, never
         // from the merged tree: otherwise a session could weaken or delete the
@@ -985,9 +1021,8 @@ impl Broker {
             )?;
         }
         let configured_gates = gates.len();
-        let main_root = self.main_root_path();
         let gate_outcomes = if graph_integrity.allows_promotion() {
-            crate::gates::run_affected(
+            crate::gates::run_affected_for_submit(
                 self.store(),
                 &main_root,
                 &sim_worktree,
@@ -995,6 +1030,7 @@ impl Broker {
                 &changed,
                 Some(entry.session_id),
                 cache_policy,
+                progress,
             )
         } else {
             Ok(Vec::new())
@@ -1005,6 +1041,9 @@ impl Broker {
         // acquire the same stable slot. Release the non-reentrant flock
         // before either path is reachable or one process deadlocks itself.
         drop(verification_slot);
+        if let Some(progress) = progress {
+            progress.phase("recording the verdict");
+        }
         let gate_outcomes = gate_outcomes?;
 
         // A gate the host stopped from judging the change is not a verdict on

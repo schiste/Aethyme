@@ -275,6 +275,38 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
                 );
             }
         }
+        if !status.in_flight_submits.is_empty() {
+            out!();
+            out!("Submits in progress:");
+            for submit in &status.in_flight_submits {
+                let mut line = format!(
+                    "  session {}: {} for {} (total {}",
+                    submit.session_id,
+                    submit.phase,
+                    crate::submit_progress::duration_label(submit.phase_elapsed_ms),
+                    crate::submit_progress::duration_label(submit.elapsed_ms)
+                );
+                line.push_str(&format!(
+                    ", last progress {} ago)",
+                    crate::submit_progress::duration_label(submit.last_progress_age_ms)
+                ));
+                if !submit.alive {
+                    line.push_str(" -- process gone");
+                } else if submit.possibly_stalled {
+                    line.push_str(" -- possibly stalled");
+                }
+                out!("{line}");
+                if let Some(position) = &submit.position {
+                    out!(
+                        "    {}",
+                        crate::submit_progress::describe_position(position)
+                    );
+                }
+                if !submit.last_progress.is_empty() {
+                    out!("    last: {}", submit.last_progress);
+                }
+            }
+        }
         let terminal_counts = &status.queue_history.terminal_counts;
         if !terminal_counts.is_empty() {
             let total = terminal_counts.iter().map(|item| item.count).sum::<usize>();

@@ -884,12 +884,25 @@ impl GateProgressSink for StderrGateProgressSink {
     }
 }
 
+/// The stderr sink, also recording each line as the submit's last progress so
+/// `broker status` can show what a running submit last did.
+struct SubmitGateProgressSink<'a> {
+    progress: &'a crate::submit_progress::SubmitProgress,
+}
+
+impl GateProgressSink for SubmitGateProgressSink<'_> {
+    fn report(&self, line: &str) {
+        StderrGateProgressSink.report(line);
+        self.progress.progress(line, true);
+    }
+}
+
 pub(crate) struct GateExecutionContext<'a> {
     pub cache_policy: CachePolicy,
     pub progress: &'a dyn GateProgressSink,
 }
 
-fn heartbeat_interval() -> Duration {
+pub(crate) fn heartbeat_interval() -> Duration {
     let seconds = std::env::var("AETHYME_GATE_HEARTBEAT_SECS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
@@ -1254,6 +1267,45 @@ pub(crate) fn run_affected(
     )
 }
 
+/// [`run_affected`] for a submit: gate lines also become the submit's
+/// recorded progress.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_affected_for_submit(
+    store: &mut BrokerStore,
+    main_root: &Path,
+    checkout: &GitRepo,
+    gates: &[Gate],
+    changed: &[String],
+    session_id: Option<i64>,
+    cache_policy: CachePolicy,
+    submit: Option<&crate::submit_progress::SubmitProgress>,
+) -> Result<Vec<GateRunOutcome>, crate::broker::BrokerOpError> {
+    let Some(submit) = submit else {
+        return run_affected(
+            store,
+            main_root,
+            checkout,
+            gates,
+            changed,
+            session_id,
+            cache_policy,
+        );
+    };
+    let progress = SubmitGateProgressSink { progress: submit };
+    run_affected_with_progress(
+        store,
+        main_root,
+        checkout,
+        gates,
+        changed,
+        session_id,
+        GateExecutionContext {
+            cache_policy,
+            progress: &progress,
+        },
+    )
+}
+
 /// Like [`run_affected`], with an injectable progress sink.
 pub(crate) fn run_affected_with_progress(
     store: &mut BrokerStore,
@@ -1376,29 +1428,82 @@ struct GateOwnerLocks {
 }
 
 impl GateOwnerLocks {
+    /// Take every owner lock of `gate_name`, in a fixed order.
+    ///
+    /// A free lock is taken silently. A held one is named with its holder (the
+    /// worker that wrote itself into the lock file) and re-reported every
+    /// `report_every` until it frees, so a gate queued behind another never
+    /// sits silent for minutes.
     fn acquire(
         owner_dir: &Path,
         gate_name: &str,
         owner_paths: &[String],
+        holder: &str,
+        report_every: Duration,
         progress: &dyn GateProgressSink,
     ) -> Result<Self, std::io::Error> {
         std::fs::create_dir_all(owner_dir)?;
         let mut paths = gate_owner_lock_paths(owner_dir, gate_name, owner_paths);
         paths.sort();
         paths.dedup();
-        if !paths.is_empty() {
-            progress.report(&format!(
-                "gate {gate_name} waiting for {} owner lock(s)",
-                paths.len()
-            ));
-        }
 
         let mut locks = Vec::with_capacity(paths.len());
         for path in paths {
-            let file = crate::file_lock::open_lock_file(&path)?;
-            locks.push(crate::file_lock::ExclusiveFileLock::acquire(file)?);
+            let started = Instant::now();
+            let mut next_report = Duration::ZERO;
+            let lock = loop {
+                let file = crate::file_lock::open_lock_file(&path)?;
+                if let Some(lock) = crate::file_lock::ExclusiveFileLock::try_acquire(file)? {
+                    break lock;
+                }
+                let waited = started.elapsed();
+                if waited >= next_report {
+                    progress.report(&format!(
+                        "gate {gate_name} waiting for an owner lock held by {} ({}s)",
+                        describe_owner_lock_holder(&path),
+                        waited.as_secs()
+                    ));
+                    next_report = waited + report_every;
+                }
+                std::thread::sleep(OWNER_LOCK_POLL);
+            };
+            lock.record_holder(holder)?;
+            locks.push(lock);
         }
         Ok(Self { _locks: locks })
+    }
+}
+
+const OWNER_LOCK_POLL: Duration = Duration::from_millis(250);
+
+/// Who an owner lock file says holds it: `session 812 for 3m10s`.
+fn describe_owner_lock_holder(path: &Path) -> String {
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let text = text.trim();
+    if text.is_empty() {
+        return "another gate run".into();
+    }
+    let mut fields = text.split_whitespace();
+    let worker = fields.next().unwrap_or_default();
+    let since_ms = fields
+        .find_map(|field| field.strip_prefix("since="))
+        .and_then(|value| value.parse::<i64>().ok());
+    let who = match worker
+        .strip_prefix('s')
+        .and_then(|id| id.parse::<i64>().ok())
+    {
+        Some(session) => format!("session {session}"),
+        None => match worker.strip_prefix('p') {
+            Some(pid) => format!("process {pid}"),
+            None => worker.to_string(),
+        },
+    };
+    match since_ms {
+        Some(since) => format!(
+            "{who} for {}",
+            crate::submit_progress::duration_label(crate::clock::epoch_ms() - since)
+        ),
+        None => who,
     }
 }
 
@@ -1902,12 +2007,18 @@ fn run_selections(
         // Before owner locks, leases and the timeout clock: see gate_admission.
         crate::gate_admission::admit_gate(gate, progress);
         let owner_dir = run_dir.join("owners");
-        let owner_locks =
-            GateOwnerLocks::acquire(&owner_dir, &gate.name, &selection.owner_paths, progress)
-                .map_err(|source| crate::BrokerError::Io {
-                    path: owner_dir,
-                    source,
-                })?;
+        let owner_locks = GateOwnerLocks::acquire(
+            &owner_dir,
+            &gate.name,
+            &selection.owner_paths,
+            &format!("{worker_id} since={}", crate::clock::epoch_ms()),
+            heartbeat_interval(),
+            progress,
+        )
+        .map_err(|source| crate::BrokerError::Io {
+            path: owner_dir,
+            source,
+        })?;
         let log_path = log_dir.join(format!(
             "{}-{}-{}.log",
             gate.name,
@@ -2960,6 +3071,78 @@ fn preserve_failed_gate_log(log_path: &Path, status: GateStatus) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Default)]
+    struct Lines(std::sync::Mutex<Vec<String>>);
+
+    impl GateProgressSink for Lines {
+        fn report(&self, line: &str) {
+            self.0.lock().unwrap().push(line.to_string());
+        }
+    }
+
+    /// A gate queued behind another names the holder and keeps saying so,
+    /// instead of one line followed by minutes of silence.
+    #[test]
+    fn a_gate_waiting_for_an_owner_lock_names_its_holder_and_keeps_reporting() {
+        let owners = tempfile::tempdir().unwrap();
+        let paths = vec!["src/lib.rs".to_string()];
+        let quiet = Lines::default();
+        let held = GateOwnerLocks::acquire(
+            owners.path(),
+            "unit",
+            &paths,
+            &format!("s812 since={}", crate::clock::epoch_ms() - 190_000),
+            Duration::from_millis(100),
+            &quiet,
+        )
+        .unwrap();
+        assert!(
+            quiet.0.lock().unwrap().is_empty(),
+            "a free lock reported a wait"
+        );
+
+        let lines = std::sync::Arc::new(Lines::default());
+        let waiter_lines = std::sync::Arc::clone(&lines);
+        let directory = owners.path().to_path_buf();
+        let waiter = std::thread::spawn(move || {
+            GateOwnerLocks::acquire(
+                &directory,
+                "unit",
+                &paths,
+                "s813 since=0",
+                Duration::from_millis(100),
+                waiter_lines.as_ref(),
+            )
+            .unwrap()
+        });
+        // Polls every 250ms, reporting at once and then every 100ms of waiting.
+        std::thread::sleep(Duration::from_millis(800));
+        drop(held);
+        drop(waiter.join().unwrap());
+
+        let lines = lines.0.lock().unwrap().clone();
+        assert!(
+            lines.len() >= 3,
+            "the wait was reported only {} time(s)",
+            lines.len()
+        );
+        assert!(
+            lines[0].starts_with("gate unit waiting for an owner lock held by session 812 for 3m1"),
+            "{}",
+            lines[0]
+        );
+    }
+
+    #[test]
+    fn an_owner_lock_without_a_recorded_holder_is_still_described() {
+        let owners = tempfile::tempdir().unwrap();
+        let path = owners.path().join("legacy.lock");
+        std::fs::write(&path, b"").unwrap();
+        assert_eq!(describe_owner_lock_holder(&path), "another gate run");
+        std::fs::write(&path, b"p4242 since=nope").unwrap();
+        assert_eq!(describe_owner_lock_holder(&path), "process 4242");
+    }
 
     /// Allocate, record the directory name, and delete it again -- what a
     /// finished gate leaves behind for the next one on the same owner paths.

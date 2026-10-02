@@ -18,6 +18,7 @@
 //! reports it.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::file_lock::{ExclusiveFileLock, open_lock_file};
 use crate::{BrokerError, BrokerOpError, GitRepo};
@@ -170,10 +171,24 @@ impl ExactTreeVerificationSlot {
     /// existing installation keeps warm stays the first one used. A free slot
     /// is taken without waiting; when all are busy this polls until one is
     /// released. Locks are `flock`s, so a holder that dies releases its slot.
+    #[cfg(test)]
     pub(crate) fn acquire_pooled(
         main_root: &Path,
         namespace: &str,
         size: usize,
+    ) -> Result<Self, BrokerOpError> {
+        Self::acquire_pooled_reporting(main_root, namespace, size, Duration::MAX, &mut |_| {})
+    }
+
+    /// [`Self::acquire_pooled`], calling `on_wait` with the time waited as
+    /// soon as every slot is found busy and then every `report_every` until
+    /// one frees, so a caller can say it is queued instead of looking hung.
+    pub(crate) fn acquire_pooled_reporting(
+        main_root: &Path,
+        namespace: &str,
+        size: usize,
+        report_every: Duration,
+        on_wait: &mut dyn FnMut(Duration),
     ) -> Result<Self, BrokerOpError> {
         let placements = (0..size.max(1))
             .map(|index| {
@@ -185,13 +200,20 @@ impl ExactTreeVerificationSlot {
                 plan_slot_placement(main_root, &name)
             })
             .collect::<Vec<_>>();
+        let started = std::time::Instant::now();
+        let mut next_report = Duration::ZERO;
         loop {
             for placement in &placements {
                 if let Some(slot) = Self::try_acquire_at(main_root, placement.clone())? {
                     return Ok(slot);
                 }
             }
-            std::thread::sleep(std::time::Duration::from_millis(250));
+            let waited = started.elapsed();
+            if waited >= next_report {
+                on_wait(waited);
+                next_report = waited.saturating_add(report_every);
+            }
+            std::thread::sleep(Duration::from_millis(250));
         }
     }
 
@@ -443,6 +465,52 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("a released slot was never taken");
         assert_eq!(path, held_path);
+    }
+
+    /// A free slot is taken without a word; a full pool says so at once and
+    /// again on every report interval, so a queued submit never looks hung.
+    #[test]
+    fn a_waiting_verification_reports_at_once_and_then_on_every_interval() {
+        let fx = fixture();
+        let free_waits = std::cell::Cell::new(0);
+        drop(
+            ExactTreeVerificationSlot::acquire_pooled_reporting(
+                &fx.main,
+                "merge-sim",
+                1,
+                Duration::from_millis(100),
+                &mut |_| free_waits.set(free_waits.get() + 1),
+            )
+            .unwrap(),
+        );
+        assert_eq!(free_waits.get(), 0, "a free slot reported a wait");
+
+        let held = ExactTreeVerificationSlot::acquire_pooled(&fx.main, "merge-sim", 1).unwrap();
+        let main = fx.main.clone();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            ExactTreeVerificationSlot::acquire_pooled_reporting(
+                &main,
+                "merge-sim",
+                1,
+                Duration::from_millis(100),
+                &mut |waited| sender.send(waited).unwrap(),
+            )
+            .unwrap()
+        });
+        let first = receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a blocked verification said nothing");
+        assert!(
+            first < Duration::from_millis(100),
+            "the first report waited {first:?}"
+        );
+        let later = receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("no report on the next interval");
+        assert!(later >= Duration::from_millis(100), "{later:?}");
+        drop(held);
+        waiter.join().unwrap();
     }
 
     #[test]

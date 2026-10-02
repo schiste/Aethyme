@@ -33,6 +33,14 @@ impl ExclusiveFileLock {
         Ok(Self { file })
     }
 
+    /// Write who holds the lock into the lock file, so a waiter can name its
+    /// holder. Only ever written while the lock is held.
+    pub(crate) fn record_holder(&self, holder: &str) -> io::Result<()> {
+        use std::os::unix::fs::FileExt;
+        self.file.set_len(0)?;
+        self.file.write_all_at(holder.as_bytes(), 0)
+    }
+
     /// Lock `file` exclusively if nobody holds it; `None` when it is held.
     pub(crate) fn try_acquire(file: File) -> io::Result<Option<Self>> {
         match file.try_lock() {
@@ -71,6 +79,16 @@ mod tests {
         contender
             .try_lock()
             .expect("the lock is free once the guard drops");
+    }
+
+    #[test]
+    fn a_holder_written_into_a_held_lock_is_readable_by_a_waiter() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("owner.lock");
+        std::fs::write(&path, b"a much longer previous holder line").unwrap();
+        let held = ExclusiveFileLock::acquire(open_lock_file(&path).unwrap()).unwrap();
+        held.record_holder("s812 since=1").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "s812 since=1");
     }
 
     #[test]
