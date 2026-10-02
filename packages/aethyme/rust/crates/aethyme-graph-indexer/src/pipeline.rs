@@ -11,7 +11,7 @@
 //! IndexedFile records before they reach `build_fragment`.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use rayon::prelude::*;
@@ -72,7 +72,11 @@ pub fn build_fragment(
 pub fn default_registry() -> LanguageRegistry {
     let mut registry = LanguageRegistry::new();
     registry.register(PythonIndexer::new());
-    registry.register(TypeScriptIndexer::new());
+    // The walker classifies `.js`/`.jsx`/`.cjs`/`.mjs` as `javascript`
+    // (see `language_map::infer_language_from_extension`), so the oxc
+    // indexer has to answer to that tag too or every JavaScript file
+    // falls through as `parser_unavailable`.
+    registry.register_alias(TypeScriptIndexer::new(), "javascript");
     registry.register(RustIndexer::new());
     // PhpIndexer construction can fail (tree-sitter `set_language`
     // returns Result). For the default registry we ignore the
@@ -311,6 +315,10 @@ pub fn index_repo_to_disk_with(
         observations.push(observation);
     }
 
+    // Captured before this pass rewrites `units.ndjson`, so pruning can tell
+    // what the previous run owned.
+    let previously_indexed = previously_indexed_paths(ctx.repo_root());
+
     let serialization_started = Instant::now();
     let fragments_written: Vec<PathBuf> = built_fragments
         .par_iter()
@@ -335,6 +343,27 @@ pub fn index_repo_to_disk_with(
         .collect::<Result<Vec<_>, _>>()?;
     // Canonical sort by path for deterministic summary output.
     shards_written.sort();
+
+    let currently_indexed: std::collections::HashSet<String> = built_fragments
+        .iter()
+        .map(|built| built.source_path.to_string())
+        .collect();
+
+    // Remove fragments and shards whose source file no longer exists.
+    //
+    // Writing is not enough to keep the fragment store accurate: a
+    // deleted or renamed source leaves its `*.bin` fragment and its
+    // `_index/*.ndjson` shard behind forever. The linker keeps reading
+    // those shards, so symbols from a file that no longer exists stay
+    // in the symbol index and resolve as if they were live.
+    //
+    // `aethyme graph refresh` avoided this by deleting the whole graph
+    // directory before rebuilding, so the divergence was invisible on
+    // that path; only a direct `index_repo_to_disk` accumulated stale
+    // artifacts. Pruning here makes both paths behave the same.
+    let stale_artifacts =
+        prune_stale_artifacts(ctx.repo_root(), &previously_indexed, &currently_indexed);
+
     let coverage = assemble(ctx, &walk, &observations, &built_fragments);
     let coverage_paths = if ctx.source_revision().is_some() {
         let (coverage_path, units_path) =
@@ -358,6 +387,7 @@ pub fn index_repo_to_disk_with(
         total_skipped,
         fragments_written,
         shards_written,
+        stale_artifacts_removed: stale_artifacts.len(),
         counts_by_kind,
         total_nodes,
         total_edges,
@@ -387,6 +417,9 @@ pub struct IndexRepoSummary {
     pub total_skipped: usize,
     pub fragments_written: Vec<PathBuf>,
     pub shards_written: Vec<PathBuf>,
+    /// Fragment and shard files removed because their source file no
+    /// longer exists. Non-zero after a source file is deleted or renamed.
+    pub stale_artifacts_removed: usize,
     pub counts_by_kind: BTreeMap<NodeKind, usize>,
     pub total_nodes: usize,
     pub total_edges: usize,
@@ -408,6 +441,104 @@ impl std::fmt::Display for BuildFragmentError {
 }
 
 impl std::error::Error for BuildFragmentError {}
+
+/// Read the source paths recorded by the previous index pass.
+///
+/// `units.ndjson` names every indexed path, so it is the indexer's own
+/// record of what it owns. Reading it must happen *before* this pass
+/// rewrites it, which is why the caller captures the set up front.
+fn previously_indexed_paths(repo_root: &std::path::Path) -> std::collections::HashSet<String> {
+    let mut paths = std::collections::HashSet::new();
+    let Ok(contents) = std::fs::read_to_string(repo_root.join(".aethyme/graph/units.ndjson"))
+    else {
+        return paths;
+    };
+    for line in contents.lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if let Some(source) = value.get("path").and_then(|v| v.as_str()) {
+            paths.insert(source.to_string());
+        }
+    }
+    paths
+}
+
+/// True for a relative path made only of ordinary components, which
+/// therefore stays inside whatever directory it is joined onto.
+fn is_contained_relative_path(path: &str) -> bool {
+    !path.is_empty()
+        && Path::new(path)
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+}
+
+/// Delete artifacts belonging to source paths this pass no longer indexes.
+///
+/// Deletion is driven by the previous run's own record rather than by
+/// scanning the tree for anything that looks like an artifact, so the
+/// set to reclaim is exactly `previously indexed − currently indexed`.
+/// That is precise: a hand-placed `.bin` next to the generated ones is
+/// not in the record and is never touched.
+fn prune_stale_artifacts(
+    repo_root: &std::path::Path,
+    previously_indexed: &std::collections::HashSet<String>,
+    currently_indexed: &std::collections::HashSet<String>,
+) -> Vec<PathBuf> {
+    let graph_root = repo_root.join(".aethyme").join("graph");
+    let mut removed = Vec::new();
+    let mut stale_modules = std::collections::HashSet::new();
+
+    for source_path in previously_indexed.difference(currently_indexed) {
+        // The record is committed alongside the fragments, so it is
+        // repository-controlled: a `..` or absolute path would aim the
+        // removal below outside the graph directory.
+        if !is_contained_relative_path(source_path) {
+            continue;
+        }
+        let fragment = graph_root.join(format!("{source_path}.bin"));
+        if fragment.is_file() && std::fs::remove_file(&fragment).is_ok() {
+            removed.push(fragment.clone());
+        }
+        stale_modules.insert(crate::linker::synthesize_module_name(source_path));
+        // Drop the now-empty source directory so the tree does not
+        // accumulate one empty directory per deleted file.
+        let mut parent = fragment.parent().map(Path::to_path_buf);
+        while let Some(directory) = parent {
+            if directory == graph_root || std::fs::remove_dir(&directory).is_err() {
+                break;
+            }
+            parent = directory.parent().map(Path::to_path_buf);
+        }
+    }
+
+    // Remove index shards for modules that no longer exist, so symbols
+    // from a deleted file cannot survive in the symbol index and keep
+    // resolving as if they were live.
+    let current_modules: std::collections::HashSet<String> = currently_indexed
+        .iter()
+        .map(|path| crate::linker::synthesize_module_name(path))
+        .collect();
+    if let Ok(entries) = std::fs::read_dir(graph_root.join("_index")) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() || path.extension().and_then(|v| v.to_str()) != Some("ndjson") {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            if current_modules.contains(stem) || !stale_modules.contains(stem) {
+                continue;
+            }
+            if std::fs::remove_file(&path).is_ok() {
+                removed.push(path);
+            }
+        }
+    }
+
+    removed
+}
 
 #[derive(Debug)]
 pub enum IndexRepoError {

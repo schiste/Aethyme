@@ -5785,13 +5785,32 @@ impl Broker {
         mode: GraphImpactMode,
         budget: usize,
     ) -> Result<GraphImpactReport, BrokerOpError> {
+        let report = self.graph_impact_evaluate(revision, changed_files, mode, budget)?;
+        self.store().append_event(
+            crate::events::GRAPH_IMPACT_EVALUATED,
+            None,
+            Some(&crate::events::graph_impact_evaluated_payload(&report)),
+        )?;
+        Ok(report)
+    }
+
+    /// Evaluate graph impact without recording it, so a read-only broker
+    /// snapshot can answer: [`Self::graph_impact_report`] is this plus the
+    /// `graph.impact_evaluated` event.
+    pub fn graph_impact_evaluate(
+        &self,
+        revision: &str,
+        changed_files: Vec<String>,
+        mode: GraphImpactMode,
+        budget: usize,
+    ) -> Result<GraphImpactReport, BrokerOpError> {
         let resolved_revision =
             self.repo
                 .resolve_ref(revision)
                 .ok_or_else(|| BrokerOpError::GraphImpactInvalid {
                     reason: format!("revision {revision:?} does not resolve in this repository"),
                 })?;
-        let report = revision_bound_impact_report(
+        revision_bound_impact_report(
             &self.main_root,
             revision,
             &resolved_revision,
@@ -5802,13 +5821,7 @@ impl Broker {
         )
         .map_err(|error| BrokerOpError::GraphImpactInvalid {
             reason: error.to_string(),
-        })?;
-        self.store().append_event(
-            crate::events::GRAPH_IMPACT_EVALUATED,
-            None,
-            Some(&crate::events::graph_impact_evaluated_payload(&report)),
-        )?;
-        Ok(report)
+        })
     }
 
     /// Run the affected gates for a session's worktree: cheap-first,

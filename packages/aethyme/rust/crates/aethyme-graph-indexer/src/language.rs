@@ -7,6 +7,7 @@
 //! 3.3+).
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use aethyme_graph_schema::{Edge, Node};
 
@@ -64,7 +65,7 @@ pub trait LanguageIndexer: Send + Sync {
 /// matches the rest of the crate's determinism discipline.
 #[derive(Default)]
 pub struct LanguageRegistry {
-    indexers: BTreeMap<&'static str, Box<dyn LanguageIndexer>>,
+    indexers: BTreeMap<&'static str, Arc<dyn LanguageIndexer>>,
 }
 
 impl LanguageRegistry {
@@ -78,11 +79,44 @@ impl LanguageRegistry {
     /// configuration bug.
     pub fn register<I: LanguageIndexer + 'static>(&mut self, indexer: I) {
         let language = indexer.language();
-        let prev = self.indexers.insert(language, Box::new(indexer));
+        self.insert(language, Arc::new(indexer));
+    }
+
+    /// Register `indexer` under an additional canonical language tag.
+    ///
+    /// One parser can serve more than one canonical tag. The oxc-based
+    /// indexer declares `typescript` as its primary tag, while the
+    /// walker classifies `.js`/`.jsx`/`.cjs`/`.mjs` files as
+    /// `javascript`. Registering only the primary tag left every
+    /// JavaScript file without an indexer, so it was reported as
+    /// `parser_unavailable` and contributed no symbols at all.
+    ///
+    /// Both tags share one indexer instance, so an alias costs no
+    /// extra allocation and cannot observe different state. Panics if
+    /// the primary tag or the alias is already taken, matching
+    /// [`LanguageRegistry::register`].
+    pub fn register_alias<I: LanguageIndexer + 'static>(
+        &mut self,
+        indexer: I,
+        alias: &'static str,
+    ) {
+        let language = indexer.language();
+        assert!(
+            alias != language,
+            "LanguageRegistry: alias {alias:?} must differ from the primary \
+             tag {language:?} of the indexer it aliases"
+        );
+        let shared: Arc<dyn LanguageIndexer> = Arc::new(indexer);
+        self.insert(language, Arc::clone(&shared));
+        self.insert(alias, shared);
+    }
+
+    fn insert(&mut self, tag: &'static str, indexer: Arc<dyn LanguageIndexer>) {
+        let prev = self.indexers.insert(tag, indexer);
         assert!(
             prev.is_none(),
             "LanguageRegistry: a different indexer was already \
-             registered for language {language:?}; the registry \
+             registered for language {tag:?}; the registry \
              should be built once at startup"
         );
     }

@@ -1,4 +1,6 @@
 pub mod analyze_cli;
+pub mod cli_args;
+pub mod cli_error;
 pub mod context;
 pub mod context_pack;
 pub mod daemon;

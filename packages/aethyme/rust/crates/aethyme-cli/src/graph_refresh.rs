@@ -49,9 +49,26 @@ fn run_inner(args: &[String]) -> Result<(), String> {
     match args.first().map(String::as_str) {
         Some("status") => {
             let repo = option_path(args, "--repo")?;
-            let json = has_flag(args, "--json");
+            let json = has_flag(args, "--json") || has_flag(args, "--json-output");
             let status = GraphStatusInspector::inspect(&repo)?;
-            render_status(&status, json)
+            render_status(&status, json)?;
+            // `graph status` is the command a gate or an agent runs to
+            // decide whether graph commands are usable. Reporting
+            // `healthy: false` and `action_required: true` while
+            // exiting 0 let a scripted check pass on a broken graph —
+            // the one command whose exit code matters most was the one
+            // that always succeeded.
+            //
+            // `--json-output` keeps the historical always-zero contract
+            // for consumers that parse the report; the human path now
+            // reports health in its exit code.
+            if !json && status.action_required {
+                return Err(format!(
+                    "graph is not healthy: fragments={:?} store={:?}; next: {}",
+                    status.fragments.status, status.derived_store.status, status.next_action
+                ));
+            }
+            Ok(())
         }
         Some("units") => {
             let repo = option_path(args, "--repo")?;
@@ -82,7 +99,7 @@ fn run_inner(args: &[String]) -> Result<(), String> {
         Some("materialize") => {
             let repo = option_path(args, "--repo")?;
             let report = materialize(&repo)?;
-            if has_flag(args, "--json") {
+            if has_flag(args, "--json") || has_flag(args, "--json-output") {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&report).map_err(|error| error.to_string())?
@@ -104,7 +121,7 @@ fn run_inner(args: &[String]) -> Result<(), String> {
         Some("refresh") => match args.get(1).map(String::as_str) {
             Some("plan") => {
                 let repo = option_path(args, "--repo")?;
-                let json = has_flag(args, "--json");
+                let json = has_flag(args, "--json") || has_flag(args, "--json-output");
                 let diff = has_flag(args, "--diff");
                 if json && diff {
                     return Err("--json and --diff are separate review surfaces".into());
@@ -127,7 +144,7 @@ fn run_inner(args: &[String]) -> Result<(), String> {
                 let repo = option_path(args, "--repo")?;
                 let confirmation = required_option(args, "--confirm")?;
                 let plan = execute(&repo, confirmation)?;
-                if has_flag(args, "--json") {
+                if has_flag(args, "--json") || has_flag(args, "--json-output") {
                     println!(
                         "{}",
                         serde_json::to_string_pretty(&plan).map_err(|error| error.to_string())?

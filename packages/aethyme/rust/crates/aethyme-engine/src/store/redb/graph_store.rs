@@ -47,7 +47,7 @@ use crate::model::unresolved::UnresolvedNode;
 
 /// Bumped when the on-disk format changes incompatibly. We re-create the file
 /// rather than try to migrate.
-const SCHEMA_VERSION: u32 = 8;
+const SCHEMA_VERSION: u32 = 9;
 
 /// Public compatibility identity used by the immutable materialization cache.
 pub const GRAPH_STORE_SCHEMA_VERSION: u32 = SCHEMA_VERSION;
@@ -172,9 +172,24 @@ pub enum GraphStoreError {
     Io(std::io::Error),
     Db(redb::Error),
     Encode(bincode::Error),
-    SchemaMismatch { found: u32, expected: u32 },
-    MissingGraphStore { path: PathBuf },
-    IncompatibleRedbFileFormat { path: PathBuf, found: u8 },
+    SchemaMismatch {
+        found: u32,
+        expected: u32,
+    },
+    MissingGraphStore {
+        path: PathBuf,
+    },
+    IncompatibleRedbFileFormat {
+        path: PathBuf,
+        found: u8,
+    },
+    /// The store exists and is readable, but was materialized from a
+    /// commit other than the repository's current HEAD, so it describes
+    /// older source than the working tree.
+    IndexedAtDifferentCommit {
+        indexed: String,
+        head: String,
+    },
 }
 
 impl std::fmt::Display for GraphStoreError {
@@ -191,13 +206,32 @@ impl std::fmt::Display for GraphStoreError {
             }
             Self::MissingGraphStore { path } => write!(
                 f,
-                "graph store at {} is missing; rebuild it from committed fragments with `aethyme-engine-cli index --repo <repo>`. Query commands are read-only and will not create it.",
+                "graph store at {} is missing.\n\
+                 Query commands are read-only and will not create it. To build one:\n  \
+                 aethyme graph status --repo <repo>            # reports which posture applies\n  \
+                 aethyme graph refresh plan --repo <repo>       # if graph authority is disabled, \
+                 enroll first: aethyme deploy --repo <repo> --with-graph\n  \
+                 aethyme graph refresh execute --repo <repo> --confirm <plan-sha256>\n  \
+                 aethyme graph materialize --repo <repo>\n\
+                 `aethyme graph status` names the next action for the current state.",
                 path.display()
             ),
             Self::IncompatibleRedbFileFormat { path, found } => write!(
                 f,
-                "graph store at {} uses old redb file format v{found}; regenerate it from committed fragments with `aethyme-engine-cli index --repo <repo>`. The `.aethyme/graph/` fragments are not modified.",
+                "graph store at {} uses old redb file format v{found}; it must be regenerated. The `.aethyme/graph/` fragments are not modified.\n  \
+                 aethyme graph materialize --repo <repo>\n\
+                 If that reports a fragment mismatch, run `aethyme graph refresh plan --repo <repo>` and follow its `next:` line.",
                 path.display()
+            ),
+            Self::IndexedAtDifferentCommit { indexed, head } => write!(
+                f,
+                "graph store was built from commit {} but HEAD is now {}; it describes older source.\n  \
+                 Results may omit symbols added since. Refresh it with:\n  \
+                 aethyme graph refresh plan --repo <repo>\n  \
+                 aethyme graph refresh execute --repo <repo> --confirm <plan-sha256>\n  \
+                 aethyme graph materialize --repo <repo>",
+                short_commit(indexed),
+                short_commit(head)
             ),
         }
     }
@@ -308,6 +342,7 @@ pub struct IncompatibleGraphStore {
 }
 
 mod lifecycle;
+pub use lifecycle::{Freshness, FreshnessPolicy};
 mod listing;
 mod nodes;
 mod queries;
@@ -328,3 +363,10 @@ use nodes::*;
 use relations::*;
 use surface_flow::*;
 use symbols::*;
+
+/// Abbreviate a commit hash for display, tolerating short or non-hash
+/// values so the message never panics on malformed metadata.
+fn short_commit(commit: &str) -> &str {
+    let trimmed = commit.trim();
+    &trimmed[..trimmed.len().min(12)]
+}

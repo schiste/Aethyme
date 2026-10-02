@@ -316,24 +316,15 @@ fn main() -> ExitCode {
         }
         "graph" => match aethyme_engine::graph_cli::run(&args[1..]) {
             Ok(()) => ExitCode::SUCCESS,
-            Err(message) => {
-                eprintln!("Error: {message}");
-                ExitCode::from(1)
-            }
+            Err(error) => report_cli_error(error),
         },
         "analyze" => match aethyme_engine::analyze_cli::run(&args[1..]) {
             Ok(()) => ExitCode::SUCCESS,
-            Err(message) => {
-                eprintln!("Error: {message}");
-                ExitCode::from(1)
-            }
+            Err(error) => report_cli_error(error),
         },
         "facts" => match aethyme_engine::facts_cli::run_facts(&args[1..]) {
             Ok(()) => ExitCode::SUCCESS,
-            Err(message) => {
-                eprintln!("Error: {message}");
-                ExitCode::from(1)
-            }
+            Err(error) => report_cli_error(error),
         },
         "intents" => match aethyme_engine::facts_cli::run_intents(&args[1..]) {
             Ok(()) => ExitCode::SUCCESS,
@@ -369,17 +360,11 @@ fn main() -> ExitCode {
         },
         "task" => match aethyme_engine::task_cli::run(&args[1..]) {
             Ok(()) => ExitCode::SUCCESS,
-            Err(message) => {
-                eprintln!("Error: {message}");
-                ExitCode::from(1)
-            }
+            Err(error) => report_cli_error(error),
         },
         "query" => match aethyme_engine::query_cli::run(&args[1..]) {
             Ok(()) => ExitCode::SUCCESS,
-            Err(message) => {
-                eprintln!("Error: {message}");
-                ExitCode::from(1)
-            }
+            Err(error) => report_cli_error(error),
         },
         "root" => run_root_subcommand(&args[1..]),
         // The agent-surface hook entry point the Aethyme plugin shims
@@ -456,6 +441,18 @@ fn print_version() {
     );
 }
 
+/// Map a typed engine front-end error onto a process exit code.
+///
+/// Usage errors (unknown flag, missing subcommand, bad arity) exit 2,
+/// matching the unknown-subcommand and `explore` paths. Runtime
+/// failures (missing store, unreadable path, target not found) exit 1.
+/// A caller can therefore tell "I invoked this wrong" from "the work
+/// failed" without string-matching stderr.
+fn report_cli_error(error: aethyme_engine::cli_error::CliError) -> ExitCode {
+    eprintln!("Error: {error}");
+    ExitCode::from(error.exit_code())
+}
+
 fn run_graph_impact(args: &[String]) -> ExitCode {
     match run_graph_impact_inner(args) {
         Ok(()) => ExitCode::SUCCESS,
@@ -510,12 +507,30 @@ fn run_graph_impact_inner(args: &[String]) -> Result<(), String> {
     } else {
         aethyme_broker::GRAPH_IMPACT_DEFAULT_BUDGET
     };
-    let json = args.iter().any(|argument| argument == "--json");
-    let mut broker = aethyme_broker::Broker::open(&repo)
-        .map_err(|error| format!("cannot open broker for {}: {error}", repo.display()))?;
-    let report = broker
-        .graph_impact_report(&revision, changed_files, mode, budget)
-        .map_err(|error| error.to_string())?;
+    let json = args
+        .iter()
+        .any(|argument| argument == "--json" || argument == "--json-output");
+    // `graph impact` is a read-only report inside a group whose other
+    // 13 subcommands never write. `Broker::open` creates `broker.db` and
+    // runs the broker's write and recovery paths, so in a repository with
+    // no broker merely asking for an impact report would create one; there
+    // the report is evaluated against a read-only snapshot and recorded
+    // nowhere. Where a broker already exists, the evaluation is recorded in
+    // its append-only event log as `graph.impact_evaluated`, which needs a
+    // writable open: a snapshot rejects the append.
+    let main_root = aethyme_broker::GitRepo::discover(&repo)
+        .and_then(|repository| repository.main_root())
+        .map_err(|error| format!("cannot open repository {}: {error}", repo.display()))?;
+    let report = if main_root.join(aethyme_broker::BROKER_DB_RELPATH).is_file() {
+        aethyme_broker::Broker::open(&repo)
+            .map_err(|error| format!("cannot open broker for {}: {error}", repo.display()))?
+            .graph_impact_report(&revision, changed_files, mode, budget)
+    } else {
+        aethyme_broker::Broker::open_snapshot(&repo)
+            .map_err(|error| format!("cannot open broker for {}: {error}", repo.display()))?
+            .graph_impact_evaluate(&revision, changed_files, mode, budget)
+    }
+    .map_err(|error| error.to_string())?;
     if json {
         println!(
             "{}",
