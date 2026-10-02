@@ -122,7 +122,7 @@ fn assemble(
     events.sort_by_key(|event| event.id);
     let folded = insights::fold_events(&events);
 
-    let pull_requests = load_pull_requests(&store)?;
+    let pull_requests = load_pull_requests(store)?;
     let stage_times = insights::stage_map(&folded, &pull_requests);
     let activity = store.session_activity_totals()?;
 

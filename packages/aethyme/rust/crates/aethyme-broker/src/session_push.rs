@@ -628,6 +628,23 @@ impl Broker {
                 ),
             })?;
         created.created = true;
+        // This push opened the pull request, so its opening is known now, not
+        // only once someone watches it — and PR monitoring is off by default,
+        // so without this most pull requests would never get a lifetime in
+        // `broker advanced insights`. Recorded after the provider confirmed the
+        // pull request exists, so the instant is never before the real one; a
+        // later watch poll that reads the provider's `createdAt` can only move
+        // it earlier (milestones keep the earliest sighting). Best-effort: the
+        // push already succeeded and must not fail over telemetry.
+        crate::warn_unrecorded(
+            "record when the pull request opened",
+            self.store().record_pull_request_opened(
+                repository,
+                created.number,
+                Some(session_id),
+                crate::clock::epoch_ms(),
+            ),
+        );
         Ok(created)
     }
 

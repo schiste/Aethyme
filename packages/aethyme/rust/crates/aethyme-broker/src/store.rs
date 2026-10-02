@@ -1536,9 +1536,7 @@ impl BrokerStore {
     }
 
     /// Every recorded pull request milestone, with its linked sessions.
-    pub fn pull_request_milestones(
-        &self,
-    ) -> Result<Vec<(String, i64, Option<i64>, Option<i64>)>, BrokerError> {
+    pub fn pull_request_milestones(&self) -> Result<Vec<PullRequestMilestoneRow>, BrokerError> {
         let mut stmt = self.conn.prepare(
             "SELECT repository, pr_number, opened_at, merged_at
              FROM pull_request_milestones
@@ -7159,6 +7157,10 @@ fn upsert_pull_request_milestone_in_tx(
     }
     Ok(())
 }
+
+/// `(repository, pr_number, opened_at, merged_at)` for one pull request, as
+/// [`BrokerStore::pull_request_milestones`] returns it.
+pub type PullRequestMilestoneRow = (String, i64, Option<i64>, Option<i64>);
 
 /// End a session's open period of attention, if it has one.
 ///

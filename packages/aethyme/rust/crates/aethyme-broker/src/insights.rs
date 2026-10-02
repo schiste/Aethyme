@@ -508,7 +508,7 @@ impl InsightsQuery {
     }
 
     fn admits(&self, ts: i64) -> bool {
-        self.window.map_or(true, |window| window.contains(ts))
+        self.window.is_none_or(|window| window.contains(ts))
     }
 }
 
@@ -732,8 +732,7 @@ pub fn report(query: InsightsQuery, input: &InsightsInput) -> InsightsReport {
                 Stage::ORDER
                     .iter()
                     .copied()
-                    .filter(|stage| stages.contains_key(stage))
-                    .next_back()
+                    .rfind(|stage| stages.contains_key(stage))
                     .unwrap_or(Stage::Registered)
             })
             .unwrap_or(Stage::Registered);
@@ -742,17 +741,17 @@ pub fn report(query: InsightsQuery, input: &InsightsInput) -> InsightsReport {
             accumulator.funnel.registered += 1;
         }
         for stage in Stage::ORDER {
-            if let Some(at) = times.and_then(|stages| stages.get(&stage)) {
-                if query.admits(*at) {
-                    observe(*at);
-                    match stage {
-                        Stage::Registered => {}
-                        Stage::Submitted => accumulator.funnel.submitted += 1,
-                        Stage::Verified => accumulator.funnel.verified += 1,
-                        Stage::Landed => accumulator.funnel.landed += 1,
-                        Stage::PullRequestOpened => accumulator.funnel.pr_opened += 1,
-                        Stage::PullRequestMerged => accumulator.funnel.pr_merged += 1,
-                    }
+            if let Some(at) = times.and_then(|stages| stages.get(&stage))
+                && query.admits(*at)
+            {
+                observe(*at);
+                match stage {
+                    Stage::Registered => {}
+                    Stage::Submitted => accumulator.funnel.submitted += 1,
+                    Stage::Verified => accumulator.funnel.verified += 1,
+                    Stage::Landed => accumulator.funnel.landed += 1,
+                    Stage::PullRequestOpened => accumulator.funnel.pr_opened += 1,
+                    Stage::PullRequestMerged => accumulator.funnel.pr_merged += 1,
                 }
             }
         }
@@ -854,7 +853,7 @@ pub fn report(query: InsightsQuery, input: &InsightsInput) -> InsightsReport {
     }
     pull_requests.sort_by_key(|pr| (pr.merged_at, pr.opened_at, pr.pr_number));
 
-    summaries.sort_by(|left, right| right.session_id.cmp(&left.session_id));
+    summaries.sort_by_key(|summary| std::cmp::Reverse(summary.session_id));
     let sessions_total = summaries.len();
     summaries.truncate(query.session_limit);
     let pull_requests_total = pull_requests.len();

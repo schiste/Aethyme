@@ -558,7 +558,7 @@ fn the_json_report_carries_no_person() {
 #[test]
 fn the_json_report_names_the_idle_gap_because_it_defines_active_time() {
     let (_root, mut broker, _ids) = fixture(1);
-    let json = serde_json::to_value(&report(&mut broker, InsightsQuery::default())).unwrap();
+    let json = serde_json::to_value(report(&mut broker, InsightsQuery::default())).unwrap();
     assert_eq!(
         json["idle_gap_ms"].as_i64(),
         Some(insights::IDLE_GAP_MS),
@@ -569,7 +569,7 @@ fn the_json_report_names_the_idle_gap_because_it_defines_active_time() {
 #[test]
 fn the_json_contract_carries_its_schema_version() {
     let (_root, mut broker, _ids) = fixture(1);
-    let json = serde_json::to_value(&report(&mut broker, InsightsQuery::default())).unwrap();
+    let json = serde_json::to_value(report(&mut broker, InsightsQuery::default())).unwrap();
     assert_eq!(
         json["schema_version"].as_u64(),
         Some(insights::INSIGHTS_SCHEMA_VERSION as u64)
