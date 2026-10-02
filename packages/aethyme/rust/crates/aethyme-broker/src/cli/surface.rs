@@ -153,6 +153,10 @@ pub const ADVANCED_VERBS: &[(&str, &str)] = &[
     ),
     ("events", "show or prune the append-only event log"),
     ("metrics", "cost/benefit accounting from local telemetry"),
+    (
+        "insights",
+        "session funnel, time-to-land and gate reliability from local history",
+    ),
     ("worktree-root", "resolve the external worktree root"),
     ("worktrees", "list broker-owned worktrees"),
     ("scaffold", "deterministic only-if-missing broker setup"),

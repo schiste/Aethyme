@@ -94,6 +94,11 @@ fn snapshot(state: &str, sha: char, activity: &[&str]) -> PullRequestSnapshot {
         head_branch: "feature".into(),
         head_sha: sha.to_string().repeat(40),
         is_draft: true,
+        // The provider's own instants, absent here so the fixture keeps
+        // describing only what these tests exercise. The parsing of them is
+        // covered in `pr_watch::tests`.
+        created_at_ms: None,
+        merged_at_ms: None,
         activities: activity
             .iter()
             .map(|id| PullRequestActivityMetadata {

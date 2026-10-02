@@ -23,7 +23,7 @@ use rusqlite::Connection;
 use crate::error::BrokerError;
 
 /// Current database schema version (== `MIGRATIONS.len()`).
-pub const SCHEMA_VERSION: i64 = 44;
+pub const SCHEMA_VERSION: i64 = 45;
 
 /// The oldest schema version whose binaries can safely use a database at
 /// [`SCHEMA_VERSION`]. Before this existed every newer database locked out
@@ -34,6 +34,11 @@ pub const SCHEMA_VERSION: i64 = 44;
 ///   writer names its columns explicitly, so its rows simply leave them NULL.
 /// - v44: nullable session short names; older binaries continue to ignore the
 ///   additional column.
+/// - v45: three new tables for lifecycle telemetry. A writer that predates
+///   them never names them, so they stay empty and every figure derived from
+///   them is reported as unmeasured rather than as zero. Nothing existing is
+///   renamed, retyped or given a new constraint, which is what would force
+///   older binaries out.
 pub const MIN_COMPATIBLE_SCHEMA: i64 = 42;
 
 /// Whether this binary may use a database at `found`, a version newer than
@@ -1298,6 +1303,89 @@ ALTER TABLE gate_results ADD COLUMN free_disk_bytes_start INTEGER;
 const MIGRATION_V44: &str = "
 ALTER TABLE sessions ADD COLUMN short_name TEXT;
 ";
+/// Lifecycle telemetry (`crate::insights`).
+///
+/// Two problems, two tables.
+///
+/// **Activity intervals.** `sessions.last_activity_at` holds one value — the
+/// most recent signal — so every earlier signal is overwritten the moment the
+/// agent acts again. Wall-clock session lifetime is therefore the only duration
+/// the store can report, and it is not a duration anyone worked: measured over
+/// this repository's own history it averages ~46 hours against a median inside
+/// the 1-4 hour band, because a session registered on Monday and finished on
+/// Thursday reports three days of elapsed time of which the agent spent an
+/// unknown and certainly smaller amount working. Intervals keep the history
+/// that column threw away.
+///
+/// The shape is one row per *period of attention*, not per signal: a signal
+/// arriving within the idle gap extends the open row, and one arriving after
+/// it closes the row at the previous signal and opens a new one. `signals`
+/// counts the turns each period absorbed, which is the one engagement number
+/// that survives aggregation. The gap that decides the split is a constant in
+/// `crate::insights` and is reported alongside every figure computed from
+/// these rows, because a duration whose threshold is invisible gets read as a
+/// fact about the work rather than a choice about the measurement.
+///
+/// `ended_at IS NULL` means "still open": the period the session is in right
+/// now, which has no duration until the next signal or the session's close
+/// ends it. The partial unique index keeps that true under the concurrent
+/// hook writes that every session in a repository produces.
+///
+/// **Pull request milestones.** `pull_request_observations` is a memory of the
+/// last look, overwritten in place by design, so it cannot answer "when did
+/// this open" — the answer is gone by the second poll, and the provider's own
+/// `createdAt` was never requested. Milestones are first-seen facts about a
+/// pull request and are immutable once written, which is the opposite shape,
+/// so they get their own table keyed by pull request. `session_id` is the
+/// session that first observed it and is NULL for a repository whose pull
+/// requests nobody watched.
+const MIGRATION_V45: &str = "
+CREATE TABLE session_activity (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id     INTEGER NOT NULL REFERENCES sessions(id),
+    started_at     INTEGER NOT NULL,
+    last_signal_at INTEGER NOT NULL,
+    ended_at       INTEGER,
+    signals        INTEGER NOT NULL DEFAULT 1,
+    source         TEXT NOT NULL DEFAULT 'host_hook'
+                   CHECK (source IN ('host_hook', 'close'))
+);
+
+CREATE UNIQUE INDEX session_activity_one_open
+    ON session_activity (session_id) WHERE ended_at IS NULL;
+
+CREATE INDEX session_activity_by_session
+    ON session_activity (session_id, started_at);
+
+CREATE TABLE pull_request_milestones (
+    repository    TEXT NOT NULL,
+    pr_number     INTEGER NOT NULL,
+    session_id    INTEGER REFERENCES sessions(id),
+    opened_at     INTEGER,
+    merged_at     INTEGER,
+    closed_at     INTEGER,
+    first_seen_at INTEGER NOT NULL,
+    updated_at    INTEGER NOT NULL,
+    PRIMARY KEY (repository, pr_number)
+);
+
+CREATE INDEX pull_request_milestones_by_merge
+    ON pull_request_milestones (merged_at)
+    WHERE merged_at IS NOT NULL;
+
+CREATE TABLE pull_request_session_links (
+    repository    TEXT NOT NULL,
+    pr_number     INTEGER NOT NULL,
+    session_id    INTEGER NOT NULL REFERENCES sessions(id),
+    linked_at     INTEGER NOT NULL,
+    link_source   TEXT NOT NULL DEFAULT 'watch'
+                   CHECK (link_source IN ('watch', 'representation', 'ship')),
+    PRIMARY KEY (repository, pr_number, session_id)
+);
+
+CREATE INDEX pull_request_session_links_by_session
+    ON pull_request_session_links (session_id);
+";
 const MIGRATIONS: &[&str] = &[
     MIGRATION_V1,
     MIGRATION_V2,
@@ -1343,6 +1431,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_V42,
     MIGRATION_V43,
     MIGRATION_V44,
+    MIGRATION_V45,
 ];
 
 pub(crate) fn current_version(conn: &Connection) -> Result<i64, BrokerError> {
@@ -1577,17 +1666,137 @@ mod tests {
     }
 
     #[test]
+    fn additive_v45_is_declared_compatible_so_a_v42_binary_keeps_using_the_database() {
+        // The declaration itself: v45 only adds tables, so it does not raise
+        // the minimum. Raising it would lock existing binaries and plugin hooks
+        // out of this repository's database, so doing so must be a deliberate
+        // edit.
+        assert_eq!(SCHEMA_VERSION, 45);
+        assert_eq!(MIN_COMPATIBLE_SCHEMA, 42);
+
+        let conn = migrated();
+        assert_eq!(current_version(&conn).unwrap(), 45);
+
+        // A v42 binary still reads and writes, and the tables it has never
+        // heard of are simply absent from its world.
+        assert!(schema_is_compatible_with(&conn, 46, 42).unwrap());
+        assert!(!schema_is_compatible_with(&conn, 46, 41).unwrap());
+    }
+
+    #[test]
+    fn a_session_has_at_most_one_open_activity_interval() {
+        // The invariant the partial unique index exists to hold: concurrent
+        // hook writes from every session in a repository must not open two
+        // periods of attention for one session.
+        let conn = migrated();
+        conn.execute(
+            "INSERT INTO sessions (
+                 id, worktree_path, branch, origin, status,
+                 created_at, updated_at, last_activity_at
+             ) VALUES (1, '/repo', 'agent/one', 'spawned', 'active', 1, 1, 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_activity (session_id, started_at, last_signal_at)
+             VALUES (1, 100, 100)",
+            [],
+        )
+        .unwrap();
+        assert!(
+            conn.execute(
+                "INSERT INTO session_activity (session_id, started_at, last_signal_at)
+                 VALUES (1, 200, 200)",
+                [],
+            )
+            .is_err(),
+            "a second open interval for the same session must be refused"
+        );
+        // A closed interval is history, not a conflict.
+        conn.execute(
+            "UPDATE session_activity SET ended_at = 150 WHERE session_id = 1",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_activity (session_id, started_at, last_signal_at)
+             VALUES (1, 200, 200)",
+            [],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_pull_request_milestone_is_written_once_per_pull_request() {
+        // First-seen facts are immutable, so the key is the pull request
+        // itself: a second observer of the same pull request updates the
+        // existing row's facts rather than adding a competing one.
+        let conn = migrated();
+        conn.execute(
+            "INSERT INTO pull_request_milestones (repository, pr_number, opened_at, first_seen_at, updated_at)
+             VALUES ('o/r', 7, 1000, 1000, 1000)",
+            [],
+        )
+        .unwrap();
+        assert!(
+            conn.execute(
+                "INSERT INTO pull_request_milestones (repository, pr_number, opened_at, first_seen_at, updated_at)
+                 VALUES ('o/r', 7, 2000, 2000, 2000)",
+                [],
+            )
+            .is_err(),
+            "a pull request must have one milestone row"
+        );
+    }
+
+    #[test]
+    fn a_pull_request_links_to_several_sessions() {
+        // Two sessions can each open a watch on one pull request — a session
+        // that created it and one that was later assigned its review — so the
+        // link table is many-to-many and the primary key allows it. Without
+        // that, the second link is silently dropped and the pull request looks
+        // like it belongs to whoever saw it first.
+        let conn = migrated();
+        for (id, path) in [(1i64, "/one"), (2, "/two")] {
+            conn.execute(
+                "INSERT INTO sessions (
+                     id, worktree_path, branch, origin, status,
+                     created_at, updated_at, last_activity_at
+                 ) VALUES (?1, ?2, 'agent/x', 'spawned', 'active', 1, 1, 1)",
+                rusqlite::params![id, path],
+            )
+            .unwrap();
+        }
+        for session in [1i64, 2] {
+            conn.execute(
+                "INSERT INTO pull_request_session_links (repository, pr_number, session_id, linked_at)
+                 VALUES ('o/r', 7, ?1, 10)",
+                rusqlite::params![session],
+            )
+            .unwrap();
+        }
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pull_request_session_links WHERE repository='o/r' AND pr_number=7",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 2);
+    }
+
+    #[test]
     fn additive_v44_is_declared_compatible_so_a_v42_binary_keeps_using_the_database() {
         // The declaration itself: v44 adds only a nullable column and does
         // not raise the minimum. Raising it would lock existing binaries and
         // plugin hooks out of this repository's database, so doing so must be
         // a deliberate edit.
-        assert_eq!(SCHEMA_VERSION, 44);
+        assert_eq!(SCHEMA_VERSION, 45);
         assert_eq!(MIN_COMPATIBLE_SCHEMA, 42);
 
-        // A database this binary migrated to v44 ...
+        // A database this binary migrated all the way to the current version ...
         let conn = migrated();
-        assert_eq!(current_version(&conn).unwrap(), 44);
+        assert_eq!(current_version(&conn).unwrap(), SCHEMA_VERSION);
 
         // ... is accepted by a binary whose SCHEMA_VERSION is 42, through the
         // compatibility path rather than the equal-version one ...

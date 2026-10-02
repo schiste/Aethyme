@@ -67,6 +67,7 @@ pub mod hooks;
 mod host_operations;
 mod host_state;
 pub mod init;
+pub mod insights;
 pub mod install_health;
 mod issue_form;
 mod lease_export;
@@ -275,6 +276,15 @@ pub use hooks::{HookReport, HookSnippet, HookState, HooksError};
 pub use host_operations::{
     HostOperation, HostOperationError, HostOperationGuard, default_host_operation_db_path,
     host_operation, reconcile_host_operation,
+};
+/// The insights report's own pull request input, distinct from the review
+/// trigger's provider snapshot of the same name.
+pub use insights::PullRequestObservation as InsightsPullRequest;
+pub use insights::{
+    Coverage, DurationSummary, FoldedEvents, GateObservation, IDLE_GAP_MS, INSIGHTS_SCHEMA_VERSION,
+    InsightGateRow, InsightSessionRow, InsightsInput, InsightsQuery, InsightsReport, Outcome,
+    OutcomeCounts, PullRequestSummary, SessionInsightRow, SessionSummary, Stage, Window,
+    fold_events, report, stage_for_event, stage_map,
 };
 pub use issue_form::{
     ISSUE_FORM_RENDER_SCHEMA_VERSION, ISSUE_REVIEW_ARTIFACT_SCHEMA_VERSION, IssueFormFieldKind,

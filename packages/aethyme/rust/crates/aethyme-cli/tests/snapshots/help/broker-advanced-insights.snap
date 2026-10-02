@@ -1,0 +1,5 @@
+exit: 0
+--- stdout
+  aethyme broker advanced insights [--json]
+      session funnel, time-to-land and gate reliability from local history
+--- stderr

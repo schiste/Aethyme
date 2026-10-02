@@ -86,6 +86,11 @@ fn report_only_commands_do_not_append_metrics() {
         &["broker", "advanced", "queue", "--json"][..],
         &["broker", "advanced", "events", "--json"][..],
         &["broker", "advanced", "metrics", "--json"][..],
+        // `insights` is a report over the same history `metrics` accounts for,
+        // so it belongs in the same set: a cron job polling it must not appear
+        // in the numbers it reads.
+        &["broker", "advanced", "insights", "--json"][..],
+        &["broker", "advanced", "insights", "--days", "0", "--json"][..],
         &["broker", "status", "doctor", "--json"][..],
         &[
             "broker",
