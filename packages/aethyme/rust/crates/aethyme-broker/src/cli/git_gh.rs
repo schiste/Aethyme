@@ -594,12 +594,42 @@ pub(super) fn run_git_gh(parsed: Parsed, subcommand: &str) -> Result<(), UsageEr
                 code: crate::exit_status::OUTCOME_UNKNOWN,
             });
         }
-        return Err(UsageError::Message(format!(
-            "coordinated {subcommand} operation {} failed",
-            report.operation.id
+        return Err(UsageError::Message(coordinated_failure_message(
+            subcommand, &report,
         )));
     }
     Ok(())
+}
+
+/// Lines of provider stderr carried into a coordinated failure's message.
+const COORDINATED_FAILURE_STDERR_LINES: usize = 3;
+
+/// The failure line for a coordinated operation, with the end of the
+/// provider's stderr: that is where git and gh say why (`index.lock exists`,
+/// `HTTP 422`), and without it the recorded failure names only an id.
+fn coordinated_failure_message(
+    subcommand: &str,
+    report: &crate::CoordinatedOperationReport,
+) -> String {
+    let mut message = format!(
+        "coordinated {subcommand} operation {} failed",
+        report.operation.id
+    );
+    if let Some(code) = report.operation.exit_code {
+        message.push_str(&format!(" (exit {code})"));
+    }
+    let lines: Vec<&str> = report
+        .stderr
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    let tail = &lines[lines.len().saturating_sub(COORDINATED_FAILURE_STDERR_LINES)..];
+    if !tail.is_empty() {
+        message.push_str(": ");
+        message.push_str(&tail.join(" | "));
+    }
+    message
 }
 
 /// `broker operations`.

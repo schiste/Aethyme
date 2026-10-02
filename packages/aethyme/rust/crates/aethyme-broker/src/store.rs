@@ -6119,6 +6119,25 @@ impl BrokerStore {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    /// Events of one kind recorded at or after `since_ms`, newest first.
+    /// Walks the `(kind, id)` index backwards, so it stays cheap on a large
+    /// event table.
+    pub(crate) fn recent_events_of_kind(
+        &self,
+        kind: &str,
+        since_ms: i64,
+        limit: i64,
+    ) -> Result<Vec<Event>, BrokerError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, schema_version, ts, kind, session_id, payload_json
+             FROM events
+             WHERE kind = ?1 AND ts >= ?2
+             ORDER BY id DESC LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![kind, since_ms, limit], event_from_row)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
     /// Most recent event rows for an offline report, newest first.
     pub(crate) fn recent_events(
         &self,
