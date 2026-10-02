@@ -464,6 +464,15 @@ fn previously_indexed_paths(repo_root: &std::path::Path) -> std::collections::Ha
     paths
 }
 
+/// True for a relative path made only of ordinary components, which
+/// therefore stays inside whatever directory it is joined onto.
+fn is_contained_relative_path(path: &str) -> bool {
+    !path.is_empty()
+        && Path::new(path)
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+}
+
 /// Delete artifacts belonging to source paths this pass no longer indexes.
 ///
 /// Deletion is driven by the previous run's own record rather than by
@@ -481,9 +490,14 @@ fn prune_stale_artifacts(
     let mut stale_modules = std::collections::HashSet::new();
 
     for source_path in previously_indexed.difference(currently_indexed) {
+        // The record is committed alongside the fragments, so it is
+        // repository-controlled: a `..` or absolute path would aim the
+        // removal below outside the graph directory.
+        if !is_contained_relative_path(source_path) {
+            continue;
+        }
         let fragment = graph_root.join(format!("{source_path}.bin"));
-        if fragment.is_file() {
-            let _ = std::fs::remove_file(&fragment);
+        if fragment.is_file() && std::fs::remove_file(&fragment).is_ok() {
             removed.push(fragment.clone());
         }
         stale_modules.insert(crate::linker::synthesize_module_name(source_path));
@@ -517,8 +531,9 @@ fn prune_stale_artifacts(
             if current_modules.contains(stem) || !stale_modules.contains(stem) {
                 continue;
             }
-            let _ = std::fs::remove_file(&path);
-            removed.push(path);
+            if std::fs::remove_file(&path).is_ok() {
+                removed.push(path);
+            }
         }
     }
 
