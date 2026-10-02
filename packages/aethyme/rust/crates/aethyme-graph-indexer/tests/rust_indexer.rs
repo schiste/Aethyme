@@ -396,12 +396,26 @@ fn skips_self_and_super_rooted_calls() {
 }
 
 #[test]
-fn skips_std_and_crate_rooted_calls() {
+fn skips_std_rooted_calls() {
     let result = index_source("fn caller() -> u32 { std::cmp::min(1, 2) }\n");
     assert!(
         call_targets(&result).is_empty(),
         "std-rooted calls are not repository symbols, got {:?}",
         call_targets(&result)
+    );
+}
+
+/// `crate::` names the repository's own crate root, so a
+/// `crate::`-qualified call is a repository call: the root is dropped and
+/// the rest normalized like any module path.
+#[test]
+fn normalizes_crate_rooted_calls_to_repository_paths() {
+    let result = index_source(
+        "mod store { pub fn helper() -> u32 { 1 } }\nfn top() -> u32 { 2 }\nfn caller() -> u32 { crate::store::helper() + crate::top() }\n",
+    );
+    assert_eq!(
+        call_targets(&result),
+        vec!["store.helper".to_string(), "top".to_string()]
     );
 }
 

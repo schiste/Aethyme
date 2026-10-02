@@ -34,8 +34,9 @@ use aethyme_graph_schema::{
 use crate::language::LanguageIndexError;
 
 /// Roots that refer to the enclosing item or a language intrinsic rather
-/// than a repository symbol.
-const NON_REFERENCE_ROOTS: &[&str] = &["self", "super", "Self", "crate", "std", "core", "alloc"];
+/// than a repository symbol. `crate` is not one of them: it names this
+/// crate's root, so [`normalize_rust_path`] drops it and keeps the path.
+const NON_REFERENCE_ROOTS: &[&str] = &["self", "super", "Self", "std", "core", "alloc"];
 
 /// Prelude constructors and intrinsics that are syntactically
 /// indistinguishable from a bare path call (`Ok(x)`, `drop(x)`) but are
@@ -117,10 +118,14 @@ fn callee_name(expr: Option<ast::Expr>) -> Option<String> {
 /// `crate::store::helper` → `store.helper`
 /// `self::helper` → `None`
 fn normalize_rust_path(raw: &str) -> Option<String> {
-    let segments: Vec<&str> = raw
+    let mut segments: Vec<&str> = raw
         .split("::")
         .filter(|segment| !segment.is_empty())
         .collect();
+    // `crate::store::helper` is the repository's own `store::helper`.
+    if segments.first() == Some(&"crate") {
+        segments.remove(0);
+    }
     if segments.is_empty() {
         return None;
     }
