@@ -214,6 +214,20 @@ pub(super) fn run_leases(parsed: Parsed) -> Result<(), UsageError> {
                 out!("{}", serde_json::to_string_pretty(&report)?);
             } else {
                 out!("Session {session} claimed {path}.");
+                for warning in &report.warnings {
+                    out!(
+                        "  note: session {} ({}) also holds {} [{}]: {}",
+                        warning.session_id,
+                        warning
+                            .holder_context
+                            .as_deref()
+                            .or(warning.holder_status.as_deref())
+                            .unwrap_or("unknown"),
+                        warning.path,
+                        warning.kind.as_str(),
+                        warning.reason.as_deref().unwrap_or("")
+                    );
+                }
             }
         }
         Some("plan") => {
