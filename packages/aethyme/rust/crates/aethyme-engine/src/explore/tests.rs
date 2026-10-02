@@ -843,19 +843,25 @@ fn observability_reports_surface_flow_coverage_gaps() {
     write_test_file(tmp.path(), ".aethyme/graph_store.redb", "placeholder");
 
     let observability = graph_store_observability(tmp.path());
+    // Freshness is decided by comparing the store's recorded commit
+    // against HEAD. This fixture is not a git checkout and writes a
+    // placeholder store file, so neither side of the comparison is
+    // available. The honest answer is "unknown" — and `fresh` must
+    // stay false, because reporting absent evidence as currency is what
+    // made this field actively misleading before.
     assert_eq!(
         observability
             .get("graph_freshness")
             .and_then(|value| value.get("status"))
             .and_then(|value| value.as_str()),
-        Some("fresh")
+        Some("unknown")
     );
     assert_eq!(
         observability
             .get("graph_freshness")
             .and_then(|value| value.get("fresh"))
             .and_then(|value| value.as_bool()),
-        Some(true)
+        Some(false)
     );
     let surface_flow = observability
         .get("surface_flow_graph")

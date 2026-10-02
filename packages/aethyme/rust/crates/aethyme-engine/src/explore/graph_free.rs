@@ -18,6 +18,14 @@ pub(super) fn graph_store_explore_error(error: GraphStoreError) -> ExploreError 
             "incompatible",
             format!("graph store file format {found} is incompatible with this runtime"),
         ),
+        GraphStoreError::IndexedAtDifferentCommit { indexed, head } => (
+            // Not an error state for Explore: the store is readable and
+            // mostly right, it just trails HEAD. Reporting it as its own
+            // status lets the caller say so instead of implying the
+            // answer covers current source.
+            "stale",
+            format!("graph store was built from commit {indexed} but HEAD is now {head}"),
+        ),
         GraphStoreError::Io(_) => (
             "unavailable",
             "the local graph store could not be read".into(),

@@ -53,9 +53,14 @@ use crate::language::{LanguageIndexError, LanguageIndexResult, LanguageIndexer, 
 
 /// Indexer for `.ts`/`.tsx`/`.js`/`.jsx`/`.cjs`/`.mjs` files via oxc.
 ///
-/// One indexer instance is registered under the canonical language
-/// tag "typescript" (because the filesystem walker normalizes both
-/// JS and TS extensions to that tag — see `language_map.rs`).
+/// One indexer instance serves two canonical language tags: its
+/// primary tag is `typescript`, and `default_registry` additionally
+/// aliases it to `javascript`, which is what the filesystem walker
+/// reports for `.js`/`.jsx`/`.cjs`/`.mjs` extensions (see
+/// `language_map::infer_language_from_extension`). Without the alias
+/// those files were classified as `javascript`, found no registered
+/// indexer, and were reported as `parser_unavailable` with no
+/// symbols extracted.
 pub struct TypeScriptIndexer;
 
 impl TypeScriptIndexer {

@@ -927,3 +927,69 @@ fn symlinked_graph_output_is_refused_without_writing_through_it() {
     );
     assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
 }
+
+/// `graph impact --diff` takes `git diff --name-only` output (or JSON), not a
+/// patch.
+fn impact_diff(repo: &Path) -> PathBuf {
+    let diff = repo.join("change.diff");
+    fs::write(&diff, "app.py\n").unwrap();
+    diff
+}
+
+fn impact(repo: &Path) -> Output {
+    let diff = impact_diff(repo);
+    run(
+        repo,
+        &[
+            "graph",
+            "impact",
+            "--repo",
+            ".",
+            "--revision",
+            "HEAD",
+            "--diff",
+            diff.to_str().unwrap(),
+            "--json",
+        ],
+    )
+}
+
+/// `graph impact` is a read-only report: in a repository with no broker it
+/// must neither fail nor create `broker.db` to answer.
+#[test]
+fn graph_impact_without_a_broker_succeeds_and_creates_no_broker_database() {
+    let (_temporary, repo) = fixture();
+    let report: Value = serde_json::from_str(&success(impact(&repo))).unwrap();
+    assert!(report["status"].is_string(), "{report}");
+    assert_eq!(report["request"]["changed_files"], 1, "{report}");
+    assert!(!repo.join(".aethyme/broker.db").exists());
+}
+
+/// Where a broker already exists, the evaluation is still recorded in its
+/// append-only event log, as before the command became read-only.
+#[test]
+fn graph_impact_with_a_broker_records_its_evaluation_event() {
+    let (_temporary, repo) = fixture();
+    success(run(&repo, &["broker", "status", "--json"]));
+    assert!(repo.join(".aethyme/broker.db").is_file());
+    success(impact(&repo));
+    // `events --json` prints one event object per line.
+    let events = success(run(
+        &repo,
+        &[
+            "broker",
+            "advanced",
+            "events",
+            "--kind",
+            "graph.impact_evaluated",
+            "--json",
+        ],
+    ));
+    let recorded = events
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|event| event["kind"] == "graph.impact_evaluated")
+        .count();
+    assert_eq!(recorded, 1, "{events}");
+}

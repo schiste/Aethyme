@@ -43,11 +43,19 @@ shim, and the old spelling fails with `No module named src`. Every
 command below is native, and an unknown subcommand is an error (exit 2)
 rather than a fallthrough.
 
-## Global Options
+## Output Format
 
-- `--tenant-id`
-- `--json`
-- `--verbose`
+There are no global flags: the router parses no options before the command name.
+Machine-readable output is requested per command.
+
+- `--json` and `--json-output` are accepted interchangeably on every command
+  that emits JSON, including `graph`, `query`, `task`, `facts` and `analyze`.
+  `--json` on its own does not apply to the whole CLI.
+- A misspelled flag is an error (exit 2), never a silent no-op.
+
+Exit codes: `0` success, `1` the invocation was valid but the work failed
+(missing store, unreadable path, target not found), `2` the invocation itself was
+wrong (unknown command, unknown flag, wrong arity).
 
 ## Product-Surface Tiers
 
@@ -2449,9 +2457,13 @@ Current scope limits:
 
 ## Core Commands
 
-### Indexing
-- `aethyme index PATH --name NAME --languages python,typescript --use-fallback`
-- `aethyme stats`
+### Graph Lifecycle
+Graph commands are read-only and refuse to run without a local store. Check the
+posture first; it names the exact next command.
+- `aethyme graph status --repo PATH [--json]`
+- `aethyme graph refresh plan --repo PATH [--diff]`
+- `aethyme graph refresh execute --repo PATH --confirm <plan-sha256>`
+- `aethyme graph materialize --repo PATH`
 
 ### Local Repo Intake
 - `aethyme repo ingest /path/to/repo`
@@ -2998,12 +3010,16 @@ Optional params:
 - `aethyme graph callees /path/to/repo <target> --json-output`
 - `aethyme graph docs /path/to/repo <target> --json-output`
 - `aethyme graph configs /path/to/repo <target> --json-output`
+- `aethyme graph expand /path/to/repo <target> --json-output`
 - `aethyme graph overview /path/to/repo --json-output`
 
-`node`, relation, and expansion graph commands read
-`.aethyme/graph_store.redb` through read-only engine APIs. `graph overview`
-still uses the in-memory graph overview path until it receives its own redb
-adapter.
+Every navigation command, including `graph overview`, reads
+`.aethyme/graph_store.redb` through read-only engine APIs.
+
+`node`, `expand` and the relation commands exit 1 with `node not found` when
+the target does not resolve, and exit 0 with `"items": []` when the node exists
+but has no such relation. Check the exit code to tell a misspelled symbol from
+a genuine empty result.
 
 ### Derived Facts
 - `aethyme facts public-functions --repo /path/to/repo --scope src/pkg --json-output`
@@ -3039,9 +3055,6 @@ still read from the filesystem when context packs need snippets/content, but
 candidate selection and graph navigation come from `.aethyme/graph_store.redb`.
 
 ### Local Evaluation
-- `aethyme eval explain-repo --repo /path/to/repo --json-output`
-- `aethyme eval explain-repo --repo /path/to/repo --control-cmd "<cmd>" --explore-cmd "<cmd>" --leverage-cmd "<cmd>"`
-- `aethyme eval navigation-ctf --repo /path/to/repo --json-output`
 - Example Codex wrapper command: `packages/aethyme-eval/.venv/bin/python packages/aethyme-eval/scripts/run_codex_eval.py` (eval tooling is Python and lives in the separate `aethyme-eval` package; `packages/aethyme` carries none)
 - Example regression gate command: `packages/aethyme-eval/.venv/bin/python packages/aethyme-eval/scripts/check_regression_gate.py --suite /path/to/suite.json`
 
@@ -3066,9 +3079,12 @@ Current behavior:
 - the Aethyme-assisted evaluation prompt uses a compact rendered pack rather than the full raw JSON payload
 
 ### Graph Queries
-- `aethyme search TERM --limit 20 --type hybrid`
-- `aethyme ego SYMBOL --depth 2`
-- `aethyme impact SYMBOL --max-depth 10`
+- `aethyme graph node PATH <target> --json-output`
+- `aethyme graph expand PATH <target> --json-output`
+- `aethyme graph callers PATH <target> --json-output`
+- `aethyme graph callees PATH <target> --json-output`
+- `aethyme graph impact --repo PATH --revision HEAD --diff <file-or-"text"> [--mode calls|imports] [--budget N] [--json]`
+- `aethyme query symbol PATH <query> --json-output`
 
 ### Scorecard
 - `aethyme ai-ready --repo PATH --format md`

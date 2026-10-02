@@ -24,7 +24,7 @@ export PATH="$PWD/packages/aethyme/rust/target/release:$PATH"
 # `aethyme` — whichever is first on PATH wins. The line above puts the
 # Rust binary first for this shell. Log every time this bites.
 
-aethyme broker gates validate   # sanity-check .aethyme/gates.toml
+aethyme broker advanced gates validate   # sanity-check .aethyme/gates.toml
 ```
 
 Gates and broker config are committed (`.aethyme/gates.toml`,
@@ -47,17 +47,17 @@ cd <reported-worktree>
 cd <worktree> && aethyme broker adopt --task "short task description" --short-name "Short label"
 
 # Before planned shared edits:
-aethyme broker leases claim <path> --session <id>
+aethyme broker advanced leases claim <path> --session <id>
 
 # For broad rewrite tools:
-aethyme broker exec --session <id> -- <command>
+aethyme broker advanced exec --session <id> -- <command>
 
 # Or let the broker create worktree + branch + spawn in one step:
-aethyme broker start-agent --task "port X" --short-name "Port X" --cmd "claude -p '...'"
+aethyme broker start --task "port X" --short-name "Port X" --cmd "claude -p '...'"
 
 # The picture, any time (also refreshes leases → overlap warnings):
 aethyme broker status
-aethyme broker events --since <id>       # or --follow in a spare terminal
+aethyme broker advanced agents           # live sessions with activity-derived liveness
 
 # An agent's work is committed and ready:
 aethyme broker submit --session <id>     # simulate → affected gates on merged tree
@@ -66,11 +66,11 @@ aethyme broker submit --session <id>     # simulate → affected gates on merged
                                          # mode = "manual" for an explicit step)
 
 # Shipping remains explicit and authorized, but coordinated through the broker:
-aethyme broker git --session <id> --repo <owner/name> --reason "authorized release" -- push origin <refspec>
-aethyme broker gh --session <id> --repo <owner/name> --reason "authorized release" -- pr create ...
+aethyme broker advanced git --session <id> --repo <owner/name> --reason "authorized release" -- push origin <refspec>
+aethyme broker advanced gh --session <id> --repo <owner/name> --reason "authorized release" -- pr create ...
 
 # Done with a session:
-aethyme broker cleanup <id>              # refuses if work would be lost; --force discards
+aethyme broker finish close <id>        # refuses if work would be lost
 ```
 
 Multi-vendor requirement: at least once, run Claude Code and a second
@@ -95,7 +95,7 @@ whether it should become an issue.
 The event log has the receipts:
 
 ```bash
-aethyme broker events --json | jq -r .kind | sort | uniq -c
+aethyme broker advanced agents --json
 ```
 
 - CI avoided: `gates run`/`submit` outcomes with `"cached": true`

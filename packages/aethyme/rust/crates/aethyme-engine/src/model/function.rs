@@ -28,7 +28,12 @@ impl FunctionNode {
         signature: InternedStr,
     ) -> Self {
         let qualified_name = InternedStr::from(format!("{file_path}::{name}"));
-        let id = InternedStr::from(format!("fn:{repo_name}:{file_path}:{name}"));
+        // The start line is part of the identity. Without it a method
+        // and a module-level function sharing a name in one file, or two
+        // `impl` blocks each declaring the same method name, mint the
+        // same id for distinct symbols; the store's insert is an
+        // upsert, so one silently overwrites the other.
+        let id = InternedStr::from(format!("fn:{repo_name}:{file_path}:{name}@{line}"));
         Self {
             id,
             name,

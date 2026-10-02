@@ -193,3 +193,133 @@ fn index_repo_handles_empty_tree() {
     assert!(summary.fragments_written.is_empty());
     assert!(summary.shards_written.is_empty());
 }
+
+/// Deleting a source file must remove its fragment and its index shard.
+///
+/// Writing artifacts is not enough to keep the fragment store accurate:
+/// a removed file used to leave `*.bin` and `_index/*.ndjson` behind
+/// forever, so the linker kept indexing symbols belonging to a file
+/// that no longer existed and resolved them as if they were live.
+///
+/// `aethyme graph refresh` hid this by deleting the whole graph
+/// directory before rebuilding; only a direct `index_repo_to_disk`
+/// accumulated them.
+#[test]
+fn deleting_a_source_file_removes_its_fragment_and_shard() {
+    let tmp = tempfile::tempdir().unwrap();
+    // A source revision is required for `units.ndjson` to be written,
+    // and that file is the record pruning reads to learn what the
+    // previous pass owned.
+    let ctx = IndexerContext::new("prune-test", tmp.path().to_path_buf(), "0.1.0")
+        .unwrap()
+        .with_source_revision("0123456789abcdef0123456789abcdef01234567")
+        .unwrap()
+        .with_source_tree_digest("tree-digest")
+        .unwrap();
+
+    std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+    std::fs::write(
+        tmp.path().join("src/keep.py"),
+        "def keep():\n    return 1\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join("src/gone.py"),
+        "def gone():\n    return 2\n",
+    )
+    .unwrap();
+
+    let first = index_repo_to_disk(&ctx, &WalkOptions::default()).unwrap();
+    let gone_fragment = tmp.path().join(".aethyme/graph/src/gone.py.bin");
+    assert!(gone_fragment.is_file(), "fixture must produce a fragment");
+    assert_eq!(first.stale_artifacts_removed, 0);
+
+    std::fs::remove_file(tmp.path().join("src/gone.py")).unwrap();
+
+    let second = index_repo_to_disk(&ctx, &WalkOptions::default()).unwrap();
+
+    assert!(
+        !gone_fragment.exists(),
+        "a deleted source must not leave its fragment behind"
+    );
+    assert!(
+        second.stale_artifacts_removed > 0,
+        "the summary must report the pruned artifacts"
+    );
+
+    // The surviving file is untouched.
+    assert!(tmp.path().join(".aethyme/graph/src/keep.py.bin").is_file());
+}
+
+/// Pruning must not remove files it did not write, such as a
+/// hand-placed artifact living alongside the generated ones.
+#[test]
+fn pruning_leaves_unrelated_files_in_the_graph_tree() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = IndexerContext::new("prune-scope-test", tmp.path().to_path_buf(), "0.1.0").unwrap();
+
+    std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+    std::fs::write(
+        tmp.path().join("src/only.py"),
+        "def only():\n    return 1\n",
+    )
+    .unwrap();
+    index_repo_to_disk(&ctx, &WalkOptions::default()).unwrap();
+
+    let marker = tmp.path().join(".aethyme/graph/NOTES.txt");
+    std::fs::write(&marker, "hand-written").unwrap();
+    let stray_bin = tmp.path().join(".aethyme/graph/stray.bin");
+    std::fs::write(&stray_bin, "not ours").unwrap();
+
+    index_repo_to_disk(&ctx, &WalkOptions::default()).unwrap();
+
+    assert!(marker.is_file(), "non-artifact files must survive pruning");
+    assert!(
+        stray_bin.is_file(),
+        "a .bin the indexer did not write is indistinguishable by extension alone; \
+         pruning is scoped to paths this pass wrote, so it must be left alone"
+    );
+}
+
+/// `units.ndjson` is committed with the fragments, so the previous-run
+/// record pruning reads is repository-controlled. A recorded path that
+/// escapes the graph directory must never turn pruning into a deletion
+/// outside `.aethyme/graph`.
+#[test]
+fn pruning_never_deletes_outside_the_graph_directory() {
+    let tmp = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let ctx = IndexerContext::new("prune-escape-test", tmp.path().to_path_buf(), "0.1.0")
+        .unwrap()
+        .with_source_revision("0123456789abcdef0123456789abcdef01234567")
+        .unwrap()
+        .with_source_tree_digest("tree-digest")
+        .unwrap();
+    write(tmp.path(), "src/only.py", b"def only():\n    return 1\n");
+    index_repo_to_disk(&ctx, &WalkOptions::default()).unwrap();
+
+    let in_repo_victim = tmp.path().join("victim.bin");
+    std::fs::write(&in_repo_victim, "repository file").unwrap();
+    let absolute_victim = outside.path().join("victim.bin");
+    std::fs::write(&absolute_victim, "file outside the repository").unwrap();
+    let units = tmp.path().join(".aethyme/graph/units.ndjson");
+    let mut recorded = std::fs::read_to_string(&units).unwrap();
+    recorded.push_str("{\"path\":\"../../victim\"}\n");
+    recorded.push_str(&format!(
+        "{{\"path\":{}}}\n",
+        serde_json::to_string(outside.path().join("victim").to_str().unwrap()).unwrap()
+    ));
+    std::fs::write(&units, recorded).unwrap();
+
+    index_repo_to_disk(&ctx, &WalkOptions::default()).unwrap();
+
+    assert!(
+        in_repo_victim.is_file(),
+        "a `..` path must not escape the graph directory"
+    );
+    assert!(
+        absolute_victim.is_file(),
+        "an absolute path must not escape the graph directory"
+    );
+    assert!(outside.path().is_dir());
+}
