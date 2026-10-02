@@ -239,21 +239,27 @@ pub fn graph_integrity_checked_payload(outcome: &crate::GraphIntegrityOutcome) -
     .to_string()
 }
 
+/// `message` is the failure's error text, already redacted and capped by
+/// the caller; it is omitted when absent so a success payload is unchanged.
 pub fn broker_command_outcome_payload(
     command_surface: &str,
     exit_code: u8,
     failure_class: Option<&str>,
     operation_id: Option<i64>,
     queue_entry_id: Option<i64>,
+    message: Option<&str>,
 ) -> String {
-    json!({
+    let mut payload = json!({
         "command_surface": command_surface,
         "exit_code": exit_code,
         "failure_class": failure_class,
         "operation_id": operation_id,
         "queue_entry_id": queue_entry_id,
-    })
-    .to_string()
+    });
+    if let Some(message) = message {
+        payload["message"] = json!(message);
+    }
+    payload.to_string()
 }
 
 /// Redacted durable handoff. Deliberately excludes the absolute worktree

@@ -185,6 +185,36 @@ fn v1_constructor_payload_field_names_are_frozen() {
         "session.registered",
     );
     assert_keys(
+        &events::broker_command_outcome_payload("broker.start", 0, None, None, None, None),
+        &[
+            "command_surface",
+            "exit_code",
+            "failure_class",
+            "operation_id",
+            "queue_entry_id",
+        ],
+        "broker.command.succeeded",
+    );
+    assert_keys(
+        &events::broker_command_outcome_payload(
+            "broker.start",
+            1,
+            Some("command_failed"),
+            None,
+            None,
+            Some("m"),
+        ),
+        &[
+            "command_surface",
+            "exit_code",
+            "failure_class",
+            "message",
+            "operation_id",
+            "queue_entry_id",
+        ],
+        "broker.command.failed",
+    );
+    assert_keys(
         &events::session_reused_payload(Some("t"), Some("d")),
         &["diff_base", "task"],
         "session.reused",
