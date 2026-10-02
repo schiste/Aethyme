@@ -270,7 +270,7 @@ pub(super) fn command_records_metric(args: &[String]) -> bool {
         Some("review") => !matches!(args.get(1).map(String::as_str), Some("show")),
         Some("ship") => args.get(1).map(String::as_str) != Some("plan"),
         Some("checkpoint") => args.get(1).map(String::as_str) == Some("apply"),
-        Some("gc") => args.get(1).map(String::as_str) == Some("apply"),
+        Some("gc") => matches!(args.get(1).map(String::as_str), Some("apply" | "sweep")),
         Some("storage") => args.get(1).map(String::as_str) == Some("apply"),
         Some("representation") => args.get(1).map(String::as_str) == Some("record"),
         Some("operations") => args.get(1).map(String::as_str) == Some("reconcile"),

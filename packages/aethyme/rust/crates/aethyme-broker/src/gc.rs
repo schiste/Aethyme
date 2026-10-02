@@ -42,11 +42,60 @@ const ARTIFACT_SWEEP_STAMP_KEY: &str = "gc.artifact_sweep.last_run_ms";
 /// never reaches the backlog behind it. The cadence stamp records *when* a pass
 /// ran; this records *how far* it got (#222).
 const ARTIFACT_SWEEP_CURSOR_KEY: &str = "gc.artifact_sweep.cursor_session_id";
+/// When an unfinished pass last made progress on a broker open.
+///
+/// An unfinished pass withholds the cadence stamp so the backlog is not hidden
+/// for a whole interval. Without this second stamp that made *every* broker
+/// open resume the backlog: a repository whose backlog outlasts one budget
+/// paid a full budget -- a minute under disk pressure -- on every `gh`, `note`
+/// and hook call. Inline continuation is spaced by this instead.
+const ARTIFACT_SWEEP_PROGRESS_KEY: &str = "gc.artifact_sweep.last_partial_ms";
 
+/// The build cache an unfinished pass was part-way through removing.
+///
+/// Unlinking a tree's contents updates its modification time, so without
+/// this the next pass mistook its own partial removal for a writer and
+/// protected an idle open session's half-removed cache for another idle
+/// window. A cache already judged idle and partly removed is finished.
+const ARTIFACT_SWEEP_INTERRUPTED_KEY: &str = "gc.artifact_sweep.interrupted_path";
+
+/// Most a broker open may spend on the artifact sweep, whatever the policy
+/// budget or disk pressure. Broker open runs before every command, including
+/// the agent hook on every tool call; a larger or pressure-scaled pass belongs
+/// to commands that are about reclaiming disk (`gc sweep`, `finish`).
+pub const INLINE_ARTIFACT_SWEEP_BUDGET_MS: u64 = 250;
+
+/// Minimum spacing between inline continuations of an unfinished sweep,
+/// before the pressure divisor (so hourly-cadence pressure resumes about every
+/// 25 seconds rather than on every command).
+const INLINE_PARTIAL_PASS_SPACING_MS: i64 = 10 * 60_000;
+
+/// Which caller is sweeping, which decides the budget and what may skip it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ArtifactSweepOutcome {
+pub(crate) enum ArtifactSweepScope {
+    /// Broker open: a small fixed budget that disk pressure never scales,
+    /// respecting both the cadence and the partial-pass spacing.
+    Inline,
+    /// An explicit reclaim command: the policy budget scaled by disk
+    /// pressure, ignoring cadence and spacing.
+    Drain,
+    /// The targeted pass over one just-closed session.
+    ClosedSession(i64),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct ArtifactSweepOutcome {
     pub directories_reclaimed: usize,
     pub complete: bool,
+}
+
+/// Result of an explicit `gc sweep`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ArtifactSweepReport {
+    pub directories_reclaimed: usize,
+    pub complete: bool,
+    pub budget_ms: u64,
+    pub disk_pressured: bool,
 }
 
 /// Visit order for one sweep pass: everything after the cursor, then the head
@@ -64,6 +113,74 @@ fn sweep_order<T: Clone>(items: &[T], cursor: i64, id: impl Fn(&T) -> i64) -> Ve
         .chain(items.iter().filter(|item| id(item) <= cursor))
         .cloned()
         .collect()
+}
+
+/// Whether a remembered paused tree may be resumed by path inside `root`.
+///
+/// The path comes from the broker database, not from a scan, so it is
+/// re-proved here before anything is removed, each check on its own:
+/// - every component below `root` is a plain name -- no parent or root components --
+///   because [`Path::starts_with`] is lexical and `<root>/../elsewhere`
+///   passes it;
+/// - no component from `root` down is a symlink, so the walk cannot be
+///   redirected, and the canonical path stays strictly under the canonical
+///   root;
+/// - its name is still one the unattended lane may remove. The witness may be
+///   gone after a partial removal; the name may not change.
+fn resumable_interrupted_tree(root: &Path, path: &Path, extras: &[String]) -> bool {
+    let Ok(relative) = path.strip_prefix(root) else {
+        return false;
+    };
+    let components = relative.components().collect::<Vec<_>>();
+    if components.is_empty()
+        || !components
+            .iter()
+            .all(|component| matches!(component, Component::Normal(_)))
+    {
+        return false;
+    }
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    if crate::artifact_catalog::unattended_witness(name, extras).is_none() {
+        return false;
+    }
+    let real_directory = |candidate: &Path| {
+        std::fs::symlink_metadata(candidate).is_ok_and(|metadata| metadata.file_type().is_dir())
+    };
+    if !real_directory(root) {
+        return false;
+    }
+    let mut walked = root.to_path_buf();
+    for component in &components {
+        walked.push(component);
+        if !real_directory(&walked) {
+            return false;
+        }
+    }
+    match (std::fs::canonicalize(root), std::fs::canonicalize(path)) {
+        (Ok(canonical_root), Ok(canonical_path)) => {
+            canonical_path != canonical_root && canonical_path.starts_with(&canonical_root)
+        }
+        _ => false,
+    }
+}
+
+/// Wall-clock budget for one sweep pass. A broker open gets the smaller of the
+/// policy budget and [`INLINE_ARTIFACT_SWEEP_BUDGET_MS`], never scaled by disk
+/// pressure: under pressure the scale used to turn every command into a
+/// minute-long sweep. Explicit reclaim gets the policy budget, scaled.
+fn artifact_sweep_budget_ms(
+    policy_budget_ms: u64,
+    scope: ArtifactSweepScope,
+    urgency: crate::disk_headroom::SweepUrgency,
+) -> u64 {
+    match scope {
+        ArtifactSweepScope::Inline => policy_budget_ms.min(INLINE_ARTIFACT_SWEEP_BUDGET_MS),
+        ArtifactSweepScope::Drain | ArtifactSweepScope::ClosedSession(_) => {
+            policy_budget_ms.saturating_mul(urgency.budget_scale())
+        }
+    }
 }
 
 fn is_real_directory(path: &Path) -> bool {
@@ -1729,8 +1846,85 @@ impl Broker {
         };
         // The sweep only reclaims rebuildable caches, and this runs inside
         // broker open: its failure must not stop every command.
-        let _ = self.sweep_artifacts_autonomously(&policy, None);
+        let _ = self.sweep_artifacts_autonomously(&policy, ArtifactSweepScope::Inline);
         Ok(resumed)
+    }
+
+    /// Run the autonomous artifact sweep now with the full policy budget,
+    /// scaled by disk pressure, regardless of cadence. Safety rules are the
+    /// ones broker open applies; only the budget and the schedule differ.
+    pub fn gc_sweep_artifacts(&mut self) -> Result<ArtifactSweepReport, BrokerOpError> {
+        let policy = load_retention_policy(self.main_root())?;
+        let (budget_ms, urgency) = self.artifact_sweep_budget(&policy, ArtifactSweepScope::Drain);
+        let outcome = self.sweep_artifacts_autonomously(&policy, ArtifactSweepScope::Drain)?;
+        Ok(ArtifactSweepReport {
+            directories_reclaimed: outcome.directories_reclaimed,
+            complete: outcome.complete,
+            budget_ms,
+            disk_pressured: urgency == crate::disk_headroom::SweepUrgency::Pressured,
+        })
+    }
+
+    /// Continue an unfinished sweep with the full budget, if one is pending.
+    /// `finish` calls this: an agent finishing is about to leave anyway, so
+    /// the drain the inline path no longer does is paid there instead.
+    pub(crate) fn continue_artifact_sweep_backlog(
+        &mut self,
+    ) -> Result<Option<ArtifactSweepOutcome>, BrokerOpError> {
+        if !self.artifact_sweep_backlog_pending()? {
+            return Ok(None);
+        }
+        let policy = load_retention_policy(self.main_root())?;
+        self.sweep_artifacts_autonomously(&policy, ArtifactSweepScope::Drain)
+            .map(Some)
+    }
+
+    /// An earlier pass stopped at its budget and has not finished a lap since.
+    fn artifact_sweep_backlog_pending(&mut self) -> Result<bool, BrokerOpError> {
+        let cursor = self
+            .store()
+            .meta_get(ARTIFACT_SWEEP_CURSOR_KEY)?
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+        let partial = self
+            .store()
+            .meta_get(ARTIFACT_SWEEP_PROGRESS_KEY)?
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+        Ok(cursor != 0 || partial != 0)
+    }
+
+    /// Whether the millisecond stamp under `key` is set and younger than
+    /// `window_ms`.
+    fn meta_stamp_within(
+        &mut self,
+        key: &str,
+        now: i64,
+        window_ms: i64,
+    ) -> Result<bool, BrokerOpError> {
+        Ok(self
+            .store()
+            .meta_get(key)?
+            .and_then(|value| value.parse::<i64>().ok())
+            .is_some_and(|last| last > 0 && now.saturating_sub(last) < window_ms))
+    }
+
+    fn artifact_sweep_budget(
+        &self,
+        policy: &RetentionPolicy,
+        scope: ArtifactSweepScope,
+    ) -> (u64, crate::disk_headroom::SweepUrgency) {
+        let main_root = self.main_root();
+        // React to the fact the gate refuses on, rather than sweeping at one
+        // fixed rate whether the volume is comfortable or already out of room.
+        let urgency = crate::disk_headroom::sweep_urgency(
+            crate::disk_headroom::available_bytes_for(main_root, main_root),
+            crate::disk_headroom::DEFAULT_GATE_HEADROOM_BYTES,
+        );
+        (
+            artifact_sweep_budget_ms(policy.artifact_sweep_budget_ms, scope, urgency),
+            urgency,
+        )
     }
 
     /// Reclaim build caches from one just-closed session while retaining its
@@ -1741,7 +1935,7 @@ impl Broker {
         session_id: i64,
     ) -> Result<ArtifactSweepOutcome, BrokerOpError> {
         let policy = load_retention_policy(self.main_root())?;
-        self.sweep_artifacts_autonomously(&policy, Some(session_id))
+        self.sweep_artifacts_autonomously(&policy, ArtifactSweepScope::ClosedSession(session_id))
     }
 
     /// Reclaim build caches from long-idle closed worktrees without operator
@@ -1777,7 +1971,7 @@ impl Broker {
     fn sweep_artifacts_autonomously(
         &mut self,
         policy: &RetentionPolicy,
-        closed_session_id: Option<i64>,
+        scope: ArtifactSweepScope,
     ) -> Result<ArtifactSweepOutcome, BrokerOpError> {
         if policy.artifact_sweep_budget_ms == 0 {
             return Ok(ArtifactSweepOutcome {
@@ -1785,30 +1979,28 @@ impl Broker {
                 complete: true,
             });
         }
+        let closed_session_id = match scope {
+            ArtifactSweepScope::ClosedSession(session_id) => Some(session_id),
+            ArtifactSweepScope::Inline | ArtifactSweepScope::Drain => None,
+        };
         let main_root = self.main_root().to_path_buf();
         let now = now_ms();
-        // React to the fact the gate refuses on, rather than sweeping at one
-        // fixed rate whether the volume is comfortable or already out of room.
-        let urgency = crate::disk_headroom::sweep_urgency(
-            crate::disk_headroom::available_bytes_for(&main_root, &main_root),
-            crate::disk_headroom::DEFAULT_GATE_HEADROOM_BYTES,
-        );
-        let budget_ms = policy
-            .artifact_sweep_budget_ms
-            .saturating_mul(urgency.budget_scale());
-        let interval_ms = (i64::from(policy.artifact_sweep_interval_hours) * 3_600_000)
-            / urgency.interval_divisor().max(1);
-        if closed_session_id.is_none()
-            && self
-                .store()
-                .meta_get(ARTIFACT_SWEEP_STAMP_KEY)?
-                .and_then(|value| value.parse::<i64>().ok())
-                .is_some_and(|last| now.saturating_sub(last) < interval_ms)
-        {
-            return Ok(ArtifactSweepOutcome {
-                directories_reclaimed: 0,
-                complete: true,
-            });
+        let (budget_ms, urgency) = self.artifact_sweep_budget(policy, scope);
+        // The deadline covers discovery as well as removal: scanning dozens of
+        // worktrees is itself work a broker open must not pay unbounded.
+        let deadline = Instant::now() + Duration::from_millis(budget_ms);
+        if scope == ArtifactSweepScope::Inline {
+            let interval_ms = (i64::from(policy.artifact_sweep_interval_hours) * 3_600_000)
+                / urgency.interval_divisor().max(1);
+            let spacing_ms = INLINE_PARTIAL_PASS_SPACING_MS / urgency.interval_divisor().max(1);
+            if self.meta_stamp_within(ARTIFACT_SWEEP_STAMP_KEY, now, interval_ms)?
+                || self.meta_stamp_within(ARTIFACT_SWEEP_PROGRESS_KEY, now, spacing_ms)?
+            {
+                return Ok(ArtifactSweepOutcome {
+                    directories_reclaimed: 0,
+                    complete: true,
+                });
+            }
         }
         // A concurrent GC owns the artifact namespace; skip rather than race.
         let Ok(_lock) = GcLock::acquire(&main_root) else {
@@ -1840,7 +2032,6 @@ impl Broker {
             .iter()
             .map(|session| session.id)
             .collect::<Vec<_>>();
-        let deadline = Instant::now() + Duration::from_millis(budget_ms);
         if closed_session_id.is_none() {
             // The shared preparation cache is content-addressed: an entry no
             // checkout computes is unreadable forever, so it needs no operator
@@ -1889,7 +2080,22 @@ impl Broker {
             }
         };
         let mut idle_open_removed = 0usize;
+        // Forget a remembered tree that no longer exists, whoever removed it.
+        let mut interrupted_path = self
+            .store()
+            .meta_get(ARTIFACT_SWEEP_INTERRUPTED_KEY)?
+            .filter(|path| !path.is_empty() && is_real_directory(Path::new(path)));
+        let mut visited_any = false;
         for session in sessions {
+            // Checked before the session is taken, so the cursor names the
+            // last session actually visited and the next pass starts here.
+            // The first session is always visited: a budget spent before the
+            // loop must still buy ground, or a backlog never converges.
+            if visited_any && check_deadline(Some(deadline)) {
+                scan_completed = false;
+                break;
+            }
+            visited_any = true;
             last_visited = session.id;
             let is_idle_open = idle_open_ids.contains(&session.id);
             let root = PathBuf::from(&session.worktree_path);
@@ -1930,6 +2136,23 @@ impl Broker {
                 &policy.artefact_directories,
                 &mut found,
             );
+            // The tree this sweep was part-way through goes first and is found
+            // by path: a cache witnessed only by being non-empty stops
+            // classifying once a paused removal has emptied it, and taking it
+            // first means a pause elsewhere can never replace -- and so forget
+            // -- the one remembered tree.
+            if let Some(path) = interrupted_path.as_deref().map(PathBuf::from)
+                && path.starts_with(&root)
+            {
+                if resumable_interrupted_tree(&root, &path, &policy.artefact_directories) {
+                    found.retain(|dir| dir != &path);
+                    found.insert(0, path);
+                } else {
+                    // Lexically claims this worktree but is not a build cache
+                    // inside it: never act on it, and stop remembering it.
+                    interrupted_path = None;
+                }
+            }
             for dir in found {
                 let Some(relative) = repo_relative(&root, &dir) else {
                     continue;
@@ -1941,7 +2164,9 @@ impl Broker {
                 // thing that writes build output: a dev server or a long
                 // build can outlive the agent's last commit. Output touched
                 // inside the idle window is still in use.
-                if is_idle_open && modified_within(&dir, now, idle_window_ms) {
+                let dir_key = dir.to_string_lossy().into_owned();
+                let resuming = interrupted_path.as_deref() == Some(dir_key.as_str());
+                if is_idle_open && !resuming && modified_within(&dir, now, idle_window_ms) {
                     continue;
                 }
                 let deferrable =
@@ -1949,7 +2174,10 @@ impl Broker {
                         .and_then(ArtifactWitness::deferrable_entry);
                 match remove_condemned_tree(&dir, deferrable, Some(deadline)) {
                     Ok(TreeRemoval::Complete) => {
-                        removed.push(dir.to_string_lossy().into_owned());
+                        if resuming {
+                            interrupted_path = None;
+                        }
+                        removed.push(dir_key);
                         if is_idle_open {
                             idle_open_removed += 1;
                         }
@@ -1959,7 +2187,16 @@ impl Broker {
                     // it again and carries on -- and withholding the cadence
                     // stamp below is what makes a next pass happen today
                     // rather than after the interval.
-                    Ok(TreeRemoval::Interrupted) => scan_completed = false,
+                    Ok(TreeRemoval::Interrupted) => {
+                        // One remembered tree at a time, and never replaced
+                        // before it is finished: the next pass starts after
+                        // this session, so a pause elsewhere would otherwise
+                        // overwrite it before it is resumed.
+                        if interrupted_path.is_none() {
+                            interrupted_path = Some(dir_key);
+                        }
+                        scan_completed = false;
+                    }
                     Err(_) if closed_session_id.is_some() => scan_completed = false,
                     Err(_) => {}
                 }
@@ -1973,6 +2210,18 @@ impl Broker {
             if !scan_completed {
                 break;
             }
+        }
+        // A full lap visited every eligible session, so a remembered tree it
+        // did not resume is no longer eligible; holding it would only stop
+        // the next pause from being remembered.
+        if scan_completed && closed_session_id.is_none() {
+            interrupted_path = None;
+        }
+        match &interrupted_path {
+            Some(path) => self
+                .store()
+                .meta_set(ARTIFACT_SWEEP_INTERRUPTED_KEY, path)?,
+            None => self.store().meta_set(ARTIFACT_SWEEP_INTERRUPTED_KEY, "")?,
         }
         // Do not consume the cadence window before any closed worktree exists,
         // and do not hide an unfinished backlog for a full interval. Removal
@@ -1994,12 +2243,16 @@ impl Broker {
             }
             // A finished lap starts the next one from the top; an interrupted pass
             // remembers where it stopped so the next one advances instead of
-            // re-walking what it already cleared.
+            // re-walking what it already cleared, and when, so broker opens
+            // space their continuations instead of each paying a budget.
             if scan_completed {
                 self.store().meta_set(ARTIFACT_SWEEP_CURSOR_KEY, "0")?;
+                self.store().meta_set(ARTIFACT_SWEEP_PROGRESS_KEY, "0")?;
             } else {
                 self.store()
                     .meta_set(ARTIFACT_SWEEP_CURSOR_KEY, &last_visited.to_string())?;
+                self.store()
+                    .meta_set(ARTIFACT_SWEEP_PROGRESS_KEY, &now.to_string())?;
             }
         }
         if !removed.is_empty() {
@@ -2642,6 +2895,122 @@ impl Broker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::disk_headroom::SweepUrgency;
+
+    /// A broker open runs before every command and every hook call, so its
+    /// share of the sweep is small and fixed. Disk pressure used to multiply
+    /// it to a minute per command.
+    #[test]
+    fn a_broker_open_never_spends_more_than_the_inline_cap_even_under_pressure() {
+        for urgency in [SweepUrgency::Routine, SweepUrgency::Pressured] {
+            assert_eq!(
+                artifact_sweep_budget_ms(5_000, ArtifactSweepScope::Inline, urgency),
+                INLINE_ARTIFACT_SWEEP_BUDGET_MS,
+                "{urgency:?}"
+            );
+            assert_eq!(
+                artifact_sweep_budget_ms(60_000, ArtifactSweepScope::Inline, urgency),
+                INLINE_ARTIFACT_SWEEP_BUDGET_MS,
+                "{urgency:?}"
+            );
+        }
+        // A policy budget below the cap is honoured as given.
+        assert_eq!(
+            artifact_sweep_budget_ms(100, ArtifactSweepScope::Inline, SweepUrgency::Pressured),
+            100
+        );
+    }
+
+    /// Each case is rejected by exactly one guard, so each guard is proved on
+    /// its own rather than masked by the others.
+    #[test]
+    fn a_remembered_tree_is_resumed_only_when_every_guard_holds() {
+        let root_dir = tempfile::tempdir().unwrap();
+        let root = root_dir.path();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.join(".pnpm-store")).unwrap();
+        std::fs::create_dir_all(root.join("web/node_modules")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        std::fs::create_dir_all(outside.path().join("node_modules")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.join("link")).unwrap();
+        std::fs::create_dir_all(root.join("real/node_modules")).unwrap();
+        std::os::unix::fs::symlink(root.join("real"), root.join("inner-link")).unwrap();
+
+        assert!(resumable_interrupted_tree(
+            root,
+            &root.join(".pnpm-store"),
+            &[]
+        ));
+        assert!(resumable_interrupted_tree(
+            root,
+            &root.join("web/node_modules"),
+            &[]
+        ));
+        // Component guard only: canonically inside root, no symlink, an
+        // artefact name -- but it is spelled with `..`.
+        assert!(!resumable_interrupted_tree(
+            root,
+            &root.join("a/../.pnpm-store"),
+            &[]
+        ));
+        // Name guard only: a real directory inside root, but not a cache.
+        assert!(!resumable_interrupted_tree(root, &root.join("src"), &[]));
+        assert!(!resumable_interrupted_tree(
+            root,
+            &root.join("src"),
+            &["src".to_string()]
+        ));
+        std::fs::create_dir(root.join("custom-cache")).unwrap();
+        assert!(resumable_interrupted_tree(
+            root,
+            &root.join("custom-cache"),
+            &["custom-cache".to_string()]
+        ));
+        // Symlink guard only: the link resolves inside root.
+        assert!(!resumable_interrupted_tree(
+            root,
+            &root.join("inner-link/node_modules"),
+            &[]
+        ));
+        // A link leaving root.
+        assert!(!resumable_interrupted_tree(
+            root,
+            &root.join("link/node_modules"),
+            &[]
+        ));
+        // Not under root at all, and root itself.
+        assert!(!resumable_interrupted_tree(
+            root,
+            &outside.path().join("node_modules"),
+            &[]
+        ));
+        assert!(!resumable_interrupted_tree(root, root, &[]));
+        // Gone.
+        assert!(!resumable_interrupted_tree(
+            root,
+            &root.join("node_modules"),
+            &[]
+        ));
+    }
+
+    /// Explicit reclaim commands keep the pressure-scaled policy budget.
+    #[test]
+    fn explicit_and_closed_session_sweeps_keep_the_pressure_scaled_budget() {
+        for scope in [
+            ArtifactSweepScope::Drain,
+            ArtifactSweepScope::ClosedSession(7),
+        ] {
+            assert_eq!(
+                artifact_sweep_budget_ms(5_000, scope, SweepUrgency::Routine),
+                5_000
+            );
+            assert_eq!(
+                artifact_sweep_budget_ms(5_000, scope, SweepUrgency::Pressured),
+                60_000
+            );
+        }
+    }
 
     #[test]
     fn legacy_gc_journal_defaults_new_protection_work() {

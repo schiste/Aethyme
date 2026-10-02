@@ -8611,6 +8611,24 @@ impl Broker {
                 )),
             }
         }
+        if report.closed {
+            // Broker open only nibbles at an unfinished sweep; an agent that
+            // is leaving pays the full budget to drain it instead.
+            match self.continue_artifact_sweep_backlog() {
+                Ok(Some(outcome)) if outcome.directories_reclaimed > 0 => {
+                    report.warnings.push(format!(
+                        "continued the build-artifact sweep: reclaimed {} director{} from idle or finished sessions{}",
+                        outcome.directories_reclaimed,
+                        if outcome.directories_reclaimed == 1 { "y" } else { "ies" },
+                        if outcome.complete { "" } else { "; more remains for `aethyme broker gc sweep`" }
+                    ));
+                }
+                Ok(_) => {}
+                Err(error) => report.warnings.push(format!(
+                    "the build-artifact sweep could not continue and is left for `aethyme broker gc sweep`: {error}"
+                )),
+            }
+        }
         Ok(report)
     }
 
