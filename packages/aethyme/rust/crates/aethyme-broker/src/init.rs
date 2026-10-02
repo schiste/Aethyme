@@ -1248,7 +1248,9 @@ fn prepare_draft_parts(main_root: &Path) -> Option<PrepareDraftParts> {
                     r#"["pnpm", "install", "--offline", "--frozen-lockfile"]"#,
                     r#"["package.json", "pnpm-lock.yaml"]"#,
                     "pnpm hard-links node_modules out of one content-addressable store, so \
-                     repository_shared costs one copy on disk instead of one per worktree. \
+                     worktrees on the store's volume already share one copy; to give this \
+                     repository its own store, set repository_shared and pass \
+                     --store-dir \"$AETHYME_PREPARE_CACHE_DIR\" through sh -c. \
                      pnpm's dev server accepts an ephemeral port with --port 0 and prints \
                      the bound one; prefer that over a fixed PORT in a gate.",
                 ));
@@ -1286,18 +1288,19 @@ fn prepare_draft_parts(main_root: &Path) -> Option<PrepareDraftParts> {
     if main_root.join("uv.lock").exists() {
         if main_root.join("pyproject.toml").exists() {
             runtimes.push_str("\n[[runtimes]]\nname = \"uv\"\ncommand = [\"uv\", \"--version\"]\n");
-            steps.push_str(&format!(
+            steps.push_str(
                 "\n[[steps]]\n\
-                 # uv writes a project-local .venv/; repository_shared exports\n\
-                 # UV_CACHE_DIR so concurrent worktrees download each artifact once.\n\
+                 # uv writes a project-local .venv/. To download each artifact once\n\
+                 # across worktrees, set cache = \"repository_shared\" and pass the\n\
+                 # exported store: [\"sh\", \"-c\", \"uv sync --frozen --cache-dir \\\"$AETHYME_PREPARE_CACHE_DIR\\\"\"].\n\
                  name = \"python-dependencies\"\n\
                  command = [\"uv\", \"sync\", \"--frozen\"]\n\
                  offline_command = [\"uv\", \"sync\", \"--frozen\", \"--offline\"]\n\
                  inputs = [\"pyproject.toml\", \"uv.lock\"]\n\
                  outputs = [\".venv/\"]\n\
                  cache = \"worktree_local\"\n\
-                 required_for_hooks = true\n"
-            ));
+                 required_for_hooks = true\n",
+            );
         } else {
             guidance.push(
                 "uv: uv.lock found without a pyproject.toml, so no step was drafted; \

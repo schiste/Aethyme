@@ -443,6 +443,12 @@ impl Broker {
         } else {
             None
         };
+        // Enforce the budget while the exclusive lease is held, never after
+        // release: rotation removes a store other worktrees may be reading, so
+        // it has to be inside the same critical section that granted access.
+        // It also runs before this run's directory is created, because it
+        // moves the whole repository store away, that directory included.
+        let rotation = shared_cache_budget(config.shared_cache.as_ref(), &digest, self)?;
         let cache_dir = if shared {
             Some(preparation_cache_dir(self, &digest)?)
         } else {
@@ -454,10 +460,6 @@ impl Broker {
                 source,
             })?;
         }
-        // Enforce the budget while the exclusive lease is held, never after
-        // release: rotation removes a store other worktrees may be reading, so
-        // it has to be inside the same critical section that granted access.
-        let rotation = shared_cache_budget(config.shared_cache.as_ref(), &digest, self)?;
 
         let started_at = now_ms();
         let mut record = PreparationRecord {

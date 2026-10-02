@@ -258,23 +258,3 @@ fn an_existing_prepare_toml_is_never_overwritten() {
     let written = std::fs::read_to_string(tmp.path().join(".aethyme/prepare.toml")).unwrap();
     assert_eq!(written, "schema_version = 1\n# hand written\n");
 }
-
-/// A budget declared without a shared step reads as a disk bound that is not
-/// being applied, which is the exact belief the field exists to remove. Refuse
-/// it at parse time rather than accepting a silent no-op.
-#[test]
-fn a_cache_budget_without_a_shared_step_is_refused() {
-    let config = r#"
-schema_version = 1
-
-[[steps]]
-name = "javascript-dependencies"
-command = ["npm", "ci"]
-inputs = ["package.json", "package-lock.json"]
-outputs = ["node_modules/"]
-cache = "worktree_local"
-
-[shared_cache]
-max_bytes = 1024
-"#;
-}

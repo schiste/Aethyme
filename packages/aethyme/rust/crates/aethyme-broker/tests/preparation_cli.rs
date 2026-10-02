@@ -423,3 +423,76 @@ fn unconfigured_preparation_stays_quiet_without_gates() {
     );
     assert!(status["next_action"].is_null());
 }
+
+/// A rotation clears the whole repository store, and the step that triggered it
+/// still has to run against an existing cache directory: the budget is enforced
+/// before this run's directory is created, never after, so the install command
+/// never sees `AETHYME_PREPARE_CACHE_DIR` pointing at a directory that the
+/// rotation just moved away.
+#[test]
+fn a_cache_rotation_leaves_this_runs_cache_directory_in_place() {
+    let temp = tempfile::tempdir().unwrap();
+    git(temp.path(), &["init", "-q", "-b", "main"]);
+    std::fs::create_dir_all(temp.path().join(".aethyme")).unwrap();
+    std::fs::write(
+        temp.path().join(".gitignore"),
+        "/.aethyme/broker.db*\n/.aethyme/run/\n/node_modules/\n/host-state/\n",
+    )
+    .unwrap();
+    std::fs::write(temp.path().join("pnpm-lock.yaml"), "v1\n").unwrap();
+    std::fs::write(
+        temp.path().join(".aethyme/prepare.toml"),
+        r#"schema_version = 1
+
+[shared_cache]
+max_bytes = 1
+
+[[steps]]
+name = "deps"
+command = ["sh", "-c", "test -d \"$AETHYME_PREPARE_CACHE_DIR\" && mkdir -p node_modules"]
+inputs = ["pnpm-lock.yaml"]
+outputs = ["node_modules/"]
+cache = "repository_shared"
+"#,
+    )
+    .unwrap();
+    git(temp.path(), &["add", "."]);
+    git(temp.path(), &["commit", "-qm", "fixture"]);
+    let state = temp.path().join("host-state");
+    let adopted = success_json(run(
+        temp.path(),
+        &state,
+        &["start", "--adopt", ".", "--task", "prepare", "--json"],
+    ));
+    let session = adopted["id"].as_i64().unwrap().to_string();
+    success_json(run(
+        temp.path(),
+        &state,
+        &["submit", "prepare", "--session", &session, "--json"],
+    ));
+
+    // Push the repository store over its one-byte budget, then change the
+    // lockfile so the next run is a fresh digest that must rotate.
+    let store = std::fs::read_dir(state.join("preparation-cache"))
+        .unwrap()
+        .flatten()
+        .next()
+        .expect("the first run created the repository store")
+        .path();
+    std::fs::write(store.join("old-artifact"), "bytes over budget").unwrap();
+    std::fs::write(temp.path().join("pnpm-lock.yaml"), "v2\n").unwrap();
+    std::fs::remove_dir_all(temp.path().join("node_modules")).unwrap();
+
+    let rotated = success_json(run(
+        temp.path(),
+        &state,
+        &["submit", "prepare", "--session", &session, "--json"],
+    ));
+    assert_eq!(rotated["state"], "current", "{rotated}");
+    assert!(
+        rotated["shared_cache_rotation"].is_object(),
+        "the over-budget store must be reported as rotated: {rotated}"
+    );
+    assert!(!store.join("old-artifact").exists());
+    assert!(temp.path().join("node_modules").is_dir());
+}
