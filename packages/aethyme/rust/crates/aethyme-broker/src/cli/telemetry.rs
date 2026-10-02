@@ -118,7 +118,14 @@ pub(super) fn safe_command_surface(args: &[String]) -> Option<String> {
     Some(words.join("."))
 }
 
-pub(super) fn record_command_outcome(args: &[String], exit: u8) {
+/// Longest failure message kept with a `broker.command.failed` event. Enough
+/// for an error and its first cause; the full text went to stderr.
+pub(super) const FAILURE_MESSAGE_MAX_CHARS: usize = 500;
+
+/// `error` is the text the command printed as `Error: …`, when it printed
+/// one. It is stored redacted and capped so a failure can be explained after
+/// the terminal that showed it is gone.
+pub(super) fn record_command_outcome(args: &[String], exit: u8, error: Option<&str>) {
     if !command_records_metric(args) {
         return;
     }
@@ -160,12 +167,17 @@ pub(super) fn record_command_outcome(args: &[String], exit: u8) {
         Some("git" | "gh") => "coordinated_operation_failed",
         _ => "command_failed",
     });
+    let message = (exit != 0)
+        .then_some(error)
+        .flatten()
+        .and_then(|error| crate::text_redaction::failure_message(error, FAILURE_MESSAGE_MAX_CHARS));
     let payload = crate::events::broker_command_outcome_payload(
         &command_surface,
         exit,
         failure_class,
         None,
         None,
+        message.as_deref(),
     );
     let kind = if exit == 0 {
         crate::events::BROKER_COMMAND_SUCCEEDED

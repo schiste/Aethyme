@@ -550,6 +550,7 @@ pub(super) fn run_doctor(parsed: Parsed) -> Result<(), UsageError> {
             }
         }
         render_unpushed_work(&report.unpushed_work);
+        render_recent_command_failures(&report.recent_command_failures);
         if let Some(repair) = &report.version_repair {
             out!(
                 "version repair: {} — {}",
@@ -798,6 +799,39 @@ pub(super) fn run_certify_scaffold(parsed: Parsed, subcommand: &str) -> Result<(
         return Err(UsageError::Message("certification failed".into()));
     }
     Ok(())
+}
+
+/// Failed broker commands of the last day with the error each printed, so a
+/// failure can be explained after the terminal that showed it is gone.
+fn render_recent_command_failures(failures: &[crate::RecentCommandFailure]) {
+    if failures.is_empty() {
+        return;
+    }
+    let now = crate::clock::epoch_ms();
+    out!(
+        "recent command failures: {} in the last day (newest first)",
+        failures.len()
+    );
+    for failure in failures {
+        let session = failure
+            .session_id
+            .map(|id| format!(" session {id}"))
+            .unwrap_or_default();
+        let exit = failure
+            .exit_code
+            .map(|code| format!(" exit {code}"))
+            .unwrap_or_default();
+        out!(
+            "  {} ago{session}: {}{exit}: {}",
+            crate::unpushed::describe_age(now.saturating_sub(failure.ts)),
+            failure.command_surface,
+            failure
+                .message
+                .as_deref()
+                .unwrap_or("(no message recorded)"),
+        );
+    }
+    out!("  all: aethyme broker advanced events --kind broker.command.failed");
 }
 
 /// Doctor's view of committed work only this machine holds. Status carries

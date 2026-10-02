@@ -839,21 +839,21 @@ pub fn run_resolved_with_mode(args: &[String], mode: CompatibilityMode) -> u8 {
         return crate::contract_check::run(&args[1..]);
     }
     let started = std::time::Instant::now();
-    let (code, record_outcome) = match run_inner(args, mode) {
-        Ok(()) => (0, true),
+    let (code, record_outcome, error) = match run_inner(args, mode) {
+        Ok(()) => (0, true, None),
         Err(UsageError::Help) => {
             eprint!("{}", surface::public_help());
-            (crate::exit_status::USAGE, false)
+            (crate::exit_status::USAGE, false, None)
         }
         Err(UsageError::Message(message)) => {
             eprintln!("Error: {message}");
-            (1, true)
+            (1, true, Some(message))
         }
         Err(UsageError::Exit { message, code }) => {
             eprintln!("Error: {message}");
-            (code, true)
+            (code, true, Some(message))
         }
-        Err(UsageError::SilentExit(code)) => (code, true),
+        Err(UsageError::SilentExit(code)) => (code, true, None),
     };
     let internal_hook = args.first().map(String::as_str) == Some("hooks")
         && matches!(
@@ -862,7 +862,7 @@ pub fn run_resolved_with_mode(args: &[String], mode: CompatibilityMode) -> u8 {
         );
     if mode == CompatibilityMode::Normal && !internal_hook {
         if record_outcome {
-            record_command_outcome(args, code);
+            record_command_outcome(args, code, error.as_deref());
         }
         record_command_metric(args, code, started.elapsed().as_millis() as i64);
     }
