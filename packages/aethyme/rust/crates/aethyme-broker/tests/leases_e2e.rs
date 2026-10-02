@@ -271,7 +271,7 @@ fn explicit_directory_claim_overlaps_other_sessions_files() {
 }
 
 #[test]
-fn explicit_claim_blocks_paths_owned_by_another_live_session() {
+fn explicit_claim_blocks_paths_explicitly_claimed_by_a_working_session() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());
     let mut broker = Broker::open(tmp.path()).unwrap();
@@ -279,9 +279,13 @@ fn explicit_claim_blocks_paths_owned_by_another_live_session() {
     let wt_a = add_worktree(tmp.path(), "a");
     let wt_b = add_worktree(tmp.path(), "b");
     let session_a = broker.adopt(&wt_a, None).unwrap();
-    let _session_b = broker.adopt(&wt_b, None).unwrap();
+    let session_b = broker.adopt(&wt_b, None).unwrap();
 
+    // An edit alone (an implicit lease) only warns; see lease_claim_policy_e2e.
     std::fs::write(wt_b.join("src/auth.py"), "owned elsewhere\n").unwrap();
+    broker
+        .claim_lease(session_b.id, "src/auth.py", None)
+        .unwrap();
     let err = broker.claim_lease(session_a.id, "src/", None).unwrap_err();
 
     assert!(matches!(

@@ -931,6 +931,17 @@ implicit or explicit lease kind, expiry, and whether a claim would currently
 conflict. With `--session`, leases already owned by that session are separated
 from foreign blockers; without it, every overlap is a potential conflict.
 
+A claim is refused by one kind of lease only: another session's explicit
+lease whose holder is actively working, and never in a `verify-only`
+repository. Implicit leases (derived from another session's edits) and leases
+held by idle, stale or exited sessions do not refuse; the claim succeeds and
+returns them as `warnings`, each with its holder, the reason and the
+`aethyme broker advanced note send` command to coordinate. Leases implied by a
+stale session's old edits are left out. `would_conflict` in a plan follows the
+same rule, and so do planned leases at `start --path` and the guarded-exec
+check. The rule is shared with `submit`, which additionally requires the two
+sessions' edits to conflict.
+
 A plan is a point-in-time read. Another session can claim a path after the plan
 returns, so the claim remains authoritative:
 

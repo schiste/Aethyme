@@ -1520,9 +1520,9 @@ pub struct LeaseBlocker {
     pub session_id: i64,
     pub path: String,
     pub kind: LeaseKind,
-    /// Holder's session status. A lease held by a stale or idle session blocks
-    /// exactly as hard as one held by a session actively editing the file, and
-    /// the refusal is only actionable if the reader can tell them apart.
+    /// Holder's session status. Only an explicit lease held by a session that
+    /// is actively working can refuse (see `LeaseRefusalPolicy`), so the reader
+    /// needs the status to tell a live editor from a stale holder.
     pub holder_status: Option<String>,
     /// Repository, Chau7 tab, and AI provider when the holder supplied them.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1542,6 +1542,84 @@ pub struct LeaseClaimReport {
     pub path: String,
     pub accepted: bool,
     pub blockers: Vec<LeaseBlocker>,
+    /// Other live sessions' leases on the claimed path that did not refuse
+    /// the claim, each with the reason and how to coordinate.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<LeaseBlocker>,
+}
+
+/// Which other sessions' leases may refuse a lease claim, a submit or a
+/// guarded exec. One rule for all three so they cannot drift apart again:
+/// #475 made submit inform under verify-only while `leases claim` kept
+/// refusing on any overlapping lease, including leases held by stale
+/// sessions and implicit leases derived from edits.
+pub(crate) struct LeaseRefusalPolicy {
+    /// Under verify-only every session delivers through its own pull
+    /// request, so a lease informs and never refuses.
+    verify_only: bool,
+    /// Derived status of each live session (active or idle).
+    live: std::collections::HashMap<i64, SessionStatus>,
+}
+
+impl LeaseRefusalPolicy {
+    /// Only an explicit lease held by a session that is actively working may
+    /// refuse, and never under verify-only. Implicit leases are telemetry
+    /// derived from edits; stale, exited and closed holders are not working.
+    pub(crate) fn may_block(&self, blocker: &LeaseBlocker) -> bool {
+        Self::refuses(
+            self.verify_only,
+            blocker.kind,
+            self.live.get(&blocker.session_id).copied(),
+        )
+    }
+
+    /// The rule itself, for callers that already know the holder's derived
+    /// status (planned leases at start). The store's transactional recheck
+    /// mirrors it in SQL against the stored status.
+    pub(crate) fn refuses(
+        verify_only: bool,
+        kind: LeaseKind,
+        holder: Option<SessionStatus>,
+    ) -> bool {
+        !verify_only && kind == LeaseKind::Explicit && holder == Some(SessionStatus::Active)
+    }
+
+    /// Whether this repository delivers through pull requests (verify-only),
+    /// read from the configuration committed on the default branch.
+    pub(crate) fn verify_only_at(main_root: &Path) -> bool {
+        crate::merge::PromoteConfig::load(main_root).mode == crate::merge::PromoteMode::VerifyOnly
+    }
+
+    pub(crate) fn is_live(&self, session_id: i64) -> bool {
+        self.live.contains_key(&session_id)
+    }
+
+    /// Why a lease that does not refuse is still worth knowing about.
+    pub(crate) fn non_blocking_reason(&self, session_id: i64, blocker: &LeaseBlocker) -> String {
+        let coordinate = format!(
+            "coordinate: aethyme broker advanced note send --session {session_id} \
+             --to-session {} --message \"…\"",
+            blocker.session_id
+        );
+        if !self.is_live(blocker.session_id) {
+            return format!(
+                "held by a session that is not live ({}); its leases never block",
+                blocker.holder_status.as_deref().unwrap_or("unknown")
+            );
+        }
+        if self.verify_only {
+            return format!(
+                "this repository delivers through pull requests (verify-only), so a lease \
+                 informs rather than blocks; {coordinate}"
+            );
+        }
+        if blocker.kind == LeaseKind::Implicit {
+            return format!(
+                "the holder is editing this path; implicit leases never block; {coordinate}"
+            );
+        }
+        format!("the holder is not actively working; {coordinate}")
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
@@ -1574,7 +1652,9 @@ pub struct LeasePlanOverlap {
 pub struct LeasePathPlan {
     pub path: String,
     pub owned: Vec<LeasePlanOverlap>,
+    /// Every other session's lease on this path, refusing or not.
     pub conflicts: Vec<LeasePlanOverlap>,
+    /// Whether a claim would be refused now under `LeaseRefusalPolicy`.
     pub would_conflict: bool,
 }
 
@@ -2963,6 +3043,7 @@ impl Broker {
                         .as_ref()
                         .map(|sync| sync.after_head.as_str());
                     let session = self.store.reuse_session_with_context_and_leases(
+                        LeaseRefusalPolicy::verify_only_at(&self.main_root),
                         existing.id,
                         task,
                         refreshed_base,
@@ -3023,6 +3104,7 @@ impl Broker {
         };
         let session = if let Some(replaced_session_id) = replaced_session_id {
             self.store.replace_session_with_context_and_leases(
+                LeaseRefusalPolicy::verify_only_at(&self.main_root),
                 replaced_session_id,
                 &new_session,
                 &context,
@@ -3030,6 +3112,7 @@ impl Broker {
             )?
         } else {
             self.store.register_session_with_context_and_leases(
+                LeaseRefusalPolicy::verify_only_at(&self.main_root),
                 &new_session,
                 &context,
                 &planned_paths,
@@ -3372,6 +3455,7 @@ impl Broker {
             agent_identity: agent_identity.map(str::to_string),
         };
         let session = match self.store.register_session_with_context_and_leases(
+            LeaseRefusalPolicy::verify_only_at(&self.main_root),
             &new_session,
             &context,
             &planned_paths,
@@ -3469,6 +3553,7 @@ impl Broker {
             })?;
 
         let session = self.store.register_session_with_context_and_leases(
+            LeaseRefusalPolicy::verify_only_at(&self.main_root),
             &NewSession {
                 worktree_path: worktree.root().to_string_lossy().into_owned(),
                 branch,
@@ -4594,9 +4679,11 @@ impl Broker {
         Ok(after)
     }
 
-    /// Claim an explicit write lease after checking active ownership from
-    /// other live sessions. Implicit leases remain advisory conflict
-    /// telemetry; explicit leases are the boundary used by guarded exec.
+    /// Claim an explicit write lease. Another session's lease refuses the
+    /// claim only under `LeaseRefusalPolicy`: an explicit lease held by a
+    /// session that is actively working, outside verify-only. Every other
+    /// overlapping lease of a live session is returned as a warning with how
+    /// to coordinate; leases implied by stale sessions' old edits are omitted.
     pub fn claim_lease(
         &mut self,
         session_id: i64,
@@ -4609,7 +4696,25 @@ impl Broker {
         }
         let path = normalize_lease_path(path)?;
         self.refresh_leases()?;
-        let blockers = self.lease_blockers(session_id, &path, false)?;
+        let policy = self.lease_refusal_policy()?;
+        let mut blockers = Vec::new();
+        let mut warnings = Vec::new();
+        for mut lease in self.lease_blockers(session_id, &path)? {
+            if lease.kind == LeaseKind::Implicit && !policy.is_live(lease.session_id) {
+                continue;
+            }
+            if let Some(status) = policy.live.get(&lease.session_id) {
+                lease.holder_status = Some(status.as_str().to_string());
+            }
+            if policy.may_block(&lease) {
+                lease.reason =
+                    Some("explicitly claimed by a session that is actively working".into());
+                blockers.push(lease);
+            } else {
+                lease.reason = Some(policy.non_blocking_reason(session_id, &lease));
+                warnings.push(lease);
+            }
+        }
         if !blockers.is_empty() {
             return Err(BrokerOpError::LeaseClaimConflict {
                 session_id,
@@ -4624,7 +4729,27 @@ impl Broker {
             path,
             accepted: true,
             blockers: Vec::new(),
+            warnings,
         })
+    }
+
+    /// The lease refusal rule for this repository right now: the promote mode
+    /// from the configuration committed on the default branch, and each live
+    /// session's derived status.
+    pub(crate) fn lease_refusal_policy(&mut self) -> Result<LeaseRefusalPolicy, BrokerOpError> {
+        let verify_only = LeaseRefusalPolicy::verify_only_at(&self.main_root);
+        let live = self
+            .agents(crate::clock::epoch_ms())?
+            .into_iter()
+            .filter(|agent| {
+                matches!(
+                    agent.derived_status,
+                    SessionStatus::Active | SessionStatus::Idle
+                )
+            })
+            .map(|agent| (agent.session.id, agent.derived_status))
+            .collect();
+        Ok(LeaseRefusalPolicy { verify_only, live })
     }
 
     /// Inspect how proposed explicit lease claims intersect the current
@@ -4648,6 +4773,7 @@ impl Broker {
 
         let leases = self.store.active_leases()?;
         let agents = self.agents_snapshot(now_ms())?;
+        let verify_only = LeaseRefusalPolicy::verify_only_at(&self.main_root);
         let mut planned = Vec::with_capacity(normalized.len());
         for path in normalized {
             let mut owned = Vec::new();
@@ -4695,7 +4821,9 @@ impl Broker {
             }
             owned.sort_by(lease_plan_overlap_order);
             conflicts.sort_by(lease_plan_overlap_order);
-            let would_conflict = !conflicts.is_empty();
+            let would_conflict = conflicts.iter().any(|blocker| {
+                LeaseRefusalPolicy::refuses(verify_only, blocker.kind, Some(blocker.owner_status))
+            });
             planned.push(LeasePathPlan {
                 path,
                 owned,
@@ -4712,16 +4840,37 @@ impl Broker {
     }
 
     fn ensure_planned_paths_available(
-        &self,
+        &mut self,
         paths: &[String],
         owner_session_id: Option<i64>,
     ) -> Result<(), BrokerOpError> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        // Persist liveness transitions first: the store rechecks planned
+        // leases inside the registering transaction against the stored
+        // status, which would otherwise still read `active` for a session
+        // that has gone stale since the last status pass.
+        self.agents(now_ms())?;
         let plan = self.plan_leases(paths, owner_session_id)?;
-        if let Some(path) = plan.paths.iter().find(|path| path.would_conflict) {
-            let blocker = path
-                .conflicts
-                .first()
-                .expect("conflicting path has at least one blocker");
+        let verify_only = LeaseRefusalPolicy::verify_only_at(&self.main_root);
+        let refusing = plan
+            .paths
+            .iter()
+            .filter(|path| path.would_conflict)
+            .find_map(|path| {
+                path.conflicts
+                    .iter()
+                    .find(|blocker| {
+                        LeaseRefusalPolicy::refuses(
+                            verify_only,
+                            blocker.kind,
+                            Some(blocker.owner_status),
+                        )
+                    })
+                    .map(|blocker| (path, blocker))
+            });
+        if let Some((path, blocker)) = refusing {
             return Err(BrokerError::PlannedLeaseConflict(Box::new(
                 crate::error::PlannedLeaseConflict {
                     path: path.path.clone(),
@@ -4784,9 +4933,9 @@ impl Broker {
         head: &str,
         mut changed: Vec<String>,
         allow_implicit: bool,
-        // Submit only: another session's lease blocks when its holder is
-        // actively working AND the two sessions' edits conflict. Guarded exec
-        // keeps explicit leases as a hard boundary.
+        // Submit only: another session's lease blocks when the shared
+        // `LeaseRefusalPolicy` allows it AND the two sessions' edits conflict.
+        // Guarded exec applies the policy alone, like a lease claim.
         block_only_on_conflicts: bool,
     ) -> Result<OwnershipAuditReport, BrokerOpError> {
         use crate::leases::{LeaseIgnoreRules, paths_overlap};
@@ -4856,16 +5005,31 @@ impl Broker {
         // them merges, and refusing here only stalls an agent. The overlap is
         // still reported, with how to coordinate. `auto` and `manual` keep
         // the block because they promote onto a shared integration branch.
-        let verify_only = block_only_on_conflicts
-            && crate::merge::PromoteConfig::load(&self.main_root).mode
-                == crate::merge::PromoteMode::VerifyOnly;
-        if block_only_on_conflicts && !conflicting_leases.is_empty() {
-            let active: std::collections::HashSet<i64> = self
-                .agents(crate::clock::epoch_ms())?
+        let policy = if conflicting_leases.is_empty() {
+            None
+        } else {
+            Some(self.lease_refusal_policy()?)
+        };
+        if let (Some(policy), false) = (policy.as_ref(), block_only_on_conflicts) {
+            // Guarded exec: the same rule as a claim. Leases of stale or idle
+            // holders, and every lease under verify-only, are reported only.
+            let (block, warn): (Vec<_>, Vec<_>) = conflicting_leases
                 .into_iter()
-                .filter(|agent| agent.derived_status == SessionStatus::Active)
-                .map(|agent| agent.session.id)
-                .collect();
+                .map(|mut blocker| {
+                    let blocks = policy.may_block(&blocker);
+                    blocker.reason = Some(if blocks {
+                        "explicitly claimed by a session that is actively working".into()
+                    } else {
+                        policy.non_blocking_reason(session_id, &blocker)
+                    });
+                    (blocker, blocks)
+                })
+                .partition(|(_, blocks)| *blocks);
+            conflicting_leases = block.into_iter().map(|(blocker, _)| blocker).collect();
+            warned_leases = warn.into_iter().map(|(blocker, _)| blocker).collect();
+        }
+        if let (Some(policy), true) = (policy.as_ref(), block_only_on_conflicts) {
+            let verify_only = policy.verify_only;
             let overlaps = crate::detect_overlaps(&leases);
             let (block, warn): (Vec<_>, Vec<_>) = conflicting_leases
                 .into_iter()
@@ -4879,7 +5043,8 @@ impl Broker {
                     blocker.severity = Some(
                         if conflicting { "high" } else { "low" }.to_string(),
                     );
-                    let holder_active = active.contains(&blocker.session_id);
+                    let holder_active =
+                        policy.live.get(&blocker.session_id) == Some(&SessionStatus::Active);
                     blocker.reason = Some(match (conflicting, holder_active) {
                         (true, true) if verify_only => format!(
                             "the holder is actively working and Git reports a conflict with this \
@@ -4896,7 +5061,8 @@ impl Broker {
                             .map(|pair| pair.reason)
                             .unwrap_or_else(|| "the holder has not edited this path".into()),
                     });
-                    (blocker, conflicting && holder_active && !verify_only)
+                    let blocks = conflicting && policy.may_block(&blocker);
+                    (blocker, blocks)
                 })
                 .partition(|(_, blocks)| *blocks);
             conflicting_leases = block.into_iter().map(|(blocker, _)| blocker).collect();
@@ -4926,7 +5092,6 @@ impl Broker {
         &self,
         session_id: i64,
         path: &str,
-        explicit_only: bool,
     ) -> Result<Vec<LeaseBlocker>, BrokerOpError> {
         use crate::leases::paths_overlap;
 
@@ -4935,7 +5100,6 @@ impl Broker {
             .active_leases()?
             .into_iter()
             .filter(|lease| lease.session_id != session_id)
-            .filter(|lease| !explicit_only || lease.kind == LeaseKind::Explicit)
             .filter(|lease| paths_overlap(&lease.path, path))
             .map(|lease| LeaseBlocker {
                 session_id: lease.session_id,

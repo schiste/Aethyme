@@ -49,6 +49,10 @@ blocked.
 
    Use a trailing `/` for directory leases. Implicit leases refresh from
    changed files, but explicit leases are clearer for planned shared edits.
+   A claim is refused only by another explicit lease whose holder is actively
+   working, and never in a `verify-only` repository; every other overlap comes
+   back as a warning naming the holder, with the `note send` command to
+   coordinate.
 
 3. **Guard broad rewrite commands**. For formatters, code generators, or any
    command likely to touch many files, run through the broker guard:

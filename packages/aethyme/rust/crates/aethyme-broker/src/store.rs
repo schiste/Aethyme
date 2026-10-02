@@ -341,6 +341,7 @@ impl BrokerStore {
         planned_paths: &[String],
     ) -> Result<Session, BrokerError> {
         self.register_session_with_context_and_leases(
+            false,
             new,
             &SessionContext::default(),
             planned_paths,
@@ -349,6 +350,7 @@ impl BrokerStore {
 
     pub fn register_session_with_context_and_leases(
         &mut self,
+        verify_only: bool,
         new: &NewSession,
         context: &SessionContext,
         planned_paths: &[String],
@@ -357,7 +359,7 @@ impl BrokerStore {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        validate_planned_lease_conflicts(&tx, None, planned_paths, now)?;
+        validate_planned_lease_conflicts(&tx, None, planned_paths, now, verify_only)?;
         let id = insert_session(&tx, new, context, now)?;
         insert_session_context_event(&tx, id, context, now)?;
         insert_planned_explicit_leases(&tx, id, planned_paths, now)?;
@@ -419,6 +421,7 @@ impl BrokerStore {
         planned_paths: &[String],
     ) -> Result<Session, BrokerError> {
         self.reuse_session_with_context_and_leases(
+            false,
             id,
             task,
             diff_base,
@@ -428,8 +431,12 @@ impl BrokerStore {
         )
     }
 
+    // `verify_only` decides whether planned leases may be refused; see
+    // `validate_planned_lease_conflicts`.
+    #[allow(clippy::too_many_arguments)]
     pub fn reuse_session_with_context_and_leases(
         &mut self,
+        verify_only: bool,
         id: i64,
         task: Option<&str>,
         diff_base: Option<&str>,
@@ -441,7 +448,7 @@ impl BrokerStore {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        validate_planned_lease_conflicts(&tx, Some(id), planned_paths, now)?;
+        validate_planned_lease_conflicts(&tx, Some(id), planned_paths, now, verify_only)?;
         let changed = tx.execute(
             "UPDATE sessions SET task = COALESCE(?2, task), diff_base = COALESCE(?3, diff_base),
                                  agent_identity = COALESCE(?4, agent_identity),
@@ -492,6 +499,7 @@ impl BrokerStore {
         planned_paths: &[String],
     ) -> Result<Session, BrokerError> {
         self.replace_session_with_context_and_leases(
+            false,
             replaced_id,
             new,
             &SessionContext::default(),
@@ -501,6 +509,7 @@ impl BrokerStore {
 
     pub fn replace_session_with_context_and_leases(
         &mut self,
+        verify_only: bool,
         replaced_id: i64,
         new: &NewSession,
         context: &SessionContext,
@@ -510,7 +519,7 @@ impl BrokerStore {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        validate_planned_lease_conflicts(&tx, Some(replaced_id), planned_paths, now)?;
+        validate_planned_lease_conflicts(&tx, Some(replaced_id), planned_paths, now, verify_only)?;
         let changed = tx.execute(
             "UPDATE sessions
              SET status = 'cleaned', cleanup_state = 'cleaned', closed_at = ?2,
@@ -5910,19 +5919,27 @@ fn insert_session_context_event(
     Ok(())
 }
 
+/// Recheck planned leases inside the registering transaction so two
+/// concurrent planners cannot both claim one path. Mirrors
+/// `LeaseRefusalPolicy::refuses` against the stored status: only an explicit
+/// lease of an active session refuses, and nothing refuses under verify-only.
 fn validate_planned_lease_conflicts(
     tx: &Transaction<'_>,
     owner_session_id: Option<i64>,
     planned_paths: &[String],
     now: i64,
+    verify_only: bool,
 ) -> Result<(), BrokerError> {
+    if verify_only {
+        return Ok(());
+    }
     let leases = {
         let mut stmt = tx.prepare(&format!(
             "{LEASE_SELECT}
              WHERE released_at IS NULL
                AND (expires_at IS NULL OR expires_at > ?1)
-               AND session_id IN
-                   (SELECT id FROM sessions WHERE status IN ('active', 'idle', 'stale'))
+               AND kind = 'explicit'
+               AND session_id IN (SELECT id FROM sessions WHERE status = 'active')
              ORDER BY session_id, path, kind"
         ))?;
         let rows = stmt.query_map([now], lease_from_row)?;
