@@ -30,6 +30,10 @@ fn git(root: &std::path::Path, args: &[&str]) {
     let output = Command::new("git")
         .args(args)
         .current_dir(root)
+        .env("GIT_AUTHOR_NAME", "t")
+        .env("GIT_AUTHOR_EMAIL", "t@t")
+        .env("GIT_COMMITTER_NAME", "t")
+        .env("GIT_COMMITTER_EMAIL", "t@t")
         .output()
         .unwrap();
     assert!(
