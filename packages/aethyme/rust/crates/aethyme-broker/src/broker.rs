@@ -963,6 +963,55 @@ pub struct DoctorReport {
     /// against [`Self::healthy`]: an unpushed commit is not a broken broker.
     #[serde(skip_serializing_if = "crate::UnpushedWorkReport::is_empty")]
     pub unpushed_work: crate::UnpushedWorkReport,
+    /// Broker commands that failed in the last day, newest first, with the
+    /// error each printed. Reported, never counted against [`Self::healthy`]:
+    /// a refused command is the broker working, and the list exists so a
+    /// failure can be explained after its terminal is gone.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub recent_command_failures: Vec<RecentCommandFailure>,
+}
+
+/// One `broker.command.failed` event as `doctor` reports it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RecentCommandFailure {
+    pub event_id: i64,
+    pub ts: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<i64>,
+    pub command_surface: String,
+    pub exit_code: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_class: Option<String>,
+    /// Absent for failures recorded before messages were kept, and for
+    /// commands that exit without printing an error.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// How far back `doctor` looks for failed commands, and how many it lists.
+const RECENT_COMMAND_FAILURE_WINDOW_MS: i64 = 24 * 60 * 60 * 1000;
+const RECENT_COMMAND_FAILURE_LIMIT: i64 = 10;
+
+fn recent_command_failure(event: &crate::Event) -> Option<RecentCommandFailure> {
+    let payload: serde_json::Value = serde_json::from_str(event.payload_json.as_deref()?).ok()?;
+    let text = |key: &str| {
+        payload
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    };
+    Some(RecentCommandFailure {
+        event_id: event.id,
+        ts: event.ts,
+        session_id: event.session_id,
+        command_surface: text("command_surface")?,
+        exit_code: payload
+            .get("exit_code")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|code| u8::try_from(code).ok()),
+        failure_class: text("failure_class"),
+        message: text("message"),
+    })
 }
 
 impl DoctorReport {
@@ -7714,6 +7763,7 @@ impl Broker {
         let integration_movement =
             self.integration_movement_notice_from_sessions(&live_sessions)?;
         let unpushed_work = self.unpushed_work(now_ms()).unwrap_or_default();
+        let recent_command_failures = self.recent_command_failures(now_ms())?;
 
         Ok(DoctorReport {
             integrity,
@@ -7725,7 +7775,25 @@ impl Broker {
             retention,
             integration_movement,
             unpushed_work,
+            recent_command_failures,
         })
+    }
+
+    /// Failed broker commands of the last day, for `doctor`.
+    pub fn recent_command_failures(
+        &self,
+        now: i64,
+    ) -> Result<Vec<RecentCommandFailure>, BrokerOpError> {
+        Ok(self
+            .store
+            .recent_events_of_kind(
+                crate::events::BROKER_COMMAND_FAILED,
+                now - RECENT_COMMAND_FAILURE_WINDOW_MS,
+                RECENT_COMMAND_FAILURE_LIMIT,
+            )?
+            .iter()
+            .filter_map(recent_command_failure)
+            .collect())
     }
 
     fn integration_movement_notice_from_sessions(
@@ -12171,6 +12239,7 @@ mod tests {
             },
             integration_movement: None,
             unpushed_work: Default::default(),
+            recent_command_failures: Vec::new(),
         }
     }
 

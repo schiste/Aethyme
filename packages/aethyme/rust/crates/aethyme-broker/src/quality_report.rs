@@ -740,35 +740,8 @@ fn is_hex(value: &str) -> bool {
 }
 
 fn redact_publication_text(value: &str) -> String {
-    let mut redacted = value.to_string();
-    let mut earliest: Option<usize> = None;
-    for marker in [
-        "ghp_",
-        "github_pat_",
-        "sk-",
-        "Bearer ",
-        "TOKEN=",
-        "token=",
-        "SECRET=",
-        "secret=",
-        "PASSWORD=",
-        "password=",
-        "API_KEY=",
-        "api_key=",
-    ] {
-        if let Some(index) = redacted.find(marker) {
-            earliest = Some(earliest.map_or(index, |seen: usize| seen.min(index)));
-        }
-    }
-    // The cut must be at the earliest marker in the *text*, not at whichever
-    // marker happens to come first in this list. Breaking on the first list hit
-    // truncated after anything that appeared before it: `PASSWORD=hunter2
-    // TOKEN=ghp_x` matched `ghp_` first and published the password verbatim
-    // into a public comment.
-    if let Some(index) = earliest {
-        redacted.truncate(index);
-        redacted.push_str("[redacted]");
-    }
+    let redacted = crate::text_redaction::redact_secrets(value);
+    // Publication additionally hides local paths, which local diagnostics keep.
     if [
         "/Users/",
         "/home/",

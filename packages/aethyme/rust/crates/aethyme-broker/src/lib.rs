@@ -84,6 +84,7 @@ mod pr_link;
 mod pr_monitoring;
 mod scopes;
 pub mod session_guidance;
+mod text_redaction;
 mod unpushed;
 pub mod worktree_location;
 mod worktree_report;
@@ -186,14 +187,14 @@ pub use broker::{
     IntegrationMovementNotice, IntegrationNextAction, IntegrationStabilityReport,
     IntegrationStatusView, LeaseBlocker, LeaseClaimReport, LeaseOverlapRelation, LeasePathPlan,
     LeasePlan, LeasePlanOverlap, OwnershipAuditReport, PromotedConflict, PromotedIntegrationEntry,
-    RepairAction, RepairGateSelection, RepairReport, RepairSource, RepresentationScan,
-    RetentionConfigStatus, SESSION_NOTE_MAX_BYTES, SemanticGateAdvice, SemanticGateSelection,
-    SemanticGateSource, SemanticGateSourceStatus, SemanticGateSuggestionChain,
-    SessionCheckpointApplyReport, SessionCheckpointRecoveryPlan, SessionHandoffReport,
-    SessionStartBase, SessionStartBaseEvidence, StartAgentReport, StartReport, StatusAdvice,
-    StatusAdviceSeverity, StatusBrief, StatusIntegrationRelation, StatusSummary, StatusView,
-    VersionRepairReport, VersionRepairStep, WORKTREE_ROOT_SCHEMA_VERSION, WorktreePlacement,
-    WorktreeRootPlan, WorktreeRootSource,
+    RecentCommandFailure, RepairAction, RepairGateSelection, RepairReport, RepairSource,
+    RepresentationScan, RetentionConfigStatus, SESSION_NOTE_MAX_BYTES, SemanticGateAdvice,
+    SemanticGateSelection, SemanticGateSource, SemanticGateSourceStatus,
+    SemanticGateSuggestionChain, SessionCheckpointApplyReport, SessionCheckpointRecoveryPlan,
+    SessionHandoffReport, SessionStartBase, SessionStartBaseEvidence, StartAgentReport,
+    StartReport, StatusAdvice, StatusAdviceSeverity, StatusBrief, StatusIntegrationRelation,
+    StatusSummary, StatusView, VersionRepairReport, VersionRepairStep,
+    WORKTREE_ROOT_SCHEMA_VERSION, WorktreePlacement, WorktreeRootPlan, WorktreeRootSource,
 };
 pub use cleanup_audit::{
     AuditDisposition, AuditItem, AuditOwner, AuditSummary, AuditTarget,
