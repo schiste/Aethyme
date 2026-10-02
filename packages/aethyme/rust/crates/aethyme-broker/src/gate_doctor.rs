@@ -267,7 +267,7 @@ pub fn static_gate_diagnostics(gates: &[Gate]) -> Vec<GateDiagnostic> {
                 "Declare the required tcp_port, exclusive_key, or capacity resources and consume the broker-provided environment.",
             ));
         }
-        if fixed_resource_identifier(&lower) {
+        if fixed_resource_identifier(&gate.command) {
             findings.push(finding(
                 GateDiagnosticId::FixedResourceIdentifier,
                 Some(&gate.name),
@@ -910,24 +910,384 @@ fn service_family(command: &str) -> &'static str {
     }
 }
 
+/// A hardcoded listening port in a gate command.
+///
+/// Parsed rather than substring-matched. The previous check looked for the
+/// literal `:5432` and `=5432`, which both miss the two most common dev-server
+/// ports (`:3000`, `:8080`) entirely and fire on unrelated text — a fixture
+/// string, or `:15432` standing in for a non-default port.
+///
+/// Three shapes are recognised, all of which name one specific port:
+///
+/// - `:NNNN` as a URL authority or host separator (`http://localhost:3000`)
+/// - `PORT=NNNN` and `--port NNNN` / `--port=NNNN`
+/// - a bare `-p NNNN` is *not* matched: `-p` is too overloaded (it is
+///   `cargo --package`, `docker publish`, `pgrep`) to carry this meaning
+///
+/// A non-default port is as much a collision as the default one, so the whole
+/// digit run is read: `:15432` is port 15432, never `5432` with a stray prefix.
+fn hardcoded_port(command: &str) -> Option<u16> {
+    let bytes = command.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        // `:NNNN` after a host — the `localhost:3000` case is the reason this is
+        // a parse and not a token list.
+        if bytes[index] == b':'
+            && bytes.get(index + 1).is_some_and(u8::is_ascii_digit)
+            && host_before_colon(&command[..index])
+            // A quoted literal names a value under test, not a listener:
+            // `grep -c ':5432' expected.txt` asserts about a port without
+            // binding one. Only a colon outside quotes configures anything.
+            && !inside_quotes(&command[..index])
+            && let Some((port, _)) = port_digits(&command[index + 1..])
+        {
+            return Some(port);
+        }
+        // `PORT=NNNN`, `PGPORT=NNNN`, `SERVER_PORT=NNNN`: an identifier that
+        // names a port, assigned a number.
+        if (index == 0 || !is_name_byte(bytes[index - 1]))
+            && let Some(port) = port_assignment(&command[index..])
+        {
+            return Some(port);
+        }
+        // `--port NNNN` / `--port=NNNN`.
+        let rest = &command[index..];
+        if let Some(tail) = rest
+            .strip_prefix("--port=")
+            .or_else(|| rest.strip_prefix("--port "))
+            && let Some((port, _)) = port_digits(tail)
+        {
+            return Some(port);
+        }
+        index += 1;
+    }
+    None
+}
+
+/// Whether the text before a `:NNNN` names a host, so the digits are a port.
+///
+/// A host is `localhost`, an IP address, a dotted name, a bare `:3000` listen
+/// address, a URL authority (`postgres://db:5432`), or the published half of a
+/// Docker mapping (`5432:5432`). Anything else is a name with a tag —
+/// `postgres:16`, `node:20-alpine`, `ghcr.io/acme/app:1234` — which pins a
+/// version, not a listener. A dotted registry path counts as an image, not a
+/// host, because the segment that carries the tag follows a `/`.
+fn host_before_colon(prefix: &str) -> bool {
+    let start = prefix
+        .rfind(|character: char| {
+            character.is_ascii_whitespace()
+                || matches!(character, '/' | '@' | '=' | '\'' | '"' | '(')
+        })
+        .map_or(0, |position| position + 1);
+    let segment = &prefix[start..];
+    let delimiter = prefix[..start].chars().last();
+    let authority = prefix[..start].ends_with("//") || delimiter == Some('@');
+    if delimiter == Some('/') && !authority {
+        // `registry/name:tag` — an image path, never a host.
+        return false;
+    }
+    segment.is_empty()
+        || authority
+        || segment.eq_ignore_ascii_case("localhost")
+        || segment
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte == b'.')
+        || (segment.contains('.') && !segment.contains('/'))
+}
+
+/// `NAME=NNNN` where `NAME` is `PORT`, ends in `_PORT`, or is `PGPORT`, in any
+/// case. A word that merely ends in those letters (`SUPPORT`, `REPORT`) is not
+/// a port variable.
+fn port_assignment(text: &str) -> Option<u16> {
+    let end =
+        text.find(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))?;
+    let name = &text[..end];
+    let value = text[end..].strip_prefix('=')?;
+    let upper = name.to_ascii_uppercase();
+    if upper == "PORT" || upper == "PGPORT" || upper.ends_with("_PORT") {
+        return port_digits(value).map(|(port, _)| port);
+    }
+    None
+}
+
+/// A fixed value assigned to a name that identifies a shared resource
+/// (`COMPOSE_PROJECT_NAME=app`, `DATABASE_URL=...`).
+fn fixed_shared_name(command: &str) -> bool {
+    let bytes = command.as_bytes();
+    (0..bytes.len()).any(|index| {
+        (index == 0 || !is_name_byte(bytes[index - 1]))
+            && screaming_snake_identifier(&command[index..]).is_some_and(|(identifier, end)| {
+                command[index + end..].starts_with('=')
+                    && SHARED_IDENTIFIER_NAMES.contains(&identifier)
+            })
+    })
+}
+
+/// A hardcoded port must be detected whichever shape it takes: the two dev-server
+/// ports the previous substring check missed, the forms it did catch, and the
+/// broker-provided spellings that must stay silent.
+#[cfg(test)]
+mod port_detection {
+    /// Run a command through the same entry point `gates doctor` uses, so a
+    /// test cannot pass on an input production never sees (the inspection
+    /// lowercases nothing it must not, and these spellings reach it verbatim).
+    fn detect(command: &str) -> bool {
+        let gates = crate::parse_gates(&format!(
+            "[[gate]]\nname = \"g\"\ncommand = '''{command}'''\ncost = 1\ntriggers = [\"**\"]\ntimeout_seconds = 60\n"
+        ))
+        .unwrap();
+        super::static_gate_diagnostics(&gates)
+            .iter()
+            .any(|finding| finding.id == super::GateDiagnosticId::FixedResourceIdentifier)
+    }
+
+    /// An image tag is a version, not a port: `postgres:16` and `node:20` name
+    /// what to run, and gates that start containers are exactly where this
+    /// detector looks, so it must not fire on every one of them.
+    #[test]
+    fn an_image_tag_is_not_a_port() {
+        for command in [
+            r#"docker run --rm postgres:16 pg_isready"#,
+            r#"docker run --rm node:20-alpine npm test"#,
+            r#"docker pull ghcr.io/acme/app:1234"#,
+        ] {
+            assert!(!detect(command), "an image tag is not a port: {command}");
+        }
+    }
+
+    /// `port=` must end an identifier that names a port, not any word that
+    /// happens to end in those letters.
+    #[test]
+    fn a_word_ending_in_port_is_not_a_port_variable() {
+        for command in [r#"SUPPORT=1234 make check"#, r#"make REPORT=2024 summary"#] {
+            assert!(!detect(command), "not a port variable: {command}");
+        }
+    }
+
+    #[test]
+    fn common_hardcoded_ports_are_detected() {
+        for command in [
+            // The two the previous substring check missed entirely.
+            r#"npm run dev -- --port 3000"#,
+            r#"PORT=8080 npm start"#,
+            r#"curl http://localhost:3000/health"#,
+            r#"docker run -p 5432:5432 postgres"#,
+            // Previously detected; must stay detected.
+            r#"PGPORT=5432 psql"#,
+            r#"postgres --port 5432"#,
+            r#"POSTGRES_PORT=5432 pg_ctl start"#,
+        ] {
+            assert!(
+                detect(command),
+                "a hardcoded port must be flagged: {command}"
+            );
+        }
+    }
+
+    /// A port published by the broker must not be reported, even when the same
+    /// command names a fixed *container-side* port alongside it: that half
+    /// describes the image, not what this host binds.
+    #[test]
+    fn broker_provided_ports_are_not_flagged() {
+        for command in [
+            r#"TEST_URL=postgres://localhost:$AETHYME_RESOURCE_PGPORT/db npm test"#,
+            r#"PORT=$AETHYME_RESOURCE_PGPORT npm start"#,
+            r#"psql --port $AETHYME_RESOURCE_PGPORT"#,
+            r#"docker run -p $AETHYME_RESOURCE_PGPORT:5432 postgres"#,
+        ] {
+            assert!(
+                !detect(command),
+                "a broker-provided port must not be flagged: {command}"
+            );
+        }
+    }
+
+    /// A non-default port is still a hardcoded port: `--port 15432` collides
+    /// across worktrees exactly as `--port 5432` does. The old substring check
+    /// did not see it at all, because it only looked for `5432`.
+    #[test]
+    fn a_non_default_port_is_still_a_hardcoded_port() {
+        for command in [
+            r#"psql --port 15432"#,
+            r#"curl http://localhost:15432/health"#,
+        ] {
+            assert!(
+                detect(command),
+                "a non-default hardcoded port is the same defect: {command}"
+            );
+        }
+    }
+
+    /// Text that names digits without configuring a listener must stay clean. A
+    /// detector that cries wolf on a healthy gate gets ignored, which is worse
+    /// than not shipping it.
+    #[test]
+    fn text_that_merely_contains_digits_is_not_a_port() {
+        for command in [
+            // Fixtures and assertions, not listeners.
+            r#"test -f fixtures/expected-3000.json"#,
+            r#"grep -c ':5432' expected.txt"#,
+            // A feature name, not a port.
+            r#"cargo test --features port-3000-compat"#,
+            // A bare `scheme://` colon, and a ratio in prose.
+            r#"curl -sS http://localhost/health"#,
+            r#"test $((3000 / 2)) -eq 1500"#,
+        ] {
+            assert!(
+                !detect(command),
+                "text naming digits is not a hardcoded port: {command}"
+            );
+        }
+    }
+
+    /// `-p` is deliberately not read as a port flag: `cargo -p`, `docker
+    /// publish -p` and `pgrep -p` all use it for something else.
+    #[test]
+    fn an_overloaded_short_flag_is_not_a_port() {
+        for command in [
+            r#"cargo test -p aethyme-broker"#,
+            r#"cargo publish -p aethyme-cli --dry-run"#,
+        ] {
+            assert!(
+                !detect(command),
+                "-p is too overloaded to carry port meaning: {command}"
+            );
+        }
+    }
+
+    /// The identifier forms that are not ports must still be caught, so the
+    /// parse did not replace the check but widened it.
+    #[test]
+    fn non_port_shared_identifiers_are_still_detected() {
+        for command in [
+            r#"docker compose --project-name fixed-name up"#,
+            r#"COMPOSE_PROJECT_NAME=myapp docker compose up"#,
+            r#"DATABASE_URL=postgres://localhost/db npm test"#,
+            r#"POSTGRES_DB=app docker compose up"#,
+        ] {
+            assert!(
+                detect(command),
+                "a fixed shared name must be flagged: {command}"
+            );
+        }
+    }
+}
+
+/// Environment identifiers that name a shared resource under concurrency.
+///
+/// A fixed value here is the same defect as a fixed port: two worktrees resolve
+/// the same database, container project, or network and overwrite each other.
+/// Matched by shape (`COMPOSE_PROJECT_NAME=`) rather than by enumerating every
+/// value, so a spelling that is not listed still reads as the shape it is.
+const SHARED_IDENTIFIER_NAMES: &[&str] = &[
+    "COMPOSE_PROJECT_NAME",
+    "DATABASE_URL",
+    "DATABASE_NAME",
+    "POSTGRES_DB",
+    "POSTGRES_USER",
+    "POSTGRES_PASSWORD",
+    "PGDATABASE",
+    "PGUSER",
+    "PGPASSWORD",
+    "MYSQL_DATABASE",
+    "REDIS_URL",
+    "MONGODB_URI",
+];
+
+/// Prefixes the broker exports to a gate. Their presence means the repository
+/// already resolved this value through a lease, so a literal in the same
+/// command is describing something else — the image, the far end of a tunnel,
+/// or a value asserted in a fixture.
+///
+/// Lowercase; compared against a lowercased command.
+const BROKER_VALUE_PREFIXES: &[&str] = &[
+    "aethyme_resource_",
+    "aethyme_test_db_suffix",
+    "aethyme_gate_worker_id",
+    "aethyme_gate_cache_dir",
+    "aethyme_prepare_cache_dir",
+];
+
+fn is_name_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+/// Whether `offset` sits inside a single- or double-quoted run.
+///
+/// Both quote characters are honoured rather than only the one this repository
+/// happens to use, because a gate command is a repository's own text. An
+/// unterminated quote runs to the end, which is the conservative reading: it
+/// suppresses a finding rather than inventing one.
+fn inside_quotes(prefix: &str) -> bool {
+    let bytes = prefix.as_bytes();
+    let mut single = false;
+    let mut double = false;
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            // A backslash escapes the next byte, so `\'` does not close a run.
+            b'\\' => index += 1,
+            b'\'' if !double => single = !single,
+            b'"' if !single => double = !double,
+            _ => {}
+        }
+        index += 1;
+    }
+    single || double
+}
+
+/// Read a leading SCREAMING_SNAKE identifier, if the text starts with one.
+fn screaming_snake_identifier(text: &str) -> Option<(&str, usize)> {
+    let end = text
+        .find(|character: char| !(character.is_ascii_uppercase() || character == '_'))
+        .unwrap_or(text.len());
+    // A single letter is a flag or a variable, not a configuration key.
+    if end < 3 || !text[..end].contains('_') {
+        return None;
+    }
+    Some((&text[..end], end))
+}
+
+/// Read a decimal port from the front of `text`.
+///
+/// The whole digit run is consumed, so `:15432` is read as port 15432 and never
+/// as 5432 with a stray prefix — it is a hardcoded port either way, and a
+/// non-default one is exactly what collides across worktrees.
+fn port_digits(text: &str) -> Option<(u16, usize)> {
+    let end = text
+        .find(|character: char| !character.is_ascii_digit())
+        .unwrap_or(text.len());
+    if end == 0 {
+        return None;
+    }
+    let value: u16 = text[..end].parse().ok()?;
+    Some((value, end))
+}
+
+/// Takes the command as written: the variable names it reads are uppercase by
+/// convention, so lowercasing first would hide every one of them.
 fn fixed_resource_identifier(command: &str) -> bool {
-    if command.contains("aethyme_gate_worker_id")
-        || command.contains("aethyme_test_db_suffix")
-        || command.contains("aethyme_resource_")
+    let lower = command.to_ascii_lowercase();
+    // A command that consumes a broker value has already resolved the shared
+    // identifier through a lease, so a remaining literal is the image or the
+    // far end rather than something this host binds. Matched without case
+    // because the documented spelling is uppercase (`AETHYME_RESOURCE_PGPORT`).
+    if BROKER_VALUE_PREFIXES
+        .iter()
+        .any(|prefix| lower.contains(prefix))
     {
         return false;
     }
-    [
-        "postgres_port=",
-        "database_name=",
-        "postgres_db=",
-        "compose_project_name=",
-        "--project-name ",
-        ":5432",
-        "=5432",
-    ]
-    .iter()
-    .any(|token| command.contains(token))
+    hardcoded_port(command).is_some()
+        || fixed_shared_name(command)
+        || [
+            "database_name=",
+            "postgres_db=",
+            "compose_project_name=",
+            "--project-name ",
+        ]
+        .iter()
+        .any(|token| lower.contains(token))
 }
 
 fn shared_writable_cache(command: &str) -> bool {

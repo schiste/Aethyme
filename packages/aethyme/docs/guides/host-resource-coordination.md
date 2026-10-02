@@ -1,6 +1,6 @@
 # Concurrent Host Resource Coordination
 
-Last Updated: 2026-08-26
+Last Updated: 2026-10-01
 
 Aethyme can run validation concurrently from independent clones without
 sharing fixed ports, Docker project names, database names, or host-capacity
@@ -131,6 +131,24 @@ receives `AETHYME_RESOURCE_DOCKER_PROJECT`,
 `AETHYME_RESOURCE_LEASE_ID` and `AETHYME_RESOURCE_GENERATION`. The ownership
 token used to renew and release the bundle is never exposed to the child.
 
+A broker-chosen port is broker-free and OS-bindable at the moment it is
+granted, but the generic contract cannot hold the socket open while an
+arbitrary application binds it. Between the grant and the bind, a
+non-Aethyme process can still win that race, and the application will see
+`EADDRINUSE`. That is a real limit of this contract, not a misconfiguration,
+so applications should fail clearly and retry rather than assume exclusivity:
+
+```sh
+# Bind an ephemeral port and report it, so the caller reads the real value
+# rather than assuming the one it asked for.
+port="$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')"
+export TEST_DATABASE_URL="postgres://localhost:$port/$AETHYME_RESOURCE_DATABASE"
+```
+
+Socket activation — passing a bound descriptor to the child — would close the
+race properly, but it needs an application-specific protocol and is outside
+this generic contract.
+
 Use these values in repository scripts rather than fixed names:
 
 ```sh
@@ -160,6 +178,57 @@ starts. Its default is `0`, preserving fail-fast behavior. A positive value
 retries only an unavailable bundle, reports bounded waiting progress, and
 returns the original `resource_contention` diagnosis at the deadline. Invalid
 requests, storage errors, and ownership failures are never retried.
+
+## Prepare Dependencies For Isolated Worktrees
+
+A worktree is a bare checkout. It has no `node_modules/`, no `.venv/`, and no
+package-manager store, so a gate that shells out to `pnpm test` or `pytest`
+fails on a fresh worktree in a way that has nothing to do with the change under
+review. `.aethyme/prepare.toml` declares that install step once, and the
+broker runs it per session.
+
+`aethyme init` drafts the file from the repository's manifests. The draft is
+only emitted where an install command **deterministically creates every
+declared output**, because `prepare` records `failed` for an output that never
+appears and a permanently red status is worse than a missing declaration. That
+admits Node (`node_modules/`) and uv (`.venv/`), and deliberately excludes:
+
+- **Cargo** and **Go**, which populate host-global stores and write nothing
+  into the worktree. A bare Rust or Go checkout already satisfies its gates, so
+  a step would declare an output its own command never creates. The draft says
+  so in a comment instead.
+- **Poetry**, which places the environment outside the worktree unless
+  `virtualenvs.in-project` is set, and **plain pip**, which installs into the
+  interpreter and therefore leaves nothing to check.
+
+```bash
+aethyme broker submit prepare status --session <id>   # read-only, no network
+aethyme broker submit prepare --session <id>          # the only execution boundary
+```
+
+Each step declares `inputs` (hashed into the preparation digest) and
+`outputs` (checked after the command runs). `cache` chooses the store:
+
+- `worktree_local` — each worktree installs its own copy. Correct default.
+- `repository_shared` — exports `AETHYME_PREPARE_CACHE_DIR` and serializes
+  writers in host state by canonical remote identity, so N worktrees share one
+  package-manager store.
+
+Prefer `repository_shared` for a package manager with a content-addressable
+store (pnpm, uv). For a copying package manager such as npm it only shares the
+*download* cache, so each worktree still materializes a full tree on disk; the
+real saving there comes from migrating to pnpm, not from the flag.
+
+The shared store is keyed by preparation digest, so a repository whose lockfile
+differs between branches accumulates one store directory per distinct input set.
+`shared_cache.max_bytes` caps that, and the store is rotated when it exceeds the
+budget. Rotation happens inside the exclusive lease, never after it, because it
+removes a store other worktrees may be reading. Declaring a budget without a
+`repository_shared` step is refused rather than ignored.
+
+`npm install` is never drafted. It rewrites a committed lockfile, which is a
+tracked-file mutation the worktree guard refuses without an explicit lease.
+Commit `package-lock.json` and the draft uses `npm ci`.
 
 ## Reuse A Bounded Artifact Cache
 
