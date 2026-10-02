@@ -182,6 +182,9 @@ impl DurationSummary {
         if values.len() < DISTRIBUTION_FLOOR {
             return;
         }
+        for value in &mut values {
+            *value = (*value).max(0);
+        }
         values.sort_unstable();
         self.p50_ms = Some(nearest_rank(&values, 50));
         self.p95_ms = Some(nearest_rank(&values, 95));
@@ -814,13 +817,17 @@ pub fn report(query: InsightsQuery, input: &InsightsInput) -> InsightsReport {
     accumulator.funnel.unsubmitted = accumulator.outcomes.unsubmitted;
 
     let gates = gate_summary(&input.gates);
-    let mut gates_by_name: BTreeMap<String, GateSummary> = BTreeMap::new();
+    let mut observations_by_name: BTreeMap<String, Vec<GateObservation>> = BTreeMap::new();
     for observation in &input.gates {
-        gates_by_name
+        observations_by_name
             .entry(observation.gate_name.clone())
             .or_default()
-            .merge(&gate_summary(std::slice::from_ref(observation)));
+            .push(observation.clone());
     }
+    let gates_by_name = observations_by_name
+        .into_iter()
+        .map(|(name, observations)| (name, gate_summary(&observations)))
+        .collect();
 
     let mut pull_requests: Vec<PullRequestSummary> = Vec::new();
     for observation in &input.pull_requests {
@@ -937,40 +944,6 @@ fn resolve_outcome(
         Some(outcome) => outcome,
         None if in_flight => Outcome::InFlight,
         None => Outcome::Unsubmitted,
-    }
-}
-
-impl GateSummary {
-    /// Merge another summary into this one: counts add, durations sum, and the
-    /// pass rate is recomputed from the accumulated counts.
-    ///
-    /// Recomputing rather than averaging the two rates is what keeps a merged
-    /// summary honest — averaging rates weights a 1-run summary equally with a
-    /// 1000-run one.
-    fn merge(&mut self, other: &GateSummary) {
-        self.runs += other.runs;
-        self.passed += other.passed;
-        self.cached += other.cached;
-        merge_distribution(&mut self.execute_ms, &other.execute_ms);
-        merge_distribution(&mut self.wait_ms, &other.wait_ms);
-        merge_distribution(&mut self.first_output_ms, &other.first_output_ms);
-        self.cached_saved_ms += other.cached_saved_ms;
-        self.pass_rate = (self.runs > 0).then(|| self.passed as f64 / self.runs as f64);
-    }
-}
-
-/// Fold one distribution's counts and totals into another.
-fn merge_distribution(target: &mut DurationSummary, other: &DurationSummary) {
-    target.count += other.count;
-    target.total_ms = target.total_ms.saturating_add(other.total_ms);
-    target.max_ms = max_option(target.max_ms, other.max_ms);
-    target.mean_ms = (target.count > 0).then(|| target.total_ms / target.count as i64);
-}
-
-fn max_option(left: Option<i64>, right: Option<i64>) -> Option<i64> {
-    match (left, right) {
-        (Some(left), Some(right)) => Some(left.max(right)),
-        (left, right) => left.or(right),
     }
 }
 
@@ -1463,6 +1436,37 @@ mod tests {
         let report = report(InsightsQuery::default(), &input);
         assert_eq!(report.pull_requests[0].to_merge_ms, Some(3_599_000));
         assert_eq!(report.pull_requests[0].session_ids, vec![1, 2]);
+    }
+
+    #[test]
+    fn per_gate_percentiles_use_all_of_that_gates_observations() {
+        let input = InsightsInput {
+            gates: (1..=5)
+                .map(|value| GateObservation {
+                    gate_name: "unit".into(),
+                    status: "pass",
+                    duration_ms: Some(value * 1_000),
+                    wait_duration_ms: Some(value * 10),
+                    first_output_ms: Some(value),
+                    failure_class: None,
+                })
+                .collect(),
+            ..InsightsInput::default()
+        };
+        let report = report(InsightsQuery::default(), &input);
+        let gate = &report.gates_by_name["unit"];
+        assert_eq!(gate.execute_ms.p50_ms, Some(3_000));
+        assert_eq!(gate.execute_ms.p95_ms, Some(5_000));
+        assert_eq!(gate.wait_ms.p50_ms, Some(30));
+        assert_eq!(gate.first_output_ms.p95_ms, Some(5));
+    }
+
+    #[test]
+    fn backwards_clock_samples_are_clamped_in_percentiles_too() {
+        let summary = DurationSummary::from_values(vec![-30, -20, -10, 10, 20]);
+        assert_eq!(summary.p50_ms, Some(0));
+        assert_eq!(summary.p95_ms, Some(20));
+        assert_eq!(summary.total_ms, 30);
     }
 
     #[test]
