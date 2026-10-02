@@ -809,7 +809,7 @@ fn parallel_dimension(
                 )],
                 vec![action(
                     "Declare reproducible dependency preparation for isolated worktrees",
-                    Some("aethyme broker submit prepare status --session <id>"),
+                    Some("aethyme init"),
                 )],
             );
         }

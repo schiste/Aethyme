@@ -694,7 +694,7 @@ pub(super) fn run_init(parsed: Parsed) -> Result<(), UsageError> {
     if parsed.json {
         out!("{}", serde_json::to_string_pretty(&report)?);
     } else {
-        out!("Phase 1/3 — certify (read-only):");
+        out!("Phase 1/4 — certify (read-only):");
         print_checks(&report.certify.checks);
         let Some(scaffold) = &report.scaffold else {
             out!();
@@ -705,10 +705,10 @@ pub(super) fn run_init(parsed: Parsed) -> Result<(), UsageError> {
             ));
         };
         out!();
-        out!("Phase 2/3 — scaffold (deterministic, only-if-missing):");
+        out!("Phase 2/4 — scaffold (deterministic, only-if-missing):");
         print_checks(&scaffold.checks);
         out!();
-        out!("Phase 3/3 — gates draft (adaptive):");
+        out!("Phase 3/4 — gates draft (adaptive):");
         match &report.gates {
             Some(gates) => print_checks(&gates.checks),
             None => out!(
@@ -718,10 +718,21 @@ pub(super) fn run_init(parsed: Parsed) -> Result<(), UsageError> {
             ),
         }
         out!();
+        out!("Phase 4/4 — prepare draft (adaptive):");
+        match &report.prepare {
+            Some(prepare) => print_checks(&prepare.checks),
+            None => out!(
+                "{:<8} {:<28} .aethyme/prepare.toml already present — drafting skipped",
+                "skip",
+                "prepare.draft"
+            ),
+        }
+        out!();
         let write_checks: Vec<&crate::init::Check> = scaffold
             .checks
             .iter()
             .chain(report.gates.iter().flat_map(|g| g.checks.iter()))
+            .chain(report.prepare.iter().flat_map(|p| p.checks.iter()))
             .collect();
         let existing: Vec<&str> = write_checks
             .iter()

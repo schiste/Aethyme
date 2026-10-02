@@ -21,6 +21,10 @@
 //! gates.toml. Its output depends on the repo, which is exactly why it
 //! is neither certification nor scaffolding.
 //!
+//! **`draft_prepare()`** — adaptive, same reasoning: drafts a
+//! prepare.toml, and only for ecosystems whose install command
+//! deterministically creates the outputs it declares.
+//!
 //! Shared rules: no network, no clocks; generated files contain no
 //! timestamps and no absolute paths; report ordering is fixed.
 
@@ -450,6 +454,15 @@ pub struct GuidedInitReport {
     /// because `.aethyme/gates.toml` already existed (never overwritten)
     /// or because certification failed.
     pub gates: Option<InitReport>,
+    /// Phase 4 — adaptive preparation drafting. `None` when it was skipped
+    /// because `.aethyme/prepare.toml` already existed (never overwritten)
+    /// or because certification failed.
+    ///
+    /// Added because readiness tells a customer to "declare reproducible
+    /// dependency preparation" and the only command it named was
+    /// `prepare status`, which is read-only and can never create the file.
+    /// The diagnosis was correct and its remediation impossible to follow.
+    pub prepare: Option<InitReport>,
     /// True when this run wrote anything at all; a second invocation on
     /// the same repository must report `false`.
     pub changed: bool,
@@ -464,14 +477,16 @@ impl GuidedInitReport {
         self.certify.certified()
             && self.scaffold.as_ref().is_none_or(InitReport::certified)
             && self.gates.as_ref().is_none_or(InitReport::certified)
+            && self.prepare.as_ref().is_none_or(InitReport::certified)
     }
 }
 
 /// `aethyme init` — one guided pass over the whole setup: certify
 /// (read-only), then scaffold (deterministic, only-if-missing writes),
-/// then gate drafting (adaptive, only when no gates.toml exists yet).
-/// Pure composition of the three phases above — init adds no setup
-/// logic of its own, which is what makes a second run a no-op.
+/// then gate drafting and preparation drafting (adaptive, each only when
+/// its file does not exist yet). Pure composition of the phases above —
+/// init adds no setup logic of its own, which is what makes a second run a
+/// no-op.
 pub fn guided_init(repo_hint: &Path) -> Result<GuidedInitReport, BrokerOpError> {
     let certify = certify(repo_hint)?;
     if !certify.certified() {
@@ -479,6 +494,7 @@ pub fn guided_init(repo_hint: &Path) -> Result<GuidedInitReport, BrokerOpError> 
             certify,
             scaffold: None,
             gates: None,
+            prepare: None,
             changed: false,
             readiness: crate::inspect_repository_readiness(repo_hint),
         });
@@ -486,21 +502,29 @@ pub fn guided_init(repo_hint: &Path) -> Result<GuidedInitReport, BrokerOpError> 
     let repo = crate::GitRepo::discover(repo_hint).map_err(BrokerOpError::Git)?;
     let main_root = repo.main_root()?;
     let had_gates = main_root.join(".aethyme/gates.toml").exists();
+    let had_prepare = main_root.join(".aethyme/prepare.toml").exists();
     let scaffold = scaffold(repo_hint)?;
     let gates = if had_gates {
         None
     } else {
         Some(draft_gates(repo_hint)?)
     };
+    let prepare = if had_prepare {
+        None
+    } else {
+        Some(draft_prepare(repo_hint)?)
+    };
     let changed = scaffold
         .checks
         .iter()
         .chain(gates.iter().flat_map(|report| report.checks.iter()))
+        .chain(prepare.iter().flat_map(|report| report.checks.iter()))
         .any(|check| check.status == CheckStatus::Created);
     Ok(GuidedInitReport {
         certify,
         scaffold: Some(scaffold),
         gates,
+        prepare,
         changed,
         readiness: crate::inspect_repository_readiness(repo_hint),
     })
@@ -1174,6 +1198,301 @@ pub fn draft_gate_config(main_root: &Path) -> Option<String> {
 
 fn toml_basic_string(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Deterministic `.aethyme/prepare.toml` draft from the same manifest
+/// sniffing that drafts gates.
+///
+/// A step is emitted only where the ecosystem's install command
+/// deterministically creates every declared output, because `prepare`
+/// records `failed` for a step whose outputs never appear — a speculative
+/// output is worse than no step, because it turns a missing declaration into
+/// a permanently red status. That admits Node, which always writes
+/// `node_modules/`, and uv, which always writes `.venv/`. It excludes most of
+/// the rest on purpose: `cargo fetch` and `go mod download` populate
+/// host-global stores and write nothing into the worktree, which is exactly
+/// why a bare Rust or Go checkout already satisfies its gates and needs no
+/// preparation. Those ecosystems get guidance instead of a step.
+///
+/// The draft is parsed by the real configuration reader before it is ever
+/// returned, so `init` cannot emit a file that `prepare` would reject. The
+/// reader is the only authority on what is valid; this function only decides
+/// what is worth declaring.
+/// The draft's three parts, kept separate because they are reported
+/// differently: steps become a file, guidance becomes a check detail.
+///
+/// A guidance-only result must never become a file. The reader rejects a
+/// configuration with no steps, so writing one would produce a draft that
+/// `prepare status` immediately calls `invalid`.
+struct PrepareDraftParts {
+    runtimes: String,
+    steps: String,
+    guidance: Vec<String>,
+}
+
+fn prepare_draft_parts(main_root: &Path) -> Option<PrepareDraftParts> {
+    let mut runtimes = String::new();
+    let mut steps = String::new();
+    let mut guidance: Vec<&'static str> = Vec::new();
+
+    // Node. `npm install` is deliberately not a draft: it rewrites the
+    // lockfile, and a tracked lockfile rewrite is a tracked-file mutation
+    // that the worktree guard refuses without an explicit lease. `npm ci` is
+    // the only reproducible npm install, and it requires a committed lock.
+    if main_root.join("package.json").exists() {
+        runtimes.push_str("\n[[runtimes]]\nname = \"node\"\ncommand = [\"node\", \"--version\"]\n");
+        match node_runner(main_root) {
+            NodeRunner::Pnpm => {
+                steps.push_str(&node_step(
+                    r#"["pnpm", "install", "--frozen-lockfile"]"#,
+                    r#"["pnpm", "install", "--offline", "--frozen-lockfile"]"#,
+                    r#"["package.json", "pnpm-lock.yaml"]"#,
+                    "pnpm hard-links node_modules out of one content-addressable store, so \
+                     repository_shared costs one copy on disk instead of one per worktree. \
+                     pnpm's dev server accepts an ephemeral port with --port 0 and prints \
+                     the bound one; prefer that over a fixed PORT in a gate.",
+                ));
+            }
+            NodeRunner::Yarn => {
+                steps.push_str(&node_step(
+                    r#"["yarn", "install", "--frozen-lockfile"]"#,
+                    r#"["yarn", "install", "--offline", "--frozen-lockfile"]"#,
+                    r#"["package.json", "yarn.lock"]"#,
+                    "Yarn Berry spells the same guarantee --immutable; adjust if this repo uses it.",
+                ));
+            }
+            NodeRunner::Npm if main_root.join("package-lock.json").exists() => {
+                steps.push_str(&node_step(
+                    r#"["npm", "ci"]"#,
+                    r#"["npm", "ci", "--offline"]"#,
+                    r#"["package.json", "package-lock.json"]"#,
+                    "npm copies every package into each worktree. Under many concurrent \
+                     worktrees, migrating to pnpm and setting repository_shared is the \
+                     difference between one copy on disk and one per session.",
+                ));
+            }
+            NodeRunner::Npm => guidance.push(
+                "npm: no package-lock.json found, so no step was drafted. `npm install` \
+                 rewrites the lockfile, which is a tracked-file mutation the worktree guard \
+                 refuses. Commit package-lock.json and re-run the draft, or adopt pnpm.",
+            ),
+        }
+    }
+
+    // uv. `uv sync` writes a project `.venv/` in-tree, so the output is
+    // checkable. Poetry is excluded on purpose: it places the environment in a
+    // platform-specific cache path unless `virtualenvs.in-project` is set, so
+    // declaring `.venv/` as its output would report `failed` forever.
+    if main_root.join("uv.lock").exists() {
+        if main_root.join("pyproject.toml").exists() {
+            runtimes.push_str("\n[[runtimes]]\nname = \"uv\"\ncommand = [\"uv\", \"--version\"]\n");
+            steps.push_str(&format!(
+                "\n[[steps]]\n\
+                 # uv writes a project-local .venv/; repository_shared exports\n\
+                 # UV_CACHE_DIR so concurrent worktrees download each artifact once.\n\
+                 name = \"python-dependencies\"\n\
+                 command = [\"uv\", \"sync\", \"--frozen\"]\n\
+                 offline_command = [\"uv\", \"sync\", \"--frozen\", \"--offline\"]\n\
+                 inputs = [\"pyproject.toml\", \"uv.lock\"]\n\
+                 outputs = [\".venv/\"]\n\
+                 cache = \"worktree_local\"\n\
+                 required_for_hooks = true\n"
+            ));
+        } else {
+            guidance.push(
+                "uv: uv.lock found without a pyproject.toml, so no step was drafted; \
+                 `uv sync` needs both.",
+            );
+        }
+    } else if main_root.join("poetry.lock").exists() {
+        guidance.push(
+            "poetry: no step was drafted. `poetry install` places the environment outside \
+             the worktree unless `virtualenvs.in-project` is true, so a declared in-tree \
+             output would never appear. Set that option, or migrate to uv.",
+        );
+    } else if main_root.join("requirements.txt").exists() {
+        guidance.push(
+            "pip: no step was drafted. Installing into the interpreter writes nothing into \
+             the worktree, so there is no output `prepare` can check. Declare the \
+             environment explicitly (uv sync) or create a venv with declared outputs.",
+        );
+    }
+
+    if manifest_exists(main_root, &["Cargo.toml", "rust/Cargo.toml"]) {
+        guidance.push(
+            "cargo: no step is needed. `cargo fetch` populates the shared ~/.cargo registry \
+             and writes nothing into the worktree, so a bare checkout already satisfies \
+             its gates. Use a [gate.managed_cache] entry for compiled output instead.",
+        );
+    }
+    if manifest_exists(main_root, &["go.mod"]) {
+        guidance.push(
+            "go: no step is needed. `go mod download` populates the shared module cache and \
+             writes nothing into the worktree, so a bare checkout already satisfies its \
+             gates.",
+        );
+    }
+
+    if steps.is_empty() && guidance.is_empty() {
+        return None;
+    }
+    Some(PrepareDraftParts {
+        runtimes,
+        steps,
+        guidance: guidance.into_iter().map(str::to_string).collect(),
+    })
+}
+
+/// The draftable `.aethyme/prepare.toml`, or `None` when this repository has
+/// no step worth declaring.
+///
+/// The draft is parsed by the real configuration reader before it is returned,
+/// so `init` cannot emit a file that `prepare` would reject. The reader is the
+/// only authority on what is valid; this module only decides what is worth
+/// declaring. See [`prepare_guidance`] for the explanation when no step is
+/// emitted but the repository was recognized.
+pub fn draft_prepare_config(main_root: &Path) -> Option<String> {
+    let parts = prepare_draft_parts(main_root)?;
+    // No steps means no writable configuration: the reader rejects an empty
+    // step list, so a guidance-only repository gets a check detail instead of
+    // a file it could never use.
+    if parts.steps.is_empty() {
+        return None;
+    }
+
+    let mut draft = String::from(
+        "# Draft generated by `aethyme init` from this repo's manifests.\n\
+         # REVIEW EVERY STEP: commands, inputs, outputs, and cache policy are guesses.\n\
+         #\n\
+         # A step is only valid when its command deterministically creates every\n\
+         # declared output — `prepare` records `failed` for outputs that never appear.\n\
+         #\n\
+         # cache = \"worktree_local\"    each worktree installs its own copy.\n\
+         # cache = \"repository_shared\" exports AETHYME_PREPARE_CACHE_DIR and serializes\n\
+         #                            writers in host state, so concurrent worktrees share\n\
+         #                            one package-manager store. Costs a lock and a shared\n\
+         #                            directory; use it when installs are the bottleneck.\n\
+         #\n\
+         # The store is keyed by preparation digest, so a repository whose lockfile\n\
+         # changes between branches grows one directory per distinct input set. Uncomment\n\
+         # to cap it; the store is rotated when it exceeds the budget.\n\
+         # [shared_cache]\n\
+         # max_bytes = 21474836480\n\
+         #\n\
+         # Nesting: this draft reads the repository root only. A manifest in a\n\
+         # subdirectory needs its own step with repository-relative paths.\n\
+         \n\
+         schema_version = 1\n",
+    );
+    draft.push_str(&parts.runtimes);
+    draft.push_str(&parts.steps);
+    for note in &parts.guidance {
+        draft.push('\n');
+        draft.push_str("# ");
+        draft.push_str(note);
+        draft.push('\n');
+    }
+
+    if crate::preparation::parse_config(&draft).is_err() {
+        return None;
+    }
+    Some(draft)
+}
+
+/// Why no step was drafted, for a repository that was recognized but needs no
+/// per-worktree install.
+///
+/// Without this the reasoning is lost: a Rust or Go customer is told only
+/// that nothing was written, and cannot tell "correct, nothing to do" from
+/// "the detector did not understand my repository".
+pub fn prepare_guidance(main_root: &Path) -> Vec<String> {
+    prepare_draft_parts(main_root)
+        .map(|parts| parts.guidance)
+        .unwrap_or_default()
+}
+
+/// One Node preparation step. The cache note is emitted as a comment so the
+/// shared-store trade-off is visible at the point a customer chooses a policy.
+fn node_step(command: &str, offline_command: &str, inputs: &str, cache_note: &str) -> String {
+    format!(
+        "\n[[steps]]\n\
+         # {cache_note}\n\
+         name = \"javascript-dependencies\"\n\
+         command = {command}\n\
+         offline_command = {offline_command}\n\
+         inputs = {inputs}\n\
+         outputs = [\"node_modules/\"]\n\
+         cache = \"worktree_local\"\n\
+         required_for_hooks = true\n"
+    )
+}
+
+/// Whether any ecosystem manifest exists at the repository root.
+///
+/// Distinguishes "this repository needs no per-worktree install" (Cargo, Go)
+/// from "this repository's dependencies are unknown" (nothing recognized).
+/// The first is a pass; the second is a warning worth a human's attention.
+fn detects_any_manifest(main_root: &Path) -> bool {
+    manifest_exists(
+        main_root,
+        &[
+            "package.json",
+            "Cargo.toml",
+            "rust/Cargo.toml",
+            "go.mod",
+            "pyproject.toml",
+            "requirements.txt",
+            "uv.lock",
+            "poetry.lock",
+        ],
+    )
+}
+
+/// Adaptive preparation drafting: sniff the repo's manifests and write a
+/// draft `.aethyme/prepare.toml`. Never overwrites, exactly like
+/// [`draft_gates`]. NOT scaffolding, NOT certification — the output depends
+/// on the repo.
+pub fn draft_prepare(repo_hint: &Path) -> Result<InitReport, BrokerOpError> {
+    let repo = crate::GitRepo::discover(repo_hint).map_err(BrokerOpError::Git)?;
+    let checkout_root = repo.root();
+    let check = match draft_prepare_config(checkout_root) {
+        Some(draft) => ensure_file(
+            &checkout_root.join(".aethyme/prepare.toml"),
+            "prepare.draft",
+            || draft,
+        ),
+        None if checkout_root.join(".aethyme/prepare.toml").exists() => Check {
+            id: "prepare.draft",
+            status: CheckStatus::Pass,
+            detail: ".aethyme/prepare.toml present (never overwritten)".into(),
+        },
+        None if detects_any_manifest(checkout_root) => {
+            let guidance = prepare_guidance(checkout_root);
+            Check {
+                id: "prepare.draft",
+                status: CheckStatus::Pass,
+                detail: if guidance.is_empty() {
+                    "no per-worktree dependency tree — this repository's dependencies are \
+                     already host-global, so a bare worktree satisfies its gates"
+                        .into()
+                } else {
+                    format!("no step drafted — {}", guidance.join(" "))
+                },
+            }
+        }
+        None => Check {
+            id: "prepare.draft",
+            status: CheckStatus::Warn,
+            detail: "no dependency manifest recognized at the repository root; declare \
+                     .aethyme/prepare.toml yourself if this project installs anything \
+                     into the worktree"
+                .into(),
+        },
+    };
+    Ok(InitReport {
+        check_mode: false,
+        checks: vec![check],
+    })
 }
 
 fn manifest_exists(main_root: &Path, candidates: &[&str]) -> bool {
