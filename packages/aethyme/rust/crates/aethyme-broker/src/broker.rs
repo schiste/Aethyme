@@ -4596,8 +4596,13 @@ impl Broker {
 
     /// Return overlaps from the persisted lease snapshot without recomputing
     /// implicit leases, extending expiries, or emitting overlap events.
+    /// Like [`Broker::refresh_leases`], only sessions still working are
+    /// paired.
     pub fn lease_overlaps_snapshot(&self) -> Result<Vec<crate::Overlap>, BrokerOpError> {
-        Ok(crate::detect_overlaps(&self.store.active_leases()?))
+        let coordinating = self.coordinating_session_ids()?;
+        Ok(crate::detect_overlaps(
+            &self.coordinating_leases(&coordinating)?,
+        ))
     }
 
     /// Collisions between what live sessions say they will work on.
@@ -4678,16 +4683,35 @@ impl Broker {
 
     // ── leases (Phase 3) ──────────────────────────────────────────────
 
-    /// Recompute every live session's implicit leases from its diff
-    /// against its recorded base (ignore rules applied), then return the
-    /// current overlap set. Overlaps are classified per session pair and
-    /// announced once per pair: when it starts overlapping, and again only
-    /// when its severity or conflicting paths change (see `overlap_pairs`).
+    /// Recompute the implicit leases of every session that is still
+    /// working (active or idle) from its diff against its recorded base
+    /// (ignore rules applied), then return the overlap set between those
+    /// sessions. Overlaps are classified per session pair and announced once
+    /// per pair: when it starts overlapping, and again only when its severity
+    /// or conflicting paths change (see `overlap_pairs`).
+    ///
+    /// Stale sessions are left out: their recorded leases stay as data, but
+    /// they are neither rescanned nor paired. Nobody is working there to
+    /// coordinate with, and in a repository with dozens of abandoned sessions
+    /// rescanning and pairing them made every `status` run Git hundreds of
+    /// times. A stale session that resumes work becomes active again and is
+    /// included from its next refresh.
     ///
     /// Sessions whose worktree is gone or whose base no longer resolves
     /// are skipped, never fatal: lease freshness must not take the broker
     /// down.
     pub fn refresh_leases(&mut self) -> Result<Vec<crate::leases::Overlap>, BrokerOpError> {
+        self.refresh_leases_including(None)
+    }
+
+    /// [`Broker::refresh_leases`], always rescanning `acting` as well: the
+    /// session whose own command (submit, claim, guarded exec) needs its
+    /// leases current even when it has been quiet long enough to read as
+    /// stale.
+    pub(crate) fn refresh_leases_including(
+        &mut self,
+        acting: Option<i64>,
+    ) -> Result<Vec<crate::leases::Overlap>, BrokerOpError> {
         use crate::leases::{LeaseIgnoreRules, detect_overlaps};
 
         let rules = LeaseIgnoreRules::load(&self.main_root);
@@ -4695,11 +4719,10 @@ impl Broker {
         // inside the loop cost one git subprocess per live session.
         let integration = self.integration_tip();
         let upstream = self.repo.upstream_default().map(|(_, commit)| commit);
+        let mut coordinating = self.coordinating_session_ids()?;
+        coordinating.extend(acting);
         for session in self.store.live_sessions()? {
-            if !matches!(
-                session.status,
-                SessionStatus::Active | SessionStatus::Idle | SessionStatus::Stale
-            ) {
+            if !coordinating.contains(&session.id) {
                 continue;
             }
             let Ok(checkout) = GitRepo::discover(Path::new(&session.worktree_path)) else {
@@ -4723,9 +4746,42 @@ impl Broker {
             self.store.set_implicit_leases(session.id, &paths)?;
         }
 
-        let after = detect_overlaps(&self.store.active_leases()?);
+        let after = detect_overlaps(&self.coordinating_leases(&coordinating)?);
         self.classify_and_announce_overlaps(&after)?;
         Ok(after)
+    }
+
+    /// Sessions someone may still be working in: live, with activity
+    /// within the stale threshold. Read without persisting status
+    /// transitions.
+    fn coordinating_session_ids(&self) -> Result<std::collections::BTreeSet<i64>, BrokerOpError> {
+        let now = now_ms();
+        Ok(self
+            .agents_snapshot(now)?
+            .into_iter()
+            // Stale by activity, not by PID: a spawned session whose command
+            // has exited still holds work that needs its leases.
+            .filter(|agent| {
+                matches!(
+                    agent.session.status,
+                    SessionStatus::Active | SessionStatus::Idle | SessionStatus::Stale
+                ) && now.saturating_sub(agent.activity_at) <= STALE_AFTER_MS
+            })
+            .map(|agent| agent.session.id)
+            .collect())
+    }
+
+    /// Active leases held by the given sessions.
+    fn coordinating_leases(
+        &self,
+        coordinating: &std::collections::BTreeSet<i64>,
+    ) -> Result<Vec<crate::types::Lease>, BrokerOpError> {
+        Ok(self
+            .store
+            .active_leases()?
+            .into_iter()
+            .filter(|lease| coordinating.contains(&lease.session_id))
+            .collect())
     }
 
     /// Claim an explicit write lease. Another session's lease refuses the
@@ -4744,7 +4800,7 @@ impl Broker {
             return Err(BrokerOpError::ClosedSessionOperation { session_id });
         }
         let path = normalize_lease_path(path)?;
-        self.refresh_leases()?;
+        self.refresh_leases_including(Some(session_id))?;
         let policy = self.lease_refusal_policy()?;
         let mut blockers = Vec::new();
         let mut warnings = Vec::new();
@@ -4970,7 +5026,7 @@ impl Broker {
             .session_change_base(&checkout)
             .or(session.diff_base)
             .unwrap_or_else(|| "HEAD".to_string());
-        self.refresh_leases()?;
+        self.refresh_leases_including(Some(session_id))?;
         let changed = self.repo.changed_between(&base, &head)?;
         self.audit_paths(session_id, &base, &head, changed, true, true)
     }
@@ -5079,6 +5135,27 @@ impl Broker {
         }
         if let (Some(policy), true) = (policy.as_ref(), block_only_on_conflicts) {
             let verify_only = policy.verify_only;
+            // A lease refresh pairs only sessions still working, so a stale
+            // holder's pair with this session may never have been classified.
+            // Classify just this session's pairs with its blockers: bounded by
+            // the blockers, and the verdict tells the agent whether the stale
+            // work it overlaps would actually conflict.
+            let holders: std::collections::BTreeSet<i64> = conflicting_leases
+                .iter()
+                .map(|blocker| blocker.session_id)
+                .chain(std::iter::once(session_id))
+                .collect();
+            let own: Vec<crate::Overlap> = crate::detect_overlaps(
+                &leases
+                    .iter()
+                    .filter(|lease| holders.contains(&lease.session_id))
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            )
+            .into_iter()
+            .filter(|overlap| overlap.session_a == session_id || overlap.session_b == session_id)
+            .collect();
+            self.classify_overlap_subset(&own)?;
             let overlaps = crate::detect_overlaps(&leases);
             let (block, warn): (Vec<_>, Vec<_>) = conflicting_leases
                 .into_iter()
@@ -5208,7 +5285,7 @@ impl Broker {
             return Err(BrokerOpError::MissingExecCommand);
         }
         let session = self.store.session(session_id)?;
-        self.refresh_leases()?;
+        self.refresh_leases_including(Some(session_id))?;
         let checkout = GitRepo::discover(Path::new(&session.worktree_path))?;
         let mut before_dirty = checkout.dirty_paths()?;
         before_dirty.sort();

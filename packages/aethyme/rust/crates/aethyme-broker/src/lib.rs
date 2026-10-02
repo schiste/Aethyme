@@ -328,7 +328,9 @@ pub use operations::{
     UnknownOutcomeRecovery, classify_gh, classify_git,
 };
 pub(crate) use operations::{is_within, worktree_relative_push_sources};
-pub use overlap_pairs::{OverlapPair, OverlapSeverity};
+pub use overlap_pairs::{
+    BUDGET_EXHAUSTED_REASON, OverlapPair, OverlapSeverity, overlap_state_reads,
+};
 pub use pr::{
     PrActivityItem, PrCheckOptions, PrCheckReport, PrCheckRun, PrDecision, PrDecisionStatus,
     PrDispatchReport, PrDispatchStatus, PrError, PrMarker, PrSummary,
