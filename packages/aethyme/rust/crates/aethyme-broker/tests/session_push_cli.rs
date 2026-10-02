@@ -435,6 +435,46 @@ fn pr_opens_one_draft_and_then_reuses_it() {
 }
 
 #[test]
+fn a_pull_request_the_push_opens_gets_its_opening_recorded() {
+    // PR monitoring is off by default, so a watch poll is not something to
+    // rely on for the opening instant: the push that opened the pull request
+    // records it, and a later push that only finds it does not move it.
+    fn epoch_ms() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64
+    }
+    let fixture = Fixture::new();
+    fixture.authorize(true);
+    let (session, _) = fixture.session_with_commit();
+
+    let before = epoch_ms();
+    json(&fixture.push(session, &["--pr"]));
+    let after = epoch_ms();
+
+    let milestones = fixture.broker().store().pull_request_milestones().unwrap();
+    let opened = milestones
+        .iter()
+        .find(|(_, number, _, _)| *number == 7)
+        .and_then(|(_, _, opened_at, _)| *opened_at)
+        .expect("the opened pull request has a recorded opening");
+    assert!(
+        (before..=after).contains(&opened),
+        "{before} <= {opened} <= {after}"
+    );
+
+    json(&fixture.push(session, &["--pr"]));
+    let again = fixture.broker().store().pull_request_milestones().unwrap();
+    assert_eq!(again.len(), 1);
+    assert_eq!(
+        again[0].2,
+        Some(opened),
+        "finding the pull request does not re-open it"
+    );
+}
+
+#[test]
 fn push_state_counts_commits_no_remote_holds() {
     let fixture = Fixture::new();
     fixture.authorize(true);

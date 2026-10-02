@@ -160,6 +160,7 @@ const BROKER_ADVANCED: &[&str] = &[
     "external-events",
     "events",
     "metrics",
+    "insights",
     "worktrees",
     "scaffold",
     "quick-test",

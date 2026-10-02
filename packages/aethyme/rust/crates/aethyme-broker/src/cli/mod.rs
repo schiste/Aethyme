@@ -16,6 +16,7 @@ mod flags;
 mod gates;
 mod gc_storage;
 mod git_gh;
+mod insights;
 mod leases;
 mod render;
 mod report;
@@ -35,6 +36,7 @@ use flags::*;
 use gates::*;
 use gc_storage::*;
 use git_gh::*;
+use insights::*;
 use leases::*;
 use render::*;
 use report::*;
@@ -952,6 +954,12 @@ struct Parsed {
     since: Option<i64>,
     kind: Option<String>,
     keep_days: Option<i64>,
+    /// `insights --days`: reporting window in days. `0` means all history.
+    days: Option<i64>,
+    /// `insights --session-limit`: cap on per-session rows.
+    session_limit: Option<i64>,
+    /// `insights --pull-request-limit`: cap on per-pull-request rows.
+    pull_request_limit: Option<i64>,
     seconds: Option<u64>,
     upstream: Option<String>,
     base: Option<String>,
@@ -1070,6 +1078,9 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         since: None,
         kind: None,
         keep_days: None,
+        days: None,
+        session_limit: None,
+        pull_request_limit: None,
         seconds: None,
         upstream: None,
         base: None,
@@ -1287,6 +1298,34 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
                     .ok_or(UsageError::Message("--seconds requires a value".into()))?;
                 parsed.seconds = Some(value.parse().map_err(|_| {
                     UsageError::Message("--seconds must be a non-negative integer".into())
+                })?);
+            }
+            "--days" => {
+                // `0` is meaningful and not a typo: it asks for all recorded
+                // history, which is expressed as having no window at all.
+                let value = iter
+                    .next()
+                    .ok_or(UsageError::Message("--days requires a value".into()))?;
+                parsed.days = Some(value.parse().map_err(|_| {
+                    UsageError::Message("--days must be a non-negative integer".into())
+                })?);
+            }
+            "--session-limit" => {
+                let value = iter.next().ok_or(UsageError::Message(
+                    "--session-limit requires a value".into(),
+                ))?;
+                parsed.session_limit = Some(value.parse().map_err(|_| {
+                    UsageError::Message("--session-limit must be a non-negative integer".into())
+                })?);
+            }
+            "--pull-request-limit" => {
+                let value = iter.next().ok_or(UsageError::Message(
+                    "--pull-request-limit requires a value".into(),
+                ))?;
+                parsed.pull_request_limit = Some(value.parse().map_err(|_| {
+                    UsageError::Message(
+                        "--pull-request-limit must be a non-negative integer".into(),
+                    )
                 })?);
             }
             "--upstream" => {
@@ -1793,6 +1832,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
         "status" => run_status(parsed)?,
         "events" => run_events(parsed)?,
         "metrics" => run_metrics(parsed)?,
+        "insights" => run_insights(parsed)?,
         "blockers" => run_blockers(parsed)?,
         "unblock" => run_unblock(parsed)?,
         "doctor" => run_doctor(parsed)?,

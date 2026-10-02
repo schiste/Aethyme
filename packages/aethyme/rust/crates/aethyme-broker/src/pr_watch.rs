@@ -184,6 +184,20 @@ pub struct PullRequestSnapshot {
     pub head_branch: String,
     pub head_sha: String,
     pub is_draft: bool,
+    /// When the provider says the pull request was created, in Unix
+    /// milliseconds.
+    ///
+    /// The only trustworthy source for how long a pull request existed:
+    /// `created_at` on a watch row is when *Aethyme* started watching, which is
+    /// always after the pull request opened, and `observed_at` on an
+    /// observation row is a record of one poll. A pull request that opened and
+    /// closed between two watches has no local record of ever existing.
+    pub created_at_ms: Option<i64>,
+    /// When the provider says it was merged, in Unix milliseconds.
+    ///
+    /// Written once, from the first poll that sees `mergedAt`; a later poll
+    /// reports the same instant, so this does not drift.
+    pub merged_at_ms: Option<i64>,
     pub activities: Vec<PullRequestActivityMetadata>,
 }
 
@@ -321,7 +335,13 @@ impl PullRequestWatchProvider for GithubCliPullRequestWatchProvider {
         &self,
         request: &PullRequestWatchRequest,
     ) -> Result<PullRequestSnapshot, PullRequestWatchError> {
-        let fields = "number,title,url,state,baseRefName,headRefName,headRefOid,isDraft,comments,reviews,statusCheckRollup";
+        // `createdAt` and `mergedAt` are requested for `broker advanced
+        // insights`, not for the snapshot: they are the provider's own record
+        // of when the pull request opened and merged, and no amount of polling
+        // can recover either one after the fact — the first poll is already too
+        // late to observe the opening, and a merged pull request reports
+        // `MERGED` on every poll thereafter.
+        let fields = "number,title,url,state,baseRefName,headRefName,headRefOid,isDraft,comments,reviews,statusCheckRollup,createdAt,mergedAt";
         let output = Command::new("gh")
             .args([
                 "pr",
@@ -431,8 +451,73 @@ fn parse_github_snapshot(
             .get("isDraft")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false),
+        // GitHub reports ISO-8601 with a `Z` offset. Anything else is left as
+        // unknown rather than guessed: a mis-parsed instant is worse than an
+        // absent one, because it looks like a measurement.
+        created_at_ms: json_timestamp_ms(&value, "createdAt"),
+        merged_at_ms: json_timestamp_ms(&value, "mergedAt"),
         activities,
     })
+}
+
+/// Parse a GitHub ISO-8601 timestamp into Unix milliseconds.
+///
+/// Accepts only the shape GitHub documents for these fields: `YYYY-MM-DD` plus
+/// `THH:MM:SS` and an optional fractional part, always `Z`. Returns `None` for
+/// anything else, including `null` — which is how GitHub reports a pull request
+/// that has not merged yet.
+fn json_timestamp_ms(value: &serde_json::Value, field: &str) -> Option<i64> {
+    let raw = value.get(field)?.as_str()?;
+    parse_iso8601_utc_ms(raw)
+}
+
+/// `2026-09-30T20:28:04Z` (or with fractional seconds) to Unix milliseconds.
+pub(crate) fn parse_iso8601_utc_ms(raw: &str) -> Option<i64> {
+    let (date, time) = raw.split_once('T')?;
+    if !time.ends_with('Z') {
+        // A non-UTC offset would need real offset arithmetic; these fields are
+        // documented as UTC and an offset means something upstream changed.
+        return None;
+    }
+    let time = time.trim_end_matches('Z');
+    let time = time.split_once('.').map_or(time, |(whole, _)| whole);
+
+    let mut date_parts = date.split('-');
+    let year: i64 = date_parts.next()?.parse().ok()?;
+    let month: u32 = date_parts.next()?.parse().ok()?;
+    let day: u32 = date_parts.next()?.parse().ok()?;
+    if date_parts.next().is_some() || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+
+    let mut time_parts = time.split(':');
+    let hour: i64 = time_parts.next()?.parse().ok()?;
+    let minute: i64 = time_parts.next()?.parse().ok()?;
+    let second: i64 = time_parts.next()?.parse().ok()?;
+    if time_parts.next().is_some() || hour > 23 || minute > 59 || second > 60 {
+        return None;
+    }
+
+    let days = days_from_civil(year, month, day);
+    Some((days * 86_400 + hour * 3_600 + minute * 60 + second.min(59)) * 1_000)
+}
+
+/// Days since 1970-01-01 for a proleptic Gregorian date.
+///
+/// The inverse of [`crate::cli::insights`]'s `civil_from_days`, kept here so
+/// the provider timestamp parsing does not depend on a CLI module. March is
+/// treated as month 0 so the leap day lands at the end of the year and no
+/// separate correction is needed.
+fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    let month = i64::from(month);
+    let day = i64::from(day);
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = year.div_euclid(400);
+    let year_of_era = year - era * 400;
+    let month_of_year = if month > 2 { month - 3 } else { month + 9 };
+    let day_of_year = (153 * month_of_year + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
 }
 
 fn append_github_items(
@@ -891,6 +976,8 @@ mod tests {
             head_branch: "x".into(),
             head_sha: "a".repeat(40),
             is_draft: false,
+            created_at_ms: None,
+            merged_at_ms: None,
             activities: vec![
                 PullRequestActivityMetadata {
                     kind: PullRequestActivityKind::Review,

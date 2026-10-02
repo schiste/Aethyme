@@ -13,6 +13,7 @@ may depend on their field names:
 | Integration status | `aethyme broker advanced integration status --json` | `IntegrationStatusView` (`src/broker.rs`) |
 | Events | `aethyme broker advanced events --json` | `Event` rows (`src/types.rs`), NDJSON |
 | Metrics | `aethyme broker advanced metrics --json` | inline object (`src/cli.rs`) |
+| Insights | `aethyme broker advanced insights --json` | `InsightsReport` (`src/insights.rs`) — see [insights-contract.md](insights-contract.md) |
 | Submit outcome | `aethyme broker submit --json` | `SubmitOutcome` (`src/merge.rs`) |
 | Report list | `aethyme broker advanced report list --json` | `ReportList` (`src/report.rs`) |
 | Report show | `aethyme broker advanced report show <filename> --json` | `ReportInspection` (`src/report.rs`) |

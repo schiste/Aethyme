@@ -261,9 +261,25 @@ fn current_session(broker: &mut Broker, cwd: &std::path::Path) -> Option<Session
         .max_by_key(|candidate| candidate.worktree_path.len())
 }
 
+/// Record that the agent did something, in both the places that matter.
+///
+/// `last_activity_at` is what every liveness and abandonment check reads; the
+/// activity interval is what `broker advanced insights` reads to tell working
+/// time from elapsed time. `record_session_activity` updates both in one
+/// transaction, so the hook — which runs on every agent turn — pays for one
+/// write, not two. If recording the interval fails, liveness is still updated
+/// on its own: the telemetry tables must never be what makes a live session
+/// look abandoned.
+///
+/// Failure is warned about and swallowed: a hook that could not record liveness
+/// must not stop the agent from working.
 fn touch(broker: &mut Broker, session: Option<&Session>) {
-    if let Some(session) = session {
-        let now = now_ms();
+    let Some(session) = session else {
+        return;
+    };
+    let now = now_ms();
+    if let Err(error) = broker.store().record_session_activity(session.id, now) {
+        crate::warn_unrecorded::<(), _>("record the session activity interval", Err(error));
         crate::warn_unrecorded(
             "record session activity",
             broker.store().touch_session_activity(session.id, now),
