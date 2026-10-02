@@ -1336,10 +1336,13 @@ fn same_file_method_call_resolves_to_module_function_with_redb_parity() {
 
     assert_eq!(expected.items.len(), 1, "{expected:#?}");
     assert_eq!(expected.items[0].kind, "function");
+    // Match on the identity prefix rather than the whole id: node ids
+    // carry a disambiguating start-line suffix, and the point of this
+    // assertion is *which* symbol was resolved, not its id spelling.
+    let resolved_id = &expected.items[0].id;
     assert!(
-        expected.items[0]
-            .id
-            .ends_with(":src/auth/token.py:load_token")
+        resolved_id.starts_with("fn:") && resolved_id.contains(":src/auth/token.py:load_token"),
+        "callee must be load_token in src/auth/token.py, got {resolved_id}"
     );
     assert_eq!(
         graph_cli_json(tmp.path(), "graph-callees", target),
@@ -1576,8 +1579,14 @@ fn redb_explore_observability_reports_store_freshness() {
     assert_eq!(graph_store["backend"], "redb");
     assert_eq!(graph_store["exists"], true);
     assert_eq!(graph_store["fragments_exist"], true);
-    assert_eq!(graph_store["status"], "fresh");
-    assert_eq!(graph_store["stale"], false);
+    // Freshness is now decided by comparing the store's recorded commit
+    // against HEAD, not by comparing file mtimes. This fixture is a
+    // temp directory rather than a git checkout, so the comparison
+    // cannot be made and the honest answer is "unknown" — previously
+    // the mtime heuristic claimed "fresh" from no evidence at all.
+    assert_eq!(graph_store["status"], "unknown");
+    assert!(graph_store["stale"].is_null());
+    assert_eq!(graph_store["freshness_basis"], "indexed_commit_vs_head");
     assert!(
         graph_store.get("path").is_none(),
         "observability should report freshness without leaking generated artifact paths"
@@ -3246,8 +3255,12 @@ fn query_commands_fail_cleanly_and_do_not_create_store_when_missing() {
             "stderr={stderr}"
         );
         assert!(
-            stderr.contains("aethyme-engine-cli index --repo <repo>"),
-            "stderr={stderr}"
+            stderr.contains("aethyme graph materialize --repo <repo>"),
+            "recovery advice must name a command the user-facing CLI serves: stderr={stderr}"
+        );
+        assert!(
+            !stderr.contains("aethyme-engine-cli"),
+            "recovery advice must not point at an unshipped binary path: stderr={stderr}"
         );
         assert!(
             stderr.contains("Query commands are read-only"),

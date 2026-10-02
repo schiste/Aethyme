@@ -190,7 +190,45 @@ Before starting work, `aethyme broker advanced worktree-root --json` shows the e
 clone-specific root without changing state. A normal `broker start` creates a
 sibling beneath that external root even when invoked from an existing broker
 worktree; it never nests the new checkout below the invoking worktree. Start
-output records the selected root and reports any legacy fallback reason.
+output records the selected root and reports any fallback reason.
+
+To keep worktrees on an external drive, set `[worktrees] root` in
+`.aethyme/config.toml`. The per-user default stays in use whenever that path is
+missing, unplugged, inside the repository or below its free-space floor, and
+`start` says why, so machines without the drive keep working. Worktrees on the
+drive are locked, so nothing prunes or cleans them up while it is away. See the
+CLI reference for the rules.
+
+## The Working Agreement
+
+`broker start`, `start --reuse` and `start --adopt` print a short "Working
+agreement" for the agent that is about to begin, and include it as `guidance`
+in `--json`. Without configuration, the built-in default asks agents to:
+
+1. commit one small, coherent step at a time, staging explicit paths only and
+   checking `git diff --cached` first (then push, where the push lane is on);
+2. keep each PR to one reviewable concern;
+3. reuse or extend an existing shared component instead of adding a parallel
+   path;
+4. keep units focused behind narrow interfaces;
+5. test every behaviour change;
+6. finish with nothing unintended committed or pushed, a clean tree, a pushed
+   branch and an up-to-date PR.
+
+A repository replaces it in `.aethyme/config.toml`, read like `[promote]`:
+
+```toml
+[session]
+guidance = [
+  "Run `pnpm lint` before every commit.",
+  "Ask before changing a database migration.",
+]
+```
+
+At most 6 single-line entries of up to 240 characters. `guidance = []` shows
+none. An invalid list prints a warning and the default; it never stops a
+session. The agreement is shown only when a session starts, not repeated in
+generated instructions or `status`, so it costs tokens once per session.
 
 Use reuse when a dedicated broker worktree should continue with a follow-up
 task. Start by checking whether integration advanced while the session was
@@ -932,6 +970,30 @@ it cannot refresh an expiry or acknowledge ownership. Keep provider-specific
 labels and queue payloads in adapters; use the exported schema as their
 idempotent input rather than extending the broker's lease storage.
 
+## Coordinating Through Leases and Notes
+
+Leases describe who is changing what. They are a coordination channel, not a
+lock: nothing an agent edits is refused because another session leases it.
+
+With the Aethyme plugin installed (Claude Code or Codex), the broker speaks at
+the agent's turn boundaries, for no tokens when there is nothing to say:
+
+- **Before an edit** (`PreToolUse`), when another live session is changing the
+  same file, the agent is told which session (id, short name, task), where
+  (line ranges, and the function Git names for each hunk), whether Git would
+  conflict with its own change at the last overlap check, and the exact
+  `aethyme broker advanced note send --session <me> --to-session <them>
+  --message "…"` command. It hears this once per change of the other session.
+- **Notes** from other sessions arrive at the next prompt (`UserPromptSubmit`)
+  or right after the next tool call (`PostToolUse`), each with the command to
+  reply. An agent idle at its prompt gets them at its next turn or broker
+  command.
+- **At session start**, one line names the live sessions changing files this
+  session leases.
+
+Stale, exited and finished sessions are never reported: only active and idle
+ones are still in the file.
+
 ## Push Session Branches As You Go
 
 Work that exists only in a session worktree is lost with the worktree, and
@@ -999,6 +1061,17 @@ delivery path, and the integration branch plays no part:
   request shows; an unpublished one by rebasing. A failed fetch never fails
   the push: the last fetched copy is compared and `default_branch_note` says
   so. This applies in every promote mode.
+- **`broker start` starts from the latest default branch.** It fetches
+  exactly the default branch (one ref, at most ten seconds) before choosing
+  the base. If the fetch fails, the session starts from the cached copy and
+  says how old it is (`start_base.cached_ref_age_seconds`). `start --reuse` and `--adopt` fetch
+  too and report how far the worktree drifted (`default_branch`).
+- **`broker sync --session <id>` catches a session up when it is safe.** The
+  tree must be clean and nothing in progress; it fetches, simulates, and then
+  rebases an unpublished branch or merges the default branch into a published
+  one. If catching up would conflict it changes nothing and lists the paths.
+  Run it before resuming a reused session and whenever `push` reports the
+  branch is behind.
 - **`broker status` shows `session.behind-main`** per live session: `info`
   while the branch still merges cleanly, `warning` when it would conflict. It
   uses only fetched refs and the verdict cached by the last push or status,
@@ -1010,6 +1083,26 @@ delivery path, and the integration branch plays no part:
 
 Open pull requests are compared separately (`pr_overlaps`); `default_branch`
 covers work that has already merged.
+
+In a verify-only repository a conflicting lease **informs** rather than
+blocks. `broker submit` reports another active session's conflicting explicit
+lease in `lease_warnings`, with the `broker advanced note send` command to
+coordinate, then runs the gates as usual. Submit only verifies against the
+current default branch and promotes nothing; each session delivers through
+its own pull request, so the conflict is resolved when one of them merges.
+Blocking would only stall an agent. `broker advanced exec`'s guard is
+unchanged: it stops an agent from editing paths outside its own leases inside
+its own worktree, which is a different concern.
+
+When several sessions work on the same pull request, `broker start`, `push`
+and `status` say so (`duplicate_work`, `session.duplicate-work`). Decide which
+one continues and finish the others; two agents repairing one PR keep
+conflicting with each other however leases are configured.
+
+Files that every session regenerates, such as generated manifests, conflict in
+nearly every pair of sessions. List them in `[leases] ignore` (exact paths,
+directory prefixes ending in `/`, or bare file names), or stop committing
+them, and resolve the merge-time conflict by regenerating.
 
 ## Where A New Session Starts
 

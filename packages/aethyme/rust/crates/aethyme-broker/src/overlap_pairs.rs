@@ -183,6 +183,15 @@ fn build_pair(key: PairKey, paths: &[String], cached: Option<&CachedPair>) -> Ov
     }
 }
 
+/// Why one session's state could not be read for a merge simulation.
+enum StateError {
+    /// The worktree is part-way through a merge, rebase, cherry-pick or
+    /// revert, or holds unresolved conflicts. Not an error in the broker: the
+    /// pair stays unclassified, and the reason says what to finish.
+    MidOperation(String),
+    Other(String),
+}
+
 /// One session's state for a merge simulation: a commit plus the identity
 /// that decides whether a cached verdict is still valid.
 struct SessionState {
@@ -264,6 +273,40 @@ fn classify(
     Ok(conflicting.into_iter().collect())
 }
 
+/// One `session.mid-merge` advice row per live session whose worktree is
+/// part-way through a merge, rebase, cherry-pick or revert. Read from each
+/// worktree's Git directory without running Git: `status` must not fork per
+/// session. An agent stuck mid-merge is often why its work has stopped.
+pub(crate) fn mid_operation_advice(agents: &[crate::AgentView]) -> Vec<crate::StatusAdvice> {
+    agents
+        .iter()
+        .filter(|agent| !agent.derived_status.is_closed())
+        .filter_map(|agent| {
+            let worktree = Path::new(&agent.session.worktree_path);
+            let operation = crate::git::worktree_operation_in_progress(worktree)?;
+            let quoted = format!("'{}'", agent.session.worktree_path.replace('\'', "'\\''"));
+            Some(crate::StatusAdvice {
+                id: "session.mid-merge",
+                severity: crate::StatusAdviceSeverity::Warning,
+                reason: "the session's worktree is part-way through a Git operation",
+                summary: format!(
+                    "session {} is mid-{operation}; its overlaps cannot be classified and its \
+                     work cannot be submitted until the {operation} is finished or aborted",
+                    agent.session.id
+                ),
+                session_id: Some(agent.session.id),
+                queue_entry_id: None,
+                evidence: vec![agent.session.worktree_path.clone()],
+                commands: vec![
+                    format!("git -C {quoted} status"),
+                    format!("git -C {quoted} {operation} --continue"),
+                    format!("git -C {quoted} {operation} --abort"),
+                ],
+            })
+        })
+        .collect()
+}
+
 fn announcement_signature(pair: &OverlapPair) -> String {
     format!(
         "{}|{}|{}",
@@ -334,13 +377,21 @@ impl Broker {
             .into_iter()
             .map(|session| (session.id, session.worktree_path))
             .collect();
-        let state_for = |session: i64, paths: &[String]| -> Result<SessionState, String> {
+        let state_for = |session: i64, paths: &[String]| -> Result<SessionState, StateError> {
             let worktree = sessions
                 .get(&session)
-                .ok_or_else(|| format!("session {session} is not live"))?;
+                .ok_or_else(|| StateError::Other(format!("session {session} is not live")))?;
             let checkout = GitRepo::discover(Path::new(worktree))
-                .map_err(|error| format!("session {session}: {error}"))?;
-            session_state(&checkout, paths)
+                .map_err(|error| StateError::Other(format!("session {session}: {error}")))?;
+            // An index with unmerged entries cannot become a tree, and a
+            // half-finished merge or rebase is not the session's work yet.
+            if let Some(operation) = checkout
+                .operation_in_progress()
+                .map_err(|error| StateError::Other(format!("session {session}: {error}")))?
+            {
+                return Err(StateError::MidOperation(operation.describe(session)));
+            }
+            session_state(&checkout, paths).map_err(StateError::Other)
         };
 
         let mut pairs = Vec::new();
@@ -384,7 +435,10 @@ impl Broker {
                     entry.severity = Some(OverlapSeverity::Low);
                     entry.conflicting_paths.clear();
                     entry.classified = false;
-                    entry.reason = format!("could not classify: {error}");
+                    entry.reason = match error {
+                        StateError::MidOperation(reason) => reason,
+                        StateError::Other(error) => format!("could not classify: {error}"),
+                    };
                     entry.input_key.clear();
                 }
             }

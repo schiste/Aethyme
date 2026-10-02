@@ -1755,6 +1755,8 @@ mod tests {
     use std::fs;
 
     use super::RepositoryMap;
+    use crate::model::class::ClassNode;
+    use crate::model::function::FunctionNode;
 
     #[test]
     fn build_map_creates_graph_layers() {
@@ -1814,6 +1816,98 @@ mod tests {
         assert!(
             !root.join(".aethyme/parse_store.redb").exists(),
             "RepositoryMap builds must not recreate the deleted ParseStore"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Regression: engine node ids were minted as
+    /// `fn:{repo}:{path}:{name}` and `class:{repo}:{path}:{name}`, with
+    /// no line or kind. Distinct symbols therefore collided: a method
+    /// and a module-level function sharing a name, two `impl` blocks
+    /// with the same method name, or `struct Foo` alongside `trait Foo`
+    /// in one file all produced one id. The store's node insert is an
+    /// upsert, so one symbol silently overwrote the other.
+    ///
+    /// Scope note: this fixes collisions the engine projection
+    /// introduces. Two symbols that also collide *upstream* in the
+    /// schema layer — same kind, same file, same name, which is what
+    /// two `impl` blocks each declaring `fn new` produce, because the
+    /// schema hash covers kind/repo/path/name and not line — are still
+    /// merged before they reach this code. Changing that hash is a
+    /// wire-format break for every committed fragment and is
+    /// deliberately out of scope here.
+    #[test]
+    fn same_named_symbols_in_one_file_get_distinct_node_ids() {
+        let root = std::env::temp_dir().join("aethyme_engine_id_collision_test");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).expect("create temp repo");
+        // `m` exists twice in this one file: once as a method of a
+        // class, once as a module-level function. The schema layer
+        // hashes the kind, so these are already distinct nodes and both
+        // reach the projection — which is exactly where the collision
+        // this fixes used to happen.
+        fs::write(
+            root.join("src/collide.py"),
+            "class Foo:\n    def m(self):\n        return 1\n\ndef m():\n    return 2\n",
+        )
+        .expect("write source");
+
+        let map = RepositoryMap::build(&root).expect("build repository map");
+
+        let named_m: Vec<&FunctionNode> = map.functions.iter().filter(|f| f.name == "m").collect();
+        assert_eq!(
+            named_m.len(),
+            2,
+            "both `m` definitions must survive the projection"
+        );
+        assert_ne!(
+            named_m[0].id, named_m[1].id,
+            "same-named symbols in one file must not share a node id"
+        );
+        assert_ne!(
+            named_m[0].line, named_m[1].line,
+            "the fixtures are on different lines, which is what separates them"
+        );
+
+        // The property that actually matters: no two projected nodes
+        // anywhere in the map may share an id.
+        let mut seen = std::collections::HashSet::new();
+        for node in map.graph.nodes.iter() {
+            assert!(
+                seen.insert(node.id.clone()),
+                "duplicate node id {} in the projected graph",
+                node.id
+            );
+        }
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A `struct` and a `trait` sharing a name in one file must not
+    /// collapse, which the kind-less id scheme could not distinguish.
+    #[test]
+    fn same_named_type_kinds_in_one_file_get_distinct_ids() {
+        let root = std::env::temp_dir().join("aethyme_engine_kind_collision_test");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).expect("create temp repo");
+        fs::write(
+            root.join("src/kinds.rs"),
+            "pub struct Thing;\npub trait Thing { fn go(&self); }\n",
+        )
+        .expect("write rust source");
+
+        let map = RepositoryMap::build(&root).expect("build repository map");
+
+        let things: Vec<&ClassNode> = map.classes.iter().filter(|c| c.name == "Thing").collect();
+        assert_eq!(things.len(), 2, "both `Thing` declarations must survive");
+        assert_ne!(
+            things[0].id, things[1].id,
+            "a struct and a trait sharing a name must not share a node id"
+        );
+        assert_ne!(
+            things[0].signature, things[1].signature,
+            "the projections keep their distinct kinds"
         );
 
         let _ = fs::remove_dir_all(&root);

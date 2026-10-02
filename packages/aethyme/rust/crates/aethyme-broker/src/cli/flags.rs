@@ -314,6 +314,7 @@ pub(super) const FLAG_RULES: &[(&str, &[&str])] = &[
     ("watch pr ack", &["--id", "--outcome", "--reason"]),
     ("submit", &["--session", "--no-cache", "--verify-only"]),
     ("push", &["--session", "--pr", "--open-pr"]),
+    ("sync", &["--session"]),
     ("repair", &["--session"]),
     ("checkpoint plan", &["--session"]),
     ("checkpoint apply", &["--session", "--confirm"]),

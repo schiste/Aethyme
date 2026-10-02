@@ -26,7 +26,13 @@ impl ClassNode {
         signature: InternedStr,
     ) -> Self {
         let qualified_name = InternedStr::from(format!("{file_path}::{name}"));
-        let id = InternedStr::from(format!("class:{repo_name}:{file_path}:{name}"));
+        // The start line is part of the identity. Without it a file
+        // declaring `struct Foo` and `trait Foo`, or two `impl` blocks
+        // each declaring `fn new`, mints the same id for distinct
+        // symbols; the store's insert is an upsert, so one silently
+        // overwrites the other and every edge through it becomes
+        // ambiguous.
+        let id = InternedStr::from(format!("class:{repo_name}:{file_path}:{name}@{line}"));
         Self {
             id,
             name,

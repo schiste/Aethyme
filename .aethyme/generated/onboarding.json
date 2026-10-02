@@ -78,7 +78,7 @@
         },
         {
           "kind": "ci_usage",
-          "detail": "workspace root mentioned 24 time(s) in CI",
+          "detail": "workspace root mentioned 30 time(s) in CI",
           "confidence": "medium"
         }
       ],
@@ -88,9 +88,9 @@
         "root_manifest": false,
         "declares_workspace": true,
         "member_count": 10,
-        "ci_mentions": 24,
+        "ci_mentions": 30,
         "executable_entrypoints": 1,
-        "source_files": 490
+        "source_files": 503
       }
     },
     {
@@ -195,7 +195,7 @@
       },
       {
         "kind": "ci_usage",
-        "detail": "workspace root mentioned 24 time(s) in CI",
+        "detail": "workspace root mentioned 30 time(s) in CI",
         "confidence": "medium"
       }
     ],
@@ -205,9 +205,9 @@
       "root_manifest": false,
       "declares_workspace": true,
       "member_count": 10,
-      "ci_mentions": 24,
+      "ci_mentions": 30,
       "executable_entrypoints": 1,
-      "source_files": 490
+      "source_files": 503
     }
   },
   "commands": [
@@ -418,9 +418,9 @@
     ]
   },
   "freshness": {
-    "source_digest": "4c75fb686828f7b0eead13267f29193023bfb8bb7df9af6ada0d3ac3a67cce54",
+    "source_digest": "918c86bbd4ff212f18aa109ffa56a87461e8d91c30c69b6fcb889d65e8008d7c",
     "source_commit": null,
-    "source_file_count": 905,
+    "source_file_count": 920,
     "generator": "deterministic"
   },
   "notes": [

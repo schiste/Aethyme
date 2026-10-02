@@ -11,6 +11,7 @@
 //!
 //! Golden-verified byte parity against the Python renderers.
 
+use crate::cli_error::CliError;
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
@@ -24,12 +25,24 @@ use crate::pipeline::{build_context_pack_redb, build_context_pack_with_content_r
 use crate::store::redb::graph_store::GraphStore;
 
 /// Run `task <subcommand> ...`. `args` excludes the leading `task`.
-pub fn run(args: &[String]) -> Result<(), String> {
+pub fn run(args: &[String]) -> Result<(), CliError> {
+    // `--help` must succeed on every subcommand; handle it before the
+    // strict flag parser rejects it as an unknown flag.
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        println!("aethyme task — task-scoped context from the graph store");
+        for subcommand in [
+            "pack", "context", "anchors", "scope", "next", "expand", "explain",
+        ] {
+            println!(
+                "  aethyme task {subcommand} --repo <path> [--task <text>] [--json|--json-output]"
+            );
+        }
+        return Ok(());
+    }
     let Some(subcommand) = args.first() else {
-        return Err(
-            "missing task subcommand (pack | context | anchors | scope | next | expand | explain)"
-                .to_string(),
-        );
+        return Err(CliError::usage(
+            "missing task subcommand (pack | context | anchors | scope | next | expand | explain)",
+        ));
     };
     let rest = &args[1..];
     let json_output = rest.iter().any(|a| a == "--json-output");
@@ -39,7 +52,9 @@ pub fn run(args: &[String]) -> Result<(), String> {
             .ok_or_else(|| format!("usage: aethyme task {subcommand} --repo <path> ..."))?;
         let path = PathBuf::from(&raw);
         if !path.is_dir() {
-            return Err(format!("repository path is not a directory: {raw}"));
+            return Err(CliError::runtime(format!(
+                "repository path is not a directory: {raw}"
+            )));
         }
         path.canonicalize().map_err(|e| e.to_string())?
     };
@@ -151,7 +166,11 @@ pub fn run(args: &[String]) -> Result<(), String> {
                 opt_value(rest, "--task").unwrap_or_else(|| "Explain this repo".to_string());
             println!("{}", render_explain(&repo, &task_value)?);
         }
-        other => return Err(format!("unsupported task subcommand: {other}")),
+        other => {
+            return Err(CliError::usage(format!(
+                "unsupported task subcommand: {other}"
+            )));
+        }
     }
     Ok(())
 }

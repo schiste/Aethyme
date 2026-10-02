@@ -206,8 +206,11 @@ Usage:
       without a declared offline_command.
   aethyme broker worktree-root [--json]
       Resolve the scanner-safe external root used by future broker starts.
-      Read-only: reports the preferred per-user location, repository key,
-      and constrained legacy fallback without creating either directory.
+      Read-only: reports the preferred location, repository key and
+      fallbacks without creating any directory. A [worktrees] root in
+      .aethyme/config.toml supersedes the per-user default while it exists,
+      is outside the repository and has worktrees.min_free_bytes free;
+      otherwise starts use the default and say why.
   aethyme broker agents [--json]
       List live sessions with activity-derived liveness, refreshing
       diff-derived leases and warning on overlapping edits.
@@ -549,6 +552,14 @@ Usage:
       `[delivery] push_session_branches = true` in .aethyme/config.toml on
       the default branch. --pr also opens a draft pull request when none is
       open for the branch (never marks it ready, never merges).
+  aethyme broker sync --session <id> [--json]
+      Bring this session up to the freshly fetched default branch when it
+      is safe: the tree must be clean and nothing in progress. An unpushed
+      branch is rebased; a published one has the default branch merged in,
+      so a pull request's history is never rewritten. If catching up would
+      conflict, nothing changes and the conflicting paths are listed. Run
+      it before resuming a reused session and whenever `push` reports the
+      branch is behind the default branch.
   aethyme broker repair --session <id> [--json]
       Conflict-scoped recovery: apply the documented local rebase path for
       the latest submit conflict, or rebase onto promoted integration work
@@ -1810,6 +1821,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
         "hooks" => run_hooks(parsed)?,
         "submit" => run_submit(parsed)?,
         "push" => run_push(parsed)?,
+        "sync" => run_sync(parsed)?,
         "repair" => run_repair(parsed)?,
         "representation" => run_representation(parsed)?,
         "main" => run_main_reconcile(parsed)?,

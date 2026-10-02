@@ -43,11 +43,19 @@ shim, and the old spelling fails with `No module named src`. Every
 command below is native, and an unknown subcommand is an error (exit 2)
 rather than a fallthrough.
 
-## Global Options
+## Output Format
 
-- `--tenant-id`
-- `--json`
-- `--verbose`
+There are no global flags: the router parses no options before the command name.
+Machine-readable output is requested per command.
+
+- `--json` and `--json-output` are accepted interchangeably on every command
+  that emits JSON, including `graph`, `query`, `task`, `facts` and `analyze`.
+  `--json` on its own does not apply to the whole CLI.
+- A misspelled flag is an error (exit 2), never a silent no-op.
+
+Exit codes: `0` success, `1` the invocation was valid but the work failed
+(missing store, unreadable path, target not found), `2` the invocation itself was
+wrong (unknown command, unknown flag, wrong arity).
 
 ## Product-Surface Tiers
 
@@ -291,6 +299,63 @@ If the platform host-state root cannot be prepared, `broker start` uses the
 legacy `.aethyme/worktrees/` location and reports the exact fallback reason in
 text and JSON. Explicit environment overrides fail closed instead of silently
 falling back. Existing legacy sessions remain cleanup-compatible.
+
+#### Putting worktrees on another drive
+
+The default location stays the per-user host-state root above. A repository
+can name another place, for example an external drive, in
+`.aethyme/config.toml`:
+
+```toml
+[worktrees]
+root = "/Volumes/T7/aethyme-worktrees"
+# min_free_bytes = 8589934592   # default: the 8 GiB a gate needs to start
+```
+
+It is read like `[promote]`: from the copy committed on the fetched default
+branch, else the main checkout's working-tree file. `AETHYME_WORKTREE_ROOT` and
+the library override still take precedence, with their existing fail-closed
+behaviour.
+
+The configured root supersedes the default only while it is usable. It is
+never created: a new session uses the default, and `start` says why in text and
+in `worktree_placement.fallback_reason`, when the root
+
+- does not exist, or sits under `/Volumes/<name>` while that volume is not
+  mounted (an unplugged drive is never replaced by an empty directory on the
+  startup disk);
+- resolves inside the repository;
+- has less free space than `worktrees.min_free_bytes`;
+- or the `[worktrees]` section is invalid (for example a relative `root`).
+
+Because the key is committed, a machine without that path simply keeps the
+default.
+
+### Working agreement
+
+`start`, `start --reuse` and `start --adopt` print the repository's working
+agreement after the start base and worktree placement, and add to `--json`:
+
+- `guidance`: the lines shown, in order;
+- `guidance_source`: `default` (built in), `repository` (`[session] guidance`)
+  or `disabled` (`guidance = []`);
+- `guidance_warning`: present only when a configured list was ignored, with
+  the reason.
+
+`[session] guidance` is read from the committed default branch like
+`[promote]`. It takes at most 6 single-line entries of up to 240 characters;
+an invalid list falls back to the default with a warning. The default's first
+line names `broker push` and a draft PR only when
+`[delivery] push_session_branches = true`. `start-agent`, `status` and other
+commands do not print the agreement.
+
+Worktrees the broker places on the configured root are locked with
+`git worktree lock`, so `git worktree prune` (including the automatic one in
+`git gc`) keeps their registration while the drive is unplugged; the broker
+unlocks a worktree before removing it. While the root is unavailable,
+`finish cleanup` and `gc plan` report such a worktree as `inspection_failed`
+("the configured worktree root ... is unavailable") instead of treating it as
+deleted: its branch and records are kept until the drive is back.
 
 ### Repository readiness
 
@@ -612,6 +677,8 @@ continues to expose the complete local `log_path` without embedding log data.
 - `aethyme broker advanced leases export (--session <id> | --entry <id>) [--limit <n>] [--json]`
 - `aethyme broker submit --session <id> [--no-cache] [--json]`
 - `aethyme broker push --session <id> [--pr] [--json]` — publish the session's own `agent/*` branch to the default branch's remote (and nothing else); `--pr` opens a draft pull request when none is open. Authorized by `[delivery] push_session_branches = true` in `.aethyme/config.toml` on the default branch; a fast-forward is pushed plainly, a rewritten branch only under a lease on the oid this broker last pushed for the session. It reports what it left behind the way `git status` shows it: changed tracked paths, and each untracked directory as one entry (JSON `uncommitted.modified`, `uncommitted.untracked_entries`, `uncommitted.sample`). After pushing it compares the session's change with the repository's open pull requests and reports `pr_overlaps` (see [Overlap with open pull requests](#overlap-with-open-pull-requests)), then fetches exactly the default branch and reports `default_branch` (`reference`, `commit`, `head`, `behind`, `ahead`, `would_conflict`, `conflicting_paths` (up to five), `suggested_command`) from a `git merge-tree` simulation; a failed fetch compares the last fetched copy and sets `default_branch_note`. Neither ever fails the push. In a `[promote] mode = "verify-only"` repository, `broker submit` simulates and gates against the fetched default branch instead of the integration branch and reports the base as `verified_against` (`source`, `reference`, `commit`, `fallback_reason`); see [broker workflows](../guides/broker-workflows.md).
+- `aethyme broker sync --session <id> [--json]` — bring a live session up to the default branch, fetched first, when that is safe. It refuses (exit code for refusals, nothing changed) a dirty tree (each untracked directory counts as one entry, ignored files never count), a rebase, merge, cherry-pick or revert already in progress, a closed session, or a repository without a fetched default branch. It simulates the catch-up with `git merge-tree`: when that would conflict it changes nothing, lists up to five conflicting paths and the manual commands, and exits with the refusal code; otherwise it rebases an unpublished branch onto the default branch, or merges the default branch into a published one (a branch already on the remote), so a pull request's history is never rewritten. JSON: `session_id`, `branch`, `outcome` (`already_current`, `synced`, `conflict`), `strategy` (`rebase`, `merge`, `none`), `before`, `after`, `default_ref`, `default_commit`, `behind_before`, `ahead`, `conflicts`, `fetched`, optional `fetch_note` and `manual_commands`. Emits `broker.session.synced` when it changes the branch.
+- `broker start` fetches exactly the default branch from its remote (one ref, at most ten seconds) before choosing the base, so a new worktree starts from the remote's tip. `start_base` gains `fetched`, `fetch_error` and, when the fetch failed and the base came from the cached copy, `cached_ref_age_seconds` (how long ago that copy last moved). `start --reuse` and `start --adopt` refresh it too and report `default_branch` / `default_branch_note`, the comparison `push` makes.
 - `aethyme broker advanced repair --session <id> [--json]`
 - `aethyme broker finish --session <id> [--keep-worktree] [--abandon --reason <why>] [--json]`
 - `aethyme broker advanced representation scan --session <id> [--json]`
@@ -1172,6 +1239,40 @@ against the default branch, excluding the session's own:
 `status`, `start` and `adopt` read only the cached listing and local refs; they
 never call GitHub, and ignore a listing older than a day. Nothing here blocks a
 command or writes to GitHub.
+
+### Duplicate work and sessions stuck mid-merge
+
+Several live sessions repairing one pull request conflict with each other by
+construction. The broker names that, from local facts only, and never blocks:
+
+- **Duplicate work:** `broker start`, `start-agent`, `adopt` (including
+  `--reuse`) and `broker push` report other sessions that work on the same
+  branch (`same_branch`), on the open PR whose head is the other session's
+  branch (`same_pr`, from the listing `broker push` caches), or whose task text
+  names the same PR number (`task_mentions_pr`: `PR #1122`, `PR1122`,
+  `pr-1122`, `pull request 1122` or `#1122`). JSON gains `duplicate_work`
+  (`session_id`, `status`, `task`, `reason`, `pull_request`), omitted when
+  empty. `broker status` adds one `session.duplicate-work` row per pair:
+  `warning` when both sessions are active or idle, `info` when one has gone
+  quiet. Its commands are a coordination note and `broker finish`.
+- **Mid-merge worktrees:** a session whose worktree is part-way through a
+  merge, rebase, cherry-pick or revert, or holds unresolved conflicts, is not
+  merge-simulated. Its overlap pairs stay `classified: false` with the reason
+  `session <id> is mid-<operation> with unresolved conflicts`, and `broker
+  status` adds a `session.mid-merge` warning with `git status`,
+  `--continue` and `--abort` commands. The check reads the worktree's Git
+  directory and runs no Git command.
+- **Verify-only submit:** in a `[promote] mode = "verify-only"` repository, a
+  conflicting explicit lease held by an active session no longer fails the
+  submit ownership audit. It is reported in `lease_warnings` with the
+  coordination command, and submit continues to the gates. `auto` and
+  `manual` repositories still refuse, because they promote onto a shared
+  integration branch. `broker advanced exec`'s guard is unchanged.
+- **`[leases] ignore`:** an entry ending in `/` is a directory prefix, an entry
+  containing `/` is an exact repository-relative path, and any other entry is
+  a file name matched in every directory. The rules are read from
+  `.aethyme/config.toml` as committed on the fetched default branch, else the
+  main checkout's file, like `[promote]`.
 
 Work that reaches the default branch through a reviewed pull request is
 delivered, but leaves no promoted queue entry, and a squash merge rewrites the
@@ -2357,9 +2458,13 @@ Current scope limits:
 
 ## Core Commands
 
-### Indexing
-- `aethyme index PATH --name NAME --languages python,typescript --use-fallback`
-- `aethyme stats`
+### Graph Lifecycle
+Graph commands are read-only and refuse to run without a local store. Check the
+posture first; it names the exact next command.
+- `aethyme graph status --repo PATH [--json]`
+- `aethyme graph refresh plan --repo PATH [--diff]`
+- `aethyme graph refresh execute --repo PATH --confirm <plan-sha256>`
+- `aethyme graph materialize --repo PATH`
 
 ### Local Repo Intake
 - `aethyme repo ingest /path/to/repo`
@@ -2906,12 +3011,16 @@ Optional params:
 - `aethyme graph callees /path/to/repo <target> --json-output`
 - `aethyme graph docs /path/to/repo <target> --json-output`
 - `aethyme graph configs /path/to/repo <target> --json-output`
+- `aethyme graph expand /path/to/repo <target> --json-output`
 - `aethyme graph overview /path/to/repo --json-output`
 
-`node`, relation, and expansion graph commands read
-`.aethyme/graph_store.redb` through read-only engine APIs. `graph overview`
-still uses the in-memory graph overview path until it receives its own redb
-adapter.
+Every navigation command, including `graph overview`, reads
+`.aethyme/graph_store.redb` through read-only engine APIs.
+
+`node`, `expand` and the relation commands exit 1 with `node not found` when
+the target does not resolve, and exit 0 with `"items": []` when the node exists
+but has no such relation. Check the exit code to tell a misspelled symbol from
+a genuine empty result.
 
 ### Derived Facts
 - `aethyme facts public-functions --repo /path/to/repo --scope src/pkg --json-output`
@@ -2947,9 +3056,6 @@ still read from the filesystem when context packs need snippets/content, but
 candidate selection and graph navigation come from `.aethyme/graph_store.redb`.
 
 ### Local Evaluation
-- `aethyme eval explain-repo --repo /path/to/repo --json-output`
-- `aethyme eval explain-repo --repo /path/to/repo --control-cmd "<cmd>" --explore-cmd "<cmd>" --leverage-cmd "<cmd>"`
-- `aethyme eval navigation-ctf --repo /path/to/repo --json-output`
 - Example Codex wrapper command: `packages/aethyme-eval/.venv/bin/python packages/aethyme-eval/scripts/run_codex_eval.py` (eval tooling is Python and lives in the separate `aethyme-eval` package; `packages/aethyme` carries none)
 - Example regression gate command: `packages/aethyme-eval/.venv/bin/python packages/aethyme-eval/scripts/check_regression_gate.py --suite /path/to/suite.json`
 
@@ -2974,9 +3080,12 @@ Current behavior:
 - the Aethyme-assisted evaluation prompt uses a compact rendered pack rather than the full raw JSON payload
 
 ### Graph Queries
-- `aethyme search TERM --limit 20 --type hybrid`
-- `aethyme ego SYMBOL --depth 2`
-- `aethyme impact SYMBOL --max-depth 10`
+- `aethyme graph node PATH <target> --json-output`
+- `aethyme graph expand PATH <target> --json-output`
+- `aethyme graph callers PATH <target> --json-output`
+- `aethyme graph callees PATH <target> --json-output`
+- `aethyme graph impact --repo PATH --revision HEAD --diff <file-or-"text"> [--mode calls|imports] [--budget N] [--json]`
+- `aethyme query symbol PATH <query> --json-output`
 
 ### Scorecard
 - `aethyme ai-ready --repo PATH --format md`

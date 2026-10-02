@@ -213,7 +213,7 @@ pub fn session_content(
     // question one process can answer. The candidate search in `find_landing`
     // was batched for the same reason (#408); this is the other half.
     let wanted = repo
-        .blobs_at_many(
+        .objects_at_many(
             &changed
                 .iter()
                 .map(|path| (head, path.as_str()))
@@ -237,7 +237,7 @@ pub fn content_at(
     target: &str,
 ) -> Result<ContentVerdict, BrokerOpError> {
     let found = repo
-        .blobs_at_many(
+        .objects_at_many(
             &content
                 .paths
                 .keys()
@@ -334,7 +334,7 @@ pub fn find_landing(
             })
             .collect::<Vec<_>>();
         let blobs = repo
-            .blobs_at_many(&queries)
+            .objects_at_many(&queries)
             .map_err(|source| unavailable(format!("cannot read candidate content: {source}")))?;
         for (offset, (candidate, found)) in batch.iter().zip(blobs.chunks(paths.len())).enumerate()
         {
@@ -687,6 +687,127 @@ mod tests {
             .map(|path| (path.clone(), repo.blob_at(&head, path)))
             .collect::<BTreeMap<_, _>>();
         assert_eq!(content.paths, expected);
+    }
+
+    /// Point a gitlink at `target` without a checkout of the submodule.
+    fn set_gitlink(root: &Path, path: &str, target: &str) {
+        git(
+            root,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("160000,{target},{path}"),
+            ],
+        );
+    }
+
+    /// A session that only moves a submodule pointer has content to keep.
+    ///
+    /// `cat-file --batch-check` reports a gitlink as `submodule`, not `blob`.
+    /// Read as "no object", the old and the new pointer both became `None`,
+    /// so the session's content compared equal to its own base and the probe
+    /// called the worktree "nothing to represent": the one direction a
+    /// cleanup decision must not fail in. The per-path read compared the
+    /// pointers themselves, and the batched read must too.
+    #[test]
+    fn a_submodule_pointer_bump_is_not_already_represented() {
+        let (tmp, repo, _) = seeded();
+        let old = "1111111111111111111111111111111111111111";
+        let new = "2222222222222222222222222222222222222222";
+        set_gitlink(tmp.path(), "vendor/lib", old);
+        git(tmp.path(), &["commit", "-q", "-m", "add submodule"]);
+        let base = git(tmp.path(), &["rev-parse", "HEAD"]);
+        set_gitlink(tmp.path(), "vendor/lib", new);
+        git(tmp.path(), &["commit", "-q", "-m", "bump submodule"]);
+        let head = git(tmp.path(), &["rev-parse", "HEAD"]);
+
+        let content = session_content(&repo, &base, &head).unwrap();
+
+        assert_eq!(
+            content.paths.get("vendor/lib"),
+            Some(&Some(new.to_string()))
+        );
+        assert!(matches!(
+            content_at(&repo, &content, &base).unwrap(),
+            ContentVerdict::Absent { ref path, ref found, .. }
+                if path == "vendor/lib" && found.as_deref() == Some(old)
+        ));
+        let search = find_landing(&repo, &content, &base, DEFAULT_SEARCH_CAP).unwrap();
+        assert_ne!(search.outcome, LandingOutcome::NothingToRepresent);
+        assert!(!search.represented());
+    }
+
+    /// A trailing carriage return is part of a path, and the batch must not
+    /// lose it: Git strips one from each batch input line, which would read
+    /// `plain.txt\r` as `plain.txt` and answer a different file's object.
+    /// (A newline cannot reach this map at all: the diff parser drops such
+    /// paths before they are recorded.)
+    #[test]
+    fn session_content_keeps_paths_with_spaces_and_carriage_returns_distinct() {
+        let (tmp, repo, base) = seeded();
+        write(tmp.path(), "plain.txt", "three\n");
+        write(tmp.path(), "plain.txt\r", "four\n");
+        write(tmp.path(), "with space.txt", "two\n");
+        let head = commit(tmp.path(), "awkward names");
+
+        let content = session_content(&repo, &base, &head).unwrap();
+
+        assert_eq!(content.paths.len(), 3);
+        for (path, wanted) in &content.paths {
+            assert!(wanted.is_some(), "{path:?} has no object");
+            assert_eq!(wanted, &repo.blob_at(&head, path), "{path:?}");
+        }
+        assert_ne!(
+            content.paths.get("plain.txt"),
+            content.paths.get("plain.txt\r")
+        );
+        assert!(content_at(&repo, &content, &head).unwrap().is_present());
+    }
+
+    /// The batched read answers every kind of tree entry exactly as the
+    /// per-path `rev-parse` does: a blob, a tree, a gitlink, a missing path,
+    /// and names with spaces and newlines, in input order.
+    #[test]
+    fn batched_object_read_matches_the_per_path_read_for_every_entry_kind() {
+        let (tmp, repo, _) = seeded();
+        std::fs::create_dir(tmp.path().join("dir")).unwrap();
+        write(tmp.path(), "dir/inner.txt", "inner\n");
+        write(tmp.path(), "line\nbreak.txt", "nl\n");
+        write(tmp.path(), "with space.txt", "sp\n");
+        write(tmp.path(), "base.txt\r", "cr\n");
+        git(tmp.path(), &["add", "-A"]);
+        set_gitlink(
+            tmp.path(),
+            "vendor/lib",
+            "3333333333333333333333333333333333333333",
+        );
+        git(tmp.path(), &["commit", "-q", "-m", "every kind"]);
+        let head = git(tmp.path(), &["rev-parse", "HEAD"]);
+
+        let paths = [
+            "base.txt",
+            "dir",
+            "vendor/lib",
+            "no/such/path",
+            "with space.txt",
+            "line\nbreak.txt",
+            "base.txt\r",
+            "base.txt",
+        ];
+        let queries = paths
+            .iter()
+            .map(|path| (head.as_str(), *path))
+            .collect::<Vec<_>>();
+        let batched = repo.objects_at_many(&queries).unwrap();
+        let per_path = paths
+            .iter()
+            .map(|path| repo.blob_at(&head, path))
+            .collect::<Vec<_>>();
+        assert_eq!(batched, per_path);
+        assert_eq!(batched[3], None);
+        assert_eq!(batched.iter().filter(|found| found.is_some()).count(), 7);
+        assert_ne!(batched[6], batched[7]);
     }
 
     /// A path Git cannot resolve is `None`, batched or not.
