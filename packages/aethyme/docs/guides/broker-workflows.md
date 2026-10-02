@@ -1248,9 +1248,19 @@ A `target/` of any real size takes minutes to unlink, which no per-open budget
 can hold. Removal therefore stops at the deadline mid-directory and leaves the
 tree still recognisable as the cache it is — the file that classifies it is
 always the last one taken. An unfinished pass withholds the sweep's cadence
-stamp, so the next broker command resumes instead of waiting out
-`artifact_sweep_interval_hours`, and a backlog too large for one budget still
-drains.
+stamp, so the backlog is not hidden for `artifact_sweep_interval_hours`, and a
+backlog too large for one budget still drains.
+
+Broker open runs before every command, including the agent hook on each tool
+call, so its share of that work is small and fixed: at most 250 ms per open,
+never scaled by disk pressure, and an open continues an unfinished pass at most
+once every 10 minutes (about every 25 seconds when the disk is below the gate
+headroom). The full `artifact_sweep_budget_ms` -- multiplied when the disk is
+below the gate headroom -- is spent by commands that exist to reclaim disk:
+`aethyme broker gc sweep`, which runs a pass now regardless of cadence, and
+`finish`, which continues an unfinished pass before the agent leaves. Before
+this split, a repository whose backlog outlasted one budget paid the full
+budget -- a minute under pressure -- on every command.
 
 The sweep also reaches sessions that are still open once their agent has been
 quiet for `[retention].idle_session_artifact_hours` (default 24). The session

@@ -248,7 +248,10 @@ pub use gates::{
     gate_scope_manifest_with_graph, load_gates, load_gates_at_commit, parse_gates, plan_pre_push,
     select_gates, verify_gate_scope_manifest,
 };
-pub use gc::{GC_PLAN_SCHEMA_VERSION, UNCLASSIFIED_ARTIFACT_REPORT_THRESHOLD_BYTES};
+pub use gc::{
+    ArtifactSweepOutcome, ArtifactSweepReport, GC_PLAN_SCHEMA_VERSION,
+    INLINE_ARTIFACT_SWEEP_BUDGET_MS, UNCLASSIFIED_ARTIFACT_REPORT_THRESHOLD_BYTES,
+};
 pub use git::{
     CherrySide, GitError, GitRepo, LoggedCommit, MergeSimulation, RemoteDefaultBranch,
     UncommittedSummary,

@@ -402,6 +402,7 @@ pub(super) const FLAG_RULES: &[(&str, &[&str])] = &[
         &["--detail", "--confirm", "--include-active-gate-cache"],
     ),
     ("gc apply", &["--confirm", "--include-active-gate-cache"]),
+    ("gc sweep", &[]),
     ("worktrees", &[]),
     ("storage", &["--detail", "--confirm"]),
     ("storage plan", &["--detail", "--confirm"]),

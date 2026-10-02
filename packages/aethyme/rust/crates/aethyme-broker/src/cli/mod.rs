@@ -737,6 +737,13 @@ Usage:
       Apply or resume the exact reviewed plan under an exclusive lock. A
       recovery journal makes interrupted row, file, and worktree cleanup safe.
       Pass --include-active-gate-cache when the plan was made with it.
+  aethyme broker gc sweep [--json]
+      Run the unattended build-artifact sweep now with its full budget
+      (scaled up when disk is below the gate headroom), ignoring its daily
+      cadence. It removes only git-ignored build caches of finished sessions
+      and of open sessions idle past idle_session_artifact_hours; broker open
+      spends at most 250 ms on the same sweep. Run again to continue a pass
+      that paused at its budget.
   aethyme broker storage [--json]
   aethyme broker storage plan [--json]
   aethyme broker storage apply --confirm <sha256> [--json]

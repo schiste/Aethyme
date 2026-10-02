@@ -823,11 +823,11 @@ pub(super) fn run_gc(parsed: Parsed) -> Result<(), UsageError> {
         .first()
         .map(String::as_str)
         .ok_or_else(|| {
-            UsageError::Message("gc requires `plan` or `apply --confirm <sha256>`".into())
+            UsageError::Message("gc requires `plan`, `apply --confirm <sha256>` or `sweep`".into())
         })?;
     if parsed.positional.len() != 1 {
         return Err(UsageError::Message(
-            "gc accepts exactly one action: `plan` or `apply --confirm <sha256>`".into(),
+            "gc accepts exactly one action: `plan`, `apply --confirm <sha256>` or `sweep`".into(),
         ));
     }
     let mut broker = open_broker(parsed.read_only_snapshot)?;
@@ -873,13 +873,44 @@ pub(super) fn run_gc(parsed: Parsed) -> Result<(), UsageError> {
                 )));
             }
         }
+        "sweep" => {
+            let report = broker.gc_sweep_artifacts()?;
+            if parsed.json {
+                out!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                render_gc_sweep(&report);
+            }
+        }
         other => {
             return Err(UsageError::Message(format!(
-                "unknown gc action {other:?}; expected `plan` or `apply`"
+                "unknown gc action {other:?}; expected `plan`, `apply` or `sweep`"
             )));
         }
     }
     Ok(())
+}
+
+fn render_gc_sweep(report: &crate::ArtifactSweepReport) {
+    let noun = if report.directories_reclaimed == 1 {
+        "directory"
+    } else {
+        "directories"
+    };
+    out!(
+        "artifact sweep: reclaimed {} build-output {noun} within {} ms{}",
+        report.directories_reclaimed,
+        report.budget_ms,
+        if report.disk_pressured {
+            " (disk below the gate headroom: pressured budget)"
+        } else {
+            ""
+        }
+    );
+    if report.complete {
+        out!("  complete: every eligible session was visited");
+    } else {
+        out!("  paused at the budget; run `aethyme broker gc sweep` again to continue");
+    }
 }
 
 /// `broker storage`.

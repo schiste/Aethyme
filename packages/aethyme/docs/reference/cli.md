@@ -691,6 +691,7 @@ continues to expose the complete local `log_path` without embedding log data.
 - `aethyme broker advanced main reconcile apply --session <id> --confirm <sha256> [--resolution-file <path>] [--json]`
 - `aethyme broker gc plan [--include-active-gate-cache] [--json]`
 - `aethyme broker gc apply --confirm <sha256> [--include-active-gate-cache] [--json]`
+- `aethyme broker gc sweep [--json]`
 - `aethyme broker gc storage [--json]`
 - `aethyme broker gc storage plan [--json]`
 - `aethyme broker gc storage apply --confirm <sha256> [--json]`
@@ -1699,16 +1700,18 @@ reclaimed automatically on broker startup, without per-run confirmation.
 This is the one exemption from the rule that startup never authorizes fresh work,
 and it is narrow: the sweep removes only build caches, never commits, refs, or
 worktrees, and it skips live sessions. It runs at most once per
-`artifact_sweep_interval_hours` within `artifact_sweep_budget_ms`, so discovery
-stays off the hot path of every broker command. If the budget expires before a
-backlog is scanned, the next broker command resumes maintenance instead of
-holding the remaining caches for a full interval. A later broker startup
-continues that bounded backlog for the repository. Its cadence stamp lives in the
+`artifact_sweep_interval_hours`, and a broker open spends at most 250 ms of
+`artifact_sweep_budget_ms` on it -- never scaled by disk pressure -- so discovery
+stays off the hot path of every broker command. If that budget expires before a
+backlog is scanned, the remaining caches are not held for a full interval: a
+broker open continues the pass at most once every 10 minutes (every ~25 seconds
+below the gate headroom), `finish` continues it with the full budget, and
+`gc sweep` runs a full-budget pass on demand. Its cadence stamp lives in the
 broker database rather than under `.aethyme/`, where a durable runtime file would
 register as a dirty path to the checkout-cleanliness gates. A sweep with no
 closed worktree does not consume the cadence window, so the first command after
 a session closes can reclaim its caches. With an explicitly disabled policy, or
-to clear an existing backlog immediately, use `gc plan` and digest-confirmed
+to clear an existing backlog immediately, use `gc sweep` (which needs the policy enabled), or `gc plan` and digest-confirmed
 `gc apply`.
 
 Worktree storage is host-scoped while the records that own it are
