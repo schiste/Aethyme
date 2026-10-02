@@ -55,6 +55,7 @@ fn session_context_round_trips_and_can_be_enriched_from_chau7() {
     let (_tmp, mut store) = open_temp();
     let session = store
         .register_session_with_context_and_leases(
+            false,
             &NewSession {
                 worktree_path: "/repo/.aethyme/worktrees/chau7-auth".into(),
                 branch: "agent/chau7-auth".into(),
@@ -109,6 +110,7 @@ fn session_context_round_trips_and_can_be_enriched_from_chau7() {
 
     let reused = store
         .reuse_session_with_context_and_leases(
+            false,
             session.id,
             None,
             None,
