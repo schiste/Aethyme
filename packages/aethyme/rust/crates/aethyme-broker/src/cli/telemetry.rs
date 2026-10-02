@@ -251,7 +251,8 @@ pub(super) fn command_records_metric(args: &[String]) -> bool {
         // from cron must not write a telemetry line, or the report would be one
         // of the things it reports on.
         Some(
-            "certify" | "readiness" | "queue" | "metrics" | "insights" | "handoff" | "worktree-root",
+            "certify" | "readiness" | "queue" | "metrics" | "insights" | "handoff"
+            | "worktree-root",
         ) => false,
         Some("advisories") => matches!(args.get(1).map(String::as_str), Some("ack" | "suppress")),
         Some("exposures") => args.get(1).map(String::as_str) == Some("apply"),

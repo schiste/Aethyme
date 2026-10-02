@@ -43,7 +43,19 @@ const DEFAULT_WINDOW_DAYS: i64 = 30;
 /// `broker advanced insights`.
 pub(super) fn run_insights(parsed: Parsed) -> Result<(), UsageError> {
     let days = parsed.days.unwrap_or(DEFAULT_WINDOW_DAYS);
-    let session_limit = bounded("--session-limit", parsed.session_limit, 50, MAX_SESSION_ROWS)?;
+    if days < 0 {
+        // Without this, a negative window fails the `days > 0` filter below and
+        // silently reports all history — a typo answered as `--days 0`.
+        return Err(UsageError::Message(
+            "--days must not be negative (0 means all history)".into(),
+        ));
+    }
+    let session_limit = bounded(
+        "--session-limit",
+        parsed.session_limit,
+        50,
+        MAX_SESSION_ROWS,
+    )?;
     let pull_request_limit = bounded(
         "--pull-request-limit",
         parsed.pull_request_limit,
@@ -93,10 +105,18 @@ fn assemble(
         pull_request_limit,
     };
 
+    // Every section covers the same period. The funnel filters sessions by
+    // their creation; the gate, cache, coordination and operation figures are
+    // counts of things that happened, so they take the window's start directly.
+    // Without this, the default 30-day funnel sat beside lifetime gate and
+    // coordination figures with nothing saying so.
+    let since_ms = query.window.map_or(0, |window| window.from_ms);
+
     let mut events = Vec::new();
     for prefix in insights::STAGE_EVENT_PREFIXES {
         events.extend(store.events_after_filtered(0, i64::MAX, Some(prefix))?);
     }
+    events.retain(|event| event.ts >= since_ms);
     // Merge events arrive out of order across prefixes; the fold takes the
     // first of each kind by timestamp, so order does not change the answer.
     events.sort_by_key(|event| event.id);
@@ -126,15 +146,25 @@ fn assemble(
         })
         .collect();
 
-    let (cached, cached_saved_ms) = cached_gate_totals(&events);
+    // Cache hits are not funnel events, so they are not in `events`: read them
+    // on their own. Counting them from the funnel's events would report zero
+    // cache hits for every repository.
+    let mut cache_hits =
+        store.events_after_filtered(0, i64::MAX, Some(crate::events::GATE_CACHED))?;
+    cache_hits.retain(|event| event.ts >= since_ms);
+    let (cached, cached_saved_ms) = cached_gate_totals(&cache_hits);
 
-    let (succeeded, failed, outcome_unknown) = store.insight_operation_counts()?;
+    let (succeeded, failed, outcome_unknown) = store.insight_operation_counts(since_ms)?;
 
     let input = InsightsInput {
         sessions,
         stage_times,
         failure_times: folded.failures,
-        gates: store.insight_gate_rows()?.into_iter().map(Into::into).collect(),
+        gates: store
+            .insight_gate_rows(since_ms)?
+            .into_iter()
+            .map(Into::into)
+            .collect(),
         gates_cached: cached,
         gates_cached_saved_ms: cached_saved_ms,
         pull_requests,
@@ -175,7 +205,10 @@ fn load_pull_requests(
 fn cached_gate_totals(events: &[crate::types::Event]) -> (u64, i64) {
     let mut count = 0u64;
     let mut saved_ms = 0i64;
-    for event in events.iter().filter(|e| e.kind == "gate.cached") {
+    for event in events
+        .iter()
+        .filter(|e| e.kind == crate::events::GATE_CACHED)
+    {
         count += 1;
         saved_ms = saved_ms.saturating_add(
             event
@@ -398,9 +431,7 @@ fn render(report: &InsightsReport) -> String {
 }
 
 fn window_days(report: &InsightsReport) -> f64 {
-    report
-        .window
-        .map_or(0.0, |window| window.days())
+    report.window.map_or(0.0, |window| window.days())
 }
 
 /// A duration, with the distribution's shape rather than just its mean.

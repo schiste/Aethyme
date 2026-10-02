@@ -1321,7 +1321,9 @@ impl BrokerStore {
         at_ms: i64,
     ) -> Result<i64, BrokerError> {
         let now = now_ms();
-        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let open: Option<(i64, i64)> = tx
             .query_row(
                 "SELECT id, last_signal_at FROM session_activity
@@ -1334,7 +1336,9 @@ impl BrokerStore {
         let id = match open {
             // Backwards clock, or a signal that predates the open interval:
             // extend the existing one rather than writing a negative gap.
-            Some((id, last_signal_at)) if at_ms.saturating_sub(last_signal_at) <= crate::insights::IDLE_GAP_MS => {
+            Some((id, last_signal_at))
+                if at_ms.saturating_sub(last_signal_at) <= crate::insights::IDLE_GAP_MS =>
+            {
                 tx.execute(
                     "UPDATE session_activity
                      SET last_signal_at = MAX(last_signal_at, ?2), signals = signals + 1
@@ -1385,13 +1389,12 @@ impl BrokerStore {
     /// forever and read as an unbounded duration. Sessions are never back-
     /// filled: an open interval on a closed session would otherwise be
     /// indistinguishable from one whose session is merely idle.
-    pub fn close_session_activity(&mut self, session_id: i64, at_ms: i64) -> Result<usize, BrokerError> {
-        let changed = self.conn.execute(
-            "UPDATE session_activity SET ended_at = ?2
-             WHERE session_id = ?1 AND ended_at IS NULL AND last_signal_at <= ?2",
-            params![session_id, at_ms],
-        )?;
-        Ok(changed)
+    pub fn close_session_activity(
+        &mut self,
+        session_id: i64,
+        at_ms: i64,
+    ) -> Result<usize, BrokerError> {
+        close_open_activity_in_tx(&self.conn, session_id, at_ms)
     }
 
     /// Session rows for the insights funnel, newest first.
@@ -1443,12 +1446,17 @@ impl BrokerStore {
     }
 
     /// Gate rows for the insights report.
-    pub fn insight_gate_rows(&self) -> Result<Vec<crate::InsightGateRow>, BrokerError> {
+    /// Gate runs recorded at or after `since_ms` (0 reads all history), so the
+    /// gate figures cover the same window as the funnel beside them.
+    pub fn insight_gate_rows(
+        &self,
+        since_ms: i64,
+    ) -> Result<Vec<crate::InsightGateRow>, BrokerError> {
         let mut stmt = self.conn.prepare(
             "SELECT gate_name, status, duration_ms, wait_duration_ms, first_output_ms, failure_class
-             FROM gate_results ORDER BY created_at DESC",
+             FROM gate_results WHERE created_at >= ?1 ORDER BY created_at DESC",
         )?;
-        let rows = stmt.query_map([], |row| {
+        let rows = stmt.query_map([since_ms], |row| {
             let status: String = row.get(1)?;
             Ok(crate::InsightGateRow {
                 gate_name: row.get(0)?,
@@ -1467,16 +1475,15 @@ impl BrokerStore {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
-    /// Coordinated operation outcome counts, for the insights report.
-    pub fn insight_operation_counts(
-        &self,
-    ) -> Result<(u64, u64, u64), BrokerError> {
+    /// Coordinated operation outcome counts at or after `since_ms` (0 reads
+    /// all history), for the insights report.
+    pub fn insight_operation_counts(&self, since_ms: i64) -> Result<(u64, u64, u64), BrokerError> {
         let mut stmt = self.conn.prepare(
             "SELECT status, COUNT(*) FROM coordinated_operations
-             WHERE status IN ('succeeded','failed','outcome_unknown')
+             WHERE status IN ('succeeded','failed','outcome_unknown') AND created_at >= ?1
              GROUP BY status",
         )?;
-        let rows = stmt.query_map([], |row| {
+        let rows = stmt.query_map([since_ms], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
         })?;
         let mut succeeded = 0;
@@ -1491,7 +1498,11 @@ impl BrokerStore {
                 _ => {}
             }
         }
-        Ok((succeeded.max(0) as u64, failed.max(0) as u64, unknown.max(0) as u64))
+        Ok((
+            succeeded.max(0) as u64,
+            failed.max(0) as u64,
+            unknown.max(0) as u64,
+        ))
     }
 
     /// Active milliseconds and signal count per session, in one query.
@@ -1572,7 +1583,9 @@ impl BrokerStore {
         opened_at: i64,
     ) -> Result<(), BrokerError> {
         let now = now_ms();
-        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         upsert_pull_request_milestone_in_tx(
             &tx,
             repository,
@@ -1595,7 +1608,9 @@ impl BrokerStore {
         merged_at: i64,
     ) -> Result<(), BrokerError> {
         let now = now_ms();
-        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         upsert_pull_request_milestone_in_tx(
             &tx,
             repository,
@@ -7130,9 +7145,13 @@ fn upsert_pull_request_milestone_in_tx(
 ///
 /// Called from every path that closes a session, inside that path's
 /// transaction, so a close and the end of its activity interval commit together.
-/// The interval ends at `at_ms` and only when its last signal precedes it: an
-/// open interval whose last signal is in the future belongs to a clock that
-/// disagreed, and closing it backwards would produce a negative duration.
+///
+/// A close within [`crate::insights::IDLE_GAP_MS`] of the last signal is the
+/// agent finishing its own work, so the period runs to the close. A later close
+/// is housekeeping — cleanup, the sweep, abandonment, often a day on — and the
+/// period ends at its last signal, by the same rule that splits a period on a
+/// long silence. A last signal after the close (a clock that disagreed) also
+/// ends the period at that signal, never with a negative duration.
 fn close_open_activity_in_tx(
     conn: &Connection,
     session_id: i64,
@@ -7140,9 +7159,13 @@ fn close_open_activity_in_tx(
 ) -> Result<usize, BrokerError> {
     Ok(conn.execute(
         "UPDATE session_activity
-         SET ended_at = ?2, source = 'close'
-         WHERE session_id = ?1 AND ended_at IS NULL AND last_signal_at <= ?2",
-        params![session_id, at_ms],
+         SET ended_at = CASE
+                 WHEN ?2 >= last_signal_at AND ?2 - last_signal_at <= ?3 THEN ?2
+                 ELSE last_signal_at
+             END,
+             source = 'close'
+         WHERE session_id = ?1 AND ended_at IS NULL",
+        params![session_id, at_ms, crate::insights::IDLE_GAP_MS],
     )?)
 }
 

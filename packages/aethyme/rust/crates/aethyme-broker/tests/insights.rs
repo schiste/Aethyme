@@ -22,8 +22,8 @@
 use std::process::Command;
 
 use aethyme_broker::{
-    Broker, BrokerStore, GateStatus, InsightsInput, InsightsQuery, InsightsReport,
-    NewGateResult, NewSession, SessionOrigin, SessionStatus, insights,
+    Broker, BrokerStore, GateStatus, InsightsInput, InsightsQuery, InsightsReport, NewGateResult,
+    NewSession, SessionOrigin, SessionStatus, insights,
 };
 
 fn git(root: &std::path::Path, args: &[&str]) {
@@ -53,7 +53,11 @@ fn fixture(count: usize) -> (tempfile::TempDir, Broker, Vec<i64>) {
         let session = broker
             .store()
             .register_session(&NewSession {
-                worktree_path: root.path().join(format!("wt-{index}")).display().to_string(),
+                worktree_path: root
+                    .path()
+                    .join(format!("wt-{index}"))
+                    .display()
+                    .to_string(),
                 branch: format!("agent/{index}"),
                 origin: SessionOrigin::Spawned,
                 // Deliberately distinctive: the privacy test asserts none of
@@ -85,7 +89,9 @@ fn event_at(broker: &mut Broker, ts: i64, kind: &str, session_id: i64) {
         .append_event(kind, Some(session_id), Some("{}"))
         .unwrap();
     broker.store().set_event_timestamp_for_test(id, ts);
-    broker.store().set_session_created_at_for_test(session_id, ts);
+    broker
+        .store()
+        .set_session_created_at_for_test(session_id, ts);
 }
 
 fn landed_lifecycle(broker: &mut Broker, session_id: i64, base: i64) {
@@ -153,13 +159,13 @@ fn assemble(store: &BrokerStore) -> InsightsInput {
         })
         .collect();
 
-    let (succeeded, failed, outcome_unknown) = store.insight_operation_counts().unwrap();
+    let (succeeded, failed, outcome_unknown) = store.insight_operation_counts(0).unwrap();
     InsightsInput {
         stage_times: insights::stage_map(&folded, &pull_requests),
         failure_times: folded.failures,
         sessions,
         gates: store
-            .insight_gate_rows()
+            .insight_gate_rows(0)
             .unwrap()
             .into_iter()
             .map(Into::into)
@@ -275,9 +281,18 @@ fn recorded_activity_is_summed_and_ends_at_the_close() {
     let session_id = ids[0];
 
     // Three signals inside the idle gap: one period of attention.
-    broker.store().record_session_activity(session_id, base + 1_000).unwrap();
-    broker.store().record_session_activity(session_id, base + 5_000).unwrap();
-    broker.store().record_session_activity(session_id, base + 9_000).unwrap();
+    broker
+        .store()
+        .record_session_activity(session_id, base + 1_000)
+        .unwrap();
+    broker
+        .store()
+        .record_session_activity(session_id, base + 5_000)
+        .unwrap();
+    broker
+        .store()
+        .record_session_activity(session_id, base + 9_000)
+        .unwrap();
     broker
         .store()
         .close_session_activity(session_id, base + 60_000)
@@ -300,15 +315,24 @@ fn a_long_silence_splits_one_worked_period_into_two() {
     let session_id = ids[0];
     let gap = insights::IDLE_GAP_MS;
 
-    broker.store().record_session_activity(session_id, base).unwrap();
+    broker
+        .store()
+        .record_session_activity(session_id, base)
+        .unwrap();
     broker
         .store()
         .record_session_activity(session_id, base + gap - 1_000)
         .unwrap();
     // A pause longer than the gap, then a short burst, then the close.
     let resumed = base + gap + 3_600_000;
-    broker.store().record_session_activity(session_id, resumed).unwrap();
-    broker.store().close_session_activity(session_id, resumed + 60_000).unwrap();
+    broker
+        .store()
+        .record_session_activity(session_id, resumed)
+        .unwrap();
+    broker
+        .store()
+        .close_session_activity(session_id, resumed + 60_000)
+        .unwrap();
 
     let report = report(&mut broker, InsightsQuery::default());
     // First period runs to the last signal before the pause; second runs to the
@@ -324,7 +348,10 @@ fn closing_a_session_ends_its_open_period_of_attention() {
     let (_root, mut broker, ids) = fixture(1);
     let session_id = ids[0];
     let base = broker.store().newest_event_ts();
-    broker.store().record_session_activity(session_id, base).unwrap();
+    broker
+        .store()
+        .record_session_activity(session_id, base)
+        .unwrap();
     broker
         .store()
         .set_session_status(session_id, SessionStatus::Closed, None)
@@ -337,13 +364,70 @@ fn closing_a_session_ends_its_open_period_of_attention() {
 }
 
 #[test]
+fn a_close_long_after_the_last_signal_does_not_count_the_silence() {
+    // Cleanup, the sweep and abandonment close sessions hours or days after the
+    // agent last acted. A close within the idle gap is the agent finishing its
+    // own work; one after it is housekeeping, and crediting the period up to it
+    // would make a session cleaned up the next morning look worked overnight.
+    let (_root, mut broker, ids) = fixture(1);
+    let session_id = ids[0];
+    let base = broker.store().newest_event_ts();
+    broker
+        .store()
+        .record_session_activity(session_id, base)
+        .unwrap();
+    broker
+        .store()
+        .record_session_activity(session_id, base + 30_000)
+        .unwrap();
+    broker
+        .store()
+        .close_session_activity(session_id, base + 30_000 + 86_400_000)
+        .unwrap();
+
+    let report = report(&mut broker, InsightsQuery::default());
+    assert_eq!(report.sessions[0].active_ms, Some(30_000));
+}
+
+#[test]
+fn closing_a_session_long_after_its_last_signal_ends_the_period_at_that_signal() {
+    // The same rule through a real close path, which is how cleanup ends it.
+    let (_root, mut broker, ids) = fixture(1);
+    let session_id = ids[0];
+    let long_ago = broker.store().newest_event_ts() - 2 * 86_400_000;
+    broker
+        .store()
+        .record_session_activity(session_id, long_ago)
+        .unwrap();
+    broker
+        .store()
+        .record_session_activity(session_id, long_ago + 45_000)
+        .unwrap();
+    broker
+        .store()
+        .set_session_status(session_id, SessionStatus::Closed, None)
+        .unwrap();
+
+    let report = report(&mut broker, InsightsQuery::default());
+    let session = report
+        .sessions
+        .iter()
+        .find(|session| session.session_id == session_id)
+        .expect("session in the report");
+    assert_eq!(session.active_ms, Some(45_000));
+}
+
+#[test]
 fn an_open_interval_never_counts_the_silence_that_follows_it() {
     // Crediting an open interval with the time since its last signal would make
     // a session idle for a day look like it was worked on for a day.
     let (_root, mut broker, ids) = fixture(1);
     let session_id = ids[0];
     let base = broker.store().newest_event_ts();
-    broker.store().record_session_activity(session_id, base).unwrap();
+    broker
+        .store()
+        .record_session_activity(session_id, base)
+        .unwrap();
     // No close: the interval stays open.
 
     let report = report(&mut broker, InsightsQuery::default());

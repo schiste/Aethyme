@@ -1311,19 +1311,17 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
                 })?);
             }
             "--session-limit" => {
-                let value = iter
-                    .next()
-                    .ok_or(UsageError::Message("--session-limit requires a value".into()))?;
+                let value = iter.next().ok_or(UsageError::Message(
+                    "--session-limit requires a value".into(),
+                ))?;
                 parsed.session_limit = Some(value.parse().map_err(|_| {
                     UsageError::Message("--session-limit must be a non-negative integer".into())
                 })?);
             }
             "--pull-request-limit" => {
-                let value = iter
-                    .next()
-                    .ok_or(UsageError::Message(
-                        "--pull-request-limit requires a value".into(),
-                    ))?;
+                let value = iter.next().ok_or(UsageError::Message(
+                    "--pull-request-limit requires a value".into(),
+                ))?;
                 parsed.pull_request_limit = Some(value.parse().map_err(|_| {
                     UsageError::Message(
                         "--pull-request-limit must be a non-negative integer".into(),

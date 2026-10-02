@@ -58,7 +58,6 @@ pub use gate_database::GateBrokerDatabase;
 mod gate_doctor;
 mod gates;
 mod gc;
-pub mod insights;
 mod git;
 mod github_target;
 mod graph_impact;
@@ -68,6 +67,7 @@ pub mod hooks;
 mod host_operations;
 mod host_state;
 pub mod init;
+pub mod insights;
 pub mod install_health;
 mod issue_form;
 mod lease_export;
@@ -239,15 +239,6 @@ pub use gate_doctor::{
     GateProbeReport, GateProbeWorktree, inspect_gate_quality, probe_gate_quality,
     static_gate_diagnostics,
 };
-pub use insights::{
-    Coverage, DurationSummary, FoldedEvents, GateObservation, IDLE_GAP_MS, INSIGHTS_SCHEMA_VERSION,
-    InsightGateRow, InsightSessionRow, InsightsInput, InsightsQuery, InsightsReport, Outcome,
-    OutcomeCounts, PullRequestSummary, SessionInsightRow, SessionSummary, Stage, Window,
-    fold_events, report, stage_for_event, stage_map,
-};
-/// The insights report's own pull request input, distinct from the review
-/// trigger's provider snapshot of the same name.
-pub use insights::PullRequestObservation as InsightsPullRequest;
 pub use gates::{
     CachePolicy, GATE_SCOPE_MANIFEST_SCHEMA_VERSION, GATES_CONFIG_RELPATH, Gate, GateConfigError,
     GateProgressSink, GateResourceProvenance, GateRunOutcome, GateScopeDefinition, GateScopeError,
@@ -281,6 +272,15 @@ pub use hooks::{HookReport, HookSnippet, HookState, HooksError};
 pub use host_operations::{
     HostOperation, HostOperationError, HostOperationGuard, default_host_operation_db_path,
     host_operation, reconcile_host_operation,
+};
+/// The insights report's own pull request input, distinct from the review
+/// trigger's provider snapshot of the same name.
+pub use insights::PullRequestObservation as InsightsPullRequest;
+pub use insights::{
+    Coverage, DurationSummary, FoldedEvents, GateObservation, IDLE_GAP_MS, INSIGHTS_SCHEMA_VERSION,
+    InsightGateRow, InsightSessionRow, InsightsInput, InsightsQuery, InsightsReport, Outcome,
+    OutcomeCounts, PullRequestSummary, SessionInsightRow, SessionSummary, Stage, Window,
+    fold_events, report, stage_for_event, stage_map,
 };
 pub use issue_form::{
     ISSUE_FORM_RENDER_SCHEMA_VERSION, ISSUE_REVIEW_ARTIFACT_SCHEMA_VERSION, IssueFormFieldKind,

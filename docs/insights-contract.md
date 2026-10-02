@@ -49,6 +49,12 @@ closes that period at the previous signal and starts a new one. Fifteen minutes
 is a choice, not a constant of nature, and a reader comparing two numbers computed
 at different gaps would be comparing different things.
 
+The same gap decides how a session's last period ends when the session closes.
+A close within the gap is the agent finishing its own work, and the period runs
+to the close. A later close is housekeeping (cleanup, the sweep, abandonment,
+often a day on), and the period ends at its last signal: the silence before a
+housekeeping close is not attention.
+
 **3. A funnel is a count. A rate needs a denominator the caller supplied.**
 
 `funnel.registered` … `funnel.pr_merged` count sessions that reached each
@@ -71,6 +77,14 @@ any person.**
 selected by the query behind this report. Nothing here ranks sessions, scores
 agents, or attributes a duration to an identity. `sessions.agent_identity` would
 answer "how long does someone leave a worktree open", which is not work.
+
+## One window for every section
+
+`--days <n>` (default 30) bounds **every** figure: sessions by their creation,
+pull requests by their milestones, and gate runs, cache hits, coordination events
+and coordinated operations by when they happened. `--days 0` is all history for
+all of them. A report never puts a windowed funnel beside lifetime gate figures.
+A negative `--days` is a usage error rather than a silent all-history report.
 
 ## Stages and outcomes
 

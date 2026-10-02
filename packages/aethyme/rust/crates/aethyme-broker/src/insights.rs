@@ -277,7 +277,11 @@ impl OutcomeCounts {
     }
 
     pub fn total(&self) -> u64 {
-        self.landed + self.rejected + self.superseded + self.conflicted + self.unsubmitted
+        self.landed
+            + self.rejected
+            + self.superseded
+            + self.conflicted
+            + self.unsubmitted
             + self.in_flight
     }
 }
@@ -821,9 +825,7 @@ pub fn report(query: InsightsQuery, input: &InsightsInput) -> InsightsReport {
 
     let mut pull_requests: Vec<PullRequestSummary> = Vec::new();
     for observation in &input.pull_requests {
-        if observation
-            .opened_at
-            .is_some_and(|at| !query.admits(at))
+        if observation.opened_at.is_some_and(|at| !query.admits(at))
             || observation.merged_at.is_some_and(|at| !query.admits(at))
         {
             continue;
@@ -1190,7 +1192,10 @@ mod tests {
             ..InsightsInput::default()
         };
         let report = report(InsightsQuery::default(), &input);
-        assert_eq!(report.funnel.registered, 0, "no session.registered event means the row is not counted");
+        assert_eq!(
+            report.funnel.registered, 0,
+            "no session.registered event means the row is not counted"
+        );
         assert_eq!(report.outcomes.unsubmitted, 1);
         assert_eq!(report.sessions[0].stage, Stage::Registered);
     }
@@ -1250,10 +1255,9 @@ mod tests {
     #[test]
     fn a_rejected_session_is_counted_as_rejected() {
         let mut input = input_with_one_landed_session();
-        input.failure_times.insert(
-            1,
-            BTreeMap::from([(Outcome::Rejected, 90_000)]),
-        );
+        input
+            .failure_times
+            .insert(1, BTreeMap::from([(Outcome::Rejected, 90_000)]));
         // Still landed: a rejection the session recovered from is not its
         // outcome.
         let report = report(InsightsQuery::default(), &input);
@@ -1297,7 +1301,10 @@ mod tests {
         );
         input.failure_times.insert(
             1,
-            BTreeMap::from([(Outcome::Conflicted, 80_000), (Outcome::Superseded, 120_000)]),
+            BTreeMap::from([
+                (Outcome::Conflicted, 80_000),
+                (Outcome::Superseded, 120_000),
+            ]),
         );
         let report = report(InsightsQuery::default(), &input);
         assert_eq!(report.outcomes.conflicted, 1);
