@@ -352,6 +352,10 @@ pub(super) const FLAG_RULES: &[(&str, &[&str])] = &[
     ("events", &["--since", "--kind", "--follow"]),
     ("events prune", &["--keep-days"]),
     ("metrics", &[]),
+    (
+        "insights",
+        &["--days", "--session-limit", "--pull-request-limit"],
+    ),
     ("doctor", &["--fix-version"]),
     ("quick-test", &["--chau7", "--with-gate"]),
     ("verify-loop", &[]),

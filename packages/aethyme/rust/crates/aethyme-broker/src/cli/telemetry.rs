@@ -70,6 +70,7 @@ pub(super) const KNOWN_COMMAND_WORDS: &[&str] = &[
     "events",
     "prune",
     "metrics",
+    "insights",
     "doctor",
     "quick-test",
     "trust",
@@ -245,7 +246,12 @@ pub(super) fn output_measurement_opted_in() -> bool {
 
 pub(super) fn command_records_metric(args: &[String]) -> bool {
     match args.first().map(String::as_str) {
-        Some("certify" | "readiness" | "queue" | "metrics" | "handoff" | "worktree-root") => false,
+        // `insights` reads the same history `metrics` accounts for. Polling it
+        // from cron must not write a telemetry line, or the report would be one
+        // of the things it reports on.
+        Some(
+            "certify" | "readiness" | "queue" | "metrics" | "insights" | "handoff" | "worktree-root",
+        ) => false,
         Some("advisories") => matches!(args.get(1).map(String::as_str), Some("ack" | "suppress")),
         Some("exposures") => args.get(1).map(String::as_str) == Some("apply"),
         Some("report") => args.get(1).map(String::as_str) == Some("file"),

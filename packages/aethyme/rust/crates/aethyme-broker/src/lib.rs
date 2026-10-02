@@ -56,6 +56,7 @@ pub use gate_database::GateBrokerDatabase;
 mod gate_doctor;
 mod gates;
 mod gc;
+pub mod insights;
 mod git;
 mod github_target;
 mod graph_impact;
@@ -232,6 +233,15 @@ pub use gate_doctor::{
     GateProbeReport, GateProbeWorktree, inspect_gate_quality, probe_gate_quality,
     static_gate_diagnostics,
 };
+pub use insights::{
+    Coverage, DurationSummary, FoldedEvents, GateObservation, IDLE_GAP_MS, INSIGHTS_SCHEMA_VERSION,
+    InsightGateRow, InsightSessionRow, InsightsInput, InsightsQuery, InsightsReport, Outcome,
+    OutcomeCounts, PullRequestSummary, SessionInsightRow, SessionSummary, Stage, Window,
+    fold_events, report, stage_for_event, stage_map,
+};
+/// The insights report's own pull request input, distinct from the review
+/// trigger's provider snapshot of the same name.
+pub use insights::PullRequestObservation as InsightsPullRequest;
 pub use gates::{
     CachePolicy, GATE_SCOPE_MANIFEST_SCHEMA_VERSION, GATES_CONFIG_RELPATH, Gate, GateConfigError,
     GateProgressSink, GateResourceProvenance, GateRunOutcome, GateScopeDefinition, GateScopeError,

@@ -7,7 +7,7 @@
 //! (CLI invocations are short-lived). Cross-process safety comes from
 //! SQLite WAL + a 5s busy timeout; nothing here assumes in-process locks.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -681,6 +681,13 @@ impl BrokerStore {
         if changed == 0 {
             return Err(BrokerError::SessionNotFound(id));
         }
+        // A closed session has no more working time ahead of it, so its open
+        // period of attention ends now. Left open, it would keep accruing
+        // nothing while `session_activity_totals` reported an interval that
+        // never resolves.
+        if matches!(status, SessionStatus::Closed | SessionStatus::Cleaned) {
+            close_open_activity_in_tx(&tx, id, now)?;
+        }
         // `cleaned` is terminal (reuse_session excludes it), so the
         // session's leases can never matter again — drop them in the same
         // transaction. Without this every cleaned session leaves its last
@@ -743,6 +750,7 @@ impl BrokerStore {
             Some(id),
             None,
         )?;
+        close_open_activity_in_tx(&tx, id, now)?;
         insert_event(
             &tx,
             now,
@@ -1292,6 +1300,313 @@ impl BrokerStore {
         )?;
         let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    // ── lifecycle telemetry ───────────────────────────────────────────
+
+    /// Record one activity signal for a session, opening or extending a period
+    /// of attention.
+    ///
+    /// A signal within [`crate::insights::IDLE_GAP_MS`] of the previous one
+    /// extends the open interval; a signal after the gap closes that interval
+    /// at the last signal seen and opens a new one. Splitting on the gap is
+    /// what makes active time different from wall-clock: without it, an
+    /// overnight pause is indistinguishable from a long uninterrupted stretch
+    /// of work and both come out the same length.
+    ///
+    /// Returns the id of the interval the signal landed in.
+    pub fn record_session_activity(
+        &mut self,
+        session_id: i64,
+        at_ms: i64,
+    ) -> Result<i64, BrokerError> {
+        let now = now_ms();
+        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let open: Option<(i64, i64)> = tx
+            .query_row(
+                "SELECT id, last_signal_at FROM session_activity
+                 WHERE session_id = ?1 AND ended_at IS NULL",
+                params![session_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+
+        let id = match open {
+            // Backwards clock, or a signal that predates the open interval:
+            // extend the existing one rather than writing a negative gap.
+            Some((id, last_signal_at)) if at_ms.saturating_sub(last_signal_at) <= crate::insights::IDLE_GAP_MS => {
+                tx.execute(
+                    "UPDATE session_activity
+                     SET last_signal_at = MAX(last_signal_at, ?2), signals = signals + 1
+                     WHERE id = ?1",
+                    params![id, at_ms],
+                )?;
+                id
+            }
+            Some((id, last_signal_at)) => {
+                // The gap closed the period: end it at the last signal rather
+                // than at this one, so the interval measures the attention that
+                // was actually recorded and not the silence that followed.
+                tx.execute(
+                    "UPDATE session_activity SET ended_at = ?2 WHERE id = ?1",
+                    params![id, last_signal_at],
+                )?;
+                tx.execute(
+                    "INSERT INTO session_activity (session_id, started_at, last_signal_at, source)
+                     VALUES (?1, ?2, ?2, 'host_hook')",
+                    params![session_id, at_ms],
+                )?;
+                tx.last_insert_rowid()
+            }
+            None => {
+                tx.execute(
+                    "INSERT INTO session_activity (session_id, started_at, last_signal_at, source)
+                     VALUES (?1, ?2, ?2, 'host_hook')",
+                    params![session_id, at_ms],
+                )?;
+                tx.last_insert_rowid()
+            }
+        };
+        // A session's activity and its liveness are the same fact; keeping
+        // them in one transaction is what stops `last_activity_at` from
+        // disagreeing with the history it summarizes.
+        tx.execute(
+            "UPDATE sessions SET last_activity_at = MAX(last_activity_at, ?2), updated_at = ?3
+             WHERE id = ?1",
+            params![session_id, at_ms, now],
+        )?;
+        tx.commit()?;
+        Ok(id)
+    }
+
+    /// Close whatever period of attention a session currently has open.
+    ///
+    /// Called when a session closes, so its final interval does not stay open
+    /// forever and read as an unbounded duration. Sessions are never back-
+    /// filled: an open interval on a closed session would otherwise be
+    /// indistinguishable from one whose session is merely idle.
+    pub fn close_session_activity(&mut self, session_id: i64, at_ms: i64) -> Result<usize, BrokerError> {
+        let changed = self.conn.execute(
+            "UPDATE session_activity SET ended_at = ?2
+             WHERE session_id = ?1 AND ended_at IS NULL AND last_signal_at <= ?2",
+            params![session_id, at_ms],
+        )?;
+        Ok(changed)
+    }
+
+    /// Session rows for the insights funnel, newest first.
+    ///
+    /// A deliberately narrow projection rather than [`Session`]: the funnel
+    /// needs identity, origin, and two timestamps, and pulling task text, work
+    /// paths, commands, log paths, and agent identities into a reporting query
+    /// would put every one of those fields one refactor away from a serialized
+    /// report. `agent_identity` in particular is not selected — see
+    /// [`crate::insights`].
+    ///
+    /// `in_flight` is derived rather than stored: a session is in flight when
+    /// it is live and has queue work that has not reached a terminal status.
+    pub fn insight_session_rows(&self) -> Result<Vec<crate::InsightSessionRow>, BrokerError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT s.id, s.origin, s.created_at, s.closed_at,
+                    EXISTS(SELECT 1 FROM merge_queue q
+                           WHERE q.session_id = s.id
+                             AND q.status IN ('submitted','simulating','verified')) AS in_flight
+             FROM sessions s
+             ORDER BY s.created_at DESC",
+        )?;
+        // The origin string is parsed through the same `parse` the rest of the
+        // store uses, and an unrecognized value is an error rather than a
+        // default: a CHECK constraint makes it unreachable, and silently
+        // reporting an adopted session as spawned would be a wrong answer
+        // instead of a loud one.
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+                row.get::<_, i64>(4)? != 0,
+            ))
+        })?;
+        let mut sessions = Vec::new();
+        for row in rows {
+            let (session_id, origin, created_at, closed_at, in_flight) = row?;
+            sessions.push(crate::InsightSessionRow {
+                session_id,
+                origin: SessionOrigin::parse(&origin)?,
+                created_at,
+                closed_at,
+                in_flight,
+            });
+        }
+        Ok(sessions)
+    }
+
+    /// Gate rows for the insights report.
+    pub fn insight_gate_rows(&self) -> Result<Vec<crate::InsightGateRow>, BrokerError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT gate_name, status, duration_ms, wait_duration_ms, first_output_ms, failure_class
+             FROM gate_results ORDER BY created_at DESC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let status: String = row.get(1)?;
+            Ok(crate::InsightGateRow {
+                gate_name: row.get(0)?,
+                status: match status.as_str() {
+                    "pass" => "pass",
+                    "fail" => "fail",
+                    "cancelled" => "cancelled",
+                    _ => "error",
+                },
+                duration_ms: row.get(2)?,
+                wait_duration_ms: row.get(3)?,
+                first_output_ms: row.get(4)?,
+                failure_class: row.get(5)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Coordinated operation outcome counts, for the insights report.
+    pub fn insight_operation_counts(
+        &self,
+    ) -> Result<(u64, u64, u64), BrokerError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT status, COUNT(*) FROM coordinated_operations
+             WHERE status IN ('succeeded','failed','outcome_unknown')
+             GROUP BY status",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        let mut succeeded = 0;
+        let mut failed = 0;
+        let mut unknown = 0;
+        for row in rows {
+            let (status, count) = row?;
+            match status.as_str() {
+                "succeeded" => succeeded = count,
+                "failed" => failed = count,
+                "outcome_unknown" => unknown = count,
+                _ => {}
+            }
+        }
+        Ok((succeeded.max(0) as u64, failed.max(0) as u64, unknown.max(0) as u64))
+    }
+
+    /// Active milliseconds and signal count per session, in one query.
+    ///
+    /// An open interval is bounded by its own `last_signal_at` rather than by
+    /// `now`: its duration is not yet known, and crediting it with the time
+    /// since the last signal would make a session that has been idle for a day
+    /// look like it was worked on for a day.
+    pub fn session_activity_totals(&self) -> Result<BTreeMap<i64, (i64, u64)>, BrokerError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT session_id,
+                    SUM(CASE WHEN ended_at IS NULL
+                             THEN MAX(last_signal_at - started_at, 0)
+                             ELSE MAX(ended_at - started_at, 0) END),
+                    SUM(signals)
+             FROM session_activity
+             GROUP BY session_id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                (row.get::<_, i64>(1)?, row.get::<_, i64>(2)?),
+            ))
+        })?;
+        let mut totals = BTreeMap::new();
+        for row in rows {
+            let (session_id, (active_ms, signals)) = row?;
+            totals.insert(session_id, (active_ms, signals.max(0) as u64));
+        }
+        Ok(totals)
+    }
+
+    /// Every recorded pull request milestone, with its linked sessions.
+    pub fn pull_request_milestones(
+        &self,
+    ) -> Result<Vec<(String, i64, Option<i64>, Option<i64>)>, BrokerError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT repository, pr_number, opened_at, merged_at
+             FROM pull_request_milestones
+             ORDER BY COALESCE(merged_at, opened_at, first_seen_at)",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+            ))
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Sessions linked to one pull request.
+    pub fn pull_request_sessions(
+        &self,
+        repository: &str,
+        pr_number: i64,
+    ) -> Result<Vec<i64>, BrokerError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT session_id FROM pull_request_session_links
+             WHERE repository = ?1 AND pr_number = ?2 ORDER BY session_id",
+        )?;
+        let rows = stmt.query_map(params![repository, pr_number], |row| row.get(0))?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Record when a pull request opened, first sighting wins.
+    ///
+    /// Idempotent on the pull request, because several observers can report the
+    /// same pull request and the earliest `opened_at` any of them saw is the
+    /// best answer available — later polls see a pull request that already
+    /// exists and cannot recover when it was created.
+    pub fn record_pull_request_opened(
+        &mut self,
+        repository: &str,
+        pr_number: i64,
+        session_id: Option<i64>,
+        opened_at: i64,
+    ) -> Result<(), BrokerError> {
+        let now = now_ms();
+        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        upsert_pull_request_milestone_in_tx(
+            &tx,
+            repository,
+            pr_number,
+            session_id,
+            Some(opened_at),
+            None,
+            now,
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Record when a pull request merged.
+    pub fn record_pull_request_merged(
+        &mut self,
+        repository: &str,
+        pr_number: i64,
+        session_id: Option<i64>,
+        merged_at: i64,
+    ) -> Result<(), BrokerError> {
+        let now = now_ms();
+        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        upsert_pull_request_milestone_in_tx(
+            &tx,
+            repository,
+            pr_number,
+            session_id,
+            None,
+            Some(merged_at),
+            now,
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     // ── merge queue ───────────────────────────────────────────────────
@@ -4793,6 +5108,36 @@ impl BrokerStore {
                 next_poll_at,
             ],
         )?;
+        // The provider's own open and merge instants, recorded on first sight.
+        // Both are in the same transaction as the poll that observed them, so a
+        // crash cannot leave a poll that saw a merge with nothing recording it.
+        //
+        // Written on *every* poll rather than only on transition, because the
+        // first poll of a pull request that is already merged is the only poll
+        // that can ever observe the opening, and a watch that starts late must
+        // still recover the provider's `createdAt`.
+        if let Some(created_at_ms) = snapshot.created_at_ms {
+            upsert_pull_request_milestone_in_tx(
+                &tx,
+                &current.display_repository,
+                snapshot.number,
+                Some(current.session_id),
+                Some(created_at_ms),
+                None,
+                now,
+            )?;
+        }
+        if let Some(merged_at_ms) = snapshot.merged_at_ms {
+            upsert_pull_request_milestone_in_tx(
+                &tx,
+                &current.display_repository,
+                snapshot.number,
+                Some(current.session_id),
+                None,
+                Some(merged_at_ms),
+                now,
+            )?;
+        }
         let payload = serde_json::json!({
             "watch_id": id,
             "head_sha": snapshot.head_sha,
@@ -5322,6 +5667,60 @@ impl BrokerStore {
         let id = insert_event(&tx, now_ms(), kind, session_id, payload_json)?;
         tx.commit()?;
         Ok(id)
+    }
+
+    // ── test-only fixtures ────────────────────────────────────────────
+    //
+    // These exist because the insights tests need scenarios the production
+    // path cannot produce: an event stamped in the past, a session created at a
+    // chosen instant. `append_event` is deliberately now-only — there is no
+    // production reason to backdate an event, and adding a timestamp parameter
+    // for tests would make backdating reachable from production. So the tests
+    // write the row through the real API and correct it here, in one place,
+    // rather than growing a general capability.
+
+    /// Backdate one event row. `#[doc(hidden)]`: reachable from integration
+    /// tests, not part of the broker's API.
+    #[doc(hidden)]
+    pub fn set_event_timestamp_for_test(&mut self, id: i64, ts: i64) {
+        self.conn
+            .execute("UPDATE events SET ts = ?2 WHERE id = ?1", params![id, ts])
+            .expect("event row exists");
+    }
+
+    /// Backdate one session's `created_at`, so a funnel scenario's window is
+    /// anchored where the test means it to be.
+    #[doc(hidden)]
+    pub fn set_session_created_at_for_test(&mut self, id: i64, created_at: i64) {
+        self.conn
+            .execute(
+                "UPDATE sessions SET created_at = ?2 WHERE id = ?1",
+                params![id, created_at],
+            )
+            .expect("session row exists");
+    }
+
+    /// How many activity intervals a session has, optionally only the open one.
+    #[doc(hidden)]
+    pub fn count_session_activity_for_test(&self, session_id: i64, open_only: bool) -> i64 {
+        self.conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_activity
+                 WHERE session_id = ?1 AND (?2 = 0 OR ended_at IS NULL)",
+                params![session_id, i64::from(open_only)],
+                |row| row.get(0),
+            )
+            .expect("activity query")
+    }
+
+    /// Newest event timestamp in the log, or 0 when it is empty.
+    #[doc(hidden)]
+    pub fn newest_event_ts(&self) -> i64 {
+        self.conn
+            .query_row("SELECT COALESCE(MAX(ts), 0) FROM events", [], |row| {
+                row.get(0)
+            })
+            .expect("events query")
     }
 
     /// Events with id > `after_id`, optionally filtered to kinds starting
@@ -6649,6 +7048,102 @@ fn update_accepted_checkpoint(
         return Err(BrokerError::SessionNotFound(session_id));
     }
     Ok(())
+}
+
+/// Record a pull request's own open and merge instants.
+///
+/// `MIN(COALESCE(existing, new), new)` rather than an unconditional overwrite:
+/// the provider reports the same instant on every poll, but a watch that
+/// started late can still recover the original `createdAt`, so a later poll must
+/// never be able to make a milestone *later* than one already recorded. An
+/// absent column is filled from the first poll that supplies it and then left
+/// alone.
+fn upsert_pull_request_milestone_in_tx(
+    tx: &Transaction<'_>,
+    repository: &str,
+    pr_number: i64,
+    session_id: Option<i64>,
+    opened_at: Option<i64>,
+    merged_at: Option<i64>,
+    now: i64,
+) -> Result<(), BrokerError> {
+    let first_seen_at = match (opened_at, merged_at) {
+        (Some(opened), Some(merged)) => opened.min(merged),
+        (Some(opened), None) => opened,
+        (None, Some(merged)) => merged,
+        (None, None) => now,
+    };
+    // `opened_at` and `merged_at` are updated only when this observation
+    // supplies one. A merge poll carries `mergedAt` but not `createdAt`, and
+    // SQLite's `MIN(a, NULL)` is NULL — so a single combined upsert would erase
+    // the opening that an earlier poll recorded, which is exactly the field the
+    // insights report needs in order to have a lifetime at all. Two guarded
+    // updates keep each column first-seen-wins and never cleared.
+    tx.execute(
+        "INSERT INTO pull_request_milestones (
+             repository, pr_number, session_id, opened_at, merged_at,
+             first_seen_at, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT (repository, pr_number) DO UPDATE SET
+             session_id = COALESCE(session_id, ?3),
+             first_seen_at = MIN(first_seen_at, ?6),
+             updated_at = ?7",
+        params![
+            repository,
+            pr_number,
+            session_id,
+            opened_at,
+            merged_at,
+            first_seen_at,
+            now
+        ],
+    )?;
+    if opened_at.is_some() {
+        tx.execute(
+            "UPDATE pull_request_milestones
+             SET opened_at = MIN(COALESCE(opened_at, ?3), ?3)
+             WHERE repository = ?1 AND pr_number = ?2",
+            params![repository, pr_number, opened_at],
+        )?;
+    }
+    if merged_at.is_some() {
+        tx.execute(
+            "UPDATE pull_request_milestones
+             SET merged_at = MIN(COALESCE(merged_at, ?3), ?3)
+             WHERE repository = ?1 AND pr_number = ?2",
+            params![repository, pr_number, merged_at],
+        )?;
+    }
+    if let Some(session_id) = session_id {
+        tx.execute(
+            "INSERT INTO pull_request_session_links
+                 (repository, pr_number, session_id, linked_at, link_source)
+             VALUES (?1, ?2, ?3, ?4, 'watch')
+             ON CONFLICT DO NOTHING",
+            params![repository, pr_number, session_id, now],
+        )?;
+    }
+    Ok(())
+}
+
+/// End a session's open period of attention, if it has one.
+///
+/// Called from every path that closes a session, inside that path's
+/// transaction, so a close and the end of its activity interval commit together.
+/// The interval ends at `at_ms` and only when its last signal precedes it: an
+/// open interval whose last signal is in the future belongs to a clock that
+/// disagreed, and closing it backwards would produce a negative duration.
+fn close_open_activity_in_tx(
+    conn: &Connection,
+    session_id: i64,
+    at_ms: i64,
+) -> Result<usize, BrokerError> {
+    Ok(conn.execute(
+        "UPDATE session_activity
+         SET ended_at = ?2, source = 'close'
+         WHERE session_id = ?1 AND ended_at IS NULL AND last_signal_at <= ?2",
+        params![session_id, at_ms],
+    )?)
 }
 
 fn release_checkpoint_pin_in_tx(

@@ -206,31 +206,63 @@ pub fn session_content(
         }
     })?;
 
-    let mut paths = BTreeMap::new();
-    for path in changed {
-        paths.insert(path.clone(), repo.blob_at(head, &path));
-    }
+    // One `cat-file` for the whole diff, not one `rev-parse` per path. The
+    // cleanup plan behind `broker status` builds this map for every retained
+    // worktree on every call, so a repository holding thirty sessions with
+    // ~46k changed paths between them was forking ~46k processes to answer a
+    // question one process can answer. The candidate search in `find_landing`
+    // was batched for the same reason (#408); this is the other half.
+    let wanted = repo
+        .blobs_at_many(
+            &changed
+                .iter()
+                .map(|path| (head, path.as_str()))
+                .collect::<Vec<_>>(),
+        )
+        .map_err(|source| BrokerOpError::RepresentationUnavailable {
+            reason: format!("cannot read session content at {}: {source}", short(head)),
+        })?;
 
     Ok(SessionContent {
         base: base.to_string(),
         head: head.to_string(),
-        paths,
+        paths: changed.into_iter().zip(wanted).collect(),
     })
 }
 
 /// Whether `target` — a fixed historical commit — holds the session's content.
-pub fn content_at(repo: &GitRepo, content: &SessionContent, target: &str) -> ContentVerdict {
-    for (path, wanted) in &content.paths {
-        let found = repo.blob_at(target, path);
+pub fn content_at(
+    repo: &GitRepo,
+    content: &SessionContent,
+    target: &str,
+) -> Result<ContentVerdict, BrokerOpError> {
+    let found = repo
+        .blobs_at_many(
+            &content
+                .paths
+                .keys()
+                .map(|path| (target, path.as_str()))
+                .collect::<Vec<_>>(),
+        )
+        .map_err(|source| BrokerOpError::RepresentationUnavailable {
+            reason: format!("cannot read session content at {}: {source}", short(target)),
+        })?;
+
+    // Batched, so every path is read before the first mismatch is reported;
+    // the comparison still stops at the first mismatch, in the same order, so
+    // the path named in `Absent` is unchanged. A read failure propagates
+    // rather than reading as "absent": a failed read must never be able to
+    // assert that a worktree holds nothing worth keeping.
+    for ((path, wanted), found) in content.paths.iter().zip(found) {
         if &found != wanted {
-            return ContentVerdict::Absent {
+            return Ok(ContentVerdict::Absent {
                 path: path.clone(),
                 wanted: wanted.clone(),
                 found,
-            };
+            });
         }
     }
-    ContentVerdict::Present
+    Ok(ContentVerdict::Present)
 }
 
 /// Candidates asked about per `cat-file` batch. Most landings are found near
@@ -268,7 +300,7 @@ pub fn find_landing(
     // Content already at the session's own base means the session changed
     // nothing the branch lacks. Naming a landing commit here would be a lie
     // about which commit carried the work.
-    if content_at(repo, content, &content.base).is_present() {
+    if content_at(repo, content, &content.base)?.is_present() {
         return Ok(LandingSearch {
             outcome: LandingOutcome::NothingToRepresent,
             examined: 0,
@@ -624,6 +656,74 @@ mod tests {
         assert_ne!(Some(blob), repo.blob_at(&base, "a.txt"));
     }
 
+    /// The batched read must answer exactly what the per-path read answered.
+    ///
+    /// `session_content` reads every changed path in one `cat-file` instead of
+    /// one `rev-parse` per path, because the cleanup plan behind `broker
+    /// status` builds this map for every retained worktree. The equivalence is
+    /// the whole risk of that change, so it is checked against `blob_at` on a
+    /// diff wide enough that a truncation or an ordering slip would show up:
+    /// `cat-file --batch-check` answers in input order, and this asserts it.
+    #[test]
+    fn session_content_batch_matches_the_per_path_read() {
+        let (tmp, repo, base) = seeded();
+        // Wider than one batch, and past the point where a path list could be
+        // dropped or reordered without a single-path test noticing.
+        let width = CANDIDATE_BATCH * 2 + 7;
+        for i in 0..width {
+            write(tmp.path(), &format!("f{i:03}.txt"), &format!("body {i}\n"));
+        }
+        let head = commit(tmp.path(), "a wide diff");
+
+        let content = session_content(&repo, &base, &head).unwrap();
+
+        assert_eq!(content.paths.len(), width);
+        // BTreeMap iteration is sorted; the batch is answered in the order the
+        // paths were asked, which is the order `git diff` listed them.
+        let expected = repo
+            .changed_between(&base, &head)
+            .unwrap()
+            .iter()
+            .map(|path| (path.clone(), repo.blob_at(&head, path)))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(content.paths, expected);
+    }
+
+    /// A path Git cannot resolve is `None`, batched or not.
+    ///
+    /// The batch answers `<input> missing` for an absent path where `rev-parse
+    /// --verify --quiet` fails, and both must mean the same thing: a file the
+    /// session deleted has no blob to compare, so its content is not present
+    /// at a commit that still holds the file.
+    #[test]
+    fn session_content_batch_reports_absent_paths_as_none() {
+        let (tmp, repo, _base) = seeded();
+        write(tmp.path(), "kept.txt", "first\n");
+        write(tmp.path(), "dropped.txt", "doomed\n");
+        let with_both = commit(tmp.path(), "two files");
+        write(tmp.path(), "kept.txt", "second\n");
+        std::fs::remove_file(tmp.path().join("dropped.txt")).unwrap();
+        let head = commit(tmp.path(), "edit one, drop one");
+
+        let content = session_content(&repo, &with_both, &head).unwrap();
+
+        assert_eq!(content.paths.len(), 2);
+        // Changed file: the batched read resolves it, exactly as `blob_at` does.
+        assert_eq!(
+            content.paths.get("kept.txt").cloned().flatten(),
+            repo.blob_at(&head, "kept.txt")
+        );
+        // Deleted file: no blob at `head`, batched or not.
+        assert_eq!(content.paths.get("dropped.txt"), Some(&None));
+        // Against the commit that still holds the deleted file, the path named
+        // as the mismatch is unchanged by batching: every path is read, but the
+        // comparison still stops at the first mismatch in the same order.
+        assert!(matches!(
+            content_at(&repo, &content, &with_both).unwrap(),
+            ContentVerdict::Absent { ref path, .. } if path == "dropped.txt"
+        ));
+    }
+
     /// The failure that invalidated the tip-comparison approach.
     ///
     /// A session lands, then an unrelated change rewrites one of the same files.
@@ -653,12 +753,12 @@ mod tests {
 
         // Tip comparison — the discarded approach — reports it unrepresented.
         assert!(matches!(
-            content_at(&repo, &content, &tip),
+            content_at(&repo, &content, &tip).unwrap(),
             ContentVerdict::Absent { ref path, .. } if path == "store.rs"
         ));
 
         // The landing commit still carries it, and the walk finds that commit.
-        assert!(content_at(&repo, &content, &landing).is_present());
+        assert!(content_at(&repo, &content, &landing).unwrap().is_present());
         let search = find_landing(&repo, &content, &tip, DEFAULT_SEARCH_CAP).unwrap();
         assert!(search.represented());
         assert_eq!(search.landing().unwrap().commit, landing);
@@ -718,9 +818,13 @@ mod tests {
         assert_eq!(content.paths.get("doomed.txt"), Some(&None));
 
         // Present at the base, where the file still exists: not represented.
-        assert!(!content_at(&repo, &content, &with_file).is_present());
+        assert!(
+            !content_at(&repo, &content, &with_file)
+                .unwrap()
+                .is_present()
+        );
         // Represented at the original base, which predates the file.
-        assert!(content_at(&repo, &content, &base).is_present());
+        assert!(content_at(&repo, &content, &base).unwrap().is_present());
     }
 
     #[test]

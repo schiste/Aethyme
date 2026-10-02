@@ -127,6 +127,14 @@ One JSON object per line:
   (`.aethyme/logs/command-metrics.jsonl`) is safe by construction: the
   command label is allowlisted subcommand words only — task text, paths,
   and ids can never appear in it.
+- `aethyme broker advanced insights [--days <n>] [--session-limit <n>]
+  [--pull-request-limit <n>] [--json]` — what the pipeline did rather than
+  what it cost: the session funnel (registered → submitted → verified →
+  landed → pull request), time between stages, outcomes, gate reliability
+  split into execution vs coordination wait, and coordination counts.
+  `--days 0` reads all recorded history. See
+  [`insights-contract.md`](insights-contract.md) for the JSON contract and
+  for the four rules the report follows about what it may claim.
 
 ## Rules for broker developers
 

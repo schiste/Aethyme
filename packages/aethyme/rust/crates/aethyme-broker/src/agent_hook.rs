@@ -260,14 +260,32 @@ fn current_session(broker: &mut Broker, cwd: &std::path::Path) -> Option<Session
         .max_by_key(|candidate| candidate.worktree_path.len())
 }
 
+/// Record that the agent did something, in both the places that matter.
+///
+/// Two writes, not one, and both are needed. `last_activity_at` is what every
+/// existing liveness and abandonment check reads, so it must keep being
+/// updated. The activity interval is what `broker advanced insights` reads to
+/// tell working time from elapsed time — without it, every duration the report
+/// can produce is wall-clock, and wall-clock counts the overnight pause.
+///
+/// Failure is warned about and swallowed: a hook that could not record liveness
+/// must not stop the agent from working.
 fn touch(broker: &mut Broker, session: Option<&Session>) {
-    if let Some(session) = session {
-        let now = now_ms();
-        crate::warn_unrecorded(
-            "record session activity",
-            broker.store().touch_session_activity(session.id, now),
-        );
-    }
+    let Some(session) = session else {
+        return;
+    };
+    let now = now_ms();
+    crate::warn_unrecorded(
+        "record session activity",
+        broker.store().touch_session_activity(session.id, now),
+    );
+    crate::warn_unrecorded(
+        "record the session activity interval",
+        broker
+            .store()
+            .record_session_activity(session.id, now)
+            .map(|_| ()),
+    );
 }
 
 /// Register presence, tell every peer that the repository just became

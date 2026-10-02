@@ -110,6 +110,7 @@ use most:
 - `aethyme broker advanced gates ...`
 - `aethyme broker advanced events`
 - `aethyme broker advanced metrics`
+- `aethyme broker advanced insights`
 - `aethyme broker advanced pr check`
 - `aethyme graph ...`
 - `aethyme facts ...`

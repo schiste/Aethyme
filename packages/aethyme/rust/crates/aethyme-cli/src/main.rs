@@ -164,7 +164,8 @@ fn broker_command_capability(args: &[String]) -> repository_upgrade::CommandCapa
         | (Some("review"), Some("show"))
         | (
             Some(
-                "handoff" | "queue" | "status" | "agents" | "metrics" | "certify" | "readiness"
+                "handoff" | "queue" | "status" | "agents" | "metrics" | "insights" | "certify"
+                | "readiness"
                 | "worktree-root" | "storage",
             ),
             _,
