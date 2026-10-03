@@ -79,6 +79,10 @@ mod merge;
 mod operation_stats;
 mod operations;
 mod overlap_pairs;
+mod ownership;
+pub use ownership::{
+    MAX_OWNERSHIP_CLAIM_NAME_CHARS, OwnershipClaim, OwnershipClaimReport, OwnershipClaimView,
+};
 pub mod plugin_cli;
 mod pr;
 mod pr_link;

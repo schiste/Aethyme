@@ -23,7 +23,7 @@ use rusqlite::Connection;
 use crate::error::BrokerError;
 
 /// Current database schema version (== `MIGRATIONS.len()`).
-pub const SCHEMA_VERSION: i64 = 45;
+pub const SCHEMA_VERSION: i64 = 46;
 
 /// The oldest schema version whose binaries can safely use a database at
 /// [`SCHEMA_VERSION`]. Before this existed every newer database locked out
@@ -39,6 +39,8 @@ pub const SCHEMA_VERSION: i64 = 45;
 ///   them is reported as unmeasured rather than as zero. Nothing existing is
 ///   renamed, retyped or given a new constraint, which is what would force
 ///   older binaries out.
+/// - v46: one new table for named ownership claims. An older binary never
+///   names it, so it neither sees nor writes claims.
 pub const MIN_COMPATIBLE_SCHEMA: i64 = 42;
 
 /// Whether this binary may use a database at `found`, a version newer than
@@ -1386,6 +1388,33 @@ CREATE TABLE pull_request_session_links (
 CREATE INDEX pull_request_session_links_by_session
     ON pull_request_session_links (session_id);
 ";
+/// Named ownership claims (`crate::ownership`): which session is driving a
+/// repository-wide operation such as a release, which no path lease can name.
+///
+/// History is kept: a release or takeover stamps `released_at` instead of
+/// deleting the row, so who held a claim before stays answerable. The partial
+/// unique index keeps one open claim per name under concurrent writers.
+/// Finishing a session does not touch its rows; every read joins live
+/// sessions, the same rule leases and scopes use, so a finished holder's
+/// claim stops counting the moment it closes.
+const MIGRATION_V46: &str = "
+CREATE TABLE ownership_claims (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    name            TEXT NOT NULL,
+    session_id      INTEGER NOT NULL REFERENCES sessions(id),
+    purpose         TEXT NOT NULL,
+    claimed_at      INTEGER NOT NULL,
+    released_at     INTEGER,
+    released_reason TEXT,
+    taken_over_from INTEGER REFERENCES sessions(id)
+);
+
+CREATE UNIQUE INDEX ownership_claims_one_open
+    ON ownership_claims (name) WHERE released_at IS NULL;
+
+CREATE INDEX ownership_claims_by_session
+    ON ownership_claims (session_id, released_at);
+";
 const MIGRATIONS: &[&str] = &[
     MIGRATION_V1,
     MIGRATION_V2,
@@ -1432,6 +1461,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_V43,
     MIGRATION_V44,
     MIGRATION_V45,
+    MIGRATION_V46,
 ];
 
 pub(crate) fn current_version(conn: &Connection) -> Result<i64, BrokerError> {
@@ -1671,16 +1701,49 @@ mod tests {
         // the minimum. Raising it would lock existing binaries and plugin hooks
         // out of this repository's database, so doing so must be a deliberate
         // edit.
-        assert_eq!(SCHEMA_VERSION, 45);
+        assert_eq!(SCHEMA_VERSION, 46);
         assert_eq!(MIN_COMPATIBLE_SCHEMA, 42);
 
         let conn = migrated();
-        assert_eq!(current_version(&conn).unwrap(), 45);
+        assert_eq!(current_version(&conn).unwrap(), 46);
 
         // A v42 binary still reads and writes, and the tables it has never
         // heard of are simply absent from its world.
         assert!(schema_is_compatible_with(&conn, 46, 42).unwrap());
         assert!(!schema_is_compatible_with(&conn, 46, 41).unwrap());
+    }
+
+    #[test]
+    fn a_name_has_at_most_one_open_ownership_claim() {
+        // v46 only adds a table, so the minimum stays put; the index is what
+        // keeps two racing sessions from both holding "release v1".
+        let conn = migrated();
+        assert!(schema_is_compatible_with(&conn, 46, 42).unwrap());
+        for id in [1, 2] {
+            conn.execute(
+                "INSERT INTO sessions (
+                     id, worktree_path, branch, origin, status,
+                     created_at, updated_at, last_activity_at
+                 ) VALUES (?1, '/repo/' || ?1, 'agent/x' || ?1, 'spawned', 'active', 1, 1, 1)",
+                [id],
+            )
+            .unwrap();
+        }
+        let claim = |session: i64| {
+            conn.execute(
+                "INSERT INTO ownership_claims (name, session_id, purpose, claimed_at)
+                 VALUES ('release v1', ?1, 'cut v1', 1)",
+                [session],
+            )
+        };
+        claim(1).unwrap();
+        assert!(claim(2).is_err());
+        conn.execute(
+            "UPDATE ownership_claims SET released_at = 2 WHERE session_id = 1",
+            [],
+        )
+        .unwrap();
+        claim(2).unwrap();
     }
 
     #[test]
@@ -1791,7 +1854,7 @@ mod tests {
         // not raise the minimum. Raising it would lock existing binaries and
         // plugin hooks out of this repository's database, so doing so must be
         // a deliberate edit.
-        assert_eq!(SCHEMA_VERSION, 45);
+        assert_eq!(SCHEMA_VERSION, 46);
         assert_eq!(MIN_COMPATIBLE_SCHEMA, 42);
 
         // A database this binary migrated all the way to the current version ...
