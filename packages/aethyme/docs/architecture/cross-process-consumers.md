@@ -134,6 +134,12 @@ consumer. This file exists so that doesn't happen again.
 |---|---|---|
 | Stable broker JSON command contract (`docs/json-contracts.md`) | `aethyme broker advanced worktrees --json` reports disk usage and Git registration state, including detached, locked, and prunable worktrees. `git_registered` separates a confirmed absence from unreadable inventory; see the field contract for exact omission and error behavior. | Treating unreadable inventory as unregistered can hide Git state; treating a prunable registration as deletion permission can lose work. Consumers must preserve the distinction and treat the report as diagnostic. |
 
+### Branch audit report (introduced 2026-10-03)
+
+| Source | Invokes / assumes | Failure mode |
+|---|---|---|
+| Operators and scripts deciding which local branches to delete: `aethyme repo branches audit [<repo_path>] [--remote <name>] [--no-gh] [--json-output]` | Read-only. Each `branches[]` row has `name`, `tip`, `classification` (`on-remote`, `contained`, `merged-via-pr`, `local-only`), `evidence`, `protected` and `protected_reasons`; `local-only` rows add `local_commits[]` and `uncovered_commit_count`. Top level: `remote_source`, `remote_warning`, `default_branch`, `remote_tips_missing_locally[]`, `gh`, `summary`, `worktrees[]` (`branch`, `dirty_paths`, `prunable`, `broker_managed`). | Only `local-only` means unique work. A `local-only` row with `evidence.note` has a merged PR whose content did not match: read those commits before deleting. Non-empty `remote_tips_missing_locally` means containment was unprovable for those tips. The report never grants deletion permission for `protected` branches. |
+
 ### Console lifecycle (introduced 2026-09-27, #374 section 3)
 
 | Source | Invokes / assumes | Failure mode |
