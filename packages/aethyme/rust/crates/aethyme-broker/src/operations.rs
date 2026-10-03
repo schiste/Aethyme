@@ -2019,6 +2019,72 @@ fn stored_resource_scope(operation: &CoordinatedOperation) -> Option<String> {
     resource_lock_scope(operation.provider, command.get(1..)?)
 }
 
+pub(crate) const DESTRUCTIVE_FLAG_REQUIRED: &str =
+    "destructive operation requires --destructive after resolving exact targets";
+pub(crate) const GH_REPO_REQUIRED: &str = "broker gh requires --repo owner/name";
+pub(crate) const REMOTE_GIT_REPO_REQUIRED: &str = "remote Git operation requires --repo owner/name";
+
+/// The flags a refused coordinated operation was missing, when the refusal is
+/// one a re-run with those flags would get past.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MissingOperationFlags {
+    pub destructive: bool,
+    /// `Some` when `--repo` is missing: the repository inferred from the
+    /// remote the command targets, or `None` inside when it cannot be.
+    pub repository: Option<Option<String>>,
+    /// The command writes, so the re-run needs `--reason` too.
+    pub reason_required: bool,
+}
+
+/// Which flags `reason` says were missing. The destructive check runs before
+/// the repository check, so a refusal for `--destructive` also reports a
+/// `--repo` the same command would be refused for next.
+pub(crate) fn missing_operation_flags(
+    reason: &str,
+    provider: OperationProvider,
+    args: &[String],
+    declared_effect: Option<OperationEffect>,
+    has_repository: bool,
+    repo: &crate::GitRepo,
+) -> Option<MissingOperationFlags> {
+    let needs_repository = !has_repository
+        && (provider == OperationProvider::Github
+            || git_operation_kind(args) == GitOperationKind::Remote);
+    let destructive = match reason {
+        DESTRUCTIVE_FLAG_REQUIRED => true,
+        GH_REPO_REQUIRED | REMOTE_GIT_REPO_REQUIRED => false,
+        _ => return None,
+    };
+    let repository = needs_repository.then(|| inferred_repository(provider, args, repo));
+    let inferred = match provider {
+        OperationProvider::Git => classify_git(args),
+        OperationProvider::Github => classify_gh(args),
+    };
+    let reason_required = resolve_effect(inferred, declared_effect)
+        .map_or(true, |(effect, _)| effect != OperationEffect::Read);
+    Some(MissingOperationFlags {
+        destructive,
+        repository,
+        reason_required,
+    })
+}
+
+/// The `owner/name` a command without `--repo` would act on: the remote a Git
+/// command names (or its default), or `origin` for `gh`.
+fn inferred_repository(
+    provider: OperationProvider,
+    args: &[String],
+    repo: &crate::GitRepo,
+) -> Option<String> {
+    let target = match provider {
+        OperationProvider::Git => {
+            repo.resolve_remote_command_target(git_subcommand_args(args)?, None)
+        }
+        OperationProvider::Github => repo.resolve_remote_target("origin", None),
+    };
+    target.ok().map(|target| target.display_slug)
+}
+
 /// Whether a parsed Git command can have changed a remote.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GitOperationKind {
@@ -3446,9 +3512,7 @@ impl Broker {
         let (effect, classification) = resolve_effect(inferred, request.declared_effect)?;
         if effect == OperationEffect::Destructive && !request.destructive_confirmed {
             return Err(BrokerOpError::InvalidCoordinatedOperation {
-                reason:
-                    "destructive operation requires --destructive after resolving exact targets"
-                        .into(),
+                reason: DESTRUCTIVE_FLAG_REQUIRED.into(),
             });
         }
         let authorization_reason =
@@ -3512,12 +3576,12 @@ impl Broker {
             }
             (None, None, OperationProvider::Github) => {
                 return Err(BrokerOpError::InvalidCoordinatedOperation {
-                    reason: "broker gh requires --repo owner/name".into(),
+                    reason: GH_REPO_REQUIRED.into(),
                 });
             }
             (None, None, OperationProvider::Git) if is_remote_git => {
                 return Err(BrokerOpError::InvalidCoordinatedOperation {
-                    reason: "remote Git operation requires --repo owner/name".into(),
+                    reason: REMOTE_GIT_REPO_REQUIRED.into(),
                 });
             }
             (None, None, OperationProvider::Git) => None,

@@ -71,6 +71,11 @@ pub struct SessionPullRequest {
     pub state: String,
     /// True when this invocation created it.
     pub created: bool,
+    /// The repository's CI workflows skip draft pull requests, so checks run
+    /// only once it is marked ready. Known only for a pull request this
+    /// invocation opened.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub ci_skips_drafts: bool,
 }
 
 /// What `broker push` did.
@@ -571,20 +576,31 @@ impl Broker {
             .filter(|subject| !subject.trim().is_empty())
             .or_else(|| session.task.clone())
             .unwrap_or_else(|| session.branch.clone());
-        let mut body = String::new();
-        if let Some(task) = session.task.as_deref() {
-            body.push_str(task.trim());
-            body.push_str("\n\n");
-        }
-        body.push_str("Commits:\n");
-        for commit in commits.iter().rev() {
-            body.push_str(&format!(
-                "- {} {}\n",
-                &commit.sha[..commit.sha.len().min(10)],
-                commit.subject
-            ));
-        }
-        body.push_str("\nOpened by aethyme broker push as a draft.\n");
+        let base = BaseBranchFiles::read(self.repo_handle(), &default.tracking_ref);
+        let messages: Vec<String> = commits
+            .iter()
+            .rev()
+            .map(|commit| {
+                self.repo_handle()
+                    .commit_message(&commit.sha)
+                    .unwrap_or_else(|_| commit.subject.clone())
+            })
+            .collect();
+        let body_commits: Vec<crate::pr_body::BodyCommit<'_>> = commits
+            .iter()
+            .rev()
+            .zip(&messages)
+            .map(|(commit, message)| crate::pr_body::BodyCommit {
+                sha: &commit.sha,
+                subject: &commit.subject,
+                message,
+            })
+            .collect();
+        let body = crate::pr_body::compose(
+            session.task.as_deref(),
+            &body_commits,
+            base.template.as_deref(),
+        );
         let create = self.run_coordinated_operation_at_with_wait(
             CoordinatedCommand {
                 session_id,
@@ -628,6 +644,7 @@ impl Broker {
                 ),
             })?;
         created.created = true;
+        created.ci_skips_drafts = base.ci_skips_drafts;
         // This push opened the pull request, so its opening is known now, not
         // only once someone watches it — and PR monitoring is off by default,
         // so without this most pull requests would never get a lifetime in
@@ -686,6 +703,36 @@ impl Broker {
     }
 }
 
+/// What the base branch says about the pull request about to be opened: its
+/// template, and whether its CI skips drafts. Read from the fetched default
+/// branch because that is the commit GitHub takes both from, and read without
+/// a checkout. Unreadable means "no template" and "no note": both only shape
+/// text, and must never fail a push that already happened.
+struct BaseBranchFiles {
+    template: Option<String>,
+    ci_skips_drafts: bool,
+}
+
+impl BaseBranchFiles {
+    fn read(repo: &GitRepo, base: &str) -> Self {
+        let paths = repo.tracked_files_at(base).unwrap_or_default();
+        let read = |path: &str| repo.file_at_commit(base, path).ok().flatten();
+        let template = crate::pr_body::template_path(&paths).and_then(read);
+        let ci_skips_drafts = paths
+            .iter()
+            .filter(|path| {
+                path.starts_with(".github/workflows/")
+                    && (path.ends_with(".yml") || path.ends_with(".yaml"))
+            })
+            .filter_map(|path| read(path))
+            .any(|workflow| crate::pr_body::workflow_skips_drafts(&workflow));
+        Self {
+            template,
+            ci_skips_drafts,
+        }
+    }
+}
+
 /// The open pull request whose head is exactly `branch`, from `gh pr list`
 /// JSON. Anything unparseable is "none found" -- creation then fails loudly
 /// on the post-create lookup rather than trusting a guess.
@@ -701,6 +748,7 @@ fn parse_pull_request_list(stdout: &str, branch: &str) -> Option<SessionPullRequ
             number: pr["number"].as_i64().unwrap_or_default(),
             state: pr["state"].as_str().unwrap_or_default().to_string(),
             created: false,
+            ci_skips_drafts: false,
         })
     })
 }

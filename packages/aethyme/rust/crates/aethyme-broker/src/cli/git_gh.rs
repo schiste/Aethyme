@@ -479,6 +479,75 @@ pub(super) fn run_exec(parsed: Parsed) -> Result<(), UsageError> {
     Ok(())
 }
 
+/// The `broker advanced git|gh` invocation as typed, kept to print the
+/// corrected command when the broker refuses it for a missing flag.
+struct OperationEcho {
+    subcommand: String,
+    session: i64,
+    repository: Option<String>,
+    effect: Option<String>,
+    scope: Option<String>,
+    destructive: bool,
+    reason: Option<String>,
+    no_wait: bool,
+    queue_timeout_seconds: Option<u64>,
+    json: bool,
+    args: Vec<String>,
+}
+
+impl OperationEcho {
+    /// The same command with the missing flags added before `--`. A
+    /// repository that cannot be inferred stays a visible placeholder.
+    fn corrected(&self, missing: &crate::MissingOperationFlags) -> String {
+        let quote = crate::broker::shell_quote;
+        let mut words = vec![
+            "aethyme".to_string(),
+            "broker".into(),
+            "advanced".into(),
+            self.subcommand.clone(),
+            "--session".into(),
+            self.session.to_string(),
+        ];
+        let repository = match (&self.repository, &missing.repository) {
+            (Some(repository), _) => Some(quote(repository)),
+            (None, Some(Some(inferred))) => Some(quote(inferred)),
+            (None, Some(None)) => Some("<owner/name>".to_string()),
+            (None, None) => None,
+        };
+        if let Some(repository) = repository {
+            words.extend(["--repo".to_string(), repository]);
+        }
+        if let Some(effect) = &self.effect {
+            words.extend(["--effect".to_string(), quote(effect)]);
+        }
+        if let Some(scope) = &self.scope {
+            words.extend(["--scope".to_string(), quote(scope)]);
+        }
+        if self.destructive || missing.destructive {
+            words.push("--destructive".into());
+        }
+        match &self.reason {
+            Some(reason) => words.extend(["--reason".to_string(), quote(reason)]),
+            None if missing.reason_required => {
+                words.extend(["--reason".to_string(), "'<authorization>'".to_string()]);
+            }
+            None => {}
+        }
+        if self.no_wait {
+            words.push("--no-wait".into());
+        }
+        if let Some(seconds) = self.queue_timeout_seconds {
+            words.extend(["--queue-timeout".to_string(), seconds.to_string()]);
+        }
+        if self.json {
+            words.push("--json".into());
+        }
+        words.push("--".into());
+        words.extend(self.args.iter().map(|arg| quote(arg)));
+        words.join(" ")
+    }
+}
+
 /// `broker git` | `broker gh`.
 pub(super) fn run_git_gh(parsed: Parsed, subcommand: &str) -> Result<(), UsageError> {
     let session = parsed.session.ok_or(UsageError::Message(format!(
@@ -489,13 +558,27 @@ pub(super) fn run_git_gh(parsed: Parsed, subcommand: &str) -> Result<(), UsageEr
     } else {
         crate::OperationProvider::Github
     };
+    let declared_effect = parse_operation_effect(parsed.effect.as_deref())?;
+    let echo = OperationEcho {
+        subcommand: subcommand.to_string(),
+        session,
+        repository: parsed.repository.clone(),
+        effect: parsed.effect.clone(),
+        scope: parsed.scope.clone(),
+        destructive: parsed.destructive,
+        reason: parsed.reason.clone(),
+        no_wait: parsed.no_wait,
+        queue_timeout_seconds: parsed.queue_timeout_seconds,
+        json: parsed.json,
+        args: parsed.exec_command.clone(),
+    };
     let request = crate::CoordinatedCommand {
         session_id: session,
         provider,
         repository: parsed.repository,
         resolved_target: None,
         scope: parsed.scope,
-        declared_effect: parse_operation_effect(parsed.effect.as_deref())?,
+        declared_effect,
         destructive_confirmed: parsed.destructive,
         authorization_reason: parsed.reason,
         args: parsed.exec_command,
@@ -538,7 +621,31 @@ pub(super) fn run_git_gh(parsed: Parsed, subcommand: &str) -> Result<(), UsageEr
             )));
         }
     }
-    let report = broker.run_coordinated_operation_with_wait(request, queue_wait)?;
+    let report = match broker.run_coordinated_operation_with_wait(request, queue_wait) {
+        Ok(report) => report,
+        Err(crate::BrokerOpError::InvalidCoordinatedOperation { reason }) => {
+            // A refusal for a missing flag is only useful with the command
+            // that would pass, so print it whole instead of making the reader
+            // rebuild a long argv by hand.
+            let repo = crate::GitRepo::discover(broker.main_root()).ok();
+            let missing = repo.as_ref().and_then(|repo| {
+                crate::missing_operation_flags(
+                    &reason,
+                    provider,
+                    &echo.args,
+                    declared_effect,
+                    echo.repository.is_some(),
+                    repo,
+                )
+            });
+            let reason = match missing {
+                Some(missing) => format!("{reason}\n  run instead: {}", echo.corrected(&missing)),
+                None => reason,
+            };
+            return Err(crate::BrokerOpError::InvalidCoordinatedOperation { reason }.into());
+        }
+        Err(error) => return Err(error.into()),
+    };
     render_coordinated_operation(&report, parsed.json)?;
     // After the coordinated operation returned, so the repository
     // write lock is released. Starting the watch inside it would hold

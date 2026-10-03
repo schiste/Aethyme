@@ -12030,7 +12030,7 @@ fn combined_repair_tail(steps: &[VersionRepairStep], stdout: bool) -> Vec<String
     lines
 }
 
-fn shell_quote(value: &str) -> String {
+pub(crate) fn shell_quote(value: &str) -> String {
     if !value.is_empty()
         && value.bytes().all(|byte| {
             byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-' | b':' | b'@')
