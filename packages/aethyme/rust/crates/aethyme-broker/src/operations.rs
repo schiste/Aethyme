@@ -2143,6 +2143,46 @@ fn canonical_local_repository(
     }
 }
 
+/// Refuse a `--repo` that none of the session worktree's remotes identify.
+///
+/// A session id is resolved against the broker of the caller's directory, so
+/// `--session 4 --repo owner/other` run from the wrong checkout picks up this
+/// repository's session 4 and would run, journaled under it, against an
+/// unrelated repository. Any configured remote counts, so a fork whose
+/// `upstream` names the target still passes. A worktree whose remotes cannot
+/// be resolved at all gives no evidence either way and is left alone.
+fn refuse_session_repository_mismatch(
+    session_id: i64,
+    worktree: &Path,
+    requested: &str,
+) -> Result<(), BrokerOpError> {
+    let Ok(repo) = crate::GitRepo::discover(worktree) else {
+        return Ok(());
+    };
+    let Ok(remotes) = repo.remotes() else {
+        return Ok(());
+    };
+    let mut mismatched = Vec::new();
+    for remote in &remotes {
+        match repo.resolve_remote_target(remote, Some(requested)) {
+            Ok(_) => return Ok(()),
+            Err(crate::RemoteTargetError::AssertionMismatch { resolved, .. }) => {
+                mismatched.push(format!("{remote}: {resolved}"));
+            }
+            Err(_) => {}
+        }
+    }
+    if mismatched.is_empty() {
+        return Ok(());
+    }
+    Err(BrokerOpError::SessionRepositoryMismatch {
+        session_id,
+        requested: requested.trim().to_string(),
+        session_repositories: mismatched.join(", "),
+        worktree: worktree.display().to_string(),
+    })
+}
+
 fn journal_details(
     classification: &'static str,
     resolved_target: Option<&crate::ResolvedRemoteTarget>,
@@ -3240,7 +3280,15 @@ impl Broker {
         if session.status.is_closed() {
             return Err(BrokerOpError::ClosedSessionOperation {
                 session_id: session.id,
+                repository_root: self.main_root().display().to_string(),
             });
+        }
+        if let Some(requested) = request.repository.as_deref() {
+            refuse_session_repository_mismatch(
+                session.id,
+                Path::new(&session.worktree_path),
+                requested,
+            )?;
         }
         let should_cleanup_after_merge = request.provider == OperationProvider::Github
             && is_github_pull_request_merge(&request.args);

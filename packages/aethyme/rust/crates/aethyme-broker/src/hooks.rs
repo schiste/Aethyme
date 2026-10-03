@@ -500,6 +500,181 @@ fn configured_hooks_dir(repo: &GitRepo) -> Option<PathBuf> {
     })
 }
 
+/// Hook names git invokes; an executable file under one of these names is
+/// what makes a hooks directory do anything.
+const GIT_HOOK_NAMES: [&str; 20] = [
+    "applypatch-msg",
+    "pre-applypatch",
+    "post-applypatch",
+    "pre-commit",
+    "pre-merge-commit",
+    "prepare-commit-msg",
+    "commit-msg",
+    "post-commit",
+    "pre-rebase",
+    "post-checkout",
+    "post-merge",
+    "pre-push",
+    "pre-receive",
+    "update",
+    "post-receive",
+    "post-update",
+    "reference-transaction",
+    "push-to-checkout",
+    "pre-auto-gc",
+    "post-rewrite",
+];
+
+/// Hook directories a repository may ship for `core.hooksPath` to name.
+const SHIPPED_HOOK_DIRS: [&str; 3] = [".husky", ".githooks", ".hooks"];
+
+/// Install scripts a repository may ship to wire its hooks up.
+const HOOK_INSTALL_SCRIPTS: [&str; 3] = [
+    "scripts/install-git-hooks.sh",
+    "scripts/install-hooks.sh",
+    "scripts/setup-git-hooks.sh",
+];
+
+/// Why a configured `core.hooksPath` runs no hooks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HooksPathProblem {
+    /// The configured path does not exist.
+    Missing,
+    /// The configured path exists but is not a directory.
+    NotADirectory,
+    /// The directory holds no executable hook while the repository ships one.
+    NoExecutableHooks,
+}
+
+impl HooksPathProblem {
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::Missing => "does not exist",
+            Self::NotADirectory => "is not a directory",
+            Self::NoExecutableHooks => "holds no executable git hook",
+        }
+    }
+}
+
+/// A `core.hooksPath` that makes git silently skip every hook.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct HooksPathFinding {
+    /// The value as configured (after git's `~/` expansion).
+    pub configured: String,
+    /// Config scope that set it: `local`, `global`, `worktree`, `system`.
+    pub scope: String,
+    /// Where it is set, as git reports it (`file:<path>`).
+    pub origin: String,
+    /// The path git resolves it to for this checkout.
+    pub resolved: String,
+    pub problem: HooksPathProblem,
+    /// Hook directory this repository ships, when it ships one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shipped_hooks_dir: Option<String>,
+    /// Suggested command; never run automatically.
+    pub fix: String,
+}
+
+impl HooksPathFinding {
+    /// One-line summary for human output.
+    pub fn message(&self) -> String {
+        format!(
+            "core.hooksPath = {:?} ({} config, {}) {}; git silently skips every hook",
+            self.configured,
+            self.scope,
+            self.origin,
+            self.problem.describe()
+        )
+    }
+}
+
+/// Inspect `core.hooksPath` for `checkout_root`. Returns a finding when the
+/// configured path cannot run hooks: it is missing, not a directory, or an
+/// empty-of-hooks directory while the repository ships its own hooks.
+/// Read-only: the git config is never changed.
+pub fn inspect_hooks_path(checkout_root: &Path) -> Option<HooksPathFinding> {
+    let repo = GitRepo::discover(checkout_root).ok()?;
+    let entry = repo.config_get_path_with_origin("core.hooksPath")?;
+    // Git runs hooks from the top of the working tree, so a relative
+    // hooksPath resolves against the checkout root.
+    let resolved = {
+        let path = PathBuf::from(&entry.value);
+        if path.is_relative() {
+            repo.root().join(path)
+        } else {
+            path
+        }
+    };
+    let shipped = SHIPPED_HOOK_DIRS
+        .iter()
+        .map(|dir| repo.root().join(dir))
+        .find(|dir| dir.is_dir());
+    let problem = match std::fs::metadata(&resolved) {
+        Err(_) => HooksPathProblem::Missing,
+        Ok(meta) if !meta.is_dir() => HooksPathProblem::NotADirectory,
+        Ok(_) => {
+            let runs_a_hook = GIT_HOOK_NAMES
+                .iter()
+                .any(|hook| is_executable(&resolved.join(hook)));
+            if runs_a_hook || shipped.is_none() {
+                return None;
+            }
+            HooksPathProblem::NoExecutableHooks
+        }
+    };
+    let fix = hooks_path_fix(repo.root(), &entry.scope, &resolved, shipped.as_deref());
+    Some(HooksPathFinding {
+        configured: entry.value,
+        scope: entry.scope,
+        origin: entry.origin,
+        resolved: resolved.to_string_lossy().into_owned(),
+        problem,
+        shipped_hooks_dir: shipped.map(|dir| dir.to_string_lossy().into_owned()),
+        fix,
+    })
+}
+
+fn hooks_path_fix(root: &Path, scope: &str, resolved: &Path, shipped: Option<&Path>) -> String {
+    if let Some(script) = HOOK_INSTALL_SCRIPTS
+        .iter()
+        .find(|script| root.join(script).is_file())
+    {
+        return format!("./{script}");
+    }
+    // Husky regenerates its own `.husky/_` wrappers; pointing hooksPath at
+    // `.husky` by hand would bypass them.
+    if std::fs::read_to_string(root.join("package.json")).is_ok_and(|text| text.contains("husky")) {
+        return "npx husky".into();
+    }
+    // Write the fix into the same scope that holds the broken value, so it
+    // replaces that value rather than shadowing or being shadowed by it.
+    let scope_flag = match scope {
+        "global" | "system" | "worktree" => format!("--{scope} "),
+        _ => String::new(),
+    };
+    match shipped {
+        Some(dir) if same_path(dir, resolved) => {
+            format!("chmod +x {}/<hook>", dir.display())
+        }
+        Some(dir) => {
+            let relative = dir.strip_prefix(root).unwrap_or(dir);
+            format!(
+                "git config {scope_flag}core.hooksPath {}",
+                relative.display()
+            )
+        }
+        None => format!("git config {scope_flag}--unset core.hooksPath"),
+    }
+}
+
+fn same_path(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
+}
+
 fn is_executable(path: &Path) -> bool {
     #[cfg(unix)]
     {

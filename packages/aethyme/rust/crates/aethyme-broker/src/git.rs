@@ -1016,6 +1016,14 @@ pub struct GitWorktreeInfo {
     pub prunable_reason: Option<String>,
 }
 
+/// One effective git config entry with the scope and file that set it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigEntry {
+    pub scope: String,
+    pub origin: String,
+    pub value: String,
+}
+
 impl GitRepo {
     /// Discover the repository containing `path`.
     pub fn discover(path: &Path) -> Result<Self, GitError> {
@@ -1143,6 +1151,34 @@ impl GitRepo {
         run_git(&self.root, &["config", "--get", key])
             .ok()
             .filter(|value| !value.is_empty())
+    }
+
+    /// A path-typed git config value with where it is set: the effective
+    /// entry's scope (`local`, `global`, `worktree`, `system`, `command`),
+    /// its origin (`file:<path>`), and the value with `~/` expanded as git
+    /// expands it. `None` when unset.
+    pub fn config_get_path_with_origin(&self, key: &str) -> Option<ConfigEntry> {
+        let line = run_git(
+            &self.root,
+            &[
+                "config",
+                "--show-scope",
+                "--show-origin",
+                "--type=path",
+                "--get",
+                key,
+            ],
+        )
+        .ok()?;
+        let mut fields = line.splitn(3, '\t');
+        let scope = fields.next()?.to_string();
+        let origin = fields.next()?.to_string();
+        let value = fields.next()?.to_string();
+        (!value.is_empty()).then_some(ConfigEntry {
+            scope,
+            origin,
+            value,
+        })
     }
 
     /// Configured URL for `remote`.

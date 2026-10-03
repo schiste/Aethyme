@@ -329,6 +329,7 @@ pub(super) fn format_optional_usize(value: Option<usize>) -> String {
 
 pub(super) fn render_coordinated_operation(
     report: &crate::CoordinatedOperationReport,
+    session_worktree: Option<&str>,
     json: bool,
 ) -> Result<(), UsageError> {
     if json {
@@ -347,13 +348,23 @@ pub(super) fn render_coordinated_operation(
             }
         }
         out!(
-            "operation {}: {} {} on {} ({})",
+            "operation {}: {} {} on {} ({} effect)",
             report.operation.id,
             report.operation.provider.as_str(),
             report.operation.status.as_str(),
             report.operation.repository,
             report.classification,
         );
+        // Session ids are numbered per repository and resolved against the
+        // broker of the caller's directory, so naming the worktree the id
+        // resolved to is what makes a session of the wrong repository visible
+        // at the point of the command rather than later from its effects.
+        if let Some(worktree) = session_worktree {
+            out!(
+                "  session {} worktree: {worktree}",
+                report.operation.session_id
+            );
+        }
         // What the push actually sent. The planner resolved this before the
         // command ran; printing it is what makes a refspec that resolved to an
         // unintended commit visible at the point of the push rather than later
@@ -621,6 +632,11 @@ pub(super) fn run_git_gh(parsed: Parsed, subcommand: &str) -> Result<(), UsageEr
             )));
         }
     }
+    let session_worktree = broker
+        .store()
+        .session(session)
+        .ok()
+        .map(|record| record.worktree_path);
     let report = match broker.run_coordinated_operation_with_wait(request, queue_wait) {
         Ok(report) => report,
         Err(crate::BrokerOpError::InvalidCoordinatedOperation { reason }) => {
@@ -646,7 +662,7 @@ pub(super) fn run_git_gh(parsed: Parsed, subcommand: &str) -> Result<(), UsageEr
         }
         Err(error) => return Err(error.into()),
     };
-    render_coordinated_operation(&report, parsed.json)?;
+    render_coordinated_operation(&report, session_worktree.as_deref(), parsed.json)?;
     // After the coordinated operation returned, so the repository
     // write lock is released. Starting the watch inside it would hold
     // that lock across a provider call (#138). Opt-in only: a fleet

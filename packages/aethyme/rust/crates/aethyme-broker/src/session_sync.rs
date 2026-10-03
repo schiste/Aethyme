@@ -188,7 +188,10 @@ impl crate::Broker {
     pub fn sync_session(&mut self, session_id: i64) -> Result<SessionSyncReport, BrokerOpError> {
         let session = self.store().session(session_id)?;
         if session.status.is_closed() {
-            return Err(BrokerOpError::ClosedSessionOperation { session_id });
+            return Err(BrokerOpError::ClosedSessionOperation {
+                session_id,
+                repository_root: self.main_root().display().to_string(),
+            });
         }
         let path = Path::new(&session.worktree_path);
         let worktree = GitRepo::discover(path).map_err(|error| {
