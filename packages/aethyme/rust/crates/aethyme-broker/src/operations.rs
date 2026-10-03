@@ -2151,7 +2151,7 @@ fn canonical_local_repository(
 /// unrelated repository. Any configured remote counts, so a fork whose
 /// `upstream` names the target still passes. A worktree whose remotes cannot
 /// be resolved at all gives no evidence either way and is left alone.
-fn refuse_session_repository_mismatch(
+pub(crate) fn refuse_session_repository_mismatch(
     session_id: i64,
     worktree: &Path,
     requested: &str,
