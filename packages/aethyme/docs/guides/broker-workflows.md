@@ -1189,7 +1189,7 @@ aethyme broker finish cleanup --all-cleaned --apply
 The plan lists each retained spawned worktree, its eligibility, and estimated
 bytes. Apply revalidates every candidate and never force-removes adopted
 worktrees, dirty paths, symlinked paths, or commits not represented by main,
-integration, or the configured upstream. `broker status` warns when eligible
+integration, or the configured upstream. `broker status --refresh` warns when eligible
 cleaned worktrees remain. Use `--json` for the stable plan or sweep report.
 
 Treat `broker status` as the bounded present-state dashboard, not as an audit
@@ -1202,7 +1202,7 @@ aethyme broker advanced queue history --limit 50 --json
 aethyme broker advanced queue history --limit 50 --before <next-before-id> --json
 ```
 
-Status also grades retained cleanup cost using worktree and branch counts,
+Refreshed status also grades retained cleanup cost using worktree and branch counts,
 estimated bytes, and oldest closed-session age against the declared retention
 policy. A warning means at least one threshold has been crossed; review the
 dry-run cleanup or GC plan before authorizing reclamation.
@@ -1334,3 +1334,31 @@ aethyme broker finish cleanup 111
 
 The new session ID may differ from the old one. Always use the ID printed by
 `start --reuse`; “existing worktree” does not imply “same session identity.”
+
+
+### Routine status and explicit audits
+
+`aethyme broker status --summary` reads session liveness, the queue and recorded
+lease overlaps without scanning Git history or retained checkouts. It carries
+`deferred_checks`, `leases_refreshed: false`, and `leases_refreshed_at_ms` (null
+until a refresh has been recorded). Ref heads and commit counts in this summary
+are uninspected; use the explicit audit when those values matter.
+
+Ordinary `broker status` adds recorded size observations. Its retention
+inventory checks ownership but limits work between sessions; an incomplete
+inventory reports `inventory_complete: false` and `inventory_deferred_sessions`.
+Cleanup eligibility is always uninspected on this path. Zero counts for a
+check named in `deferred_checks` do not mean that nothing needs attention.
+`phase_timings_ms` identifies the cost of opening, coordination and retention.
+
+`aethyme broker status --refresh` explicitly runs the expensive lease, Git
+conflict, publication and cleanup eligibility checks. It cannot be combined
+with `--summary` or used in degraded read-only compatibility mode. Neither
+routine view authorizes deletion: `broker gc plan`, apply, finish and submit
+continue to perform their independent checks. Routine size observations carry
+their measurement timestamp and are not silently refreshed by a directory walk.
+
+Recorded PR-overlap warnings come from the last push and are invalidated when
+its session head, baseline ref/commit or cached PR listing changes, or when the
+listing expires. Routine status reads branch tips in one batch and reports the
+listing timestamp; it performs neither new PR diffs nor network requests.

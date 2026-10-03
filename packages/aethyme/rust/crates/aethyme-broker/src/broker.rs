@@ -1242,6 +1242,10 @@ impl RetentionConfigStatus {
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct CleanupRetention {
+    pub inventory_complete: bool,
+    pub inventory_deferred_sessions: usize,
+    /// False on routine status: eligibility requires an explicit audit.
+    pub eligibility_checked: bool,
     pub broker_owned_worktree_count: usize,
     pub retained_session_branch_count: usize,
     pub eligible_worktree_count: usize,
@@ -1336,6 +1340,10 @@ pub struct PendingOperationView {
 /// Everything `broker status` renders, in one serializable shape.
 #[derive(Debug, serde::Serialize)]
 pub struct StatusView {
+    pub deferred_checks: Vec<String>,
+    pub leases_refreshed_at_ms: Option<i64>,
+    pub leases_refreshed: bool,
+    pub phase_timings_ms: std::collections::BTreeMap<String, u64>,
     pub summary: StatusSummary,
     pub advice: Vec<StatusAdvice>,
     /// Durable, non-blocking advisories that remain outstanding.
@@ -1448,6 +1456,9 @@ pub struct ReviewRefusalView {
 /// that silently yields unparseable JSON.
 #[derive(Debug, serde::Serialize)]
 pub struct StatusBrief {
+    pub deferred_checks: Vec<String>,
+    pub leases_refreshed_at_ms: Option<i64>,
+    pub phase_timings_ms: std::collections::BTreeMap<String, u64>,
     pub summary: StatusSummary,
     pub advice: Vec<StatusAdvice>,
     /// Always false, and serialized rather than implied: `overlap_count` and
@@ -1506,6 +1517,7 @@ struct SummaryIntegration {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StatusIntegrationRelation {
+    NotChecked,
     CurrentWithMain,
     AheadOfMain,
     DivergedFromMain,
@@ -4789,6 +4801,8 @@ impl Broker {
 
         let after = detect_overlaps(&self.coordinating_leases(&coordinating)?);
         self.classify_and_announce_overlaps(&after)?;
+        self.store
+            .meta_set("leases.refreshed_at_ms", &now_ms().to_string())?;
         Ok(after)
     }
 
@@ -6726,15 +6740,21 @@ impl Broker {
     /// views, promoted/unmerged conflicts, the merge queue, and the
     /// integration branch head.
     pub fn status(&mut self, now_ms: i64) -> Result<StatusView, BrokerOpError> {
+        let started = std::time::Instant::now();
         let overlaps = self.refresh_leases()?;
+        let leases_ms = started.elapsed().as_millis() as u64;
         let agents = self.agents(now_ms)?;
         let integration = self.integration_head()?;
-        let mut view = self.build_status(agents, overlaps, integration, now_ms)?;
+        let mut view = self.build_status(agents, overlaps, integration, now_ms, true)?;
         self.store.record_advisories_shown(
             &view.outstanding_advisories,
             crate::AdvisoryDeliverySurface::Status,
         )?;
         view.advisory_delivery = self.store.advisory_delivery_summary()?;
+        view.phase_timings_ms
+            .insert("lease_refresh".into(), leases_ms);
+        view.phase_timings_ms
+            .insert("total".into(), started.elapsed().as_millis() as u64);
         Ok(view)
     }
 
@@ -6752,13 +6772,88 @@ impl Broker {
     /// does not render them, and recording a delivery that never happened
     /// would corrupt the shown-to-action correlation.
     pub fn status_brief(&mut self, now_ms: i64) -> Result<StatusBrief, BrokerOpError> {
-        let overlaps = self.lease_overlaps_snapshot()?;
         let agents = self.agents(now_ms)?;
-        let integration = self.integration_head()?;
-        let view = self.build_status(agents, overlaps, integration, now_ms)?;
+        self.build_status_brief(agents, now_ms)
+    }
+
+    pub fn status_brief_snapshot(&self, now_ms: i64) -> Result<StatusBrief, BrokerOpError> {
+        self.build_status_brief(self.agents_snapshot(now_ms)?, now_ms)
+    }
+
+    fn build_status_brief(
+        &self,
+        agents: Vec<AgentView>,
+        now_ms: i64,
+    ) -> Result<StatusBrief, BrokerOpError> {
+        let started = std::time::Instant::now();
+        let overlaps = self.lease_overlaps_snapshot()?;
+        let pairs = self.overlap_pairs_snapshot(&overlaps);
+        let promotes = PromoteConfig::load(&self.main_root).mode.promotes_at_all();
+        let summary = status_summary(
+            &agents,
+            overlaps.len(),
+            OverlapPairCounts {
+                pairs: pairs.len(),
+                conflicting: pairs
+                    .iter()
+                    .filter(|p| p.severity == crate::OverlapSeverity::High)
+                    .count(),
+            },
+            0,
+            0,
+            &SummaryIntegration {
+                branch: PromoteConfig::load(&self.main_root).branch,
+                head: String::new(),
+                baseline_ref: "not inspected".into(),
+                baseline_head: String::new(),
+                relation: StatusIntegrationRelation::NotChecked,
+                ahead_baseline_commits: 0,
+                main_head: String::new(),
+                main_is_ancestor: false,
+                ahead_main_commits: 0,
+                promotes,
+            },
+        );
+        let ids = agents.iter().map(|a| a.session.id).collect::<Vec<_>>();
+        let latest = self.store.latest_merge_queue_for_sessions(&ids)?;
+        let mut advice = self.status_advice(&agents, &[], &latest, ("", ""), promotes, false);
+        let blockers = self.blockers();
+        if let Some(item) = crate::blockers::status_advice(&blockers.blockers) {
+            advice.push(item);
+        }
+        advice.extend(stalled_submit_advice(
+            &crate::submit_progress::in_flight_submits(&self.main_root, now_ms),
+        ));
+        advice.extend(overlap_pair_advice(&pairs));
+        advice.push(StatusAdvice {
+            id: "status.recorded-observations", severity: StatusAdviceSeverity::Notice,
+            reason: "summary reads broker records without scanning Git history or retained checkouts",
+            summary: "Recorded leases/overlaps only; Git refs, dirty worktrees, unpushed commits, disk retention and cleanup eligibility were not checked".into(),
+            session_id: None, queue_entry_id: None, evidence: Vec::new(),
+            commands: vec!["aethyme broker status --refresh".into()],
+        });
         Ok(StatusBrief {
-            summary: view.summary,
-            advice: view.advice,
+            phase_timings_ms: std::collections::BTreeMap::from([(
+                "total".into(),
+                started.elapsed().as_millis() as u64,
+            )]),
+            deferred_checks: vec![
+                "git_refs",
+                "dirty_worktrees",
+                "unpushed_commits",
+                "promoted_conflicts",
+                "disk_retention",
+                "cleanup_eligibility",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+            leases_refreshed_at_ms: self
+                .store
+                .meta_get("leases.refreshed_at_ms")?
+                .and_then(|v| v.parse().ok()),
+            summary,
+            advice,
             leases_refreshed: false,
         })
     }
@@ -6770,7 +6865,44 @@ impl Broker {
         let overlaps = self.lease_overlaps_snapshot()?;
         let agents = self.agents_snapshot(now_ms)?;
         let integration = self.integration_head_snapshot()?;
-        self.build_status(agents, overlaps, integration, now_ms)
+        let mut view = self.build_status(agents, overlaps, integration, now_ms, true)?;
+        view.leases_refreshed = false;
+        Ok(view)
+    }
+
+    /// Routine, read-only variant for degraded CLI reporting.
+    pub fn status_current_snapshot(&self, now_ms: i64) -> Result<StatusView, BrokerOpError> {
+        self.build_status(
+            self.agents_snapshot(now_ms)?,
+            self.lease_overlaps_snapshot()?,
+            self.integration_head_snapshot()?,
+            now_ms,
+            false,
+        )
+    }
+
+    /// Routine reporting uses persisted leases and recorded sizes. It never
+    /// proves cleanup eligibility or reclassifies Git conflicts. Explicit
+    /// refresh and all mutation paths still perform their own checks.
+    pub fn status_current(&mut self, now_ms: i64) -> Result<StatusView, BrokerOpError> {
+        let started = std::time::Instant::now();
+        let overlaps = self.lease_overlaps_snapshot()?;
+        let leases_ms = started.elapsed().as_millis() as u64;
+        let sessions_started = std::time::Instant::now();
+        let agents = self.agents(now_ms)?;
+        let sessions_ms = sessions_started.elapsed().as_millis() as u64;
+        let integration = self.integration_head()?;
+        let mut view = self.build_status(agents, overlaps, integration, now_ms, false)?;
+        self.store.record_advisories_shown(
+            &view.outstanding_advisories,
+            crate::AdvisoryDeliverySurface::Status,
+        )?;
+        view.advisory_delivery = self.store.advisory_delivery_summary()?;
+        view.phase_timings_ms.insert("leases".into(), leases_ms);
+        view.phase_timings_ms.insert("sessions".into(), sessions_ms);
+        view.phase_timings_ms
+            .insert("total".into(), started.elapsed().as_millis() as u64);
+        Ok(view)
     }
 
     fn build_status(
@@ -6779,14 +6911,21 @@ impl Broker {
         overlaps: Vec<crate::Overlap>,
         (integration_branch, integration_head): (String, String),
         now_ms: i64,
+        refresh: bool,
     ) -> Result<StatusView, BrokerOpError> {
+        let started = std::time::Instant::now();
+        let mut phase_timings_ms = std::collections::BTreeMap::new();
         // In a verify-only repository nothing moves integration: submit
         // verifies against the default branch and sessions start from it. Every
         // row below that tells an agent integration may move, has drifted, or
         // needs reconciling is noise there (and some of it is `blocked`), so
         // the mode is read once and gates all of them.
         let promotes = PromoteConfig::load(&self.main_root).mode.promotes_at_all();
-        let promoted_conflicts = self.promoted_conflicts()?;
+        let promoted_conflicts = if refresh {
+            self.promoted_conflicts()?
+        } else {
+            Vec::new()
+        };
         // Declared intent, not yet visible in any diff. Read from the same
         // snapshot as the leases above so both halves of "who else is working
         // on this" describe one moment.
@@ -6801,9 +6940,9 @@ impl Broker {
             .collect::<Vec<i64>>();
         let latest_live_queue = self.store.latest_merge_queue_for_sessions(&session_ids)?;
         let main_head = self.repo.head_commit()?;
-        let (upstream_ref, upstream_head) = self
-            .repo
-            .tracking_upstream()
+        let (upstream_ref, upstream_head) = refresh
+            .then(|| self.repo.tracking_upstream())
+            .flatten()
             .map(|(name, commit)| (Some(name), Some(commit)))
             .unwrap_or((None, None));
         let (main_ahead_upstream_commits, main_behind_upstream_commits) =
@@ -6819,19 +6958,24 @@ impl Broker {
         // "what would publishing add to the default branch", which is the only
         // reading anyone acts on.
         let (baseline_ref, baseline_head) = self.publication_baseline()?;
-        let (integration_relation, integration_ahead_main_commits) =
-            if integration_head == baseline_head {
-                (StatusIntegrationRelation::CurrentWithMain, 0)
-            } else if self.repo.is_ancestor(&baseline_head, &integration_head) {
-                (
-                    StatusIntegrationRelation::AheadOfMain,
-                    self.repo
-                        .commit_count_between(&baseline_head, &integration_head)?,
-                )
-            } else {
-                (StatusIntegrationRelation::DivergedFromMain, 0)
-            };
-        let dirty_sessions = dirty_session_count(&agents);
+        let (integration_relation, integration_ahead_main_commits) = if !refresh {
+            (StatusIntegrationRelation::NotChecked, 0)
+        } else if integration_head == baseline_head {
+            (StatusIntegrationRelation::CurrentWithMain, 0)
+        } else if self.repo.is_ancestor(&baseline_head, &integration_head) {
+            (
+                StatusIntegrationRelation::AheadOfMain,
+                self.repo
+                    .commit_count_between(&baseline_head, &integration_head)?,
+            )
+        } else {
+            (StatusIntegrationRelation::DivergedFromMain, 0)
+        };
+        let dirty_sessions = if refresh {
+            dirty_session_count(&agents)
+        } else {
+            0
+        };
         let overlap_pairs = self.overlap_pairs_snapshot(&overlaps);
         let summary = status_summary(
             &agents,
@@ -6853,10 +6997,14 @@ impl Broker {
                 relation: integration_relation,
                 ahead_baseline_commits: integration_ahead_main_commits,
                 main_head: main_head.clone(),
-                main_is_ancestor: self.repo.is_ancestor(&main_head, &integration_head),
-                ahead_main_commits: self
-                    .repo
-                    .commit_count_between(&main_head, &integration_head)?,
+                main_is_ancestor: main_head == integration_head
+                    || (refresh && self.repo.is_ancestor(&main_head, &integration_head)),
+                ahead_main_commits: if refresh {
+                    self.repo
+                        .commit_count_between(&main_head, &integration_head)?
+                } else {
+                    0
+                },
                 promotes,
             },
         );
@@ -6864,17 +7012,20 @@ impl Broker {
             &agents,
             &promoted_conflicts,
             &latest_live_queue,
-            &integration_branch,
-            &integration_head,
+            (&integration_branch, &integration_head),
             promotes,
+            refresh,
         );
         let integration_contains_upstream = upstream_head
             .as_deref()
             .is_some_and(|upstream| self.repo.is_ancestor(upstream, &integration_head));
         let integration_reconciliation = match (upstream_ref.as_deref(), upstream_head.as_deref()) {
-            (Some(upstream_ref), Some(upstream_head)) if !integration_contains_upstream => self
-                .assess_integration_drift(upstream_ref, upstream_head, &integration_head)
-                .ok(),
+            (Some(upstream_ref), Some(upstream_head))
+                if refresh && !integration_contains_upstream =>
+            {
+                self.assess_integration_drift(upstream_ref, upstream_head, &integration_head)
+                    .ok()
+            }
             _ => None,
         };
         if promotes
@@ -6997,7 +7148,23 @@ impl Broker {
                 ],
             });
         }
-        let cleanup_retention = self.cleanup_retention(now_ms)?;
+        phase_timings_ms.insert("coordination".into(), started.elapsed().as_millis() as u64);
+        let retention_started = std::time::Instant::now();
+        let cleanup_retention = self.cleanup_retention_with_audit(now_ms, refresh)?;
+        phase_timings_ms.insert(
+            "retention".into(),
+            retention_started.elapsed().as_millis() as u64,
+        );
+        if !refresh {
+            advice.push(StatusAdvice {
+                id: "status.recorded-observations", severity: StatusAdviceSeverity::Notice,
+                reason: "routine status does not run Git conflict or cleanup eligibility audits",
+                summary: "Recorded leases/overlaps only; dirty worktrees, unpushed commits, Git conflicts, branch drift and cleanup eligibility were not checked".into(),
+                session_id: None, queue_entry_id: None,
+                evidence: vec![format!("oldest recorded size: {:?}", cleanup_retention.sizes_measured_at_ms)],
+                commands: vec!["aethyme broker status --refresh".into(), "aethyme broker gc plan".into()],
+            });
+        }
         if let Some(config_advice) = retention_config_advice(&cleanup_retention.retention_config) {
             advice.insert(0, config_advice);
         }
@@ -7012,7 +7179,7 @@ impl Broker {
         ) {
             advice.insert(0, headroom_advice);
         }
-        if cleanup_retention.broker_owned_worktree_count > 0 {
+        if refresh && cleanup_retention.broker_owned_worktree_count > 0 {
             let count = cleanup_retention.broker_owned_worktree_count;
             let required = crate::disk_headroom::DEFAULT_GATE_HEADROOM_BYTES;
             advice.push(StatusAdvice {
@@ -7318,30 +7485,67 @@ impl Broker {
         }
         // A status that cannot read refs still reports everything else; the
         // unpushed count is context, not a precondition for any command.
-        let unpushed_work = self.unpushed_work(now_ms).unwrap_or_default();
+        let unpushed_work = if refresh {
+            self.unpushed_work(now_ms).unwrap_or_default()
+        } else {
+            crate::UnpushedWorkReport::default()
+        };
         advice.extend(unpushed_work_advice(&unpushed_work, now_ms, !promotes));
-        advice.extend(self.integration_behind_upstream_advice());
+        if refresh {
+            advice.extend(self.integration_behind_upstream_advice());
+        }
         advice.extend(overlap_pair_advice(&overlap_pairs));
         // Cached listing and local refs only: `status` never calls GitHub.
-        advice.extend(self.pr_overlap_advice(now_ms));
+        if refresh {
+            advice.extend(self.pr_overlap_advice(now_ms));
+        } else {
+            advice.extend(self.recorded_pr_overlap_advice(now_ms, &baseline_head, &baseline_ref));
+        }
         // Several sessions on one PR conflict by construction; name it.
         advice.extend(self.duplicate_work_advice(&agents));
         // A worktree stuck mid-merge cannot be classified or submitted.
         advice.extend(crate::overlap_pairs::mid_operation_advice(&agents));
         // The default branch moving under a session: last fetched copy only.
-        advice.extend(self.behind_main_advice());
+        if refresh {
+            advice.extend(self.behind_main_advice());
+        }
         // Two sessions on one target: landing the shared edit first keeps
         // both on the default branch instead of chaining one onto the other.
-        advice.extend(crate::shared_edit_advice::shared_edit_advice(
-            &self.repo,
-            &agents,
-            &overlaps,
-            &scope_overlaps,
-        ));
+        if refresh {
+            advice.extend(crate::shared_edit_advice::shared_edit_advice(
+                &self.repo,
+                &agents,
+                &overlaps,
+                &scope_overlaps,
+            ));
+        }
         let in_flight_submits = crate::submit_progress::in_flight_submits(&self.main_root, now_ms);
         advice.extend(stalled_submit_advice(&in_flight_submits));
 
+        phase_timings_ms.insert("build_total".into(), started.elapsed().as_millis() as u64);
         Ok(StatusView {
+            deferred_checks: if refresh {
+                Vec::new()
+            } else {
+                vec![
+                    "dirty_worktrees",
+                    "unpushed_commits",
+                    "promoted_conflicts",
+                    "branch_drift",
+                    "shared_edit_classification",
+                    "pr_overlap_refresh",
+                    "cleanup_eligibility",
+                ]
+                .into_iter()
+                .map(String::from)
+                .collect()
+            },
+            leases_refreshed_at_ms: self
+                .store
+                .meta_get("leases.refreshed_at_ms")?
+                .and_then(|v| v.parse().ok()),
+            leases_refreshed: refresh,
+            phase_timings_ms,
             publication_baseline_ref: baseline_ref,
             publication_baseline_head: baseline_head,
             summary,
@@ -7826,11 +8030,12 @@ impl Broker {
         agents: &[AgentView],
         promoted_conflicts: &[PromotedConflict],
         queue: &[MergeQueueEntry],
-        integration_branch: &str,
-        integration_head: &str,
+        integration: (&str, &str),
         promotes: bool,
+        inspect_worktrees: bool,
     ) -> Vec<StatusAdvice> {
         use std::collections::BTreeMap;
+        let (integration_branch, integration_head) = integration;
 
         let mut advice = Vec::new();
         let mut latest_queue_by_session = BTreeMap::new();
@@ -7881,7 +8086,7 @@ impl Broker {
             ));
         }
 
-        for agent in agents {
+        for agent in agents.iter().filter(|_| inspect_worktrees) {
             let Ok(checkout) = GitRepo::discover(Path::new(&agent.session.worktree_path)) else {
                 continue;
             };
@@ -10050,6 +10255,82 @@ impl Broker {
         Ok(plan)
     }
 
+    /// Inventory only: one branch listing and filesystem existence checks.
+    /// No content comparison, directory walk, or deletion authorization.
+    fn cleanup_plan_observed(&self) -> Result<(CleanupPlan, usize), BrokerOpError> {
+        self.cleanup_plan_observed_with_budget(std::time::Duration::from_millis(250))
+    }
+
+    fn cleanup_plan_observed_with_budget(
+        &self,
+        budget: std::time::Duration,
+    ) -> Result<(CleanupPlan, usize), BrokerOpError> {
+        let mut plan = CleanupPlan::default();
+        let records = crate::measurement::load_size_records(&self.main_root);
+        let Some(tips) = self.repo.local_branch_tips() else {
+            return Ok((plan, self.store.cleaned_sessions()?.len()));
+        };
+        let mut retained = crate::MeasuredTotal::default();
+        let sessions = self.store.cleaned_sessions()?;
+        let started = std::time::Instant::now();
+        let mut deferred = 0;
+        for (index, session) in sessions.iter().enumerate() {
+            if started.elapsed() >= budget {
+                deferred = sessions.len() - index;
+                break;
+            }
+            if session.origin != SessionOrigin::Spawned {
+                continue;
+            }
+            let path = Path::new(&session.worktree_path);
+            if !self.is_broker_owned_worktree(session, path) {
+                continue;
+            }
+            let present = path.exists();
+            let branch_ref = format!("refs/heads/{}", session.branch);
+            let tip = tips.get(&branch_ref).cloned();
+            if !present && tip.is_none() {
+                continue;
+            }
+            let record = records.get(&session.worktree_path);
+            let bytes = if present {
+                record.map(|r| r.bytes)
+            } else {
+                Some(0)
+            };
+            if present {
+                plan.retained_worktree_count += 1;
+            }
+            if tip.is_some() {
+                plan.retained_branch_count += 1;
+            }
+            match bytes {
+                Some(bytes) => retained
+                    .add_measured(bytes, record.map(|r| r.measured_at_ms).unwrap_or(i64::MAX)),
+                None => retained.add_unmeasured(),
+            }
+            plan.worktrees.push(CleanupWorktreePlan {
+                session_id: session.id,
+                worktree_path: session.worktree_path.clone(),
+                worktree_present: present,
+                branch_ref,
+                branch_tip: tip,
+                delete_branch: false,
+                origin: session.origin,
+                disposition: CleanupDisposition::InspectionFailed,
+                provenance: None,
+                estimated_bytes: bytes,
+                reason: "eligibility not inspected by routine status".into(),
+                inspection_commands: vec!["aethyme broker gc plan".into()],
+                force_cleanup_command: String::new(),
+            });
+        }
+        plan.estimated_retained_bytes = retained.bytes;
+        plan.unmeasured_worktree_count = retained.unmeasured;
+        plan.sizes_measured_at_ms = retained.oldest_measured_at_ms.filter(|at| *at != i64::MAX);
+        Ok((plan, deferred))
+    }
+
     /// Measure one directory the broker has never sized, or whose recorded
     /// size has aged out, and write the result down.
     ///
@@ -10139,6 +10420,14 @@ impl Broker {
     /// here is what made the routine check and the five-minute audit the same
     /// code (#176).
     fn cleanup_retention(&self, now_ms: i64) -> Result<CleanupRetention, BrokerOpError> {
+        self.cleanup_retention_with_audit(now_ms, true)
+    }
+
+    fn cleanup_retention_with_audit(
+        &self,
+        now_ms: i64,
+        audit: bool,
+    ) -> Result<CleanupRetention, BrokerOpError> {
         let (policy, retention_config) = match crate::load_retention_policy_report(&self.main_root)
         {
             Ok(report) => (
@@ -10156,7 +10445,11 @@ impl Broker {
                 },
             ),
         };
-        let plan = self.cleanup_plan_recorded()?;
+        let (plan, deferred) = if audit {
+            (self.cleanup_plan_recorded()?, 0)
+        } else {
+            self.cleanup_plan_observed()?
+        };
         let closed_sessions = self.store.cleaned_sessions()?;
         let closed_worktrees = crate::retention::ClosedWorktreeSummary::from_cleanup(
             &plan,
@@ -10199,12 +10492,17 @@ impl Broker {
             unmeasured: plan.unmeasured_worktree_count,
             oldest_measured_at_ms: plan.sizes_measured_at_ms,
         };
+        let mut retained_total = retained_total;
+        retained_total.unmeasured = retained_total.unmeasured.saturating_add(deferred);
         let budget_verdict = crate::budget_verdict(&retained_total, policy.retained_bytes_budget);
         // Only `Over` asserts that the budget is broken. A floor under the
         // budget is not a pass -- the bytes it skipped are exactly the ones
         // that would have decided it.
         let over_retained_bytes_budget = budget_verdict.exceeded();
         Ok(CleanupRetention {
+            inventory_complete: deferred == 0,
+            inventory_deferred_sessions: deferred,
+            eligibility_checked: audit,
             broker_owned_worktree_count: plan.retained_worktree_count,
             retained_session_branch_count: plan.retained_branch_count,
             eligible_worktree_count: plan.eligible_worktree_count,
@@ -11115,6 +11413,9 @@ fn integration_summary_phrase(integration: &SummaryIntegration) -> String {
     let branch = &integration.branch;
     let label = baseline_label(&integration.baseline_ref);
     let mut phrase = match integration.relation {
+        StatusIntegrationRelation::NotChecked => {
+            format!("{branch} relation to {label} not checked")
+        }
         StatusIntegrationRelation::CurrentWithMain => format!("{branch} current with {label}"),
         StatusIntegrationRelation::AheadOfMain => format!(
             "{branch} ahead of {label} by {} {}",
@@ -11127,7 +11428,10 @@ fn integration_summary_phrase(integration: &SummaryIntegration) -> String {
         ),
         StatusIntegrationRelation::DivergedFromMain => format!("{branch} diverged from {label}"),
     };
-    if integration.baseline_ref != "HEAD" && integration.main_head != integration.baseline_head {
+    if integration.relation != StatusIntegrationRelation::NotChecked
+        && integration.baseline_ref != "HEAD"
+        && integration.main_head != integration.baseline_head
+    {
         let local = if integration.main_head == integration.head {
             "local checkout matches integration".to_string()
         } else if integration.main_is_ancestor {
@@ -11935,6 +12239,40 @@ mod tests {
     use crate::version::{BinaryBuild, VersionDriftReport, VersionDriftStatus};
 
     #[test]
+    fn routine_inventory_zero_budget_is_incomplete_and_cannot_authorize_cleanup() {
+        let repo = tempfile::tempdir().unwrap();
+        for args in [
+            vec!["init", "-q", "-b", "main"],
+            vec!["config", "user.name", "Test"],
+            vec!["config", "user.email", "test@example.com"],
+            vec!["commit", "--allow-empty", "-qm", "init"],
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(repo.path())
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        let mut broker = super::Broker::open(repo.path()).unwrap();
+        let session = broker.start_worktree("retained", None).unwrap();
+        broker
+            .store()
+            .set_session_status(session.id, SessionStatus::Closed, None)
+            .unwrap();
+        let (plan, deferred) = broker
+            .cleanup_plan_observed_with_budget(std::time::Duration::ZERO)
+            .unwrap();
+        assert_eq!(deferred, 1);
+        assert!(plan.digest.is_empty());
+        assert!(plan.worktrees.is_empty());
+        assert_eq!(plan.eligible_worktree_count, 0);
+        assert!(std::path::Path::new(&session.worktree_path).exists());
+    }
+
+    #[test]
     fn worktree_build_defaults_are_written_once_and_never_over_a_choice() {
         let tmp = tempfile::tempdir().unwrap();
         let config = tmp.path().join(".cargo/config.toml");
@@ -12359,6 +12697,9 @@ mod tests {
         );
 
         let mut retention = super::CleanupRetention {
+            eligibility_checked: true,
+            inventory_complete: true,
+            inventory_deferred_sessions: 0,
             closed_worktrees: Default::default(),
             reconciliation: crate::WorktreeReconciliation {
                 schema_version: crate::WORKTREE_RECONCILIATION_SCHEMA_VERSION,

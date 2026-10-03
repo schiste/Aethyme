@@ -191,7 +191,7 @@ impl Fixture {
     /// need it.
     fn status_offline(&self) -> serde_json::Value {
         json(&self.run(
-            &["status", "--json"],
+            &["status", "--refresh", "--json"],
             &self.tmp.path().join("no-such-remote.git"),
         ))
     }

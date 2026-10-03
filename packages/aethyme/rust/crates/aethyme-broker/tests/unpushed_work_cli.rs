@@ -95,7 +95,7 @@ fn session_with_commit(repo: &Path, file: &str) -> (i64, PathBuf, String) {
 }
 
 fn status(repo: &Path) -> serde_json::Value {
-    json(&run(repo, &["status", "--json"]))
+    json(&run(repo, &["status", "--refresh", "--json"]))
 }
 
 fn advice<'a>(status: &'a serde_json::Value, id: &str) -> Vec<&'a serde_json::Value> {
@@ -351,4 +351,27 @@ fn abandoning_unpushed_work_needs_a_reason_and_is_recorded() {
     assert_eq!(payload["branch"], branch.as_str());
     assert_eq!(payload["unpushed_commits"], 1);
     assert_eq!(payload["reason"], "superseded by session 99");
+}
+
+#[test]
+fn routine_status_marks_unpushed_work_unknown_until_an_explicit_audit() {
+    let fixture = fixture("");
+    let (session, _, _) = session_with_commit(&fixture.repo, "pending.txt");
+    let routine = json(&run(&fixture.repo, &["status", "--json"]));
+    assert!(
+        routine["deferred_checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value == "unpushed_commits")
+    );
+    let audited = status(&fixture.repo);
+    assert_eq!(
+        audited["unpushed_work"]["sessions"][0]["session_id"],
+        session
+    );
+    assert_eq!(
+        audited["unpushed_work"]["sessions"][0]["unpushed_commits"],
+        1
+    );
 }

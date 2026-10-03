@@ -8,9 +8,9 @@
         "string"
       ],
       "id": "string",
-      "queue_entry_id": "integer",
+      "queue_entry_id": "null",
       "reason": "string",
-      "session_id": "integer",
+      "session_id": "null",
       "severity": "string",
       "summary": "string"
     }
@@ -77,12 +77,15 @@
       "unmeasured_count": "integer"
     },
     "closed_worktrees_policy_days": "integer",
+    "eligibility_checked": "bool",
     "eligible_worktree_count": "integer",
     "estimated_blocked_bytes": "integer",
     "estimated_reclaimable_bytes": "integer",
     "estimated_retained_bytes": "integer",
     "host_available_bytes": "integer",
     "host_volume_probe": "string",
+    "inventory_complete": "bool",
+    "inventory_deferred_sessions": "integer",
     "oldest_closed_age_days": "integer",
     "over_retained_bytes_budget": "bool",
     "reconciliation": {
@@ -103,6 +106,9 @@
     "unmeasured_worktree_count": "integer"
   },
   "coordinated_operations": [],
+  "deferred_checks": [
+    "string"
+  ],
   "integration_branch": "string",
   "integration_head": "string",
   "leases": [
@@ -116,6 +122,8 @@
       "session_id": "integer"
     }
   ],
+  "leases_refreshed": "bool",
+  "leases_refreshed_at_ms": "integer",
   "main_ahead_upstream_commits": "integer",
   "main_behind_upstream_commits": "integer",
   "main_head": "string",
@@ -138,6 +146,16 @@
   ],
   "overlap_pairs": [],
   "overlaps": [],
+  "phase_timings_ms": {
+    "build_total": "integer",
+    "command_total": "integer",
+    "coordination": "integer",
+    "leases": "integer",
+    "open": "integer",
+    "retention": "integer",
+    "sessions": "integer",
+    "total": "integer"
+  },
   "promoted_conflicts": [],
   "publication_baseline_head": "string",
   "publication_baseline_ref": "string",

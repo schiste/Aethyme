@@ -185,7 +185,7 @@ fn a_promoting_repository_skips_an_integration_that_fell_behind() {
         "{human}"
     );
 
-    let status = json(&run(tmp.path(), &["status", "--json"]));
+    let status = json(&run(tmp.path(), &["status", "--refresh", "--json"]));
     let advice = status["advice"]
         .as_array()
         .unwrap()
@@ -210,7 +210,7 @@ fn a_current_integration_is_still_the_base() {
     assert_eq!(base["evidence"], "integration_tip");
     assert!(base["bypassed_integration"].is_null());
 
-    let status = json(&run(tmp.path(), &["status", "--json"]));
+    let status = json(&run(tmp.path(), &["status", "--refresh", "--json"]));
     assert!(
         !status["advice"]
             .as_array()
@@ -279,7 +279,7 @@ fn a_session_started_from_upstream_leases_only_its_own_changes() {
     let worktree = value["worktree_path"].as_str().unwrap().to_string();
     commit_file(Path::new(&worktree), "mine.txt", "my change");
 
-    let status = json(&run(tmp.path(), &["status", "--json"]));
+    let status = json(&run(tmp.path(), &["status", "--refresh", "--json"]));
     let paths: Vec<&str> = status["leases"]
         .as_array()
         .unwrap()

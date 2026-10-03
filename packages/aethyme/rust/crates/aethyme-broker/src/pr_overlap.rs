@@ -72,7 +72,7 @@ pub struct PrOverlap {
 }
 
 /// The result of comparing one session with the open PRs.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PrOverlapCheck {
     pub overlaps: Vec<PrOverlap>,
     /// Open PRs whose change could not be read (no current local ref and no
@@ -101,6 +101,21 @@ struct OpenPrListing {
 struct CachedRanges {
     head_oid: String,
     ranges: FileRanges,
+}
+
+/// A reporting-only push result. Binding every input lets routine status
+/// read it without recomputing ranges, and never present an obsolete warning.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct RecordedPrOverlap {
+    head: String,
+    baseline: String,
+    baseline_ref: String,
+    listing: String,
+    check: PrOverlapCheck,
+}
+
+fn checked_key(session: i64) -> String {
+    format!("pr_overlap.checked.{session}")
 }
 
 /// Parse `gh pr list --json number,url,state,headRefName,headRefOid`.
@@ -476,6 +491,25 @@ impl Broker {
                 None => check.unknown_prs.push(pr.number),
             }
         }
+        if let Some(listing) = self.store_ref().meta_get(OPEN_PRS_KEY).ok().flatten() {
+            let mut cached_check = check.clone();
+            for overlap in &mut cached_check.overlaps {
+                overlap.files.truncate(5);
+            }
+            let recorded = RecordedPrOverlap {
+                head: head.into(),
+                baseline: default.commit.clone(),
+                baseline_ref: default.tracking_ref.clone(),
+                listing,
+                check: cached_check,
+            };
+            if let Ok(raw) = serde_json::to_string(&recorded) {
+                crate::warn_unrecorded(
+                    "record PR overlap check",
+                    self.store_ref().meta_set(&checked_key(session_id), &raw),
+                );
+            }
+        }
         check
     }
 
@@ -527,6 +561,69 @@ impl Broker {
 
     /// One `session.pr-overlap` advice row per live session whose change
     /// touches an open PR, from cached data only.
+    pub(crate) fn recorded_pr_overlap_advice(
+        &self,
+        now_ms: i64,
+        baseline: &str,
+        baseline_ref: &str,
+    ) -> Vec<StatusAdvice> {
+        let Some(listing_raw) = self.store_ref().meta_get(OPEN_PRS_KEY).ok().flatten() else {
+            return Vec::new();
+        };
+        let Ok(listing) = serde_json::from_str::<OpenPrListing>(&listing_raw) else {
+            return Vec::new();
+        };
+        if now_ms.saturating_sub(listing.fetched_at_ms) > LIST_STALE_MS {
+            return Vec::new();
+        }
+        // A repository without origin/HEAD labels its publication baseline
+        // HEAD; use its configured upstream rather than treating that alias
+        // as a different default branch or guessing a branch name.
+        let actual = if baseline_ref == "HEAD" {
+            tracked_default(self.repo_handle())
+        } else {
+            None
+        };
+        let baseline = actual
+            .as_ref()
+            .map(|d| d.commit.as_str())
+            .unwrap_or(baseline);
+        let baseline_ref = actual
+            .as_ref()
+            .map(|d| d.tracking_ref.as_str())
+            .unwrap_or(baseline_ref);
+        let Some(tips) = self.repo_handle().local_branch_tips() else {
+            return Vec::new();
+        };
+        let Ok(sessions) = self.store_ref().live_sessions() else {
+            return Vec::new();
+        };
+        sessions
+            .into_iter()
+            .filter_map(|session| {
+                let raw = self
+                    .store_ref()
+                    .meta_get(&checked_key(session.id))
+                    .ok()
+                    .flatten()?;
+                let recorded: RecordedPrOverlap = serde_json::from_str(&raw).ok()?;
+                if recorded.baseline != baseline
+                    || recorded.baseline_ref != baseline_ref
+                    || recorded.listing != listing_raw
+                    || tips.get(&format!("refs/heads/{}", session.branch)) != Some(&recorded.head)
+                {
+                    return None;
+                }
+                let mut row = overlap_advice(session.id, &recorded.check)?;
+                row.evidence.push(format!(
+                    "recorded at push; PR listing timestamp: {}",
+                    listing.fetched_at_ms
+                ));
+                Some(row)
+            })
+            .collect()
+    }
+
     pub(crate) fn pr_overlap_advice(&self, now_ms: i64) -> Vec<StatusAdvice> {
         let Ok(sessions) = self.store_ref().live_sessions() else {
             return Vec::new();

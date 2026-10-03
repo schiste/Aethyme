@@ -618,18 +618,16 @@ Usage:
       queue attestations and per-SHA unrecorded-commit dispositions. The
       template option atomically writes a no-clobber schema-v2 document with
       exact identifiers and deliberately invalid null operator judgments.
-  aethyme broker status [--json] [--summary]
-      The whole picture: agents, overlaps, promoted conflicts, merge
-      queue, integration head. Session records are reported under the
+  aethyme broker status [--json] [--summary] [--refresh]
+      Sessions, recorded overlaps, merge queue and ref tips.
+      Session records are reported under the
       `agents` key; the id every `--session <id>` flag expects is
       `agents[].id`. There is no `sessions` key.
-      --summary prints only `summary` and `advice`, and skips the
-      per-session diff that dominates the full view's cost. Prefer it for
-      the orientation step at the start of a session: it is cheap, and
-      small enough that truncating it does not yield unparseable JSON.
-      Its `overlap_count` is as of the last refresh, which it reports as
-      `leases_refreshed: false`; use the full view when lease truth must
-      be current.
+      Routine status reads recorded leases/overlaps and size observations;
+      it does not audit cleanup eligibility or promoted conflicts. The JSON
+      and text explicitly identify unrefreshed data. --summary renders only
+      summary, advice and phase timings. --refresh explicitly performs the
+      expensive full lease, conflict and cleanup audit; use it when needed.
   aethyme broker events [--since <id>] [--kind <prefix>] [--follow] [--json]
       Show the append-only event log (see docs/events-contract.md).
       --kind filters by prefix (e.g. merge. or lease.overlap); --follow
@@ -915,6 +913,7 @@ struct Parsed {
     verify_only: bool,
     /// `status --summary`: skip the per-session lease refresh (#182).
     summary: bool,
+    refresh: bool,
     positional: Vec<String>,
     task: Option<String>,
     cmd: Option<String>,
@@ -1041,6 +1040,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         read_only_snapshot: false,
         verify_only: false,
         summary: false,
+        refresh: false,
         positional: Vec::new(),
         task: None,
         cmd: None,
@@ -1160,6 +1160,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
             }
             "--json" => parsed.json = true,
             "--summary" => parsed.summary = true,
+            "--refresh" => parsed.refresh = true,
             "--follow" => parsed.follow = true,
             "--since" => {
                 let value = iter
