@@ -857,7 +857,10 @@ fn run_git(cwd: &Path, args: &[&str]) -> Result<String, GitError> {
 
 fn run_git_bytes(cwd: &Path, args: &[&str]) -> Result<Vec<u8>, GitError> {
     let mut command = Command::new(&git_program().program);
-    command.args(args).current_dir(cwd);
+    command
+        .args(args)
+        .current_dir(cwd)
+        .env("GIT_OPTIONAL_LOCKS", "0");
     let output = run_git_command_output(command, args, git_timeout())?;
     Ok(output.stdout)
 }
@@ -870,7 +873,15 @@ fn run_git_with_index(cwd: &Path, index_file: &str, args: &[&str]) -> Result<Str
 
 fn run_git_inner(cwd: &Path, index_file: Option<&str>, args: &[&str]) -> Result<String, GitError> {
     let mut command = Command::new(&git_program().program);
-    command.args(args).current_dir(cwd);
+    // No opportunistic index refresh: `git status` and friends otherwise
+    // rewrite a checkout's index when file stats moved, and the broker reads
+    // that index's mtime as evidence the session's agent is working. Merely
+    // looking at a stale session (status, lease refresh) made it read as
+    // active again for the next two hours.
+    command
+        .args(args)
+        .current_dir(cwd)
+        .env("GIT_OPTIONAL_LOCKS", "0");
     if let Some(index) = index_file {
         command.env("GIT_INDEX_FILE", index);
     }

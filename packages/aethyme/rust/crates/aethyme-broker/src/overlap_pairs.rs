@@ -38,6 +38,16 @@ const PAIR_CACHE_META_KEY: &str = "lease.overlap.pairs.v1";
 /// How many paths a pair lists before summarising the rest as a count.
 pub const OVERLAP_SAMPLE_PATHS: usize = 5;
 
+/// Wall-clock budget for one classification pass. Reading a session's state
+/// runs Git in its worktree, which on a loaded host with large worktrees can
+/// take seconds; past the budget the remaining pairs keep their last verdict
+/// (or report themselves unclassified) and the next refresh continues.
+pub(crate) const CLASSIFY_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Reason recorded on a pair the budget left unclassified.
+pub const BUDGET_EXHAUSTED_REASON: &str =
+    "not classified: the classification time budget ran out; the next lease refresh continues";
+
 /// Whether two sessions' overlapping edits would conflict when merged.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
@@ -91,6 +101,16 @@ struct CachedPair {
 }
 
 type PairKey = (i64, i64);
+
+/// Session states read by classification since the process started. Lets a
+/// test prove a pass reads each session once, however many pairs it is in.
+static STATE_READS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// How many session states classification has read in this process.
+#[doc(hidden)]
+pub fn overlap_state_reads() -> usize {
+    STATE_READS.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 fn pair_key_string((a, b): PairKey) -> String {
     format!("{a}-{b}")
@@ -184,6 +204,7 @@ fn build_pair(key: PairKey, paths: &[String], cached: Option<&CachedPair>) -> Ov
 }
 
 /// Why one session's state could not be read for a merge simulation.
+#[derive(Clone)]
 enum StateError {
     /// The worktree is part-way through a merge, rebase, cherry-pick or
     /// revert, or holds unresolved conflicts. Not an error in the broker: the
@@ -365,11 +386,45 @@ impl Broker {
         &mut self,
         overlaps: &[Overlap],
     ) -> Result<Vec<OverlapPair>, BrokerOpError> {
+        self.classify_and_announce_overlaps_within(overlaps, CLASSIFY_BUDGET)
+    }
+
+    /// [`Broker::classify_and_announce_overlaps`] with an explicit time
+    /// budget for the pass.
+    pub fn classify_and_announce_overlaps_within(
+        &mut self,
+        overlaps: &[Overlap],
+        budget: std::time::Duration,
+    ) -> Result<Vec<OverlapPair>, BrokerOpError> {
+        self.classify_pass(overlaps, budget, true)
+    }
+
+    /// Classify only the given pairs, leaving every other cached pair as it
+    /// is. For a surface that needs a verdict on a few specific pairs, such
+    /// as submit judging its own overlaps with sessions a full refresh no
+    /// longer pairs because they went stale.
+    pub(crate) fn classify_overlap_subset(
+        &mut self,
+        overlaps: &[Overlap],
+    ) -> Result<Vec<OverlapPair>, BrokerOpError> {
+        self.classify_pass(overlaps, CLASSIFY_BUDGET, false)
+    }
+
+    fn classify_pass(
+        &mut self,
+        overlaps: &[Overlap],
+        budget: std::time::Duration,
+        // A full pass sees every current overlap, so it may forget pairs
+        // that stopped overlapping; a subset pass must not.
+        full: bool,
+    ) -> Result<Vec<OverlapPair>, BrokerOpError> {
         let grouped = group_overlaps(overlaps);
         let mut cache = self.overlap_pair_cache();
         // A pair that stopped overlapping is forgotten, so overlapping again
         // later counts as a new start.
-        cache.retain(|key, _| grouped.keys().any(|pair| pair_key_string(*pair) == *key));
+        if full {
+            cache.retain(|key, _| grouped.keys().any(|pair| pair_key_string(*pair) == *key));
+        }
 
         let sessions: BTreeMap<i64, String> = self
             .store_ref()
@@ -377,7 +432,20 @@ impl Broker {
             .into_iter()
             .map(|session| (session.id, session.worktree_path))
             .collect();
-        let state_for = |session: i64, paths: &[String]| -> Result<SessionState, StateError> {
+        // Every path each session overlaps on, across all its pairs. A
+        // session's state is read once per pass over this union, not once
+        // per pair: with N sessions sharing a file there are N*(N-1)/2 pairs,
+        // and reading state runs several Git commands in the worktree.
+        let mut session_paths: BTreeMap<i64, BTreeSet<String>> = BTreeMap::new();
+        for ((a, b), paths) in &grouped {
+            for session in [a, b] {
+                session_paths
+                    .entry(*session)
+                    .or_default()
+                    .extend(paths.iter().cloned());
+            }
+        }
+        let read_state = |session: i64| -> Result<SessionState, StateError> {
             let worktree = sessions
                 .get(&session)
                 .ok_or_else(|| StateError::Other(format!("session {session} is not live")))?;
@@ -391,60 +459,95 @@ impl Broker {
             {
                 return Err(StateError::MidOperation(operation.describe(session)));
             }
-            session_state(&checkout, paths).map_err(StateError::Other)
+            let paths: Vec<String> = session_paths
+                .get(&session)
+                .map(|paths| paths.iter().cloned().collect())
+                .unwrap_or_default();
+            session_state(&checkout, &paths).map_err(StateError::Other)
         };
+        let mut states: BTreeMap<i64, Result<SessionState, StateError>> = BTreeMap::new();
 
+        // Pairs never classified go first, so a pass the budget cuts short
+        // still makes progress on what nobody has seen yet.
+        let mut order: Vec<(&PairKey, &Vec<String>)> = grouped.iter().collect();
+        order.sort_by_key(|(key, _)| {
+            cache
+                .get(&pair_key_string(**key))
+                .is_some_and(|entry| entry.classified)
+        });
+
+        let started = std::time::Instant::now();
         let mut pairs = Vec::new();
-        for (key, paths) in &grouped {
+        for (key, paths) in order {
             let entry = cache.entry(pair_key_string(*key)).or_default();
-            let left = state_for(key.0, paths);
-            let right = state_for(key.1, paths);
-            match (left, right) {
-                (Ok(left), Ok(right)) => {
-                    let current = input_key(&left, &right, paths);
-                    if !entry.classified || entry.input_key != current {
-                        match classify(self.repo_handle(), &left, &right, paths) {
-                            Ok(conflicting) => {
-                                entry.severity = Some(if conflicting.is_empty() {
-                                    OverlapSeverity::Low
-                                } else {
-                                    OverlapSeverity::High
-                                });
-                                entry.reason = if conflicting.is_empty() {
-                                    "the overlapping edits merge cleanly".into()
-                                } else {
-                                    format!(
-                                        "Git reports a conflict on {} path(s)",
-                                        conflicting.len()
-                                    )
-                                };
-                                entry.conflicting_paths = conflicting;
-                                entry.classified = true;
-                            }
-                            Err(error) => {
-                                entry.severity = Some(OverlapSeverity::Low);
-                                entry.conflicting_paths.clear();
-                                entry.classified = false;
-                                entry.reason = format!("could not classify: {error}");
-                            }
-                        }
-                        entry.input_key = current;
-                    }
-                }
-                (Err(error), _) | (_, Err(error)) => {
+            if started.elapsed() >= budget {
+                // Keep a previous verdict untouched; its input key no longer
+                // matching makes the next pass recheck it.
+                if !entry.classified {
                     entry.severity = Some(OverlapSeverity::Low);
                     entry.conflicting_paths.clear();
-                    entry.classified = false;
-                    entry.reason = match error {
-                        StateError::MidOperation(reason) => reason,
-                        StateError::Other(error) => format!("could not classify: {error}"),
-                    };
+                    entry.reason = BUDGET_EXHAUSTED_REASON.into();
                     entry.input_key.clear();
+                }
+            } else {
+                for session in [key.0, key.1] {
+                    states.entry(session).or_insert_with(|| {
+                        STATE_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        read_state(session)
+                    });
+                }
+                let left = &states[&key.0];
+                let right = &states[&key.1];
+                match (left, right) {
+                    (Ok(left), Ok(right)) => {
+                        let current = input_key(left, right, paths);
+                        if !entry.classified || entry.input_key != current {
+                            match classify(self.repo_handle(), left, right, paths) {
+                                Ok(conflicting) => {
+                                    entry.severity = Some(if conflicting.is_empty() {
+                                        OverlapSeverity::Low
+                                    } else {
+                                        OverlapSeverity::High
+                                    });
+                                    entry.reason = if conflicting.is_empty() {
+                                        "the overlapping edits merge cleanly".into()
+                                    } else {
+                                        format!(
+                                            "Git reports a conflict on {} path(s)",
+                                            conflicting.len()
+                                        )
+                                    };
+                                    entry.conflicting_paths = conflicting;
+                                    entry.classified = true;
+                                }
+                                Err(error) => {
+                                    entry.severity = Some(OverlapSeverity::Low);
+                                    entry.conflicting_paths.clear();
+                                    entry.classified = false;
+                                    entry.reason = format!("could not classify: {error}");
+                                }
+                            }
+                            entry.input_key = current;
+                        }
+                    }
+                    (Err(error), _) | (_, Err(error)) => {
+                        entry.severity = Some(OverlapSeverity::Low);
+                        entry.conflicting_paths.clear();
+                        entry.classified = false;
+                        entry.reason = match error {
+                            StateError::MidOperation(reason) => reason.clone(),
+                            StateError::Other(error) => format!("could not classify: {error}"),
+                        };
+                        entry.input_key.clear();
+                    }
                 }
             }
             let pair = build_pair(*key, paths, Some(entry));
             let signature = announcement_signature(&pair);
-            if entry.announced.as_deref() != Some(signature.as_str()) {
+            // Only a full pass announces: a subset pass judges pairs a full
+            // refresh no longer tracks (a stale holder), and the next full
+            // pass forgets them, so announcing would repeat on every submit.
+            if full && entry.announced.as_deref() != Some(signature.as_str()) {
                 let payload = serde_json::json!({
                     "session_a": pair.session_a,
                     "session_b": pair.session_b,
