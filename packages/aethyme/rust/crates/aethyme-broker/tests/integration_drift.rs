@@ -172,3 +172,100 @@ fn divergence_is_still_refused() {
         "a diverged integration ref must not move"
     );
 }
+
+/// Put `count` commits on integration that `origin/main` lacks, the shape a
+/// repository leaves behind when it promoted once and later switched to
+/// verify-only (the SP42 case: six-week-old drafts superseded by merged PRs).
+fn add_leftover_integration_work(root: &Path, count: usize) -> String {
+    let integration = git(root, &["rev-parse", "refs/heads/aethyme/integration"]);
+    git(root, &["switch", "-qc", "leftover", &integration]);
+    for n in 0..count {
+        std::fs::write(root.join(format!("leftover{n}.txt")), "draft\n").unwrap();
+        git(root, &["add", "-A"]);
+        git(root, &["commit", "-qm", &format!("leftover {n}")]);
+    }
+    let head = git(root, &["rev-parse", "HEAD"]);
+    git(
+        root,
+        &["update-ref", "refs/heads/aethyme/integration", &head],
+    );
+    git(root, &["switch", "-q", "main"]);
+    head
+}
+
+fn set_promote_mode(root: &Path, mode: &str) {
+    std::fs::create_dir_all(root.join(".aethyme")).unwrap();
+    std::fs::write(
+        root.join(".aethyme/config.toml"),
+        format!("[promote]\nmode = \"{mode}\"\n"),
+    )
+    .unwrap();
+}
+
+/// A verify-only repository's leftover integration work must surface on the
+/// routine (unrefreshed) status every session runs first, not only after a
+/// pull-request merge defers the post-merge cleanup.
+#[test]
+fn verify_only_status_reports_leftover_integration_work_without_refresh() {
+    let (tmp, _broker) = fixture(1);
+    let root = tmp.path();
+    add_leftover_integration_work(root, 2);
+    set_promote_mode(root, "verify-only");
+    let mut broker = Broker::open(root).unwrap();
+
+    let status = broker.status_current(0).unwrap();
+    let advice = status
+        .advice
+        .iter()
+        .find(|entry| entry.id == "integration.leftover-work")
+        .unwrap_or_else(|| panic!("leftover work must be reported: {:?}", status.advice));
+
+    assert_eq!(advice.severity, StatusAdviceSeverity::Warning);
+    assert!(
+        advice.summary.contains("2 commits origin/main lacks"),
+        "{}",
+        advice.summary
+    );
+    assert_eq!(
+        advice.commands,
+        vec!["aethyme broker advanced integration reconcile --upstream origin/main --dry-run"]
+    );
+}
+
+/// Integration behind the published branch carries nothing of its own; it is
+/// the normal verify-only state and must stay silent.
+#[test]
+fn verify_only_status_is_silent_when_integration_holds_nothing_of_its_own() {
+    let (tmp, _broker) = fixture(2);
+    set_promote_mode(tmp.path(), "verify-only");
+    let mut broker = Broker::open(tmp.path()).unwrap();
+
+    let status = broker.status_current(0).unwrap();
+    assert!(
+        !status
+            .advice
+            .iter()
+            .any(|entry| entry.id == "integration.leftover-work"),
+        "{:?}",
+        status.advice
+    );
+}
+
+/// Promoting repositories keep their own integration rows: work on
+/// integration ahead of the published branch is the normal pending layer.
+#[test]
+fn promoting_status_does_not_report_pending_layer_as_leftover() {
+    let (tmp, _broker) = fixture(1);
+    add_leftover_integration_work(tmp.path(), 1);
+    let mut broker = Broker::open(tmp.path()).unwrap();
+
+    let status = broker.status_current(0).unwrap();
+    assert!(
+        !status
+            .advice
+            .iter()
+            .any(|entry| entry.id == "integration.leftover-work"),
+        "{:?}",
+        status.advice
+    );
+}
