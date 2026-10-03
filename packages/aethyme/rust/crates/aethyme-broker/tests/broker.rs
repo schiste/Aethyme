@@ -2188,3 +2188,48 @@ fn summary_snapshot_does_not_persist_liveness_transitions() {
     );
     assert!(!report.leases_refreshed);
 }
+
+#[test]
+fn routine_status_counts_rendered_advisories_but_summary_does_not() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let session = broker
+        .adopt(tmp.path(), Some("advisory reporting"))
+        .unwrap();
+    broker
+        .store()
+        .record_advisory(&aethyme_broker::NewAdvisory {
+            identity: "status-current-test".into(),
+            audience: aethyme_broker::AdvisoryAudience::Session,
+            producer: aethyme_broker::AdvisoryProducer::Coordination,
+            session_id: Some(session.id),
+            severity: aethyme_broker::AdvisorySeverity::Warning,
+            queue_entry_id: None,
+            integration_sha: None,
+            paths: Vec::new(),
+            evidence: Vec::new(),
+        })
+        .unwrap();
+    broker.status_brief(now_ms()).unwrap();
+    assert_eq!(
+        broker
+            .store()
+            .advisory_delivery_summary()
+            .unwrap()
+            .total_shows,
+        0
+    );
+    let current = broker.status_current(now_ms()).unwrap();
+    assert_eq!(current.outstanding_advisories.len(), 1);
+    assert_eq!(current.advisory_delivery.total_shows, 1);
+    broker.status_brief(now_ms()).unwrap();
+    assert_eq!(
+        broker
+            .store()
+            .advisory_delivery_summary()
+            .unwrap()
+            .total_shows,
+        1
+    );
+}

@@ -6893,6 +6893,11 @@ impl Broker {
         let sessions_ms = sessions_started.elapsed().as_millis() as u64;
         let integration = self.integration_head()?;
         let mut view = self.build_status(agents, overlaps, integration, now_ms, false)?;
+        self.store.record_advisories_shown(
+            &view.outstanding_advisories,
+            crate::AdvisoryDeliverySurface::Status,
+        )?;
+        view.advisory_delivery = self.store.advisory_delivery_summary()?;
         view.phase_timings_ms.insert("leases".into(), leases_ms);
         view.phase_timings_ms.insert("sessions".into(), sessions_ms);
         view.phase_timings_ms
