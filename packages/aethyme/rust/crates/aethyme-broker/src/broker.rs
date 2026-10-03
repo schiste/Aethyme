@@ -360,10 +360,29 @@ pub enum BrokerOpError {
     MissingExecCommand,
     #[error("invalid coordinated operation: {reason}")]
     InvalidCoordinatedOperation { reason: String },
+    /// Session ids are numbered per repository and resolved against the
+    /// broker of the directory the command runs in, so the repository is
+    /// named: "closed" is otherwise indistinguishable from "you meant the
+    /// session with this id in a different repository".
     #[error(
-        "session {session_id} is closed and cannot authorize coordinated operations; start a new session with `aethyme broker start --task <text> --short-name <name>` or adopt an active worktree with `aethyme broker start --adopt --task <text> --short-name <name>`"
+        "session {session_id} of the broker at {repository_root} is closed and cannot authorize coordinated operations; start a new session with `aethyme broker start --task <text> --short-name <name>` or adopt an active worktree with `aethyme broker start --adopt --task <text> --short-name <name>`. Session ids are numbered per repository: if you meant a session of another repository, run the command from that repository's checkout"
     )]
-    ClosedSessionOperation { session_id: i64 },
+    ClosedSessionOperation {
+        session_id: i64,
+        repository_root: String,
+    },
+    /// `--repo` names a repository none of the session worktree's remotes
+    /// identify. The command would otherwise run under, and be journaled
+    /// against, a session of an unrelated repository.
+    #[error(
+        "--repo {requested} does not match session {session_id}'s repository ({session_repositories}, from the remotes of {worktree}). Session ids are numbered per repository and resolved against the broker of the directory you run in: run the command from a checkout of {requested} (`cd <that checkout> && aethyme broker ...`) with a session of that repository's broker"
+    )]
+    SessionRepositoryMismatch {
+        session_id: i64,
+        requested: String,
+        session_repositories: String,
+        worktree: String,
+    },
     /// `broker push` declined before anything was sent: the repository has
     /// not authorized session-branch pushes, the branch is not a session
     /// branch, or the remote holds work this session never pushed.
@@ -4921,7 +4940,10 @@ impl Broker {
     ) -> Result<LeaseClaimReport, BrokerOpError> {
         let session = self.store.session(session_id)?;
         if session.status.is_closed() {
-            return Err(BrokerOpError::ClosedSessionOperation { session_id });
+            return Err(BrokerOpError::ClosedSessionOperation {
+                session_id,
+                repository_root: self.main_root().display().to_string(),
+            });
         }
         let path = normalize_lease_path(path)?;
         self.refresh_leases_including(Some(session_id))?;
