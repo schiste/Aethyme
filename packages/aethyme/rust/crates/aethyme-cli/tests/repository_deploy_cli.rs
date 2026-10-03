@@ -638,3 +638,58 @@ fn oss_ci_enforces_self_contained_repository_deployment() {
     assert!(workflow.contains("deployed policy embeds the target checkout"));
     assert!(!workflow.contains("export AETHYME_ROOT="));
 }
+
+#[test]
+fn deploy_warns_when_core_hooks_path_runs_no_hooks() {
+    let temp = tmp_dir();
+    let repo = repository(temp.path());
+    fs::create_dir_all(repo.join(".husky")).unwrap();
+    fs::write(repo.join(".husky/pre-commit"), "#!/bin/sh\nexit 0\n").unwrap();
+    let configured = Command::new("git")
+        .args(["config", "core.hooksPath", "/nonexistent/old-clone/.husky"])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    assert!(configured.status.success());
+
+    let deployed = command(&repo)
+        .args(["deploy", "--repo"])
+        .arg(&repo)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&deployed.stderr);
+    assert!(
+        deployed.status.success(),
+        "a broken hooksPath warns, it does not fail the deploy: {stderr}"
+    );
+    assert!(
+        stderr
+            .contains("warning: core.hooksPath = \"/nonexistent/old-clone/.husky\" (local config")
+            && stderr.contains("does not exist")
+            && stderr.contains("fix: git config core.hooksPath .husky"),
+        "{stderr}"
+    );
+    let unchanged = Command::new("git")
+        .args(["config", "--get", "core.hooksPath"])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&unchanged.stdout).trim(),
+        "/nonexistent/old-clone/.husky",
+        "deploy must never rewrite the operator's hook routing"
+    );
+}
+
+#[test]
+fn deploy_is_silent_about_hooks_when_core_hooks_path_is_unset() {
+    let temp = tmp_dir();
+    let repo = repository(temp.path());
+    let deployed = command(&repo)
+        .args(["deploy", "--repo"])
+        .arg(&repo)
+        .output()
+        .unwrap();
+    assert!(deployed.status.success());
+    assert!(!String::from_utf8_lossy(&deployed.stderr).contains("core.hooksPath"));
+}
