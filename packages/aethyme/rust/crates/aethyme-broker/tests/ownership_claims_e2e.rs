@@ -145,7 +145,9 @@ fn a_quiet_holders_claim_is_taken_over_and_the_report_names_it() {
         .claim_ownership(t.second, "release v1", "finish v1")
         .unwrap();
 
-    let replaced = report.replaced.expect("the takeover names the claim it replaced");
+    let replaced = report
+        .replaced
+        .expect("the takeover names the claim it replaced");
     assert_eq!(replaced.claim.session_id, t.first);
     assert_eq!(replaced.holder_status, SessionStatus::Stale);
     assert!(!replaced.working);
@@ -232,7 +234,10 @@ fn status_names_the_holder_in_json_and_advice() {
 
     let brief = t.broker.status_brief(now_ms()).unwrap();
     assert!(
-        brief.advice.iter().any(|item| item.id == "ownership.claimed"),
+        brief
+            .advice
+            .iter()
+            .any(|item| item.id == "ownership.claimed"),
         "status --summary shows it too"
     );
 }
