@@ -1058,6 +1058,124 @@ impl BrokerStore {
         Ok(rows)
     }
 
+    /// Open ownership claims whose holder is still a live session, by name.
+    ///
+    /// The same allow-list as [`Self::active_session_scopes`]: a finished
+    /// session's claim is history and stops counting when the session closes,
+    /// without a write on the finish path.
+    pub fn active_ownership_claims(&self) -> Result<Vec<crate::OwnershipClaim>, BrokerError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT c.id, c.name, c.session_id, c.purpose, c.claimed_at,
+                    c.taken_over_from
+               FROM ownership_claims c
+               JOIN sessions ON sessions.id = c.session_id
+              WHERE c.released_at IS NULL
+                AND sessions.status IN ('active', 'idle', 'stale')
+              ORDER BY c.name",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(crate::OwnershipClaim {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    session_id: row.get(2)?,
+                    purpose: row.get(3)?,
+                    claimed_at: row.get(4)?,
+                    taken_over_from: row.get(5)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Record `session_id` as the holder of `name`.
+    ///
+    /// In one transaction: close the open row of a holder that is no longer
+    /// live, or of `replacing` (a takeover the caller already judged safe),
+    /// then insert. A live holder the caller did not name survives the update,
+    /// so the insert hits the one-open-claim index and the claim fails rather
+    /// than silently taking a name someone else just took.
+    pub fn take_ownership_claim(
+        &mut self,
+        name: &str,
+        session_id: i64,
+        purpose: &str,
+        replacing: Option<i64>,
+        at_ms: i64,
+    ) -> Result<bool, BrokerError> {
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "UPDATE ownership_claims
+                SET released_at = ?2,
+                    released_reason = CASE WHEN session_id = ?3 THEN 'taken_over'
+                                           ELSE 'holder_closed' END
+              WHERE name = ?1 AND released_at IS NULL AND session_id != ?4
+                AND (session_id = ?3 OR session_id NOT IN
+                     (SELECT id FROM sessions WHERE status IN ('active', 'idle', 'stale')))",
+            rusqlite::params![name, at_ms, replacing, session_id],
+        )?;
+        let updated = tx.execute(
+            "UPDATE ownership_claims SET purpose = ?3
+              WHERE name = ?1 AND session_id = ?2 AND released_at IS NULL",
+            rusqlite::params![name, session_id, purpose],
+        )?;
+        let inserted = if updated == 0 {
+            match tx.execute(
+                "INSERT INTO ownership_claims
+                     (name, session_id, purpose, claimed_at, taken_over_from)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![name, session_id, purpose, at_ms, replacing],
+            ) {
+                Ok(_) => true,
+                Err(rusqlite::Error::SqliteFailure(error, _))
+                    if error.code == rusqlite::ErrorCode::ConstraintViolation =>
+                {
+                    return Ok(false);
+                }
+                Err(error) => return Err(error.into()),
+            }
+        } else {
+            false
+        };
+        tx.commit()?;
+        Ok(inserted || updated > 0)
+    }
+
+    /// Close `session_id`'s open claim on `name`; false when it held none.
+    pub fn release_ownership_claim(
+        &mut self,
+        name: &str,
+        session_id: i64,
+        at_ms: i64,
+    ) -> Result<bool, BrokerError> {
+        let changed = self.conn.execute(
+            "UPDATE ownership_claims SET released_at = ?3, released_reason = 'released'
+              WHERE name = ?1 AND session_id = ?2 AND released_at IS NULL",
+            rusqlite::params![name, session_id, at_ms],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// The most recent coordinated operation a session ran: when it last
+    /// changed and the reason it was authorized with. "Last activity" for a
+    /// release driver is its last push, merge or tag, which hook-driven
+    /// activity does not always see.
+    pub fn latest_coordinated_operation(
+        &self,
+        session_id: i64,
+    ) -> Result<Option<(i64, Option<String>)>, BrokerError> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT updated_at, authorization_reason FROM coordinated_operations
+                  WHERE session_id = ?1 ORDER BY id DESC LIMIT 1",
+                [session_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        Ok(row)
+    }
+
     pub fn active_leases(&self) -> Result<Vec<Lease>, BrokerError> {
         self.active_leases_at(now_ms())
     }

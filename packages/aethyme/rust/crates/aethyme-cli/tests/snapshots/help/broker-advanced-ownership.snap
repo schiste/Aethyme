@@ -1,0 +1,13 @@
+exit: 0
+--- stdout
+  aethyme broker advanced ownership [list] [--json]
+      List named operations a live session declared it is driving, with each
+      holder's liveness and last coordinated operation.
+  aethyme broker advanced ownership claim <name> --session <id> --reason <text> [--json]
+      Declare this session is driving <name>, e.g. a release.
+      Refused only while another session holds it and is working; a quiet
+      holder's claim is taken over and the report names it. Finishing the
+      session ends the claim.
+  aethyme broker advanced ownership release <name> --session <id> [--json]
+      Release this session's claim on <name>.
+--- stderr

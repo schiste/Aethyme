@@ -1110,6 +1110,21 @@ and `status` say so (`duplicate_work`, `session.duplicate-work`). Decide which
 one continues and finish the others; two agents repairing one PR keep
 conflicting with each other however leases are configured.
 
+Orchestration that touches no particular path, such as cutting a release or
+merging a chain of pull requests, is claimed by name:
+
+```bash
+aethyme broker advanced ownership claim "release v1.2.0" --session <id> --reason "cut and tag v1.2.0"
+```
+
+`status` (including `--summary`) then names the holder, its agent, whether it
+is still working and its last coordinated operation, so a second orchestrator
+sees the release is taken before it merges or tags anything. The claim is
+refused only while the holder is working; a holder that went quiet, for
+example after hitting a usage limit, is taken over and the takeover report
+names it. Finishing the session ends its claims; `ownership release` ends one
+early.
+
 Files that every session regenerates, such as generated manifests, conflict in
 nearly every pair of sessions. List them in `[leases] ignore` (exact paths,
 directory prefixes ending in `/`, or bare file names), or stop committing

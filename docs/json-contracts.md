@@ -78,6 +78,15 @@ usually `aethyme broker unblock <id>` plus any flag an operator must supply.
 present, `blockers` is incomplete, never "nothing blocks". The same report is
 `aethyme broker unblock --json`.
 
+`ownership_claims` (added 2026-10-03) lists the named operations live
+sessions declared they are driving (`aethyme broker advanced ownership claim
+<name>`): `id`, `name`, `session_id`, `purpose`, `claimed_at`,
+`taken_over_from`, `holder_status`, `holder_agent`, `holder_short_name`,
+`last_active_at`, `last_operation_at`, `last_operation_reason` and `working`
+(the holder is active, or ran a coordinated operation within the idle window;
+only then is a competing claim refused). Each claim also appears in `advice`
+as `ownership.claimed`, so `status --summary` shows it.
+
 `cleanup_retention.closed_worktrees` (introduced 2026-09-27) counts closed
 sessions whose checkout is still on disk, which a state-only
 `aethyme broker finish close` leaves behind: `count` (broker-created

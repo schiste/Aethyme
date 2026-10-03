@@ -107,7 +107,9 @@ fn broker_command_capability(args: &[String]) -> repository_upgrade::CommandCapa
         }
         (Some("hooks"), Some("pre-commit")) => CommandCapability::ManagedPreCommit,
         (Some("hooks"), Some("post-commit")) => CommandCapability::SessionContinuation,
-        (Some("leases"), Some("claim" | "release")) => CommandCapability::SessionContinuation,
+        (Some("leases" | "ownership"), Some("claim" | "release")) => {
+            CommandCapability::SessionContinuation
+        }
         (Some("gates"), Some("run" | "pre-push" | "affected" | "semantic")) => {
             CommandCapability::SessionContinuation
         }
@@ -156,7 +158,7 @@ fn broker_command_capability(args: &[String]) -> repository_upgrade::CommandCapa
         (Some("ship"), Some("plan"))
         | (Some("checkpoint"), Some("plan"))
         | (Some("integration"), Some("status" | "reconcile"))
-        | (Some("leases"), _)
+        | (Some("leases" | "ownership"), _)
         | (Some("resources"), Some("plan" | "list"))
         | (Some("gates"), Some("validate"))
         | (Some("report"), Some("capture" | "list" | "show" | "render"))
