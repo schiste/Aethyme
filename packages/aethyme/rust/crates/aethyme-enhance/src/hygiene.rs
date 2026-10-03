@@ -354,6 +354,14 @@ fn parse_subject(subject_line: &str, errors: &mut Vec<String>) -> Option<ParsedS
     })
 }
 
+/// The `Problem:`/`Decision:`/... sections of a whole commit message, parsed
+/// exactly as `repo lint-commit-message` reads them. The subject line is
+/// skipped; a message without sections yields an empty list.
+pub fn commit_message_sections(message: &str) -> Vec<(String, String)> {
+    let lines = crate::util::py_splitlines(message.trim());
+    parse_sections(&lines[1.min(lines.len())..])
+}
+
 /// `_parse_sections`: ordered by first appearance; duplicate headers keep
 /// appending to the earlier bucket; content joined then stripped.
 fn parse_sections(body_lines: &[&str]) -> Vec<(String, String)> {

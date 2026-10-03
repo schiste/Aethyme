@@ -39,7 +39,7 @@ pub(crate) mod gate_trust;
 /// Idle/stale thresholds for activity-derived liveness (issue #9).
 /// Configurable via `.aethyme/config.toml` in a later phase; constants
 /// for now, chosen so an agent "thinking" for a few minutes stays active.
-const IDLE_AFTER_MS: i64 = 10 * 60 * 1000;
+pub(crate) const IDLE_AFTER_MS: i64 = 10 * 60 * 1000;
 const STALE_AFTER_MS: i64 = 2 * 60 * 60 * 1000;
 pub const SESSION_NOTE_MAX_BYTES: usize = 1_000;
 pub const WORKTREE_ROOT_SCHEMA_VERSION: u32 = 1;
@@ -334,6 +334,19 @@ pub enum BrokerOpError {
     },
     #[error("invalid lease path {path:?}: {reason}")]
     InvalidLeasePath { path: String, reason: String },
+    #[error(
+        "session {session_id} cannot claim {name:?}: {} holds it and is working (last active {}); coordinate first: aethyme broker advanced note send --session {session_id} --to-session {} --message \"…\"",
+        crate::ownership::describe_holder(holder),
+        crate::ownership::age_label(crate::clock::epoch_ms().saturating_sub(holder.last_active_at)) + " ago",
+        holder.claim.session_id
+    )]
+    OwnershipClaimHeld {
+        name: String,
+        session_id: i64,
+        holder: Box<crate::OwnershipClaimView>,
+    },
+    #[error("invalid ownership claim {name:?}: {reason}")]
+    InvalidOwnershipClaim { name: String, reason: String },
     #[error("invalid advisory: {reason}")]
     InvalidAdvisory { reason: String },
     #[error("invalid broker note: {reason}")]
@@ -1386,6 +1399,8 @@ pub struct StatusView {
     /// path comparison cannot see until both sides have already edited.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub scope_overlaps: Vec<crate::ScopeOverlap>,
+    /// Named operations a live session declared it is driving (`ownership`).
+    pub ownership_claims: Vec<crate::OwnershipClaimView>,
     pub promoted_conflicts: Vec<PromotedConflict>,
     /// Unresolved coordinated write operations, across every repository.
     /// Separate from `queue`, which is the merge queue.
@@ -6921,6 +6936,10 @@ impl Broker {
             &crate::submit_progress::in_flight_submits(&self.main_root, now_ms),
         ));
         advice.extend(overlap_pair_advice(&pairs));
+        advice.extend(crate::ownership::ownership_claim_advice(
+            &self.ownership_claim_views(&agents, now_ms)?,
+            now_ms,
+        ));
         advice.push(StatusAdvice {
             id: "status.recorded-observations", severity: StatusAdviceSeverity::Notice,
             reason: "summary reads broker records without scanning Git history or retained checkouts",
@@ -7609,6 +7628,13 @@ impl Broker {
         }
         // Several sessions on one PR conflict by construction; name it.
         advice.extend(self.duplicate_work_advice(&agents));
+        // Who is driving a release or another named operation, and whether
+        // they still are: two drivers race each other's merges and tags.
+        let ownership_claims = self.ownership_claim_views(&agents, now_ms)?;
+        advice.extend(crate::ownership::ownership_claim_advice(
+            &ownership_claims,
+            now_ms,
+        ));
         // A worktree stuck mid-merge cannot be classified or submitted.
         advice.extend(crate::overlap_pairs::mid_operation_advice(&agents));
         // The default branch moving under a session: last fetched copy only.
@@ -7664,6 +7690,7 @@ impl Broker {
             overlaps,
             overlap_pairs,
             scope_overlaps,
+            ownership_claims,
             promoted_conflicts,
             coordinated_operations,
             queue,
@@ -12175,7 +12202,7 @@ fn combined_repair_tail(steps: &[VersionRepairStep], stdout: bool) -> Vec<String
     lines
 }
 
-fn shell_quote(value: &str) -> String {
+pub(crate) fn shell_quote(value: &str) -> String {
     if !value.is_empty()
         && value.bytes().all(|byte| {
             byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-' | b':' | b'@')

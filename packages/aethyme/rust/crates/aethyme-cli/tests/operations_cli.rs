@@ -71,6 +71,44 @@ fn coordinated_git_frontend_journals_a_read() {
     assert_eq!(journal.json()["next_before_id"], serde_json::Value::Null);
 }
 
+/// A remote Git refusal names the repository the command would have reached,
+/// read from the remote it targets, so the printed command runs as-is.
+#[test]
+fn a_remote_git_refusal_prints_the_command_with_the_inferred_repository() {
+    let (tmp, session) = repo();
+    git(
+        tmp.path(),
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/acme/widgets.git",
+        ],
+    );
+    let session_arg = session.to_string();
+    let refused = Invoke::new([
+        "broker",
+        "advanced",
+        "git",
+        "--session",
+        &session_arg,
+        "--reason",
+        "release v1",
+        "--",
+        "push",
+        "origin",
+        "main",
+    ])
+    .cwd(tmp.path())
+    .run();
+    refused.expect_code(3);
+    refused.assert_contains("remote Git operation requires --repo owner/name");
+    refused.assert_contains(&format!(
+        "run instead: aethyme broker advanced git --session {session_arg} --repo acme/widgets \
+         --reason 'release v1' -- push origin main"
+    ));
+}
+
 #[test]
 fn github_and_destructive_frontends_fail_before_execution_without_required_scope() {
     let (tmp, session) = repo();
@@ -91,6 +129,12 @@ fn github_and_destructive_frontends_fail_before_execution_without_required_scope
     // Refused before execution: exit 3, distinct from an unclassified failure (P0.6).
     missing_repo.expect_code(3);
     missing_repo.assert_contains("broker gh requires --repo owner/name");
+    // The refusal prints the command that would pass; this fixture has no
+    // `origin`, so the repository stays a placeholder rather than a guess.
+    missing_repo.assert_contains(&format!(
+        "run instead: aethyme broker advanced gh --session {session_arg} --repo <owner/name> \
+         -- pr view 1"
+    ));
 
     let destructive = Invoke::new([
         "broker",
@@ -107,6 +151,10 @@ fn github_and_destructive_frontends_fail_before_execution_without_required_scope
     .run();
     destructive.expect_code(3);
     destructive.assert_contains("requires --destructive");
+    destructive.assert_contains(&format!(
+        "run instead: aethyme broker advanced git --session {session_arg} --destructive \
+         --reason '<authorization>' -- branch -D main"
+    ));
 
     let missing_reason = Invoke::new([
         "broker",

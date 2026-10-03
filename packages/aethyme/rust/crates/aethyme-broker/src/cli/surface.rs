@@ -78,6 +78,10 @@ pub const ADVANCED_VERBS: &[(&str, &str)] = &[
         "leases",
         "inspect, claim, plan, export or release path ownership",
     ),
+    (
+        "ownership",
+        "claim, list or release a named operation such as a release",
+    ),
     ("git", "run Git through the durable operation coordinator"),
     ("gh", "run GitHub CLI through the same coordinator"),
     (

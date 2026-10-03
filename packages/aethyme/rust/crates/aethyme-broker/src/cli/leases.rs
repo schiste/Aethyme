@@ -646,3 +646,91 @@ pub(super) fn run_note(parsed: Parsed) -> Result<(), UsageError> {
     }
     Ok(())
 }
+
+/// `broker ownership`: named operations a session declared it is driving.
+pub(super) fn run_ownership(parsed: Parsed) -> Result<(), UsageError> {
+    let mut broker = open_broker(parsed.read_only_snapshot)?;
+    let name = || {
+        parsed
+            .positional
+            .get(1)
+            .ok_or_else(|| UsageError::Message("ownership claim/release requires a name".into()))
+    };
+    let session = |verb: &str| {
+        parsed
+            .session
+            .ok_or_else(|| UsageError::Message(format!("ownership {verb} requires --session <id>")))
+    };
+    match parsed.positional.first().map(String::as_str) {
+        None | Some("list") => {
+            let claims = broker.ownership_claims()?;
+            if parsed.json {
+                out!("{}", serde_json::to_string_pretty(&claims)?);
+            } else if claims.is_empty() {
+                out!("No ownership claims.");
+            } else {
+                let now = now_ms();
+                for view in &claims {
+                    out!(
+                        "{:?} held by {} — {}, last active {} ago",
+                        view.claim.name,
+                        crate::ownership::describe_holder(view),
+                        if view.working {
+                            "working".to_string()
+                        } else {
+                            view.holder_status.as_str().to_string()
+                        },
+                        crate::ownership::age_label(now - view.last_active_at)
+                    );
+                    out!("  purpose: {}", view.claim.purpose);
+                    if let Some(reason) = view.last_operation_reason.as_deref() {
+                        out!("  last coordinated operation: {reason}");
+                    }
+                }
+            }
+        }
+        Some("claim") => {
+            let name = name()?;
+            let session = session("claim")?;
+            let purpose = parsed.reason.as_deref().ok_or_else(|| {
+                UsageError::Message("ownership claim requires --reason <what it is for>".into())
+            })?;
+            let report = broker.claim_ownership(session, name, purpose)?;
+            if parsed.json {
+                out!("{}", serde_json::to_string_pretty(&report)?);
+            } else if report.already_held {
+                out!(
+                    "Session {session} already holds {:?}; purpose updated.",
+                    report.name
+                );
+            } else {
+                out!("Session {session} claimed {:?}.", report.name);
+                if let Some(previous) = &report.replaced {
+                    out!(
+                        "  took over from {} ({}, last active {} ago): {}",
+                        crate::ownership::describe_holder(previous),
+                        previous.holder_status.as_str(),
+                        crate::ownership::age_label(now_ms() - previous.last_active_at),
+                        previous.claim.purpose
+                    );
+                }
+            }
+        }
+        Some("release") => {
+            let name = name()?;
+            let session = session("release")?;
+            broker.release_ownership(session, name)?;
+            if parsed.json {
+                out!("{{\"released\":{}}}", serde_json::to_string(name.trim())?);
+            } else {
+                out!("Session {session} released {:?}.", name.trim());
+            }
+        }
+        Some(other) => {
+            return Err(UsageError::Message(format!(
+                "unknown ownership action {other:?} — expected list, claim, or release"
+            )));
+        }
+    }
+    Ok(())
+}

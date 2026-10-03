@@ -77,6 +77,8 @@ pub fn for_broker_error(error: &BrokerOpError) -> u8 {
         | E::NestedWorktreePath { .. }
         | E::RepositoryContract { .. }
         | E::LeaseClaimConflict { .. }
+        | E::OwnershipClaimHeld { .. }
+        | E::InvalidOwnershipClaim { .. }
         | E::InvalidLeasePath { .. }
         | E::OwnershipViolation { .. }
         | E::InvalidCoordinatedOperation { .. }

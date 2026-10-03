@@ -146,6 +146,7 @@
   ],
   "overlap_pairs": [],
   "overlaps": [],
+  "ownership_claims": [],
   "phase_timings_ms": {
     "build_total": "integer",
     "command_total": "integer",
