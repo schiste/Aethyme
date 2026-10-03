@@ -73,7 +73,9 @@ pub fn run(args: &[String]) -> u8 {
         return if options.action == Action::Verify {
             verify_local_repository(&repo)
         } else {
-            deploy_local_repository(&repo, options.force)
+            let deployed = deploy_local_repository(&repo, options.force);
+            warn_broken_hooks_path(&repo);
+            deployed
         };
     }
     if options.action == Action::Verify {
@@ -131,7 +133,19 @@ pub fn run(args: &[String]) -> u8 {
         print_artifact_ownership();
         print_readiness(&repo);
     }
+    warn_broken_hooks_path(&repo);
     verified
+}
+
+/// Warn, never repair: a `core.hooksPath` naming a missing or hook-less
+/// directory makes git skip every hook, including the gates this
+/// deployment just enrolled, and nothing else reports it.
+fn warn_broken_hooks_path(repo: &Path) {
+    if let Some(finding) = aethyme_broker::hooks::inspect_hooks_path(repo) {
+        eprintln!("warning: {}", finding.message());
+        eprintln!("  resolved: {}", finding.resolved);
+        eprintln!("  fix: {}", finding.fix);
+    }
 }
 
 fn verify_repository(repo: &Path) -> u8 {
