@@ -659,6 +659,25 @@ pub(super) fn run_reclaim(parsed: Parsed) -> Result<(), UsageError> {
         .map(|session| std::path::PathBuf::from(session.worktree_path))
         .collect();
     crate::reclaim::protect_unrecorded_worktrees(&mut candidates, &recorded);
+    // Session state cannot see a dev server or a build started from a plain
+    // shell, nor someone working without the hook; both keep using the build
+    // output a quiet session's row would release. Checked at plan and again
+    // at apply, so a worktree that came back into use in between keeps it.
+    match crate::reclaim::open_paths_under(&root) {
+        Some(open_paths) => {
+            crate::reclaim::protect_worktrees_with_open_files(&mut candidates, &open_paths);
+        }
+        None => eprintln!(
+            "Warning: could not list open files (`lsof` unavailable or empty), so a build or \
+             dev server running in a quiet session's worktree is not detected; session activity \
+             and recent Git index changes still protect build output in use."
+        ),
+    }
+    crate::reclaim::protect_recently_worked_worktrees(
+        &mut candidates,
+        now,
+        crate::reclaim::RECENT_WORK_WINDOW_MS,
+    );
     let session_flag = parsed
         .session
         .map(|id| format!(" --session {id}"))
