@@ -4,6 +4,33 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.15] - 2026-10-03
+
+Faster broker commands, visible submit progress, local throughput reports, and more reliable code graphs.
+
+### Added
+
+- `broker advanced insights` reports the session funnel, recorded active time alongside elapsed time, PR lifetimes, gate reliability and coordination counts, without identifying people. JSON output is versioned; percentiles require at least five samples (#487).
+- `broker submit` reports its phase, wait position, owner-lock holder and last progress on stderr. `broker status` exposes in-flight submits and warns about dead processes or five minutes without progress (#491).
+- `aethyme init` drafts `.aethyme/prepare.toml` for supported Node and uv projects without executing or overwriting it. Shared preparation caches can have a size budget; `gates doctor` detects fixed ports and shared resource names (#461).
+- JavaScript files are indexed and Rust calls produce caller/callee edges, including `crate::` calls. Graph navigation accepts `--repo`, and `--json`/`--json-output` are interchangeable (#459).
+
+### Changed
+
+- Opening the broker spends at most 250 ms on artifact cleanup. Interrupted passes resume at most once every ten minutes; `broker finish` and the new `broker gc sweep` perform larger sweeps. Remembered paths must stay inside the worktree, contain no parent traversal or symlinks, and name an allowed build artifact (#490).
+- Overlap refresh classifies each participating session once, skips inactive sessions in routine refreshes while retaining their leases, and defers unfinished pair classification after a ten-second budget checked between operations. Submit still checks its overlaps with inactive holders (#492).
+- Lease claims inform rather than block; only an explicitly leased path held by a session actively doing work can refuse a claim (#489).
+- Cleanup representation reads batch Git object queries instead of forking once per path, while preserving comparisons of files, trees and submodule pointers (#467).
+- Graph freshness compares recorded commits with HEAD instead of file timestamps. The derived graph-store schema advances to 9 for line-qualified node IDs, so older stores need rebuilding. Unknown flags and missing targets are reported as errors; usage errors exit 2 and an unhealthy text-mode `graph status` exits 1 (#459).
+
+### Fixed
+
+- Failed broker command events retain a redacted error message so diagnostics explain the failure without exposing secrets (#488).
+- Partly deleted build caches no longer gain another idle-protection period, and emptied `.pnpm-store` directories are removed (#490).
+- Insights per-gate percentiles use the complete sample set; negative clock deltas are clamped consistently, and long idle periods are not counted as active work (#487).
+- Deleted source fragments are pruned within the graph directory only; same-named symbols on different lines retain distinct projected IDs. `graph impact` works with read-only broker snapshots (#459).
+- Preparation cache rotation leaves the current run's cache available; Docker image tags and unrelated environment variables are no longer reported as fixed ports (#461).
+
 ## [0.8.14] - 2026-10-01
 
 Fresher coordination notes, quieter verify-only status, faster per-session reclaim.
