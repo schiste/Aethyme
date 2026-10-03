@@ -2489,6 +2489,18 @@ posture first; it names the exact next command.
 - `aethyme repo deploy-skills /path/to/repo --force`
 - `aethyme repo engine-info --json-output`
 - `aethyme repo engine-info --check`
+- `aethyme repo branches audit /path/to/repo --json-output`
+
+`repo branches audit` is read-only. It classifies every local branch against
+the remote: `on-remote` (same tip as a remote branch, from `git ls-remote`),
+`contained` (an ancestor of a remote tip), `merged-via-pr` (every unpushed
+commit is patch-equivalent to the default branch or to a merged PR's head, or
+the branch's whole diff matches the PR's squash commit; PRs are looked up with
+`gh` for GitHub remotes unless `--no-gh`), or `local-only`, listing the commits
+that match nothing. It also lists worktrees with their dirty-path counts and
+marks protected branches: the default branch, `aethyme/integration`, and any
+branch checked out in a worktree. Remote tips whose objects are not local
+cannot prove containment, and the report says how many there are.
 
 `repo compile-skills` generates repo-specific skills, currently
 `repo-onboarding`, into `.aethyme/generated/` plus per-product skill paths.
