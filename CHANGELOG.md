@@ -4,6 +4,29 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.16] - 2026-10-03
+
+Prompt status, earlier warnings about disk, hooks and leftover integration work, safer coordinated operations, and tools for landing and auditing work.
+
+### Added
+
+- `aethyme repo branches audit` classifies every local branch as on the remote, contained in a remote branch, merged through a pull request (by patch equivalence, even when SHAs differ) or local-only, lists the commits that exist only locally, and inventories worktrees. It is read-only: remote state comes from `git ls-remote` and no refs move (#502).
+- `broker advanced ownership claim|release|list` names who is driving work that has no file path, such as a release. `broker status` lists active claims with the holder's last coordinated operation; a claim is refused only while another session holding it is working (#507).
+- `broker advanced merge-chain` lands pull requests in order: it marks drafts ready, updates branches, waits for the latest run of every check on the exact head, merges with `--match-head-commit`, and requires the base branch's runs on the merge commit to succeed before continuing. It stops with a next action on the first failure and resumes by skipping merged pull requests (#508).
+- `broker push --pr` fills the repository's pull request template from the commits' Problem, Decision, Rationale and Validation sections, and notes when the repository's CI skips draft pull requests (#506).
+
+### Changed
+
+- Routine `broker status` reports recorded observations and names the checks it did not inspect instead of scanning dirty worktrees and cleanup history; `--summary` reads only the ledger and `--refresh` keeps the full audit. JSON exposes freshness, incomplete inventory and phase timings (#500).
+- `broker status` warns with `host.disk-low` below twice the gate headroom threshold and points to `gc reclaim plan`. Reclaim keeps build output in worktrees that have open files or a git index changed in the last three hours (#504).
+- `broker status` reports `integration.leftover-work` in verify-only repositories when the integration branch holds commits the published branch lacks, with `broker advanced integration reconcile --dry-run` as the next action (#503).
+- `aethyme doctor` reports a `core.hooksPath` that makes git skip every hook (missing, not a directory, or without executable hooks while the repository ships a hooks directory), and `aethyme deploy` warns about it. Neither changes git configuration (#505).
+
+### Fixed
+
+- Coordinated `git` and `gh` operations refuse a `--repo` that is not one of the session worktree's remotes. Session ids are numbered per repository, so an id resolved in another checkout no longer authorizes an operation there. Success output names the session worktree (#501).
+- Refusals for a missing `--destructive` or `--repo` print the corrected command (#506).
+
 ## [0.8.15] - 2026-10-03
 
 Faster broker commands, visible submit progress, local throughput reports, and more reliable code graphs.
