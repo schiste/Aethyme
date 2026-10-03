@@ -360,10 +360,29 @@ pub enum BrokerOpError {
     MissingExecCommand,
     #[error("invalid coordinated operation: {reason}")]
     InvalidCoordinatedOperation { reason: String },
+    /// Session ids are numbered per repository and resolved against the
+    /// broker of the directory the command runs in, so the repository is
+    /// named: "closed" is otherwise indistinguishable from "you meant the
+    /// session with this id in a different repository".
     #[error(
-        "session {session_id} is closed and cannot authorize coordinated operations; start a new session with `aethyme broker start --task <text> --short-name <name>` or adopt an active worktree with `aethyme broker start --adopt --task <text> --short-name <name>`"
+        "session {session_id} of the broker at {repository_root} is closed and cannot authorize coordinated operations; start a new session with `aethyme broker start --task <text> --short-name <name>` or adopt an active worktree with `aethyme broker start --adopt --task <text> --short-name <name>`. Session ids are numbered per repository: if you meant a session of another repository, run the command from that repository's checkout"
     )]
-    ClosedSessionOperation { session_id: i64 },
+    ClosedSessionOperation {
+        session_id: i64,
+        repository_root: String,
+    },
+    /// `--repo` names a repository none of the session worktree's remotes
+    /// identify. The command would otherwise run under, and be journaled
+    /// against, a session of an unrelated repository.
+    #[error(
+        "--repo {requested} does not match session {session_id}'s repository ({session_repositories}, from the remotes of {worktree}). Session ids are numbered per repository and resolved against the broker of the directory you run in: run the command from a checkout of {requested} (`cd <that checkout> && aethyme broker ...`) with a session of that repository's broker"
+    )]
+    SessionRepositoryMismatch {
+        session_id: i64,
+        requested: String,
+        session_repositories: String,
+        worktree: String,
+    },
     /// `broker push` declined before anything was sent: the repository has
     /// not authorized session-branch pushes, the branch is not a session
     /// branch, or the remote holds work this session never pushed.
@@ -969,6 +988,11 @@ pub struct DoctorReport {
     /// failure can be explained after its terminal is gone.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub recent_command_failures: Vec<RecentCommandFailure>,
+    /// A `core.hooksPath` that makes git skip every hook. Reported, never
+    /// counted against [`Self::healthy`], and never repaired: hook routing
+    /// is the operator's git config.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hooks_path: Option<crate::hooks::HooksPathFinding>,
 }
 
 /// One `broker.command.failed` event as `doctor` reports it.
@@ -2499,6 +2523,75 @@ pub struct StatusAdvice {
     pub queue_entry_id: Option<i64>,
     pub evidence: Vec<String>,
     pub commands: Vec<String>,
+}
+
+/// Work a verify-only repository's integration branch carries that the
+/// published branch lacks.
+///
+/// Nothing moves integration in verify-only mode, so no session owns such
+/// commits: they are left over from when the repository promoted. Before this
+/// row they surfaced only after a pull-request merge, as a deferred post-merge
+/// cleanup demanding reviewed reconciliation, and the `integration.*` rows above
+/// are gated to promoting repositories and to `--refresh`. The check is one
+/// ancestry test (plus a count when it fails), so it runs on every status;
+/// the patch-level classification is added only when a refreshed status has
+/// already computed it.
+fn leftover_integration_advice(
+    repo: &GitRepo,
+    integration_head: &str,
+    (baseline_ref, baseline_head): (&str, &str),
+    assessment: Option<&crate::IntegrationDriftAssessment>,
+) -> Result<Option<StatusAdvice>, BrokerOpError> {
+    // `HEAD` means no `origin/HEAD` names a published branch; measuring
+    // against the checkout would call every unpublished commit leftover.
+    let tracked;
+    let (baseline_ref, baseline_head) = if baseline_ref == "HEAD" {
+        let Some(upstream) = repo.tracking_upstream() else {
+            return Ok(None);
+        };
+        tracked = upstream;
+        (tracked.0.as_str(), tracked.1.as_str())
+    } else {
+        (baseline_ref, baseline_head)
+    };
+    if integration_head == baseline_head || repo.is_ancestor(integration_head, baseline_head) {
+        return Ok(None);
+    }
+    let count = repo.commit_count_between(baseline_head, integration_head)?;
+    let upstream = baseline_ref
+        .strip_prefix("refs/remotes/")
+        .or_else(|| baseline_ref.strip_prefix("refs/heads/"))
+        .unwrap_or(baseline_ref);
+    let stale_only = assessment.filter(|assessment| assessment.stale_only);
+    let mut summary = format!(
+        "integration carries {count} {} {upstream} lacks; this repository is verify-only, so no \
+         session owns {} and the next pull-request merge will defer integration cleanup",
+        plural_word(count as usize, "commit", "commits"),
+        if count == 1 { "it" } else { "them" }
+    );
+    if let Some(assessment) = assessment {
+        summary.push_str("; ");
+        summary.push_str(&assessment.explanation);
+    }
+    Ok(Some(StatusAdvice {
+        id: "integration.leftover-work",
+        severity: if stale_only.is_some() {
+            StatusAdviceSeverity::Notice
+        } else {
+            StatusAdviceSeverity::Warning
+        },
+        reason: "a verify-only integration branch holds commits the published branch lacks",
+        summary,
+        session_id: None,
+        queue_entry_id: None,
+        evidence: vec![
+            format!("integration: {}", short_commit(integration_head)),
+            format!("{upstream}: {}", short_commit(baseline_head)),
+        ],
+        commands: vec![format!(
+            "aethyme broker advanced integration reconcile --upstream {upstream} --dry-run"
+        )],
+    }))
 }
 
 /// One warning per submit that is gone or has made no progress for
@@ -4852,7 +4945,10 @@ impl Broker {
     ) -> Result<LeaseClaimReport, BrokerOpError> {
         let session = self.store.session(session_id)?;
         if session.status.is_closed() {
-            return Err(BrokerOpError::ClosedSessionOperation { session_id });
+            return Err(BrokerOpError::ClosedSessionOperation {
+                session_id,
+                repository_root: self.main_root().display().to_string(),
+            });
         }
         let path = normalize_lease_path(path)?;
         self.refresh_leases_including(Some(session_id))?;
@@ -7112,6 +7208,16 @@ impl Broker {
                 },
                 );
         }
+        if !promotes
+            && let Some(row) = leftover_integration_advice(
+                &self.repo,
+                &integration_head,
+                (&baseline_ref, &baseline_head),
+                integration_reconciliation.as_ref(),
+            )?
+        {
+            advice.insert(0, row);
+        }
         // "Never passed through submit" is every commit under verify-only,
         // where landing goes through pull requests and integration stays put.
         if let Some((branch, commits)) = promotes
@@ -8254,6 +8360,7 @@ impl Broker {
             self.integration_movement_notice_from_sessions(&live_sessions)?;
         let unpushed_work = self.unpushed_work(now_ms()).unwrap_or_default();
         let recent_command_failures = self.recent_command_failures(now_ms())?;
+        let hooks_path = crate::hooks::inspect_hooks_path(&self.main_root);
 
         Ok(DoctorReport {
             integrity,
@@ -8266,6 +8373,7 @@ impl Broker {
             integration_movement,
             unpushed_work,
             recent_command_failures,
+            hooks_path,
         })
     }
 
@@ -12935,6 +13043,7 @@ mod tests {
             integration_movement: None,
             unpushed_work: Default::default(),
             recent_command_failures: Vec::new(),
+            hooks_path: None,
         }
     }
 
