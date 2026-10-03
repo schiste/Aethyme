@@ -424,3 +424,18 @@ When a cross-process consumer references a deleted entry point:
 
 Class-3 failures are why this registry exists. Static analysis can't
 help; only manual audit of every consumer can.
+
+
+### Broker status reporting
+
+`broker status --refresh` explicitly requests fresh lease derivation, dirty
+worktree inspection, Git conflict/history checks and cleanup eligibility.
+Routine `broker status` and `--summary` report recorded observations instead.
+Consumers must check `deferred_checks`, `leases_refreshed` and
+`leases_refreshed_at_ms` before interpreting zero counts as an absence of work.
+`integration_relation: not_checked` and empty ref heads in summary mean unknown,
+not synchronized. `cleanup_retention.eligibility_checked` is false on routine
+status; its inventory can be incomplete, declared by `inventory_complete` and
+`inventory_deferred_sessions`. `phase_timings_ms` contains measured phase costs
+and `command_total` including broker opening. See the status section in
+`../guides/broker-workflows.md`. Neither reporting mode authorizes deletion.

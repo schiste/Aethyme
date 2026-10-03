@@ -2170,3 +2170,21 @@ fn routine_status_never_authorizes_cleanup_of_a_dirty_closed_checkout() {
     );
     assert!(checkout.join("keep.txt").exists());
 }
+
+#[test]
+fn summary_snapshot_does_not_persist_liveness_transitions() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let session = broker.adopt(tmp.path(), Some("snapshot status")).unwrap();
+    let snapshot = Broker::open_snapshot(tmp.path()).unwrap();
+    let report = snapshot
+        .status_brief_snapshot(now_ms() + 3 * 60 * 60 * 1000)
+        .unwrap();
+    assert_eq!(report.summary.stale_sessions, 1);
+    assert_eq!(
+        broker.store().session(session.id).unwrap().status,
+        SessionStatus::Active
+    );
+    assert!(!report.leases_refreshed);
+}

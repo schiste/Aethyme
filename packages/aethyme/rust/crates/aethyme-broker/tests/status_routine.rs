@@ -55,6 +55,13 @@ fn cli_routine_and_explicit_audit_have_distinct_freshness_contracts() {
     let repo = fixture();
     let routine = status(repo.path(), &["status", "--json"]);
     assert_eq!(routine["leases_refreshed"], false);
+    assert_eq!(routine["summary"]["integration_relation"], "not_checked");
+    assert!(
+        !routine["summary"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("diverged")
+    );
     assert_eq!(routine["cleanup_retention"]["eligibility_checked"], false);
     assert!(
         routine["deferred_checks"]
@@ -88,7 +95,7 @@ fn cli_rejects_summary_with_refresh_and_refresh_on_another_command() {
     let repo = fixture();
     for args in [
         vec!["status", "--summary", "--refresh"],
-        vec!["events", "--refresh"],
+        vec!["advanced", "events", "--refresh"],
     ] {
         let output = common::broker_cli(CLI, &args)
             .current_dir(repo.path())

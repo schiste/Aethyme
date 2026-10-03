@@ -6740,7 +6740,9 @@ impl Broker {
     /// views, promoted/unmerged conflicts, the merge queue, and the
     /// integration branch head.
     pub fn status(&mut self, now_ms: i64) -> Result<StatusView, BrokerOpError> {
+        let started = std::time::Instant::now();
         let overlaps = self.refresh_leases()?;
+        let leases_ms = started.elapsed().as_millis() as u64;
         let agents = self.agents(now_ms)?;
         let integration = self.integration_head()?;
         let mut view = self.build_status(agents, overlaps, integration, now_ms, true)?;
@@ -6749,6 +6751,10 @@ impl Broker {
             crate::AdvisoryDeliverySurface::Status,
         )?;
         view.advisory_delivery = self.store.advisory_delivery_summary()?;
+        view.phase_timings_ms
+            .insert("lease_refresh".into(), leases_ms);
+        view.phase_timings_ms
+            .insert("total".into(), started.elapsed().as_millis() as u64);
         Ok(view)
     }
 
@@ -6810,7 +6816,7 @@ impl Broker {
         );
         let ids = agents.iter().map(|a| a.session.id).collect::<Vec<_>>();
         let latest = self.store.latest_merge_queue_for_sessions(&ids)?;
-        let mut advice = self.status_advice(&agents, &[], &latest, "", "", promotes, false);
+        let mut advice = self.status_advice(&agents, &[], &latest, ("", ""), promotes, false);
         let blockers = self.blockers();
         if let Some(item) = crate::blockers::status_advice(&blockers.blockers) {
             advice.push(item);
@@ -6859,7 +6865,20 @@ impl Broker {
         let overlaps = self.lease_overlaps_snapshot()?;
         let agents = self.agents_snapshot(now_ms)?;
         let integration = self.integration_head_snapshot()?;
-        self.build_status(agents, overlaps, integration, now_ms, false)
+        let mut view = self.build_status(agents, overlaps, integration, now_ms, true)?;
+        view.leases_refreshed = false;
+        Ok(view)
+    }
+
+    /// Routine, read-only variant for degraded CLI reporting.
+    pub fn status_current_snapshot(&self, now_ms: i64) -> Result<StatusView, BrokerOpError> {
+        self.build_status(
+            self.agents_snapshot(now_ms)?,
+            self.lease_overlaps_snapshot()?,
+            self.integration_head_snapshot()?,
+            now_ms,
+            false,
+        )
     }
 
     /// Routine reporting uses persisted leases and recorded sizes. It never
@@ -6934,20 +6953,19 @@ impl Broker {
         // "what would publishing add to the default branch", which is the only
         // reading anyone acts on.
         let (baseline_ref, baseline_head) = self.publication_baseline()?;
-        let (integration_relation, integration_ahead_main_commits) =
-            if integration_head == baseline_head {
-                (StatusIntegrationRelation::CurrentWithMain, 0)
-            } else if !refresh {
-                (StatusIntegrationRelation::NotChecked, 0)
-            } else if self.repo.is_ancestor(&baseline_head, &integration_head) {
-                (
-                    StatusIntegrationRelation::AheadOfMain,
-                    self.repo
-                        .commit_count_between(&baseline_head, &integration_head)?,
-                )
-            } else {
-                (StatusIntegrationRelation::DivergedFromMain, 0)
-            };
+        let (integration_relation, integration_ahead_main_commits) = if !refresh {
+            (StatusIntegrationRelation::NotChecked, 0)
+        } else if integration_head == baseline_head {
+            (StatusIntegrationRelation::CurrentWithMain, 0)
+        } else if self.repo.is_ancestor(&baseline_head, &integration_head) {
+            (
+                StatusIntegrationRelation::AheadOfMain,
+                self.repo
+                    .commit_count_between(&baseline_head, &integration_head)?,
+            )
+        } else {
+            (StatusIntegrationRelation::DivergedFromMain, 0)
+        };
         let dirty_sessions = if refresh {
             dirty_session_count(&agents)
         } else {
@@ -6989,8 +7007,7 @@ impl Broker {
             &agents,
             &promoted_conflicts,
             &latest_live_queue,
-            &integration_branch,
-            &integration_head,
+            (&integration_branch, &integration_head),
             promotes,
             refresh,
         );
@@ -8005,12 +8022,12 @@ impl Broker {
         agents: &[AgentView],
         promoted_conflicts: &[PromotedConflict],
         queue: &[MergeQueueEntry],
-        integration_branch: &str,
-        integration_head: &str,
+        integration: (&str, &str),
         promotes: bool,
         inspect_worktrees: bool,
     ) -> Vec<StatusAdvice> {
         use std::collections::BTreeMap;
+        let (integration_branch, integration_head) = integration;
 
         let mut advice = Vec::new();
         let mut latest_queue_by_session = BTreeMap::new();
@@ -10258,7 +10275,7 @@ impl Broker {
                 continue;
             }
             let path = Path::new(&session.worktree_path);
-            if !self.is_broker_owned_worktree(&session, path) {
+            if !self.is_broker_owned_worktree(session, path) {
                 continue;
             }
             let present = path.exists();
@@ -11403,7 +11420,10 @@ fn integration_summary_phrase(integration: &SummaryIntegration) -> String {
         ),
         StatusIntegrationRelation::DivergedFromMain => format!("{branch} diverged from {label}"),
     };
-    if integration.baseline_ref != "HEAD" && integration.main_head != integration.baseline_head {
+    if integration.relation != StatusIntegrationRelation::NotChecked
+        && integration.baseline_ref != "HEAD"
+        && integration.main_head != integration.baseline_head
+    {
         let local = if integration.main_head == integration.head {
             "local checkout matches integration".to_string()
         } else if integration.main_is_ancestor {
@@ -12669,7 +12689,9 @@ mod tests {
         );
 
         let mut retention = super::CleanupRetention {
-            eligibility_checked: true, inventory_complete: true, inventory_deferred_sessions: 0,
+            eligibility_checked: true,
+            inventory_complete: true,
+            inventory_deferred_sessions: 0,
             closed_worktrees: Default::default(),
             reconciliation: crate::WorktreeReconciliation {
                 schema_version: crate::WORKTREE_RECONCILIATION_SCHEMA_VERSION,

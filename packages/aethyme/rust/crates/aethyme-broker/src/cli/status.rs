@@ -93,6 +93,9 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
             broker.status_brief(now_ms())?
         };
         brief.phase_timings_ms.insert("open".into(), open_ms);
+        brief
+            .phase_timings_ms
+            .insert("command_total".into(), opened.elapsed().as_millis() as u64);
         if parsed.json {
             out!("{}", serde_json::to_string_pretty(&brief)?);
         } else {
@@ -102,13 +105,16 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
         return Ok(());
     }
     let mut status = if parsed.read_only_snapshot {
-        broker.status_snapshot(now_ms())?
+        broker.status_current_snapshot(now_ms())?
     } else if parsed.refresh {
         broker.status(now_ms())?
     } else {
         broker.status_current(now_ms())?
     };
     status.phase_timings_ms.insert("open".into(), open_ms);
+    status
+        .phase_timings_ms
+        .insert("command_total".into(), opened.elapsed().as_millis() as u64);
     if parsed.json {
         out!("{}", serde_json::to_string_pretty(&status)?);
     } else {

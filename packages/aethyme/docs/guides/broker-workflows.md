@@ -1189,7 +1189,7 @@ aethyme broker finish cleanup --all-cleaned --apply
 The plan lists each retained spawned worktree, its eligibility, and estimated
 bytes. Apply revalidates every candidate and never force-removes adopted
 worktrees, dirty paths, symlinked paths, or commits not represented by main,
-integration, or the configured upstream. `broker status` warns when eligible
+integration, or the configured upstream. `broker status --refresh` warns when eligible
 cleaned worktrees remain. Use `--json` for the stable plan or sweep report.
 
 Treat `broker status` as the bounded present-state dashboard, not as an audit
@@ -1202,7 +1202,7 @@ aethyme broker advanced queue history --limit 50 --json
 aethyme broker advanced queue history --limit 50 --before <next-before-id> --json
 ```
 
-Status also grades retained cleanup cost using worktree and branch counts,
+Refreshed status also grades retained cleanup cost using worktree and branch counts,
 estimated bytes, and oldest closed-session age against the declared retention
 policy. A warning means at least one threshold has been crossed; review the
 dry-run cleanup or GC plan before authorizing reclamation.
