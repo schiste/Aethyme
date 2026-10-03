@@ -207,6 +207,11 @@ impl Fixture {
             "land the queue this test is about",
             "--poll-seconds",
             "0",
+            // A regression must fail fast, not spin for the hour-long default.
+            "--checks-timeout",
+            "10",
+            "--main-timeout",
+            "10",
         ];
         args.extend_from_slice(extra);
         self.run(&args)
@@ -253,14 +258,16 @@ fn a_draft_behind_its_base_is_readied_updated_verified_and_merged() {
     fixture.script(
         "checks-bbb",
         2,
+        // Newest first, as the provider lists them: the superseded run comes
+        // after the one that replaced it.
         &checks(&[
+            ("lint", "completed", Some("success"), "2026-10-03T10:05:00Z"),
             (
                 "lint",
                 "completed",
                 Some("cancelled"),
                 "2026-10-03T10:00:00Z",
             ),
-            ("lint", "completed", Some("success"), "2026-10-03T10:05:00Z"),
         ]),
     );
     fixture.script(

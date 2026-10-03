@@ -918,40 +918,30 @@ impl ChainReader for GhChainReader {
 mod tests {
     use super::*;
 
-    fn run(name: &str, status: &str, conclusion: Option<&str>, at: &str, id: u64) -> RunState {
+    fn run(name: &str, conclusion: Option<&str>, at: &str, id: u64) -> RunState {
         RunState {
             name: name.into(),
-            status: status.into(),
+            status: if conclusion.is_some() {
+                "completed"
+            } else {
+                "in_progress"
+            }
+            .into(),
             conclusion: conclusion.map(str::to_string),
             started_at: at.into(),
             id,
         }
     }
 
+    // Fixtures list runs newest first, as the provider does, so "the last
+    // one listed wins" cannot pass for "the newest one wins".
+
     #[test]
     fn a_superseded_cancelled_run_does_not_fail_the_commit() {
         let runs = [
-            run(
-                "lint",
-                "completed",
-                Some("cancelled"),
-                "2026-10-03T15:10:13Z",
-                1,
-            ),
-            run(
-                "lint",
-                "completed",
-                Some("success"),
-                "2026-10-03T15:10:20Z",
-                2,
-            ),
-            run(
-                "tests",
-                "completed",
-                Some("success"),
-                "2026-10-03T15:10:19Z",
-                3,
-            ),
+            run("lint", Some("success"), "2026-10-03T15:10:20Z", 2),
+            run("tests", Some("success"), "2026-10-03T15:10:19Z", 3),
+            run("lint", Some("cancelled"), "2026-10-03T15:10:13Z", 1),
         ];
         assert_eq!(
             run_verdict(&runs),
@@ -964,20 +954,8 @@ mod tests {
     #[test]
     fn the_newest_run_decides_even_when_an_older_one_passed() {
         let runs = [
-            run(
-                "lint",
-                "completed",
-                Some("success"),
-                "2026-10-03T15:00:00Z",
-                1,
-            ),
-            run(
-                "lint",
-                "completed",
-                Some("failure"),
-                "2026-10-03T15:10:00Z",
-                2,
-            ),
+            run("lint", Some("failure"), "2026-10-03T15:10:00Z", 2),
+            run("lint", Some("success"), "2026-10-03T15:00:00Z", 1),
         ];
         assert_eq!(
             run_verdict(&runs),
@@ -990,14 +968,8 @@ mod tests {
     #[test]
     fn a_pending_newest_run_keeps_the_commit_pending() {
         let runs = [
-            run(
-                "lint",
-                "completed",
-                Some("failure"),
-                "2026-10-03T15:00:00Z",
-                1,
-            ),
-            run("lint", "in_progress", None, "2026-10-03T15:10:00Z", 2),
+            run("lint", None, "2026-10-03T15:10:00Z", 2),
+            run("lint", Some("failure"), "2026-10-03T15:00:00Z", 1),
         ];
         assert_eq!(
             run_verdict(&runs),
