@@ -44,11 +44,35 @@ fn fixture(retention: &str) -> (tempfile::TempDir, tempfile::TempDir) {
 }
 
 fn run(repo: &Path, container: &Path, args: &[&str]) -> Output {
+    // `gc reclaim` keeps worktrees whose Git index changed within the last
+    // three hours. These fixtures model sessions whose agents left long ago,
+    // so their indexes are aged first; `run_as_is` exercises the guard itself.
+    if args.starts_with(&["gc", "reclaim"]) {
+        age_worktree_indexes(repo);
+    }
+    run_as_is(repo, container, args)
+}
+
+fn run_as_is(repo: &Path, container: &Path, args: &[&str]) -> Output {
     common::broker_cli(CLI, args)
         .current_dir(repo)
         .env("AETHYME_WORKTREE_ROOT", container)
         .output()
         .unwrap()
+}
+
+/// Date every linked worktree's index four hours back.
+fn age_worktree_indexes(repo: &Path) {
+    let Ok(entries) = std::fs::read_dir(repo.join(".git/worktrees")) else {
+        return;
+    };
+    let then = std::time::SystemTime::now() - std::time::Duration::from_secs(4 * 3600);
+    for entry in entries.flatten() {
+        let index = entry.path().join("index");
+        if let Ok(file) = std::fs::OpenOptions::new().write(true).open(&index) {
+            file.set_modified(then).unwrap();
+        }
+    }
 }
 
 fn plan_json(repo: &Path, container: &Path) -> serde_json::Value {
@@ -283,6 +307,52 @@ fn closed_session_with_target(repo: &Path, container: &Path, task: &str) -> (Pat
     std::fs::create_dir_all(&target).unwrap();
     std::fs::write(target.join("artifact"), "output\n").unwrap();
     (worktree, id)
+}
+
+/// A quiet session is not an idle worktree: someone who staged or committed
+/// in it within the last three hours keeps its build output.
+#[test]
+fn a_worktree_worked_in_recently_keeps_its_build_output() {
+    let (repo, container) = fixture("");
+    let _ = closed_session_with_target(repo.path(), container.path(), "recent");
+    let planned = run_as_is(
+        repo.path(),
+        container.path(),
+        &["gc", "reclaim", "plan", "--json"],
+    );
+    assert!(
+        planned.status.success(),
+        "reclaim plan: {}",
+        String::from_utf8_lossy(&planned.stderr)
+    );
+    let plan: serde_json::Value = serde_json::from_slice(&planned.stdout).unwrap();
+    let candidate = plan["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|candidate| {
+            candidate["path"]
+                .as_str()
+                .is_some_and(|path| path.ends_with("rust/target"))
+        })
+        .unwrap_or_else(|| panic!("no rust/target candidate: {plan}"));
+    assert_eq!(candidate["reclaimable"], false, "{candidate}");
+    assert!(
+        candidate["reason"]
+            .as_str()
+            .unwrap()
+            .contains("Git index changed"),
+        "{candidate}"
+    );
+    assert_eq!(plan["reclaimable_bytes"], 0, "{plan}");
+
+    // The same worktree, idle for hours, is reclaimable.
+    assert!(
+        reclaim_plan_json(repo.path(), container.path())["reclaimable_bytes"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
 }
 
 /// Another agent's checkout gaining build output after review used to void
