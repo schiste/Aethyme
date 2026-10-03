@@ -76,6 +76,7 @@ mod main_drift;
 pub mod main_reconcile;
 mod measurement;
 mod merge;
+mod merge_chain;
 mod operation_stats;
 mod operations;
 mod overlap_pairs;

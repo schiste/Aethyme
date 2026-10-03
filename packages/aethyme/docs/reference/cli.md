@@ -96,6 +96,7 @@ use most:
 
 - `aethyme broker advanced git`
 - `aethyme broker advanced gh`
+- `aethyme broker advanced merge-chain`
 - `aethyme broker advanced operations`
 - `aethyme broker advanced exec`
 - `aethyme broker advanced leases ...`

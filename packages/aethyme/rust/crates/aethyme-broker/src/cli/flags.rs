@@ -238,6 +238,21 @@ pub(super) const FLAG_RULES: &[(&str, &[&str])] = &[
         ],
     ),
     (
+        "merge-chain",
+        &[
+            "--session",
+            "--repo",
+            "--reason",
+            "--merge-method",
+            "--poll-seconds",
+            "--checks-timeout",
+            "--main-timeout",
+            "--dispatch-after",
+            "--gates-workflow",
+            "--dry-run",
+        ],
+    ),
+    (
         "operations",
         &[
             "--limit",

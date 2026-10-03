@@ -1,0 +1,11 @@
+exit: 0
+--- stdout
+  aethyme broker advanced merge-chain --session <id> --repo <owner/name> --reason <text> <pr>... [--merge-method <merge|squash|rebase>] [--poll-seconds <n>] [--checks-timeout <seconds>] [--main-timeout <seconds>] [--gates-workflow <file> [--dispatch-after <seconds>]] [--dry-run] [--json]
+      Land pull requests one at a time, in order. For each: mark it ready,
+      update it onto the base when behind, wait for the latest run of every
+      check on that exact head, merge with --match-head-commit, then wait for
+      the base branch's runs on the merge commit (dispatching --gates-workflow
+      when none appears). Stops at the first failure and names the safe next
+      action; every write is a journaled `gh` operation. Re-running resumes:
+      merged pull requests are skipped and the last one is verified again.
+--- stderr
