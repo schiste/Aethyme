@@ -298,6 +298,8 @@ Usage:
       Wrap stdin as a hook additionalContext envelope (default event: SessionStart).
   aethyme repo record-wrapper-invocation <repo_path> --wrapper <name> [--detail key=value ...]
       Record a wrapper invocation in the telemetry ledger (used by hooks).
+  aethyme repo branches audit [<repo_path>] [--remote <name>] [--no-gh] [--json-output]
+      Read-only: classify local branches as on-remote, contained, merged-via-pr, or local-only.
 "#,
     ),
     (

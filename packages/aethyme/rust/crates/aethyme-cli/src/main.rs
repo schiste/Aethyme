@@ -27,6 +27,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
+mod branches_audit;
 mod graph_refresh;
 mod help;
 mod readiness_remediation;
@@ -339,6 +340,11 @@ fn main() -> ExitCode {
         // aethyme_enhance::repo_cli. The Python repo group is deleted;
         // unknown subcommands (and `--help`) get the native error shape
         // like the other native groups.
+        // `repo branches audit` is native to the router: it needs neither
+        // the engine nor the enhance templates.
+        "repo" if args.get(1).map(String::as_str) == Some("branches") => {
+            ExitCode::from(branches_audit::run(&args[2..]))
+        }
         "repo" => match aethyme_engine::repo_cli::run(&args[1..]) {
             aethyme_engine::repo_cli::Outcome::Handled(Ok(())) => ExitCode::SUCCESS,
             aethyme_engine::repo_cli::Outcome::Handled(Err(message)) => {
