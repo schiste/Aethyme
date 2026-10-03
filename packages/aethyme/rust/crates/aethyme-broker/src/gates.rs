@@ -673,7 +673,8 @@ pub struct GateRunOutcome {
     pub cached: bool,
     pub exit_code: Option<i64>,
     pub duration_ms: Option<i64>,
-    /// Time spent waiting for owner locks, host resources, and cache prep.
+    /// Time spent waiting for host-load admission, owner locks, host resources,
+    /// and cache preparation.
     pub wait_duration_ms: Option<i64>,
     /// Time from command spawn until the first stdout/stderr byte appeared.
     pub first_output_ms: Option<i64>,
@@ -900,6 +901,13 @@ impl GateProgressSink for SubmitGateProgressSink<'_> {
 pub(crate) struct GateExecutionContext<'a> {
     pub cache_policy: CachePolicy,
     pub progress: &'a dyn GateProgressSink,
+}
+
+/// Per-run host sampling and progress dependencies. Tests inject deterministic
+/// load readings; production uses the system load sampler.
+struct GateRuntimeContext<'a> {
+    progress: &'a dyn GateProgressSink,
+    admission_host: &'a dyn crate::gate_admission::AdmissionHost,
 }
 
 pub(crate) fn heartbeat_interval() -> Duration {
@@ -1324,7 +1332,10 @@ pub(crate) fn run_affected_with_progress(
         selections,
         session_id,
         context.cache_policy,
-        context.progress,
+        GateRuntimeContext {
+            progress: context.progress,
+            admission_host: &crate::gate_admission::SystemAdmissionHost,
+        },
     )
 }
 
@@ -1380,7 +1391,10 @@ pub(crate) fn run_all_with_progress(
         selections,
         session_id,
         cache_policy,
-        progress,
+        GateRuntimeContext {
+            progress,
+            admission_host: &crate::gate_admission::SystemAdmissionHost,
+        },
     )
 }
 
@@ -1419,7 +1433,10 @@ pub(crate) fn run_named(
         }],
         session_id,
         cache_policy,
-        &progress,
+        GateRuntimeContext {
+            progress: &progress,
+            admission_host: &crate::gate_admission::SystemAdmissionHost,
+        },
     )
 }
 
@@ -1894,8 +1911,10 @@ fn run_selections(
     selections: Vec<Selection<'_>>,
     session_id: Option<i64>,
     cache_policy: CachePolicy,
-    progress: &dyn GateProgressSink,
+    runtime: GateRuntimeContext<'_>,
 ) -> Result<Vec<GateRunOutcome>, crate::broker::BrokerOpError> {
+    let progress = runtime.progress;
+    let admission_host = runtime.admission_host;
     let tree = checkout.working_tree_hash()?;
     if let Some(session_id) = session_id {
         cancel_obsolete_runs(store, main_root, session_id, &tree)?;
@@ -2004,8 +2023,38 @@ fn run_selections(
         }
 
         let wait_started = Instant::now();
+        let log_path = log_dir.join(format!(
+            "{}-{}-{}.log",
+            gate.name,
+            &tree[..8.min(tree.len())],
+            worker_id
+        ));
         // Before owner locks, leases and the timeout clock: see gate_admission.
-        crate::gate_admission::admit_gate(gate, progress);
+        if let crate::gate_admission::Admission::BoundReached {
+            waited,
+            last,
+            threshold,
+        } = crate::gate_admission::admit_gate_with(gate, progress, admission_host)
+        {
+            let diagnostic = format!(
+                "host load stayed above its admission threshold for {}s: {}; retry after load falls",
+                waited.as_secs(),
+                crate::gate_admission::describe(last, threshold)
+            );
+            let wait_duration_ms = wait_started.elapsed().as_millis() as i64;
+            let outcome = record_gate_preflight_resource_failure(
+                store,
+                gate,
+                &tree,
+                session_id,
+                wait_duration_ms,
+                &log_path,
+                &diagnostic,
+                progress,
+            )?;
+            outcomes.push(outcome);
+            break;
+        }
         let owner_dir = run_dir.join("owners");
         let owner_locks = GateOwnerLocks::acquire(
             &owner_dir,
@@ -2019,63 +2068,22 @@ fn run_selections(
             path: owner_dir,
             source,
         })?;
-        let log_path = log_dir.join(format!(
-            "{}-{}-{}.log",
-            gate.name,
-            &tree[..8.min(tree.len())],
-            worker_id
-        ));
         let mut resource_runtime =
             match acquire_gate_resources(gate, checkout, &tree, &worker_id, progress) {
                 Ok(runtime) => runtime,
                 Err(message) => {
-                    let _ = std::fs::write(
-                        &log_path,
-                        format!("aethyme host resource acquisition failed: {message}\n"),
-                    );
-                    progress.report(&format!(
-                        "gate {} blocked by host resources: {}",
-                        gate.name, message
-                    ));
                     drop(owner_locks);
-                    // An error here is still a failure whose log a later run on
-                    // the same tree would overwrite, so it moves aside exactly
-                    // as a failing run's log does.
-                    let log_path = preserve_failed_gate_log(&log_path, GateStatus::Error);
-                    store.record_gate_result(&NewGateResult {
-                        gate_name: gate.name.clone(),
-                        tree_hash: tree.clone(),
-                        definition_hash: gate.definition_hash.clone(),
-                        status: GateStatus::Error,
-                        failure_class: Some(GateFailureClass::ResourceContention),
-                        exit_code: None,
-                        duration_ms: Some(0),
-                        wait_duration_ms: Some(wait_started.elapsed().as_millis() as i64),
-                        first_output_ms: None,
-                        output_bytes: Some(0),
-                        log_path: Some(log_path.to_string_lossy().into_owned()),
+                    let outcome = record_gate_preflight_resource_failure(
+                        store,
+                        gate,
+                        &tree,
                         session_id,
-                    })?;
-                    outcomes.push(GateRunOutcome {
-                        gate: gate.name.clone(),
-                        tree_hash: tree.clone(),
-                        definition_hash: gate.definition_hash.clone(),
-                        resource_lease: None,
-                        managed_cache: None,
-                        broker_database: None,
-                        status: GateStatus::Error,
-                        failure_class: Some(GateFailureClass::ResourceContention),
-                        cached: false,
-                        exit_code: None,
-                        duration_ms: Some(0),
-                        wait_duration_ms: Some(wait_started.elapsed().as_millis() as i64),
-                        first_output_ms: None,
-                        output_bytes: Some(0),
-                        log_path: Some(log_path.to_string_lossy().into_owned()),
-                        environment: GateEnvironment::default(),
-                        // Refused host resources: the command never ran.
-                        host_fault: true,
-                    });
+                        wait_started.elapsed().as_millis() as i64,
+                        &log_path,
+                        &format!("host resource acquisition failed: {message}"),
+                        progress,
+                    )?;
+                    outcomes.push(outcome);
                     break;
                 }
             };
@@ -2305,6 +2313,60 @@ fn run_selections(
         }
     }
     Ok(outcomes)
+}
+
+/// Persist a broker-observed resource refusal that happened before a gate
+/// command could start. Such rows are auditable but never reusable as verdicts.
+fn record_gate_preflight_resource_failure(
+    store: &mut BrokerStore,
+    gate: &Gate,
+    tree: &str,
+    session_id: Option<i64>,
+    wait_duration_ms: i64,
+    log_path: &Path,
+    diagnostic: &str,
+    progress: &dyn GateProgressSink,
+) -> Result<GateRunOutcome, crate::broker::BrokerOpError> {
+    let message = format!("aethyme: gate {} did not start: {diagnostic}\n", gate.name);
+    crate::warn_unrecorded(
+        "write the gate preflight resource diagnostic",
+        std::fs::write(log_path, message),
+    );
+    progress.report(&format!("gate {} could not start: {diagnostic}", gate.name));
+    let log_path = preserve_failed_gate_log(log_path, GateStatus::Error);
+    store.record_gate_result(&NewGateResult {
+        gate_name: gate.name.clone(),
+        tree_hash: tree.to_string(),
+        definition_hash: gate.definition_hash.clone(),
+        status: GateStatus::Error,
+        failure_class: Some(GateFailureClass::ResourceContention),
+        exit_code: None,
+        duration_ms: Some(0),
+        wait_duration_ms: Some(wait_duration_ms),
+        first_output_ms: None,
+        output_bytes: Some(0),
+        log_path: Some(log_path.to_string_lossy().into_owned()),
+        session_id,
+    })?;
+    Ok(GateRunOutcome {
+        gate: gate.name.clone(),
+        tree_hash: tree.to_string(),
+        definition_hash: gate.definition_hash.clone(),
+        resource_lease: None,
+        managed_cache: None,
+        broker_database: None,
+        status: GateStatus::Error,
+        failure_class: Some(GateFailureClass::ResourceContention),
+        cached: false,
+        exit_code: None,
+        duration_ms: Some(0),
+        wait_duration_ms: Some(wait_duration_ms),
+        first_output_ms: None,
+        output_bytes: Some(0),
+        log_path: Some(log_path.to_string_lossy().into_owned()),
+        environment: GateEnvironment::default(),
+        host_fault: true,
+    })
 }
 
 fn short_tree_hash(tree_hash: &str) -> &str {
@@ -3081,6 +3143,30 @@ mod tests {
         }
     }
 
+    struct SequencedAdmissionHost {
+        samples: Vec<Option<crate::gate_admission::LoadSample>>,
+        next: std::cell::Cell<usize>,
+    }
+
+    impl SequencedAdmissionHost {
+        fn new(samples: Vec<Option<crate::gate_admission::LoadSample>>) -> Self {
+            Self {
+                samples,
+                next: std::cell::Cell::new(0),
+            }
+        }
+    }
+
+    impl crate::gate_admission::AdmissionHost for SequencedAdmissionHost {
+        fn sample(&self) -> Option<crate::gate_admission::LoadSample> {
+            let index = self.next.get().min(self.samples.len().saturating_sub(1));
+            self.next.set(self.next.get().saturating_add(1));
+            self.samples.get(index).copied().flatten()
+        }
+
+        fn sleep(&self, _duration: Duration) {}
+    }
+
     /// A gate queued behind another names the holder and keeps saying so,
     /// instead of one line followed by minutes of silence.
     #[test]
@@ -3202,6 +3288,134 @@ mod tests {
     fn this_platform_reports_load_and_cpus() {
         assert!(load_average_1m().is_some_and(|load| load >= 0.0));
         assert!(logical_cpu_count().is_some_and(|cpus| cpus >= 1));
+    }
+
+    #[test]
+    fn sustained_host_load_defers_without_spawning_and_retry_runs_after_recovery() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("app");
+        init_repo(&root);
+        let gates = parse_gates(
+            "[[gate]]\nname='heavy'\ncommand='touch .gate-started'\n\
+             cost=3\nresource_wait_seconds=6\n",
+        )
+        .unwrap();
+        let checkout = GitRepo::discover(&root).unwrap();
+        let mut store = BrokerStore::open(&root.join(".aethyme/broker.db")).unwrap();
+        let progress = Lines::default();
+        let changed = vec!["file.txt".to_string()];
+        let selections = select_gates(&gates, &changed);
+        let host = SequencedAdmissionHost::new(vec![Some(crate::gate_admission::LoadSample {
+            load_1m: 90.0,
+            cpus: 10,
+        })]);
+
+        let deferred = run_selections(
+            &mut store,
+            &root,
+            &checkout,
+            selections,
+            None,
+            CachePolicy::Use,
+            GateRuntimeContext {
+                progress: &progress,
+                admission_host: &host,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(deferred.len(), 1);
+        assert_eq!(deferred[0].status, GateStatus::Error);
+        assert_eq!(
+            deferred[0].failure_class,
+            Some(GateFailureClass::ResourceContention)
+        );
+        assert!(deferred[0].is_host_fault());
+        assert!(deferred[0].wait_duration_ms.is_some());
+        assert!(!root.join(".gate-started").exists());
+        let diagnostic = std::fs::read_to_string(deferred[0].log_path.as_ref().unwrap()).unwrap();
+        assert!(diagnostic.contains("for 6s"), "{diagnostic}");
+        assert!(diagnostic.contains("load 1m 90.0/10 cpus"), "{diagnostic}");
+        assert!(diagnostic.contains("max 3.00"), "{diagnostic}");
+        assert!(diagnostic.contains("retry"), "{diagnostic}");
+
+        let selections = select_gates(&gates, &changed);
+        let recovered_host = SequencedAdmissionHost::new(vec![
+            Some(crate::gate_admission::LoadSample {
+                load_1m: 90.0,
+                cpus: 10,
+            }),
+            Some(crate::gate_admission::LoadSample {
+                load_1m: 20.0,
+                cpus: 10,
+            }),
+        ]);
+        let retried = run_selections(
+            &mut store,
+            &root,
+            &checkout,
+            selections,
+            None,
+            CachePolicy::Use,
+            GateRuntimeContext {
+                progress: &progress,
+                admission_host: &recovered_host,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(retried.len(), 1);
+        assert_eq!(retried[0].status, GateStatus::Pass);
+        assert!(!retried[0].cached, "a deferred result must not be cached");
+        assert!(root.join(".gate-started").exists());
+    }
+
+    #[test]
+    fn assertion_failure_after_load_recovers_remains_a_gate_verdict() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("app");
+        init_repo(&root);
+        let gates = parse_gates(
+            "[[gate]]\nname='assertion'\ncommand='echo assertion-failed; exit 1'\n\
+             cost=3\nresource_wait_seconds=6\n",
+        )
+        .unwrap();
+        let checkout = GitRepo::discover(&root).unwrap();
+        let mut store = BrokerStore::open(&root.join(".aethyme/broker.db")).unwrap();
+        let changed = vec!["file.txt".to_string()];
+        let host = SequencedAdmissionHost::new(vec![
+            Some(crate::gate_admission::LoadSample {
+                load_1m: 90.0,
+                cpus: 10,
+            }),
+            Some(crate::gate_admission::LoadSample {
+                load_1m: 20.0,
+                cpus: 10,
+            }),
+        ]);
+
+        let progress = Lines::default();
+        let outcomes = run_selections(
+            &mut store,
+            &root,
+            &checkout,
+            select_gates(&gates, &changed),
+            None,
+            CachePolicy::Bypass,
+            GateRuntimeContext {
+                progress: &progress,
+                admission_host: &host,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].status, GateStatus::Fail);
+        assert_eq!(
+            outcomes[0].failure_class,
+            Some(GateFailureClass::TestFailure)
+        );
+        assert!(!outcomes[0].is_host_fault());
     }
 
     fn pid_record(pgid: i32, start: Option<u64>) -> GatePidRecord {
