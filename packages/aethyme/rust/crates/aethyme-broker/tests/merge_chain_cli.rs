@@ -503,3 +503,25 @@ fn a_dry_run_plans_without_writing() {
     assert!(stdout.contains("gh pr ready"), "{stdout}");
     assert!(stdout.contains("update-branch (3 behind main)"), "{stdout}");
 }
+
+/// `--session` resolves against this checkout's broker, so a `--repo` its
+/// session does not point at is refused before the provider is asked
+/// anything -- not at the first write, after the checks wait.
+#[test]
+fn a_repo_the_session_does_not_point_at_is_refused_before_any_call() {
+    let fixture = Fixture::new();
+    git(
+        fixture.repo.path(),
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/someone/else.git",
+        ],
+    );
+    fixture.script("pr-5", 1, &pr(5, "OPEN", false, "aaa", None));
+
+    let output = fixture.chain(&["5"]);
+    assert_eq!(output.status.code(), Some(3), "{}", text(&output));
+    assert!(fixture.log().is_empty(), "{}", fixture.log());
+}

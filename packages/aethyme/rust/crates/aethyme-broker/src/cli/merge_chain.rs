@@ -166,14 +166,20 @@ pub(super) fn run_merge_chain(parsed: Parsed) -> Result<(), UsageError> {
     };
     let mut broker = open_broker(parsed.read_only_snapshot)?;
     // Refuse a closed or foreign session before the first provider call,
-    // not at the first write after minutes of waiting.
+    // not at the first write after minutes of waiting on checks.
     let record = broker.store().session(session)?;
     if record.status.is_closed() {
         return Err(crate::BrokerOpError::ClosedSessionOperation {
             session_id: session,
+            repository_root: broker.main_root().display().to_string(),
         }
         .into());
     }
+    crate::operations::refuse_session_repository_mismatch(
+        session,
+        Path::new(&record.worktree_path),
+        &repository,
+    )?;
     let reader = GhChainReader {
         repository: repository.clone(),
     };
