@@ -2039,7 +2039,7 @@ fn a_finished_session_stops_colliding_on_its_declared_targets() {
 /// views must now carry the same SHAs and the same local-main count, and the
 /// summary must name the baseline its own count is against.
 #[test]
-fn summary_and_integration_status_agree_after_an_unpushed_fast_forward() {
+fn refreshed_summary_and_integration_status_agree_after_an_unpushed_fast_forward() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());
     sh(
@@ -2075,7 +2075,7 @@ fn summary_and_integration_status_agree_after_an_unpushed_fast_forward() {
     assert_eq!(rev(tmp.path(), "refs/remotes/origin/main"), published);
 
     let detailed = broker.integration_status(now_ms()).unwrap();
-    let summary = broker.status_brief(now_ms()).unwrap().summary;
+    let summary = broker.status(now_ms()).unwrap().summary;
 
     assert_eq!(detailed.head, integration);
     assert_eq!(summary.integration_head, detailed.head);
@@ -2097,4 +2097,76 @@ fn summary_and_integration_status_agree_after_an_unpushed_fast_forward() {
         "{}",
         summary.message
     );
+}
+
+#[test]
+fn routine_status_reports_unknown_checks_and_does_not_refresh_dirty_leases() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    broker.adopt(tmp.path(), Some("routine status")).unwrap();
+    std::fs::write(tmp.path().join("README.md"), "uncommitted\n").unwrap();
+    let status = broker.status_current(now_ms()).unwrap();
+    assert!(!status.leases_refreshed);
+    assert!(status.leases_refreshed_at_ms.is_none());
+    assert!(
+        status
+            .deferred_checks
+            .iter()
+            .any(|check| check == "dirty_worktrees")
+    );
+    assert!(!status.cleanup_retention.eligibility_checked);
+    assert!(broker.store().active_leases().unwrap().is_empty());
+    assert!(status.phase_timings_ms.contains_key("retention"));
+    assert!(status.phase_timings_ms.contains_key("sessions"));
+    let refreshed = broker.status(now_ms()).unwrap();
+    assert!(refreshed.leases_refreshed);
+    assert!(refreshed.leases_refreshed_at_ms.is_some());
+    assert!(refreshed.deferred_checks.is_empty());
+    assert!(refreshed.cleanup_retention.eligibility_checked);
+    assert!(
+        broker
+            .store()
+            .active_leases()
+            .unwrap()
+            .iter()
+            .any(|l| l.path == "README.md")
+    );
+    let recorded = broker.status_current(now_ms()).unwrap();
+    assert_eq!(
+        recorded.leases_refreshed_at_ms,
+        refreshed.leases_refreshed_at_ms
+    );
+}
+
+#[test]
+fn routine_status_never_authorizes_cleanup_of_a_dirty_closed_checkout() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let session = broker.start_worktree("closed retained work", None).unwrap();
+    let checkout = std::path::PathBuf::from(&session.worktree_path);
+    std::fs::write(checkout.join("keep.txt"), "untracked user work\n").unwrap();
+    broker
+        .store()
+        .set_session_status(session.id, SessionStatus::Closed, None)
+        .unwrap();
+    let current = broker.status_current(now_ms()).unwrap();
+    assert_eq!(current.cleanup_retention.broker_owned_worktree_count, 1);
+    assert!(!current.cleanup_retention.eligibility_checked);
+    assert_eq!(current.cleanup_retention.eligible_worktree_count, 0);
+    assert!(current.cleanup_retention.unmeasured_worktree_count > 0);
+    assert!(checkout.join("keep.txt").exists());
+    // A routine inventory cannot bypass the independent audit on the GC lane.
+    let plan = broker.cleanup_plan().unwrap();
+    assert!(!plan.digest.is_empty());
+    assert!(
+        !plan
+            .worktrees
+            .iter()
+            .find(|item| item.session_id == session.id)
+            .unwrap()
+            .eligible()
+    );
+    assert!(checkout.join("keep.txt").exists());
 }

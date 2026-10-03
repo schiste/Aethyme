@@ -1334,3 +1334,26 @@ aethyme broker finish cleanup 111
 
 The new session ID may differ from the old one. Always use the ID printed by
 `start --reuse`; “existing worktree” does not imply “same session identity.”
+
+
+### Routine status and explicit audits
+
+`aethyme broker status --summary` reads session liveness, the queue and recorded
+lease overlaps without scanning Git history or retained checkouts. It carries
+`deferred_checks`, `leases_refreshed: false`, and `leases_refreshed_at_ms` (null
+until a refresh has been recorded). Ref heads and commit counts in this summary
+are uninspected; use the explicit audit when those values matter.
+
+Ordinary `broker status` adds recorded size observations. Its retention
+inventory checks ownership but limits work between sessions; an incomplete
+inventory reports `inventory_complete: false` and `inventory_deferred_sessions`.
+Cleanup eligibility is always uninspected on this path. Zero counts for a
+check named in `deferred_checks` do not mean that nothing needs attention.
+`phase_timings_ms` identifies the cost of opening, coordination and retention.
+
+`aethyme broker status --refresh` explicitly runs the expensive lease, Git
+conflict, publication and cleanup eligibility checks. It cannot be combined
+with `--summary` or used in degraded read-only compatibility mode. Neither
+routine view authorizes deletion: `broker gc plan`, apply, finish and submit
+continue to perform their independent checks. Routine size observations carry
+their measurement timestamp and are not silently refreshed by a directory walk.

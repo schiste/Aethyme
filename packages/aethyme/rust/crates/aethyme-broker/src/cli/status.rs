@@ -70,12 +70,29 @@ pub(super) fn run_readiness(parsed: Parsed) -> Result<(), UsageError> {
 
 /// `broker status`.
 pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
+    if parsed.refresh && parsed.summary {
+        return Err(UsageError::Message(
+            "--refresh and --summary cannot be combined".into(),
+        ));
+    }
+    if parsed.refresh && parsed.read_only_snapshot {
+        return Err(UsageError::Message(
+            "--refresh is unavailable in read-only compatibility mode".into(),
+        ));
+    }
+    let opened = std::time::Instant::now();
     let mut broker = open_broker(parsed.read_only_snapshot)?;
+    let open_ms = opened.elapsed().as_millis() as u64;
     // The mandated first step of every session, so its cost is a tax
     // on every agent. `--summary` skips the per-session diff that
     // dominates it and prints only what that step is read for (#182).
     if parsed.summary {
-        let brief = broker.status_brief(now_ms())?;
+        let mut brief = if parsed.read_only_snapshot {
+            broker.status_brief_snapshot(now_ms())?
+        } else {
+            broker.status_brief(now_ms())?
+        };
+        brief.phase_timings_ms.insert("open".into(), open_ms);
         if parsed.json {
             out!("{}", serde_json::to_string_pretty(&brief)?);
         } else {
@@ -84,11 +101,14 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
         }
         return Ok(());
     }
-    let status = if parsed.read_only_snapshot {
+    let mut status = if parsed.read_only_snapshot {
         broker.status_snapshot(now_ms())?
-    } else {
+    } else if parsed.refresh {
         broker.status(now_ms())?
+    } else {
+        broker.status_current(now_ms())?
     };
+    status.phase_timings_ms.insert("open".into(), open_ms);
     if parsed.json {
         out!("{}", serde_json::to_string_pretty(&status)?);
     } else {
