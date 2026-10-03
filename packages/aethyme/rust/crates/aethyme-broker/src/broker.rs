@@ -1394,6 +1394,11 @@ pub struct StatusView {
     /// commits and integration commits upstream lacks. Omitted when empty.
     #[serde(skip_serializing_if = "crate::UnpushedWorkReport::is_empty")]
     pub unpushed_work: crate::UnpushedWorkReport,
+    /// `broker submit` runs in progress, with phase, queue position and last
+    /// progress, so a waiting submit can be told from a stuck one. Omitted
+    /// when none is running.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub in_flight_submits: Vec<crate::InFlightSubmit>,
 }
 
 /// How many refused reviews `broker status` carries.
@@ -2482,6 +2487,42 @@ pub struct StatusAdvice {
     pub queue_entry_id: Option<i64>,
     pub evidence: Vec<String>,
     pub commands: Vec<String>,
+}
+
+/// One warning per submit that is gone or has made no progress for
+/// [`crate::SUBMIT_STALL_AFTER`]. A submit that is only waiting in line keeps
+/// reporting and never appears here.
+fn stalled_submit_advice(submits: &[crate::InFlightSubmit]) -> Vec<StatusAdvice> {
+    submits
+        .iter()
+        .filter(|submit| submit.possibly_stalled)
+        .map(|submit| {
+            let silent = crate::submit_progress::duration_label(submit.last_progress_age_ms);
+            StatusAdvice {
+                id: "submit.possibly-stalled",
+                severity: StatusAdviceSeverity::Warning,
+                reason: "a broker submit has stopped reporting progress",
+                summary: if submit.alive {
+                    format!(
+                        "session {}'s submit has made no progress for {silent} (phase: {})",
+                        submit.session_id, submit.phase
+                    )
+                } else {
+                    format!(
+                        "session {}'s submit process {} is gone; it stopped during: {}",
+                        submit.session_id, submit.pid, submit.phase
+                    )
+                },
+                session_id: Some(submit.session_id),
+                queue_entry_id: None,
+                evidence: vec![format!("last progress: {}", submit.last_progress)],
+                commands: vec![format!(
+                    "aethyme broker submit --session {}",
+                    submit.session_id
+                )],
+            }
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -7297,6 +7338,8 @@ impl Broker {
             &overlaps,
             &scope_overlaps,
         ));
+        let in_flight_submits = crate::submit_progress::in_flight_submits(&self.main_root, now_ms);
+        advice.extend(stalled_submit_advice(&in_flight_submits));
 
         Ok(StatusView {
             publication_baseline_ref: baseline_ref,
@@ -7332,6 +7375,7 @@ impl Broker {
             blockers: blocker_report.blockers,
             blocker_sources_unavailable: blocker_report.unavailable,
             unpushed_work,
+            in_flight_submits,
         })
     }
 
