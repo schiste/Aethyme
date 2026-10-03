@@ -117,7 +117,10 @@ impl Broker {
         }
         let session = self.store_ref().session(session_id)?;
         if session.status.is_closed() {
-            return Err(BrokerOpError::ClosedSessionOperation { session_id });
+            return Err(BrokerOpError::ClosedSessionOperation {
+                session_id,
+                repository_root: self.main_root().display().to_string(),
+            });
         }
         let now = crate::clock::epoch_ms();
         let agents = self.agents(now)?;
