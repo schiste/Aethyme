@@ -217,9 +217,12 @@ pub enum WriteOutcome {
         detail: String,
     },
     /// The write may or may not have happened; `recovery` says how to find out.
+    /// `detail` is the provider's last stderr line, which can still prove a
+    /// refusal the journal could not classify.
     Unknown {
         operation: i64,
         recovery: String,
+        detail: String,
     },
 }
 
@@ -368,9 +371,39 @@ impl<R: ChainReader, W: ChainWriter, C: ChainClock> Chain<'_, R, W, C> {
         })
     }
 
+    /// GitHub refusing an update-branch because the merge conflicts. Nothing
+    /// was written, whatever the journal recorded: the refusal is the answer.
+    fn update_conflict(&self, number: u64, operation: i64, detail: &str) -> Box<ChainStop> {
+        self.stop(
+            number,
+            Stage::UpdateBranch,
+            format!(
+                "GitHub cannot update pull request #{number} onto its base: the branches \
+                 conflict (operation {operation}): {detail}"
+            ),
+            format!(
+                "sync the pull request branch onto its base and resolve the conflicts \
+                 (`aethyme broker sync --session <its session>`), push, then {}; if \
+                 operation {operation} is recorded as outcome_unknown, reconcile it first: \
+                 `aethyme broker advanced operations reconcile --operation {operation} \
+                 --outcome failed --reason \"update-branch refused: merge conflict\"`",
+                rerun_hint()
+            ),
+            crate::exit_status::FAILED,
+        )
+    }
+
     fn write(&mut self, number: u64, stage: Stage, args: Vec<String>) -> Step<i64> {
         let printed = args.join(" ");
         match self.writer.write(args) {
+            Ok(
+                WriteOutcome::Failed { operation, detail }
+                | WriteOutcome::Unknown {
+                    operation, detail, ..
+                },
+            ) if stage == Stage::UpdateBranch && is_update_conflict(&detail) => {
+                Err(self.update_conflict(number, operation, &detail))
+            }
             Ok(WriteOutcome::Succeeded { operation }) => {
                 self.say(format!(
                     "#{number} {}: gh {printed} (operation {operation})",
@@ -392,6 +425,7 @@ impl<R: ChainReader, W: ChainWriter, C: ChainClock> Chain<'_, R, W, C> {
             Ok(WriteOutcome::Unknown {
                 operation,
                 recovery,
+                ..
             }) => Err(self.stop(
                 number,
                 stage,
@@ -822,6 +856,13 @@ pub fn run_merge_chain<R: ChainReader, W: ChainWriter, C: ChainClock>(
     report
 }
 
+/// GitHub's refusal of an update-branch whose merge would conflict
+/// (`Cannot update PR branch due to conflicts`).
+fn is_update_conflict(detail: &str) -> bool {
+    let detail = detail.to_ascii_lowercase();
+    detail.contains("cannot update pr branch") || detail.contains("merge conflict")
+}
+
 fn short(sha: &str) -> &str {
     sha.get(..12).unwrap_or(sha)
 }
@@ -935,6 +976,88 @@ mod tests {
 
     // Fixtures list runs newest first, as the provider does, so "the last
     // one listed wins" cannot pass for "the newest one wins".
+
+    struct OneOpenPr;
+
+    impl ChainReader for OneOpenPr {
+        fn pull_request(&self, number: u64) -> Result<PullRequestState, String> {
+            Ok(PullRequestState {
+                number,
+                state: "OPEN".into(),
+                is_draft: false,
+                head: "aaa".into(),
+                base: "main".into(),
+                merge_commit: None,
+            })
+        }
+        fn behind_by(&self, _: &str, _: &str) -> Result<u64, String> {
+            Ok(1)
+        }
+        fn check_runs(&self, _: &str) -> Result<Vec<RunState>, String> {
+            Ok(Vec::new())
+        }
+        fn branch_runs(&self, _: &str, _: &str) -> Result<Vec<RunState>, String> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// The journal records the refused update as outcome_unknown.
+    struct UnknownConflict;
+
+    impl ChainWriter for UnknownConflict {
+        fn write(&mut self, _: Vec<String>) -> Result<WriteOutcome, String> {
+            Ok(WriteOutcome::Unknown {
+                operation: 7,
+                recovery: "reconcile operation 7".into(),
+                detail: "GraphQL: Cannot update PR branch due to conflicts".into(),
+            })
+        }
+    }
+
+    struct NoWait;
+
+    impl ChainClock for NoWait {
+        fn now(&self) -> Instant {
+            Instant::now()
+        }
+        fn sleep(&self, _: Duration) {}
+    }
+
+    #[test]
+    fn an_update_conflict_recorded_as_unknown_is_still_a_definite_stop() {
+        let options = MergeChainOptions {
+            repository: "o/n".into(),
+            pull_requests: vec![5],
+            merge_method: MergeMethod::Merge,
+            poll_interval: Duration::ZERO,
+            checks_timeout: Duration::ZERO,
+            main_timeout: Duration::ZERO,
+            dispatch_after: Duration::ZERO,
+            gates_workflow: None,
+            dry_run: false,
+        };
+        let report = run_merge_chain(
+            &options,
+            &OneOpenPr,
+            &mut UnknownConflict,
+            &NoWait,
+            &mut |_| {},
+        );
+        let stop = report.stopped.expect("stopped");
+        assert_eq!(stop.stage, Stage::UpdateBranch);
+        assert_eq!(stop.exit_code, crate::exit_status::FAILED);
+        assert!(
+            stop.next_action.contains("broker sync"),
+            "{}",
+            stop.next_action
+        );
+        assert!(
+            stop.next_action
+                .contains("operations reconcile --operation 7 --outcome failed"),
+            "{}",
+            stop.next_action
+        );
+    }
 
     #[test]
     fn a_superseded_cancelled_run_does_not_fail_the_commit() {

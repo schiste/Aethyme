@@ -84,12 +84,6 @@ impl ChainWriter for CoordinatedWriter<'_> {
         if report.ok() {
             return Ok(WriteOutcome::Succeeded { operation });
         }
-        if let Some(recovery) = report.unknown_outcome_recovery() {
-            return Ok(WriteOutcome::Unknown {
-                operation,
-                recovery: recovery.to_string(),
-            });
-        }
         let detail = report
             .stderr
             .lines()
@@ -97,6 +91,13 @@ impl ChainWriter for CoordinatedWriter<'_> {
             .rfind(|line| !line.is_empty())
             .unwrap_or("no provider output")
             .to_string();
+        if let Some(recovery) = report.unknown_outcome_recovery() {
+            return Ok(WriteOutcome::Unknown {
+                operation,
+                recovery: recovery.to_string(),
+                detail,
+            });
+        }
         Ok(WriteOutcome::Failed { operation, detail })
     }
 }

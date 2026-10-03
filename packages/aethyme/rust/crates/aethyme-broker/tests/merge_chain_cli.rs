@@ -525,3 +525,27 @@ fn a_repo_the_session_does_not_point_at_is_refused_before_any_call() {
     assert_eq!(output.status.code(), Some(3), "{}", text(&output));
     assert!(fixture.log().is_empty(), "{}", fixture.log());
 }
+
+/// GitHub refuses an update-branch whose merge conflicts. Nothing was
+/// written, so the chain stops with a definite failure that says to sync
+/// the branch, not "outcome unknown", and never merges.
+#[test]
+fn an_update_branch_conflict_is_a_definite_failure_that_says_to_sync() {
+    let fixture = Fixture::new();
+    fixture.script("pr-5", 1, &pr(5, "OPEN", false, "aaa", None));
+    fixture.script("compare-aaa", 1, r#"{"behind_by":2}"#);
+    std::fs::write(
+        fixture.gh.path().join("fail-update-5"),
+        "GraphQL: Cannot update PR branch due to conflicts (updatePullRequestBranch)\n",
+    )
+    .unwrap();
+
+    let output = fixture.chain(&["5", "6"]);
+    assert_eq!(output.status.code(), Some(1), "{}", text(&output));
+    assert_eq!(fixture.writes(), vec!["pr update-branch 5"]);
+    assert!(!fixture.log().contains("pr view 6"), "{}", fixture.log());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("the branches"), "{stdout}");
+    assert!(stdout.contains("broker sync"), "{stdout}");
+    assert!(!stdout.contains("is unknown"), "{stdout}");
+}
