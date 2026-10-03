@@ -112,7 +112,7 @@ fn edit_lines(worktree: &Path, lines: &[usize], tag: &str, date: &str) {
 }
 
 fn advice(repo: &Path) -> Vec<serde_json::Value> {
-    let output = run(repo, &["status", "--json"]);
+    let output = run(repo, &["status", "--refresh", "--json"]);
     assert!(
         output.status.success(),
         "{}",

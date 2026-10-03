@@ -116,9 +116,9 @@ impl Fixture {
     }
 
     /// Recompute implicit leases from every worktree's diff, and classify
-    /// overlapping pairs, the way any routine broker command does.
+    /// overlapping pairs through the explicit status audit.
     fn refresh(&self) {
-        self.run(&["broker", "status", "--json"]);
+        self.run(&["broker", "status", "--refresh", "--json"]);
     }
 
     /// The hook's raw stdout for one event, asserting it never fails.
