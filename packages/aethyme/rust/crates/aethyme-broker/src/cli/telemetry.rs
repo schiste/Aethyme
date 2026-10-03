@@ -26,6 +26,7 @@ pub(super) const KNOWN_COMMAND_WORDS: &[&str] = &[
     "reconcile",
     "agents",
     "leases",
+    "ownership",
     "export",
     "resources",
     "console",
@@ -298,6 +299,7 @@ pub(super) fn command_records_metric(args: &[String]) -> bool {
         }
         Some("hooks") => !matches!(args.get(1).map(String::as_str), Some("status" | "snippet")),
         Some("leases") => !matches!(args.get(1).map(String::as_str), Some("plan" | "export")),
+        Some("ownership") => matches!(args.get(1).map(String::as_str), Some("claim" | "release")),
         Some("console") => args.get(1).map(String::as_str) == Some("run"),
         Some("resources") => !matches!(
             args.get(1).map(String::as_str),

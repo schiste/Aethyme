@@ -434,6 +434,56 @@ fn pr_opens_one_draft_and_then_reuses_it() {
     assert_eq!(fixture.gh_log().matches("pr create").count(), 1);
 }
 
+/// A repository with a PR template gets that template, filled from the
+/// commit's sections and carrying its contract decision; a CI that skips
+/// drafts gets a note saying checks wait for `pr ready`.
+#[test]
+fn pr_fills_the_repository_template_and_notes_draft_skipping_ci() {
+    let fixture = Fixture::new();
+    fixture.authorize(true);
+    std::fs::create_dir_all(fixture.repo.join(".github/workflows")).unwrap();
+    std::fs::write(
+        fixture.repo.join(".github/pull_request_template.md"),
+        "## Summary\n\n<!-- why -->\n\n## Contract\n\n- [ ] **none** — internal.\n\
+         - [ ] **introduce** — new surface.\n\n## Test plan\n\n- [ ] tests\n",
+    )
+    .unwrap();
+    std::fs::write(
+        fixture.repo.join(".github/workflows/ci.yml"),
+        "on: pull_request\njobs:\n  test:\n    if: github.event.pull_request.draft == false\n",
+    )
+    .unwrap();
+    git(&fixture.repo, &["add", ".github"]);
+    git(&fixture.repo, &["commit", "-qm", "template"]);
+    fixture.git_env(&["push", "-q", "origin", "main"]);
+    let session = fixture
+        .broker()
+        .start_worktree("tidy the queue", None)
+        .unwrap();
+    let worktree = PathBuf::from(&session.worktree_path);
+    fixture.commit(
+        &worktree,
+        "feature.txt",
+        "one\n",
+        "fix(queue): drop stale entries\n\nProblem: stale entries pile up.\n\n\
+         Decision: drop them on read.\n\nRationale: reads already scan.\n\n\
+         Validation: cargo test queue passes.\n\nContract decision: none",
+    );
+
+    let id = session.id.to_string();
+    let output = fixture.run(&["push", "--session", id.as_str(), "--pr"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stdout}{}", stderr(&output));
+    assert!(stdout.contains("Opened draft pull request #7"), "{stdout}");
+    assert!(stdout.contains("CI skips draft pull requests"), "{stdout}");
+    let log = fixture.gh_log();
+    assert!(log.contains("## Summary"), "{log}");
+    assert!(log.contains("**Problem:** stale entries pile up."), "{log}");
+    assert!(log.contains("- [x] **none** — internal."), "{log}");
+    assert!(log.contains("Contract decision: none"), "{log}");
+    assert!(log.contains("cargo test queue passes."), "{log}");
+}
+
 #[test]
 fn a_pull_request_the_push_opens_gets_its_opening_recorded() {
     // PR monitoring is off by default, so a watch poll is not something to

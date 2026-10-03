@@ -232,6 +232,16 @@ Usage:
       refreshes leases or writes broker state or command telemetry.
   aethyme broker leases release <path> --session <id> [--json]
       Release an explicit claim.
+  aethyme broker ownership [list] [--json]
+      List named operations a live session declared it is driving, with each
+      holder's liveness and last coordinated operation.
+  aethyme broker ownership claim <name> --session <id> --reason <text> [--json]
+      Declare this session is driving <name>, e.g. a release.
+      Refused only while another session holds it and is working; a quiet
+      holder's claim is taken over and the report names it. Finishing the
+      session ends the claim.
+  aethyme broker ownership release <name> --session <id> [--json]
+      Release this session's claim on <name>.
   aethyme broker resources plan <request.json> [--json]
       Read-only host-wide availability estimate for a typed resource bundle.
       Never reserves a port, namespace, capacity slot, or exclusive key.
@@ -1835,6 +1845,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
         "resources" => run_resources(parsed)?,
         "agents" => run_agents(parsed)?,
         "leases" => run_leases(parsed)?,
+        "ownership" => run_ownership(parsed)?,
         "exec" => run_exec(parsed)?,
         "git" | "gh" => run_git_gh(parsed, subcommand)?,
         "merge-chain" => run_merge_chain(parsed)?,

@@ -129,6 +129,7 @@ const COMMANDS: &[&str] = &[
 /// Every current advanced broker subcommand.
 const BROKER_ADVANCED: &[&str] = &[
     "leases",
+    "ownership",
     "git",
     "gh",
     "merge-chain",

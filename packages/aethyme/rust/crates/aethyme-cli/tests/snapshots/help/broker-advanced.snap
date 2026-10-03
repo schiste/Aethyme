@@ -6,6 +6,7 @@ Usage: aethyme broker advanced <verb> [args...]
 
 Verbs:
   leases           inspect, claim, plan, export or release path ownership
+  ownership        claim, list or release a named operation such as a release
   git              run Git through the durable operation coordinator
   gh               run GitHub CLI through the same coordinator
   merge-chain      land pull requests in order, each verified on its merge commit

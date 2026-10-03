@@ -100,6 +100,7 @@ use most:
 - `aethyme broker advanced operations`
 - `aethyme broker advanced exec`
 - `aethyme broker advanced leases ...`
+- `aethyme broker advanced ownership ...`
 - `aethyme broker advanced ship plan`
 - `aethyme broker advanced ship execute`
 - `aethyme broker advanced advisories`
