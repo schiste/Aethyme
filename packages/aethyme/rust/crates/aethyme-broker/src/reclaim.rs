@@ -858,6 +858,146 @@ pub fn protect_unrecorded_worktrees(candidates: &mut [ReclaimCandidate], recorde
     }
 }
 
+/// How long after a worktree's Git index last changed its build output is
+/// still treated as in use.
+///
+/// `Active` is ten minutes of hook activity, which an agent thinking through a
+/// long change, or a person working in the checkout without the hook, falls
+/// outside of. A Git index changes on every `add`, `commit`, `checkout` and
+/// index-refreshing `status`, so it is a cheap witness that someone worked
+/// here recently whatever the session row says.
+pub const RECENT_WORK_WINDOW_MS: i64 = 3 * 3_600_000;
+
+/// Keep candidates in worktrees a process has a file or working directory
+/// open in.
+///
+/// Session state cannot see a dev server, a test watcher or a build started
+/// from a plain shell: each outlives the agent that launched it and keeps
+/// writing to the very `node_modules` or `target/` a reclaim would delete.
+/// `open_paths` is one snapshot of every open path (see
+/// [`open_paths_under`]); a candidate is kept when any of them lies in its
+/// worktree.
+pub fn protect_worktrees_with_open_files(
+    candidates: &mut [ReclaimCandidate],
+    open_paths: &[PathBuf],
+) {
+    for candidate in candidates.iter_mut().filter(|c| c.reclaimable) {
+        let worktree = &candidate.worktree;
+        let canonical = std::fs::canonicalize(worktree).ok();
+        let in_use = open_paths.iter().any(|open| {
+            open.starts_with(worktree)
+                || canonical
+                    .as_ref()
+                    .is_some_and(|canonical| open.starts_with(canonical))
+        });
+        if in_use {
+            candidate.reclaimable = false;
+            candidate.reason = "a process has a file or working directory open in this \
+                worktree; a build or dev server may still be using it"
+                .into();
+        }
+    }
+}
+
+/// Keep candidates in worktrees whose Git index changed within `window_ms`.
+///
+/// An index whose timestamp cannot be read counts as recent: not knowing when
+/// someone last worked here is not evidence that nobody did.
+pub fn protect_recently_worked_worktrees(
+    candidates: &mut [ReclaimCandidate],
+    now_ms: i64,
+    window_ms: i64,
+) {
+    for candidate in candidates.iter_mut().filter(|c| c.reclaimable) {
+        let Some(index) = git_index_path(&candidate.worktree) else {
+            continue;
+        };
+        if !index.exists() {
+            continue;
+        }
+        let age_ms = std::fs::metadata(&index)
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|since| now_ms.saturating_sub(since.as_millis() as i64));
+        match age_ms {
+            Some(age_ms) if age_ms >= window_ms => {}
+            Some(age_ms) => {
+                candidate.reclaimable = false;
+                candidate.reason = format!(
+                    "Git index changed {} min ago; someone worked here within the last {} h",
+                    age_ms / 60_000,
+                    window_ms / 3_600_000
+                );
+            }
+            None => {
+                candidate.reclaimable = false;
+                candidate.reason = "cannot read when this worktree's Git index last changed".into();
+            }
+        }
+    }
+}
+
+/// The index file of the checkout rooted at `worktree`: `.git/index` for a
+/// primary checkout, `<gitdir>/index` for a linked worktree whose `.git` is a
+/// `gitdir:` pointer file.
+fn git_index_path(worktree: &Path) -> Option<PathBuf> {
+    let dot_git = worktree.join(".git");
+    let metadata = std::fs::symlink_metadata(&dot_git).ok()?;
+    if metadata.is_dir() {
+        return Some(dot_git.join("index"));
+    }
+    let pointer = std::fs::read_to_string(&dot_git).ok()?;
+    let gitdir = pointer
+        .lines()
+        .find_map(|line| line.strip_prefix("gitdir:"))?
+        .trim();
+    Some(worktree.join(gitdir).join("index"))
+}
+
+/// Every path a process on this host has open beneath `root`, from one
+/// `lsof` snapshot, or `None` when the snapshot cannot be taken.
+///
+/// One system-wide listing filtered here, rather than `lsof +D`: `+D` walks
+/// the whole tree, which under a root of build caches is the slow part of a
+/// reclaim already. Working directories are included -- `lsof` reports them as
+/// the `cwd` descriptor -- so an idle shell parked in a worktree keeps it.
+pub fn open_paths_under(root: &Path) -> Option<Vec<PathBuf>> {
+    let output = std::process::Command::new("lsof")
+        .args(["-w", "-n", "-P", "-Fn"])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    // `lsof` exits 1 when it could not inspect some process (another user's,
+    // one that exited mid-listing) while still listing every other one; only
+    // an empty listing means no snapshot was taken.
+    if output.stdout.is_empty() {
+        return None;
+    }
+    Some(parse_lsof_names(
+        &String::from_utf8_lossy(&output.stdout),
+        root,
+    ))
+}
+
+/// The `n` (name) fields of `lsof -F` output that lie beneath `root`, under
+/// either its given or its canonical spelling.
+fn parse_lsof_names(listing: &str, root: &Path) -> Vec<PathBuf> {
+    let canonical = std::fs::canonicalize(root).ok();
+    listing
+        .lines()
+        .filter_map(|line| line.strip_prefix('n'))
+        .map(PathBuf::from)
+        .filter(|path| {
+            path.starts_with(root)
+                || canonical
+                    .as_ref()
+                    .is_some_and(|canonical| path.starts_with(canonical))
+        })
+        .collect()
+}
+
 /// What stays fixed while one worktree is walked.
 struct Walk<'a> {
     worktree: &'a Path,
@@ -975,6 +1115,10 @@ pub fn apply(plan: &ReclaimPlan) -> ReclaimOutcome {
 #[cfg(test)]
 mod scan_tests {
     use super::*;
+
+    fn p(value: &str) -> PathBuf {
+        PathBuf::from(value)
+    }
 
     fn write(path: &Path, bytes: usize) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -1306,5 +1450,86 @@ mod scan_tests {
             "{}",
             candidates[1].reason
         );
+    }
+    #[test]
+    fn a_worktree_with_an_open_file_is_kept() {
+        let mut candidates = vec![
+            classify(&p("/w/busy/target"), &p("/w/busy"), 8, &[]),
+            classify(&p("/w/quiet/target"), &p("/w/quiet"), 8, &[]),
+        ];
+        protect_worktrees_with_open_files(&mut candidates, &[p("/w/busy/web/vite.log")]);
+        assert!(!candidates[0].reclaimable);
+        assert!(
+            candidates[0].reason.contains("open"),
+            "{}",
+            candidates[0].reason
+        );
+        assert!(candidates[1].reclaimable, "{}", candidates[1].reason);
+    }
+
+    #[test]
+    fn a_sibling_worktree_sharing_a_name_prefix_is_not_kept() {
+        let mut candidates = vec![classify(&p("/w/app/target"), &p("/w/app"), 8, &[])];
+        protect_worktrees_with_open_files(&mut candidates, &[p("/w/app-2/src/main.rs")]);
+        assert!(candidates[0].reclaimable, "{}", candidates[0].reason);
+    }
+
+    #[test]
+    fn lsof_names_are_narrowed_to_the_root() {
+        let listing = "p123\nfcwd\nn/w/root/a\nf3\nn/elsewhere/b\np9\nn/w/root/c/d.txt\n";
+        assert_eq!(
+            parse_lsof_names(listing, Path::new("/w/root")),
+            vec![p("/w/root/a"), p("/w/root/c/d.txt")]
+        );
+    }
+
+    fn set_index_age(worktree: &Path, age: std::time::Duration) {
+        let index = git_index_path(worktree).unwrap();
+        let file = std::fs::OpenOptions::new().write(true).open(index).unwrap();
+        file.set_modified(std::time::SystemTime::now() - age)
+            .unwrap();
+    }
+
+    #[test]
+    fn a_worktree_worked_in_recently_is_kept_and_an_idle_one_is_not() {
+        let tmp = tempfile::tempdir().unwrap();
+        let recent = tmp.path().join("recent");
+        let idle = tmp.path().join("idle");
+        for worktree in [&recent, &idle] {
+            checkout(worktree, "target/\n");
+            git(worktree, &["add", ".gitignore"]);
+        }
+        set_index_age(&recent, std::time::Duration::from_secs(20 * 60));
+        set_index_age(&idle, std::time::Duration::from_secs(4 * 3600));
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let mut candidates = vec![
+            classify(&recent.join("target"), &recent, 8, &[]),
+            classify(&idle.join("target"), &idle, 8, &[]),
+        ];
+        protect_recently_worked_worktrees(&mut candidates, now, RECENT_WORK_WINDOW_MS);
+        assert!(!candidates[0].reclaimable, "{}", candidates[0].reason);
+        assert!(
+            candidates[0].reason.contains("Git index changed"),
+            "{}",
+            candidates[0].reason
+        );
+        assert!(candidates[1].reclaimable, "{}", candidates[1].reason);
+    }
+
+    #[test]
+    fn a_linked_worktrees_index_is_found_through_its_gitdir_pointer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let main = tmp.path().join("main");
+        checkout(&main, "target/\n");
+        git(&main, &["add", ".gitignore"]);
+        git(&main, &["commit", "-qm", "init"]);
+        let linked = tmp.path().join("linked");
+        git(&main, &["worktree", "add", "-q", linked.to_str().unwrap()]);
+        let index = git_index_path(&linked).unwrap();
+        assert!(index.exists(), "{}", index.display());
+        assert_ne!(index, main.join(".git/index"));
     }
 }
