@@ -609,6 +609,11 @@ pub(super) fn run_doctor(parsed: Parsed) -> Result<(), UsageError> {
         }
         render_unpushed_work(&report.unpushed_work);
         render_recent_command_failures(&report.recent_command_failures);
+        if let Some(finding) = &report.hooks_path {
+            out!("git hooks: {}", finding.message());
+            out!("  resolved: {}", finding.resolved);
+            out!("  fix: {}", finding.fix);
+        }
         if let Some(repair) = &report.version_repair {
             out!(
                 "version repair: {} — {}",

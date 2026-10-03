@@ -969,6 +969,11 @@ pub struct DoctorReport {
     /// failure can be explained after its terminal is gone.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub recent_command_failures: Vec<RecentCommandFailure>,
+    /// A `core.hooksPath` that makes git skip every hook. Reported, never
+    /// counted against [`Self::healthy`], and never repaired: hook routing
+    /// is the operator's git config.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hooks_path: Option<crate::hooks::HooksPathFinding>,
 }
 
 /// One `broker.command.failed` event as `doctor` reports it.
@@ -8254,6 +8259,7 @@ impl Broker {
             self.integration_movement_notice_from_sessions(&live_sessions)?;
         let unpushed_work = self.unpushed_work(now_ms()).unwrap_or_default();
         let recent_command_failures = self.recent_command_failures(now_ms())?;
+        let hooks_path = crate::hooks::inspect_hooks_path(&self.main_root);
 
         Ok(DoctorReport {
             integrity,
@@ -8266,6 +8272,7 @@ impl Broker {
             integration_movement,
             unpushed_work,
             recent_command_failures,
+            hooks_path,
         })
     }
 
@@ -12884,6 +12891,7 @@ mod tests {
             integration_movement: None,
             unpushed_work: Default::default(),
             recent_command_failures: Vec::new(),
+            hooks_path: None,
         }
     }
 
