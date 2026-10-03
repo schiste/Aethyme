@@ -7498,6 +7498,8 @@ impl Broker {
         // Cached listing and local refs only: `status` never calls GitHub.
         if refresh {
             advice.extend(self.pr_overlap_advice(now_ms));
+        } else {
+            advice.extend(self.recorded_pr_overlap_advice(now_ms, &baseline_head, &baseline_ref));
         }
         // Several sessions on one PR conflict by construction; name it.
         advice.extend(self.duplicate_work_advice(&agents));
@@ -7531,6 +7533,7 @@ impl Broker {
                     "promoted_conflicts",
                     "branch_drift",
                     "shared_edit_classification",
+                    "pr_overlap_refresh",
                     "cleanup_eligibility",
                 ]
                 .into_iter()

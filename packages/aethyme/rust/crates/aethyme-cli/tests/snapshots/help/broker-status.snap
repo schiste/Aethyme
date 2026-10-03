@@ -1,17 +1,15 @@
 exit: 0
 --- stdout
-  aethyme broker status [--json] [--summary]
-      The whole picture: agents, overlaps, promoted conflicts, merge
-      queue, integration head. Session records are reported under the
+  aethyme broker status [--json] [--summary] [--refresh]
+      Sessions, recorded overlaps, merge queue and ref tips.
+      Session records are reported under the
       `agents` key; the id every `--session <id>` flag expects is
       `agents[].id`. There is no `sessions` key.
-      --summary prints only `summary` and `advice`, and skips the
-      per-session diff that dominates the full view's cost. Prefer it for
-      the orientation step at the start of a session: it is cheap, and
-      small enough that truncating it does not yield unparseable JSON.
-      Its `overlap_count` is as of the last refresh, which it reports as
-      `leases_refreshed: false`; use the full view when lease truth must
-      be current.
+      Routine status reads recorded leases/overlaps and size observations;
+      it does not audit cleanup eligibility or promoted conflicts. The JSON
+      and text explicitly identify unrefreshed data. --summary renders only
+      summary, advice and phase timings. --refresh explicitly performs the
+      expensive full lease, conflict and cleanup audit; use it when needed.
   aethyme broker status readiness [--require <conflict-only|agent-ready|parallel-ready>] [--json]
       Interpret deterministic repository, broker, agent-context, validation,
       parallel-execution, graph, and upgrade facts into a typed readiness

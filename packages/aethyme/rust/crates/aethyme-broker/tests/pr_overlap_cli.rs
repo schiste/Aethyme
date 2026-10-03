@@ -406,3 +406,90 @@ fn the_work_per_push_is_bounded() {
         fixture.gh_log()
     );
 }
+
+#[test]
+fn recorded_status_warning_is_invalidated_when_push_inputs_move() {
+    for changed in [
+        "session-head",
+        "baseline",
+        "baseline-ref",
+        "listing",
+        "expired",
+    ] {
+        let fixture = Fixture::new();
+        let other = fixture.publish_other("agent/other", &[(2, "theirs")], true);
+        fixture.open_prs(&[(12, "agent/other", &other, "OPEN")]);
+        let (id, _) = fixture.session_editing(&[(3, "ours")]);
+        fixture.push(id);
+        assert_eq!(overlap_advice(&fixture.status()).len(), 1);
+        let mut broker = fixture.broker();
+        match changed {
+            "session-head" => {
+                let session = broker.store().session(id).unwrap();
+                git(
+                    Path::new(&session.worktree_path),
+                    &["commit", "--allow-empty", "-qm", "new head"],
+                );
+            }
+            "baseline" => git(
+                &fixture.repo,
+                &["update-ref", "refs/remotes/origin/main", &other],
+            ),
+            "baseline-ref" => {
+                git(
+                    &fixture.repo,
+                    &["update-ref", "refs/remotes/origin/other", "HEAD"],
+                );
+                git(
+                    &fixture.repo,
+                    &[
+                        "symbolic-ref",
+                        "refs/remotes/origin/HEAD",
+                        "refs/remotes/origin/other",
+                    ],
+                );
+            }
+            "listing" | "expired" => {
+                let mut listing: serde_json::Value = serde_json::from_str(
+                    &broker
+                        .store()
+                        .meta_get("pr_overlap.open_prs")
+                        .unwrap()
+                        .unwrap(),
+                )
+                .unwrap();
+                if changed == "expired" {
+                    listing["fetched_at_ms"] = serde_json::json!(0);
+                } else {
+                    listing["prs"][0]["head_oid"] = serde_json::json!("f".repeat(40));
+                }
+                let raw = listing.to_string();
+                broker
+                    .store()
+                    .meta_set("pr_overlap.open_prs", &raw)
+                    .unwrap();
+                if changed == "expired" {
+                    // Keep the listing binding matching: this case must fail
+                    // freshness, not merely the listing-identity check.
+                    let key = format!("pr_overlap.checked.{id}");
+                    let mut recorded: serde_json::Value =
+                        serde_json::from_str(&broker.store().meta_get(&key).unwrap().unwrap())
+                            .unwrap();
+                    recorded["listing"] = serde_json::json!(raw);
+                    broker
+                        .store()
+                        .meta_set(&key, &recorded.to_string())
+                        .unwrap();
+                }
+            }
+            _ => unreachable!(),
+        }
+        fixture.clear_gh_log();
+        let status = fixture.status();
+        assert!(
+            overlap_advice(&status).is_empty(),
+            "obsolete warning survived {changed}: {status}"
+        );
+        assert_eq!(fixture.gh_log(), "", "routine status must stay offline");
+    }
+}

@@ -1357,3 +1357,8 @@ with `--summary` or used in degraded read-only compatibility mode. Neither
 routine view authorizes deletion: `broker gc plan`, apply, finish and submit
 continue to perform their independent checks. Routine size observations carry
 their measurement timestamp and are not silently refreshed by a directory walk.
+
+Recorded PR-overlap warnings come from the last push and are invalidated when
+its session head, baseline ref/commit or cached PR listing changes, or when the
+listing expires. Routine status reads branch tips in one batch and reports the
+listing timestamp; it performs neither new PR diffs nor network requests.

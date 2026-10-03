@@ -619,8 +619,8 @@ Usage:
       template option atomically writes a no-clobber schema-v2 document with
       exact identifiers and deliberately invalid null operator judgments.
   aethyme broker status [--json] [--summary] [--refresh]
-      The whole picture: agents, overlaps, promoted conflicts, merge
-      queue, integration head. Session records are reported under the
+      Sessions, recorded overlaps, merge queue and ref tips.
+      Session records are reported under the
       `agents` key; the id every `--session <id>` flag expects is
       `agents[].id`. There is no `sessions` key.
       Routine status reads recorded leases/overlaps and size observations;
