@@ -269,6 +269,16 @@ fn branches_audit_without_gh_keeps_squash_merged_work_local_only() {
 #[test]
 fn branches_audit_is_read_only() {
     let fixture = fixture();
+    // Stale stat data on a tracked file: a `git status` allowed to take the
+    // index lock would refresh and rewrite the index here.
+    let tracked = std::fs::File::options()
+        .write(true)
+        .open(fixture.work.join("base.txt"))
+        .expect("open tracked file");
+    tracked
+        .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(60))
+        .expect("bump mtime");
+    drop(tracked);
     let refs_before = git(&fixture.work, &["for-each-ref"]);
     let index = fixture.work.join(".git").join("index");
     let index_before = std::fs::metadata(&index)
