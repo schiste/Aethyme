@@ -390,7 +390,7 @@ fn remote_git_refuses_mismatched_assertions_and_multiple_push_urls() {
             .run_coordinated_operation(mismatch)
             .unwrap_err()
             .to_string()
-            .contains("does not match resolved repository")
+            .contains("does not match session")
     );
     assert!(broker.store().coordinated_operations().unwrap().is_empty());
 
@@ -452,6 +452,88 @@ fn github_operations_journal_normalized_identity_and_display_spelling() {
         "github.com/schiste/aethyme"
     );
     assert_eq!(details["github_target"]["display_slug"], "Schiste/Aethyme");
+}
+
+#[test]
+fn repository_unrelated_to_the_session_is_refused_before_journaling() {
+    // Session ids are numbered per repository and resolved against the broker
+    // of the caller's directory: `--session N --repo owner/other` run from the
+    // wrong checkout picks up *this* repository's session N.
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    git(
+        tmp.path(),
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/schiste/Aethyme.git",
+        ],
+    );
+    git(
+        tmp.path(),
+        &[
+            "remote",
+            "add",
+            "upstream",
+            "git@github.com:upstream/Fork.git",
+        ],
+    );
+    let worktree = add_worktree(tmp.path(), "wrong-repository");
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let session = broker.adopt(&worktree, None).unwrap();
+
+    let github = broker
+        .run_coordinated_operation(github_request(session.id, "schiste/SP42", &["--version"]))
+        .unwrap_err();
+    assert!(
+        matches!(github, BrokerOpError::SessionRepositoryMismatch { .. }),
+        "{github}"
+    );
+    let message = github.to_string();
+    assert!(message.contains("--repo schiste/SP42"), "{message}");
+    assert!(message.contains("origin: schiste/Aethyme"), "{message}");
+    assert!(message.contains("upstream: upstream/Fork"), "{message}");
+    assert!(message.contains("run the command from a checkout of schiste/SP42"));
+
+    let mut local_git = request(session.id, &["branch", "wrong-repository-branch"]);
+    local_git.repository = Some("schiste/SP42".into());
+    let git_error = broker.run_coordinated_operation(local_git).unwrap_err();
+    assert!(
+        matches!(git_error, BrokerOpError::SessionRepositoryMismatch { .. }),
+        "{git_error}"
+    );
+    assert!(broker.store().coordinated_operations().unwrap().is_empty());
+
+    // Any configured remote counts, and the comparison ignores case, so a
+    // fork addressing its upstream is not refused.
+    for repository in ["Schiste/aethyme", "upstream/Fork"] {
+        let report = broker
+            .run_coordinated_operation(github_request(session.id, repository, &["--version"]))
+            .unwrap();
+        assert!(report.ok(), "{repository}");
+    }
+}
+
+#[test]
+fn closed_session_error_names_the_broker_it_resolved_against() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let worktree = add_worktree(tmp.path(), "closed-names-broker");
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let session = broker.adopt(&worktree, None).unwrap();
+    broker.close(session.id).unwrap();
+
+    let error = broker
+        .run_coordinated_operation(github_request(session.id, "owner/repo", &["--version"]))
+        .unwrap_err();
+    let message = error.to_string();
+    let root = broker.main_root().display().to_string();
+    assert!(
+        message.contains(&format!("of the broker at {root}")),
+        "{message}"
+    );
+    assert!(message.contains("numbered per repository"), "{message}");
 }
 
 #[test]
@@ -1473,7 +1555,7 @@ fn a_local_command_refuses_a_repository_assertion_that_contradicts_origin() {
 
     let error = broker.run_coordinated_operation(command).unwrap_err();
     assert!(
-        matches!(error, BrokerOpError::InvalidCoordinatedOperation { .. }),
+        matches!(error, BrokerOpError::SessionRepositoryMismatch { .. }),
         "unexpected error: {error:?}"
     );
 }
