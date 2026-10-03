@@ -911,7 +911,16 @@ pub(super) fn run_push(parsed: Parsed) -> Result<(), UsageError> {
         );
     }
     match &report.pr {
-        Some(pr) if pr.created => out!("  Opened draft pull request #{} {}", pr.number, pr.url),
+        Some(pr) if pr.created => {
+            out!("  Opened draft pull request #{} {}", pr.number, pr.url);
+            if pr.ci_skips_drafts {
+                out!(
+                    "  Note: this repository's CI skips draft pull requests; checks run once \
+                     it is marked ready (`gh pr ready {}`, through `aethyme broker advanced gh`)",
+                    pr.number
+                );
+            }
+        }
         Some(pr) => out!("  Pull request #{} {} ({})", pr.number, pr.url, pr.state),
         None => out!(
             "  Open a draft pull request with: aethyme broker push --session {} --pr",

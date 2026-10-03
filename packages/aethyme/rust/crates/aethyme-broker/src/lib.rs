@@ -85,6 +85,7 @@ pub use ownership::{
 };
 pub mod plugin_cli;
 mod pr;
+mod pr_body;
 mod pr_link;
 mod pr_monitoring;
 mod scopes;
@@ -330,12 +331,14 @@ pub use operation_stats::{
 pub use operations::{
     CoordinatedCommand, CoordinatedOperationReport, OperationReconcileReport, PushedRef,
 };
+pub(crate) use operations::{
+    MissingOperationFlags, is_within, missing_operation_flags, worktree_relative_push_sources,
+};
 pub use operations::{
     OperationReconciliation, OperationReconciliationRecovery, OperationReconciliationState,
     OperationShowReport, PostMergeCleanupReport, PostMergeCleanupState, QueueWait,
     UnknownOutcomeRecovery, classify_gh, classify_git,
 };
-pub(crate) use operations::{is_within, worktree_relative_push_sources};
 pub use overlap_pairs::{
     BUDGET_EXHAUSTED_REASON, OverlapPair, OverlapSeverity, overlap_state_reads,
 };
