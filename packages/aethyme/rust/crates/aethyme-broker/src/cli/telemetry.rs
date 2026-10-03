@@ -12,6 +12,7 @@ pub(super) const KNOWN_COMMAND_WORDS: &[&str] = &[
     "exec",
     "git",
     "gh",
+    "merge-chain",
     "operations",
     "stats",
     "blockers",
@@ -281,6 +282,7 @@ pub(super) fn command_records_metric(args: &[String]) -> bool {
         Some("storage") => args.get(1).map(String::as_str) == Some("apply"),
         Some("representation") => args.get(1).map(String::as_str) == Some("record"),
         Some("operations") => args.get(1).map(String::as_str) == Some("reconcile"),
+        Some("merge-chain") => !args.iter().any(|arg| arg == "--dry-run"),
         Some("git" | "gh") => {
             let command = args
                 .iter()

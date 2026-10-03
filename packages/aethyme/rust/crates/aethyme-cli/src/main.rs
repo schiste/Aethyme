@@ -87,7 +87,9 @@ fn broker_invocation_surface(args: &[String]) -> repository_upgrade::InvocationS
         args.get(1).map(String::as_str),
     ) {
         (Some("hooks"), Some("pre-commit" | "post-commit")) => InvocationSurface::Hook,
-        (Some("git" | "gh" | "operations"), _) => InvocationSurface::CoordinatedOperation,
+        (Some("git" | "gh" | "merge-chain" | "operations"), _) => {
+            InvocationSurface::CoordinatedOperation
+        }
         _ => InvocationSurface::BrokerCommand,
     }
 }
@@ -111,7 +113,7 @@ fn broker_command_capability(args: &[String]) -> repository_upgrade::CommandCapa
         (Some("gates"), Some("run" | "pre-push" | "affected" | "semantic")) => {
             CommandCapability::SessionContinuation
         }
-        (Some("close" | "finish" | "git" | "gh" | "cleanup"), _) => {
+        (Some("close" | "finish" | "git" | "gh" | "merge-chain" | "cleanup"), _) => {
             CommandCapability::RecoveryWrite
         }
         (Some("storage"), Some("apply")) => CommandCapability::RecoveryWrite,

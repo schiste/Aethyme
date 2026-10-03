@@ -18,6 +18,7 @@ mod gc_storage;
 mod git_gh;
 mod insights;
 mod leases;
+mod merge_chain;
 mod render;
 mod report;
 mod resources;
@@ -38,6 +39,7 @@ use gc_storage::*;
 use git_gh::*;
 use insights::*;
 use leases::*;
+use merge_chain::*;
 use render::*;
 use report::*;
 use resources::*;
@@ -304,6 +306,14 @@ Usage:
       secret-bearing argument values. After a successful `gh pr merge`, it
       refreshes the tracked target and removes a fully landed integration
       layer; mixed or uncertain work remains unchanged with recovery guidance.
+  aethyme broker merge-chain --session <id> --repo <owner/name> --reason <text> <pr>... [--merge-method <merge|squash|rebase>] [--poll-seconds <n>] [--checks-timeout <seconds>] [--main-timeout <seconds>] [--gates-workflow <file> [--dispatch-after <seconds>]] [--dry-run] [--json]
+      Land pull requests one at a time, in order. For each: mark it ready,
+      update it onto the base when behind, wait for the latest run of every
+      check on that exact head, merge with --match-head-commit, then wait for
+      the base branch's runs on the merge commit (dispatching --gates-workflow
+      when none appears). Stops at the first failure and names the safe next
+      action; every write is a journaled `gh` operation. Re-running resumes:
+      merged pull requests are skipped and the last one is verified again.
   aethyme broker operations list [--limit <n>] [--before <id>] [--session <id>] [--status <status>] [--repo <canonical-id>] [--provider <git|github>] [--json]
       List a filtered newest-first page of the durable operation journal.
       `operations` without `list` is a compatibility alias during deprecation.
@@ -1029,6 +1039,8 @@ struct Parsed {
     planned_paths: Vec<String>,
     declared_scopes: Vec<String>,
     exec_command: Vec<String>,
+    /// `merge-chain` tuning: merge method, poll interval, timeouts, gates workflow.
+    merge_chain: MergeChainFlags,
     /// Every flag spelled on the command line, in order, as written (`--` for
     /// the command separator). `validate_flags` checks these against the
     /// subcommand's entry in `FLAG_RULES`.
@@ -1146,6 +1158,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         planned_paths: Vec::new(),
         declared_scopes: Vec::new(),
         exec_command: Vec::new(),
+        merge_chain: MergeChainFlags::default(),
         given_flags: Vec::new(),
     };
     let mut iter = args.iter();
@@ -1218,6 +1231,13 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
                 })?);
             }
             "--destructive" => parsed.destructive = true,
+            flag @ ("--merge-method" | "--poll-seconds" | "--checks-timeout" | "--main-timeout"
+            | "--dispatch-after" | "--gates-workflow") => {
+                let value = iter
+                    .next()
+                    .ok_or(UsageError::Message(format!("{flag} requires a value")))?;
+                parsed.merge_chain.set(flag, value)?;
+            }
             "--allow-parallel" => parsed.allow_parallel = true,
             "--break-glass" => parsed.break_glass = true,
             "--sync-main" => parsed.sync_main = true,
@@ -1817,6 +1837,7 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
         "leases" => run_leases(parsed)?,
         "exec" => run_exec(parsed)?,
         "git" | "gh" => run_git_gh(parsed, subcommand)?,
+        "merge-chain" => run_merge_chain(parsed)?,
         "advisories" => run_advisories(parsed)?,
         "exposures" => run_exposures(parsed)?,
         "note" => run_note(parsed)?,

@@ -81,6 +81,10 @@ pub const ADVANCED_VERBS: &[(&str, &str)] = &[
     ("git", "run Git through the durable operation coordinator"),
     ("gh", "run GitHub CLI through the same coordinator"),
     (
+        "merge-chain",
+        "land pull requests in order, each verified on its merge commit",
+    ),
+    (
         "operations",
         "inspect or reconcile the remote-operation journal",
     ),
