@@ -2501,6 +2501,75 @@ pub struct StatusAdvice {
     pub commands: Vec<String>,
 }
 
+/// Work a verify-only repository's integration branch carries that the
+/// published branch lacks.
+///
+/// Nothing moves integration in verify-only mode, so no session owns such
+/// commits: they are left over from when the repository promoted. Before this
+/// row they surfaced only after a pull-request merge, as a deferred post-merge
+/// cleanup demanding reviewed reconciliation, and the `integration.*` rows above
+/// are gated to promoting repositories and to `--refresh`. The check is one
+/// ancestry test (plus a count when it fails), so it runs on every status;
+/// the patch-level classification is added only when a refreshed status has
+/// already computed it.
+fn leftover_integration_advice(
+    repo: &GitRepo,
+    integration_head: &str,
+    (baseline_ref, baseline_head): (&str, &str),
+    assessment: Option<&crate::IntegrationDriftAssessment>,
+) -> Result<Option<StatusAdvice>, BrokerOpError> {
+    // `HEAD` means no `origin/HEAD` names a published branch; measuring
+    // against the checkout would call every unpublished commit leftover.
+    let tracked;
+    let (baseline_ref, baseline_head) = if baseline_ref == "HEAD" {
+        let Some(upstream) = repo.tracking_upstream() else {
+            return Ok(None);
+        };
+        tracked = upstream;
+        (tracked.0.as_str(), tracked.1.as_str())
+    } else {
+        (baseline_ref, baseline_head)
+    };
+    if integration_head == baseline_head || repo.is_ancestor(integration_head, baseline_head) {
+        return Ok(None);
+    }
+    let count = repo.commit_count_between(baseline_head, integration_head)?;
+    let upstream = baseline_ref
+        .strip_prefix("refs/remotes/")
+        .or_else(|| baseline_ref.strip_prefix("refs/heads/"))
+        .unwrap_or(baseline_ref);
+    let stale_only = assessment.filter(|assessment| assessment.stale_only);
+    let mut summary = format!(
+        "integration carries {count} {} {upstream} lacks; this repository is verify-only, so no \
+         session owns {} and the next pull-request merge will defer integration cleanup",
+        plural_word(count as usize, "commit", "commits"),
+        if count == 1 { "it" } else { "them" }
+    );
+    if let Some(assessment) = assessment {
+        summary.push_str("; ");
+        summary.push_str(&assessment.explanation);
+    }
+    Ok(Some(StatusAdvice {
+        id: "integration.leftover-work",
+        severity: if stale_only.is_some() {
+            StatusAdviceSeverity::Notice
+        } else {
+            StatusAdviceSeverity::Warning
+        },
+        reason: "a verify-only integration branch holds commits the published branch lacks",
+        summary,
+        session_id: None,
+        queue_entry_id: None,
+        evidence: vec![
+            format!("integration: {}", short_commit(integration_head)),
+            format!("{upstream}: {}", short_commit(baseline_head)),
+        ],
+        commands: vec![format!(
+            "aethyme broker advanced integration reconcile --upstream {upstream} --dry-run"
+        )],
+    }))
+}
+
 /// One warning per submit that is gone or has made no progress for
 /// [`crate::SUBMIT_STALL_AFTER`]. A submit that is only waiting in line keeps
 /// reporting and never appears here.
@@ -7111,6 +7180,16 @@ impl Broker {
                     },
                 },
                 );
+        }
+        if !promotes
+            && let Some(row) = leftover_integration_advice(
+                &self.repo,
+                &integration_head,
+                (&baseline_ref, &baseline_head),
+                integration_reconciliation.as_ref(),
+            )?
+        {
+            advice.insert(0, row);
         }
         // "Never passed through submit" is every commit under verify-only,
         // where landing goes through pull requests and integration stays put.
