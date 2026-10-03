@@ -94,8 +94,7 @@ impl ChainWriter for CoordinatedWriter<'_> {
             .stderr
             .lines()
             .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .last()
+            .rfind(|line| !line.is_empty())
             .unwrap_or("no provider output")
             .to_string();
         Ok(WriteOutcome::Failed { operation, detail })

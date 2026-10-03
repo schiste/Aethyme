@@ -8,6 +8,7 @@ Verbs:
   leases           inspect, claim, plan, export or release path ownership
   git              run Git through the durable operation coordinator
   gh               run GitHub CLI through the same coordinator
+  merge-chain      land pull requests in order, each verified on its merge commit
   operations       inspect or reconcile the remote-operation journal
   exec             run a command in a session worktree under the dirty-path guard
   ship             plan or execute a reviewed full-SHA publication
