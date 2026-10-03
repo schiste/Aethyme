@@ -266,7 +266,10 @@ impl Broker {
     ) -> Result<SessionPushReport, BrokerOpError> {
         let session = self.store().session(session_id)?;
         if session.status.is_closed() {
-            return Err(BrokerOpError::ClosedSessionOperation { session_id });
+            return Err(BrokerOpError::ClosedSessionOperation {
+                session_id,
+                repository_root: self.main_root().display().to_string(),
+            });
         }
         let main_root = self.main_root().to_path_buf();
         let repo = self.repo_handle();

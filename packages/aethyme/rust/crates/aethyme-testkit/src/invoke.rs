@@ -85,6 +85,7 @@ pub struct Invoke {
     args: Vec<String>,
     cwd: Option<PathBuf>,
     stdin: Option<String>,
+    envs: Vec<(String, String)>,
 }
 
 impl Invoke {
@@ -100,6 +101,7 @@ impl Invoke {
                 .collect(),
             cwd: None,
             stdin: None,
+            envs: Vec::new(),
         }
     }
 
@@ -111,6 +113,12 @@ impl Invoke {
     /// Feed the child's stdin, for reader commands accepting `--from -`.
     pub fn stdin(mut self, text: impl Into<String>) -> Self {
         self.stdin = Some(text.into());
+        self
+    }
+
+    /// Set an environment variable for the child (e.g. a PATH carrying a stub).
+    pub fn env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.envs.push((key.into(), value.into()));
         self
     }
 
@@ -133,6 +141,9 @@ impl Invoke {
             .stderr(Stdio::piped());
         if let Some(dir) = &self.cwd {
             command.current_dir(dir);
+        }
+        for (key, value) in &self.envs {
+            command.env(key, value);
         }
 
         let mut child = command
