@@ -81,6 +81,7 @@ pub fn for_broker_error(error: &BrokerOpError) -> u8 {
         | E::OwnershipViolation { .. }
         | E::InvalidCoordinatedOperation { .. }
         | E::ClosedSessionOperation { .. }
+        | E::SessionRepositoryMismatch { .. }
         | E::CoordinatedOperationBlocked { .. }
         | E::UnsafeSubmissionPlan { .. }
         | E::UnsupportedSubmissionCommit { .. }
