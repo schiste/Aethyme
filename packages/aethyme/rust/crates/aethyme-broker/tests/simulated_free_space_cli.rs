@@ -17,6 +17,8 @@ mod common;
 const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
 const LOW: &str = "1024";
 const GENEROUS: &str = "1099511627776";
+/// 12 GiB: above the 8 GiB a gate needs, below twice that.
+const MARGINAL: &str = "12884901888";
 
 fn git(repo: &Path, args: &[&str]) {
     let output = Command::new("git")
@@ -124,5 +126,27 @@ fn a_generous_reading_admits_the_gate_and_keeps_status_quiet() {
             .iter()
             .any(|id| id == "host.gate-headroom"),
         "a simulated 1 TiB still reported a starved volume"
+    );
+    assert!(
+        !fx.advice_ids(GENEROUS)
+            .iter()
+            .any(|id| id == "host.disk-low"),
+        "a simulated 1 TiB still warned about free space"
+    );
+}
+
+#[test]
+fn a_marginal_reading_admits_the_gate_but_warns_before_it_would_refuse() {
+    let fx = fixture();
+    let (passed, text) = fx.gate(MARGINAL);
+    assert!(passed, "12 GiB is above the gate threshold: {text}");
+    let ids = fx.advice_ids(MARGINAL);
+    assert!(
+        ids.iter().any(|id| id == "host.disk-low"),
+        "status stayed silent one large build away from refusing every gate: {ids:?}"
+    );
+    assert!(
+        !ids.iter().any(|id| id == "host.gate-headroom"),
+        "a gate that starts must not be reported as refused: {ids:?}"
     );
 }

@@ -11145,6 +11145,18 @@ fn lowest_available_with(
 /// plan` covers every repository's broker storage on the host. It does not
 /// promise that reclaiming this repository is enough -- the volume is shared.
 ///
+/// Below [`DISK_LOW_WARNING_MULTIPLE`] times the gate threshold the same row
+/// appears one band earlier, as `host.disk-low` at `warning`: gates still
+/// start, but the margin is one large build. Measured 2026-10-03, a machine
+/// went from comfortable to 3.4 GiB free with status silent until the gate
+/// threshold, by which point every gate already refused.
+///
+/// Both bands name `gc reclaim plan`. `gc plan` and `gc sweep` touch only
+/// closed sessions and sessions idle past `idle_session_artifact_hours`;
+/// build output in open sessions that are merely quiet -- the bulk of the
+/// 40 GiB reclaimed by hand that day -- is reachable only through the
+/// reviewed `gc reclaim` lane.
+///
 /// Unknown headroom does not escalate, for the reason `refusal` fails open: a
 /// reading that could not be taken is not evidence of a full disk.
 fn gate_headroom_advice(
@@ -11152,38 +11164,63 @@ fn gate_headroom_advice(
     probe: Option<&Path>,
     required: u64,
 ) -> Option<StatusAdvice> {
-    if !matches!(
-        crate::disk_headroom::sweep_urgency(available, required),
+    let available = available?;
+    let starved = matches!(
+        crate::disk_headroom::sweep_urgency(Some(available), required),
         crate::disk_headroom::SweepUrgency::Pressured
-    ) {
+    );
+    let warn_below = required.saturating_mul(DISK_LOW_WARNING_MULTIPLE);
+    if !starved && available >= warn_below {
         return None;
     }
-    let available = available?;
     let volume = probe
         .map(|probe| format!(" on the volume holding {}", probe.display()))
         .unwrap_or_default();
+    let free = crate::disk_headroom::format_gibibytes(available);
+    let needed = crate::disk_headroom::format_gibibytes(required);
+    let (id, severity, reason, summary) = if starved {
+        (
+            "host.gate-headroom",
+            StatusAdviceSeverity::Blocked,
+            "the host has less free space than a gate needs to start",
+            format!(
+                "{free} free{volume} and a gate needs {needed} to start, so every gate here refuses \
+                 before running anything until space is reclaimed"
+            ),
+        )
+    } else {
+        (
+            "host.disk-low",
+            StatusAdviceSeverity::Warning,
+            "the host is close to the free space a gate needs to start",
+            format!(
+                "{free} free{volume}; gates refuse below {needed}, so one large build \
+                 could stop every gate here"
+            ),
+        )
+    };
     Some(StatusAdvice {
-        id: "host.gate-headroom",
-        severity: StatusAdviceSeverity::Blocked,
-        reason: "the host has less free space than a gate needs to start",
-        summary: format!(
-            "{} free{volume} and a gate needs {} to start, so every gate here refuses \
-             before running anything until space is reclaimed",
-            crate::disk_headroom::format_gibibytes(available),
-            crate::disk_headroom::format_gibibytes(required),
-        ),
+        id,
+        severity,
+        reason,
+        summary,
         session_id: None,
         queue_entry_id: None,
         evidence: vec![
             format!("free/required: {}/{} bytes", available, required),
             "the volume is shared: other repositories and files on it count too".into(),
+            "`gc reclaim plan` also covers quiet open sessions' build output, which `gc plan` does not".into(),
         ],
         commands: vec![
+            "aethyme broker gc reclaim plan".into(),
             "aethyme broker gc plan".into(),
             "aethyme broker gc storage plan".into(),
         ],
     })
 }
+
+/// Free space below this multiple of the gate threshold raises `host.disk-low`.
+const DISK_LOW_WARNING_MULTIPLE: u64 = 2;
 
 /// Severity for the retained-worktree advisory, from per-repository signals.
 ///
@@ -12916,14 +12953,28 @@ mod tests {
         );
         assert_eq!(
             starved.commands,
-            vec!["aethyme broker gc plan", "aethyme broker gc storage plan"]
+            vec![
+                "aethyme broker gc reclaim plan",
+                "aethyme broker gc plan",
+                "aethyme broker gc storage plan"
+            ]
         );
 
-        assert!(
-            super::gate_headroom_advice(Some(required), Some(probe), required).is_none(),
-            "exactly the requirement lets a gate start"
+        let at_threshold = super::gate_headroom_advice(Some(required), Some(probe), required)
+            .expect("exactly the requirement still warns: one build from refusing");
+        assert_eq!(
+            at_threshold.id, "host.disk-low",
+            "exactly the requirement lets a gate start, so it must not report a blocked gate"
         );
-        assert!(super::gate_headroom_advice(Some(required * 2), None, required).is_none());
+        assert_eq!(at_threshold.severity, super::StatusAdviceSeverity::Warning);
+        assert_eq!(at_threshold.commands, starved.commands);
+        let warn_below = required * super::DISK_LOW_WARNING_MULTIPLE;
+        assert_eq!(
+            super::gate_headroom_advice(Some(warn_below - 1), None, required)
+                .map(|advice| advice.id),
+            Some("host.disk-low")
+        );
+        assert!(super::gate_headroom_advice(Some(warn_below), None, required).is_none());
         // Unknown fails open, for the same reason `refusal` does.
         assert!(super::gate_headroom_advice(None, Some(probe), required).is_none());
     }
