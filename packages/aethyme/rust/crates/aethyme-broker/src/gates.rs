@@ -2044,13 +2044,15 @@ fn run_selections(
             let wait_duration_ms = wait_started.elapsed().as_millis() as i64;
             let outcome = record_gate_preflight_resource_failure(
                 store,
-                gate,
-                &tree,
-                session_id,
-                wait_duration_ms,
-                &log_path,
-                &diagnostic,
-                progress,
+                GatePreflightResourceFailure {
+                    gate,
+                    tree: &tree,
+                    session_id,
+                    wait_duration_ms,
+                    log_path: &log_path,
+                    diagnostic: &diagnostic,
+                    progress,
+                },
             )?;
             outcomes.push(outcome);
             break;
@@ -2073,15 +2075,18 @@ fn run_selections(
                 Ok(runtime) => runtime,
                 Err(message) => {
                     drop(owner_locks);
+                    let diagnostic = format!("host resource acquisition failed: {message}");
                     let outcome = record_gate_preflight_resource_failure(
                         store,
-                        gate,
-                        &tree,
-                        session_id,
-                        wait_started.elapsed().as_millis() as i64,
-                        &log_path,
-                        &format!("host resource acquisition failed: {message}"),
-                        progress,
+                        GatePreflightResourceFailure {
+                            gate,
+                            tree: &tree,
+                            session_id,
+                            wait_duration_ms: wait_started.elapsed().as_millis() as i64,
+                            log_path: &log_path,
+                            diagnostic: &diagnostic,
+                            progress,
+                        },
                     )?;
                     outcomes.push(outcome);
                     break;
@@ -2317,16 +2322,29 @@ fn run_selections(
 
 /// Persist a broker-observed resource refusal that happened before a gate
 /// command could start. Such rows are auditable but never reusable as verdicts.
-fn record_gate_preflight_resource_failure(
-    store: &mut BrokerStore,
-    gate: &Gate,
-    tree: &str,
+struct GatePreflightResourceFailure<'a> {
+    gate: &'a Gate,
+    tree: &'a str,
     session_id: Option<i64>,
     wait_duration_ms: i64,
-    log_path: &Path,
-    diagnostic: &str,
-    progress: &dyn GateProgressSink,
+    log_path: &'a Path,
+    diagnostic: &'a str,
+    progress: &'a dyn GateProgressSink,
+}
+
+fn record_gate_preflight_resource_failure(
+    store: &mut BrokerStore,
+    failure: GatePreflightResourceFailure<'_>,
 ) -> Result<GateRunOutcome, crate::broker::BrokerOpError> {
+    let GatePreflightResourceFailure {
+        gate,
+        tree,
+        session_id,
+        wait_duration_ms,
+        log_path,
+        diagnostic,
+        progress,
+    } = failure;
     let message = format!("aethyme: gate {} did not start: {diagnostic}\n", gate.name);
     crate::warn_unrecorded(
         "write the gate preflight resource diagnostic",
