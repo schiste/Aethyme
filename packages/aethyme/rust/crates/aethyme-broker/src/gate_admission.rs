@@ -6,8 +6,9 @@
 //! time out through no fault of the diff. Before such a gate is spawned, the
 //! broker therefore waits while the one-minute load average per logical CPU
 //! is above the gate's threshold, bounded by the gate's existing
-//! `resource_wait_seconds`. Admission only ever delays: when the bound is
-//! reached, or the load cannot be read, the gate runs anyway.
+//! `resource_wait_seconds`. If load remains above the threshold at the bound,
+//! the broker defers the gate before it starts; if the load cannot be read,
+//! the gate runs without waiting because saturation was not established.
 //!
 //! Which gates are admitted this way:
 //! - a gate that sets `max_load_per_cpu` uses that threshold;
@@ -57,7 +58,7 @@ pub(crate) trait AdmissionHost {
     fn sleep(&self, duration: Duration);
 }
 
-struct SystemAdmissionHost;
+pub(crate) struct SystemAdmissionHost;
 
 impl AdmissionHost for SystemAdmissionHost {
     fn sample(&self) -> Option<LoadSample> {
@@ -81,9 +82,13 @@ pub(crate) enum Admission {
     Unmeasured,
     /// The load was at or below the threshold after `waited`.
     Admitted { waited: Duration },
-    /// The load stayed above the threshold for the whole bound; the gate
-    /// runs anyway.
-    BoundReached { waited: Duration, last: LoadSample },
+    /// The load stayed above the threshold for the whole bound; the caller
+    /// must record a host deferral without starting the gate.
+    BoundReached {
+        waited: Duration,
+        last: LoadSample,
+        threshold: f64,
+    },
 }
 
 /// Parse the optional per-gate `max_load_per_cpu` key. Integers are accepted
@@ -113,13 +118,18 @@ pub(crate) fn effective_max_load_per_cpu(cost: i64, configured: Option<f64>) -> 
     configured.or((cost >= EXPENSIVE_GATE_MIN_COST).then_some(DEFAULT_MAX_LOAD_PER_CPU))
 }
 
-/// Admit `gate` against the real host load. Returns once the gate may run.
-pub(crate) fn admit_gate(gate: &Gate, progress: &dyn GateProgressSink) -> Admission {
+/// Resolve load admission for one configured gate using an injected host.
+/// Production supplies the system host; tests use deterministic samples.
+pub(crate) fn admit_gate_with(
+    gate: &Gate,
+    progress: &dyn GateProgressSink,
+    host: &dyn AdmissionHost,
+) -> Admission {
     admit(
         &gate.name,
         effective_max_load_per_cpu(gate.cost, gate.max_load_per_cpu),
         Duration::from_secs(gate.resource_wait_seconds),
-        &SystemAdmissionHost,
+        host,
         progress,
     )
 }
@@ -161,13 +171,14 @@ pub(crate) fn admit(
         }
         if waited >= bound {
             progress.report(&format!(
-                "gate {gate_name} host load wait bound of {}s reached ({}); running anyway",
+                "gate {gate_name} host load wait bound of {}s reached ({}); deferring without starting the gate",
                 bound.as_secs(),
                 describe(sample, max)
             ));
             return Admission::BoundReached {
                 waited,
                 last: sample,
+                threshold: max,
             };
         }
         if waited >= next_report {
@@ -185,7 +196,7 @@ pub(crate) fn admit(
     }
 }
 
-fn describe(sample: LoadSample, max: f64) -> String {
+pub(crate) fn describe(sample: LoadSample, max: f64) -> String {
     format!(
         "load 1m {:.1}/{} cpus = {:.2} per cpu, max {:.2}",
         sample.load_1m,
@@ -311,7 +322,7 @@ mod tests {
     }
 
     #[test]
-    fn the_wait_is_bounded_and_the_gate_then_runs_anyway() {
+    fn the_wait_is_bounded_and_defers_without_starting_the_gate() {
         let host = ScriptedHost::new(&[Some(9.0)]);
         let lines = Lines::default();
         let admission = admit("g", Some(3.0), Duration::from_secs(12), &host, &lines);
@@ -323,6 +334,7 @@ mod tests {
                     load_1m: 90.0,
                     cpus: 10
                 },
+                threshold: 3.0,
             }
         );
         // The last step is clipped to the bound rather than overshooting it.
@@ -342,7 +354,12 @@ mod tests {
                 .contains("host load wait bound of 12s reached"),
             "{lines:?}"
         );
-        assert!(lines.last().unwrap().ends_with("running anyway"));
+        assert!(
+            lines
+                .last()
+                .unwrap()
+                .ends_with("deferring without starting the gate")
+        );
     }
 
     #[test]

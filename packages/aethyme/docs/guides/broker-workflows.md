@@ -661,12 +661,17 @@ divided by the logical CPU count is above the gate's threshold, the broker
 waits, reporting `gate <name> waiting for host load: ...` about every 30
 seconds. The threshold is `max_load_per_cpu` when the gate sets it, otherwise
 `3.0` for any gate with `cost >= 3`; cheaper gates without the key are never
-delayed. The wait is bounded by the gate's `resource_wait_seconds` (so a gate
-with the default `0` is never delayed), and when the bound is reached, or the
-load cannot be read, the gate runs anyway: load never refuses a gate. The wait
-happens before owner locks and host resource leases are taken and before the
-`timeout_seconds` clock starts, and it is counted in the result's
-`wait_duration_ms`.
+delayed. The wait is bounded by the gate's `resource_wait_seconds`; a zero
+budget means no wait. If a measured load is still above threshold when a
+nonzero bound expires, the gate is recorded as `error/resource_contention` and
+the submit is deferred: no command starts, no owner lock or host-resource lease
+is taken, and the result is not cached. The diagnostic records the wait, load,
+CPU count, and threshold; retry after host load falls. The gate runs normally if
+load drops within the bound. If load cannot be read, the broker keeps the
+existing fallback and runs without waiting. This admission decision never turns
+a test assertion into a host fault: a gate that starts and fails remains a
+failure. The wait occurs before the `timeout_seconds` clock starts and is counted
+in the result's `wait_duration_ms`.
 
 ```toml
 [[gate]]
