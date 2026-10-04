@@ -2926,6 +2926,103 @@ fn created_resource_url(stdout: &str, repository: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// HTTP statuses with which GitHub rejects a request outright: the request was
+/// refused as invalid, unauthorized, conflicting or aimed at nothing, so it was
+/// not applied. 408 and 429 are absent on purpose (the request may be retried
+/// or may not have been read), as is every 5xx, which says nothing about
+/// whether the write landed.
+const GITHUB_REJECTION_STATUSES: &[u16] = &[400, 401, 403, 404, 409, 410, 422];
+
+/// Refusal messages `gh` prints when GitHub declines the command's one
+/// mutation, or when `gh` itself declines before sending it. Each is tied to
+/// the commands whose first and only mutation it can describe.
+const GITHUB_REFUSAL_MESSAGES: &[(&str, &str, &str)] = &[
+    (
+        "pr",
+        "update-branch",
+        "Cannot update PR branch due to conflicts",
+    ),
+    ("pr", "merge", "is not mergeable"),
+];
+
+/// Every `HTTP <status>` token `gh` printed, in its two spellings:
+/// `HTTP 422: Validation Failed (...)` and `gh: Not Found (HTTP 404)`.
+fn github_http_statuses(stderr: &str) -> Vec<u16> {
+    stderr
+        .match_indices("HTTP ")
+        .filter_map(|(index, _)| {
+            let rest = &stderr[index + "HTTP ".len()..];
+            let digits = rest.get(..3)?;
+            let terminator = rest[3..].chars().next()?;
+            (digits.bytes().all(|byte| byte.is_ascii_digit()) && matches!(terminator, ':' | ')'))
+                .then(|| digits.parse().ok())
+                .flatten()
+        })
+        .collect()
+}
+
+/// Evidence that GitHub definitively refused a coordinated write, so that it
+/// had no effect and is safely `failed` rather than `outcome_unknown`.
+///
+/// Deliberately narrow. A failed write stays unknown unless all of these hold:
+/// `gh` exited on its own with its generic error status (not a signal, a
+/// crash, or a timeout, which the caller handles before this); the command is
+/// one whose refusal can only describe its single mutation, so nothing was
+/// applied before the refusal; and stderr carries an explicit server-side or
+/// pre-flight rejection. A transport error, a 5xx, or any message not listed
+/// here keeps the operation unknown, because a wrong "failed" is what makes a
+/// blind retry look safe.
+fn classify_github_refusal(
+    args: &[String],
+    exit_code: Option<i32>,
+    stderr: &[u8],
+) -> Option<serde_json::Value> {
+    if exit_code != Some(1) {
+        return None;
+    }
+    let stderr = String::from_utf8_lossy(stderr);
+    let statuses = github_http_statuses(&stderr);
+    if statuses.iter().any(|status| *status >= 500) {
+        return None;
+    }
+    let command = args.first()?.as_str();
+    let action = args.get(1).map(String::as_str);
+    // `gh api` sends exactly one request unless it paginates; the other
+    // commands here send one mutation.
+    let single_request = match (command, action) {
+        ("api", _) => !has_any(args, &["--paginate"]),
+        ("pr", Some("update-branch" | "merge")) => true,
+        _ => false,
+    };
+    if !single_request {
+        return None;
+    }
+    if let Some(status) = statuses
+        .iter()
+        .find(|status| GITHUB_REJECTION_STATUSES.contains(status))
+    {
+        return Some(json!({
+            "failure_class": "github_refused",
+            "remote_outcome": "rejected",
+            "evidence": { "http_status": status },
+        }));
+    }
+    GITHUB_REFUSAL_MESSAGES
+        .iter()
+        .find(|(refused_command, refused_action, message)| {
+            command == *refused_command
+                && action == Some(*refused_action)
+                && stderr.contains(message)
+        })
+        .map(|(_, _, message)| {
+            json!({
+                "failure_class": "github_refused",
+                "remote_outcome": "rejected",
+                "evidence": { "message": message },
+            })
+        })
+}
+
 /// Decide whether a failed `gh` create nevertheless created something.
 ///
 /// The same shape as [`reconcile_failed_push`]: observe external state, then
@@ -4287,6 +4384,22 @@ impl Broker {
                     json!({ "create_reconciliation": create_reconciliation }),
                 ),
             )
+        } else if let Some(refusal) = (request.provider == OperationProvider::Github)
+            .then(|| classify_github_refusal(&request.args, output.status.code(), &output.stderr))
+            .flatten()
+        {
+            // GitHub said no to the command's only mutation, so nothing was
+            // applied. Recording that as unknown write-blocked the repository
+            // over a refusal the PR head itself proved (2026-10-03).
+            (
+                OperationStatus::Failed,
+                journal_details(
+                    classification,
+                    resolved_target.as_ref(),
+                    github_target.as_ref(),
+                    refusal,
+                ),
+            )
         } else {
             // A mutating command may have applied a subset of its effects
             // before returning non-zero. Treating that as safely failed would
@@ -4617,6 +4730,114 @@ mod tests {
         // that was truncated, so it does prove absence.
         let (status, _) = classify_create_observation(&plan, 10, &listed(&full[1..]));
         assert_eq!(status, OperationStatus::Failed);
+    }
+
+    fn gh_args(args: &[&str]) -> Vec<String> {
+        args.iter().map(|arg| (*arg).to_string()).collect()
+    }
+
+    /// The 2026-10-03 report: GitHub refused `pr update-branch` for a
+    /// conflict, the PR head never moved, and the repository was write-blocked
+    /// anyway. A definitive refusal of the command's only mutation is failed.
+    #[test]
+    fn a_github_refusal_of_the_only_mutation_is_failed() {
+        let refusal = classify_github_refusal(
+            &gh_args(&["pr", "update-branch", "506"]),
+            Some(1),
+            b"X Cannot update PR branch due to conflicts\n",
+        )
+        .expect("a conflict refusal is definitive");
+        assert_eq!(refusal["failure_class"], "github_refused");
+        assert_eq!(
+            refusal["evidence"]["message"],
+            "Cannot update PR branch due to conflicts"
+        );
+
+        let refusal = classify_github_refusal(
+            &gh_args(&["api", "-X", "PATCH", "repos/o/r/pulls/1", "-f", "base=x"]),
+            Some(1),
+            b"gh: Validation Failed (HTTP 422)\n",
+        )
+        .expect("a 422 on a single request is definitive");
+        assert_eq!(refusal["evidence"]["http_status"], 422);
+
+        assert!(
+            classify_github_refusal(
+                &gh_args(&["pr", "merge", "7", "--squash"]),
+                Some(1),
+                b"X Pull request #7 is not mergeable: the merge commit cannot be cleanly created.\n",
+            )
+            .is_some()
+        );
+        assert!(
+            classify_github_refusal(
+                &gh_args(&["pr", "update-branch", "7"]),
+                Some(1),
+                b"HTTP 422: Validation Failed (https://api.github.com/graphql)\n",
+            )
+            .is_some()
+        );
+    }
+
+    /// Ambiguity stays unknown: a transport error, a 5xx, a killed process, a
+    /// paginated or multi-step command, or a message nobody listed could all
+    /// sit next to a write that landed.
+    #[test]
+    fn an_ambiguous_github_failure_is_not_a_refusal() {
+        let update = gh_args(&["pr", "update-branch", "506"]);
+        let conflict: &[u8] = b"X Cannot update PR branch due to conflicts\n";
+        // Killed by a signal: no exit code at all.
+        assert!(classify_github_refusal(&update, None, conflict).is_none());
+        // Any other exit status is not gh's ordinary refusal.
+        assert!(classify_github_refusal(&update, Some(2), conflict).is_none());
+        // Network trouble says nothing about the server's answer.
+        assert!(
+            classify_github_refusal(
+                &update,
+                Some(1),
+                b"Post \"https://api.github.com/graphql\": read: connection reset by peer\n",
+            )
+            .is_none()
+        );
+        // A 5xx is not a rejection, even next to a refusal-looking message.
+        assert!(
+            classify_github_refusal(
+                &update,
+                Some(1),
+                b"HTTP 502: Bad Gateway (https://api.github.com/graphql)\nHTTP 422: x (y)\n",
+            )
+            .is_none()
+        );
+        // A refusal message only counts for the command it describes.
+        assert!(
+            classify_github_refusal(&gh_args(&["pr", "edit", "506"]), Some(1), conflict).is_none()
+        );
+        // A multi-step command may have applied an earlier step.
+        assert!(
+            classify_github_refusal(
+                &gh_args(&["pr", "create", "--title", "t"]),
+                Some(1),
+                b"HTTP 422: Validation Failed (https://api.github.com/graphql)\n",
+            )
+            .is_none()
+        );
+        assert!(
+            classify_github_refusal(
+                &gh_args(&["api", "--paginate", "-X", "POST", "repos/o/r/x"]),
+                Some(1),
+                b"gh: Validation Failed (HTTP 422)\n",
+            )
+            .is_none()
+        );
+        // Rate limiting and request timeouts are not listed rejections.
+        assert!(
+            classify_github_refusal(
+                &gh_args(&["api", "-X", "POST", "repos/o/r/x"]),
+                Some(1),
+                b"gh: Too Many Requests (HTTP 429)\n",
+            )
+            .is_none()
+        );
     }
 
     /// A create nobody could recognise afterwards is unknown, not failed.
