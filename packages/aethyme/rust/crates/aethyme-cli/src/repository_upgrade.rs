@@ -380,6 +380,31 @@ impl CompatibilityDecision {
         })
     }
 
+    /// What a broker command running as a read-only snapshot quotes when it
+    /// refuses a writing flag: the repository's compatibility state relative
+    /// to this binary, and the action that restores normal operation.
+    pub fn read_only_compatibility(&self) -> aethyme_broker::cli::ReadOnlyCompatibility {
+        let state = match self.repository {
+            RepositoryCompatibility::Current => "current",
+            RepositoryCompatibility::UpgradeRequired => "upgrade required",
+            RepositoryCompatibility::UpgradeInProgress => "upgrade in progress",
+            RepositoryCompatibility::NewerThanBinary => "newer than this binary",
+            RepositoryCompatibility::Invalid => "invalid",
+        };
+        let schemas = match self.repository_schema {
+            Some(schema) => format!("repository deployment schema {schema}, "),
+            None => String::new(),
+        };
+        aethyme_broker::cli::ReadOnlyCompatibility {
+            cause: format!(
+                "{} ({state}: {schemas}aethyme {} uses schema {REPOSITORY_SCHEMA_VERSION})",
+                self.reason,
+                env!("CARGO_PKG_VERSION"),
+            ),
+            remediation: self.remediation.clone(),
+        }
+    }
+
     /// The managed pre-commit hook is the last guard before Git writes a
     /// commit. Its refusal must make clear that compatibility—not the staged
     /// changes—caused the stop, and that the worktree was left untouched.

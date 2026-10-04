@@ -1310,3 +1310,26 @@ fn every_cli_reference_example_passes_flag_validation() {
         );
     }
 }
+
+#[test]
+fn a_read_only_refusal_names_the_cause_the_fix_and_the_snapshot_alternative() {
+    let mut parsed = super::parse(&[]).unwrap_or_else(|_| panic!("empty parse"));
+    parsed.read_only_snapshot = true;
+    parsed.read_only_compatibility = Some(super::ReadOnlyCompatibility {
+        cause: "repository deployment requires an embedded upgrade".into(),
+        remediation: Some("run `aethyme upgrade plan --repo .`".into()),
+    });
+    let UsageError::Message(message) =
+        super::read_only_refusal(&parsed, "`--refresh`", "run it without --refresh")
+    else {
+        panic!("a read-only refusal is a plain usage message");
+    };
+    assert_eq!(
+        message,
+        "`--refresh` writes broker state, so it is unavailable while this repository runs \
+         broker diagnostics as a read-only compatibility snapshot: repository deployment \
+         requires an embedded upgrade.\n\
+         To restore it: run `aethyme upgrade plan --repo .`.\n\
+         For the recorded snapshot now: run it without --refresh"
+    );
+}

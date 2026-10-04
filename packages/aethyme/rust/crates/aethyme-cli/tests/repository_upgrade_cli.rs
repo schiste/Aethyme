@@ -975,6 +975,67 @@ fn obsolete_repository_status_is_a_genuinely_non_mutating_snapshot() {
     assert_eq!(fs::read(&metrics_path).ok(), before_metrics);
 }
 
+/// `status --refresh` writes, so a read-only snapshot refuses it; the refusal
+/// must say why the repository is read-only for this binary and what to run
+/// next, not only that the mode exists (SP42, 2026-10-03).
+#[test]
+fn read_only_refresh_refusal_names_the_cause_and_the_next_action() {
+    let newer = aethyme_broker::REPOSITORY_SCHEMA_VERSION + 1;
+    let cases = [
+        (
+            None,
+            vec![
+                "requires an embedded upgrade",
+                "upgrade required: repository deployment schema 0",
+                "aethyme upgrade plan --repo .",
+            ],
+        ),
+        (
+            Some(serde_json::json!({
+                "schema_version": newer,
+                "applied_migrations": ["repository-deployment-v1"]
+            })),
+            vec![
+                "newer than this binary supports",
+                "update Aethyme before retrying the broker command",
+            ],
+        ),
+    ];
+    for (marker, expected) in cases {
+        let temp = tmp_dir();
+        let repo = repository(temp.path());
+        old_canonical_deployment(&repo);
+        if let Some(marker) = marker {
+            fs::write(
+                repo.join(".aethyme/repository.json"),
+                serde_json::to_vec(&marker).unwrap(),
+            )
+            .unwrap();
+        }
+
+        let refused = run(&repo, &["broker", "status", "--refresh"]);
+        assert!(!refused.status.success());
+        let stderr = String::from_utf8_lossy(&refused.stderr);
+        let binary = format!("aethyme {} uses schema", env!("CARGO_PKG_VERSION"));
+        let common = [
+            "`--refresh` writes broker state",
+            "read-only compatibility snapshot",
+            binary.as_str(),
+            "run `aethyme broker status` without --refresh",
+        ];
+        for needle in expected.iter().chain(common.iter()) {
+            assert!(stderr.contains(needle), "missing {needle:?} in: {stderr}");
+        }
+
+        let snapshot = run(&repo, &["broker", "status", "--json"]);
+        assert!(
+            snapshot.status.success(),
+            "the suggested alternative must work: {}",
+            String::from_utf8_lossy(&snapshot.stderr)
+        );
+    }
+}
+
 #[test]
 fn older_repository_allows_diagnostics_recovery_and_only_pinned_continuation() {
     let temp = tmp_dir();

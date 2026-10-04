@@ -293,7 +293,9 @@ fn main() -> ExitCode {
             }
             if decision.execution == repository_upgrade::CompatibilityExecution::ReadOnlySnapshot {
                 broker_compatibility_mode =
-                    aethyme_broker::cli::CompatibilityMode::ReadOnlySnapshot;
+                    aethyme_broker::cli::CompatibilityMode::ReadOnlySnapshot(
+                        decision.read_only_compatibility(),
+                    );
             }
         }
     }
