@@ -304,6 +304,11 @@ fn sync_rebases_an_unpublished_clean_branch_onto_the_default_branch() {
     assert_eq!(report["strategy"], "rebase", "{report}");
     assert_eq!(report["behind_before"], 1, "{report}");
     assert_eq!(
+        report["next_action"],
+        format!("aethyme broker push --session {session}"),
+        "{report}"
+    );
+    assert_eq!(
         git_output(&worktree, &["rev-parse", "HEAD~1"]),
         landed,
         "the session commit now sits on the fetched tip"
@@ -335,6 +340,85 @@ fn sync_merges_into_a_published_branch_without_rewriting_it() {
     );
     assert_eq!(git_output(&worktree, &["rev-parse", "HEAD^2"]), landed);
     assert_eq!(report["after"], after, "{report}");
+    assert_eq!(
+        report["next_action"],
+        format!("aethyme broker push --session {session}"),
+        "a sync never pushes, so the merge still needs publishing: {report}"
+    );
+}
+
+/// The branch's tip on the bare remote, empty when it is not there.
+fn remote_branch(fixture: &Fixture, branch: &str) -> String {
+    git_output(
+        &fixture.remote,
+        &[
+            "for-each-ref",
+            "--format=%(objectname)",
+            &format!("refs/heads/{branch}"),
+        ],
+    )
+}
+
+/// The 2026-10-03 report: "merged into published branch" read as "my branch
+/// was published", while the merge only happened in the local worktree.
+#[test]
+fn sync_says_what_it_merged_into_what_and_that_nothing_was_pushed() {
+    let fixture = Fixture::new();
+    let (session, worktree) = fixture.session_changing("tracked.txt", "session\n");
+    json(&fixture.run(&["push", "--session", &session.to_string(), "--json"]));
+    let branch = git_output(&worktree, &["branch", "--show-current"]);
+    let published = remote_branch(&fixture, &branch);
+    fixture.land_on_remote_only("other.txt", "moved on\n");
+
+    let output = fixture.run(&["sync", "--session", &session.to_string()]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(output.status.success(), "{stdout}");
+    assert!(
+        stdout.contains(&format!("locally: merged origin/main into {branch}")),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("Nothing was pushed: the remote branch is unchanged."),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(&format!("`aethyme broker push --session {session}`")),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("published branch"), "{stdout}");
+    assert_eq!(
+        remote_branch(&fixture, &branch),
+        published,
+        "sync must not move the remote branch"
+    );
+    assert_ne!(head(&worktree), published, "the local branch did move");
+}
+
+#[test]
+fn sync_of_an_unpublished_branch_says_it_is_not_on_the_remote_yet() {
+    let fixture = Fixture::new();
+    let (session, worktree) = fixture.session_changing("tracked.txt", "session\n");
+    let branch = git_output(&worktree, &["branch", "--show-current"]);
+    fixture.land_on_remote_only("other.txt", "moved on\n");
+
+    let output = fixture.run(&["sync", "--session", &session.to_string()]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(output.status.success(), "{stdout}");
+    assert!(
+        stdout.contains(&format!("locally: rebased {branch} onto origin/main")),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("Nothing was pushed: the branch is not on the remote yet."),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(&format!("`aethyme broker push --session {session}`")),
+        "{stdout}"
+    );
+    assert_eq!(remote_branch(&fixture, &branch), "", "still unpublished");
 }
 
 #[test]

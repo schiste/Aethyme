@@ -757,19 +757,33 @@ pub(super) fn run_sync(parsed: Parsed) -> Result<(), UsageError> {
                 report.default_ref,
                 short(&report.default_commit)
             ),
-            crate::SyncOutcome::Synced => out!(
-                "Synced session {} with {} ({} commit(s) behind): {} {} -> {}",
-                report.session_id,
-                report.default_ref,
-                report.behind_before,
-                match report.strategy {
-                    crate::SyncStrategy::Merge => "merged into published branch",
-                    crate::SyncStrategy::Rebase => "rebased unpublished branch",
-                    crate::SyncStrategy::None => "unchanged",
-                },
-                short(&report.before),
-                short(&report.after)
-            ),
+            crate::SyncOutcome::Synced => {
+                // Name the direction and say nothing left this machine: "merged
+                // into published branch" read as "my branch is published"
+                // (2026-10-03), when only the local session branch moved.
+                let (action, remote_state) = match report.strategy {
+                    crate::SyncStrategy::Rebase => (
+                        format!("rebased {} onto {}", report.branch, report.default_ref),
+                        "the branch is not on the remote yet",
+                    ),
+                    // `None` never accompanies `Synced`.
+                    crate::SyncStrategy::Merge | crate::SyncStrategy::None => (
+                        format!("merged {} into {}", report.default_ref, report.branch),
+                        "the remote branch is unchanged",
+                    ),
+                };
+                out!(
+                    "Synced session {} locally: {action}, bringing in {} commit(s): {} -> {}",
+                    report.session_id,
+                    report.behind_before,
+                    short(&report.before),
+                    short(&report.after)
+                );
+                out!("  Nothing was pushed: {remote_state}.");
+                if let Some(next) = &report.next_action {
+                    out!("  Next: `{next}` to publish it.");
+                }
+            }
             crate::SyncOutcome::Conflict => {
                 eprintln!(
                     "✗ not synced: catching up with {} ({} commit(s) behind) would conflict; \
