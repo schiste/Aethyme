@@ -115,9 +115,38 @@ fn distinct_product_proof_remains_automatic_for_both_events() {
 
 #[test]
 fn changed_workflows_have_read_only_permissions() {
-    for name in ["oss-ci.yml", "aethyme-gates.yml", "aethyme-local-tests.yml"] {
+    for name in ["oss-ci.yml", "aethyme-local-tests.yml"] {
         assert_eq!(block(&workflow(name), "permissions:"), ["  contents: read"]);
     }
+    // The contract gate reads the merged PR's body on main; still read-only.
+    assert_eq!(
+        block(&workflow("aethyme-gates.yml"), "permissions:"),
+        ["  contents: read", "  pull-requests: read"]
+    );
+}
+
+/// A contract decision accepted on a pull request must be accepted again on
+/// its merge commit (PR #514 turned main red on 2026-10-04 because the gate
+/// read only commit messages while the PR check read only the PR body).
+#[test]
+fn contract_check_reads_the_same_sources_on_prs_and_on_main() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(5)
+        .unwrap();
+    let policy = std::fs::read_to_string(root.join(".aethyme/gates.toml")).unwrap();
+    let gate = policy
+        .split("[[gate]]")
+        .find(|gate| gate.contains("name = \"cross-process-contract\""))
+        .unwrap();
+    assert!(gate.contains("--commit-messages --merged-pr"), "{gate}");
+
+    let pr_check = workflow("cross-process-contract.yml");
+    assert!(pr_check.contains("--pr-body /tmp/pr-body.md \\\n            --commit-messages"));
+
+    let gates = workflow("aethyme-gates.yml");
+    let job = block(&gates, "  gates:");
+    assert!(job.contains(&"          GH_TOKEN: ${{ github.token }}"));
 }
 
 #[test]

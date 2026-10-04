@@ -254,8 +254,18 @@ max_bytes = 12884901888
 # (`aethyme broker check-contract`) and is built from the worktree under
 # test rather than taken from PATH — a gate that validated a diff using
 # a stale installed binary would be checking the wrong code.
+# 2026-10-04: reading commit messages alone turned main red. PR #514 put
+# its decision in the PR body (the template's convention), passed the PR
+# check, and failed here on its merge commit, where no PR body was read.
+# The checker now reads the commits itself (`--commit-messages`) and, only
+# when they declare nothing that passes, the bodies of the pull requests
+# GitHub associates with HEAD (`--merged-pr`, via `gh`; Aethyme Gates
+# provides GH_TOKEN). A lookup that cannot run fails with its cause and
+# the list of sources read; it never passes by default. In a broker
+# session the decision still belongs in a commit message, which needs no
+# network.
 name = "cross-process-contract"
-command = 'export CHAU7_CTO_OPTIM_ACTIVE=1 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=1 CARGO_TARGET_DIR="$AETHYME_GATE_CACHE_DIR" && BASE="$(git merge-base HEAD aethyme/integration 2>/dev/null || git rev-parse HEAD~1)" && BODY="$(mktemp)" && git log --format=%B "$BASE"..HEAD > "$BODY" && cargo run --locked --quiet --manifest-path packages/aethyme/rust/Cargo.toml -p aethyme-cli --bin aethyme -- broker check-contract --base "$BASE" --pr-body "$BODY"'
+command = 'export CHAU7_CTO_OPTIM_ACTIVE=1 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=1 CARGO_TARGET_DIR="$AETHYME_GATE_CACHE_DIR" && BASE="$(git merge-base HEAD aethyme/integration 2>/dev/null || git rev-parse HEAD~1)" && cargo run --locked --quiet --manifest-path packages/aethyme/rust/Cargo.toml -p aethyme-cli --bin aethyme -- broker check-contract --base "$BASE" --commit-messages --merged-pr'
 cost = 1
 cache = false
 timeout_seconds = 300

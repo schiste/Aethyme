@@ -68,6 +68,11 @@ jobs:
         # `cargo run` from the repo root: the checker resolves the
         # registry and the diff relative to the current worktree, so
         # cwd must stay at the repository root.
+        #
+        # `--commit-messages` gives this check the same decision sources as
+        # the `cross-process-contract` gate, which reads the merged commits
+        # and the merged PR's body on main: a decision accepted here is
+        # accepted again on the merge commit.
         env:
           BASE_REF: ${{ github.base_ref }}
           # The checker is built from the PR tree. Keep any broker access by
@@ -80,4 +85,5 @@ jobs:
             -p aethyme-cli --bin aethyme -- \
             broker check-contract \
             --base "origin/${BASE_REF}" \
-            --pr-body /tmp/pr-body.md
+            --pr-body /tmp/pr-body.md \
+            --commit-messages

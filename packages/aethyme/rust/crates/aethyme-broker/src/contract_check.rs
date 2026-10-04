@@ -32,9 +32,18 @@
 //!    symbol. Removals are the dangerous direction — additions mean
 //!    someone is *introducing* something, which is fine on its own.
 //! 4. If any tracked symbols appear on removed lines, look for a contract
-//!    decision in the PR body / commit messages (`--pr-body`). Missing or
-//!    `none` fails; `introduce` / `soft-retire` / `hard-delete` passes
-//!    with an informational note.
+//!    decision in every source the caller names: a PR body (`--pr-body`),
+//!    the commits in `<base>..HEAD` (`--commit-messages`), and, only when
+//!    those declare nothing that passes, the pull requests GitHub
+//!    associates with HEAD (`--merged-pr`). Missing or unjustified `none`
+//!    fails and names each source it read; `introduce` / `soft-retire` /
+//!    `hard-delete` passes with an informational note.
+//!
+//! The PR workflow and the gate pass the same decision sources, so a
+//! decision accepted on a pull request is accepted again on its merge
+//! commit. Before 2026-10-04 the gate read only commit messages: PR #514
+//! declared its decision in the PR body, passed the PR check, and then
+//! failed `Aethyme Gates` on main, where no PR body was read.
 //!
 //! Intentionally heuristic. False positives are acceptable — they prompt
 //! a human to confirm the decision. False negatives (silently dropping a
@@ -82,14 +91,21 @@ const REMOVAL_MARKERS: &[&str] = &["do not run", "not a valid command", "was rem
 
 const USAGE: &str = "\
 usage: aethyme broker check-contract [--base <ref>] [--pr-body <file>]
+                                     [--commit-messages] [--merged-pr]
                                      [--consumers-doc <file>]
 
 Refuse diffs that remove cross-process symbols without a declared
 contract decision.
 
   --base <ref>            base ref to diff against (default: origin/main)
-  --pr-body <file>        file containing the PR body or commit messages,
+  --pr-body <file>        file containing the PR body (or any text),
                           parsed for the contract decision
+  --commit-messages       also read the messages of the commits in
+                          <base>..HEAD
+  --merged-pr             when no other source declares a decision, ask
+                          GitHub (through `gh`) for the pull requests
+                          associated with HEAD and read their bodies; an
+                          unavailable lookup is reported, never passed
   --consumers-doc <file>  override the consumers registry path
                           (default: <repo>/packages/aethyme/docs/\
 architecture/cross-process-consumers.md)
@@ -100,6 +116,8 @@ Exit codes: 0 clean/declared, 1 undeclared contract change, 2 bad usage.
 struct Args {
     base: String,
     pr_body: Option<PathBuf>,
+    commit_messages: bool,
+    merged_pr: bool,
     consumers_doc: Option<PathBuf>,
 }
 
@@ -187,66 +205,196 @@ pub fn run(args: &[String]) -> u8 {
         return 0;
     }
 
-    let pr_body = parsed
-        .pr_body
-        .as_deref()
-        .and_then(|path| std::fs::read_to_string(path).ok())
-        .unwrap_or_default();
-    let decision = parse_contract_decision(&pr_body);
+    let mut sources = Vec::new();
+    if let Some(path) = &parsed.pr_body {
+        sources.push(DecisionSource {
+            label: format!("PR body ({})", path.display()),
+            text: std::fs::read_to_string(path)
+                .map_err(|error| format!("could not read the file: {error}")),
+        });
+    }
+    if parsed.commit_messages {
+        sources.push(commit_message_source(&repo_root, &parsed.base));
+    }
+    let lookup = || associated_pull_request_sources(&repo_root);
+    let merged_pr: Option<&dyn Fn() -> Vec<DecisionSource>> = if parsed.merged_pr {
+        Some(&lookup)
+    } else {
+        None
+    };
+    let (sources, verdict) = decide(sources, merged_pr);
 
     println!("Cross-process symbols touched on removed lines:");
     for (symbol, lines) in &findings {
         println!("  - `{symbol}` ({} occurrence(s))", lines.len());
     }
     println!();
-    match decision {
-        Some(Decision::Introduce) | Some(Decision::SoftRetire) | Some(Decision::HardDelete) => {
+    match verdict {
+        Verdict::Declared { decision, source } => {
             println!(
-                "Contract decision in PR body: **{}** — treating as deliberate.",
-                decision.expect("matched Some above").label()
+                "Contract decision in {source}: **{}** — treating as deliberate.",
+                decision.label()
             );
             0
         }
-        Some(Decision::None) => match parse_contract_justification(&pr_body) {
-            Some(reason) => {
-                // The finding stays printed above; this records why the author
-                // says it is spurious, so a reviewer sees both.
-                println!(
-                    "Contract decision in PR body: **none**, justified — treating \
-                     as deliberate.\n  justification: {reason}"
-                );
-                0
-            }
-            None => {
-                eprintln!(
-                    "ERROR: PR contract is **none**, but the diff removes tracked \
-                     cross-process symbols. Either pick a different contract label \
-                     (introduce / soft-retire / hard-delete), restore the symbols, \
-                     or state why the match is spurious on a line beginning \
-                     `Contract justification:` (at least {MIN_JUSTIFICATION_CHARS} \
-                     characters). The matcher reads diff text, so it cannot tell a \
-                     name leaving a comment or a string from an entry point leaving \
-                     the product."
-                );
-                1
-            }
-        },
-        None => {
-            eprintln!(
-                "ERROR: PR body does not declare a contract decision \
-                 (`none` / `introduce` / `soft-retire` / `hard-delete`). \
-                 See `.github/pull_request_template.md`. The 2026-05-08 \
-                 playground breakage came from a missing decision here."
+        Verdict::JustifiedNone {
+            source,
+            justification,
+        } => {
+            // The finding stays printed above; this records why the author
+            // says it is spurious, so a reviewer sees both.
+            println!(
+                "Contract decision in {source}: **none**, justified — treating \
+                 as deliberate.\n  justification: {justification}"
             );
+            0
+        }
+        Verdict::UnjustifiedNone | Verdict::Undeclared => {
+            eprint!("{}", failure_message(&verdict, &sources));
             1
         }
     }
+}
+
+/// One place a contract decision may be declared, and what reading it gave:
+/// its text, or why it could not be read.
+///
+/// Sources are kept apart rather than concatenated up front so that a failure
+/// can say where it looked. The gate that turned main red on 2026-10-04 read
+/// only commit messages while its error blamed the "PR body", and the PR body
+/// was exactly where the decision was.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecisionSource {
+    pub label: String,
+    pub text: Result<String, String>,
+}
+
+/// What the declared decisions, taken together, amount to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Verdict {
+    /// `introduce` / `soft-retire` / `hard-delete`, found in `source`.
+    Declared { decision: Decision, source: String },
+    /// `none`, with a `Contract justification:` line.
+    JustifiedNone {
+        source: String,
+        justification: String,
+    },
+    /// `none`, and nothing says why the finding is spurious.
+    UnjustifiedNone,
+    /// No source declares anything.
+    Undeclared,
+}
+
+impl Verdict {
+    fn passes(&self) -> bool {
+        matches!(
+            self,
+            Verdict::Declared { .. } | Verdict::JustifiedNone { .. }
+        )
+    }
+}
+
+/// Judge the readable sources together: the most restrictive decision any of
+/// them declares wins, exactly as it did when they were one text.
+pub fn judge(sources: &[DecisionSource]) -> Verdict {
+    let readable: Vec<(&str, &str)> = sources
+        .iter()
+        .filter_map(|source| {
+            source
+                .text
+                .as_deref()
+                .ok()
+                .map(|text| (source.label.as_str(), text))
+        })
+        .collect();
+    let combined = readable
+        .iter()
+        .map(|(_, text)| *text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let Some(decision) = parse_contract_decision(&combined) else {
+        return Verdict::Undeclared;
+    };
+    let source = readable
+        .iter()
+        .find(|(_, text)| parse_contract_decision(text) == Some(decision))
+        .map(|(label, _)| (*label).to_string())
+        .unwrap_or_default();
+    if decision != Decision::None {
+        return Verdict::Declared { decision, source };
+    }
+    match parse_contract_justification(&combined) {
+        Some(justification) => Verdict::JustifiedNone {
+            source,
+            justification,
+        },
+        None => Verdict::UnjustifiedNone,
+    }
+}
+
+/// Judge `sources`; when they do not pass and a pull-request lookup is
+/// available, consult it and judge again.
+///
+/// The lookup runs only when it could change the outcome, so a broker
+/// submission whose commits carry the decision never reaches the network.
+pub fn decide(
+    mut sources: Vec<DecisionSource>,
+    pull_requests: Option<&dyn Fn() -> Vec<DecisionSource>>,
+) -> (Vec<DecisionSource>, Verdict) {
+    let verdict = judge(&sources);
+    if verdict.passes() {
+        return (sources, verdict);
+    }
+    let Some(lookup) = pull_requests else {
+        return (sources, verdict);
+    };
+    sources.extend(lookup());
+    let verdict = judge(&sources);
+    (sources, verdict)
+}
+
+/// The refusal, naming every place the check looked and what each held.
+pub fn failure_message(verdict: &Verdict, sources: &[DecisionSource]) -> String {
+    let mut out = match verdict {
+        Verdict::UnjustifiedNone => format!(
+            "ERROR: the contract decision is **none**, but the diff removes tracked \
+             cross-process symbols. Either pick a different contract label \
+             (introduce / soft-retire / hard-delete), restore the symbols, or state \
+             why the match is spurious on a line beginning `Contract justification:` \
+             (at least {MIN_JUSTIFICATION_CHARS} characters). The matcher reads diff \
+             text, so it cannot tell a name leaving a comment or a string from an \
+             entry point leaving the product.\n"
+        ),
+        _ => "ERROR: no contract decision (`none` / `introduce` / `soft-retire` / \
+              `hard-delete`) is declared. Declare one in the PR body (see \
+              `.github/pull_request_template.md`) or on a `Contract decision: <label>` \
+              line in a commit message. The 2026-05-08 playground breakage came from \
+              a missing decision.\n"
+            .to_string(),
+    };
+    out.push_str("Looked in:\n");
+    if sources.is_empty() {
+        out.push_str("  - nothing: no --pr-body, --commit-messages or --merged-pr was given\n");
+    }
+    for source in sources {
+        let status = match &source.text {
+            Err(reason) => format!("unavailable — {reason}"),
+            Ok(text) => match parse_contract_decision(text) {
+                Some(decision) => format!("declares **{}**", decision.label()),
+                None => "no contract decision".to_string(),
+            },
+        };
+        out.push_str(&format!("  - {}: {status}\n", source.label));
+    }
+    out
 }
 
 fn parse_args(args: &[String]) -> Result<Option<Args>, String> {
     let mut parsed = Args {
         base: "origin/main".to_string(),
         pr_body: None,
+        commit_messages: false,
+        merged_pr: false,
         consumers_doc: None,
     };
     let mut index = 0;
@@ -267,6 +415,8 @@ fn parse_args(args: &[String]) -> Result<Option<Args>, String> {
                         .ok_or_else(|| "--pr-body requires a value".to_string())?,
                 ));
             }
+            "--commit-messages" => parsed.commit_messages = true,
+            "--merged-pr" => parsed.merged_pr = true,
             "--consumers-doc" => {
                 index += 1;
                 parsed.consumers_doc =
@@ -279,6 +429,113 @@ fn parse_args(args: &[String]) -> Result<Option<Args>, String> {
         index += 1;
     }
     Ok(Some(parsed))
+}
+
+/// The messages of the commits in `<base>..HEAD`: the broker path, where a
+/// submission has no PR body and the decision travels in a commit.
+fn commit_message_source(repo_root: &Path, base: &str) -> DecisionSource {
+    let range = format!("{base}..HEAD");
+    let label = format!("commit messages {range}");
+    let output = crate::git::git_command()
+        .args(["log", "--format=%B", &range, "--"])
+        .current_dir(repo_root)
+        .output();
+    let text = match output {
+        Ok(output) if output.status.success() => {
+            Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        }
+        Ok(output) => Err(format!(
+            "git log failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )),
+        Err(error) => Err(format!("git log failed to spawn: {error}")),
+    };
+    DecisionSource { label, text }
+}
+
+/// The bodies of the pull requests GitHub associates with HEAD.
+///
+/// On main HEAD is the merge (or squash) commit of the PR that was just
+/// merged, and that PR's body is where the repository's convention puts the
+/// decision. A failed lookup is a source with a reason, not an empty body:
+/// the check must not pass because it could not see.
+fn associated_pull_request_sources(repo_root: &Path) -> Vec<DecisionSource> {
+    let head = match crate::git::git_command()
+        .args(["rev-parse", "HEAD"])
+        .current_dir(repo_root)
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        }
+        _ => {
+            return vec![DecisionSource {
+                label: "pull requests associated with HEAD".to_string(),
+                text: Err("could not resolve HEAD".to_string()),
+            }];
+        }
+    };
+    let short = &head[..head.len().min(12)];
+    let label = format!("pull requests associated with HEAD {short}");
+    let output = std::process::Command::new("gh")
+        .args([
+            "api",
+            &format!("repos/{{owner}}/{{repo}}/commits/{head}/pulls"),
+        ])
+        .env("GH_PROMPT_DISABLED", "1")
+        .stdin(std::process::Stdio::null())
+        .current_dir(repo_root)
+        .output();
+    let result = match output {
+        Err(error) => Err(format!(
+            "could not run `gh` ({error}); the lookup needs the GitHub CLI and a \
+             token (GH_TOKEN)"
+        )),
+        Ok(output) if !output.status.success() => Err(format!(
+            "`gh api repos/{{owner}}/{{repo}}/commits/{short}/pulls` failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )),
+        Ok(output) => associated_pull_requests(&String::from_utf8_lossy(&output.stdout)),
+    };
+    match result {
+        Err(reason) => vec![DecisionSource {
+            label,
+            text: Err(reason),
+        }],
+        Ok(pulls) if pulls.is_empty() => vec![DecisionSource {
+            label,
+            text: Err("GitHub associates no pull request with this commit".to_string()),
+        }],
+        Ok(pulls) => pulls
+            .into_iter()
+            .map(|(number, body)| DecisionSource {
+                label: format!("PR #{number} body (associated with HEAD {short})"),
+                text: Ok(body),
+            })
+            .collect(),
+    }
+}
+
+/// `(number, body)` for each pull request in a
+/// `GET /repos/{owner}/{repo}/commits/{sha}/pulls` response.
+pub fn associated_pull_requests(json: &str) -> Result<Vec<(u64, String)>, String> {
+    let value: serde_json::Value = serde_json::from_str(json)
+        .map_err(|error| format!("unreadable GitHub response: {error}"))?;
+    let pulls = value
+        .as_array()
+        .ok_or_else(|| "unexpected GitHub response: not a list of pull requests".to_string())?;
+    Ok(pulls
+        .iter()
+        .filter_map(|pull| {
+            let number = pull.get("number")?.as_u64()?;
+            let body = pull
+                .get("body")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            Some((number, body))
+        })
+        .collect())
 }
 
 /// The worktree root the diff and the registry are read from. Uses the
@@ -1010,6 +1267,127 @@ mod tests {
         );
         assert!(tracked.iter().any(|s| s.contains("aethyme-explore")));
         assert!(tracked.iter().any(|s| s.contains("SKILL.md")));
+    }
+
+    fn source(label: &str, text: &str) -> DecisionSource {
+        DecisionSource {
+            label: label.to_string(),
+            text: Ok(text.to_string()),
+        }
+    }
+
+    /// The main-branch shape of #514: the merged commits carry no decision,
+    /// the PR body does. The gate must accept on main what the PR check
+    /// accepted on the pull request.
+    #[test]
+    fn a_decision_only_in_the_merged_pr_body_passes() {
+        let commits = vec![source(
+            "commit messages HEAD~1..HEAD",
+            "Merge pull request #514 from schiste/agent/x\n\nfix(broker): report behind\n",
+        )];
+        let lookup = || {
+            vec![source(
+                "PR #514 body (associated with HEAD 43e61fc8)",
+                "## Summary\n\nContract decision: introduce\n",
+            )]
+        };
+        let (_, verdict) = decide(commits, Some(&lookup));
+        assert_eq!(
+            verdict,
+            Verdict::Declared {
+                decision: Decision::Introduce,
+                source: "PR #514 body (associated with HEAD 43e61fc8)".to_string(),
+            }
+        );
+    }
+
+    /// Reading more sources must not weaken the check: nothing declared
+    /// anywhere still fails, and the refusal names every place it read.
+    #[test]
+    fn no_decision_anywhere_still_fails_and_names_each_source() {
+        let commits = vec![source("commit messages abc..HEAD", "fix: thing\n")];
+        let lookup = || vec![source("PR #9 body (associated with HEAD abc)", "Summary\n")];
+        let (sources, verdict) = decide(commits, Some(&lookup));
+        assert_eq!(verdict, Verdict::Undeclared);
+        let message = failure_message(&verdict, &sources);
+        assert!(
+            message.contains("commit messages abc..HEAD: no contract decision"),
+            "{message}"
+        );
+        assert!(
+            message.contains("PR #9 body (associated with HEAD abc): no contract decision"),
+            "{message}"
+        );
+    }
+
+    /// Offline, unauthenticated, or not on GitHub: the lookup cannot see the
+    /// PR. That is a failure with its cause, never a pass by default.
+    #[test]
+    fn an_unavailable_lookup_fails_with_its_cause() {
+        let commits = vec![source("commit messages abc..HEAD", "fix: thing\n")];
+        let lookup = || {
+            vec![DecisionSource {
+                label: "pull requests associated with HEAD abc".to_string(),
+                text: Err("could not run `gh` (No such file or directory)".to_string()),
+            }]
+        };
+        let (sources, verdict) = decide(commits, Some(&lookup));
+        assert_eq!(verdict, Verdict::Undeclared);
+        let message = failure_message(&verdict, &sources);
+        assert!(
+            message.contains(
+                "pull requests associated with HEAD abc: unavailable — could not run `gh`"
+            ),
+            "{message}"
+        );
+    }
+
+    /// A broker submission whose commits declare the decision never reaches
+    /// the network.
+    #[test]
+    fn the_lookup_runs_only_when_the_other_sources_do_not_pass() {
+        let called = std::cell::Cell::new(false);
+        let lookup = || {
+            called.set(true);
+            Vec::new()
+        };
+        let commits = vec![source(
+            "commit messages",
+            "Contract decision: soft-retire\n",
+        )];
+        let (_, verdict) = decide(commits, Some(&lookup));
+        assert!(matches!(verdict, Verdict::Declared { .. }));
+        assert!(!called.get());
+    }
+
+    /// An unjustified `none` in the commits is not final: the PR body may
+    /// carry a more restrictive label, as it would if both were one text.
+    #[test]
+    fn an_unjustified_none_still_consults_the_pull_request() {
+        let commits = vec![source("commit messages", "Contract decision: none\n")];
+        let lookup = || vec![source("PR #3 body", "- [x] **hard-delete**\n")];
+        let (_, verdict) = decide(commits, Some(&lookup));
+        assert!(matches!(
+            verdict,
+            Verdict::Declared {
+                decision: Decision::HardDelete,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn associated_pull_requests_reads_numbers_and_bodies() {
+        let json = r#"[{"number":514,"body":"Contract decision: introduce"},
+                       {"number":515,"body":null}]"#;
+        assert_eq!(
+            associated_pull_requests(json).unwrap(),
+            vec![
+                (514, "Contract decision: introduce".to_string()),
+                (515, String::new())
+            ]
+        );
+        assert!(associated_pull_requests(r#"{"message":"Not Found"}"#).is_err());
     }
 
     #[test]

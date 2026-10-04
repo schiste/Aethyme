@@ -772,10 +772,13 @@ Usage:
       Git registrations, and repository session ledgers. Apply removes only
       exact reviewed orphan roots or stray directories.
   aethyme broker check-contract [--base <ref>] [--pr-body <file>]
+                                [--commit-messages] [--merged-pr]
       Cross-process contract gate: refuse a diff that removes symbols
-      listed in the consumers registry unless the PR body or commit
-      messages declare a contract decision. Run by CI and by the
-      `cross-process-contract` gate. Exit 1 = undeclared contract change.
+      listed in the consumers registry unless the PR body, the commits in
+      <base>..HEAD, or (--merged-pr, via gh) the pull request GitHub
+      associates with HEAD declare a contract decision. Run by CI and by
+      the `cross-process-contract` gate. Exit 1 = undeclared contract
+      change; the refusal lists every source it read.
 
 Overlaps warn — they never block (v0 policy).
 ";
