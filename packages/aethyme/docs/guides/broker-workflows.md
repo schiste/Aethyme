@@ -1081,6 +1081,9 @@ delivery path, and the integration branch plays no part:
   tree must be clean and nothing in progress; it fetches, simulates, and then
   rebases an unpublished branch or merges the default branch into a published
   one. If catching up would conflict it changes nothing and lists the paths.
+  Sync only moves the local session branch and never pushes: its output says
+  what it merged into what (or rebased onto what), that nothing was pushed,
+  and names `aethyme broker push --session <id>` as the next step.
   Run it before resuming a reused session and whenever `push` reports the
   branch is behind.
 - **`broker status` shows `session.behind-main`** per live session: `info`

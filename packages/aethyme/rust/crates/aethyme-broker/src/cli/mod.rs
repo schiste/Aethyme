@@ -577,9 +577,10 @@ Usage:
       is safe: the tree must be clean and nothing in progress. An unpushed
       branch is rebased; a published one has the default branch merged in,
       so a pull request's history is never rewritten. If catching up would
-      conflict, nothing changes and the conflicting paths are listed. Run
-      it before resuming a reused session and whenever `push` reports the
-      branch is behind the default branch.
+      conflict, nothing changes and the conflicting paths are listed. Only
+      the local session branch moves; nothing is pushed, so follow a sync
+      with `broker push`. Run it before resuming a reused session and
+      whenever `push` reports the branch is behind the default branch.
   aethyme broker repair --session <id> [--json]
       Conflict-scoped recovery: apply the documented local rebase path for
       the latest submit conflict, or rebase onto promoted integration work
