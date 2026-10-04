@@ -76,4 +76,19 @@ mod tests {
         assert!(REVIEW_RULES_SKILL_MD.contains("aethyme broker advanced review plan"));
         assert!(REVIEW_RULES_REFERENCE_MD.contains("[[review.trigger.rule]]"));
     }
+
+    #[test]
+    fn graph_task_template_sections_are_unique() {
+        for heading in [
+            "## Task Scope And Anchors",
+            "## Context Packs",
+            "## Verification Discipline",
+        ] {
+            assert_eq!(
+                REF_GRAPH_TASK_MD.matches(heading).count(),
+                1,
+                "expected exactly one `{heading}` section",
+            );
+        }
+    }
 }
