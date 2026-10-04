@@ -18,7 +18,8 @@
 //!   is safe -- a clean tree and a merge Git can make without conflicts --
 //!   rebasing an unpublished branch and merging into a published one, so a
 //!   pull request's history is never rewritten. On a conflict it changes
-//!   nothing and names the paths.
+//!   nothing and names the paths. Sync is local only: it moves the session
+//!   branch in its worktree and never pushes; `broker push` publishes it.
 
 use std::path::Path;
 
@@ -81,6 +82,11 @@ pub struct SessionSyncReport {
     /// What to run by hand, when the sync stopped at a conflict.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub manual_commands: Vec<String>,
+    /// The command that publishes a synced branch. A sync only moves the
+    /// local session branch; it never pushes, so after `synced` the remote
+    /// still holds the old head (or no branch at all) until this runs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_action: Option<String>,
 }
 
 fn sync_refused(reason: impl Into<String>) -> BrokerOpError {
@@ -260,6 +266,7 @@ impl crate::Broker {
             fetched: fetch_note.is_none(),
             fetch_note,
             manual_commands: Vec::new(),
+            next_action: None,
         };
         if drift.behind == 0 {
             return Ok(report);
@@ -301,6 +308,7 @@ impl crate::Broker {
             CatchUp::Rebase => SyncStrategy::Rebase,
         };
         report.after = after.clone();
+        report.next_action = Some(format!("aethyme broker push --session {session_id}"));
         let payload = serde_json::json!({
             "session_id": session_id,
             "branch": session.branch,

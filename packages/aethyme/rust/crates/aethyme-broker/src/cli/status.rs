@@ -76,8 +76,10 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
         ));
     }
     if parsed.refresh && parsed.read_only_snapshot {
-        return Err(UsageError::Message(
-            "--refresh is unavailable in read-only compatibility mode".into(),
+        return Err(read_only_refusal(
+            &parsed,
+            "`--refresh`",
+            "run `aethyme broker status` without --refresh",
         ));
     }
     let opened = std::time::Instant::now();
@@ -613,6 +615,19 @@ pub(super) fn run_doctor(parsed: Parsed) -> Result<(), UsageError> {
             out!("git hooks: {}", finding.message());
             out!("  resolved: {}", finding.resolved);
             out!("  fix: {}", finding.fix);
+        }
+        if let Some(leftover) = &report.leftover_integration_work {
+            out!(
+                "integration leftover work: {} [{}]",
+                leftover.summary,
+                leftover.severity.as_str()
+            );
+            for evidence in &leftover.evidence {
+                out!("  {evidence}");
+            }
+            for command in &leftover.commands {
+                out!("  run: {command}");
+            }
         }
         if let Some(repair) = &report.version_repair {
             out!(

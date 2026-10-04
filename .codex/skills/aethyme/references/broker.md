@@ -109,6 +109,8 @@ blocked.
    `aethyme broker sync --session <id>` when it warns, before the pull request
    reports the conflict: it rebases an unpublished branch or merges the default
    branch into a published one, and changes nothing if that would conflict.
+   Sync is local only: it never pushes, so run `aethyme broker push --session
+   <id>` afterwards to publish the caught-up branch.
    `broker start` and `start --reuse` refresh the default branch first, so a
    new worktree starts from the latest fetched tip. In a repository
    with `[promote] mode = "verify-only"`, `broker submit` is a pre-flight
