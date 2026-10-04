@@ -688,6 +688,8 @@ pub struct GateResult {
     pub log_path: Option<String>,
     pub session_id: Option<i64>,
     pub created_at: i64,
+    pub cleared_at: Option<i64>,
+    pub cleared_reason: Option<String>,
     #[serde(flatten)]
     pub environment: GateEnvironment,
 }

@@ -1343,10 +1343,45 @@ impl BrokerStore {
         Ok(id)
     }
 
-    /// Cache lookup: the most recent *conclusive* result for this gate
-    /// against this exact tree. Passes are conclusive; failures are only
-    /// conclusive when classified as real test failures. Cancelled,
-    /// error, infra-classified, and legacy unclassified fail rows never
+    /// Mark conclusive failing gate results cleared without removing their
+    /// historical rows. Cleared rows stop satisfying the active cache.
+    pub(crate) fn clear_cached_test_failures(
+        &mut self,
+        gate_name: &str,
+        tree_hash: &str,
+        reason: &str,
+    ) -> Result<Vec<i64>, BrokerError> {
+        let now = now_ms();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let ids = {
+            let mut stmt = tx.prepare(
+                "SELECT id FROM gate_results
+                 WHERE gate_name = ?1 AND tree_hash = ?2
+                   AND status = 'fail' AND failure_class = 'test_failure'
+                   AND cleared_at IS NULL
+                 ORDER BY id",
+            )?;
+            stmt.query_map(params![gate_name, tree_hash], |row| row.get::<_, i64>(0))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        for id in &ids {
+            tx.execute(
+                "UPDATE gate_results
+                 SET cleared_at = ?1, cleared_reason = ?2
+                 WHERE id = ?3 AND cleared_at IS NULL",
+                params![now, reason, id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(ids)
+    }
+
+    /// Cache lookup: the most recent conclusive, uncleared result for this
+    /// gate against this exact tree. Passes are conclusive; failures are only
+    /// conclusive when classified as real test failures. Cancelled, error,
+    /// infra-classified, legacy unclassified fail, and cleared rows never
     /// satisfy the cache.
     pub fn cached_gate_result(
         &self,
@@ -1358,9 +1393,16 @@ impl BrokerStore {
             .query_row(
                 &format!(
                     "{GATE_RESULT_SELECT}
-                     WHERE gate_name = ?1 AND tree_hash = ?2
-                       AND (status = 'pass'
-                            OR (status = 'fail' AND failure_class = 'test_failure'))
+                    WHERE gate_name = ?1 AND tree_hash = ?2 AND cleared_at IS NULL
+                      AND NOT EXISTS (
+                          SELECT 1 FROM gate_results cleared
+                          WHERE cleared.gate_name = gate_results.gate_name
+                            AND cleared.tree_hash = gate_results.tree_hash
+                            AND cleared.cleared_at IS NOT NULL
+                            AND cleared.id > gate_results.id
+                      )
+                      AND (status = 'pass'
+                           OR (status = 'fail' AND failure_class = 'test_failure'))
                      ORDER BY id DESC LIMIT 1"
                 ),
                 params![gate_name, tree_hash],
@@ -1370,8 +1412,8 @@ impl BrokerStore {
         result.transpose()
     }
 
-    /// Definition-bound cache lookup used by execution. The two-argument
-    /// reader remains available for diagnostics over historical rows.
+    /// Definition-bound cache lookup used by execution. Cleared results remain
+    /// in gate history but cannot satisfy this lookup.
     pub fn cached_gate_result_for_definition(
         &self,
         gate_name: &str,
@@ -1383,8 +1425,17 @@ impl BrokerStore {
             .query_row(
                 &format!(
                     "{GATE_RESULT_SELECT}
-                     WHERE gate_name = ?1 AND tree_hash = ?2 AND definition_hash = ?3
-                       AND (
+                    WHERE gate_name = ?1 AND tree_hash = ?2 AND definition_hash = ?3
+                      AND cleared_at IS NULL
+                      AND NOT EXISTS (
+                          SELECT 1 FROM gate_results cleared
+                          WHERE cleared.gate_name = gate_results.gate_name
+                            AND cleared.tree_hash = gate_results.tree_hash
+                            AND cleared.definition_hash = gate_results.definition_hash
+                            AND cleared.cleared_at IS NOT NULL
+                            AND cleared.id > gate_results.id
+                      )
+                      AND (
                             status = 'pass'
                             OR (status = 'fail' AND failure_class = 'test_failure')
                        )
@@ -2274,9 +2325,9 @@ impl BrokerStore {
         limit: usize,
     ) -> Result<Vec<GateResult>, BrokerError> {
         let limit = limit.clamp(1, crate::RECOMMENDATION_GATE_HISTORY_LIMIT);
-        let mut stmt = self
-            .conn
-            .prepare(&format!("{GATE_RESULT_SELECT} ORDER BY id DESC LIMIT ?1"))?;
+        let mut stmt = self.conn.prepare(&format!(
+            "{GATE_RESULT_SELECT} WHERE cleared_at IS NULL ORDER BY id DESC LIMIT ?1"
+        ))?;
         let rows = stmt.query_map([limit as i64], gate_result_from_row)?;
         rows.map(|row| row?).collect()
     }
@@ -6208,6 +6259,12 @@ impl BrokerStore {
                     [row.id],
                 )?;
             }
+            if row.kind == crate::GcRowKind::GateResult {
+                tx.execute(
+                    "INSERT OR IGNORE INTO gate_result_gc_permits (gate_result_id) VALUES (?1)",
+                    [row.id],
+                )?;
+            }
             let table = match row.kind {
                 crate::GcRowKind::Event => "events",
                 crate::GcRowKind::GateResult => "gate_results",
@@ -6219,6 +6276,12 @@ impl BrokerStore {
                 crate::GcRowKind::MergeQueue => "merge_queue",
             };
             removed += tx.execute(&format!("DELETE FROM {table} WHERE id = ?1"), [row.id])?;
+            if row.kind == crate::GcRowKind::GateResult {
+                tx.execute(
+                    "DELETE FROM gate_result_gc_permits WHERE gate_result_id = ?1",
+                    [row.id],
+                )?;
+            }
         }
         tx.commit()?;
         Ok(removed)
@@ -6623,7 +6686,7 @@ const LEASE_SELECT: &str =
 const GATE_RESULT_SELECT: &str = "SELECT id, gate_name, tree_hash, definition_hash, status, \
      failure_class, exit_code, duration_ms, log_path, session_id, created_at, wait_duration_ms, \
      first_output_ms, output_bytes, load_avg_1m_start, load_avg_1m_end, cpu_count, \
-     free_disk_bytes_start FROM gate_results";
+     free_disk_bytes_start, cleared_at, cleared_reason FROM gate_results";
 
 const MERGE_SELECT: &str = "SELECT id, session_id, head_commit, base_commit, status, \
      merged_tree, details_json, created_at, updated_at FROM merge_queue";
@@ -6775,6 +6838,8 @@ fn gate_result_from_row(row: &rusqlite::Row<'_>) -> RowResult<GateResult> {
             wait_duration_ms: row.get(11)?,
             first_output_ms: row.get(12)?,
             output_bytes: row.get(13)?,
+            cleared_at: row.get(18)?,
+            cleared_reason: row.get(19)?,
             environment: GateEnvironment {
                 load_avg_1m_start: row.get(14)?,
                 load_avg_1m_end: row.get(15)?,
@@ -6783,6 +6848,127 @@ fn gate_result_from_row(row: &rusqlite::Row<'_>) -> RowResult<GateResult> {
             },
         })
     })())
+}
+
+#[cfg(test)]
+mod gate_result_clear_metadata_tests {
+    use super::*;
+
+    #[test]
+    fn gate_result_readback_exposes_clear_time_and_reason() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::schema::migrate(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO gate_results (
+                 gate_name, tree_hash, definition_hash, status, failure_class,
+                 created_at, cleared_at, cleared_reason
+             ) VALUES ('unit', 'tree', 'definition', 'fail', 'test_failure', 1, 2, 'operator review')",
+            [],
+        )
+        .unwrap();
+
+        let result = conn
+            .query_row(
+                &format!("{GATE_RESULT_SELECT} WHERE id = 1"),
+                [],
+                gate_result_from_row,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.cleared_at, Some(2));
+        assert_eq!(result.cleared_reason.as_deref(), Some("operator review"));
+    }
+
+    #[test]
+    fn garbage_collection_can_purge_failed_gate_results_without_opening_delete_to_old_writers() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = BrokerStore::open_in_repo(directory.path()).unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO gate_results (
+                     gate_name, tree_hash, definition_hash, status, failure_class, created_at
+                 ) VALUES ('unit', 'tree', 'definition', 'fail', 'test_failure', 1)",
+                [],
+            )
+            .unwrap();
+        let id = store.conn.last_insert_rowid();
+        let candidate = crate::GcRowCandidate {
+            kind: crate::GcRowKind::GateResult,
+            id,
+            recorded_at: 1,
+            estimated_bytes: 1,
+            gate_log_path: None,
+        };
+
+        assert!(
+            store
+                .conn
+                .execute("DELETE FROM gate_results WHERE id = ?1", [id])
+                .is_err(),
+            "ordinary old-writer deletes remain fenced"
+        );
+        assert_eq!(store.delete_gc_rows(&[candidate]).unwrap(), 1);
+        let remaining: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM gate_results WHERE id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining, 0);
+        let permits: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM gate_result_gc_permits", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(permits, 0);
+    }
+
+    #[test]
+    fn a_cleared_latest_failure_prevents_falling_back_to_an_older_pass() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = BrokerStore::open_in_repo(directory.path()).unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO gate_results (
+                     gate_name, tree_hash, definition_hash, status, created_at
+                 ) VALUES ('unit', 'tree', 'definition', 'pass', 1)",
+                [],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO gate_results (
+                     gate_name, tree_hash, definition_hash, status,
+                     failure_class, created_at
+                 ) VALUES ('unit', 'tree', 'definition', 'fail', 'test_failure', 2)",
+                [],
+            )
+            .unwrap();
+
+        assert_eq!(
+            store
+                .clear_cached_test_failures("unit", "tree", "operator review")
+                .unwrap(),
+            vec![2]
+        );
+        assert!(
+            store
+                .cached_gate_result_for_definition("unit", "tree", "definition")
+                .unwrap()
+                .is_none(),
+            "clearing the newest failure must invalidate earlier cached proof"
+        );
+        assert!(
+            store.cached_gate_result("unit", "tree").unwrap().is_none(),
+            "the definition-agnostic lookup must also require a fresh run"
+        );
+    }
 }
 
 fn merge_from_row(row: &rusqlite::Row<'_>) -> RowResult<MergeQueueEntry> {

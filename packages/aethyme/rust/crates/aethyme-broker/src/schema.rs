@@ -10,9 +10,11 @@
 //!   database opens it without migrating when its own [`SCHEMA_VERSION`] is at
 //!   least that value, and otherwise fails with [`BrokerError::SchemaTooNew`].
 //!   Raise [`MIN_COMPATIBLE_SCHEMA`] in the same change as a migration older
-//!   writers cannot tolerate: a renamed or dropped column, a new `NOT NULL`
-//!   column without a default, a changed constraint. New tables, indexes and
-//!   nullable or defaulted columns leave it unchanged.
+//!   writers cannot tolerate, or when older writer behavior would violate a
+//!   new durable-data invariant. Structural examples include a renamed or
+//!   dropped column, a new `NOT NULL` column without a default, or a changed
+//!   constraint. New tables, indexes and nullable/defaulted columns alone leave
+//!   it unchanged.
 //! - The `events` table is append-only by contract: the store exposes no
 //!   update or delete for it, and each row carries its own
 //!   `schema_version` ([`EVENTS_SCHEMA_VERSION`]) so old rows stay
@@ -23,7 +25,7 @@ use rusqlite::Connection;
 use crate::error::BrokerError;
 
 /// Current database schema version (== `MIGRATIONS.len()`).
-pub const SCHEMA_VERSION: i64 = 46;
+pub const SCHEMA_VERSION: i64 = 47;
 
 /// The oldest schema version whose binaries can safely use a database at
 /// [`SCHEMA_VERSION`]. Before this existed every newer database locked out
@@ -41,7 +43,13 @@ pub const SCHEMA_VERSION: i64 = 46;
 ///   older binaries out.
 /// - v46: one new table for named ownership claims. An older binary never
 ///   names it, so it neither sees nor writes claims.
-pub const MIN_COMPATIBLE_SCHEMA: i64 = 42;
+/// - v47: keeps the existing `gate_results` columns, adds nullable clear
+///   metadata, makes result ids AUTOINCREMENT, and seeds the sequence above
+///   historical gate events. The minimum rises to v47 because a newly opened
+///   older broker would delete failing rows during `unblock`; the migration
+///   also fences already-open v46 writers with a DELETE trigger, and records
+///   the new floor in the same transaction as the v47 schema marker.
+pub const MIN_COMPATIBLE_SCHEMA: i64 = 47;
 
 /// Whether this binary may use a database at `found`, a version newer than
 /// its own, because every migration past [`SCHEMA_VERSION`] was declared
@@ -1415,6 +1423,104 @@ CREATE UNIQUE INDEX ownership_claims_one_open
 CREATE INDEX ownership_claims_by_session
     ON ownership_claims (session_id, released_at);
 ";
+/// Preserve gate-result history when an operator invalidates a cached verdict,
+/// and make row ids monotonic even when retention later physically purges rows.
+const MIGRATION_V47: &str = "
+DROP INDEX IF EXISTS gate_results_by_gate_tree;
+DROP INDEX IF EXISTS gate_results_by_gate_tree_definition;
+DROP INDEX IF EXISTS gate_results_by_retention_age;
+ALTER TABLE gate_results RENAME TO gate_results_v46;
+
+CREATE TABLE gate_results (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    gate_name       TEXT NOT NULL,
+    tree_hash       TEXT NOT NULL,
+    status          TEXT NOT NULL CHECK (status IN ('pass', 'fail', 'cancelled', 'error')),
+    exit_code       INTEGER,
+    duration_ms     INTEGER,
+    log_path        TEXT,
+    session_id      INTEGER REFERENCES sessions (id),
+    created_at      INTEGER NOT NULL,
+    failure_class   TEXT CHECK (failure_class IS NULL OR failure_class IN (
+                        'test_failure',
+                        'build_failure',
+                        'environment',
+                        'resource_contention',
+                        'timeout',
+                        'cached_prior_fail',
+                        'unknown'
+                    )),
+    definition_hash TEXT NOT NULL DEFAULT '',
+    wait_duration_ms INTEGER,
+    first_output_ms INTEGER,
+    output_bytes    INTEGER,
+    load_avg_1m_start REAL,
+    load_avg_1m_end   REAL,
+    cpu_count        INTEGER,
+    free_disk_bytes_start INTEGER,
+    cleared_at      INTEGER,
+    cleared_reason  TEXT,
+    CHECK ((cleared_at IS NULL) = (cleared_reason IS NULL))
+);
+
+INSERT INTO gate_results (
+    id, gate_name, tree_hash, status, exit_code, duration_ms, log_path,
+    session_id, created_at, failure_class, definition_hash, wait_duration_ms,
+    first_output_ms, output_bytes, load_avg_1m_start, load_avg_1m_end,
+    cpu_count, free_disk_bytes_start, cleared_at, cleared_reason
+)
+SELECT
+    id, gate_name, tree_hash, status, exit_code, duration_ms, log_path,
+    session_id, created_at, failure_class, definition_hash, wait_duration_ms,
+    first_output_ms, output_bytes, load_avg_1m_start, load_avg_1m_end,
+    cpu_count, free_disk_bytes_start, NULL, NULL
+FROM gate_results_v46;
+
+DROP TABLE gate_results_v46;
+
+CREATE INDEX gate_results_by_gate_tree ON gate_results (gate_name, tree_hash, id);
+CREATE INDEX gate_results_by_gate_tree_definition
+    ON gate_results (gate_name, tree_hash, definition_hash, id);
+CREATE INDEX gate_results_by_retention_age ON gate_results (created_at, id);
+
+-- Garbage collection is the only authorized physical purge of failing
+-- results. Its permit rows live only inside delete_gc_rows' immediate
+-- transaction, so an already-open v46 writer cannot use them as a delete path.
+CREATE TABLE gate_result_gc_permits (
+    gate_result_id INTEGER PRIMARY KEY
+);
+
+-- A broker that opened v46 before this migration may still issue its old
+-- DELETE. Preserve every failing row, including one it tries to clear before a
+-- v47 writer can attach clear metadata, unless GC explicitly permits the row.
+CREATE TRIGGER gate_results_preserve_failures_before_delete
+BEFORE DELETE ON gate_results
+FOR EACH ROW WHEN OLD.status = 'fail'
+    AND NOT EXISTS (
+        SELECT 1 FROM gate_result_gc_permits WHERE gate_result_id = OLD.id
+    )
+BEGIN
+    SELECT RAISE(ABORT, 'failing gate history is retained');
+END;
+
+-- v46 used INTEGER PRIMARY KEY, so a highest row deleted before this rebuild
+-- left no sqlite_sequence high-water mark. Gate-result writes append events;
+-- `events` uses AUTOINCREMENT and its sequence survives event pruning, so its
+-- durable high-water mark bounds gate-result ids even after old rows are gone.
+UPDATE sqlite_sequence
+SET seq = MAX(
+    COALESCE(seq, 0),
+    COALESCE((SELECT MAX(id) FROM gate_results), 0),
+    COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'events'), 0)
+)
+WHERE name = 'gate_results';
+INSERT INTO sqlite_sequence (name, seq)
+SELECT 'gate_results', MAX(
+    COALESCE((SELECT MAX(id) FROM gate_results), 0),
+    COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'events'), 0)
+)
+WHERE NOT EXISTS (SELECT 1 FROM sqlite_sequence WHERE name = 'gate_results');
+";
 const MIGRATIONS: &[&str] = &[
     MIGRATION_V1,
     MIGRATION_V2,
@@ -1462,6 +1568,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_V44,
     MIGRATION_V45,
     MIGRATION_V46,
+    MIGRATION_V47,
 ];
 
 pub(crate) fn current_version(conn: &Connection) -> Result<i64, BrokerError> {
@@ -1512,18 +1619,23 @@ pub fn migrate(conn: &Connection) -> Result<(), BrokerError> {
             conn.execute_batch("COMMIT")?;
             continue;
         }
-        let applied = conn.execute_batch(sql).and_then(|()| {
+        let applied = (|| -> Result<(), BrokerError> {
+            conn.execute_batch(sql)?;
             conn.execute(
                 "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)
                  ON CONFLICT (key) DO UPDATE SET value = excluded.value",
                 [version.to_string()],
-            )
-        });
+            )?;
+            if version >= MIN_COMPATIBLE_SCHEMA {
+                record_min_compatible_schema(conn)?;
+            }
+            Ok(())
+        })();
         match applied {
-            Ok(_) => conn.execute_batch("COMMIT")?,
+            Ok(()) => conn.execute_batch("COMMIT")?,
             Err(err) => {
                 let _ = conn.execute_batch("ROLLBACK");
-                return Err(err.into());
+                return Err(err);
             }
         }
     }
@@ -1616,15 +1728,19 @@ mod tests {
 
     /// Apply migrations 1..=`through` the way `migrate` does, without the
     /// min-compatible bookkeeping, to build a database an older binary left.
-    fn migrated_through(through: usize) -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
+    fn migrate_through(conn: &Connection, through: usize) {
         conn.execute_batch("PRAGMA foreign_keys = ON").unwrap();
         conn.execute_batch("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
             .unwrap();
         for (index, sql) in MIGRATIONS.iter().take(through).enumerate() {
             conn.execute_batch(sql).unwrap();
-            set_meta(&conn, "schema_version", (index + 1) as i64);
+            set_meta(conn, "schema_version", (index + 1) as i64);
         }
+    }
+
+    fn migrated_through(through: usize) -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate_through(&conn, through);
         conn
     }
 
@@ -1634,6 +1750,92 @@ mod tests {
              definition_hash, status, failure_class, exit_code, duration_ms, log_path,
              session_id, created_at, wait_duration_ms, first_output_ms, output_bytes)
          VALUES (?1, 'tree', 'def', 'pass', NULL, 0, 1200, NULL, NULL, ?2, 0, 5, 10)";
+
+    #[test]
+    fn v47_minimum_compatible_schema_is_committed_atomically() {
+        let conn = migrated_through(46);
+        set_meta(&conn, "min_compatible_schema", 42);
+        conn.execute_batch(
+            "CREATE TRIGGER refuse_min_compatible_raise
+             BEFORE UPDATE OF value ON meta
+             WHEN OLD.key = 'min_compatible_schema'
+                  AND CAST(NEW.value AS INTEGER) > CAST(OLD.value AS INTEGER)
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected compatibility-floor failure');
+             END;",
+        )
+        .unwrap();
+
+        assert!(
+            migrate(&conn).is_err(),
+            "the injected floor write must fail"
+        );
+        assert_eq!(current_version(&conn).unwrap(), 46);
+        let minimum: String = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'min_compatible_schema'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(minimum, "42");
+        let columns = conn
+            .prepare("PRAGMA table_info(gate_results)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(!columns.iter().any(|column| column == "cleared_at"));
+    }
+
+    #[test]
+    fn an_already_open_v46_connection_cannot_delete_cleared_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("broker.db");
+        let old_connection = Connection::open(&path).unwrap();
+        migrate_through(&old_connection, 46);
+        old_connection
+            .execute(V42_GATE_RESULT_INSERT, rusqlite::params!["old-failure", 1])
+            .unwrap();
+        old_connection
+            .execute(
+                "UPDATE gate_results SET status = 'fail', failure_class = 'test_failure'
+                 WHERE id = 1",
+                [],
+            )
+            .unwrap();
+
+        let migrator = Connection::open(&path).unwrap();
+        migrate(&migrator).unwrap();
+        let deletion_before_clear =
+            old_connection.execute("DELETE FROM gate_results WHERE id = 1", []);
+        assert!(
+            deletion_before_clear.is_err(),
+            "a pre-migration writer must not erase an unmarked failure"
+        );
+        migrator
+            .execute(
+                "UPDATE gate_results SET cleared_at = 2, cleared_reason = 'operator review'
+                 WHERE id = 1",
+                [],
+            )
+            .unwrap();
+
+        let deletion = old_connection.execute("DELETE FROM gate_results WHERE id = 1", []);
+        assert!(
+            deletion.is_err(),
+            "a pre-migration writer must not erase a cleared result"
+        );
+        let reason: String = old_connection
+            .query_row(
+                "SELECT cleared_reason FROM gate_results WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(reason, "operator review");
+    }
 
     #[test]
     fn v43_adds_nullable_gate_environment_columns_to_existing_rows() {
@@ -1696,29 +1898,163 @@ mod tests {
     }
 
     #[test]
-    fn additive_v45_is_declared_compatible_so_a_v42_binary_keeps_using_the_database() {
-        // The declaration itself: v45 only adds tables, so it does not raise
-        // the minimum. Raising it would lock existing binaries and plugin hooks
-        // out of this repository's database, so doing so must be a deliberate
-        // edit.
-        assert_eq!(SCHEMA_VERSION, 46);
-        assert_eq!(MIN_COMPATIBLE_SCHEMA, 42);
+    fn v47_preserves_gate_history_and_never_reuses_gate_result_ids() {
+        let conn = migrated_through(46);
+        conn.execute(
+            "INSERT INTO gate_results (
+                 id, gate_name, tree_hash, definition_hash, status, failure_class,
+                 exit_code, duration_ms, created_at
+             ) VALUES (
+                 1506, 'unit', 'tree', 'definition', 'fail', 'test_failure', 1, 1200, 7
+             )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO gate_results (
+                 id, gate_name, tree_hash, definition_hash, status, failure_class,
+                 exit_code, duration_ms, created_at
+             ) VALUES (
+                 1507, 'unit', 'tree', 'definition', 'pass', NULL, 0, 10, 8
+             )",
+            [],
+        )
+        .unwrap();
+        conn.execute("DELETE FROM gate_results WHERE id = 1507", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO events (id, schema_version, ts, kind, session_id, payload_json)
+             VALUES (1507, ?1, 1507, 'gate.fail', NULL, '{}')",
+            [EVENTS_SCHEMA_VERSION],
+        )
+        .unwrap();
+        conn.execute("DELETE FROM events", []).unwrap();
+
+        migrate(&conn).unwrap();
+        assert_eq!(current_version(&conn).unwrap(), SCHEMA_VERSION);
+        let (gate, tree, status, failure_class, duration, cleared_at, cleared_reason): (
+            String,
+            String,
+            String,
+            Option<String>,
+            i64,
+            Option<i64>,
+            Option<String>,
+        ) = conn
+            .query_row(
+                "SELECT gate_name, tree_hash, status, failure_class, duration_ms,
+                        cleared_at, cleared_reason
+                 FROM gate_results WHERE id = 1506",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            (
+                gate.as_str(),
+                tree.as_str(),
+                status.as_str(),
+                failure_class.as_deref(),
+                duration
+            ),
+            ("unit", "tree", "fail", Some("test_failure"), 1200)
+        );
+        assert_eq!((cleared_at, cleared_reason), (None, None));
+
+        conn.execute(
+            "INSERT INTO gate_results (gate_name, tree_hash, definition_hash, status, created_at)
+             VALUES ('unit', 'tree', 'definition', 'pass', 8)",
+            [],
+        )
+        .unwrap();
+        let purged_id = conn.last_insert_rowid();
+        assert!(
+            purged_id > 1507,
+            "pruned event ids still bound the gate-result high-water mark"
+        );
+        conn.execute("DELETE FROM gate_results WHERE id = ?1", [purged_id])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO gate_results (gate_name, tree_hash, definition_hash, status, created_at)
+             VALUES ('unit', 'tree', 'definition', 'pass', 9)",
+            [],
+        )
+        .unwrap();
+        assert!(
+            conn.last_insert_rowid() > purged_id,
+            "a purged gate result id must never be reused"
+        );
+    }
+
+    #[test]
+    fn v47_requires_a_v47_reader_to_preserve_cleared_gate_history() {
+        assert_eq!(SCHEMA_VERSION, 47);
+        assert_eq!(MIN_COMPATIBLE_SCHEMA, 47);
 
         let conn = migrated();
-        assert_eq!(current_version(&conn).unwrap(), 46);
+        assert_eq!(current_version(&conn).unwrap(), 47);
+        assert!(schema_is_compatible_with(&conn, 47, 47).unwrap());
+        assert!(!schema_is_compatible_with(&conn, 47, 46).unwrap());
+        assert!(!schema_is_compatible_with(&conn, 47, 42).unwrap());
+    }
 
-        // A v42 binary still reads and writes, and the tables it has never
-        // heard of are simply absent from its world.
-        assert!(schema_is_compatible_with(&conn, 46, 42).unwrap());
-        assert!(!schema_is_compatible_with(&conn, 46, 41).unwrap());
+    #[test]
+    fn additive_v44_is_declared_compatible_for_a_v42_writer() {
+        let conn = migrated_through(44);
+        set_meta(&conn, "min_compatible_schema", 42);
+        assert_eq!(current_version(&conn).unwrap(), 44);
+        assert!(schema_is_compatible_with(&conn, 44, 42).unwrap());
+        assert!(!schema_is_compatible_with(&conn, 44, 41).unwrap());
+
+        conn.execute(V42_GATE_RESULT_INSERT, rusqlite::params!["old-writer", 3])
+            .unwrap();
+        let cpus: Option<i64> = conn
+            .query_row(
+                "SELECT cpu_count FROM gate_results WHERE gate_name = 'old-writer'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(cpus, None);
+    }
+
+    #[test]
+    fn additive_v45_is_declared_compatible_for_a_v42_writer() {
+        let conn = migrated_through(45);
+        set_meta(&conn, "min_compatible_schema", 42);
+        assert_eq!(current_version(&conn).unwrap(), 45);
+        assert!(schema_is_compatible_with(&conn, 45, 42).unwrap());
+        assert!(!schema_is_compatible_with(&conn, 45, 41).unwrap());
+
+        conn.execute(V42_GATE_RESULT_INSERT, rusqlite::params!["old-writer", 3])
+            .unwrap();
+        let cpus: Option<i64> = conn
+            .query_row(
+                "SELECT cpu_count FROM gate_results WHERE gate_name = 'old-writer'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(cpus, None);
     }
 
     #[test]
     fn a_name_has_at_most_one_open_ownership_claim() {
-        // v46 only adds a table, so the minimum stays put; the index is what
-        // keeps two racing sessions from both holding "release v1".
+        // The active binary is compatible with the migrated schema; a v46
+        // binary is intentionally refused because its unblock deletes history.
         let conn = migrated();
-        assert!(schema_is_compatible_with(&conn, 46, 42).unwrap());
+        assert!(schema_is_compatible_with(&conn, 47, 47).unwrap());
+        assert!(!schema_is_compatible_with(&conn, 47, 46).unwrap());
         for id in [1, 2] {
             conn.execute(
                 "INSERT INTO sessions (
@@ -1846,39 +2182,6 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 2);
-    }
-
-    #[test]
-    fn additive_v44_is_declared_compatible_so_a_v42_binary_keeps_using_the_database() {
-        // The declaration itself: v44 adds only a nullable column and does
-        // not raise the minimum. Raising it would lock existing binaries and
-        // plugin hooks out of this repository's database, so doing so must be
-        // a deliberate edit.
-        assert_eq!(SCHEMA_VERSION, 46);
-        assert_eq!(MIN_COMPATIBLE_SCHEMA, 42);
-
-        // A database this binary migrated all the way to the current version ...
-        let conn = migrated();
-        assert_eq!(current_version(&conn).unwrap(), SCHEMA_VERSION);
-
-        // ... is accepted by a binary whose SCHEMA_VERSION is 42, through the
-        // compatibility path rather than the equal-version one ...
-        assert!(schema_is_compatible_with(&conn, 43, 42).unwrap());
-        // ... but not by one from before the minimum.
-        assert!(!schema_is_compatible_with(&conn, 43, 41).unwrap());
-
-        // And that binary's writes still succeed: its insert names only the
-        // columns it knows, and the new ones default to NULL.
-        conn.execute(V42_GATE_RESULT_INSERT, rusqlite::params!["old-writer", 3])
-            .unwrap();
-        let cpus: Option<i64> = conn
-            .query_row(
-                "SELECT cpu_count FROM gate_results WHERE gate_name = 'old-writer'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(cpus, None);
     }
 
     #[test]
