@@ -4,6 +4,24 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.17] - 2026-10-04
+
+Coordinated writes that GitHub refuses no longer block the repository, and sync, read-only refusals and doctor say what happened and what to do next.
+
+### Added
+
+- `aethyme broker doctor` reports `integration.leftover-work` in verify-only repositories, using the same detection, evidence and `broker advanced integration reconcile --dry-run` next action as `broker status`. It reads refs only and never makes doctor unhealthy (#513).
+
+### Changed
+
+- `broker sync` says what it merged into what (or what it rebased onto), that nothing was pushed, and to run `aethyme broker push` next. JSON gains `next_action` (#514).
+- Commands refused in read-only compatibility mode, such as `broker status --refresh`, name the repository's compatibility state and the remediation instead of only the mode (#512).
+
+### Fixed
+
+- A coordinated `gh` write that GitHub definitively refuses (exit status 1 for a single-mutation command with an HTTP 4xx rejection or a known refusal such as "Cannot update PR branch due to conflicts") is recorded as failed and no longer write-blocks the repository. Killed processes, network errors, 5xx, 408 and 429 stay `outcome_unknown` (#515).
+- The graph-task skill no longer repeats its task, context-pack and verification sections (#510).
+
 ## [0.8.16] - 2026-10-03
 
 Prompt status, earlier warnings about disk, hooks and leftover integration work, safer coordinated operations, and tools for landing and auditing work.
