@@ -17,10 +17,14 @@ name: Cross-Process Contract Check
 on:
   pull_request:
     branches: ["main", "master"]
+    types: [opened, reopened, synchronize, ready_for_review, edited]
 
 jobs:
   contract-check:
     name: Cross-process contract check
+    # A rerun keeps the original event payload. Revalidate changed PR bodies,
+    # but avoid rebuilding the checker for title-only or base-only edits.
+    if: github.event.action != 'edited' || github.event.changes.body
     runs-on: ubuntu-latest
     steps:
       - name: Checkout PR (full history for diff)
