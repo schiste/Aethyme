@@ -76,8 +76,10 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
         ));
     }
     if parsed.refresh && parsed.read_only_snapshot {
-        return Err(UsageError::Message(
-            "--refresh is unavailable in read-only compatibility mode".into(),
+        return Err(read_only_refusal(
+            &parsed,
+            "`--refresh`",
+            "run `aethyme broker status` without --refresh",
         ));
     }
     let opened = std::time::Instant::now();
