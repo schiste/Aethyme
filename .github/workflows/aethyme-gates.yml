@@ -16,6 +16,9 @@ on:
 
 permissions:
   contents: read
+  # cross-process-contract reads the merged PR's body for its contract
+  # decision (`gh api repos/{owner}/{repo}/commits/<sha>/pulls`).
+  pull-requests: read
 
 # One group per commit: every commit on main gets a completed verdict.
 # Cancelling superseded runs left merge commits (including a release commit on
@@ -96,6 +99,10 @@ jobs:
           # gates this repository defines on its own main branch; that is the
           # trust decision, made here explicitly.
           AETHYME_TRUST_NONINTERACTIVE_FOR_TESTS: "1"
+          # cross-process-contract looks up the pull request merged as this
+          # commit when the merged commits declare no contract decision; the
+          # decision conventionally lives in the PR body. Read-only.
+          GH_TOKEN: ${{ github.token }}
         run: packages/aethyme/rust/target/release/aethyme broker advanced gates run --all
 
       # Runs after the gates, before the cache post-step saves. Keep
