@@ -787,10 +787,44 @@ pub fn run(args: &[String]) -> u8 {
 /// How the router permits this broker invocation to observe broker state.
 /// Degraded repository compatibility uses `ReadOnlySnapshot`; ordinary
 /// current-repository operation retains reconciliation behavior.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompatibilityMode {
     Normal,
-    ReadOnlySnapshot,
+    /// Carries the router's explanation so a refusal can say why the command
+    /// is read-only and what to run next, not merely that it is.
+    ReadOnlySnapshot(ReadOnlyCompatibility),
+}
+
+/// Why the router chose a read-only snapshot for this repository, and the
+/// action that restores normal (writing) broker commands.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReadOnlyCompatibility {
+    /// The repository's compatibility state relative to this binary, e.g.
+    /// "repository deployment schema 0 requires an embedded upgrade to schema 1".
+    pub cause: String,
+    /// The command that returns the repository to normal operation.
+    pub remediation: Option<String>,
+}
+
+/// The one wording for a flag or command refused because it would write
+/// broker state while the router only allows a read-only snapshot. It names
+/// the cause, the action that lifts the restriction, and the read-only
+/// alternative that works now.
+fn read_only_refusal(parsed: &Parsed, refused: &str, snapshot_alternative: &str) -> UsageError {
+    let mut message = format!(
+        "{refused} writes broker state, so it is unavailable while this repository runs broker \
+         diagnostics as a read-only compatibility snapshot"
+    );
+    if let Some(compatibility) = &parsed.read_only_compatibility {
+        message.push_str(&format!(": {}", compatibility.cause));
+        if let Some(remediation) = &compatibility.remediation {
+            message.push_str(&format!(".\nTo restore it: {remediation}"));
+        }
+    }
+    message.push_str(&format!(
+        ".\nFor the recorded snapshot now: {snapshot_alternative}"
+    ));
+    UsageError::Message(message)
 }
 
 pub fn run_with_mode(args: &[String], mode: CompatibilityMode) -> u8 {
@@ -867,7 +901,7 @@ pub fn run_resolved_with_mode(args: &[String], mode: CompatibilityMode) -> u8 {
         return crate::contract_check::run(&args[1..]);
     }
     let started = std::time::Instant::now();
-    let (code, record_outcome, error) = match run_inner(args, mode) {
+    let (code, record_outcome, error) = match run_inner(args, &mode) {
         Ok(()) => (0, true, None),
         Err(UsageError::Help) => {
             eprint!("{}", surface::public_help());
@@ -930,6 +964,8 @@ impl<E: std::fmt::Display + 'static> From<E> for UsageError {
 #[derive(Clone)]
 struct Parsed {
     read_only_snapshot: bool,
+    /// Why `read_only_snapshot` is set; refusals quote it.
+    read_only_compatibility: Option<ReadOnlyCompatibility>,
     /// `submit --verify-only`: run verification and promote nothing.
     verify_only: bool,
     /// `status --summary`: skip the per-session lease refresh (#182).
@@ -1061,6 +1097,7 @@ struct Parsed {
 fn parse(args: &[String]) -> Result<Parsed, UsageError> {
     let mut parsed = Parsed {
         read_only_snapshot: false,
+        read_only_compatibility: None,
         verify_only: false,
         summary: false,
         refresh: false,
@@ -1779,7 +1816,7 @@ fn warn_stale_broker_binary(broker: &Broker) {
     }
 }
 
-fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError> {
+fn run_inner(args: &[String], mode: &CompatibilityMode) -> Result<(), UsageError> {
     let Some(subcommand) = args.first() else {
         return Err(UsageError::Help);
     };
@@ -1816,7 +1853,10 @@ fn run_inner(args: &[String], mode: CompatibilityMode) -> Result<(), UsageError>
             error
         }
     })?;
-    parsed.read_only_snapshot = mode == CompatibilityMode::ReadOnlySnapshot;
+    if let CompatibilityMode::ReadOnlySnapshot(compatibility) = mode {
+        parsed.read_only_snapshot = true;
+        parsed.read_only_compatibility = Some(compatibility.clone());
+    }
     // `start` is the one public verb that merges by flag: registering an
     // existing worktree and spawning a process keep their own handlers.
     let subcommand = &match subcommand.as_str() {
