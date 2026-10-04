@@ -6,11 +6,15 @@ artifacts and their exact source revision are recorded in each signed
 
 ## [0.8.18] - 2026-10-04
 
-A contract decision accepted on a pull request is accepted on its merge commit too.
+A contract decision accepted on a pull request is accepted on its merge commit too, and gates on an overloaded host defer instead of failing.
 
 ### Added
 
 - `aethyme broker check-contract` takes `--commit-messages`, which reads the `<base>..HEAD` commit messages itself, and `--merged-pr`, which asks GitHub for the pull requests that merged HEAD and reads their bodies. The lookup runs only when no other source declares a decision that passes (#517).
+
+### Changed
+
+- A load-admitted gate whose host stays above its load threshold for the whole `resource_wait_seconds` is deferred as `error/resource_contention`, with the measured wait, load, CPU count, threshold and retry guidance, before it spawns or takes owner locks or resource leases. The result is not cached, so a later retry runs. A gate that starts and fails an assertion is still a test failure (#499).
 
 ### Fixed
 
