@@ -4,6 +4,18 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.18] - 2026-10-04
+
+A contract decision accepted on a pull request is accepted on its merge commit too.
+
+### Added
+
+- `aethyme broker check-contract` takes `--commit-messages`, which reads the `<base>..HEAD` commit messages itself, and `--merged-pr`, which asks GitHub for the pull requests that merged HEAD and reads their bodies. The lookup runs only when no other source declares a decision that passes (#517).
+
+### Fixed
+
+- The `cross-process-contract` gate on the default branch reads the merged pull request's contract decision, so a pull request that declared its decision only in its body no longer turns the branch red after merging. The pull request check also reads commit messages, so both lanes judge the same sources. A change with no decision anywhere still fails, and a lookup that cannot run is reported with its cause and never counts as a pass. Every refusal lists where it looked (#517).
+
 ## [0.8.17] - 2026-10-04
 
 Coordinated writes that GitHub refuses no longer block the repository, and sync, read-only refusals and doctor say what happened and what to do next.
