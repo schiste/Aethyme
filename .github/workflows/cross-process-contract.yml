@@ -17,7 +17,7 @@ name: Cross-Process Contract Check
 on:
   pull_request:
     branches: ["main", "master"]
-    types: [opened, reopened, synchronize, ready_for_review, edited]
+    types: [opened, reopened, synchronize, edited]
 
 jobs:
   contract-check:
@@ -39,6 +39,15 @@ jobs:
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           toolchain: stable
+
+      # Reuse the protected-main cache warmed for the same Rust workspace;
+      # never let an untrusted PR write shared compiler artifacts.
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: packages/aethyme/rust
+          shared-key: rust-tests
+          save-if: false
 
       - name: Capture PR body
         # Write the PR body to a file so the checker can parse the
