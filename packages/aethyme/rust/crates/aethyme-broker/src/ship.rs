@@ -1462,19 +1462,7 @@ fn delivery_operator_untracked_paths(repo: &GitRepo) -> Result<Vec<String>, Brok
 }
 
 fn is_broker_runtime_path(path: &str) -> bool {
-    path == crate::BROKER_DB_RELPATH
-        || path.starts_with(".aethyme/broker.db.")
-        || path == crate::BROKER_ADVISORY_RELPATH
-        || path.starts_with(".aethyme/logs/")
-        || path.starts_with(".aethyme/reports/")
-        || path.starts_with(".aethyme/run/")
-        || path.starts_with(".aethyme/worktrees/")
-        || path == ".aethyme/worktree-sizes.json"
-        || path == ".aethyme/gc-journal.json"
-        || path == ".aethyme/gc.lock"
-        || path == ".aethyme/graph_store.redb"
-        || path == ".aethyme/graph_store.redb.indexing"
-        || path.starts_with(".aethyme/graph/")
+    crate::runtime_paths::is_broker_runtime_path(path)
 }
 
 fn delivery_plan_digest(plan: &ShipPlan) -> Result<String, BrokerOpError> {
@@ -3150,6 +3138,16 @@ mod tests {
         assert!(is_broker_runtime_path(
             ".aethyme/logs/command-metrics.jsonl"
         ));
+        assert!(is_broker_runtime_path(".aethyme/gc.lock"));
+        assert!(is_broker_runtime_path(".aethyme/gc-journal.json"));
+        assert!(is_broker_runtime_path(".aethyme/worktree-sizes.json"));
+        assert!(is_broker_runtime_path(".aethyme/reviews/review.json"));
+        assert!(is_broker_runtime_path(".aethyme/locks/gc.lock"));
+        assert!(is_broker_runtime_path(".aethyme/graph/fragments.json"));
+        assert!(is_broker_runtime_path(
+            ".aethyme/generated/experience-status.json"
+        ));
+        assert!(is_broker_runtime_path(".aethyme/broker-action-required.md"));
         assert!(!is_broker_runtime_path(".aethyme/config.toml"));
         assert!(!is_broker_runtime_path("operator-note.txt"));
     }

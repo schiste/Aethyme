@@ -1,13 +1,5 @@
-# Aethyme broker runtime state (per-repo). The configs — .aethyme/gates.toml
-# and .aethyme/config.toml — are tracked; everything the broker writes at
-# runtime is not.
-.aethyme/broker.db*
-.aethyme/logs/
-.aethyme/locks/
-.aethyme/reports/
-.aethyme/run/
-.aethyme/worktrees/
-.aethyme/broker-action-required.md
+# Broker-owned runtime state is listed once in the managed block below.
+# .aethyme/gates.toml and .aethyme/config.toml remain tracked.
 
 # Local strategy/progress boards (personal working views, kept out of git)
 docs/strategy.html
@@ -57,36 +49,25 @@ packages/aethyme/dhat-heap.json
 # is opened in directly grow their own runtime directory.
 packages/aethyme/.claude/
 
-# Graph fragments are generated on demand, not committed (decision D2).
-.aethyme/graph/
-.aethyme/graph_store.redb*
-
-# Review workspaces. `review.routing.workspace_root` in
-# .aethyme/config.toml points at .aethyme/reviews, and the broker registers
-# a detached git worktree per review dimension inside it. Unignored, every
-# session's `git status` carried two permanent untracked entries, and a
-# review worktree registered inside the repository can surface in a gate's
-# working-tree diff -- which is the same tree-hash churn the managed block
-# below exists to prevent.
-.aethyme/reviews/
-
-# Measured worktree sizes, written by the broker's inventory and GC
-# accounting. A cache of measured bytes, not configuration.
-.aethyme/worktree-sizes.json
-
 # aethyme-broker:begin (managed block — do not edit inside)
 .aethyme/broker.db*
 .aethyme/logs/
+.aethyme/locks/
 .aethyme/reports/
 .aethyme/run/
 .aethyme/worktrees/
 .aethyme/broker-action-required.md
 .aethyme/broker-advisory.md
+.aethyme/graph/
 .aethyme/graph_store.redb
 .aethyme/graph_store.redb.indexing
 .aethyme/generated/experience-status.json
 .aethyme/generated/experience-status.md
 .aethyme/generated/experience-telemetry.jsonl
+.aethyme/reviews/
+.aethyme/worktree-sizes.json
+.aethyme/gc-journal.json
+.aethyme/gc.lock
 # aethyme-broker:end
 
 # TypeScript incremental build output

@@ -727,7 +727,8 @@ fn unknown_config_keys(value: &toml::Value) -> Vec<String> {
 
 fn check_gitignore_contract(main_root: &Path) -> Check {
     let existing = std::fs::read_to_string(main_root.join(".gitignore")).unwrap_or_default();
-    let satisfied = gitignore_contract_satisfied(&existing);
+    let managed_block = crate::runtime_paths::managed_gitignore_block();
+    let satisfied = gitignore_contract_satisfied(&existing, &managed_block);
     if satisfied {
         Check {
             id: "certify.gitignore",
@@ -951,48 +952,33 @@ fn rel(path: &Path) -> String {
     }
 }
 
-const GITIGNORE_BLOCK: &str = "\
-# aethyme-broker:begin (managed block — do not edit inside)
-.aethyme/broker.db*
-.aethyme/logs/
-.aethyme/reports/
-.aethyme/run/
-.aethyme/worktrees/
-.aethyme/broker-action-required.md
-.aethyme/broker-advisory.md
-.aethyme/graph_store.redb
-.aethyme/graph_store.redb.indexing
-.aethyme/generated/experience-status.json
-.aethyme/generated/experience-status.md
-.aethyme/generated/experience-telemetry.jsonl
-# aethyme-broker:end
-";
-
 fn ensure_gitignore_block(main_root: &Path) -> Check {
     let path = main_root.join(".gitignore");
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
-    // Hand-maintained repos qualify when every runtime entry is present.
-    // A managed block from an older release is upgraded in place below.
-    if gitignore_contract_satisfied(&existing) {
+    let managed_block = crate::runtime_paths::managed_gitignore_block();
+    // A hand-maintained file without a managed block may still qualify when
+    // every runtime path is ignored. A present managed block is always upgraded.
+    if gitignore_contract_satisfied(&existing, &managed_block) {
         return Check {
             id: "scaffold.gitignore",
             status: CheckStatus::Pass,
             detail: ".gitignore covers broker runtime state".into(),
         };
     }
-    let (updated, detail) = if let Some(updated) = replace_managed_gitignore_block(&existing) {
-        (updated, "updated the aethyme-broker block in .gitignore")
-    } else {
-        let mut updated = existing;
-        if !updated.is_empty() && !updated.ends_with('\n') {
-            updated.push('\n');
-        }
-        if !updated.is_empty() {
-            updated.push('\n');
-        }
-        updated.push_str(GITIGNORE_BLOCK);
-        (updated, "appended the aethyme-broker block to .gitignore")
-    };
+    let (updated, detail) =
+        if let Some(updated) = replace_managed_gitignore_block(&existing, &managed_block) {
+            (updated, "updated the aethyme-broker block in .gitignore")
+        } else {
+            let mut updated = existing;
+            if !updated.is_empty() && !updated.ends_with('\n') {
+                updated.push('\n');
+            }
+            if !updated.is_empty() {
+                updated.push('\n');
+            }
+            updated.push_str(&managed_block);
+            (updated, "appended the aethyme-broker block to .gitignore")
+        };
     match std::fs::write(&path, updated) {
         Ok(()) => Check {
             id: "scaffold.gitignore",
@@ -1007,28 +993,38 @@ fn ensure_gitignore_block(main_root: &Path) -> Check {
     }
 }
 
-fn gitignore_contract_satisfied(existing: &str) -> bool {
-    GITIGNORE_BLOCK
+fn gitignore_contract_satisfied(existing: &str, managed_block: &str) -> bool {
+    if let Some((start, end)) = managed_gitignore_block_range(existing) {
+        return existing[start..end].lines().eq(managed_block.lines());
+    }
+    if existing.contains(crate::runtime_paths::MANAGED_GITIGNORE_BEGIN_MARKER) {
+        return false;
+    }
+    managed_block
         .lines()
-        .filter(|line| !line.starts_with('#'))
+        .filter(|line| !line.starts_with('#') && !line.is_empty())
         .all(|required| existing.lines().any(|have| have.trim() == required))
 }
 
-fn replace_managed_gitignore_block(existing: &str) -> Option<String> {
-    const BEGIN: &str = "# aethyme-broker:begin";
-    const END: &str = "# aethyme-broker:end";
-    let start = existing.find(BEGIN)?;
-    let end_marker = start + existing[start..].find(END)?;
-    let mut end = end_marker + END.len();
+fn managed_gitignore_block_range(existing: &str) -> Option<(usize, usize)> {
+    let start = existing.find(crate::runtime_paths::MANAGED_GITIGNORE_BEGIN_MARKER)?;
+    let end_marker =
+        start + existing[start..].find(crate::runtime_paths::MANAGED_GITIGNORE_END_LINE)?;
+    let mut end = end_marker + crate::runtime_paths::MANAGED_GITIGNORE_END_LINE.len();
     if existing.as_bytes().get(end) == Some(&b'\r') {
         end += 1;
     }
     if existing.as_bytes().get(end) == Some(&b'\n') {
         end += 1;
     }
-    let mut updated = String::with_capacity(existing.len() + GITIGNORE_BLOCK.len());
+    Some((start, end))
+}
+
+fn replace_managed_gitignore_block(existing: &str, managed_block: &str) -> Option<String> {
+    let (start, end) = managed_gitignore_block_range(existing)?;
+    let mut updated = String::with_capacity(existing.len() + managed_block.len());
     updated.push_str(&existing[..start]);
-    updated.push_str(GITIGNORE_BLOCK);
+    updated.push_str(managed_block);
     updated.push_str(&existing[end..]);
     Some(updated)
 }

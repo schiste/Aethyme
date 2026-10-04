@@ -89,6 +89,7 @@ mod pr;
 mod pr_body;
 mod pr_link;
 mod pr_monitoring;
+mod runtime_paths;
 mod scopes;
 mod submit_progress;
 pub use submit_progress::{
