@@ -269,3 +269,96 @@ fn promoting_status_does_not_report_pending_layer_as_leftover() {
         status.advice
     );
 }
+
+fn doctor_cli(root: &Path, args: &[&str]) -> String {
+    let output = Command::new(env!("CARGO_BIN_EXE_broker-cli-shim"))
+        .args(["status", "doctor"])
+        .args(args)
+        .current_dir(root)
+        .env(
+            "AETHYME_HOST_STATE_DIR",
+            root.join(".aethyme/test-host-state"),
+        )
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+/// A repository health check must find the leftover work `status` reports,
+/// with the same dry-run next action, and leave every ref where it was.
+#[test]
+fn verify_only_doctor_reports_leftover_integration_work() {
+    let (tmp, _broker) = fixture(1);
+    let root = tmp.path();
+    let leftover = add_leftover_integration_work(root, 2);
+    set_promote_mode(root, "verify-only");
+    let upstream = git(root, &["rev-parse", "refs/remotes/origin/main"]);
+    let mut broker = Broker::open(root).unwrap();
+
+    let report = broker.doctor().unwrap();
+    let advice = report
+        .leftover_integration_work
+        .as_ref()
+        .expect("doctor must report leftover integration work");
+    assert_eq!(advice.id, "integration.leftover-work");
+    assert_eq!(advice.severity, StatusAdviceSeverity::Warning);
+    assert!(
+        advice.summary.contains("2 commits origin/main lacks"),
+        "{}",
+        advice.summary
+    );
+    let command = "aethyme broker advanced integration reconcile --upstream origin/main --dry-run";
+    assert_eq!(advice.commands, vec![command]);
+    assert!(report.healthy(), "leftover work is reported, not unhealthy");
+    drop(broker);
+
+    let json: serde_json::Value =
+        serde_json::from_str(&doctor_cli(root, &["--json"])).expect("doctor --json");
+    assert_eq!(
+        json["leftover_integration_work"]["commands"][0], command,
+        "{json}"
+    );
+    let text = doctor_cli(root, &[]);
+    assert!(
+        text.contains("integration leftover work: integration carries 2 commits"),
+        "{text}"
+    );
+    assert!(text.contains(&format!("  run: {command}")), "{text}");
+
+    assert_eq!(
+        git(root, &["rev-parse", "refs/heads/aethyme/integration"]),
+        leftover,
+        "doctor must not move integration"
+    );
+    assert_eq!(
+        git(root, &["rev-parse", "refs/remotes/origin/main"]),
+        upstream,
+        "doctor must not move the published branch"
+    );
+}
+
+/// Integration behind the published branch holds nothing of its own, and the
+/// JSON key is omitted rather than reported empty.
+#[test]
+fn verify_only_doctor_is_silent_when_integration_holds_nothing_of_its_own() {
+    let (tmp, _broker) = fixture(2);
+    set_promote_mode(tmp.path(), "verify-only");
+    let mut broker = Broker::open(tmp.path()).unwrap();
+
+    assert!(broker.doctor().unwrap().leftover_integration_work.is_none());
+    drop(broker);
+    let json: serde_json::Value =
+        serde_json::from_str(&doctor_cli(tmp.path(), &["--json"])).expect("doctor --json");
+    assert!(json.get("leftover_integration_work").is_none(), "{json}");
+}
+
+/// Promoting repositories keep their pending layer on integration; `doctor`
+/// follows `status` and does not call it leftover.
+#[test]
+fn promoting_doctor_does_not_report_pending_layer_as_leftover() {
+    let (tmp, _broker) = fixture(1);
+    add_leftover_integration_work(tmp.path(), 1);
+    let mut broker = Broker::open(tmp.path()).unwrap();
+
+    assert!(broker.doctor().unwrap().leftover_integration_work.is_none());
+}

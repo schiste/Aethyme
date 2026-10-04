@@ -614,6 +614,19 @@ pub(super) fn run_doctor(parsed: Parsed) -> Result<(), UsageError> {
             out!("  resolved: {}", finding.resolved);
             out!("  fix: {}", finding.fix);
         }
+        if let Some(leftover) = &report.leftover_integration_work {
+            out!(
+                "integration leftover work: {} [{}]",
+                leftover.summary,
+                leftover.severity.as_str()
+            );
+            for evidence in &leftover.evidence {
+                out!("  {evidence}");
+            }
+            for command in &leftover.commands {
+                out!("  run: {command}");
+            }
+        }
         if let Some(repair) = &report.version_repair {
             out!(
                 "version repair: {} — {}",

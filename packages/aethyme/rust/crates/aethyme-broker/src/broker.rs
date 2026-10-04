@@ -1006,6 +1006,12 @@ pub struct DoctorReport {
     /// is the operator's git config.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hooks_path: Option<crate::hooks::HooksPathFinding>,
+    /// The `integration.leftover-work` row `status` shows: commits a
+    /// verify-only repository's integration branch holds that the published
+    /// branch lacks. Reported, never counted against [`Self::healthy`], and
+    /// never reconciled: `doctor` only names the dry run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub leftover_integration_work: Option<StatusAdvice>,
 }
 
 /// One `broker.command.failed` event as `doctor` reports it.
@@ -8388,6 +8394,7 @@ impl Broker {
         let unpushed_work = self.unpushed_work(now_ms()).unwrap_or_default();
         let recent_command_failures = self.recent_command_failures(now_ms())?;
         let hooks_path = crate::hooks::inspect_hooks_path(&self.main_root);
+        let leftover_integration_work = self.leftover_integration_work()?;
 
         Ok(DoctorReport {
             integrity,
@@ -8401,7 +8408,28 @@ impl Broker {
             unpushed_work,
             recent_command_failures,
             hooks_path,
+            leftover_integration_work,
         })
+    }
+
+    /// The `status` leftover-work check, for `doctor`. Reads the integration
+    /// ref without [`Self::integration_head`], which may fast-forward it: a
+    /// health check moves no refs. A repository with no integration branch
+    /// has nothing left over.
+    fn leftover_integration_work(&self) -> Result<Option<StatusAdvice>, BrokerOpError> {
+        if PromoteConfig::load(&self.main_root).mode.promotes_at_all() {
+            return Ok(None);
+        }
+        let Some(integration_head) = self.integration_tip() else {
+            return Ok(None);
+        };
+        let (baseline_ref, baseline_head) = self.publication_baseline()?;
+        leftover_integration_advice(
+            &self.repo,
+            &integration_head,
+            (&baseline_ref, &baseline_head),
+            None,
+        )
     }
 
     /// Failed broker commands of the last day, for `doctor`.
@@ -13071,6 +13099,7 @@ mod tests {
             unpushed_work: Default::default(),
             recent_command_failures: Vec::new(),
             hooks_path: None,
+            leftover_integration_work: None,
         }
     }
 
