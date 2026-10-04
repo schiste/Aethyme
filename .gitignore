@@ -49,6 +49,11 @@ packages/aethyme/dhat-heap.json
 # is opened in directly grow their own runtime directory.
 packages/aethyme/.claude/
 
+# This checkout does not commit its generated graph fragments. Keep this
+# repository-specific choice outside the broker-managed block: other repos
+# may commit .aethyme/graph as authoritative source.
+.aethyme/graph/
+
 # aethyme-broker:begin (managed block — do not edit inside)
 .aethyme/broker.db*
 .aethyme/logs/
@@ -58,7 +63,6 @@ packages/aethyme/.claude/
 .aethyme/worktrees/
 .aethyme/broker-action-required.md
 .aethyme/broker-advisory.md
-.aethyme/graph/
 .aethyme/graph_store.redb
 .aethyme/graph_store.redb.indexing
 .aethyme/generated/experience-status.json

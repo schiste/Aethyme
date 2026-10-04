@@ -851,7 +851,7 @@ fn existing_files_are_never_touched_and_gitignore_appends_preserving_content() {
     assert!(gitignore.contains(".aethyme/generated/experience-status.json"));
     assert!(gitignore.contains(".aethyme/generated/experience-status.md"));
     assert!(gitignore.contains(".aethyme/locks/"));
-    assert!(gitignore.contains(".aethyme/graph/"));
+    assert!(!gitignore.contains(".aethyme/graph/"));
     assert!(gitignore.contains(".aethyme/reviews/"));
     assert!(gitignore.contains(".aethyme/worktree-sizes.json"));
     assert!(gitignore.contains(".aethyme/gc-journal.json"));
@@ -912,7 +912,6 @@ fn broker_runtime_files_do_not_change_the_gate_tree_hash() {
         ".aethyme/worktrees/session/marker",
         ".aethyme/broker-action-required.md",
         ".aethyme/broker-advisory.md",
-        ".aethyme/graph/fragments.json",
         ".aethyme/graph_store.redb",
         ".aethyme/graph_store.redb.indexing",
         ".aethyme/generated/experience-status.json",

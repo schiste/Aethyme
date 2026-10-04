@@ -67,7 +67,6 @@ const BROKER_RUNTIME_PATH_RULES: &[RuntimePathRule] = &[
     RuntimePathRule::directory(".aethyme/worktrees/"),
     RuntimePathRule::exact(".aethyme/broker-action-required.md"),
     RuntimePathRule::exact(".aethyme/broker-advisory.md"),
-    RuntimePathRule::directory(".aethyme/graph/"),
     RuntimePathRule::exact(".aethyme/graph_store.redb"),
     RuntimePathRule::exact(".aethyme/graph_store.redb.indexing"),
     RuntimePathRule::exact(".aethyme/generated/experience-status.json"),
@@ -151,6 +150,7 @@ mod tests {
             );
         }
         assert!(!is_broker_runtime_path(".aethyme/config.toml"));
+        assert!(!is_broker_runtime_path(".aethyme/graph/example.rs.bin"));
         assert!(!is_broker_runtime_path("operator-note.txt"));
         assert!(is_broker_runtime_path(".aethyme/gc.lock/child"));
     }

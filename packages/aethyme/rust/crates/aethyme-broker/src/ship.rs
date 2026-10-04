@@ -3143,7 +3143,7 @@ mod tests {
         assert!(is_broker_runtime_path(".aethyme/worktree-sizes.json"));
         assert!(is_broker_runtime_path(".aethyme/reviews/review.json"));
         assert!(is_broker_runtime_path(".aethyme/locks/gc.lock"));
-        assert!(is_broker_runtime_path(".aethyme/graph/fragments.json"));
+        assert!(!is_broker_runtime_path(".aethyme/graph/fragments.json"));
         assert!(is_broker_runtime_path(
             ".aethyme/generated/experience-status.json"
         ));
