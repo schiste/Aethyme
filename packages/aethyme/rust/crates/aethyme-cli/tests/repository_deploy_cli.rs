@@ -169,6 +169,25 @@ fn deploy_enrolls_and_verifies_a_repository_without_a_source_checkout() {
     let stdout = String::from_utf8_lossy(&deployed.stdout);
     assert!(stdout.contains("Review and commit repository policy:"));
     assert!(stdout.contains("Ignored machine-local runtime state:"));
+    let runtime_summary = stdout
+        .split_once("Ignored machine-local runtime state:\n")
+        .unwrap()
+        .1;
+    for runtime_path in [
+        ".aethyme/broker.db*",
+        ".aethyme/locks/",
+        ".aethyme/broker-advisory.md",
+        ".aethyme/reviews/",
+        ".aethyme/worktree-sizes.json",
+        ".aethyme/gc-journal.json",
+        ".aethyme/gc.lock",
+    ] {
+        assert!(
+            runtime_summary.contains(&format!("  {runtime_path}\n")),
+            "deploy summary omits ignored runtime path {runtime_path}"
+        );
+        assert!(gitignore.contains(runtime_path), "missing {runtime_path}");
+    }
     assert!(stdout.contains(".aethyme/generated/onboarding.json"));
     assert!(stdout.contains("Optional local Claude integration:"));
     assert!(stdout.contains("settings.local.json (machine-local; never commit)"));

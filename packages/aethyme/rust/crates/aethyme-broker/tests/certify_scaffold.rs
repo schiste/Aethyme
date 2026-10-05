@@ -850,6 +850,170 @@ fn existing_files_are_never_touched_and_gitignore_appends_preserving_content() {
     assert!(gitignore.contains(".aethyme/generated/experience-telemetry.jsonl"));
     assert!(gitignore.contains(".aethyme/generated/experience-status.json"));
     assert!(gitignore.contains(".aethyme/generated/experience-status.md"));
+    assert!(gitignore.contains(".aethyme/locks/"));
+    assert!(!gitignore.contains(".aethyme/graph/"));
+    assert!(gitignore.contains(".aethyme/reviews/"));
+    assert!(gitignore.contains(".aethyme/worktree-sizes.json"));
+    assert!(gitignore.contains(".aethyme/gc-journal.json"));
+    assert!(gitignore.contains(".aethyme/gc.lock"));
+}
+
+#[test]
+fn directory_ignore_rules_leave_same_named_untracked_files_visible() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    init::scaffold(tmp.path()).unwrap();
+
+    let file_path = ".aethyme/logs";
+    std::fs::write(tmp.path().join(file_path), "operator note\n").unwrap();
+    let repo = aethyme_broker::GitRepo::discover(tmp.path()).unwrap();
+    let untracked = repo.untracked_paths_readonly().unwrap();
+    assert!(untracked.iter().any(|path| path == file_path));
+    let ignored = Command::new("git")
+        .args(["check-ignore", "--quiet", "--no-index", file_path])
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert_eq!(
+        ignored.status.code(),
+        Some(1),
+        "the directory-only ignore pattern must not hide a same-named file"
+    );
+
+    std::fs::remove_file(tmp.path().join(file_path)).unwrap();
+    let child_path = ".aethyme/logs/runtime.log";
+    let child = tmp.path().join(child_path);
+    std::fs::create_dir_all(child.parent().unwrap()).unwrap();
+    std::fs::write(child, "broker output\n").unwrap();
+    let ignored_child = Command::new("git")
+        .args(["check-ignore", "--quiet", "--no-index", child_path])
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert!(ignored_child.status.success());
+}
+
+#[test]
+fn broker_runtime_files_do_not_change_the_gate_tree_hash() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    init::scaffold(tmp.path()).unwrap();
+    sh(tmp.path(), &["add", ".gitignore", ".aethyme/config.toml"]);
+    sh(tmp.path(), &["commit", "-qm", "scaffold"]);
+
+    let repo = aethyme_broker::GitRepo::discover(tmp.path()).unwrap();
+    let before = repo.working_tree_hash().unwrap();
+    for relative in [
+        ".aethyme/broker.db-wal",
+        ".aethyme/logs/command.log",
+        ".aethyme/locks/gc.lock",
+        ".aethyme/reports/report.json",
+        ".aethyme/run/gate.log",
+        ".aethyme/worktrees/session/marker",
+        ".aethyme/broker-action-required.md",
+        ".aethyme/broker-advisory.md",
+        ".aethyme/graph_store.redb",
+        ".aethyme/graph_store.redb.indexing",
+        ".aethyme/generated/experience-status.json",
+        ".aethyme/generated/experience-status.md",
+        ".aethyme/generated/experience-telemetry.jsonl",
+        ".aethyme/reviews/review.json",
+        ".aethyme/worktree-sizes.json",
+        ".aethyme/gc-journal.json",
+        ".aethyme/gc.lock",
+    ] {
+        let path = tmp.path().join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "runtime output").unwrap();
+    }
+
+    let after = repo.working_tree_hash().unwrap();
+    assert_eq!(
+        before, after,
+        "broker runtime output changed the gate tree hash"
+    );
+    let status = Command::new("git")
+        .args(["status", "--porcelain", "--untracked-files=all"])
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert!(status.status.success());
+    assert!(
+        status.stdout.is_empty(),
+        "runtime artifacts left git status output: {}",
+        String::from_utf8_lossy(&status.stdout)
+    );
+}
+
+#[test]
+fn scaffold_refuses_an_unterminated_managed_block_instead_of_appending_another() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let original = "target/\n# aethyme-broker:begin (managed block — do not edit inside)\n\
+                    .aethyme/broker.db*\n\
+                    maintainer-rule-a\n\
+                    maintainer-rule-b\n";
+    std::fs::write(tmp.path().join(".gitignore"), original).unwrap();
+
+    // Run twice: a single append looks harmless, but the second run would
+    // treat the orphaned begin marker and the appended end marker as one
+    // block and delete the maintainer rules between them.
+    for _ in 0..2 {
+        let report = init::scaffold(tmp.path()).unwrap();
+        assert_eq!(status_of(&report, "scaffold.gitignore"), CheckStatus::Fail);
+        let gitignore = std::fs::read_to_string(tmp.path().join(".gitignore")).unwrap();
+        assert_eq!(gitignore, original, ".gitignore must be left untouched");
+    }
+}
+
+#[test]
+fn scaffold_refreshes_a_stale_managed_block_even_when_rules_exist_outside_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let stale_block = "# aethyme-broker:begin (managed block — do not edit inside)\n.aethyme/broker.db*\n.aethyme/logs/\n# aethyme-broker:end\n";
+    let manual_rules = [
+        ".aethyme/broker.db*",
+        ".aethyme/logs/",
+        ".aethyme/locks/",
+        ".aethyme/reports/",
+        ".aethyme/run/",
+        ".aethyme/worktrees/",
+        ".aethyme/broker-action-required.md",
+        ".aethyme/broker-advisory.md",
+        ".aethyme/graph_store.redb",
+        ".aethyme/graph_store.redb.indexing",
+        ".aethyme/generated/experience-status.json",
+        ".aethyme/generated/experience-status.md",
+        ".aethyme/generated/experience-telemetry.jsonl",
+        ".aethyme/graph/",
+        ".aethyme/reviews/",
+        ".aethyme/worktree-sizes.json",
+        ".aethyme/gc-journal.json",
+        ".aethyme/gc.lock",
+    ]
+    .join("\n");
+    std::fs::write(
+        tmp.path().join(".gitignore"),
+        format!("{stale_block}\n{manual_rules}\n"),
+    )
+    .unwrap();
+
+    let report = init::scaffold(tmp.path()).unwrap();
+    assert_eq!(
+        status_of(&report, "scaffold.gitignore"),
+        CheckStatus::Created
+    );
+    let gitignore = std::fs::read_to_string(tmp.path().join(".gitignore")).unwrap();
+    let managed = gitignore
+        .split_once("# aethyme-broker:begin")
+        .unwrap()
+        .1
+        .split_once("# aethyme-broker:end")
+        .unwrap()
+        .0;
+    assert!(managed.contains(".aethyme/gc.lock"));
+    assert!(managed.contains(".aethyme/reviews/"));
+    assert_eq!(gitignore.matches("aethyme-broker:begin").count(), 1);
 }
 
 #[test]
