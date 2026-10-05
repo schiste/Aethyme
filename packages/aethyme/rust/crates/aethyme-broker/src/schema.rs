@@ -45,10 +45,12 @@ pub const SCHEMA_VERSION: i64 = 47;
 ///   names it, so it neither sees nor writes claims.
 /// - v47: keeps the existing `gate_results` columns, adds nullable clear
 ///   metadata, makes result ids AUTOINCREMENT, and seeds the sequence above
-///   historical gate events. The minimum rises to v47 because a newly opened
-///   older broker would delete failing rows during `unblock`; the migration
-///   also fences already-open v46 writers with a DELETE trigger, and records
-///   the new floor in the same transaction as the v47 schema marker.
+///   historical gate events. The minimum rises to v47 because an older
+///   binary never reads `cleared_at`: it would keep serving a cleared failure
+///   as a cached verdict and listing it as a blocker, and its `unblock` DELETE
+///   is refused by the trigger below, so it could never clear it. The
+///   migration fences already-open v46 writers with that DELETE trigger, and
+///   records the new floor in the same transaction as the v47 schema marker.
 pub const MIN_COMPATIBLE_SCHEMA: i64 = 47;
 
 /// Whether this binary may use a database at `found`, a version newer than
