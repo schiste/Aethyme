@@ -22,14 +22,14 @@ aethyme-graph-storage = { path = "../aethyme-graph-storage" }
 aethyme-graph-schema = { path = "../aethyme-graph-schema" }
 # Payload serde bounds — producers stamp Serialize + DeserializeOwned
 # on their payload types and the trait bound surfaces it here.
-serde = { version = "1", features = ["derive"] }
+serde = { workspace = true }
 
 [dev-dependencies]
 # ProducerCtx wraps a real FragmentStore (which insists its on-disk
 # layout exists), so the harness test needs a tempdir + bootstrap_repo
 # call rather than an in-memory fake. tempfile = "3" matches the rest
 # of the workspace.
-tempfile = "3"
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

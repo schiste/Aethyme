@@ -16,20 +16,20 @@ aethyme-enhance = { path = "../aethyme-enhance" }
 aethyme-graph-indexer = { path = "../aethyme-graph-indexer" }
 aethyme-graph-storage = { path = "../aethyme-graph-storage" }
 aethyme-quality = { path = "../aethyme-quality" }
-libc = "0.2"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-sha2 = "0.10"
-tempfile = "3"
-toml_edit = "0.22"
+libc = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tempfile = { workspace = true }
+toml_edit = { workspace = true }
 
 # The implementation-blind CLI suites under `tests/` drive the built
 # `aethyme` binary as a subprocess and never link the product crates, so
 # the harness plus JSON/tempdir helpers are all they need.
 [dev-dependencies]
 aethyme-testkit = { path = "../aethyme-testkit" }
-serde_json = "1"
-sha2 = "0.10"
+serde_json = { workspace = true }
+sha2 = { workspace = true }
 
 [lints]
 workspace = true
