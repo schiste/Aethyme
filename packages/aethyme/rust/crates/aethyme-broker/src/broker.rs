@@ -1235,7 +1235,25 @@ pub struct CleanupPlan {
     /// worktree into an eligible one, and that is a different plan (#354).
     pub target_snapshot: Vec<String>,
     pub worktrees: Vec<CleanupWorktreePlan>,
+    /// Worktrees a recorded-size plan listed without judging eligibility,
+    /// because the health-check budget ran out first (#460). Always `0` on a
+    /// [`SizeScan::Measure`](crate::SizeScan) pass, which inspects everything,
+    /// and left out of the JSON when `0` so a measured plan's digest is
+    /// unchanged.
+    #[serde(skip_serializing_if = "is_zero_count")]
+    pub eligibility_not_inspected_count: usize,
 }
+
+fn is_zero_count(count: &usize) -> bool {
+    *count == 0
+}
+
+/// How long a recorded-size cleanup plan spends judging eligibility before it
+/// lists the remaining worktrees uninspected. `doctor`, `certify`, the verify
+/// loop and `status --audit` take that path, and each eligibility check runs
+/// git over the session's history, so on a repository with hundreds of
+/// retained worktrees an unbounded pass ran for many minutes (#460).
+pub const HEALTH_CHECK_ELIGIBILITY_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
 
 impl Default for CleanupPlan {
     fn default() -> Self {
@@ -1252,6 +1270,7 @@ impl Default for CleanupPlan {
             sizes_measured_at_ms: None,
             target_snapshot: Vec::new(),
             worktrees: Vec::new(),
+            eligibility_not_inspected_count: 0,
         }
     }
 }
@@ -10355,15 +10374,43 @@ impl Broker {
     /// one directory, so the records fill in over successive routine checks
     /// instead of waiting for somebody to run `gc plan` (#176).
     pub fn cleanup_plan_recorded(&self) -> Result<CleanupPlan, BrokerOpError> {
-        let plan = self.cleanup_plan_scanned(crate::SizeScan::Recorded)?;
+        self.cleanup_plan_recorded_within(HEALTH_CHECK_ELIGIBILITY_BUDGET)
+    }
+
+    /// [`Self::cleanup_plan_recorded`] with an explicit eligibility budget.
+    /// Once `budget` is spent the remaining worktrees are listed with
+    /// eligibility not inspected; the plan carries no digest either way, so a
+    /// shorter budget can never authorize a removal.
+    pub fn cleanup_plan_recorded_within(
+        &self,
+        budget: std::time::Duration,
+    ) -> Result<CleanupPlan, BrokerOpError> {
+        let plan = self.cleanup_plan_scanned_within(crate::SizeScan::Recorded, Some(budget))?;
         self.warm_one_size_record(&plan)?;
         Ok(plan)
     }
 
+    /// A recorded-size pass is bounded by [`HEALTH_CHECK_ELIGIBILITY_BUDGET`];
+    /// a measuring pass, the only one whose digest authorizes removal, always
+    /// inspects every worktree.
     pub(crate) fn cleanup_plan_scanned(
         &self,
         scan: crate::SizeScan,
     ) -> Result<CleanupPlan, BrokerOpError> {
+        let budget = (!scan.measures()).then_some(HEALTH_CHECK_ELIGIBILITY_BUDGET);
+        self.cleanup_plan_scanned_within(scan, budget)
+    }
+
+    fn cleanup_plan_scanned_within(
+        &self,
+        scan: crate::SizeScan,
+        budget: Option<std::time::Duration>,
+    ) -> Result<CleanupPlan, BrokerOpError> {
+        debug_assert!(
+            budget.is_none() || !scan.measures(),
+            "a measuring plan authorizes removal and must inspect every worktree"
+        );
+        let started = std::time::Instant::now();
         let mut plan = CleanupPlan {
             target_snapshot: self.cleanup_target_snapshot(),
             ..CleanupPlan::default()
@@ -10379,15 +10426,31 @@ impl Broker {
             if session.origin != SessionOrigin::Spawned {
                 continue;
             }
-            let Some(item) = self.cleanup_item_scanned_with_tips(
-                &session,
-                scan,
-                &mut records,
-                branch_tips.as_ref(),
-            )?
-            else {
+            let over_budget = budget.is_some_and(|budget| started.elapsed() >= budget);
+            let item = if over_budget {
+                self.cleanup_item_not_inspected(
+                    &session,
+                    &records,
+                    branch_tips.as_ref(),
+                    format!(
+                        "eligibility not inspected within the {} s health-check budget; run `aethyme broker gc plan` for the full inspection",
+                        budget.unwrap_or_default().as_secs()
+                    ),
+                )
+            } else {
+                self.cleanup_item_scanned_with_tips(
+                    &session,
+                    scan,
+                    &mut records,
+                    branch_tips.as_ref(),
+                )?
+            };
+            let Some(item) = item else {
                 continue;
             };
+            if over_budget {
+                plan.eligibility_not_inspected_count += 1;
+            }
             known.insert(item.worktree_path.clone());
             if item.worktree_present {
                 plan.retained_worktree_count += 1;
@@ -10484,53 +10547,75 @@ impl Broker {
             if session.origin != SessionOrigin::Spawned {
                 continue;
             }
-            let path = Path::new(&session.worktree_path);
-            if !self.is_broker_owned_worktree(session, path) {
+            let Some(item) = self.cleanup_item_not_inspected(
+                session,
+                &records,
+                Some(&tips),
+                "eligibility not inspected by routine status".into(),
+            ) else {
                 continue;
-            }
-            let present = path.exists();
-            let branch_ref = format!("refs/heads/{}", session.branch);
-            let tip = tips.get(&branch_ref).cloned();
-            if !present && tip.is_none() {
-                continue;
-            }
-            let record = records.get(&session.worktree_path);
-            let bytes = if present {
-                record.map(|r| r.bytes)
-            } else {
-                Some(0)
             };
-            if present {
+            let record = records.get(&session.worktree_path);
+            if item.worktree_present {
                 plan.retained_worktree_count += 1;
             }
-            if tip.is_some() {
+            if item.branch_tip.is_some() {
                 plan.retained_branch_count += 1;
             }
-            match bytes {
+            match item.estimated_bytes {
                 Some(bytes) => retained
                     .add_measured(bytes, record.map(|r| r.measured_at_ms).unwrap_or(i64::MAX)),
                 None => retained.add_unmeasured(),
             }
-            plan.worktrees.push(CleanupWorktreePlan {
-                session_id: session.id,
-                worktree_path: session.worktree_path.clone(),
-                worktree_present: present,
-                branch_ref,
-                branch_tip: tip,
-                delete_branch: false,
-                origin: session.origin,
-                disposition: CleanupDisposition::InspectionFailed,
-                provenance: None,
-                estimated_bytes: bytes,
-                reason: "eligibility not inspected by routine status".into(),
-                inspection_commands: vec!["aethyme broker gc plan".into()],
-                force_cleanup_command: String::new(),
-            });
+            plan.worktrees.push(item);
         }
         plan.estimated_retained_bytes = retained.bytes;
         plan.unmeasured_worktree_count = retained.unmeasured;
         plan.sizes_measured_at_ms = retained.oldest_measured_at_ms.filter(|at| *at != i64::MAX);
         Ok((plan, deferred))
+    }
+
+    /// A plan entry for a closed session's worktree that lists what is on
+    /// disk without judging eligibility: existence, the branch tip and the
+    /// recorded size only. It is never eligible, so it cannot authorize a
+    /// removal. `None` when there is nothing left to list.
+    fn cleanup_item_not_inspected(
+        &self,
+        session: &Session,
+        records: &crate::measurement::SizeRecords,
+        tips: Option<&std::collections::BTreeMap<String, String>>,
+        reason: String,
+    ) -> Option<CleanupWorktreePlan> {
+        let path = Path::new(&session.worktree_path);
+        if !self.is_broker_owned_worktree(session, path) {
+            return None;
+        }
+        let present = path.exists();
+        let branch_ref = format!("refs/heads/{}", session.branch);
+        let tip = tips.and_then(|tips| tips.get(&branch_ref).cloned());
+        if !present && tip.is_none() {
+            return None;
+        }
+        let estimated_bytes = if present {
+            records.get(&session.worktree_path).map(|r| r.bytes)
+        } else {
+            Some(0)
+        };
+        Some(CleanupWorktreePlan {
+            session_id: session.id,
+            worktree_path: session.worktree_path.clone(),
+            worktree_present: present,
+            branch_ref,
+            branch_tip: tip,
+            delete_branch: false,
+            origin: session.origin,
+            disposition: CleanupDisposition::InspectionFailed,
+            provenance: None,
+            estimated_bytes,
+            reason,
+            inspection_commands: vec!["aethyme broker gc plan".into()],
+            force_cleanup_command: String::new(),
+        })
     }
 
     /// Measure one directory the broker has never sized, or whose recorded
