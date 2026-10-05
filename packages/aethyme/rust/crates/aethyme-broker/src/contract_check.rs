@@ -740,12 +740,19 @@ pub fn preflight_submit_decision(
     pending_commit_messages: &str,
 ) -> Result<(), String> {
     let consumers_doc = repo_root.join(DEFAULT_CONSUMERS_DOC);
-    let doc_text = std::fs::read_to_string(&consumers_doc).map_err(|error| {
-        format!(
-            "submit preflight could not read {}: {error}",
-            consumers_doc.display()
-        )
-    })?;
+    let doc_text = match std::fs::read_to_string(&consumers_doc) {
+        Ok(doc_text) => doc_text,
+        // The broker is also used in repositories that do not carry Aethyme's
+        // consumer inventory. Without that inventory there are no tracked
+        // symbols to preflight; the merged-tree gate remains authoritative.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(format!(
+                "submit preflight could not read {}: {error}",
+                consumers_doc.display()
+            ));
+        }
+    };
     let tracked = extract_tracked_symbols(&doc_text);
     if tracked.is_empty() {
         return Err(format!(
@@ -1294,6 +1301,12 @@ mod tests {
         };
         assert!(validate_submit_decision(&BTreeMap::new(), Vec::new(), &lookup).is_ok());
         assert!(!looked_up.get());
+    }
+
+    #[test]
+    fn submit_preflight_skips_repositories_without_consumer_inventory() {
+        let repo = tempfile::tempdir().expect("temporary repository");
+        assert!(preflight_submit_decision(repo.path(), "HEAD", "").is_ok());
     }
 
     #[test]
