@@ -84,11 +84,21 @@ pub(crate) fn is_broker_runtime_path(path: &str) -> bool {
         .any(|rule| rule.matches(path))
 }
 
+/// The `.gitignore` patterns for broker-owned runtime state, in managed-block
+/// order. Every surface that names these paths (the managed block, ship's
+/// delivery classifier, and `aethyme deploy`'s summary) reads this catalog so
+/// a new runtime file cannot be listed in one and forgotten in another.
+pub fn broker_runtime_ignore_patterns() -> impl Iterator<Item = &'static str> {
+    BROKER_RUNTIME_PATH_RULES
+        .iter()
+        .map(|rule| rule.gitignore_pattern)
+}
+
 pub(crate) fn managed_gitignore_block() -> String {
     let mut block = String::from(MANAGED_GITIGNORE_BEGIN_LINE);
     block.push('\n');
-    for rule in BROKER_RUNTIME_PATH_RULES {
-        block.push_str(rule.gitignore_pattern);
+    for pattern in broker_runtime_ignore_patterns() {
+        block.push_str(pattern);
         block.push('\n');
     }
     block.push_str(MANAGED_GITIGNORE_END_LINE);

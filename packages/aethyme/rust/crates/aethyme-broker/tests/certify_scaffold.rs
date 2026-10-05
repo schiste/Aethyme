@@ -946,6 +946,27 @@ fn broker_runtime_files_do_not_change_the_gate_tree_hash() {
 }
 
 #[test]
+fn scaffold_refuses_an_unterminated_managed_block_instead_of_appending_another() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let original = "target/\n# aethyme-broker:begin (managed block — do not edit inside)\n\
+                    .aethyme/broker.db*\n\
+                    maintainer-rule-a\n\
+                    maintainer-rule-b\n";
+    std::fs::write(tmp.path().join(".gitignore"), original).unwrap();
+
+    // Run twice: a single append looks harmless, but the second run would
+    // treat the orphaned begin marker and the appended end marker as one
+    // block and delete the maintainer rules between them.
+    for _ in 0..2 {
+        let report = init::scaffold(tmp.path()).unwrap();
+        assert_eq!(status_of(&report, "scaffold.gitignore"), CheckStatus::Fail);
+        let gitignore = std::fs::read_to_string(tmp.path().join(".gitignore")).unwrap();
+        assert_eq!(gitignore, original, ".gitignore must be left untouched");
+    }
+}
+
+#[test]
 fn scaffold_refreshes_a_stale_managed_block_even_when_rules_exist_outside_it() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());

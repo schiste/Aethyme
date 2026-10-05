@@ -166,15 +166,26 @@ edited directly.
 
 ## Ignore runtime state
 
-The managed `.gitignore` block excludes machine-local broker state:
+The managed `.gitignore` block excludes machine-local broker state. It is
+generated from the broker's single runtime-path catalog, the same list
+`aethyme broker advanced ship` uses to tell broker output from operator
+changes, so the two cannot drift:
 
 - `.aethyme/broker.db*`;
-- `.aethyme/logs/`, `.aethyme/reports/`, `.aethyme/run/`, and
-  `.aethyme/worktrees/`;
-- `.aethyme/broker-action-required.md`;
+- `.aethyme/logs/`, `.aethyme/locks/`, `.aethyme/reports/`, `.aethyme/run/`,
+  `.aethyme/worktrees/`, and `.aethyme/reviews/`;
+- `.aethyme/broker-action-required.md` and `.aethyme/broker-advisory.md`;
+- `.aethyme/graph_store.redb` and `.aethyme/graph_store.redb.indexing`;
 - `.aethyme/generated/experience-telemetry.jsonl`;
 - `.aethyme/generated/experience-status.json` and
-  `.aethyme/generated/experience-status.md`.
+  `.aethyme/generated/experience-status.md`;
+- `.aethyme/worktree-sizes.json`, `.aethyme/gc-journal.json`, and
+  `.aethyme/gc.lock`.
+
+Unignored, any of these would enter the gate working-tree hash and bust the
+gate result cache. Graph fragments under `.aethyme/graph/` are deliberately
+not in the block: a repository with graph authority commits them as source.
+Redeploying rewrites an outdated block in place; edit outside the markers.
 
 These files describe one checkout or active broker process. They are rebuilt
 locally and must not travel between clones.

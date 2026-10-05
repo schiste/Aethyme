@@ -90,6 +90,7 @@ mod pr_body;
 mod pr_link;
 mod pr_monitoring;
 mod runtime_paths;
+pub use runtime_paths::broker_runtime_ignore_patterns;
 mod scopes;
 mod submit_progress;
 pub use submit_progress::{

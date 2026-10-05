@@ -735,6 +735,12 @@ fn check_gitignore_contract(main_root: &Path) -> Check {
             status: CheckStatus::Pass,
             detail: ".gitignore covers broker runtime state".into(),
         }
+    } else if has_unterminated_managed_gitignore_block(&existing) {
+        Check {
+            id: "certify.gitignore",
+            status: CheckStatus::Warn,
+            detail: UNTERMINATED_MANAGED_BLOCK_DETAIL.into(),
+        }
     } else {
         Check {
             id: "certify.gitignore",
@@ -965,6 +971,17 @@ fn ensure_gitignore_block(main_root: &Path) -> Check {
             detail: ".gitignore covers broker runtime state".into(),
         };
     }
+    if has_unterminated_managed_gitignore_block(&existing) {
+        // Appending a second block here would make the next run's range
+        // span from this orphaned begin marker to the appended end marker,
+        // and replacing that range would delete the maintainer's rules in
+        // between. Refuse instead of guessing where the block was meant to end.
+        return Check {
+            id: "scaffold.gitignore",
+            status: CheckStatus::Fail,
+            detail: UNTERMINATED_MANAGED_BLOCK_DETAIL.into(),
+        };
+    }
     let (updated, detail) =
         if let Some(updated) = replace_managed_gitignore_block(&existing, &managed_block) {
             (updated, "updated the aethyme-broker block in .gitignore")
@@ -993,11 +1010,20 @@ fn ensure_gitignore_block(main_root: &Path) -> Check {
     }
 }
 
+const UNTERMINATED_MANAGED_BLOCK_DETAIL: &str = ".gitignore has `# aethyme-broker:begin` without a following \
+     `# aethyme-broker:end`; add the end marker after the managed entries \
+     (or delete the begin marker), then rerun";
+
+fn has_unterminated_managed_gitignore_block(existing: &str) -> bool {
+    existing.contains(crate::runtime_paths::MANAGED_GITIGNORE_BEGIN_MARKER)
+        && managed_gitignore_block_range(existing).is_none()
+}
+
 fn gitignore_contract_satisfied(existing: &str, managed_block: &str) -> bool {
     if let Some((start, end)) = managed_gitignore_block_range(existing) {
         return existing[start..end].lines().eq(managed_block.lines());
     }
-    if existing.contains(crate::runtime_paths::MANAGED_GITIGNORE_BEGIN_MARKER) {
+    if has_unterminated_managed_gitignore_block(existing) {
         return false;
     }
     managed_block
