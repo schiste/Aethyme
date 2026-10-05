@@ -257,3 +257,58 @@ fn two_identical_audits_agree_on_the_digest() {
         "the timestamp is still reported, just not authorized against"
     );
 }
+
+/// Judging eligibility runs git over each session's history, so on a
+/// repository with hundreds of retained worktrees an unbounded health check
+/// ran for many minutes (#460). Once the budget is spent the remaining
+/// worktrees are still listed, never as eligible, and the plan says how many
+/// it did not judge.
+#[test]
+fn a_health_check_lists_worktrees_it_had_no_budget_to_judge() {
+    let (_tmp, mut broker) = fixture(1_024 * 1_024 * 1_024, 0);
+    let first = deliver(&mut broker, "first retained delivery", 1_024);
+    let second = deliver(&mut broker, "second retained delivery", 2_048);
+
+    let judged = broker
+        .cleanup_plan_recorded_within(std::time::Duration::from_secs(600))
+        .unwrap();
+    assert_eq!(judged.eligibility_not_inspected_count, 0);
+    assert_eq!(judged.eligible_worktree_count, 2, "{judged:#?}");
+
+    let bounded = broker
+        .cleanup_plan_recorded_within(std::time::Duration::ZERO)
+        .unwrap();
+    assert_eq!(bounded.eligibility_not_inspected_count, 2, "{bounded:#?}");
+    assert_eq!(bounded.retained_worktree_count, 2, "both are still listed");
+    assert_eq!(bounded.eligible_worktree_count, 0);
+    let mut listed: Vec<_> = bounded
+        .worktrees
+        .iter()
+        .map(|item| item.session_id)
+        .collect();
+    listed.sort_unstable();
+    assert_eq!(listed, vec![first, second]);
+    for item in &bounded.worktrees {
+        assert!(!item.eligible());
+        assert!(
+            item.reason.contains("health-check budget"),
+            "{}",
+            item.reason
+        );
+    }
+    assert!(
+        bounded.digest.is_empty(),
+        "a recorded plan never authorizes removal"
+    );
+
+    // The measuring pass behind `gc plan` and cleanup confirmation judges
+    // every worktree, and its JSON (which its digest hashes) has no new key.
+    let measured = broker.cleanup_plan().unwrap();
+    assert_eq!(measured.eligibility_not_inspected_count, 0);
+    assert_eq!(measured.eligible_worktree_count, 2);
+    let json = serde_json::to_value(&measured).unwrap();
+    assert!(
+        json.get("eligibility_not_inspected_count").is_none(),
+        "{json}"
+    );
+}
