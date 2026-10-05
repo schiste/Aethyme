@@ -4,6 +4,14 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.20] - 2026-10-05
+
+Cleanup explains a shallow clone instead of failing with an empty error.
+
+### Fixed
+
+- In a shallow clone, `broker finish cleanup` could not relate a session older than the shallow boundary to its delivery target, and reported `inspection_failed` with an empty `git merge-base … failed:` message. The reason now says the repository is a shallow clone and gives the `broker advanced git … fetch --shallow-since=<date>` (or `--unshallow`) command to deepen it. The disposition is unchanged and no safety check is loosened (#526, issue #525).
+
 ## [0.8.19] - 2026-10-05
 
 Cleared gate failures are kept as history instead of deleted, and broker runtime files are ignored from one catalog.
