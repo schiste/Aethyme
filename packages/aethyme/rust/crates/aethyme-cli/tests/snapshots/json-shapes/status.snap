@@ -120,6 +120,7 @@
       "kind": "string",
       "path": "string",
       "released_at": "null",
+      "scope": "string",
       "session_id": "integer"
     }
   ],
