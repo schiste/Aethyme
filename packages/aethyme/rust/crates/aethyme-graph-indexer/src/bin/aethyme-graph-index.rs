@@ -20,7 +20,7 @@ use std::path::PathBuf;
 use std::process::{Command, ExitCode};
 use std::time::Instant;
 
-use clap::Parser;
+use clap::{Arg, ArgAction, value_parser};
 
 use aethyme_graph_indexer::{
     IndexRepoSummary, IndexerContext, LinkSummary, WalkOptions, index_repo_to_disk, link_repo,
@@ -34,58 +34,98 @@ use aethyme_graph_storage::{bootstrap_repo, committed_source_tree_digest};
 /// per-module NDJSON index shards under `<repo-root>/.aethyme/
 /// graph/`. The layout is the committed-artifact form locked in
 /// Phase 2 (per `docs/architecture/graph-schema.md` §5).
-#[derive(Parser, Debug)]
-#[command(
-    name = "aethyme-graph-index",
-    about = "Index a source repo into per-file binary fragments + per-module NDJSON shards.",
-    long_about = None,
-)]
+#[derive(Debug)]
 struct Cli {
-    /// Absolute path to the repo root. Source files are
-    /// discovered relative to this path.
-    #[arg(long, value_name = "PATH")]
     repo_root: PathBuf,
-
-    /// Stable repo namespace identifier. Used as the `<repo>`
-    /// component of every NodeId. Must not contain `:`.
-    #[arg(long, value_name = "NAME")]
     repo_name: String,
-
-    /// Engine version string written to `.aethyme/engine-version`
-    /// and stored on the context. CI uses this for the
-    /// parser-version-drift check.
-    #[arg(long, value_name = "VERSION")]
     engine_version: String,
-
-    /// Skip the bootstrap step (creating `.aethyme/graph/`,
-    /// `.gitattributes`, `engine-version`). Use for re-indexing
-    /// existing repos where the bootstrap already ran.
-    #[arg(long)]
     skip_bootstrap: bool,
-
-    /// Skip files larger than this many bytes (default 5 MiB,
-    /// matching the library's WalkOptions default).
-    #[arg(long, value_name = "BYTES")]
     max_file_size: Option<u64>,
-
-    /// Repo-relative directory to skip during the walk (repeatable).
-    /// Extends the default ignore list (.git/, node_modules/, etc.).
-    #[arg(long = "extra-ignore", value_name = "DIR")]
     extra_ignore: Vec<String>,
-
-    /// Print JSON summary instead of human-readable text. Useful
-    /// when piping into eval harnesses or scripts.
-    #[arg(long)]
     json: bool,
-
-    /// Skip the post-index linker pass (Phase 4.5). The linker
-    /// rewrites Imports edges that point at UnresolvedSymbol
-    /// placeholders to point at the resolved concrete nodes; with
-    /// this flag, placeholders are preserved as-is. Useful when
-    /// you want to inspect raw stage-1 output, or when re-running
-    /// the link step separately via `aethyme-graph-link`.
-    #[arg(long)]
     skip_link: bool,
+}
+
+/// The command line, built with clap's builder API rather than its derive
+/// macros: `clap_derive` was the only crate in the workspace pulling a second
+/// `syn`, so every build compiled two. Help text keeps the derive form's
+/// convention of no trailing period.
+fn command() -> clap::Command {
+    clap::Command::new("aethyme-graph-index")
+        .about("Index a source repo into per-file binary fragments + per-module NDJSON shards.")
+        .arg(
+            Arg::new("repo_root")
+                .long("repo-root")
+                .value_name("PATH")
+                .required(true)
+                .value_parser(value_parser!(PathBuf))
+                .help("Absolute path to the repo root. Source files are discovered relative to this path"),
+        )
+        .arg(
+            Arg::new("repo_name")
+                .long("repo-name")
+                .value_name("NAME")
+                .required(true)
+                .help("Stable repo namespace identifier. Used as the `<repo>` component of every NodeId. Must not contain `:`"),
+        )
+        .arg(
+            Arg::new("engine_version")
+                .long("engine-version")
+                .value_name("VERSION")
+                .required(true)
+                .help("Engine version string written to `.aethyme/engine-version` and stored on the context. CI uses this for the parser-version-drift check"),
+        )
+        .arg(
+            Arg::new("skip_bootstrap")
+                .long("skip-bootstrap")
+                .action(ArgAction::SetTrue)
+                .help("Skip the bootstrap step (creating `.aethyme/graph/`, `.gitattributes`, `engine-version`). Use for re-indexing existing repos where the bootstrap already ran"),
+        )
+        .arg(
+            Arg::new("max_file_size")
+                .long("max-file-size")
+                .value_name("BYTES")
+                .value_parser(value_parser!(u64))
+                .help("Skip files larger than this many bytes (default 5 MiB, matching the library's WalkOptions default)"),
+        )
+        .arg(
+            Arg::new("extra_ignore")
+                .long("extra-ignore")
+                .value_name("DIR")
+                .action(ArgAction::Append)
+                .help("Repo-relative directory to skip during the walk (repeatable). Extends the default ignore list (.git/, node_modules/, etc.)"),
+        )
+        .arg(
+            Arg::new("json")
+                .long("json")
+                .action(ArgAction::SetTrue)
+                .help("Print JSON summary instead of human-readable text. Useful when piping into eval harnesses or scripts"),
+        )
+        .arg(
+            Arg::new("skip_link")
+                .long("skip-link")
+                .action(ArgAction::SetTrue)
+                .help("Skip the post-index linker pass (Phase 4.5). The linker rewrites Imports edges that point at UnresolvedSymbol placeholders to point at the resolved concrete nodes; with this flag, placeholders are preserved as-is. Useful when you want to inspect raw stage-1 output, or when re-running the link step separately via `aethyme-graph-link`"),
+        )
+}
+
+impl Cli {
+    fn parse() -> Self {
+        let mut matches = command().get_matches();
+        Self {
+            repo_root: matches.remove_one("repo_root").expect("required"),
+            repo_name: matches.remove_one("repo_name").expect("required"),
+            engine_version: matches.remove_one("engine_version").expect("required"),
+            skip_bootstrap: matches.get_flag("skip_bootstrap"),
+            max_file_size: matches.remove_one("max_file_size"),
+            extra_ignore: matches
+                .remove_many("extra_ignore")
+                .map(Iterator::collect)
+                .unwrap_or_default(),
+            json: matches.get_flag("json"),
+            skip_link: matches.get_flag("skip_link"),
+        }
+    }
 }
 
 fn main() -> ExitCode {

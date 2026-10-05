@@ -23,24 +23,47 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Instant;
 
-use clap::Parser;
+use clap::{Arg, ArgAction, value_parser};
 
 use aethyme_graph_indexer::{LinkSummary, link_repo_path};
 
-#[derive(Parser, Debug)]
-#[command(
-    name = "aethyme-graph-link",
-    about = "Resolve cross-file UnresolvedSymbol placeholders into concrete edges.",
-    long_about = None,
-)]
+#[derive(Debug)]
 struct Cli {
     /// Repo root containing the `.aethyme/graph/` tree.
-    #[arg(long, value_name = "PATH")]
     repo_root: PathBuf,
-
     /// Print JSON summary instead of human-readable text.
-    #[arg(long)]
     json: bool,
+}
+
+/// Built with clap's builder API, not its derive macros, so the workspace
+/// compiles one `syn` (see `aethyme-graph-index`).
+fn command() -> clap::Command {
+    clap::Command::new("aethyme-graph-link")
+        .about("Resolve cross-file UnresolvedSymbol placeholders into concrete edges.")
+        .arg(
+            Arg::new("repo_root")
+                .long("repo-root")
+                .value_name("PATH")
+                .required(true)
+                .value_parser(value_parser!(PathBuf))
+                .help("Repo root containing the `.aethyme/graph/` tree"),
+        )
+        .arg(
+            Arg::new("json")
+                .long("json")
+                .action(ArgAction::SetTrue)
+                .help("Print JSON summary instead of human-readable text"),
+        )
+}
+
+impl Cli {
+    fn parse() -> Self {
+        let mut matches = command().get_matches();
+        Self {
+            repo_root: matches.remove_one("repo_root").expect("required"),
+            json: matches.get_flag("json"),
+        }
+    }
 }
 
 fn main() -> ExitCode {

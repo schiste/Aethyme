@@ -121,10 +121,11 @@ ra_ap_syntax = "=0.0.331"
 tree-sitter = "0.25"
 tree-sitter-php = "=0.23.11"
 
-# clap for the aethyme-graph-index CLI (Phase 4.1). v4 with
-# derive macros — keeps the subcommand-and-arg surface declarative
-# and the binary's source readable.
-clap = { version = "4", features = ["derive"] }
+# clap for the aethyme-graph-index, -link and -query CLIs (Phase 4.1),
+# through its builder API. The derive feature is off on purpose:
+# clap_derive was the only crate pulling syn 3, so with it every
+# workspace build compiled syn twice (2026-10-06).
+clap = "4"
 serde_json = "1"
 
 [dev-dependencies]

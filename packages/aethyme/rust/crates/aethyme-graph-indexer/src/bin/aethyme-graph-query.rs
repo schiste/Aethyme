@@ -8,51 +8,106 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
+use clap::{Arg, value_parser};
 
 use aethyme_graph_schema::NodeKind;
 use aethyme_graph_storage::FragmentStore;
 
-#[derive(Parser, Debug)]
-#[command(
-    name = "aethyme-graph-query",
-    about = "Query the committed Aethyme graph for symbols, modules, and counts."
-)]
+#[derive(Debug)]
 struct Cli {
-    /// Absolute path to the repo root. The store reads from
-    /// `<repo-root>/.aethyme/graph/`.
-    #[arg(long, value_name = "PATH")]
     repo_root: PathBuf,
-
-    #[command(subcommand)]
     command: Command,
 }
 
-#[derive(Subcommand, Debug)]
+#[derive(Debug)]
 enum Command {
-    /// Look up symbols by name.
     FindSymbol {
-        /// Symbol name (matched exactly).
-        #[arg(long)]
         name: String,
-
-        /// Restrict to a specific module (omit to scan all).
-        #[arg(long)]
         module: Option<String>,
-
-        /// Restrict to a specific kind. Accepts the canonical
-        /// snake_case kind name (e.g. "function", "class").
-        #[arg(long)]
         kind: Option<String>,
     },
-    /// List all modules that have an index shard on disk.
     ListModules,
-    /// List all source paths that have a fragment on disk.
     ListFiles,
-    /// Distinct languages observed across all File nodes.
     ListLanguages,
-    /// Aggregate node counts by kind across the whole store.
     Counts,
+}
+
+/// Built with clap's builder API, not its derive macros, so the workspace
+/// compiles one `syn` (see `aethyme-graph-index`). A missing subcommand is an
+/// error, and no arguments at all prints help, as the derive form did.
+fn command() -> clap::Command {
+    clap::Command::new("aethyme-graph-query")
+        .about("Query the committed Aethyme graph for symbols, modules, and counts.")
+        .subcommand_required(true)
+        .arg_required_else_help(true)
+        .arg(
+            Arg::new("repo_root")
+                .long("repo-root")
+                .value_name("PATH")
+                .required(true)
+                .value_parser(value_parser!(PathBuf))
+                .help("Absolute path to the repo root. The store reads from `<repo-root>/.aethyme/graph/`"),
+        )
+        .subcommand(
+            clap::Command::new("find-symbol")
+                .about("Look up symbols by name")
+                .arg(
+                    Arg::new("name")
+                        .long("name")
+                        .value_name("NAME")
+                        .required(true)
+                        .help("Symbol name (matched exactly)"),
+                )
+                .arg(
+                    Arg::new("module")
+                        .long("module")
+                        .value_name("MODULE")
+                        .help("Restrict to a specific module (omit to scan all)"),
+                )
+                .arg(Arg::new("kind").long("kind")
+                        .value_name("KIND").help(
+                    "Restrict to a specific kind. Accepts the canonical snake_case kind name (e.g. \"function\", \"class\")",
+                )),
+        )
+        .subcommand(
+            clap::Command::new("list-modules")
+                .about("List all modules that have an index shard on disk"),
+        )
+        .subcommand(
+            clap::Command::new("list-files")
+                .about("List all source paths that have a fragment on disk"),
+        )
+        .subcommand(
+            clap::Command::new("list-languages")
+                .about("Distinct languages observed across all File nodes"),
+        )
+        .subcommand(
+            clap::Command::new("counts")
+                .about("Aggregate node counts by kind across the whole store"),
+        )
+}
+
+impl Cli {
+    fn parse() -> Self {
+        let mut matches = command().get_matches();
+        let repo_root = matches.remove_one("repo_root").expect("required");
+        let command = match matches.remove_subcommand() {
+            Some((name, mut sub)) => match name.as_str() {
+                "find-symbol" => Command::FindSymbol {
+                    name: sub.remove_one("name").expect("required"),
+                    module: sub.remove_one("module"),
+                    kind: sub.remove_one("kind"),
+                },
+                "list-modules" => Command::ListModules,
+                "list-files" => Command::ListFiles,
+                "list-languages" => Command::ListLanguages,
+                "counts" => Command::Counts,
+                other => unreachable!("clap accepted unknown subcommand {other}"),
+            },
+            None => unreachable!("clap requires a subcommand"),
+        };
+        Self { repo_root, command }
+    }
 }
 
 fn main() -> ExitCode {
