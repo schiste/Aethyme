@@ -6845,6 +6845,7 @@ fn gate_result_from_row(row: &rusqlite::Row<'_>) -> RowResult<GateResult> {
                 load_avg_1m_end: row.get(15)?,
                 cpu_count: row.get(16)?,
                 free_disk_bytes_start: row.get(17)?,
+                free_disk_bytes_end: None,
             },
         })
     })())
