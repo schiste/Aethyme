@@ -7673,24 +7673,51 @@ impl Broker {
         }
         let in_flight_submits = crate::submit_progress::in_flight_submits(&self.main_root, now_ms);
         advice.extend(stalled_submit_advice(&in_flight_submits));
+        let foreign_started = std::time::Instant::now();
+        // The main checkout is where agents gather before starting their own
+        // sessions, so several of them there is normal, not co-tenancy.
+        let main_checkout = self.main_root.to_string_lossy();
+        let live_worktrees: Vec<(i64, String)> = agents
+            .iter()
+            .filter(|agent| {
+                matches!(
+                    agent.derived_status,
+                    SessionStatus::Active | SessionStatus::Idle | SessionStatus::Stale
+                ) && agent.session.worktree_path != main_checkout
+            })
+            .map(|agent| (agent.session.id, agent.session.worktree_path.clone()))
+            .collect();
+        let foreign = crate::session_holder::foreign_process_advice(&self.store, &live_worktrees);
+        let foreign_deferred = foreign.is_none();
+        advice.extend(foreign.unwrap_or_default());
+        phase_timings_ms.insert(
+            "foreign_processes".into(),
+            foreign_started.elapsed().as_millis() as u64,
+        );
 
         phase_timings_ms.insert("build_total".into(), started.elapsed().as_millis() as u64);
         Ok(StatusView {
-            deferred_checks: if refresh {
-                Vec::new()
-            } else {
-                vec![
-                    "dirty_worktrees",
-                    "unpushed_commits",
-                    "promoted_conflicts",
-                    "branch_drift",
-                    "shared_edit_classification",
-                    "pr_overlap_refresh",
-                    "cleanup_eligibility",
-                ]
-                .into_iter()
-                .map(String::from)
-                .collect()
+            deferred_checks: {
+                let mut deferred: Vec<String> = if refresh {
+                    Vec::new()
+                } else {
+                    vec![
+                        "dirty_worktrees",
+                        "unpushed_commits",
+                        "promoted_conflicts",
+                        "branch_drift",
+                        "shared_edit_classification",
+                        "pr_overlap_refresh",
+                        "cleanup_eligibility",
+                    ]
+                    .into_iter()
+                    .map(String::from)
+                    .collect()
+                };
+                if foreign_deferred {
+                    deferred.push("foreign_processes".into());
+                }
+                deferred
             },
             leases_refreshed_at_ms: self
                 .store

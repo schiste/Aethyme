@@ -251,3 +251,73 @@ impl Fixture {
         PathBuf::from(store.session(session).unwrap().worktree_path)
     }
 }
+
+/// A stand-in agent runtime working in `dir`: `sleep` run through a symlink
+/// named `codex`, so its command line identifies it as an agent.
+fn codex_in(dir: &Path, bin: &Path) -> Agent {
+    let codex = bin.join("codex");
+    if !codex.exists() {
+        std::fs::create_dir_all(bin).unwrap();
+        std::os::unix::fs::symlink("/bin/sleep", &codex).unwrap();
+    }
+    Agent(
+        Command::new(&codex)
+            .arg("600")
+            .current_dir(dir)
+            .spawn()
+            .unwrap(),
+    )
+}
+
+fn foreign_advice(fx: &Fixture) -> Vec<serde_json::Value> {
+    let output = fx.run_as("0", &["status", "--json"]);
+    let status: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|error| panic!("status --json: {error}: {}", stderr(&output)));
+    if status["deferred_checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|check| check == "foreign_processes")
+    {
+        panic!("the working-directory scan was deferred on this host: {status}");
+    }
+    status["advice"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["id"] == "session.foreign-process")
+        .cloned()
+        .collect()
+}
+
+#[test]
+fn status_reports_a_second_agent_working_in_a_session_worktree() {
+    let fx = fixture();
+    let bin = fx.host.join("bin");
+    let holder = codex_in(&fx.repo, &bin);
+    let session = fx.start_as(&holder.pid());
+    let worktree = fx.holder_worktree(session);
+    drop(holder);
+
+    // The holder working in its own worktree is not a co-tenant.
+    let holder = codex_in(&worktree, &bin);
+    let id = session.to_string();
+    let taken = fx.run_as(&holder.pid(), &["sync", "--session", &id, "--take-over"]);
+    assert!(!refused(&taken), "{}", stderr(&taken));
+    assert!(foreign_advice(&fx).is_empty(), "{:?}", foreign_advice(&fx));
+
+    let intruder = codex_in(&worktree.join("."), &bin);
+    let advice = foreign_advice(&fx);
+    assert_eq!(advice.len(), 1, "{advice:?}");
+    assert_eq!(advice[0]["session_id"].as_i64(), Some(session));
+    assert_eq!(advice[0]["severity"], "warning");
+    let summary = advice[0]["summary"].as_str().unwrap();
+    assert!(
+        summary.contains(&format!("pid {}", intruder.pid())),
+        "{summary}"
+    );
+    assert!(
+        summary.contains(&format!("held by pid {}", holder.pid())),
+        "{summary}"
+    );
+}

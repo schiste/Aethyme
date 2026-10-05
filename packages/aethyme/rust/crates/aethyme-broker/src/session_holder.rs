@@ -107,23 +107,53 @@ impl ProcessTable {
             .is_some_and(|row| row.started == process.started)
     }
 
-    /// The nearest ancestor of `pid` (itself included) that is an agent
-    /// runtime.
+    /// Every process that is itself an agent runtime.
+    pub fn agent_pids(&self) -> Vec<i64> {
+        let mut pids: Vec<i64> = self
+            .rows
+            .iter()
+            .filter(|(_, row)| is_agent_runtime(&row.args))
+            .map(|(pid, _)| *pid)
+            .collect();
+        pids.sort_unstable();
+        pids
+    }
+
+    /// The agent runtime `pid` runs under: its nearest ancestor (itself
+    /// included) that is an agent runtime, extended upward while that
+    /// process's direct parent is one too. One agent can be several such
+    /// processes -- Codex runs as a `node .../codex` wrapper around a native
+    /// `codex-*` child -- and they must not read as two agents. Only a direct
+    /// chain merges: a `codex` started from a `claude` shell is its own agent.
     pub fn agent_root(&self, pid: i64) -> Option<AgentProcess> {
         let mut current = pid;
-        // A cycle cannot occur in a real table; the bound keeps a malformed
+        // A cycle cannot occur in a real table; the bounds keep a malformed
         // snapshot from looping.
+        let mut found = false;
         for _ in 0..64 {
             let row = self.rows.get(&current)?;
             if is_agent_runtime(&row.args) {
-                return self.process(current);
+                found = true;
+                break;
             }
             if row.ppid <= 1 || row.ppid == current {
                 return None;
             }
             current = row.ppid;
         }
-        None
+        if !found {
+            return None;
+        }
+        for _ in 0..64 {
+            let ppid = self.rows.get(&current)?.ppid;
+            match self.rows.get(&ppid) {
+                Some(parent) if ppid != current && is_agent_runtime(&parent.args) => {
+                    current = ppid;
+                }
+                _ => break,
+            }
+        }
+        self.process(current)
     }
 }
 
@@ -294,6 +324,174 @@ fn abbreviate(command: &str) -> String {
     format!("{kept}…")
 }
 
+/// How long `status` may spend asking `lsof` for agent working directories.
+/// Past the budget the check is reported as deferred rather than slowing
+/// every status call.
+pub const FOREIGN_SCAN_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Agent processes working in a session's worktree that do not hold it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForeignAgents {
+    pub session_id: i64,
+    pub holder: Option<AgentProcess>,
+    pub foreign: Vec<AgentProcess>,
+}
+
+/// The working directories of `pids`, from one bounded `lsof`, or `None` when
+/// `lsof` is missing, fails or overruns `budget`. Only agent runtimes are
+/// asked about: a system-wide listing took over 800 ms on a busy host, while
+/// the co-tenant #393 describes was an agent launched inside the worktree.
+pub(crate) fn working_directories(
+    pids: &[i64],
+    budget: std::time::Duration,
+) -> Option<Vec<(i64, String)>> {
+    if pids.is_empty() {
+        return Some(Vec::new());
+    }
+    let pid_list = pids
+        .iter()
+        .map(i64::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    // `lsof` lives in /usr/sbin, which a non-login PATH often omits.
+    let program = ["/usr/sbin/lsof", "/usr/bin/lsof"]
+        .into_iter()
+        .find(|path| std::path::Path::new(path).is_file())
+        .unwrap_or("lsof");
+    let mut command = Command::new(program);
+    command.args(["-a", "-d", "cwd", "-Fpn", "-w", "-p", &pid_list]);
+    let output = crate::bounded_output::output_within(&mut command, budget)
+        .ok()
+        .flatten()?;
+    // lsof exits 1 when some process could not be inspected; its output is
+    // still the complete list of those it could.
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut cwds = Vec::new();
+    let mut pid = None;
+    for line in text.lines() {
+        if let Some(value) = line.strip_prefix('p') {
+            pid = value.parse().ok();
+        } else if let (Some(value), Some(pid)) = (line.strip_prefix('n'), pid) {
+            cwds.push((pid, value.to_string()));
+        }
+    }
+    Some(cwds)
+}
+
+/// The agent processes, other than its holder, whose working directory is
+/// inside a session's worktree. `sessions` pairs each live session with its
+/// worktree path and recorded holder. A process that is not an agent runtime
+/// and has none as an ancestor -- an editor, the operator's own shell -- is not
+/// a co-tenant. With no recorded holder, two or more agents are.
+pub fn find_foreign(
+    table: &ProcessTable,
+    cwds: &[(i64, String)],
+    sessions: &[(i64, String, Option<AgentProcess>)],
+) -> Vec<ForeignAgents> {
+    let roots: Vec<(i64, std::path::PathBuf, &Option<AgentProcess>)> = sessions
+        .iter()
+        .filter(|(_, worktree, _)| !worktree.is_empty())
+        .map(|(id, worktree, holder)| {
+            let path = std::path::Path::new(worktree);
+            (
+                *id,
+                std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()),
+                holder,
+            )
+        })
+        .collect();
+    let mut found: std::collections::BTreeMap<i64, Vec<AgentProcess>> = Default::default();
+    for (pid, cwd) in cwds {
+        let cwd = std::path::Path::new(cwd);
+        let Some((session_id, _, _)) = roots.iter().find(|(_, root, _)| cwd.starts_with(root))
+        else {
+            continue;
+        };
+        let Some(agent) = table.agent_root(*pid) else {
+            continue;
+        };
+        let agents = found.entry(*session_id).or_default();
+        if !agents.contains(&agent) {
+            agents.push(agent);
+        }
+    }
+    let mut report = Vec::new();
+    for (session_id, _, holder) in &roots {
+        let Some(agents) = found.remove(session_id) else {
+            continue;
+        };
+        let foreign: Vec<AgentProcess> = match holder {
+            Some(holder) => agents.into_iter().filter(|agent| agent != holder).collect(),
+            None if agents.len() > 1 => agents,
+            None => Vec::new(),
+        };
+        if !foreign.is_empty() {
+            report.push(ForeignAgents {
+                session_id: *session_id,
+                holder: (*holder).clone(),
+                foreign,
+            });
+        }
+    }
+    report
+}
+
+/// `session.foreign-process` advice for the given live sessions, or `None`
+/// when the working-directory scan could not finish within its budget.
+pub(crate) fn foreign_process_advice(
+    store: &crate::BrokerStore,
+    sessions: &[(i64, String)],
+) -> Option<Vec<crate::StatusAdvice>> {
+    if sessions.is_empty() {
+        return Some(Vec::new());
+    }
+    let table = ProcessTable::snapshot()?;
+    let cwds = working_directories(&table.agent_pids(), FOREIGN_SCAN_BUDGET)?;
+    let sessions: Vec<(i64, String, Option<AgentProcess>)> = sessions
+        .iter()
+        .map(|(id, worktree)| {
+            let holder = recorded_holder(store, *id).ok().flatten();
+            (*id, worktree.clone(), holder)
+        })
+        .collect();
+    Some(
+        find_foreign(&table, &cwds, &sessions)
+            .into_iter()
+            .map(|found| {
+                let others = found
+                    .foreign
+                    .iter()
+                    .map(|agent| format!("pid {} ({})", agent.pid, abbreviate(&agent.command)))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let held_by = found.holder.as_ref().map_or_else(
+                    || "no recorded holder".to_string(),
+                    |holder| format!("held by pid {}", holder.pid),
+                );
+                crate::StatusAdvice {
+                    id: "session.foreign-process",
+                    severity: crate::StatusAdviceSeverity::Warning,
+                    reason: "an agent process that does not hold this session is working in its worktree",
+                    summary: format!(
+                        "session {}'s worktree is in use by {others}, which does not hold it \
+                         ({held_by}); two agents driving one session can overwrite each \
+                         other's pushes",
+                        found.session_id
+                    ),
+                    session_id: Some(found.session_id),
+                    queue_entry_id: None,
+                    evidence: found
+                        .foreign
+                        .iter()
+                        .map(|agent| format!("pid {} started {}", agent.pid, agent.started))
+                        .collect(),
+                    commands: Vec::new(),
+                }
+            })
+            .collect(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -317,7 +515,19 @@ mod tests {
         let root = table.agent_root(88900).unwrap();
         assert_eq!(root.pid, 1977);
         assert_eq!(root.started, "Fri Oct 2 15:22:59 2026");
-        assert_eq!(table.agent_root(2100).unwrap().pid, 2023);
+        assert_eq!(
+            table.agent_root(2100).unwrap().pid,
+            2000,
+            "Codex's native child belongs to its node wrapper"
+        );
+    }
+
+    #[test]
+    fn an_agent_started_from_another_agents_shell_is_its_own_agent() {
+        let table = ProcessTable::parse(&format!(
+            "{TABLE} 4000 88836 Mon Oct  5 22:00:00 2026     /usr/local/bin/codex exec review\n"
+        ));
+        assert_eq!(table.agent_root(4000).unwrap().pid, 4000);
     }
 
     #[test]
@@ -345,5 +555,34 @@ mod tests {
         assert!(table.is_alive(&holder));
         holder.started = "Thu Oct  1 09:00:00 2026".into();
         assert!(!table.is_alive(&holder));
+    }
+
+    #[test]
+    fn only_agents_other_than_the_holder_are_foreign() {
+        let table = ProcessTable::parse(TABLE);
+        let holder = table.process(1977).unwrap();
+        let cwds = vec![
+            (88900, "/wt/a/src".to_string()),
+            (2100, "/wt/a".to_string()),
+            (2023, "/wt/a".to_string()),
+            (2000, "/wt/a".to_string()),
+            (1297, "/wt/a".to_string()),
+            (2100, "/elsewhere".to_string()),
+        ];
+        let sessions = vec![(7, "/wt/a".to_string(), Some(holder.clone()))];
+        let found = find_foreign(&table, &cwds, &sessions);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].session_id, 7);
+        let pids: Vec<i64> = found[0].foreign.iter().map(|agent| agent.pid).collect();
+        assert_eq!(
+            pids,
+            vec![2000],
+            "the holder's shell and a plain shell are not foreign"
+        );
+
+        let unheld = vec![(7, "/wt/a".to_string(), None)];
+        assert_eq!(find_foreign(&table, &cwds, &unheld)[0].foreign.len(), 2);
+        let alone = vec![(7, "/wt/a".to_string(), None)];
+        assert!(find_foreign(&table, &cwds[..1], &alone).is_empty());
     }
 }

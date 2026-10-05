@@ -151,6 +151,7 @@
     "build_total": "integer",
     "command_total": "integer",
     "coordination": "integer",
+    "foreign_processes": "integer",
     "leases": "integer",
     "open": "integer",
     "retention": "integer",
