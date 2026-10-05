@@ -10,6 +10,7 @@ use aethyme_broker::{
     NewGateResult, OperationEffect, OperationIdentityProvenance, OperationProvider,
     OperationStatus,
 };
+use rusqlite::{Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
 
 const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
@@ -279,6 +280,12 @@ fn a_cached_failing_verdict_can_be_invalidated_so_the_gate_runs_fresh() {
             })
             .unwrap();
     }
+    let failed_id = broker
+        .store()
+        .cached_gate_result_for_definition("unit", tree, "def")
+        .unwrap()
+        .unwrap()
+        .id;
     drop(broker);
 
     let id = format!("gatecache:unit@{tree}");
@@ -303,7 +310,53 @@ fn a_cached_failing_verdict_can_be_invalidated_so_the_gate_runs_fresh() {
     let cleared = fixture.run(&["unblock", &id, "--reason", "disk was full", "--json"]);
     assert_eq!(cleared.status.code(), Some(0), "{}", stderr(&cleared));
     let mut broker = fixture.broker();
+    let totals = broker.store().gate_execution_totals().unwrap();
+    assert!(
+        totals
+            .iter()
+            .any(|(gate, runs, _)| gate == "unit" && *runs == 1),
+        "clearing a cache verdict must retain its gate run in history"
+    );
+    struct ClearedMetadata {
+        cleared_at: Option<i64>,
+        reason: Option<String>,
+        status: String,
+        failure_class: Option<String>,
+    }
+    let cleared_metadata = Connection::open(aethyme_broker::broker_db_path(&fixture.repo).unwrap())
+        .unwrap()
+        .query_row(
+            "SELECT cleared_at, cleared_reason, status, failure_class
+             FROM gate_results WHERE id = ?1",
+            [failed_id],
+            |row| {
+                Ok(ClearedMetadata {
+                    cleared_at: row.get(0)?,
+                    reason: row.get(1)?,
+                    status: row.get(2)?,
+                    failure_class: row.get(3)?,
+                })
+            },
+        )
+        .optional()
+        .unwrap()
+        .expect("the gate result remains in history");
+    assert!(cleared_metadata.cleared_at.is_some());
+    assert_eq!(cleared_metadata.reason.as_deref(), Some("disk was full"));
+    assert_eq!(cleared_metadata.status, "fail");
+    assert_eq!(
+        cleared_metadata.failure_class.as_deref(),
+        Some("test_failure")
+    );
     // The lookup the runner uses now misses, so the next run executes.
+    assert!(
+        broker
+            .store()
+            .cached_gate_result("unit", tree)
+            .unwrap()
+            .is_none(),
+        "a cleared result cannot satisfy a cache lookup"
+    );
     assert!(
         broker
             .store()
@@ -330,6 +383,20 @@ fn a_cached_failing_verdict_can_be_invalidated_so_the_gate_runs_fresh() {
             .as_deref()
             .unwrap()
             .contains("disk was full")
+    );
+    assert!(
+        events[0]
+            .payload_json
+            .as_deref()
+            .unwrap()
+            .contains("removed_gate_result_ids")
+    );
+    assert!(
+        !events[0]
+            .payload_json
+            .as_deref()
+            .unwrap()
+            .contains("cleared_gate_result_ids")
     );
     assert!(fixture.blocker(&id).is_none());
 }

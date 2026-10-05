@@ -17,7 +17,7 @@
 
 use std::path::{Path, PathBuf};
 
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use sha2::{Digest, Sha256};
 
 use crate::{Broker, BrokerOpError, GitRepo, OperationStatus, SessionStatus};
@@ -503,10 +503,12 @@ impl Broker {
                  FROM gate_results r
                  JOIN sessions s ON s.id = r.session_id AND s.cleanup_state = 'open'
                  WHERE r.status = 'fail' AND r.failure_class = 'test_failure'
+                   AND r.cleared_at IS NULL
                    AND NOT EXISTS (
                        SELECT 1 FROM gate_results p
                        WHERE p.gate_name = r.gate_name AND p.tree_hash = r.tree_hash
                          AND p.definition_hash = r.definition_hash AND p.id > r.id
+                         AND p.cleared_at IS NULL
                          AND (p.status = 'pass'
                               OR (p.status = 'fail' AND p.failure_class = 'test_failure'))
                    )
@@ -910,10 +912,10 @@ impl Broker {
                 false,
             ));
         }
-        let removed =
-            delete_failing_verdicts(&crate::broker_db_path(self.main_root())?, gate, tree)
-                .map_err(sqlite_error)?;
-        if removed.is_empty() {
+        let cleared = self
+            .store()
+            .clear_cached_test_failures(gate, tree, reason)?;
+        if cleared.is_empty() {
             return Err(BrokerOpError::InvalidCoordinatedOperation {
                 reason: format!(
                     "no cached failing verdict for gate {gate} on tree {tree}; nothing to clear"
@@ -926,7 +928,7 @@ impl Broker {
             serde_json::json!({
                 "gate_name": gate,
                 "tree_hash": tree,
-                "removed_gate_result_ids": removed,
+                "removed_gate_result_ids": cleared,
                 "operator_reason": reason,
             }),
         )?;
@@ -935,10 +937,10 @@ impl Broker {
             kind: BlockerKind::GateCache,
             cleared: true,
             action: format!(
-                "removed {} cached failing {} for gate {gate} on tree {}; the next run executes \
+                "marked {} cached failing {} as cleared for gate {gate} on tree {}; the next run executes \
                  the gate",
-                removed.len(),
-                if removed.len() == 1 {
+                cleared.len(),
+                if cleared.len() == 1 {
                     "verdict"
                 } else {
                     "verdicts"
@@ -1233,34 +1235,6 @@ fn unresolved_host_operations(database: &Path) -> Result<Vec<HostOperationRow>, 
         })
     })?
     .collect()
-}
-
-/// Delete the conclusive failing verdicts for one gate on one tree, and
-/// nothing else: passes, cancellations, and infra-classified rows never
-/// satisfied the cache and are history, not verdicts.
-fn delete_failing_verdicts(
-    database: &Path,
-    gate: &str,
-    tree: &str,
-) -> Result<Vec<i64>, rusqlite::Error> {
-    let mut conn = Connection::open(database)?;
-    conn.busy_timeout(std::time::Duration::from_secs(5))?;
-    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    let ids = {
-        let mut stmt = tx.prepare(
-            "SELECT id FROM gate_results
-             WHERE gate_name = ?1 AND tree_hash = ?2
-               AND status = 'fail' AND failure_class = 'test_failure'
-             ORDER BY id",
-        )?;
-        stmt.query_map(params![gate, tree], |row| row.get::<_, i64>(0))?
-            .collect::<Result<Vec<_>, _>>()?
-    };
-    for id in &ids {
-        tx.execute("DELETE FROM gate_results WHERE id = ?1", [id])?;
-    }
-    tx.commit()?;
-    Ok(ids)
 }
 
 struct GatePidfile {

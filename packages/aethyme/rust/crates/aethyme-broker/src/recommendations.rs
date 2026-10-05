@@ -324,13 +324,17 @@ pub fn derive_gate_recommendations(
     merges: &[MergeQueueEntry],
     events: &[Event],
 ) -> Vec<MaintainerRecommendation> {
-    let results = &results[..results.len().min(RECOMMENDATION_GATE_HISTORY_LIMIT)];
+    let results: Vec<&GateResult> = results
+        .iter()
+        .filter(|result| result.cleared_at.is_none())
+        .take(RECOMMENDATION_GATE_HISTORY_LIMIT)
+        .collect();
     let merge_trees = merges
         .iter()
         .filter_map(|entry| entry.merged_tree.as_deref())
         .collect::<BTreeSet<_>>();
     let mut by_gate = BTreeMap::<String, Vec<&GateResult>>::new();
-    for result in results {
+    for &result in &results {
         by_gate
             .entry(result.gate_name.clone())
             .or_default()
@@ -727,6 +731,8 @@ mod tests {
             log_path: Some("/absolute/log/must-not-leak".into()),
             session_id: Some(1),
             created_at: id,
+            cleared_at: None,
+            cleared_reason: None,
             environment: crate::GateEnvironment::default(),
         }
     }
@@ -868,6 +874,44 @@ mod tests {
         assert!(!json.contains("/absolute/log"));
         assert!(!json.contains("definition_hash"));
         assert!(!json.contains("output"));
+    }
+
+    #[test]
+    fn cleared_gate_failures_do_not_drive_active_recommendations() {
+        let gate = "workspace";
+        let mut merges = Vec::new();
+        let mut results = Vec::new();
+        for id in 1..=3 {
+            let tree = format!("{id:040x}");
+            let mut merge = entry(id, MergeStatus::Promoted, None);
+            merge.merged_tree = Some(tree.clone());
+            merges.push(merge);
+
+            let mut cleared = gate_result(
+                id,
+                gate,
+                &tree,
+                GateStatus::Fail,
+                Some(GateFailureClass::TestFailure),
+                100,
+            );
+            cleared.cleared_at = Some(id);
+            cleared.cleared_reason = Some("operator invalidated this verdict".into());
+            results.push(cleared);
+            results.push(gate_result(
+                id + 10,
+                gate,
+                &format!("{:040x}", id + 10),
+                GateStatus::Pass,
+                None,
+                100,
+            ));
+        }
+
+        assert!(
+            derive_gate_recommendations(&results, &merges, &[]).is_empty(),
+            "cleared failures must not be presented as active merged-tree failures"
+        );
     }
 
     #[test]
