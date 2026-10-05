@@ -1146,6 +1146,14 @@ impl GitRepo {
             .to_string())
     }
 
+    /// Whether this repository is a shallow clone. History before the
+    /// shallow boundary is missing locally, so `merge_base` fails without a
+    /// message for any commit older than it.
+    pub fn is_shallow(&self) -> bool {
+        run_git(&self.root, &["rev-parse", "--is-shallow-repository"])
+            .is_ok_and(|output| output.trim() == "true")
+    }
+
     /// A git config value (`git config --get`), `None` when unset.
     pub fn config_get(&self, key: &str) -> Option<String> {
         run_git(&self.root, &["config", "--get", key])

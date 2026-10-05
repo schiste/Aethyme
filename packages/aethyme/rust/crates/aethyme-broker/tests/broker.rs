@@ -713,6 +713,55 @@ fn missing_acceptance_bookkeeping_does_not_strand_work_on_integration() {
     );
 }
 
+/// In a shallow clone, a session older than the shallow boundary cannot be
+/// related to main: `git merge-base` exits 1 with no message, so the reason
+/// used to end in an empty `failed:`. It stays `inspection_failed`, but
+/// now names the shallow clone and how to deepen it (#525).
+#[test]
+fn cleanup_names_a_shallow_clone_when_inspection_fails() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let session = broker
+        .start_worktree("older than the boundary", None)
+        .unwrap();
+    let path = std::path::PathBuf::from(&session.worktree_path);
+    std::fs::write(path.join("old.txt"), "old\n").unwrap();
+    sh(&path, &["add", "old.txt"]);
+    sh(&path, &["commit", "-qm", "old work"]);
+    let session_head = rev(&path, "HEAD");
+    broker.close(session.id).unwrap();
+    drop(broker);
+
+    sh(
+        tmp.path(),
+        &["commit", "-q", "--allow-empty", "-m", "main moves on"],
+    );
+    let main_head = rev(tmp.path(), "HEAD");
+    // Cut history at both tips, as a shallow fetch leaves it: neither
+    // commit has a parent locally, so they share no ancestor.
+    std::fs::write(
+        tmp.path().join(".git/shallow"),
+        format!("{main_head}\n{session_head}\n"),
+    )
+    .unwrap();
+
+    let broker = Broker::open(tmp.path()).unwrap();
+    let plan = broker.cleanup_plan().unwrap();
+    let item = plan
+        .worktrees
+        .iter()
+        .find(|item| item.session_id == session.id)
+        .unwrap();
+    assert_eq!(
+        item.disposition,
+        CleanupDisposition::InspectionFailed,
+        "{item:#?}"
+    );
+    assert!(item.reason.contains("shallow clone"), "{}", item.reason);
+    assert!(item.reason.contains("--shallow-since"), "{}", item.reason);
+}
+
 #[test]
 fn doctor_reports_healthy_then_finds_missing_worktree() {
     let tmp = tempfile::tempdir().unwrap();

@@ -9707,6 +9707,25 @@ impl Broker {
             && marker.repository_root == self.main_root
     }
 
+    /// The reason for a cleanup inspection that could not complete. In a
+    /// shallow clone the usual cause is a merge-base across the shallow
+    /// boundary, which git reports with no message at all, so the reason
+    /// names the clone and how to deepen it (#525).
+    fn cleanup_inspection_failure(&self, error: &dyn std::fmt::Display) -> String {
+        let mut reason = format!("cleanup inspection failed: {error}");
+        if self.repo.is_shallow() {
+            reason.push_str(
+                " (this repository is a shallow clone, so history older than its \
+                 shallow boundary is missing and the session cannot be related to a \
+                 delivery target; deepen it with `aethyme broker advanced git --session \
+                 <id> --repo <owner/name> --reason \"<authorization>\" -- fetch \
+                 --shallow-since=<date> origin <default-branch>`, or `--unshallow`, \
+                 then re-plan)",
+            );
+        }
+        reason
+    }
+
     fn cleanup_eligibility(
         &self,
         session_id: i64,
@@ -10113,7 +10132,7 @@ impl Broker {
                 }
                 Err(error) => (
                     CleanupDisposition::InspectionFailed,
-                    format!("cleanup inspection failed: {error}"),
+                    self.cleanup_inspection_failure(&error),
                     None,
                 ),
             },
@@ -10202,7 +10221,7 @@ impl Broker {
                 Ok(result) => result,
                 Err(error) => (
                     CleanupDisposition::InspectionFailed,
-                    format!("cleanup inspection failed: {error}"),
+                    self.cleanup_inspection_failure(&error),
                     None,
                 ),
             }
