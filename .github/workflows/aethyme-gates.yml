@@ -71,6 +71,14 @@ jobs:
       - name: Build aethyme binary
         run: cargo build --locked --release --manifest-path packages/aethyme/rust/Cargo.toml --bin aethyme
 
+      # The cargo-test gate runs the workspace suite under nextest when it is
+      # on PATH (`.aethyme/gates.toml`); under `cargo test` that gate took
+      # about 17 minutes here. Same pinned version as oss-ci.yml.
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: cargo-nextest@0.9.146
+
       # The Rust gates build into the broker's managed cache,
       # `<host cache>/gates/<repository key>/rust-workspace-v3`, where the key
       # is the SHA-256 of the repository's canonical origin
