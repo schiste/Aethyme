@@ -726,6 +726,18 @@ pub(super) fn run_doctor(parsed: Parsed) -> Result<(), UsageError> {
                 },
             );
         }
+        if closed.eligibility_not_inspected_count > 0 {
+            out!(
+                "  retention: {} retained {} not inspected for cleanup eligibility within the {} s health-check budget; see all of them with `aethyme broker gc plan`",
+                closed.eligibility_not_inspected_count,
+                crate::broker::plural_word(
+                    closed.eligibility_not_inspected_count,
+                    "worktree was",
+                    "worktrees were",
+                ),
+                crate::HEALTH_CHECK_ELIGIBILITY_BUDGET.as_secs(),
+            );
+        }
         // Doctor takes the recorded-size path, so its byte figures
         // can be floors. Say so before the budget line: a floor
         // under the budget is not a pass, it is an unanswered
