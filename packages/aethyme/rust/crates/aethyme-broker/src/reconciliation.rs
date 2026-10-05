@@ -726,6 +726,8 @@ impl Broker {
         };
 
         if !self.repo_handle().is_ancestor(&local_main, &upstream_head) {
+            let checkout =
+                CheckoutHead::describe(self.repo_handle(), &options.upstream, &local_main);
             // Local main *ahead* of upstream is not divergence: it is what an
             // operator gets by pulling upstream into main. When integration
             // contains upstream too, there is nothing to reconcile, and
@@ -738,29 +740,33 @@ impl Broker {
             {
                 report.new_integration = old_integration.clone();
                 report.next_action = format!(
-                    "nothing to reconcile: {} {upstream_head} is already contained in local main and {branch}; no refs or broker rows were changed",
-                    options.upstream
+                    "nothing to reconcile: {} {upstream_head} is already contained in {} and {branch}; no refs or broker rows were changed",
+                    options.upstream, checkout.name
                 );
                 return Ok(report);
             }
             report.safe = false;
             if upstream_in_main {
                 report.warnings.push(format!(
-                    "local main {local_main} already contains {} {upstream_head}, but {branch} {old_integration} does not; refusing to rebuild integration behind local main",
-                    options.upstream
+                    "{} already contains {} {upstream_head}, but {branch} {old_integration} does not; refusing to rebuild integration behind {}",
+                    checkout.label, options.upstream, checkout.name
                 ));
-                report.next_action = format!(
-                    "inspect how local main absorbed {} outside {branch}; no refs or broker rows were changed",
-                    options.upstream
-                );
+                report.next_action = match &checkout.switch_hint {
+                    Some(hint) => hint.clone(),
+                    None => format!(
+                        "inspect how local main absorbed {} outside {branch}; no refs or broker rows were changed",
+                        options.upstream
+                    ),
+                };
             } else {
                 report.warnings.push(format!(
-                    "local main {local_main} is not an ancestor of {} {upstream_head}; refusing to choose between divergent histories",
-                    options.upstream
+                    "{} is not an ancestor of {} {upstream_head}; refusing to choose between divergent histories",
+                    checkout.label, options.upstream
                 ));
-                report.next_action =
+                report.next_action = checkout.switch_hint.clone().unwrap_or_else(|| {
                     "inspect the main/upstream divergence, update the local main checkout, then rerun the dry-run"
-                        .into();
+                        .into()
+                });
             }
             return Ok(report);
         }
@@ -2096,4 +2102,57 @@ fn reconciliation_updates(
             })
         })
         .collect()
+}
+
+/// How a reconcile refusal names the commit it compared against upstream:
+/// the primary checkout's HEAD. That is "local main" only when the checkout
+/// is on the branch the upstream ref names. On any other branch, calling it
+/// local main sent operators to inspect a main/upstream divergence that did
+/// not exist (#463).
+struct CheckoutHead {
+    /// Short name for running text: "local main", or the checked-out branch.
+    name: String,
+    /// The name with its commit, for the warning.
+    label: String,
+    /// The fix when the checkout is not on the upstream's branch.
+    switch_hint: Option<String>,
+}
+
+impl CheckoutHead {
+    fn describe(repo: &crate::git::GitRepo, upstream: &str, head: &str) -> Self {
+        let expected = upstream
+            .rsplit_once('/')
+            .map_or(upstream, |(_, branch)| branch)
+            .to_string();
+        let current = repo
+            .current_branch()
+            .ok()
+            .filter(|branch| !branch.is_empty());
+        match current.as_deref() {
+            Some(branch) if branch == expected => Self {
+                name: format!("local {expected}"),
+                label: format!("local {expected} {head}"),
+                switch_hint: None,
+            },
+            current => {
+                let (name, on) = match current {
+                    Some("HEAD") | None => (
+                        "the primary checkout's detached HEAD".to_string(),
+                        "a detached HEAD".to_string(),
+                    ),
+                    Some(branch) => (
+                        format!("the primary checkout's branch {branch}"),
+                        format!("branch {branch}"),
+                    ),
+                };
+                Self {
+                    label: format!("{name} (HEAD {head}; {on}, not {expected})"),
+                    name,
+                    switch_hint: Some(format!(
+                        "the primary checkout is on {on}, not {expected}: run `git switch {expected}` there (or compare {expected} itself), then rerun the dry-run; no refs or broker rows were changed"
+                    )),
+                }
+            }
+        }
+    }
 }
