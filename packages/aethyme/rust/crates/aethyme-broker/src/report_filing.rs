@@ -186,6 +186,7 @@ pub fn file_reviewed_report(
         scope: Some(filing_scope),
         declared_effect: Some(OperationEffect::Write),
         destructive_confirmed: false,
+        cross_session: None,
         authorization_reason: Some(format!(
             "file reviewed report confirmed by SHA-256 {digest}"
         )),
