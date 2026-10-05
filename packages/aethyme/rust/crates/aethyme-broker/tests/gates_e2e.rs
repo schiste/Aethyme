@@ -6,6 +6,7 @@ use std::ffi::OsString;
 use std::path::Path;
 use std::process::Command;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use aethyme_broker::{
     AdvisoryEvidence, AdvisorySeverity, Broker, CachePolicy, GRAPH_IMPACT_MAX_DEPTH,
@@ -110,7 +111,7 @@ fn init_repo(root: &Path) {
     // bust its own cache by writing broker.db/logs between runs.
     std::fs::write(
         root.join(".gitignore"),
-        "gate-markers.txt\nslow-finished.txt\n\
+        "gate-markers.txt\nslow-finished.txt\nslow-started.txt\n\
          .aethyme/broker.db*\n.aethyme/logs/\n.aethyme/run/\n.aethyme/worktrees/\n",
     )
     .unwrap();
@@ -121,6 +122,18 @@ fn init_repo(root: &Path) {
 fn write_gates(root: &Path, body: &str) {
     std::fs::create_dir_all(root.join(".aethyme")).unwrap();
     std::fs::write(root.join(".aethyme/gates.toml"), body).unwrap();
+}
+
+fn wait_for_file(path: &Path, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while !path.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for readiness file {}",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 fn commit_all(root: &Path, message: &str) {
@@ -1189,7 +1202,7 @@ fn resubmit_with_new_tree_cancels_obsolete_slow_run() {
         r#"
 [[gate]]
 name = "slow"
-command = "sleep 30; echo done >> slow-finished.txt"
+command = "touch slow-started.txt; sleep 30; echo done >> slow-finished.txt"
 triggers = ["**/*.py"]
 "#,
     );
@@ -1208,8 +1221,9 @@ triggers = ["**/*.py"]
         broker.run_gates(session_id)
     });
 
-    // Give the gate time to actually start.
-    std::thread::sleep(std::time::Duration::from_millis(800));
+    // Wait for the gate process itself to signal readiness. A fixed delay
+    // races with slow CI hosts and can cancel the run before it starts.
+    wait_for_file(&wt.join("slow-started.txt"), Duration::from_secs(60));
 
     // The agent edits again → new tree → the obsolete run is cancelled
     // (run_gates does this automatically; tested here in isolation so the

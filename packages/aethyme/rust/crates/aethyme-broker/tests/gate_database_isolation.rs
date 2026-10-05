@@ -312,7 +312,20 @@ fn concurrent_gate_workers_receive_distinct_databases() {
     let repo = fixture();
     write_gate(
         repo.path(),
-        "printf '%s %s\\n' \"$AETHYME_TEST_DB_SUFFIX\" \"$AETHYME_BROKER_DB\" > \"worker-$AETHYME_TEST_DB_SUFFIX.record\"",
+        r#"mkdir -p .aethyme/run/gate-workers
+printf '%s %s\n' "$AETHYME_TEST_DB_SUFFIX" "$AETHYME_BROKER_DB" > "worker-$AETHYME_TEST_DB_SUFFIX.record"
+touch ".aethyme/run/gate-workers/worker-$AETHYME_TEST_DB_SUFFIX.ready"
+attempt=0
+while [ "$attempt" -lt 5000 ]; do
+    ready=$(find .aethyme/run/gate-workers -type f -name '*.ready' | wc -l)
+    if [ "$ready" -ge 2 ]; then
+        exit 0
+    fi
+    attempt=$((attempt + 1))
+    sleep 0.01
+done
+echo 'timed out waiting for both gate workers' >&2
+exit 1"#,
     );
     let workers: Vec<_> = (0..2)
         .map(|_| {
