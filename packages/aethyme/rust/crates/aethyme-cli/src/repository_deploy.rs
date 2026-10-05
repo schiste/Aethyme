@@ -434,19 +434,7 @@ fn print_artifact_ownership() {
     println!("  .claude/skills/ and .claude/hooks/aethyme-load-context.sh");
     println!("  .claude/settings.local.json (machine-local; never commit)");
     println!("Ignored machine-local runtime state:");
-    for path in [
-        ".aethyme/broker.db*",
-        ".aethyme/logs/",
-        ".aethyme/reports/",
-        ".aethyme/run/",
-        ".aethyme/worktrees/",
-        ".aethyme/broker-action-required.md",
-        ".aethyme/graph_store.redb",
-        ".aethyme/graph_store.redb.indexing",
-        ".aethyme/generated/experience-telemetry.jsonl",
-        ".aethyme/generated/experience-status.json",
-        ".aethyme/generated/experience-status.md",
-    ] {
+    for path in aethyme_broker::broker_runtime_ignore_patterns() {
         println!("  {path}");
     }
     println!(
