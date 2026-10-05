@@ -42,6 +42,10 @@ pub enum UnresolvedKind {
     /// A glob that matches no tracked path. A glob can legitimately match
     /// nothing yet, so this only warns.
     GlobMatchesNothing,
+    /// A `generated_paths` entry that is neither tracked nor on disk. Build
+    /// output is normally gitignored and may not have been produced yet, so
+    /// this only warns.
+    GeneratedNotPresent,
     /// The file could not be read or parsed, so its references are unknown.
     /// Fails verification.
     Unreadable,
@@ -50,7 +54,7 @@ pub enum UnresolvedKind {
 impl UnresolvedKind {
     /// Whether this finding fails `deploy verify`.
     pub fn fails(self) -> bool {
-        !matches!(self, Self::GlobMatchesNothing)
+        !matches!(self, Self::GlobMatchesNothing | Self::GeneratedNotPresent)
     }
 }
 
@@ -64,6 +68,10 @@ impl std::fmt::Display for UnresolvedPathReference {
             UnresolvedKind::NotAFile => {
                 write!(f, "{file}: {key} {path:?} is not a regular file")
             }
+            UnresolvedKind::GeneratedNotPresent => write!(
+                f,
+                "{file}: {key} {path:?} is not in the tree or on disk; generated output may not exist yet"
+            ),
             UnresolvedKind::GlobMatchesNothing => {
                 write!(f, "{file}: {key} glob {path:?} matches no tracked path")
             }
@@ -345,13 +353,29 @@ fn onboarding_references(repo: &Path, tree: &Tree<'_>, found: &mut Vec<Unresolve
         let Some(Value::Array(items)) = payload.get(key) else {
             continue;
         };
+        let item_is_generated = key == "generated_paths";
         for (index, item) in items.iter().enumerate() {
-            match item {
-                Value::Str(path) => check(tree, file, format!("$.{key}[{index}]"), path, found),
-                _ => {
-                    if let Some(Value::Str(path)) = item.get("path") {
-                        check(tree, file, format!("$.{key}[{index}].path"), path, found);
-                    }
+            let (key, path) = match item {
+                Value::Str(path) => (format!("$.{key}[{index}]"), path),
+                _ => match item.get("path") {
+                    Some(Value::Str(path)) => (format!("$.{key}[{index}].path"), path),
+                    _ => continue,
+                },
+            };
+            let start = found.len();
+            check(tree, file, key, path, found);
+            // Generated output is normally gitignored, so a generated path
+            // absent from the tracked tree is fine when it is on disk, and
+            // only worth a warning when it is not there yet either.
+            if item_is_generated && found.len() > start {
+                let finding = found.pop().expect("check pushed one");
+                if finding.kind == UnresolvedKind::Missing && !repo.join(&finding.path).exists() {
+                    found.push(UnresolvedPathReference {
+                        kind: UnresolvedKind::GeneratedNotPresent,
+                        ..finding
+                    });
+                } else if finding.kind != UnresolvedKind::Missing {
+                    found.push(finding);
                 }
             }
         }
@@ -597,6 +621,51 @@ mod tests {
         assert_eq!(found.len(), 1, "{found:?}");
         assert_eq!(found[0].kind, UnresolvedKind::NotAFile);
         assert_eq!(found[0].path, "web/pnpm-lock.yaml");
+    }
+
+    /// Build output named in `generated_paths` is normally gitignored: an
+    /// untracked one on disk passes, a missing one only warns, while a
+    /// missing entrypoint still fails.
+    #[test]
+    fn generated_paths_need_not_be_tracked() {
+        let mut files = complete();
+        files.retain(|(path, _)| {
+            *path != ".aethyme/overrides/onboarding.json" && *path != "web/src/main.ts"
+        });
+        files.push((
+            ".aethyme/overrides/onboarding.json",
+            r#"{"entrypoints": [{"path": "web/src/main.ts"}],
+                "generated_paths": [{"path": "dist/"}, {"path": "target"}]}"#,
+        ));
+        let repo = fixture(&files);
+        std::fs::create_dir_all(repo.0.join("target/debug")).unwrap();
+        let found = unresolved_path_references(&repo.0);
+        let named: Vec<(&str, &str, UnresolvedKind)> = found
+            .iter()
+            .map(|r| (r.key.as_str(), r.path.as_str(), r.kind))
+            .collect();
+        assert_eq!(
+            named,
+            [
+                (
+                    "$.entrypoints[0].path",
+                    "web/src/main.ts",
+                    UnresolvedKind::Missing
+                ),
+                (
+                    "$.generated_paths[0].path",
+                    "dist/",
+                    UnresolvedKind::GeneratedNotPresent
+                ),
+            ]
+        );
+        assert!(found[0].kind.fails());
+        assert!(!found[1].kind.fails());
+        assert!(
+            found[1].to_string().contains("may not exist yet"),
+            "{}",
+            found[1]
+        );
     }
 
     #[test]
