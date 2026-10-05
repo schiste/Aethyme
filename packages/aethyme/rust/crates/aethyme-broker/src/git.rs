@@ -919,6 +919,23 @@ fn run_git_command_output(
     }
     Ok(output)
 }
+/// A commit's tree and parents, in Git's stored parent order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitShape {
+    pub tree: String,
+    pub parents: Vec<String>,
+}
+
+/// Newline-separated commit names, as `--stdin` reads them.
+fn commit_list(commits: &[String]) -> Vec<u8> {
+    let mut input = Vec::with_capacity(commits.len() * 41);
+    for commit in commits {
+        input.extend_from_slice(commit.as_bytes());
+        input.push(b'\n');
+    }
+    input
+}
+
 /// Uncommitted work in a checkout, counted the way `git status` shows it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct UncommittedSummary {
@@ -1926,6 +1943,200 @@ impl GitRepo {
         .lines()
         .map(str::to_string)
         .collect())
+    }
+
+    /// Tree and parents of each commit, keyed by commit, from one
+    /// `git log --no-walk` however many commits are named. Every requested
+    /// commit must resolve; a missing one is an error, as a per-commit
+    /// `rev-parse` would have been.
+    pub fn commit_shapes(
+        &self,
+        commits: &[String],
+    ) -> Result<BTreeMap<String, CommitShape>, GitError> {
+        let mut shapes = BTreeMap::new();
+        if commits.is_empty() {
+            return Ok(shapes);
+        }
+        let args = [
+            "log",
+            "--no-walk=unsorted",
+            "--stdin",
+            "--no-color",
+            "--format=%H %T %P",
+        ];
+        let stdout = self.run_git_with_stdin(&args, commit_list(commits))?;
+        for line in String::from_utf8_lossy(&stdout).lines() {
+            let mut fields = line.split_whitespace();
+            let (Some(commit), Some(tree)) = (fields.next(), fields.next()) else {
+                continue;
+            };
+            shapes.insert(
+                commit.to_string(),
+                CommitShape {
+                    tree: tree.to_string(),
+                    parents: fields.map(str::to_string).collect(),
+                },
+            );
+        }
+        if let Some(missing) = commits.iter().find(|commit| !shapes.contains_key(*commit)) {
+            return Err(GitError::Git {
+                args: args.join(" "),
+                stderr: format!("no commit shape reported for {missing}"),
+            });
+        }
+        Ok(shapes)
+    }
+
+    /// Stable patch id of each commit's diff against its first parent --
+    /// [`Self::patch_id_between`] for `parent..commit` -- from one `git log -p`
+    /// streamed into one `git patch-id`, however many commits are named.
+    /// Commits whose diff is empty have no patch id and are absent from the
+    /// map. Pass only commits that have a parent: a root commit would be
+    /// diffed against the empty tree.
+    pub fn first_parent_patch_ids(
+        &self,
+        commits: &[String],
+    ) -> Result<BTreeMap<String, String>, GitError> {
+        let mut patch_ids = BTreeMap::new();
+        if commits.is_empty() {
+            return Ok(patch_ids);
+        }
+        let log_args = [
+            "log",
+            "--no-walk=unsorted",
+            "--stdin",
+            "--no-color",
+            "-p",
+            "--binary",
+            "--diff-merges=first-parent",
+            "--format=commit %H",
+        ];
+        let mut log = git_command()
+            .args(log_args)
+            .current_dir(&self.root)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|source| GitError::Spawn {
+                args: log_args.join(" "),
+                source,
+            })?;
+        let log_stdout = log.stdout.take().ok_or_else(|| GitError::Git {
+            args: log_args.join(" "),
+            stderr: "failed to open log stdout".into(),
+        })?;
+        // The diff streams from one process into the other through a pipe,
+        // so it is never held in memory however much history it covers.
+        let patch_id = git_command()
+            .args(["patch-id", "--stable"])
+            .current_dir(&self.root)
+            .stdin(std::process::Stdio::from(log_stdout))
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|source| GitError::Spawn {
+                args: "patch-id --stable".into(),
+                source,
+            })?;
+        let mut log_stdin = log.stdin.take().ok_or_else(|| GitError::Git {
+            args: log_args.join(" "),
+            stderr: "failed to open log stdin".into(),
+        })?;
+        let input = commit_list(commits);
+        let writer = std::thread::spawn(move || log_stdin.write_all(&input));
+        let mut log_stderr = log.stderr.take();
+        let stderr_reader = std::thread::spawn(move || {
+            let mut text = String::new();
+            if let Some(stderr) = log_stderr.as_mut() {
+                let _ = std::io::Read::read_to_string(stderr, &mut text);
+            }
+            text
+        });
+        let output = patch_id
+            .wait_with_output()
+            .map_err(|source| GitError::Spawn {
+                args: "patch-id --stable".into(),
+                source,
+            })?;
+        let log_status = log.wait().map_err(|source| GitError::Spawn {
+            args: log_args.join(" "),
+            source,
+        })?;
+        let log_stderr = stderr_reader.join().unwrap_or_default();
+        writer
+            .join()
+            .map_err(|_| GitError::Git {
+                args: log_args.join(" "),
+                stderr: "log stdin writer panicked".into(),
+            })?
+            .map_err(|source| GitError::Spawn {
+                args: log_args.join(" "),
+                source,
+            })?;
+        if !log_status.success() {
+            return Err(GitError::Git {
+                args: log_args.join(" "),
+                stderr: log_stderr.trim().to_string(),
+            });
+        }
+        if !output.status.success() {
+            return Err(GitError::Git {
+                args: "patch-id --stable".into(),
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            });
+        }
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            let mut fields = line.split_whitespace();
+            if let (Some(patch), Some(commit)) = (fields.next(), fields.next()) {
+                patch_ids.insert(commit.to_string(), patch.to_string());
+            }
+        }
+        Ok(patch_ids)
+    }
+
+    /// Run git with `input` on stdin and return its stdout. The input is
+    /// written from a thread: a long list fills the output pipe before it is
+    /// consumed, and a single thread would deadlock.
+    fn run_git_with_stdin(&self, args: &[&str], input: Vec<u8>) -> Result<Vec<u8>, GitError> {
+        let mut child = git_command()
+            .args(args)
+            .current_dir(&self.root)
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|source| GitError::Spawn {
+                args: args.join(" "),
+                source,
+            })?;
+        let mut stdin = child.stdin.take().ok_or_else(|| GitError::Git {
+            args: args.join(" "),
+            stderr: "failed to open stdin".into(),
+        })?;
+        let writer = std::thread::spawn(move || stdin.write_all(&input));
+        let output = child.wait_with_output().map_err(|source| GitError::Spawn {
+            args: args.join(" "),
+            source,
+        })?;
+        writer
+            .join()
+            .map_err(|_| GitError::Git {
+                args: args.join(" "),
+                stderr: "stdin writer panicked".into(),
+            })?
+            .map_err(|source| GitError::Spawn {
+                args: args.join(" "),
+                source,
+            })?;
+        if !output.status.success() {
+            return Err(GitError::Git {
+                args: args.join(" "),
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            });
+        }
+        Ok(output.stdout)
     }
 
     /// Stable patch id for the cumulative diff `from..to`. Empty diffs
@@ -3887,5 +4098,120 @@ mod local_branch_tips_tests {
         );
         assert_eq!(tips.len(), 3, "{tips:?}");
         assert!(!tips.contains_key("refs/heads/agent/gone"));
+    }
+}
+
+/// The batched commit questions submit asks (#463) must answer exactly what
+/// the per-commit ones did, on every kind of commit a session carries.
+#[cfg(test)]
+mod batched_commit_tests {
+    use super::*;
+
+    fn run(root: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@example.test")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@example.test")
+            .output()
+            .expect("run git");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    #[test]
+    fn batched_shapes_and_patch_ids_match_the_per_commit_answers() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        run(root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("a.txt"), "one\ntwo\nthree\n").expect("write");
+        run(root, &["add", "-A"]);
+        run(root, &["commit", "-qm", "root"]);
+        // An ordinary edit.
+        std::fs::write(root.join("a.txt"), "one\n2\nthree\n").expect("write");
+        run(root, &["commit", "-qam", "edit"]);
+        // A rename with an edit.
+        run(root, &["mv", "a.txt", "b.txt"]);
+        std::fs::write(root.join("b.txt"), "one\n2\nthree\nfour\n").expect("write");
+        run(root, &["add", "-A"]);
+        run(root, &["commit", "-qm", "rename"]);
+        // A binary file and a mode change.
+        std::fs::write(root.join("blob.bin"), [0_u8, 159, 146, 150, 0, 7]).expect("write");
+        run(root, &["add", "blob.bin"]);
+        run(root, &["commit", "-qm", "binary"]);
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(root.join("b.txt"), std::fs::Permissions::from_mode(0o755))
+                .expect("chmod");
+        }
+        run(root, &["commit", "-qam", "mode"]);
+        // An empty commit has no patch id.
+        run(root, &["commit", "-q", "--allow-empty", "-m", "empty"]);
+        // A merge, whose patch id is its diff against the first parent.
+        run(root, &["switch", "-q", "-c", "side", "HEAD~2"]);
+        std::fs::write(root.join("side.txt"), "side\n").expect("write");
+        run(root, &["add", "side.txt"]);
+        run(root, &["commit", "-qm", "side"]);
+        run(root, &["switch", "-q", "main"]);
+        run(
+            root,
+            &["merge", "-q", "--no-ff", "-m", "merge side", "side"],
+        );
+        // A cherry-pick of the side commit is patch-identical to it.
+        run(root, &["switch", "-q", "-c", "picked", "HEAD~1"]);
+        run(root, &["cherry-pick", "side"]);
+        run(root, &["switch", "-q", "main"]);
+
+        let repo = GitRepo::discover(root).expect("repo");
+        let mut commits = run(root, &["rev-list", "--reverse", "--all"])
+            .lines()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        commits.dedup();
+        let shapes = repo.commit_shapes(&commits).expect("shapes");
+        let with_parents = commits
+            .iter()
+            .filter(|commit| !shapes[*commit].parents.is_empty())
+            .cloned()
+            .collect::<Vec<_>>();
+        let patch_ids = repo
+            .first_parent_patch_ids(&with_parents)
+            .expect("patch ids");
+
+        let mut empty = 0;
+        for commit in &commits {
+            let parents = repo.commit_parents(commit).expect("parents");
+            assert_eq!(shapes[commit].parents, parents, "{commit}");
+            assert_eq!(
+                shapes[commit].tree,
+                repo.commit_tree_id(commit).expect("tree"),
+                "{commit}"
+            );
+            let expected = match parents.first() {
+                Some(parent) => repo.patch_id_between(parent, commit).expect("patch id"),
+                None => None,
+            };
+            if expected.is_none() {
+                empty += 1;
+            }
+            assert_eq!(patch_ids.get(commit).cloned(), expected, "{commit}");
+        }
+        assert_eq!(empty, 2, "the root and the empty commit have no patch id");
+        let side = run(root, &["rev-parse", "side"]);
+        let picked = run(root, &["rev-parse", "picked"]);
+        assert_ne!(side, picked);
+        assert_eq!(
+            patch_ids[&side], patch_ids[&picked],
+            "a cherry-pick keeps its patch id"
+        );
+
+        let missing = vec!["0000000000000000000000000000000000000001".to_string()];
+        assert!(repo.commit_shapes(&missing).is_err());
     }
 }
