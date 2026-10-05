@@ -90,7 +90,7 @@
         "member_count": 10,
         "ci_mentions": 31,
         "executable_entrypoints": 1,
-        "source_files": 531
+        "source_files": 532
       }
     },
     {
@@ -207,7 +207,7 @@
       "member_count": 10,
       "ci_mentions": 31,
       "executable_entrypoints": 1,
-      "source_files": 531
+      "source_files": 532
     }
   },
   "commands": [
@@ -418,9 +418,9 @@
     ]
   },
   "freshness": {
-    "source_digest": "ddacb19a78c3d30569afaec65abfd6f0d1935c493a4e6ed996ce311ff6578bdc",
+    "source_digest": "b4966f2bb5a737b0fcf815bd1d0db511c4409ecf0b4d76e9d836e9813b66456f",
     "source_commit": null,
-    "source_file_count": 952,
+    "source_file_count": 953,
     "generator": "deterministic"
   },
   "notes": [
