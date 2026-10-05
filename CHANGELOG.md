@@ -4,6 +4,21 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.19] - 2026-10-05
+
+Cleared gate failures are kept as history instead of deleted, and broker runtime files are ignored from one catalog.
+
+The broker database schema advances from 46 to 47, and the minimum compatible schema rises from 42 to 47. This is not a compatible migration: once 0.8.19 opens a repository's broker database, older binaries refuse that repository, because they ignore `cleared_at` and would serve a cleared failure as a cached verdict. Upgrade every installed `aethyme`, including tree-built gate binaries, before using 0.8.19 on a shared repository; rolling back below 0.8.19 is not supported.
+
+### Changed
+
+- `broker unblock gatecache:` marks failing gate results cleared, with a time and reason, instead of deleting them. Cleared results no longer feed cache lookups, blockers or recommendations, and a clear stops the cache from falling back to an older pass for that tree, so the next run executes the gate. Gate result ids are never reused. `broker.blocker.cleared` events keep the `removed_gate_result_ids` key, which now names the retained, cleared rows (#523).
+- Broker runtime paths come from one catalog, which feeds the generated `.gitignore` block, `ship`'s untracked-file check and the paths `aethyme deploy` reports. The block now also ignores `gc.lock`, `gc-journal.json`, `worktree-sizes.json`, `reviews/` and `locks/` (#521).
+
+### Fixed
+
+- Scaffold refuses, and certify warns about, a `.gitignore` whose `# aethyme-broker:begin` marker has no end marker, instead of appending a second block that a later run would replace together with the rules in between (#521).
+
 ## [0.8.18] - 2026-10-04
 
 A contract decision accepted on a pull request is accepted on its merge commit too, and gates on an overloaded host defer instead of failing.
