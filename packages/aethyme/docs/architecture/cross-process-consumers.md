@@ -1,6 +1,6 @@
 # Cross-process consumers of Aethyme entry points
 
-Last Updated: 2026-09-27
+Last Updated: 2026-10-05
 
 When code outside the `packages/aethyme/` Rust source tree invokes an
 Aethyme command, it crosses a process boundary. Static
@@ -448,3 +448,11 @@ status; its inventory can be incomplete, declared by `inventory_complete` and
 `inventory_deferred_sessions`. `phase_timings_ms` contains measured phase costs
 and `command_total` including broker opening. See the status section in
 `../guides/broker-workflows.md`. Neither reporting mode authorizes deletion.
+
+### Lease scope and guarded-execution reporting
+
+Lease records returned by "`"aethyme broker advanced leases list --json"`" and broker status JSON include "`"scope"`": "`"exact"`" covers only the named path, while "`"recursive_directory"`" covers a directory subtree claimed with a trailing "`"/"`". "`"leases claim --json"`" reports the same scope and adds a "`"warning"`" when an existing directory was claimed as an exact path; the warning does not change coverage.
+
+"`"aethyme broker advanced leases plan ... --session <id> --json"`" adds a "`"coverage"`" object for proposed paths. Only that session's explicit leases count as authority; implicit and other-session leases do not. Missing paths include exact and narrow recursive claim suggestions.
+
+"`"aethyme broker advanced exec --session <id> --json"`" reports "`"edits_remain"`" and "`"changed_paths_remaining"`", including exact tracked and untracked paths left by the command. Human output says whether the command ran and whether edits remain. An ownership refusal can happen after a command has changed files, so consumers must inspect the reported paths before retrying.

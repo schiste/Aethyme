@@ -54,6 +54,47 @@ pub(super) fn render_lease_plan(report: &crate::LeasePlan, json: bool) -> Result
     Ok(())
 }
 
+fn render_lease_coverage(report: &crate::leases::LeaseCoverageReport) {
+    out!(
+        "Lease coverage for session {}: {} missing explicit claim(s)",
+        report.session_id,
+        report.missing_count
+    );
+    for entry in &report.paths {
+        if let Some(claim) = &entry.covered_by {
+            out!(
+                "  {} — covered by {} lease {}",
+                entry.path,
+                if claim.ends_with('/') {
+                    "recursive directory"
+                } else {
+                    "exact"
+                },
+                claim
+            );
+            continue;
+        }
+
+        out!("  {} — missing explicit claim", entry.path);
+        if let Some(claim) = &entry.exact_claim {
+            let claim = crate::broker::shell_quote(claim);
+            out!(
+                "    exact claim: aethyme broker advanced leases claim {} --session {}",
+                claim,
+                report.session_id
+            );
+        }
+        if let Some(claim) = &entry.recursive_claim {
+            let claim = crate::broker::shell_quote(claim);
+            out!(
+                "    recursive claim: aethyme broker advanced leases claim {} --session {}",
+                claim,
+                report.session_id
+            );
+        }
+    }
+}
+
 pub(super) fn render_planned_explicit_leases(leases: &[crate::Lease]) {
     if leases.is_empty() {
         return;
@@ -189,12 +230,16 @@ pub(super) fn run_leases(parsed: Parsed) -> Result<(), UsageError> {
             } else if leases.is_empty() {
                 out!("No active leases.");
             } else {
-                out!("{:<4} {:<9} PATH", "SID", "KIND");
+                out!("{:<4} {:<9} {:<21} PATH", "SID", "KIND", "SCOPE");
                 for lease in leases {
                     out!(
-                        "{:<4} {:<9} {}",
+                        "{:<4} {:<9} {:<21} {}",
                         lease.session_id,
                         lease.kind.as_str(),
+                        match lease.scope() {
+                            crate::types::LeaseScope::Exact => "exact",
+                            crate::types::LeaseScope::RecursiveDirectory => "recursive directory",
+                        },
                         lease.path
                     );
                 }
@@ -209,11 +254,41 @@ pub(super) fn run_leases(parsed: Parsed) -> Result<(), UsageError> {
             let session = parsed
                 .session
                 .ok_or(UsageError::Message("claim requires --session <id>".into()))?;
+            let session_info = broker.store().session(session)?;
+            let is_directory = std::path::Path::new(&session_info.worktree_path)
+                .join(path)
+                .is_dir();
+            let scope_warning = crate::leases::exact_directory_claim_warning(path, is_directory);
             let report = broker.claim_lease(session, path, parsed.ttl_seconds.map(|s| s * 1000))?;
             if parsed.json {
-                out!("{}", serde_json::to_string_pretty(&report)?);
+                let mut value = serde_json::to_value(&report)?;
+                let object = value
+                    .as_object_mut()
+                    .expect("lease claim report is an object");
+                object.insert(
+                    "scope".into(),
+                    serde_json::to_value(if report.path.ends_with('/') {
+                        crate::types::LeaseScope::RecursiveDirectory
+                    } else {
+                        crate::types::LeaseScope::Exact
+                    })?,
+                );
+                if let Some(warning) = scope_warning {
+                    object.insert("warning".into(), serde_json::Value::String(warning));
+                }
+                out!("{}", serde_json::to_string_pretty(&value)?);
             } else {
-                out!("Session {session} claimed {path}.");
+                out!(
+                    "Session {session} claimed {path} as a {} lease.",
+                    if report.path.ends_with('/') {
+                        "recursive directory"
+                    } else {
+                        "exact"
+                    }
+                );
+                if let Some(warning) = scope_warning {
+                    out!("  warning: {warning}");
+                }
                 for warning in &report.warnings {
                     out!(
                         "  note: session {} ({}) also holds {} [{}]: {}",
@@ -238,7 +313,36 @@ pub(super) fn run_leases(parsed: Parsed) -> Result<(), UsageError> {
                 ));
             }
             let report = broker.plan_leases(paths, parsed.session)?;
-            render_lease_plan(&report, parsed.json)?;
+            let coverage = if let Some(session_id) = parsed.session {
+                let leases = broker.store().active_leases()?;
+                let normalized_paths = report
+                    .paths
+                    .iter()
+                    .map(|path| path.path.clone())
+                    .collect::<Vec<_>>();
+                Some(crate::leases::plan_lease_coverage(
+                    session_id,
+                    &normalized_paths,
+                    &leases,
+                ))
+            } else {
+                None
+            };
+            if parsed.json {
+                let mut value = serde_json::to_value(&report)?;
+                if let Some(coverage) = coverage {
+                    value
+                        .as_object_mut()
+                        .expect("lease plan is an object")
+                        .insert("coverage".into(), serde_json::to_value(coverage)?);
+                }
+                out!("{}", serde_json::to_string_pretty(&value)?);
+            } else {
+                render_lease_plan(&report, false)?;
+                if let Some(coverage) = &coverage {
+                    render_lease_coverage(coverage);
+                }
+            }
         }
         Some("export") => {
             let limit = parsed

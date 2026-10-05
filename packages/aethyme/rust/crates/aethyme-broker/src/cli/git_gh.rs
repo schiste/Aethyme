@@ -402,6 +402,14 @@ pub(super) fn render_coordinated_operation(
     Ok(())
 }
 
+fn changed_paths_remaining(report: &crate::GuardedExecReport) -> Vec<String> {
+    let mut paths = report.touched_paths.clone();
+    paths.extend(report.new_untracked_paths.iter().cloned());
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
 /// `broker exec`.
 pub(super) fn run_exec(parsed: Parsed) -> Result<(), UsageError> {
     let session = parsed
@@ -409,8 +417,22 @@ pub(super) fn run_exec(parsed: Parsed) -> Result<(), UsageError> {
         .ok_or(UsageError::Message("exec requires --session <id>".into()))?;
     let mut broker = open_broker(parsed.read_only_snapshot)?;
     let report = broker.guarded_exec(session, &parsed.exec_command)?;
+    let changed_paths = changed_paths_remaining(&report);
     if parsed.json {
-        out!("{}", serde_json::to_string_pretty(&report)?);
+        let mut value = serde_json::to_value(&report)?;
+        let object = value
+            .as_object_mut()
+            .expect("guarded exec report is an object");
+        object.insert("command_ran".into(), serde_json::Value::Bool(true));
+        object.insert(
+            "edits_remain".into(),
+            serde_json::Value::Bool(!changed_paths.is_empty()),
+        );
+        object.insert(
+            "changed_paths_remaining".into(),
+            serde_json::to_value(&changed_paths)?,
+        );
+        out!("{}", serde_json::to_string_pretty(&value)?);
     } else {
         out!(
             "exec session {}: command {}{}",
@@ -425,10 +447,22 @@ pub(super) fn run_exec(parsed: Parsed) -> Result<(), UsageError> {
                 .map(|code| format!(" ({code})"))
                 .unwrap_or_default()
         );
-        if report.touched_paths.is_empty() {
-            out!("  touched paths: none");
+        out!("  command ran: yes");
+        out!(
+            "  edits remain after command: {}",
+            if changed_paths.is_empty() {
+                "no"
+            } else {
+                "yes"
+            }
+        );
+        if changed_paths.is_empty() {
+            out!("  changed paths: none");
         } else {
-            out!("  touched paths: {}", capped_join(&report.touched_paths, 8));
+            out!("  changed paths:");
+            for path in &changed_paths {
+                out!("    - {path}");
+            }
         }
         if !report.newly_dirty_paths.is_empty() {
             out!(
@@ -465,11 +499,13 @@ pub(super) fn run_exec(parsed: Parsed) -> Result<(), UsageError> {
             || !report.modified_preexisting_dirty_paths.is_empty();
         return Err(UsageError::Message(
             match (report.command_success, guard_refused) {
-                (true, _) => "guarded exec refused: the command changed paths outside \
+                (true, _) => {
+                    "guarded exec refused: the command ran and left changed paths outside \
                           this session's ownership (listed above)"
-                    .to_string(),
+                        .to_string()
+                }
                 (false, false) => format!(
-                    "guarded exec: the command exited {} — the guard found no ownership \
+                    "guarded exec: the command ran and exited {} — the guard found no ownership \
                  violation, so this is the command's own failure",
                     report
                         .exit_code
@@ -477,7 +513,7 @@ pub(super) fn run_exec(parsed: Parsed) -> Result<(), UsageError> {
                         .unwrap_or_else(|| "by signal".into())
                 ),
                 (false, true) => format!(
-                    "guarded exec: the command exited {}, and it changed paths outside \
+                    "guarded exec: the command ran and exited {}, and it left changed paths outside \
                  this session's ownership (listed above)",
                     report
                         .exit_code
@@ -905,4 +941,33 @@ pub(super) fn run_blockers(parsed: Parsed) -> Result<(), UsageError> {
         render_blockers(&report);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod exec_report_tests {
+    use super::*;
+
+    #[test]
+    fn remaining_changed_paths_include_untracked_and_tracked_edits_once() {
+        let report = crate::GuardedExecReport {
+            session_id: 1,
+            command: vec!["test".into()],
+            exit_code: Some(0),
+            command_success: true,
+            before_dirty_paths: Vec::new(),
+            after_dirty_paths: Vec::new(),
+            newly_dirty_paths: vec!["src/changed.rs".into()],
+            new_untracked_paths: vec!["notes.txt".into(), "src/changed.rs".into()],
+            modified_preexisting_dirty_paths: Vec::new(),
+            touched_paths: vec!["src/changed.rs".into()],
+            outside_lease_paths: Vec::new(),
+            foreign_paths: Vec::new(),
+            ok: true,
+        };
+
+        assert_eq!(
+            changed_paths_remaining(&report),
+            vec!["notes.txt".to_string(), "src/changed.rs".to_string()]
+        );
+    }
 }

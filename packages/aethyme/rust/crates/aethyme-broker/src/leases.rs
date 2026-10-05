@@ -9,7 +9,7 @@
 use std::collections::HashSet;
 use std::path::Path;
 
-use crate::types::{Lease, SessionStatus};
+use crate::types::{Lease, LeaseKind, SessionStatus};
 
 /// Concrete, preservation-first commands for resolving a planned lease
 /// conflict in the worktree that already owns the path.
@@ -160,6 +160,94 @@ pub(crate) fn paths_overlap(a: &str, b: &str) -> bool {
     (a.ends_with('/') && b.starts_with(a)) || (b.ends_with('/') && a.starts_with(b))
 }
 
+/// A proposed edit path and the explicit lease that covers it, if any.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct LeaseCoverageEntry {
+    pub path: String,
+    pub covered_by: Option<String>,
+    /// Exact-file claim to add when the path is not covered.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exact_claim: Option<String>,
+    /// Narrowest recursive directory claim that covers this path, when it
+    /// has a repository-relative parent directory.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recursive_claim: Option<String>,
+}
+
+/// Read-only coverage result for a proposed set of edit paths.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct LeaseCoverageReport {
+    pub session_id: i64,
+    pub paths: Vec<LeaseCoverageEntry>,
+    pub missing_count: usize,
+}
+
+/// Determine whether each proposed edit path is covered by one of the
+/// session's explicit leases. Implicit leases describe edits already made and
+/// therefore cannot authorize future guarded writes.
+pub fn plan_lease_coverage(
+    session_id: i64,
+    paths: &[String],
+    leases: &[Lease],
+) -> LeaseCoverageReport {
+    let mut paths = paths.to_vec();
+    paths.sort();
+    paths.dedup();
+
+    let entries = paths
+        .into_iter()
+        .map(|path| {
+            let covered_by = leases
+                .iter()
+                .filter(|lease| {
+                    lease.session_id == session_id
+                        && lease.kind == LeaseKind::Explicit
+                        && (path == lease.path
+                            || (lease.path.ends_with('/') && path.starts_with(&lease.path)))
+                })
+                .max_by_key(|lease| lease.path.len())
+                .map(|lease| lease.path.clone());
+            if covered_by.is_some() {
+                LeaseCoverageEntry {
+                    path,
+                    covered_by,
+                    exact_claim: None,
+                    recursive_claim: None,
+                }
+            } else {
+                let recursive_claim = path
+                    .trim_end_matches('/')
+                    .rsplit_once('/')
+                    .map(|(parent, _)| format!("{parent}/"));
+                LeaseCoverageEntry {
+                    exact_claim: Some(path.clone()),
+                    path,
+                    covered_by: None,
+                    recursive_claim,
+                }
+            }
+        })
+        .collect::<Vec<_>>();
+    let missing_count = entries
+        .iter()
+        .filter(|entry| entry.covered_by.is_none())
+        .count();
+
+    LeaseCoverageReport {
+        session_id,
+        paths: entries,
+        missing_count,
+    }
+}
+
+pub(crate) fn exact_directory_claim_warning(path: &str, is_directory: bool) -> Option<String> {
+    (is_directory && !path.ends_with('/')).then(|| {
+        format!(
+            "{path} is an existing directory, but this lease is exact; append / to claim its subtree"
+        )
+    })
+}
+
 /// Pairwise overlap detection over active leases. O(n²) over leases held
 /// by *different* sessions — fine at the 15-session design ceiling.
 pub fn detect_overlaps(leases: &[Lease]) -> Vec<Overlap> {
@@ -226,6 +314,13 @@ mod tests {
         }
     }
 
+    fn explicit_lease(session_id: i64, path: &str) -> Lease {
+        Lease {
+            kind: LeaseKind::Explicit,
+            ..lease(session_id, path)
+        }
+    }
+
     #[test]
     fn ignore_rules_cover_lockfiles_and_prefixes() {
         let rules = LeaseIgnoreRules::default();
@@ -262,6 +357,63 @@ mod tests {
             lease(2, "src/auth.py"),
         ]);
         assert_eq!(overlaps.len(), 1);
+    }
+
+    #[test]
+    fn lease_coverage_distinguishes_exact_and_recursive_claims() {
+        let paths = vec![
+            "src/file.rs".to_string(),
+            "src/other.rs".to_string(),
+            "src2/file.rs".to_string(),
+        ];
+        let leases = [
+            explicit_lease(1, "src/file.rs"),
+            explicit_lease(1, "src2/"),
+            explicit_lease(2, "src/"),
+        ];
+
+        let report = plan_lease_coverage(1, &paths, &leases);
+        assert_eq!(report.missing_count, 1);
+        assert_eq!(report.paths[0].covered_by.as_deref(), Some("src/file.rs"));
+        assert_eq!(report.paths[1].covered_by, None);
+        assert_eq!(report.paths[1].exact_claim.as_deref(), Some("src/other.rs"));
+        assert_eq!(report.paths[1].recursive_claim.as_deref(), Some("src/"));
+        assert_eq!(report.paths[2].covered_by.as_deref(), Some("src2/"));
+    }
+
+    #[test]
+    fn lease_coverage_does_not_treat_implicit_or_foreign_claims_as_authority() {
+        let report = plan_lease_coverage(
+            1,
+            &["src/file.rs".to_string()],
+            &[lease(1, "src/"), explicit_lease(2, "src/")],
+        );
+
+        assert_eq!(report.missing_count, 1);
+        assert_eq!(report.paths[0].exact_claim.as_deref(), Some("src/file.rs"));
+        assert_eq!(report.paths[0].recursive_claim.as_deref(), Some("src/"));
+    }
+
+    #[test]
+    fn claiming_an_existing_directory_without_slash_warns_it_is_exact() {
+        assert!(
+            exact_directory_claim_warning("packages/plugin-utils", true)
+                .unwrap()
+                .contains("append /")
+        );
+        assert_eq!(
+            exact_directory_claim_warning("packages/plugin-utils/", true),
+            None
+        );
+        assert_eq!(exact_directory_claim_warning("src/file.rs", false), None);
+    }
+
+    #[test]
+    fn serialized_lease_reports_its_scope() {
+        let exact = serde_json::to_value(lease(1, "src/file.rs")).unwrap();
+        let recursive = serde_json::to_value(lease(1, "src/")).unwrap();
+        assert_eq!(exact["scope"], "exact");
+        assert_eq!(recursive["scope"], "recursive_directory");
     }
 
     #[test]
