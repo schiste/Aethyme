@@ -442,14 +442,41 @@ pub(super) fn run_submit(parsed: Parsed) -> Result<(), UsageError> {
         .session
         .ok_or(UsageError::Message("submit requires --session <id>".into()))?;
     let mut broker = open_broker(parsed.read_only_snapshot)?;
+    let info = broker.store().session(session).map_err(|error| {
+        UsageError::Message(format!("cannot load session {session} for submit: {error}"))
+    })?;
+    let repo_root = std::path::Path::new(&info.worktree_path);
+    let checkout = crate::GitRepo::discover(repo_root).map_err(|error| {
+        UsageError::Message(format!(
+            "cannot inspect session {session} worktree for submit: {error}"
+        ))
+    })?;
+    let plan = broker.submission_plan(session)?;
+    let base = checkout
+        .merge_base("HEAD", &plan.integration_head)
+        .map_err(|error| {
+            UsageError::Message(format!(
+                "cannot determine the submit preflight base for session {session}: {error}"
+            ))
+        })?;
+    let pending_commit_messages = plan
+        .pending_owned_commit_ids()
+        .iter()
+        .map(|commit| checkout.commit_message(commit))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| {
+            UsageError::Message(format!(
+                "cannot read pending commit messages for session {session}: {error}"
+            ))
+        })?
+        .join("\n");
+    crate::contract_check::preflight_submit_decision(repo_root, &base, &pending_commit_messages)
+        .map_err(UsageError::Message)?;
+
     // Preflight (dogfood feedback 2026-07-14): show exactly what
     // will be submitted before anything runs — and warn about
     // uncommitted work, which never integrates.
-    if !parsed.json
-        && let Ok(info) = broker.store().session(session)
-        && let Ok(checkout) = crate::GitRepo::discover(std::path::Path::new(&info.worktree_path))
-    {
-        let plan = broker.submission_plan(session)?;
+    if !parsed.json {
         render_submission_plan(&plan, &checkout);
         if let Ok(uncommitted) = checkout.uncommitted_summary()
             && !uncommitted.is_empty()

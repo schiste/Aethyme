@@ -728,6 +728,67 @@ pub fn find_touched_symbols(
         .collect()
 }
 
+/// Check a broker submission's contract decision before its gates start.
+///
+/// The merged-tree gate remains authoritative, but a missing decision in an
+/// associated PR body is already knowable from the session worktree. Catching
+/// it here avoids building the CLI inside `cross-process-contract` only to
+/// report a text-only omission after the rest of submit has begun.
+pub fn preflight_submit_decision(
+    repo_root: &Path,
+    base: &str,
+    pending_commit_messages: &str,
+) -> Result<(), String> {
+    let consumers_doc = repo_root.join(DEFAULT_CONSUMERS_DOC);
+    let doc_text = std::fs::read_to_string(&consumers_doc).map_err(|error| {
+        format!(
+            "submit preflight could not read {}: {error}",
+            consumers_doc.display()
+        )
+    })?;
+    let tracked = extract_tracked_symbols(&doc_text);
+    if tracked.is_empty() {
+        return Err(format!(
+            "submit preflight could not extract tracked symbols from {}",
+            consumers_doc.display()
+        ));
+    }
+    let diff_lines = read_diff(repo_root, base)
+        .map_err(|message| format!("submit preflight could not inspect {base}..HEAD: {message}"))?;
+    let findings = find_touched_symbols(&diff_lines, &tracked);
+    if findings.is_empty() {
+        return Ok(());
+    }
+
+    let sources = vec![DecisionSource {
+        label: "pending session commit messages".to_string(),
+        text: Ok(pending_commit_messages.to_string()),
+    }];
+    let lookup = || associated_pull_request_sources(repo_root);
+    validate_submit_decision(&findings, sources, &lookup)
+}
+
+fn validate_submit_decision(
+    findings: &BTreeMap<String, Vec<String>>,
+    sources: Vec<DecisionSource>,
+    pull_requests: &dyn Fn() -> Vec<DecisionSource>,
+) -> Result<(), String> {
+    if findings.is_empty() {
+        return Ok(());
+    }
+    let (sources, verdict) = decide(sources, Some(pull_requests));
+    if verdict.passes() {
+        return Ok(());
+    }
+
+    Err(format!(
+        "ERROR: contract-decision preflight failed before any gate ran.\n{}\
+         Add `Contract decision: <none|introduce|soft-retire|hard-delete>` to the PR body or a commit message.\n\
+         If `none` is correct for a tracked removal, also add `Contract justification: <reason>` (at least {MIN_JUSTIFICATION_CHARS} characters).\n",
+        failure_message(&verdict, &sources)
+    ))
+}
+
 /// The contract decision an author declared.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Decision {
@@ -1222,6 +1283,71 @@ mod tests {
     #[test]
     fn parse_contract_decision_handles_empty_body() {
         assert_eq!(parse_contract_decision(""), None);
+    }
+
+    #[test]
+    fn submit_preflight_skips_lookup_without_tracked_removals() {
+        let looked_up = std::cell::Cell::new(false);
+        let lookup = || {
+            looked_up.set(true);
+            Vec::new()
+        };
+        assert!(validate_submit_decision(&BTreeMap::new(), Vec::new(), &lookup).is_ok());
+        assert!(!looked_up.get());
+    }
+
+    #[test]
+    fn submit_preflight_accepts_the_associated_pr_body_decision() {
+        let findings = BTreeMap::from([(
+            "aethyme-explore".to_string(),
+            vec!["-    run(\"aethyme-explore\");".to_string()],
+        )]);
+        let lookup = || {
+            vec![DecisionSource {
+                label: "PR #42 body".to_string(),
+                text: Ok("Contract decision: hard-delete".to_string()),
+            }]
+        };
+
+        assert!(validate_submit_decision(&findings, Vec::new(), &lookup).is_ok());
+    }
+
+    #[test]
+    fn submit_preflight_refusal_names_the_required_lines_before_gates() {
+        let findings = BTreeMap::from([(
+            "aethyme-explore".to_string(),
+            vec!["-    run(\"aethyme-explore\");".to_string()],
+        )]);
+        let lookup = || {
+            vec![DecisionSource {
+                label: "PR #42 body".to_string(),
+                text: Ok("No decision declared".to_string()),
+            }]
+        };
+
+        let error = validate_submit_decision(&findings, Vec::new(), &lookup).unwrap_err();
+        assert!(error.contains("before any gate ran"));
+        assert!(error.contains("Contract decision: <none|introduce|soft-retire|hard-delete>"));
+        assert!(error.contains("Contract justification: <reason>"));
+        assert!(error.contains("PR #42 body: no contract decision"));
+    }
+
+    #[test]
+    fn submit_preflight_needs_a_reason_for_none_on_a_tracked_removal() {
+        let findings = BTreeMap::from([(
+            "aethyme-explore".to_string(),
+            vec!["-    run(\"aethyme-explore\");".to_string()],
+        )]);
+        let lookup = || {
+            vec![DecisionSource {
+                label: "PR #42 body".to_string(),
+                text: Ok("Contract decision: none".to_string()),
+            }]
+        };
+
+        let error = validate_submit_decision(&findings, Vec::new(), &lookup).unwrap_err();
+        assert!(error.contains("Contract justification:"));
+        assert!(error.contains("before any gate ran"));
     }
 
     #[test]
