@@ -71,6 +71,7 @@ pub(super) const FLAG_RULES: &[(&str, &[&str])] = &[
             "--reuse",
             "--sync-integration",
             "--replace-stale",
+            "--take-over",
             // `start --adopt` resolves here; the flag only selects the handler.
             "--adopt",
         ],
@@ -220,6 +221,7 @@ pub(super) const FLAG_RULES: &[(&str, &[&str])] = &[
             "--destructive",
             "--no-wait",
             "--queue-timeout",
+            "--take-over",
             "--",
         ],
     ),
@@ -234,6 +236,7 @@ pub(super) const FLAG_RULES: &[(&str, &[&str])] = &[
             "--destructive",
             "--no-wait",
             "--queue-timeout",
+            "--take-over",
             "--",
         ],
     ),
@@ -331,9 +334,12 @@ pub(super) const FLAG_RULES: &[(&str, &[&str])] = &[
     ("watch pr tick", &["--limit"]),
     ("watch pr batches", &["--id", "--all"]),
     ("watch pr ack", &["--id", "--outcome", "--reason"]),
-    ("submit", &["--session", "--no-cache", "--verify-only"]),
-    ("push", &["--session", "--pr", "--open-pr"]),
-    ("sync", &["--session"]),
+    (
+        "submit",
+        &["--session", "--no-cache", "--verify-only", "--take-over"],
+    ),
+    ("push", &["--session", "--pr", "--open-pr", "--take-over"]),
+    ("sync", &["--session", "--take-over"]),
     ("repair", &["--session"]),
     ("checkpoint plan", &["--session"]),
     ("checkpoint apply", &["--session", "--confirm"]),
@@ -386,9 +392,18 @@ pub(super) const FLAG_RULES: &[(&str, &[&str])] = &[
     ("handoff", &["--session", "--worktree"]),
     (
         "finish",
-        &["--session", "--keep-worktree", "--abandon", "--reason"],
+        &[
+            "--session",
+            "--keep-worktree",
+            "--abandon",
+            "--reason",
+            "--take-over",
+        ],
     ),
-    ("close", &["--session", "--abandon", "--reason"]),
+    (
+        "close",
+        &["--session", "--abandon", "--reason", "--take-over"],
+    ),
     (
         "cleanup",
         &[

@@ -61,6 +61,20 @@ pub enum BrokerOpError {
         head: String,
         unpushed_commits: u32,
     },
+    /// Another live agent process holds the session (#393).
+    #[error(
+        "session {session_id} is held by another live agent process: pid {holder_pid} \
+         ({holder_command}){holder_context}. Run this from that agent, or pass `--take-over` \
+         to move the session to this agent; the transfer is recorded as a \
+         `session.holder_bound` event"
+    )]
+    SessionHeldByAnotherAgent {
+        session_id: i64,
+        holder_pid: i64,
+        holder_command: String,
+        /// `, agent <identity>, tab <name>` for whichever are recorded.
+        holder_context: String,
+    },
     #[error("main reconciliation is unavailable: {reason}")]
     MainReconcileUnavailable { reason: String },
     /// Representation asks a different question from reconciliation -- whether

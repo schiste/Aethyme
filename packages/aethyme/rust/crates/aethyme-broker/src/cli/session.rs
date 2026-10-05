@@ -877,6 +877,11 @@ pub(super) fn run_adopt(parsed: Parsed) -> Result<(), UsageError> {
     } else {
         None
     };
+    // Reusing a session another live agent holds is the attachment #393
+    // describes; it needs `--take-over` like any other command for it.
+    if let Some(previous) = previous_session.as_ref() {
+        admit_caller(broker.store(), previous.id, parsed.take_over)?;
+    }
     let agent_identity = session_agent_identity(parsed.agent.as_deref());
     let report = broker.adopt_with_options_and_context(
         &path,
@@ -889,6 +894,7 @@ pub(super) fn run_adopt(parsed: Parsed) -> Result<(), UsageError> {
         agent_identity.as_deref(),
         context,
     )?;
+    bind_caller_as_holder(broker.store(), report.session.id);
     let tab_rename = crate::chau7_mcp::rename_session_tab(
         &report.session,
         previous_session
@@ -1081,6 +1087,9 @@ pub(super) fn run_start(parsed: Parsed) -> Result<(), UsageError> {
         context,
         parsed.base.as_deref(),
     )?;
+    // `start-agent` binds nothing: the agent it spawns is a different process
+    // from its caller, and binds on its own first command.
+    bind_caller_as_holder(broker.store(), report.session.id);
     let tab_rename = crate::chau7_mcp::rename_session_tab(
         &report.session,
         None,
