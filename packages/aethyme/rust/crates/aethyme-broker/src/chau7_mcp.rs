@@ -30,6 +30,24 @@ pub(crate) enum SessionTabRename {
     Refused { reason: String },
 }
 
+pub(crate) fn rename_session_tab_if_applicable(
+    session: &Session,
+    previous_short_name: Option<&str>,
+    repository_name_fallback: Option<&str>,
+) -> SessionTabRename {
+    if session
+        .tab_name
+        .as_deref()
+        .is_some_and(|name| !name.trim().is_empty())
+    {
+        rename_session_tab(session, previous_short_name, repository_name_fallback)
+    } else {
+        SessionTabRename::NotApplicable {
+            reason: "broker start did not launch or identify a Chau7 tab".into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SessionTabIdentity<'a> {
     id: i64,
