@@ -14,15 +14,15 @@ name = "aethyme-engine-cli"
 path = "src/bin/aethyme-engine-cli.rs"
 
 [dependencies]
-rayon = "1.10"
-sha2 = "0.10"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-bincode = "1"
-redb = "4"
-regex = "1"
-libc = "0.2"
-dhat = { version = "0.3", optional = true }
+rayon = { workspace = true }
+sha2 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+bincode = { workspace = true }
+redb = { workspace = true }
+regex = { workspace = true }
+libc = { workspace = true }
+dhat = { workspace = true, optional = true }
 aethyme-graph-storage = { path = "../aethyme-graph-storage" }
 aethyme-graph-schema = { path = "../aethyme-graph-schema" }
 aethyme-producers = { path = "../aethyme-producers" }
@@ -32,7 +32,7 @@ aethyme-graph-indexer = { path = "../aethyme-graph-indexer" }
 
 [dev-dependencies]
 aethyme-testkit = { path = "../aethyme-testkit" }
-tempfile = "3"
+tempfile = { workspace = true }
 
 [features]
 dhat-heap = ["dep:dhat"]
