@@ -2176,6 +2176,13 @@ fn run_selections(
                 .and_then(|headroom| i64::try_from(headroom.bytes).ok()),
             free_disk_bytes_end: None,
         };
+        let timeout_seconds = crate::gate_admission::timeout_seconds_for_load(
+            gate.timeout_seconds,
+            gate.cost,
+            gate.max_load_per_cpu,
+            environment.load_avg_1m_start,
+            environment.cpu_count,
+        );
         let started = Instant::now();
         let broker_database = std::cell::OnceCell::new();
         let status = run_gate_command(
@@ -2192,7 +2199,8 @@ fn run_selections(
                 tree: &tree,
                 worker_id: &worker_id,
                 owner_paths: &selection.owner_paths,
-                timeout_seconds: gate.timeout_seconds,
+                configured_timeout_seconds: gate.timeout_seconds,
+                timeout_seconds,
                 started,
                 progress,
                 resources: resource_runtime.as_ref(),
@@ -2704,6 +2712,7 @@ struct GateCommandContext<'a> {
     tree: &'a str,
     worker_id: &'a str,
     owner_paths: &'a [String],
+    configured_timeout_seconds: Option<u64>,
     timeout_seconds: Option<u64>,
     started: Instant,
     progress: &'a dyn GateProgressSink,
@@ -2720,6 +2729,33 @@ struct GateCommandOutcome {
     resource_error: Option<String>,
     first_output_ms: Option<i64>,
     output_bytes: u64,
+}
+
+fn format_gate_timeout_diagnostic(
+    configured_timeout_seconds: Option<u64>,
+    effective_timeout_seconds: u64,
+    environment: &GateEnvironment,
+    load_at_timeout: Option<crate::gate_admission::LoadSample>,
+) -> String {
+    let load_at_start = environment
+        .load_avg_1m_start
+        .zip(environment.cpu_count)
+        .filter(|(_, cpus)| *cpus > 0)
+        .map(|(load_1m, cpus)| crate::gate_admission::LoadSample { load_1m, cpus });
+    let start = load_at_start
+        .map(crate::gate_admission::describe_load)
+        .unwrap_or_else(|| "unavailable".into());
+    let at_timeout = load_at_timeout
+        .map(crate::gate_admission::describe_load)
+        .unwrap_or_else(|| "unavailable".into());
+    let scaled_from = configured_timeout_seconds
+        .filter(|configured| *configured < effective_timeout_seconds)
+        .map(|configured| format!(" (configured {configured}s, scaled from start load)"))
+        .unwrap_or_default();
+
+    format!(
+        "aethyme gate timeout exceeded after {effective_timeout_seconds}s{scaled_from}; host load at start: {start}; host load at timeout: {at_timeout}\n"
+    )
 }
 
 /// The private directory holding one gate command's broker database.
@@ -3000,9 +3036,20 @@ fn run_gate_command(
                 {
                     timed_out = true;
                     let seconds = context.timeout_seconds.unwrap_or_default();
+                    let load_at_timeout = load_average_1m()
+                        .zip(logical_cpu_count())
+                        .filter(|(load_1m, cpus)| {
+                            load_1m.is_finite() && *load_1m >= 0.0 && *cpus > 0
+                        })
+                        .map(|(load_1m, cpus)| crate::gate_admission::LoadSample { load_1m, cpus });
                     let _ = append_gate_log(
                         context.log_path,
-                        &format!("aethyme gate timeout exceeded after {seconds}s\n"),
+                        &format_gate_timeout_diagnostic(
+                            context.configured_timeout_seconds,
+                            seconds,
+                            context.environment,
+                            load_at_timeout,
+                        ),
                     );
                     // SAFETY: killpg has no memory-safety preconditions; the
                     // leader is unreaped, so the group cannot have been reused.

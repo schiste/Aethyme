@@ -1112,6 +1112,11 @@ triggers = ["**/*.py"]
     assert!(!wt.join("slow-finished.txt").exists());
     let log = std::fs::read_to_string(outcomes[0].log_path.as_ref().unwrap()).unwrap();
     assert!(log.contains("aethyme gate timeout exceeded after 1s"));
+    assert!(
+        log.contains("host load at start: load 1m")
+            && log.contains("host load at timeout: load 1m"),
+        "the timeout refusal must record measured host load at start and at timeout: {log}"
+    );
 }
 
 #[test]
