@@ -19,7 +19,7 @@ mod common;
 /// or kills itself to stand in for a crash part-way through the request.
 const FAKE_GH: &str = r#"#!/bin/sh
 case "$1 $2" in
-  'pr update-branch')
+  'pr update-branch'|'pr merge')
     printf '%s\n' "$AETHYME_FAKE_GH_STDERR" >&2
     if [ "$AETHYME_FAKE_GH_RC" = 'kill' ]; then kill -9 $$; fi
     exit "$AETHYME_FAKE_GH_RC"
@@ -107,29 +107,50 @@ impl Fixture {
     /// Run `gh pr update-branch` through the broker and return the status the
     /// journal recorded for it.
     fn update_branch(&self, stderr: &str, rc: &str) -> (Output, String) {
-        let output = self.run(
-            &[
-                "advanced",
-                "gh",
-                "--session",
-                &self.session,
-                "--repo",
-                "schiste/Aethyme",
-                "--reason",
-                "update the PR branch this test is about",
-                "--",
-                "pr",
-                "update-branch",
-                "506",
-            ],
+        self.run_mutation(
+            &["pr", "update-branch", "506"],
+            "update the PR branch this test is about",
             stderr,
             rc,
-        );
+        )
+    }
+
+    fn merge_pr(&self, stderr: &str, rc: &str) -> (Output, String) {
+        self.run_mutation(
+            &["pr", "merge", "506", "--squash", "--auto"],
+            "request auto-merge for this test PR",
+            stderr,
+            rc,
+        )
+    }
+
+    fn run_mutation(
+        &self,
+        gh_args: &[&str],
+        reason: &str,
+        stderr: &str,
+        rc: &str,
+    ) -> (Output, String) {
+        let mut args = vec![
+            "advanced",
+            "gh",
+            "--session",
+            &self.session,
+            "--repo",
+            "schiste/Aethyme",
+            "--reason",
+            reason,
+            "--",
+        ];
+        args.extend_from_slice(gh_args);
+        let output = self.run(&args, stderr, rc);
         let listed = self.run(&["advanced", "operations", "list", "--json"], "", "0");
         let listed: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
         let operations = listed["operations"].as_array().unwrap();
-        assert_eq!(operations.len(), 1, "{listed}");
-        let status = operations[0]["status"].as_str().unwrap().to_string();
+        let status = operations.last().unwrap()["status"]
+            .as_str()
+            .unwrap()
+            .to_string();
         (output, status)
     }
 }
@@ -146,6 +167,46 @@ fn a_conflict_refusal_is_failed_and_does_not_write_block() {
     assert!(
         stderr.contains("Cannot update PR branch due to conflicts"),
         "{stderr}"
+    );
+}
+
+#[test]
+fn disabled_auto_merge_is_failed_and_repository_remains_writable() {
+    let fixture = Fixture::new();
+    let refusal =
+        "GraphQL: Auto merge is not allowed for this repository (enablePullRequestAutoMerge)";
+    let (output, status) = fixture.merge_pr(refusal, "1");
+
+    assert_eq!(status, "failed");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("write-blocked"), "{stderr}");
+    assert!(stderr.contains(refusal), "{stderr}");
+
+    let next_write = fixture.run(
+        &[
+            "advanced",
+            "gh",
+            "--session",
+            &fixture.session,
+            "--repo",
+            "schiste/Aethyme",
+            "--reason",
+            "prove a definitive rejection does not block a later write",
+            "--",
+            "pr",
+            "edit",
+            "506",
+            "--title",
+            "still writable",
+        ],
+        "",
+        "0",
+    );
+    assert!(
+        next_write.status.success(),
+        "repository stayed blocked after a definitive refusal: {}",
+        String::from_utf8_lossy(&next_write.stderr)
     );
 }
 

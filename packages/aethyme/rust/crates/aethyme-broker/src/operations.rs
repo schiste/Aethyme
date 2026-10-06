@@ -3031,6 +3031,11 @@ const GITHUB_REFUSAL_MESSAGES: &[(&str, &str, &str)] = &[
         "Cannot update PR branch due to conflicts",
     ),
     ("pr", "merge", "is not mergeable"),
+    (
+        "pr",
+        "merge",
+        "Auto merge is not allowed for this repository (enablePullRequestAutoMerge)",
+    ),
 ];
 
 /// Every `HTTP <status>` token `gh` printed, in its two spellings:
@@ -4920,6 +4925,23 @@ mod tests {
                 b"X Pull request #7 is not mergeable: the merge commit cannot be cleanly created.\n",
             )
             .is_some()
+        );
+        let auto_merge_disabled =
+            b"GraphQL: Auto merge is not allowed for this repository (enablePullRequestAutoMerge)\n";
+        let refusal = classify_github_refusal(
+            &gh_args(&["pr", "merge", "7", "--squash", "--auto"]),
+            Some(1),
+            auto_merge_disabled,
+        )
+        .expect("GitHub's explicit auto-merge-disabled rejection is definitive");
+        assert_eq!(
+            refusal["evidence"]["message"],
+            "Auto merge is not allowed for this repository (enablePullRequestAutoMerge)"
+        );
+        assert!(
+            classify_github_refusal(&gh_args(&["pr", "edit", "7"]), Some(1), auto_merge_disabled)
+                .is_none(),
+            "the refusal only describes gh pr merge"
         );
         assert!(
             classify_github_refusal(
