@@ -38,6 +38,12 @@ printf 'GH_BROWSER=%s EDITOR=%s GIT_SSH_COMMAND=%s GH_CONFIG_DIR=%s GH_HOST=%s G
   >> "$AETHYME_FAKE_GH_LOG.env"
 printf 'ARGV0=%s\nPATH=%s\nHOME=%s\nGIT_CONFIG_GLOBAL=%s\nGIT_CONFIG_NOSYSTEM=%s\n' \
   "$0" "$PATH" "$HOME" "$GIT_CONFIG_GLOBAL" "$GIT_CONFIG_NOSYSTEM" >> "$AETHYME_FAKE_GH_LOG.child"
+i=0
+while [ "$i" -lt "${GIT_CONFIG_COUNT:-0}" ]; do
+  eval "key=\$GIT_CONFIG_KEY_$i; value=\$GIT_CONFIG_VALUE_$i"
+  printf 'config.%s=%s\n' "$key" "$value" >> "$AETHYME_FAKE_GH_LOG.child"
+  i=$((i + 1))
+done
 exit 0
 "#;
 
@@ -789,7 +795,10 @@ fn gh_runs_by_absolute_path_with_a_fixed_path() {
         "the caller's PATH leaked: {}",
         env["PATH"]
     );
-    assert!(env["PATH"].ends_with("/usr/bin:/bin"), "{}", env["PATH"]);
+    assert_eq!(
+        env["PATH"], "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
+        "the child PATH is exactly the trusted directories"
+    );
 }
 
 #[test]
@@ -807,6 +816,11 @@ fn gh_and_its_git_read_no_relocated_home_or_global_config() {
     assert!(!env["HOME"].is_empty());
     assert_eq!(env["GIT_CONFIG_GLOBAL"], "/dev/null");
     assert_eq!(env["GIT_CONFIG_NOSYSTEM"], "1");
+    // The repository's own config cannot run a helper, a hook or a file
+    // transport in the git gh starts.
+    assert_eq!(env["config.credential.helper"], "");
+    assert_eq!(env["config.core.hooksPath"], "/dev/null");
+    assert_eq!(env["config.protocol.file.allow"], "never");
 }
 
 #[test]
@@ -816,6 +830,7 @@ fn commands_that_run_git_on_user_configuration_are_refused() {
         &["extension", "install", "someone/gh-x"][..],
         &["extension", "upgrade", "--all"],
         &["gist", "clone", "abc"],
+        &["issue", "develop", "1", "--checkout"],
         &["pr", "create", "--title", "t", "--body", "b"],
     ] {
         let output = fixture.gh(&["--effect", "write", "--scope", "github:test"], gh, "");

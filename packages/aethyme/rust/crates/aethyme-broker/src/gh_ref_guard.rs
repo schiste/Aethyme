@@ -57,7 +57,22 @@ const NO_REF_WRITE: &[(&str, &str)] = &[
     ("completion", "*"),
     ("auth", "*"),
     ("alias", "*"),
-    ("issue", "*"),
+    // Not `issue develop`, whose `--checkout` runs a local git fetch and
+    // checkout on the repository's configuration.
+    ("issue", "view"),
+    ("issue", "list"),
+    ("issue", "status"),
+    ("issue", "comment"),
+    ("issue", "edit"),
+    ("issue", "close"),
+    ("issue", "reopen"),
+    ("issue", "create"),
+    ("issue", "lock"),
+    ("issue", "unlock"),
+    ("issue", "pin"),
+    ("issue", "unpin"),
+    ("issue", "transfer"),
+    ("issue", "delete"),
     ("label", "*"),
     ("project", "*"),
     // Not `gist clone`, which runs git on the user's configuration.
@@ -786,6 +801,8 @@ mod tests {
             &["extension", "install", "o/gh-x"],
             &["extension", "upgrade", "--all"],
             &["gist", "clone", "abc"],
+            &["issue", "develop", "1", "--checkout"],
+            &["issue", "develop", "1"],
         ] {
             assert!(unverifiable_line(line), "{line:?}");
         }

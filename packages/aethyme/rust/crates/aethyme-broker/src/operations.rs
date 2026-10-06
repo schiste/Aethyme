@@ -3795,23 +3795,47 @@ const GH_INHERITED_ENV: &[&str] = &[
     "all_proxy",
 ];
 
+/// The only directories gh, and the git gh starts, are taken from. The
+/// caller's `PATH` never chooses either binary (#393).
+const TRUSTED_TOOL_DIRS: &[&str] = &["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"];
+
 static GH_PROGRAM: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
 
-/// The gh binary, resolved once to an absolute, canonical path from the same
-/// candidates `git` is probed from, so the child's `PATH` never chooses it.
+/// Where gh is looked up. Release builds use only [`TRUSTED_TOOL_DIRS`].
+/// Debug builds, which only the test suite runs, also search `PATH` first,
+/// so a fixture can stand in a fake gh; installed binaries are release builds.
+fn gh_search_dirs(include_path: bool) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if include_path && let Some(path) = std::env::var_os("PATH") {
+        dirs.extend(std::env::split_paths(&path));
+    }
+    dirs.extend(TRUSTED_TOOL_DIRS.iter().map(PathBuf::from));
+    dirs
+}
+
+/// The first `name` in `dirs` that canonicalizes to a regular executable
+/// file owned by root or the current user and writable by neither group nor
+/// others.
+fn trusted_tool(name: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    // SAFETY: getuid has no preconditions and cannot fail.
+    let uid = unsafe { libc::getuid() };
+    dirs.iter().find_map(|dir| {
+        let resolved = dir.join(name).canonicalize().ok()?;
+        let metadata = std::fs::metadata(&resolved).ok()?;
+        let mode = metadata.permissions().mode();
+        (metadata.is_file()
+            && mode & 0o111 != 0
+            && mode & 0o022 == 0
+            && (metadata.uid() == 0 || metadata.uid() == uid))
+            .then_some(resolved)
+    })
+}
+
+/// The gh binary, resolved once from [`gh_search_dirs`].
 fn gh_program() -> Option<&'static PathBuf> {
     GH_PROGRAM
-        .get_or_init(|| {
-            use std::os::unix::fs::PermissionsExt as _;
-            crate::git::path_candidates("gh")
-                .into_iter()
-                .find_map(|candidate| {
-                    let resolved = candidate.canonicalize().ok()?;
-                    let metadata = std::fs::metadata(&resolved).ok()?;
-                    (metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
-                        .then_some(resolved)
-                })
-        })
+        .get_or_init(|| trusted_tool("gh", &gh_search_dirs(cfg!(debug_assertions))))
         .as_ref()
 }
 
@@ -3855,19 +3879,9 @@ fn github_command() -> Command {
             command.env(&key, &value);
         }
     }
-    // A fixed PATH: gh's own directory, the probed git's, and the system's.
-    let mut path = Vec::new();
-    for binary in [program, crate::git::git_program_path()] {
-        if let Some(dir) = binary.parent()
-            && !path.iter().any(|known: &PathBuf| known == dir)
-        {
-            path.push(dir.to_path_buf());
-        }
-    }
-    path.extend([PathBuf::from("/usr/bin"), PathBuf::from("/bin")]);
-    if let Ok(joined) = std::env::join_paths(&path) {
-        command.env("PATH", joined);
-    }
+    // gh finds git, and anything else it starts, only in the trusted
+    // directories.
+    command.env("PATH", TRUSTED_TOOL_DIRS.join(":"));
     if let Some(home) = passwd_home() {
         command.env("HOME", home);
     }
@@ -3884,13 +3898,20 @@ fn github_command() -> Command {
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_COUNT", "3")
+        // An empty `credential.helper` resets the helper list, so a helper
+        // the repository's config names never runs. `include.path` cannot be
+        // switched off this way; it is a known limit.
+        .env("GIT_CONFIG_COUNT", "5")
         .env("GIT_CONFIG_KEY_0", "core.hooksPath")
         .env("GIT_CONFIG_VALUE_0", "/dev/null")
         .env("GIT_CONFIG_KEY_1", "core.sshCommand")
         .env("GIT_CONFIG_VALUE_1", "ssh")
         .env("GIT_CONFIG_KEY_2", "core.fsmonitor")
-        .env("GIT_CONFIG_VALUE_2", "false");
+        .env("GIT_CONFIG_VALUE_2", "false")
+        .env("GIT_CONFIG_KEY_3", "credential.helper")
+        .env("GIT_CONFIG_VALUE_3", "")
+        .env("GIT_CONFIG_KEY_4", "protocol.file.allow")
+        .env("GIT_CONFIG_VALUE_4", "never");
     command
 }
 
@@ -5031,7 +5052,11 @@ impl Broker {
         if let Some(trace) = &git_trace {
             command.env("GIT_TRACE2_EVENT", trace.path());
         }
-        remove_inherited_git_config_overrides(&mut command);
+        // gh's child gets its own command-scope git config from
+        // `github_command`; stripping it here would undo those overrides.
+        if request.provider == OperationProvider::Git {
+            remove_inherited_git_config_overrides(&mut command);
+        }
         command
             .current_dir(cwd)
             .stdin(Stdio::inherit())
@@ -6011,6 +6036,35 @@ mod tests {
             "gh runs by absolute path: {:?}",
             provider_command(OperationProvider::Github).get_program()
         );
+    }
+
+    #[test]
+    fn gh_is_trusted_only_from_fixed_directories_and_safe_files() {
+        use std::os::unix::fs::PermissionsExt as _;
+        // Release resolution never consults PATH.
+        assert_eq!(
+            gh_search_dirs(false),
+            TRUSTED_TOOL_DIRS
+                .iter()
+                .map(PathBuf::from)
+                .collect::<Vec<_>>()
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let gh = dir.path().join("gh");
+        std::fs::write(&gh, "#!/bin/sh\n").unwrap();
+        for (mode, trusted) in [
+            (0o755, true),
+            (0o775, false),
+            (0o757, false),
+            (0o644, false),
+        ] {
+            std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(mode)).unwrap();
+            assert_eq!(
+                trusted_tool("gh", &[dir.path().to_path_buf()]).is_some(),
+                trusted,
+                "mode {mode:o}"
+            );
+        }
     }
 
     #[test]
