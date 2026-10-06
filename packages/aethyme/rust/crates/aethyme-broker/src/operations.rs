@@ -4421,6 +4421,7 @@ impl Broker {
             Ok(refs) => refs,
             Err(why) => return refuse(why),
         };
+        self.advise_pr_merge_graph_integrity(request.session_id, cwd, &number, &refs.head_oid);
         let targets = vec![refs.head, refs.base];
         match match_head_commit {
             Some(sha) if sha != refs.head_oid => refuse(format!(
@@ -4433,6 +4434,43 @@ impl Broker {
                 args.extend(["--match-head-commit".to_string(), refs.head_oid]);
                 Ok((targets, Some(args)))
             }
+        }
+    }
+
+    /// Graph integrity is advice on the pull-request lane too (#280, #292):
+    /// check the head tree the merge lands, record the verdict, and print
+    /// its advice. Nothing here can refuse or delay the merge beyond the check
+    /// itself; the head is already bound by `--match-head-commit`.
+    fn advise_pr_merge_graph_integrity(
+        &mut self,
+        session_id: i64,
+        cwd: &Path,
+        number: &str,
+        head_oid: &str,
+    ) {
+        let Ok(checkout) = crate::GitRepo::discover(cwd) else {
+            return;
+        };
+        let main_root = self.main_root_path();
+        let Some(outcome) =
+            crate::graph_integrity::verify_commit_for_advice(&main_root, &checkout, head_oid)
+        else {
+            return;
+        };
+        let recorded = self.store().append_event(
+            crate::events::GRAPH_INTEGRITY_CHECKED,
+            Some(session_id),
+            Some(&crate::events::graph_integrity_checked_payload(&outcome)),
+        );
+        if let Err(error) = recorded {
+            eprintln!("[graph-integrity] could not record the verdict: {error}");
+        }
+        match outcome.advice() {
+            Some(advice) => eprintln!("[graph-integrity] pull request #{number}: {advice}"),
+            None => eprintln!(
+                "[graph-integrity] pull request #{number}: committed graph is fresh for head {}",
+                head_oid.get(..12).unwrap_or(head_oid)
+            ),
         }
     }
 

@@ -1,9 +1,11 @@
 //! Repository-owned policy for committed graph artifacts.
 //!
-//! Semantic graph impact remains advisory. This policy models a different
-//! contract: whether committed `.aethyme/graph/**` fragments are an
-//! authoritative generated artifact that must match the exact tree before it
-//! can be promoted.
+//! This policy models whether committed `.aethyme/graph/**` fragments are an
+//! authoritative generated artifact matching the exact tree. Its verdict is
+//! advice on every landing lane (#280, #292): a stale or unverifiable graph is
+//! recorded and reported, and never refuses a submission, a gate run or a
+//! brokered pull-request merge. Blocking coupled every landing to an optional
+//! subsystem, and only one of the two lanes enforced it.
 
 use std::path::Path;
 
@@ -58,24 +60,105 @@ impl GraphIntegrityStatus {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+/// What a graph-integrity outcome tells a reader, independent of how it was
+/// reached. Only a verified match is `Fresh`; a check that could not reach a
+/// verdict is `Unknown`, never `Fresh`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GraphIntegrityVerdict {
+    Disabled,
+    Fresh,
+    Stale,
+    Unknown,
+}
+
+impl GraphIntegrityVerdict {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Fresh => "fresh",
+            Self::Stale => "stale",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl GraphIntegrityStatus {
+    pub fn verdict(self) -> GraphIntegrityVerdict {
+        match self {
+            Self::Disabled => GraphIntegrityVerdict::Disabled,
+            Self::Passed => GraphIntegrityVerdict::Fresh,
+            Self::Stale => GraphIntegrityVerdict::Stale,
+            Self::Incompatible | Self::Error => GraphIntegrityVerdict::Unknown,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GraphIntegrityOutcome {
     pub status: GraphIntegrityStatus,
     pub enforced: bool,
     pub tree_hash: String,
     pub policy_digest: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub engine_version: Option<String>,
     pub changed_paths: Vec<String>,
     pub reason: String,
 }
 
 impl GraphIntegrityOutcome {
-    pub fn allows_promotion(&self) -> bool {
-        matches!(
-            self.status,
-            GraphIntegrityStatus::Disabled | GraphIntegrityStatus::Passed
-        )
+    pub fn verdict(&self) -> GraphIntegrityVerdict {
+        self.status.verdict()
+    }
+
+    /// The advice a stale or unverifiable graph earns, or `None` when there is
+    /// nothing to say. It never refuses anything (#280).
+    pub fn advice(&self) -> Option<String> {
+        match self.verdict() {
+            GraphIntegrityVerdict::Disabled | GraphIntegrityVerdict::Fresh => None,
+            GraphIntegrityVerdict::Stale => Some(format!(
+                "committed graph fragments are stale for tree {}; this is advice and blocks \
+                 nothing. Refresh them with `aethyme graph refresh plan --repo .` and commit \
+                 the generated diff",
+                short_tree(&self.tree_hash)
+            )),
+            GraphIntegrityVerdict::Unknown => Some(format!(
+                "graph integrity could not be verified for tree {} ({}); treat the committed \
+                 graph as unverified. This is advice and blocks nothing",
+                short_tree(&self.tree_hash),
+                self.reason
+            )),
+        }
+    }
+}
+
+fn short_tree(tree: &str) -> &str {
+    if tree.is_empty() {
+        "<unknown>"
+    } else {
+        tree.get(..12).unwrap_or(tree)
+    }
+}
+
+impl serde::Serialize for GraphIntegrityOutcome {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let advice = self.advice();
+        let fields = 7 + usize::from(self.engine_version.is_some()) + usize::from(advice.is_some());
+        let mut state = serializer.serialize_struct("GraphIntegrityOutcome", fields)?;
+        state.serialize_field("status", &self.status)?;
+        state.serialize_field("verdict", &self.verdict())?;
+        state.serialize_field("enforced", &self.enforced)?;
+        state.serialize_field("tree_hash", &self.tree_hash)?;
+        state.serialize_field("policy_digest", &self.policy_digest)?;
+        if let Some(engine_version) = &self.engine_version {
+            state.serialize_field("engine_version", engine_version)?;
+        }
+        state.serialize_field("changed_paths", &self.changed_paths)?;
+        state.serialize_field("reason", &self.reason)?;
+        if let Some(advice) = &advice {
+            state.serialize_field("advice", advice)?;
+        }
+        state.end()
     }
 }
 
@@ -324,6 +407,67 @@ pub(crate) fn verify_checkout_without_mutation(
     Ok(outcome)
 }
 
+/// Check one local commit's tree for the brokered pull-request lane (#292).
+///
+/// Infallible on purpose: the verdict is advice, so every failure to reach
+/// one -- an unreadable policy, a head not fetched locally, a slot or
+/// checkout error -- becomes an `Error` outcome, reported as `unknown`, and
+/// never an error that could stop the merge. `None` means the repository does
+/// not declare committed graph fragments authoritative.
+pub(crate) fn verify_commit_for_advice(
+    main_root: &Path,
+    checkout: &crate::GitRepo,
+    commit: &str,
+) -> Option<GraphIntegrityOutcome> {
+    let unknown = |policy_digest: String, reason: String| {
+        Some(graph_error(String::new(), policy_digest, None, reason))
+    };
+    let policy = match GraphIntegrityPolicy::load(checkout.root()) {
+        Ok(policy) => policy,
+        Err(error) => {
+            return unknown(
+                String::new(),
+                format!("cannot read the graph policy: {error}"),
+            );
+        }
+    };
+    if !policy.enforces_committed_fragments() {
+        return None;
+    }
+    let policy_digest = policy.digest();
+    if checkout
+        .resolve_ref(&format!("{commit}^{{commit}}"))
+        .is_none()
+    {
+        return unknown(
+            policy_digest,
+            format!("commit {commit} is not available locally; fetch it to verify its graph"),
+        );
+    }
+    let mut slot =
+        match crate::verification::ExactTreeVerificationSlot::acquire(main_root, "graph-integrity")
+        {
+            Ok(slot) => slot,
+            Err(error) => {
+                return unknown(
+                    policy_digest,
+                    format!("cannot acquire a verification slot: {error}"),
+                );
+            }
+        };
+    let outcome = match slot.materialize(checkout, commit) {
+        Ok(disposable) => verify_disposable_checkout(&disposable, &policy),
+        Err(error) => graph_error(
+            String::new(),
+            policy_digest,
+            None,
+            format!("cannot materialize commit {commit}: {error}"),
+        ),
+    };
+    slot.cleanup();
+    Some(outcome)
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error(
     "graph integrity {status:?} for tree {tree_hash} under policy {policy_digest}: {reason}; changed paths: {changed_paths:?}"
@@ -352,6 +496,102 @@ impl From<GraphIntegrityOutcome> for GraphIntegrityRejection {
 mod tests {
     use super::*;
     use std::process::Command;
+
+    fn outcome(status: GraphIntegrityStatus) -> GraphIntegrityOutcome {
+        GraphIntegrityOutcome {
+            status,
+            enforced: true,
+            tree_hash: "0123456789abcdef0123456789abcdef01234567".into(),
+            policy_digest: "digest".into(),
+            engine_version: None,
+            changed_paths: Vec::new(),
+            reason: "reason".into(),
+        }
+    }
+
+    /// #280: only a verified match is fresh. A check that could not reach a
+    /// verdict reads as unknown, never as fresh, and both it and a stale
+    /// verdict carry advice; the JSON carries `verdict` and `advice`.
+    #[test]
+    fn verdicts_map_to_advice_and_unknown_is_never_fresh() {
+        let cases = [
+            (
+                GraphIntegrityStatus::Disabled,
+                GraphIntegrityVerdict::Disabled,
+                false,
+            ),
+            (
+                GraphIntegrityStatus::Passed,
+                GraphIntegrityVerdict::Fresh,
+                false,
+            ),
+            (
+                GraphIntegrityStatus::Stale,
+                GraphIntegrityVerdict::Stale,
+                true,
+            ),
+            (
+                GraphIntegrityStatus::Incompatible,
+                GraphIntegrityVerdict::Unknown,
+                true,
+            ),
+            (
+                GraphIntegrityStatus::Error,
+                GraphIntegrityVerdict::Unknown,
+                true,
+            ),
+        ];
+        for (status, verdict, advised) in cases {
+            let outcome = outcome(status);
+            assert_eq!(outcome.verdict(), verdict, "{status:?}");
+            assert_eq!(outcome.advice().is_some(), advised, "{status:?}");
+            let json = serde_json::to_value(&outcome).unwrap();
+            assert_eq!(json["verdict"], verdict.as_str());
+            assert_eq!(json["status"], status.as_str());
+            assert_eq!(json.get("advice").is_some(), advised, "{json}");
+        }
+    }
+
+    /// The pull-request lane's check never fails: a head that is not
+    /// available locally is an `unknown` verdict, not an error that could
+    /// stop the merge (#292).
+    #[test]
+    fn an_unavailable_pull_request_head_is_unknown_not_an_error() {
+        let repo = tempfile::tempdir().unwrap();
+        git(repo.path(), &["init", "-q", "-b", "main"]);
+        write_config(
+            repo.path(),
+            "[graph]\nauthority = 'committed_fragments'\nrepository = 'fixture'\n",
+        );
+        std::fs::write(repo.path().join("a.txt"), "a\n").unwrap();
+        git(repo.path(), &["add", "-A"]);
+        git(repo.path(), &["commit", "-qm", "init"]);
+        let checkout = crate::GitRepo::discover(repo.path()).unwrap();
+        let outcome = verify_commit_for_advice(
+            repo.path(),
+            &checkout,
+            "1111111111111111111111111111111111111111",
+        )
+        .expect("an authoritative policy always yields an outcome");
+        assert_eq!(outcome.verdict(), GraphIntegrityVerdict::Unknown);
+        assert!(
+            outcome.reason.contains("not available locally"),
+            "{}",
+            outcome.reason
+        );
+    }
+
+    #[test]
+    fn the_pull_request_lane_says_nothing_without_an_authoritative_policy() {
+        let repo = tempfile::tempdir().unwrap();
+        git(repo.path(), &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.path().join("a.txt"), "a\n").unwrap();
+        git(repo.path(), &["add", "-A"]);
+        git(repo.path(), &["commit", "-qm", "init"]);
+        let checkout = crate::GitRepo::discover(repo.path()).unwrap();
+        let head = checkout.head_commit().unwrap();
+        assert!(verify_commit_for_advice(repo.path(), &checkout, &head).is_none());
+    }
 
     fn write_config(root: &Path, body: &str) {
         std::fs::create_dir_all(root.join(".aethyme")).unwrap();
@@ -536,8 +776,45 @@ mod tests {
         let policy = GraphIntegrityPolicy::load(repo.path()).unwrap();
         let outcome = verify_disposable_checkout(&checkout, &policy);
         assert_eq!(outcome.status, GraphIntegrityStatus::Passed);
-        assert!(outcome.allows_promotion());
+        assert_eq!(outcome.verdict(), GraphIntegrityVerdict::Fresh);
+        assert!(outcome.advice().is_none());
         assert!(outcome.changed_paths.is_empty());
+    }
+
+    /// The pull-request lane checks a commit, not a worktree: a fresh head
+    /// reads as fresh, and a stale one as stale with advice (#292).
+    #[test]
+    fn the_pull_request_lane_checks_the_head_commit() {
+        let repo = graph_repo();
+        let checkout = crate::GitRepo::discover(repo.path()).unwrap();
+        let fresh = checkout.head_commit().unwrap();
+        let outcome = verify_commit_for_advice(repo.path(), &checkout, &fresh).unwrap();
+        assert_eq!(
+            outcome.verdict(),
+            GraphIntegrityVerdict::Fresh,
+            "{outcome:?}"
+        );
+
+        std::fs::write(
+            repo.path().join("src/lib.rs"),
+            "pub fn answer() -> u8 { 44 }\n",
+        )
+        .unwrap();
+        git(repo.path(), &["add", "src/lib.rs"]);
+        git(repo.path(), &["commit", "-m", "change source only"]);
+        let stale = checkout.head_commit().unwrap();
+        let outcome = verify_commit_for_advice(repo.path(), &checkout, &stale).unwrap();
+        assert_eq!(
+            outcome.verdict(),
+            GraphIntegrityVerdict::Stale,
+            "{outcome:?}"
+        );
+        assert!(outcome.advice().is_some());
+        assert_eq!(
+            checkout.head_commit().unwrap(),
+            stale,
+            "the check never moves the caller's checkout"
+        );
     }
 
     #[test]
@@ -554,7 +831,7 @@ mod tests {
         let policy = GraphIntegrityPolicy::load(repo.path()).unwrap();
         let outcome = verify_disposable_checkout(&checkout, &policy);
         assert_eq!(outcome.status, GraphIntegrityStatus::Stale);
-        assert!(!outcome.allows_promotion());
+        assert_eq!(outcome.verdict(), GraphIntegrityVerdict::Stale);
         assert!(
             outcome
                 .changed_paths

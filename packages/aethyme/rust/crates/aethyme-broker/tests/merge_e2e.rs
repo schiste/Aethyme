@@ -117,8 +117,11 @@ fn refresh_graph(root: &Path, repository: &str) {
     write_graph_authority_manifest(root, &source, repository, env!("CARGO_PKG_VERSION")).unwrap();
 }
 
+/// #280: a sound `Stale` verdict is advice. The submission runs its gates
+/// and lands, and the verdict travels with it to the submit JSON and to
+/// `broker status`.
 #[test]
-fn submit_rejects_stale_authoritative_graph_before_promotion() {
+fn submit_advises_on_a_stale_authoritative_graph_and_still_promotes() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());
     std::fs::write(
@@ -136,29 +139,51 @@ fn submit_rejects_stale_authoritative_graph_before_promotion() {
         &["commit", "-qm", "declare authoritative graph"],
     );
 
-    let integration_before = resolve(tmp.path(), "main");
+    let integration_before = resolve(tmp.path(), "aethyme/integration");
     let mut broker = Broker::open(tmp.path()).unwrap();
     let worktree = agent_worktree(tmp.path(), "stale-graph");
     let session = broker.adopt(&worktree, Some("change source")).unwrap();
     commit_edit(&worktree, "src/a.py", "a = 2\n");
 
     let outcome = broker.submit(session.id).unwrap();
-    assert_eq!(outcome.entry.status, MergeStatus::Rejected);
-    assert!(!outcome.promoted);
-    assert!(outcome.gate_outcomes.is_empty());
-    let graph = outcome.graph_integrity.expect("graph integrity outcome");
+    assert!(outcome.promoted, "a stale graph must not stop promotion");
+    assert_ne!(outcome.entry.status, MergeStatus::Rejected);
+    let graph = outcome
+        .graph_integrity
+        .clone()
+        .expect("graph integrity outcome");
     assert_eq!(graph.status, GraphIntegrityStatus::Stale);
+    assert_eq!(
+        graph.verdict(),
+        aethyme_broker::GraphIntegrityVerdict::Stale
+    );
     assert!(
         graph
             .changed_paths
             .iter()
             .any(|path| path == ".aethyme/graph/src/a.py.bin")
     );
-    assert_eq!(
+    let json = serde_json::to_value(&graph).unwrap();
+    assert_eq!(json["verdict"], "stale");
+    assert!(
+        json["advice"]
+            .as_str()
+            .is_some_and(|advice| advice.contains("blocks nothing")),
+        "{json}"
+    );
+    assert_ne!(
         resolve(tmp.path(), "aethyme/integration"),
         integration_before,
-        "stale graph must not move integration"
+        "a stale graph is advice; integration still moves"
     );
+
+    let status = broker.status(0).unwrap();
+    let row = status
+        .advice
+        .iter()
+        .find(|row| row.id == "graph.stale" && row.session_id == Some(session.id))
+        .expect("status reports the stale graph as advice");
+    assert_eq!(row.severity, StatusAdviceSeverity::Warning);
 }
 
 fn resolve(root: &Path, rev: &str) -> String {
