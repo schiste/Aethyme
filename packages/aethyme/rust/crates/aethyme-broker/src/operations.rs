@@ -1648,13 +1648,13 @@ fn gh_pr_refs(
     );
     if head.is_empty()
         || base.is_empty()
-        || head_oid.len() != 40
+        || !(1..=64).contains(&head_oid.len())
         || !head_oid
             .bytes()
             .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
     {
         return Err(format!(
-            "gh pr view {number} did not name a head branch, full head commit and base branch"
+            "gh pr view {number} did not name a head branch, a hex head commit and a base branch"
         ));
     }
     Ok(PullRequestRefs {
