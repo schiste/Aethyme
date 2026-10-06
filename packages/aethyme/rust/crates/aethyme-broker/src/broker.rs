@@ -142,6 +142,23 @@ pub enum BrokerOpError {
         stage: String,
         budget: String,
     },
+    /// A read-only operation got no answer within its budget. It changed
+    /// nothing, so unlike a timed-out write it needs no reconciliation; the
+    /// phase split says whether the broker or the provider spent the time
+    /// (#555).
+    #[error(
+        "read-only operation {operation_id} for {repository} got no answer within its {budget} budget: {} preparing, then {} waiting for `{provider}` to respond; it changed nothing, so retry it, or allow more time with --queue-timeout <seconds>",
+        crate::operations::humanize_ms(*preparation_ms),
+        crate::operations::humanize_ms(*provider_wait_ms)
+    )]
+    ReadOperationTimedOut {
+        provider: &'static str,
+        operation_id: i64,
+        repository: String,
+        budget: String,
+        preparation_ms: u64,
+        provider_wait_ms: u64,
+    },
 
     #[error(transparent)]
     Git(#[from] GitError),
@@ -753,6 +770,22 @@ pub struct AdoptIntegrationSync {
     pub after_head: String,
 }
 
+/// Ownership a re-adoption inherited from the worktree's previous session
+/// (issue #294). Closing a session and adopting its worktree again, or
+/// replacing a stale one, used to record the current HEAD as the new baseline,
+/// so the previous session's unsubmitted commits silently stopped being
+/// replayed. The new session now starts from the previous one's ownership
+/// boundary whenever that still leaves session-owned commits pending.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AdoptCarriedOwnership {
+    /// The closed or replaced session whose baseline was carried forward.
+    pub from_session: i64,
+    /// The ownership boundary the new session starts from.
+    pub baseline: String,
+    /// Commits after `baseline` that submit will replay.
+    pub pending_owned_commits: usize,
+}
+
 /// Adoption result with the session fields kept at the JSON top level.
 #[derive(Debug, serde::Serialize)]
 pub struct AdoptReport {
@@ -777,6 +810,9 @@ pub struct AdoptReport {
     /// Why `default_branch` is missing or used the last fetched copy.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_branch_note: Option<String>,
+    /// Present when the session kept its predecessor's ownership boundary.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub carried_ownership: Option<AdoptCarriedOwnership>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -3330,6 +3366,7 @@ impl Broker {
                         preparation,
                         default_branch: None,
                         default_branch_note: None,
+                        carried_ownership: None,
                     });
                 }
                 AdoptMode::ReplaceStale => {
@@ -3350,14 +3387,31 @@ impl Broker {
             }
         }
 
+        // Issue #294: the same protection reuse gives a live session's
+        // baseline, for the session this adoption succeeds. Without it a
+        // close followed by adopt silently disowned every unsubmitted commit.
+        let predecessor = match replaced_session_id {
+            Some(id) => Some(self.store.session(id)?),
+            None => self.store.closed_session_for_worktree(&worktree_path)?,
+        };
+        let carried_ownership = match (predecessor.as_ref(), diff_base.as_deref()) {
+            (Some(previous), Some(head)) if previous.branch == branch => {
+                self.carried_ownership(previous, head)
+            }
+            _ => None,
+        };
+        let ownership_base = carried_ownership
+            .as_ref()
+            .map(|carried| carried.baseline.clone())
+            .or_else(|| diff_base.clone());
         let new_session = NewSession {
             worktree_path,
             branch,
             origin: SessionOrigin::Adopted,
             task: task.map(str::to_string),
-            adoption_base: diff_base.clone(),
+            adoption_base: ownership_base.clone(),
             adopted_head: diff_base.clone(),
-            diff_base,
+            diff_base: ownership_base,
             repository_contract: Some(repository_contract),
             pid: None,
             command: None,
@@ -3407,6 +3461,26 @@ impl Broker {
             renamed_targets,
             default_branch: None,
             default_branch_note: None,
+            carried_ownership,
+        })
+    }
+
+    /// The previous session's ownership boundary, when it still owns commits
+    /// at `head` that integration does not have yet. `None` leaves the new
+    /// session's baseline at `head`, as before.
+    fn carried_ownership(&self, previous: &Session, head: &str) -> Option<AdoptCarriedOwnership> {
+        let (_, integration_head) = self.integration_head_snapshot().ok()?;
+        let plan = self
+            .build_submission_plan(previous, head, &integration_head)
+            .ok()?;
+        let pending_owned_commits = plan.pending_owned_commit_ids().len();
+        if pending_owned_commits == 0 {
+            return None;
+        }
+        Some(AdoptCarriedOwnership {
+            from_session: previous.id,
+            baseline: plan.recorded_baseline?,
+            pending_owned_commits,
         })
     }
 
@@ -4736,7 +4810,14 @@ impl Broker {
     /// one directory per session, but some roots *are* a checkout. Keying on
     /// depth descends into those and reports each of their source directories
     /// as a worktree, every one inheriting the parent's git state.
-    pub fn worktree_report(&mut self) -> Result<crate::WorktreeReport, BrokerOpError> {
+    ///
+    /// Sizing follows `sizing`: [`crate::WorktreeSizing::Bounded`] reuses each
+    /// repository's recorded measurements and walks the rest only until its
+    /// deadline, so a host with hundreds of checkouts still answers (#559).
+    pub fn worktree_report(
+        &mut self,
+        sizing: crate::WorktreeSizing,
+    ) -> Result<crate::WorktreeReport, BrokerOpError> {
         fn is_checkout(path: &std::path::Path) -> bool {
             path.join(".git").exists()
         }
@@ -4796,7 +4877,7 @@ impl Broker {
             .into_iter()
             .map(|(path, label)| (label, path))
             .collect();
-        let mut report = crate::build_worktree_report(&worktrees, &live);
+        let mut report = crate::build_worktree_report_with(&worktrees, &live, sizing);
         let registrations = self.repo.worktree_inventory()?;
         crate::append_prunable_registrations(
             &mut report,

@@ -227,3 +227,61 @@ fn doctor_omits_the_section_when_nothing_failed() {
         "an empty list is omitted: {report}"
     );
 }
+
+/// #555: a read nobody bounded still ends inside its default budget, with the
+/// phase that spent it and the environment exit code, instead of outliving the
+/// caller's own timeout.
+#[cfg(unix)]
+#[test]
+fn an_unbounded_read_ends_at_its_default_budget_with_a_diagnostic() {
+    let tmp = fixture();
+    let hook = tmp.path().join(".git/slow-fsmonitor");
+    std::fs::write(&hook, "#!/bin/sh\nsleep 6\n").unwrap();
+    std::fs::set_permissions(&hook, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    git(
+        tmp.path(),
+        &["config", "core.fsmonitor", hook.to_str().unwrap()],
+    );
+    let mut broker = test_broker(tmp.path());
+    let session = broker
+        .store()
+        .register_session(&NewSession {
+            worktree_path: tmp.path().to_string_lossy().into_owned(),
+            branch: "main".into(),
+            origin: SessionOrigin::Adopted,
+            task: None,
+            diff_base: None,
+            adoption_base: None,
+            adopted_head: None,
+            repository_contract: None,
+            pid: None,
+            command: None,
+            log_path: None,
+            agent_identity: None,
+        })
+        .unwrap();
+    drop(broker);
+
+    let session_id = session.id.to_string();
+    let started = std::time::Instant::now();
+    // No --queue-timeout and no --no-wait: the caller asked for no bound.
+    let output = Command::new(CLI)
+        .args(["advanced", "git", "--session", &session_id, "--", "status"])
+        .current_dir(tmp.path())
+        .env("AETHYME_HOST_STATE_DIR", host_state_dir(tmp.path()))
+        .env("AETHYME_BROKER_READ_BUDGET_SECS", "1")
+        .output()
+        .unwrap();
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "the read outlived its budget: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(i32::from(aethyme_broker::exit_status::ENVIRONMENT))
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("waiting for `git` to respond"), "{stderr}");
+    assert!(stderr.contains("1s budget"), "{stderr}");
+}

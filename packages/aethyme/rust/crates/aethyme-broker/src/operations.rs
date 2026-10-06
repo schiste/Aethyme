@@ -6,7 +6,7 @@
 //! after the command starts becomes `outcome_unknown`; later writes fail
 //! closed until an operator reconciles that journal row.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
@@ -47,6 +47,43 @@ pub enum QueueWait {
 /// remote they take seconds. A budget keeps "promptly" meaningful without
 /// turning a slow network into a refusal on every call.
 const NO_WAIT_ADMISSION_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The bound a read-only coordinated operation gets when its caller set none.
+///
+/// A read takes no lock and no write block applies to it, so the only thing an
+/// unbounded read can wait on is the provider. A stalled `gh api` therefore
+/// outlived the caller's own timeout and said nothing about why (#555). The
+/// bound sits under the 120 s most agent harnesses give a command, so the
+/// caller gets the diagnostic instead of a kill; `--queue-timeout` still sets
+/// it explicitly, and `AETHYME_BROKER_READ_BUDGET_SECS` changes the default.
+pub(crate) const READ_OPERATION_BUDGET: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// A read whose length is the point, so the default read budget must not cut
+/// it: following a run or checks until they finish, streaming a run's log,
+/// downloading artifacts, or paginating an API list. Only an explicit
+/// `--queue-timeout` bounds these (#555).
+pub(crate) fn is_long_running_read(provider: OperationProvider, args: &[String]) -> bool {
+    if provider != OperationProvider::Github {
+        return false;
+    }
+    let command = args.first().map(String::as_str);
+    let action = args.get(1).map(String::as_str);
+    let watches = action == Some("watch") || has_any(args, &["--watch", "-w"]);
+    let streams_log = command == Some("run")
+        && action == Some("view")
+        && has_any(args, &["--log", "--log-failed"]);
+    let downloads = action == Some("download");
+    let paginates = command == Some("api") && has_any(args, &["--paginate"]);
+    watches || streams_log || downloads || paginates
+}
+
+fn read_operation_budget() -> std::time::Duration {
+    std::env::var("AETHYME_BROKER_READ_BUDGET_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .map_or(READ_OPERATION_BUDGET, std::time::Duration::from_secs)
+}
 
 /// How often a bounded child is checked for completion.
 const ADMISSION_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
@@ -413,6 +450,7 @@ fn append_progress_event(path: &Path, message: &str, phase: Option<&str>) {
 /// park for 120.
 #[derive(Debug, Clone, Copy)]
 struct AdmissionDeadline {
+    started: std::time::Instant,
     at: Option<std::time::Instant>,
     budget: Option<std::time::Duration>,
 }
@@ -426,10 +464,32 @@ impl AdmissionDeadline {
             QueueWait::Refuse => Some(NO_WAIT_ADMISSION_BUDGET),
             QueueWait::Seconds(seconds) => Some(std::time::Duration::from_secs(seconds)),
         };
+        let started = std::time::Instant::now();
         Self {
-            at: budget.map(|budget| std::time::Instant::now() + budget),
+            started,
+            at: budget.map(|budget| started + budget),
             budget,
         }
+    }
+
+    /// Bound a read its caller left unbounded. A read never queues for the
+    /// lock, so "wait forever" could only mean "wait forever on the provider"
+    /// (#555). Writes keep exactly the wait their caller chose, and so does a
+    /// read that is long by design ([`is_long_running_read`]).
+    fn bounded_for(self, effect: OperationEffect, long_running: bool) -> Self {
+        if effect != OperationEffect::Read || long_running || self.budget.is_some() {
+            return self;
+        }
+        let budget = read_operation_budget();
+        Self {
+            started: self.started,
+            at: Some(self.started + budget),
+            budget: Some(budget),
+        }
+    }
+
+    fn elapsed_ms(&self) -> u64 {
+        u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
 
     fn budget_label(&self) -> String {
@@ -1222,6 +1282,15 @@ fn is_push(args: &[String]) -> bool {
     git_subcommand_args(args)
         .and_then(|args| args.first())
         .is_some_and(|command| command == "push")
+}
+
+/// Milliseconds as the shortest readable span: `850ms`, `4.2s`, `1m 31s`.
+pub(crate) fn humanize_ms(milliseconds: u64) -> String {
+    match milliseconds {
+        0..=999 => format!("{milliseconds}ms"),
+        1_000..=59_999 => format!("{:.1}s", milliseconds as f64 / 1_000.0),
+        _ => humanize_duration(milliseconds / 1_000),
+    }
 }
 
 pub(crate) fn humanize_duration(seconds: u64) -> String {
@@ -2519,6 +2588,244 @@ fn journal_details(
     details
 }
 
+const FAILURE_STDERR_TAIL_LINES: usize = 12;
+const FAILURE_STDERR_LINE_CHARS: usize = 256;
+
+fn consume_csi_sequence(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+    for character in chars.by_ref() {
+        if ('@'..='~').contains(&character) {
+            break;
+        }
+    }
+}
+
+fn consume_escape_intermediate_sequence(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    first: char,
+) {
+    // ISO-2022 character-set designations such as ESC ( B have one or more
+    // intermediate bytes before their final byte. Consume the whole sequence
+    // so its final byte cannot splice into a credential marker.
+    if !('\x20'..='\x2f').contains(&first) {
+        return;
+    }
+    for character in chars.by_ref() {
+        if ('\x30'..='\x7e').contains(&character) {
+            break;
+        }
+    }
+}
+
+fn consume_terminated_escape_sequence(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    bell_terminates: bool,
+) {
+    while let Some(character) = chars.next() {
+        if (bell_terminates && character == '\x07') || character == '\u{009c}' {
+            break;
+        }
+        if character == '\x1b' && chars.peek() == Some(&'\\') {
+            chars.next();
+            break;
+        }
+    }
+}
+
+/// Decode stderr lossily while preserving raw C1 bytes as control characters.
+/// `from_utf8_lossy` would replace a standalone 0x80..=0x9f byte, preventing
+/// the terminal parser from consuming a C1 control string around a marker.
+fn decode_stderr_preserving_c1(stderr: &[u8]) -> String {
+    let mut decoded = String::with_capacity(stderr.len());
+    let mut index = 0;
+    while index < stderr.len() {
+        let byte = stderr[index];
+        if byte < 0x80 {
+            decoded.push(char::from(byte));
+            index += 1;
+            continue;
+        }
+        if (0x80..=0x9f).contains(&byte) {
+            decoded.push(char::from(byte));
+            index += 1;
+            continue;
+        }
+
+        let width = match byte {
+            0xc2..=0xdf => 2,
+            0xe0..=0xef => 3,
+            0xf0..=0xf4 => 4,
+            _ => 1,
+        };
+        let end = index.saturating_add(width);
+        if width == 1 || end > stderr.len() {
+            decoded.push(char::REPLACEMENT_CHARACTER);
+            index += 1;
+            continue;
+        }
+        match std::str::from_utf8(&stderr[index..end]) {
+            Ok(valid) => {
+                decoded.push_str(valid);
+                index = end;
+            }
+            Err(_) => {
+                decoded.push(char::REPLACEMENT_CHARACTER);
+                index += 1;
+            }
+        }
+    }
+    decoded
+}
+
+/// Remove terminal controls without splitting a credential marker that was
+/// deliberately or accidentally interrupted by terminal formatting.
+fn stderr_without_terminal_controls(stderr: &str) -> String {
+    let mut chars = stderr.chars().peekable();
+    let mut printable = String::with_capacity(stderr.len());
+    while let Some(character) = chars.next() {
+        match character {
+            '\x1b' => match chars.next() {
+                Some('[') => consume_csi_sequence(&mut chars),
+                Some(']') => consume_terminated_escape_sequence(&mut chars, true),
+                Some('P' | 'X' | '^' | '_') => {
+                    consume_terminated_escape_sequence(&mut chars, false)
+                }
+                Some(first) => consume_escape_intermediate_sequence(&mut chars, first),
+                None => {}
+            },
+            '\u{009b}' => consume_csi_sequence(&mut chars),
+            '\u{009d}' => consume_terminated_escape_sequence(&mut chars, true),
+            '\u{0090}' | '\u{0098}' | '\u{009e}' | '\u{009f}' => {
+                consume_terminated_escape_sequence(&mut chars, false)
+            }
+            '\n' => printable.push('\n'),
+            control if control.is_control() => {}
+            printable_character => printable.push(printable_character),
+        }
+    }
+    printable
+}
+
+/// Redact both before and after terminal-control removal: either stream may
+/// contain a complete credential marker that the other representation hides.
+fn redacted_failure_stderr(stderr: &[u8]) -> String {
+    let decoded = decode_stderr_preserving_c1(stderr);
+    let redacted_raw = crate::text_redaction::redact_secrets(&decoded);
+    let printable = stderr_without_terminal_controls(&redacted_raw);
+    crate::text_redaction::redact_secrets(&printable)
+}
+
+/// Preserve a small, credential-redacted tail of a failed push's stderr.
+/// Hook output is the actionable reason for local pre-push refusals, but it is
+/// untrusted free text and must not be copied wholesale into durable history.
+fn add_failure_stderr(details: &mut serde_json::Value, stderr: &[u8]) {
+    let redacted = redacted_failure_stderr(stderr);
+    let mut tail = VecDeque::with_capacity(FAILURE_STDERR_TAIL_LINES);
+    for line in redacted.lines() {
+        if let Some(line) = crate::text_redaction::failure_message(line, FAILURE_STDERR_LINE_CHARS)
+        {
+            if tail.len() == FAILURE_STDERR_TAIL_LINES {
+                tail.pop_front();
+            }
+            tail.push_back(line);
+        }
+    }
+    if !tail.is_empty() {
+        details["failure_output"] = json!({ "stderr_tail": tail.into_iter().collect::<Vec<_>>() });
+    }
+}
+
+#[cfg(test)]
+mod failure_stderr_tests {
+    use super::{FAILURE_STDERR_LINE_CHARS, FAILURE_STDERR_TAIL_LINES, add_failure_stderr};
+    use serde_json::{Value, json};
+
+    #[test]
+    fn persisted_stderr_is_a_redacted_bounded_tail() {
+        let mut lines: Vec<String> = (0..16).map(|index| format!("diagnostic {index}")).collect();
+        lines.push("é".repeat(400));
+        lines.push("TOKEN=ghp_example_secret_not_real".into());
+        let mut details = json!({});
+
+        add_failure_stderr(&mut details, lines.join("\n").as_bytes());
+
+        let stderr_tail: &Vec<Value> = details["failure_output"]["stderr_tail"]
+            .as_array()
+            .expect("failure stderr is recorded");
+        assert_eq!(stderr_tail.len(), FAILURE_STDERR_TAIL_LINES);
+        assert_eq!(stderr_tail.last().unwrap(), "[redacted]");
+        assert!(stderr_tail.iter().all(|line| {
+            line.as_str()
+                .is_some_and(|line| line.chars().count() <= FAILURE_STDERR_LINE_CHARS + 1)
+        }));
+        assert!(
+            stderr_tail.iter().any(|line| {
+                line.as_str().is_some_and(|line| {
+                    line.chars().count() == FAILURE_STDERR_LINE_CHARS + 1 && line.ends_with('…')
+                })
+            }),
+            "long diagnostic lines are capped with an ellipsis: {stderr_tail:?}"
+        );
+        assert!(!details.to_string().contains("ghp_example_secret_not_real"));
+        assert_eq!(stderr_tail.first().unwrap(), "diagnostic 6");
+    }
+
+    #[test]
+    fn redacts_markers_split_across_lines_before_persisting_stderr() {
+        let mut details = json!({});
+        add_failure_stderr(&mut details, b"gate refused\nTO\nKEN=split-newline-secret");
+
+        assert!(details.to_string().contains("gate refused"));
+        assert!(
+            !details.to_string().contains("split-newline-secret"),
+            "a credential marker split across lines must be redacted before tailing: {details}"
+        );
+    }
+
+    #[test]
+    fn redacts_markers_that_ansi_sequence_parsing_would_obscure() {
+        let mut details = json!({});
+        add_failure_stderr(&mut details, b"TO\x1b[31mKEN=ansi-csi-secret");
+
+        assert!(
+            !details.to_string().contains("ansi-csi-secret"),
+            "ANSI parsing must not make credential markers disappear before redaction: {details}"
+        );
+    }
+
+    #[test]
+    fn redacts_markers_obscured_by_escape_charset_sequences() {
+        let mut details = json!({});
+        add_failure_stderr(&mut details, b"TO\x1b(BKEN=ansi-charset-secret");
+
+        assert!(
+            !details.to_string().contains("ansi-charset-secret"),
+            "ANSI charset parsing must not make credential markers disappear before redaction: {details}"
+        );
+    }
+
+    #[test]
+    fn redacts_markers_obscured_by_seven_bit_sos_sequences() {
+        let mut details = json!({});
+        add_failure_stderr(&mut details, b"TO\x1bXx\x1b\\KEN=ansi-sos-secret");
+
+        assert!(
+            !details.to_string().contains("ansi-sos-secret"),
+            "SOS controls must not expose credential markers hidden in string payloads: {details}"
+        );
+    }
+
+    #[test]
+    fn redacts_markers_obscured_by_raw_c1_sos_bytes() {
+        let mut details = json!({});
+        add_failure_stderr(&mut details, b"TO\x98x\x9cKEN=raw-c1-sos-secret");
+
+        assert!(
+            !details.to_string().contains("raw-c1-sos-secret"),
+            "raw C1 SOS bytes must not hide credential markers before redaction: {details}"
+        );
+    }
+}
+
 fn add_operation_liveness(details: &mut serde_json::Value, liveness: serde_json::Value) {
     if let Some(details) = details.as_object_mut() {
         details.insert("operation_liveness".into(), liveness);
@@ -3260,6 +3567,59 @@ const GITHUB_REFUSAL_MESSAGES: &[(&str, &str, &str)] = &[
     ("pr", "merge", "is not mergeable"),
 ];
 
+/// The GraphQL mutations each single-mutation command sends. `gh` reports a
+/// resolver's refusal as `GraphQL: <message> (<mutation>)`; an error naming
+/// the command's own mutation is GitHub declining that mutation, so nothing
+/// was applied (#549: `Auto merge is not allowed for this repository
+/// (enablePullRequestAutoMerge)` write-blocked the repository as unknown).
+const GITHUB_GRAPHQL_MUTATIONS: &[(&str, &str, &[&str])] = &[
+    (
+        "pr",
+        "merge",
+        &[
+            "mergePullRequest",
+            "enablePullRequestAutoMerge",
+            "disablePullRequestAutoMerge",
+            "enqueuePullRequest",
+        ],
+    ),
+    ("pr", "update-branch", &["updatePullRequestBranch"]),
+];
+
+/// GraphQL error text that says the server failed rather than refused: the
+/// mutation may still have run, so it never counts as a refusal.
+const GITHUB_GRAPHQL_AMBIGUOUS: &[&str] = &["Something went wrong", "timeout", "timed out"];
+
+/// The refused mutation and `gh`'s line for it, when stderr carries a GraphQL
+/// error naming one of `command action`'s own mutations.
+fn github_graphql_refusal<'a>(
+    command: &str,
+    action: Option<&str>,
+    stderr: &'a str,
+) -> Option<(&'static str, &'a str)> {
+    let (_, _, mutations) =
+        GITHUB_GRAPHQL_MUTATIONS
+            .iter()
+            .find(|(refused_command, refused_action, _)| {
+                command == *refused_command && action == Some(*refused_action)
+            })?;
+    stderr.lines().find_map(|line| {
+        let line = line.trim();
+        let message = line.split_once("GraphQL: ")?.1;
+        if GITHUB_GRAPHQL_AMBIGUOUS.iter().any(|ambiguous| {
+            message
+                .to_ascii_lowercase()
+                .contains(&ambiguous.to_ascii_lowercase())
+        }) {
+            return None;
+        }
+        mutations
+            .iter()
+            .find(|mutation| message.contains(&format!("({mutation})")))
+            .map(|mutation| (*mutation, line))
+    })
+}
+
 /// Every `HTTP <status>` token `gh` printed, in its two spellings:
 /// `HTTP 422: Validation Failed (...)` and `gh: Not Found (HTTP 404)`.
 fn github_http_statuses(stderr: &str) -> Vec<u16> {
@@ -3320,6 +3680,13 @@ fn classify_github_refusal(
             "failure_class": "github_refused",
             "remote_outcome": "rejected",
             "evidence": { "http_status": status },
+        }));
+    }
+    if let Some((mutation, line)) = github_graphql_refusal(command, action, &stderr) {
+        return Some(json!({
+            "failure_class": "github_refused",
+            "remote_outcome": "rejected",
+            "evidence": { "graphql_mutation": mutation, "message": line },
         }));
     }
     GITHUB_REFUSAL_MESSAGES
@@ -3507,6 +3874,14 @@ fn provider_command(provider: OperationProvider) -> Command {
         OperationProvider::Git => crate::git::git_command(),
         OperationProvider::Github => Command::new(provider_executable(provider)),
     }
+}
+
+/// Do not let inherited command-scope Git config change what a coordinated
+/// pre-push hook check verifies relative to the real push.
+fn remove_inherited_git_config_overrides(command: &mut Command) {
+    command
+        .env_remove("GIT_CONFIG_PARAMETERS")
+        .env_remove("GIT_CONFIG_COUNT");
 }
 
 fn redacted_command(provider: OperationProvider, args: &[String]) -> Result<String, BrokerOpError> {
@@ -3843,7 +4218,11 @@ impl Broker {
     /// operation never started. Best-effort: the caller is already returning the
     /// real failure, and the liveness-aware sweep is the backstop.
     fn resolve_unstarted_operation(&mut self, id: i64, reason: &str) {
-        let details = json!({ "reason": reason }).to_string();
+        self.resolve_unstarted_operation_with_details(id, json!({ "reason": reason }));
+    }
+
+    fn resolve_unstarted_operation_with_details(&mut self, id: i64, details: serde_json::Value) {
+        let details = details.to_string();
         crate::warn_unrecorded(
             "mark an unstarted coordinated operation failed",
             self.store().transition_coordinated_operation(
@@ -4029,6 +4408,10 @@ impl Broker {
             OperationProvider::Github => classify_gh(&request.args),
         };
         let (effect, classification) = resolve_effect(inferred, request.declared_effect)?;
+        let admission = admission.bounded_for(
+            effect,
+            is_long_running_read(request.provider, &request.args),
+        );
         if effect == OperationEffect::Destructive && !request.destructive_confirmed {
             return Err(BrokerOpError::InvalidCoordinatedOperation {
                 reason: DESTRUCTIVE_FLAG_REQUIRED.into(),
@@ -4265,6 +4648,7 @@ impl Broker {
         // (issues #138, #146).
         let prechecked_plan = if hooks_ran_outside_lock {
             let mut dry_run = crate::git::git_command();
+            remove_inherited_git_config_overrides(&mut dry_run);
             let command_index =
                 git_subcommand_index(&request.args).expect("push command was parsed");
             dry_run.args(&request.args[..command_index]);
@@ -4282,11 +4666,14 @@ impl Broker {
                 Ok(output) => {
                     // Failing here is the point: nothing is queued, and no other
                     // session waited on a gate that was going to refuse anyway.
-                    self.resolve_unstarted_operation(queued_operation_id, "pre_push_refused");
+                    let mut details = json!({ "reason": "pre_push_refused" });
+                    add_failure_stderr(&mut details, &output.stderr);
+                    self.resolve_unstarted_operation_with_details(queued_operation_id, details);
+                    let safe_stderr = redacted_failure_stderr(&output.stderr);
                     return Err(BrokerOpError::InvalidCoordinatedOperation {
                         reason: format!(
                             "the repository's pre-push hook refused this push before the lock was taken: {}",
-                            String::from_utf8_lossy(&output.stderr).trim()
+                            safe_stderr.trim()
                         ),
                     });
                 }
@@ -4514,15 +4901,12 @@ impl Broker {
         if let Some(trace) = &git_trace {
             command.env("GIT_TRACE2_EVENT", trace.path());
         }
+        remove_inherited_git_config_overrides(&mut command);
         command
             .current_dir(cwd)
             .stdin(Stdio::inherit())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            // Inline config from the caller's environment would bypass the
-            // `-c` refusal above.
-            .env_remove("GIT_CONFIG_PARAMETERS")
-            .env_remove("GIT_CONFIG_COUNT")
             .env("AETHYME_BROKER_SESSION_ID", request.session_id.to_string());
         // The pre-push hook treats the operation id as coordination for
         // protected branches, so a read never carries one.
@@ -4541,6 +4925,9 @@ impl Broker {
                     .display_slug,
             );
         }
+        // Split the budget a read spent by phase, so a timeout says whether
+        // the broker or the provider used it (#555).
+        let preparation_ms = admission.elapsed_ms();
         let output = match output_within(
             command,
             admission,
@@ -4575,6 +4962,8 @@ impl Broker {
                             } else {
                                 "not_applicable"
                             },
+                            "preparation_ms": preparation_ms,
+                            "provider_wait_ms": admission.elapsed_ms().saturating_sub(preparation_ms),
                         }),
                         &push_planning,
                     ),
@@ -4604,6 +4993,16 @@ impl Broker {
                         repository,
                         operation_id: operation.id,
                         recovery: UnknownOutcomeRecovery::from_operation(&operation),
+                    });
+                }
+                if effect == OperationEffect::Read {
+                    return Err(BrokerOpError::ReadOperationTimedOut {
+                        provider: provider_executable(request.provider),
+                        operation_id: operation.id,
+                        repository,
+                        budget,
+                        preparation_ms,
+                        provider_wait_ms: admission.elapsed_ms().saturating_sub(preparation_ms),
                     });
                 }
                 return Err(BrokerOpError::CoordinatedOperationTimedOut {
@@ -4811,6 +5210,12 @@ impl Broker {
                 ),
             )
         };
+        // Every failed Git write keeps its stderr tail: a failed local
+        // `merge --ff-only` (main reconcile) is as undiagnosable without it as
+        // a refused push (#415).
+        if request.provider == OperationProvider::Git && !output.status.success() {
+            add_failure_stderr(&mut details, &output.stderr);
+        }
         // The row leaves `running` on the next statement, after which liveness
         // is no longer consulted, so this is the first moment the heartbeat is
         // redundant rather than load-bearing.
@@ -5164,6 +5569,65 @@ mod tests {
                 b"HTTP 422: Validation Failed (https://api.github.com/graphql)\n",
             )
             .is_some()
+        );
+    }
+
+    /// #549: GitHub refused to enable auto-merge on a repository where it is
+    /// disabled. The PR never changed, yet the write was recorded as unknown.
+    #[test]
+    fn a_graphql_refusal_of_the_commands_own_mutation_is_failed() {
+        let refusal = classify_github_refusal(
+            &gh_args(&["pr", "merge", "12", "--squash", "--auto"]),
+            Some(1),
+            b"GraphQL: Auto merge is not allowed for this repository (enablePullRequestAutoMerge)\n",
+        )
+        .expect("a GraphQL refusal of pr merge's own mutation is definitive");
+        assert_eq!(refusal["failure_class"], "github_refused");
+        assert_eq!(
+            refusal["evidence"]["graphql_mutation"],
+            "enablePullRequestAutoMerge"
+        );
+        assert!(
+            refusal["evidence"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("Auto merge is not allowed")
+        );
+        assert!(
+            classify_github_refusal(
+                &gh_args(&["pr", "merge", "12", "--merge"]),
+                Some(1),
+                b"GraphQL: Merge commits are not allowed on this repository. (mergePullRequest)\n",
+            )
+            .is_some()
+        );
+
+        // A server failure reported through GraphQL may still have run.
+        assert!(
+            classify_github_refusal(
+                &gh_args(&["pr", "merge", "12", "--squash"]),
+                Some(1),
+                b"GraphQL: Something went wrong while executing your query. This may be the result of a timeout (mergePullRequest)\n",
+            )
+            .is_none()
+        );
+        // An error naming some other mutation is not this command's refusal.
+        assert!(
+            classify_github_refusal(
+                &gh_args(&["pr", "update-branch", "12"]),
+                Some(1),
+                b"GraphQL: Auto merge is not allowed for this repository (enablePullRequestAutoMerge)\n",
+            )
+            .is_none()
+        );
+        // A command not known to send a single mutation stays unknown.
+        assert!(
+            classify_github_refusal(
+                &gh_args(&["pr", "edit", "12", "--add-label", "x"]),
+                Some(1),
+                b"GraphQL: Could not resolve to a node (addLabelsToLabelable)\n",
+            )
+            .is_none()
         );
     }
 
@@ -5833,6 +6297,94 @@ mod tests {
             classify_gh(&args(&["api", "-Xget", "repos/o/r"])),
             Some(Read)
         );
+    }
+
+    #[test]
+    fn an_unbounded_read_gets_the_read_budget_and_writes_keep_theirs() {
+        // #555: "wait forever" on a read can only mean waiting on the provider.
+        let read =
+            AdmissionDeadline::start(QueueWait::Forever).bounded_for(OperationEffect::Read, false);
+        assert_eq!(read.budget, Some(READ_OPERATION_BUDGET));
+        assert!(read.at.is_some());
+
+        // A caller's own bound wins, and writes keep the wait they asked for.
+        let explicit = AdmissionDeadline::start(QueueWait::Seconds(5))
+            .bounded_for(OperationEffect::Read, false);
+        assert_eq!(explicit.budget, Some(Duration::from_secs(5)));
+        for effect in [OperationEffect::Write, OperationEffect::Destructive] {
+            let write = AdmissionDeadline::start(QueueWait::Forever).bounded_for(effect, false);
+            assert_eq!(write.budget, None, "{effect:?} must stay unbounded");
+            assert!(write.at.is_none());
+        }
+    }
+
+    /// #555 review: a read that is long by design keeps the caller's
+    /// unbounded wait; only an explicit `--queue-timeout` bounds it.
+    fn assert_long_running_read_is_exempt(args: &[&str]) {
+        let args = gh(args);
+        assert_eq!(classify_gh(&args), Some(OperationEffect::Read), "{args:?}");
+        assert!(
+            is_long_running_read(OperationProvider::Github, &args),
+            "{args:?}"
+        );
+        let admission = AdmissionDeadline::start(QueueWait::Forever).bounded_for(
+            OperationEffect::Read,
+            is_long_running_read(OperationProvider::Github, &args),
+        );
+        assert_eq!(admission.budget, None, "{args:?} must stay unbounded");
+    }
+
+    #[test]
+    fn run_watch_is_exempt_from_the_read_budget() {
+        assert_long_running_read_is_exempt(&["run", "watch", "123"]);
+    }
+
+    #[test]
+    fn pr_checks_watch_is_exempt_from_the_read_budget() {
+        assert_long_running_read_is_exempt(&["pr", "checks", "12", "--watch"]);
+    }
+
+    #[test]
+    fn run_view_log_is_exempt_from_the_read_budget() {
+        assert_long_running_read_is_exempt(&["run", "view", "123", "--log"]);
+        assert_long_running_read_is_exempt(&["run", "view", "123", "--log-failed"]);
+    }
+
+    #[test]
+    fn downloads_are_exempt_from_the_read_budget() {
+        assert_long_running_read_is_exempt(&["run", "download", "123"]);
+        assert_long_running_read_is_exempt(&["release", "download", "v1.0.0"]);
+    }
+
+    #[test]
+    fn paginated_api_reads_are_exempt_from_the_read_budget() {
+        assert_long_running_read_is_exempt(&["api", "repos/o/r/issues", "--paginate"]);
+    }
+
+    #[test]
+    fn short_reads_and_git_keep_the_read_budget() {
+        for args in [
+            gh(&["api", "repos/o/r/issues/230/comments?per_page=100&page=1"]),
+            gh(&["pr", "view", "12"]),
+            gh(&["pr", "checks", "12"]),
+            gh(&["run", "view", "123"]),
+        ] {
+            assert!(
+                !is_long_running_read(OperationProvider::Github, &args),
+                "{args:?}"
+            );
+        }
+        assert!(!is_long_running_read(
+            OperationProvider::Git,
+            &gh(&["log", "--watch"])
+        ));
+    }
+
+    #[test]
+    fn humanize_ms_reads_at_every_scale() {
+        assert_eq!(humanize_ms(850), "850ms");
+        assert_eq!(humanize_ms(4_200), "4.2s");
+        assert_eq!(humanize_ms(91_000), "1m 31s");
     }
 
     #[test]

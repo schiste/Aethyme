@@ -398,6 +398,25 @@ impl BrokerStore {
             .transpose()
     }
 
+    /// The most recent session closed with its worktree kept at
+    /// `worktree_path`, the predecessor a re-adoption succeeds (issue #294).
+    pub fn closed_session_for_worktree(
+        &self,
+        worktree_path: &str,
+    ) -> Result<Option<Session>, BrokerError> {
+        self.conn
+            .query_row(
+                &format!(
+                    "{SESSION_SELECT} WHERE worktree_path = ?1 AND cleanup_state = 'closed'
+                     ORDER BY id DESC LIMIT 1"
+                ),
+                params![worktree_path],
+                session_from_row,
+            )
+            .optional()?
+            .transpose()
+    }
+
     /// Point an existing session at a follow-up task: new task text (when
     /// given), an optional explicitly-safe diff-base refresh, and activity
     /// touched. Plain active reuse preserves the ownership boundary.
