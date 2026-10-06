@@ -33,47 +33,25 @@ const PROMOTION_SUBJECT_MAX_CHARS: usize = 72;
 fn promotion_subject(session_id: i64, task: Option<&str>) -> String {
     let prefix = format!("chore(broker): promote session {session_id} (");
     let suffix = ")";
-    let task = task.unwrap_or("no task");
+    // A subject is one line: a multi-line task contributes its first line.
+    let task = task
+        .and_then(|task| task.lines().next())
+        .map(str::trim)
+        .filter(|task| !task.is_empty())
+        .unwrap_or("no task");
     let task_budget =
         PROMOTION_SUBJECT_MAX_CHARS.saturating_sub(prefix.chars().count() + suffix.chars().count());
     let task = if task.chars().count() <= task_budget {
         task.to_string()
     } else {
-        let visible_chars = task_budget.saturating_sub(1);
+        // ASCII, so a hook that counts UTF-16 units sees the same length.
+        let marker = "...";
+        let visible_chars = task_budget.saturating_sub(marker.len());
         let shortened = task.chars().take(visible_chars).collect::<String>();
-        format!("{shortened}…")
+        format!("{}{marker}", shortened.trim_end())
     };
 
     format!("{prefix}{task}{suffix}")
-}
-
-#[cfg(test)]
-mod promotion_subject_tests {
-    use super::{PROMOTION_SUBJECT_MAX_CHARS, promotion_subject};
-
-    #[test]
-    fn keeps_short_task_names_intact() {
-        assert_eq!(
-            promotion_subject(42, Some("fix lease refresh")),
-            "chore(broker): promote session 42 (fix lease refresh)"
-        );
-    }
-
-    #[test]
-    fn caps_long_task_names_at_the_conventional_subject_limit() {
-        let subject = promotion_subject(42, Some(&"long task ".repeat(20)));
-
-        assert_eq!(subject.chars().count(), PROMOTION_SUBJECT_MAX_CHARS);
-        assert!(subject.ends_with("…)"));
-    }
-
-    #[test]
-    fn truncates_unicode_task_names_on_character_boundaries() {
-        let subject = promotion_subject(42, Some(&"🚀".repeat(100)));
-
-        assert_eq!(subject.chars().count(), PROMOTION_SUBJECT_MAX_CHARS);
-        assert!(subject.ends_with("…)"));
-    }
 }
 
 /// How many merge verifications may run at once in one repository. Each slot
@@ -2273,5 +2251,44 @@ mod promotion_ref_tests {
             first,
             "the first promotion was overwritten"
         );
+    }
+}
+
+#[cfg(test)]
+mod promotion_subject_tests {
+    use super::{PROMOTION_SUBJECT_MAX_CHARS, promotion_subject};
+
+    #[test]
+    fn keeps_short_task_names_intact() {
+        assert_eq!(
+            promotion_subject(42, Some("fix lease refresh")),
+            "chore(broker): promote session 42 (fix lease refresh)"
+        );
+    }
+
+    #[test]
+    fn caps_long_task_names_at_the_conventional_subject_limit() {
+        let subject = promotion_subject(42, Some(&"long task ".repeat(20)));
+
+        assert!(subject.chars().count() <= PROMOTION_SUBJECT_MAX_CHARS);
+        // The cut never leaves a space before the marker.
+        assert!(subject.ends_with("...)"), "{subject}");
+        assert!(!subject.ends_with(" ...)"), "{subject}");
+    }
+
+    #[test]
+    fn a_multi_line_task_contributes_only_its_first_line() {
+        assert_eq!(
+            promotion_subject(42, Some("fix lease refresh\n\nlong details")),
+            "chore(broker): promote session 42 (fix lease refresh)"
+        );
+    }
+
+    #[test]
+    fn truncates_unicode_task_names_on_character_boundaries() {
+        let subject = promotion_subject(42, Some(&"🚀".repeat(100)));
+
+        assert_eq!(subject.chars().count(), PROMOTION_SUBJECT_MAX_CHARS);
+        assert!(subject.ends_with("...)"));
     }
 }
