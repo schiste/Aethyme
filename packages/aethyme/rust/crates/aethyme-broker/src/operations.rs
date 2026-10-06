@@ -618,6 +618,9 @@ pub struct CoordinatedCommand {
     pub scope: Option<String>,
     pub declared_effect: Option<OperationEffect>,
     pub destructive_confirmed: bool,
+    /// The live session whose branch a destructive write may delete or
+    /// rewrite (`--cross-session`). Without it such a write is refused (#393).
+    pub cross_session: Option<i64>,
     /// Required for writes; identifies the user request or documented workflow.
     pub authorization_reason: Option<String>,
     pub args: Vec<String>,
@@ -1469,6 +1472,91 @@ fn has_forced_refspec(args: &[String]) -> bool {
     args.iter()
         .skip(1)
         .any(|arg| arg.starts_with('+') && arg.len() > 1)
+}
+
+/// Branch names a destructive command deletes or rewrites, as a session
+/// records them (`agent/<slug>`, no `refs/heads/`). Over-inclusive on
+/// purpose: a name that matches no live session's branch refuses nothing.
+fn destructive_branch_targets(provider: OperationProvider, args: &[String]) -> Vec<String> {
+    match provider {
+        OperationProvider::Git => git_destructive_branch_targets(args),
+        // `gh api -X DELETE repos/<owner>/<name>/git/refs/heads/<branch>`.
+        OperationProvider::Github => args
+            .iter()
+            .filter_map(|arg| arg.split_once("git/refs/heads/"))
+            .map(|(_, branch)| branch.to_string())
+            .collect(),
+    }
+}
+
+fn git_destructive_branch_targets(args: &[String]) -> Vec<String> {
+    let Some(args) = git_subcommand_args(args) else {
+        return Vec::new();
+    };
+    let Some((command, rest)) = args.split_first() else {
+        return Vec::new();
+    };
+    let positionals = git_positionals(rest);
+    let references: Vec<&str> = match command.as_str() {
+        // The first positional is the remote; each refspec names its
+        // destination after `:`, or is itself the destination.
+        "push" | "send-pack" => positionals
+            .iter()
+            .skip(1)
+            .map(|spec| {
+                let spec = spec.trim_start_matches('+');
+                spec.split_once(':')
+                    .map_or(spec, |(_, destination)| destination)
+            })
+            .collect(),
+        "branch" if has_any(rest, &["-r", "--remotes"]) || has_short_flag(rest, 'r') => {
+            // `branch -dr origin/<branch>` names the remote-tracking ref.
+            positionals
+                .iter()
+                .map(|name| name.split_once('/').map_or(*name, |(_, branch)| branch))
+                .collect()
+        }
+        "branch" | "update-ref" => positionals,
+        _ => Vec::new(),
+    };
+    references
+        .into_iter()
+        .map(|reference| {
+            if let Some(branch) = reference.strip_prefix("refs/heads/") {
+                branch
+            } else if let Some(rest) = reference.strip_prefix("refs/remotes/") {
+                rest.split_once('/').map_or(rest, |(_, branch)| branch)
+            } else {
+                reference
+            }
+        })
+        .filter(|branch| !branch.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Positional arguments of a Git subcommand, skipping options and the values
+/// of the options that take one as a separate argument.
+fn git_positionals(args: &[String]) -> Vec<&str> {
+    let mut positionals = Vec::new();
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if arg == "--" {
+            positionals.extend(iter.map(String::as_str));
+            break;
+        }
+        if matches!(
+            arg.as_str(),
+            "-o" | "--push-option" | "--repo" | "--receive-pack" | "--exec"
+        ) {
+            iter.next();
+            continue;
+        }
+        if !arg.starts_with('-') {
+            positionals.push(arg.as_str());
+        }
+    }
+    positionals
 }
 
 /// Config keys that make Git run a program or reinterpret a command name.
@@ -3452,6 +3540,7 @@ impl Broker {
             scope: Some(format!("ref:{destination}")),
             declared_effect: None,
             destructive_confirmed: false,
+            cross_session: None,
             authorization_reason: Some(
                 "refresh the tracked target after an authorized pull-request merge".into(),
             ),
@@ -3598,6 +3687,60 @@ impl Broker {
         )
     }
 
+    /// Refuse a destructive operation on a branch that belongs to another
+    /// live session, unless `cross_session` names exactly that session.
+    /// Returns the session the caller was allowed to cross into.
+    fn refuse_foreign_session_branches(
+        &mut self,
+        request: &CoordinatedCommand,
+        effect: OperationEffect,
+    ) -> Result<Option<i64>, BrokerOpError> {
+        if effect != OperationEffect::Destructive {
+            return match request.cross_session {
+                Some(_) => Err(BrokerOpError::InvalidCoordinatedOperation {
+                    reason: "--cross-session applies only to a destructive operation".into(),
+                }),
+                None => Ok(None),
+            };
+        }
+        let targets = destructive_branch_targets(request.provider, &request.args);
+        let owners: Vec<crate::Session> = if targets.is_empty() {
+            Vec::new()
+        } else {
+            self.store()
+                .live_sessions()?
+                .into_iter()
+                .filter(|session| {
+                    session.id != request.session_id
+                        && !session.status.is_closed()
+                        && targets.contains(&session.branch)
+                })
+                .collect()
+        };
+        match (owners.as_slice(), request.cross_session) {
+            ([], None) => Ok(None),
+            ([], Some(id)) => Err(BrokerOpError::InvalidCoordinatedOperation {
+                reason: format!(
+                    "--cross-session {id} names no live session whose branch this command deletes or rewrites"
+                ),
+            }),
+            ([owner], Some(id)) if owner.id == id => Ok(Some(id)),
+            (owners, _) => {
+                let owner = owners
+                    .iter()
+                    .find(|owner| Some(owner.id) != request.cross_session)
+                    .unwrap_or(&owners[0]);
+                Err(BrokerOpError::InvalidCoordinatedOperation {
+                    reason: format!(
+                        "refusing a destructive operation from session {}: branch {} belongs to live session {} ({:?}). \
+                         Run it from session {}, or, with the operator's confirmation, add --cross-session {}",
+                        request.session_id, owner.branch, owner.id, owner.task, owner.id, owner.id
+                    ),
+                })
+            }
+        }
+    }
+
     /// Execute through the normal coordinated-operation state machine while
     /// allowing a caller to revalidate local state under the repository lock,
     /// then durably journal structured successful stdout before success.
@@ -3660,13 +3803,22 @@ impl Broker {
                 reason: DESTRUCTIVE_FLAG_REQUIRED.into(),
             });
         }
-        let authorization_reason =
+        let mut authorization_reason =
             validate_authorization_reason(request.authorization_reason.as_deref())?;
         if effect != OperationEffect::Read && authorization_reason.is_none() {
             return Err(BrokerOpError::InvalidCoordinatedOperation {
                 reason: "coordinated writes require --reason identifying their authorization"
                     .into(),
             });
+        }
+        // A session id is all a caller needs to name a session, so it proves
+        // nothing about whose branch is being deleted or rewritten. Before
+        // anything is journaled: the refusal leaves no operation behind (#393).
+        if let Some(owner) = self.refuse_foreign_session_branches(&request, effect)? {
+            // Recorded with the authorization, so the journal says which
+            // session's branch this operation was allowed to touch.
+            authorization_reason =
+                authorization_reason.map(|reason| format!("{reason} [cross-session {owner}]"));
         }
 
         let git_operation =
@@ -5807,5 +5959,45 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("second repository target"));
+    }
+
+    #[test]
+    fn destructive_branch_targets_name_session_branches() {
+        let git = |args: &[&str]| {
+            destructive_branch_targets(
+                OperationProvider::Git,
+                &args
+                    .iter()
+                    .map(|arg| (*arg).to_string())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        assert_eq!(git(&["push", "origin", ":agent/a"]), ["agent/a"]);
+        assert_eq!(
+            git(&["push", "-o", "ci.skip", "origin", "--delete", "agent/a"]),
+            ["agent/a"]
+        );
+        assert_eq!(
+            git(&["push", "--force", "origin", "+HEAD:refs/heads/agent/a"]),
+            ["agent/a"]
+        );
+        assert_eq!(
+            git(&["-C", "x", "branch", "-D", "agent/a", "agent/b"]),
+            ["agent/a", "agent/b"]
+        );
+        assert_eq!(git(&["branch", "-dr", "origin/agent/a"]), ["agent/a"]);
+        assert_eq!(
+            git(&["update-ref", "-d", "refs/remotes/origin/agent/a"]),
+            ["agent/a"]
+        );
+        assert!(git(&["reset", "--hard", "HEAD~1"]).is_empty());
+        let gh = destructive_branch_targets(
+            OperationProvider::Github,
+            &["api", "-X", "DELETE", "repos/o/n/git/refs/heads/agent/a"]
+                .iter()
+                .map(|arg| (*arg).to_string())
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(gh, ["agent/a"]);
     }
 }

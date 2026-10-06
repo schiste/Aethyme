@@ -920,6 +920,7 @@ impl Broker {
                 scope: Some(format!("ship:fetch:{}", plan.remote_default_branch_ref)),
                 declared_effect: None,
                 destructive_confirmed: false,
+                cross_session: None,
                 authorization_reason: Some(format!(
                     "confirmed broker ship for queue entry {}",
                     plan.queue_entry.id
@@ -990,6 +991,7 @@ impl Broker {
                 scope: Some(format!("ship:push:{}", plan.remote_default_branch_ref)),
                 declared_effect: None,
                 destructive_confirmed: false,
+                cross_session: None,
                 authorization_reason: Some(format!(
                     "{}; confirmed broker ship for queue entry {} at {confirm}",
                     publication_authorization_label(&publication_authorization),
@@ -1017,6 +1019,7 @@ impl Broker {
                 scope: Some(format!("ship:verify:{}", plan.remote_default_branch_ref)),
                 declared_effect: Some(OperationEffect::Read),
                 destructive_confirmed: false,
+                cross_session: None,
                 authorization_reason: None,
                 args: vec![
                     "ls-remote".into(),
@@ -1077,6 +1080,7 @@ impl Broker {
                     scope: Some(format!("ship:sync:{}", plan.local_default_branch_ref)),
                     declared_effect: None,
                     destructive_confirmed: false,
+                    cross_session: None,
                     authorization_reason: Some(format!(
                         "explicit --sync-main after publishing queue entry {} at {confirm}",
                         plan.queue_entry.id
@@ -1687,6 +1691,7 @@ fn preserve_local_main_before_delivery(
             scope: Some(format!("delivery:preserve:{preservation_ref}")),
             declared_effect: Some(OperationEffect::Write),
             destructive_confirmed: false,
+            cross_session: None,
             authorization_reason: Some(format!(
                 "preserve reviewed local main tip {} before delivery plan {} for queue entry {}",
                 plan.local_default_branch_sha, plan.plan_digest, plan.queue_entry.id
@@ -1818,6 +1823,7 @@ fn merge_local_main_before_delivery(
             scope: Some(format!("delivery:local-main-merge:{expected_branch}")),
             declared_effect: Some(OperationEffect::Write),
             destructive_confirmed: false,
+            cross_session: None,
             authorization_reason: Some(format!(
                 "reviewed local_main_merge delivery plan {} for queue entry {}",
                 plan.plan_digest, plan.queue_entry.id
@@ -1897,6 +1903,7 @@ fn execute_pull_request_delivery(
             scope: Some(format!("delivery:fetch:{}", plan.remote_default_branch_ref)),
             declared_effect: None,
             destructive_confirmed: false,
+            cross_session: None,
             authorization_reason: Some(format!(
                 "revalidate pull-request delivery base for queue entry {}",
                 plan.queue_entry.id
@@ -1950,6 +1957,7 @@ fn execute_pull_request_delivery(
                     scope: Some(format!("delivery:branch:{branch_ref}")),
                     declared_effect: Some(OperationEffect::Write),
                     destructive_confirmed: false,
+                    cross_session: None,
                     authorization_reason: Some(format!(
                         "create deterministic delivery branch for queue entry {} at {}",
                         plan.queue_entry.id, plan.publication_sha
@@ -2001,6 +2009,7 @@ fn execute_pull_request_delivery(
             scope: Some(format!("delivery:push:{remote_branch_ref}")),
             declared_effect: Some(OperationEffect::Write),
             destructive_confirmed: false,
+            cross_session: None,
             authorization_reason: Some(format!(
                 "push exact pull-request delivery head {} for queue entry {}",
                 plan.publication_sha, plan.queue_entry.id
@@ -2056,6 +2065,7 @@ fn execute_pull_request_delivery(
                 scope: Some(format!("delivery:pr-create:{branch}")),
                 declared_effect: Some(OperationEffect::Write),
                 destructive_confirmed: false,
+                cross_session: None,
                 authorization_reason: Some(format!(
                     "open pull-request delivery for queue entry {} at {}",
                     plan.queue_entry.id, plan.publication_sha
@@ -2244,6 +2254,7 @@ fn delivery_github_read(
             scope: Some(scope),
             declared_effect: Some(OperationEffect::Read),
             destructive_confirmed: false,
+            cross_session: None,
             authorization_reason: None,
             args,
         },
@@ -2296,6 +2307,7 @@ fn verify_delivery_target(
             // conservative.
             declared_effect: None,
             destructive_confirmed: false,
+            cross_session: None,
             authorization_reason: Some(format!(
                 "refresh target branch evidence after provider merge for queue entry {}",
                 plan.queue_entry.id

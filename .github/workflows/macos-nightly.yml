@@ -1,8 +1,15 @@
 name: macOS nightly
 
-# Full Rust workspace on macOS, the primary user platform (Homebrew). Pull
-# requests run only the crates they change (oss-ci.yml, rust-tests-macos);
-# this workflow owns the full macOS run. Recovery plan P1.6.
+# Full Rust workspace on macOS, the primary user platform (Homebrew). Since
+# 2026-10-06 this is the only macOS test run: the per-pull-request macOS job
+# spent 6-10 min waiting for a runner and ~10 min testing, and blocked every
+# merge on it. A macOS-only break now surfaces here within a day. Recovery
+# plan P1.6.
+#
+# Until 2026-10-06 this ran `cargo test --workspace --examples`, which
+# narrows Cargo to example targets: the nightly ran three example binaries
+# and none of the workspace suite. It now runs the suite the Linux
+# pull-request job runs.
 
 on:
   schedule:
@@ -33,5 +40,23 @@ jobs:
         with:
           workspaces: packages/aethyme/rust
 
-      - name: Run Rust tests
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: cargo-nextest@0.9.146
+
+      # See oss-ci.yml: the test helpers use these instead of building the
+      # binaries once per nextest process.
+      - name: Build the product binaries
+        run: cargo build --locked --workspace --bins
+
+      - name: Run workspace tests
+        env:
+          AETHYME_TESTKIT_PREBUILT_BINS: "1"
+        run: cargo nextest run --locked --workspace --profile ci
+
+      - name: Run example tests
         run: cargo test --locked --workspace --examples
+
+      - name: Run doctests
+        run: cargo test --locked --workspace --doc

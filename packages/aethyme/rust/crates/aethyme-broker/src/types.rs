@@ -652,6 +652,11 @@ pub struct GateEnvironment {
     pub cpu_count: Option<i64>,
     /// Free bytes on the filesystem the disk-headroom check measured.
     pub free_disk_bytes_start: Option<i64>,
+    /// Free bytes on the same filesystem once a failing gate finished, read
+    /// to tell a run that starved mid-way from a verdict (#288). Not stored
+    /// with the result row; the gate log records the reading instead.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub free_disk_bytes_end: Option<i64>,
 }
 
 /// Input for recording one gate run.

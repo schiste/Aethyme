@@ -284,6 +284,7 @@ pub(super) fn run_quality_report(parsed: Parsed) -> Result<(), UsageError> {
         scope: Some(format!("pr/{pull_request}/quality-report")),
         declared_effect: Some(crate::OperationEffect::Write),
         destructive_confirmed: false,
+        cross_session: None,
         authorization_reason: Some(publication.reason(pull_request, &plan.report_digest)),
         args: publication.gh_args(pull_request),
     }) {

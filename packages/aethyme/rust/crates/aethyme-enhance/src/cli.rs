@@ -169,7 +169,19 @@ fn run_verify(rest: &[String]) -> u8 {
         // Python: f"  [{marker:4}] {path}{suffix}"
         println!("  [{marker:<4}] {}{suffix}", r.relative_path);
     }
-    if !is_ok(&results) {
+    // A stale `.aethyme/**` path breaks the next session to start, not the
+    // commit that moved the file, so name every one now (#289).
+    let unresolved = crate::path_references::unresolved_path_references(&repo.given);
+    for reference in &unresolved {
+        let marker = if reference.kind.fails() {
+            "FAIL"
+        } else {
+            "WARN"
+        };
+        println!("  [{marker:<4}] {reference}");
+    }
+    let references_ok = !unresolved.iter().any(|reference| reference.kind.fails());
+    if !is_ok(&results) || !references_ok {
         eprintln!("Verification failed.");
         return 1;
     }

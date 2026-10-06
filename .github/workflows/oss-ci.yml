@@ -8,6 +8,11 @@ on:
 permissions:
   contents: read
 
+# Retry transient registry and git fetch failures instead of failing the job
+# on one dropped connection (Cargo's default is 3).
+env:
+  CARGO_NET_RETRY: "10"
+
 concurrency:
   group: oss-ci-${{ github.ref }}
   cancel-in-progress: true
@@ -190,6 +195,21 @@ jobs:
       - name: Build the product binaries
         run: cargo build --locked --workspace --bins
 
+      # Compiling and running are separate steps so the job's log shows which
+      # one is slow, and `--timings` records where the compile time goes:
+      # download the `cargo-timings` artifact for the HTML report. nextest then
+      # reuses these test binaries instead of building them.
+      - name: Compile the workspace tests
+        run: cargo test --locked --workspace --no-run --timings
+
+      - name: Upload the compile timings
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: cargo-timings
+          path: packages/aethyme/rust/target/cargo-timings/cargo-timing.html
+          if-no-files-found: ignore
+          retention-days: 14
+
       # Library, binary and integration tests. `cargo test --workspace
       # --examples` stood in for this step until now, but a target flag
       # narrows cargo's selection to examples only: it ran three binaries.
@@ -198,19 +218,73 @@ jobs:
           AETHYME_TESTKIT_PREBUILT_BINS: "1"
         run: cargo nextest run --locked --workspace --profile ci
 
-      # nextest runs neither example targets nor doctests. The release-manifest
-      # assertions live in examples (#435) and must keep running.
+  # nextest runs neither example targets nor doctests. The release-manifest
+  # assertions live in examples (#435) and must keep running. A job of their
+  # own so they run beside the workspace suite instead of after it.
+  rust-examples-doctests:
+    name: Rust examples and doctests
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: packages/aethyme/rust
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: packages/aethyme/rust
+          shared-key: rust-tests
+          save-if: false
+
       - name: Run example tests
         run: cargo test --locked --workspace --examples
 
       - name: Run doctests
         run: cargo test --locked --workspace --doc
 
+  # ── Tested tree ─────────────────────────────────────────────────────────
+  # A pull_request run tests GitHub's merge of the PR into its base. Once both
+  # suites pass, record that merge's tree as an artifact. When a merge commit
+  # on main has a byte-identical tree, Aethyme Gates skips the gates these
+  # suites already cover (aethyme-gates.yml). If main moved after this run,
+  # the trees differ and every gate runs.
+  record-tested-tree:
+    name: Record the tested tree
+    if: github.event_name == 'pull_request'
+    needs: [rust-tests, rust-examples-doctests]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Name the tested tree
+        run: |
+          set -euo pipefail
+          tree="$(git rev-parse 'HEAD^{tree}')"
+          mkdir -p tested-tree
+          printf '%s\n' "$tree" > tested-tree/tree
+          echo "TESTED_TREE=$tree" >> "$GITHUB_ENV"
+
+      - name: Upload the tested tree
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: tested-tree-${{ env.TESTED_TREE }}
+          path: tested-tree/tree
+          retention-days: 14
+
   # ── Cache warm-up ───────────────────────────────────────────────────────
   # Compiles main's tests on each push so the pull-request test jobs above
-  # and below restore a warm cache instead of starting cold (the macOS job
-  # took 26 min cold and ~7 warm). Builds only; main's test verdict is
-  # Aethyme Gates.
+  # restore a warm cache instead of starting cold. Builds only; main's test
+  # verdict is Aethyme Gates. macOS is tested nightly (macos-nightly.yml),
+  # which keeps its own cache.
   warm-rust-cache:
     name: Warm Rust cache (${{ matrix.os }})
     if: github.event_name == 'push'
@@ -219,8 +293,6 @@ jobs:
         include:
           - os: ubuntu-latest
             key: rust-tests
-          - os: macos-14
-            key: rust-tests-macos
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -288,70 +360,3 @@ jobs:
         with:
           manifest-path: packages/aethyme/rust/Cargo.toml
           command: check
-
-  # ── macOS ───────────────────────────────────────────────────────────────
-  # macOS is the primary user platform (Homebrew). Pull requests test only
-  # the crates they change, so the check stays diff-scoped and fast; a
-  # manifest or toolchain change widens it to the workspace. The full
-  # workspace runs nightly on macOS in macos-nightly.yml.
-  rust-tests-macos:
-    name: Rust tests (macOS, changed crates)
-    if: github.event_name == 'pull_request'
-    runs-on: macos-14
-    defaults:
-      run:
-        working-directory: packages/aethyme/rust
-    steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
-        with:
-          toolchain: stable
-
-      # Restores the cache `warm-rust-cache` saves from main.
-      - name: Cache Rust build
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-        with:
-          workspaces: packages/aethyme/rust
-          shared-key: rust-tests-macos
-          save-if: false
-
-      - name: Install cargo-nextest
-        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
-        with:
-          tool: cargo-nextest@0.9.146
-
-      - name: Select crates
-        id: scope
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-        run: |
-          set -euo pipefail
-          changed="$(git diff --name-only "$BASE_SHA"...HEAD)"
-          if printf '%s\n' "$changed" | grep -qE '^(packages/aethyme/rust/Cargo\.(toml|lock)|rust-toolchain\.toml)$'; then
-            echo "args=--workspace" >> "$GITHUB_OUTPUT"; exit 0
-          fi
-          crates="$(printf '%s\n' "$changed" | sed -nE 's#^packages/aethyme/rust/crates/([^/]+)/.*#\1#p' | sort -u)"
-          args=""
-          for crate in $crates; do args="$args -p $crate"; done
-          echo "args=$args" >> "$GITHUB_OUTPUT"
-          echo "selected:${args:- none}"
-
-      - name: Build the product binaries
-        if: steps.scope.outputs.args != ''
-        run: cargo build --locked --workspace --bins
-
-      - name: Run tests
-        if: steps.scope.outputs.args != ''
-        env:
-          ARGS: ${{ steps.scope.outputs.args }}
-          AETHYME_TESTKIT_PREBUILT_BINS: "1"
-        # ARGS is built from crate directory names only; word-splitting is intended.
-        # `--no-tests=pass`: a selected crate may have no tests of its own.
-        run: |
-          # shellcheck disable=SC2086 # ARGS is a list of -p flags
-          cargo nextest run --locked --profile ci --no-tests=pass $ARGS
