@@ -206,6 +206,7 @@ impl Broker {
                 )),
                 declared_effect: Some(OperationEffect::Read),
                 destructive_confirmed: false,
+                cross_session: None,
                 authorization_reason: None,
                 args: vec![
                     "ls-remote".into(),

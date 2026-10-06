@@ -73,6 +73,7 @@ impl ChainWriter for CoordinatedWriter<'_> {
             scope: None,
             declared_effect: None,
             destructive_confirmed: false,
+            cross_session: None,
             authorization_reason: Some(self.reason.clone()),
             args,
         };

@@ -97,6 +97,7 @@ pub use submit_progress::{
     InFlightSubmit, SUBMIT_STALL_AFTER, SlotHolder, SubmitProgressRecord, WaitPosition,
 };
 pub mod session_guidance;
+pub mod session_holder;
 mod text_redaction;
 mod unpushed;
 pub mod worktree_location;
@@ -196,18 +197,19 @@ pub use broker::{
     FinishCleanupHandoff, FinishCleanupReport, FinishDelivery, FinishGateCacheSource,
     FinishGateRun, FinishGraphIntegrity, FinishHandoff, FinishLease, FinishLeaseState,
     FinishOptions, FinishPendingWork, FinishReport, FinishStatus, GuardedExecReport,
-    IntegrationBypassReason, IntegrationDeliveryState, IntegrationLiveSession,
-    IntegrationMovementNotice, IntegrationNextAction, IntegrationStabilityReport,
-    IntegrationStatusView, LeaseBlocker, LeaseClaimReport, LeaseOverlapRelation, LeasePathPlan,
-    LeasePlan, LeasePlanOverlap, OwnershipAuditReport, PromotedConflict, PromotedIntegrationEntry,
-    RecentCommandFailure, RepairAction, RepairGateSelection, RepairReport, RepairSource,
-    RepresentationScan, RetentionConfigStatus, SESSION_NOTE_MAX_BYTES, SemanticGateAdvice,
-    SemanticGateSelection, SemanticGateSource, SemanticGateSourceStatus,
-    SemanticGateSuggestionChain, SessionCheckpointApplyReport, SessionCheckpointRecoveryPlan,
-    SessionHandoffReport, SessionStartBase, SessionStartBaseEvidence, StartAgentReport,
-    StartReport, StatusAdvice, StatusAdviceSeverity, StatusBrief, StatusIntegrationRelation,
-    StatusSummary, StatusView, VersionRepairReport, VersionRepairStep,
-    WORKTREE_ROOT_SCHEMA_VERSION, WorktreePlacement, WorktreeRootPlan, WorktreeRootSource,
+    HEALTH_CHECK_ELIGIBILITY_BUDGET, IntegrationBypassReason, IntegrationDeliveryState,
+    IntegrationLiveSession, IntegrationMovementNotice, IntegrationNextAction,
+    IntegrationStabilityReport, IntegrationStatusView, LeaseBlocker, LeaseClaimReport,
+    LeaseOverlapRelation, LeasePathPlan, LeasePlan, LeasePlanOverlap, OwnershipAuditReport,
+    PromotedConflict, PromotedIntegrationEntry, RecentCommandFailure, RepairAction,
+    RepairGateSelection, RepairReport, RepairSource, RepresentationScan, RetentionConfigStatus,
+    SESSION_NOTE_MAX_BYTES, SemanticGateAdvice, SemanticGateSelection, SemanticGateSource,
+    SemanticGateSourceStatus, SemanticGateSuggestionChain, SessionCheckpointApplyReport,
+    SessionCheckpointRecoveryPlan, SessionHandoffReport, SessionStartBase,
+    SessionStartBaseEvidence, StartAgentReport, StartReport, StatusAdvice, StatusAdviceSeverity,
+    StatusBrief, StatusIntegrationRelation, StatusSummary, StatusView, VersionRepairReport,
+    VersionRepairStep, WORKTREE_ROOT_SCHEMA_VERSION, WorktreePlacement, WorktreeRootPlan,
+    WorktreeRootSource,
 };
 pub use cleanup_audit::{
     AuditDisposition, AuditItem, AuditOwner, AuditSummary, AuditTarget,
@@ -519,12 +521,13 @@ pub use ship::{
     ShipPublicationPolicy, ShipPush, ShipReviewEvidence,
 };
 pub use storage::{
-    STORAGE_PLAN_SCHEMA_VERSION, STORAGE_RECONCILIATION_SCHEMA_VERSION, StorageAppliedItem,
-    StorageApplyFailure, StorageApplyReport, StorageCandidate, StorageCandidateKind,
-    StorageDirectoryKind, StorageEntry, StorageError, StorageFilesystemKind, StorageMarkerStatus,
-    StoragePlan, StoragePrimaryArtifact, StoragePrimaryCandidate, StoragePrimaryCheckout,
-    StorageReconciliation, StorageRecoveryArchiveGroup, StorageRoot, StorageSource, StorageSummary,
-    storage_apply, storage_plan,
+    STORAGE_ATTRIBUTION_SCHEMA_VERSION, STORAGE_PLAN_SCHEMA_VERSION,
+    STORAGE_RECONCILIATION_SCHEMA_VERSION, StorageAppliedItem, StorageApplyFailure,
+    StorageApplyReport, StorageAttribution, StorageAttributionReport, StorageCandidate,
+    StorageCandidateKind, StorageDirectoryKind, StorageEntry, StorageError, StorageFilesystemKind,
+    StorageMarkerStatus, StoragePlan, StoragePrimaryArtifact, StoragePrimaryCandidate,
+    StoragePrimaryCheckout, StorageReconciliation, StorageRecoveryArchiveGroup, StorageRoot,
+    StorageSource, StorageSummary, storage_apply, storage_attribute, storage_plan,
 };
 pub use store::BrokerStore;
 pub use types::{

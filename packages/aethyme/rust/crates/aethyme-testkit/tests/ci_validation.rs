@@ -45,8 +45,12 @@ fn pr_and_main_have_one_automatic_full_workspace_owner() {
     // nextest runs neither example targets nor doctests, and the
     // release-manifest assertions in
     // `crates/aethyme-broker/examples/release_manifest.rs` live in an example.
-    assert!(rust.contains(&"        run: cargo test --locked --workspace --examples"));
-    assert!(rust.contains(&"        run: cargo test --locked --workspace --doc"));
+    // They run in a job of their own, beside the workspace suite, on every
+    // pull request.
+    let examples = block(&oss, "  rust-examples-doctests:");
+    assert!(examples.contains(&"    if: github.event_name == 'pull_request'"));
+    assert!(examples.contains(&"        run: cargo test --locked --workspace --examples"));
+    assert!(examples.contains(&"        run: cargo test --locked --workspace --doc"));
     // No second condition can silently skip a step within this job.
     assert_eq!(
         rust.iter()
@@ -80,6 +84,19 @@ fn pr_and_main_have_one_automatic_full_workspace_owner() {
         &"        run: packages/aethyme/rust/target/release/aethyme broker advanced gates run --all"
     ));
     assert!(!job.iter().any(|line| line.trim_start().starts_with("if:")));
+}
+
+/// macOS is tested nightly, and that run must be the whole workspace: until
+/// 2026-10-06 it was `cargo test --workspace --examples`, which runs example
+/// targets only.
+#[test]
+fn macos_nightly_runs_the_whole_workspace_suite() {
+    let nightly = workflow("macos-nightly.yml");
+    let job = block(&nightly, "  rust-tests-macos-full:");
+    assert!(job.contains(&"        run: cargo nextest run --locked --workspace --profile ci"));
+    assert!(job.contains(&"        run: cargo test --locked --workspace --examples"));
+    assert!(job.contains(&"        run: cargo test --locked --workspace --doc"));
+    assert!(job.contains(&"        run: cargo build --locked --workspace --bins"));
 }
 
 #[test]

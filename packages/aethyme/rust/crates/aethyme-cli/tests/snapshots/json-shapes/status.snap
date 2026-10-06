@@ -73,6 +73,7 @@
       "adopted_count": "integer",
       "command": "null",
       "count": "integer",
+      "eligibility_not_inspected_count": "integer",
       "estimated_bytes": "integer",
       "unmeasured_count": "integer"
     },
@@ -151,6 +152,7 @@
     "build_total": "integer",
     "command_total": "integer",
     "coordination": "integer",
+    "foreign_processes": "integer",
     "leases": "integer",
     "open": "integer",
     "retention": "integer",

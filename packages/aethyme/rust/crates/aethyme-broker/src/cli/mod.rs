@@ -110,7 +110,7 @@ Usage:
       Inspect exact-HEAD gate quality without changing enforced selection.
       --probe explicitly runs all or one selected gate in a disposable
       detached worktree with ephemeral cache evidence and mutation capture.
-  aethyme broker adopt [<path>] [--task <text>] [--short-name <name>] [--path <repo-path>]... [--agent <name-and-email>] [--repo-name <name>] [--tab-name <name>] [--ai-provider <provider>] [--reuse [--sync-integration]|--replace-stale] [--json]
+  aethyme broker adopt [<path>] [--task <text>] [--short-name <name>] [--path <repo-path>]... [--agent <name-and-email>] [--repo-name <name>] [--tab-name <name>] [--ai-provider <provider>] [--reuse [--sync-integration]|--replace-stale] [--take-over] [--json]
       Register an existing worktree (attach-first). Defaults to the
       current directory. If the worktree already has a session:
       --reuse points it at a follow-up task with a fresh baseline and
@@ -303,14 +303,16 @@ Usage:
       Run a command in the session worktree, then fail if it creates or
       modifies dirty paths outside explicit leases or in adoption-time
       foreign files. Exports AETHYME_TEST_DB_SUFFIX=s<id>-exec.
-  aethyme broker git --session <id> [--repo <owner/name>] [--scope <scope>] [--effect <read|write|destructive>] [--reason <text>] [--destructive] [--no-wait|--queue-timeout <seconds>] [--json] -- <git-args>
+  aethyme broker git --session <id> [--repo <owner/name>] [--scope <scope>] [--effect <read|write|destructive>] [--reason <text>] [--destructive [--cross-session <id>]] [--no-wait|--queue-timeout <seconds>] [--json] -- <git-args>
       Run Git through the durable operation coordinator. Remote Git commands
       require an exact --repo. Repository writes are serialized, journaled,
       and fail closed after a crash with an unknown remote outcome.
       A write queues for the repository lock and is recorded while it waits, so
       `operations list` shows it. Use --no-wait to refuse rather than queue, or
       --queue-timeout <seconds> to give up after a bounded wait.
-  aethyme broker gh --session <id> --repo <owner/name> [--scope <scope>] [--effect <read|write|destructive>] [--reason <text>] [--destructive] [--no-wait|--queue-timeout <seconds>] [--json] -- <gh-args>
+      A destructive write to a branch that belongs to another live session is
+      refused unless --cross-session names that session.
+  aethyme broker gh --session <id> --repo <owner/name> [--scope <scope>] [--effect <read|write|destructive>] [--reason <text>] [--destructive [--cross-session <id>]] [--no-wait|--queue-timeout <seconds>] [--json] -- <gh-args>
       Run GitHub CLI through the same repository coordinator. The broker sets
       GH_REPO from the exact target and never persists command output or
       secret-bearing argument values. After a successful `gh pr merge`, it
@@ -563,6 +565,11 @@ Usage:
       Executed and cached gate results identify the proven tree hash.
       --no-cache bypasses merged-tree cache lookup for this submission,
       but stores each fresh result for later normal reuse.
+      Session holder: a session is held by the agent process (claude,
+      codex, or AETHYME_AGENT_PID) that started or adopted it. submit,
+      push, sync, finish, close, git, gh and adopt --reuse refuse another
+      live agent; --take-over moves the session to the caller and records
+      a session.holder_bound event. Unidentified callers are not refused.
   aethyme broker push --session <id> [--pr] [--json]
       Publish this session's own agent/* branch to the default branch's
       remote, and nothing else. Commit, then push, as often as you like:
@@ -771,6 +778,12 @@ Usage:
       Inventory every host worktree root by reconciling disk directories,
       Git registrations, and repository session ledgers. Apply removes only
       exact reviewed orphan roots or stray directories.
+  aethyme broker storage attribute [--apply] [--json]
+      List host worktree roots with no ownership marker and whether this
+      repository can prove it owns each one: every Git worktree under it is
+      registered here, or its name is this repository's key. --apply writes
+      the marker for those it can prove, removing nothing; review a new
+      storage plan afterwards. A root it cannot prove is never marked.
   aethyme broker check-contract [--base <ref>] [--pr-body <file>]
                                 [--commit-messages] [--merged-pr]
       Cross-process contract gate: refuse a diff that removes symbols
@@ -995,6 +1008,7 @@ struct Parsed {
     open_pr: bool,
     session: Option<i64>,
     to_session: Option<i64>,
+    cross_session: Option<i64>,
     note_id: Option<i64>,
     message: Option<String>,
     entry: Option<i64>,
@@ -1061,6 +1075,8 @@ struct Parsed {
     /// `start --adopt`: register an existing worktree (formerly `adopt`).
     adopt: bool,
     replace_stale: bool,
+    /// `--take-over`: move a session held by another live agent to this one.
+    take_over: bool,
     all: bool,
     all_cleaned: bool,
     archive: bool,
@@ -1123,6 +1139,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         open_pr: false,
         session: None,
         to_session: None,
+        cross_session: None,
         note_id: None,
         message: None,
         entry: None,
@@ -1180,6 +1197,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         reuse: false,
         adopt: false,
         replace_stale: false,
+        take_over: false,
         all: false,
         all_cleaned: false,
         archive: false,
@@ -1338,6 +1356,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
                 )
             }
             "--replace-stale" => parsed.replace_stale = true,
+            "--take-over" => parsed.take_over = true,
             "--path" => parsed.planned_paths.push(
                 iter.next()
                     .ok_or(UsageError::Message(
@@ -1719,6 +1738,14 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
                     UsageError::Message("--session must be an integer session id".into())
                 })?);
             }
+            "--cross-session" => {
+                let value = iter.next().ok_or(UsageError::Message(
+                    "--cross-session requires a session id".into(),
+                ))?;
+                parsed.cross_session = Some(value.parse().map_err(|_| {
+                    UsageError::Message("--cross-session must be an integer session id".into())
+                })?);
+            }
             "--to-session" => {
                 let value = iter
                     .next()
@@ -1871,6 +1898,7 @@ fn run_inner(args: &[String], mode: &CompatibilityMode) -> Result<(), UsageError
     // a flag the subcommand never reads is refused rather than dropped.
     validate_flags(subcommand, &parsed)?;
     surface_command_advisories(subcommand, &parsed);
+    admit_session_holder(subcommand, &parsed)?;
 
     match subcommand.as_str() {
         "readiness" => run_readiness(parsed)?,
@@ -1940,6 +1968,89 @@ fn run_inner(args: &[String], mode: &CompatibilityMode) -> Result<(), UsageError
         }
     }
     Ok(())
+}
+
+/// Commands that act for a session, and so must come from its holder (#393).
+const HOLDER_GUARDED: &[&str] = &["submit", "push", "sync", "finish", "close", "git", "gh"];
+
+/// Refuse a command for a session that another live agent process holds,
+/// unless `--take-over`. Anything this check cannot establish -- no broker
+/// database, no such session, no `ps`, an unidentified caller -- lets the
+/// command through to fail or succeed on its own terms.
+fn admit_session_holder(subcommand: &str, parsed: &Parsed) -> Result<(), UsageError> {
+    if parsed.read_only_snapshot || !HOLDER_GUARDED.contains(&subcommand) {
+        return Ok(());
+    }
+    let Ok(cwd) = std::env::current_dir() else {
+        return Ok(());
+    };
+    let Ok(checkout) = crate::GitRepo::discover(&cwd) else {
+        return Ok(());
+    };
+    let Ok(main_root) = checkout.main_root() else {
+        return Ok(());
+    };
+    if !main_root.join(crate::BROKER_DB_RELPATH).is_file() {
+        return Ok(());
+    }
+    let mut store = crate::BrokerStore::open_in_repo(&main_root)?;
+    let session_id = match parsed.session {
+        Some(id) => id,
+        None => match store.session_for_worktree(checkout.root().to_string_lossy().as_ref())? {
+            Some(session) => session.id,
+            None => return Ok(()),
+        },
+    };
+    if store.session(session_id).is_err() {
+        return Ok(());
+    }
+    admit_caller(&mut store, session_id, parsed.take_over)
+}
+
+/// [`admit_session_holder`] for a resolved session, reporting a transfer.
+fn admit_caller(
+    store: &mut crate::BrokerStore,
+    session_id: i64,
+    take_over: bool,
+) -> Result<(), UsageError> {
+    use crate::session_holder::{HolderCheck, ProcessTable, caller_in, reason};
+    let Some(table) = ProcessTable::snapshot() else {
+        return Ok(());
+    };
+    let caller = caller_in(
+        &table,
+        std::env::var(crate::session_holder::AGENT_PID_ENV)
+            .ok()
+            .as_deref(),
+    );
+    if let HolderCheck::Bound {
+        reason: why @ (reason::TAKE_OVER | reason::HOLDER_GONE),
+    } = crate::session_holder::admit(store, session_id, &caller, &table, take_over)?
+    {
+        eprintln!(
+            "note: session {session_id} is now held by this agent ({})",
+            if why == reason::TAKE_OVER {
+                "taken over from a live holder"
+            } else {
+                "its previous holder is no longer running"
+            }
+        );
+    }
+    Ok(())
+}
+
+/// Record the calling agent as the holder of a session it just started or
+/// adopted. Best effort: the session exists either way.
+fn bind_caller_as_holder(store: &mut crate::BrokerStore, session_id: i64) {
+    let caller = crate::session_holder::caller();
+    if let Err(error) = crate::session_holder::bind(
+        store,
+        session_id,
+        &caller,
+        crate::session_holder::reason::REGISTERED,
+    ) {
+        eprintln!("warning: could not record session {session_id}'s holder: {error}");
+    }
 }
 
 /// Every broker invocation associated with a live session surfaces its
