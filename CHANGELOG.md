@@ -4,6 +4,30 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.22] - 2026-10-06
+
+Broker status, worktree listings and brokered reads return within a bounded time on large hosts. A provider's definitive refusal no longer write-blocks the repository. A re-adopted worktree keeps the commits it still owes. The Homebrew tap is published from a reusable, retryable workflow.
+
+### Changed
+
+- `broker status --refresh` and `status doctor` run per-session inspection in parallel and batch drift ancestry and patch ids into a few Git calls, under one 15 s inspection budget (`AETHYME_STATUS_INSPECTION_BUDGET_MS`). Anything the budget cut is named in `deferred_checks` and reported as unknown, never as clean. On a 65-session repository `status --refresh` went from 150 s to 44 s (#570, issue #460).
+- `broker advanced worktrees --json` sizes checkouts from the recorded size cache or under a 10 s budget, and inspects checkouts on up to 8 threads; rows not measured in time report `size: "unmeasured"` and are counted in `unmeasured_count`. `--measure` walks every checkout as before. 225 worktrees went from 187 s to 24 s (#563, issue #559).
+- Brokered read-only `gh` and `git` operations without a caller budget stop after 90 s (`AETHYME_BROKER_READ_BUDGET_SECS`) and exit 6 with the time split between preparation and provider wait; nothing needs reconciling. Long-running reads (`run watch`, `--watch`, `run view --log`, downloads, `api --paginate`) keep an unbounded wait (#562, issue #555).
+- Re-adopting a worktree after `broker close` carries the closed session's ownership boundary forward while its commits are still pending, so `submit` replays them; `adopt --json` reports `carried_ownership`. `finish` on such a session now refuses and recommends `submit` (#557, issue #294).
+- Load-admitted gates scale their deadline by the one-minute load per CPU at start (1x floor, capped by the admission threshold and 4x), and timeout diagnostics record the load at start and at timeout (#552, issue #413).
+- `aethyme explore` warns when it reads a checkout that is behind `aethyme/integration` or the upstream branch: a stderr line, a `source_staleness` object in JSON output, and `safe_to_use_as_answer: false`. Generated agent guidance says to read code in a session worktree (#571, issue #232).
+- Empty delivery polls no longer write command metrics or events, and the PR monitor starts the delivery adapter only when the outbox has work (#561, issue #417).
+- `broker start` and `adopt` without a tab name skip the Chau7 tab lookup and report `tab_rename.status: not_applicable` (#550, issue #496).
+- Stable releases publish the Homebrew formula through `homebrew-tap.yml`: it verifies the signed manifest, writes once with the formula's current blob SHA as precondition, and reads the result back byte for byte. Re-run it with `workflow_dispatch` to retry; pull requests that touch the path rehearse it read-only (#553, issue #253).
+- `quality inspect` skips the standard temp roots in `relative-links` and files marked `linguist-generated` in `.gitattributes`; `--include-generated` brings them back. This repository's findings went from 56 false positives to 0 (#565, issue #384).
+
+### Fixed
+
+- A definitive GraphQL refusal of `gh pr merge` or `pr update-branch` that names the command's own mutation (for example auto-merge disabled) is recorded as a failure, not as an unknown outcome that write-blocks the repository (#558, issue #549).
+- A killed coordinated write's two blockers name each other, carry an inspect command, and list the ordered recovery (inspect the remote, record the outcome, reconcile the lease); clearing one half reports what still blocks (#558, issue #286).
+- A refused local pre-push hook or failed coordinated Git operation keeps a bounded, redacted stderr tail in its operation record (#551, issue #415).
+- `aethyme-enhance` has its first integration suite, covering deploy idempotence, file modes, overrides, hand edits, policy rendering and the symlink guard (#568, issue #381).
+
 ## [0.8.21] - 2026-10-06
 
 Broker sessions belong to the agent process that holds them. Health checks finish on large hosts. Gates that run out of disk space or inodes are reported as host faults.
