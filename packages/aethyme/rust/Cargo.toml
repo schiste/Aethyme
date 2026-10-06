@@ -18,7 +18,7 @@ bincode = "1"
 blake3 = "1"
 clap = { version = "4", features = ["derive"] }
 data-encoding = "2"
-dhat = { version = "0.3" }
+dhat = "0.3"
 fastrand = "2"
 globset = "0.4"
 libc = "0.2"

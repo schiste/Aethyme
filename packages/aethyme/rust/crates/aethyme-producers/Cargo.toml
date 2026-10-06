@@ -27,8 +27,7 @@ serde = { workspace = true }
 [dev-dependencies]
 # ProducerCtx wraps a real FragmentStore (which insists its on-disk
 # layout exists), so the harness test needs a tempdir + bootstrap_repo
-# call rather than an in-memory fake. tempfile = "3" matches the rest
-# of the workspace.
+# call rather than an in-memory fake.
 tempfile = { workspace = true }
 
 [lints]
