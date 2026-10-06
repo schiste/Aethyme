@@ -12,6 +12,9 @@
 //!   most once and nothing else.
 //! - [`Verdict::DeleteBranch`]: exactly `api -X DELETE
 //!   repos/<owner>/<repo>/git/refs/heads/<branch>` for the target repository.
+//! - [`Verdict::SafeWrite`]: an exact `gh api -X POST|PATCH|DELETE` write to
+//!   one of a few comment, review, label and issue endpoints, which cannot
+//!   touch a git ref (see [`safe_write_endpoint`]).
 //! - [`Verdict::Unverifiable`]: everything else. The caller refuses it unless
 //!   the operator acknowledges it explicitly.
 //!
@@ -27,6 +30,9 @@ pub(crate) enum Verdict {
         match_head_commit: Option<String>,
     },
     DeleteBranch(String),
+    /// An exact `gh api` write to a comment, review, label or issue endpoint
+    /// of the target repository, which cannot touch a git ref.
+    SafeWrite,
     Unverifiable(String),
 }
 
@@ -175,7 +181,111 @@ fn assess_pr_merge(tokens: &[&str]) -> Verdict {
     }
 }
 
+/// Endpoints a `gh api` write may target without acknowledgement, as
+/// segment patterns after `repos/<owner>/<repo>/`: `N` is a decimal number,
+/// `L` a plain label name, anything else a literal segment. The methods each
+/// accepts follow. None of these can create, move or delete a git ref.
+const SAFE_WRITE_ENDPOINTS: &[(&[&str], &[&str])] = &[
+    (&["issues", "N", "comments"], &["POST"]),
+    (&["issues", "comments", "N"], &["PATCH", "DELETE"]),
+    (&["pulls", "N", "comments"], &["POST"]),
+    (&["pulls", "N", "comments", "N", "replies"], &["POST"]),
+    (&["pulls", "comments", "N"], &["PATCH", "DELETE"]),
+    (&["pulls", "N", "reviews"], &["POST"]),
+    (&["pulls", "N", "reviews", "N"], &["PUT", "PATCH", "DELETE"]),
+    (&["pulls", "N", "reviews", "N", "events"], &["POST"]),
+    (&["issues", "N", "labels"], &["POST", "PUT", "DELETE"]),
+    (&["issues", "N", "labels", "L"], &["DELETE"]),
+    (&["issues", "N"], &["PATCH"]),
+];
+
+/// Fields an issue PATCH may set; anything else could be a field this list
+/// does not anticipate.
+const ISSUE_PATCH_FIELDS: &[&str] = &["title", "body", "state", "labels[]", "assignees[]"];
+
+fn is_plain_label(segment: &str) -> bool {
+    !segment.is_empty()
+        && segment
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+/// The [`SAFE_WRITE_ENDPOINTS`] entry `path` matches exactly for
+/// `repository`, if any.
+fn safe_write_endpoint(
+    path: &str,
+    repository: &str,
+) -> Option<&'static (&'static [&'static str], &'static [&'static str])> {
+    let rest = path
+        .strip_prefix("repos/")?
+        .strip_prefix(repository)?
+        .strip_prefix('/')?;
+    let segments: Vec<&str> = rest.split('/').collect();
+    SAFE_WRITE_ENDPOINTS.iter().find(|(pattern, _)| {
+        pattern.len() == segments.len()
+            && pattern
+                .iter()
+                .zip(&segments)
+                .all(|(want, got)| match *want {
+                    "N" => is_number(got),
+                    "L" => is_plain_label(got),
+                    literal => literal == *got,
+                })
+    })
+}
+
+/// An exact allowlisted write: `-X <METHOD>` once, one endpoint, plain
+/// `-f`/`-F key=value` fields (no `@file`), and optional output filters.
+fn is_safe_write(tokens: &[&str], repository: &str) -> bool {
+    let mut method = None;
+    let mut endpoint = None;
+    let mut fields = Vec::new();
+    let mut iter = tokens.iter();
+    while let Some(&token) = iter.next() {
+        match token {
+            "-X" if method.is_none() => method = iter.next().copied(),
+            "-f" | "-F" => match iter.next() {
+                Some(field) => fields.push((token, *field)),
+                None => return false,
+            },
+            "--silent" => {}
+            "-q" | "--jq" => {
+                if iter.next().is_none() {
+                    return false;
+                }
+            }
+            _ if !token.starts_with('-') && endpoint.is_none() => endpoint = Some(token),
+            _ => return false,
+        }
+    }
+    let (Some(method), Some(endpoint)) = (method, endpoint) else {
+        return false;
+    };
+    let Some((pattern, methods)) = safe_write_endpoint(endpoint, repository) else {
+        return false;
+    };
+    if !methods.contains(&method) {
+        return false;
+    }
+    let issue_patch = *pattern == ["issues", "N"];
+    fields.iter().all(|(flag, field)| {
+        let Some((key, value)) = field.split_once('=') else {
+            return false;
+        };
+        let plain_key = !key.is_empty()
+            && key
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'[' | b']'));
+        // `-F key=@file` reads a file the broker cannot see.
+        let plain_value = !(*flag == "-F" && value.starts_with('@'));
+        plain_key && plain_value && (!issue_patch || ISSUE_PATCH_FIELDS.contains(&key))
+    })
+}
+
 fn assess_api(tokens: &[&str], repository: &str) -> Verdict {
+    if is_safe_write(tokens, repository) {
+        return Verdict::SafeWrite;
+    }
     if let ["-X", "DELETE", path] = tokens {
         return match branch_ref_path(path, repository) {
             Some(branch) => Verdict::DeleteBranch(branch),
@@ -334,6 +444,198 @@ mod tests {
             ]),
             Verdict::NoRefWrite
         );
+    }
+
+    #[test]
+    fn only_exact_comment_review_label_and_issue_writes_are_safe() {
+        for line in [
+            &[
+                "api",
+                "-X",
+                "POST",
+                "repos/o/n/issues/5/comments",
+                "-f",
+                "body=hi",
+            ][..],
+            &[
+                "api",
+                "-X",
+                "PATCH",
+                "repos/o/n/issues/comments/9",
+                "-f",
+                "body=x",
+            ],
+            &["api", "-X", "DELETE", "repos/o/n/issues/comments/9"],
+            &[
+                "api",
+                "-X",
+                "POST",
+                "repos/o/n/pulls/5/comments",
+                "-f",
+                "body=x",
+            ],
+            &[
+                "api",
+                "-X",
+                "POST",
+                "repos/o/n/pulls/5/comments/9/replies",
+                "-f",
+                "body=x",
+                "--jq",
+                ".id",
+            ],
+            &[
+                "api",
+                "-X",
+                "PATCH",
+                "repos/o/n/pulls/comments/9",
+                "-f",
+                "body=x",
+            ],
+            &[
+                "api",
+                "-X",
+                "POST",
+                "repos/o/n/pulls/5/reviews",
+                "-f",
+                "event=COMMENT",
+            ],
+            &[
+                "api",
+                "-X",
+                "POST",
+                "repos/o/n/pulls/5/reviews/3/events",
+                "-f",
+                "event=APPROVE",
+            ],
+            &[
+                "api",
+                "-X",
+                "POST",
+                "repos/o/n/issues/5/labels",
+                "-f",
+                "labels[]=bug",
+            ],
+            &[
+                "api",
+                "-X",
+                "DELETE",
+                "repos/o/n/issues/5/labels/needs-review",
+            ],
+            &[
+                "api",
+                "-X",
+                "PATCH",
+                "repos/o/n/issues/5",
+                "-f",
+                "state=closed",
+                "--silent",
+            ],
+        ] {
+            assert_eq!(assess_line(line), Verdict::SafeWrite, "{line:?}");
+        }
+        for line in [
+            &[
+                "api",
+                "-X",
+                "POST",
+                "repos/x/n/issues/5/comments",
+                "-f",
+                "body=x",
+            ][..],
+            &[
+                "api",
+                "-X",
+                "POST",
+                "repos/o/n/issues/five/comments",
+                "-f",
+                "body=x",
+            ],
+            &[
+                "api",
+                "-X",
+                "POST",
+                "repos/o/n/issues/5/comments/extra",
+                "-f",
+                "body=x",
+            ],
+            &[
+                "api",
+                "-X",
+                "POST",
+                "repos/o/n/issues/5/comments",
+                "--input",
+                "body.json",
+            ],
+            &[
+                "api",
+                "-X",
+                "POST",
+                "repos/o/n/issues%2F5/comments",
+                "-f",
+                "body=x",
+            ],
+            &[
+                "api",
+                "-X",
+                "POST",
+                "-X",
+                "POST",
+                "repos/o/n/issues/5/comments",
+            ],
+            &[
+                "api",
+                "-X",
+                "POST",
+                "/repos/o/n/issues/5/comments",
+                "-f",
+                "body=x",
+            ],
+            &[
+                "api",
+                "-X",
+                "PUT",
+                "repos/o/n/issues/5/comments",
+                "-f",
+                "body=x",
+            ],
+            &[
+                "api",
+                "-X",
+                "PATCH",
+                "repos/o/n/issues/5",
+                "-f",
+                "milestone=1",
+            ],
+            &[
+                "api",
+                "-X",
+                "POST",
+                "repos/o/n/issues/5/comments",
+                "-F",
+                "body=@x.md",
+            ],
+            &["api", "repos/o/n/issues/5/comments", "-f", "body=x"],
+            &["api", "-X", "POST", "graphql", "-f", "query=mutation{x}"],
+            &[
+                "api",
+                "-X",
+                "POST",
+                "repos/o/n/issues/5/comments",
+                "-H",
+                "Accept: x",
+            ],
+            &[
+                "api",
+                "--method",
+                "POST",
+                "repos/o/n/issues/5/comments",
+                "-f",
+                "body=x",
+            ],
+        ] {
+            assert!(unverifiable_line(line), "{line:?}");
+        }
     }
 
     #[test]

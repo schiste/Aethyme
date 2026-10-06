@@ -4192,6 +4192,13 @@ impl Broker {
                 return Ok((Vec::new(), None));
             }
             Verdict::Unverifiable(why) => return refuse(why),
+            // It cannot touch a ref, but only in the session's own repository.
+            Verdict::SafeWrite => {
+                return match verify_github_origin(cwd, github_target) {
+                    Ok(_) => Ok((Vec::new(), None)),
+                    Err(why) => refuse(why),
+                };
+            }
             Verdict::DeleteBranch(branch) => {
                 if let Err(why) = verify_github_origin(cwd, github_target) {
                     return refuse(why);

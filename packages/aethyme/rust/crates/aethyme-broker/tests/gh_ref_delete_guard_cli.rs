@@ -473,3 +473,165 @@ fn an_unverifiable_write_runs_only_when_acknowledged_and_destructive() {
     );
     assert_ran_exactly(&fixture, &output, "api graphql -f query=mutation { x }");
 }
+
+// --- Exact writes that cannot touch a ref run without acknowledgement ----
+
+#[test]
+fn allowlisted_comment_review_label_and_issue_writes_run_unacknowledged() {
+    let fixture = Fixture::new();
+    let r = "repos/schiste/Aethyme";
+    let cases: Vec<(Vec<&str>, Vec<String>)> = vec![
+        (
+            vec![],
+            vec![
+                "-X".into(),
+                "POST".into(),
+                format!("{r}/issues/5/comments"),
+                "-f".into(),
+                "body=hi".into(),
+            ],
+        ),
+        (
+            vec![],
+            vec![
+                "-X".into(),
+                "PATCH".into(),
+                format!("{r}/issues/comments/9"),
+                "-f".into(),
+                "body=x".into(),
+            ],
+        ),
+        (
+            vec!["--destructive"],
+            vec![
+                "-X".into(),
+                "DELETE".into(),
+                format!("{r}/issues/comments/9"),
+            ],
+        ),
+        (
+            vec![],
+            vec![
+                "-X".into(),
+                "POST".into(),
+                format!("{r}/pulls/5/comments/9/replies"),
+                "-f".into(),
+                "body=x".into(),
+            ],
+        ),
+        (
+            vec![],
+            vec![
+                "-X".into(),
+                "POST".into(),
+                format!("{r}/pulls/5/reviews"),
+                "-f".into(),
+                "event=COMMENT".into(),
+            ],
+        ),
+        (
+            vec![],
+            vec![
+                "-X".into(),
+                "POST".into(),
+                format!("{r}/issues/5/labels"),
+                "-f".into(),
+                "labels[]=bug".into(),
+            ],
+        ),
+        (
+            vec![],
+            vec![
+                "-X".into(),
+                "PATCH".into(),
+                format!("{r}/issues/5"),
+                "-f".into(),
+                "state=closed".into(),
+            ],
+        ),
+    ];
+    for (flags, api) in cases {
+        let mut gh: Vec<&str> = vec!["api"];
+        gh.extend(api.iter().map(String::as_str));
+        let output = fixture.gh(&flags, &gh, "");
+        assert!(output.status.success(), "{gh:?}: {}", stderr(&output));
+        assert!(
+            fixture.ran().contains(&gh[1..].join(" ")),
+            "{gh:?} did not run"
+        );
+    }
+}
+
+#[test]
+fn near_misses_of_the_allowlisted_writes_are_refused() {
+    let fixture = Fixture::new();
+    let r = "repos/schiste/Aethyme";
+    let cases: Vec<Vec<String>> = vec![
+        // Another repository.
+        vec![
+            "-X".into(),
+            "POST".into(),
+            "repos/someone/else/issues/5/comments".into(),
+            "-f".into(),
+            "body=x".into(),
+        ],
+        // A non-numeric id.
+        vec![
+            "-X".into(),
+            "POST".into(),
+            format!("{r}/issues/five/comments"),
+            "-f".into(),
+            "body=x".into(),
+        ],
+        // An extra path segment.
+        vec![
+            "-X".into(),
+            "POST".into(),
+            format!("{r}/issues/5/comments/x"),
+            "-f".into(),
+            "body=x".into(),
+        ],
+        // A body the broker cannot see.
+        vec![
+            "-X".into(),
+            "POST".into(),
+            format!("{r}/issues/5/comments"),
+            "--input".into(),
+            "body.json".into(),
+        ],
+        // GraphQL.
+        vec![
+            "-X".into(),
+            "POST".into(),
+            "graphql".into(),
+            "-f".into(),
+            "query=mutation { x }".into(),
+        ],
+        // An encoded slash.
+        vec![
+            "-X".into(),
+            "POST".into(),
+            format!("{r}/issues%2F5/comments"),
+            "-f".into(),
+            "body=x".into(),
+        ],
+        // A repeated method.
+        vec![
+            "-X".into(),
+            "GET".into(),
+            "-X".into(),
+            "POST".into(),
+            format!("{r}/issues/5/comments"),
+            "-f".into(),
+            "body=x".into(),
+        ],
+    ];
+    for api in cases {
+        let mut gh: Vec<&str> = vec!["api"];
+        gh.extend(api.iter().map(String::as_str));
+        let output = fixture.gh(&[], &gh, "");
+        assert!(!output.status.success(), "{gh:?} ran");
+        assert_eq!(fixture.ran(), "", "{gh:?} ran");
+    }
+    assert_eq!(fixture.journaled(), 0, "a refusal leaves no operation");
+}
