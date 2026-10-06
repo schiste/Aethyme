@@ -61,7 +61,19 @@ pub(super) fn render_blockers(report: &crate::BlockerReport) {
             },
             blocker.cause
         );
+        if let Some(inspect) = &blocker.inspect {
+            out!("  inspect: {inspect}");
+        }
         out!("  clear: {}", blocker.clear);
+    }
+    if let Some(pair) = &report.paired_recovery {
+        out!(
+            "recovery order: {} are the halves of one killed write; clearing one alone is not a recovery",
+            pair.blockers.join(" + ")
+        );
+        for (index, step) in pair.steps.iter().enumerate() {
+            out!("  {}. {step}", index + 1);
+        }
     }
     for source in &report.unavailable {
         out!(

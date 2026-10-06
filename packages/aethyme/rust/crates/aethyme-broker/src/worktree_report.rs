@@ -73,6 +73,12 @@ pub struct WorktreeRow {
     pub bytes: u64,
     /// Unique filesystem nodes below this checkout, including its root.
     pub inodes: u64,
+    /// Where `bytes` and `inodes` came from. `unmeasured` means both are 0
+    /// because the report's sizing budget ran out first (#559).
+    pub size: SizeSource,
+    /// When a `recorded` size was measured, in Unix milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size_measured_at_ms: Option<i64>,
     /// Days since the last commit. Absent when there is no commit to date.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub idle_days: Option<i64>,
@@ -95,12 +101,19 @@ pub struct WorktreeRow {
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub struct WorktreeReport {
     pub rows: Vec<WorktreeRow>,
+    /// A floor when `unmeasured_count` is non-zero.
     pub total_bytes: u64,
     pub total_inodes: u64,
-    /// Bytes held by checkouts whose work exists nowhere else.
+    /// Bytes held by checkouts whose work exists nowhere else; a floor when
+    /// `unmeasured_count` is non-zero.
     pub unique_work_bytes: u64,
     pub unique_work_inodes: u64,
     pub unique_work_count: usize,
+    /// `bounded` (the default: recorded sizes, then walks within
+    /// [`WORKTREE_REPORT_SIZE_BUDGET`]) or `measure` (every checkout walked).
+    pub size_scan: &'static str,
+    /// Rows whose size was not measured within the budget.
+    pub unmeasured_count: usize,
 }
 
 /// Bytes under a directory, following no symlink out of it.
@@ -199,6 +212,8 @@ fn append_prunable_rows(
             branch: short_branch(entry.branch.as_deref()),
             bytes: usage.bytes,
             inodes: usage.inodes,
+            size: SizeSource::Measured,
+            size_measured_at_ms: None,
             idle_days: None,
             work: WorkState::PrunableRegistration,
             live: live.iter().any(|path| same_path(path, &entry.path)),
@@ -219,47 +234,116 @@ pub(crate) fn append_prunable_registrations(
     sort_report(report);
 }
 
-struct WorktreeInspection {
+/// How long a default `worktrees` pass may spend walking directories to size
+/// checkouts that no earlier measurement recorded.
+///
+/// Sizing has no shortcut: every figure is a full recursive walk, and on a
+/// host holding ~220 worktrees across a dozen repositories the unbounded walk
+/// kept `worktrees --json` past a 150 s caller limit (#559). `--measure`
+/// walks everything, as before.
+pub const WORKTREE_REPORT_SIZE_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Upper bound on the threads inspecting checkouts at once. The work is
+/// process spawns and filesystem reads, not CPU.
+const INSPECTION_WORKERS: usize = 8;
+
+/// How a report sizes the checkouts it lists.
+#[derive(Debug, Clone, Copy)]
+pub enum WorktreeSizing {
+    /// Walk every checkout to completion.
+    Measure,
+    /// Use a recorded measurement where one exists, and walk the rest for at
+    /// most `budget`, counted from when sizing starts (after the Git
+    /// inspection, which always completes). A checkout the walk did not
+    /// finish is reported as unmeasured rather than as a partial or zero
+    /// figure.
+    Bounded { budget: std::time::Duration },
+}
+
+/// Where a row's `bytes` and `inodes` came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SizeSource {
+    /// Walked by this report.
+    Measured,
+    /// Taken from the repository's size records; see `size_measured_at_ms`.
+    Recorded,
+    /// Not walked within the report's budget. `bytes` and `inodes` are 0 and
+    /// mean nothing; the report's totals are floors.
+    Unmeasured,
+}
+
+struct Sized {
+    usage: crate::disk_headroom::DirectoryUsage,
+    source: SizeSource,
+    measured_at_ms: Option<i64>,
+}
+
+fn size_checkout(
+    path: &Path,
+    record: Option<crate::measurement::SizeRecord>,
+    deadline: Option<std::time::Instant>,
+) -> Sized {
+    match deadline {
+        None => Sized {
+            usage: tree_usage(path),
+            source: SizeSource::Measured,
+            measured_at_ms: None,
+        },
+        Some(deadline) => {
+            if let Some(record) = record
+                && let Some(inodes) = record.inodes
+            {
+                return Sized {
+                    usage: crate::disk_headroom::DirectoryUsage {
+                        bytes: record.bytes,
+                        inodes,
+                    },
+                    source: SizeSource::Recorded,
+                    measured_at_ms: Some(record.measured_at_ms),
+                };
+            }
+            match crate::disk_headroom::directory_usage_bounded(path, deadline) {
+                Some(usage) => Sized {
+                    usage,
+                    source: SizeSource::Measured,
+                    measured_at_ms: None,
+                },
+                None => Sized {
+                    usage: crate::disk_headroom::DirectoryUsage::default(),
+                    source: SizeSource::Unmeasured,
+                    measured_at_ms: None,
+                },
+            }
+        }
+    }
+}
+
+/// What one checkout holds, read without changing it. Registration is matched
+/// afterwards, once per repository, so this needs no shared state and can run
+/// on a worker thread.
+struct CheckoutState {
+    /// The main checkout of the repository this worktree belongs to, and this
+    /// checkout's own top level; `None` when the path is not a checkout.
+    roots: Option<(PathBuf, PathBuf)>,
     branch: Option<String>,
     idle_days: Option<i64>,
     work: WorkState,
-    git: Option<GitWorktreeState>,
-    git_registered: Option<bool>,
-    git_error: Option<String>,
 }
 
-/// Read a checkout's state without changing it.
-fn inspect(
-    path: &Path,
-    repository: &str,
-    inventories: &mut InventoryCache,
-    inventory_repositories: &mut BTreeMap<PathBuf, String>,
-) -> WorktreeInspection {
+fn inspect_checkout(path: &Path) -> CheckoutState {
     let Ok(repo) = GitRepo::discover(path) else {
-        return WorktreeInspection {
+        return CheckoutState {
+            roots: None,
             branch: None,
             idle_days: None,
             work: WorkState::NotACheckout,
-            git: None,
-            git_registered: None,
-            git_error: None,
         };
     };
     let branch = repo.current_branch().ok();
     let repository_root = repo
         .main_root()
         .unwrap_or_else(|_| repo.root().to_path_buf());
-    inventory_repositories
-        .entry(repository_root.clone())
-        .or_insert_with(|| repository.to_string());
-    let inventory = inventories
-        .entry(repository_root)
-        .or_insert_with(|| repo.worktree_inventory().map_err(|error| error.to_string()));
-    let inventory = match inventory {
-        Ok(entries) => Ok(entries.as_slice()),
-        Err(error) => Err(error.as_str()),
-    };
-    let (git, git_registered, git_error) = identify_registration(repo.root(), inventory);
 
     // Untracked build output is not work. Counting it would report every
     // checkout that has ever been built as holding something unique, which is
@@ -297,29 +381,65 @@ fn inspect(
             (now - at).max(0) / 86_400
         });
 
-    if dirty > 0 {
-        return WorktreeInspection {
-            branch,
-            idle_days,
-            work: WorkState::Uncommitted { files: dirty },
-            git,
-            git_registered,
-            git_error,
-        };
-    }
-    let state = match repo.commits_not_on_any_remote() {
-        Ok(0) => WorkState::Recoverable,
-        Ok(commits) => WorkState::Unpushed { commits },
-        Err(_) => WorkState::NotACheckout,
+    let work = if dirty > 0 {
+        WorkState::Uncommitted { files: dirty }
+    } else {
+        match repo.commits_not_on_any_remote() {
+            Ok(0) => WorkState::Recoverable,
+            Ok(commits) => WorkState::Unpushed { commits },
+            Err(_) => WorkState::NotACheckout,
+        }
     };
-    WorktreeInspection {
+    CheckoutState {
+        roots: Some((repository_root, repo.root().to_path_buf())),
         branch,
         idle_days,
-        work: state,
-        git,
-        git_registered,
-        git_error,
+        work,
     }
+}
+
+/// Run `inspect` over `items` on a few worker threads, keeping input order.
+fn inspect_in_parallel<T, R, F>(items: &[T], inspect: F) -> Vec<R>
+where
+    T: Sync,
+    R: Send,
+    F: Fn(&T) -> R + Sync,
+{
+    let workers = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1)
+        .clamp(1, INSPECTION_WORKERS)
+        .min(items.len().max(1));
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let mut results: Vec<(usize, R)> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut done = Vec::new();
+                    loop {
+                        let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(item) = items.get(index) else {
+                            break;
+                        };
+                        done.push((index, inspect(item)));
+                    }
+                    done
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|handle| handle.join().expect("worktree inspection worker panicked"))
+            .collect()
+    });
+    results.sort_by_key(|(index, _)| *index);
+    results.into_iter().map(|(_, result)| result).collect()
+}
+
+/// Classify an enumerated set of worktrees, worst first, measuring every
+/// checkout. See [`build_with`].
+pub fn build(worktrees: &[(String, PathBuf)], live: &BTreeSet<PathBuf>) -> WorktreeReport {
+    build_with(worktrees, live, WorktreeSizing::Measure)
 }
 
 /// Classify an enumerated set of worktrees, worst first.
@@ -331,31 +451,89 @@ fn inspect(
 ///
 /// `live` marks checkouts a session is using, so a reader can tell "busy" from
 /// "abandoned" without consulting the broker separately.
-pub fn build(worktrees: &[(String, PathBuf)], live: &BTreeSet<PathBuf>) -> WorktreeReport {
-    let mut report = WorktreeReport::default();
+///
+/// Work classification always completes: it is what the report is for, and
+/// it is per-checkout bounded Git work. Only sizing is subject to `sizing`.
+pub fn build_with(
+    worktrees: &[(String, PathBuf)],
+    live: &BTreeSet<PathBuf>,
+    sizing: WorktreeSizing,
+) -> WorktreeReport {
+    let present: Vec<&(String, PathBuf)> =
+        worktrees.iter().filter(|(_, path)| path.is_dir()).collect();
+    let states = inspect_in_parallel(&present, |(_, path)| inspect_checkout(path));
+
+    // Size records live with each repository's main checkout; read each file
+    // once. Read-only: a report never writes them.
+    let mut records: BTreeMap<PathBuf, crate::measurement::SizeRecords> = BTreeMap::new();
+    if matches!(sizing, WorktreeSizing::Bounded { .. }) {
+        for state in &states {
+            if let Some((repository_root, _)) = &state.roots {
+                records
+                    .entry(repository_root.clone())
+                    .or_insert_with(|| crate::measurement::load_size_records(repository_root));
+            }
+        }
+    }
+    let to_size: Vec<(&PathBuf, Option<crate::measurement::SizeRecord>)> = present
+        .iter()
+        .zip(&states)
+        .map(|((_, path), state)| {
+            let record = state.roots.as_ref().and_then(|(repository_root, _)| {
+                records
+                    .get(repository_root)
+                    .and_then(|records| records.get(&path.to_string_lossy()))
+            });
+            (path, record)
+        })
+        .collect();
+    let deadline = match sizing {
+        WorktreeSizing::Measure => None,
+        WorktreeSizing::Bounded { budget } => Some(std::time::Instant::now() + budget),
+    };
+    let sizes = inspect_in_parallel(&to_size, |(path, record)| {
+        size_checkout(path, *record, deadline)
+    });
+
+    let mut report = WorktreeReport {
+        size_scan: match sizing {
+            WorktreeSizing::Measure => "measure",
+            WorktreeSizing::Bounded { .. } => "bounded",
+        },
+        ..WorktreeReport::default()
+    };
     let mut inventories = InventoryCache::new();
     let mut inventory_repositories = BTreeMap::new();
-    for (repository, path) in worktrees {
-        if !path.is_dir() {
-            continue;
-        }
-        let usage = tree_usage(path);
-        let WorktreeInspection {
-            branch,
-            idle_days,
-            work,
-            git,
-            git_registered,
-            git_error,
-        } = inspect(
-            path,
-            repository,
-            &mut inventories,
-            &mut inventory_repositories,
-        );
+    for (((repository, path), state), sized) in present.into_iter().zip(states).zip(sizes) {
+        let (git, git_registered, git_error) = match &state.roots {
+            Some((repository_root, checkout_root)) => {
+                inventory_repositories
+                    .entry(repository_root.clone())
+                    .or_insert_with(|| repository.clone());
+                let inventory = inventories
+                    .entry(repository_root.clone())
+                    .or_insert_with(|| {
+                        GitRepo::discover(checkout_root)
+                            .map_err(|error| error.to_string())
+                            .and_then(|repo| {
+                                repo.worktree_inventory().map_err(|error| error.to_string())
+                            })
+                    });
+                let inventory = match inventory {
+                    Ok(entries) => Ok(entries.as_slice()),
+                    Err(error) => Err(error.as_str()),
+                };
+                identify_registration(checkout_root, inventory)
+            }
+            None => (None, None, None),
+        };
+        let usage = sized.usage;
         report.total_bytes = report.total_bytes.saturating_add(usage.bytes);
         report.total_inodes = report.total_inodes.saturating_add(usage.inodes);
-        if work.holds_unique_work() {
+        if sized.source == SizeSource::Unmeasured {
+            report.unmeasured_count += 1;
+        }
+        if state.work.holds_unique_work() {
             report.unique_work_bytes = report.unique_work_bytes.saturating_add(usage.bytes);
             report.unique_work_inodes = report.unique_work_inodes.saturating_add(usage.inodes);
             report.unique_work_count += 1;
@@ -364,11 +542,13 @@ pub fn build(worktrees: &[(String, PathBuf)], live: &BTreeSet<PathBuf>) -> Workt
             repository: repository.clone(),
             live: live.contains(path),
             path: path.clone(),
-            branch,
+            branch: state.branch,
             bytes: usage.bytes,
             inodes: usage.inodes,
-            idle_days,
-            work,
+            size: sized.source,
+            size_measured_at_ms: sized.measured_at_ms,
+            idle_days: state.idle_days,
+            work: state.work,
             git,
             git_registered,
             git_error,
@@ -589,5 +769,104 @@ mod tests {
             report.unique_work_count, 0,
             "nothing can be said about it, so it is not counted as work at risk"
         );
+    }
+
+    /// #559: a budget that runs out leaves sizes unmeasured, never partial or
+    /// guessed, while the work classification the report exists for still
+    /// completes for every checkout.
+    #[test]
+    fn an_expired_size_budget_reports_unmeasured_rows_and_still_classifies_work() {
+        let tmp = tempfile::tempdir().unwrap();
+        let clean = checkout(tmp.path(), "clean");
+        let dirty = checkout(tmp.path(), "dirty");
+        std::fs::write(dirty.join("file.txt"), "edited\n").unwrap();
+        let expired = WorktreeSizing::Bounded {
+            budget: std::time::Duration::ZERO,
+        };
+        let report = build_with(
+            &[
+                ("repo".to_string(), clean.clone()),
+                ("repo".to_string(), dirty.clone()),
+            ],
+            &BTreeSet::new(),
+            expired,
+        );
+
+        assert_eq!(report.size_scan, "bounded");
+        assert_eq!(report.unmeasured_count, 2);
+        assert_eq!(report.total_bytes, 0, "an unmeasured row adds nothing");
+        for row in &report.rows {
+            assert_eq!(row.size, SizeSource::Unmeasured, "{row:?}");
+            assert_eq!((row.bytes, row.inodes), (0, 0));
+        }
+        let state_of = |path: &Path| {
+            report
+                .rows
+                .iter()
+                .find(|row| row.path == path)
+                .map(|row| row.work.clone())
+                .unwrap()
+        };
+        assert_eq!(state_of(&dirty), WorkState::Uncommitted { files: 1 });
+        assert_eq!(state_of(&clean), WorkState::Unpushed { commits: 1 });
+        assert_eq!(report.unique_work_count, 2);
+
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["unmeasured_count"], 2);
+        assert_eq!(json["rows"][0]["size"], "unmeasured");
+    }
+
+    /// A recorded measurement answers without a walk, so a host whose
+    /// checkouts were sized by `gc plan` or status warming lists instantly,
+    /// and the row says how old the figure is.
+    #[test]
+    fn a_recorded_size_is_used_without_walking_and_says_when_it_was_measured() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = checkout(tmp.path(), "recorded");
+        std::fs::write(path.join(".git/info/exclude"), ".aethyme/\n").unwrap();
+        let mut records = crate::measurement::SizeRecords::default();
+        records.record_usage(&path.to_string_lossy(), 4_242, Some(7), 1_700_000_000_000);
+        std::fs::create_dir_all(path.join(".aethyme")).unwrap();
+        std::fs::write(
+            path.join(".aethyme/worktree-sizes.json"),
+            serde_json::to_vec(&records).unwrap(),
+        )
+        .unwrap();
+
+        let report = build_with(
+            &[("repo".to_string(), path)],
+            &BTreeSet::new(),
+            WorktreeSizing::Bounded {
+                budget: std::time::Duration::ZERO,
+            },
+        );
+        let row = &report.rows[0];
+        assert_eq!(row.size, SizeSource::Recorded);
+        assert_eq!((row.bytes, row.inodes), (4_242, 7));
+        assert_eq!(row.size_measured_at_ms, Some(1_700_000_000_000));
+        assert_eq!(report.unmeasured_count, 0);
+        assert_eq!(row.work, WorkState::Unpushed { commits: 1 });
+    }
+
+    #[test]
+    fn measuring_walks_every_checkout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = checkout(tmp.path(), "measured");
+        let report = build(&[("repo".to_string(), path)], &BTreeSet::new());
+        assert_eq!(report.size_scan, "measure");
+        assert_eq!(report.rows[0].size, SizeSource::Measured);
+        assert!(report.rows[0].bytes > 0);
+        assert_eq!(report.unmeasured_count, 0);
+    }
+
+    #[test]
+    fn parallel_inspection_keeps_input_order() {
+        let items: Vec<usize> = (0..200).collect();
+        let doubled = inspect_in_parallel(&items, |item| item * 2);
+        assert_eq!(
+            doubled,
+            items.iter().map(|item| item * 2).collect::<Vec<_>>()
+        );
+        assert!(inspect_in_parallel(&Vec::<usize>::new(), |item| *item).is_empty());
     }
 }

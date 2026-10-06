@@ -185,7 +185,8 @@ pub use aethyme_graph_storage::{
 pub use attribution::{Attribution, Identity};
 pub use blockers::{
     BLOCKER_CLEARED, Blocker, BlockerKind, BlockerRef, BlockerReport, BlockerScope,
-    BlockerSourceError, UnblockOutcome, UnblockRefusal, UnblockReport, UnblockRequest,
+    BlockerSourceError, PairedRecovery, UnblockOutcome, UnblockRefusal, UnblockReport,
+    UnblockRequest,
 };
 pub use broker::{
     AdoptCarriedOwnership, AdoptIntegrationDrift, AdoptIntegrationRelation, AdoptIntegrationSync,
@@ -566,7 +567,9 @@ pub use worktree_reconcile::{
 };
 pub(crate) use worktree_report::append_prunable_registrations;
 pub use worktree_report::{
-    GitWorktreeState, WorkState, WorktreeReport, WorktreeRow, build as build_worktree_report,
+    GitWorktreeState, SizeSource, WORKTREE_REPORT_SIZE_BUDGET, WorkState, WorktreeReport,
+    WorktreeRow, WorktreeSizing, build as build_worktree_report,
+    build_with as build_worktree_report_with,
 };
 
 /// Repo-relative location of the broker database.

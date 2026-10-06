@@ -1,5 +1,9 @@
 exit: 0
 --- stdout
-  aethyme broker advanced worktrees [--json]
-      list broker-owned worktrees
+  aethyme broker advanced worktrees [--measure] [--json]
+      List every worktree on this host with its repository, size, age and
+      what removing it would lose (uncommitted, unpushed, recoverable).
+      Read-only. Sizes come from recorded measurements, then walks within a
+      10 s budget; a row not measured in time reports size unmeasured and the
+      totals are floors. --measure walks every checkout instead.
 --- stderr
