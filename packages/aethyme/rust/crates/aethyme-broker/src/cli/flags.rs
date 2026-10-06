@@ -443,7 +443,7 @@ pub(super) const FLAG_RULES: &[(&str, &[&str])] = &[
     ),
     ("gc apply", &["--confirm", "--include-active-gate-cache"]),
     ("gc sweep", &[]),
-    ("worktrees", &[]),
+    ("worktrees", &["--measure"]),
     ("storage", &["--detail", "--confirm"]),
     ("storage plan", &["--detail", "--confirm"]),
     ("storage apply", &["--confirm"]),

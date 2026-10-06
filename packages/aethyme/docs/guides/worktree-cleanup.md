@@ -22,6 +22,9 @@ aethyme broker advanced worktrees
 age, size, and what deleting it would cost — `recoverable`, `unpushed
 (N commits)`, or `uncommitted (N files)`. Read the header first. It states how
 many hold work that exists nowhere else, and no cleanup path can reclaim those.
+Sizes come from recorded measurements and a 10 s walk budget; a `?` size was
+not measured in time and the header says the totals are floors. Add
+`--measure` when you need every size.
 
 A worktree outside this repository belongs to whoever ran it. Classify it, do
 not act on it.
