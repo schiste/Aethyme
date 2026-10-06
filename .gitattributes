@@ -1,0 +1,6 @@
+# Recorded output of eval and benchmark runs. These files capture the state of
+# one run on one machine (absolute checkout paths included), so they are
+# generated, not hand-written: `aethyme quality inspect` skips them unless
+# `--include-generated` is passed, and GitHub collapses them in diffs.
+packages/aethyme-eval/*/results/** linguist-generated
+packages/aethyme-eval/benchmarks/*/results/** linguist-generated

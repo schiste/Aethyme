@@ -7,7 +7,7 @@ use crate::detectors::{Detector, all_detectors};
 use crate::model::{
     DetectorResult, InspectionDetectorResult, QualityInspection, ScorecardReport, Severity,
 };
-use crate::snapshot::TrackedSnapshot;
+use crate::snapshot::{GeneratedFiles, TrackedSnapshot};
 use crate::util::{now_timestamps, uuid4};
 use crate::walk::{count_files_skip, py_suffix, rglob_all};
 
@@ -103,8 +103,17 @@ impl ScorecardEngine {
         &self,
         detectors: Option<&[String]>,
     ) -> Result<QualityInspection, String> {
+        self.inspect_tracked_with(detectors, GeneratedFiles::Exclude)
+    }
+
+    /// `inspect_tracked`, choosing whether generated files are inspected.
+    pub fn inspect_tracked_with(
+        &self,
+        detectors: Option<&[String]>,
+        generated: GeneratedFiles,
+    ) -> Result<QualityInspection, String> {
         let start = Instant::now();
-        let snapshot = TrackedSnapshot::materialize(&self.repo_path)?;
+        let snapshot = TrackedSnapshot::materialize_with(&self.repo_path, generated)?;
         let to_run: Vec<Box<dyn Detector>> = match detectors {
             None => all_detectors(),
             Some(names) => all_detectors()

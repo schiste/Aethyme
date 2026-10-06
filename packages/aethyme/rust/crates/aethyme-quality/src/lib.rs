@@ -1,7 +1,9 @@
 //! Optional repository-quality analysis and the legacy AI-readiness scorecard.
 //!
 //! `quality inspect` is the maintained, bounded surface. It scans a tracked,
-//! relevant snapshot and records detector applicability. Its suggestions are
+//! relevant snapshot (vendored files and generated files left out, including
+//! those `.gitattributes` marks `linguist-generated`, unless
+//! `--include-generated`) and records detector applicability. Its suggestions are
 //! advisory and never feed operational readiness. `ai-ready` preserves the
 //! old scorecard contract as a deprecated compatibility alias.
 //!

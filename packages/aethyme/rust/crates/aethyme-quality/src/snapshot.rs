@@ -1,7 +1,9 @@
+use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fs;
+use std::io::Write;
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use crate::util::uuid4;
 
@@ -48,8 +50,22 @@ pub struct TrackedSnapshot {
     relative_paths: Vec<PathBuf>,
 }
 
+/// Which tracked files the snapshot leaves out as generated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GeneratedFiles {
+    /// Leave out files whose name or contents mark them as generated, and
+    /// files the repository marks `linguist-generated` in `.gitattributes`.
+    Exclude,
+    /// Keep every tracked file, so suppressed findings can be reviewed.
+    Include,
+}
+
 impl TrackedSnapshot {
     pub fn materialize(repo_path: &Path) -> Result<Self, String> {
+        Self::materialize_with(repo_path, GeneratedFiles::Exclude)
+    }
+
+    pub fn materialize_with(repo_path: &Path, generated: GeneratedFiles) -> Result<Self, String> {
         let source_root = git_root(repo_path)?;
         let output = Command::new("git")
             .arg("-C")
@@ -65,6 +81,10 @@ impl TrackedSnapshot {
         }
 
         let tracked_paths = split_nul_paths(&output.stdout)?;
+        let attribute_generated = match generated {
+            GeneratedFiles::Exclude => linguist_generated_paths(&source_root, &output.stdout)?,
+            GeneratedFiles::Include => HashSet::new(),
+        };
         let materialized_root = std::env::temp_dir().join(format!(
             "aethyme-quality-snapshot-{}-{}",
             std::process::id(),
@@ -108,7 +128,9 @@ impl TrackedSnapshot {
                     relative.display()
                 )
             })?;
-            if is_generated(&relative, &bytes) {
+            if generated == GeneratedFiles::Exclude
+                && (attribute_generated.contains(&relative) || is_generated(&relative, &bytes))
+            {
                 snapshot.excluded_generated_count += 1;
                 continue;
             }
@@ -166,6 +188,52 @@ fn git_root(repo_path: &Path) -> Result<PathBuf, String> {
     let root = String::from_utf8(output.stdout)
         .map_err(|_| "repository root is not valid UTF-8".to_string())?;
     Ok(PathBuf::from(root.trim_end_matches(['\n', '\r'])))
+}
+
+/// Tracked paths the repository marks `linguist-generated` (set or `true`)
+/// in `.gitattributes`: the conventional declaration that a file is
+/// produced by a tool or a run rather than written by hand.
+fn linguist_generated_paths(
+    root: &Path,
+    nul_separated_paths: &[u8],
+) -> Result<HashSet<PathBuf>, String> {
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["check-attr", "-z", "--stdin", "linguist-generated"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("could not read generated-file attributes: {error}"))?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or("could not read generated-file attributes: no stdin")?;
+    let input = nul_separated_paths.to_vec();
+    let writer = std::thread::spawn(move || stdin.write_all(&input));
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("could not read generated-file attributes: {error}"))?;
+    writer
+        .join()
+        .map_err(|_| "could not read generated-file attributes: writer panicked".to_string())?
+        .map_err(|error| format!("could not read generated-file attributes: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "could not read generated-file attributes: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    // `-z` output is `<path> NUL <attribute> NUL <value> NUL` per path.
+    let fields: Vec<&[u8]> = output.stdout.split(|byte| *byte == 0).collect();
+    let mut generated = HashSet::new();
+    for record in fields.chunks_exact(3) {
+        if matches!(record[2], b"set" | b"true") {
+            generated.insert(bytes_to_path(record[0])?);
+        }
+    }
+    Ok(generated)
 }
 
 fn split_nul_paths(bytes: &[u8]) -> Result<Vec<PathBuf>, String> {
@@ -283,6 +351,51 @@ mod tests {
         assert!(!snapshot.root().join("scratch.tsx").exists());
 
         drop(snapshot);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn linguist_generated_files_are_excluded_unless_included() {
+        let root = std::env::temp_dir().join(format!(
+            "aethyme-quality-linguist-generated-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("results")).unwrap();
+        git(&root, &["init", "-q"]);
+        fs::write(root.join("notes.md"), "hand-written\n").unwrap();
+        fs::write(root.join("results/run.json"), "{}\n").unwrap();
+        fs::write(root.join("results/kept.json"), "{}\n").unwrap();
+        fs::write(root.join("client.ts"), "// @generated\nexport {};\n").unwrap();
+        fs::write(
+            root.join(".gitattributes"),
+            "results/** linguist-generated\nresults/kept.json -linguist-generated\n",
+        )
+        .unwrap();
+        git(&root, &["add", "."]);
+
+        let snapshot = TrackedSnapshot::materialize(&root).unwrap();
+        assert_eq!(snapshot.excluded_generated_count, 2);
+        assert_eq!(
+            snapshot.relative_paths(),
+            &[
+                PathBuf::from(".gitattributes"),
+                PathBuf::from("notes.md"),
+                PathBuf::from("results/kept.json"),
+            ]
+        );
+
+        let included = TrackedSnapshot::materialize_with(&root, GeneratedFiles::Include).unwrap();
+        assert_eq!(included.excluded_generated_count, 0);
+        for kept in ["results/run.json", "client.ts"] {
+            assert!(
+                included.relative_paths().contains(&PathBuf::from(kept)),
+                "{kept} must be inspected with GeneratedFiles::Include"
+            );
+        }
+
+        drop(snapshot);
+        drop(included);
         let _ = fs::remove_dir_all(&root);
     }
 }
