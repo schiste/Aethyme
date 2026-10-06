@@ -624,6 +624,77 @@ fn promotion_persists_one_non_blocking_advisory_per_affected_live_session() {
     );
 }
 
+/// A repository whose consumer inventory tracks `legacy_entry_point`, which
+/// `src/a.py` uses, plus one adopted agent worktree.
+fn contract_tracked_repo(root: &Path, name: &str) -> (Broker, i64, std::path::PathBuf) {
+    init_repo(root);
+    let doc = root.join("packages/aethyme/docs/architecture/cross-process-consumers.md");
+    std::fs::create_dir_all(doc.parent().unwrap()).unwrap();
+    std::fs::write(&doc, "# Consumers\n\n- `legacy_entry_point`\n").unwrap();
+    std::fs::write(root.join("src/a.py"), "a = legacy_entry_point\n").unwrap();
+    sh(root, &["add", "-A"]);
+    sh(root, &["commit", "-qm", "track a consumer"]);
+    let mut broker = Broker::open(root).unwrap();
+    let worktree = agent_worktree(root, name);
+    let session = broker.adopt(&worktree, Some(name)).unwrap();
+    (broker, session.id, worktree)
+}
+
+fn cli_submit(root: &Path, session: i64) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_broker-cli-shim"))
+        .args(["submit", "--session", &session.to_string()])
+        .current_dir(root)
+        .output()
+        .unwrap()
+}
+
+// #418: the contract decision is checked before the gates start, against the
+// session's commits, which are all the broker's contract gate can see.
+#[test]
+fn submit_refuses_an_undeclared_tracked_removal_before_any_gate_runs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (broker, session, worktree) = contract_tracked_repo(tmp.path(), "undeclared");
+    commit_edit(&worktree, "src/a.py", "a = 2\n");
+    drop(broker);
+
+    let output = cli_submit(tmp.path(), session);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("contract-decision preflight failed before any gate ran"),
+        "{stderr}"
+    );
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    assert!(
+        broker
+            .store()
+            .merge_queue()
+            .unwrap()
+            .iter()
+            .all(|entry| entry.session_id != session),
+        "a refused submission must never reach the queue or its gates"
+    );
+}
+
+// The preflight judges committed work: an uncommitted removal never
+// integrates, so it must not refuse a submission whose commits are clean.
+#[test]
+fn submit_preflight_ignores_uncommitted_tracked_removals() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (broker, session, worktree) = contract_tracked_repo(tmp.path(), "uncommitted");
+    commit_edit(&worktree, "src/b.py", "b = 2\n");
+    std::fs::write(worktree.join("src/a.py"), "a = 2\n").unwrap();
+    drop(broker);
+
+    let output = cli_submit(tmp.path(), session);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        !stderr.contains("contract-decision preflight failed"),
+        "{stderr}"
+    );
+}
+
 #[test]
 fn verification_commit_preserves_only_the_owned_contract_decision() {
     let tmp = tempfile::tempdir().unwrap();
