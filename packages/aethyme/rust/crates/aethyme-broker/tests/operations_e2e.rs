@@ -738,11 +738,9 @@ fn exact_rejected_push_is_failed_when_every_destination_remains_at_its_base() {
         serde_json::from_str(report.operation.details_json.as_deref().unwrap()).unwrap();
     let persisted_stderr = &details["failure_output"]["stderr_tail"];
     assert!(
-        persisted_stderr
-            .as_array()
-            .is_some_and(|tail| tail.iter().any(|line| {
-                line.as_str() == Some("remote: push failed according to stderr")
-            })),
+        persisted_stderr.as_array().is_some_and(|tail| tail
+            .iter()
+            .any(|line| { line.as_str() == Some("remote: push failed according to stderr") })),
         "failed coordinated pushes must preserve an actionable stderr tail: {details}"
     );
     assert!(
