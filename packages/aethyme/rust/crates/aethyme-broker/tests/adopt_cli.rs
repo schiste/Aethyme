@@ -150,6 +150,168 @@ fn start_cli_records_chau7_session_context_for_status_and_json() {
     assert!(status.contains("Aethyme / Fix auth / claude"), "{status}");
 }
 
+#[cfg(unix)]
+#[test]
+fn start_without_a_chau7_tab_skips_mcp_lookup() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = fixture();
+    let bridge = tmp.path().join("record-mcp-lookup");
+    let marker = tmp.path().join("mcp-was-called");
+    std::fs::write(
+        &bridge,
+        format!(
+            "#!/bin/sh\nprintf called > '{}'\nexit 1\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&bridge).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&bridge, permissions).unwrap();
+
+    let output = common::broker_cli(CLI, &["start", "--task", "without a tab", "--json"])
+        .current_dir(tmp.path())
+        .env("AETHYME_CHAU7_MCP_BRIDGE", &bridge)
+        .output()
+        .unwrap();
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+            panic!(
+                "invalid JSON ({error}): stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )
+        });
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(report["tab_rename"]["status"], "not_applicable");
+    assert!(
+        !marker.exists(),
+        "the Chau7 MCP bridge must not be launched"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn adopted_reused_session_without_a_chau7_tab_skips_mcp_lookup() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = fixture();
+    let created = stdout(&run_verbatim(
+        tmp.path(),
+        &["start", "--adopt", "--task", "first", "--json"],
+    ));
+    let created: serde_json::Value = serde_json::from_str(&created).unwrap();
+    assert_eq!(created["tab_rename"]["status"], "not_applicable");
+
+    let bridge = tmp.path().join("record-adopt-mcp-lookup");
+    let marker = tmp.path().join("adopt-mcp-was-called");
+    std::fs::write(
+        &bridge,
+        format!(
+            "#!/bin/sh\nprintf called > '{}'\nexit 1\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&bridge).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&bridge, permissions).unwrap();
+
+    let output = common::broker_cli(
+        CLI,
+        &[
+            "start",
+            "--adopt",
+            "--reuse",
+            "--task",
+            "follow-up",
+            "--json",
+        ],
+    )
+    .current_dir(tmp.path())
+    .env("AETHYME_CHAU7_MCP_BRIDGE", &bridge)
+    .output()
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let reused: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(reused["outcome"], "reused");
+    assert_eq!(reused["tab_rename"]["status"], "not_applicable");
+    assert!(
+        !marker.exists(),
+        "the Chau7 MCP bridge must not be launched for an adopted session without a tab"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn mcp_timeout_keeps_start_successful_and_is_bounded() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{Duration, Instant};
+
+    let tmp = fixture();
+    let bridge = tmp.path().join("stalling-mcp-bridge");
+    std::fs::write(
+        &bridge,
+        "#!/bin/sh\nwhile IFS= read -r message; do :; done\n",
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&bridge).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&bridge, permissions).unwrap();
+
+    let started_at = Instant::now();
+    let output = common::broker_cli(
+        CLI,
+        &[
+            "start",
+            "--task",
+            "tab lookup timeout",
+            "--repo-name",
+            "Aethyme",
+            "--tab-name",
+            "Named tab",
+            "--json",
+        ],
+    )
+    .current_dir(tmp.path())
+    .env("AETHYME_CHAU7_MCP_BRIDGE", &bridge)
+    .output()
+    .unwrap();
+    let elapsed = started_at.elapsed();
+
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "bounded MCP timeout took {elapsed:?}"
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["tab_rename"]["status"], "pending");
+    assert!(
+        report["tab_rename"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("timed out waiting for Chau7 MCP initialize"),
+        "{}",
+        report["tab_rename"]
+    );
+}
+
 /// Run the CLI exactly as given: [`run`] adds a short name to every start.
 fn run_verbatim(repo: &Path, args: &[&str]) -> Output {
     Command::new(CLI)
