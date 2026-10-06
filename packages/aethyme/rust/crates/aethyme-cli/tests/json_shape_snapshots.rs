@@ -36,6 +36,10 @@ fn aethyme(cwd: &Path, args: &[&str]) -> Output {
         .current_dir(cwd)
         .env_remove("AETHYME_REPO")
         .env_remove("AETHYME_AGENT")
+        // Pin the session holder to this test process. Otherwise the holder
+        // is whatever agent runtime launched the suite (a live `claude`
+        // locally, none in CI), and lease liveness changes the JSON shape.
+        .env("AETHYME_AGENT_PID", std::process::id().to_string())
         .env(
             "AETHYME_CHAU7_MCP_BRIDGE",
             "/__aethyme_test_no_chau7_bridge__",
