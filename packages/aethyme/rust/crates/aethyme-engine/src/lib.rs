@@ -20,6 +20,7 @@ pub mod query_cli;
 pub mod repo;
 pub mod repo_cli;
 pub mod snippets;
+pub mod source_staleness;
 pub mod store;
 pub mod task_cli;
 pub mod verify_targets_cli;
