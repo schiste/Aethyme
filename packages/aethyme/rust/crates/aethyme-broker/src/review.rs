@@ -735,6 +735,7 @@ impl Broker {
                 scope: Some(format!("pull_request:{}", current.pr_number)),
                 declared_effect: Some(OperationEffect::Write),
                 destructive_confirmed: false,
+                cross_session: None,
                 authorization_reason: Some("explicit review lifecycle request transition".into()),
                 args: vec!["pr".into(), "ready".into(), current.pr_number.to_string()],
             })?;
@@ -828,6 +829,7 @@ impl Broker {
             scope: Some(format!("validation_unlock:pr:{}", current.pr_number)),
             declared_effect: Some(OperationEffect::Write),
             destructive_confirmed: false,
+            cross_session: None,
             authorization_reason: Some("explicit review-satisfied validation unlock".into()),
             args,
         })?;

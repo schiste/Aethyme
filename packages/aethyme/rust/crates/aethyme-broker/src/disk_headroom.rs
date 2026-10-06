@@ -101,11 +101,18 @@ fn simulated_available_bytes(repository: &std::path::Path) -> Option<u64> {
 
 /// [`simulated_available_bytes`] with the environment value supplied, so the
 /// narrowing is tested without mutating the process environment.
+///
+/// A value of `@<file>` reads the byte count from that file on every call,
+/// so a test's gate command can lower the reading while it runs (#288).
 fn simulated_available_bytes_from(
     value: Option<&std::ffi::OsStr>,
     repository: &std::path::Path,
 ) -> Option<u64> {
-    let bytes = value?.to_str()?.trim().parse().ok()?;
+    let value = value?.to_str()?.trim();
+    let bytes = match value.strip_prefix('@') {
+        Some(file) => std::fs::read_to_string(file).ok()?.trim().parse().ok()?,
+        None => value.parse().ok()?,
+    };
     crate::host_state::path_is_ephemeral(repository).then_some(bytes)
 }
 
