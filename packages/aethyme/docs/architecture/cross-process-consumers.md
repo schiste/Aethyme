@@ -139,7 +139,7 @@ consumer. This file exists so that doesn't happen again.
 
 | Source | Invokes / assumes | Failure mode |
 |---|---|---|
-| Stable broker JSON command contract (`docs/json-contracts.md`) | `aethyme broker advanced worktrees --json` reports disk usage and Git registration state, including detached, locked, and prunable worktrees. `git_registered` separates a confirmed absence from unreadable inventory; see the field contract for exact omission and error behavior. | Treating unreadable inventory as unregistered can hide Git state; treating a prunable registration as deletion permission can lose work. Consumers must preserve the distinction and treat the report as diagnostic. |
+| Stable broker JSON command contract (`docs/json-contracts.md`) | `aethyme broker advanced worktrees --json` reports disk usage and Git registration state, including detached, locked, and prunable worktrees. `git_registered` separates a confirmed absence from unreadable inventory; see the field contract for exact omission and error behavior. Since 2026-10-06 (#559) sizing is bounded by default: each row adds `size` (`measured`, `recorded` with `size_measured_at_ms`, or `unmeasured`), and the report adds `size_scan` (`bounded` or `measure`) and `unmeasured_count`; `--measure` walks every checkout. Work classification always completes. | Treating unreadable inventory as unregistered can hide Git state; treating a prunable registration as deletion permission can lose work. Consumers must preserve the distinction and treat the report as diagnostic. An `unmeasured` row's `bytes`/`inodes` are 0 and mean nothing, and the totals are floors while `unmeasured_count` is non-zero; summing them as complete under-reports disk use. |
 
 ### Branch audit report (introduced 2026-10-03)
 

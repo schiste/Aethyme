@@ -213,6 +213,12 @@ Usage:
       .aethyme/config.toml supersedes the per-user default while it exists,
       is outside the repository and has worktrees.min_free_bytes free;
       otherwise starts use the default and say why.
+  aethyme broker worktrees [--measure] [--json]
+      List every worktree on this host with its repository, size, age and
+      what removing it would lose (uncommitted, unpushed, recoverable).
+      Read-only. Sizes come from recorded measurements, then walks within a
+      10 s budget; a row not measured in time reports size unmeasured and the
+      totals are floors. --measure walks every checkout instead.
   aethyme broker agents [--json]
       List live sessions with activity-derived liveness, refreshing
       diff-derived leases and warning on overlapping edits.
@@ -1088,6 +1094,8 @@ struct Parsed {
     apply: bool,
     dry_run: bool,
     include_active_gate_cache: bool,
+    /// `worktrees --measure`: walk every checkout instead of a budget.
+    measure: bool,
     destructive: bool,
     no_wait: bool,
     allow_parallel: bool,
@@ -1209,6 +1217,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         apply: false,
         dry_run: false,
         include_active_gate_cache: false,
+        measure: false,
         destructive: false,
         no_wait: false,
         allow_parallel: false,
@@ -1287,6 +1296,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
             "--apply" => parsed.apply = true,
             "--dry-run" => parsed.dry_run = true,
             "--include-active-gate-cache" => parsed.include_active_gate_cache = true,
+            "--measure" => parsed.measure = true,
             "--from-provider" => parsed.from_provider = true,
             "--no-wait" => parsed.no_wait = true,
             "--queue-timeout" => {
