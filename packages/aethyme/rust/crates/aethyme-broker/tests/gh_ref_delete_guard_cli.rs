@@ -284,3 +284,204 @@ fn the_named_owner_may_be_crossed_into_with_cross_session() {
     );
     assert!(fixture.mutations().contains("pr merge 7 --delete-branch"));
 }
+
+// Each case below is a spelling that deleted or force-moved another live
+// session's branch past the first version of this guard (security review of
+// PR #566). Every one must be refused with nothing run.
+
+fn assert_refused_unrun(fixture: &Fixture, output: &Output, needle: &str) {
+    assert!(!output.status.success(), "unexpectedly ran");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(needle), "missing {needle:?}: {stderr}");
+    assert_eq!(fixture.mutations(), "", "the mutation must never run");
+    assert_eq!(fixture.journaled(), 0, "a refusal leaves no operation");
+}
+
+#[test]
+fn closing_with_delete_branch_refuses_another_live_sessions_head() {
+    let fixture = Fixture::new();
+    let output = fixture.gh(
+        &["--destructive"],
+        &["pr", "close", "7", "--delete-branch"],
+        &fixture.other.branch,
+    );
+    assert_refused_unrun(
+        &fixture,
+        &output,
+        &format!("belongs to live session {}", fixture.other.id),
+    );
+}
+
+#[test]
+fn graphql_ref_mutations_are_refused_in_every_spelling() {
+    let fixture = Fixture::new();
+    let document = fixture.bin.path().join("delete.graphql");
+    std::fs::write(
+        &document,
+        "mutation { deleteRef(input: {refId: \"REF_x\"}) { clientMutationId } }",
+    )
+    .unwrap();
+    let from_file = format!("query=@{}", document.display());
+    for args in [
+        vec![
+            "api",
+            "graphql",
+            "-f",
+            "query=mutation { deleteRef(input: {refId: \"REF_x\"}) { clientMutationId } }",
+        ],
+        vec!["api", "graphql", "-F", from_file.as_str()],
+        vec!["api", "graphql", "--input", "-"],
+        vec![
+            "api",
+            "graphql",
+            "-f",
+            "query=mutation { updateRef(input: {refId: \"REF_x\", oid: \"0\", force: true}) { clientMutationId } }",
+        ],
+    ] {
+        let output = fixture.gh(&["--effect", "write", "--scope", "github:test"], &args, "");
+        assert_refused_unrun(&fixture, &output, "cannot verify");
+    }
+}
+
+#[test]
+fn a_repeated_method_flag_cannot_turn_a_delete_into_a_read() {
+    let fixture = Fixture::new();
+    let endpoint = format!(
+        "repos/schiste/Aethyme/git/refs/heads/{}",
+        fixture.other.branch
+    );
+    // gh keeps the last -X: this is a DELETE, and must not pass as a read.
+    let output = fixture.gh(&[], &["api", "-X", "GET", "-X", "DELETE", &endpoint], "");
+    assert_refused_unrun(&fixture, &output, "--destructive");
+    let output = fixture.gh(
+        &["--destructive"],
+        &["api", "-X", "GET", "--method=delete", &endpoint],
+        "",
+    );
+    assert_refused_unrun(
+        &fixture,
+        &output,
+        &format!("belongs to live session {}", fixture.other.id),
+    );
+}
+
+#[test]
+fn encoded_or_ambiguous_ref_endpoints_are_resolved_or_refused() {
+    let fixture = Fixture::new();
+    let encoded = fixture.other.branch.replace('/', "%2F");
+    for endpoint in [
+        format!("repos/schiste/Aethyme/git/refs/heads%2F{encoded}"),
+        format!(
+            "https://api.github.com/repos/schiste/Aethyme/git/refs/heads/{}",
+            fixture.other.branch.replace('/', "%252F")
+        ),
+        format!(
+            "/repos/schiste/Aethyme/git/refs/heads/{}/",
+            fixture.other.branch
+        ),
+        format!(
+            "repos/schiste/Aethyme/git/refs/tags/../heads/{}",
+            fixture.other.branch
+        ),
+        format!(
+            "repos/schiste/Aethyme/Git/Refs/Heads/{}",
+            fixture.other.branch
+        ),
+    ] {
+        let output = fixture.gh(&["--destructive"], &["api", "-X", "DELETE", &endpoint], "");
+        assert!(!output.status.success(), "{endpoint} ran");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("belongs to live session") || stderr.contains("cannot verify"),
+            "{endpoint}: {stderr}"
+        );
+        assert_eq!(fixture.mutations(), "", "{endpoint} ran");
+    }
+}
+
+#[test]
+fn a_method_override_header_is_refused() {
+    let fixture = Fixture::new();
+    let endpoint = format!(
+        "repos/schiste/Aethyme/git/refs/heads/{}",
+        fixture.other.branch
+    );
+    let output = fixture.gh(
+        &[],
+        &[
+            "api",
+            "-X",
+            "POST",
+            "-H",
+            "X-HTTP-Method-Override: DELETE",
+            &endpoint,
+        ],
+        "",
+    );
+    assert_refused_unrun(&fixture, &output, "method override");
+}
+
+#[test]
+fn a_pull_request_url_for_another_repository_is_refused() {
+    let fixture = Fixture::new();
+    let output = fixture.gh(
+        &["--destructive"],
+        &[
+            "pr",
+            "merge",
+            "https://github.com/someone/else/pull/7",
+            "--delete-branch",
+        ],
+        &fixture.own.branch,
+    );
+    assert_refused_unrun(&fixture, &output, "is in someone/else, not schiste/Aethyme");
+}
+
+#[test]
+fn with_no_pr_named_the_head_is_what_gh_resolves_not_the_local_branch() {
+    let fixture = Fixture::new();
+    // The session's own branch is checked out, but gh resolves the PR from
+    // its push/merge configuration, here another session's branch.
+    let output = fixture.gh(
+        &["--destructive"],
+        &["pr", "merge", "--delete-branch"],
+        &fixture.other.branch,
+    );
+    assert_refused_unrun(
+        &fixture,
+        &output,
+        &format!("belongs to live session {}", fixture.other.id),
+    );
+}
+
+#[test]
+fn aliases_and_extensions_are_refused() {
+    let fixture = Fixture::new();
+    for args in [
+        vec!["mymerge", "7"],
+        vec!["co", "7"],
+        vec!["extension", "exec", "something"],
+    ] {
+        let output = fixture.gh(
+            &["--effect", "write", "--scope", "github:test"],
+            &args,
+            &fixture.other.branch,
+        );
+        assert_refused_unrun(&fixture, &output, "cannot verify");
+    }
+}
+
+#[test]
+fn a_forced_repo_sync_of_another_sessions_branch_is_refused() {
+    let fixture = Fixture::new();
+    let output = fixture.gh(
+        &["--destructive"],
+        &["repo", "sync", "--force", "--branch", &fixture.other.branch],
+        "",
+    );
+    assert_refused_unrun(
+        &fixture,
+        &output,
+        &format!("belongs to live session {}", fixture.other.id),
+    );
+}
