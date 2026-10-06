@@ -1605,15 +1605,28 @@ fn git_destructive_branch_targets(args: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// The head branch and head commit of pull request `number`, read once with
-/// the same directory and `GH_REPO` the merge will use.
-fn gh_pr_head(
+/// The branches a pull request joins, read in one call.
+struct PullRequestRefs {
+    head: String,
+    head_oid: String,
+    base: String,
+}
+
+/// The head branch, head commit and base branch of pull request `number`,
+/// read once with the same directory and `GH_REPO` the command will use.
+fn gh_pr_refs(
     number: &str,
     cwd: &Path,
     target: &crate::ResolvedGithubTarget,
-) -> Result<(String, String), String> {
+) -> Result<PullRequestRefs, String> {
     let output = provider_command(OperationProvider::Github)
-        .args(["pr", "view", number, "--json", "headRefName,headRefOid"])
+        .args([
+            "pr",
+            "view",
+            number,
+            "--json",
+            "headRefName,headRefOid,baseRefName",
+        ])
         .current_dir(cwd)
         .stdin(Stdio::null())
         .env("GH_REPO", &target.display_slug)
@@ -1627,19 +1640,28 @@ fn gh_pr_head(
     }
     let value: serde_json::Value = serde_json::from_slice(&output.stdout)
         .map_err(|error| format!("gh pr view {number} returned no JSON: {error}"))?;
-    let head = value["headRefName"].as_str().unwrap_or_default();
-    let oid = value["headRefOid"].as_str().unwrap_or_default();
+    let field = |name: &str| value[name].as_str().unwrap_or_default().to_string();
+    let (head, head_oid, base) = (
+        field("headRefName"),
+        field("headRefOid"),
+        field("baseRefName"),
+    );
     if head.is_empty()
-        || oid.len() != 40
-        || !oid
+        || base.is_empty()
+        || head_oid.len() != 40
+        || !head_oid
             .bytes()
             .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
     {
         return Err(format!(
-            "gh pr view {number} did not name a head branch and full head commit"
+            "gh pr view {number} did not name a head branch, full head commit and base branch"
         ));
     }
-    Ok((head.to_string(), oid.to_string()))
+    Ok(PullRequestRefs {
+        head,
+        head_oid,
+        base,
+    })
 }
 
 /// The `--repo` target, required to be this checkout's `origin` on
@@ -3733,8 +3755,59 @@ fn provider_executable(provider: OperationProvider) -> &'static str {
 fn provider_command(provider: OperationProvider) -> Command {
     match provider {
         OperationProvider::Git => crate::git::git_command(),
-        OperationProvider::Github => Command::new(provider_executable(provider)),
+        OperationProvider::Github => github_command(),
     }
+}
+
+/// Variables a coordinated `gh` (and any `git` it starts) may inherit: auth,
+/// locale, proxies and certificates. Everything else is dropped, because gh
+/// and git turn variables into commands (`GH_BROWSER`, `EDITOR`, `PAGER`,
+/// `GIT_SSH_COMMAND`, `GIT_CONFIG_*` ...) or into another target (`GH_HOST`,
+/// `GH_CONFIG_DIR`, `GIT_DIR` ...), either of which bypasses the branch guard
+/// (#393). `AETHYME_*` is the broker's own namespace.
+const GH_INHERITED_ENV: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "TMPDIR",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TZ",
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "HTTPS_PROXY",
+    "https_proxy",
+    "HTTP_PROXY",
+    "http_proxy",
+    "NO_PROXY",
+    "no_proxy",
+    "ALL_PROXY",
+    "all_proxy",
+];
+
+fn github_command() -> Command {
+    let mut command = Command::new(provider_executable(OperationProvider::Github));
+    command.env_clear();
+    for (key, value) in std::env::vars_os() {
+        let name = key.to_string_lossy();
+        if GH_INHERITED_ENV.contains(&name.as_ref()) || name.starts_with("AETHYME_") {
+            command.env(&key, &value);
+        }
+    }
+    // gh's own settings may name a browser, editor or pager command in its
+    // config file; the environment overrides them with harmless programs.
+    command
+        .env("GH_PROMPT_DISABLED", "1")
+        .env("GH_NO_UPDATE_NOTIFIER", "1")
+        .env("GH_PAGER", "cat")
+        .env("GH_BROWSER", "false")
+        .env("GH_EDITOR", "false")
+        .env("GIT_TERMINAL_PROMPT", "0");
+    command
 }
 
 /// Do not let inherited command-scope Git config change what a coordinated
@@ -4181,11 +4254,7 @@ impl Broker {
         let slug = github_target.map_or("", |target| target.display_slug.as_str());
         let verdict = crate::gh_ref_guard::assess(&request.args, slug);
         let (number, match_head_commit) = match verdict {
-            Verdict::NoRefWrite
-            | Verdict::PrMerge {
-                deletes_head: false,
-                ..
-            } => return Ok((Vec::new(), None)),
+            Verdict::NoRefWrite => return Ok((Vec::new(), None)),
             Verdict::Unverifiable(_)
                 if request.ref_write_acknowledged && request.destructive_confirmed =>
             {
@@ -4199,35 +4268,51 @@ impl Broker {
                     Err(why) => refuse(why),
                 };
             }
-            Verdict::DeleteBranch(branch) => {
-                if let Err(why) = verify_github_origin(cwd, github_target) {
-                    return refuse(why);
-                }
-                return Ok((vec![branch], None));
+            Verdict::DeleteBranch(branch) | Verdict::PrBase(branch) => {
+                return match verify_github_origin(cwd, github_target) {
+                    Ok(_) => Ok((vec![branch], None)),
+                    Err(why) => refuse(why),
+                };
             }
+            // Merging the base into the head writes the head branch.
+            Verdict::PrUpdateBranch(number) => {
+                let target = match verify_github_origin(cwd, github_target) {
+                    Ok(target) => target,
+                    Err(why) => return refuse(why),
+                };
+                return match gh_pr_refs(&number, cwd, target) {
+                    Ok(refs) => Ok((vec![refs.head], None)),
+                    Err(why) => refuse(why),
+                };
+            }
+            // Every merge advances its base and may delete its head, with
+            // `-d` or the repository's delete-on-merge setting, so both are
+            // checked and the head is bound to the commit read here.
             Verdict::PrMerge {
                 number,
-                deletes_head: true,
                 match_head_commit,
+                ..
             } => (number, match_head_commit),
         };
         let target = match verify_github_origin(cwd, github_target) {
             Ok(target) => target,
             Err(why) => return refuse(why),
         };
-        let (head, head_oid) = match gh_pr_head(&number, cwd, target) {
-            Ok(head) => head,
+        let refs = match gh_pr_refs(&number, cwd, target) {
+            Ok(refs) => refs,
             Err(why) => return refuse(why),
         };
+        let targets = vec![refs.head, refs.base];
         match match_head_commit {
-            Some(sha) if sha != head_oid => refuse(format!(
-                "--match-head-commit {sha} is not pull request #{number}'s head {head_oid}"
+            Some(sha) if sha != refs.head_oid => refuse(format!(
+                "--match-head-commit {sha} is not pull request #{number}'s head {}",
+                refs.head_oid
             )),
-            Some(_) => Ok((vec![head], None)),
+            Some(_) => Ok((targets, None)),
             None => {
                 let mut args = request.args.clone();
-                args.extend(["--match-head-commit".to_string(), head_oid]);
-                Ok((vec![head], Some(args)))
+                args.extend(["--match-head-commit".to_string(), refs.head_oid]);
+                Ok((targets, Some(args)))
             }
         }
     }

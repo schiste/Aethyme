@@ -30,6 +30,12 @@ pub(crate) enum Verdict {
         match_head_commit: Option<String>,
     },
     DeleteBranch(String),
+    /// Exactly `pr update-branch <N>`: merges the base into the PR's head
+    /// branch, whose owner the caller checks.
+    PrUpdateBranch(String),
+    /// `pr edit|create` setting the base branch to this exact name, which a
+    /// later merge would advance; the caller checks its owner.
+    PrBase(String),
     /// An exact `gh api` write to a comment, review, label or issue endpoint
     /// of the target repository, which cannot touch a git ref.
     SafeWrite,
@@ -44,9 +50,7 @@ const NO_REF_WRITE: &[(&str, &str)] = &[
     ("help", "*"),
     ("status", "*"),
     ("search", "*"),
-    ("browse", "*"),
     ("completion", "*"),
-    ("config", "*"),
     ("auth", "*"),
     ("alias", "*"),
     ("issue", "*"),
@@ -112,14 +116,36 @@ pub(crate) fn assess(args: &[String], repository: &str) -> Verdict {
     if command == "api" {
         return assess_api(rest, repository);
     }
+    // `--web` runs the configured browser, which is a command.
+    if rest.iter().any(|token| *token == "--web" || *token == "-w") {
+        return unverifiable("`--web` / `-w` opens a browser, which runs a configurable command");
+    }
+    // A download into a `.git` directory can plant hooks.
+    if matches!(command, "run" | "release")
+        && action == "download"
+        && rest.iter().any(|token| {
+            token
+                .split(['/', '\\', '='])
+                .any(|part| part.eq_ignore_ascii_case(".git"))
+        })
+    {
+        return unverifiable("a download into a `.git` directory");
+    }
     if command == "pr" && action == "merge" {
         return assess_pr_merge(&rest[1..]);
     }
-    // Exact closes and branch updates that cannot delete or rewrite the head.
-    if let ["pr", "close" | "update-branch", number] = tokens.as_slice()
+    if let ["pr", "close", number] = tokens.as_slice()
         && is_number(number)
     {
         return Verdict::NoRefWrite;
+    }
+    if let ["pr", "update-branch", number] = tokens.as_slice()
+        && is_number(number)
+    {
+        return Verdict::PrUpdateBranch((*number).to_string());
+    }
+    if command == "pr" && matches!(action, "edit" | "create") {
+        return assess_pr_base(&rest[1..]);
     }
     if NO_REF_WRITE.iter().any(|(known, known_action)| {
         *known == command && (*known_action == "*" || *known_action == action)
@@ -130,6 +156,36 @@ pub(crate) fn assess(args: &[String], repository: &str) -> Verdict {
         "`gh {command} {action}` is not on the broker's list of gh commands that cannot write \
          a branch ref (an alias, an extension, or a command that can delete or rewrite one)"
     ))
+}
+
+/// `pr edit|create` may set the base only as a separate `--base <name>` or
+/// `-B <name>` pair, at most once. Any other token that could spell the base
+/// option (`--base=…`, `-Bname`, a cluster containing `B`) is unverifiable.
+fn assess_pr_base(tokens: &[&str]) -> Verdict {
+    let mut base = None;
+    let mut iter = tokens.iter();
+    while let Some(&token) = iter.next() {
+        if matches!(token, "--base" | "-B") {
+            match (iter.next(), base.is_none()) {
+                (Some(name), true) if !name.is_empty() && !name.starts_with('-') => {
+                    base = Some((*name).to_string());
+                }
+                _ => return unverifiable("a repeated or missing --base value"),
+            }
+        } else if token.starts_with("--base")
+            || token
+                .strip_prefix('-')
+                .is_some_and(|cluster| !cluster.starts_with('-') && cluster.contains('B'))
+        {
+            return unverifiable(format!(
+                "base option spelled {token:?}; use `--base <name>`"
+            ));
+        }
+    }
+    match base {
+        Some(base) => Verdict::PrBase(base),
+        None => Verdict::NoRefWrite,
+    }
 }
 
 fn is_number(token: &str) -> bool {
@@ -639,6 +695,44 @@ mod tests {
     }
 
     #[test]
+    fn browsers_bases_updates_and_git_downloads() {
+        for line in [
+            &["browse"][..],
+            &["config", "set", "browser", "x"],
+            &["pr", "view", "7", "--web"],
+            &["issue", "view", "1", "-w"],
+            &["run", "download", "1", "-D", ".git/hooks"],
+            &["release", "download", "v1", "--dir=x/.git/hooks"],
+            &["pr", "edit", "7", "--base=agent/x"],
+            &["pr", "edit", "7", "-Bagent/x"],
+            &["pr", "edit", "7", "--base", "a", "--base", "b"],
+            &["pr", "create", "-fB", "agent/x"],
+        ] {
+            assert!(unverifiable_line(line), "{line:?}");
+        }
+        assert_eq!(
+            assess_line(&["pr", "update-branch", "7"]),
+            Verdict::PrUpdateBranch("7".into())
+        );
+        assert_eq!(
+            assess_line(&["pr", "edit", "7", "--base", "agent/x"]),
+            Verdict::PrBase("agent/x".into())
+        );
+        assert_eq!(
+            assess_line(&["pr", "create", "-B", "main", "--title", "t"]),
+            Verdict::PrBase("main".into())
+        );
+        assert_eq!(
+            assess_line(&["pr", "edit", "7", "--title", "t"]),
+            Verdict::NoRefWrite
+        );
+        assert_eq!(
+            assess_line(&["run", "download", "1", "-D", "artifacts"]),
+            Verdict::NoRefWrite
+        );
+    }
+
+    #[test]
     fn unknown_commands_and_rewriting_forms_are_unverifiable() {
         for line in [
             &["co", "7"][..],
@@ -655,7 +749,6 @@ mod tests {
         }
         for line in [
             &["pr", "close", "7"][..],
-            &["pr", "update-branch", "7"],
             &["pr", "view", "7"],
             &["issue", "comment", "1", "--body", "x"],
         ] {

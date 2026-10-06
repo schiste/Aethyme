@@ -28,10 +28,14 @@ if [ "$1 $2" = 'pr view' ]; then
     fail) echo 'GraphQL: Could not resolve to a PullRequest' >&2; exit 1 ;;
     garbage) echo 'not json'; exit 0 ;;
   esac
-  printf '{"headRefName":"%s","headRefOid":"%s"}\n' "$AETHYME_FAKE_HEAD" "$AETHYME_FAKE_OID"
+  printf '{"headRefName":"%s","headRefOid":"%s","baseRefName":"%s"}\n' \
+    "$AETHYME_FAKE_HEAD" "$AETHYME_FAKE_OID" "${AETHYME_FAKE_BASE:-main}"
   exit 0
 fi
 printf '%s\n' "$*" >> "$AETHYME_FAKE_GH_LOG"
+printf 'GH_BROWSER=%s EDITOR=%s GIT_SSH_COMMAND=%s GH_CONFIG_DIR=%s GH_HOST=%s GH_PROMPT_DISABLED=%s\n' \
+  "$GH_BROWSER" "$EDITOR" "$GIT_SSH_COMMAND" "$GH_CONFIG_DIR" "$GH_HOST" "$GH_PROMPT_DISABLED" \
+  >> "$AETHYME_FAKE_GH_LOG.env"
 exit 0
 "#;
 
@@ -295,14 +299,26 @@ fn a_callers_match_head_commit_must_be_the_checked_head() {
 }
 
 #[test]
-fn a_merge_that_keeps_its_branch_is_unchanged() {
+fn every_merge_checks_its_head_even_without_delete_branch() {
+    // GitHub deletes the head on merge when the repository says so, so a
+    // merge without `-d` is checked and bound like one with it.
     let fixture = Fixture::new();
     let output = fixture.gh(
         &[],
         &["pr", "merge", "7", "--squash"],
         &fixture.other.branch,
     );
-    assert_ran_exactly(&fixture, &output, "pr merge 7 --squash");
+    assert_refused(
+        &fixture,
+        &output,
+        &format!("belongs to live session {}", fixture.other.id),
+    );
+    let output = fixture.gh(&[], &["pr", "merge", "7", "--squash"], &fixture.own.branch);
+    assert_ran_exactly(
+        &fixture,
+        &output,
+        &format!("pr merge 7 --squash --match-head-commit {HEAD_OID}"),
+    );
 }
 
 #[test]
@@ -634,4 +650,95 @@ fn near_misses_of_the_allowlisted_writes_are_refused() {
         assert_eq!(fixture.ran(), "", "{gh:?} ran");
     }
     assert_eq!(fixture.journaled(), 0, "a refusal leaves no operation");
+}
+
+// --- Second adversarial review --------------------------------------------
+
+#[test]
+fn browsers_are_refused_and_the_gh_environment_is_scrubbed() {
+    let fixture = Fixture::new();
+    for gh in [
+        &["browse"][..],
+        &["pr", "view", "7", "--web"],
+        &[
+            "config",
+            "set",
+            "browser",
+            "sh -c 'git push origin --delete x'",
+        ],
+        &["run", "download", "1", "-D", ".git/hooks"],
+    ] {
+        // Refused by the guard, or earlier because `config` has no inferred
+        // effect; either way nothing runs and nothing is journaled.
+        let output = fixture.gh(&[], gh, "");
+        assert!(!output.status.success(), "{gh:?} ran");
+        assert_eq!(fixture.ran(), "", "{gh:?} ran");
+        let output = fixture.gh(&["--effect", "write", "--scope", "github:test"], gh, "");
+        assert!(
+            !output.status.success(),
+            "{gh:?} ran with a declared effect"
+        );
+        assert_eq!(fixture.ran(), "", "{gh:?} ran");
+    }
+    assert_eq!(fixture.journaled(), 0, "a refusal leaves no operation");
+    // A command that runs gets none of the variables gh or git turn into
+    // commands or targets, and prompts are off.
+    let output = fixture.gh_env(
+        &[],
+        &["issue", "comment", "1", "--body", "x"],
+        "",
+        &[
+            ("GH_BROWSER", "evil"),
+            ("EDITOR", "evil"),
+            ("GH_CONFIG_DIR", "/tmp/evil"),
+        ],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    let env = std::fs::read_to_string(format!("{}.env", fixture.log().display())).unwrap();
+    assert_eq!(
+        env,
+        "GH_BROWSER=false EDITOR= GIT_SSH_COMMAND= GH_CONFIG_DIR= GH_HOST= GH_PROMPT_DISABLED=1\n"
+    );
+}
+
+#[test]
+fn updating_another_sessions_head_is_refused() {
+    let fixture = Fixture::new();
+    let output = fixture.gh(&[], &["pr", "update-branch", "7"], &fixture.other.branch);
+    assert_refused(
+        &fixture,
+        &output,
+        &format!("belongs to live session {}", fixture.other.id),
+    );
+    let output = fixture.gh(&[], &["pr", "update-branch", "7"], &fixture.own.branch);
+    assert_ran_exactly(&fixture, &output, "pr update-branch 7");
+}
+
+#[test]
+fn a_base_owned_by_another_session_is_refused() {
+    let fixture = Fixture::new();
+    let owner = format!("belongs to live session {}", fixture.other.id);
+    let output = fixture.gh_env(
+        &[],
+        &["pr", "merge", "7", "--squash"],
+        &fixture.own.branch,
+        &[("AETHYME_FAKE_BASE", &fixture.other.branch)],
+    );
+    assert_refused(&fixture, &output, &owner);
+    for gh in [
+        vec!["pr", "edit", "7", "--base", &fixture.other.branch],
+        vec![
+            "pr",
+            "create",
+            "--base",
+            &fixture.other.branch,
+            "--title",
+            "t",
+            "--body",
+            "b",
+        ],
+    ] {
+        let output = fixture.gh(&[], &gh, "");
+        assert_refused(&fixture, &output, &owner);
+    }
 }
