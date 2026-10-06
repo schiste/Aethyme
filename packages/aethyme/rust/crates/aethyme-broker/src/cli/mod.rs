@@ -231,6 +231,11 @@ Usage:
       overlaps, owner liveness and worktree, expiry, valid next actions, and
       whether each claim conflicts.
       Does not create or refresh leases.
+  aethyme broker leases explain [<paths...>] [--json]
+      Each active lease (or those overlapping <paths>) with its liveness:
+      active, idle, stale or unknown, bound to the holder process, with the
+      evidence. A holder gone past [leases] stale_grace_minutes no longer
+      conflicts but is still listed. Read-only.
   aethyme broker leases export (--session <id> | --entry <id>) [--limit <n>] [--json]
       Export bounded, redacted lease ownership and deterministic routing
       categories from committed [leases.routing] configuration. Includes

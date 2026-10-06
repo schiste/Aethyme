@@ -20,6 +20,9 @@ pub const SESSION_REUSED: &str = "session.reused";
 pub const SESSION_CONTEXT_UPDATED: &str = "session.context_updated";
 pub const SESSION_FINISHED: &str = "session.finished";
 pub const SESSION_HOLDER_BOUND: &str = "session.holder_bound";
+/// The broker first saw a session's holder process gone (#360). Starts the
+/// lease stale-grace clock for that holder.
+pub const SESSION_HOLDER_GONE: &str = "session.holder_gone";
 pub const SESSION_INSTALL_RECORDED: &str = "session.install_recorded";
 pub const SESSION_FINISH_CLEANUP_STARTED: &str = "session.finish_cleanup_started";
 pub const SESSION_CHECKPOINT_REANCHORED: &str = "session.checkpoint_reanchored";
@@ -100,6 +103,16 @@ pub fn session_holder_bound_payload(
         "reason": reason,
         "previous_pid": previous.map(|process| process.pid),
         "previous_started": previous.map(|process| process.started.as_str()),
+    })
+    .to_string()
+}
+
+/// `session.holder_gone`: the holder the broker found no longer running.
+pub fn session_holder_gone_payload(holder: &crate::session_holder::AgentProcess) -> String {
+    json!({
+        "pid": holder.pid,
+        "started": holder.started,
+        "command": holder.command,
     })
     .to_string()
 }

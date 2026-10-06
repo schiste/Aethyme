@@ -1502,6 +1502,8 @@ pub struct StatusView {
     pub outstanding_entry_exposures: Vec<crate::EntryPathExposure>,
     pub agents: Vec<AgentView>,
     pub leases: Vec<crate::Lease>,
+    /// Liveness of each lease in `leases`, bound to its holder process (#360).
+    pub lease_liveness: Vec<crate::lease_liveness::LeaseLivenessView>,
     pub overlaps: Vec<crate::leases::Overlap>,
     /// `overlaps` grouped by session pair and ranked: pairs whose edits Git
     /// says would conflict first. Classified at the last lease refresh.
@@ -1861,6 +1863,11 @@ pub struct LeasePlanOverlap {
     /// Repository, Chau7 tab, and AI provider when the owner supplied them.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub owner_context: Option<String>,
+    /// Lease liveness bound to the holder process (#360).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub liveness: Option<crate::lease_liveness::LeaseLiveness>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub liveness_evidence: Option<crate::lease_liveness::LeaseLivenessEvidence>,
     pub safe_next_actions: Vec<String>,
 }
 
@@ -5240,8 +5247,53 @@ impl Broker {
                 )
             })
             .map(|agent| (agent.session.id, agent.derived_status))
-            .collect();
+            .collect::<std::collections::HashMap<_, _>>();
+        // A holder gone past its stale grace no longer refuses (#360); its
+        // leases are still listed.
+        let mut live = live;
+        for session_id in self.sessions_released_by_grace()? {
+            live.remove(&session_id);
+        }
         Ok(LeaseRefusalPolicy { verify_only, live })
+    }
+
+    /// Record, once per holder, that a live session's holder process is
+    /// gone, so its leases' stale grace runs from the first sighting (#360).
+    pub fn record_gone_lease_holders(&mut self) -> Result<(), BrokerOpError> {
+        let Some(table) = crate::session_holder::ProcessTable::snapshot() else {
+            return Ok(());
+        };
+        let mut sessions: Vec<i64> = self
+            .store
+            .active_leases()?
+            .iter()
+            .map(|lease| lease.session_id)
+            .collect();
+        sessions.sort_unstable();
+        sessions.dedup();
+        crate::lease_liveness::record_gone_holders(&mut self.store, &sessions, &table)?;
+        Ok(())
+    }
+
+    /// Liveness of every active lease right now.
+    pub fn lease_liveness(
+        &self,
+        now_ms: i64,
+    ) -> Result<Vec<crate::lease_liveness::LeaseLivenessView>, BrokerOpError> {
+        crate::lease_liveness::assess(
+            &self.store,
+            &self.store.active_leases()?,
+            crate::session_holder::ProcessTable::snapshot().as_ref(),
+            now_ms,
+            crate::lease_liveness::LeaseLivenessPolicy::load(&self.main_root),
+        )
+    }
+
+    /// Sessions whose leases no longer hold: holder gone past the grace.
+    fn sessions_released_by_grace(&self) -> Result<std::collections::HashSet<i64>, BrokerOpError> {
+        Ok(crate::lease_liveness::released_by_grace(
+            &self.lease_liveness(crate::clock::epoch_ms())?,
+        ))
     }
 
     /// Inspect how proposed explicit lease claims intersect the current
@@ -5266,6 +5318,14 @@ impl Broker {
         let leases = self.store.active_leases()?;
         let agents = self.agents_snapshot(now_ms())?;
         let verify_only = LeaseRefusalPolicy::verify_only_at(&self.main_root);
+        let liveness = crate::lease_liveness::assess(
+            &self.store,
+            &leases,
+            crate::session_holder::ProcessTable::snapshot().as_ref(),
+            now_ms(),
+            crate::lease_liveness::LeaseLivenessPolicy::load(&self.main_root),
+        )?;
+        let released_by_grace = crate::lease_liveness::released_by_grace(&liveness);
         let mut planned = Vec::with_capacity(normalized.len());
         for path in normalized {
             let mut owned = Vec::new();
@@ -5294,6 +5354,14 @@ impl Broker {
                     owner_activity_at: owner.activity_at,
                     owner_pid_alive: owner.pid_alive,
                     owner_context: owner.session.context_label(),
+                    liveness: liveness
+                        .iter()
+                        .find(|view| view.lease_id == lease.id)
+                        .map(|view| view.liveness),
+                    liveness_evidence: liveness
+                        .iter()
+                        .find(|view| view.lease_id == lease.id)
+                        .map(|view| view.liveness_evidence.clone()),
                     safe_next_actions: if owned_by_requester {
                         Vec::new()
                     } else {
@@ -5314,7 +5382,12 @@ impl Broker {
             owned.sort_by(lease_plan_overlap_order);
             conflicts.sort_by(lease_plan_overlap_order);
             let would_conflict = conflicts.iter().any(|blocker| {
-                LeaseRefusalPolicy::refuses(verify_only, blocker.kind, Some(blocker.owner_status))
+                !released_by_grace.contains(&blocker.session_id)
+                    && LeaseRefusalPolicy::refuses(
+                        verify_only,
+                        blocker.kind,
+                        Some(blocker.owner_status),
+                    )
             });
             planned.push(LeasePathPlan {
                 path,
@@ -5354,11 +5427,15 @@ impl Broker {
                 path.conflicts
                     .iter()
                     .find(|blocker| {
-                        LeaseRefusalPolicy::refuses(
-                            verify_only,
-                            blocker.kind,
-                            Some(blocker.owner_status),
-                        )
+                        blocker
+                            .liveness_evidence
+                            .as_ref()
+                            .is_none_or(|evidence| evidence.holds)
+                            && LeaseRefusalPolicy::refuses(
+                                verify_only,
+                                blocker.kind,
+                                Some(blocker.owner_status),
+                            )
                     })
                     .map(|blocker| (path, blocker))
             });
@@ -7272,6 +7349,7 @@ impl Broker {
         let agents = self.agents(now_ms)?;
         let sessions_ms = sessions_started.elapsed().as_millis() as u64;
         let integration = self.integration_head()?;
+        self.record_gone_lease_holders()?;
         let mut view = self.build_status(agents, overlaps, integration, now_ms, false)?;
         push_integration_refresh_advice(&mut view, integration_refresh);
         self.store.record_advisories_shown(
@@ -8020,6 +8098,20 @@ impl Broker {
             foreign_started.elapsed().as_millis() as u64,
         );
 
+        let liveness_started = std::time::Instant::now();
+        let leases = self.store.active_leases()?;
+        let lease_liveness = crate::lease_liveness::assess(
+            &self.store,
+            &leases,
+            crate::session_holder::ProcessTable::snapshot().as_ref(),
+            now_ms,
+            crate::lease_liveness::LeaseLivenessPolicy::load(&self.main_root),
+        )?;
+        phase_timings_ms.insert(
+            "lease_liveness".into(),
+            liveness_started.elapsed().as_millis() as u64,
+        );
+
         phase_timings_ms.insert("build_total".into(), started.elapsed().as_millis() as u64);
         Ok(StatusView {
             deferred_checks: {
@@ -8065,7 +8157,8 @@ impl Broker {
             advisory_delivery: self.store.advisory_delivery_summary()?,
             outstanding_entry_exposures: self.store.outstanding_entry_path_exposures()?,
             agents,
-            leases: self.store.active_leases()?,
+            leases,
+            lease_liveness,
             overlaps,
             overlap_pairs,
             scope_overlaps,

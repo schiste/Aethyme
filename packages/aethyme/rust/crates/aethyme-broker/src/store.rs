@@ -6439,6 +6439,24 @@ impl BrokerStore {
             .map_err(BrokerError::from)
     }
 
+    /// Latest `session.holder_gone` event for one session.
+    pub fn latest_session_holder_gone_event(
+        &self,
+        session_id: i64,
+    ) -> Result<Option<Event>, BrokerError> {
+        self.conn
+            .query_row(
+                "SELECT id, schema_version, ts, kind, session_id, payload_json
+                 FROM events
+                 WHERE session_id = ?1 AND kind = ?2
+                 ORDER BY id DESC LIMIT 1",
+                params![session_id, crate::events::SESSION_HOLDER_GONE],
+                event_from_row,
+            )
+            .optional()
+            .map_err(BrokerError::from)
+    }
+
     /// Latest `session.install_recorded` event for one session: the build
     /// that was installed when the session started or was adopted.
     pub fn latest_session_install_event(

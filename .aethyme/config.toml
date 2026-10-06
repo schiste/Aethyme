@@ -32,6 +32,11 @@ mode = "verify-only"
 # Entries ending in "/" are directory prefixes. Gitignored paths never
 # produce leases, so most generated artifacts need no entry here.
 # ignore = ["docs/reports/"]
+# Lease liveness follows the holder process (#360): idle after this many
+# quiet minutes (informational), and a gone holder's leases keep their hold
+# for the grace before they stop conflicting.
+# idle_minutes = 30
+# stale_grace_minutes = 15
 
 # ---------------------------------------------------------------------------
 # Review routing. Live since 2026-09-12: this repository reviews its own pull
