@@ -1633,11 +1633,22 @@ fn finish_closes_promoted_session_and_suggests_cleanup_when_integration_contains
             queue_entry.id
         ))
     );
+    // A verified close releases the session's leases in the transaction
+    // that closes it, before any physical cleanup (#358): the store holds
+    // none of them any more, so the handoff must not read "active".
+    assert!(
+        broker
+            .store()
+            .active_leases()
+            .unwrap()
+            .iter()
+            .all(|lease| lease.session_id != session.id)
+    );
     assert!(
         closed
             .leases_held
             .iter()
-            .any(|lease| { lease.path == "src/" && lease.state == FinishLeaseState::Active })
+            .any(|lease| { lease.path == "src/" && lease.state == FinishLeaseState::Released })
     );
     assert!(closed.leases_held.iter().any(|lease| {
         lease.path == "released.txt" && lease.state == FinishLeaseState::Released

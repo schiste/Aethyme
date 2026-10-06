@@ -412,6 +412,11 @@ fn v1_constructor_payload_field_names_are_frozen() {
         "lease.claimed / lease.released",
     );
     assert_keys(
+        &events::lease_released_payload("p", "finish", 1, 0),
+        &["created_at", "lease_id", "path", "reason"],
+        "lease.released by a terminal finish",
+    );
+    assert_keys(
         &events::gate_result_payload("g", "t", None),
         &["failure_class", "gate", "tree"],
         "gate.pass / gate.fail / gate.cancelled / gate.error",

@@ -937,6 +937,35 @@ pub(crate) fn managed_cache_lease_name(repository: &str, key: &str) -> String {
     format!("aethyme-gate-cache:{repository}:{key}")
 }
 
+/// Gates running right now on behalf of `session_id`, by name, from their
+/// `<session>-<gate>.pid` files. A pidfile that cannot be read counts as
+/// running: a finish must not release leases a gate may still rely on (#358).
+pub(crate) fn running_session_gates(main_root: &Path, session_id: i64) -> Vec<String> {
+    let prefix = format!("{session_id}-");
+    let mut running = Vec::new();
+    let Ok(entries) = std::fs::read_dir(running_dir(main_root)) else {
+        return running;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(gate) = name
+            .strip_prefix(&prefix)
+            .and_then(|rest| rest.strip_suffix(".pid"))
+        else {
+            continue;
+        };
+        let live = std::fs::read_to_string(entry.path())
+            .ok()
+            .and_then(|content| GatePidRecord::parse(&content))
+            .is_none_or(|record| record.names_running_process());
+        if live {
+            running.push(gate.to_string());
+        }
+    }
+    running.sort();
+    running
+}
+
 /// Evidence that a gate of the repository rooted at `main_root` is running
 /// right now, one human-readable line per witness. Empty means none was found.
 ///
@@ -964,17 +993,7 @@ pub(crate) fn running_gate_evidence(main_root: &Path) -> Vec<String> {
                 continue;
             };
             let pid = record.pid.unwrap_or(record.pgid);
-            let alive = match (record.start, process_start_time(pid)) {
-                // A different process reusing the PID is not the gate.
-                (Some(recorded), Some(live)) => recorded == live,
-                (_, Some(_)) => true,
-                // No start time on this platform: fall back to existence.
-                (_, None) => {
-                    cfg!(not(any(target_os = "macos", target_os = "linux")))
-                        && crate::broker::pid_alive(i64::from(pid))
-                }
-            };
-            if alive {
+            if record.names_running_process() {
                 evidence.push(format!("gate pidfile {name} names running process {pid}"));
             }
         }
@@ -1026,6 +1045,22 @@ pub(crate) struct GatePidRecord {
 }
 
 impl GatePidRecord {
+    /// Whether the recorded leader is still running: same PID and, where the
+    /// platform reports it, the same start time.
+    fn names_running_process(&self) -> bool {
+        let pid = self.pid.unwrap_or(self.pgid);
+        match (self.start, process_start_time(pid)) {
+            // A different process reusing the PID is not the gate.
+            (Some(recorded), Some(live)) => recorded == live,
+            (_, Some(_)) => true,
+            // No start time on this platform: fall back to existence.
+            (_, None) => {
+                cfg!(not(any(target_os = "macos", target_os = "linux")))
+                    && crate::broker::pid_alive(i64::from(pid))
+            }
+        }
+    }
+
     fn render(&self) -> String {
         let field = |value: Option<String>| value.unwrap_or_else(|| "-".to_string());
         format!(

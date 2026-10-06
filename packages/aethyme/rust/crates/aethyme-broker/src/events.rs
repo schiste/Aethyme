@@ -325,6 +325,18 @@ pub fn lease_path_payload(path: &str) -> String {
     json!({ "path": path }).to_string()
 }
 
+/// `lease.released` for a lease a terminal transition released (#358):
+/// which lease generation (`lease_id`, `created_at`) and why.
+pub fn lease_released_payload(path: &str, reason: &str, lease_id: i64, created_at: i64) -> String {
+    json!({
+        "path": path,
+        "reason": reason,
+        "lease_id": lease_id,
+        "created_at": created_at,
+    })
+    .to_string()
+}
+
 pub fn guard_paths_payload(paths: &[String]) -> String {
     json!({ "paths": paths }).to_string()
 }
