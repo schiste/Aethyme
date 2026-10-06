@@ -766,7 +766,7 @@ impl BrokerStore {
             return Err(BrokerError::SessionNotFound(id));
         }
         release_checkpoint_pin_in_tx(&tx, id, now)?;
-        tx.execute("DELETE FROM leases WHERE session_id = ?1", [id])?;
+        release_session_leases_in_tx(&tx, id, now, "finish")?;
         tx.execute(
             "DELETE FROM session_foreign_files WHERE session_id = ?1",
             [id],
@@ -822,7 +822,7 @@ impl BrokerStore {
                 params![id, now],
             )?;
             release_checkpoint_pin_in_tx(&tx, id, now)?;
-            tx.execute("DELETE FROM leases WHERE session_id = ?1", [id])?;
+            release_session_leases_in_tx(&tx, id, now, "finish")?;
             tx.execute(
                 "DELETE FROM session_foreign_files WHERE session_id = ?1",
                 [id],
@@ -6734,6 +6734,43 @@ const SESSION_SELECT: &str = "SELECT id, worktree_path, branch, origin, status, 
      exit_code, created_at, updated_at, last_activity_at, cleanup_state, closed_at, \
      cleanup_completed_at, agent_identity, repository_name, tab_name, ai_provider, short_name \
      FROM sessions";
+
+/// Release every lease `session_id` still holds, inside a terminal
+/// transition's transaction: one `lease.released` event per lease naming its
+/// generation and `reason`, then the rows go. Scoped to this session, so a
+/// newer generation of the same path held by another session is untouched.
+fn release_session_leases_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    session_id: i64,
+    now: i64,
+    reason: &str,
+) -> Result<(), BrokerError> {
+    let held: Vec<(i64, String, i64)> = {
+        let mut stmt = tx.prepare(
+            "SELECT id, path, created_at FROM leases
+             WHERE session_id = ?1 AND released_at IS NULL
+               AND (expires_at IS NULL OR expires_at > ?2)
+             ORDER BY id",
+        )?;
+        stmt.query_map(params![session_id, now], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?
+        .collect::<Result<_, _>>()?
+    };
+    for (lease_id, path, created_at) in held {
+        insert_event(
+            tx,
+            now,
+            crate::events::LEASE_RELEASED,
+            Some(session_id),
+            Some(&crate::events::lease_released_payload(
+                &path, reason, lease_id, created_at,
+            )),
+        )?;
+    }
+    tx.execute("DELETE FROM leases WHERE session_id = ?1", [session_id])?;
+    Ok(())
+}
 
 const LEASE_SELECT: &str =
     "SELECT id, session_id, path, kind, created_at, expires_at, released_at FROM leases";

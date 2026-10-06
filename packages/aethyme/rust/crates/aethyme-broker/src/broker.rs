@@ -9532,8 +9532,19 @@ impl Broker {
         //
         // Closing alone deliberately does not qualify: `close` only sets the
         // session status, so a closed session still holds its leases -- and
-        // saying otherwise would hide a real block on other sessions.
-        if report.cleanup.completed {
+        // saying otherwise would hide a real block on other sessions. A
+        // verified terminal finish (`Closed` or `Cleaned`) releases them in
+        // the transaction that closes the session, before any physical
+        // cleanup (#358), so it qualifies too -- checked against the store,
+        // not assumed from the status.
+        let released_by_close = report.closed
+            && matches!(report.status, FinishStatus::Closed | FinishStatus::Cleaned)
+            && !self
+                .store
+                .active_leases()?
+                .iter()
+                .any(|lease| lease.session_id == session_id);
+        if report.cleanup.completed || released_by_close {
             let released_at = now_ms();
             for lease in &mut report.leases_held {
                 if lease.state == FinishLeaseState::Active {
@@ -9932,6 +9943,22 @@ impl Broker {
             // remedy this block exists to remove.
             report.next_commands.push(format!(
                 "aethyme broker advanced representation scan --session {session_id}"
+            ));
+            self.finalize_finish_report(&mut report);
+            return Ok(report);
+        }
+
+        // A gate running for this session still relies on what it leased:
+        // closing now would release those leases under it (#358). Unknown
+        // pidfiles count as running, so this fails closed.
+        let running_gates = crate::gates::running_session_gates(&self.main_root, session_id);
+        if !running_gates.is_empty() {
+            report.warnings.push(format!(
+                "gate {} is still running for this session; its leases stay held until it ends",
+                running_gates.join(", ")
+            ));
+            report.next_commands.push(format!(
+                "wait for the gate to end, then: aethyme broker finish --session {session_id}"
             ));
             self.finalize_finish_report(&mut report);
             return Ok(report);
