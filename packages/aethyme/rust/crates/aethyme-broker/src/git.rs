@@ -276,6 +276,11 @@ pub(crate) fn git_command() -> Command {
     Command::new(&git_program().program)
 }
 
+/// The probed git binary every coordinated git command runs.
+pub(crate) fn git_program_path() -> PathBuf {
+    git_program().program.clone()
+}
+
 fn resolve_git_program() -> GitProgram {
     let mut dishonest: Vec<BypassedGit> = Vec::new();
     let mut unusable: Vec<BypassedGit> = Vec::new();
@@ -478,7 +483,7 @@ fn require_trustworthy_porcelain() -> Result<(), GitError> {
 }
 
 /// Executable files named `program` on PATH, in PATH order.
-fn path_candidates(program: &str) -> Vec<PathBuf> {
+pub(crate) fn path_candidates(program: &str) -> Vec<PathBuf> {
     let Some(path) = std::env::var_os("PATH") else {
         return Vec::new();
     };

@@ -1605,6 +1605,60 @@ fn git_destructive_branch_targets(args: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// Why a `gh run|release download` would write inside a `.git` directory,
+/// where a file can become a hook: each target directory or output file is
+/// resolved against `cwd` through symlinks (the nearest existing ancestor is
+/// canonicalized) before its components are checked.
+fn download_into_git_dir(args: &[String], cwd: &Path) -> Option<String> {
+    let (Some(command), Some("download")) = (
+        args.first().map(String::as_str),
+        args.get(1).map(String::as_str),
+    ) else {
+        return None;
+    };
+    if !matches!(command, "run" | "release") {
+        return None;
+    }
+    let mut targets = Vec::new();
+    let mut iter = args[2..].iter();
+    while let Some(token) = iter.next() {
+        match token.as_str() {
+            "-D" | "--dir" | "-O" | "--output" => targets.extend(iter.next().cloned()),
+            other => {
+                if let Some(value) = other
+                    .strip_prefix("--dir=")
+                    .or_else(|| other.strip_prefix("--output="))
+                    .or_else(|| other.strip_prefix("-D"))
+                    .or_else(|| other.strip_prefix("-O"))
+                    .filter(|value| !value.is_empty())
+                {
+                    targets.push(value.to_string());
+                }
+            }
+        }
+    }
+    targets.into_iter().find_map(|target| {
+        let joined = cwd.join(&target);
+        let mut existing = joined.as_path();
+        let mut rest = Vec::new();
+        while !existing.exists() {
+            rest.push(existing.file_name()?.to_os_string());
+            existing = existing.parent()?;
+        }
+        let mut resolved = existing.canonicalize().ok()?;
+        resolved.extend(rest.iter().rev());
+        resolved
+            .components()
+            .any(|part| part.as_os_str() == ".git")
+            .then(|| {
+                format!(
+                    "a download into a `.git` directory ({target:?} resolves to {})",
+                    resolved.display()
+                )
+            })
+    })
+}
+
 /// The branches a pull request joins, read in one call.
 struct PullRequestRefs {
     head: String,
@@ -3764,10 +3818,9 @@ fn provider_command(provider: OperationProvider) -> Command {
 /// and git turn variables into commands (`GH_BROWSER`, `EDITOR`, `PAGER`,
 /// `GIT_SSH_COMMAND`, `GIT_CONFIG_*` ...) or into another target (`GH_HOST`,
 /// `GH_CONFIG_DIR`, `GIT_DIR` ...), either of which bypasses the branch guard
-/// (#393). `AETHYME_*` is the broker's own namespace.
+/// (#393). `PATH` and `HOME` are set, not inherited. `AETHYME_*` is the
+/// broker's own namespace.
 const GH_INHERITED_ENV: &[&str] = &[
-    "PATH",
-    "HOME",
     "USER",
     "LOGNAME",
     "TMPDIR",
@@ -3789,8 +3842,59 @@ const GH_INHERITED_ENV: &[&str] = &[
     "all_proxy",
 ];
 
+static GH_PROGRAM: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+
+/// The gh binary, resolved once to an absolute, canonical path from the same
+/// candidates `git` is probed from, so the child's `PATH` never chooses it.
+fn gh_program() -> Option<&'static PathBuf> {
+    GH_PROGRAM
+        .get_or_init(|| {
+            use std::os::unix::fs::PermissionsExt as _;
+            crate::git::path_candidates("gh")
+                .into_iter()
+                .find_map(|candidate| {
+                    let resolved = candidate.canonicalize().ok()?;
+                    let metadata = std::fs::metadata(&resolved).ok()?;
+                    (metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+                        .then_some(resolved)
+                })
+        })
+        .as_ref()
+}
+
+/// The invoking user's home directory from the passwd database, not `HOME`,
+/// so a relocated `HOME` cannot supply gh or git configuration.
+fn passwd_home() -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let mut buffer = vec![0_u8; 16 * 1024];
+    // SAFETY: `passwd` is a plain C struct of pointers and integers, for which
+    // all-zero bytes are a valid (empty) value; getpwuid_r overwrites it.
+    let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut result: *mut libc::passwd = std::ptr::null_mut();
+    // SAFETY: `getpwuid_r` writes only into `entry` and `buffer`, both owned
+    // here and sized as passed; `result` is null or points at `entry`.
+    let status = unsafe {
+        libc::getpwuid_r(
+            libc::getuid(),
+            &mut entry,
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+            &mut result,
+        )
+    };
+    if status != 0 || result.is_null() || entry.pw_dir.is_null() {
+        return None;
+    }
+    // SAFETY: `pw_dir` points into `buffer`, NUL-terminated by getpwuid_r.
+    let dir = unsafe { std::ffi::CStr::from_ptr(entry.pw_dir) };
+    Some(PathBuf::from(std::ffi::OsStr::from_bytes(dir.to_bytes())))
+}
+
 fn github_command() -> Command {
-    let mut command = Command::new(provider_executable(OperationProvider::Github));
+    let program = gh_program()
+        .cloned()
+        .unwrap_or_else(|| PathBuf::from("/nonexistent/gh"));
+    let mut command = Command::new(&program);
     command.env_clear();
     for (key, value) in std::env::vars_os() {
         let name = key.to_string_lossy();
@@ -3798,15 +3902,42 @@ fn github_command() -> Command {
             command.env(&key, &value);
         }
     }
-    // gh's own settings may name a browser, editor or pager command in its
-    // config file; the environment overrides them with harmless programs.
+    // A fixed PATH: gh's own directory, the probed git's, and the system's.
+    let mut path = Vec::new();
+    for binary in [program, crate::git::git_program_path()] {
+        if let Some(dir) = binary.parent()
+            && !path.iter().any(|known: &PathBuf| known == dir)
+        {
+            path.push(dir.to_path_buf());
+        }
+    }
+    path.extend([PathBuf::from("/usr/bin"), PathBuf::from("/bin")]);
+    if let Ok(joined) = std::env::join_paths(&path) {
+        command.env("PATH", joined);
+    }
+    if let Some(home) = passwd_home() {
+        command.env("HOME", home);
+    }
+    // gh's settings may name a browser, editor or pager command; the
+    // environment overrides them. The git gh starts reads no system or
+    // global configuration, and the repository's own cannot name a hook
+    // directory, an ssh command or an fsmonitor to run.
     command
         .env("GH_PROMPT_DISABLED", "1")
         .env("GH_NO_UPDATE_NOTIFIER", "1")
         .env("GH_PAGER", "cat")
         .env("GH_BROWSER", "false")
         .env("GH_EDITOR", "false")
-        .env("GIT_TERMINAL_PROMPT", "0");
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_COUNT", "3")
+        .env("GIT_CONFIG_KEY_0", "core.hooksPath")
+        .env("GIT_CONFIG_VALUE_0", "/dev/null")
+        .env("GIT_CONFIG_KEY_1", "core.sshCommand")
+        .env("GIT_CONFIG_VALUE_1", "ssh")
+        .env("GIT_CONFIG_KEY_2", "core.fsmonitor")
+        .env("GIT_CONFIG_VALUE_2", "false");
     command
 }
 
@@ -4251,6 +4382,11 @@ impl Broker {
                 ),
             })
         };
+        if let Some(why) = download_into_git_dir(&request.args, cwd)
+            && !(request.ref_write_acknowledged && request.destructive_confirmed)
+        {
+            return refuse(why);
+        }
         let slug = github_target.map_or("", |target| target.display_slug.as_str());
         let verdict = crate::gh_ref_guard::assess(&request.args, slug);
         let (number, match_head_commit) = match verdict {

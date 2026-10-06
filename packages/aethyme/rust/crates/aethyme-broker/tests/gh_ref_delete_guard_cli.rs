@@ -36,6 +36,8 @@ printf '%s\n' "$*" >> "$AETHYME_FAKE_GH_LOG"
 printf 'GH_BROWSER=%s EDITOR=%s GIT_SSH_COMMAND=%s GH_CONFIG_DIR=%s GH_HOST=%s GH_PROMPT_DISABLED=%s\n' \
   "$GH_BROWSER" "$EDITOR" "$GIT_SSH_COMMAND" "$GH_CONFIG_DIR" "$GH_HOST" "$GH_PROMPT_DISABLED" \
   >> "$AETHYME_FAKE_GH_LOG.env"
+printf 'ARGV0=%s\nPATH=%s\nHOME=%s\nGIT_CONFIG_GLOBAL=%s\nGIT_CONFIG_NOSYSTEM=%s\n' \
+  "$0" "$PATH" "$HOME" "$GIT_CONFIG_GLOBAL" "$GIT_CONFIG_NOSYSTEM" >> "$AETHYME_FAKE_GH_LOG.child"
 exit 0
 "#;
 
@@ -732,6 +734,8 @@ fn a_base_owned_by_another_session_is_refused() {
             "create",
             "--base",
             &fixture.other.branch,
+            "--head",
+            &fixture.own.branch,
             "--title",
             "t",
             "--body",
@@ -741,4 +745,108 @@ fn a_base_owned_by_another_session_is_refused() {
         let output = fixture.gh(&[], &gh, "");
         assert_refused(&fixture, &output, &owner);
     }
+}
+
+// --- Third review: binary choice, git configuration, symlinked downloads --
+
+fn child_env(fixture: &Fixture) -> std::collections::HashMap<String, String> {
+    std::fs::read_to_string(format!("{}.child", fixture.log().display()))
+        .unwrap()
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect()
+}
+
+#[test]
+fn gh_runs_by_absolute_path_with_a_fixed_path() {
+    let fixture = Fixture::new();
+    // A directory the caller puts on PATH after gh: gh's own git lookups
+    // must never reach it.
+    let evil = tempfile::tempdir().unwrap();
+    let caller_path = format!(
+        "{}:{}:{}",
+        fixture.bin.path().display(),
+        evil.path().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let output = fixture.gh_env(
+        &[],
+        &["issue", "comment", "1", "--body", "x"],
+        "",
+        &[("PATH", &caller_path)],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    let env = child_env(&fixture);
+    let gh = fixture.bin.path().join("gh").canonicalize().unwrap();
+    assert_eq!(
+        env["ARGV0"],
+        gh.display().to_string(),
+        "gh ran by absolute path"
+    );
+    assert!(
+        !env["PATH"].contains(&evil.path().display().to_string()),
+        "the caller's PATH leaked: {}",
+        env["PATH"]
+    );
+    assert!(env["PATH"].ends_with("/usr/bin:/bin"), "{}", env["PATH"]);
+}
+
+#[test]
+fn gh_and_its_git_read_no_relocated_home_or_global_config() {
+    let fixture = Fixture::new();
+    let output = fixture.gh_env(
+        &[],
+        &["issue", "comment", "1", "--body", "x"],
+        "",
+        &[("HOME", "/tmp/relocated-home")],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    let env = child_env(&fixture);
+    assert_ne!(env["HOME"], "/tmp/relocated-home");
+    assert!(!env["HOME"].is_empty());
+    assert_eq!(env["GIT_CONFIG_GLOBAL"], "/dev/null");
+    assert_eq!(env["GIT_CONFIG_NOSYSTEM"], "1");
+}
+
+#[test]
+fn commands_that_run_git_on_user_configuration_are_refused() {
+    let fixture = Fixture::new();
+    for gh in [
+        &["extension", "install", "someone/gh-x"][..],
+        &["extension", "upgrade", "--all"],
+        &["gist", "clone", "abc"],
+        &["pr", "create", "--title", "t", "--body", "b"],
+    ] {
+        let output = fixture.gh(&["--effect", "write", "--scope", "github:test"], gh, "");
+        assert!(!output.status.success(), "{gh:?} ran");
+        assert_eq!(fixture.ran(), "", "{gh:?} ran");
+    }
+    assert_eq!(fixture.journaled(), 0);
+    let output = fixture.gh(
+        &[],
+        &[
+            "pr",
+            "create",
+            "--head",
+            &fixture.own.branch,
+            "--title",
+            "t",
+            "--body",
+            "b",
+        ],
+        "",
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+}
+
+#[test]
+fn a_download_through_a_symlink_into_git_is_refused() {
+    let fixture = Fixture::new();
+    let links = tempfile::tempdir().unwrap();
+    let link = links.path().join("artifacts");
+    std::os::unix::fs::symlink(fixture.repo.path().join(".git/hooks"), &link).unwrap();
+    let target = link.join("sub").display().to_string();
+    let output = fixture.gh(&[], &["run", "download", "1", "-D", &target], "");
+    assert_refused(&fixture, &output, "`.git` directory");
 }

@@ -56,7 +56,13 @@ const NO_REF_WRITE: &[(&str, &str)] = &[
     ("issue", "*"),
     ("label", "*"),
     ("project", "*"),
-    ("gist", "*"),
+    // Not `gist clone`, which runs git on the user's configuration.
+    ("gist", "list"),
+    ("gist", "view"),
+    ("gist", "create"),
+    ("gist", "edit"),
+    ("gist", "delete"),
+    ("gist", "rename"),
     ("ssh-key", "*"),
     ("gpg-key", "*"),
     ("org", "*"),
@@ -70,10 +76,9 @@ const NO_REF_WRITE: &[(&str, &str)] = &[
     ("workflow", "*"),
     // Releases and their tags; tags are never session branches.
     ("release", "*"),
-    // Installing or listing an extension runs nothing; `exec` is not here.
+    // Listing or removing an extension runs nothing. Installing or upgrading
+    // one runs git on the user's configuration, and `exec` runs it.
     ("extension", "list"),
-    ("extension", "install"),
-    ("extension", "upgrade"),
     ("extension", "remove"),
     ("extension", "search"),
     ("extension", "browse"),
@@ -89,8 +94,6 @@ const NO_REF_WRITE: &[(&str, &str)] = &[
     ("pr", "reopen"),
     ("pr", "lock"),
     ("pr", "unlock"),
-    // Pushes only the current branch, never with force.
-    ("pr", "create"),
     ("repo", "view"),
     ("repo", "list"),
 ];
@@ -144,7 +147,15 @@ pub(crate) fn assess(args: &[String], repository: &str) -> Verdict {
     {
         return Verdict::PrUpdateBranch((*number).to_string());
     }
-    if command == "pr" && matches!(action, "edit" | "create") {
+    if command == "pr" && action == "create" {
+        // Without an explicit head, gh pushes the current branch with git,
+        // which runs the repository's configuration.
+        if let Err(why) = require_explicit_head(&rest[1..]) {
+            return unverifiable(why);
+        }
+        return assess_pr_base(&rest[1..]);
+    }
+    if command == "pr" && action == "edit" {
         return assess_pr_base(&rest[1..]);
     }
     if NO_REF_WRITE.iter().any(|(known, known_action)| {
@@ -156,6 +167,34 @@ pub(crate) fn assess(args: &[String], repository: &str) -> Verdict {
         "`gh {command} {action}` is not on the broker's list of gh commands that cannot write \
          a branch ref (an alias, an extension, or a command that can delete or rewrite one)"
     ))
+}
+
+/// `pr create` must name its head as exactly one separate `--head <name>` or
+/// `-H <name>` pair; any other spelling, or none, could make gh push.
+fn require_explicit_head(tokens: &[&str]) -> Result<(), String> {
+    let mut head = false;
+    let mut iter = tokens.iter();
+    while let Some(&token) = iter.next() {
+        if matches!(token, "--head" | "-H") {
+            match iter.next() {
+                Some(name) if !head && !name.is_empty() && !name.starts_with('-') => head = true,
+                _ => return Err("a repeated or missing --head value".into()),
+            }
+        } else if token.starts_with("--head")
+            || token
+                .strip_prefix('-')
+                .is_some_and(|cluster| !cluster.starts_with('-') && cluster.contains('H'))
+        {
+            return Err(format!(
+                "head option spelled {token:?}; use `--head <name>`"
+            ));
+        }
+    }
+    if head {
+        Ok(())
+    } else {
+        Err("`gh pr create` without --head pushes the current branch with git".into())
+    }
 }
 
 /// `pr edit|create` may set the base only as a separate `--base <name>` or
@@ -707,6 +746,11 @@ mod tests {
             &["pr", "edit", "7", "-Bagent/x"],
             &["pr", "edit", "7", "--base", "a", "--base", "b"],
             &["pr", "create", "-fB", "agent/x"],
+            &["pr", "create", "--title", "t"],
+            &["pr", "create", "--head=x", "--title", "t"],
+            &["extension", "install", "o/gh-x"],
+            &["extension", "upgrade", "--all"],
+            &["gist", "clone", "abc"],
         ] {
             assert!(unverifiable_line(line), "{line:?}");
         }
@@ -719,7 +763,9 @@ mod tests {
             Verdict::PrBase("agent/x".into())
         );
         assert_eq!(
-            assess_line(&["pr", "create", "-B", "main", "--title", "t"]),
+            assess_line(&[
+                "pr", "create", "-B", "main", "--head", "agent/a", "--title", "t"
+            ]),
             Verdict::PrBase("main".into())
         );
         assert_eq!(
