@@ -82,6 +82,8 @@ const COMMANDS: &[&str] = &[
     "update check",
     "update plan",
     "update execute",
+    "update apply",
+    "self-update",
     "upgrade",
     "upgrade plan",
     "upgrade apply",

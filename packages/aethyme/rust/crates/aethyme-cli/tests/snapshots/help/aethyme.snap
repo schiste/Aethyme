@@ -30,7 +30,10 @@ Agent broker:
   plugin install|status|remove
                               install the agent-surface plugin, or report the
                               plugin/CLI version skew that makes one inert
-  update check|plan|execute   explicit paired-binary updates; never background
+  update check|plan|execute|apply
+                              explicit paired-binary updates; never background
+  self-update [--version X.Y.Z]
+                              verified, atomic upgrade (= update apply)
   upgrade plan|apply|recover  review, apply, or recover repository migrations
 
 Setup:
