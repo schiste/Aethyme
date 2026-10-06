@@ -121,6 +121,25 @@ pub(super) fn safe_command_surface(args: &[String]) -> Option<String> {
     Some(words.join("."))
 }
 
+/// Set when this invocation was a delivery poll that found nothing to claim
+/// (#417). The PR monitor polls on a timer whether or not anything happened,
+/// so these empty polls were most of the command history -- 79% of all
+/// commands, about 130 an hour overnight with no session working -- and buried
+/// the failures the history exists to show. A poll that claims, or fails, is
+/// still recorded.
+static IDLE_DELIVERY_POLL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub(super) fn mark_idle_delivery_poll() {
+    IDLE_DELIVERY_POLL.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether a successful invocation should leave no outcome event and no
+/// metric line because it was an empty delivery poll.
+pub(super) fn idle_delivery_poll(exit: u8) -> bool {
+    exit == 0 && IDLE_DELIVERY_POLL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Longest failure message kept with a `broker.command.failed` event. Enough
 /// for an error and its first cause; the full text went to stderr.
 pub(super) const FAILURE_MESSAGE_MAX_CHARS: usize = 500;
@@ -318,6 +337,9 @@ pub(super) fn command_records_metric(args: &[String]) -> bool {
         Some("doctor") => args.iter().any(|arg| arg == "--fix-version"),
         Some("trust") => args.get(1).map(String::as_str) != Some("status"),
         Some("blockers") => false,
+        // Listing the outbox is a read; claims, dispatches and completions
+        // change it.
+        Some("deliveries") => args.get(1).map(String::as_str) != Some("list"),
         _ => true,
     }
 }

@@ -597,3 +597,142 @@ fn a_delivery_that_is_always_deferred_is_eventually_dead_lettered() {
         "the dead-lettered row must keep the reason it kept failing"
     );
 }
+
+/// #417: the PR monitor polls for deliveries on a timer, and the empty polls
+/// were 79% of the command history, outcome events included. A poll that
+/// finds nothing records nothing; a poll that claims, a poll that fails, and
+/// a completion are still recorded, and listing the outbox is a read.
+#[test]
+fn an_empty_delivery_poll_records_no_command_telemetry() {
+    const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
+    let (root, mut broker, session_id) = broker_fixture();
+    let run = |args: &[&str]| {
+        Command::new(CLI)
+            .args(args)
+            .current_dir(root.path())
+            .env_remove("AETHYME_MEASURE_OUTPUT")
+            .output()
+            .unwrap()
+    };
+    let metrics_path = root.path().join(".aethyme/logs/command-metrics.jsonl");
+    let metric_lines = || {
+        std::fs::read_to_string(&metrics_path)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| line.contains("\"command\":\"deliveries"))
+            .count()
+    };
+    let command_events = |broker: &mut Broker| {
+        broker
+            .store()
+            .events_after(0, 10_000)
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.kind.starts_with("broker.command."))
+            .count()
+    };
+    let tabs = root.path().join("tabs.json");
+    std::fs::write(&tabs, "[]").unwrap();
+    let claim = [
+        "advanced",
+        "deliveries",
+        "claim",
+        "--adapter",
+        "test-adapter",
+        "--worker",
+        "worker-1",
+        "--json",
+    ];
+    let dispatch = [
+        "advanced",
+        "deliveries",
+        "dispatch",
+        "--adapter",
+        "chau7",
+        "--worker",
+        "worker-1",
+        "--tabs-file",
+        tabs.to_str().unwrap(),
+        "--json",
+    ];
+
+    for args in [&claim[..], &dispatch[..]] {
+        let output = run(args);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("\"delivery\": null")
+                || String::from_utf8_lossy(&output.stdout).contains("\"claimed\":false")
+        );
+    }
+    let listed = run(&["advanced", "deliveries", "list", "--json"]);
+    assert!(listed.status.success());
+    assert_eq!(
+        metric_lines(),
+        0,
+        "empty polls and listings write no metric line"
+    );
+    assert_eq!(
+        command_events(&mut broker),
+        0,
+        "empty polls write no outcome event"
+    );
+
+    let provider = FakeProvider(Mutex::new(VecDeque::from([
+        snapshot("open", 'a', &["C1"]),
+        snapshot("open", 'b', &["C1", "C2"]),
+    ])));
+    let watch = broker
+        .start_pull_request_watch(
+            session_id,
+            "Owner/Repo",
+            7,
+            vec![PullRequestActivityKind::Comment],
+            60,
+            &provider,
+            1_000,
+        )
+        .unwrap();
+    broker
+        .subscribe_pull_request_delivery(
+            watch.id,
+            "test-adapter",
+            "recipient-1",
+            DeliveryPolicy::Notify,
+            2_000,
+        )
+        .unwrap();
+    broker
+        .poll_pull_request_watch(watch.id, &provider, 61_000)
+        .unwrap();
+
+    let claimed = run(&claim);
+    assert!(
+        claimed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&claimed.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&claimed.stdout).unwrap();
+    assert!(report["delivery"].is_object(), "{report}");
+    assert_eq!(
+        metric_lines(),
+        1,
+        "a poll that claims is recorded: {}",
+        std::fs::read_to_string(&metrics_path).unwrap_or_default()
+    );
+    assert_eq!(command_events(&mut broker), 1);
+
+    let failed = run(&[
+        "advanced",
+        "deliveries",
+        "claim",
+        "--adapter",
+        "test-adapter",
+    ]);
+    assert!(!failed.status.success());
+    assert_eq!(metric_lines(), 2, "a failed poll is recorded");
+    assert_eq!(command_events(&mut broker), 2);
+}
