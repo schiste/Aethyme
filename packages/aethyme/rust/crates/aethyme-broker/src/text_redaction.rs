@@ -67,13 +67,17 @@ fn earliest_secret(text: &str) -> Option<usize> {
             .filter(|&index| at_token_boundary(text, index))
     });
     let (compact, source_offsets) = compact_marker_separators(text);
+    // ASCII lowercasing keeps every byte offset, so `source_offsets` indexes
+    // both. Value prefixes stay case-sensitive, as in the uncompacted search:
+    // `SK-1234` is a ticket key, not a key.
+    let compact_lower = compact.to_ascii_lowercase();
     let split_assignment = ASSIGNMENT_MARKERS.iter().flat_map(|marker| {
         let normalized_marker: String = marker
             .chars()
             .filter(|character| !character.is_whitespace())
             .map(|character| character.to_ascii_lowercase())
             .collect();
-        compact
+        compact_lower
             .match_indices(&normalized_marker)
             .filter_map(|(index, _)| {
                 let marker_end = index + normalized_marker.len();
@@ -146,7 +150,7 @@ fn is_marker_separator(character: char) -> bool {
 }
 
 /// Remove whitespace and invisible formatting for conservative marker
-/// detection while retaining each normalized byte's position in the original
+/// detection, keeping case, while retaining each normalized byte's position in the original
 /// text, so redaction can cut at the beginning of a split marker.
 fn compact_marker_separators(text: &str) -> (String, Vec<usize>) {
     let mut compact = String::with_capacity(text.len());
@@ -155,9 +159,8 @@ fn compact_marker_separators(text: &str) -> (String, Vec<usize>) {
         if is_marker_separator(character) {
             continue;
         }
-        let normalized = character.to_ascii_lowercase();
-        compact.push(normalized);
-        source_offsets.extend(std::iter::repeat_n(byte_offset, normalized.len_utf8()));
+        compact.push(character);
+        source_offsets.extend(std::iter::repeat_n(byte_offset, character.len_utf8()));
     }
     (compact, source_offsets)
 }
@@ -253,6 +256,10 @@ mod tests {
         assert_eq!(
             redact_secrets("disk-space before s\nk-split-value-secret"),
             "disk-space before [redacted]"
+        );
+        assert_eq!(
+            redact_secrets("ticket SK-1234 and GHP_NOTE stay readable"),
+            "ticket SK-1234 and GHP_NOTE stay readable"
         );
         for (separator, secret) in [
             ('\u{180b}', "mongolian-selector"),
