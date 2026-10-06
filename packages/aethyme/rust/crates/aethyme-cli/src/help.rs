@@ -24,7 +24,13 @@ pub enum HelpRoute {
 /// Commands whose group-level `--help` is safe and complete. Subcommand help
 /// is answered with the group's help so no subcommand parser ever sees it.
 const GROUP_NATIVE: &[&str] = &[
-    "intents", "update", "plugin", "ai-ready", "quality", "autofix",
+    "intents",
+    "update",
+    "self-update",
+    "plugin",
+    "ai-ready",
+    "quality",
+    "autofix",
 ];
 
 /// Commands that check for `--help` anywhere before doing anything, so the

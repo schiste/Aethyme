@@ -20,6 +20,7 @@ pub const SESSION_REUSED: &str = "session.reused";
 pub const SESSION_CONTEXT_UPDATED: &str = "session.context_updated";
 pub const SESSION_FINISHED: &str = "session.finished";
 pub const SESSION_HOLDER_BOUND: &str = "session.holder_bound";
+pub const SESSION_INSTALL_RECORDED: &str = "session.install_recorded";
 pub const SESSION_FINISH_CLEANUP_STARTED: &str = "session.finish_cleanup_started";
 pub const SESSION_CHECKPOINT_REANCHORED: &str = "session.checkpoint_reanchored";
 pub const REVIEW_LIFECYCLE_REASSIGNED: &str = "review.lifecycle_reassigned";
@@ -99,6 +100,22 @@ pub fn session_holder_bound_payload(
         "reason": reason,
         "previous_pid": previous.map(|process| process.pid),
         "previous_started": previous.map(|process| process.started.as_str()),
+    })
+    .to_string()
+}
+
+/// `session.install_recorded`: the router build that started or adopted the
+/// session, and the engine banner on PATH beside it (#293).
+pub fn session_install_recorded_payload(
+    router: &crate::version::BinaryBuild,
+    engine_banner: Option<&str>,
+) -> String {
+    json!({
+        "version": router.version,
+        "describe": router.describe,
+        "commit": router.commit,
+        "path": router.path,
+        "engine_banner": engine_banner,
     })
     .to_string()
 }

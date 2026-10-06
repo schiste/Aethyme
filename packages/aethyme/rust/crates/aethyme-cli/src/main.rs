@@ -397,6 +397,10 @@ fn main() -> ExitCode {
             broker_compatibility_mode,
         )),
         "update" => ExitCode::from(aethyme_broker::run_update_cli(command.args)),
+        // #293/#251: the supported upgrade path, spelled as the decision named it.
+        "self-update" => ExitCode::from(aethyme_broker::run_update_cli(&self_update_args(
+            command.args,
+        ))),
         "upgrade" => ExitCode::from(repository_upgrade::run(command.args)),
         // Certification — top-level by design (the "airport certification"
         // inspection). Strictly read-only; adaptive setup lives in
@@ -644,7 +648,10 @@ Agent broker:
   plugin install|status|remove
                               install the agent-surface plugin, or report the
                               plugin/CLI version skew that makes one inert
-  update check|plan|execute   explicit paired-binary updates; never background
+  update check|plan|execute|apply
+                              explicit paired-binary updates; never background
+  self-update [--version X.Y.Z]
+                              verified, atomic upgrade (= update apply)
   upgrade plan|apply|recover  review, apply, or recover repository migrations
 
 Setup:
@@ -699,6 +706,7 @@ fn answer_help(route: help::HelpRoute, args: &[String]) -> ExitCode {
                     }
                 },
                 "update" => aethyme_broker::run_update_cli(rest),
+                "self-update" => aethyme_broker::run_update_cli(&self_update_args(rest)),
                 "plugin" => aethyme_broker::plugin_cli::run(rest),
                 "ai-ready" => aethyme_quality::ai_ready_cli::run(rest),
                 "quality" => aethyme_quality::quality_cli::run(rest),
@@ -1040,6 +1048,13 @@ fn unknown_subcommand(subcommand: &str) -> ExitCode {
     eprintln!("aethyme: unknown subcommand '{subcommand}'");
     eprintln!("Run `aethyme --help` for the command list.");
     ExitCode::from(2)
+}
+
+/// `aethyme self-update <args>` is `aethyme update apply <args>`.
+fn self_update_args(args: &[String]) -> Vec<String> {
+    std::iter::once("apply".to_string())
+        .chain(args.iter().cloned())
+        .collect()
 }
 
 #[cfg(test)]
