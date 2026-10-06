@@ -5,6 +5,7 @@ use serde::Serialize;
 
 use crate::engine::ScorecardEngine;
 use crate::model::{Finding, QualityInspection, Severity};
+use crate::snapshot::GeneratedFiles;
 
 const DEFAULT_FINDING_LIMIT: usize = 100;
 
@@ -22,6 +23,9 @@ Options:
   --detectors TEXT        Comma-separated detector names
   --limit N               Maximum rendered findings (default: 100)
   --full                  Render every finding
+  --include-generated     Also inspect files marked generated (by name, by a
+                          generated-file header, or `linguist-generated` in
+                          .gitattributes); they are skipped by default
   --help                  Show this message and exit.
 ";
 
@@ -33,6 +37,7 @@ struct Args {
     detectors: Option<Vec<String>>,
     limit: usize,
     full: bool,
+    include_generated: bool,
 }
 
 pub fn run(args: &[String]) -> u8 {
@@ -73,7 +78,12 @@ pub fn run(args: &[String]) -> u8 {
             return 2;
         }
     };
-    let inspection = match engine.inspect_tracked(parsed.detectors.as_deref()) {
+    let generated = if parsed.include_generated {
+        GeneratedFiles::Include
+    } else {
+        GeneratedFiles::Exclude
+    };
+    let inspection = match engine.inspect_tracked_with(parsed.detectors.as_deref(), generated) {
         Ok(report) => report,
         Err(message) => {
             eprintln!("Error: {message}");
@@ -105,6 +115,7 @@ fn parse_args(args: &[String]) -> Result<Option<Args>, String> {
         detectors: None,
         limit: DEFAULT_FINDING_LIMIT,
         full: false,
+        include_generated: false,
     };
     let mut index = 0;
     while index < args.len() {
@@ -138,6 +149,10 @@ fn parse_args(args: &[String]) -> Result<Option<Args>, String> {
             }
             "--full" => {
                 parsed.full = true;
+                index += 1;
+            }
+            "--include-generated" => {
+                parsed.include_generated = true;
                 index += 1;
             }
             other => {

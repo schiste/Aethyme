@@ -56,6 +56,30 @@ fn markdown_html_link_pattern() -> &'static Regex {
     CELL.get_or_init(|| Regex::new(r#"(?i)\b(?:href|src)\s*=\s*["']([^"']+)["']"#).unwrap())
 }
 
+/// Scratch locations every POSIX host provides. A path under one is a
+/// fixture, socket or cache location, not something a relative link could
+/// replace, so inspection does not report it. `/private/...` is where macOS
+/// resolves `/tmp` and `/var`; `/var/folders` is its per-user temp root.
+const TEMP_ROOTS: [&str; 5] = [
+    "/tmp/",
+    "/var/tmp/",
+    "/var/folders/",
+    "/private/tmp/",
+    "/private/var/",
+];
+
+fn is_temp_path(line: &str, matched: &regex::Match<'_>) -> bool {
+    // The patterns match `/tmp/...` inside `/private/tmp/...`, so look at
+    // the whole path the match belongs to, not just the matched text.
+    let path_start = line[..matched.start()]
+        .char_indices()
+        .rev()
+        .find(|(_, c)| !(c.is_alphanumeric() || matches!(c, '/' | '_' | '.' | '-')))
+        .map_or(0, |(index, c)| index + c.len_utf8());
+    let path = &line[path_start..matched.end()];
+    TEMP_ROOTS.iter().any(|root| path.starts_with(root))
+}
+
 fn local_destination(destination: &str) -> bool {
     destination.starts_with('/')
         || destination.starts_with(r"C:\")
@@ -210,6 +234,11 @@ impl RelativeLinksDetector {
                                 range.start <= matched_path.start()
                                     && matched_path.end() <= range.end
                             }))
+                        {
+                            continue;
+                        }
+                        if mode == DetectionMode::QualityInspection
+                            && is_temp_path(line, &matched_path)
                         {
                             continue;
                         }
@@ -386,5 +415,52 @@ mod tests {
         let mut paths: Vec<&str> = findings.iter().map(|f| f.file_path.as_str()).collect();
         paths.sort_unstable();
         assert_eq!(paths, ["config.json", "settings.py"]);
+    }
+
+    #[test]
+    fn inspection_skips_temp_directory_paths_but_not_other_system_paths() {
+        let tmp = tmpdir("rellinks-inspection-temp");
+        let repo = tmp.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(
+            repo.join("test_paths.py"),
+            concat!(
+                "SOCKETS = Path(\"/tmp/example-sockets\")\n",
+                "REPO = \"/private/tmp/example/repo\"\n",
+                "SCRATCH = \"/var/tmp/example\"\n",
+                "USER_TMP = \"/var/folders/xy/T/example\"\n",
+                "NOTE = \"\u{2019}/tmp/after-a-curly-quote\"\n",
+                "STATE = \"/var/lib/example/state\"\n",
+                "HOME_TMP = \"/Users/alice/tmp/notes\"\n",
+            ),
+        )
+        .unwrap();
+
+        // The legacy scorecard keeps its historical behaviour.
+        assert_eq!(RelativeLinksDetector.detect(&repo).len(), 9);
+
+        let mut lines: Vec<_> = RelativeLinksDetector
+            .inspect(&repo)
+            .iter()
+            .map(|finding| (finding.line_number, finding.message.clone()))
+            .collect();
+        lines.sort();
+        assert_eq!(
+            lines,
+            [
+                (
+                    Some(6),
+                    "Absolute System path should use relative path".to_string()
+                ),
+                (
+                    Some(7),
+                    "Absolute Temp path should use relative path".to_string()
+                ),
+                (
+                    Some(7),
+                    "Absolute macOS home path should use relative path".to_string()
+                ),
+            ]
+        );
     }
 }

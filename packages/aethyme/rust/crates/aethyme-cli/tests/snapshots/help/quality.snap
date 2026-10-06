@@ -14,5 +14,8 @@ Options:
   --detectors TEXT        Comma-separated detector names
   --limit N               Maximum rendered findings (default: 100)
   --full                  Render every finding
+  --include-generated     Also inspect files marked generated (by name, by a
+                          generated-file header, or `linguist-generated` in
+                          .gitattributes); they are skipped by default
   --help                  Show this message and exit.
 --- stderr
