@@ -560,6 +560,9 @@ pub(super) fn run_submit(parsed: Parsed) -> Result<(), UsageError> {
             if !graph.changed_paths.is_empty() {
                 out!("  stale graph paths: {}", graph.changed_paths.join(", "));
             }
+            if let Some(advice) = graph.advice() {
+                out!("  advice: {advice}");
+            }
         }
         let gate_wall_ms: i64 = outcome
             .gate_outcomes
