@@ -967,10 +967,12 @@ impl Broker {
                 // Discovery is `read_dir` plus one `check-ignore`; sizing is
                 // the walk. A recorded-size pass keeps the candidate and
                 // reports zero bytes with an unknown inode count -- dropping
-                // it would understate the count. A measured empty directory
-                // still consumes an inode and remains a candidate (#176).
+                // it would understate the count (#176). A measured directory
+                // holding no bytes and nothing but itself (an empty `target/`)
+                // frees nothing worth a candidate.
                 let usage = if size_scan.measures() {
                     match crate::disk_headroom::directory_usage_without_following_links(&dir) {
+                        Ok(usage) if usage.bytes == 0 && usage.inodes <= 1 => continue,
                         Ok(usage) => Some(usage),
                         Err(_) => continue,
                     }
@@ -2051,7 +2053,7 @@ impl Broker {
         let urgency = crate::disk_headroom::sweep_urgency_with_inodes(
             headroom.map(|value| value.bytes),
             crate::disk_headroom::DEFAULT_GATE_HEADROOM_BYTES,
-            headroom.map(|value| value.inodes),
+            headroom.and_then(|value| value.inodes),
             crate::disk_headroom::MIN_GATE_HEADROOM_INODES,
         );
         (

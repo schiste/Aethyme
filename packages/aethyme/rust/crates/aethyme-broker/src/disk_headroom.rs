@@ -31,7 +31,10 @@ pub const MIN_GATE_HEADROOM_INODES: u64 = 100_000;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DiskHeadroom {
     pub bytes: u64,
-    pub inodes: u64,
+    /// `None` when the filesystem keeps no inode count. btrfs and an
+    /// unlimited tmpfs report zero total inodes, and zero free out of zero
+    /// total means "not counted", not "full".
+    pub inodes: Option<u64>,
 }
 
 /// Filesystem objects and their logical byte sizes below a path.
@@ -41,6 +44,24 @@ pub(crate) struct DiskHeadroom {
 pub(crate) struct DirectoryUsage {
     pub bytes: u64,
     pub inodes: u64,
+}
+
+/// Whether a walk meets this filesystem object for the first time.
+///
+/// Only an object that can be reached twice is remembered: a directory, or a
+/// file with more than one hard link. A single-link file is met once by
+/// construction, so remembering it would cost memory per file (about 50 MB per
+/// million) for nothing.
+fn first_visit(
+    seen: &mut std::collections::HashSet<(u64, u64)>,
+    metadata: &std::fs::Metadata,
+) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    if metadata.is_dir() || metadata.nlink() > 1 {
+        seen.insert((metadata.dev(), metadata.ino()))
+    } else {
+        true
+    }
 }
 
 /// Measure one path without following symlinks. Directories and symlinks
@@ -60,9 +81,8 @@ pub(crate) fn directory_usage_without_following_links(
                 "directory measurement budget expired",
             ));
         }
-        use std::os::unix::fs::MetadataExt;
         let metadata = std::fs::symlink_metadata(path)?;
-        let first_link = seen.insert((metadata.dev(), metadata.ino()));
+        let first_link = first_visit(seen, &metadata);
         if first_link {
             usage.inodes = usage.inodes.saturating_add(1);
         }
@@ -97,11 +117,10 @@ pub(crate) fn directory_usage_best_effort(path: &std::path::Path) -> DirectoryUs
         usage: &mut DirectoryUsage,
         seen: &mut std::collections::HashSet<(u64, u64)>,
     ) {
-        use std::os::unix::fs::MetadataExt;
         let Ok(metadata) = std::fs::symlink_metadata(path) else {
             return;
         };
-        let first_link = seen.insert((metadata.dev(), metadata.ino()));
+        let first_link = first_visit(seen, &metadata);
         if first_link {
             usage.inodes = usage.inodes.saturating_add(1);
         }
@@ -143,9 +162,8 @@ pub(crate) fn directory_usage_bounded(
                 "directory measurement budget expired",
             ));
         }
-        use std::os::unix::fs::MetadataExt;
         let metadata = std::fs::symlink_metadata(path)?;
-        let first_link = seen.insert((metadata.dev(), metadata.ino()));
+        let first_link = first_visit(seen, &metadata);
         if first_link {
             usage.inodes = usage.inodes.saturating_add(1);
         }
@@ -189,10 +207,20 @@ pub(crate) fn available_headroom(path: &std::path::Path) -> Option<DiskHeadroom>
         if libc::statvfs(c_path.as_ptr(), &mut stat) != 0 {
             return None;
         }
-        Some(DiskHeadroom {
-            bytes: stat.f_bavail as u64 * stat.f_frsize as u64,
-            inodes: stat.f_favail as u64,
-        })
+        Some(headroom_from_counts(
+            stat.f_bavail as u64 * stat.f_frsize as u64,
+            stat.f_files as u64,
+            stat.f_favail as u64,
+        ))
+    }
+}
+
+/// Builds the reading from statvfs counts: a filesystem reporting zero
+/// total inodes keeps no count, so its inode headroom is unknown.
+fn headroom_from_counts(bytes: u64, total_inodes: u64, available_inodes: u64) -> DiskHeadroom {
+    DiskHeadroom {
+        bytes,
+        inodes: (total_inodes != 0).then_some(available_inodes),
     }
 }
 
@@ -247,7 +275,7 @@ pub(crate) fn available_headroom_for(
     let bytes =
         simulated_available_bytes(repository).or_else(|| measured.map(|value| value.bytes))?;
     let inodes =
-        simulated_available_inodes(repository).or_else(|| measured.map(|value| value.inodes))?;
+        simulated_available_inodes(repository).or_else(|| measured.and_then(|value| value.inodes));
     Some(DiskHeadroom { bytes, inodes })
 }
 
@@ -259,7 +287,7 @@ pub(crate) fn available_headroom_at_or_above_for(
     let bytes =
         simulated_available_bytes(repository).or_else(|| measured.map(|value| value.bytes))?;
     let inodes =
-        simulated_available_inodes(repository).or_else(|| measured.map(|value| value.inodes))?;
+        simulated_available_inodes(repository).or_else(|| measured.and_then(|value| value.inodes));
     Some(DiskHeadroom { bytes, inodes })
 }
 
@@ -537,6 +565,41 @@ mod tests {
     }
     use super::*;
 
+    /// btrfs and an unlimited tmpfs report zero total and zero free inodes.
+    /// That is no count at all, not a full filesystem, and must never refuse
+    /// a gate or mark the sweep pressured.
+    #[test]
+    fn a_filesystem_without_an_inode_count_reports_unknown_inodes() {
+        assert_eq!(
+            headroom_from_counts(10, 0, 0),
+            DiskHeadroom {
+                bytes: 10,
+                inodes: None
+            }
+        );
+        assert_eq!(headroom_from_counts(10, 100, 0).inodes, Some(0));
+        let unknown = headroom_from_counts(DEFAULT_GATE_HEADROOM_BYTES, 0, 0);
+        assert!(
+            refusal_with_headroom_and_gate_cache(
+                Some(unknown.bytes),
+                unknown.inodes,
+                DEFAULT_GATE_HEADROOM_BYTES,
+                MIN_GATE_HEADROOM_INODES,
+                None,
+            )
+            .is_none()
+        );
+        assert_ne!(
+            sweep_urgency_with_inodes(
+                Some(unknown.bytes),
+                DEFAULT_GATE_HEADROOM_BYTES,
+                unknown.inodes,
+                MIN_GATE_HEADROOM_INODES,
+            ),
+            SweepUrgency::Pressured
+        );
+    }
+
     #[test]
     fn low_inode_headroom_refuses_even_when_byte_headroom_is_ample() {
         let message = refusal_with_headroom(
@@ -796,6 +859,7 @@ mod tests {
         let headroom = available_headroom(here).expect("statvfs works on the checkout");
         assert!(headroom.bytes > 0, "a writable checkout has free bytes");
         assert!(available_bytes(here).is_some());
-        assert!(available_headroom(here).is_some_and(|headroom| headroom.inodes > 0));
+        // Uncounted (btrfs, unlimited tmpfs) or some free inodes.
+        assert!(headroom.inodes.is_none_or(|inodes| inodes > 0));
     }
 }

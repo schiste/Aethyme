@@ -1372,6 +1372,9 @@ pub struct CleanupRetention {
     pub inodes_free: Option<u64>,
     /// Sum of recorded inode counts for broker-owned worktrees. A floor when
     /// worktree_inode_unmeasured is non-zero; status never walks these trees.
+    /// A closed worktree is measured by the cleanup plan's size warmer; a live
+    /// one only by `gc storage plan`'s warmer, one directory per run, so live
+    /// sessions count as unmeasured until a storage plan has reached them.
     pub worktree_inodes: u64,
     pub worktree_inode_unmeasured: usize,
     pub severity: StatusAdviceSeverity,
@@ -11359,14 +11362,15 @@ fn lowest_headroom_with(
                 available: headroom.bytes,
             });
         }
-        if lowest
-            .inodes
-            .as_ref()
-            .is_none_or(|current| headroom.inodes < current.available)
+        if let Some(inodes) = headroom.inodes
+            && lowest
+                .inodes
+                .as_ref()
+                .is_none_or(|current| inodes < current.available)
         {
             lowest.inodes = Some(HeadroomReading {
                 path: probe.clone(),
-                available: headroom.inodes,
+                available: inodes,
             });
         }
     }
@@ -11430,8 +11434,9 @@ fn gate_headroom_advice(
             .map(|probe| format!(" on {}", probe.display()))
             .unwrap_or_default();
         constraints.push(format!(
-            "{} free bytes{volume}; a gate needs {} bytes",
-            available, required_bytes
+            "{} free{volume}; a gate needs {}",
+            crate::disk_headroom::format_gibibytes(available),
+            crate::disk_headroom::format_gibibytes(required_bytes)
         ));
         evidence.push(format!("free/required bytes: {available}/{required_bytes}"));
     }
@@ -13221,12 +13226,12 @@ mod tests {
             if path == Path::new("/bytes") {
                 Some(crate::disk_headroom::DiskHeadroom {
                     bytes: 1,
-                    inodes: 10,
+                    inodes: Some(10),
                 })
             } else {
                 Some(crate::disk_headroom::DiskHeadroom {
                     bytes: 10,
-                    inodes: 1,
+                    inodes: Some(1),
                 })
             }
         };
@@ -13359,11 +13364,11 @@ mod tests {
         let read = |path: &std::path::Path| match path.to_str() {
             Some("/roomy") => Some(crate::disk_headroom::DiskHeadroom {
                 bytes: 500,
-                inodes: 500,
+                inodes: Some(500),
             }),
             Some("/starved") => Some(crate::disk_headroom::DiskHeadroom {
                 bytes: 3,
-                inodes: 3,
+                inodes: Some(3),
             }),
             _ => None,
         };

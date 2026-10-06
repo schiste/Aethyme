@@ -2183,7 +2183,7 @@ fn run_selections(
             GateCommandContext {
                 cwd: checkout.root(),
                 available_bytes: available.map(|headroom| headroom.bytes),
-                available_inodes: available.map(|headroom| headroom.inodes),
+                available_inodes: available.and_then(|headroom| headroom.inodes),
                 environment: &environment,
                 log_path: &log_path,
                 run_dir: &run_dir,
@@ -2266,9 +2266,9 @@ fn run_selections(
         // already attributed to the host (#288).
         if gate_status != GateStatus::Pass && !host_fault {
             let available_end =
-                crate::disk_headroom::available_bytes_for(checkout.root(), checkout.root());
+                crate::disk_headroom::available_headroom_for(checkout.root(), checkout.root());
             environment.free_disk_bytes_end =
-                available_end.and_then(|bytes| i64::try_from(bytes).ok());
+                available_end.and_then(|headroom| i64::try_from(headroom.bytes).ok());
             if let Some(note) = starved_after_start(available_end) {
                 host_fault = true;
                 gate_status = GateStatus::Error;
@@ -2407,19 +2407,36 @@ fn record_gate_preflight_resource_failure(
     })
 }
 
-/// The gate-log note for a failing gate that ended with free disk below the
-/// floor a gate is admitted on, or `None` when the reading is unknown or above
-/// it. Such a failure is recorded as resource contention: never cached as a
-/// verdict, and a submission defers on it instead of rejecting.
-fn starved_after_start(available_end: Option<u64>) -> Option<String> {
+/// The gate-log note for a failing gate that ended with free disk or free
+/// inodes below the floor a gate is admitted on, or `None` when the reading is
+/// unknown or above both floors. Such a failure is recorded as resource
+/// contention: never cached as a verdict, and a submission defers on it
+/// instead of rejecting.
+fn starved_after_start(
+    available_end: Option<crate::disk_headroom::DiskHeadroom>,
+) -> Option<String> {
     let available = available_end?;
-    (available < crate::DEFAULT_GATE_HEADROOM_BYTES).then(|| {
-        format!(
-            "aethyme: free disk fell to {} while this gate ran, below the {} a gate is admitted on; \
-             the failure is host starvation, not a verdict on the change. Free space \
-             (`aethyme broker gc plan`) and run the gate again\n",
-            crate::disk_headroom::format_gibibytes(available),
+    let mut shortfalls = Vec::new();
+    if available.bytes < crate::DEFAULT_GATE_HEADROOM_BYTES {
+        shortfalls.push(format!(
+            "free disk fell to {}, below the {} a gate is admitted on",
+            crate::disk_headroom::format_gibibytes(available.bytes),
             crate::disk_headroom::format_gibibytes(crate::DEFAULT_GATE_HEADROOM_BYTES),
+        ));
+    }
+    if let Some(inodes) = available.inodes
+        && inodes < crate::disk_headroom::MIN_GATE_HEADROOM_INODES
+    {
+        shortfalls.push(format!(
+            "free inodes fell to {inodes}, below the {} a gate is admitted on",
+            crate::disk_headroom::MIN_GATE_HEADROOM_INODES,
+        ));
+    }
+    (!shortfalls.is_empty()).then(|| {
+        format!(
+            "aethyme: {} while this gate ran; the failure is host starvation, not a verdict on \
+             the change. Free space (`aethyme broker gc plan`) and run the gate again\n",
+            shortfalls.join(" and "),
         )
     })
 }
@@ -2752,7 +2769,9 @@ fn run_gate_command(
                 root,
                 directory_usage(root).ok()?,
                 cache.provenance.key.as_str(),
-                directory_usage(&cache.directory).ok()?,
+                // A missing active key directory holds nothing; the rest of
+                // the cache is still worth naming.
+                directory_usage(&cache.directory).unwrap_or_default(),
             ))
         });
         let refusal = crate::disk_headroom::refusal_with_headroom_and_gate_cache(
@@ -3332,11 +3351,27 @@ mod tests {
     /// unknown reading or one above the floor leaves the verdict alone (#288).
     #[test]
     fn only_a_failure_that_ends_below_the_floor_is_starvation() {
+        use crate::disk_headroom::{DiskHeadroom, MIN_GATE_HEADROOM_INODES};
+        let reading = |bytes, inodes| Some(DiskHeadroom { bytes, inodes });
         assert!(starved_after_start(None).is_none());
-        assert!(starved_after_start(Some(crate::DEFAULT_GATE_HEADROOM_BYTES)).is_none());
-        let note = starved_after_start(Some(1024)).unwrap();
+        assert!(starved_after_start(reading(crate::DEFAULT_GATE_HEADROOM_BYTES, None)).is_none());
+        assert!(
+            starved_after_start(reading(
+                crate::DEFAULT_GATE_HEADROOM_BYTES,
+                Some(MIN_GATE_HEADROOM_INODES)
+            ))
+            .is_none()
+        );
+        let note = starved_after_start(reading(1024, None)).unwrap();
         assert!(note.contains("host starvation"), "{note}");
         assert!(note.contains("0.0 GiB"), "{note}");
+        // A build can run out of inodes with bytes to spare (#471).
+        let note = starved_after_start(reading(
+            crate::DEFAULT_GATE_HEADROOM_BYTES,
+            Some(MIN_GATE_HEADROOM_INODES - 1),
+        ))
+        .unwrap();
+        assert!(note.contains("free inodes fell to 99999"), "{note}");
     }
 
     #[test]

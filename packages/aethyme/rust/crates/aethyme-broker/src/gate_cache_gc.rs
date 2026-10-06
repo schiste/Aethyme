@@ -614,7 +614,11 @@ pub(crate) fn reclaim_in(
     let current_inodes = current_usage.map(|usage| usage.inodes);
     if current_used != Some(candidate.last_used_at_ms)
         || current_bytes != Some(candidate.estimated_bytes)
-        || current_inodes != candidate.estimated_inodes
+        // A plan written before inode counts existed carries none; it is
+        // still checked on bytes and last use.
+        || candidate
+            .estimated_inodes
+            .is_some_and(|planned| current_inodes != Some(planned))
     {
         release(&mut coordinator);
         return Err(format!(
