@@ -131,6 +131,7 @@
       "session_id": "integer"
     }
   ],
+  "lease_release_requests": [],
   "leases": [
     {
       "created_at": "integer",

@@ -57,6 +57,15 @@ pub const BROKER_SESSION_ABANDONED_UNPUSHED: &str = "broker.session.abandoned_un
 // (active/idle/stale/exited/cleaned) by the store.
 pub const LEASE_CLAIMED: &str = "lease.claimed";
 pub const LEASE_RELEASED: &str = "lease.released";
+/// A session asked another to release a lease (#359). The event id is the
+/// request id; the outcome events below name it.
+pub const LEASE_RELEASE_REQUESTED: &str = "lease.release_requested";
+/// The holder acknowledged a release request and released the lease.
+pub const LEASE_RELEASE_ACKED: &str = "lease.release_acked";
+/// The holder declined a release request, with a reason.
+pub const LEASE_RELEASE_DECLINED: &str = "lease.release_declined";
+/// The holder was gone past the stale grace; the broker released for it.
+pub const LEASE_RELEASE_GRANTED: &str = "lease.release_granted";
 pub const LEASE_OVERLAP: &str = "lease.overlap";
 pub const GUARD_OUT_OF_LEASE_WRITE: &str = "guard.out_of_lease_write";
 pub const GUARD_UNTRACKED_ARTIFACT: &str = "guard.untracked_artifact";

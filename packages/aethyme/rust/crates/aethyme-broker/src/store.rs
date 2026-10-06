@@ -972,6 +972,27 @@ impl BrokerStore {
         Ok(lease)
     }
 
+    /// Release `session_id`'s leases on exactly `path` for `reason`, audited
+    /// like a finish release (lease id and generation on the record). Rows
+    /// stay, marked released. Returns the released lease ids.
+    pub fn release_lease_for(
+        &mut self,
+        session_id: i64,
+        path: &str,
+        reason: &str,
+    ) -> Result<Vec<i64>, BrokerError> {
+        let now = now_ms();
+        let tx = self.conn.transaction()?;
+        let ids = record_lease_releases_in_tx(&tx, session_id, Some(path), now, reason)?;
+        tx.execute(
+            "UPDATE leases SET released_at = ?3
+             WHERE session_id = ?1 AND path = ?2 AND released_at IS NULL",
+            params![session_id, path, now],
+        )?;
+        tx.commit()?;
+        Ok(ids)
+    }
+
     pub fn release_lease(&mut self, session_id: i64, path: &str) -> Result<(), BrokerError> {
         let now = now_ms();
         let tx = self.conn.transaction()?;
@@ -6754,28 +6775,32 @@ const SESSION_SELECT: &str = "SELECT id, worktree_path, branch, origin, status, 
      cleanup_completed_at, agent_identity, repository_name, tab_name, ai_provider, short_name \
      FROM sessions";
 
-/// Release every lease `session_id` still holds, inside a terminal
-/// transition's transaction: one `lease.released` event per lease naming its
-/// generation and `reason`, then the rows go. Scoped to this session, so a
-/// newer generation of the same path held by another session is untouched.
-fn release_session_leases_in_tx(
+/// Record one `lease.released` event per lease `session_id` still holds
+/// (optionally only those on `path`), naming its generation and `reason`,
+/// and return their ids. The one audit path every reasoned release shares:
+/// a terminal finish (#358) and an acknowledged or granted release request
+/// (#359).
+fn record_lease_releases_in_tx(
     tx: &rusqlite::Transaction<'_>,
     session_id: i64,
+    path: Option<&str>,
     now: i64,
     reason: &str,
-) -> Result<(), BrokerError> {
+) -> Result<Vec<i64>, BrokerError> {
     let held: Vec<(i64, String, i64)> = {
         let mut stmt = tx.prepare(
             "SELECT id, path, created_at FROM leases
              WHERE session_id = ?1 AND released_at IS NULL
                AND (expires_at IS NULL OR expires_at > ?2)
+               AND (?3 IS NULL OR path = ?3)
              ORDER BY id",
         )?;
-        stmt.query_map(params![session_id, now], |row| {
+        stmt.query_map(params![session_id, now, path], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?))
         })?
         .collect::<Result<_, _>>()?
     };
+    let mut ids = Vec::with_capacity(held.len());
     for (lease_id, path, created_at) in held {
         insert_event(
             tx,
@@ -6786,7 +6811,22 @@ fn release_session_leases_in_tx(
                 &path, reason, lease_id, created_at,
             )),
         )?;
+        ids.push(lease_id);
     }
+    Ok(ids)
+}
+
+/// Release every lease `session_id` still holds, inside a terminal
+/// transition's transaction: audited by [`record_lease_releases_in_tx`],
+/// then the rows go. Scoped to this session, so a newer generation of the
+/// same path held by another session is untouched.
+fn release_session_leases_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    session_id: i64,
+    now: i64,
+    reason: &str,
+) -> Result<(), BrokerError> {
+    record_lease_releases_in_tx(tx, session_id, None, now, reason)?;
     tx.execute("DELETE FROM leases WHERE session_id = ?1", [session_id])?;
     Ok(())
 }

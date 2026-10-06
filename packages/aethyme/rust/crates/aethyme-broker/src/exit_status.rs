@@ -25,6 +25,14 @@ pub const OUTCOME_UNKNOWN: u8 = 5;
 /// The host could not run the command: a missing tool, path or remote base,
 /// or an I/O failure outside the broker's control.
 pub const ENVIRONMENT: u8 = 6;
+/// `leases wait`: the holder was gone past the stale grace and the broker
+/// granted the release (#359). The path is free, as with `SUCCESS`
+/// (released), but nobody let go of it.
+pub const LEASE_WAIT_GRANTED: u8 = 10;
+/// `leases wait`: the holder declined the release request.
+pub const LEASE_WAIT_DECLINED: u8 = 11;
+/// `leases wait`: the path was still held when `--timeout` ran out.
+pub const LEASE_WAIT_TIMED_OUT: u8 = 12;
 
 /// The exit code for a broker error, by what the caller should do next.
 pub fn for_broker_error(error: &BrokerOpError) -> u8 {
@@ -119,6 +127,7 @@ pub fn for_broker_error(error: &BrokerOpError) -> u8 {
         | E::ReuseSyncNotFastForward { .. }
         | E::GatePolicyUntrusted { .. }
         | E::SessionPushRefused { .. }
+        | E::LeaseRequestRefused { .. }
         | E::SessionSyncRefused { .. } => REFUSED,
         _ => FAILED,
     }

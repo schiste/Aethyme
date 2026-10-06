@@ -30,6 +30,10 @@ const V1_KINDS: &[&str] = &[
     "graph.integrity_checked",
     "lease.claimed",
     "lease.overlap",
+    "lease.release_acked",
+    "lease.release_declined",
+    "lease.release_granted",
+    "lease.release_requested",
     "lease.released",
     "merge.conflict",
     "merge.externally_landed",
@@ -125,6 +129,10 @@ fn v1_kind_catalog_is_frozen() {
         events::SESSION_HOLDER_GONE.into(),
         events::LEASE_CLAIMED.into(),
         events::LEASE_RELEASED.into(),
+        events::LEASE_RELEASE_REQUESTED.into(),
+        events::LEASE_RELEASE_ACKED.into(),
+        events::LEASE_RELEASE_DECLINED.into(),
+        events::LEASE_RELEASE_GRANTED.into(),
         events::LEASE_OVERLAP.into(),
         events::GATE_CACHED.into(),
         events::GRAPH_INTEGRITY_CHECKED.into(),
@@ -415,6 +423,21 @@ fn v1_constructor_payload_field_names_are_frozen() {
         &events::lease_released_payload("p", "finish", 1, 0),
         &["created_at", "lease_id", "path", "reason"],
         "lease.released by a terminal finish",
+    );
+    assert_keys(
+        &aethyme_broker::lease_requests::request_payload("p", 2, 1, "why"),
+        &[
+            "holder_session_id",
+            "path",
+            "reason",
+            "requester_session_id",
+        ],
+        "lease.release_requested",
+    );
+    assert_keys(
+        &aethyme_broker::lease_requests::outcome_payload(1, "p", Some("why")),
+        &["path", "reason", "request_id"],
+        "lease.release_acked / lease.release_declined / lease.release_granted",
     );
     assert_keys(
         &events::gate_result_payload("g", "t", None),

@@ -236,6 +236,20 @@ Usage:
       active, idle, stale or unknown, bound to the holder process, with the
       evidence. A holder gone past [leases] stale_grace_minutes no longer
       conflicts but is still listed. Read-only.
+  aethyme broker leases request-release <path> --session <id> --reason <why> [--json]
+      Ask every other session holding a lease on <path> to release it. The
+      holder sees the request in broker status with ack/decline commands. A
+      holder gone past [leases] stale_grace_minutes is granted against at
+      once; one whose liveness is unknown never is.
+  aethyme broker leases ack <request-id> --session <holder> [--json]
+      Acknowledge a release request: the holder's leases on the path are
+      released.
+  aethyme broker leases decline <request-id> --session <holder> --reason <why> [--json]
+      Decline a release request; the leases stay.
+  aethyme broker leases wait <path> --session <id> [--timeout <seconds>] [--json]
+      Block until no other session holds <path> (exit 0, released), the
+      broker granted it from a stale holder (exit 10), a request was declined
+      (exit 11), or --timeout (default 300) ran out (exit 12).
   aethyme broker leases export (--session <id> | --entry <id>) [--limit <n>] [--json]
       Export bounded, redacted lease ownership and deterministic routing
       categories from committed [leases.routing] configuration. Includes
@@ -1047,6 +1061,8 @@ struct Parsed {
     generation: Option<i64>,
     events: Option<String>,
     ttl_seconds: Option<i64>,
+    /// `leases wait --timeout`: seconds to wait for a held path.
+    timeout_seconds: Option<u64>,
     wait: Option<String>,
     since: Option<i64>,
     kind: Option<String>,
@@ -1181,6 +1197,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         generation: None,
         events: None,
         ttl_seconds: None,
+        timeout_seconds: None,
         wait: None,
         since: None,
         kind: None,
@@ -1830,6 +1847,14 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
                     .ok_or(UsageError::Message("--operation requires a value".into()))?;
                 parsed.operation = Some(value.parse().map_err(|_| {
                     UsageError::Message("--operation must be an integer operation id".into())
+                })?);
+            }
+            "--timeout" => {
+                let value = iter
+                    .next()
+                    .ok_or(UsageError::Message("--timeout requires seconds".into()))?;
+                parsed.timeout_seconds = Some(value.parse().map_err(|_| {
+                    UsageError::Message("--timeout must be a whole number of seconds".into())
                 })?);
             }
             "--ttl" => {

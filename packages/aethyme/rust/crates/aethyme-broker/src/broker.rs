@@ -462,6 +462,11 @@ pub enum BrokerOpError {
     /// dirty or mid-operation, or there is no default branch to sync with.
     #[error("broker sync refused: {reason}")]
     SessionSyncRefused { reason: String },
+    /// A lease release request, acknowledgement or decline the broker would
+    /// not record: no other session holds the path, the request is not
+    /// pending, or the caller is not its holder (#359).
+    #[error("lease request refused: {reason}")]
+    LeaseRequestRefused { reason: String },
     #[error("{recovery}")]
     CoordinatedOperationBlocked {
         repository: String,
@@ -1504,6 +1509,8 @@ pub struct StatusView {
     pub leases: Vec<crate::Lease>,
     /// Liveness of each lease in `leases`, bound to its holder process (#360).
     pub lease_liveness: Vec<crate::lease_liveness::LeaseLivenessView>,
+    /// Lease release requests still pending, or resolved in the last day (#359).
+    pub lease_release_requests: Vec<crate::lease_requests::LeaseReleaseRequest>,
     pub overlaps: Vec<crate::leases::Overlap>,
     /// `overlaps` grouped by session pair and ranked: pairs whose edits Git
     /// says would conflict first. Classified at the last lease refresh.
@@ -5289,6 +5296,235 @@ impl Broker {
         )
     }
 
+    /// Every lease release request, with its state (#359).
+    pub fn lease_release_requests(
+        &self,
+    ) -> Result<Vec<crate::lease_requests::LeaseReleaseRequest>, BrokerOpError> {
+        let leases = self.store.active_leases()?;
+        crate::lease_requests::requests(&self.store, |holder, path| {
+            leases.iter().any(|lease| {
+                lease.session_id == holder && crate::leases::paths_overlap(path, &lease.path)
+            })
+        })
+    }
+
+    /// Ask every other session holding a lease on `path` to release it. One
+    /// request per holder; an identical pending request is returned, not
+    /// repeated. Requests against a holder already gone past its grace are
+    /// granted at once.
+    pub fn request_lease_release(
+        &mut self,
+        requester: i64,
+        path: &str,
+        reason: &str,
+    ) -> Result<Vec<crate::lease_requests::LeaseReleaseRequest>, BrokerOpError> {
+        self.store.session(requester)?;
+        let path = normalize_lease_path(path)?;
+        if reason.trim().is_empty() {
+            return Err(BrokerOpError::LeaseRequestRefused {
+                reason: "a release request needs --reason".into(),
+            });
+        }
+        let mut holders: Vec<i64> = self
+            .store
+            .active_leases()?
+            .iter()
+            .filter(|lease| {
+                lease.session_id != requester && crate::leases::paths_overlap(&path, &lease.path)
+            })
+            .map(|lease| lease.session_id)
+            .collect();
+        holders.sort_unstable();
+        holders.dedup();
+        if holders.is_empty() {
+            return Err(BrokerOpError::LeaseRequestRefused {
+                reason: format!("no other session holds a lease on {path}"),
+            });
+        }
+        let existing = self.lease_release_requests()?;
+        let mut ids = Vec::new();
+        for holder in holders {
+            if let Some(pending) = existing.iter().find(|request| {
+                request.state == crate::lease_requests::RequestState::Pending
+                    && request.requester_session_id == requester
+                    && request.holder_session_id == holder
+                    && request.path == path
+            }) {
+                ids.push(pending.request_id);
+                continue;
+            }
+            ids.push(self.store.append_event(
+                crate::lease_requests::REQUESTED,
+                Some(requester),
+                Some(&crate::lease_requests::request_payload(
+                    &path, requester, holder, reason,
+                )),
+            )?);
+        }
+        self.grant_stale_lease_requests()?;
+        Ok(self
+            .lease_release_requests()?
+            .into_iter()
+            .filter(|request| ids.contains(&request.request_id))
+            .collect())
+    }
+
+    /// The pending request `request_id`, if `holder` is the one it asks.
+    fn pending_request_for_holder(
+        &self,
+        request_id: i64,
+        holder: i64,
+    ) -> Result<crate::lease_requests::LeaseReleaseRequest, BrokerOpError> {
+        let request = self
+            .lease_release_requests()?
+            .into_iter()
+            .find(|request| request.request_id == request_id)
+            .ok_or_else(|| BrokerOpError::LeaseRequestRefused {
+                reason: format!("no lease release request {request_id}"),
+            })?;
+        if request.holder_session_id != holder {
+            return Err(BrokerOpError::LeaseRequestRefused {
+                reason: format!(
+                    "request {request_id} asks session {}, not session {holder}",
+                    request.holder_session_id
+                ),
+            });
+        }
+        if request.state != crate::lease_requests::RequestState::Pending {
+            return Err(BrokerOpError::LeaseRequestRefused {
+                reason: format!("request {request_id} is already {}", request.state.as_str()),
+            });
+        }
+        Ok(request)
+    }
+
+    /// Release `holder`'s leases on a request's path and record `kind`.
+    fn release_for_request(
+        &mut self,
+        request: &crate::lease_requests::LeaseReleaseRequest,
+        kind: &str,
+        reason: Option<&str>,
+    ) -> Result<(), BrokerOpError> {
+        let held: Vec<String> = self
+            .store
+            .active_leases()?
+            .into_iter()
+            .filter(|lease| {
+                lease.session_id == request.holder_session_id
+                    && crate::leases::paths_overlap(&request.path, &lease.path)
+            })
+            .map(|lease| lease.path)
+            .collect();
+        // The same audited release a finish records (#358), with the reason
+        // `request_acked` or `request_granted`.
+        let release_reason = if kind == crate::lease_requests::GRANTED {
+            "request_granted"
+        } else {
+            "request_acked"
+        };
+        for path in held {
+            self.store
+                .release_lease_for(request.holder_session_id, &path, release_reason)?;
+        }
+        self.store.append_event(
+            kind,
+            Some(request.holder_session_id),
+            Some(&crate::lease_requests::outcome_payload(
+                request.request_id,
+                &request.path,
+                reason,
+            )),
+        )?;
+        Ok(())
+    }
+
+    /// The holder acknowledges a request: its leases on the path are released.
+    pub fn ack_lease_release(
+        &mut self,
+        holder: i64,
+        request_id: i64,
+    ) -> Result<crate::lease_requests::LeaseReleaseRequest, BrokerOpError> {
+        let request = self.pending_request_for_holder(request_id, holder)?;
+        self.release_for_request(&request, crate::lease_requests::ACKED, None)?;
+        self.lease_release_request(request_id)
+    }
+
+    /// The holder declines a request; its leases stay.
+    pub fn decline_lease_release(
+        &mut self,
+        holder: i64,
+        request_id: i64,
+        reason: &str,
+    ) -> Result<crate::lease_requests::LeaseReleaseRequest, BrokerOpError> {
+        if reason.trim().is_empty() {
+            return Err(BrokerOpError::LeaseRequestRefused {
+                reason: "declining needs --reason".into(),
+            });
+        }
+        let request = self.pending_request_for_holder(request_id, holder)?;
+        self.store.append_event(
+            crate::lease_requests::DECLINED,
+            Some(holder),
+            Some(&crate::lease_requests::outcome_payload(
+                request_id,
+                &request.path,
+                Some(reason),
+            )),
+        )?;
+        self.lease_release_request(request_id)
+    }
+
+    pub fn lease_release_request(
+        &self,
+        request_id: i64,
+    ) -> Result<crate::lease_requests::LeaseReleaseRequest, BrokerOpError> {
+        self.lease_release_requests()?
+            .into_iter()
+            .find(|request| request.request_id == request_id)
+            .ok_or_else(|| BrokerOpError::LeaseRequestRefused {
+                reason: format!("no lease release request {request_id}"),
+            })
+    }
+
+    /// Grant every pending request whose holder is gone past the stale grace
+    /// on all its leases covering the path (#360). A holder that is running,
+    /// within its grace, or of unknown liveness is never granted against.
+    pub fn grant_stale_lease_requests(&mut self) -> Result<Vec<i64>, BrokerOpError> {
+        let pending: Vec<_> = self
+            .lease_release_requests()?
+            .into_iter()
+            .filter(|request| request.state == crate::lease_requests::RequestState::Pending)
+            .collect();
+        if pending.is_empty() {
+            return Ok(Vec::new());
+        }
+        let liveness = self.lease_liveness(crate::clock::epoch_ms())?;
+        let mut granted = Vec::new();
+        for request in pending {
+            let covering: Vec<_> = liveness
+                .iter()
+                .filter(|view| {
+                    view.session_id == request.holder_session_id
+                        && crate::leases::paths_overlap(&request.path, &view.path)
+                })
+                .collect();
+            let gone_past_grace = !covering.is_empty()
+                && covering.iter().all(|view| {
+                    view.liveness == crate::lease_liveness::LeaseLiveness::Stale
+                        && !view.liveness_evidence.holds
+                });
+            if gone_past_grace {
+                self.release_for_request(
+                    &request,
+                    crate::lease_requests::GRANTED,
+                    Some("holder_stale"),
+                )?;
+                granted.push(request.request_id);
+            }
+        }
+        Ok(granted)
+    }
+
     /// Sessions whose leases no longer hold: holder gone past the grace.
     fn sessions_released_by_grace(&self) -> Result<std::collections::HashSet<i64>, BrokerOpError> {
         Ok(crate::lease_liveness::released_by_grace(
@@ -7350,6 +7586,7 @@ impl Broker {
         let sessions_ms = sessions_started.elapsed().as_millis() as u64;
         let integration = self.integration_head()?;
         self.record_gone_lease_holders()?;
+        self.grant_stale_lease_requests()?;
         let mut view = self.build_status(agents, overlaps, integration, now_ms, false)?;
         push_integration_refresh_advice(&mut view, integration_refresh);
         self.store.record_advisories_shown(
@@ -8111,6 +8348,42 @@ impl Broker {
             "lease_liveness".into(),
             liveness_started.elapsed().as_millis() as u64,
         );
+        let lease_release_requests: Vec<_> = self
+            .lease_release_requests()?
+            .into_iter()
+            .filter(|request| {
+                request.state == crate::lease_requests::RequestState::Pending
+                    || request
+                        .resolved_at
+                        .is_some_and(|at| now_ms.saturating_sub(at) < 24 * 60 * 60 * 1000)
+            })
+            .collect();
+        for request in lease_release_requests
+            .iter()
+            .filter(|request| request.state == crate::lease_requests::RequestState::Pending)
+        {
+            advice.push(StatusAdvice {
+                id: "lease.release-requested",
+                severity: StatusAdviceSeverity::Warning,
+                reason: "another session asked this session to release a lease",
+                summary: format!(
+                    "session {} asks session {} to release {} (request {}): {}",
+                    request.requester_session_id,
+                    request.holder_session_id,
+                    request.path,
+                    request.request_id,
+                    request.reason
+                ),
+                session_id: Some(request.holder_session_id),
+                queue_entry_id: None,
+                evidence: vec![
+                    format!("requester: session {}", request.requester_session_id),
+                    format!("holder: session {}", request.holder_session_id),
+                    format!("state: {}", request.state.as_str()),
+                ],
+                commands: crate::lease_requests::holder_commands(request),
+            });
+        }
 
         phase_timings_ms.insert("build_total".into(), started.elapsed().as_millis() as u64);
         Ok(StatusView {
@@ -8159,6 +8432,7 @@ impl Broker {
             agents,
             leases,
             lease_liveness,
+            lease_release_requests,
             overlaps,
             overlap_pairs,
             scope_overlaps,

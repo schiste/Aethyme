@@ -1286,6 +1286,14 @@ construction. The broker names that, from local facts only, and never blocks:
   gone (the `session.holder_gone` event), then no longer conflicts but is
   still listed. `broker status --json` reports `lease_liveness[]` and
   `broker advanced leases explain [<paths...>]` explains each lease.
+- **Lease release requests (#359):** `broker advanced leases request-release
+  <path> --session <id> --reason <why>` asks every other holder of the path;
+  the holder answers with `leases ack <request-id>` (releasing) or `leases
+  decline <request-id> --reason <why>`. A holder gone past
+  `stale_grace_minutes` is granted against automatically; one whose liveness
+  is unknown never is. `leases wait <path> --session <id> [--timeout
+  <seconds>]` replaces polling: exit 0 released, 10 granted, 11 declined, 12
+  timeout.
 
 Work that reaches the default branch through a reviewed pull request is
 delivered, but leaves no promoted queue entry, and a squash merge rewrites the
