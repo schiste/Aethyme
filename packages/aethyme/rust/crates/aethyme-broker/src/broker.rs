@@ -13196,6 +13196,7 @@ mod tests {
                 reclaim_order: crate::ReclaimOrder::OldestFirst,
                 budget_verdict: crate::BudgetVerdict::Within,
                 unmeasured_directory_count: 0,
+                artifact_worktrees_not_scanned: 0,
                 sizes_measured_at_ms: None,
                 blockers: 0,
             },
