@@ -1104,6 +1104,142 @@ fn bounded_local_write_timeout_is_failed_without_remote_recovery() {
     assert_eq!(details["remote_outcome"], "not_applicable");
 }
 
+/// #555: a read that outlives its budget names the phase that spent it and
+/// leaves nothing to reconcile, instead of hanging past the caller.
+#[cfg(unix)]
+#[test]
+fn a_read_that_times_out_reports_the_phase_and_needs_no_reconciliation() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let worktree = add_worktree(tmp.path(), "read-timeout");
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let session = broker.adopt(&worktree, None).unwrap();
+    // A recognized read that stalls: `git status` waits on the repository's
+    // fsmonitor hook, the way `gh api` waits on a provider that never answers.
+    let hook = tmp.path().join("slow-fsmonitor");
+    std::fs::write(&hook, "#!/bin/sh\nsleep 5\n").unwrap();
+    std::fs::set_permissions(&hook, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    git(
+        tmp.path(),
+        &["config", "core.fsmonitor", hook.to_str().unwrap()],
+    );
+    let command = request(session.id, &["status"]);
+
+    let started = Instant::now();
+    let error = broker
+        .run_coordinated_operation_with_wait(command, QueueWait::Seconds(1))
+        .unwrap_err();
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "the read was not bounded"
+    );
+    let operation_id = match &error {
+        BrokerOpError::ReadOperationTimedOut {
+            operation_id,
+            provider,
+            ..
+        } => {
+            assert_eq!(*provider, "git");
+            *operation_id
+        }
+        other => panic!("expected a read timeout, got {other:?}"),
+    };
+    let message = error.to_string();
+    assert!(
+        message.contains("waiting for `git` to respond"),
+        "{message}"
+    );
+    assert!(message.contains("it changed nothing"), "{message}");
+    assert!(message.contains("--queue-timeout"), "{message}");
+    assert_eq!(
+        aethyme_broker::exit_status::for_broker_error(&error),
+        aethyme_broker::exit_status::ENVIRONMENT
+    );
+
+    let operation = broker
+        .store()
+        .coordinated_operation(operation_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(operation.status, OperationStatus::Failed);
+    let details: serde_json::Value =
+        serde_json::from_str(operation.details_json.as_deref().unwrap()).unwrap();
+    assert_eq!(details["remote_outcome"], "not_applicable");
+    assert!(
+        details["provider_wait_ms"].as_u64().unwrap() >= 500,
+        "{details}"
+    );
+    assert!(details["preparation_ms"].is_u64(), "{details}");
+}
+
+/// #555: a read takes no lock and no write block applies to it, so it must
+/// answer while a write holds the repository lane and while an unreconciled
+/// write blocks every other write.
+#[test]
+fn a_read_does_not_wait_behind_a_held_lock_or_a_blocked_repository() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let writer = add_worktree(tmp.path(), "lane-writer");
+    let reader = add_worktree(tmp.path(), "lane-reader");
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let writer_session = broker.adopt(&writer, None).unwrap();
+    let reader_session = broker.adopt(&reader, None).unwrap();
+    git(tmp.path(), &["config", "alias.pause", "!sleep 4"]);
+
+    let root = tmp.path().to_path_buf();
+    let holder = std::thread::spawn(move || {
+        let mut broker = Broker::open(&root).unwrap();
+        let mut command = request(writer_session.id, &["pause"]);
+        command.declared_effect = Some(OperationEffect::Write);
+        command.scope = Some("test:lane".into());
+        broker.run_coordinated_operation(command).unwrap()
+    });
+    std::thread::sleep(Duration::from_millis(500));
+    let started = Instant::now();
+    let read = broker
+        .run_coordinated_operation(request(reader_session.id, &["rev-parse", "HEAD"]))
+        .unwrap();
+    assert!(read.ok());
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "the read waited for the writer's lock: {:?}",
+        started.elapsed()
+    );
+    assert!(holder.join().unwrap().ok());
+
+    // An unreconciled write blocks writes, never reads.
+    let repository = format!("local:{}", broker.main_root().display());
+    let stale = broker
+        .store()
+        .create_coordinated_operation(&NewCoordinatedOperation {
+            session_id: writer_session.id,
+            provider: OperationProvider::Git,
+            repository,
+            scope: "repository".into(),
+            effect: OperationEffect::Write,
+            authorization_reason: Some("simulated authorized crash".into()),
+            command_json: r#"["git","branch","possibly-created"]"#.into(),
+            pid: 999_999,
+            host_operation_id: None,
+            identity_provenance: OperationIdentityProvenance::LocalRepository,
+        })
+        .unwrap();
+    broker
+        .store()
+        .transition_coordinated_operation(stale.id, OperationStatus::OutcomeUnknown, None, None)
+        .unwrap();
+    assert!(matches!(
+        broker
+            .run_coordinated_operation(request(reader_session.id, &["branch", "blocked"]))
+            .unwrap_err(),
+        BrokerOpError::CoordinatedOperationBlocked { .. }
+    ));
+    let read = broker
+        .run_coordinated_operation(request(reader_session.id, &["rev-parse", "HEAD"]))
+        .unwrap();
+    assert!(read.ok());
+}
+
 #[cfg(unix)]
 #[test]
 fn complex_unplannable_push_remains_conservatively_unknown() {
