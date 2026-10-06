@@ -6157,7 +6157,7 @@ impl Broker {
         &mut self,
         session_id: i64,
     ) -> Result<Vec<(String, Option<String>)>, BrokerOpError> {
-        let (_, gates, changed) = self.gate_inputs(session_id)?;
+        let (_, gates, changed) = self.gate_selection_inputs(session_id)?;
         Ok(crate::gates::select_gates(&gates, &changed)
             .into_iter()
             .map(|s| (s.gate.name.clone(), s.triggered_by))
@@ -6170,7 +6170,7 @@ impl Broker {
         &mut self,
         session_id: i64,
     ) -> Result<SemanticGateAdvice, BrokerOpError> {
-        let (_, gates, changed) = self.gate_inputs(session_id)?;
+        let (_, gates, changed) = self.gate_selection_inputs(session_id)?;
         let path_selected_gates = crate::gates::select_gates(&gates, &changed)
             .into_iter()
             .map(|selection| {
@@ -6539,9 +6539,32 @@ impl Broker {
         &mut self,
         session_id: i64,
     ) -> Result<(GitRepo, Vec<crate::gates::Gate>, Vec<String>), BrokerOpError> {
+        self.gate_inputs_with_integrity(session_id, true)
+    }
+
+    /// Read-only gate selection does not rebuild graph artifacts in the
+    /// repository-wide verification slot. Execution performs that enforcement
+    /// before any gate can run. Selection therefore never reports a
+    /// graph-integrity rejection, and graph-backed semantic advice on this
+    /// path reads the graph without exact-tree verification. That advice is
+    /// only advisory, and no gate runs on it.
+    fn gate_selection_inputs(
+        &mut self,
+        session_id: i64,
+    ) -> Result<(GitRepo, Vec<crate::gates::Gate>, Vec<String>), BrokerOpError> {
+        self.gate_inputs_with_integrity(session_id, false)
+    }
+
+    fn gate_inputs_with_integrity(
+        &mut self,
+        session_id: i64,
+        enforce_graph_integrity: bool,
+    ) -> Result<(GitRepo, Vec<crate::gates::Gate>, Vec<String>), BrokerOpError> {
         let session = self.store.session(session_id)?;
         let checkout = GitRepo::discover(Path::new(&session.worktree_path))?;
-        self.enforce_graph_integrity(&checkout, Some(session_id))?;
+        if enforce_graph_integrity {
+            self.enforce_graph_integrity(&checkout, Some(session_id))?;
+        }
         let config_root = checkout.root().to_path_buf();
         let gates = self.load_and_sync_gates_from(&config_root)?;
         let base = self
@@ -6580,8 +6603,10 @@ impl Broker {
     /// Load gates.toml and sync the definition snapshot so recorded
     /// results stay interpretable after config edits.
     ///
-    /// Every caller runs the gates it loads, so this is also where the
-    /// checkout's policy must be trusted: nothing is synced or run otherwise.
+    /// Callers that run gates load them here, and so do selection-only
+    /// callers (`gates affected`, semantic advice), which run nothing. Either
+    /// way this is where the checkout's policy must be trusted: nothing is
+    /// synced or selected from an untrusted policy.
     pub(crate) fn load_and_sync_gates_from(
         &mut self,
         config_root: &Path,
