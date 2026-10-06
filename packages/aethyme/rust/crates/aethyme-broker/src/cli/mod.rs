@@ -303,14 +303,16 @@ Usage:
       Run a command in the session worktree, then fail if it creates or
       modifies dirty paths outside explicit leases or in adoption-time
       foreign files. Exports AETHYME_TEST_DB_SUFFIX=s<id>-exec.
-  aethyme broker git --session <id> [--repo <owner/name>] [--scope <scope>] [--effect <read|write|destructive>] [--reason <text>] [--destructive] [--no-wait|--queue-timeout <seconds>] [--json] -- <git-args>
+  aethyme broker git --session <id> [--repo <owner/name>] [--scope <scope>] [--effect <read|write|destructive>] [--reason <text>] [--destructive [--cross-session <id>]] [--no-wait|--queue-timeout <seconds>] [--json] -- <git-args>
       Run Git through the durable operation coordinator. Remote Git commands
       require an exact --repo. Repository writes are serialized, journaled,
       and fail closed after a crash with an unknown remote outcome.
       A write queues for the repository lock and is recorded while it waits, so
       `operations list` shows it. Use --no-wait to refuse rather than queue, or
       --queue-timeout <seconds> to give up after a bounded wait.
-  aethyme broker gh --session <id> --repo <owner/name> [--scope <scope>] [--effect <read|write|destructive>] [--reason <text>] [--destructive] [--no-wait|--queue-timeout <seconds>] [--json] -- <gh-args>
+      A destructive write to a branch that belongs to another live session is
+      refused unless --cross-session names that session.
+  aethyme broker gh --session <id> --repo <owner/name> [--scope <scope>] [--effect <read|write|destructive>] [--reason <text>] [--destructive [--cross-session <id>]] [--no-wait|--queue-timeout <seconds>] [--json] -- <gh-args>
       Run GitHub CLI through the same repository coordinator. The broker sets
       GH_REPO from the exact target and never persists command output or
       secret-bearing argument values. After a successful `gh pr merge`, it
@@ -995,6 +997,7 @@ struct Parsed {
     open_pr: bool,
     session: Option<i64>,
     to_session: Option<i64>,
+    cross_session: Option<i64>,
     note_id: Option<i64>,
     message: Option<String>,
     entry: Option<i64>,
@@ -1123,6 +1126,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         open_pr: false,
         session: None,
         to_session: None,
+        cross_session: None,
         note_id: None,
         message: None,
         entry: None,
@@ -1717,6 +1721,14 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
                     .ok_or(UsageError::Message("--session requires a value".into()))?;
                 parsed.session = Some(value.parse().map_err(|_| {
                     UsageError::Message("--session must be an integer session id".into())
+                })?);
+            }
+            "--cross-session" => {
+                let value = iter.next().ok_or(UsageError::Message(
+                    "--cross-session requires a session id".into(),
+                ))?;
+                parsed.cross_session = Some(value.parse().map_err(|_| {
+                    UsageError::Message("--cross-session must be an integer session id".into())
                 })?);
             }
             "--to-session" => {

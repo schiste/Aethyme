@@ -903,6 +903,11 @@ pub struct ClosedWorktreeSummary {
     /// them and never removes them; they are counted so they are not
     /// invisible.
     pub adopted_count: usize,
+    /// Retained worktrees the plan listed without judging eligibility,
+    /// because the health-check budget ran out first (#460). The count of
+    /// eligible ones is a floor while this is non-zero.
+    #[serde(default)]
+    pub eligibility_not_inspected_count: usize,
     /// Where to see which of them GC would reclaim, and why the rest are
     /// retained. `None` when there is nothing to review.
     pub command: Option<String>,
@@ -948,6 +953,7 @@ impl ClosedWorktreeSummary {
                     && !std::fs::canonicalize(path).is_ok_and(|path| path == canonical_main)
             })
             .count();
+        summary.eligibility_not_inspected_count = plan.eligibility_not_inspected_count;
         if summary.count > 0 || summary.adopted_count > 0 {
             summary.command = Some("aethyme broker gc plan".into());
         }

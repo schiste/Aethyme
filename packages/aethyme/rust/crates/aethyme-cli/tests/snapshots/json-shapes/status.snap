@@ -73,6 +73,7 @@
       "adopted_count": "integer",
       "command": "null",
       "count": "integer",
+      "eligibility_not_inspected_count": "integer",
       "estimated_bytes": "integer",
       "unmeasured_count": "integer"
     },
