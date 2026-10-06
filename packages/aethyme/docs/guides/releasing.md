@@ -57,11 +57,35 @@ the requested version change.
 5. Submit the release series, inspect `broker advanced ship plan`, and execute only the
    exact confirmed integration SHA.
 6. Create and push the matching annotated tag through the coordinated Git
-   lane. Wait for the release workflow and verify the manifest, checksums,
-   installer, and every supported archive.
-7. Update the Homebrew formula from the published archive and digest, then
-   verify both installed binaries, `broker quick-test`, and repository
-   enhancement compatibility.
+   lane. Wait for the release workflow and verify the signed manifest,
+   checksums, installer, and every supported archive.
+7. For a stable release, the workflow verifies the signed manifest, renders
+   `aethyme.rb` from its exact tag and source commit, and publishes it to the
+   tap through an Aethyme broker session. It checks the tap's default branch
+   and current formula blob SHA before the write, then reads the formula back
+   byte-for-byte and reports the resulting commit. The workflow needs the
+   fine-grained `HOMEBREW_TAP_TOKEN` secret with write access to
+   `schiste/homebrew-tap` only.
+
+   If that secret is unavailable, run the repository-owned publisher from an
+   active Aethyme broker worktree after verifying the release manifest and
+   downloading its `aethyme.rb` asset. Set `REF_NAME` to the stable tag and
+   `SESSION_ID` to that worktree's broker session:
+
+   ```sh
+   tap_branch=$(gh api repos/schiste/homebrew-tap --jq .default_branch)
+   tap_sha=$(gh api "repos/schiste/homebrew-tap/contents/Formula/aethyme.rb?ref=$tap_branch" --jq .sha)
+   scripts/publish-homebrew-tap.sh --formula dist/aethyme.rb --tag "$REF_NAME" \
+     --release-repo schiste/Aethyme --tap-repo schiste/homebrew-tap \
+     --branch "$tap_branch" --expected-file-sha "$tap_sha" --dry-run
+   scripts/publish-homebrew-tap.sh --formula dist/aethyme.rb --tag "$REF_NAME" \
+     --release-repo schiste/Aethyme --tap-repo schiste/homebrew-tap \
+     --branch "$tap_branch" --expected-file-sha "$tap_sha" --session "$SESSION_ID"
+   ```
+
+   The publisher uses OpenSSL's portable base64 mode, refuses a stale SHA or
+   non-default branch before creating a broker operation, and verifies the
+   exact remote formula and commit after the write.
 8. Close release-bound issues only after the published and installed artifacts
    have passed those checks.
 

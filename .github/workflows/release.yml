@@ -207,6 +207,8 @@ jobs:
             cargo run --locked --manifest-path packages/aethyme/rust/Cargo.toml \
               -p aethyme-broker --example homebrew_formula -- \
               --manifest "$GITHUB_WORKSPACE/dist/release-manifest.json" \
+              --tag "$REF_NAME" \
+              --source-sha "$source_sha" \
               --repo "$GITHUB_REPOSITORY" \
               --output "$GITHUB_WORKSPACE/dist/aethyme.rb"
           fi
@@ -252,20 +254,14 @@ jobs:
           generate_release_notes: true
           prerelease: ${{ contains(github.ref_name, '-') }}
 
-  # Issue #253: keep the Homebrew tap in lock-step with each stable release by
-  # committing the formula rendered above (the aethyme.rb release asset) to
-  # schiste/homebrew-tap. The tap is broker-enrolled on the maintainer's
-  # machine; this push deliberately bypasses that local broker, which is
-  # accepted for a formula-only bump that the release itself already reviewed.
+  # Issue #253: publish only the formula regenerated from the signed manifest.
+  # The Contents API uses the expected blob SHA as a compare-and-swap guard,
+  # and the write itself runs through this release's broker session.
   homebrew-tap:
     name: Update Homebrew tap
     needs: release
-    # Preview tags (containing '-') get no formula: Homebrew exposes one
-    # current version, and the release job renders aethyme.rb only for stable.
     if: ${{ !contains(github.ref_name, '-') }}
     runs-on: ubuntu-latest
-    # The tap is written only through HOMEBREW_TAP_TOKEN; this job's own
-    # token only reads the release asset.
     permissions:
       contents: read
     concurrency:
@@ -280,48 +276,133 @@ jobs:
           if [ -n "$HOMEBREW_TAP_TOKEN" ]; then
             echo "present=true" >> "$GITHUB_OUTPUT"
           else
-            echo "::warning title=Homebrew tap not updated::HOMEBREW_TAP_TOKEN is not set; update Formula/aethyme.rb in schiste/homebrew-tap by hand from this release's aethyme.rb asset."
+            echo "::warning title=Homebrew tap not updated::HOMEBREW_TAP_TOKEN is not set; publish the verified aethyme.rb release asset with scripts/publish-homebrew-tap.sh from a broker session."
             echo "present=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Download rendered formula
+      - name: Check out tagged release source
+        if: steps.tap-token.outputs.present == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Rust
+        if: steps.tap-token.outputs.present == 'true'
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+
+      - name: Install Cosign
+        if: steps.tap-token.outputs.present == 'true'
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Download release assets
         if: steps.tap-token.outputs.present == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           REF_NAME: ${{ github.ref_name }}
         run: |
+          mkdir -p "$RUNNER_TEMP/formula"
           gh release download "$REF_NAME" --repo "$GITHUB_REPOSITORY" \
-            --pattern aethyme.rb --dir "$RUNNER_TEMP/formula"
-          # Refuse a formula that does not point at this release's archives.
-          grep -F "https://github.com/${GITHUB_REPOSITORY}/releases/download/${REF_NAME}/" \
-            "$RUNNER_TEMP/formula/aethyme.rb" >/dev/null
+            --pattern aethyme.rb \
+            --pattern release-manifest.json \
+            --pattern release-manifest.sigstore.json \
+            --dir "$RUNNER_TEMP/formula"
 
-      - name: Check out tap
+      - name: Verify signed manifest and regenerate formula
         if: steps.tap-token.outputs.present == 'true'
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: schiste/homebrew-tap
-          ref: main
-          path: homebrew-tap
-          # Fine-grained PAT, contents:write on schiste/homebrew-tap only.
-          # checkout keeps it in the git credential config, never on a
-          # command line, so it is not echoed.
-          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          cosign verify-blob \
+            --bundle "$RUNNER_TEMP/formula/release-manifest.sigstore.json" \
+            --certificate-identity "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@refs/tags/${REF_NAME}" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "$RUNNER_TEMP/formula/release-manifest.json"
+          cargo run --locked --manifest-path packages/aethyme/rust/Cargo.toml \
+            -p aethyme-broker --example homebrew_formula -- \
+            --manifest "$RUNNER_TEMP/formula/release-manifest.json" \
+            --tag "$REF_NAME" \
+            --source-sha "$SOURCE_SHA" \
+            --repo "$GITHUB_REPOSITORY" \
+            --output "$RUNNER_TEMP/formula/expected-aethyme.rb"
+          cmp "$RUNNER_TEMP/formula/expected-aethyme.rb" "$RUNNER_TEMP/formula/aethyme.rb"
 
-      - name: Commit and push formula
+      - name: Build Aethyme broker CLI
         if: steps.tap-token.outputs.present == 'true'
-        working-directory: homebrew-tap
+        run: |
+          cargo build --locked --manifest-path packages/aethyme/rust/Cargo.toml \
+            -p aethyme-cli --bin aethyme
+          echo "AETHYME_BIN=$GITHUB_WORKSPACE/packages/aethyme/rust/target/debug/aethyme" >> "$GITHUB_ENV"
+
+      - name: Preflight Homebrew tap update
+        if: steps.tap-token.outputs.present == 'true'
+        id: tap-preflight
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          TAP_REPOSITORY: schiste/homebrew-tap
+          RELEASE_REPOSITORY: ${{ github.repository }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          branch="$(gh api "repos/$TAP_REPOSITORY" --jq '.default_branch')"
+          expected_file_sha="$(gh api "repos/$TAP_REPOSITORY/contents/Formula/aethyme.rb?ref=$branch" --jq '.sha')"
+          scripts/publish-homebrew-tap.sh \
+            --formula "$RUNNER_TEMP/formula/aethyme.rb" \
+            --tag "$REF_NAME" \
+            --release-repo "$RELEASE_REPOSITORY" \
+            --tap-repo "$TAP_REPOSITORY" \
+            --branch "$branch" \
+            --expected-file-sha "$expected_file_sha" \
+            --dry-run
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+          echo "expected_file_sha=$expected_file_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Start broker publication session
+        if: steps.tap-token.outputs.present == 'true'
+        id: broker-session
         env:
           REF_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          cp "$RUNNER_TEMP/formula/aethyme.rb" Formula/aethyme.rb
-          if git diff --quiet -- Formula/aethyme.rb; then
-            echo "schiste/homebrew-tap already carries the ${REF_NAME} formula"
-            exit 0
-          fi
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add Formula/aethyme.rb
-          git commit --quiet -m "chore: update Aethyme to ${REF_NAME}"
-          git push origin HEAD:main
+          version="${REF_NAME#v}"
+          session_json="$("$AETHYME_BIN" broker start \
+            --task "Publish Homebrew formula for $REF_NAME" \
+            --short-name "homebrew-$version" \
+            --base "$GITHUB_SHA" \
+            --agent "GitHub Actions <41898282+github-actions[bot]@users.noreply.github.com>" \
+            --json)"
+          session_id="$(printf '%s' "$session_json" | jq -er '.id | select(type == "number")')"
+          echo "session_id=$session_id" >> "$GITHUB_OUTPUT"
+
+      - name: Publish and verify Homebrew formula
+        if: steps.tap-token.outputs.present == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          SESSION_ID: ${{ steps.broker-session.outputs.session_id }}
+          TAP_REPOSITORY: schiste/homebrew-tap
+          TAP_BRANCH: ${{ steps.tap-preflight.outputs.branch }}
+          EXPECTED_FILE_SHA: ${{ steps.tap-preflight.outputs.expected_file_sha }}
+          RELEASE_REPOSITORY: ${{ github.repository }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          "$AETHYME_BIN" broker advanced exec --session "$SESSION_ID" -- \
+            "$GITHUB_WORKSPACE/scripts/publish-homebrew-tap.sh" \
+              --formula "$RUNNER_TEMP/formula/aethyme.rb" \
+              --tag "$REF_NAME" \
+              --release-repo "$RELEASE_REPOSITORY" \
+              --tap-repo "$TAP_REPOSITORY" \
+              --branch "$TAP_BRANCH" \
+              --expected-file-sha "$EXPECTED_FILE_SHA" \
+              --session "$SESSION_ID"
+
+      - name: Finish broker publication session
+        if: always() && steps.broker-session.outputs.session_id != ''
+        env:
+          SESSION_ID: ${{ steps.broker-session.outputs.session_id }}
+        run: "$AETHYME_BIN broker finish --session \"$SESSION_ID\" --json"
