@@ -565,14 +565,28 @@ fn build_plan(
 
     let mut roots = Vec::with_capacity(paths.len());
     let mut candidates = Vec::new();
+    // Read-only: a root with no marker is only told whether this repository
+    // can prove it owns it, and how to record that (#257).
+    let this_repository = ThisRepository::observe(main_root).ok();
     for path in paths {
-        let root = inspect_root(
+        let mut root = inspect_root(
             &path,
             evaluated_at,
             orphan_worktree_roots_days,
             scan,
             records,
         );
+        if root.marker_status == StorageMarkerStatus::Missing
+            && let Some(this_repository) = &this_repository
+        {
+            root.blockers
+                .push(match attribute_root(&root.path, this_repository) {
+                    Attribution::ThisRepository { .. } => "its Git worktrees are registered in this repository; record that ownership with `aethyme broker gc storage attribute --apply`, then review a new plan".into(),
+                    Attribution::Unattributable(reason) => format!(
+                        "not attributable to this repository: {reason}. Run `aethyme broker gc storage attribute` from the repository that owns it, or see what its worktrees hold with `aethyme broker advanced worktrees`"
+                    ),
+                });
+        }
         candidates.extend(candidates_for_root(&root, orphan_worktree_roots_days));
         roots.push(root);
     }
@@ -2080,6 +2094,272 @@ fn read_marker(root: &Path) -> MarkerObservation {
         marker: Some(marker),
         bytes: Some(bytes),
         error: None,
+    }
+}
+
+pub const STORAGE_ATTRIBUTION_SCHEMA_VERSION: u32 = 1;
+
+/// Whether one host worktree root with no ownership marker can be proved to
+/// belong to the invoking repository, and whether this run recorded it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StorageAttribution {
+    pub root: PathBuf,
+    pub attributable: bool,
+    /// True only when this run wrote the marker.
+    pub marked: bool,
+    /// Git worktrees under the root that this repository has registered.
+    pub registered_worktree_count: usize,
+    pub reason: String,
+}
+
+/// `broker gc storage attribute`: the host roots with no ownership marker,
+/// judged against the invoking repository (#257).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StorageAttributionReport {
+    pub schema_version: u32,
+    pub storage_root: PathBuf,
+    pub repository_root: PathBuf,
+    pub repository_key: String,
+    /// Whether markers were written (`--apply`) or only reported.
+    pub applied: bool,
+    pub roots: Vec<StorageAttribution>,
+}
+
+/// The invoking repository as attribution evidence: its host-storage key and
+/// every worktree path its Git registrations name.
+struct ThisRepository {
+    main_root: PathBuf,
+    key: String,
+    registered: BTreeSet<PathBuf>,
+}
+
+impl ThisRepository {
+    fn observe(main_root: &Path) -> Result<Self, StorageError> {
+        let repo = GitRepo::discover(main_root)?;
+        let key = crate::host_state::repository_key(main_root, Some(&repo.git_common_dir()?));
+        let registered = repo
+            .worktree_paths()?
+            .iter()
+            .map(|path| normalise(path))
+            .collect();
+        Ok(Self {
+            main_root: normalise(main_root),
+            key,
+            registered,
+        })
+    }
+}
+
+enum Attribution {
+    ThisRepository { registered: usize },
+    Unattributable(String),
+}
+
+/// Prove ownership from Git, never from a guess. A root belongs to this
+/// repository when every Git worktree directly under it is one this
+/// repository registered, and there is at least one, or when its name is
+/// exactly the key this repository's broker would create it under. A single
+/// worktree registered elsewhere, or none at all under a foreign name, leaves
+/// it unattributable: a marker is what later lets cleanup remove strays, so
+/// writing one on weaker evidence would authorize removing someone else's
+/// directories.
+fn attribute_root(root: &Path, this: &ThisRepository) -> Attribution {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Attribution::Unattributable("its entries cannot be listed".into());
+    };
+    let mut worktrees = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if is_real_directory(&path)
+            && !is_infrastructure(&entry.file_name())
+            && has_git_marker(&path)
+        {
+            worktrees.push(normalise(&path));
+        }
+    }
+    worktrees.sort();
+    let foreign: Vec<&PathBuf> = worktrees
+        .iter()
+        .filter(|path| !this.registered.contains(*path))
+        .collect();
+    if let Some(first) = foreign.first() {
+        return Attribution::Unattributable(format!(
+            "{} of its {} Git worktrees {} not registered in this repository (first: {})",
+            foreign.len(),
+            worktrees.len(),
+            if foreign.len() == 1 { "is" } else { "are" },
+            first.display()
+        ));
+    }
+    let named_for_this = root
+        .file_name()
+        .is_some_and(|name| name.to_string_lossy() == this.key);
+    if worktrees.is_empty() && !named_for_this {
+        return Attribution::Unattributable(
+            "it holds no Git worktree and its name is not this repository's key, so nothing ties it to a repository".into(),
+        );
+    }
+    Attribution::ThisRepository {
+        registered: worktrees.len(),
+    }
+}
+
+/// Report, and with `apply` record, which unmarked host worktree roots belong
+/// to the repository containing `path_inside_repo`.
+///
+/// Writing a marker removes nothing. It lets the reviewed, digest-confirmed
+/// `gc storage` plan reconcile the root against this repository's Git
+/// registrations and session ledger, as it does every root the broker created
+/// since markers existed. The proof is re-taken immediately before each
+/// write, and an existing marker is never replaced.
+pub fn storage_attribute(
+    path_inside_repo: &Path,
+    apply: bool,
+) -> Result<StorageAttributionReport, StorageError> {
+    let checkout = GitRepo::discover(path_inside_repo)?;
+    let main_root = checkout.main_root()?;
+    let storage_root = normalise(&absolute_path(&main_root, &storage_container(&main_root)?));
+    let this = ThisRepository::observe(&main_root)?;
+    let mut paths = Vec::new();
+    match std::fs::read_dir(&storage_root) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = entry.map_err(|source| StorageError::Io {
+                    path: storage_root.clone(),
+                    source,
+                })?;
+                paths.push(entry.path());
+            }
+        }
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(StorageError::Io {
+                path: storage_root,
+                source,
+            });
+        }
+    }
+    paths.sort();
+    let mut roots = Vec::new();
+    for path in paths {
+        // Only an unmarked root is in question. A checkout sitting where a
+        // root belongs is reported by the storage plan, not attributed.
+        if !is_real_directory(&path)
+            || is_infrastructure(path.file_name().unwrap_or_default())
+            || has_git_marker(&path)
+        {
+            continue;
+        }
+        let path = normalise(&path);
+        let observation = read_marker(&path);
+        if observation.status == StorageMarkerStatus::Valid {
+            continue;
+        }
+        if observation.status == StorageMarkerStatus::Invalid {
+            roots.push(StorageAttribution {
+                root: path,
+                attributable: false,
+                marked: false,
+                registered_worktree_count: 0,
+                reason: format!(
+                    "{}; an existing marker is never replaced, so repair or remove it by hand",
+                    observation
+                        .error
+                        .unwrap_or_else(|| "its ownership marker is invalid".into())
+                ),
+            });
+            continue;
+        }
+        let attribution = match attribute_root(&path, &this) {
+            Attribution::ThisRepository { registered } => {
+                let reason = if registered == 0 {
+                    "its name is this repository's worktree-root key".to_string()
+                } else {
+                    format!(
+                        "all {registered} of its Git {} registered in this repository",
+                        if registered == 1 {
+                            "worktree is"
+                        } else {
+                            "worktrees are"
+                        }
+                    )
+                };
+                let marked = if apply {
+                    write_attributed_marker(&path, &this).map_err(|source| StorageError::Io {
+                        path: path.join(WORKTREE_ROOT_MARKER),
+                        source,
+                    })?
+                } else {
+                    false
+                };
+                StorageAttribution {
+                    root: path,
+                    attributable: true,
+                    marked,
+                    registered_worktree_count: registered,
+                    reason,
+                }
+            }
+            Attribution::Unattributable(reason) => StorageAttribution {
+                root: path,
+                attributable: false,
+                marked: false,
+                registered_worktree_count: 0,
+                reason,
+            },
+        };
+        roots.push(attribution);
+    }
+    Ok(StorageAttributionReport {
+        schema_version: STORAGE_ATTRIBUTION_SCHEMA_VERSION,
+        storage_root,
+        repository_root: this.main_root.clone(),
+        repository_key: this.key.clone(),
+        applied: apply,
+        roots,
+    })
+}
+
+/// Write the marker the broker would have written when it created `root`.
+/// `Ok(false)` when a marker appeared in the meantime: it is left untouched,
+/// because the hard link that publishes the new one never replaces a file.
+fn write_attributed_marker(root: &Path, this: &ThisRepository) -> std::io::Result<bool> {
+    // Re-take the proof at the moment of writing: a worktree registered
+    // elsewhere may have been added since the report was read.
+    if !matches!(
+        attribute_root(root, this),
+        Attribution::ThisRepository { .. }
+    ) {
+        return Ok(false);
+    }
+    let marker = WorktreeRootMarker {
+        schema_version: WORKTREE_ROOT_SCHEMA_VERSION,
+        repository_key: this.key.clone(),
+        repository_root: this.main_root.clone(),
+    };
+    let mut bytes = serde_json::to_vec_pretty(&marker).map_err(std::io::Error::other)?;
+    bytes.push(b'\n');
+    let temporary = root.join(format!(
+        ".aethyme-worktree-root.{}.{}.tmp",
+        std::process::id(),
+        now_ms()
+    ));
+    {
+        use std::io::Write as _;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+    }
+    let published = crate::host_state::protect_host_state_path(&temporary, false)
+        .and_then(|()| std::fs::hard_link(&temporary, root.join(WORKTREE_ROOT_MARKER)));
+    let _ = std::fs::remove_file(&temporary);
+    match published {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(error) => Err(error),
     }
 }
 

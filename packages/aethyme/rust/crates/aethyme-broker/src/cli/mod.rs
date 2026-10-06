@@ -773,6 +773,12 @@ Usage:
       Inventory every host worktree root by reconciling disk directories,
       Git registrations, and repository session ledgers. Apply removes only
       exact reviewed orphan roots or stray directories.
+  aethyme broker storage attribute [--apply] [--json]
+      List host worktree roots with no ownership marker and whether this
+      repository can prove it owns each one: every Git worktree under it is
+      registered here, or its name is this repository's key. --apply writes
+      the marker for those it can prove, removing nothing; review a new
+      storage plan afterwards. A root it cannot prove is never marked.
   aethyme broker check-contract [--base <ref>] [--pr-body <file>]
                                 [--commit-messages] [--merged-pr]
       Cross-process contract gate: refuse a diff that removes symbols

@@ -520,12 +520,13 @@ pub use ship::{
     ShipPublicationPolicy, ShipPush, ShipReviewEvidence,
 };
 pub use storage::{
-    STORAGE_PLAN_SCHEMA_VERSION, STORAGE_RECONCILIATION_SCHEMA_VERSION, StorageAppliedItem,
-    StorageApplyFailure, StorageApplyReport, StorageCandidate, StorageCandidateKind,
-    StorageDirectoryKind, StorageEntry, StorageError, StorageFilesystemKind, StorageMarkerStatus,
-    StoragePlan, StoragePrimaryArtifact, StoragePrimaryCandidate, StoragePrimaryCheckout,
-    StorageReconciliation, StorageRecoveryArchiveGroup, StorageRoot, StorageSource, StorageSummary,
-    storage_apply, storage_plan,
+    STORAGE_ATTRIBUTION_SCHEMA_VERSION, STORAGE_PLAN_SCHEMA_VERSION,
+    STORAGE_RECONCILIATION_SCHEMA_VERSION, StorageAppliedItem, StorageApplyFailure,
+    StorageApplyReport, StorageAttribution, StorageAttributionReport, StorageCandidate,
+    StorageCandidateKind, StorageDirectoryKind, StorageEntry, StorageError, StorageFilesystemKind,
+    StorageMarkerStatus, StoragePlan, StoragePrimaryArtifact, StoragePrimaryCandidate,
+    StoragePrimaryCheckout, StorageReconciliation, StorageRecoveryArchiveGroup, StorageRoot,
+    StorageSource, StorageSummary, storage_apply, storage_attribute, storage_plan,
 };
 pub use store::BrokerStore;
 pub use types::{
