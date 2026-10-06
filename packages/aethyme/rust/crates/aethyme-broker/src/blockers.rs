@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use sha2::{Digest, Sha256};
 
+use crate::broker::shell_quote;
 use crate::{Broker, BrokerOpError, GitRepo, OperationStatus, SessionStatus};
 
 /// Event recorded whenever `broker unblock` clears something.
@@ -494,11 +495,15 @@ impl Broker {
                 ),
                 session_id: owner.map(|session| session.id),
                 clear: if safe {
-                    format!("{UNBLOCK} resource:{}", lease.lease_id)
+                    format!(
+                        "{UNBLOCK} {}",
+                        shell_quote(&format!("resource:{}", lease.lease_id))
+                    )
                 } else {
                     format!(
-                        "{UNBLOCK} resource:{} --confirm {}",
-                        lease.lease_id, lease.generation
+                        "{UNBLOCK} {} --confirm {}",
+                        shell_quote(&format!("resource:{}", lease.lease_id)),
+                        lease.generation
                     )
                 },
                 safe_to_clear_automatically: safe,
@@ -596,7 +601,8 @@ impl Broker {
             }
             found.push(Blocker {
                 clear: format!(
-                    "{UNBLOCK} {id} --reason \"<why this verdict was not the code's fault>\""
+                    "{UNBLOCK} {} --reason \"<why this verdict was not the code's fault>\"",
+                    shell_quote(&id)
                 ),
                 id,
                 kind: BlockerKind::GateCache,
@@ -634,7 +640,10 @@ impl Broker {
                         .map_or_else(|| "no readable pid".to_string(), |pid| format!("pid {pid}")),
                 ),
                 session_id: Some(pidfile.session_id),
-                clear: format!("{UNBLOCK} pidfile:{}-{}", pidfile.session_id, pidfile.gate),
+                clear: format!(
+                    "{UNBLOCK} {}",
+                    shell_quote(&format!("pidfile:{}-{}", pidfile.session_id, pidfile.gate))
+                ),
                 safe_to_clear_automatically: true,
                 inspect: None,
             });
@@ -1307,12 +1316,18 @@ fn inspect_command(command_json: &str, repository: &str) -> Option<String> {
             if refs.is_empty() {
                 return None;
             }
-            Some(format!("git ls-remote {remote} {}", refs.join(" ")))
+            let refs: Vec<String> = refs.into_iter().map(shell_quote).collect();
+            Some(format!(
+                "git ls-remote {} {}",
+                shell_quote(remote),
+                refs.join(" ")
+            ))
         }
         "gh" => match args.collect::<Vec<_>>().as_slice() {
-            ["pr", _, number, ..] if number.bytes().all(|byte| byte.is_ascii_digit()) => {
+            ["pr", _, number, ..] if number.parse::<u64>().is_ok_and(|number| number > 0) => {
                 Some(format!(
-                    "gh pr view {number} --repo {repository} --json state,headRefOid,mergedAt,autoMergeRequest"
+                    "gh pr view {number} --repo {} --json state,headRefOid,mergedAt,autoMergeRequest",
+                    shell_quote(repository)
                 ))
             }
             _ => None,
@@ -1542,6 +1557,41 @@ mod tests {
         assert_eq!(
             inspect_command(r#"["gh","pr","merge","12","--squash"]"#, "o/r").as_deref(),
             Some("gh pr view 12 --repo o/r --json state,headRefOid,mergedAt,autoMergeRequest")
+        );
+        // Stored command text is untrusted: every word is quoted for a paste.
+        let hostile = r#"["git","push","or;igin","HEAD:refs/heads/$(touch x);it's"]"#;
+        assert_eq!(
+            inspect_command(hostile, "o/r").as_deref(),
+            Some(r#"git ls-remote 'or;igin' 'refs/heads/$(touch x);it'\''s'"#)
+        );
+        assert_eq!(
+            inspect_command(r#"["gh","pr","merge","12"]"#, "o/r;$(touch x)'").as_deref(),
+            Some(
+                r#"gh pr view 12 --repo 'o/r;$(touch x)'\''' --json state,headRefOid,mergedAt,autoMergeRequest"#
+            )
+        );
+        // Pasted into a shell, the quoted words come back verbatim and run nothing.
+        let words = inspect_command(hostile, "o/r")
+            .unwrap()
+            .replacen("git ls-remote ", "", 1);
+        let sandbox = tempfile::tempdir().unwrap();
+        let echoed = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("printf '%s\\n' {words}"))
+            .current_dir(sandbox.path())
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&echoed.stdout),
+            "or;igin\nrefs/heads/$(touch x);it's\n"
+        );
+        assert!(
+            !sandbox.path().join("x").exists(),
+            "the paste ran a command"
+        );
+        assert_eq!(
+            inspect_command(r#"["gh","pr","merge","1;id"]"#, "o/r"),
+            None
         );
         for unnamed in [
             r#"["git","push"]"#,
