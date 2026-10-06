@@ -610,6 +610,12 @@ pub(super) fn run_doctor(parsed: Parsed) -> Result<(), UsageError> {
             }
         }
         render_unpushed_work(&report.unpushed_work);
+        if !report.budget_cut.is_empty() {
+            out!(
+                "inspection budget: {} cut short; what it did not reach is unknown, not healthy",
+                report.budget_cut.join(", ")
+            );
+        }
         render_recent_command_failures(&report.recent_command_failures);
         if let Some(finding) = &report.hooks_path {
             out!("git hooks: {}", finding.message());
@@ -982,6 +988,18 @@ fn render_unpushed_work(report: &crate::UnpushedWorkReport) {
             integration.on_no_remote,
             age(integration.oldest_unpublished_at_ms),
             integration.severity.as_str()
+        );
+    }
+    if !report.not_inspected_sessions.is_empty() {
+        out!(
+            "  not inspected within the time budget (unpushed work unknown): {} {}",
+            plural(report.not_inspected_sessions.len(), "session", "sessions"),
+            report
+                .not_inspected_sessions
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
         );
     }
 }

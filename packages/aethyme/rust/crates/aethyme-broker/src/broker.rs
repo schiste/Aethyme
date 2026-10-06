@@ -41,6 +41,20 @@ pub(crate) mod gate_trust;
 /// for now, chosen so an agent "thinking" for a few minutes stays active.
 pub(crate) const IDLE_AFTER_MS: i64 = 10 * 60 * 1000;
 const STALE_AFTER_MS: i64 = 2 * 60 * 60 * 1000;
+/// How long `status --refresh` spends on the Git work that grows with
+/// sessions and history -- checkout reads, unpushed commits, promoted-path
+/// conflicts and the integration drift assessment -- and `status doctor` on
+/// unpushed commits (#460). Whatever the budget does not reach is named in
+/// the output, never guessed. `AETHYME_STATUS_INSPECTION_BUDGET_MS` overrides
+/// it, for tests and for an operator who would rather wait.
+const STATUS_INSPECTION_BUDGET: std::time::Duration = std::time::Duration::from_secs(15);
+
+fn status_inspection_budget() -> std::time::Duration {
+    std::env::var("AETHYME_STATUS_INSPECTION_BUDGET_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map_or(STATUS_INSPECTION_BUDGET, std::time::Duration::from_millis)
+}
 pub const SESSION_NOTE_MAX_BYTES: usize = 1_000;
 pub const WORKTREE_ROOT_SCHEMA_VERSION: u32 = 1;
 pub(crate) const WORKTREE_ROOT_MARKER: &str = ".aethyme-worktree-root.json";
@@ -1045,6 +1059,13 @@ pub struct DoctorReport {
     /// never reconciled: `doctor` only names the dry run.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub leftover_integration_work: Option<StatusAdvice>,
+    /// Milliseconds each doctor phase took (#460).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub phase_timings_ms: std::collections::BTreeMap<String, u64>,
+    /// Checks the inspection time budget cut short; what they did not reach
+    /// is unknown, not healthy. Omitted when every check completed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub budget_cut: Vec<String>,
 }
 
 /// One `broker.command.failed` event as `doctor` reports it.
@@ -2758,6 +2779,14 @@ pub struct Broker {
     graph_impact_provider: Box<dyn GraphImpactProvider>,
     host_operation_db_path: Option<PathBuf>,
     worktree_root_override: Option<PathBuf>,
+    /// Set only while a bounded eligibility pass runs: the landing search
+    /// stops at it instead of finishing one expensive worktree long past the
+    /// pass's budget (#460).
+    landing_deadline: std::cell::Cell<Option<std::time::Instant>>,
+    /// The main repository's Git common directory, read once: ownership
+    /// checks ask for it twice per closed worktree, and each ask was a
+    /// `rev-parse` subprocess (#460). Only a successful read is kept.
+    main_common_dir: std::cell::OnceCell<PathBuf>,
 }
 
 impl Broker {
@@ -2781,6 +2810,8 @@ impl Broker {
             graph_impact_provider: Box::new(GraphStoreImpactProvider),
             host_operation_db_path: None,
             worktree_root_override: None,
+            landing_deadline: std::cell::Cell::new(None),
+            main_common_dir: std::cell::OnceCell::new(),
         })
     }
 
@@ -2801,6 +2832,8 @@ impl Broker {
             graph_impact_provider: Box::new(GraphStoreImpactProvider),
             host_operation_db_path: None,
             worktree_root_override: None,
+            landing_deadline: std::cell::Cell::new(None),
+            main_common_dir: std::cell::OnceCell::new(),
         };
         broker.backfill_live_repository_contracts()?;
         Ok(broker)
@@ -2823,6 +2856,8 @@ impl Broker {
             graph_impact_provider: Box::new(graph_impact_provider),
             host_operation_db_path: None,
             worktree_root_override: None,
+            landing_deadline: std::cell::Cell::new(None),
+            main_common_dir: std::cell::OnceCell::new(),
         };
         broker.backfill_live_repository_contracts()?;
         broker.reap_abandoned_prepared_operations()?;
@@ -3660,7 +3695,9 @@ impl Broker {
             .ok()
             .map(|(reference, _)| reference)
             .filter(|reference| reference.starts_with("refs/remotes/"));
-        let (head, work) = self.session_off_remote_work(session, upstream.as_deref())?;
+        let integration_head = self.integration_head_snapshot().ok().map(|(_, head)| head);
+        let (head, work) =
+            session_off_remote_work(session, upstream.as_deref(), integration_head.as_deref())?;
         (work.commits > 0).then_some((head, work.commits))
     }
 
@@ -4258,8 +4295,18 @@ impl Broker {
     fn repository_worktree_key(&self) -> Result<String, BrokerOpError> {
         Ok(crate::host_state::repository_key(
             &self.main_root,
-            Some(&self.repo.git_common_dir()?),
+            Some(&self.main_git_common_dir()?),
         ))
+    }
+
+    /// [`GitRepo::git_common_dir`] of the main repository, cached after the
+    /// first successful read; it cannot change while this broker is open.
+    fn main_git_common_dir(&self) -> Result<PathBuf, GitError> {
+        if let Some(dir) = self.main_common_dir.get() {
+            return Ok(dir.clone());
+        }
+        let dir = self.repo.git_common_dir()?;
+        Ok(self.main_common_dir.get_or_init(|| dir).clone())
     }
 
     fn absolute_worktree_root(&self, path: &Path) -> PathBuf {
@@ -5689,12 +5736,22 @@ impl Broker {
     /// cleaned sessions alive: closed-session rows remain purged, and the
     /// promoted branch is its own conflict surface.
     fn promoted_conflicts(&self) -> Result<Vec<PromotedConflict>, BrokerOpError> {
+        Ok(self.promoted_conflicts_within(None)?.0)
+    }
+
+    /// [`Self::promoted_conflicts`], stopping at `deadline`. The flag is true
+    /// when it stopped before judging every leased session, so a caller can
+    /// say the list is incomplete rather than that there is nothing more.
+    fn promoted_conflicts_within(
+        &self,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<(Vec<PromotedConflict>, bool), BrokerOpError> {
         use std::collections::{BTreeMap, BTreeSet};
 
         use crate::leases::{LeaseIgnoreRules, paths_overlap};
 
         let Some(integration) = self.integration_tip() else {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), false));
         };
         let rules = LeaseIgnoreRules::load(&self.main_root);
         let mut leases_by_session: BTreeMap<i64, Vec<String>> = BTreeMap::new();
@@ -5707,7 +5764,7 @@ impl Broker {
             }
         }
         if leases_by_session.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), false));
         }
 
         let mut conflicts = BTreeSet::new();
@@ -5721,6 +5778,9 @@ impl Broker {
             let Some(session_paths) = leases_by_session.get(&session.id) else {
                 continue;
             };
+            if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+                return Ok((conflicts.into_iter().collect(), true));
+            }
             let Ok(checkout) = GitRepo::discover(Path::new(&session.worktree_path)) else {
                 continue;
             };
@@ -5761,7 +5821,7 @@ impl Broker {
                 }
             }
         }
-        Ok(conflicts.into_iter().collect())
+        Ok((conflicts.into_iter().collect(), false))
     }
 
     // ── checkpoint recovery and conflict-scoped repair ────────────────
@@ -7068,7 +7128,7 @@ impl Broker {
         );
         let ids = agents.iter().map(|a| a.session.id).collect::<Vec<_>>();
         let latest = self.store.latest_merge_queue_for_sessions(&ids)?;
-        let mut advice = self.status_advice(&agents, &[], &latest, ("", ""), promotes, false);
+        let mut advice = self.status_advice(&agents, &[], &latest, ("", ""), promotes, None);
         let blockers = self.blockers();
         if let Some(item) = crate::blockers::status_advice(&blockers.blockers) {
             advice.push(item);
@@ -7177,11 +7237,55 @@ impl Broker {
         // needs reconciling is noise there (and some of it is `blocked`), so
         // the mode is read once and gates all of them.
         let promotes = PromoteConfig::load(&self.main_root).mode.promotes_at_all();
+        // One deadline for every phase below whose cost grows with sessions
+        // and history; each phase that runs out names what it skipped.
+        let budget = status_inspection_budget();
+        let deadline = refresh.then(|| started + budget);
+        let mut budget_cut: Vec<&'static str> = Vec::new();
+        let conflicts_started = std::time::Instant::now();
         let promoted_conflicts = if refresh {
-            self.promoted_conflicts()?
+            let (conflicts, cut) = self.promoted_conflicts_within(deadline)?;
+            if cut {
+                budget_cut.push("promoted_conflicts");
+            }
+            conflicts
         } else {
             Vec::new()
         };
+        phase_timings_ms.insert(
+            "promoted_conflicts".into(),
+            conflicts_started.elapsed().as_millis() as u64,
+        );
+        let checkouts_started = std::time::Instant::now();
+        let checkouts = refresh.then(|| inspect_session_checkouts(&agents, deadline));
+        if checkouts.as_ref().is_some_and(|checkouts| {
+            checkouts
+                .values()
+                .any(|inspection| *inspection == CheckoutInspection::NotInspected)
+        }) {
+            budget_cut.push("dirty_worktrees");
+        }
+        phase_timings_ms.insert(
+            "checkouts".into(),
+            checkouts_started.elapsed().as_millis() as u64,
+        );
+        // Before the drift assessment, the costliest and least urgent phase:
+        // it gets whatever budget is left, and a cut there leaves the
+        // per-session answers intact.
+        let unpushed_started = std::time::Instant::now();
+        let unpushed_work = if refresh {
+            self.unpushed_work_within(now_ms, deadline)
+                .unwrap_or_default()
+        } else {
+            crate::UnpushedWorkReport::default()
+        };
+        if !unpushed_work.not_inspected_sessions.is_empty() {
+            budget_cut.push("unpushed_commits");
+        }
+        phase_timings_ms.insert(
+            "unpushed".into(),
+            unpushed_started.elapsed().as_millis() as u64,
+        );
         // Declared intent, not yet visible in any diff. Read from the same
         // snapshot as the leases above so both halves of "who else is working
         // on this" describe one moment.
@@ -7227,11 +7331,7 @@ impl Broker {
         } else {
             (StatusIntegrationRelation::DivergedFromMain, 0)
         };
-        let dirty_sessions = if refresh {
-            dirty_session_count(&agents)
-        } else {
-            0
-        };
+        let dirty_sessions = checkouts.as_ref().map_or(0, dirty_session_count);
         let overlap_pairs = self.overlap_pairs_snapshot(&overlaps);
         let summary = status_summary(
             &agents,
@@ -7270,20 +7370,38 @@ impl Broker {
             &latest_live_queue,
             (&integration_branch, &integration_head),
             promotes,
-            refresh,
+            checkouts.as_ref(),
         );
         let integration_contains_upstream = upstream_head
             .as_deref()
             .is_some_and(|upstream| self.repo.is_ancestor(upstream, &integration_head));
+        let drift_started = std::time::Instant::now();
         let integration_reconciliation = match (upstream_ref.as_deref(), upstream_head.as_deref()) {
             (Some(upstream_ref), Some(upstream_head))
                 if refresh && !integration_contains_upstream =>
             {
-                self.assess_integration_drift(upstream_ref, upstream_head, &integration_head)
-                    .ok()
+                match self.assess_integration_drift_within(
+                    upstream_ref,
+                    upstream_head,
+                    &integration_head,
+                    deadline,
+                ) {
+                    Ok(Some(assessment)) => Some(assessment),
+                    // Not assessed is not resolved: without an assessment
+                    // the drift row below keeps its unassessed severity.
+                    Ok(None) => {
+                        budget_cut.push("integration_drift");
+                        None
+                    }
+                    Err(_) => None,
+                }
             }
             _ => None,
         };
+        phase_timings_ms.insert(
+            "integration_drift".into(),
+            drift_started.elapsed().as_millis() as u64,
+        );
         if promotes
             && upstream_head.is_some()
             && (main_behind_upstream_commits > 0 || !integration_contains_upstream)
@@ -7754,11 +7872,14 @@ impl Broker {
         }
         // A status that cannot read refs still reports everything else; the
         // unpushed count is context, not a precondition for any command.
-        let unpushed_work = if refresh {
-            self.unpushed_work(now_ms).unwrap_or_default()
-        } else {
-            crate::UnpushedWorkReport::default()
-        };
+        if let Some(row) = budget_cut_advice(
+            &budget_cut,
+            checkouts.as_ref(),
+            &unpushed_work.not_inspected_sessions,
+            upstream_ref.as_deref(),
+        ) {
+            advice.push(row);
+        }
         advice.extend(unpushed_work_advice(&unpushed_work, now_ms, !promotes));
         if refresh {
             advice.extend(self.integration_behind_upstream_advice());
@@ -7840,6 +7961,13 @@ impl Broker {
                 };
                 if foreign_deferred {
                     deferred.push("foreign_processes".into());
+                }
+                // Checks the inspection budget cut short (#460), named as the
+                // routine view names the checks it never runs.
+                for check in &budget_cut {
+                    if !deferred.iter().any(|deferred| deferred == check) {
+                        deferred.push((*check).into());
+                    }
                 }
                 deferred
             },
@@ -8171,6 +8299,19 @@ impl Broker {
     /// Empty when the repository has no remote: there is nowhere to push to,
     /// so every commit would count and the number would mean nothing.
     pub fn unpushed_work(&self, now_ms: i64) -> Result<crate::UnpushedWorkReport, BrokerOpError> {
+        self.unpushed_work_within(now_ms, None)
+    }
+
+    /// [`Self::unpushed_work`], reading session checkouts in parallel and
+    /// listing in `not_inspected_sessions` every session not reached before
+    /// `deadline` (#460). One cherry-marked `rev-list` per session against an
+    /// upstream that moved far ahead is what kept `doctor` running for half a
+    /// minute on a repository with seventy sessions.
+    pub fn unpushed_work_within(
+        &self,
+        now_ms: i64,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<crate::UnpushedWorkReport, BrokerOpError> {
         let push_session_branches = crate::session_push::session_push_enabled(&self.repo);
         let mut report = crate::UnpushedWorkReport {
             push_session_branches,
@@ -8183,8 +8324,24 @@ impl Broker {
         let upstream = baseline_ref
             .starts_with("refs/remotes/")
             .then_some(baseline_ref.as_str());
-        for session in self.store.live_sessions()? {
-            let Some((head, work)) = self.session_off_remote_work(&session, upstream) else {
+        let integration_fallback = self.integration_head_snapshot().ok().map(|(_, head)| head);
+        let sessions = self.store.live_sessions()?;
+        let inspected = crate::worktree_report::inspect_in_parallel(&sessions, |session| {
+            if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+                return Err(());
+            }
+            Ok(session_off_remote_work(
+                session,
+                upstream,
+                integration_fallback.as_deref(),
+            ))
+        });
+        for (session, inspected) in sessions.into_iter().zip(inspected) {
+            let Ok(found) = inspected else {
+                report.not_inspected_sessions.push(session.id);
+                continue;
+            };
+            let Some((head, work)) = found else {
                 continue;
             };
             if work.commits == 0 {
@@ -8229,55 +8386,6 @@ impl Broker {
             }
         }
         Ok(report)
-    }
-
-    /// The session's head and the commits it made that no remote holds.
-    ///
-    /// "Made" is measured from the session's own bases, not from integration.
-    /// A session inherits whatever its base carried, and counting another
-    /// session's unpublished promotions against every session built on top
-    /// of them is how one five-week backlog read as dozens of stranded
-    /// worktrees; integration reports that backlog itself. Excluding
-    /// integration's tip would do the same today, because promotion replays
-    /// a session's commits under new SHAs -- but only for as long as it
-    /// does: once integration reaches the session's head any other way (a
-    /// fast-forward, a hand merge), the session's own unpushed commits would
-    /// vanish from the count. The session's bases do not depend on how
-    /// integration moves: the immutable start base and, after a
-    /// `start --reuse`, the reuse base -- `diff_base`, unless acceptance has
-    /// since overwritten it with this session's own head.
-    fn session_off_remote_work(
-        &self,
-        session: &Session,
-        upstream: Option<&str>,
-    ) -> Option<(String, crate::unpushed::OffRemoteWork)> {
-        let worktree = Path::new(&session.worktree_path);
-        if !worktree.exists() {
-            return None;
-        }
-        let checkout = GitRepo::discover(worktree).ok()?;
-        let head = checkout.head_commit().ok()?;
-        let mut excluded = Vec::new();
-        if let Some(base) = session.adoption_base.as_deref() {
-            excluded.push(base.to_string());
-        }
-        if let Some(base) = session.diff_base.as_deref()
-            && session.accepted_session_head.as_deref() != Some(base)
-        {
-            excluded.push(base.to_string());
-        }
-        if excluded.is_empty()
-            && let Ok((_, integration)) = self.integration_head_snapshot()
-        {
-            excluded.push(integration);
-        }
-        let excluded = excluded
-            .iter()
-            .map(String::as_str)
-            .filter(|base| *base != "HEAD" && checkout.resolve_ref(base).is_some())
-            .collect::<Vec<_>>();
-        let work = crate::unpushed::off_remote_work(&checkout, &head, &excluded, upstream).ok()?;
-        Some((head, work))
     }
 
     pub(crate) fn default_branch_tip(&self) -> Result<(String, String, String), BrokerOpError> {
@@ -8336,7 +8444,7 @@ impl Broker {
         queue: &[MergeQueueEntry],
         integration: (&str, &str),
         promotes: bool,
-        inspect_worktrees: bool,
+        checkouts: Option<&std::collections::BTreeMap<i64, CheckoutInspection>>,
     ) -> Vec<StatusAdvice> {
         use std::collections::BTreeMap;
         let (integration_branch, integration_head) = integration;
@@ -8390,23 +8498,22 @@ impl Broker {
             ));
         }
 
-        for agent in agents.iter().filter(|_| inspect_worktrees) {
-            let Ok(checkout) = GitRepo::discover(Path::new(&agent.session.worktree_path)) else {
-                continue;
-            };
-            let Ok(dirty) = checkout.dirty_paths() else {
+        for agent in agents.iter().filter(|_| checkouts.is_some()) {
+            let Some(CheckoutInspection::Read { dirty, head }) =
+                checkouts.and_then(|checkouts| checkouts.get(&agent.session.id))
+            else {
                 continue;
             };
             if !dirty.is_empty() {
-                advice.push(dirty_worktree_advice(agent, &dirty));
+                advice.push(dirty_worktree_advice(agent, dirty));
                 continue;
             }
-            let Ok(head) = checkout.head_commit() else {
+            let Some(head) = head else {
                 continue;
             };
             if let Some(entry) = queue.iter().rev().find(|entry| {
                 entry.session_id == agent.session.id
-                    && entry.head_commit == head
+                    && &entry.head_commit == head
                     && matches!(
                         entry.status,
                         MergeStatus::Promoted | MergeStatus::ExternallyLanded
@@ -8516,6 +8623,12 @@ impl Broker {
     }
 
     fn doctor_inner(&mut self, fix_version: bool) -> Result<DoctorReport, BrokerOpError> {
+        let started = std::time::Instant::now();
+        let mut phase_timings_ms = std::collections::BTreeMap::new();
+        let mut budget_cut = Vec::new();
+        let mut phase = |name: &str, since: std::time::Instant| {
+            phase_timings_ms.insert(name.to_string(), since.elapsed().as_millis() as u64);
+        };
         let integrity = self.store.integrity_check()?;
 
         let live_sessions = self.store.live_sessions()?;
@@ -8551,15 +8664,35 @@ impl Broker {
         }
 
         let purged_stale_leases = self.store.purge_leases_of_cleaned_sessions()?;
+        phase("store", started);
+        let retention_started = std::time::Instant::now();
         let retention = self.gc_health()?;
+        phase("retention", retention_started);
+        let version_started = std::time::Instant::now();
         let version = crate::version::inspect_version(&self.main_root);
         let version_repair = fix_version.then(|| self.repair_local_cli_version(&version));
+        phase("version", version_started);
+        let movement_started = std::time::Instant::now();
         let integration_movement =
             self.integration_movement_notice_from_sessions(&live_sessions)?;
-        let unpushed_work = self.unpushed_work(now_ms()).unwrap_or_default();
+        phase("integration_movement", movement_started);
+        let unpushed_started = std::time::Instant::now();
+        let unpushed_work = self
+            .unpushed_work_within(
+                now_ms(),
+                Some(unpushed_started + status_inspection_budget()),
+            )
+            .unwrap_or_default();
+        if !unpushed_work.not_inspected_sessions.is_empty() {
+            budget_cut.push("unpushed_commits".to_string());
+        }
+        phase("unpushed", unpushed_started);
+        let rest_started = std::time::Instant::now();
         let recent_command_failures = self.recent_command_failures(now_ms())?;
         let hooks_path = crate::hooks::inspect_hooks_path(&self.main_root);
         let leftover_integration_work = self.leftover_integration_work()?;
+        phase("leftover_and_hooks", rest_started);
+        phase("total", started);
 
         Ok(DoctorReport {
             integrity,
@@ -8574,6 +8707,8 @@ impl Broker {
             recent_command_failures,
             hooks_path,
             leftover_integration_work,
+            phase_timings_ms,
+            budget_cut,
         })
     }
 
@@ -9817,7 +9952,7 @@ impl Broker {
             // to.
             return self.is_orphaned_worktree_of_this_repository(&canonical_path);
         };
-        match (checkout.git_common_dir(), self.repo.git_common_dir()) {
+        match (checkout.git_common_dir(), self.main_git_common_dir()) {
             (Ok(actual), Ok(expected)) => actual == expected,
             _ => false,
         }
@@ -9833,7 +9968,7 @@ impl Broker {
     /// establish which repository the remains belong to, not that they are safe
     /// to touch.
     fn is_orphaned_worktree_of_this_repository(&self, path: &Path) -> bool {
-        let Ok(expected) = self.repo.git_common_dir() else {
+        let Ok(expected) = self.main_git_common_dir() else {
             return false;
         };
         let Ok(pointer) = std::fs::read_to_string(path.join(".git")) else {
@@ -9989,7 +10124,12 @@ impl Broker {
                 let crate::LandingVerdict::Landed {
                     evidence,
                     landed_by,
-                } = crate::work_landed(&self.repo, session_head, target)?
+                } = crate::representation::work_landed_within(
+                    &self.repo,
+                    session_head,
+                    target,
+                    self.landing_deadline.get(),
+                )?
                 else {
                     continue;
                 };
@@ -10547,6 +10687,16 @@ impl Broker {
             "a measuring plan authorizes removal and must inspect every worktree"
         );
         let started = std::time::Instant::now();
+        let deadline = budget.map(|budget| started + budget);
+        // Cleared on every exit below, including an error return.
+        struct ClearOnDrop<'a>(&'a std::cell::Cell<Option<std::time::Instant>>);
+        impl Drop for ClearOnDrop<'_> {
+            fn drop(&mut self) {
+                self.0.set(None);
+            }
+        }
+        self.landing_deadline.set(deadline);
+        let _clear_landing_deadline = ClearOnDrop(&self.landing_deadline);
         let mut plan = CleanupPlan {
             target_snapshot: self.cleanup_target_snapshot(),
             ..CleanupPlan::default()
@@ -10562,7 +10712,7 @@ impl Broker {
             if session.origin != SessionOrigin::Spawned {
                 continue;
             }
-            let over_budget = budget.is_some_and(|budget| started.elapsed() >= budget);
+            let mut over_budget = budget.is_some_and(|budget| started.elapsed() >= budget);
             let item = if over_budget {
                 self.cleanup_item_not_inspected(
                     &session,
@@ -10574,12 +10724,32 @@ impl Broker {
                     ),
                 )
             } else {
-                self.cleanup_item_scanned_with_tips(
+                let item = self.cleanup_item_scanned_with_tips(
                     &session,
                     scan,
                     &mut records,
                     branch_tips.as_ref(),
-                )?
+                )?;
+                // A landing search the deadline stopped reads as a failed
+                // inspection; it is the budget, so say so instead (#460).
+                if item
+                    .as_ref()
+                    .is_some_and(|item| item.disposition == CleanupDisposition::InspectionFailed)
+                    && budget.is_some_and(|budget| started.elapsed() >= budget)
+                {
+                    over_budget = true;
+                    self.cleanup_item_not_inspected(
+                        &session,
+                        &records,
+                        branch_tips.as_ref(),
+                        format!(
+                            "eligibility not inspected within the {} s health-check budget; run `aethyme broker gc plan` for the full inspection",
+                            budget.unwrap_or_default().as_secs()
+                        ),
+                    )
+                } else {
+                    item
+                }
             };
             let Some(item) = item else {
                 continue;
@@ -11405,17 +11575,165 @@ fn promoted_clean_finish_advice(agent: &AgentView, entry: &MergeQueueEntry) -> S
     }
 }
 
-fn dirty_session_count(agents: &[AgentView]) -> usize {
+/// The session's head and the commits it made that no remote holds.
+///
+/// "Made" is measured from the session's own bases, not from integration.
+/// A session inherits whatever its base carried, and counting another
+/// session's unpublished promotions against every session built on top
+/// of them is how one five-week backlog read as dozens of stranded
+/// worktrees; integration reports that backlog itself. Excluding
+/// integration's tip would do the same today, because promotion replays
+/// a session's commits under new SHAs -- but only for as long as it
+/// does: once integration reaches the session's head any other way (a
+/// fast-forward, a hand merge), the session's own unpushed commits would
+/// vanish from the count. The session's bases do not depend on how
+/// integration moves: the immutable start base and, after a
+/// `start --reuse`, the reuse base -- `diff_base`, unless acceptance has
+/// since overwritten it with this session's own head. `integration_head`
+/// is the fallback base for a session that recorded neither.
+///
+/// A free function rather than a method so `unpushed_work_within` can run it
+/// on worker threads: it reads only the session's own checkout.
+fn session_off_remote_work(
+    session: &Session,
+    upstream: Option<&str>,
+    integration_head: Option<&str>,
+) -> Option<(String, crate::unpushed::OffRemoteWork)> {
+    let worktree = Path::new(&session.worktree_path);
+    if !worktree.exists() {
+        return None;
+    }
+    let checkout = GitRepo::discover(worktree).ok()?;
+    let head = checkout.head_commit().ok()?;
+    let mut excluded = Vec::new();
+    if let Some(base) = session.adoption_base.as_deref() {
+        excluded.push(base.to_string());
+    }
+    if let Some(base) = session.diff_base.as_deref()
+        && session.accepted_session_head.as_deref() != Some(base)
+    {
+        excluded.push(base.to_string());
+    }
+    if excluded.is_empty()
+        && let Some(integration) = integration_head
+    {
+        excluded.push(integration.to_string());
+    }
+    let excluded = excluded
+        .iter()
+        .map(String::as_str)
+        .filter(|base| *base != "HEAD" && checkout.resolve_ref(base).is_some())
+        .collect::<Vec<_>>();
+    let work = crate::unpushed::off_remote_work(&checkout, &head, &excluded, upstream).ok()?;
+    Some((head, work))
+}
+
+/// What `status --refresh` reads from one live session's checkout. Each
+/// checkout is read once, on a worker thread, and both the dirty count and
+/// the per-session advice use the result (#460): reading them serially, twice,
+/// was 136 `git status` calls and thirteen seconds on a repository with
+/// sixty-eight sessions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CheckoutInspection {
+    /// The time budget ran out first; nothing is known about this checkout.
+    NotInspected,
+    /// No checkout, or Git could not read it. Status never reported these.
+    Unreadable,
+    Read {
+        dirty: Vec<String>,
+        head: Option<String>,
+    },
+}
+
+fn inspect_session_checkouts(
+    agents: &[AgentView],
+    deadline: Option<std::time::Instant>,
+) -> std::collections::BTreeMap<i64, CheckoutInspection> {
+    let inspections = crate::worktree_report::inspect_in_parallel(agents, |agent| {
+        if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            return CheckoutInspection::NotInspected;
+        }
+        let Ok(checkout) = GitRepo::discover(Path::new(&agent.session.worktree_path)) else {
+            return CheckoutInspection::Unreadable;
+        };
+        let Ok(dirty) = checkout.dirty_paths() else {
+            return CheckoutInspection::Unreadable;
+        };
+        // A dirty checkout's head is never consulted.
+        let head = dirty
+            .is_empty()
+            .then(|| checkout.head_commit().ok())
+            .flatten();
+        CheckoutInspection::Read { dirty, head }
+    });
     agents
         .iter()
-        .filter(|agent| {
-            let Ok(checkout) = GitRepo::discover(Path::new(&agent.session.worktree_path)) else {
-                return false;
-            };
-            checkout
-                .dirty_paths()
-                .map(|dirty| !dirty.is_empty())
-                .unwrap_or(false)
+        .map(|agent| agent.session.id)
+        .zip(inspections)
+        .collect()
+}
+
+/// The row that says which refresh checks the inspection budget cut short
+/// and for which sessions, so an incomplete answer is never read as a clean
+/// one. `None` when nothing was cut.
+fn budget_cut_advice(
+    cut: &[&'static str],
+    checkouts: Option<&std::collections::BTreeMap<i64, CheckoutInspection>>,
+    unpushed_not_inspected: &[i64],
+    upstream_ref: Option<&str>,
+) -> Option<StatusAdvice> {
+    if cut.is_empty() {
+        return None;
+    }
+    let mut sessions: Vec<i64> = checkouts
+        .into_iter()
+        .flatten()
+        .filter(|(_, inspection)| **inspection == CheckoutInspection::NotInspected)
+        .map(|(id, _)| *id)
+        .chain(unpushed_not_inspected.iter().copied())
+        .collect();
+    sessions.sort_unstable();
+    sessions.dedup();
+    let mut evidence = vec![format!("cut short: {}", cut.join(", "))];
+    if !sessions.is_empty() {
+        evidence.push(format!(
+            "sessions not inspected: {}",
+            sessions
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    Some(StatusAdvice {
+        id: "status.inspection-budget",
+        severity: StatusAdviceSeverity::Notice,
+        reason: "refresh checks stopped at the inspection time budget",
+        summary: format!(
+            "{} not completed within the {} ms inspection budget; what they did not reach is unknown, not clean",
+            cut.join(", "),
+            status_inspection_budget().as_millis()
+        ),
+        session_id: None,
+        queue_entry_id: None,
+        evidence,
+        // The unbounded reviewed path, for an operator who needs the answer
+        // the budget cut off.
+        commands: match upstream_ref {
+            Some(upstream) if cut.contains(&"integration_drift") => vec![format!(
+                "aethyme broker advanced integration reconcile --upstream {} --dry-run",
+                shell_quote(upstream)
+            )],
+            _ => Vec::new(),
+        },
+    })
+}
+
+fn dirty_session_count(inspections: &std::collections::BTreeMap<i64, CheckoutInspection>) -> usize {
+    inspections
+        .values()
+        .filter(|inspection| {
+            matches!(inspection, CheckoutInspection::Read { dirty, .. } if !dirty.is_empty())
         })
         .count()
 }
@@ -13551,6 +13869,8 @@ mod tests {
             recent_command_failures: Vec::new(),
             hooks_path: None,
             leftover_integration_work: None,
+            phase_timings_ms: Default::default(),
+            budget_cut: Vec::new(),
         }
     }
 
