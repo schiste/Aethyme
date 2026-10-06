@@ -250,6 +250,36 @@ jobs:
       - name: Run doctests
         run: cargo test --locked --workspace --doc
 
+  # ── Tested tree ─────────────────────────────────────────────────────────
+  # A pull_request run tests GitHub's merge of the PR into its base. Once both
+  # suites pass, record that merge's tree as an artifact. When a merge commit
+  # on main has a byte-identical tree, Aethyme Gates skips the gates these
+  # suites already cover (aethyme-gates.yml). If main moved after this run,
+  # the trees differ and every gate runs.
+  record-tested-tree:
+    name: Record the tested tree
+    if: github.event_name == 'pull_request'
+    needs: [rust-tests, rust-examples-doctests]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Name the tested tree
+        run: |
+          set -euo pipefail
+          tree="$(git rev-parse 'HEAD^{tree}')"
+          mkdir -p tested-tree
+          printf '%s\n' "$tree" > tested-tree/tree
+          echo "TESTED_TREE=$tree" >> "$GITHUB_ENV"
+
+      - name: Upload the tested tree
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: tested-tree-${{ env.TESTED_TREE }}
+          path: tested-tree/tree
+          retention-days: 14
+
   # ── Cache warm-up ───────────────────────────────────────────────────────
   # Compiles main's tests on each push so the pull-request test jobs above
   # restore a warm cache instead of starting cold. Builds only; main's test
