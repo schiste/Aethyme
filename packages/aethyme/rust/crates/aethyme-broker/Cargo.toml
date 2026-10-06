@@ -28,29 +28,29 @@ aethyme-graph-indexer = { path = "../aethyme-graph-indexer" }
 aethyme-graph-storage = { path = "../aethyme-graph-storage" }
 # Bundled SQLite so the broker has zero system dependencies and one
 # known SQLite version across platforms (macOS/Linux are the v0 targets).
-rusqlite = { version = "0.32", features = ["bundled"] }
-thiserror = "2"
+rusqlite = { workspace = true }
+thiserror = { workspace = true }
 # The --json CLI contract (#32): output shapes come from the library's
 # serializable types, so Serialize lives on the types themselves.
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde = { workspace = true }
+serde_json = { workspace = true }
 # Repository issue forms are YAML 1.2. Noyalib is a pure-Rust, safe-code
 # parser with native Serde support; the renderer only uses typed decoding.
-noyalib = "0.0.24"
+noyalib = { workspace = true }
 # .aethyme/config.toml ([leases] ignore, later [gates]/[promote]).
-toml = "0.8"
+toml = { workspace = true }
 # Gate trigger globs (gates.toml). Same matcher family ripgrep uses.
-globset = "0.4"
+globset = { workspace = true }
 # killpg for gate-run cancellation (the external `kill` utility parses
 # negative pgids as options on Linux).
-libc = "0.2"
+libc = { workspace = true }
 # Offline report digests are the review/filing confirmation contract.
-sha2 = "0.10"
+sha2 = { workspace = true }
 # Atomic report publication uses a sibling tempfile plus persist_noclobber.
-tempfile = "3"
+tempfile = { workspace = true }
 # Release availability and downgrade decisions use semantic versions rather
 # than string ordering.
-semver = "1"
+semver = { workspace = true }
 
 # `tests/gate_policy.rs` asserts over the live `.aethyme/gates.toml`, so it
 # needs the monorepo root rather than this crate's. `repo_root()` discovers
@@ -59,7 +59,7 @@ semver = "1"
 [dev-dependencies]
 aethyme-testkit = { path = "../aethyme-testkit" }
 # Seeds tempfile's generator in a test to reproduce the #430 name collision.
-fastrand = "2"
+fastrand = { workspace = true }
 
 # This crate does not yet satisfy the workspace's `undocumented_unsafe_blocks`
 # or `redundant_clone` ratchet: 21 `unsafe` blocks (mostly the `flock`,

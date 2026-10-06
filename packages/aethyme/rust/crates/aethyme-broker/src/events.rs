@@ -19,6 +19,7 @@ pub const SESSION_REGISTERED: &str = "session.registered";
 pub const SESSION_REUSED: &str = "session.reused";
 pub const SESSION_CONTEXT_UPDATED: &str = "session.context_updated";
 pub const SESSION_FINISHED: &str = "session.finished";
+pub const SESSION_HOLDER_BOUND: &str = "session.holder_bound";
 pub const SESSION_FINISH_CLEANUP_STARTED: &str = "session.finish_cleanup_started";
 pub const SESSION_CHECKPOINT_REANCHORED: &str = "session.checkpoint_reanchored";
 pub const REVIEW_LIFECYCLE_REASSIGNED: &str = "review.lifecycle_reassigned";
@@ -79,6 +80,24 @@ pub fn session_registered_payload(origin: &str, branch: &str, worktree_path: &st
 
 pub fn session_reused_payload(task: Option<&str>, diff_base: Option<&str>) -> String {
     json!({ "task": task, "diff_base": diff_base }).to_string()
+}
+
+/// `session.holder_bound`: the agent process that now holds the session, why
+/// it does, and the holder it replaced (#393).
+pub fn session_holder_bound_payload(
+    holder: &crate::session_holder::AgentProcess,
+    reason: &str,
+    previous: Option<&crate::session_holder::AgentProcess>,
+) -> String {
+    json!({
+        "pid": holder.pid,
+        "started": holder.started,
+        "command": holder.command,
+        "reason": reason,
+        "previous_pid": previous.map(|process| process.pid),
+        "previous_started": previous.map(|process| process.started.as_str()),
+    })
+    .to_string()
 }
 
 pub fn session_context_updated_payload(context: &crate::SessionContext) -> String {

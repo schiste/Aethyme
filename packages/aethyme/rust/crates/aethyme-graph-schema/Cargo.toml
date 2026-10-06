@@ -14,14 +14,14 @@ path = "src/lib.rs"
 # arriving in commit 1.12) and NDJSON index shards (serde_json, also 1.12)
 # route through the same Serialize/Deserialize derive — keeping one schema
 # vocabulary across both transports is the whole point of having this crate.
-serde = { version = "1", features = ["derive"] }
+serde = { workspace = true }
 
 # BLAKE3 powers the content-hash node IDs (commit 1.4). The schema doc locks
 # this choice for two reasons: (1) ~10x faster than SHA-256 on indexer
 # workloads, which matters at MediaWiki scale (~12K files × hashes per
 # symbol), and (2) the streaming API is simpler than sha2's reset/update/
 # finalize, reducing the surface for non-determinism bugs in the hashing path.
-blake3 = "1"
+blake3 = { workspace = true }
 
 # data-encoding handles the base32 step of the NodeId format (commit 1.4).
 # We use BASE32_NOPAD, which is RFC 4648 standard base32 (A–Z plus 2–7,
@@ -32,7 +32,7 @@ blake3 = "1"
 # we case-normalize and display IDs in monospace, and (c) RFC 4648 is
 # more universally understood. See identity.rs's module docs for the
 # full rationale.
-data-encoding = "2"
+data-encoding = { workspace = true }
 
 [dev-dependencies]
 # serde_json is used only by the integration tests to assert round-trip
@@ -42,14 +42,14 @@ data-encoding = "2"
 # crate, not here). Keeping serde_json out of the main `[dependencies]`
 # keeps the leaf-crate property — consumers that don't need JSON don't
 # pull it in.
-serde_json = "1"
+serde_json = { workspace = true }
 
 # bincode is used by tests/determinism.rs to assert byte-determinism
 # of the binary fragment format. Matches the engine crate's bincode 1
 # choice. Same dev-only rationale as serde_json — production binary
 # fragment writing lives in the storage layer (Phase 2+), this crate
 # only tests that its types round-trip through bincode losslessly.
-bincode = "1"
+bincode = { workspace = true }
 
 [lints]
 workspace = true

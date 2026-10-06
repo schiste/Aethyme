@@ -77,6 +77,7 @@ fn request(session_id: i64, args: &[&str]) -> CoordinatedCommand {
         scope: None,
         declared_effect: None,
         destructive_confirmed: false,
+        cross_session: None,
         authorization_reason: Some("test workflow".into()),
         args: args.iter().map(|arg| (*arg).into()).collect(),
     }
@@ -152,6 +153,7 @@ fn github_request(session_id: i64, repository: &str, args: &[&str]) -> Coordinat
         scope: Some("github:test".into()),
         declared_effect: Some(OperationEffect::Read),
         destructive_confirmed: false,
+        cross_session: None,
         authorization_reason: None,
         args: args.iter().map(|arg| (*arg).into()).collect(),
     }
@@ -281,6 +283,140 @@ fn destructive_and_ambiguous_operations_fail_closed() {
             .contains("exact owner/name slug")
     );
     assert!(broker.store().coordinated_operations().unwrap().is_empty());
+}
+
+/// Two live sessions sharing one origin, the second one's branch published.
+fn cross_session_fixture(root: &Path) -> (PushFixture, std::path::PathBuf, i64) {
+    let mut fixture = push_fixture(root, "own");
+    let repo = root.join("repo");
+    let other_worktree = add_worktree(&repo, "other");
+    let other = fixture
+        .broker
+        .adopt(&other_worktree, Some("other agent's task"))
+        .unwrap();
+    git(&repo, &["push", "-q", "origin", "agent/other", "agent/own"]);
+    (fixture, other_worktree, other.id)
+}
+
+fn remote_has_branch(remote: &Path, branch: &str) -> bool {
+    !git_output(remote, &["branch", "--list", branch]).is_empty()
+}
+
+fn destructive_push(fixture: &PushFixture, refspecs: &[&str]) -> CoordinatedCommand {
+    let mut command = exact_push_request(fixture.session_id, &fixture.worktree, refspecs);
+    command.destructive_confirmed = true;
+    command
+}
+
+#[test]
+fn destructive_write_to_another_live_sessions_branch_is_refused_and_names_the_owner() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut fixture, _other_worktree, other) = cross_session_fixture(tmp.path());
+
+    for refspecs in [
+        &[":agent/other"][..],
+        &["--delete", "agent/other"],
+        &["+HEAD:refs/heads/agent/other"],
+    ] {
+        let request = destructive_push(&fixture, refspecs);
+        let error = fixture
+            .broker
+            .run_coordinated_operation(request)
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains(&format!("belongs to live session {other}")),
+            "{refspecs:?}: {message}"
+        );
+        assert!(message.contains("other agent's task"), "{message}");
+        assert!(
+            message.contains(&format!("--cross-session {other}")),
+            "{message}"
+        );
+    }
+    let mut local = request(fixture.session_id, &["branch", "-D", "agent/other"]);
+    local.destructive_confirmed = true;
+    let error = fixture.broker.run_coordinated_operation(local).unwrap_err();
+    assert!(
+        error.to_string().contains("belongs to live session"),
+        "{error}"
+    );
+
+    // Refused before anything was journaled or sent.
+    assert!(
+        fixture
+            .broker
+            .store()
+            .coordinated_operations()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(remote_has_branch(&fixture.remote, "agent/other"));
+}
+
+#[test]
+fn cross_session_names_the_owner_it_may_touch_and_is_journaled() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut fixture, _other_worktree, other) = cross_session_fixture(tmp.path());
+
+    let mut wrong = destructive_push(&fixture, &[":agent/other"]);
+    wrong.cross_session = Some(other + 100);
+    let error = fixture.broker.run_coordinated_operation(wrong).unwrap_err();
+    assert!(
+        error.to_string().contains("belongs to live session"),
+        "{error}"
+    );
+
+    let mut not_destructive = request(fixture.session_id, &["branch", "harmless"]);
+    not_destructive.cross_session = Some(other);
+    let error = fixture
+        .broker
+        .run_coordinated_operation(not_destructive)
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("only to a destructive"),
+        "{error}"
+    );
+
+    let mut allowed = destructive_push(&fixture, &[":agent/other"]);
+    allowed.cross_session = Some(other);
+    let report = fixture.broker.run_coordinated_operation(allowed).unwrap();
+    assert!(report.ok(), "{}", report.stderr);
+    assert!(!remote_has_branch(&fixture.remote, "agent/other"));
+    let reason = report.operation.authorization_reason.unwrap_or_default();
+    assert!(
+        reason.ends_with(&format!("[cross-session {other}]")),
+        "{reason}"
+    );
+}
+
+#[test]
+fn closed_owner_and_own_branch_need_no_cross_session() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut fixture, _other_worktree, other) = cross_session_fixture(tmp.path());
+
+    // The caller's own branch is its own to rewrite.
+    let report = fixture
+        .broker
+        .run_coordinated_operation(destructive_push(&fixture, &[":agent/own"]))
+        .unwrap();
+    assert!(report.ok(), "{}", report.stderr);
+
+    fixture.broker.close(other).unwrap();
+    let mut stray = destructive_push(&fixture, &[":agent/other"]);
+    stray.cross_session = Some(other);
+    let error = fixture.broker.run_coordinated_operation(stray).unwrap_err();
+    assert!(
+        error.to_string().contains("names no live session"),
+        "{error}"
+    );
+
+    let report = fixture
+        .broker
+        .run_coordinated_operation(destructive_push(&fixture, &[":agent/other"]))
+        .unwrap();
+    assert!(report.ok(), "{}", report.stderr);
+    assert!(!remote_has_branch(&fixture.remote, "agent/other"));
 }
 
 #[test]
@@ -1140,6 +1276,7 @@ fn repository_write_lock_serializes_independent_process_clients() {
                     scope: Some("test:sleep".into()),
                     declared_effect: Some(OperationEffect::Write),
                     destructive_confirmed: false,
+                    cross_session: None,
                     authorization_reason: Some("concurrency regression".into()),
                     args: vec!["pause".into()],
                 })

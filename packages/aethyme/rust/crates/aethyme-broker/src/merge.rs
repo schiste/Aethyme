@@ -28,6 +28,31 @@ use crate::types::{AdvisoryEvidence, AdvisorySeverity, MergeQueueEntry, MergeSta
 
 pub const DEFAULT_INTEGRATION_BRANCH: &str = "aethyme/integration";
 pub const ACTION_REQUIRED_RELPATH: &str = ".aethyme/broker-action-required.md";
+const PROMOTION_SUBJECT_MAX_CHARS: usize = 72;
+
+fn promotion_subject(session_id: i64, task: Option<&str>) -> String {
+    let prefix = format!("chore(broker): promote session {session_id} (");
+    let suffix = ")";
+    // A subject is one line: a multi-line task contributes its first line.
+    let task = task
+        .and_then(|task| task.lines().next())
+        .map(str::trim)
+        .filter(|task| !task.is_empty())
+        .unwrap_or("no task");
+    let task_budget =
+        PROMOTION_SUBJECT_MAX_CHARS.saturating_sub(prefix.chars().count() + suffix.chars().count());
+    let task = if task.chars().count() <= task_budget {
+        task.to_string()
+    } else {
+        // ASCII, so a hook that counts UTF-16 units sees the same length.
+        let marker = "...";
+        let visible_chars = task_budget.saturating_sub(marker.len());
+        let shortened = task.chars().take(visible_chars).collect::<String>();
+        format!("{}{marker}", shortened.trim_end())
+    };
+
+    format!("{prefix}{task}{suffix}")
+}
 
 /// How many merge verifications may run at once in one repository. Each slot
 /// is a full checkout, and gates that share a build cache still serialise on
@@ -906,14 +931,13 @@ impl Broker {
             .as_deref()
             .and_then(crate::attribution::Identity::parse);
         let attribution = crate::attribution::for_promote(&self.main_root_path(), agent);
+        // The subject is a conventional commit so that
+        // `aethyme repo lint-commit-message` accepts a broker promotion.
+        // `chore` is honest: the substantive change is the session's own
+        // commits, which the merge carries, not this integration commit.
         let mut verification_message = format!(
-            // The subject is a conventional commit so that
-            // `aethyme repo lint-commit-message` accepts a broker promotion.
-            // `chore` is honest: the substantive change is the session's own
-            // commits, which the merge carries, not this integration commit.
-            "chore(broker): promote session {} ({}){}",
-            session.id,
-            session.task.as_deref().unwrap_or("no task"),
+            "{}{}",
+            promotion_subject(session.id, session.task.as_deref()),
             attribution.trailer_block()
         );
         let pending_messages = submission_plan
@@ -1470,24 +1494,26 @@ impl Broker {
             });
         };
 
+        // Every question below is asked of the whole commit list at once:
+        // asking it once per commit spawned several git processes each, and
+        // a session cut from a main far ahead of integration carries every
+        // commit of that drift, so submit grew to 45 minutes (#463).
         let integration_candidates =
             repo.first_parent_commits_excluding_oldest(integration_head, recorded_baseline)?;
+        let candidate_shapes = repo.commit_shapes(&integration_candidates)?;
+        let candidate_patch_ids =
+            repo.first_parent_patch_ids(&with_parent(&integration_candidates, &candidate_shapes))?;
         let mut integration_by_patch: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for commit in integration_candidates {
-            let parents = repo.commit_parents(&commit)?;
-            let Some(parent) = parents.first() else {
-                continue;
-            };
-            if let Some(patch_id) = repo.patch_id_between(parent, &commit)? {
+            if let Some(patch_id) = candidate_patch_ids.get(&commit) {
                 integration_by_patch
-                    .entry(patch_id)
+                    .entry(patch_id.clone())
                     .or_default()
                     .push(commit);
             }
         }
 
-        let mut commits = Vec::with_capacity(inherited.len() + owned.len());
-        for (commit, ownership) in inherited
+        let ordered = inherited
             .into_iter()
             .map(|commit| {
                 (
@@ -1500,31 +1526,58 @@ impl Broker {
                     .into_iter()
                     .map(|commit| (commit, SubmissionCommitOwnership::SessionOwned)),
             )
-        {
-            let parents = repo.commit_parents(&commit)?;
-            let patch_id = parents
-                .first()
-                .map(|parent| repo.patch_id_between(parent, &commit))
-                .transpose()?
-                .flatten();
+            .collect::<Vec<_>>();
+        let names = ordered
+            .iter()
+            .map(|(commit, _)| commit.clone())
+            .collect::<Vec<_>>();
+        let shapes = repo.commit_shapes(&names)?;
+        let patch_ids = repo.first_parent_patch_ids(&with_parent(&names, &shapes))?;
+        // Each commit here, and each parent of one, is reachable from the
+        // session HEAD, so it is an ancestor of integration exactly when it
+        // is not among the commits the session HEAD has and integration
+        // lacks. One rev-list answers that for all of them; if it cannot run,
+        // ask per commit as before.
+        let outside_integration = repo
+            .commits_excluding_oldest(session_head, integration_head)
+            .ok()
+            .map(|commits| commits.into_iter().collect::<BTreeSet<_>>());
+        let reaches_integration = |commit: &str| match &outside_integration {
+            Some(outside) => !outside.contains(commit),
+            None => repo.is_ancestor(commit, integration_head),
+        };
+        let synced_second_parents = shapes
+            .values()
+            .filter(|shape| shape.parents.len() == 2 && reaches_integration(&shape.parents[1]))
+            .map(|shape| shape.parents[1].clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let second_parent_shapes = repo.commit_shapes(&synced_second_parents)?;
+
+        let mut commits = Vec::with_capacity(ordered.len());
+        for (commit, ownership) in ordered {
+            let shape = &shapes[&commit];
+            let parents = shape.parents.clone();
+            let patch_id = patch_ids.get(&commit).cloned();
             let matching_integration_commits = patch_id
                 .as_ref()
                 .and_then(|patch| integration_by_patch.get(patch))
                 .cloned()
                 .unwrap_or_default();
             let exact_integration_sync = parents.len() == 2
-                && repo.is_ancestor(&parents[1], integration_head)
-                && repo.commit_tree_id(&commit)? == repo.commit_tree_id(&parents[1])?;
-            let integration_state =
-                if repo.is_ancestor(&commit, integration_head) || exact_integration_sync {
-                    SubmissionIntegrationState::AlreadyIntegratedByAncestry
-                } else {
-                    match matching_integration_commits.len() {
-                        0 => SubmissionIntegrationState::Pending,
-                        1 => SubmissionIntegrationState::AlreadyIntegratedByStablePatchIdentity,
-                        _ => SubmissionIntegrationState::Ambiguous,
-                    }
-                };
+                && second_parent_shapes
+                    .get(&parents[1])
+                    .is_some_and(|second| second.tree == shape.tree);
+            let integration_state = if reaches_integration(&commit) || exact_integration_sync {
+                SubmissionIntegrationState::AlreadyIntegratedByAncestry
+            } else {
+                match matching_integration_commits.len() {
+                    0 => SubmissionIntegrationState::Pending,
+                    1 => SubmissionIntegrationState::AlreadyIntegratedByStablePatchIdentity,
+                    _ => SubmissionIntegrationState::Ambiguous,
+                }
+            };
             commits.push(SubmissionCommitProvenance {
                 commit,
                 parents,
@@ -1908,6 +1961,23 @@ impl Broker {
     }
 }
 
+/// The commits in `commits` that have a parent, in order: a root commit has
+/// no first-parent diff, and so no patch id.
+fn with_parent(
+    commits: &[String],
+    shapes: &BTreeMap<String, crate::git::CommitShape>,
+) -> Vec<String> {
+    commits
+        .iter()
+        .filter(|commit| {
+            shapes
+                .get(*commit)
+                .is_some_and(|shape| !shape.parents.is_empty())
+        })
+        .cloned()
+        .collect()
+}
+
 fn submission_planning_failure_class(error: &BrokerOpError) -> &'static str {
     match error {
         BrokerOpError::UnsafeSubmissionPlan { .. } => "unsafe_provenance",
@@ -2181,5 +2251,44 @@ mod promotion_ref_tests {
             first,
             "the first promotion was overwritten"
         );
+    }
+}
+
+#[cfg(test)]
+mod promotion_subject_tests {
+    use super::{PROMOTION_SUBJECT_MAX_CHARS, promotion_subject};
+
+    #[test]
+    fn keeps_short_task_names_intact() {
+        assert_eq!(
+            promotion_subject(42, Some("fix lease refresh")),
+            "chore(broker): promote session 42 (fix lease refresh)"
+        );
+    }
+
+    #[test]
+    fn caps_long_task_names_at_the_conventional_subject_limit() {
+        let subject = promotion_subject(42, Some(&"long task ".repeat(20)));
+
+        assert!(subject.chars().count() <= PROMOTION_SUBJECT_MAX_CHARS);
+        // The cut never leaves a space before the marker.
+        assert!(subject.ends_with("...)"), "{subject}");
+        assert!(!subject.ends_with(" ...)"), "{subject}");
+    }
+
+    #[test]
+    fn a_multi_line_task_contributes_only_its_first_line() {
+        assert_eq!(
+            promotion_subject(42, Some("fix lease refresh\n\nlong details")),
+            "chore(broker): promote session 42 (fix lease refresh)"
+        );
+    }
+
+    #[test]
+    fn truncates_unicode_task_names_on_character_boundaries() {
+        let subject = promotion_subject(42, Some(&"🚀".repeat(100)));
+
+        assert_eq!(subject.chars().count(), PROMOTION_SUBJECT_MAX_CHARS);
+        assert!(subject.ends_with("...)"));
     }
 }

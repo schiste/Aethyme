@@ -149,6 +149,7 @@ fn enhance_deploy_writes_generated_onboarding() {
     let written = deployed_paths(&deploy(&repo, false));
     for relative in [
         ".codex/skills/aethyme/SKILL.md",
+        ".claude/skills/aethyme/aethyme-explore",
         ".codex/skills/aethyme/aethyme-explore",
         "AGENTS.md",
         ".codex/skills/repo-onboarding/SKILL.md",
@@ -222,14 +223,16 @@ fn enhance_deploy_writes_generated_onboarding() {
     assert!(wrapper.contains("repo record-wrapper-invocation"));
     assert!(wrapper.contains("--wrapper aethyme-sessionstart-hook"));
 
-    let codex_wrapper = repo.join(".codex/skills/aethyme/aethyme-explore");
-    let codex_text = read(&codex_wrapper);
-    assert!(codex_text.contains("repo record-wrapper-invocation"));
-    assert!(codex_text.contains("--wrapper aethyme-explore"));
-    assert!(
-        is_executable(&codex_wrapper),
-        "deployed wrapper must be executable"
-    );
+    for surface in [".claude", ".codex"] {
+        let explore_wrapper = repo.join(surface).join("skills/aethyme/aethyme-explore");
+        let explore_text = read(&explore_wrapper);
+        assert!(explore_text.contains("repo record-wrapper-invocation"));
+        assert!(explore_text.contains("--wrapper aethyme-explore"));
+        assert!(
+            is_executable(&explore_wrapper),
+            "deployed {surface} wrapper must be executable"
+        );
+    }
 
     let agents = read(repo.join("AGENTS.md"));
     for needle in [
