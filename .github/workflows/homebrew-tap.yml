@@ -1,0 +1,159 @@
+name: Homebrew tap
+
+# Issue #253: publish Formula/aethyme.rb to schiste/homebrew-tap for a stable
+# release, from the signed release manifest only.
+#
+# - release.yml calls this after each stable release.
+# - workflow_dispatch republishes a given tag. This is the retry path; nobody
+#   needs the tap token on a workstation. Republishing is a no-op when the
+#   tap already carries the formula.
+# - Pull requests that touch the publication path rehearse it against the
+#   latest stable release and the live tap with the read-only job token, so
+#   a broken renderer, signature check or API call fails on the PR instead of
+#   on release day. A rehearsal never writes.
+#
+# The write goes straight to the Contents API rather than through an Aethyme
+# broker session: a runner's broker database is empty, so a session there
+# coordinates with nothing. Safety comes from the write itself. It carries
+# the formula's current blob SHA (GitHub refuses it if the file changed in
+# between), and the script reads the result back byte-for-byte.
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: Stable release tag to publish (vX.Y.Z)
+        required: true
+        type: string
+    secrets:
+      HOMEBREW_TAP_TOKEN:
+        required: false
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Stable release tag to publish (vX.Y.Z)
+        required: true
+        type: string
+  pull_request:
+    paths:
+      - .github/workflows/homebrew-tap.yml
+      - .github/workflows/release.yml
+      - scripts/publish-homebrew-tap.sh
+      - packages/aethyme/rust/crates/aethyme-broker/src/homebrew.rs
+      - packages/aethyme/rust/crates/aethyme-broker/examples/homebrew_formula.rs
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: ${{ github.event_name == 'pull_request' && 'Rehearse Homebrew tap publication' || 'Update Homebrew tap' }}
+    runs-on: ubuntu-latest
+    concurrency:
+      group: ${{ github.event_name == 'pull_request' && format('homebrew-tap-pr-{0}', github.event.pull_request.number) || 'homebrew-tap' }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+    steps:
+      - name: Resolve release and mode
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = pull_request ]; then
+            tag="$(gh release list --repo "$GITHUB_REPOSITORY" --exclude-drafts \
+              --exclude-pre-releases --limit 1 --json tagName --jq '.[0].tagName')"
+            mode=rehearse
+          elif [ -n "$HOMEBREW_TAP_TOKEN" ]; then
+            tag="$INPUT_TAG"
+            mode=publish
+          elif [ "$EVENT_NAME" = workflow_dispatch ]; then
+            echo "::error title=Homebrew tap not updated::HOMEBREW_TAP_TOKEN is not set."
+            exit 1
+          else
+            echo "::warning title=Homebrew tap not updated::HOMEBREW_TAP_TOKEN is not set; set it, then run the Homebrew tap workflow for ${INPUT_TAG}."
+            echo "mode=skip" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if ! printf '%s\n' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::Homebrew publishes stable vX.Y.Z tags only, not '${tag}'."
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+
+      - name: Check out renderer source
+        if: steps.release.outputs.mode != 'skip'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # A publication renders with the tagged source; a rehearsal with
+          # the pull request's.
+          ref: ${{ steps.release.outputs.mode == 'publish' && format('refs/tags/{0}', steps.release.outputs.tag) || '' }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Rust
+        if: steps.release.outputs.mode != 'skip'
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+
+      - name: Install Cosign
+        if: steps.release.outputs.mode != 'skip'
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Verify signed manifest and regenerate formula
+        if: steps.release.outputs.mode != 'skip'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release.outputs.tag }}
+          MODE: ${{ steps.release.outputs.mode }}
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/formula"
+          mkdir -p "$dir"
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir "$dir" \
+            --pattern aethyme.rb \
+            --pattern release-manifest.json \
+            --pattern release-manifest.sigstore.json
+          cosign verify-blob \
+            --bundle "$dir/release-manifest.sigstore.json" \
+            --certificate-identity "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@refs/tags/${TAG}" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "$dir/release-manifest.json"
+          cargo run --locked --manifest-path packages/aethyme/rust/Cargo.toml \
+            -p aethyme-broker --example homebrew_formula -- \
+            --manifest "$dir/release-manifest.json" \
+            --tag "$TAG" \
+            --source-sha "$(git rev-parse "refs/tags/${TAG}^{commit}")" \
+            --repo "$GITHUB_REPOSITORY" \
+            --output "$dir/expected-aethyme.rb"
+          if ! cmp "$dir/expected-aethyme.rb" "$dir/aethyme.rb"; then
+            if [ "$MODE" = publish ]; then
+              echo "::error::The ${TAG} aethyme.rb asset is not the formula its signed manifest renders to."
+              exit 1
+            fi
+            echo "::notice::This pull request renders a different formula than ${TAG} shipped:"
+            diff -u "$dir/aethyme.rb" "$dir/expected-aethyme.rb" || true
+          fi
+
+      - name: Publish and verify formula
+        if: steps.release.outputs.mode == 'publish'
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          scripts/publish-homebrew-tap.sh --formula "$RUNNER_TEMP/formula/aethyme.rb" \
+            --tag "$TAG" --release-repo "$GITHUB_REPOSITORY" --tap-repo schiste/homebrew-tap
+
+      - name: Rehearse publication against the live tap
+        if: steps.release.outputs.mode == 'rehearse'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          scripts/publish-homebrew-tap.sh --formula "$RUNNER_TEMP/formula/aethyme.rb" \
+            --tag "$TAG" --release-repo "$GITHUB_REPOSITORY" --tap-repo schiste/homebrew-tap \
+            --dry-run
