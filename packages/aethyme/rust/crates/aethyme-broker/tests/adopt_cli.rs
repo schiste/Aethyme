@@ -253,6 +253,65 @@ fn adopted_reused_session_without_a_chau7_tab_skips_mcp_lookup() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn mcp_timeout_keeps_start_successful_and_is_bounded() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{Duration, Instant};
+
+    let tmp = fixture();
+    let bridge = tmp.path().join("stalling-mcp-bridge");
+    std::fs::write(
+        &bridge,
+        "#!/bin/sh\nwhile IFS= read -r message; do :; done\n",
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&bridge).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&bridge, permissions).unwrap();
+
+    let started_at = Instant::now();
+    let output = common::broker_cli(
+        CLI,
+        &[
+            "start",
+            "--task",
+            "tab lookup timeout",
+            "--repo-name",
+            "Aethyme",
+            "--tab-name",
+            "Named tab",
+            "--json",
+        ],
+    )
+    .current_dir(tmp.path())
+    .env("AETHYME_CHAU7_MCP_BRIDGE", &bridge)
+    .output()
+    .unwrap();
+    let elapsed = started_at.elapsed();
+
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "bounded MCP timeout took {elapsed:?}"
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["tab_rename"]["status"], "pending");
+    assert!(
+        report["tab_rename"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("timed out waiting for Chau7 MCP initialize"),
+        "{}",
+        report["tab_rename"]
+    );
+}
+
 /// Run the CLI exactly as given: [`run`] adds a short name to every start.
 fn run_verbatim(repo: &Path, args: &[&str]) -> Output {
     Command::new(CLI)
