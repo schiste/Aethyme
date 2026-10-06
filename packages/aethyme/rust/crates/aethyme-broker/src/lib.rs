@@ -268,7 +268,7 @@ pub use gc::{
     INLINE_ARTIFACT_SWEEP_BUDGET_MS, UNCLASSIFIED_ARTIFACT_REPORT_THRESHOLD_BYTES,
 };
 pub use git::{
-    CherrySide, GitError, GitRepo, LoggedCommit, MergeSimulation, RemoteDefaultBranch,
+    CherrySide, CommitShape, GitError, GitRepo, LoggedCommit, MergeSimulation, RemoteDefaultBranch,
     UncommittedSummary,
 };
 pub use github_target::{
