@@ -3033,6 +3033,59 @@ const GITHUB_REFUSAL_MESSAGES: &[(&str, &str, &str)] = &[
     ("pr", "merge", "is not mergeable"),
 ];
 
+/// The GraphQL mutations each single-mutation command sends. `gh` reports a
+/// resolver's refusal as `GraphQL: <message> (<mutation>)`; an error naming
+/// the command's own mutation is GitHub declining that mutation, so nothing
+/// was applied (#549: `Auto merge is not allowed for this repository
+/// (enablePullRequestAutoMerge)` write-blocked the repository as unknown).
+const GITHUB_GRAPHQL_MUTATIONS: &[(&str, &str, &[&str])] = &[
+    (
+        "pr",
+        "merge",
+        &[
+            "mergePullRequest",
+            "enablePullRequestAutoMerge",
+            "disablePullRequestAutoMerge",
+            "enqueuePullRequest",
+        ],
+    ),
+    ("pr", "update-branch", &["updatePullRequestBranch"]),
+];
+
+/// GraphQL error text that says the server failed rather than refused: the
+/// mutation may still have run, so it never counts as a refusal.
+const GITHUB_GRAPHQL_AMBIGUOUS: &[&str] = &["Something went wrong", "timeout", "timed out"];
+
+/// The refused mutation and `gh`'s line for it, when stderr carries a GraphQL
+/// error naming one of `command action`'s own mutations.
+fn github_graphql_refusal<'a>(
+    command: &str,
+    action: Option<&str>,
+    stderr: &'a str,
+) -> Option<(&'static str, &'a str)> {
+    let (_, _, mutations) =
+        GITHUB_GRAPHQL_MUTATIONS
+            .iter()
+            .find(|(refused_command, refused_action, _)| {
+                command == *refused_command && action == Some(*refused_action)
+            })?;
+    stderr.lines().find_map(|line| {
+        let line = line.trim();
+        let message = line.split_once("GraphQL: ")?.1;
+        if GITHUB_GRAPHQL_AMBIGUOUS.iter().any(|ambiguous| {
+            message
+                .to_ascii_lowercase()
+                .contains(&ambiguous.to_ascii_lowercase())
+        }) {
+            return None;
+        }
+        mutations
+            .iter()
+            .find(|mutation| message.contains(&format!("({mutation})")))
+            .map(|mutation| (*mutation, line))
+    })
+}
+
 /// Every `HTTP <status>` token `gh` printed, in its two spellings:
 /// `HTTP 422: Validation Failed (...)` and `gh: Not Found (HTTP 404)`.
 fn github_http_statuses(stderr: &str) -> Vec<u16> {
@@ -3093,6 +3146,13 @@ fn classify_github_refusal(
             "failure_class": "github_refused",
             "remote_outcome": "rejected",
             "evidence": { "http_status": status },
+        }));
+    }
+    if let Some((mutation, line)) = github_graphql_refusal(command, action, &stderr) {
+        return Some(json!({
+            "failure_class": "github_refused",
+            "remote_outcome": "rejected",
+            "evidence": { "graphql_mutation": mutation, "message": line },
         }));
     }
     GITHUB_REFUSAL_MESSAGES
@@ -4928,6 +4988,65 @@ mod tests {
                 b"HTTP 422: Validation Failed (https://api.github.com/graphql)\n",
             )
             .is_some()
+        );
+    }
+
+    /// #549: GitHub refused to enable auto-merge on a repository where it is
+    /// disabled. The PR never changed, yet the write was recorded as unknown.
+    #[test]
+    fn a_graphql_refusal_of_the_commands_own_mutation_is_failed() {
+        let refusal = classify_github_refusal(
+            &gh_args(&["pr", "merge", "12", "--squash", "--auto"]),
+            Some(1),
+            b"GraphQL: Auto merge is not allowed for this repository (enablePullRequestAutoMerge)\n",
+        )
+        .expect("a GraphQL refusal of pr merge's own mutation is definitive");
+        assert_eq!(refusal["failure_class"], "github_refused");
+        assert_eq!(
+            refusal["evidence"]["graphql_mutation"],
+            "enablePullRequestAutoMerge"
+        );
+        assert!(
+            refusal["evidence"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("Auto merge is not allowed")
+        );
+        assert!(
+            classify_github_refusal(
+                &gh_args(&["pr", "merge", "12", "--merge"]),
+                Some(1),
+                b"GraphQL: Merge commits are not allowed on this repository. (mergePullRequest)\n",
+            )
+            .is_some()
+        );
+
+        // A server failure reported through GraphQL may still have run.
+        assert!(
+            classify_github_refusal(
+                &gh_args(&["pr", "merge", "12", "--squash"]),
+                Some(1),
+                b"GraphQL: Something went wrong while executing your query. This may be the result of a timeout (mergePullRequest)\n",
+            )
+            .is_none()
+        );
+        // An error naming some other mutation is not this command's refusal.
+        assert!(
+            classify_github_refusal(
+                &gh_args(&["pr", "update-branch", "12"]),
+                Some(1),
+                b"GraphQL: Auto merge is not allowed for this repository (enablePullRequestAutoMerge)\n",
+            )
+            .is_none()
+        );
+        // A command not known to send a single mutation stays unknown.
+        assert!(
+            classify_github_refusal(
+                &gh_args(&["pr", "edit", "12", "--add-label", "x"]),
+                Some(1),
+                b"GraphQL: Could not resolve to a node (addLabelsToLabelable)\n",
+            )
+            .is_none()
         );
     }
 
