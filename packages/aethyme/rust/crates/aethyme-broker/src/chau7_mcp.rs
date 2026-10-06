@@ -43,7 +43,7 @@ pub(crate) fn rename_session_tab_if_applicable(
         rename_session_tab(session, previous_short_name, repository_name_fallback)
     } else {
         SessionTabRename::NotApplicable {
-            reason: "broker start did not launch or identify a Chau7 tab".into(),
+            reason: "no Chau7 tab name was given or stored for this session".into(),
         }
     }
 }
