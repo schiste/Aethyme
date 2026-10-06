@@ -114,6 +114,9 @@ fn render_tab_rename(outcome: &crate::chau7_mcp::SessionTabRename) {
         crate::chau7_mcp::SessionTabRename::Renamed { title, .. } => {
             out!("Chau7 tab title set to {title:?}.");
         }
+        crate::chau7_mcp::SessionTabRename::NotApplicable { reason } => {
+            out!("Chau7 tab rename not applicable: {reason}");
+        }
         crate::chau7_mcp::SessionTabRename::Pending { reason } => {
             out!("Warning: Chau7 tab rename pending: {reason}");
         }
@@ -1090,14 +1093,25 @@ pub(super) fn run_start(parsed: Parsed) -> Result<(), UsageError> {
     // `start-agent` binds nothing: the agent it spawns is a different process
     // from its caller, and binds on its own first command.
     bind_caller_as_holder(broker.store(), report.session.id);
-    let tab_rename = crate::chau7_mcp::rename_session_tab(
-        &report.session,
-        None,
-        broker
-            .main_root()
-            .file_name()
-            .and_then(|name| name.to_str()),
-    );
+    let tab_rename = if report
+        .session
+        .tab_name
+        .as_deref()
+        .is_some_and(|name| !name.trim().is_empty())
+    {
+        crate::chau7_mcp::rename_session_tab(
+            &report.session,
+            None,
+            broker
+                .main_root()
+                .file_name()
+                .and_then(|name| name.to_str()),
+        )
+    } else {
+        crate::chau7_mcp::SessionTabRename::NotApplicable {
+            reason: "broker start did not launch or identify a Chau7 tab".into(),
+        }
+    };
     let guidance = crate::session_guidance::load(broker.main_root());
     let session = &report.session;
     if parsed.json {

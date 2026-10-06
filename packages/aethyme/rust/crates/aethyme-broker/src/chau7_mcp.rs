@@ -25,6 +25,7 @@ const MCP_BRIDGE_SHUTDOWN_GRACE: Duration = Duration::from_millis(200);
 #[serde(tag = "status", rename_all = "snake_case")]
 pub(crate) enum SessionTabRename {
     Renamed { tab_id: String, title: String },
+    NotApplicable { reason: String },
     Pending { reason: String },
     Refused { reason: String },
 }

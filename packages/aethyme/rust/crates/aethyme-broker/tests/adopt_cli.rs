@@ -150,6 +150,52 @@ fn start_cli_records_chau7_session_context_for_status_and_json() {
     assert!(status.contains("Aethyme / Fix auth / claude"), "{status}");
 }
 
+#[cfg(unix)]
+#[test]
+fn start_without_a_chau7_tab_skips_mcp_lookup() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = fixture();
+    let bridge = tmp.path().join("record-mcp-lookup");
+    let marker = tmp.path().join("mcp-was-called");
+    std::fs::write(
+        &bridge,
+        format!(
+            "#!/bin/sh\nprintf called > '{}'\nexit 1\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&bridge).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&bridge, permissions).unwrap();
+
+    let output = common::broker_cli(CLI, &["start", "--task", "without a tab", "--json"])
+        .current_dir(tmp.path())
+        .env("AETHYME_CHAU7_MCP_BRIDGE", &bridge)
+        .output()
+        .unwrap();
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+            panic!(
+                "invalid JSON ({error}): stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )
+        });
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(report["tab_rename"]["status"], "not_applicable");
+    assert!(
+        !marker.exists(),
+        "the Chau7 MCP bridge must not be launched"
+    );
+}
+
 /// Run the CLI exactly as given: [`run`] adds a short name to every start.
 fn run_verbatim(repo: &Path, args: &[&str]) -> Output {
     Command::new(CLI)
