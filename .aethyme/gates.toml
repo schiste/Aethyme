@@ -290,6 +290,8 @@ timeout_seconds = 300
 resource_wait_seconds = 900
 # This cost-1 gate is still load-sensitive: measured runs above 3 load/CPU
 # were much more likely to fail or time out, so opt it into load admission.
+# Its 300s deadline scales proportionally to start load/CPU, up to this
+# threshold and a global 4x ceiling; timeout logs include start and timeout load.
 max_load_per_cpu = 3.0
 
 [gate.managed_cache]
