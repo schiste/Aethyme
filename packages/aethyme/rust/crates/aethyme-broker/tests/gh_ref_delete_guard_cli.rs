@@ -841,12 +841,23 @@ fn commands_that_run_git_on_user_configuration_are_refused() {
 }
 
 #[test]
-fn a_download_through_a_symlink_into_git_is_refused() {
+fn downloads_with_a_destination_are_refused_and_plain_ones_run() {
     let fixture = Fixture::new();
-    let links = tempfile::tempdir().unwrap();
-    let link = links.path().join("artifacts");
-    std::os::unix::fs::symlink(fixture.repo.path().join(".git/hooks"), &link).unwrap();
-    let target = link.join("sub").display().to_string();
-    let output = fixture.gh(&[], &["run", "download", "1", "-D", &target], "");
-    assert_refused(&fixture, &output, "`.git` directory");
+    for gh in [
+        &["run", "download", "1", "-D", "x"][..],
+        &["run", "download", "1", "--dir=x"],
+        &["run", "download", "1", "-Dx"],
+        &["run", "download", "1", "--dir", "x"],
+        &["release", "download", "v1", "--output", "x.zip"],
+        &["release", "download", "v1", "-O", "x.zip"],
+        &["release", "download", "v1", "--clobber"],
+        &["release", "download", "v1", "--archive=zip"],
+        // A second positional operand.
+        &["run", "download", "1", "x"],
+    ] {
+        let output = fixture.gh(&[], gh, "");
+        assert_refused(&fixture, &output, MAY_WRITE);
+    }
+    let output = fixture.gh(&[], &["run", "download", "1", "-n", "logs"], "");
+    assert_ran_exactly(&fixture, &output, "run download 1 -n logs");
 }

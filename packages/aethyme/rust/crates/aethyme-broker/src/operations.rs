@@ -1605,58 +1605,11 @@ fn git_destructive_branch_targets(args: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// Why a `gh run|release download` would write inside a `.git` directory,
-/// where a file can become a hook: each target directory or output file is
-/// resolved against `cwd` through symlinks (the nearest existing ancestor is
-/// canonicalized) before its components are checked.
-fn download_into_git_dir(args: &[String], cwd: &Path) -> Option<String> {
-    let (Some(command), Some("download")) = (
-        args.first().map(String::as_str),
-        args.get(1).map(String::as_str),
-    ) else {
-        return None;
-    };
-    if !matches!(command, "run" | "release") {
-        return None;
-    }
-    let mut targets = Vec::new();
-    let mut iter = args[2..].iter();
-    while let Some(token) = iter.next() {
-        match token.as_str() {
-            "-D" | "--dir" | "-O" | "--output" => targets.extend(iter.next().cloned()),
-            other => {
-                if let Some(value) = other
-                    .strip_prefix("--dir=")
-                    .or_else(|| other.strip_prefix("--output="))
-                    .or_else(|| other.strip_prefix("-D"))
-                    .or_else(|| other.strip_prefix("-O"))
-                    .filter(|value| !value.is_empty())
-                {
-                    targets.push(value.to_string());
-                }
-            }
-        }
-    }
-    targets.into_iter().find_map(|target| {
-        let joined = cwd.join(&target);
-        let mut existing = joined.as_path();
-        let mut rest = Vec::new();
-        while !existing.exists() {
-            rest.push(existing.file_name()?.to_os_string());
-            existing = existing.parent()?;
-        }
-        let mut resolved = existing.canonicalize().ok()?;
-        resolved.extend(rest.iter().rev());
-        resolved
-            .components()
-            .any(|part| part.as_os_str() == ".git")
-            .then(|| {
-                format!(
-                    "a download into a `.git` directory ({target:?} resolves to {})",
-                    resolved.display()
-                )
-            })
-    })
+fn same_directory(left: &Path, right: &Path) -> bool {
+    matches!(
+        (left.canonicalize(), right.canonicalize()),
+        (Ok(left), Ok(right)) if left == right
+    )
 }
 
 /// The branches a pull request joins, read in one call.
@@ -4365,7 +4318,7 @@ impl Broker {
     /// Every doubt refuses; only an operator's `--destructive
     /// --ref-write-acknowledged` lets an unverifiable command through.
     fn check_gh_ref_write(
-        &self,
+        &mut self,
         request: &CoordinatedCommand,
         cwd: &Path,
         github_target: Option<&crate::ResolvedGithubTarget>,
@@ -4382,11 +4335,6 @@ impl Broker {
                 ),
             })
         };
-        if let Some(why) = download_into_git_dir(&request.args, cwd)
-            && !(request.ref_write_acknowledged && request.destructive_confirmed)
-        {
-            return refuse(why);
-        }
         let slug = github_target.map_or("", |target| target.display_slug.as_str());
         let verdict = crate::gh_ref_guard::assess(&request.args, slug);
         let (number, match_head_commit) = match verdict {
@@ -4397,6 +4345,20 @@ impl Broker {
                 return Ok((Vec::new(), None));
             }
             Verdict::Unverifiable(why) => return refuse(why),
+            // Files land in the working directory, which must be the session
+            // worktree's root, never inside a `.git` directory.
+            Verdict::DownloadHere => {
+                return match self.store().session(request.session_id) {
+                    Ok(session) if same_directory(cwd, Path::new(&session.worktree_path)) => {
+                        Ok((Vec::new(), None))
+                    }
+                    _ => refuse(format!(
+                        "a download must run from session {}'s worktree root, not {}",
+                        request.session_id,
+                        cwd.display()
+                    )),
+                };
+            }
             // It cannot touch a ref, but only in the session's own repository.
             Verdict::SafeWrite => {
                 return match verify_github_origin(cwd, github_target) {

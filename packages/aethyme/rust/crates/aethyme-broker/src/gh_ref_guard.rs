@@ -36,6 +36,10 @@ pub(crate) enum Verdict {
     /// `pr edit|create` setting the base branch to this exact name, which a
     /// later merge would advance; the caller checks its owner.
     PrBase(String),
+    /// Exactly `run download [<id>] [-n <name>]… [-p <pattern>]…` or
+    /// `release download [<tag>] [-p <pattern>]…`: files land in the working
+    /// directory, which the caller requires to be the session worktree root.
+    DownloadHere,
     /// An exact `gh api` write to a comment, review, label or issue endpoint
     /// of the target repository, which cannot touch a git ref.
     SafeWrite,
@@ -123,16 +127,10 @@ pub(crate) fn assess(args: &[String], repository: &str) -> Verdict {
     if rest.iter().any(|token| *token == "--web" || *token == "-w") {
         return unverifiable("`--web` / `-w` opens a browser, which runs a configurable command");
     }
-    // A download into a `.git` directory can plant hooks.
-    if matches!(command, "run" | "release")
-        && action == "download"
-        && rest.iter().any(|token| {
-            token
-                .split(['/', '\\', '='])
-                .any(|part| part.eq_ignore_ascii_case(".git"))
-        })
-    {
-        return unverifiable("a download into a `.git` directory");
+    // A download writes files. Only the exact forms that write into the
+    // working directory are accepted; any destination is unverifiable.
+    if matches!(command, "run" | "release") && action == "download" {
+        return assess_download(command, &rest[1..]);
     }
     if command == "pr" && action == "merge" {
         return assess_pr_merge(&rest[1..]);
@@ -225,6 +223,37 @@ fn assess_pr_base(tokens: &[&str]) -> Verdict {
         Some(base) => Verdict::PrBase(base),
         None => Verdict::NoRefWrite,
     }
+}
+
+/// A download with no destination of its own: one optional positional
+/// operand and only name or pattern filters, each as a separate pair. Every
+/// destination option (`-D`, `--dir`, `-O`, `--output`, `--clobber`,
+/// `--archive` ...) and any other token is unverifiable.
+fn assess_download(command: &str, tokens: &[&str]) -> Verdict {
+    let filters: &[&str] = if command == "run" {
+        &["-n", "--name", "-p", "--pattern"]
+    } else {
+        &["-p", "--pattern"]
+    };
+    let mut operand = false;
+    let mut iter = tokens.iter();
+    while let Some(&token) = iter.next() {
+        if filters.contains(&token) {
+            match iter.next() {
+                Some(value) if !value.starts_with('-') => continue,
+                _ => return unverifiable("a download filter without a value"),
+            }
+        }
+        if !token.starts_with('-') && !operand {
+            operand = true;
+            continue;
+        }
+        return unverifiable(format!(
+            "`gh {command} download` token {token:?} can choose where files are written; \
+             only a download into the working directory is accepted"
+        ));
+    }
+    Verdict::DownloadHere
 }
 
 fn is_number(token: &str) -> bool {
@@ -742,6 +771,12 @@ mod tests {
             &["issue", "view", "1", "-w"],
             &["run", "download", "1", "-D", ".git/hooks"],
             &["release", "download", "v1", "--dir=x/.git/hooks"],
+            &["run", "download", "1", "-D", "artifacts"],
+            &["run", "download", "1", "-Dx"],
+            &["release", "download", "v1", "-O", "out.zip"],
+            &["release", "download", "v1", "--clobber"],
+            &["release", "download", "v1", "--archive=zip"],
+            &["run", "download", "1", "extra"],
             &["pr", "edit", "7", "--base=agent/x"],
             &["pr", "edit", "7", "-Bagent/x"],
             &["pr", "edit", "7", "--base", "a", "--base", "b"],
@@ -773,8 +808,12 @@ mod tests {
             Verdict::NoRefWrite
         );
         assert_eq!(
-            assess_line(&["run", "download", "1", "-D", "artifacts"]),
-            Verdict::NoRefWrite
+            assess_line(&["run", "download", "1", "-n", "logs"]),
+            Verdict::DownloadHere
+        );
+        assert_eq!(
+            assess_line(&["release", "download", "v1", "-p", "*.tar.gz"]),
+            Verdict::DownloadHere
         );
     }
 
