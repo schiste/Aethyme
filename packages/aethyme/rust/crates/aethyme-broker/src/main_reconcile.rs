@@ -447,6 +447,7 @@ impl Broker {
                 scope: Some(format!("main-reconcile:{}", plan.local_ref)),
                 declared_effect: Some(declared_effect),
                 destructive_confirmed,
+                cross_session: None,
                 authorization_reason: Some(format!(
                     "reviewed main reconcile {} onto {}",
                     plan.digest, plan.integration_sha

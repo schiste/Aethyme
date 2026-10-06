@@ -2177,6 +2177,7 @@ fn run_selections(
             load_avg_1m_end: None,
             cpu_count: logical_cpu_count(),
             free_disk_bytes_start: available.and_then(|bytes| i64::try_from(bytes).ok()),
+            free_disk_bytes_end: None,
         };
         let started = Instant::now();
         let broker_database = std::cell::OnceCell::new();
@@ -2257,8 +2258,27 @@ fn run_selections(
                 ),
             );
         }
-        let (gate_status, failure_class, exit_code) =
+        let (mut gate_status, mut failure_class, exit_code) =
             classify_gate_result(&gate.command, &log_path, status);
+        // Admission checked the disk before the command started; a build can
+        // still fill it while running, and what fails then is the host, not
+        // the change. Read again, and only for a failure the broker has not
+        // already attributed to the host (#288).
+        if gate_status != GateStatus::Pass && !host_fault {
+            let available_end =
+                crate::disk_headroom::available_bytes_for(checkout.root(), checkout.root());
+            environment.free_disk_bytes_end =
+                available_end.and_then(|bytes| i64::try_from(bytes).ok());
+            if let Some(note) = starved_after_start(available_end) {
+                host_fault = true;
+                gate_status = GateStatus::Error;
+                failure_class = Some(GateFailureClass::ResourceContention);
+                crate::warn_unrecorded(
+                    "note post-start disk starvation in the gate log",
+                    append_gate_log(&log_path, &note),
+                );
+            }
+        }
         // Classification reads the log in place, so the rename waits until
         // after it. A failing log then moves aside: the generic name is keyed
         // on (gate, tree, worker), so a re-run against an unchanged tree lands
@@ -2384,6 +2404,23 @@ fn record_gate_preflight_resource_failure(
         log_path: Some(log_path.to_string_lossy().into_owned()),
         environment: GateEnvironment::default(),
         host_fault: true,
+    })
+}
+
+/// The gate-log note for a failing gate that ended with free disk below the
+/// floor a gate is admitted on, or `None` when the reading is unknown or above
+/// it. Such a failure is recorded as resource contention: never cached as a
+/// verdict, and a submission defers on it instead of rejecting.
+fn starved_after_start(available_end: Option<u64>) -> Option<String> {
+    let available = available_end?;
+    (available < crate::DEFAULT_GATE_HEADROOM_BYTES).then(|| {
+        format!(
+            "aethyme: free disk fell to {} while this gate ran, below the {} a gate is admitted on; \
+             the failure is host starvation, not a verdict on the change. Free space \
+             (`aethyme broker gc plan`) and run the gate again\n",
+            crate::disk_headroom::format_gibibytes(available),
+            crate::disk_headroom::format_gibibytes(crate::DEFAULT_GATE_HEADROOM_BYTES),
+        )
     })
 }
 
@@ -3278,6 +3315,17 @@ mod tests {
         );
     }
 
+    /// A failure that ends below the admission floor is host starvation; an
+    /// unknown reading or one above the floor leaves the verdict alone (#288).
+    #[test]
+    fn only_a_failure_that_ends_below_the_floor_is_starvation() {
+        assert!(starved_after_start(None).is_none());
+        assert!(starved_after_start(Some(crate::DEFAULT_GATE_HEADROOM_BYTES)).is_none());
+        let note = starved_after_start(Some(1024)).unwrap();
+        assert!(note.contains("host starvation"), "{note}");
+        assert!(note.contains("0.0 GiB"), "{note}");
+    }
+
     #[test]
     fn the_environment_header_names_load_cpus_and_free_disk_or_says_unknown() {
         let known = GateEnvironment {
@@ -3285,6 +3333,7 @@ mod tests {
             load_avg_1m_end: Some(3.0),
             cpu_count: Some(10),
             free_disk_bytes_start: Some(23 * 1024 * 1024 * 1024 + 400 * 1024 * 1024),
+            free_disk_bytes_end: None,
         };
         assert_eq!(
             gate_environment_note(&known),

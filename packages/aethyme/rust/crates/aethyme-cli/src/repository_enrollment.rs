@@ -648,6 +648,7 @@ pub fn execute(repo_hint: &Path, confirmation: &str) -> Result<FirstEnrollmentEx
                 )),
                 declared_effect: None,
                 destructive_confirmed: false,
+                cross_session: None,
                 authorization_reason: Some(format!(
                     "digest-confirmed first enrollment {}",
                     journal.plan_digest
