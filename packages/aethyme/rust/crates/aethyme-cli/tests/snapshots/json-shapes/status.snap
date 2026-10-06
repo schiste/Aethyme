@@ -155,14 +155,18 @@
   "ownership_claims": [],
   "phase_timings_ms": {
     "build_total": "integer",
+    "checkouts": "integer",
     "command_total": "integer",
     "coordination": "integer",
     "foreign_processes": "integer",
+    "integration_drift": "integer",
     "leases": "integer",
     "open": "integer",
+    "promoted_conflicts": "integer",
     "retention": "integer",
     "sessions": "integer",
-    "total": "integer"
+    "total": "integer",
+    "unpushed": "integer"
   },
   "promoted_conflicts": [],
   "publication_baseline_head": "string",

@@ -289,6 +289,16 @@ pub fn find_landing(
     branch_tip: &str,
     cap: usize,
 ) -> Result<LandingSearch, BrokerOpError> {
+    find_landing_within(repo, content, branch_tip, cap, None)
+}
+
+fn find_landing_within(
+    repo: &GitRepo,
+    content: &SessionContent,
+    branch_tip: &str,
+    cap: usize,
+    deadline: Option<std::time::Instant>,
+) -> Result<LandingSearch, BrokerOpError> {
     if content.is_empty() {
         return Ok(LandingSearch {
             outcome: LandingOutcome::NothingToRepresent,
@@ -325,6 +335,13 @@ pub fn find_landing(
     let mut best: Option<(String, usize, String)> = None;
 
     for (batch_index, batch) in window.chunks(CANDIDATE_BATCH).enumerate() {
+        if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            return Err(unavailable(format!(
+                "landing search stopped at the time budget after {} of {} candidate commits",
+                batch_index * CANDIDATE_BATCH,
+                window.len()
+            )));
+        }
         let queries = batch
             .iter()
             .flat_map(|candidate| {
@@ -539,6 +556,18 @@ pub fn work_landed(
     head: &str,
     target: &str,
 ) -> Result<LandingVerdict, BrokerOpError> {
+    work_landed_within(repo, head, target, None)
+}
+
+/// [`work_landed`], failing with [`BrokerOpError::RepresentationUnavailable`]
+/// once `deadline` passes during the content search. A search the deadline
+/// stopped proved nothing, so it can never read as landed.
+pub fn work_landed_within(
+    repo: &GitRepo,
+    head: &str,
+    target: &str,
+    deadline: Option<std::time::Instant>,
+) -> Result<LandingVerdict, BrokerOpError> {
     if repo.is_ancestor(head, target) {
         return Ok(LandingVerdict::Landed {
             evidence: LandingEvidence::Ancestry,
@@ -547,7 +576,7 @@ pub fn work_landed(
     }
     let base = landing_base(repo, head, target)?;
     let content = session_content(repo, &base, head)?;
-    let search = find_landing(repo, &content, target, DEFAULT_SEARCH_CAP)?;
+    let search = find_landing_within(repo, &content, target, DEFAULT_SEARCH_CAP, deadline)?;
     Ok(match search.outcome {
         LandingOutcome::NothingToRepresent => LandingVerdict::Landed {
             evidence: LandingEvidence::NoNetChange,
@@ -883,6 +912,31 @@ mod tests {
         let search = find_landing(&repo, &content, &tip, DEFAULT_SEARCH_CAP).unwrap();
         assert!(search.represented());
         assert_eq!(search.landing().unwrap().commit, landing);
+    }
+
+    /// A bounded health check stops the content search at its deadline, and a
+    /// stopped search proves nothing: it must fail, never read as landed, even
+    /// when the work did land (#460).
+    #[test]
+    fn a_landing_search_stopped_by_its_deadline_never_reads_as_landed() {
+        let (tmp, _repo, _base) = seeded();
+        git(tmp.path(), &["checkout", "-q", "-b", "session"]);
+        write(tmp.path(), "f.rs", "work\n");
+        let head = commit(tmp.path(), "session work");
+        git(tmp.path(), &["checkout", "-q", "main"]);
+        write(tmp.path(), "f.rs", "work\n");
+        let landing = commit(tmp.path(), "squashed (#7)");
+        let repo = GitRepo::discover(tmp.path()).unwrap();
+
+        let unbounded = work_landed_within(&repo, &head, &landing, None).unwrap();
+        assert!(matches!(unbounded, LandingVerdict::Landed { .. }));
+
+        let expired = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        let error = work_landed_within(&repo, &head, &landing, Some(expired)).unwrap_err();
+        assert!(
+            matches!(&error, BrokerOpError::RepresentationUnavailable { reason } if reason.contains("time budget")),
+            "{error}"
+        );
     }
 
     #[test]
