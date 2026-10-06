@@ -286,7 +286,9 @@ pub use graph_impact::{
     GraphImpactStatus, GraphStoreImpactProvider, diff_digest, parse_diff_text,
     revision_bound_impact_report,
 };
-pub use graph_integrity::{GraphIntegrityOutcome, GraphIntegrityRejection, GraphIntegrityStatus};
+pub use graph_integrity::{
+    GraphIntegrityOutcome, GraphIntegrityRejection, GraphIntegrityStatus, GraphIntegrityVerdict,
+};
 pub use homebrew::render_homebrew_formula;
 pub use hooks::{HookReport, HookSnippet, HookState, HooksError};
 pub use host_operations::{

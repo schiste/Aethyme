@@ -202,7 +202,7 @@ fn refresh_committed_graph(root: &Path) {
 }
 
 #[test]
-fn session_and_full_tree_gates_enforce_committed_graph_authority() {
+fn session_and_full_tree_gates_record_committed_graph_authority_as_advice() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());
     write_gates(
@@ -229,27 +229,29 @@ fn session_and_full_tree_gates_enforce_committed_graph_authority() {
     std::fs::write(worktree.join("src/app.py"), "x = 2\n").unwrap();
     let status_before = GitRepo::discover(&worktree).unwrap().dirty_paths().unwrap();
 
-    let error = broker.run_gates(session.id).unwrap_err();
-    let aethyme_broker::BrokerOpError::GraphIntegrityRejected(rejection) = error else {
-        panic!("unexpected gate error: {error}");
-    };
-    assert_eq!(
-        rejection.status,
-        aethyme_broker::GraphIntegrityStatus::Stale
-    );
-    assert_eq!(rejection.tree_hash.len(), 40);
-    assert_eq!(rejection.policy_digest.len(), 64);
-    assert!(
-        rejection
-            .changed_paths
-            .iter()
-            .any(|path| path == ".aethyme/graph/src/app.py.bin")
-    );
-    assert!(!worktree.join("gate-markers.txt").exists());
+    // #280: a stale graph is recorded and reported, never a refusal. The
+    // session's gates run, and the caller's worktree and index are untouched.
+    let ran = broker.run_gates(session.id).unwrap();
+    assert_eq!(ran.len(), 1, "a stale graph must not stop the gates");
+    assert!(worktree.join("gate-markers.txt").exists());
+    std::fs::remove_file(worktree.join("gate-markers.txt")).unwrap();
     assert_eq!(
         GitRepo::discover(&worktree).unwrap().dirty_paths().unwrap(),
         status_before,
-        "refusal must not rewrite the caller worktree or index"
+        "the graph check must not rewrite the caller worktree or index"
+    );
+    let status = broker.status(0).unwrap();
+    let row = status
+        .advice
+        .iter()
+        .find(|row| row.id == "graph.stale" && row.session_id == Some(session.id))
+        .expect("the stale verdict is reported as status advice");
+    assert!(
+        row.evidence
+            .iter()
+            .any(|line| line == "stale path .aethyme/graph/src/app.py.bin"),
+        "{:?}",
+        row.evidence
     );
 
     commit_all(&worktree, "commit source edit before graph refresh");
@@ -261,6 +263,15 @@ fn session_and_full_tree_gates_enforce_committed_graph_authority() {
     let refreshed = broker.run_gates(session.id).unwrap();
     assert_eq!(refreshed.len(), 1);
     assert_eq!(refreshed[0].status, GateStatus::Pass);
+    assert!(
+        !broker
+            .status(0)
+            .unwrap()
+            .advice
+            .iter()
+            .any(|row| row.id.starts_with("graph.") && row.session_id == Some(session.id)),
+        "a fresh graph raises no advice"
+    );
     assert!(!refreshed[0].cached);
     let cached = broker.run_gates(session.id).unwrap();
     assert_eq!(cached.len(), 1);

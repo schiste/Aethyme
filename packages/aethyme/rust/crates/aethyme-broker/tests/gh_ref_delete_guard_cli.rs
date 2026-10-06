@@ -876,3 +876,96 @@ fn downloads_with_a_destination_are_refused_and_plain_ones_run() {
     let output = fixture.gh(&[], &["run", "download", "1", "-n", "logs"], "");
     assert_ran_exactly(&fixture, &output, "run download 1 -n logs");
 }
+
+// --- Graph integrity on the merge lane (#280, #292) ------------------
+
+/// A brokered merge in a repository whose committed graph is authoritative
+/// checks the head it merges and prints the verdict as advice. Whatever the
+/// verdict, the merge runs exactly as checked: graph integrity never refuses.
+#[test]
+fn a_brokered_merge_reports_graph_integrity_as_advice_and_still_runs() {
+    let fixture = Fixture::new();
+    // Brokered gh runs in the session's worktree, so its policy is read there.
+    let worktrees = String::from_utf8(
+        Command::new("git")
+            .args(["worktree", "list", "--porcelain"])
+            .current_dir(fixture.repo.path())
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    let own_worktree = worktrees
+        .split("\n\n")
+        .find(|block| block.contains(&format!("branch refs/heads/{}", fixture.own.branch)))
+        .and_then(|block| block.lines().next())
+        .and_then(|line| line.strip_prefix("worktree "))
+        .expect("the session's worktree")
+        .to_string();
+    std::fs::create_dir_all(Path::new(&own_worktree).join(".aethyme")).unwrap();
+    std::fs::write(
+        Path::new(&own_worktree).join(".aethyme/config.toml"),
+        "[graph]\nauthority = 'committed_fragments'\nrepository = 'fixture'\n",
+    )
+    .unwrap();
+    let head = String::from_utf8(
+        Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(fixture.repo.path())
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    // A head available locally is checked: it has no committed fragments, so
+    // the verdict is not fresh, and the merge still runs.
+    let output = fixture.gh_env(
+        &[],
+        &["pr", "merge", "7", "--squash"],
+        &fixture.own.branch,
+        &[("AETHYME_FAKE_OID", head.as_str())],
+    );
+    assert_ran_exactly(
+        &fixture,
+        &output,
+        &format!("pr merge 7 --squash --match-head-commit {head}"),
+    );
+    assert!(
+        stderr(&output).contains("[graph-integrity] pull request #7:")
+            && stderr(&output).contains("blocks nothing"),
+        "{}",
+        stderr(&output)
+    );
+
+    // A head that is not available locally is an unknown verdict, never fresh,
+    // and never a refusal.
+    std::fs::remove_file(fixture.log()).unwrap();
+    let output = fixture.gh(&[], &["pr", "merge", "7", "--squash"], &fixture.own.branch);
+    assert_ran_exactly(
+        &fixture,
+        &output,
+        &format!("pr merge 7 --squash --match-head-commit {HEAD_OID}"),
+    );
+    assert!(
+        stderr(&output).contains("not available locally"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+/// Without an authoritative graph policy the merge lane says nothing about
+/// graph integrity.
+#[test]
+fn a_brokered_merge_without_a_graph_policy_says_nothing_about_the_graph() {
+    let fixture = Fixture::new();
+    let output = fixture.gh(&[], &["pr", "merge", "7", "--squash"], &fixture.own.branch);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        !stderr(&output).contains("[graph-integrity]"),
+        "{}",
+        stderr(&output)
+    );
+}

@@ -490,6 +490,8 @@ pub enum BrokerOpError {
     GateConfig(#[from] crate::gates::GateConfigError),
     #[error(transparent)]
     GraphIntegrityPolicy(#[from] crate::GraphIntegrityPolicyError),
+    /// No broker path produces this since graph integrity became advice
+    /// (#280); kept so library callers matching on it still compile.
     #[error(transparent)]
     GraphIntegrityRejected(#[from] crate::GraphIntegrityRejection),
     #[error(transparent)]
@@ -6637,7 +6639,7 @@ impl Broker {
         cache_policy: crate::gates::CachePolicy,
     ) -> Result<Vec<crate::gates::GateRunOutcome>, BrokerOpError> {
         let checkout = GitRepo::discover(dir)?;
-        self.enforce_graph_integrity(&checkout, None)?;
+        self.record_graph_integrity(&checkout, None)?;
         let config_root = checkout.root().to_path_buf();
         let gates = self.load_and_sync_gates_from(&config_root)?;
         crate::gates::run_all(
@@ -6658,7 +6660,7 @@ impl Broker {
         cache_policy: crate::gates::CachePolicy,
     ) -> Result<Vec<crate::gates::GateRunOutcome>, BrokerOpError> {
         let checkout = GitRepo::discover(dir)?;
-        self.enforce_graph_integrity(&checkout, None)?;
+        self.record_graph_integrity(&checkout, None)?;
         let config_root = checkout.root().to_path_buf();
         let gates = self.load_and_sync_gates_from(&config_root)?;
         crate::gates::run_named(
@@ -6714,7 +6716,7 @@ impl Broker {
         progress: &dyn crate::gates::GateProgressSink,
     ) -> Result<Vec<crate::gates::GateRunOutcome>, BrokerOpError> {
         let checkout = GitRepo::discover(dir)?;
-        self.enforce_graph_integrity(&checkout, None)?;
+        self.record_graph_integrity(&checkout, None)?;
         let config_root = checkout.root().to_path_buf();
         let gates = self.load_and_sync_gates_from(&config_root)?;
         crate::gates::run_all_with_progress(
@@ -6736,11 +6738,11 @@ impl Broker {
     }
 
     /// Read-only gate selection does not rebuild graph artifacts in the
-    /// repository-wide verification slot. Execution performs that enforcement
-    /// before any gate can run. Selection therefore never reports a
-    /// graph-integrity rejection, and graph-backed semantic advice on this
-    /// path reads the graph without exact-tree verification. That advice is
-    /// only advisory, and no gate runs on it.
+    /// repository-wide verification slot. Execution records that verdict
+    /// before its gates run. Selection therefore never reports graph
+    /// integrity, and graph-backed semantic advice on this path reads the
+    /// graph without exact-tree verification. That advice is only advisory,
+    /// and no gate runs on it.
     fn gate_selection_inputs(
         &mut self,
         session_id: i64,
@@ -6751,12 +6753,12 @@ impl Broker {
     fn gate_inputs_with_integrity(
         &mut self,
         session_id: i64,
-        enforce_graph_integrity: bool,
+        check_graph_integrity: bool,
     ) -> Result<(GitRepo, Vec<crate::gates::Gate>, Vec<String>), BrokerOpError> {
         let session = self.store.session(session_id)?;
         let checkout = GitRepo::discover(Path::new(&session.worktree_path))?;
-        if enforce_graph_integrity {
-            self.enforce_graph_integrity(&checkout, Some(session_id))?;
+        if check_graph_integrity {
+            self.record_graph_integrity(&checkout, Some(session_id))?;
         }
         let config_root = checkout.root().to_path_buf();
         let gates = self.load_and_sync_gates_from(&config_root)?;
@@ -6768,7 +6770,7 @@ impl Broker {
         Ok((checkout, gates, changed))
     }
 
-    fn enforce_graph_integrity(
+    fn record_graph_integrity(
         &mut self,
         checkout: &GitRepo,
         session_id: Option<i64>,
@@ -6786,11 +6788,12 @@ impl Broker {
                 Some(&crate::events::graph_integrity_checked_payload(&outcome)),
             )?;
         }
-        if outcome.allows_promotion() {
-            Ok(outcome)
-        } else {
-            Err(crate::GraphIntegrityRejection::from(outcome).into())
+        // Advice, never a refusal (#280, #292): the verdict is recorded above
+        // and surfaced by `broker status` as `graph.stale` / `graph.unknown`.
+        if let Some(advice) = outcome.advice() {
+            eprintln!("[graph-integrity] {advice}");
         }
+        Ok(outcome)
     }
 
     /// Load gates.toml and sync the definition snapshot so recorded
@@ -8537,6 +8540,16 @@ impl Broker {
                 }
                 MergeStatus::Conflict => advice.push(conflict_submit_advice(agent, entry)),
                 _ => {}
+            }
+        }
+
+        // Graph integrity is advice (#280): the latest verdict recorded for a
+        // session's tree is reported here and never blocks anything.
+        for agent in agents {
+            if let Ok(Some(graph)) = self.finish_last_graph_integrity(agent.session.id)
+                && let Some(row) = graph_integrity_advice(agent, &graph)
+            {
+                advice.push(row);
             }
         }
 
@@ -11431,6 +11444,55 @@ pub(crate) fn submission_was_deferred(entry: &MergeQueueEntry) -> bool {
             .and_then(|details| serde_json::from_str::<serde_json::Value>(details).ok())
             .and_then(|details| details.get("deferred").and_then(serde_json::Value::as_bool))
             .unwrap_or(false)
+}
+
+fn graph_integrity_advice(agent: &AgentView, graph: &FinishGraphIntegrity) -> Option<StatusAdvice> {
+    let (id, severity, reason, summary) = match graph.status.verdict() {
+        crate::GraphIntegrityVerdict::Disabled | crate::GraphIntegrityVerdict::Fresh => {
+            return None;
+        }
+        crate::GraphIntegrityVerdict::Stale => (
+            "graph.stale",
+            StatusAdviceSeverity::Warning,
+            "graph_stale",
+            format!(
+                "session {} last checked tree {} with stale committed graph fragments; this is \
+                 advice and blocks nothing. Refresh and commit the graph before relying on it",
+                agent.session.id,
+                short_commit(&graph.tree_hash)
+            ),
+        ),
+        crate::GraphIntegrityVerdict::Unknown => (
+            "graph.unknown",
+            StatusAdviceSeverity::Notice,
+            "graph_unverified",
+            format!(
+                "session {} last graph-integrity check on tree {} could not reach a verdict \
+                 ({}); treat the committed graph as unverified",
+                agent.session.id,
+                short_commit(&graph.tree_hash),
+                graph.status.as_str()
+            ),
+        ),
+    };
+    let mut evidence = vec![format!("tree {}", graph.tree_hash)];
+    evidence.extend(
+        graph
+            .changed_paths
+            .iter()
+            .take(5)
+            .map(|path| format!("stale path {path}")),
+    );
+    Some(StatusAdvice {
+        id,
+        severity,
+        reason,
+        summary,
+        session_id: Some(agent.session.id),
+        queue_entry_id: None,
+        evidence,
+        commands: vec!["aethyme graph refresh plan --repo .".into()],
+    })
 }
 
 fn deferred_submit_advice(agent: &AgentView, entry: &MergeQueueEntry) -> StatusAdvice {

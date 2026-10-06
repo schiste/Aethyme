@@ -228,15 +228,12 @@ enum GateVerdict {
     Failed,
 }
 
-/// Decide a submission from its gate outcomes. `gates_may_run` is false when
-/// graph integrity refused before any gate ran, which is itself a verdict.
+/// Decide a submission from its gate outcomes. Graph integrity is advice and
+/// never part of this verdict (#280).
 ///
 /// A genuine failure always wins: deferral requires that *every* gate that
 /// did not pass be a host fault, so it can never hide a real one.
-fn gate_verdict(gates_may_run: bool, outcomes: &[crate::gates::GateRunOutcome]) -> GateVerdict {
-    if !gates_may_run {
-        return GateVerdict::Failed;
-    }
+fn gate_verdict(outcomes: &[crate::gates::GateRunOutcome]) -> GateVerdict {
     let mut not_passed = outcomes
         .iter()
         .filter(|o| o.status != crate::types::GateStatus::Pass)
@@ -1048,20 +1045,18 @@ impl Broker {
             )?;
         }
         let configured_gates = gates.len();
-        let gate_outcomes = if graph_integrity.allows_promotion() {
-            crate::gates::run_affected_for_submit(
-                self.store(),
-                &main_root,
-                &sim_worktree,
-                &gates,
-                &changed,
-                Some(entry.session_id),
-                cache_policy,
-                progress,
-            )
-        } else {
-            Ok(Vec::new())
-        };
+        // A stale or unverifiable graph is recorded above and reported with
+        // the submission; it never stops the gates or the promotion (#280).
+        let gate_outcomes = crate::gates::run_affected_for_submit(
+            self.store(),
+            &main_root,
+            &sim_worktree,
+            &gates,
+            &changed,
+            Some(entry.session_id),
+            cache_policy,
+            progress,
+        );
         verification_slot.cleanup();
         // Promotion may re-simulate another in-flight entry, and a stale
         // verification may recursively re-simulate this entry. Both paths
@@ -1081,12 +1076,11 @@ impl Broker {
         //
         // The submission is deferred only when *every* gate that did not pass
         // is a host fault the broker observed itself (see
-        // `GateRunOutcome::is_host_fault`), and only once graph integrity has
-        // allowed gates to run at all. A genuine failure anywhere is still a
+        // `GateRunOutcome::is_host_fault`). A genuine failure anywhere is still a
         // rejection, so a deferral can never hide one. The finding is still
         // printed and recorded in the entry's details -- `Deferred`, not
         // silent success.
-        let verdict = gate_verdict(graph_integrity.allows_promotion(), &gate_outcomes);
+        let verdict = gate_verdict(&gate_outcomes);
         let deferred = verdict == GateVerdict::Deferred;
         let all_pass = verdict == GateVerdict::Passed;
         let gate_verification = SubmissionGateVerification {
@@ -2178,15 +2172,15 @@ mod verdict_tests {
 
     #[test]
     fn a_host_fault_alone_defers() {
-        assert_eq!(gate_verdict(true, &[pass(), host()]), GateVerdict::Deferred);
+        assert_eq!(gate_verdict(&[pass(), host()]), GateVerdict::Deferred);
     }
 
     /// The property deferral must never break: a genuine failure anywhere in
     /// the outcomes is a rejection, whatever else the host did.
     #[test]
     fn a_real_failure_is_never_masked_by_a_host_fault() {
-        assert_eq!(gate_verdict(true, &[host(), real()]), GateVerdict::Failed);
-        assert_eq!(gate_verdict(true, &[real(), host()]), GateVerdict::Failed);
+        assert_eq!(gate_verdict(&[host(), real()]), GateVerdict::Failed);
+        assert_eq!(gate_verdict(&[real(), host()]), GateVerdict::Failed);
     }
 
     /// Classified like a host problem from its log, but not observed by the
@@ -2194,13 +2188,12 @@ mod verdict_tests {
     #[test]
     fn a_host_looking_class_without_the_observed_flag_fails() {
         let inferred = outcome(GateStatus::Error, Some(GateFailureClass::Timeout), false);
-        assert_eq!(gate_verdict(true, &[inferred]), GateVerdict::Failed);
+        assert_eq!(gate_verdict(&[inferred]), GateVerdict::Failed);
     }
 
     #[test]
-    fn passing_gates_pass_and_a_graph_refusal_fails() {
-        assert_eq!(gate_verdict(true, &[pass(), pass()]), GateVerdict::Passed);
-        assert_eq!(gate_verdict(false, &[]), GateVerdict::Failed);
+    fn passing_gates_pass() {
+        assert_eq!(gate_verdict(&[pass(), pass()]), GateVerdict::Passed);
     }
 }
 
