@@ -1288,6 +1288,175 @@ fn is_push(args: &[String]) -> bool {
         .is_some_and(|command| command == "push")
 }
 
+/// The shape of a brokered `git push`, exported to the repository's hooks as
+/// `AETHYME_PUSH_KIND` (#264).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PushKind {
+    /// Every ref update deletes a remote ref; nothing new can reach the remote.
+    DeleteOnly,
+    /// Every ref update sends local content.
+    Update,
+    /// Deletions and updates together, or a shape the broker cannot classify
+    /// with certainty. Treated like an update: hooks verify as before.
+    Mixed,
+}
+
+impl PushKind {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            PushKind::DeleteOnly => "delete-only",
+            PushKind::Update => "update",
+            PushKind::Mixed => "mixed",
+        }
+    }
+}
+
+/// What the hooks of a brokered push are told about it (#264).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PushShape {
+    pub(crate) kind: PushKind,
+    /// The refspecs as given, one per entry; empty when the push names none.
+    pub(crate) refs: Vec<String>,
+}
+
+/// Classify a `git push` from its exact arguments.
+///
+/// A push is `delete-only` only when every refspec is provably a deletion:
+/// `--delete`/`-d` with plain ref names, or `:<dst>` refspecs. Anything the
+/// parser does not fully understand -- an unknown option that may take a value,
+/// a set-expanding option such as `--all` or `--mirror`, or no refspec at all
+/// (which pushes whatever `push.default` selects) -- is `mixed`, so the
+/// repository's hooks verify exactly as they did before.
+pub(crate) fn classify_push(args: &[String]) -> Option<PushShape> {
+    let args = git_subcommand_args(args)?;
+    if args.first().map(String::as_str) != Some("push") {
+        return None;
+    }
+    let mixed = |refs: Vec<String>| {
+        Some(PushShape {
+            kind: PushKind::Mixed,
+            refs,
+        })
+    };
+    let mut delete_flag = false;
+    let mut positionals: Vec<String> = Vec::new();
+    let mut tokens = args[1..].iter();
+    let mut options_ended = false;
+    while let Some(token) = tokens.next() {
+        if options_ended || !token.starts_with('-') || token == "-" {
+            positionals.push(token.clone());
+            continue;
+        }
+        match token.as_str() {
+            "--" => options_ended = true,
+            "--delete" | "-d" => delete_flag = true,
+            // Flags that change neither the set of refs nor whether content
+            // is sent.
+            "--force"
+            | "-f"
+            | "--force-with-lease"
+            | "--force-if-includes"
+            | "--no-force-if-includes"
+            | "--set-upstream"
+            | "-u"
+            | "--atomic"
+            | "--no-atomic"
+            | "--quiet"
+            | "-q"
+            | "--verbose"
+            | "-v"
+            | "--progress"
+            | "--no-progress"
+            | "--porcelain"
+            | "--no-verify"
+            | "--verify"
+            | "--thin"
+            | "--no-thin"
+            | "--signed"
+            | "--no-signed"
+            | "--ipv4"
+            | "-4"
+            | "--ipv6"
+            | "-6"
+            | "--no-recurse-submodules" => {}
+            // Value-taking options given as a separate argument.
+            "--push-option" | "-o" | "--repo" | "--receive-pack" | "--exec" => {
+                if tokens.next().is_none() {
+                    return mixed(positionals);
+                }
+            }
+            _ => {
+                let self_contained = [
+                    "--force-with-lease=",
+                    "--push-option=",
+                    "--repo=",
+                    "--receive-pack=",
+                    "--exec=",
+                    "--signed=",
+                    "--recurse-submodules=",
+                ]
+                .iter()
+                .any(|prefix| token.starts_with(prefix));
+                if !self_contained {
+                    // `--all`, `--mirror`, `--tags`, `--prune`, `--follow-tags`
+                    // expand the ref set; anything unknown might take a value.
+                    return mixed(positionals);
+                }
+            }
+        }
+    }
+    // The first positional names the remote; the rest are refspecs.
+    let refs: Vec<String> = positionals.into_iter().skip(1).collect();
+    if refs.is_empty() {
+        return mixed(refs);
+    }
+    let mut deletions = 0;
+    let mut updates = 0;
+    for refspec in &refs {
+        let bare = refspec.strip_prefix('+').unwrap_or(refspec);
+        if bare.is_empty() {
+            return mixed(refs);
+        }
+        if delete_flag {
+            // `--delete` takes plain ref names; a `src:dst` with it is an error
+            // Git reports, so the broker does not guess.
+            if bare.contains(':') {
+                return mixed(refs);
+            }
+            deletions += 1;
+        } else if let Some(destination) = bare.strip_prefix(':') {
+            if destination.is_empty() || destination.contains(':') {
+                // `:` alone pushes matching refs.
+                return mixed(refs);
+            }
+            deletions += 1;
+        } else {
+            updates += 1;
+        }
+    }
+    let kind = match (deletions, updates) {
+        (_, 0) => PushKind::DeleteOnly,
+        (0, _) => PushKind::Update,
+        _ => PushKind::Mixed,
+    };
+    Some(PushShape { kind, refs })
+}
+
+/// Tell the repository's hooks what this push is, overriding anything the
+/// caller's environment carried under the same names.
+fn export_push_shape(command: &mut Command, shape: Option<&PushShape>) {
+    match shape {
+        Some(shape) => {
+            command.env("AETHYME_PUSH_KIND", shape.kind.as_str());
+            command.env("AETHYME_PUSH_REFS", shape.refs.join("\n"));
+        }
+        None => {
+            command.env_remove("AETHYME_PUSH_KIND");
+            command.env_remove("AETHYME_PUSH_REFS");
+        }
+    }
+}
+
 /// Milliseconds as the shortest readable span: `850ms`, `4.2s`, `1m 31s`.
 pub(crate) fn humanize_ms(milliseconds: u64) -> String {
     match milliseconds {
@@ -4770,9 +4939,19 @@ impl Broker {
         // re-issued it (issue #138).
         let command_json = redacted_command(request.provider, &request.args)?;
 
+        // What the push's hooks are told it is (#264). A delete-only push sends
+        // nothing a pre-push gate could verify, so the broker runs no dry run
+        // of its own for it; the repository's hook still runs, once, inside the
+        // push, and can short-circuit on `AETHYME_PUSH_KIND=delete-only`.
+        let push_shape = (request.provider == OperationProvider::Git)
+            .then(|| classify_push(&request.args))
+            .flatten();
         let hooks_ran_outside_lock = effect != OperationEffect::Read
             && request.provider == OperationProvider::Git
             && is_push(&request.args)
+            && push_shape
+                .as_ref()
+                .is_none_or(|shape| shape.kind != PushKind::DeleteOnly)
             && hooks_outside_lock_enabled(self.main_root());
 
         // Two identical commands from one session cannot both be intended: the
@@ -4844,6 +5023,7 @@ impl Broker {
             dry_run.arg("push").arg("--dry-run");
             dry_run.args(&request.args[command_index + 1..]);
             dry_run.current_dir(cwd);
+            export_push_shape(&mut dry_run, push_shape.as_ref());
             match output_within(
                 dry_run,
                 admission,
@@ -5076,6 +5256,9 @@ impl Broker {
         // exists to avoid (issues #138, #146).
         if hooks_ran_outside_lock {
             command.arg("--no-verify");
+        }
+        if request.provider == OperationProvider::Git {
+            export_push_shape(&mut command, push_shape.as_ref());
         }
         // Trace2 gives us process-level evidence for the one useful
         // pre-transfer distinction Git itself does not expose in its exit
@@ -7013,5 +7196,79 @@ mod tests {
             )
             .is_empty()
         );
+    }
+
+    fn push_shape(args: &[&str]) -> Option<PushShape> {
+        classify_push(
+            &args
+                .iter()
+                .map(|arg| (*arg).to_string())
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    fn push_kind(args: &[&str]) -> Option<PushKind> {
+        push_shape(args).map(|shape| shape.kind)
+    }
+
+    #[test]
+    fn push_kind_recognises_deletions_by_flag_and_by_empty_source() {
+        assert_eq!(
+            push_kind(&["push", "origin", "--delete", "feature"]),
+            Some(PushKind::DeleteOnly)
+        );
+        assert_eq!(
+            push_kind(&["push", "-d", "origin", "a", "b"]),
+            Some(PushKind::DeleteOnly)
+        );
+        assert_eq!(
+            push_kind(&["push", "origin", ":refs/heads/feature", "+:old"]),
+            Some(PushKind::DeleteOnly)
+        );
+        assert_eq!(
+            push_kind(&["-C", "/tmp/x", "push", "origin", ":feature"]),
+            Some(PushKind::DeleteOnly)
+        );
+        assert_eq!(
+            push_shape(&["push", "origin", "--delete", "a", "b"])
+                .unwrap()
+                .refs,
+            vec!["a".to_string(), "b".to_string()]
+        );
+    }
+
+    #[test]
+    fn push_kind_classifies_updates_and_mixed_pushes() {
+        assert_eq!(
+            push_kind(&["push", "origin", "HEAD:refs/heads/main"]),
+            Some(PushKind::Update)
+        );
+        assert_eq!(
+            push_kind(&["push", "--force-with-lease", "-u", "origin", "+src:dst"]),
+            Some(PushKind::Update)
+        );
+        assert_eq!(
+            push_kind(&["push", "origin", "main", ":old"]),
+            Some(PushKind::Mixed)
+        );
+    }
+
+    #[test]
+    fn push_kind_falls_back_to_mixed_when_the_shape_is_uncertain() {
+        for args in [
+            &["push", "origin"][..],
+            &["push"],
+            &["push", "--all", "origin"],
+            &["push", "--mirror", "origin"],
+            &["push", "--prune", "origin", ":x"],
+            &["push", "--unknown-option", "origin", ":x"],
+            &["push", "-dq", "origin", "x"],
+            &["push", "origin", ":"],
+            &["push", "--delete", "origin", "a:b"],
+            &["push", "-o"],
+        ] {
+            assert_eq!(push_kind(args), Some(PushKind::Mixed), "{args:?}");
+        }
+        assert_eq!(push_kind(&["fetch", "origin"]), None);
     }
 }
