@@ -1372,6 +1372,14 @@ inventory checks ownership but limits work between sessions; an incomplete
 inventory reports `inventory_complete: false` and `inventory_deferred_sessions`.
 Cleanup eligibility is always uninspected on this path. Zero counts for a
 check named in `deferred_checks` do not mean that nothing needs attention.
+
+The status JSON cleanup_retention object also reports inode pressure:
+inodes_free and host_inode_volume_probe describe free inodes on the most
+constrained broker gate volume (both unavailable when the probe cannot be
+read). worktree_inodes sums recorded inode usage without walking worktrees;
+worktree_inode_unmeasured counts worktrees that still lack an inode measure,
+so the sum is only a floor while that count is non-zero.
+
 `phase_timings_ms` identifies the cost of opening, coordination and retention.
 
 `aethyme broker status --refresh` explicitly runs the expensive lease, Git

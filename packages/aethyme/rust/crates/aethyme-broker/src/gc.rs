@@ -349,13 +349,15 @@ fn declined_artifacts(
         .into_iter()
         .filter_map(|path| {
             let relative_dir = repo_relative(root, &path)?;
-            let estimated_bytes = directory_size_without_following_links(&path).ok()?;
-            (estimated_bytes > UNCLASSIFIED_ARTIFACT_REPORT_THRESHOLD_BYTES).then(|| {
+            let usage =
+                crate::disk_headroom::directory_usage_without_following_links(&path).ok()?;
+            (usage.bytes > UNCLASSIFIED_ARTIFACT_REPORT_THRESHOLD_BYTES).then(|| {
                 GcDeclinedArtifact {
                     session_id,
                     worktree_path: worktree_path.to_owned(),
                     relative_dir,
-                    estimated_bytes,
+                    estimated_bytes: usage.bytes,
+                    estimated_inodes: Some(usage.inodes),
                     reason: declined_reason(&path, extras).into(),
                 }
             })
@@ -414,6 +416,12 @@ fn now_ms() -> i64 {
 
 fn cutoff(now: i64, days: u32) -> i64 {
     now.saturating_sub(i64::from(days).saturating_mul(86_400_000))
+}
+
+fn sum_inode_estimates(values: impl IntoIterator<Item = Option<u64>>) -> Option<u64> {
+    values.into_iter().try_fold(0_u64, |total, estimate| {
+        estimate.map(|inodes| total.saturating_add(inodes))
+    })
 }
 
 fn sha256(bytes: &[u8]) -> String {
@@ -893,23 +901,23 @@ impl Broker {
                 }
                 // Discovery is `read_dir` plus one `check-ignore`; sizing is
                 // the walk. A recorded-size pass keeps the candidate and
-                // reports zero bytes for it, because here zero means "not
-                // measured" -- dropping it would understate the count as well
-                // as the bytes (#176).
-                let bytes = if size_scan.measures() {
-                    let measured = directory_size_without_following_links(&dir).unwrap_or(0);
-                    if measured == 0 {
-                        continue;
+                // reports zero bytes with an unknown inode count -- dropping
+                // it would understate the count. A measured empty directory
+                // still consumes an inode and remains a candidate (#176).
+                let usage = if size_scan.measures() {
+                    match crate::disk_headroom::directory_usage_without_following_links(&dir) {
+                        Ok(usage) => Some(usage),
+                        Err(_) => continue,
                     }
-                    measured
                 } else {
-                    0
+                    None
                 };
                 candidates.push(GcArtifactCandidate {
                     session_id: item.session_id,
                     worktree_path: item.worktree_path.clone(),
                     relative_dir: relative,
-                    estimated_bytes: bytes,
+                    estimated_bytes: usage.map_or(0, |usage| usage.bytes),
+                    estimated_inodes: usage.map(|usage| usage.inodes),
                     idle_days,
                 });
             }
@@ -1075,15 +1083,17 @@ impl Broker {
                 });
                 continue;
             }
+            let usage = if scan.measures() {
+                crate::disk_headroom::directory_usage_without_following_links(&root).ok()
+            } else {
+                None
+            };
             candidates.push(GcOrphanCandidate {
                 repository_key: marker.repository_key,
                 worktree_root: root.to_string_lossy().into_owned(),
                 repository_root: marker.repository_root.to_string_lossy().into_owned(),
-                estimated_bytes: if scan.measures() {
-                    directory_size_without_following_links(&root).unwrap_or(0)
-                } else {
-                    0
-                },
+                estimated_bytes: usage.map_or(0, |usage| usage.bytes),
+                estimated_inodes: usage.map(|usage| usage.inodes),
                 reason: "owning repository no longer exists".into(),
             });
         }
@@ -1360,6 +1370,7 @@ impl Broker {
                     branch_ref: item.branch_ref,
                     branch_tip: item.branch_tip,
                     estimated_bytes: retained_bytes,
+                    estimated_inodes: item.estimated_inodes,
                     closed_at,
                 });
                 continue;
@@ -1647,12 +1658,38 @@ impl Broker {
             .iter()
             .map(|artifact| artifact.estimated_bytes)
             .fold(0_u64, u64::saturating_add);
+        let estimated_reclaimable_inodes = sum_inode_estimates(
+            worktrees
+                .iter()
+                .map(|worktree| worktree.estimated_inodes)
+                .chain(artifacts.iter().map(|artifact| artifact.estimated_inodes))
+                .chain(orphans.iter().map(|orphan| orphan.estimated_inodes))
+                .chain(gate_caches.iter().map(|cache| cache.estimated_inodes)),
+        );
+        let estimated_build_output_reclaimable_inodes = sum_inode_estimates(
+            artifacts
+                .iter()
+                .map(|artifact| artifact.estimated_inodes)
+                .chain(gate_caches.iter().map(|cache| cache.estimated_inodes)),
+        );
+        let estimated_declined_artifact_inodes = sum_inode_estimates(
+            declined_artifacts
+                .iter()
+                .map(|artifact| artifact.estimated_inodes),
+        );
         // Retained bytes describe disk pressure, not authorized work: every
         // byte held by a retained worktree plus every orphaned host root.
         let estimated_retained_bytes = orphans
             .iter()
             .map(|orphan| orphan.estimated_bytes)
             .fold(cleanup.estimated_retained_bytes, u64::saturating_add);
+        let estimated_retained_inodes = sum_inode_estimates(
+            cleanup
+                .worktrees
+                .iter()
+                .map(|worktree| worktree.estimated_inodes)
+                .chain(orphans.iter().map(|orphan| orphan.estimated_inodes)),
+        );
         // Blocked bytes compare like with like: only worktree-scoped totals.
         // Row and file candidates live in the repository runtime directory and
         // were never counted as retained, so subtracting them would understate
@@ -1665,6 +1702,16 @@ impl Broker {
             .fold(0_u64, u64::saturating_add);
         let estimated_blocked_bytes =
             estimated_retained_bytes.saturating_sub(worktree_scoped_reclaimable);
+        let worktree_scoped_reclaimable_inodes = sum_inode_estimates(
+            worktrees
+                .iter()
+                .map(|worktree| worktree.estimated_inodes)
+                .chain(artifacts.iter().map(|artifact| artifact.estimated_inodes))
+                .chain(orphans.iter().map(|orphan| orphan.estimated_inodes)),
+        );
+        let estimated_blocked_inodes = estimated_retained_inodes
+            .zip(worktree_scoped_reclaimable_inodes)
+            .map(|(retained, reclaimable)| retained.saturating_sub(reclaimable));
 
         // Being over budget now decides what a bounded `gc apply` spends its
         // time on, rather than only setting a flag somebody reads (#176).
@@ -1739,11 +1786,16 @@ impl Broker {
             worktree_blocker_summary,
             declined_artifacts,
             estimated_reclaimable_bytes,
+            estimated_reclaimable_inodes,
             estimated_retained_bytes,
+            estimated_retained_inodes,
             estimated_blocked_bytes,
+            estimated_blocked_inodes,
             estimated_declined_artifact_bytes,
+            estimated_declined_artifact_inodes,
             gate_cache,
             estimated_build_output_reclaimable_bytes,
+            estimated_build_output_reclaimable_inodes,
             reclaim_order,
             retained_bytes_deficit: crate::reclaim_order::deficit_bytes(
                 estimated_retained_bytes,
@@ -1806,8 +1858,11 @@ impl Broker {
             candidate_artifacts: plan.artifacts.len(),
             candidate_orphans: plan.orphans.len(),
             estimated_reclaimable_bytes: plan.estimated_reclaimable_bytes,
+            estimated_reclaimable_inodes: plan.estimated_reclaimable_inodes,
             estimated_retained_bytes: plan.estimated_retained_bytes,
+            estimated_retained_inodes: plan.estimated_retained_inodes,
             estimated_blocked_bytes: plan.estimated_blocked_bytes,
+            estimated_blocked_inodes: plan.estimated_blocked_inodes,
             over_retained_bytes_budget,
             retained_bytes_deficit: plan.retained_bytes_deficit,
             clears_retained_bytes_budget: plan.clears_retained_bytes_budget,
@@ -1917,9 +1972,12 @@ impl Broker {
         let main_root = self.main_root();
         // React to the fact the gate refuses on, rather than sweeping at one
         // fixed rate whether the volume is comfortable or already out of room.
-        let urgency = crate::disk_headroom::sweep_urgency(
-            crate::disk_headroom::available_bytes_for(main_root, main_root),
+        let headroom = crate::disk_headroom::available_headroom_for(main_root, main_root);
+        let urgency = crate::disk_headroom::sweep_urgency_with_inodes(
+            headroom.map(|value| value.bytes),
             crate::disk_headroom::DEFAULT_GATE_HEADROOM_BYTES,
+            headroom.map(|value| value.inodes),
+            crate::disk_headroom::MIN_GATE_HEADROOM_INODES,
         );
         (
             artifact_sweep_budget_ms(policy.artifact_sweep_budget_ms, scope, urgency),

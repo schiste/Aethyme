@@ -24,7 +24,6 @@
 use std::path::{Component, Path, PathBuf};
 use std::time::{Instant, UNIX_EPOCH};
 
-use crate::broker::directory_size_without_following_links;
 use crate::gc::{TreeRemoval, remove_condemned_tree};
 use crate::{
     GcGateCacheCandidate, GcGateCacheDisposition, GcGateCacheEntry, GcGateCacheInventory, GitRepo,
@@ -237,14 +236,20 @@ pub(crate) fn inspect(
                 .as_ref()
                 .map_or_else(|| entry.clone(), |(key, _)| key.clone());
             let key = path.to_string_lossy().into_owned();
-            let estimated_bytes = if scan.measures() {
-                let measured = directory_size_without_following_links(&path).ok();
-                if let Some(bytes) = measured {
-                    records.record(&key, bytes, evaluated_at);
+            let (estimated_bytes, estimated_inodes) = if scan.measures() {
+                let measured =
+                    crate::disk_headroom::directory_usage_without_following_links(&path).ok();
+                if let Some(usage) = measured {
+                    records.record_usage(&key, usage.bytes, Some(usage.inodes), evaluated_at);
                 }
                 measured
+                    .map(|usage| (Some(usage.bytes), Some(usage.inodes)))
+                    .unwrap_or((None, None))
             } else {
-                records.get(&key).map(|record| record.bytes)
+                records
+                    .get(&key)
+                    .map(|record| (Some(record.bytes), record.inodes))
+                    .unwrap_or((None, None))
             };
             let last_used_at_ms = last_used_at_ms(&path);
             let mut hold = Vec::new();
@@ -284,6 +289,7 @@ pub(crate) fn inspect(
                 cache_key,
                 path: key,
                 estimated_bytes,
+                estimated_inodes,
                 last_used_at_ms,
                 age_days: last_used_at_ms.map(|at| days_between(evaluated_at, at)),
                 disposition,
@@ -410,6 +416,7 @@ pub(crate) fn inspect(
             cache_key: entry.cache_key.clone(),
             path: entry.path.clone(),
             estimated_bytes: entry.estimated_bytes.unwrap_or(0),
+            estimated_inodes: entry.estimated_inodes,
             last_used_at_ms: entry.last_used_at_ms.unwrap_or(0),
             age_days: entry.age_days.unwrap_or(0),
             reason: entry.reason.clone(),
@@ -432,6 +439,20 @@ pub(crate) fn inspect(
             .filter_map(|entry| entry.estimated_bytes)
             .fold(0_u64, u64::saturating_add)
     };
+    let sum_known_inodes = |values: Vec<Option<u64>>| {
+        values.into_iter().try_fold(0_u64, |total, count| {
+            count.map(|count| total.saturating_add(count))
+        })
+    };
+    let sum_inodes = |disposition: GcGateCacheDisposition| {
+        sum_known_inodes(
+            entries
+                .iter()
+                .filter(|entry| entry.disposition == disposition)
+                .map(|entry| entry.estimated_inodes)
+                .collect(),
+        )
+    };
     let inventory = GcGateCacheInventory {
         root: location.root.to_string_lossy().into_owned(),
         repository_key: location.repository_key.clone(),
@@ -440,9 +461,15 @@ pub(crate) fn inspect(
             .iter()
             .filter_map(|entry| entry.estimated_bytes)
             .fold(0_u64, u64::saturating_add),
+        total_inodes: sum_known_inodes(
+            entries.iter().map(|entry| entry.estimated_inodes).collect(),
+        ),
         reclaimable_bytes: sum(GcGateCacheDisposition::Reclaimable),
+        reclaimable_inodes: sum_inodes(GcGateCacheDisposition::Reclaimable),
         held_bytes: sum(GcGateCacheDisposition::Held),
+        held_inodes: sum_inodes(GcGateCacheDisposition::Held),
         active_bytes: sum(GcGateCacheDisposition::Active),
+        active_inodes: sum_inodes(GcGateCacheDisposition::Active),
         include_active,
         holders,
         entries,
@@ -582,9 +609,12 @@ pub(crate) fn reclaim_in(
     // or its size, and removing it now would discard a cache that became warm
     // again. Checked under the lease, so no gate can change it after this.
     let current_used = last_used_at_ms(&path);
-    let current_bytes = directory_size_without_following_links(&path).ok();
+    let current_usage = crate::disk_headroom::directory_usage_without_following_links(&path).ok();
+    let current_bytes = current_usage.map(|usage| usage.bytes);
+    let current_inodes = current_usage.map(|usage| usage.inodes);
     if current_used != Some(candidate.last_used_at_ms)
         || current_bytes != Some(candidate.estimated_bytes)
+        || current_inodes != candidate.estimated_inodes
     {
         release(&mut coordinator);
         return Err(format!(
@@ -656,6 +686,10 @@ mod tests {
     }
 
     fn candidate(fixture: &Fixture, entry: &str) -> GcGateCacheCandidate {
+        let usage = crate::disk_headroom::directory_usage_without_following_links(
+            &fixture.location.root.join(entry),
+        )
+        .expect("fixture cache can be measured");
         GcGateCacheCandidate {
             entry: entry.into(),
             cache_key: retired_rotation(entry).map_or(entry, |(key, _)| key).into(),
@@ -666,10 +700,8 @@ mod tests {
                 .to_string_lossy()
                 .into_owned(),
             // What a plan measured a moment ago.
-            estimated_bytes: directory_size_without_following_links(
-                &fixture.location.root.join(entry),
-            )
-            .unwrap_or(0),
+            estimated_bytes: usage.bytes,
+            estimated_inodes: Some(usage.inodes),
             last_used_at_ms: last_used_at_ms(&fixture.location.root.join(entry)).unwrap_or(0),
             age_days: 0,
             reason: String::new(),
@@ -707,6 +739,8 @@ mod tests {
         fixture.location.registry = Some(absent.clone());
         let (inventory, candidates) = inspect_fixture(&fixture, &[]);
         assert!(candidates.is_empty(), "{candidates:?}");
+        assert!(inventory.total_inodes.unwrap() > 0, "{inventory:#?}");
+        assert!(inventory.held_inodes.unwrap() > 0, "{inventory:#?}");
         assert!(
             inventory
                 .entries
@@ -759,7 +793,54 @@ mod tests {
                 .is_file()
         );
 
-        // Same size, later use: still not the reviewed entry.
+        // Same bytes, one more empty directory: inode drift is a changed
+        // entry even though the byte estimate stayed identical.
+        let inode_changed = fixture("rust-workspace-v2", 1000);
+        let reviewed = candidate(&inode_changed, "rust-workspace-v2");
+        let cache_entry = inode_changed.location.root.join("rust-workspace-v2");
+        let debug = cache_entry.join("debug");
+        let empty = debug.join("empty");
+        std::fs::create_dir(&empty).unwrap();
+        let unchanged_mtime =
+            UNIX_EPOCH + std::time::Duration::from_millis(reviewed.last_used_at_ms as u64);
+        std::fs::File::open(&empty)
+            .unwrap()
+            .set_modified(unchanged_mtime)
+            .unwrap();
+        std::fs::File::open(&debug)
+            .unwrap()
+            .set_modified(unchanged_mtime)
+            .unwrap();
+        std::fs::File::open(&cache_entry)
+            .unwrap()
+            .set_modified(unchanged_mtime)
+            .unwrap();
+        let after =
+            crate::disk_headroom::directory_usage_without_following_links(&cache_entry).unwrap();
+        assert_eq!(after.bytes, reviewed.estimated_bytes);
+        assert_eq!(after.inodes, reviewed.estimated_inodes.unwrap() + 1);
+        assert_eq!(
+            last_used_at_ms(&cache_entry),
+            Some(reviewed.last_used_at_ms),
+            "the reviewed use time is unchanged too"
+        );
+        let error = reclaim_in(
+            &inode_changed.main_root,
+            &inode_changed.location,
+            &reviewed,
+            None,
+        )
+        .unwrap_err();
+        assert!(error.contains("changed since the plan"), "{error}");
+        assert!(
+            inode_changed
+                .location
+                .root
+                .join("rust-workspace-v2/debug/empty")
+                .is_dir()
+        );
+
+        // Same size and inode count, later use: still not the reviewed entry.
         let used = fixture("rust-workspace-v2", 1000);
         let mut reviewed = candidate(&used, "rust-workspace-v2");
         reviewed.last_used_at_ms -= 60_000;

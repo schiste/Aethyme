@@ -126,6 +126,8 @@ pub struct StorageEntry {
     pub session_ids: Vec<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub estimated_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_inodes: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -181,6 +183,8 @@ pub struct StorageRoot {
     pub empty: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub estimated_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_inodes: Option<u64>,
     pub sized: bool,
     pub reconciliation: StorageReconciliation,
     pub blockers: Vec<String>,
@@ -203,6 +207,8 @@ pub struct StorageCandidate {
     pub git_marker: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub estimated_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_inodes: Option<u64>,
     pub reason: String,
     /// Exact ownership-marker bytes are the root witness at apply time.
     pub marker_sha256: String,
@@ -228,12 +234,20 @@ pub struct StorageSummary {
     pub preparation_candidate_count: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preparation_reclaimable_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preparation_reclaimable_inodes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub estimated_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_inodes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reclaimable_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reclaimable_inodes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub primary_reclaimable_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_reclaimable_inodes: Option<u64>,
     pub sized: bool,
 }
 
@@ -250,6 +264,8 @@ pub struct StoragePreparationEntry {
     pub key: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub estimated_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_inodes: Option<u64>,
     pub reclaimable: bool,
     pub reason: String,
 }
@@ -262,6 +278,8 @@ pub struct StoragePreparationCandidate {
     pub key: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub estimated_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_inodes: Option<u64>,
     pub reason: String,
 }
 
@@ -290,6 +308,8 @@ pub struct StoragePrimaryArtifact {
     pub reclaimable: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub estimated_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_inodes: Option<u64>,
     pub reason: String,
 }
 
@@ -302,6 +322,8 @@ pub struct StoragePrimaryCandidate {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub estimated_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_inodes: Option<u64>,
     pub reason: String,
 }
 
@@ -387,6 +409,7 @@ struct MarkerObservation {
 struct DiskObservation {
     git_marker: bool,
     estimated_bytes: Option<u64>,
+    estimated_inodes: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -714,6 +737,7 @@ fn inspect_root(
     };
     if filesystem_kind != StorageFilesystemKind::Directory {
         let estimated_bytes = observed_size(raw_path, scan, records);
+        let estimated_inodes = observed_inodes(raw_path, records);
         return StorageRoot {
             path,
             filesystem_kind,
@@ -730,8 +754,9 @@ fn inspect_root(
             ledger_claimed_count: 0,
             retired_count: 0,
             empty: false,
-            sized: estimated_bytes.is_some(),
+            sized: estimated_bytes.is_some() && estimated_inodes.is_some(),
             estimated_bytes,
+            estimated_inodes,
             reconciliation: empty_reconciliation(),
             blockers: vec!["entry is not a real directory and is never swept".into()],
         };
@@ -743,11 +768,13 @@ fn inspect_root(
     // wrote a marker beside them -- so its children are never enumerated.
     if has_git_marker(&path) {
         let estimated_bytes = observed_size(&path, scan, records);
+        let estimated_inodes = observed_inodes(&path, records);
         return StorageRoot {
             age_days: age_days(&path, evaluated_at),
             blockers: vec![foreign_worktree_blocker(&path)],
             empty: false,
             estimated_bytes,
+            estimated_inodes,
             filesystem_kind,
             git_registered_count: 0,
             ledger_claimed_count: 0,
@@ -761,7 +788,7 @@ fn inspect_root(
             repository_key: None,
             repository_root: None,
             retired_count: 0,
-            sized: estimated_bytes.is_some(),
+            sized: estimated_bytes.is_some() && estimated_inodes.is_some(),
             worktree_count: 0,
         };
     }
@@ -816,11 +843,13 @@ fn inspect_root(
                 }
                 let child = normalise(&child);
                 let estimated_bytes = observed_size(&child, scan, records);
+                let estimated_inodes = observed_inodes(&child, records);
                 disk.insert(
                     child.clone(),
                     DiskObservation {
                         git_marker: has_git_marker(&child),
                         estimated_bytes,
+                        estimated_inodes,
                     },
                 );
             }
@@ -850,6 +879,7 @@ fn inspect_root(
                 git_marker: observation.git_marker,
                 session_ids: Vec::new(),
                 estimated_bytes: observation.estimated_bytes,
+                estimated_inodes: observation.estimated_inodes,
             },
         );
     }
@@ -891,12 +921,14 @@ fn inspect_root(
         entries,
     };
     let estimated_bytes = observed_size(&path, scan, records);
+    let estimated_inodes = observed_inodes(&path, records);
     let sized = estimated_bytes.is_some()
+        && estimated_inodes.is_some()
         && reconciliation
             .entries
             .iter()
             .filter(|entry| entry.on_disk)
-            .all(|entry| entry.estimated_bytes.is_some());
+            .all(|entry| entry.estimated_bytes.is_some() && entry.estimated_inodes.is_some());
     let age_days = age_days(&path, evaluated_at);
     if marker.status != StorageMarkerStatus::Valid {
         blockers.push(format!(
@@ -930,6 +962,7 @@ fn inspect_root(
         retired_count: reconciliation.retired_count,
         empty: bookkeeping_only && disk.is_empty(),
         estimated_bytes,
+        estimated_inodes,
         sized,
         reconciliation,
         blockers,
@@ -984,6 +1017,7 @@ fn inspect_primary_checkouts(
                     repository_key: checkout.repository_key.clone(),
                     name: artifact.name.clone(),
                     estimated_bytes: artifact.estimated_bytes,
+                    estimated_inodes: artifact.estimated_inodes,
                     reason: artifact.reason.clone(),
                 })
         })
@@ -1171,6 +1205,11 @@ fn inspect_preparation_cache(
             } else {
                 None
             };
+            let estimated_inodes = if !live {
+                observed_inodes(&path, records)
+            } else {
+                None
+            };
             let reason = if liveness_unknown {
                 "checkout preparation liveness could not be verified; retaining cache entries"
                     .into()
@@ -1184,6 +1223,7 @@ fn inspect_preparation_cache(
                 repository: repository_name.clone(),
                 key,
                 estimated_bytes,
+                estimated_inodes,
                 reclaimable: !live,
                 reason,
             });
@@ -1198,6 +1238,7 @@ fn inspect_preparation_cache(
             repository: entry.repository.clone(),
             key: entry.key.clone(),
             estimated_bytes: entry.estimated_bytes,
+            estimated_inodes: entry.estimated_inodes,
             reason: entry.reason.clone(),
         })
         .collect::<Vec<_>>();
@@ -1352,6 +1393,7 @@ fn inspect_primary_checkout(
                             .into()
                     };
                     let estimated_bytes = observed_size(&path, scan, records);
+                    let estimated_inodes = observed_inodes(&path, records);
                     artifacts.push(StoragePrimaryArtifact {
                         path,
                         name,
@@ -1359,6 +1401,7 @@ fn inspect_primary_checkout(
                         tracked,
                         reclaimable,
                         estimated_bytes,
+                        estimated_inodes,
                         reason,
                     });
                 }
@@ -1397,6 +1440,7 @@ struct EntryBuilder {
     git_marker: bool,
     session_ids: Vec<i64>,
     estimated_bytes: Option<u64>,
+    estimated_inodes: Option<u64>,
 }
 
 impl EntryBuilder {
@@ -1426,6 +1470,7 @@ impl EntryBuilder {
             git_marker: self.git_marker,
             session_ids: self.session_ids,
             estimated_bytes: self.estimated_bytes,
+            estimated_inodes: self.estimated_inodes,
         }
     }
 }
@@ -1462,6 +1507,7 @@ fn candidates_for_root(
                 repository_root,
                 git_marker: false,
                 estimated_bytes: root.estimated_bytes,
+                estimated_inodes: root.estimated_inodes,
                 reason: "owning repository no longer exists".into(),
                 marker_sha256,
             }];
@@ -1489,6 +1535,7 @@ fn candidates_for_root(
                 repository_root,
                 git_marker: false,
                 estimated_bytes: root.estimated_bytes,
+                estimated_inodes: root.estimated_inodes,
                 reason: "no worktree remains and no session keeps one here; the root holds only broker bookkeeping, which the next `broker start` rewrites".into(),
                 marker_sha256,
             }];
@@ -1507,6 +1554,7 @@ fn candidates_for_root(
             repository_root: repository_root.clone(),
             git_marker: entry.git_marker,
             estimated_bytes: entry.estimated_bytes,
+            estimated_inodes: entry.estimated_inodes,
             reason: if entry.git_marker {
                 "directory has .git metadata but is absent from both Git worktree registrations and the session ledger".into()
             } else {
@@ -1530,12 +1578,18 @@ fn observed_size(
 ) -> Option<u64> {
     let key = path.to_string_lossy();
     if scan.measures() {
-        let bytes = crate::broker::directory_size_without_following_links(path).ok()?;
-        records.record(&key, bytes, now_ms());
-        Some(bytes)
+        let usage = crate::disk_headroom::directory_usage_without_following_links(path).ok()?;
+        records.record_usage(&key, usage.bytes, Some(usage.inodes), now_ms());
+        Some(usage.bytes)
     } else {
         records.get(&key).map(|record| record.bytes)
     }
+}
+
+fn observed_inodes(path: &Path, records: &crate::measurement::SizeRecords) -> Option<u64> {
+    records
+        .get(&path.to_string_lossy())
+        .and_then(|record| record.inodes)
 }
 
 /// Spend one routine measurement budget on the oldest or never-measured
@@ -1557,10 +1611,11 @@ fn warm_one_storage_size_record(
     };
     let deadline =
         std::time::Instant::now() + std::time::Duration::from_millis(policy.routine_size_budget_ms);
-    let Some(bytes) = crate::broker::directory_size_bounded(Path::new(&path), deadline) else {
+    let Some(usage) = crate::disk_headroom::directory_usage_bounded(Path::new(&path), deadline)
+    else {
         return;
     };
-    records.record(&path, bytes, now_ms());
+    records.record_usage(&path, usage.bytes, Some(usage.inodes), now_ms());
     let _ = crate::measurement::save_size_records(main_root, records);
 }
 
@@ -1604,11 +1659,22 @@ fn summarise(
         .count();
     let on_disk_directory_count = roots.iter().map(|root| root.on_disk_directory_count).sum();
     let estimated_bytes = sized_sum(roots.iter().map(|root| root.estimated_bytes));
+    let estimated_inodes = sized_sum(roots.iter().map(|root| root.estimated_inodes));
     let reclaimable_bytes = sized_sum(candidates.iter().map(|candidate| candidate.estimated_bytes));
+    let reclaimable_inodes = sized_sum(
+        candidates
+            .iter()
+            .map(|candidate| candidate.estimated_inodes),
+    );
     let primary_reclaimable_bytes = sized_sum(
         primary_candidates
             .iter()
             .map(|candidate| candidate.estimated_bytes),
+    );
+    let primary_reclaimable_inodes = sized_sum(
+        primary_candidates
+            .iter()
+            .map(|candidate| candidate.estimated_inodes),
     );
     StorageSummary {
         root_count: roots.len(),
@@ -1641,9 +1707,17 @@ fn summarise(
                 .iter()
                 .map(|candidate| candidate.estimated_bytes),
         ),
+        preparation_reclaimable_inodes: sized_sum(
+            preparation_candidates
+                .iter()
+                .map(|candidate| candidate.estimated_inodes),
+        ),
         estimated_bytes,
+        estimated_inodes,
         reclaimable_bytes,
+        reclaimable_inodes,
         primary_reclaimable_bytes,
+        primary_reclaimable_inodes,
         sized: roots.iter().all(|root| root.sized),
     }
 }
@@ -2281,7 +2355,7 @@ mod tests {
         // No live root declares preparation, so nothing keeps a key alive.
         let mut records = crate::measurement::SizeRecords::default();
         let (entries, candidates) =
-            inspect_preparation_cache(&cache, &[], crate::SizeScan::Recorded, &mut records);
+            inspect_preparation_cache(&cache, &[], crate::SizeScan::Measure, &mut records);
         assert_eq!(entries.len(), 2, "both entries must be inventoried");
         assert_eq!(candidates.len(), 2, "with no live key, both are dead");
         assert!(
@@ -2294,6 +2368,9 @@ mod tests {
                 .all(|c| c.reason.contains("inputs have changed")),
             "the reason must say why it is dead, not merely that it is"
         );
+        assert!(entries.iter().all(|entry| entry.estimated_inodes.is_some()));
+        let summary = summarise(&[], &[], &[], &[], &entries, &candidates);
+        assert_eq!(summary.preparation_reclaimable_inodes, Some(3));
     }
 
     /// A checkout that still computes a key keeps its entry, and only that
@@ -2341,6 +2418,7 @@ mod tests {
             repository: "repository-a".into(),
             key,
             estimated_bytes: None,
+            estimated_inodes: None,
             reason: "previously dead".into(),
         };
         let roots = preparation_live_roots(&repo, &[], &[]);
@@ -2361,6 +2439,7 @@ mod tests {
             repository: "repository-a".into(),
             key: "ccccccccccc1".into(),
             estimated_bytes: None,
+            estimated_inodes: None,
             reason: "dead".into(),
         };
 
@@ -2389,6 +2468,7 @@ mod tests {
             repository: "repository".into(),
             key: "key".into(),
             estimated_bytes: None,
+            estimated_inodes: None,
             reason: "previously unused".into(),
         };
         let mut records = crate::measurement::SizeRecords::default();
@@ -2460,11 +2540,13 @@ mod tests {
             repository_root: PathBuf::from("/repo"),
             git_marker: false,
             estimated_bytes: Some(10),
+            estimated_inodes: Some(3),
             reason: "stray".into(),
             marker_sha256: "marker".into(),
         };
         let mut changed = candidate.clone();
         changed.estimated_bytes = Some(100);
+        changed.estimated_inodes = Some(99);
         assert_eq!(
             decision_digest(Path::new("/storage"), 1, &[candidate], &[], &[]),
             decision_digest(Path::new("/storage"), 1, &[changed], &[], &[])
@@ -2478,6 +2560,7 @@ mod tests {
             repository: "repository".into(),
             key: "key".into(),
             estimated_bytes: Some(1),
+            estimated_inodes: None,
             reason: "unused".into(),
         };
         let digest = |candidates: &[StoragePreparationCandidate]| {
@@ -2487,6 +2570,7 @@ mod tests {
         assert_ne!(approved, digest(&[]));
         let mut measured = candidate.clone();
         measured.estimated_bytes = Some(999);
+        measured.estimated_inodes = Some(999);
         measured.reason = "updated explanation".into();
         assert_eq!(approved, digest(&[measured]));
         for field in 0..3 {
@@ -2570,6 +2654,7 @@ mod tests {
             git_marker: true,
             session_ids: Vec::new(),
             estimated_bytes: Some(1),
+            estimated_inodes: None,
         }
         .finish(PathBuf::from("/root/worktree"));
         assert_eq!(

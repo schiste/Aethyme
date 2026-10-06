@@ -736,6 +736,8 @@ pub struct ManagedGateCacheProvenance {
     pub max_bytes: u64,
     pub bytes_before: u64,
     pub bytes_after: Option<u64>,
+    pub inodes_before: u64,
+    pub inodes_after: Option<u64>,
     pub rotated_before_run: bool,
     /// Files of the tree under test whose mtime the broker advanced before
     /// the command ran, so Cargo rebuilds workspace members from this tree
@@ -1845,7 +1847,8 @@ fn prepare_managed_gate_cache_in(
     let repository_root = root.join("gates").join(repository);
     std::fs::create_dir_all(&repository_root)?;
     let directory = repository_root.join(&policy.key);
-    let bytes_before = directory_usage(&directory)?;
+    let usage_before = directory_usage(&directory)?;
+    let bytes_before = usage_before.bytes;
     let rotated_before_run = bytes_before > policy.max_bytes;
     if rotated_before_run {
         progress.report(&format!(
@@ -1871,30 +1874,16 @@ fn prepare_managed_gate_cache_in(
             max_bytes: policy.max_bytes,
             bytes_before,
             bytes_after: None,
+            inodes_before: usage_before.inodes,
+            inodes_after: None,
             rotated_before_run,
             sources_refreshed: 0,
         },
     }))
 }
 
-fn directory_usage(path: &Path) -> Result<u64, std::io::Error> {
-    if !path.exists() {
-        return Ok(0);
-    }
-    let mut bytes = 0_u64;
-    let mut pending = vec![path.to_path_buf()];
-    while let Some(directory) = pending.pop() {
-        for entry in std::fs::read_dir(directory)? {
-            let entry = entry?;
-            let metadata = entry.file_type()?;
-            if metadata.is_dir() {
-                pending.push(entry.path());
-            } else {
-                bytes = bytes.saturating_add(entry.metadata()?.len());
-            }
-        }
-    }
-    Ok(bytes)
+fn directory_usage(path: &Path) -> Result<crate::disk_headroom::DirectoryUsage, std::io::Error> {
+    crate::disk_headroom::directory_usage_without_following_links(path)
 }
 
 fn sha256_text(value: &str) -> String {
@@ -2171,12 +2160,14 @@ fn run_selections(
         // checkout stands in for its repository: a gate checkout lies under
         // the temporary directory exactly when its repository does, because
         // durable host state is withheld from throwaway repositories.
-        let available = crate::disk_headroom::available_bytes_for(checkout.root(), checkout.root());
+        let available =
+            crate::disk_headroom::available_headroom_for(checkout.root(), checkout.root());
         let mut environment = GateEnvironment {
             load_avg_1m_start: load_average_1m(),
             load_avg_1m_end: None,
             cpu_count: logical_cpu_count(),
-            free_disk_bytes_start: available.and_then(|bytes| i64::try_from(bytes).ok()),
+            free_disk_bytes_start: available
+                .and_then(|headroom| i64::try_from(headroom.bytes).ok()),
         };
         let started = Instant::now();
         let broker_database = std::cell::OnceCell::new();
@@ -2184,7 +2175,8 @@ fn run_selections(
             &gate.command,
             GateCommandContext {
                 cwd: checkout.root(),
-                available,
+                available_bytes: available.map(|headroom| headroom.bytes),
+                available_inodes: available.map(|headroom| headroom.inodes),
                 environment: &environment,
                 log_path: &log_path,
                 run_dir: &run_dir,
@@ -2202,7 +2194,9 @@ fn run_selections(
             },
         );
         if let Some(cache) = managed_cache_runtime.as_mut() {
-            cache.provenance.bytes_after = directory_usage(&cache.directory).ok();
+            let usage_after = directory_usage(&cache.directory).ok();
+            cache.provenance.bytes_after = usage_after.map(|usage| usage.bytes);
+            cache.provenance.inodes_after = usage_after.map(|usage| usage.inodes);
         }
         let release_error = resource_runtime
             .as_mut()
@@ -2639,7 +2633,8 @@ struct GateCommandContext<'a> {
     cwd: &'a Path,
     /// Free bytes on `cwd`'s filesystem, measured once by the caller: the
     /// headroom check refuses on it and the gate result records it.
-    available: Option<u64>,
+    available_bytes: Option<u64>,
+    available_inodes: Option<u64>,
     /// Written into the log header so the log carries its own load context.
     environment: &'a GateEnvironment,
     log_path: &'a Path,
@@ -2696,8 +2691,16 @@ fn run_gate_command(
     // verdict is then cached against the tree -- so the retry that would clear
     // it is exactly what the cache prevents. Refusing here keeps the condition
     // and its symptom attached to each other.
-    let available = context.available;
-    if crate::disk_headroom_refusal(available, crate::DEFAULT_GATE_HEADROOM_BYTES).is_some() {
+    let available_bytes = context.available_bytes;
+    let available_inodes = context.available_inodes;
+    if crate::disk_headroom::refusal_with_headroom(
+        available_bytes,
+        available_inodes,
+        crate::disk_headroom::DEFAULT_GATE_HEADROOM_BYTES,
+        crate::disk_headroom::MIN_GATE_HEADROOM_INODES,
+    )
+    .is_some()
+    {
         // Sized only once refusing: the walk costs seconds on a warm cache,
         // which a gate about to fail can afford and one about to run cannot.
         let measured = context.managed_cache.and_then(|cache| {
@@ -2706,18 +2709,22 @@ fn run_gate_command(
                 root,
                 directory_usage(root).ok()?,
                 cache.provenance.key.as_str(),
-                directory_usage(&cache.directory).unwrap_or(0),
+                directory_usage(&cache.directory).ok()?,
             ))
         });
-        let refusal = crate::disk_headroom_refusal_with_gate_cache(
-            available,
-            crate::DEFAULT_GATE_HEADROOM_BYTES,
+        let refusal = crate::disk_headroom::refusal_with_headroom_and_gate_cache(
+            available_bytes,
+            available_inodes,
+            crate::disk_headroom::DEFAULT_GATE_HEADROOM_BYTES,
+            crate::disk_headroom::MIN_GATE_HEADROOM_INODES,
             measured.map(
-                |(root, total_bytes, active_key, active_bytes)| crate::GateCacheUsage {
+                |(root, total_usage, active_key, active_usage)| crate::GateCacheUsage {
                     root,
-                    total_bytes,
+                    total_bytes: total_usage.bytes,
+                    total_inodes: total_usage.inodes,
                     active_key,
-                    active_bytes,
+                    active_bytes: active_usage.bytes,
+                    active_inodes: active_usage.inodes,
                 },
             ),
         )

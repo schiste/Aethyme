@@ -84,7 +84,9 @@
     "estimated_reclaimable_bytes": "integer",
     "estimated_retained_bytes": "integer",
     "host_available_bytes": "integer",
+    "host_inode_volume_probe": "string",
     "host_volume_probe": "string",
+    "inodes_free": "integer",
     "inventory_complete": "bool",
     "inventory_deferred_sessions": "integer",
     "oldest_closed_age_days": "integer",
@@ -104,7 +106,9 @@
     "retained_session_branch_count": "integer",
     "severity": "string",
     "sizes_measured_at_ms": "null",
-    "unmeasured_worktree_count": "integer"
+    "unmeasured_worktree_count": "integer",
+    "worktree_inode_unmeasured": "integer",
+    "worktree_inodes": "integer"
   },
   "coordinated_operations": [],
   "deferred_checks": [
