@@ -604,7 +604,7 @@ pub struct SessionScope {
     pub released_at: Option<i64>,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone)]
 pub struct Lease {
     pub id: i64,
     pub session_id: i64,
@@ -615,6 +615,57 @@ pub struct Lease {
     /// Unix epoch milliseconds; `None` = no expiry.
     pub expires_at: Option<i64>,
     pub released_at: Option<i64>,
+}
+
+/// Whether a lease covers only the named path or its whole subtree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LeaseScope {
+    Exact,
+    RecursiveDirectory,
+}
+
+impl Lease {
+    pub fn scope(&self) -> LeaseScope {
+        if self.path.ends_with('/') {
+            LeaseScope::RecursiveDirectory
+        } else {
+            LeaseScope::Exact
+        }
+    }
+}
+
+impl serde::Serialize for Lease {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        #[derive(serde::Serialize)]
+        struct LeaseOutput<'a> {
+            id: i64,
+            session_id: i64,
+            path: &'a str,
+            scope: LeaseScope,
+            kind: LeaseKind,
+            created_at: i64,
+            expires_at: Option<i64>,
+            released_at: Option<i64>,
+        }
+
+        serde::Serialize::serialize(
+            &LeaseOutput {
+                id: self.id,
+                session_id: self.session_id,
+                path: &self.path,
+                scope: self.scope(),
+                kind: self.kind,
+                created_at: self.created_at,
+                expires_at: self.expires_at,
+                released_at: self.released_at,
+            },
+            serializer,
+        )
+    }
 }
 
 /// Snapshot of a gate definition (source of truth is `.aethyme/gates.toml`;

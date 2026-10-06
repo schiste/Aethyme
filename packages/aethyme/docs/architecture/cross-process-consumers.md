@@ -449,3 +449,27 @@ status; its inventory can be incomplete, declared by `inventory_complete` and
 `inventory_deferred_sessions`. `phase_timings_ms` contains measured phase costs
 and `command_total` including broker opening. See the status section in
 `../guides/broker-workflows.md`. Neither reporting mode authorizes deletion.
+
+### Lease scope and guarded-execution reporting
+
+Lease records returned by `aethyme broker advanced leases list --json` and by
+broker status JSON carry a scope field. Its value exact covers only the named
+path; `recursive_directory` covers the subtree of a directory claimed with a
+trailing slash. `aethyme broker advanced leases claim --json` reports the same
+scope, and adds a warning field when an existing directory was claimed as an
+exact path. The warning does not change coverage.
+
+`aethyme broker advanced leases plan --session <id> --json` adds a coverage
+object for the proposed paths. Only that session's explicit leases count as
+authority; implicit leases and other sessions' leases do not. Paths left
+uncovered come with exact and narrow recursive claim suggestions.
+
+`aethyme broker advanced exec --session <id> --json` adds `command_ran`,
+`edits_remain` and `changed_paths_remaining`. `command_ran` is true on every
+report the command produces, because a command that could not start fails
+before any report. `edits_remain` says whether any path the command changed is
+still dirty, and `changed_paths_remaining` lists those tracked and untracked
+paths in full. Human output says whether the command ran and whether edits
+remain, and shows at most eight changed paths. An ownership refusal can come
+after the command has already changed files, so a consumer must inspect the
+reported paths before retrying.
