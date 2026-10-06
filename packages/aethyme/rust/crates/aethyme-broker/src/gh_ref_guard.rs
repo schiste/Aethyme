@@ -39,21 +39,34 @@ const NO_REF_WRITE: &[(&str, &str)] = &[
     ("status", "*"),
     ("search", "*"),
     ("browse", "*"),
-    ("auth", "status"),
-    ("auth", "token"),
+    ("completion", "*"),
+    ("config", "*"),
+    ("auth", "*"),
+    ("alias", "*"),
     ("issue", "*"),
     ("label", "*"),
-    ("run", "*"),
-    ("workflow", "list"),
-    ("workflow", "view"),
-    ("release", "list"),
-    ("release", "view"),
-    ("release", "download"),
-    ("secret", "list"),
-    ("variable", "list"),
-    ("variable", "get"),
-    ("cache", "list"),
     ("project", "*"),
+    ("gist", "*"),
+    ("ssh-key", "*"),
+    ("gpg-key", "*"),
+    ("org", "*"),
+    ("ruleset", "*"),
+    ("attestation", "*"),
+    ("secret", "*"),
+    ("variable", "*"),
+    ("cache", "*"),
+    // Dispatching, re-running or cancelling a workflow writes no ref itself.
+    ("run", "*"),
+    ("workflow", "*"),
+    // Releases and their tags; tags are never session branches.
+    ("release", "*"),
+    // Installing or listing an extension runs nothing; `exec` is not here.
+    ("extension", "list"),
+    ("extension", "install"),
+    ("extension", "upgrade"),
+    ("extension", "remove"),
+    ("extension", "search"),
+    ("extension", "browse"),
     ("pr", "view"),
     ("pr", "list"),
     ("pr", "status"),
@@ -117,8 +130,11 @@ fn is_number(token: &str) -> bool {
     !token.is_empty() && token.bytes().all(|byte| byte.is_ascii_digit())
 }
 
-fn is_full_sha(token: &str) -> bool {
-    token.len() == 40
+/// A lowercase hex object id. A head-deleting merge additionally requires it
+/// to equal the full head commit the guard reads, so a short value can only
+/// make GitHub refuse the merge, never widen what is checked.
+fn is_hex_sha(token: &str) -> bool {
+    (1..=64).contains(&token.len())
         && token
             .bytes()
             .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
@@ -135,8 +151,8 @@ fn assess_pr_merge(tokens: &[&str]) -> Verdict {
             "--merge" | "--squash" | "--rebase" if method.is_none() => method = Some(token),
             "-d" | "--delete-branch" if !deletes_head => deletes_head = true,
             "--match-head-commit" if match_head_commit.is_none() => match iter.next() {
-                Some(sha) if is_full_sha(sha) => match_head_commit = Some((*sha).to_string()),
-                _ => return unverifiable("--match-head-commit needs a full 40-character sha"),
+                Some(sha) if is_hex_sha(sha) => match_head_commit = Some((*sha).to_string()),
+                _ => return unverifiable("--match-head-commit needs a lowercase hex sha"),
             },
             _ if is_number(token) && number.is_none() => number = Some(token.to_string()),
             _ => {
@@ -272,7 +288,8 @@ mod tests {
             &["pr", "merge", "#7", "--squash"],
             &["pr", "merge", "7", "8", "--squash"],
             &["pr", "merge", "7"],
-            &["pr", "merge", "7", "--squash", "--match-head-commit", "abc"],
+            &["pr", "merge", "7", "--squash", "--match-head-commit", "ABC"],
+            &["pr", "merge", "7", "--squash", "--match-head-commit", "-d"],
             &["pr", "merge", "7", "--squash", "--", "-d"],
         ] {
             assert!(unverifiable_line(line), "{line:?}");
