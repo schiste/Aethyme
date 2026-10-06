@@ -4,6 +4,30 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.21] - 2026-10-06
+
+Broker sessions belong to the agent process that holds them. Health checks finish on large hosts. Gates that run out of disk space or inodes are reported as host faults.
+
+### Changed
+
+- A broker session is bound to the agent process that started or adopted it. A second process that names the session is refused with the current holder's identity, unless it passes `--take-over`, which is recorded as an event. `broker status --json` warns with `session.foreign-process` when another process works inside a session's worktree. Agents that used to re-enter a session another process holds now need `--take-over` (#542, issue #393).
+- A destructive `broker advanced git` write to another live session's `agent/*` branch is refused unless it names that session with `--cross-session <id>` (#531, issue #393).
+- Before running gates, `broker submit` checks that the pending commits declare a contract decision whenever the diff touches a tracked cross-process symbol, so a missing `Contract decision:` line no longer surfaces only after a full gate run. The decision must be in a commit message; the gate never sees a PR body (#536, issue #418).
+- The cost-1 contract gate is admitted by host load, so a loaded machine queues it instead of timing it out (#529, issue #413).
+- Promotion commit subjects are capped at 72 characters. A multi-line task contributes only its first line (#528, issue #493).
+- `aethyme deploy` installs the `aethyme-explore` wrapper for Claude as well as Codex (#533, issue #385).
+
+### Fixed
+
+- `broker status doctor`, `certify` and the verify loop no longer run for more than 10 minutes on hosts with hundreds of retained worktrees. Cleanup eligibility and the build-artifact scan each get a 10 s budget; worktrees not judged in time are listed and counted (`eligibility_not_inspected_count`, `artifact_worktrees_not_scanned`) instead of blocking the report (#530, #535, issue #460).
+- A gate that runs out of disk space or inodes after it starts is reported as a host fault and is not cached as a test failure (#539, #545, issues #288 and #471).
+- Disk headroom accounts for inodes as well as bytes. Filesystems that report no inode counts (btrfs, unlimited tmpfs) are treated as unknown and never refuse gates (#545, issue #471).
+- `broker submit` checks the provenance of a long branch in one batched pass: 1,500 commits went from 140 s to 0.35 s (#543, issue #463).
+- `broker gc storage attribute [--apply]` attributes unmarked worktree roots to their repository from Git evidence (#541, issue #257).
+- `aethyme deploy` verifies `.aethyme/` path references in generated files against the tree (#534, issue #289).
+- `broker advanced leases plan` honours lease ignore rules, and lease records report their scope (`exact` or `recursive_directory`) (#538, issue #366).
+- Gate selection (`gates affected`) no longer waits on the graph-integrity lock (#540, issue #481).
+
 ## [0.8.20] - 2026-10-05
 
 Cleanup explains a shallow clone instead of failing with an empty error.
