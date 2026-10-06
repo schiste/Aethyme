@@ -822,3 +822,173 @@ fn storage_plan_lists_recovery_archives_without_proposing_them() {
     );
     assert!(broker_archive.exists() && manual.exists());
 }
+
+fn root_entry(plan: &serde_json::Value, root: &Path) -> serde_json::Value {
+    let root = root.canonicalize().unwrap();
+    plan["roots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["path"] == root.to_str().unwrap())
+        .cloned()
+        .unwrap_or_else(|| panic!("no root {} in {plan}", root.display()))
+}
+
+/// A root created before markers existed holds this repository's worktrees,
+/// but nothing could ever reclaim its strays, because nothing could say who
+/// owned it (#257). Attribution proves ownership from Git's own registrations,
+/// reports before it writes, and once recorded the root is reconciled like any
+/// other.
+#[test]
+fn a_root_whose_worktrees_are_registered_here_is_attributed_then_reconciled() {
+    let (repo, container) = fixture();
+    let old_root = container.path().join("renamed-checkout-0123456789abcdef");
+    std::fs::create_dir_all(&old_root).unwrap();
+    let worktree = old_root.join("registered");
+    git(
+        repo.path(),
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "registered",
+            worktree.to_str().unwrap(),
+            "HEAD",
+        ],
+    );
+    let stray = old_root.join("stray");
+    std::fs::create_dir_all(&stray).unwrap();
+    std::fs::write(stray.join("data"), "stray\n").unwrap();
+    let marker_path = old_root.join(".aethyme-worktree-root.json");
+
+    let plan = json(run(
+        repo.path(),
+        container.path(),
+        &["gc", "storage", "plan", "--json"],
+    ));
+    let root = root_entry(&plan, &old_root);
+    assert_eq!(root["marker_status"], "missing");
+    assert!(
+        root["blockers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|blocker| blocker
+                .as_str()
+                .unwrap()
+                .contains("storage attribute --apply")),
+        "{root}"
+    );
+    assert_eq!(plan["summary"]["candidate_count"], 0);
+
+    let report = json(run(
+        repo.path(),
+        container.path(),
+        &["gc", "storage", "attribute", "--json"],
+    ));
+    assert_eq!(report["applied"], false);
+    let entry = &report["roots"][0];
+    assert_eq!(entry["attributable"], true, "{report}");
+    assert_eq!(entry["marked"], false);
+    assert_eq!(entry["registered_worktree_count"], 1);
+    assert!(!marker_path.exists(), "a report writes nothing");
+
+    let applied = json(run(
+        repo.path(),
+        container.path(),
+        &["gc", "storage", "attribute", "--apply", "--json"],
+    ));
+    assert_eq!(applied["roots"][0]["marked"], true, "{applied}");
+    let marker: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&marker_path).unwrap()).unwrap();
+    assert_eq!(
+        marker["repository_root"],
+        repo.path().canonicalize().unwrap().to_str().unwrap()
+    );
+
+    let plan = json(run(
+        repo.path(),
+        container.path(),
+        &["gc", "storage", "plan", "--json"],
+    ));
+    assert_eq!(root_entry(&plan, &old_root)["marker_status"], "valid");
+    let candidates = plan["candidates"].as_array().unwrap();
+    assert_eq!(candidates.len(), 1, "{plan}");
+    assert_eq!(candidates[0]["kind"], "stray_directory");
+    assert_eq!(
+        candidates[0]["path"],
+        stray.canonicalize().unwrap().to_str().unwrap()
+    );
+    assert!(
+        worktree.exists() && stray.exists(),
+        "planning removes nothing"
+    );
+}
+
+/// Ownership is never inferred from weaker evidence: a root holding a
+/// worktree another repository registered, or no worktree under a foreign
+/// name, stays unmarked and is reported with the reason.
+#[test]
+fn a_root_this_repository_cannot_prove_is_never_marked() {
+    let (repo, container) = fixture();
+    let other = tempfile::tempdir().unwrap();
+    git(other.path(), &["init", "-q", "-b", "main"]);
+    std::fs::write(other.path().join("README.md"), "other\n").unwrap();
+    git(other.path(), &["add", "-A"]);
+    git(other.path(), &["commit", "-qm", "init"]);
+    let foreign_root = container.path().join("other-repository-key");
+    std::fs::create_dir_all(&foreign_root).unwrap();
+    let foreign_worktree = foreign_root.join("theirs");
+    git(
+        other.path(),
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "theirs",
+            foreign_worktree.to_str().unwrap(),
+            "HEAD",
+        ],
+    );
+    let bare_root = container.path().join("nobody-key");
+    std::fs::create_dir_all(bare_root.join("files")).unwrap();
+
+    let applied = json(run(
+        repo.path(),
+        container.path(),
+        &["gc", "storage", "attribute", "--apply", "--json"],
+    ));
+    let roots = applied["roots"].as_array().unwrap();
+    assert_eq!(roots.len(), 2, "{applied}");
+    for root in roots {
+        assert_eq!(root["attributable"], false, "{root}");
+        assert_eq!(root["marked"], false);
+    }
+    assert!(roots.iter().any(|root| {
+        root["reason"]
+            .as_str()
+            .unwrap()
+            .contains("not registered in this repository")
+    }));
+    assert!(!foreign_root.join(".aethyme-worktree-root.json").exists());
+    assert!(!bare_root.join(".aethyme-worktree-root.json").exists());
+
+    let plan = json(run(
+        repo.path(),
+        container.path(),
+        &["gc", "storage", "plan", "--json"],
+    ));
+    assert!(
+        root_entry(&plan, &foreign_root)["blockers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|blocker| blocker
+                .as_str()
+                .unwrap()
+                .contains("not attributable to this repository"))
+    );
+    assert_eq!(plan["summary"]["candidate_count"], 0);
+}

@@ -97,6 +97,7 @@ pub use submit_progress::{
     InFlightSubmit, SUBMIT_STALL_AFTER, SlotHolder, SubmitProgressRecord, WaitPosition,
 };
 pub mod session_guidance;
+pub mod session_holder;
 mod text_redaction;
 mod unpushed;
 pub mod worktree_location;
@@ -267,7 +268,7 @@ pub use gc::{
     INLINE_ARTIFACT_SWEEP_BUDGET_MS, UNCLASSIFIED_ARTIFACT_REPORT_THRESHOLD_BYTES,
 };
 pub use git::{
-    CherrySide, GitError, GitRepo, LoggedCommit, MergeSimulation, RemoteDefaultBranch,
+    CherrySide, CommitShape, GitError, GitRepo, LoggedCommit, MergeSimulation, RemoteDefaultBranch,
     UncommittedSummary,
 };
 pub use github_target::{
@@ -520,12 +521,13 @@ pub use ship::{
     ShipPublicationPolicy, ShipPush, ShipReviewEvidence,
 };
 pub use storage::{
-    STORAGE_PLAN_SCHEMA_VERSION, STORAGE_RECONCILIATION_SCHEMA_VERSION, StorageAppliedItem,
-    StorageApplyFailure, StorageApplyReport, StorageCandidate, StorageCandidateKind,
-    StorageDirectoryKind, StorageEntry, StorageError, StorageFilesystemKind, StorageMarkerStatus,
-    StoragePlan, StoragePrimaryArtifact, StoragePrimaryCandidate, StoragePrimaryCheckout,
-    StorageReconciliation, StorageRecoveryArchiveGroup, StorageRoot, StorageSource, StorageSummary,
-    storage_apply, storage_plan,
+    STORAGE_ATTRIBUTION_SCHEMA_VERSION, STORAGE_PLAN_SCHEMA_VERSION,
+    STORAGE_RECONCILIATION_SCHEMA_VERSION, StorageAppliedItem, StorageApplyFailure,
+    StorageApplyReport, StorageAttribution, StorageAttributionReport, StorageCandidate,
+    StorageCandidateKind, StorageDirectoryKind, StorageEntry, StorageError, StorageFilesystemKind,
+    StorageMarkerStatus, StoragePlan, StoragePrimaryArtifact, StoragePrimaryCandidate,
+    StoragePrimaryCheckout, StorageReconciliation, StorageRecoveryArchiveGroup, StorageRoot,
+    StorageSource, StorageSummary, storage_apply, storage_attribute, storage_plan,
 };
 pub use store::BrokerStore;
 pub use types::{

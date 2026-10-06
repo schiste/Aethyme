@@ -55,6 +55,7 @@ const V1_KINDS: &[&str] = &[
     "session.exited",
     "session.finish_cleanup_started",
     "session.finished",
+    "session.holder_bound",
     "session.idle",
     "session.registered",
     "session.reused",
@@ -119,6 +120,7 @@ fn v1_kind_catalog_is_frozen() {
         events::SESSION_CONTEXT_UPDATED.into(),
         events::SESSION_FINISHED.into(),
         events::SESSION_FINISH_CLEANUP_STARTED.into(),
+        events::SESSION_HOLDER_BOUND.into(),
         events::LEASE_CLAIMED.into(),
         events::LEASE_RELEASED.into(),
         events::LEASE_OVERLAP.into(),
@@ -218,6 +220,23 @@ fn v1_constructor_payload_field_names_are_frozen() {
         &events::session_reused_payload(Some("t"), Some("d")),
         &["diff_base", "task"],
         "session.reused",
+    );
+    let holder = aethyme_broker::session_holder::AgentProcess {
+        pid: 2,
+        started: "Mon Oct 5 21:56:54 2026".into(),
+        command: "claude".into(),
+    };
+    assert_keys(
+        &events::session_holder_bound_payload(&holder, "take_over", Some(&holder)),
+        &[
+            "command",
+            "pid",
+            "previous_pid",
+            "previous_started",
+            "reason",
+            "started",
+        ],
+        "session.holder_bound",
     );
     assert_keys(
         &events::session_context_updated_payload(&aethyme_broker::SessionContext::new(

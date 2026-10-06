@@ -16,9 +16,16 @@ on:
 
 permissions:
   contents: read
+  # Finds the pull-request run that already tested this merge's tree.
+  actions: read
   # cross-process-contract reads the merged PR's body for its contract
   # decision (`gh api repos/{owner}/{repo}/commits/<sha>/pulls`).
   pull-requests: read
+
+# Retry transient registry and git fetch failures instead of failing the job
+# on one dropped connection (Cargo's default is 3).
+env:
+  CARGO_NET_RETRY: "10"
 
 # One group per commit: every commit on main gets a completed verdict.
 # Cancelling superseded runs left merge commits (including a release commit on
@@ -71,6 +78,14 @@ jobs:
       - name: Build aethyme binary
         run: cargo build --locked --release --manifest-path packages/aethyme/rust/Cargo.toml --bin aethyme
 
+      # The cargo-test gate runs the workspace suite under nextest when it is
+      # on PATH (`.aethyme/gates.toml`); under `cargo test` that gate took
+      # about 17 minutes here. Same pinned version as oss-ci.yml.
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: cargo-nextest@0.9.146
+
       # The Rust gates build into the broker's managed cache,
       # `<host cache>/gates/<repository key>/rust-workspace-v3`, where the key
       # is the SHA-256 of the repository's canonical origin
@@ -92,6 +107,29 @@ jobs:
           restore-keys: |
             aethyme-gate-cache-${{ runner.os }}-${{ steps.toolchain.outputs.cachekey }}-
 
+      # A merge commit whose tree a pull-request run already tested
+      # (OSS CI's record-tested-tree job, after the workspace suite and the
+      # examples and doctests passed) skips the gates those suites cover.
+      # Only an artifact from a run in this repository counts, not one from a
+      # fork. Every other gate still runs, including gates added later.
+      # A manual dispatch, or any tree no PR run tested, runs every gate.
+      - name: Look for a pull-request run that tested this tree
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tree="$(git rev-parse 'HEAD^{tree}')"
+          repo_id="$(gh api "repos/$GITHUB_REPOSITORY" --jq .id)"
+          run="$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=tested-tree-$tree&per_page=100" \
+            --jq "[.artifacts[] | select(.expired == false and .workflow_run.head_repository_id == $repo_id) | .workflow_run.id] | first // empty")"
+          if [ -n "$run" ]; then
+            echo "Tree $tree passed the workspace suite in pull-request run $run."
+            echo "TESTED_BY_RUN=$run" >> "$GITHUB_ENV"
+          else
+            echo "No pull-request run tested tree $tree; every gate runs."
+          fi
+
       - name: Run all gates
         env:
           # A fresh runner has no gate-trust record and no gate history, so the
@@ -103,7 +141,26 @@ jobs:
           # commit when the merged commits declare no contract decision; the
           # decision conventionally lives in the PR body. Read-only.
           GH_TOKEN: ${{ github.token }}
-        run: packages/aethyme/rust/target/release/aethyme broker advanced gates run --all
+          # Gates the pull-request suites run in full: the workspace suite
+          # (cargo-test), the examples and their guard tests (fast-guards),
+          # and the testkit contract tests (workflow-contract, gate-policy).
+          COVERED_BY_PR_SUITE: "cargo-test fast-guards workflow-contract gate-policy"
+        run: |
+          set -euo pipefail
+          aethyme=packages/aethyme/rust/target/release/aethyme
+          if [ -z "${TESTED_BY_RUN:-}" ]; then
+            exec "$aethyme" broker advanced gates run --all
+          fi
+          # An assignment carries the pipeline's failure to `set -e`; a `for`
+          # over a command substitution would run no gate and pass.
+          gates="$("$aethyme" broker advanced gates manifest --json | jq -r '.manifest.gates[].name')"
+          [ -n "$gates" ] || { echo "the gate manifest lists no gates" >&2; exit 1; }
+          for gate in $gates; do
+            case " $COVERED_BY_PR_SUITE " in
+              *" $gate "*) echo "gate $gate: covered by pull-request run $TESTED_BY_RUN on this tree" ;;
+              *) "$aethyme" broker advanced gates run --all --only "$gate" ;;
+            esac
+          done
 
       # Runs after the gates, before the cache post-step saves. Keep
       # third-party artifacts only: the workspace's own crates, test binaries
