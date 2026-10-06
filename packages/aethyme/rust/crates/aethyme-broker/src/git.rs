@@ -1603,6 +1603,16 @@ impl GitRepo {
         run_git(&self.root, &["rev-parse", &format!("{commit}^1")])
     }
 
+    /// Every commit reachable from `head`, `head` included: one `rev-list`
+    /// that answers `is_ancestor(commit, head)` for any number of commits by
+    /// membership.
+    pub fn reachable_commits(&self, head: &str) -> Result<Vec<String>, GitError> {
+        Ok(run_git(&self.root, &["rev-list", head])?
+            .lines()
+            .map(str::to_string)
+            .collect())
+    }
+
     /// Commits reachable from `to` but not `from`, oldest first.
     pub fn commits_between_oldest(&self, from: &str, to: &str) -> Result<Vec<String>, GitError> {
         let range = format!("{from}..{to}");

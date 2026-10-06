@@ -399,7 +399,7 @@ fn inspect_checkout(path: &Path) -> CheckoutState {
 }
 
 /// Run `inspect` over `items` on a few worker threads, keeping input order.
-fn inspect_in_parallel<T, R, F>(items: &[T], inspect: F) -> Vec<R>
+pub(crate) fn inspect_in_parallel<T, R, F>(items: &[T], inspect: F) -> Vec<R>
 where
     T: Sync,
     R: Send,

@@ -395,16 +395,52 @@ impl Broker {
         upstream_head: &str,
         integration_head: &str,
     ) -> Result<IntegrationDriftAssessment, BrokerOpError> {
+        // Without a deadline the assessment always completes.
+        Ok(self
+            .assess_integration_drift_within(upstream_ref, upstream_head, integration_head, None)?
+            .unwrap_or_else(|| unreachable!("an assessment without a deadline cannot expire")))
+    }
+
+    /// [`Self::assess_integration_drift`] for reporting surfaces: `None` when
+    /// `deadline` passed before the classification finished. A caller must
+    /// then report the drift as not assessed, never as resolved.
+    pub fn assess_integration_drift_within(
+        &self,
+        upstream_ref: &str,
+        upstream_head: &str,
+        integration_head: &str,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<Option<IntegrationDriftAssessment>, BrokerOpError> {
+        let expired = || deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline);
         let queue = self.store_ref().merge_queue()?;
-        let plan =
-            build_reconciliation_plan(self.repo_handle(), &queue, upstream_head, integration_head)?;
+        let Some(plan) = build_reconciliation_plan_within(
+            self.repo_handle(),
+            &queue,
+            upstream_head,
+            integration_head,
+            deadline,
+        )?
+        else {
+            return Ok(None);
+        };
         let CandidateLayer {
             candidates,
             described_chain_is_complete,
             ..
         } = build_candidate_layer(self.repo_handle(), &queue, &plan, integration_head)?;
-        let classified =
-            classify_automatic_entries(self.repo_handle(), &plan, &candidates, upstream_head)?;
+        if expired() {
+            return Ok(None);
+        }
+        let Some(classified) = classify_automatic_entries_within(
+            self.repo_handle(),
+            &plan,
+            &candidates,
+            upstream_head,
+            deadline,
+        )?
+        else {
+            return Ok(None);
+        };
 
         let entries: Vec<IntegrationDriftEntry> = candidates
             .iter()
@@ -518,7 +554,7 @@ impl Broker {
                 .into()
         };
 
-        Ok(IntegrationDriftAssessment {
+        Ok(Some(IntegrationDriftAssessment {
             upstream_ref: upstream_ref.to_string(),
             upstream_head: upstream_head.to_string(),
             integration_head: integration_head.to_string(),
@@ -531,7 +567,7 @@ impl Broker {
             stale_only,
             automatic_cleanup_safe,
             explanation,
-        })
+        }))
     }
 
     /// Clean only a complete integration layer whose every recorded
@@ -1162,19 +1198,36 @@ fn build_candidate_layer(
     plan: &IntegrationReconcilePlan,
     old_integration: &str,
 ) -> Result<CandidateLayer, BrokerOpError> {
-    let mut candidates = Vec::new();
-    for entry in queue
+    // Every promoted entry ever recorded is a candidate when integration
+    // still reaches it, so ancestry and first parents are read in one Git
+    // process each rather than per entry (#460).
+    let reachable: BTreeSet<String> = repo
+        .reachable_commits(old_integration)?
+        .into_iter()
+        .collect();
+    let promoted: Vec<(MergeQueueEntry, String)> = queue
         .iter()
         .filter(|&entry| entry.status == MergeStatus::Promoted)
-        .cloned()
-    {
-        let Some(merge_commit) = promoted_commit(&entry) else {
-            continue;
+        .filter_map(|entry| {
+            let merge_commit = promoted_commit(entry)?;
+            reachable
+                .contains(&merge_commit)
+                .then(|| (entry.clone(), merge_commit))
+        })
+        .collect();
+    let merge_commits: Vec<String> = promoted.iter().map(|(_, commit)| commit.clone()).collect();
+    let shapes = repo.commit_shapes(&merge_commits)?;
+    let mut candidates = Vec::new();
+    for (entry, merge_commit) in promoted {
+        // A parentless commit falls back to the per-commit read, which fails
+        // exactly as it did before batching.
+        let old_parent = match shapes
+            .get(&merge_commit)
+            .and_then(|shape| shape.parents.first())
+        {
+            Some(parent) => parent.clone(),
+            None => repo.first_parent(&merge_commit)?,
         };
-        if !repo.is_ancestor(&merge_commit, old_integration) {
-            continue;
-        }
-        let old_parent = repo.first_parent(&merge_commit)?;
         let files = repo.changed_between(&old_parent, &merge_commit)?;
         candidates.push(Candidate {
             entry,
@@ -1226,6 +1279,24 @@ fn classify_automatic_entries(
     candidates: &[Candidate],
     upstream_head: &str,
 ) -> Result<Vec<Option<IntegrationReconcileEntry>>, BrokerOpError> {
+    // Without a deadline the classification always completes.
+    Ok(
+        classify_automatic_entries_within(repo, plan, candidates, upstream_head, None)?
+            .unwrap_or_default(),
+    )
+}
+
+/// [`classify_automatic_entries`], giving up with `None` once `deadline`
+/// passes. Reporting surfaces pass one; reconciliation itself never does,
+/// because a partial classification must not drive a ref change.
+fn classify_automatic_entries_within(
+    repo: &crate::git::GitRepo,
+    plan: &IntegrationReconcilePlan,
+    candidates: &[Candidate],
+    upstream_head: &str,
+    deadline: Option<std::time::Instant>,
+) -> Result<Option<Vec<Option<IntegrationReconcileEntry>>>, BrokerOpError> {
+    let expired = || deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline);
     let mut upstream_by_patch: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for commit in plan.commits.iter().filter(|commit| {
         commit.origin == IntegrationReconcileCommitOrigin::UpstreamOnlyExternalWork
@@ -1241,9 +1312,11 @@ fn classify_automatic_entries(
     let mut classified: Vec<Option<IntegrationReconcileEntry>> = vec![None; candidates.len()];
 
     // Exact graph ancestry is conclusive and takes precedence over
-    // content matching.
+    // content matching. One `rev-list` answers it for every candidate.
+    let upstream_reach: BTreeSet<String> =
+        repo.reachable_commits(upstream_head)?.into_iter().collect();
     for (index, candidate) in candidates.iter().enumerate() {
-        if repo.is_ancestor(&candidate.merge_commit, upstream_head) {
+        if upstream_reach.contains(&candidate.merge_commit) {
             classified[index] = Some(entry_report(
                 candidate,
                 IntegrationReconcileClassification::AlreadyLanded,
@@ -1252,7 +1325,7 @@ fn classify_automatic_entries(
                 Vec::new(),
                 "promoted merge commit is reachable from upstream".into(),
             ));
-        } else if repo.is_ancestor(&candidate.entry.head_commit, upstream_head) {
+        } else if upstream_reach.contains(&candidate.entry.head_commit) {
             classified[index] = Some(entry_report(
                 candidate,
                 IntegrationReconcileClassification::AlreadyLanded,
@@ -1268,6 +1341,9 @@ fn classify_automatic_entries(
     // squash commit that contains several promoted entries.
     for group_len in (1..=candidates.len()).rev() {
         for start in 0..=candidates.len().saturating_sub(group_len) {
+            if expired() {
+                return Ok(None);
+            }
             let end = start + group_len;
             if classified[start..end].iter().any(Option::is_some) {
                 continue;
@@ -1331,6 +1407,9 @@ fn classify_automatic_entries(
         if classified[index].is_some() || candidate.files.is_empty() {
             continue;
         }
+        if expired() {
+            return Ok(None);
+        }
         if repo.paths_equal(&candidate.merge_commit, upstream_head, &candidate.files)? {
             classified[index] = Some(entry_report(
                 candidate,
@@ -1343,7 +1422,7 @@ fn classify_automatic_entries(
         }
     }
 
-    Ok(classified)
+    Ok(Some(classified))
 }
 
 fn build_reconciliation_plan(
@@ -1352,25 +1431,81 @@ fn build_reconciliation_plan(
     upstream_head: &str,
     old_integration: &str,
 ) -> Result<IntegrationReconcilePlan, BrokerOpError> {
+    // Without a deadline the plan always completes.
+    Ok(
+        build_reconciliation_plan_within(repo, queue, upstream_head, old_integration, None)?
+            .unwrap_or_else(|| unreachable!("a plan without a deadline cannot expire")),
+    )
+}
+
+/// [`build_reconciliation_plan`], giving up with `None` once `deadline`
+/// passes between commits. Only reporting passes a deadline.
+fn build_reconciliation_plan_within(
+    repo: &crate::git::GitRepo,
+    queue: &[MergeQueueEntry],
+    upstream_head: &str,
+    old_integration: &str,
+    deadline: Option<std::time::Instant>,
+) -> Result<Option<IntegrationReconcilePlan>, BrokerOpError> {
+    let expired = || deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline);
     let common_base = repo.merge_base(upstream_head, old_integration)?;
     let upstream_commits = repo.first_parent_commits_between_oldest(&common_base, upstream_head)?;
     let integration_commits =
         repo.first_parent_commits_between_oldest(&common_base, old_integration)?;
 
+    // Parents and patch ids for both layers in two Git processes, not five
+    // per commit (#460): on a repository whose integration drifted hundreds
+    // of commits behind upstream, the per-commit chain is what kept
+    // `status --refresh` running for minutes.
+    let layered: Vec<String> = upstream_commits
+        .iter()
+        .chain(&integration_commits)
+        .cloned()
+        .collect();
+    let shapes = repo.commit_shapes(&layered)?;
+    let with_parent: Vec<String> = layered
+        .iter()
+        .filter(|commit| {
+            shapes
+                .get(*commit)
+                .is_some_and(|shape| !shape.parents.is_empty())
+        })
+        .cloned()
+        .collect();
+    let patch_ids = repo.first_parent_patch_ids(&with_parent)?;
+    // Every layered commit descends from `common_base`, so it is an ancestor
+    // of a head exactly when that head's `common_base..head` range lists it.
+    let upstream_reach: BTreeSet<String> = repo
+        .commits_between_oldest(&common_base, upstream_head)?
+        .into_iter()
+        .collect();
+    let integration_reach: BTreeSet<String> = repo
+        .commits_between_oldest(&common_base, old_integration)?
+        .into_iter()
+        .collect();
+    let known = |commit: &String, reach: &BTreeSet<String>| KnownCommit {
+        parents: shapes
+            .get(commit)
+            .map(|shape| shape.parents.clone())
+            .unwrap_or_default(),
+        patch_id: patch_ids.get(commit).cloned(),
+        reaches_other_side: reach.contains(commit),
+    };
+
     let mut upstream_by_patch: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for commit in &upstream_commits {
-        if let Some(patch_id) = commit_patch_id(repo, commit)? {
+        if let Some(patch_id) = patch_ids.get(commit) {
             upstream_by_patch
-                .entry(patch_id)
+                .entry(patch_id.clone())
                 .or_default()
                 .push(commit.clone());
         }
     }
     let mut integration_by_patch: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for commit in &integration_commits {
-        if let Some(patch_id) = commit_patch_id(repo, commit)? {
+        if let Some(patch_id) = patch_ids.get(commit) {
             integration_by_patch
-                .entry(patch_id)
+                .entry(patch_id.clone())
                 .or_default()
                 .push(commit.clone());
         }
@@ -1383,6 +1518,9 @@ fn build_reconciliation_plan(
         .collect();
     let mut commits = Vec::new();
     for commit in &upstream_commits {
+        if expired() {
+            return Ok(None);
+        }
         commits.push(reconcile_commit(
             repo,
             commit,
@@ -1390,9 +1528,13 @@ fn build_reconciliation_plan(
             None,
             &integration_by_patch,
             old_integration,
+            Some(known(commit, &integration_reach)),
         )?);
     }
     for commit in &integration_commits {
+        if expired() {
+            return Ok(None);
+        }
         let queue_entry = recorded.get(commit).copied();
         commits.push(reconcile_commit(
             repo,
@@ -1405,6 +1547,7 @@ fn build_reconciliation_plan(
             queue_entry,
             &upstream_by_patch,
             upstream_head,
+            Some(known(commit, &upstream_reach)),
         )?);
     }
     // Terminal statuses are skipped whether or not their commit still exists.
@@ -1429,13 +1572,23 @@ fn build_reconciliation_plan(
             Some(entry),
             &upstream_by_patch,
             upstream_head,
+            None,
         )?);
     }
 
-    Ok(IntegrationReconcilePlan {
+    Ok(Some(IntegrationReconcilePlan {
         common_base,
         commits,
-    })
+    }))
+}
+
+/// What [`build_reconciliation_plan`] already read in bulk for a layered
+/// commit, so [`reconcile_commit`] does not ask Git again one commit at a
+/// time.
+struct KnownCommit {
+    parents: Vec<String>,
+    patch_id: Option<String>,
+    reaches_other_side: bool,
 }
 
 fn reconcile_commit(
@@ -1445,19 +1598,27 @@ fn reconcile_commit(
     queue_entry: Option<&MergeQueueEntry>,
     other_side_by_patch: &BTreeMap<String, Vec<String>>,
     other_side_head: &str,
+    known: Option<KnownCommit>,
 ) -> Result<IntegrationReconcileCommit, BrokerOpError> {
-    let parents = repo.commit_parents(commit)?;
+    let (parents, patch_id, reaches_other_side) = match known {
+        Some(known) => (known.parents, known.patch_id, known.reaches_other_side),
+        None => {
+            let parents = repo.commit_parents(commit)?;
+            let patch_id = if let Some(parent) = parents.first() {
+                repo.patch_id_between(parent, commit)?
+            } else {
+                None
+            };
+            let reaches = repo.is_ancestor(commit, other_side_head);
+            (parents, patch_id, reaches)
+        }
+    };
     let files = if let Some(parent) = parents.first() {
         repo.changed_between(parent, commit)?
     } else {
         Vec::new()
     };
-    let patch_id = if let Some(parent) = parents.first() {
-        repo.patch_id_between(parent, commit)?
-    } else {
-        None
-    };
-    let (equivalence, matching_commits) = if repo.is_ancestor(commit, other_side_head) {
+    let (equivalence, matching_commits) = if reaches_other_side {
         (
             IntegrationReconcileEquivalence::Exact,
             vec![commit.to_string()],
@@ -1494,14 +1655,6 @@ fn reconcile_commit(
         conflicts: Vec::new(),
         execution_evidence: None,
     })
-}
-
-fn commit_patch_id(
-    repo: &crate::git::GitRepo,
-    commit: &str,
-) -> Result<Option<String>, BrokerOpError> {
-    let parent = repo.first_parent(commit)?;
-    Ok(repo.patch_id_between(&parent, commit)?)
 }
 
 fn load_operator_resolutions(

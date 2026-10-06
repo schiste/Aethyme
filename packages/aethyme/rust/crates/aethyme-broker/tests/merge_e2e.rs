@@ -2621,6 +2621,55 @@ fn broker_open_backfills_exposure_for_a_pre_v17_promotion() {
     assert_eq!(exposure.state, EntryExposureState::Outstanding);
 }
 
+/// Upstream that kept the promotion merge itself is conclusive by ancestry,
+/// ahead of any content matching. Ancestry is read in one `rev-list` for every
+/// candidate (#460); this pins that the batched answer still decides.
+#[test]
+fn reconcile_classifies_a_promotion_upstream_kept_by_ancestry() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let worktree = agent_worktree(tmp.path(), "kept-upstream");
+    let session = broker.adopt(&worktree, Some("land by merge")).unwrap();
+    commit_edit(&worktree, "src/kept.py", "kept = 1\n");
+    assert!(broker.submit(session.id).unwrap().promoted);
+
+    // Upstream took integration as it is, then moved on, so integration no
+    // longer contains it and the promotion is judged.
+    sh(
+        tmp.path(),
+        &["switch", "-qc", "external-upstream", "aethyme/integration"],
+    );
+    std::fs::write(tmp.path().join("src/later.py"), "later = 1\n").unwrap();
+    sh(tmp.path(), &["add", "src/later.py"]);
+    sh(tmp.path(), &["commit", "-qm", "later upstream work"]);
+    sh(
+        tmp.path(),
+        &["update-ref", "refs/remotes/origin/main", "HEAD"],
+    );
+    sh(tmp.path(), &["switch", "main"]);
+
+    let dry_run = broker
+        .reconcile_integration(IntegrationReconcileOptions {
+            upstream: "origin/main".into(),
+            apply: false,
+            resolution_file: None,
+            confirm: None,
+        })
+        .unwrap();
+    assert_eq!(dry_run.entries.len(), 1, "{dry_run:#?}");
+    let entry = &dry_run.entries[0];
+    assert_eq!(
+        entry.classification,
+        IntegrationReconcileClassification::AlreadyLanded,
+        "{dry_run:#?}"
+    );
+    assert_eq!(
+        entry.evidence, "promoted merge commit is reachable from upstream",
+        "{dry_run:#?}"
+    );
+}
+
 #[test]
 fn reconcile_recognizes_squash_preserves_followups_and_replays_pending_work() {
     let tmp = tempfile::tempdir().unwrap();

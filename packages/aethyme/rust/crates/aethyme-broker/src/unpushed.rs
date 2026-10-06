@@ -121,11 +121,17 @@ pub struct UnpushedWorkReport {
     /// Integration commits upstream lacks, when there are any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub integration: Option<UnpublishedIntegrationWork>,
+    /// Live sessions whose checkouts the caller's time budget ran out
+    /// before reading (#460). Their unpushed work is unknown, not zero.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub not_inspected_sessions: Vec<i64>,
 }
 
 impl UnpushedWorkReport {
     pub fn is_empty(&self) -> bool {
-        self.sessions.is_empty() && self.integration.is_none()
+        self.sessions.is_empty()
+            && self.integration.is_none()
+            && self.not_inspected_sessions.is_empty()
     }
 }
 

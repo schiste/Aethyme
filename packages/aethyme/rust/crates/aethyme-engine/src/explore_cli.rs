@@ -258,7 +258,30 @@ fn print_graph_unavailable(
 }
 
 /// Print one answer document in the requested format.
+///
+/// An answer computed from a checkout behind the freshest local ref is
+/// marked as such (#232): one warning on stderr, a `source_staleness` object
+/// and a withdrawn `safe_to_use_as_answer`. A current checkout's output is
+/// unchanged byte for byte.
 fn emit<T: serde::Serialize>(
+    repo: &std::path::Path,
+    format: Format,
+    response: &T,
+) -> ExploreCliOutcome {
+    let Some(staleness) = crate::source_staleness::detect(repo) else {
+        return emit_document(repo, format, response);
+    };
+    eprintln!("{}", staleness.warning_line());
+    match serde_json::to_value(response) {
+        Ok(mut answer) => {
+            staleness.apply(&mut answer);
+            emit_document(repo, format, &answer)
+        }
+        Err(error) => ExploreCliOutcome::Failed(format!("serialize response: {error}")),
+    }
+}
+
+fn emit_document<T: serde::Serialize>(
     repo: &std::path::Path,
     format: Format,
     response: &T,
