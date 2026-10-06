@@ -239,6 +239,9 @@ impl crate::Broker {
         let fetch_note = self
             .fetch_default_branch(session_id, &default, None, &main_root)
             .err();
+        // The fetch just moved the default branch; a disposable integration
+        // follows it when it carries nothing of its own (#352).
+        self.refresh_disposable_integration(crate::IntegrationRefreshTrigger::Sync);
         let default_commit = self
             .repo_handle()
             .resolve_ref(&default.tracking_ref)

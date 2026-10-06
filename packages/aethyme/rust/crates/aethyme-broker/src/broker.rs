@@ -2662,6 +2662,41 @@ pub struct StatusAdvice {
 /// ancestry test (plus a count when it fails), so it runs on every status;
 /// the patch-level classification is added only when a refreshed status has
 /// already computed it.
+/// The `status` row for an integration branch this very call advanced (#352):
+/// the action the old `fast-forward-available` notice asked an operator for,
+/// reported as done.
+fn push_integration_refresh_advice(
+    view: &mut StatusView,
+    refresh: Option<crate::IntegrationRefresh>,
+) {
+    let Some(refresh) = refresh else {
+        return;
+    };
+    view.advice.insert(
+        0,
+        StatusAdvice {
+            id: "integration.refreshed",
+            severity: StatusAdviceSeverity::Notice,
+            reason: "a verify-only integration branch carried nothing of its own and had fallen behind",
+            summary: format!(
+                "{} advanced from {} to {} ({}): {}",
+                refresh.branch,
+                short_commit(&refresh.from),
+                short_commit(&refresh.to),
+                refresh.upstream_ref,
+                refresh.explanation
+            ),
+            session_id: None,
+            queue_entry_id: None,
+            evidence: vec![
+                format!("from: {}", short_commit(&refresh.from)),
+                format!("{}: {}", refresh.upstream_ref, short_commit(&refresh.to)),
+            ],
+            commands: Vec::new(),
+        },
+    );
+}
+
 fn leftover_integration_advice(
     repo: &GitRepo,
     integration_head: &str,
@@ -3965,6 +4000,10 @@ impl Broker {
         self.refuse_nested_worktree_path(&worktree_path)?;
         let branch = format!("agent/{slug}");
         let refresh = self.refresh_default_branch_before_start();
+        // Verify-only sessions start from the fetched default branch either
+        // way; advancing a disposable integration here keeps it from feeding
+        // a stale copy of main to this session's submit and finish (#352).
+        self.refresh_disposable_integration(crate::IntegrationRefreshTrigger::Start);
         let mut start_base = self.select_session_start_base(explicit_base)?;
         refresh.record(&mut start_base);
         let worktree = self
@@ -7072,12 +7111,15 @@ impl Broker {
     /// views, promoted/unmerged conflicts, the merge queue, and the
     /// integration branch head.
     pub fn status(&mut self, now_ms: i64) -> Result<StatusView, BrokerOpError> {
+        let integration_refresh =
+            self.refresh_disposable_integration(crate::IntegrationRefreshTrigger::Status);
         let started = std::time::Instant::now();
         let overlaps = self.refresh_leases()?;
         let leases_ms = started.elapsed().as_millis() as u64;
         let agents = self.agents(now_ms)?;
         let integration = self.integration_head()?;
         let mut view = self.build_status(agents, overlaps, integration, now_ms, true)?;
+        push_integration_refresh_advice(&mut view, integration_refresh);
         self.store.record_advisories_shown(
             &view.outstanding_advisories,
             crate::AdvisoryDeliverySurface::Status,
@@ -7221,6 +7263,8 @@ impl Broker {
     /// proves cleanup eligibility or reclassifies Git conflicts. Explicit
     /// refresh and all mutation paths still perform their own checks.
     pub fn status_current(&mut self, now_ms: i64) -> Result<StatusView, BrokerOpError> {
+        let integration_refresh =
+            self.refresh_disposable_integration(crate::IntegrationRefreshTrigger::Status);
         let started = std::time::Instant::now();
         let overlaps = self.lease_overlaps_snapshot()?;
         let leases_ms = started.elapsed().as_millis() as u64;
@@ -7229,6 +7273,7 @@ impl Broker {
         let sessions_ms = sessions_started.elapsed().as_millis() as u64;
         let integration = self.integration_head()?;
         let mut view = self.build_status(agents, overlaps, integration, now_ms, false)?;
+        push_integration_refresh_advice(&mut view, integration_refresh);
         self.store.record_advisories_shown(
             &view.outstanding_advisories,
             crate::AdvisoryDeliverySurface::Status,

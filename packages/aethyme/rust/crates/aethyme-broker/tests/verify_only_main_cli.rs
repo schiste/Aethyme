@@ -237,11 +237,36 @@ fn verify_only_submit_verifies_against_the_default_branch_and_catches_its_confli
         vec!["tracked.txt".to_string()],
         "the change merged on the provider conflicts with this session"
     );
+    // Integration is a disposable verification base here (#352): submit may
+    // advance it onto the fetched default branch it fell behind, but never
+    // promotes the session's own work into it.
+    let after = git_output(&fixture.repo, &["rev-parse", "aethyme/integration"]);
+    assert_ne!(after, integration, "the stale integration was refreshed");
     assert_eq!(
-        git_output(&fixture.repo, &["rev-parse", "aethyme/integration"]),
-        integration,
-        "a verify-only submit leaves integration untouched"
+        after,
+        git_output(&fixture.repo, &["rev-parse", "origin/main"]),
+        "a verify-only submit only moves integration onto the default branch"
     );
+    let session_head = git_output(
+        &fixture.repo,
+        &[
+            "rev-parse",
+            &format!("refs/heads/{}", outcome_branch(&fixture, session)),
+        ],
+    );
+    assert!(
+        !Command::new("git")
+            .args(["merge-base", "--is-ancestor", &session_head, &after])
+            .current_dir(&fixture.repo)
+            .status()
+            .unwrap()
+            .success(),
+        "the session's work is never promoted into integration"
+    );
+}
+
+fn outcome_branch(fixture: &Fixture, session: i64) -> String {
+    fixture.broker().store().session(session).unwrap().branch
 }
 
 #[test]
