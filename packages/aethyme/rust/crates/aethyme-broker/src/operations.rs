@@ -1926,6 +1926,9 @@ fn gh_method(args: &[String]) -> Option<&str> {
 pub fn classify_gh(args: &[String]) -> Option<OperationEffect> {
     let command = args.first()?.as_str();
     let action = args.get(1).map(String::as_str);
+    if gh_pr_branch_deletion_requested(args) {
+        return Some(OperationEffect::Destructive);
+    }
     if command == "api" {
         let method = gh_method(args).unwrap_or_else(|| {
             if has_any(args, &["-f", "--raw-field", "-F", "--field", "--input"]) {
@@ -1973,6 +1976,223 @@ pub fn classify_gh(args: &[String]) -> Option<OperationEffect> {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GhPrBranchDeletion {
+    selector: Option<String>,
+}
+
+fn gh_pr_branch_deletion_requested(args: &[String]) -> bool {
+    matches!(
+        (
+            args.first().map(String::as_str),
+            args.get(1).map(String::as_str)
+        ),
+        (Some("pr"), Some("merge" | "close"))
+    ) && args.iter().any(|arg| {
+        matches!(arg.as_str(), "-d" | "--delete-branch")
+            || arg.starts_with("--delete-branch=")
+            || arg.starts_with("-d=")
+    })
+}
+
+fn gh_pr_branch_delete_flag_error(reason: &str) -> BrokerOpError {
+    BrokerOpError::InvalidCoordinatedOperation {
+        reason: format!(
+            "cannot safely guard gh pr branch deletion ({reason}); no branch-deleting command was sent"
+        ),
+    }
+}
+
+/// Parse only the closed flag set for commands that can delete a PR head branch.
+/// An unknown flag could consume the apparent selector, so guessing here would
+/// authorize deletion of a different PR's branch.
+fn parse_gh_pr_branch_deletion(
+    args: &[String],
+) -> Result<Option<GhPrBranchDeletion>, BrokerOpError> {
+    if !gh_pr_branch_deletion_requested(args) {
+        return Ok(None);
+    }
+    let action = args
+        .get(1)
+        .filter(|_| args.first().is_some_and(|command| command == "pr"))
+        .map(String::as_str)
+        .ok_or_else(|| gh_pr_branch_delete_flag_error("the PR action is missing"))?;
+    let mut delete_branch = None;
+    let mut selector: Option<String> = None;
+    let mut index = 2;
+    while index < args.len() {
+        let arg = &args[index];
+        if arg == "--" {
+            return Err(gh_pr_branch_delete_flag_error(
+                "an option separator makes the PR selector ambiguous",
+            ));
+        }
+        let (name, inline_value) = arg
+            .split_once('=')
+            .map_or((arg.as_str(), None), |(name, value)| (name, Some(value)));
+        if matches!(name, "-d" | "--delete-branch") {
+            let enabled = match inline_value {
+                Some(value) if value.eq_ignore_ascii_case("true") => true,
+                Some(value) if value.eq_ignore_ascii_case("false") => false,
+                Some(_) => {
+                    return Err(gh_pr_branch_delete_flag_error(
+                        "--delete-branch must be a boolean",
+                    ));
+                }
+                None => true,
+            };
+            if delete_branch.replace(enabled).is_some() {
+                return Err(gh_pr_branch_delete_flag_error(
+                    "--delete-branch was specified more than once",
+                ));
+            }
+            index += 1;
+            continue;
+        }
+
+        let common_value = matches!(name, "-R" | "--repo" | "--hostname");
+        let action_value = match action {
+            "merge" => matches!(
+                name,
+                "-A" | "--author-email"
+                    | "-b"
+                    | "--body"
+                    | "-F"
+                    | "--body-file"
+                    | "--match-head-commit"
+                    | "-t"
+                    | "--subject"
+            ),
+            "close" => matches!(name, "-c" | "--comment"),
+            _ => false,
+        };
+        let common_boolean = matches!(name, "-h" | "--help");
+        let action_boolean = match action {
+            "merge" => matches!(
+                name,
+                "--admin"
+                    | "--auto"
+                    | "--disable-auto"
+                    | "-m"
+                    | "--merge"
+                    | "-r"
+                    | "--rebase"
+                    | "-s"
+                    | "--squash"
+            ),
+            "close" => matches!(name, "-w" | "--web" | "--yes"),
+            _ => false,
+        };
+        if common_value || action_value {
+            if inline_value.is_none() {
+                index += 1;
+                if index >= args.len() || args[index].starts_with('-') {
+                    return Err(gh_pr_branch_delete_flag_error(
+                        "a recognized value flag has no unambiguous value",
+                    ));
+                }
+            }
+            index += 1;
+            continue;
+        }
+        if common_boolean || action_boolean {
+            if let Some(value) = inline_value
+                && !value.eq_ignore_ascii_case("true")
+                && !value.eq_ignore_ascii_case("false")
+            {
+                return Err(gh_pr_branch_delete_flag_error(
+                    "a recognized boolean flag has an invalid value",
+                ));
+            }
+            index += 1;
+            continue;
+        }
+        if arg.starts_with('-') {
+            return Err(gh_pr_branch_delete_flag_error(
+                "an unrecognized flag makes the PR selector ambiguous",
+            ));
+        }
+        if selector.replace(arg.clone()).is_some() {
+            return Err(gh_pr_branch_delete_flag_error(
+                "more than one PR selector was supplied",
+            ));
+        }
+        index += 1;
+    }
+
+    if delete_branch == Some(true) {
+        Ok(Some(GhPrBranchDeletion { selector }))
+    } else {
+        Ok(None)
+    }
+}
+
+fn gh_pr_head_branch_from_json(
+    json: &[u8],
+    target_repository: &str,
+) -> Result<Option<String>, String> {
+    let value: serde_json::Value =
+        serde_json::from_slice(json).map_err(|_| "GitHub returned malformed JSON".to_string())?;
+    let branch = value
+        .get("headRefName")
+        .and_then(serde_json::Value::as_str)
+        .filter(|branch| !branch.is_empty())
+        .ok_or_else(|| "GitHub omitted the PR head branch".to_string())?;
+    let repository = value
+        .get("headRepository")
+        .and_then(|repository| repository.get("nameWithOwner"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|repository| !repository.is_empty())
+        .ok_or_else(|| "GitHub omitted the PR head repository".to_string())?;
+    if repository.eq_ignore_ascii_case(target_repository) {
+        let branch = branch.strip_prefix("refs/heads/").unwrap_or(branch);
+        if branch.is_empty() {
+            return Err("GitHub returned an empty PR head branch".into());
+        }
+        Ok(Some(branch.to_string()))
+    } else {
+        // A fork's head ref is a different remote branch, even when its name
+        // happens to match a local broker session branch.
+        Ok(None)
+    }
+}
+
+fn gh_pr_branch_deletion_targets(
+    args: &[String],
+    target: Option<&crate::ResolvedGithubTarget>,
+    cwd: &Path,
+) -> Result<Vec<String>, BrokerOpError> {
+    let Some(deletion) = parse_gh_pr_branch_deletion(args)? else {
+        return Ok(Vec::new());
+    };
+    let target = target
+        .ok_or_else(|| gh_pr_branch_delete_flag_error("the target repository was not resolved"))?;
+    let mut command = provider_command(OperationProvider::Github);
+    command.args(["pr", "view"]);
+    if let Some(selector) = &deletion.selector {
+        command.arg(selector);
+    }
+    command
+        .args(["--json", "headRefName,headRepository"])
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .env("GH_REPO", &target.display_slug);
+    let output =
+        crate::bounded_output::output_within(&mut command, std::time::Duration::from_secs(5))
+            .map_err(|_| gh_pr_branch_delete_flag_error("the read-only PR lookup could not start"))?
+            .ok_or_else(|| gh_pr_branch_delete_flag_error("the read-only PR lookup timed out"))?;
+    if !output.status.success() {
+        return Err(gh_pr_branch_delete_flag_error(
+            "the read-only PR lookup failed",
+        ));
+    }
+    let branch = gh_pr_head_branch_from_json(&output.stdout, &target.display_slug)
+        .map_err(|reason| gh_pr_branch_delete_flag_error(&reason))?;
+    Ok(branch.into_iter().collect())
+}
+
 /// `gh` flags that consume the following argument, so a positional scan does
 /// not mistake a flag's value for the command's own operand.
 const GH_VALUE_FLAGS: &[&str] = &[
@@ -1991,9 +2211,16 @@ const GH_VALUE_FLAGS: &[&str] = &[
     "--input",
     "--hostname",
     "--cache",
+    "-A",
+    "--author-email",
     "-b",
     "--body",
+    "-F",
     "--body-file",
+    "-t",
+    "--subject",
+    "-c",
+    "--comment",
     "-R",
     "--repo",
     "--title",
@@ -3694,6 +3921,7 @@ impl Broker {
         &mut self,
         request: &CoordinatedCommand,
         effect: OperationEffect,
+        implicit_branch_targets: &[String],
     ) -> Result<Option<i64>, BrokerOpError> {
         if effect != OperationEffect::Destructive {
             return match request.cross_session {
@@ -3703,7 +3931,10 @@ impl Broker {
                 None => Ok(None),
             };
         }
-        let targets = destructive_branch_targets(request.provider, &request.args);
+        let mut targets = destructive_branch_targets(request.provider, &request.args);
+        targets.extend(implicit_branch_targets.iter().cloned());
+        targets.sort();
+        targets.dedup();
         let owners: Vec<crate::Session> = if targets.is_empty() {
             Vec::new()
         } else {
@@ -3811,10 +4042,15 @@ impl Broker {
                     .into(),
             });
         }
+        let implicit_branch_targets =
+            gh_pr_branch_deletion_targets(&request.args, github_target.as_ref(), cwd)?;
+
         // A session id is all a caller needs to name a session, so it proves
         // nothing about whose branch is being deleted or rewritten. Before
         // anything is journaled: the refusal leaves no operation behind (#393).
-        if let Some(owner) = self.refuse_foreign_session_branches(&request, effect)? {
+        if let Some(owner) =
+            self.refuse_foreign_session_branches(&request, effect, &implicit_branch_targets)?
+        {
             // Recorded with the authorization, so the journal says which
             // session's branch this operation was allowed to touch.
             authorization_reason =
@@ -5223,6 +5459,7 @@ mod tests {
             finished_at: None,
             host_operation_id: None,
             identity_provenance: OperationIdentityProvenance::VerifiedCanonical,
+            agent_provenance: None,
         }
     }
 
@@ -5999,5 +6236,81 @@ mod tests {
                 .collect::<Vec<_>>(),
         );
         assert_eq!(gh, ["agent/a"]);
+    }
+
+    #[test]
+    fn gh_pr_branch_deletion_requires_destructive_classification() {
+        for command in [
+            args(&["pr", "merge", "42", "--delete-branch"]),
+            args(&["pr", "merge", "-d"]),
+            args(&["pr", "close", "42", "-d"]),
+            args(&["pr", "merge", "--delete-branch=true"]),
+        ] {
+            assert_eq!(classify_gh(&command), Some(OperationEffect::Destructive));
+        }
+        assert_eq!(
+            classify_gh(&args(&["pr", "merge", "42", "--squash"])),
+            Some(OperationEffect::Write)
+        );
+    }
+
+    #[test]
+    fn gh_pr_branch_deletion_parser_fails_closed_on_ambiguous_flags() {
+        let parsed = parse_gh_pr_branch_deletion(&args(&[
+            "pr",
+            "merge",
+            "--body",
+            "subject",
+            "--auto",
+            "42",
+            "--delete-branch",
+        ]))
+        .unwrap()
+        .unwrap();
+        assert_eq!(parsed.selector.as_deref(), Some("42"));
+
+        let no_selector =
+            parse_gh_pr_branch_deletion(&args(&["pr", "merge", "--delete-branch"])).unwrap();
+        assert_eq!(no_selector.unwrap().selector, None);
+
+        for command in [
+            args(&["pr", "merge", "--unknown", "42", "--delete-branch"]),
+            args(&["pr", "merge", "--body", "--delete-branch"]),
+            args(&["pr", "merge", "42", "43", "--delete-branch"]),
+            args(&["pr", "merge", "--delete-branch=perhaps"]),
+        ] {
+            assert!(
+                parse_gh_pr_branch_deletion(&command).is_err(),
+                "{command:?}"
+            );
+        }
+        assert!(
+            parse_gh_pr_branch_deletion(&args(&["pr", "merge", "42", "--squash"]))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn gh_pr_head_ref_is_accepted_only_for_the_selected_repository() {
+        let same_repo =
+            br#"{"headRefName":"agent/other","headRepository":{"nameWithOwner":"OWNER/REPO"}}"#;
+        assert_eq!(
+            gh_pr_head_branch_from_json(same_repo, "owner/repo").unwrap(),
+            Some("agent/other".into())
+        );
+        let fork =
+            br#"{"headRefName":"agent/other","headRepository":{"nameWithOwner":"fork/repo"}}"#;
+        assert_eq!(
+            gh_pr_head_branch_from_json(fork, "owner/repo").unwrap(),
+            None
+        );
+        for malformed in [
+            &b"not json"[..],
+            &br#"{"headRepository":{"nameWithOwner":"owner/repo"}}"#[..],
+            &br#"{"headRefName":"agent/other","headRepository":null}"#[..],
+        ] {
+            assert!(gh_pr_head_branch_from_json(malformed, "owner/repo").is_err());
+        }
     }
 }

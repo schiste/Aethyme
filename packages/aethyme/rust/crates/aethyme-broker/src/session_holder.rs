@@ -18,6 +18,7 @@
 //! anyway.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::process::Command;
 
 /// Environment override for the caller's agent process: a pid, or `0`/`none`
@@ -217,8 +218,49 @@ pub enum HolderCheck {
     Unidentified,
 }
 
-/// The session's current holder, from its latest `session.holder_bound` event.
-/// `None` when it never had one, or retention pruned the record: the next
+/// A compact process identity for local operation history; never the full command line.
+fn operation_agent_identity(process: &AgentProcess) -> serde_json::Value {
+    let program = process
+        .command
+        .split_whitespace()
+        .next()
+        .and_then(|command| Path::new(command).file_name())
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("unknown")
+        .to_string();
+    serde_json::json!({
+        "pid": process.pid,
+        "started": process.started,
+        "program": program,
+    })
+}
+
+/// Snapshot local process provenance for one coordinated-operation journal row.
+/// Only the executable basename is retained from a process command line.
+pub(crate) fn operation_agent_provenance(
+    store: &crate::BrokerStore,
+    session_id: i64,
+) -> Result<serde_json::Value, crate::BrokerError> {
+    let session = store.session(session_id)?;
+    let caller = match caller() {
+        Caller::Agent(process) => Some(operation_agent_identity(&process)),
+        Caller::Unidentified => None,
+    };
+    let holder = store
+        .latest_session_holder_event(session_id)?
+        .and_then(|event| event.payload_json)
+        .and_then(|payload| serde_json::from_str::<AgentProcess>(&payload).ok())
+        .map(|process| operation_agent_identity(&process));
+    Ok(serde_json::json!({
+        "schema_version": 1,
+        "caller": caller,
+        "holder": holder,
+        "session_agent_identity": session.agent_identity,
+    }))
+}
+/// The session's current holder, from its latest holder-bound event.
+/// If it never had one, or retention pruned the record, the next
 /// identified caller then binds, so a lost record fails open.
 pub fn recorded_holder(
     store: &crate::BrokerStore,
@@ -508,6 +550,20 @@ mod tests {
  2100  2023 Fri Oct  2 15:31:00 2026     /bin/bash -lc git status
  3000     1 Fri Oct  2 15:40:00 2026     /usr/bin/nohup zsh queue.sh
 ";
+
+    #[test]
+    fn operation_provenance_keeps_only_the_agent_program_name() {
+        let identity = operation_agent_identity(&AgentProcess {
+            pid: 42,
+            started: "Mon Oct 5 12:34:56 2026".into(),
+            command: "/usr/local/bin/codex --token secret-value".into(),
+        });
+        assert_eq!(identity["pid"], 42);
+        assert_eq!(identity["program"], "codex");
+        let json = identity.to_string();
+        assert!(!json.contains("secret-value"), "{json}");
+        assert!(!json.contains("--token"), "{json}");
+    }
 
     #[test]
     fn the_caller_is_the_nearest_agent_ancestor() {

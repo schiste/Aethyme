@@ -25,7 +25,7 @@ use rusqlite::Connection;
 use crate::error::BrokerError;
 
 /// Current database schema version (== `MIGRATIONS.len()`).
-pub const SCHEMA_VERSION: i64 = 47;
+pub const SCHEMA_VERSION: i64 = 48;
 
 /// The oldest schema version whose binaries can safely use a database at
 /// [`SCHEMA_VERSION`]. Before this existed every newer database locked out
@@ -51,6 +51,9 @@ pub const SCHEMA_VERSION: i64 = 47;
 ///   is refused by the trigger below, so it could never clear it. The
 ///   migration fences already-open v46 writers with that DELETE trigger, and
 ///   records the new floor in the same transaction as the v47 schema marker.
+/// - v48 adds nullable local operation provenance. A v47 writer names its
+///   existing columns and can continue writing; a v47 reader safely ignores
+///   the additional field.
 pub const MIN_COMPATIBLE_SCHEMA: i64 = 47;
 
 /// Whether this binary may use a database at `found`, a version newer than
@@ -1523,6 +1526,12 @@ SELECT 'gate_results', MAX(
 )
 WHERE NOT EXISTS (SELECT 1 FROM sqlite_sequence WHERE name = 'gate_results');
 ";
+const MIGRATION_V48: &str = "
+-- Keep coordinated-operation caller/holder provenance local and nullable so
+-- older compatible writers may continue to create history rows.
+ALTER TABLE coordinated_operations ADD COLUMN agent_provenance_json TEXT;
+";
+
 const MIGRATIONS: &[&str] = &[
     MIGRATION_V1,
     MIGRATION_V2,
@@ -1571,6 +1580,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_V45,
     MIGRATION_V46,
     MIGRATION_V47,
+    MIGRATION_V48,
 ];
 
 pub(crate) fn current_version(conn: &Connection) -> Result<i64, BrokerError> {
@@ -1999,15 +2009,24 @@ mod tests {
     }
 
     #[test]
-    fn v47_requires_a_v47_reader_to_preserve_cleared_gate_history() {
-        assert_eq!(SCHEMA_VERSION, 47);
+    fn v48_adds_agent_provenance_without_raising_the_compatibility_floor() {
+        assert_eq!(SCHEMA_VERSION, 48);
         assert_eq!(MIN_COMPATIBLE_SCHEMA, 47);
 
         let conn = migrated();
-        assert_eq!(current_version(&conn).unwrap(), 47);
-        assert!(schema_is_compatible_with(&conn, 47, 47).unwrap());
-        assert!(!schema_is_compatible_with(&conn, 47, 46).unwrap());
-        assert!(!schema_is_compatible_with(&conn, 47, 42).unwrap());
+        assert_eq!(current_version(&conn).unwrap(), 48);
+        assert!(schema_is_compatible_with(&conn, 48, 47).unwrap());
+        assert!(!schema_is_compatible_with(&conn, 48, 46).unwrap());
+
+        let nullable: i64 = conn
+            .query_row(
+                r#"SELECT "notnull" FROM pragma_table_info('coordinated_operations')
+                   WHERE name = 'agent_provenance_json'"#,
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(nullable, 0);
     }
 
     #[test]
