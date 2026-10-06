@@ -186,6 +186,9 @@ host's reported worktrees:
       "path": "...",
       "branch": "...",
       "bytes": 0,
+      "inodes": 0,
+      "size": "measured",
+      "size_measured_at_ms": 0,
       "idle_days": 0,
       "state": "recoverable",
       "live": false,
@@ -202,10 +205,22 @@ host's reported worktrees:
     }
   ],
   "total_bytes": 0,
+  "total_inodes": 0,
   "unique_work_bytes": 0,
-  "unique_work_count": 0
+  "unique_work_inodes": 0,
+  "unique_work_count": 0,
+  "size_scan": "bounded",
+  "unmeasured_count": 0
 }
 ```
+
+Sizing is bounded by default (#559). A row's `size` says where `bytes` and
+`inodes` came from: `measured` (walked by this report), `recorded` (the
+repository's `.aethyme/worktree-sizes.json`; `size_measured_at_ms` gives its
+age), or `unmeasured` (not walked within the 10 s budget; `bytes` and `inodes`
+are 0 and mean nothing). While `unmeasured_count` is non-zero the totals are
+floors. `size_scan` is `measure` under `--measure`, which walks every checkout
+and never reports `unmeasured`. Work classification (`state`) always completes.
 
 `branch`, `idle_days`, and optional strings inside `git` are omitted when
 unknown. `state` is flattened into each row: `uncommitted` carries `files`,

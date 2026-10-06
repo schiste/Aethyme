@@ -4736,7 +4736,14 @@ impl Broker {
     /// one directory per session, but some roots *are* a checkout. Keying on
     /// depth descends into those and reports each of their source directories
     /// as a worktree, every one inheriting the parent's git state.
-    pub fn worktree_report(&mut self) -> Result<crate::WorktreeReport, BrokerOpError> {
+    ///
+    /// Sizing follows `sizing`: [`crate::WorktreeSizing::Bounded`] reuses each
+    /// repository's recorded measurements and walks the rest only until its
+    /// deadline, so a host with hundreds of checkouts still answers (#559).
+    pub fn worktree_report(
+        &mut self,
+        sizing: crate::WorktreeSizing,
+    ) -> Result<crate::WorktreeReport, BrokerOpError> {
         fn is_checkout(path: &std::path::Path) -> bool {
             path.join(".git").exists()
         }
@@ -4796,7 +4803,7 @@ impl Broker {
             .into_iter()
             .map(|(path, label)| (label, path))
             .collect();
-        let mut report = crate::build_worktree_report(&worktrees, &live);
+        let mut report = crate::build_worktree_report_with(&worktrees, &live, sizing);
         let registrations = self.repo.worktree_inventory()?;
         crate::append_prunable_registrations(
             &mut report,

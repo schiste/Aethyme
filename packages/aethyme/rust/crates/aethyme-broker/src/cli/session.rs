@@ -744,6 +744,14 @@ pub(super) fn render_worktree_report(report: &crate::WorktreeReport) {
     if report.unique_work_count > 0 {
         out!("No cleanup can reclaim those; each needs a push-or-discard decision.");
     }
+    if report.unmeasured_count > 0 {
+        out!(
+            "Sizes are floors: {} worktree(s) were not measured within the {} s budget. \
+             `aethyme broker advanced worktrees --measure` walks every one.",
+            report.unmeasured_count,
+            crate::WORKTREE_REPORT_SIZE_BUDGET.as_secs()
+        );
+    }
     out!();
     for row in &report.rows {
         let state = match &row.work {
@@ -789,7 +797,10 @@ pub(super) fn render_worktree_report(report: &crate::WorktreeReport) {
         out!(
             "  {:<22} {:>9}  {:<26} {:<10} {}{}{}",
             truncate(&row.repository, 22),
-            human_bytes(row.bytes),
+            match row.size {
+                crate::SizeSource::Unmeasured => "?".to_string(),
+                _ => human_bytes(row.bytes),
+            },
             state,
             idle,
             row.branch.as_deref().unwrap_or("-"),
@@ -1407,7 +1418,14 @@ pub(super) fn run_close(parsed: Parsed) -> Result<(), UsageError> {
 /// `broker worktrees`.
 pub(super) fn run_worktrees(parsed: Parsed) -> Result<(), UsageError> {
     let mut broker = open_broker(parsed.read_only_snapshot)?;
-    let report = broker.worktree_report()?;
+    let sizing = if parsed.measure {
+        crate::WorktreeSizing::Measure
+    } else {
+        crate::WorktreeSizing::Bounded {
+            budget: crate::WORKTREE_REPORT_SIZE_BUDGET,
+        }
+    };
+    let report = broker.worktree_report(sizing)?;
     if parsed.json {
         out!("{}", serde_json::to_string_pretty(&report)?);
     } else {
