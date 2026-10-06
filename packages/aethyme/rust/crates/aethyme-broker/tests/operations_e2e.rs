@@ -144,6 +144,25 @@ fn write_executable(path: &Path, contents: &str) {
     std::fs::set_permissions(path, permissions).unwrap();
 }
 
+#[cfg(unix)]
+fn install_pre_push_hook(repo: &Path, contents: &str) {
+    let hooks = repo.join(".aethyme/test-hooks");
+    std::fs::create_dir_all(&hooks).unwrap();
+    let hooks = hooks.canonicalize().unwrap();
+    let output = Command::new("git")
+        .args(["config", "--local", "core.hooksPath"])
+        .arg(&hooks)
+        .current_dir(repo)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git config core.hooksPath: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    write_executable(&hooks.join("pre-push"), contents);
+}
+
 fn github_request(session_id: i64, repository: &str, args: &[&str]) -> CoordinatedCommand {
     CoordinatedCommand {
         session_id,
@@ -700,7 +719,7 @@ fn exact_rejected_push_is_failed_when_every_destination_remains_at_its_base() {
     let proposed = commit_push_fixture(&fixture, "rejected\n");
     write_executable(
         &fixture.remote.join("hooks/pre-receive"),
-        "#!/bin/sh\nprintf 'push succeeded according to stderr\\n' >&2\nexit 1\n",
+        "#!/bin/sh\nprintf 'push failed according to stderr\\nTOKEN=ghp_push_secret_not_real\\n' >&2\nexit 1\n",
     );
 
     let report = fixture
@@ -714,9 +733,22 @@ fn exact_rejected_push_is_failed_when_every_destination_remains_at_its_base() {
     assert!(!report.command_success);
     assert!(!report.ok());
     assert_eq!(report.operation.status, OperationStatus::Failed);
-    assert!(report.stderr.contains("push succeeded according to stderr"));
+    assert!(report.stderr.contains("push failed according to stderr"));
     let details: serde_json::Value =
         serde_json::from_str(report.operation.details_json.as_deref().unwrap()).unwrap();
+    let persisted_stderr = &details["failure_output"]["stderr_tail"];
+    assert!(
+        persisted_stderr
+            .as_array()
+            .is_some_and(|tail| tail.iter().any(|line| {
+                line.as_str() == Some("remote: push failed according to stderr")
+            })),
+        "failed coordinated pushes must preserve an actionable stderr tail: {details}"
+    );
+    assert!(
+        !details.to_string().contains("ghp_push_secret_not_real"),
+        "failure details must redact provider stderr: {details}"
+    );
     let reconciliation = &details["push_reconciliation"];
     assert_eq!(reconciliation["planning"], "planned");
     assert_eq!(
@@ -765,9 +797,8 @@ fn local_pre_push_rejection_records_that_the_remote_was_not_contacted() {
     let mut fixture = push_fixture(tmp.path(), "push-local-hook");
     let base = git_output(&fixture.remote, &["rev-parse", "refs/heads/main"]);
     let proposed = commit_push_fixture(&fixture, "local hook rejected\n");
-    let hooks = git_output(&fixture.worktree, &["rev-parse", "--git-path", "hooks"]);
-    write_executable(
-        &Path::new(&hooks).join("pre-push"),
+    install_pre_push_hook(
+        &fixture.worktree,
         "#!/bin/sh\nprintf 'local pre-push hook rejected\\n' >&2\nexit 1\n",
     );
 
@@ -1317,14 +1348,39 @@ fn enable_hooks_outside_lock(repo: &Path) {
 /// session waits on a gate that was going to refuse anyway.
 #[cfg(unix)]
 #[test]
+fn inline_git_config_cannot_bypass_opted_in_pre_push_refusal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let hostile_hooks_path = tmp.path().join("hostile-hooks");
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "an_opted_in_pre_push_refusal_stops_before_the_lock",
+            "--exact",
+            "--nocapture",
+        ])
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "core.hooksPath")
+        .env("GIT_CONFIG_VALUE_0", hostile_hooks_path)
+        .env_remove("GIT_CONFIG_PARAMETERS")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "the pre-push hook must still refuse when command-scope Git config overrides core.hooksPath; stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn an_opted_in_pre_push_refusal_stops_before_the_lock() {
     let tmp = tempfile::tempdir().unwrap();
     let mut fixture = push_fixture(tmp.path(), "hooks-outside");
     let repo = fixture.broker.main_root().to_path_buf();
     enable_hooks_outside_lock(&repo);
-    write_executable(
-        &repo.join(".git/hooks/pre-push"),
-        "#!/bin/sh\nprintf 'gate refused\\n' >&2\nexit 1\n",
+    install_pre_push_hook(
+        &repo,
+        "#!/bin/sh\nprintf 'gate refused\\nTO\\230x\\234KEN=prelock-c1-secret\\nTO\u{e0100}KEN=prelock-variation-secret\\nTO\\nKEN=ansi-newline-secret\\nBearer\u{200b}prelock-bearer-secret\\n' >&2\nexit 1\n",
     );
     commit_push_fixture(&fixture, "work\n");
 
@@ -1345,6 +1401,79 @@ fn an_opted_in_pre_push_refusal_stops_before_the_lock() {
         rendered.contains("gate refused"),
         "the hook's own output must survive: {rendered}"
     );
+    assert!(!rendered.contains("ansi-newline-secret"));
+    assert!(!rendered.contains("prelock-c1-secret"));
+    assert!(!rendered.contains("prelock-variation-secret"));
+    assert!(!rendered.contains("prelock-bearer-secret"));
+    let operation = fixture
+        .broker
+        .store()
+        .coordinated_operations()
+        .unwrap()
+        .pop()
+        .expect("the pre-push refusal remains in operation history");
+    let details: serde_json::Value =
+        serde_json::from_str(operation.details_json.as_deref().unwrap()).unwrap();
+    assert!(
+        details["failure_output"]["stderr_tail"]
+            .as_array()
+            .is_some_and(|tail| tail
+                .iter()
+                .any(|line| line.as_str() == Some("gate refused"))),
+        "the pre-lock history must retain the hook's stderr: {details}"
+    );
+    let details_text = details.to_string();
+    assert!(!details_text.contains("ansi-newline-secret"));
+    assert!(!details_text.contains("prelock-c1-secret"));
+    assert!(!details_text.contains("prelock-variation-secret"));
+    assert!(!details_text.contains("prelock-bearer-secret"));
+}
+
+/// The durable operation row must retain the local hook's actionable stderr,
+/// not just the provider exit code and remote-contact classification.
+#[cfg(unix)]
+#[test]
+fn a_local_pre_push_failure_is_preserved_in_operation_details() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut fixture = push_fixture(tmp.path(), "hook-stderr-details");
+    let repo = fixture.broker.main_root().to_path_buf();
+    install_pre_push_hook(
+        &repo,
+        "#!/bin/sh\nprintf 'local gate refused: missing generated fixture\\nTO\\230x\\234KEN=ansi-c1-sos-secret\\nTOKEN=ghp_example_secret_not_real\\n' >&2\nexit 1\n",
+    );
+    commit_push_fixture(&fixture, "work\n");
+
+    let report = fixture
+        .broker
+        .run_coordinated_operation(exact_push_request(
+            fixture.session_id,
+            &fixture.worktree,
+            &["HEAD:refs/heads/main"],
+        ))
+        .expect("a provider refusal is a recorded operation outcome");
+    assert!(!report.ok(), "the failing local hook must refuse the push");
+    let shown = fixture
+        .broker
+        .show_coordinated_operation(report.operation.id)
+        .expect("operation history can be read back");
+    let details_text = shown.operation.details_json.as_deref().unwrap();
+    assert!(!details_text.contains("ansi-c1-sos-secret"));
+    assert!(!details_text.contains("ghp_example_secret_not_real"));
+    let details: serde_json::Value = serde_json::from_str(details_text).unwrap();
+    let stderr_tail = details["failure_output"]["stderr_tail"]
+        .as_array()
+        .expect("the operation history includes a bounded stderr tail");
+    assert!(
+        stderr_tail
+            .iter()
+            .any(|line| line.as_str() == Some("local gate refused: missing generated fixture")),
+        "the actionable hook diagnostic must survive: {stderr_tail:?}"
+    );
+    assert!(stderr_tail.len() <= 12);
+    assert!(stderr_tail.iter().all(|line| {
+        line.as_str()
+            .is_some_and(|line| line.chars().count() <= 257)
+    }));
 }
 
 /// The complete queue timeout includes preparation before the repository lock.
@@ -1357,10 +1486,7 @@ fn a_slow_pre_lock_hook_exhausts_the_queue_timeout_and_settles_the_row() {
     let mut fixture = push_fixture(tmp.path(), "hooks-timeout");
     let repo = fixture.broker.main_root().to_path_buf();
     enable_hooks_outside_lock(&repo);
-    write_executable(
-        &repo.join(".git/hooks/pre-push"),
-        "#!/bin/sh\nsleep 5\nexit 0\n",
-    );
+    install_pre_push_hook(&repo, "#!/bin/sh\nsleep 5\nexit 0\n");
     commit_push_fixture(&fixture, "pre-lock timeout\n");
 
     let started = Instant::now();
@@ -1410,8 +1536,8 @@ fn an_opted_in_push_runs_its_hook_once_and_succeeds() {
     let repo = fixture.broker.main_root().to_path_buf();
     enable_hooks_outside_lock(&repo);
     let counter = tmp.path().join("hook-runs");
-    write_executable(
-        &repo.join(".git/hooks/pre-push"),
+    install_pre_push_hook(
+        &repo,
         &format!("#!/bin/sh\nprintf 'x' >> {}\nexit 0\n", counter.display()),
     );
     let head = commit_push_fixture(&fixture, "work\n");
@@ -1446,8 +1572,8 @@ fn without_opting_in_the_hook_still_runs_inside_the_push() {
     let mut fixture = push_fixture(tmp.path(), "hooks-default");
     let repo = fixture.broker.main_root().to_path_buf();
     let counter = tmp.path().join("hook-runs");
-    write_executable(
-        &repo.join(".git/hooks/pre-push"),
+    install_pre_push_hook(
+        &repo,
         &format!("#!/bin/sh\nprintf 'x' >> {}\nexit 0\n", counter.display()),
     );
     commit_push_fixture(&fixture, "work\n");

@@ -12,8 +12,9 @@
 /// so `disk-space` or `task-text` do not read as an `sk-` key.
 const VALUE_PREFIXES: &[&str] = &["ghp_", "gho_", "ghs_", "ghu_", "ghr_", "github_pat_", "sk-"];
 
-/// Keys whose value follows them. Matched case-insensitively anywhere, so
-/// `GITHUB_TOKEN=` and `Authorization:` are both caught.
+/// Keys whose value follows them. Matched case-insensitively anywhere; the
+/// assignment markers are also searched with separators removed so whitespace
+/// or invisible formatting cannot split a credential key.
 const ASSIGNMENT_MARKERS: &[&str] = &[
     "bearer ",
     "token=",
@@ -65,7 +66,100 @@ fn earliest_secret(text: &str) -> Option<usize> {
             .map(|(index, _)| index)
             .filter(|&index| at_token_boundary(text, index))
     });
-    assignment.chain(value).min()
+    let (compact, source_offsets) = compact_marker_separators(text);
+    let split_assignment = ASSIGNMENT_MARKERS.iter().flat_map(|marker| {
+        let normalized_marker: String = marker
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .map(|character| character.to_ascii_lowercase())
+            .collect();
+        compact
+            .match_indices(&normalized_marker)
+            .filter_map(|(index, _)| {
+                let marker_end = index + normalized_marker.len();
+                if marker.ends_with(' ') {
+                    let source_end = source_offsets.get(marker_end - 1).copied()? + 1;
+                    let source_after = source_offsets
+                        .get(marker_end)
+                        .copied()
+                        .unwrap_or(text.len());
+                    if !text
+                        .get(source_end..source_after)?
+                        .chars()
+                        .any(is_marker_separator)
+                    {
+                        return None;
+                    }
+                }
+                source_offsets.get(index).copied()
+            })
+            .collect::<Vec<_>>()
+    });
+    let split_value = VALUE_PREFIXES.iter().flat_map(|prefix| {
+        compact
+            .match_indices(prefix)
+            .filter_map(|(index, _)| {
+                source_offsets
+                    .get(index)
+                    .copied()
+                    .filter(|&index| at_token_boundary(text, index))
+            })
+            .collect::<Vec<_>>()
+    });
+    assignment
+        .chain(split_assignment)
+        .chain(value)
+        .chain(split_value)
+        .min()
+}
+
+// Unicode 18.0.0 DerivedCoreProperties.txt Default_Ignorable_Code_Point.
+// This property has no stability guarantee; update the ranges and test count
+// when adopting a newer Unicode data release.
+const DEFAULT_IGNORABLE_CODE_POINT_RANGES: &[(u32, u32)] = &[
+    (0x00ad, 0x00ad),
+    (0x034f, 0x034f),
+    (0x061c, 0x061c),
+    (0x115f, 0x1160),
+    (0x17b4, 0x17b5),
+    (0x180b, 0x180f),
+    (0x200b, 0x200f),
+    (0x202a, 0x202e),
+    (0x2060, 0x206f),
+    (0x3164, 0x3164),
+    (0xfe00, 0xfe0f),
+    (0xfeff, 0xfeff),
+    (0xffa0, 0xffa0),
+    (0xfff0, 0xfff8),
+    (0x1bca0, 0x1bca3),
+    (0x1d173, 0x1d17a),
+    (0xe0000, 0xe0fff),
+];
+
+fn is_marker_separator(character: char) -> bool {
+    let code_point = u32::from(character);
+    character.is_whitespace()
+        || character.is_control()
+        || DEFAULT_IGNORABLE_CODE_POINT_RANGES
+            .iter()
+            .any(|&(start, end)| (start..=end).contains(&code_point))
+}
+
+/// Remove whitespace and invisible formatting for conservative marker
+/// detection while retaining each normalized byte's position in the original
+/// text, so redaction can cut at the beginning of a split marker.
+fn compact_marker_separators(text: &str) -> (String, Vec<usize>) {
+    let mut compact = String::with_capacity(text.len());
+    let mut source_offsets = Vec::with_capacity(text.len());
+    for (byte_offset, character) in text.char_indices() {
+        if is_marker_separator(character) {
+            continue;
+        }
+        let normalized = character.to_ascii_lowercase();
+        compact.push(normalized);
+        source_offsets.extend(std::iter::repeat_n(byte_offset, normalized.len_utf8()));
+    }
+    (compact, source_offsets)
 }
 
 fn at_token_boundary(text: &str, index: usize) -> bool {
@@ -132,6 +226,65 @@ mod tests {
     fn ordinary_words_containing_a_prefix_survive() {
         let text = "disk-space low; task-text unchanged; risk-free";
         assert_eq!(redact_secrets(text), text);
+    }
+
+    #[test]
+    fn credential_markers_split_by_whitespace_are_redacted() {
+        assert_eq!(
+            redact_secrets("pre\nTO\nKEN=split-newline-secret"),
+            "pre\n[redacted]"
+        );
+        assert_eq!(
+            redact_secrets("pre: g\nhp_split-prefix-secret"),
+            "pre: [redacted]"
+        );
+        assert_eq!(
+            redact_secrets("pre: BEA\nRER split-bearer-secret"),
+            "pre: [redacted]"
+        );
+        assert_eq!(
+            redact_secrets("pre: Bearer\u{200b}invisible-separator-secret"),
+            "pre: [redacted]"
+        );
+        assert_eq!(
+            redact_secrets("pre: bearerless; BEA\nRER split-bearer-secret"),
+            "pre: bearerless; [redacted]"
+        );
+        assert_eq!(
+            redact_secrets("disk-space before s\nk-split-value-secret"),
+            "disk-space before [redacted]"
+        );
+        for (separator, secret) in [
+            ('\u{180b}', "mongolian-selector"),
+            ('\u{e0000}', "tag-plane"),
+            ('\u{e0100}', "supplementary-selector-start"),
+            ('\u{e01ef}', "supplementary-selector-end"),
+        ] {
+            let input = format!("pre: TO{separator}KEN={secret}");
+            assert_eq!(redact_secrets(&input), "pre: [redacted]", "{secret}");
+        }
+    }
+
+    #[test]
+    fn unicode_18_default_ignorables_cannot_hide_credential_markers() {
+        let code_point_count: u32 = DEFAULT_IGNORABLE_CODE_POINT_RANGES
+            .iter()
+            .map(|&(start, end)| end - start + 1)
+            .sum();
+        assert_eq!(code_point_count, 4_174);
+
+        for &(start, end) in DEFAULT_IGNORABLE_CODE_POINT_RANGES {
+            for code_point in start..=end {
+                let separator = char::from_u32(code_point)
+                    .expect("the Unicode property ranges contain only scalar values");
+                let input = format!("TO{separator}KEN=unicode-hidden-secret");
+                assert_eq!(
+                    redact_secrets(&input),
+                    "[redacted]",
+                    "U+{code_point:04X} must not split a credential marker"
+                );
+            }
+        }
     }
 
     #[test]
