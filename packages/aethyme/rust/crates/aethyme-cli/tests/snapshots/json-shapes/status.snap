@@ -116,6 +116,21 @@
   ],
   "integration_branch": "string",
   "integration_head": "string",
+  "lease_liveness": [
+    {
+      "kind": "string",
+      "lease_id": "integer",
+      "liveness": "string",
+      "liveness_evidence": {
+        "basis": "string",
+        "holder_pid": "integer",
+        "holds": "bool",
+        "last_activity_at": "integer"
+      },
+      "path": "string",
+      "session_id": "integer"
+    }
+  ],
   "leases": [
     {
       "created_at": "integer",
@@ -160,6 +175,7 @@
     "coordination": "integer",
     "foreign_processes": "integer",
     "integration_drift": "integer",
+    "lease_liveness": "integer",
     "leases": "integer",
     "open": "integer",
     "promoted_conflicts": "integer",

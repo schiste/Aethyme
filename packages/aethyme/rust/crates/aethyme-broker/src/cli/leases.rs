@@ -423,9 +423,65 @@ pub(super) fn run_leases(parsed: Parsed) -> Result<(), UsageError> {
                 out!("Session {session} released {path}.");
             }
         }
+        Some("explain") => {
+            let filters = parsed
+                .positional
+                .get(1..)
+                .unwrap_or_default()
+                .iter()
+                .map(|path| crate::broker::normalize_lease_path(path))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| UsageError::Message(error.to_string()))?;
+            let views: Vec<_> = broker
+                .lease_liveness(now_ms())?
+                .into_iter()
+                .filter(|view| {
+                    filters.is_empty()
+                        || filters
+                            .iter()
+                            .any(|path| crate::leases::paths_overlap(path, &view.path))
+                })
+                .collect();
+            if parsed.json {
+                out!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({ "leases": views }))?
+                );
+            } else if views.is_empty() {
+                out!("No active leases.");
+            } else {
+                for view in &views {
+                    let evidence = &view.liveness_evidence;
+                    out!(
+                        "session {:<4} {:<9} {:<8} {}{}",
+                        view.session_id,
+                        view.kind.as_str(),
+                        view.liveness.as_str(),
+                        view.path,
+                        if evidence.holds {
+                            ""
+                        } else {
+                            " (no longer conflicts)"
+                        }
+                    );
+                    out!(
+                        "    basis: {}{}{}",
+                        evidence.basis,
+                        evidence
+                            .holder_pid
+                            .map(|pid| format!("; holder pid {pid}"))
+                            .unwrap_or_default(),
+                        evidence
+                            .grace_ends_at
+                            .map(|at| format!("; grace ends at {at}"))
+                            .unwrap_or_default(),
+                    );
+                }
+            }
+        }
         Some(other) => {
             return Err(UsageError::Message(format!(
-                "unknown leases action {other:?} — expected claim, plan, export, or release"
+                "unknown leases action {other:?} — expected claim, plan, explain, export, or release"
             )));
         }
     }

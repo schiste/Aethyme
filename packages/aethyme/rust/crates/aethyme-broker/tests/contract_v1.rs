@@ -56,6 +56,7 @@ const V1_KINDS: &[&str] = &[
     "session.finish_cleanup_started",
     "session.finished",
     "session.holder_bound",
+    "session.holder_gone",
     "session.idle",
     "session.registered",
     "session.reused",
@@ -121,6 +122,7 @@ fn v1_kind_catalog_is_frozen() {
         events::SESSION_FINISHED.into(),
         events::SESSION_FINISH_CLEANUP_STARTED.into(),
         events::SESSION_HOLDER_BOUND.into(),
+        events::SESSION_HOLDER_GONE.into(),
         events::LEASE_CLAIMED.into(),
         events::LEASE_RELEASED.into(),
         events::LEASE_OVERLAP.into(),
@@ -237,6 +239,11 @@ fn v1_constructor_payload_field_names_are_frozen() {
             "started",
         ],
         "session.holder_bound",
+    );
+    assert_keys(
+        &events::session_holder_gone_payload(&holder),
+        &["command", "pid", "started"],
+        "session.holder_gone",
     );
     assert_keys(
         &events::session_context_updated_payload(&aethyme_broker::SessionContext::new(

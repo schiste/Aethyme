@@ -1276,6 +1276,16 @@ construction. The broker names that, from local facts only, and never blocks:
   a file name matched in every directory. The rules are read from
   `.aethyme/config.toml` as committed on the fetched default branch, else the
   main checkout's file, like `[promote]`.
+- **`[leases] idle_minutes` and `stale_grace_minutes`** (defaults 30 and 15):
+  lease liveness is bound to the session's holder process (#360). A lease is
+  `active` while that process runs, `idle` once it has issued no broker
+  command for `idle_minutes` (informational: it holds the same), `stale` once
+  the process is gone, and `unknown` when there is no recorded holder or no
+  process table, which is never read as dead. A stale lease keeps its hold
+  for `stale_grace_minutes` from the first time the broker saw the holder
+  gone (the `session.holder_gone` event), then no longer conflicts but is
+  still listed. `broker status --json` reports `lease_liveness[]` and
+  `broker advanced leases explain [<paths...>]` explains each lease.
 
 Work that reaches the default branch through a reviewed pull request is
 delivered, but leaves no promoted queue entry, and a squash merge rewrites the

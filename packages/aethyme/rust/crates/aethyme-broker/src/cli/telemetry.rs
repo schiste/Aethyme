@@ -321,7 +321,10 @@ pub(super) fn command_records_metric(args: &[String]) -> bool {
             effect != Some(crate::OperationEffect::Read)
         }
         Some("hooks") => !matches!(args.get(1).map(String::as_str), Some("status" | "snippet")),
-        Some("leases") => !matches!(args.get(1).map(String::as_str), Some("plan" | "export")),
+        Some("leases") => !matches!(
+            args.get(1).map(String::as_str),
+            Some("plan" | "export" | "explain")
+        ),
         Some("ownership") => matches!(args.get(1).map(String::as_str), Some("claim" | "release")),
         Some("console") => args.get(1).map(String::as_str) == Some("run"),
         Some("resources") => !matches!(
