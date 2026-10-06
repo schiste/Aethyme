@@ -49,7 +49,7 @@ tree-sitter-php = "=0.23.11"
 walkdir = "2"
 
 [workspace.package]
-version = "0.8.21"
+version = "0.8.22"
 
 # Workspace lint floor. Every crate opts in with `[lints] workspace = true`.
 #
