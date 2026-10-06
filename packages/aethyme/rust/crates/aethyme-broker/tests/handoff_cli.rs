@@ -215,7 +215,9 @@ fn handoff_by_worktree_returns_the_latest_completed_session() {
 /// A second session that adopts a worktree and changes nothing did no work of
 /// its own, but the checkout still holds the first session's commit, which
 /// reached no branch. Measuring from the second session's start would call
-/// that "no net change" and the worktree safe to remove.
+/// that "no net change" and the worktree safe to remove. Since #294 the
+/// second session inherits that commit, so finish refuses rather than
+/// producing a handoff that would have to say so.
 #[test]
 fn adopting_unlanded_work_and_changing_nothing_is_not_cleanup_safe() {
     let tmp = tempfile::tempdir().unwrap();
@@ -243,23 +245,17 @@ fn adopting_unlanded_work_and_changing_nothing_is_not_cleanup_safe() {
     let second = broker
         .adopt(&worktree, Some("looked, changed nothing"))
         .unwrap();
-    assert!(broker.finish(second.id).unwrap().closed);
-
-    let output = run(
-        tmp.path(),
-        &[
-            "advanced",
-            "handoff",
-            "--worktree",
-            worktree.to_str().unwrap(),
-        ],
+    // Issue #294: the second session carries the first one's ownership
+    // boundary, so finish sees the inherited commit and asks for a submit
+    // instead of closing a session that still owns unlanded work.
+    let finish = broker.finish(second.id).unwrap();
+    assert!(!finish.closed, "{finish:#?}");
+    assert!(!finish.cleanup_safe);
+    assert_eq!(finish.unsubmitted_commits, 1);
+    assert_eq!(
+        finish.recommended_next_action.as_deref(),
+        Some(format!("aethyme broker submit --session {}", second.id).as_str())
     );
-    let text = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        text.contains(&format!("Session {} handoff", second.id)),
-        "{text}"
-    );
-    assert!(text.contains("cleanup safe: no"), "{text}");
 }
 
 #[test]
