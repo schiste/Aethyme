@@ -1264,6 +1264,15 @@ fn local_git_conflict_is_failed_without_remote_recovery_or_write_block() {
     assert_eq!(details["failure_class"], "local_git_command_failed");
     assert_eq!(details["remote_contact"], "not_applicable");
     assert_eq!(details["recovery"], "inspect_or_abort_local_worktree_state");
+    let stderr_tail = details["failure_output"]["stderr_tail"]
+        .as_array()
+        .expect("a failed local Git write keeps its stderr tail");
+    assert!(
+        stderr_tail.iter().any(|line| line
+            .as_str()
+            .is_some_and(|line| line.contains("already exists"))),
+        "git's own refusal must survive: {stderr_tail:?}"
+    );
 
     let shown = broker
         .show_coordinated_operation(report.operation.id)
@@ -1342,8 +1351,8 @@ fn enable_hooks_outside_lock(repo: &Path) {
     .unwrap();
 }
 
-/// A hook that refuses must stop the push before the lock is taken, so no other
-/// session waits on a gate that was going to refuse anyway.
+/// Command-scope Git config in the caller's environment must not point the
+/// pre-lock hook check at a different hooks directory than the real push.
 #[cfg(unix)]
 #[test]
 fn inline_git_config_cannot_bypass_opted_in_pre_push_refusal() {
@@ -1369,6 +1378,8 @@ fn inline_git_config_cannot_bypass_opted_in_pre_push_refusal() {
     );
 }
 
+/// A hook that refuses must stop the push before the lock is taken, so no other
+/// session waits on a gate that was going to refuse anyway.
 #[cfg(unix)]
 #[test]
 fn an_opted_in_pre_push_refusal_stops_before_the_lock() {

@@ -4826,10 +4826,10 @@ impl Broker {
                 ),
             )
         };
-        if request.provider == OperationProvider::Git
-            && is_push(&request.args)
-            && !output.status.success()
-        {
+        // Every failed Git write keeps its stderr tail: a failed local
+        // `merge --ff-only` (main reconcile) is as undiagnosable without it as
+        // a refused push (#415).
+        if request.provider == OperationProvider::Git && !output.status.success() {
             add_failure_stderr(&mut details, &output.stderr);
         }
         // The row leaves `running` on the next statement, after which liveness
