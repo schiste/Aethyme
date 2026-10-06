@@ -1470,24 +1470,26 @@ impl Broker {
             });
         };
 
+        // Every question below is asked of the whole commit list at once:
+        // asking it once per commit spawned several git processes each, and
+        // a session cut from a main far ahead of integration carries every
+        // commit of that drift, so submit grew to 45 minutes (#463).
         let integration_candidates =
             repo.first_parent_commits_excluding_oldest(integration_head, recorded_baseline)?;
+        let candidate_shapes = repo.commit_shapes(&integration_candidates)?;
+        let candidate_patch_ids =
+            repo.first_parent_patch_ids(&with_parent(&integration_candidates, &candidate_shapes))?;
         let mut integration_by_patch: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for commit in integration_candidates {
-            let parents = repo.commit_parents(&commit)?;
-            let Some(parent) = parents.first() else {
-                continue;
-            };
-            if let Some(patch_id) = repo.patch_id_between(parent, &commit)? {
+            if let Some(patch_id) = candidate_patch_ids.get(&commit) {
                 integration_by_patch
-                    .entry(patch_id)
+                    .entry(patch_id.clone())
                     .or_default()
                     .push(commit);
             }
         }
 
-        let mut commits = Vec::with_capacity(inherited.len() + owned.len());
-        for (commit, ownership) in inherited
+        let ordered = inherited
             .into_iter()
             .map(|commit| {
                 (
@@ -1500,31 +1502,58 @@ impl Broker {
                     .into_iter()
                     .map(|commit| (commit, SubmissionCommitOwnership::SessionOwned)),
             )
-        {
-            let parents = repo.commit_parents(&commit)?;
-            let patch_id = parents
-                .first()
-                .map(|parent| repo.patch_id_between(parent, &commit))
-                .transpose()?
-                .flatten();
+            .collect::<Vec<_>>();
+        let names = ordered
+            .iter()
+            .map(|(commit, _)| commit.clone())
+            .collect::<Vec<_>>();
+        let shapes = repo.commit_shapes(&names)?;
+        let patch_ids = repo.first_parent_patch_ids(&with_parent(&names, &shapes))?;
+        // Each commit here, and each parent of one, is reachable from the
+        // session HEAD, so it is an ancestor of integration exactly when it
+        // is not among the commits the session HEAD has and integration
+        // lacks. One rev-list answers that for all of them; if it cannot run,
+        // ask per commit as before.
+        let outside_integration = repo
+            .commits_excluding_oldest(session_head, integration_head)
+            .ok()
+            .map(|commits| commits.into_iter().collect::<BTreeSet<_>>());
+        let reaches_integration = |commit: &str| match &outside_integration {
+            Some(outside) => !outside.contains(commit),
+            None => repo.is_ancestor(commit, integration_head),
+        };
+        let synced_second_parents = shapes
+            .values()
+            .filter(|shape| shape.parents.len() == 2 && reaches_integration(&shape.parents[1]))
+            .map(|shape| shape.parents[1].clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let second_parent_shapes = repo.commit_shapes(&synced_second_parents)?;
+
+        let mut commits = Vec::with_capacity(ordered.len());
+        for (commit, ownership) in ordered {
+            let shape = &shapes[&commit];
+            let parents = shape.parents.clone();
+            let patch_id = patch_ids.get(&commit).cloned();
             let matching_integration_commits = patch_id
                 .as_ref()
                 .and_then(|patch| integration_by_patch.get(patch))
                 .cloned()
                 .unwrap_or_default();
             let exact_integration_sync = parents.len() == 2
-                && repo.is_ancestor(&parents[1], integration_head)
-                && repo.commit_tree_id(&commit)? == repo.commit_tree_id(&parents[1])?;
-            let integration_state =
-                if repo.is_ancestor(&commit, integration_head) || exact_integration_sync {
-                    SubmissionIntegrationState::AlreadyIntegratedByAncestry
-                } else {
-                    match matching_integration_commits.len() {
-                        0 => SubmissionIntegrationState::Pending,
-                        1 => SubmissionIntegrationState::AlreadyIntegratedByStablePatchIdentity,
-                        _ => SubmissionIntegrationState::Ambiguous,
-                    }
-                };
+                && second_parent_shapes
+                    .get(&parents[1])
+                    .is_some_and(|second| second.tree == shape.tree);
+            let integration_state = if reaches_integration(&commit) || exact_integration_sync {
+                SubmissionIntegrationState::AlreadyIntegratedByAncestry
+            } else {
+                match matching_integration_commits.len() {
+                    0 => SubmissionIntegrationState::Pending,
+                    1 => SubmissionIntegrationState::AlreadyIntegratedByStablePatchIdentity,
+                    _ => SubmissionIntegrationState::Ambiguous,
+                }
+            };
             commits.push(SubmissionCommitProvenance {
                 commit,
                 parents,
@@ -1906,6 +1935,23 @@ impl Broker {
         blocking.dedup();
         Ok(blocking)
     }
+}
+
+/// The commits in `commits` that have a parent, in order: a root commit has
+/// no first-parent diff, and so no patch id.
+fn with_parent(
+    commits: &[String],
+    shapes: &BTreeMap<String, crate::git::CommitShape>,
+) -> Vec<String> {
+    commits
+        .iter()
+        .filter(|commit| {
+            shapes
+                .get(*commit)
+                .is_some_and(|shape| !shape.parents.is_empty())
+        })
+        .cloned()
+        .collect()
 }
 
 fn submission_planning_failure_class(error: &BrokerOpError) -> &'static str {

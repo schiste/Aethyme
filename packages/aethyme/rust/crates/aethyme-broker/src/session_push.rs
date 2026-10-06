@@ -369,6 +369,7 @@ impl Broker {
                 // The lease is the confirmation: it can only replace this
                 // session's own last push, on this session's own branch.
                 destructive_confirmed: effect == OperationEffect::Destructive,
+                cross_session: None,
                 authorization_reason: Some(format!("repository policy {SESSION_PUSH_POLICY_KEY}")),
                 args,
             },
@@ -484,6 +485,7 @@ impl Broker {
                 scope: Some(format!("ref:{}", default.tracking_ref)),
                 declared_effect: None,
                 destructive_confirmed: false,
+                cross_session: None,
                 authorization_reason: Some(
                     "refresh the default branch to compare a session with it".into(),
                 ),
@@ -613,6 +615,7 @@ impl Broker {
                 scope: Some(format!("session-push:pr-create:{}", session.branch)),
                 declared_effect: Some(OperationEffect::Write),
                 destructive_confirmed: false,
+                cross_session: None,
                 authorization_reason: Some(format!("repository policy {SESSION_PUSH_POLICY_KEY}")),
                 args: vec![
                     "pr".into(),
@@ -684,6 +687,7 @@ impl Broker {
                 scope: Some(format!("session-push:pr-list:{branch}")),
                 declared_effect: Some(OperationEffect::Read),
                 destructive_confirmed: false,
+                cross_session: None,
                 authorization_reason: None,
                 args: vec![
                     "pr".into(),
