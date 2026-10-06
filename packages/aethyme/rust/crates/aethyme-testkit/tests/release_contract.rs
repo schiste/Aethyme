@@ -138,8 +138,284 @@ fn release_workflow_renders_the_homebrew_formula_from_the_manifest() {
     assert!(workflow.contains("--channel \"$release_channel\""));
     assert!(workflow.contains("if [ \"$release_channel\" = stable ]; then"));
     assert!(workflow.contains("--manifest \"$GITHUB_WORKSPACE/dist/release-manifest.json\""));
+    assert!(workflow.contains("--tag \"$REF_NAME\""));
+    assert!(workflow.contains("--source-sha \"$source_sha\""));
     assert!(workflow.contains("--output \"$GITHUB_WORKSPACE/dist/aethyme.rb\""));
     assert!(workflow.contains("prerelease: ${{ contains(github.ref_name, '-') }}"));
+}
+
+#[test]
+#[cfg(unix)]
+fn homebrew_tap_publication_checks_writes_once_and_verifies_readback() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // Shaped like the formula release.yml ships: no `version` line, because
+    // Homebrew infers it from the URLs.
+    fn formula(tag: &str, digest_byte: char) -> String {
+        let digest = digest_byte.to_string().repeat(64);
+        let target = |triple: &str| {
+            format!(
+                "      url \"https://github.com/schiste/Aethyme/releases/download/{tag}/aethyme-{tag}-{triple}.tar.gz\"\n      sha256 \"{digest}\"\n"
+            )
+        };
+        format!(
+            "class Aethyme < Formula\n  on_macos do\n    on_arm do\n{}    end\n  end\n  on_linux do\n    on_intel do\n{}    end\n  end\nend\n",
+            target("aarch64-apple-darwin"),
+            target("x86_64-unknown-linux-gnu"),
+        )
+    }
+
+    fn git_blob_sha(path: &Path) -> String {
+        let output = Command::new("git")
+            .arg("hash-object")
+            .arg(path)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    fn base64(path: &Path) -> String {
+        let output = Command::new("openssl")
+            .args(["base64", "-A", "-in"])
+            .arg(path)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    fn executable(path: &Path, contents: &str) {
+        std::fs::write(path, contents).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let fixture = tempfile::tempdir().unwrap();
+    let formula_path = fixture.path().join("aethyme.rb");
+    let old_formula_path = fixture.path().join("old-aethyme.rb");
+    std::fs::write(&formula_path, formula("v0.8.21", 'a')).unwrap();
+    std::fs::write(&old_formula_path, formula("v0.8.20", 'b')).unwrap();
+    let old_sha = git_blob_sha(&old_formula_path);
+    let target_sha = git_blob_sha(&formula_path);
+
+    // A fake `gh` serving the tap from TEST_TAP_STATE (absent: the old
+    // formula) and recording each PUT. TEST_WRITE=refuse fails without
+    // writing; TEST_WRITE=lost writes but reports failure, like a dropped
+    // response.
+    let bin = fixture.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let state_path = fixture.path().join("published");
+    let put_log = fixture.path().join("puts");
+    executable(
+        &bin.join("gh"),
+        r#"#!/bin/sh
+set -eu
+[ "$1" != auth ] || exit 0
+[ "$1" = api ] || exit 2
+endpoint=$2
+shift 2
+method=GET
+selector=
+fields=
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --method) method=$2; shift 2 ;;
+        --jq) selector=$2; shift 2 ;;
+        --raw-field) fields="$fields $2"; shift 2 ;;
+        *) printf 'unexpected gh argument: %s\n' "$1" >&2; exit 2 ;;
+    esac
+done
+if [ "$method" = PUT ]; then
+    [ "$endpoint" = repos/schiste/homebrew-tap/contents/Formula/aethyme.rb ] || exit 2
+    printf '%s\n' "$fields" >> "$TEST_PUT_LOG"
+    case "${TEST_WRITE:-ok}" in
+        refuse) exit 1 ;;
+        lost) : > "$TEST_TAP_STATE"; exit 1 ;;
+        *) : > "$TEST_TAP_STATE" ;;
+    esac
+    exit 0
+fi
+case "$endpoint" in
+    repos/schiste/homebrew-tap) printf 'main\n' ;;
+    'repos/schiste/homebrew-tap/contents/Formula/aethyme.rb?ref=main')
+        if [ -f "$TEST_TAP_STATE" ]; then
+            sha=$TEST_TARGET_SHA; content=$TEST_TARGET_CONTENT
+        else
+            sha=$TEST_OLD_SHA; content=$TEST_OLD_CONTENT
+        fi
+        case "$selector" in
+            .sha) printf '%s\n' "$sha" ;;
+            .content) printf '%s\n' "$content" ;;
+            *) exit 2 ;;
+        esac
+        ;;
+    'repos/schiste/homebrew-tap/commits?path=Formula/aethyme.rb&sha=main&per_page=1')
+        printf 'cccccccccccccccccccccccccccccccccccccccc\n' ;;
+    *) printf 'unexpected gh API endpoint: %s\n' "$endpoint" >&2; exit 2 ;;
+esac
+"#,
+    );
+
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let script = aethyme_testkit::paths::repo_root().join("scripts/publish-homebrew-tap.sh");
+    let run = |formula: &Path, tag: &str, extra: &[&str], env: &[(&str, &str)]| {
+        let mut command = Command::new("sh");
+        command
+            .arg(&script)
+            .arg("--formula")
+            .arg(formula)
+            .args(["--tag", tag])
+            .args(["--release-repo", "schiste/Aethyme"])
+            .args(["--tap-repo", "schiste/homebrew-tap"])
+            .args(extra)
+            .env("PATH", &path)
+            .env_remove("GITHUB_ACTIONS")
+            .env("HOMEBREW_TAP_READBACK_DELAY", "0")
+            .env("TEST_TAP_STATE", &state_path)
+            .env("TEST_PUT_LOG", &put_log)
+            .env("TEST_OLD_SHA", &old_sha)
+            .env("TEST_TARGET_SHA", &target_sha)
+            .env("TEST_OLD_CONTENT", base64(&old_formula_path))
+            .env("TEST_TARGET_CONTENT", base64(&formula_path));
+        for (key, value) in env {
+            command.env(key, value);
+        }
+        command.output().unwrap()
+    };
+    let stderr =
+        |output: &std::process::Output| String::from_utf8_lossy(&output.stderr).into_owned();
+    let stdout =
+        |output: &std::process::Output| String::from_utf8_lossy(&output.stdout).into_owned();
+    let in_actions = [("GITHUB_ACTIONS", "true")];
+
+    let dry_run = run(&formula_path, "v0.8.21", &["--dry-run"], &[]);
+    assert!(dry_run.status.success(), "{}", stderr(&dry_run));
+    assert!(stdout(&dry_run).contains("Preflight passed"));
+    assert!(!put_log.exists(), "a dry run never writes");
+
+    let workstation = run(&formula_path, "v0.8.21", &[], &[]);
+    assert!(!workstation.status.success());
+    assert!(stderr(&workstation).contains("writes run only in the Homebrew tap workflow"));
+    assert!(
+        !put_log.exists(),
+        "writes are refused outside GitHub Actions"
+    );
+
+    let invalid = [
+        ("wrong-tag", formula("v0.8.20", 'a'), "v0.8.21"),
+        (
+            "bad-digest",
+            formula("v0.8.21", 'a').replace(&"a".repeat(64), "not-a-digest"),
+            "v0.8.21",
+        ),
+        (
+            "wrong-version-line",
+            formula("v0.8.21", 'a').replace(
+                "class Aethyme < Formula\n",
+                "class Aethyme < Formula\n  version \"0.8.20\"\n",
+            ),
+            "v0.8.21",
+        ),
+        ("preview-tag", formula("v0.9.0-rc.1", 'a'), "v0.9.0-rc.1"),
+    ];
+    for (name, contents, tag) in invalid {
+        let invalid_path = fixture.path().join(format!("{name}.rb"));
+        std::fs::write(&invalid_path, contents).unwrap();
+        let output = run(&invalid_path, tag, &[], &in_actions);
+        assert!(!output.status.success(), "{name} unexpectedly passed");
+    }
+    assert!(
+        !put_log.exists(),
+        "an invalid formula never reaches the write"
+    );
+
+    let refused = run(
+        &formula_path,
+        "v0.8.21",
+        &[],
+        &[in_actions[0], ("TEST_WRITE", "refuse")],
+    );
+    assert!(!refused.status.success());
+    assert!(
+        stderr(&refused).contains("re-run the workflow"),
+        "{}",
+        stderr(&refused)
+    );
+    assert!(!state_path.exists());
+    let put = std::fs::read_to_string(&put_log).unwrap();
+    assert!(
+        put.contains(&format!("sha={old_sha}")),
+        "the write carries the read blob SHA: {put}"
+    );
+    assert!(put.contains("branch=main"));
+    assert!(put.contains(&format!("content={}", base64(&formula_path))));
+    std::fs::remove_file(&put_log).unwrap();
+
+    // A write that landed but lost its response is judged by the read-back.
+    let lost = run(
+        &formula_path,
+        "v0.8.21",
+        &[],
+        &[in_actions[0], ("TEST_WRITE", "lost")],
+    );
+    assert!(lost.status.success(), "{}", stderr(&lost));
+    assert!(stdout(&lost).contains("Published and verified"));
+    assert!(stderr(&lost).contains("but the tap read-back matches"));
+    std::fs::remove_file(&state_path).unwrap();
+    std::fs::remove_file(&put_log).unwrap();
+
+    let published = run(&formula_path, "v0.8.21", &[], &in_actions);
+    assert!(published.status.success(), "{}", stderr(&published));
+    assert!(stdout(&published).contains("cccccccccccccccccccccccccccccccccccccccc"));
+    assert_eq!(
+        std::fs::read_to_string(&put_log).unwrap().lines().count(),
+        1
+    );
+
+    let repeat = run(&formula_path, "v0.8.21", &[], &in_actions);
+    assert!(repeat.status.success(), "{}", stderr(&repeat));
+    assert!(stdout(&repeat).contains("nothing to write"));
+    assert_eq!(
+        std::fs::read_to_string(&put_log).unwrap().lines().count(),
+        1,
+        "republishing the same formula does not write"
+    );
+}
+
+#[test]
+fn homebrew_tap_workflow_publishes_from_the_signed_manifest() {
+    let root = aethyme_testkit::paths::repo_root();
+    let release = std::fs::read_to_string(root.join(".github/workflows/release.yml")).unwrap();
+    let tap = std::fs::read_to_string(root.join(".github/workflows/homebrew-tap.yml")).unwrap();
+
+    // release.yml hands stable tags to the reusable workflow, which is also
+    // the retry path and the pull-request rehearsal.
+    assert!(release.contains("uses: ./.github/workflows/homebrew-tap.yml"));
+    assert!(release.contains("if: ${{ !contains(github.ref_name, '-') }}"));
+    assert!(!release.contains("git push origin HEAD:main"));
+    for trigger in ["workflow_call:", "workflow_dispatch:", "pull_request:"] {
+        assert!(tap.contains(trigger), "homebrew-tap.yml lost {trigger}");
+    }
+
+    let verify = tap.find("cosign verify-blob").unwrap();
+    let render = tap.find("--example homebrew_formula").unwrap();
+    let publish = tap.find("Publish and verify formula").unwrap();
+    assert!(verify < render && render < publish);
+    assert!(tap.contains("release.yml@refs/tags/${TAG}"));
+    assert!(tap.contains("--source-sha \"$(git rev-parse \"refs/tags/${TAG}^{commit}\")\""));
+
+    // Only a publication sees the tap token; a rehearsal passes --dry-run
+    // with the read-only job token.
+    let rehearsal = &tap[tap
+        .find("Rehearse publication against the live tap")
+        .unwrap()..];
+    assert!(rehearsal.contains("GH_TOKEN: ${{ github.token }}"));
+    assert!(rehearsal.contains("--dry-run"));
+    assert_eq!(tap.matches("secrets.HOMEBREW_TAP_TOKEN").count(), 2);
 }
 
 #[test]

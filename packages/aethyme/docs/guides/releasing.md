@@ -57,11 +57,30 @@ the requested version change.
 5. Submit the release series, inspect `broker advanced ship plan`, and execute only the
    exact confirmed integration SHA.
 6. Create and push the matching annotated tag through the coordinated Git
-   lane. Wait for the release workflow and verify the manifest, checksums,
-   installer, and every supported archive.
-7. Update the Homebrew formula from the published archive and digest, then
-   verify both installed binaries, `broker quick-test`, and repository
-   enhancement compatibility.
+   lane. Wait for the release workflow and verify the signed manifest,
+   checksums, installer, and every supported archive.
+7. For a stable release, `release.yml` calls `homebrew-tap.yml`, which
+   verifies the signed manifest, renders `aethyme.rb` from the tag's exact
+   source commit, and checks that this matches the release asset. It then
+   writes `Formula/aethyme.rb` to the tap's default branch with one Contents
+   API call that carries the file's current blob SHA, so GitHub refuses it if
+   the formula changed in between, and reads the result back byte-for-byte.
+   The write needs the `HOMEBREW_TAP_TOKEN` secret (fine-grained, contents
+   write on `schiste/homebrew-tap` only).
+
+   To retry, or after adding a missing token, re-run the Homebrew tap
+   workflow for the tag (`workflow_dispatch` with input `tag`). An agent
+   runs `aethyme broker advanced gh --session <id> --repo schiste/Aethyme
+   --reason "<authorization>" -- workflow run homebrew-tap.yml -f
+   tag=vX.Y.Z`. Republishing the same formula is a no-op. Never write the
+   tap from a workstation: `scripts/publish-homebrew-tap.sh` refuses writes
+   outside GitHub Actions, and with `--dry-run` it only checks the tap.
+
+   The write deliberately bypasses the Aethyme broker. A runner's broker
+   database is empty, so a session there would coordinate with nothing; the
+   blob-SHA precondition and the read-back are what make the write safe.
+   Pull requests that touch the publication path rehearse it against the
+   latest stable release and the live tap without writing.
 8. Close release-bound issues only after the published and installed artifacts
    have passed those checks.
 

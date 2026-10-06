@@ -1041,6 +1041,14 @@ pub(super) fn run_adopt(parsed: Parsed) -> Result<(), UsageError> {
                 short_commit(&sync.integration_head),
             );
         }
+        if let Some(carried) = &report.carried_ownership {
+            out!(
+                "Ownership: carried from session {} (baseline {}); its {} unsubmitted commit(s) stay session-owned",
+                carried.from_session,
+                short_commit(&carried.baseline),
+                carried.pending_owned_commits,
+            );
+        }
         if let Some(drift) = &report.integration_drift {
             out!(
                 "Integration drift: {} (session HEAD {}, {} HEAD {}; {} ahead, {} behind)",
