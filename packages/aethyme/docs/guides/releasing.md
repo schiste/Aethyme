@@ -81,7 +81,17 @@ the requested version change.
    blob-SHA precondition and the read-back are what make the write safe.
    Pull requests that touch the publication path rehearse it against the
    latest stable release and the live tap without writing.
-8. Close release-bound issues only after the published and installed artifacts
+8. Install the published pair on an installer-managed machine with
+   `aethyme self-update --version X.Y.Z` (the same as `aethyme update apply`).
+   It verifies the signed manifest whenever cosign is on PATH
+   (`--require-signature` makes that mandatory), checks the archive against
+   the manifest's SHA-256, refuses a pair whose binaries do not both report
+   X.Y.Z, and switches router and engine together. Then confirm that
+   `aethyme --version` and `aethyme-engine-cli --version` report the same
+   version and build commit before collecting performance telemetry (#251).
+   Cargo and Homebrew installs keep their own update commands, which
+   `aethyme update plan` names.
+9. Close release-bound issues only after the published and installed artifacts
    have passed those checks.
 
 The router and engine sibling are one release unit. Never publish, install, or
