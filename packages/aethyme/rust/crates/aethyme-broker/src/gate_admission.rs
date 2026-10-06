@@ -15,6 +15,11 @@
 //! - otherwise a gate with `cost >= 3` uses [`DEFAULT_MAX_LOAD_PER_CPU`];
 //! - every other gate is spawned without consulting the load.
 //!
+//! A load-admitted gate with a configured timeout scales that deadline by its
+//! one-minute load-per-CPU reading at start, never below the configured value
+//! and never above four times it. Missing load data preserves the configured
+//! deadline. A timeout log records both the start and timeout readings.
+//!
 //! The wait happens before owner locks and host resource leases are taken,
 //! so a gate waiting on load never holds a lease another gate needs, and
 //! before the timeout clock starts, so the waited time is never charged to
@@ -29,6 +34,10 @@ pub(crate) const EXPENSIVE_GATE_MIN_COST: i64 = 3;
 
 /// Threshold used for an expensive gate that sets no `max_load_per_cpu`.
 pub(crate) const DEFAULT_MAX_LOAD_PER_CPU: f64 = 3.0;
+
+/// Hard ceiling for load-based timeout scaling, regardless of a repository's
+/// admission threshold.
+const MAX_TIMEOUT_LOAD_MULTIPLIER: f64 = 4.0;
 
 /// How often the load is re-read while waiting. The kernel refreshes the
 /// load average roughly every five seconds, so polling faster sees nothing new.
@@ -118,6 +127,45 @@ pub(crate) fn effective_max_load_per_cpu(cost: i64, configured: Option<f64>) -> 
     configured.or((cost >= EXPENSIVE_GATE_MIN_COST).then_some(DEFAULT_MAX_LOAD_PER_CPU))
 }
 
+/// Scale a configured deadline in proportion to the load-per-CPU reading
+/// captured as the command starts. Only load-admitted gates scale. A missing
+/// or invalid measurement preserves the configured deadline, and the hard
+/// multiplier ceiling keeps every resulting deadline bounded.
+pub(crate) fn timeout_seconds_for_load(
+    timeout_seconds: Option<u64>,
+    cost: i64,
+    configured_max_load_per_cpu: Option<f64>,
+    load_1m_start: Option<f64>,
+    cpu_count: Option<i64>,
+) -> Option<u64> {
+    let timeout_seconds = timeout_seconds?;
+    let Some(admission_limit) = effective_max_load_per_cpu(cost, configured_max_load_per_cpu)
+    else {
+        return Some(timeout_seconds);
+    };
+    let (Some(load_1m), Some(cpu_count)) = (load_1m_start, cpu_count) else {
+        return Some(timeout_seconds);
+    };
+    if !load_1m.is_finite() || load_1m < 0.0 || cpu_count <= 0 {
+        return Some(timeout_seconds);
+    }
+
+    let multiplier = (load_1m / cpu_count as f64)
+        .max(1.0)
+        .min(admission_limit.max(1.0))
+        .min(MAX_TIMEOUT_LOAD_MULTIPLIER);
+    if multiplier <= 1.0 {
+        return Some(timeout_seconds);
+    }
+
+    // Round up to the next millisecond-equivalent fraction of a second so
+    // scaling never produces a deadline shorter than the measured ratio.
+    let multiplier_millis = (multiplier * 1_000.0).ceil() as u128;
+    let scaled_millis = u128::from(timeout_seconds).saturating_mul(multiplier_millis);
+    let scaled_seconds = scaled_millis.saturating_add(999) / 1_000;
+    Some(scaled_seconds.min(u128::from(u64::MAX)) as u64)
+}
+
 /// Resolve load admission for one configured gate using an injected host.
 /// Production supplies the system host; tests use deterministic samples.
 pub(crate) fn admit_gate_with(
@@ -197,12 +245,15 @@ pub(crate) fn admit(
 }
 
 pub(crate) fn describe(sample: LoadSample, max: f64) -> String {
+    format!("{}, max {:.2}", describe_load(sample), max)
+}
+
+pub(crate) fn describe_load(sample: LoadSample) -> String {
     format!(
-        "load 1m {:.1}/{} cpus = {:.2} per cpu, max {:.2}",
+        "load 1m {:.1}/{} cpus = {:.2} per cpu",
         sample.load_1m,
         sample.cpus,
-        sample.per_cpu(),
-        max
+        sample.per_cpu()
     )
 }
 
@@ -274,6 +325,54 @@ mod tests {
         );
         assert_eq!(effective_max_load_per_cpu(1, Some(1.5)), Some(1.5));
         assert_eq!(effective_max_load_per_cpu(5, Some(8.0)), Some(8.0));
+    }
+
+    #[test]
+    fn load_admitted_gate_timeouts_scale_proportionally_and_stay_bounded() {
+        assert_eq!(
+            timeout_seconds_for_load(Some(300), 1, Some(3.0), Some(15.0), Some(10)),
+            Some(450)
+        );
+        assert_eq!(
+            timeout_seconds_for_load(Some(300), 1, Some(3.0), Some(80.0), Some(10)),
+            Some(900),
+            "the per-gate admission threshold caps the multiplier"
+        );
+        assert_eq!(
+            timeout_seconds_for_load(Some(300), 1, Some(100.0), Some(80.0), Some(10)),
+            Some(1_200),
+            "a high repository threshold cannot exceed the global four-times cap"
+        );
+        assert_eq!(
+            timeout_seconds_for_load(Some(300), 3, None, Some(25.0), Some(10)),
+            Some(750),
+            "expensive gates use the default admission threshold"
+        );
+    }
+
+    #[test]
+    fn missing_or_inapplicable_load_preserves_the_configured_timeout() {
+        for (cost, configured, load, cpus) in [
+            (1, None, Some(20.0), Some(10)),
+            (1, Some(3.0), None, Some(10)),
+            (1, Some(3.0), Some(20.0), None),
+            (1, Some(3.0), Some(f64::NAN), Some(10)),
+            (1, Some(3.0), Some(20.0), Some(0)),
+        ] {
+            assert_eq!(
+                timeout_seconds_for_load(Some(300), cost, configured, load, cpus),
+                Some(300)
+            );
+        }
+        assert_eq!(
+            timeout_seconds_for_load(None, 3, None, Some(30.0), Some(10)),
+            None
+        );
+        assert_eq!(
+            timeout_seconds_for_load(Some(300), 1, Some(3.0), Some(9.0), Some(10)),
+            Some(300),
+            "a load below one per CPU never shortens the configured deadline"
+        );
     }
 
     #[test]
