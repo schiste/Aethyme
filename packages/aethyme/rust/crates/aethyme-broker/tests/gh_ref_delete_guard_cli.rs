@@ -68,6 +68,17 @@ impl Fixture {
         std::fs::write(repo.path().join("a.txt"), "a\n").unwrap();
         git(repo.path(), &["add", "-A"]);
         git(repo.path(), &["commit", "-qm", "init"]);
+        // The guard requires --repo to be this checkout's origin. SSH with
+        // GIT_SSH_COMMAND=false keeps every fetch offline.
+        git(
+            repo.path(),
+            &[
+                "remote",
+                "add",
+                "origin",
+                "git@github.com:schiste/Aethyme.git",
+            ],
+        );
 
         let mut fixture = Self {
             repo,
@@ -128,6 +139,8 @@ impl Fixture {
                     std::env::var("PATH").unwrap_or_default()
                 ),
             )
+            .env("GIT_SSH_COMMAND", "false")
+            .env_remove("GH_HOST")
             .env("AETHYME_FAKE_HEAD", head)
             .env("AETHYME_FAKE_GH_LOG", self.log())
             .output()
@@ -338,8 +351,18 @@ fn graphql_ref_mutations_are_refused_in_every_spelling() {
             "query=mutation { updateRef(input: {refId: \"REF_x\", oid: \"0\", force: true}) { clientMutationId } }",
         ],
     ] {
-        let output = fixture.gh(&["--effect", "write", "--scope", "github:test"], &args, "");
-        assert_refused_unrun(&fixture, &output, "cannot verify");
+        let output = fixture.gh(
+            &[
+                "--effect",
+                "destructive",
+                "--scope",
+                "github:test",
+                "--destructive",
+            ],
+            &args,
+            "",
+        );
+        assert_refused_unrun(&fixture, &output, "cannot pin");
     }
 }
 
@@ -392,7 +415,7 @@ fn encoded_or_ambiguous_ref_endpoints_are_resolved_or_refused() {
         assert!(!output.status.success(), "{endpoint} ran");
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
-            stderr.contains("belongs to live session") || stderr.contains("cannot verify"),
+            stderr.contains("belongs to live session") || stderr.contains("cannot pin"),
             "{endpoint}: {stderr}"
         );
         assert_eq!(fixture.mutations(), "", "{endpoint} ran");
@@ -407,7 +430,7 @@ fn a_method_override_header_is_refused() {
         fixture.other.branch
     );
     let output = fixture.gh(
-        &[],
+        &["--destructive"],
         &[
             "api",
             "-X",
@@ -418,7 +441,7 @@ fn a_method_override_header_is_refused() {
         ],
         "",
     );
-    assert_refused_unrun(&fixture, &output, "method override");
+    assert_refused_unrun(&fixture, &output, "method-override");
 }
 
 #[test]
@@ -463,11 +486,17 @@ fn aliases_and_extensions_are_refused() {
         vec!["extension", "exec", "something"],
     ] {
         let output = fixture.gh(
-            &["--effect", "write", "--scope", "github:test"],
+            &[
+                "--effect",
+                "destructive",
+                "--scope",
+                "github:test",
+                "--destructive",
+            ],
             &args,
             &fixture.other.branch,
         );
-        assert_refused_unrun(&fixture, &output, "cannot verify");
+        assert_refused_unrun(&fixture, &output, "cannot pin");
     }
 }
 
@@ -484,4 +513,111 @@ fn a_forced_repo_sync_of_another_sessions_branch_is_refused() {
         &output,
         &format!("belongs to live session {}", fixture.other.id),
     );
+}
+
+// Parser differentials: spellings gh's own flag parser (cobra/pflag) reads
+// differently from a naive scan. Each must reach the same verdict gh would.
+
+fn assert_owner_refused(fixture: &Fixture, flags: &[&str], args: &[&str]) {
+    let output = fixture.gh(flags, args, &fixture.other.branch);
+    assert_refused_unrun(
+        fixture,
+        &output,
+        &format!("belongs to live session {}", fixture.other.id),
+    );
+}
+
+#[test]
+fn clustered_short_flags_are_parsed_as_gh_parses_them() {
+    let fixture = Fixture::new();
+    // `-sdtsubj`: squash, delete-branch, then -t consumes "subj".
+    assert_owner_refused(
+        &fixture,
+        &["--destructive"],
+        &["pr", "merge", "7", "-sdtsubj"],
+    );
+}
+
+#[test]
+fn equals_joined_boolean_values_are_parsed_as_gh_parses_them() {
+    let fixture = Fixture::new();
+    // pflag accepts 1/t/T/true/True/TRUE for a boolean.
+    assert_owner_refused(
+        &fixture,
+        &["--destructive"],
+        &["pr", "merge", "7", "--delete-branch=1"],
+    );
+}
+
+#[test]
+fn the_last_of_repeated_flags_wins_as_in_gh() {
+    let fixture = Fixture::new();
+    assert_owner_refused(
+        &fixture,
+        &["--destructive"],
+        &["pr", "merge", "7", "--delete-branch=false", "-d"],
+    );
+}
+
+#[test]
+fn fields_imply_a_write_even_without_a_method_flag() {
+    let fixture = Fixture::new();
+    let endpoint = format!(
+        "repos/schiste/Aethyme/git/refs/heads/{}",
+        fixture.other.branch
+    );
+    // gh POSTs when fields are given; this is not a read.
+    assert_owner_refused(
+        &fixture,
+        &["--destructive"],
+        &[
+            "api",
+            &endpoint,
+            "-F",
+            "sha=0000000000000000000000000000000000000000",
+        ],
+    );
+}
+
+#[test]
+fn a_repository_override_is_refused() {
+    let fixture = Fixture::new();
+    // `-dR…` slips past a prefix check for `-R`; gh reads it as a second target.
+    let output = fixture.gh(
+        &["--destructive"],
+        &["pr", "merge", "7", "-dRsomeone/else"],
+        &fixture.own.branch,
+    );
+    assert_refused_unrun(&fixture, &output, "--repo override");
+}
+
+#[test]
+fn an_unpinnable_write_runs_only_when_acknowledged() {
+    let fixture = Fixture::new();
+    let mutation = [
+        "api",
+        "graphql",
+        "-f",
+        "query=mutation { mergeBranch(input: {}) { clientMutationId } }",
+    ];
+    let output = fixture.gh(&["--destructive"], &mutation, "");
+    assert_refused_unrun(&fixture, &output, "--ref-write-acknowledged");
+    let output = fixture.gh(&["--ref-write-acknowledged"], &mutation, "");
+    assert!(
+        !output.status.success(),
+        "acknowledgement needs --destructive"
+    );
+    assert_eq!(fixture.mutations(), "");
+
+    let output = fixture.gh(
+        &["--destructive", "--ref-write-acknowledged"],
+        &mutation,
+        "",
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(fixture.mutations().contains("api graphql"));
 }

@@ -681,6 +681,10 @@ pub struct CoordinatedCommand {
     /// The live session whose branch a destructive write may delete or
     /// rewrite (`--cross-session`). Without it such a write is refused (#393).
     pub cross_session: Option<i64>,
+    /// `--ref-write-acknowledged`: the operator confirmed that a gh command
+    /// whose branch the broker cannot determine touches no other live
+    /// session's branch. Requires `--destructive` (#393).
+    pub ref_write_acknowledged: bool,
     /// Required for writes; identifies the user request or documented workflow.
     pub authorization_reason: Option<String>,
     pub args: Vec<String>,
@@ -1549,482 +1553,10 @@ fn has_forced_refspec(args: &[String]) -> bool {
 fn destructive_branch_targets(provider: OperationProvider, args: &[String]) -> Vec<String> {
     match provider {
         OperationProvider::Git => git_destructive_branch_targets(args),
-        // `gh api -X DELETE|PATCH repos/<owner>/<name>/git/refs/heads/<branch>`.
-        // `gh pr merge --delete-branch` and `gh pr update-branch --rebase`
-        // name no branch; the guard resolves theirs separately.
-        OperationProvider::Github => gh_api_branch_targets(args),
+        // gh commands are analyzed fail-closed by `gh_ref_guard`, which the
+        // guard consults directly.
+        OperationProvider::Github => Vec::new(),
     }
-}
-
-fn gh_api_branch_targets(args: &[String]) -> Vec<String> {
-    match gh_api_ref_endpoint(args) {
-        Some(Ok(branch)) => vec![branch],
-        _ => Vec::new(),
-    }
-}
-
-/// The `gh api` endpoint operand, or `None` when the command has none.
-fn gh_api_endpoint_operand(args: &[String]) -> Option<&str> {
-    if args.first().map(String::as_str) != Some("api") {
-        return None;
-    }
-    first_positional(&args[1..])
-}
-
-/// The branch a `gh api` endpoint addresses under `git/refs/heads/`.
-///
-/// `None`: the endpoint is not a Git ref. `Some(Err)`: it is one, but not in
-/// the single exact form this accepts (`repos/<owner>/<repo>/git/refs/heads/
-/// <branch>` after a scheme and host, a leading slash, a query and repeated
-/// percent-encoding are stripped). Dot segments, empty segments, `heads%2F…`
-/// and other spellings GitHub might normalize differently are refused rather
-/// than guessed at, because guessing wrong lets a deletion past the guard.
-fn gh_api_ref_endpoint(args: &[String]) -> Option<Result<String, String>> {
-    let endpoint = gh_api_endpoint_operand(args)?;
-    let mut path = endpoint.to_string();
-    if let Some((_, rest)) = path.split_once("://") {
-        path = rest
-            .split_once('/')
-            .map_or("", |(_, path)| path)
-            .to_string();
-    }
-    path = path
-        .split(['?', '#'])
-        .next()
-        .unwrap_or_default()
-        .to_string();
-    for _ in 0..5 {
-        let decoded = percent_decode(&path);
-        if decoded == path {
-            break;
-        }
-        path = decoded;
-    }
-    let path = path.trim_start_matches('/').trim_end_matches('/');
-    let segments: Vec<&str> = path.split('/').collect();
-    if !segments.iter().any(|segment| {
-        segment.eq_ignore_ascii_case("git")
-            || segment.eq_ignore_ascii_case("refs")
-            || segment.eq_ignore_ascii_case("matching-refs")
-    }) {
-        return None;
-    }
-    let refuse = |why: &str| Some(Err(format!("{why}: {endpoint:?}")));
-    if segments
-        .iter()
-        .any(|segment| segment.is_empty() || *segment == "." || *segment == "..")
-    {
-        return refuse("a ref endpoint with empty or dot path segments is ambiguous");
-    }
-    match segments.as_slice() {
-        ["repos", _, _, "git", "refs", "heads", branch @ ..] if !branch.is_empty() => {
-            Some(Ok(branch.join("/")))
-        }
-        // Tags and other namespaces are never session branches.
-        ["repos", _, _, "git", "refs", namespace, ..]
-            if !namespace.eq_ignore_ascii_case("heads") =>
-        {
-            None
-        }
-        ["repos", _, _, "git", "refs"] | ["repos", _, _, "git", "matching-refs", ..] => None,
-        _ => refuse("not a recognized `repos/<owner>/<repo>/git/refs/heads/<branch>` endpoint"),
-    }
-}
-
-fn percent_decode(value: &str) -> String {
-    let bytes = value.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'%'
-            && let (Some(high), Some(low)) = (
-                bytes.get(index + 1).and_then(|b| (*b as char).to_digit(16)),
-                bytes.get(index + 2).and_then(|b| (*b as char).to_digit(16)),
-            )
-        {
-            out.push((high * 16 + low) as u8);
-            index += 3;
-        } else {
-            out.push(bytes[index]);
-            index += 1;
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
-/// A ref update that may force: `force=<anything but false>` in any field
-/// spelling, or a request body (`--input`) that sets `"force": true` or
-/// cannot be read here (stdin).
-fn gh_api_forces(args: &[String]) -> bool {
-    let field_forces = args.iter().any(|arg| {
-        arg.trim_start_matches("--field=")
-            .trim_start_matches("--raw-field=")
-            .split_once('=')
-            .is_some_and(|(key, value)| key == "force" && !value.eq_ignore_ascii_case("false"))
-    });
-    field_forces
-        || gh_input_bodies(args).iter().any(|body| match body {
-            Some(text) => {
-                let compact: String = text.chars().filter(|ch| !ch.is_whitespace()).collect();
-                compact.contains("\"force\":true")
-            }
-            None => true,
-        })
-}
-
-/// The request bodies `gh api` will read: `--input <file>` and `@file`
-/// field values. `None` is stdin (`-` / `@-`), which the broker cannot see,
-/// or a file it cannot read.
-fn gh_input_bodies(args: &[String]) -> Vec<Option<String>> {
-    let read = |path: &str| {
-        (path != "-")
-            .then(|| std::fs::read_to_string(path).ok())
-            .flatten()
-    };
-    let mut bodies = Vec::new();
-    let mut iter = args.iter();
-    while let Some(arg) = iter.next() {
-        if arg == "--input" {
-            bodies.push(iter.next().and_then(|path| read(path)));
-        } else if let Some(path) = arg.strip_prefix("--input=") {
-            bodies.push(read(path));
-        } else if matches!(arg.as_str(), "-F" | "--field") {
-            if let Some((_, path)) = iter.next().and_then(|field| field.split_once("=@")) {
-                bodies.push(read(path));
-            }
-        } else if let Some((_, path)) = arg
-            .strip_prefix("--field=")
-            .and_then(|field| field.split_once("=@"))
-        {
-            bodies.push(read(path));
-        }
-    }
-    bodies
-}
-
-/// A `gh pr` command that deletes or rewrites the pull request's head branch.
-#[derive(Debug, PartialEq, Eq)]
-struct GhPrRefCommand {
-    /// The PR operand as typed (number, URL or branch), or `None` for the
-    /// current branch of the directory `gh` runs in.
-    selector: Option<String>,
-}
-
-/// The head branch a `gh pr merge|close --delete-branch` or `gh pr
-/// update-branch --rebase` would delete or rewrite, resolved before anything
-/// is journaled.
-///
-/// Always asks `gh pr view` with the same operand, directory and `GH_REPO`
-/// the real command will get, so the branch checked is the one gh itself
-/// resolves: with no operand that follows the current branch's push and merge
-/// configuration, which a local branch name alone does not. A fork head is
-/// still returned: a name that matches no live session refuses nothing. A PR
-/// URL for another repository, or anything that cannot be resolved, refuses.
-fn gh_pr_head_branch_target(
-    args: &[String],
-    cwd: &Path,
-    github_target: Option<&crate::ResolvedGithubTarget>,
-) -> Result<Option<String>, BrokerOpError> {
-    let refuse = |why: String| BrokerOpError::InvalidCoordinatedOperation {
-        reason: format!(
-            "refusing a gh pr command that deletes or rewrites its head branch: {why}; \
-             nothing was run, so the branch's owning session could not be checked"
-        ),
-    };
-    let Some(command) = gh_pr_ref_command(args).map_err(refuse)? else {
-        return Ok(None);
-    };
-    let target =
-        github_target.ok_or_else(|| refuse("broker gh requires --repo owner/name".into()))?;
-    if let Some(selector) = &command.selector
-        && let Some((_, path)) = selector.split_once("://")
-    {
-        let mut parts = path.split('/').skip(1);
-        let slug = format!(
-            "{}/{}",
-            parts.next().unwrap_or_default(),
-            parts.next().unwrap_or_default()
-        );
-        if !slug.eq_ignore_ascii_case(&target.display_slug) {
-            return Err(refuse(format!(
-                "pull request URL {selector:?} is in {slug}, not {}",
-                target.display_slug
-            )));
-        }
-    }
-    let mut view = provider_command(OperationProvider::Github);
-    view.args(["pr", "view"]);
-    if let Some(selector) = &command.selector {
-        view.arg(selector);
-    }
-    let output = view
-        .args(["--json", "headRefName", "--jq", ".headRefName"])
-        .current_dir(cwd)
-        .stdin(Stdio::null())
-        .env("GH_REPO", &target.display_slug)
-        .output()
-        .map_err(|error| refuse(format!("cannot run gh pr view: {error}")))?;
-    let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if !output.status.success() || branch.is_empty() {
-        return Err(refuse(format!(
-            "gh pr view could not name the head branch: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
-    }
-    Ok(Some(branch))
-}
-
-/// Built-in `gh` commands. Anything else is an alias or an extension, which
-/// can expand to any command, including a branch deletion the broker cannot
-/// see, so it is refused.
-const GH_BUILTIN_COMMANDS: &[&str] = &[
-    "agent-task",
-    "alias",
-    "api",
-    "attestation",
-    "auth",
-    "browse",
-    "cache",
-    "codespace",
-    "completion",
-    "config",
-    "copilot",
-    "extension",
-    "gist",
-    "gpg-key",
-    "help",
-    "issue",
-    "label",
-    "org",
-    "pr",
-    "preview",
-    "project",
-    "release",
-    "repo",
-    "ruleset",
-    "run",
-    "search",
-    "secret",
-    "ssh-key",
-    "status",
-    "variable",
-    "version",
-    "workflow",
-    "--version",
-    "--help",
-];
-
-/// GraphQL mutations that delete or move a ref by node id, which the broker
-/// cannot map to a branch.
-const GRAPHQL_REF_MUTATIONS: &[&str] = &["deleteRef", "updateRef", "updateRefs"];
-
-/// Refuse `gh` invocations whose effect on branch refs the broker cannot
-/// determine: aliases and extensions, GraphQL ref mutations (or a GraphQL
-/// document it cannot read), a method override smuggled through a header, and
-/// a destructive ref endpoint it cannot parse exactly (#393).
-fn refuse_unverifiable_github_ref_writes(
-    args: &[String],
-    effect: OperationEffect,
-) -> Result<(), BrokerOpError> {
-    let refuse = |why: String| {
-        Err(BrokerOpError::InvalidCoordinatedOperation {
-            reason: format!(
-                "refusing a gh command whose effect on branch refs the broker cannot verify: {why}"
-            ),
-        })
-    };
-    let Some(command) = args.first() else {
-        return Ok(());
-    };
-    if !GH_BUILTIN_COMMANDS.contains(&command.as_str()) {
-        return refuse(format!(
-            "`{command}` is not a built-in gh command, so it is an alias or extension; \
-             run the built-in command it expands to"
-        ));
-    }
-    if command == "extension" && matches!(args.get(1).map(String::as_str), Some("exec" | "e")) {
-        return refuse(
-            "`gh extension exec` runs an extension; run the built-in command instead".into(),
-        );
-    }
-    if command == "repo" && args.get(1).map(String::as_str) == Some("sync") {
-        // `gh repo sync [<destination>] [-b <branch>] [-s <source>] [--force]`
-        let mut destination = None;
-        let mut rest = args[2..].iter();
-        while let Some(arg) = rest.next() {
-            if matches!(arg.as_str(), "-b" | "--branch" | "-s" | "--source") {
-                rest.next();
-            } else if !arg.starts_with('-') && destination.is_none() {
-                destination = Some(arg.clone());
-            }
-        }
-        if args
-            .iter()
-            .any(|arg| arg == "--force" || arg == "--force=true")
-            && let Some(destination) = destination
-        {
-            return refuse(format!(
-                "`gh repo sync --force` names destination {destination:?}; force-sync only \
-                 the --repo repository, without a positional destination"
-            ));
-        }
-    }
-    if command != "api" {
-        return Ok(());
-    }
-    let headers = args.windows(2).filter_map(|pair| {
-        matches!(pair[0].as_str(), "-H" | "--header").then_some(pair[1].as_str())
-    });
-    let inline = args.iter().filter_map(|arg| {
-        arg.strip_prefix("--header=")
-            .or_else(|| arg.strip_prefix("-H"))
-    });
-    if headers
-        .chain(inline)
-        .any(|header| header.to_ascii_lowercase().contains("method-override"))
-    {
-        return refuse("an HTTP method override header".into());
-    }
-    if gh_api_endpoint_operand(args).is_some_and(|endpoint| {
-        endpoint
-            .trim_start_matches('/')
-            .eq_ignore_ascii_case("graphql")
-            || endpoint.to_ascii_lowercase().ends_with("/graphql")
-    }) {
-        let mut documents: Vec<Option<String>> = vec![Some(args.join(" "))];
-        documents.extend(gh_input_bodies(args));
-        if documents.iter().any(Option::is_none) {
-            return refuse(
-                "a GraphQL request whose document comes from stdin or an unreadable file; \
-                 pass it with -f query=… or a readable file"
-                    .into(),
-            );
-        }
-        if let Some(mutation) = GRAPHQL_REF_MUTATIONS.iter().find(|mutation| {
-            documents
-                .iter()
-                .flatten()
-                .any(|document| document.contains(**mutation))
-        }) {
-            return refuse(format!(
-                "the GraphQL `{mutation}` mutation addresses a ref by node id; delete a branch \
-                 with `gh api -X DELETE repos/<owner>/<repo>/git/refs/heads/<branch>`"
-            ));
-        }
-    }
-    if effect == OperationEffect::Destructive
-        && let Some(Err(why)) = gh_api_ref_endpoint(args)
-    {
-        return refuse(why);
-    }
-    Ok(())
-}
-
-/// The branch `gh repo sync --force --branch <b>` hard-resets.
-fn gh_repo_sync_forced_branch(args: &[String]) -> Option<String> {
-    if args.first().map(String::as_str) != Some("repo")
-        || args.get(1).map(String::as_str) != Some("sync")
-        || !args
-            .iter()
-            .any(|arg| arg == "--force" || arg == "--force=true")
-    {
-        return None;
-    }
-    args.windows(2)
-        .find(|pair| matches!(pair[0].as_str(), "-b" | "--branch"))
-        .map(|pair| pair[1].clone())
-        .or_else(|| {
-            args.iter()
-                .find_map(|arg| arg.strip_prefix("--branch=").map(str::to_string))
-        })
-}
-
-fn mentions_head_branch_rewrite(args: &[String]) -> bool {
-    args.iter().skip(2).any(|arg| {
-        arg.starts_with("--delete-branch")
-            || arg.starts_with("--rebase")
-            || arg
-                .strip_prefix('-')
-                .is_some_and(|bundle| !bundle.starts_with('-') && bundle.contains('d'))
-    })
-}
-
-/// Parse `gh pr merge … --delete-branch` and `gh pr update-branch --rebase`.
-///
-/// `Ok(None)` is a command that touches no head branch, including a merge
-/// that keeps it. An option this does not know is an error rather than a
-/// guess: if it took a value, the value would be read as the PR operand and
-/// the guard would check the wrong branch.
-fn gh_pr_ref_command(args: &[String]) -> Result<Option<GhPrRefCommand>, String> {
-    let (value_flags, deleting_flags): (&[&str], &[&str]) = match args.get(1).map(String::as_str) {
-        Some("merge") => (
-            &[
-                "-A",
-                "--author-email",
-                "-b",
-                "--body",
-                "-F",
-                "--body-file",
-                "--match-head-commit",
-                "-t",
-                "--subject",
-                "-R",
-                "--repo",
-            ],
-            &["-d", "--delete-branch", "--delete-branch=true"],
-        ),
-        Some("update-branch") => (&["-R", "--repo"], &["--rebase", "--rebase=true"]),
-        // Closing with `--delete-branch` deletes the head branch as well.
-        Some("close") => (
-            &["-c", "--comment", "-R", "--repo"],
-            &["-d", "--delete-branch", "--delete-branch=true"],
-        ),
-        _ => return Ok(None),
-    };
-    let boolean_flags = [
-        "--admin",
-        "--auto",
-        "--disable-auto",
-        "-m",
-        "--merge",
-        "-r",
-        "--rebase",
-        "-s",
-        "--squash",
-        "--delete-branch=false",
-        "--rebase=false",
-    ];
-    let mut touches = false;
-    let mut selector = None;
-    let mut rest = args[2..].iter();
-    while let Some(arg) = rest.next() {
-        if arg == "--" {
-            selector = selector.or_else(|| rest.next().cloned());
-            break;
-        }
-        if deleting_flags.contains(&arg.as_str()) {
-            touches = true;
-        } else if value_flags.contains(&arg.as_str()) {
-            rest.next();
-        } else if value_flags
-            .iter()
-            .any(|flag| flag.starts_with("--") && arg.starts_with(&format!("{flag}=")))
-            || boolean_flags.contains(&arg.as_str())
-            || arg == "-h"
-            || arg == "--help"
-        {
-        } else if let Some(bundle) = arg.strip_prefix('-').filter(|rest| {
-            !rest.starts_with('-') && rest.len() > 1 && rest.chars().all(|ch| "dmrs".contains(ch))
-        }) {
-            // `-sd`: bundled boolean short options of `pr merge`.
-            touches |= matches!(args[1].as_str(), "merge" | "close") && bundle.contains('d');
-        } else if arg.starts_with('-') {
-            return Err(format!("unrecognized option {arg:?}"));
-        } else if selector.is_none() {
-            selector = Some(arg.clone());
-        }
-    }
-    Ok(touches.then_some(GhPrRefCommand { selector }))
 }
 
 fn git_destructive_branch_targets(args: &[String]) -> Vec<String> {
@@ -2071,6 +1603,55 @@ fn git_destructive_branch_targets(args: &[String]) -> Vec<String> {
         .filter(|branch| !branch.is_empty())
         .map(str::to_string)
         .collect()
+}
+
+/// The head branch of the pull request `selector` names (or the one gh picks
+/// for the current branch when there is none), resolved before anything is
+/// journaled with the same operand, directory and `GH_REPO` the real command
+/// will get, so the branch checked is the branch gh acts on. A PR's head
+/// branch name is fixed for its lifetime. A PR URL for another repository,
+/// or anything `gh pr view` cannot name, is an error.
+fn gh_pr_head_branch(
+    selector: Option<&str>,
+    cwd: &Path,
+    target: &crate::ResolvedGithubTarget,
+) -> Result<String, String> {
+    if let Some(selector) = selector
+        && let Some((_, path)) = selector.split_once("://")
+    {
+        let mut parts = path.split('/').skip(1);
+        let slug = format!(
+            "{}/{}",
+            parts.next().unwrap_or_default(),
+            parts.next().unwrap_or_default()
+        );
+        if !slug.eq_ignore_ascii_case(&target.display_slug) {
+            return Err(format!(
+                "pull request URL {selector:?} is in {slug}, not {}",
+                target.display_slug
+            ));
+        }
+    }
+    let mut view = provider_command(OperationProvider::Github);
+    view.args(["pr", "view"]);
+    if let Some(selector) = selector {
+        view.arg(selector);
+    }
+    let output = view
+        .args(["--json", "headRefName", "--jq", ".headRefName"])
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .env("GH_REPO", &target.display_slug)
+        .output()
+        .map_err(|error| format!("cannot run gh pr view: {error}"))?;
+    let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !output.status.success() || branch.is_empty() {
+        return Err(format!(
+            "gh pr view could not name the head branch: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(branch)
 }
 
 /// Positional arguments of a Git subcommand, skipping options and the values
@@ -2471,6 +2052,16 @@ fn gh_method(args: &[String]) -> Option<&str> {
 pub fn classify_gh(args: &[String]) -> Option<OperationEffect> {
     let command = args.first()?.as_str();
     let action = args.get(1).map(String::as_str);
+    // Anything that can write a branch ref, as `gh_ref_guard` decides it
+    // fail-closed, is destructive: the guard then resolves the branch or
+    // refuses (#393). Aliases and extensions stay unclassified, so the caller
+    // must declare an effect, and the guard still refuses them.
+    if crate::gh_ref_guard::BUILTIN.contains(&command)
+        && command != "extension"
+        && crate::gh_ref_guard::analyze(args, None).writes()
+    {
+        return Some(OperationEffect::Destructive);
+    }
     if command == "api" {
         let method = gh_method(args).unwrap_or_else(|| {
             if has_any(args, &["-f", "--raw-field", "-F", "--field", "--input"]) {
@@ -2482,27 +2073,8 @@ pub fn classify_gh(args: &[String]) -> Option<OperationEffect> {
         return Some(match method.to_ascii_uppercase().as_str() {
             "GET" | "HEAD" => OperationEffect::Read,
             "DELETE" => OperationEffect::Destructive,
-            // A forced ref update rewrites the branch, as `push --force` does.
-            "PATCH" if gh_api_ref_endpoint(args).is_some() && gh_api_forces(args) => {
-                OperationEffect::Destructive
-            }
             _ => OperationEffect::Write,
         });
-    }
-    // Merging with `--delete-branch` deletes the head branch, and a rebase
-    // update rewrites it; neither names that branch in its arguments (#393).
-    if command == "repo" && gh_repo_sync_forced_branch(args).is_some() {
-        return Some(OperationEffect::Destructive);
-    }
-    // A spelling the parser cannot read still counts when it asks for either,
-    // so the guard runs and refuses it instead of the write passing unseen.
-    if command == "pr"
-        && match gh_pr_ref_command(args) {
-            Ok(found) => found.is_some(),
-            Err(_) => mentions_head_branch_rewrite(args),
-        }
-    {
-        return Some(OperationEffect::Destructive);
     }
     let read_actions = [
         "list", "view", "status", "diff", "checks", "watch", "download", "get", "token",
@@ -4411,6 +3983,7 @@ impl Broker {
             declared_effect: None,
             destructive_confirmed: false,
             cross_session: None,
+            ref_write_acknowledged: false,
             authorization_reason: Some(
                 "refresh the tracked target after an authorized pull-request merge".into(),
             ),
@@ -4561,6 +4134,48 @@ impl Broker {
         )
     }
 
+    /// The one branch a gh ref write targets, or why it cannot be named with
+    /// certainty. Any such write must also target this checkout's own
+    /// `origin` (the repository session branches live in) on github.com.
+    fn resolve_gh_ref_write(
+        &self,
+        ref_write: crate::gh_ref_guard::RefWrite,
+        cwd: &Path,
+        github_target: Option<&crate::ResolvedGithubTarget>,
+    ) -> Result<String, String> {
+        use crate::gh_ref_guard::RefWrite;
+        let target = github_target.ok_or("no --repo target")?;
+        if let Some(host) = std::env::var_os("GH_HOST")
+            && !host.to_string_lossy().eq_ignore_ascii_case("github.com")
+        {
+            return Err(format!(
+                "GH_HOST={} points gh at another host",
+                host.to_string_lossy()
+            ));
+        }
+        match canonical_local_repository(cwd, None) {
+            Ok(Some(origin)) if origin.eq_ignore_ascii_case(&target.coordination_key) => {}
+            Ok(Some(origin)) => {
+                return Err(format!(
+                    "--repo {} is not this checkout's origin ({origin})",
+                    target.display_slug
+                ));
+            }
+            _ => {
+                return Err(format!(
+                    "cannot verify that --repo {} is this checkout's origin",
+                    target.display_slug
+                ));
+            }
+        }
+        match ref_write {
+            RefWrite::None => Err("no ref write".into()),
+            RefWrite::Branch(branch) => Ok(branch),
+            RefWrite::PrHead { selector } => gh_pr_head_branch(selector.as_deref(), cwd, target),
+            RefWrite::Uncertain(why) => Err(why),
+        }
+    }
+
     /// Refuse a destructive operation on a branch that belongs to another
     /// live session, unless `cross_session` names exactly that session.
     /// Returns the session the caller was allowed to cross into.
@@ -4571,7 +4186,16 @@ impl Broker {
         cwd: &Path,
         github_target: Option<&crate::ResolvedGithubTarget>,
     ) -> Result<Option<i64>, BrokerOpError> {
-        if effect != OperationEffect::Destructive {
+        // gh is analyzed whatever its declared effect: an alias declared
+        // `--effect write` can still expand to a branch deletion.
+        let ref_write = match request.provider {
+            OperationProvider::Github => crate::gh_ref_guard::analyze(
+                &request.args,
+                github_target.map(|target| target.display_slug.as_str()),
+            ),
+            OperationProvider::Git => crate::gh_ref_guard::RefWrite::None,
+        };
+        if effect != OperationEffect::Destructive && !ref_write.writes() {
             return match request.cross_session {
                 Some(_) => Err(BrokerOpError::InvalidCoordinatedOperation {
                     reason: "--cross-session applies only to a destructive operation".into(),
@@ -4580,11 +4204,23 @@ impl Broker {
             };
         }
         let mut targets = destructive_branch_targets(request.provider, &request.args);
-        if request.provider == OperationProvider::Github {
-            if request.args.first().map(String::as_str) == Some("pr") {
-                targets.extend(gh_pr_head_branch_target(&request.args, cwd, github_target)?);
+        if ref_write.writes() {
+            match self.resolve_gh_ref_write(ref_write, cwd, github_target) {
+                Ok(branch) => targets.push(branch),
+                // The operator vouched for a write the broker cannot pin to a
+                // branch; the journal records the acknowledgement.
+                Err(_) if request.ref_write_acknowledged && request.destructive_confirmed => {}
+                Err(why) => {
+                    return Err(BrokerOpError::InvalidCoordinatedOperation {
+                        reason: format!(
+                            "refusing a gh command that may write a branch ref the broker cannot \
+                             pin to one branch: {why}. Nothing was run. Use a form the broker can \
+                             resolve, or, only if the operator confirmed it touches no other live \
+                             session's branch, add --destructive --ref-write-acknowledged"
+                        ),
+                    });
+                }
             }
-            targets.extend(gh_repo_sync_forced_branch(&request.args));
         }
         let owners: Vec<crate::Session> = if targets.is_empty() {
             Vec::new()
@@ -4700,8 +4336,9 @@ impl Broker {
         // A session id is all a caller needs to name a session, so it proves
         // nothing about whose branch is being deleted or rewritten. Before
         // anything is journaled: the refusal leaves no operation behind (#393).
-        if request.provider == OperationProvider::Github {
-            refuse_unverifiable_github_ref_writes(&request.args, effect)?;
+        if request.ref_write_acknowledged {
+            authorization_reason =
+                authorization_reason.map(|reason| format!("{reason} [ref-write-acknowledged]"));
         }
         if let Some(owner) =
             self.refuse_foreign_session_branches(&request, effect, cwd, github_target.as_ref())?
@@ -7051,83 +6688,16 @@ mod tests {
             ["agent/a"]
         );
         assert!(git(&["reset", "--hard", "HEAD~1"]).is_empty());
-        let gh = destructive_branch_targets(
-            OperationProvider::Github,
-            &["api", "-X", "DELETE", "repos/o/n/git/refs/heads/agent/a"]
-                .iter()
-                .map(|arg| (*arg).to_string())
-                .collect::<Vec<_>>(),
-        );
-        assert_eq!(gh, ["agent/a"]);
-    }
-
-    #[test]
-    fn gh_commands_that_delete_or_rewrite_a_head_branch_are_destructive() {
-        let classify = |line: &[&str]| classify_gh(&args(line));
-        for line in [
-            &["pr", "merge", "42", "--squash", "--delete-branch"][..],
-            &["pr", "merge", "42", "-d"],
-            &["pr", "merge", "-sd", "42"],
-            &["pr", "merge", "42", "--delete-branch=true"],
-            &["pr", "update-branch", "42", "--rebase"],
-            &[
-                "api",
-                "-X",
-                "PATCH",
-                "repos/o/n/git/refs/heads/agent/a",
-                "-F",
-                "force=true",
-            ],
-            &["api", "-X", "DELETE", "repos/o/n/git/refs/heads/agent%2Fa"],
-            // Unparseable, but asks for a deletion: the guard must still run.
-            &["pr", "merge", "42", "--unknown-flag", "-d"],
-        ] {
-            assert_eq!(
-                classify(line),
-                Some(OperationEffect::Destructive),
-                "{line:?}"
-            );
-        }
-        for line in [
-            &["pr", "merge", "42", "--squash"][..],
-            &["pr", "merge", "42", "--delete-branch=false"],
-            &["pr", "merge", "42", "--rebase"],
-            &["pr", "update-branch", "42"],
-            &[
-                "api",
-                "-X",
-                "PATCH",
-                "repos/o/n/git/refs/heads/agent/a",
-                "-F",
-                "sha=abc",
-            ],
-        ] {
-            assert_eq!(classify(line), Some(OperationEffect::Write), "{line:?}");
-        }
-    }
-
-    #[test]
-    fn gh_pr_ref_command_reads_the_pr_operand_past_option_values() {
-        let parse = |line: &[&str]| gh_pr_ref_command(&args(line));
-        let selector = |line: &[&str]| parse(line).unwrap().unwrap().selector;
-        assert_eq!(
-            selector(&["pr", "merge", "--match-head-commit", "abc123", "-d", "42"]),
-            Some("42".to_string())
-        );
-        assert_eq!(
-            selector(&["pr", "merge", "-t", "subject", "-b", "-d is text", "-d"]),
-            None
-        );
-        assert_eq!(
-            selector(&["pr", "merge", "--subject=x", "-d", "agent/b"]),
-            Some("agent/b".to_string())
-        );
-        assert_eq!(parse(&["pr", "merge", "42", "--squash"]).unwrap(), None);
-        assert!(parse(&["pr", "merge", "42", "--new-flag", "v", "-d"]).is_err());
-        assert_eq!(parse(&["pr", "view", "42"]).unwrap(), None);
-        assert_eq!(
-            gh_api_branch_targets(&args(&["api", "repos/o/n/git/refs/heads/agent%2Fa?x=1"])),
-            ["agent/a"]
+        // gh commands are resolved by `gh_ref_guard`, not by argument matching.
+        assert!(
+            destructive_branch_targets(
+                OperationProvider::Github,
+                &["api", "-X", "DELETE", "repos/o/n/git/refs/heads/agent/a"]
+                    .iter()
+                    .map(|arg| (*arg).to_string())
+                    .collect::<Vec<_>>(),
+            )
+            .is_empty()
         );
     }
 }

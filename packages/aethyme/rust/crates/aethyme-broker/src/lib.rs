@@ -58,6 +58,7 @@ pub use gate_database::GateBrokerDatabase;
 mod gate_doctor;
 mod gates;
 mod gc;
+mod gh_ref_guard;
 mod git;
 mod github_target;
 mod graph_impact;

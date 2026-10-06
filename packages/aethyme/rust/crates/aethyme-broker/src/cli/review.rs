@@ -853,6 +853,7 @@ pub(super) fn run_review_run(parsed: Parsed) -> Result<serde_json::Value, UsageE
                 declared_effect: Some(crate::OperationEffect::Write),
                 destructive_confirmed: false,
                 cross_session: None,
+                ref_write_acknowledged: false,
                 authorization_reason: Some(call.purpose.clone()),
                 args: call.args.clone(),
             })

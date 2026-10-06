@@ -78,6 +78,7 @@ fn request(session_id: i64, args: &[&str]) -> CoordinatedCommand {
         declared_effect: None,
         destructive_confirmed: false,
         cross_session: None,
+        ref_write_acknowledged: false,
         authorization_reason: Some("test workflow".into()),
         args: args.iter().map(|arg| (*arg).into()).collect(),
     }
@@ -173,6 +174,7 @@ fn github_request(session_id: i64, repository: &str, args: &[&str]) -> Coordinat
         declared_effect: Some(OperationEffect::Read),
         destructive_confirmed: false,
         cross_session: None,
+        ref_write_acknowledged: false,
         authorization_reason: None,
         args: args.iter().map(|arg| (*arg).into()).collect(),
     }
@@ -1451,6 +1453,7 @@ fn repository_write_lock_serializes_independent_process_clients() {
                     declared_effect: Some(OperationEffect::Write),
                     destructive_confirmed: false,
                     cross_session: None,
+                    ref_write_acknowledged: false,
                     authorization_reason: Some("concurrency regression".into()),
                     args: vec!["pause".into()],
                 })

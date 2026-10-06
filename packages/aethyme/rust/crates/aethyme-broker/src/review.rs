@@ -736,6 +736,7 @@ impl Broker {
                 declared_effect: Some(OperationEffect::Write),
                 destructive_confirmed: false,
                 cross_session: None,
+                ref_write_acknowledged: false,
                 authorization_reason: Some("explicit review lifecycle request transition".into()),
                 args: vec!["pr".into(), "ready".into(), current.pr_number.to_string()],
             })?;
@@ -830,6 +831,7 @@ impl Broker {
             declared_effect: Some(OperationEffect::Write),
             destructive_confirmed: false,
             cross_session: None,
+            ref_write_acknowledged: false,
             authorization_reason: Some("explicit review-satisfied validation unlock".into()),
             args,
         })?;

@@ -318,12 +318,17 @@ Usage:
       --queue-timeout <seconds> to give up after a bounded wait.
       A destructive write to a branch that belongs to another live session is
       refused unless --cross-session names that session.
-  aethyme broker gh --session <id> --repo <owner/name> [--scope <scope>] [--effect <read|write|destructive>] [--reason <text>] [--destructive [--cross-session <id>]] [--no-wait|--queue-timeout <seconds>] [--json] -- <gh-args>
+  aethyme broker gh --session <id> --repo <owner/name> [--scope <scope>] [--effect <read|write|destructive>] [--reason <text>] [--destructive [--cross-session <id>] [--ref-write-acknowledged]] [--no-wait|--queue-timeout <seconds>] [--json] -- <gh-args>
       Run GitHub CLI through the same repository coordinator. The broker sets
       GH_REPO from the exact target and never persists command output or
       secret-bearing argument values. After a successful `gh pr merge`, it
       refreshes the tracked target and removes a fully landed integration
       layer; mixed or uncertain work remains unchanged with recovery guidance.
+      A command that can delete or move a branch ref (pr merge|close
+      --delete-branch, update-branch --rebase, repo sync --force, api ref
+      writes, GraphQL mutations, aliases) is checked against the exact branch
+      it touches; one the broker cannot pin to a branch is refused unless
+      --destructive --ref-write-acknowledged confirms it.
   aethyme broker merge-chain --session <id> --repo <owner/name> --reason <text> <pr>... [--merge-method <merge|squash|rebase>] [--poll-seconds <n>] [--checks-timeout <seconds>] [--main-timeout <seconds>] [--gates-workflow <file> [--dispatch-after <seconds>]] [--dry-run] [--json]
       Land pull requests one at a time, in order. For each: mark it ready,
       update it onto the base when behind, wait for the latest run of every
@@ -1015,6 +1020,7 @@ struct Parsed {
     session: Option<i64>,
     to_session: Option<i64>,
     cross_session: Option<i64>,
+    ref_write_acknowledged: bool,
     note_id: Option<i64>,
     message: Option<String>,
     entry: Option<i64>,
@@ -1148,6 +1154,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         session: None,
         to_session: None,
         cross_session: None,
+        ref_write_acknowledged: false,
         note_id: None,
         message: None,
         entry: None,
@@ -1748,6 +1755,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
                     UsageError::Message("--session must be an integer session id".into())
                 })?);
             }
+            "--ref-write-acknowledged" => parsed.ref_write_acknowledged = true,
             "--cross-session" => {
                 let value = iter.next().ok_or(UsageError::Message(
                     "--cross-session requires a session id".into(),
