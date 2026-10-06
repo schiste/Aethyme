@@ -287,7 +287,7 @@ if [[ -d "$AETHYME_DIR/.git" ]]; then
     # calls spell `aethyme repo record-wrapper-invocation`, guarded by
     # `command -v aethyme`. Any executable `-m src.cli` line in a
     # deployed shell is stale — redeploy with the current template.
-    for wrapper in ".codex/skills/aethyme/aethyme-explore" ".claude/hooks/aethyme-load-context.sh"; do
+    for wrapper in ".claude/skills/aethyme/aethyme-explore" ".codex/skills/aethyme/aethyme-explore" ".claude/hooks/aethyme-load-context.sh"; do
         [[ -f "$wrapper" ]] || { check_fail "Missing deployed wrapper $wrapper"; continue; }
         grep -q '{{AETHYME_ROOT}}' "$wrapper" && check_fail "$wrapper has unresolved {{AETHYME_ROOT}} placeholder" || check_pass "$wrapper placeholders resolved"
         # The binary may be spelled bare (`aethyme`, from PATH) or through

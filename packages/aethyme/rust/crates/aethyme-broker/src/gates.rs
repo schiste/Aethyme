@@ -736,6 +736,8 @@ pub struct ManagedGateCacheProvenance {
     pub max_bytes: u64,
     pub bytes_before: u64,
     pub bytes_after: Option<u64>,
+    pub inodes_before: u64,
+    pub inodes_after: Option<u64>,
     pub rotated_before_run: bool,
     /// Files of the tree under test whose mtime the broker advanced before
     /// the command ran, so Cargo rebuilds workspace members from this tree
@@ -1845,7 +1847,14 @@ fn prepare_managed_gate_cache_in(
     let repository_root = root.join("gates").join(repository);
     std::fs::create_dir_all(&repository_root)?;
     let directory = repository_root.join(&policy.key);
-    let bytes_before = directory_usage(&directory)?;
+    let usage_before = match directory_usage(&directory) {
+        Ok(usage) => usage,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            crate::disk_headroom::DirectoryUsage::default()
+        }
+        Err(error) => return Err(error),
+    };
+    let bytes_before = usage_before.bytes;
     let rotated_before_run = bytes_before > policy.max_bytes;
     if rotated_before_run {
         progress.report(&format!(
@@ -1871,30 +1880,16 @@ fn prepare_managed_gate_cache_in(
             max_bytes: policy.max_bytes,
             bytes_before,
             bytes_after: None,
+            inodes_before: usage_before.inodes,
+            inodes_after: None,
             rotated_before_run,
             sources_refreshed: 0,
         },
     }))
 }
 
-fn directory_usage(path: &Path) -> Result<u64, std::io::Error> {
-    if !path.exists() {
-        return Ok(0);
-    }
-    let mut bytes = 0_u64;
-    let mut pending = vec![path.to_path_buf()];
-    while let Some(directory) = pending.pop() {
-        for entry in std::fs::read_dir(directory)? {
-            let entry = entry?;
-            let metadata = entry.file_type()?;
-            if metadata.is_dir() {
-                pending.push(entry.path());
-            } else {
-                bytes = bytes.saturating_add(entry.metadata()?.len());
-            }
-        }
-    }
-    Ok(bytes)
+fn directory_usage(path: &Path) -> Result<crate::disk_headroom::DirectoryUsage, std::io::Error> {
+    crate::disk_headroom::directory_usage_without_following_links(path)
 }
 
 fn sha256_text(value: &str) -> String {
@@ -2171,12 +2166,14 @@ fn run_selections(
         // checkout stands in for its repository: a gate checkout lies under
         // the temporary directory exactly when its repository does, because
         // durable host state is withheld from throwaway repositories.
-        let available = crate::disk_headroom::available_bytes_for(checkout.root(), checkout.root());
+        let available =
+            crate::disk_headroom::available_headroom_for(checkout.root(), checkout.root());
         let mut environment = GateEnvironment {
             load_avg_1m_start: load_average_1m(),
             load_avg_1m_end: None,
             cpu_count: logical_cpu_count(),
-            free_disk_bytes_start: available.and_then(|bytes| i64::try_from(bytes).ok()),
+            free_disk_bytes_start: available
+                .and_then(|headroom| i64::try_from(headroom.bytes).ok()),
             free_disk_bytes_end: None,
         };
         let started = Instant::now();
@@ -2185,7 +2182,8 @@ fn run_selections(
             &gate.command,
             GateCommandContext {
                 cwd: checkout.root(),
-                available,
+                available_bytes: available.map(|headroom| headroom.bytes),
+                available_inodes: available.and_then(|headroom| headroom.inodes),
                 environment: &environment,
                 log_path: &log_path,
                 run_dir: &run_dir,
@@ -2203,7 +2201,9 @@ fn run_selections(
             },
         );
         if let Some(cache) = managed_cache_runtime.as_mut() {
-            cache.provenance.bytes_after = directory_usage(&cache.directory).ok();
+            let usage_after = directory_usage(&cache.directory).ok();
+            cache.provenance.bytes_after = usage_after.map(|usage| usage.bytes);
+            cache.provenance.inodes_after = usage_after.map(|usage| usage.inodes);
         }
         let release_error = resource_runtime
             .as_mut()
@@ -2266,9 +2266,9 @@ fn run_selections(
         // already attributed to the host (#288).
         if gate_status != GateStatus::Pass && !host_fault {
             let available_end =
-                crate::disk_headroom::available_bytes_for(checkout.root(), checkout.root());
+                crate::disk_headroom::available_headroom_for(checkout.root(), checkout.root());
             environment.free_disk_bytes_end =
-                available_end.and_then(|bytes| i64::try_from(bytes).ok());
+                available_end.and_then(|headroom| i64::try_from(headroom.bytes).ok());
             if let Some(note) = starved_after_start(available_end) {
                 host_fault = true;
                 gate_status = GateStatus::Error;
@@ -2407,19 +2407,36 @@ fn record_gate_preflight_resource_failure(
     })
 }
 
-/// The gate-log note for a failing gate that ended with free disk below the
-/// floor a gate is admitted on, or `None` when the reading is unknown or above
-/// it. Such a failure is recorded as resource contention: never cached as a
-/// verdict, and a submission defers on it instead of rejecting.
-fn starved_after_start(available_end: Option<u64>) -> Option<String> {
+/// The gate-log note for a failing gate that ended with free disk or free
+/// inodes below the floor a gate is admitted on, or `None` when the reading is
+/// unknown or above both floors. Such a failure is recorded as resource
+/// contention: never cached as a verdict, and a submission defers on it
+/// instead of rejecting.
+fn starved_after_start(
+    available_end: Option<crate::disk_headroom::DiskHeadroom>,
+) -> Option<String> {
     let available = available_end?;
-    (available < crate::DEFAULT_GATE_HEADROOM_BYTES).then(|| {
-        format!(
-            "aethyme: free disk fell to {} while this gate ran, below the {} a gate is admitted on; \
-             the failure is host starvation, not a verdict on the change. Free space \
-             (`aethyme broker gc plan`) and run the gate again\n",
-            crate::disk_headroom::format_gibibytes(available),
+    let mut shortfalls = Vec::new();
+    if available.bytes < crate::DEFAULT_GATE_HEADROOM_BYTES {
+        shortfalls.push(format!(
+            "free disk fell to {}, below the {} a gate is admitted on",
+            crate::disk_headroom::format_gibibytes(available.bytes),
             crate::disk_headroom::format_gibibytes(crate::DEFAULT_GATE_HEADROOM_BYTES),
+        ));
+    }
+    if let Some(inodes) = available.inodes
+        && inodes < crate::disk_headroom::MIN_GATE_HEADROOM_INODES
+    {
+        shortfalls.push(format!(
+            "free inodes fell to {inodes}, below the {} a gate is admitted on",
+            crate::disk_headroom::MIN_GATE_HEADROOM_INODES,
+        ));
+    }
+    (!shortfalls.is_empty()).then(|| {
+        format!(
+            "aethyme: {} while this gate ran; the failure is host starvation, not a verdict on \
+             the change. Free space (`aethyme broker gc plan`) and run the gate again\n",
+            shortfalls.join(" and "),
         )
     })
 }
@@ -2676,7 +2693,8 @@ struct GateCommandContext<'a> {
     cwd: &'a Path,
     /// Free bytes on `cwd`'s filesystem, measured once by the caller: the
     /// headroom check refuses on it and the gate result records it.
-    available: Option<u64>,
+    available_bytes: Option<u64>,
+    available_inodes: Option<u64>,
     /// Written into the log header so the log carries its own load context.
     environment: &'a GateEnvironment,
     log_path: &'a Path,
@@ -2733,8 +2751,16 @@ fn run_gate_command(
     // verdict is then cached against the tree -- so the retry that would clear
     // it is exactly what the cache prevents. Refusing here keeps the condition
     // and its symptom attached to each other.
-    let available = context.available;
-    if crate::disk_headroom_refusal(available, crate::DEFAULT_GATE_HEADROOM_BYTES).is_some() {
+    let available_bytes = context.available_bytes;
+    let available_inodes = context.available_inodes;
+    if crate::disk_headroom::refusal_with_headroom(
+        available_bytes,
+        available_inodes,
+        crate::disk_headroom::DEFAULT_GATE_HEADROOM_BYTES,
+        crate::disk_headroom::MIN_GATE_HEADROOM_INODES,
+    )
+    .is_some()
+    {
         // Sized only once refusing: the walk costs seconds on a warm cache,
         // which a gate about to fail can afford and one about to run cannot.
         let measured = context.managed_cache.and_then(|cache| {
@@ -2743,18 +2769,24 @@ fn run_gate_command(
                 root,
                 directory_usage(root).ok()?,
                 cache.provenance.key.as_str(),
-                directory_usage(&cache.directory).unwrap_or(0),
+                // A missing active key directory holds nothing; the rest of
+                // the cache is still worth naming.
+                directory_usage(&cache.directory).unwrap_or_default(),
             ))
         });
-        let refusal = crate::disk_headroom_refusal_with_gate_cache(
-            available,
-            crate::DEFAULT_GATE_HEADROOM_BYTES,
+        let refusal = crate::disk_headroom::refusal_with_headroom_and_gate_cache(
+            available_bytes,
+            available_inodes,
+            crate::disk_headroom::DEFAULT_GATE_HEADROOM_BYTES,
+            crate::disk_headroom::MIN_GATE_HEADROOM_INODES,
             measured.map(
-                |(root, total_bytes, active_key, active_bytes)| crate::GateCacheUsage {
+                |(root, total_usage, active_key, active_usage)| crate::GateCacheUsage {
                     root,
-                    total_bytes,
+                    total_bytes: total_usage.bytes,
+                    total_inodes: total_usage.inodes,
                     active_key,
-                    active_bytes,
+                    active_bytes: active_usage.bytes,
+                    active_inodes: active_usage.inodes,
                 },
             ),
         )
@@ -3319,11 +3351,27 @@ mod tests {
     /// unknown reading or one above the floor leaves the verdict alone (#288).
     #[test]
     fn only_a_failure_that_ends_below_the_floor_is_starvation() {
+        use crate::disk_headroom::{DiskHeadroom, MIN_GATE_HEADROOM_INODES};
+        let reading = |bytes, inodes| Some(DiskHeadroom { bytes, inodes });
         assert!(starved_after_start(None).is_none());
-        assert!(starved_after_start(Some(crate::DEFAULT_GATE_HEADROOM_BYTES)).is_none());
-        let note = starved_after_start(Some(1024)).unwrap();
+        assert!(starved_after_start(reading(crate::DEFAULT_GATE_HEADROOM_BYTES, None)).is_none());
+        assert!(
+            starved_after_start(reading(
+                crate::DEFAULT_GATE_HEADROOM_BYTES,
+                Some(MIN_GATE_HEADROOM_INODES)
+            ))
+            .is_none()
+        );
+        let note = starved_after_start(reading(1024, None)).unwrap();
         assert!(note.contains("host starvation"), "{note}");
         assert!(note.contains("0.0 GiB"), "{note}");
+        // A build can run out of inodes with bytes to spare (#471).
+        let note = starved_after_start(reading(
+            crate::DEFAULT_GATE_HEADROOM_BYTES,
+            Some(MIN_GATE_HEADROOM_INODES - 1),
+        ))
+        .unwrap();
+        assert!(note.contains("free inodes fell to 99999"), "{note}");
     }
 
     #[test]
@@ -4315,6 +4363,32 @@ end = 55999
             std::fs::read_to_string(checkout.join("src/lib.rs")).unwrap(),
             "pub fn a() {}\n"
         );
+    }
+
+    #[test]
+    fn missing_managed_cache_is_measured_as_empty_before_creation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let policy = ManagedGateCache {
+            key: "cargo".into(),
+            max_bytes: 3,
+        };
+        let directory = tmp.path().join("gates/repository/cargo");
+        assert!(!directory.exists());
+
+        let runtime = prepare_managed_gate_cache_in(
+            Some(&policy),
+            "repository",
+            &StderrGateProgressSink,
+            "test",
+            tmp.path(),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(runtime.provenance.bytes_before, 0);
+        assert_eq!(runtime.provenance.inodes_before, 0);
+        assert!(!runtime.provenance.rotated_before_run);
+        assert!(runtime.directory.is_dir());
     }
 
     #[test]

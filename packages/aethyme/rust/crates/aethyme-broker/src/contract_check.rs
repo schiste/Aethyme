@@ -612,10 +612,21 @@ fn is_excluded(token: &str) -> bool {
     token.chars().all(|c| c.is_ascii_digit())
 }
 
-/// Return the unified diff against `base`.
+/// Return the unified diff of the working tree against `base`.
 fn read_diff(repo_root: &Path, base: &str) -> Result<Vec<String>, String> {
+    unified_diff(repo_root, &[base])
+}
+
+/// Return the unified diff between two commits, ignoring the working tree.
+fn read_diff_between(repo_root: &Path, base: &str, head: &str) -> Result<Vec<String>, String> {
+    unified_diff(repo_root, &[base, head])
+}
+
+fn unified_diff(repo_root: &Path, revisions: &[&str]) -> Result<Vec<String>, String> {
     let output = crate::git::git_command()
-        .args(["diff", "--unified=0", base, "--", "."])
+        .args(["diff", "--unified=0"])
+        .args(revisions)
+        .args(["--", "."])
         .current_dir(repo_root)
         .output()
         .map_err(|e| format!("git diff failed to spawn: {e}"))?;
@@ -726,6 +737,84 @@ pub fn find_touched_symbols(
         .into_iter()
         .filter(|(symbol, lines)| lines.len() > added.get(symbol).copied().unwrap_or(0))
         .collect()
+}
+
+/// Check a broker submission's contract decision before its gates start.
+///
+/// The merged-tree gate stays authoritative. It reads the broker's
+/// verification commit, a local commit GitHub has never seen, whose message
+/// carries only the `Contract decision:` and `Contract justification:` lines
+/// copied from the session's pending commits (`merge.rs`). Its `--merged-pr`
+/// lookup therefore cannot find a pull request. So this preflight judges
+/// exactly those commit messages: a decision that only a PR body declares
+/// would fail the gate, and is refused here before the gates start building.
+///
+/// `Err` means the preflight could not inspect the session; a refusal is
+/// `Ok(Err(message))`, so a caller can tell the two apart.
+pub fn preflight_submit_decision(
+    repo_root: &Path,
+    base: &str,
+    pending_commit_messages: &str,
+) -> Result<Result<(), String>, String> {
+    let consumers_doc = repo_root.join(DEFAULT_CONSUMERS_DOC);
+    let doc_text = match std::fs::read_to_string(&consumers_doc) {
+        Ok(doc_text) => doc_text,
+        // The broker is also used in repositories that do not carry Aethyme's
+        // consumer inventory. Without that inventory there are no tracked
+        // symbols to preflight; the merged-tree gate remains authoritative.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Ok(())),
+        Err(error) => {
+            return Err(format!(
+                "could not read {}: {error}",
+                consumers_doc.display()
+            ));
+        }
+    };
+    let tracked = extract_tracked_symbols(&doc_text);
+    if tracked.is_empty() {
+        return Err(format!(
+            "could not extract tracked symbols from {}",
+            consumers_doc.display()
+        ));
+    }
+    // Committed work only: uncommitted edits never integrate, so they must not
+    // decide whether a submission is refused.
+    let diff_lines = read_diff_between(repo_root, base, "HEAD")
+        .map_err(|message| format!("could not diff {base}..HEAD: {message}"))?;
+    let findings = find_touched_symbols(&diff_lines, &tracked);
+    Ok(validate_submit_decision(&findings, pending_commit_messages))
+}
+
+fn validate_submit_decision(
+    findings: &BTreeMap<String, Vec<String>>,
+    pending_commit_messages: &str,
+) -> Result<(), String> {
+    if findings.is_empty() {
+        return Ok(());
+    }
+    let sources = vec![DecisionSource {
+        label: "pending session commit messages".to_string(),
+        text: Ok(pending_commit_messages.to_string()),
+    }];
+    let (sources, verdict) = decide(sources, None);
+    if verdict.passes() {
+        return Ok(());
+    }
+    // The shared refusal points at the PR body, which this gate cannot see.
+    let reason = match verdict {
+        Verdict::Undeclared => "no contract decision is declared in the session's pending commits.\n\
+                                Looked in:\n  - pending session commit messages: no contract decision\n"
+            .to_string(),
+        _ => failure_message(&verdict, &sources),
+    };
+
+    Err(format!(
+        "ERROR: contract-decision preflight failed before any gate ran: {}\
+         Add `Contract decision: <none|introduce|soft-retire|hard-delete>` to a commit message in this session. \
+         The broker's contract gate reads only the decision your commits carry; a PR body is not visible to it.\n\
+         If `none` is correct for a tracked removal, also add `Contract justification: <reason>` (at least {MIN_JUSTIFICATION_CHARS} characters).\n",
+        reason.trim_start_matches("ERROR: ")
+    ))
 }
 
 /// The contract decision an author declared.
@@ -1222,6 +1311,57 @@ mod tests {
     #[test]
     fn parse_contract_decision_handles_empty_body() {
         assert_eq!(parse_contract_decision(""), None);
+    }
+
+    #[test]
+    fn submit_preflight_passes_without_tracked_removals() {
+        assert!(validate_submit_decision(&BTreeMap::new(), "").is_ok());
+    }
+
+    #[test]
+    fn submit_preflight_skips_repositories_without_consumer_inventory() {
+        let repo = tempfile::tempdir().expect("temporary repository");
+        assert_eq!(
+            preflight_submit_decision(repo.path(), "HEAD", ""),
+            Ok(Ok(()))
+        );
+    }
+
+    fn tracked_removal() -> BTreeMap<String, Vec<String>> {
+        BTreeMap::from([(
+            "aethyme-explore".to_string(),
+            vec!["-    run(\"aethyme-explore\");".to_string()],
+        )])
+    }
+
+    #[test]
+    fn submit_preflight_accepts_a_decision_in_a_pending_commit() {
+        let messages = "fix(skills): drop the wrapper\n\nContract decision: hard-delete";
+        assert!(validate_submit_decision(&tracked_removal(), messages).is_ok());
+    }
+
+    // The gate reads the broker's local verification commit, which GitHub
+    // cannot associate with any pull request, so a PR body never reaches it.
+    #[test]
+    fn submit_preflight_refuses_a_decision_only_a_pr_body_could_declare() {
+        let error = validate_submit_decision(&tracked_removal(), "fix(skills): drop the wrapper")
+            .unwrap_err();
+        assert!(error.contains("before any gate ran"));
+        assert!(error.contains("Contract decision: <none|introduce|soft-retire|hard-delete>"));
+        assert!(error.contains("to a commit message in this session"));
+        assert!(error.contains("a PR body is not visible to it"));
+        assert!(error.contains("pending session commit messages: no contract decision"));
+    }
+
+    #[test]
+    fn submit_preflight_needs_a_reason_for_none_on_a_tracked_removal() {
+        let error =
+            validate_submit_decision(&tracked_removal(), "Contract decision: none").unwrap_err();
+        assert!(error.contains("Contract justification:"));
+        assert!(error.contains("before any gate ran"));
+        let justified = "Contract decision: none\n\
+                         Contract justification: the removed line only renames a local variable";
+        assert!(validate_submit_decision(&tracked_removal(), justified).is_ok());
     }
 
     #[test]

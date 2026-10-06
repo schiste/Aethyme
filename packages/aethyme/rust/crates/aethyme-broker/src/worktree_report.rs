@@ -71,6 +71,8 @@ pub struct WorktreeRow {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
     pub bytes: u64,
+    /// Unique filesystem nodes below this checkout, including its root.
+    pub inodes: u64,
     /// Days since the last commit. Absent when there is no commit to date.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub idle_days: Option<i64>,
@@ -94,34 +96,16 @@ pub struct WorktreeRow {
 pub struct WorktreeReport {
     pub rows: Vec<WorktreeRow>,
     pub total_bytes: u64,
+    pub total_inodes: u64,
     /// Bytes held by checkouts whose work exists nowhere else.
     pub unique_work_bytes: u64,
+    pub unique_work_inodes: u64,
     pub unique_work_count: usize,
 }
 
 /// Bytes under a directory, following no symlink out of it.
-fn tree_bytes(root: &Path) -> u64 {
-    let mut total = 0;
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let Ok(kind) = entry.file_type() else {
-                continue;
-            };
-            if kind.is_symlink() {
-                continue;
-            }
-            if kind.is_dir() {
-                stack.push(entry.path());
-            } else if let Ok(meta) = entry.metadata() {
-                total += meta.len();
-            }
-        }
-    }
-    total
+fn tree_usage(root: &Path) -> crate::disk_headroom::DirectoryUsage {
+    crate::disk_headroom::directory_usage_best_effort(root)
 }
 
 fn path_key(path: &Path) -> PathBuf {
@@ -202,17 +186,19 @@ fn append_prunable_rows(
             continue;
         }
 
-        let bytes = if entry.path.is_dir() {
-            tree_bytes(&entry.path)
+        let usage = if entry.path.is_dir() {
+            tree_usage(&entry.path)
         } else {
-            0
+            crate::disk_headroom::DirectoryUsage::default()
         };
-        report.total_bytes += bytes;
+        report.total_bytes = report.total_bytes.saturating_add(usage.bytes);
+        report.total_inodes = report.total_inodes.saturating_add(usage.inodes);
         report.rows.push(WorktreeRow {
             repository: repository.to_string(),
             path: entry.path.clone(),
             branch: short_branch(entry.branch.as_deref()),
-            bytes,
+            bytes: usage.bytes,
+            inodes: usage.inodes,
             idle_days: None,
             work: WorkState::PrunableRegistration,
             live: live.iter().any(|path| same_path(path, &entry.path)),
@@ -353,7 +339,7 @@ pub fn build(worktrees: &[(String, PathBuf)], live: &BTreeSet<PathBuf>) -> Workt
         if !path.is_dir() {
             continue;
         }
-        let bytes = tree_bytes(path);
+        let usage = tree_usage(path);
         let WorktreeInspection {
             branch,
             idle_days,
@@ -367,9 +353,11 @@ pub fn build(worktrees: &[(String, PathBuf)], live: &BTreeSet<PathBuf>) -> Workt
             &mut inventories,
             &mut inventory_repositories,
         );
-        report.total_bytes += bytes;
+        report.total_bytes = report.total_bytes.saturating_add(usage.bytes);
+        report.total_inodes = report.total_inodes.saturating_add(usage.inodes);
         if work.holds_unique_work() {
-            report.unique_work_bytes += bytes;
+            report.unique_work_bytes = report.unique_work_bytes.saturating_add(usage.bytes);
+            report.unique_work_inodes = report.unique_work_inodes.saturating_add(usage.inodes);
             report.unique_work_count += 1;
         }
         report.rows.push(WorktreeRow {
@@ -377,7 +365,8 @@ pub fn build(worktrees: &[(String, PathBuf)], live: &BTreeSet<PathBuf>) -> Workt
             live: live.contains(path),
             path: path.clone(),
             branch,
-            bytes,
+            bytes: usage.bytes,
+            inodes: usage.inodes,
             idle_days,
             work,
             git,
@@ -512,6 +501,7 @@ mod tests {
             .unwrap();
         assert_eq!(row.work, WorkState::PrunableRegistration);
         assert_eq!(row.bytes, 0);
+        assert_eq!(row.inodes, 0);
         assert_eq!(row.git_registered, Some(true));
         assert!(row.git.as_ref().unwrap().prunable);
     }
@@ -530,6 +520,9 @@ mod tests {
         );
         assert_eq!(report.unique_work_count, 1);
         assert!(report.unique_work_bytes > 0);
+        assert!(report.rows[0].inodes > 0);
+        assert_eq!(report.total_inodes, report.rows[0].inodes);
+        assert_eq!(report.unique_work_inodes, report.rows[0].inodes);
     }
 
     /// Untracked build output is not work. Counting it would mark every

@@ -21,38 +21,219 @@
 /// still room to *act* -- reclaiming needs the tooling to run.
 pub const DEFAULT_GATE_HEADROOM_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
+/// Free inodes a gate should have before it is allowed to start.
+///
+/// A single dependency install can create tens of thousands of entries. Keep a
+/// reserve large enough for the broker and recovery tools to keep working.
+pub const MIN_GATE_HEADROOM_INODES: u64 = 100_000;
+
+/// Free space on a filesystem, captured in one statvfs call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DiskHeadroom {
+    pub bytes: u64,
+    /// `None` when the filesystem keeps no inode count. btrfs and an
+    /// unlimited tmpfs report zero total inodes, and zero free out of zero
+    /// total means "not counted", not "full".
+    pub inodes: Option<u64>,
+}
+
+/// Filesystem objects and their logical byte sizes below a path.
+///
+/// Inodes count directory entries and files without following symlinks.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DirectoryUsage {
+    pub bytes: u64,
+    pub inodes: u64,
+}
+
+/// Whether a walk meets this filesystem object for the first time.
+///
+/// Only an object that can be reached twice is remembered: a directory, or a
+/// file with more than one hard link. A single-link file is met once by
+/// construction, so remembering it would cost memory per file (about 50 MB per
+/// million) for nothing.
+fn first_visit(
+    seen: &mut std::collections::HashSet<(u64, u64)>,
+    metadata: &std::fs::Metadata,
+) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    if metadata.is_dir() || metadata.nlink() > 1 {
+        seen.insert((metadata.dev(), metadata.ino()))
+    } else {
+        true
+    }
+}
+
+/// Measure one path without following symlinks. Directories and symlinks
+/// consume inodes too; only regular-file lengths contribute bytes.
+pub(crate) fn directory_usage_without_following_links(
+    path: &std::path::Path,
+) -> std::io::Result<DirectoryUsage> {
+    fn visit(
+        path: &std::path::Path,
+        usage: &mut DirectoryUsage,
+        seen: &mut std::collections::HashSet<(u64, u64)>,
+        deadline: Option<std::time::Instant>,
+    ) -> std::io::Result<()> {
+        if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "directory measurement budget expired",
+            ));
+        }
+        let metadata = std::fs::symlink_metadata(path)?;
+        let first_link = first_visit(seen, &metadata);
+        if first_link {
+            usage.inodes = usage.inodes.saturating_add(1);
+        }
+        // Preserve the established logical byte total for hard-linked paths;
+        // inode accounting deduplicates the shared filesystem object.
+        if metadata.is_file() {
+            usage.bytes = usage.bytes.saturating_add(metadata.len());
+        }
+        if metadata.is_dir() && first_link {
+            for entry in std::fs::read_dir(path)? {
+                visit(&entry?.path(), usage, seen, deadline)?;
+            }
+        }
+        Ok(())
+    }
+
+    let mut usage = DirectoryUsage::default();
+    visit(
+        path,
+        &mut usage,
+        &mut std::collections::HashSet::new(),
+        None,
+    )?;
+    Ok(usage)
+}
+
+/// Best-effort counterpart for status reports: inaccessible entries are
+/// skipped while the rest of the tree remains useful.
+pub(crate) fn directory_usage_best_effort(path: &std::path::Path) -> DirectoryUsage {
+    fn visit(
+        path: &std::path::Path,
+        usage: &mut DirectoryUsage,
+        seen: &mut std::collections::HashSet<(u64, u64)>,
+    ) {
+        let Ok(metadata) = std::fs::symlink_metadata(path) else {
+            return;
+        };
+        let first_link = first_visit(seen, &metadata);
+        if first_link {
+            usage.inodes = usage.inodes.saturating_add(1);
+        }
+        // Preserve the established logical byte total for hard-linked paths;
+        // inode accounting deduplicates the shared filesystem object.
+        if metadata.is_file() {
+            usage.bytes = usage.bytes.saturating_add(metadata.len());
+        }
+        if metadata.is_dir() && first_link {
+            let Ok(entries) = std::fs::read_dir(path) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                visit(&entry.path(), usage, seen);
+            }
+        }
+    }
+
+    let mut usage = DirectoryUsage::default();
+    visit(path, &mut usage, &mut std::collections::HashSet::new());
+    usage
+}
+
+/// Measure a tree, returning neither partial bytes nor partial inode counts
+/// when the caller's budget expires.
+pub(crate) fn directory_usage_bounded(
+    path: &std::path::Path,
+    deadline: std::time::Instant,
+) -> Option<DirectoryUsage> {
+    fn visit(
+        path: &std::path::Path,
+        usage: &mut DirectoryUsage,
+        seen: &mut std::collections::HashSet<(u64, u64)>,
+        deadline: std::time::Instant,
+    ) -> std::io::Result<()> {
+        if std::time::Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "directory measurement budget expired",
+            ));
+        }
+        let metadata = std::fs::symlink_metadata(path)?;
+        let first_link = first_visit(seen, &metadata);
+        if first_link {
+            usage.inodes = usage.inodes.saturating_add(1);
+        }
+        // Preserve the established logical byte total for hard-linked paths;
+        // inode accounting deduplicates the shared filesystem object.
+        if metadata.is_file() {
+            usage.bytes = usage.bytes.saturating_add(metadata.len());
+        }
+        if metadata.is_dir() && first_link {
+            for entry in std::fs::read_dir(path)? {
+                visit(&entry?.path(), usage, seen, deadline)?;
+            }
+        }
+        Ok(())
+    }
+
+    let mut usage = DirectoryUsage::default();
+    visit(
+        path,
+        &mut usage,
+        &mut std::collections::HashSet::new(),
+        deadline,
+    )
+    .ok()?;
+    Some(usage)
+}
+
 /// Free space on the filesystem holding `path`, or `None` when it cannot be
 /// determined.
 ///
 /// Unknown is not treated as low: refusing every gate because `statvfs` failed
 /// would be worse than the problem, and the build's own errors remain the
 /// fallback.
-pub fn available_bytes(path: &std::path::Path) -> Option<u64> {
+pub(crate) fn available_headroom(path: &std::path::Path) -> Option<DiskHeadroom> {
     use std::os::unix::ffi::OsStrExt;
     let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
-    // SAFETY: `c_path` is a valid NUL-terminated string that outlives the call,
-    // and `stat` is fully initialised by the callee on success.
+    // SAFETY: c_path is a valid NUL-terminated string that outlives the call,
+    // and stat is fully initialised by the callee on success.
     unsafe {
         let mut stat: libc::statvfs = std::mem::zeroed();
         if libc::statvfs(c_path.as_ptr(), &mut stat) != 0 {
             return None;
         }
-        Some(stat.f_bavail as u64 * stat.f_frsize as u64)
+        Some(headroom_from_counts(
+            stat.f_bavail as u64 * stat.f_frsize as u64,
+            stat.f_files as u64,
+            stat.f_favail as u64,
+        ))
     }
 }
 
-/// [`available_bytes`] for a directory that may not exist yet, read at its
-/// nearest existing ancestor -- the same volume it will be created on.
-///
-/// A directory is often named before it is created: a repository's broker
-/// worktree root does not exist until its first session. `statvfs` on a
-/// missing path fails, and a failure reads as unknown, which never escalates
-/// -- so measuring the missing path itself would stay silent on exactly the
-/// host that has not started a session yet.
-pub fn available_bytes_at_or_above(path: &std::path::Path) -> Option<u64> {
+/// Builds the reading from statvfs counts: a filesystem reporting zero
+/// total inodes keeps no count, so its inode headroom is unknown.
+fn headroom_from_counts(bytes: u64, total_inodes: u64, available_inodes: u64) -> DiskHeadroom {
+    DiskHeadroom {
+        bytes,
+        inodes: (total_inodes != 0).then_some(available_inodes),
+    }
+}
+
+pub fn available_bytes(path: &std::path::Path) -> Option<u64> {
+    available_headroom(path).map(|headroom| headroom.bytes)
+}
+
+/// The nearest existing ancestor carries the same filesystem as a missing
+/// path that will eventually be created beneath it.
+pub(crate) fn available_headroom_at_or_above(path: &std::path::Path) -> Option<DiskHeadroom> {
     path.ancestors()
         .filter(|ancestor| ancestor.exists())
-        .find_map(available_bytes)
+        .find_map(available_headroom)
 }
 
 /// Test-only: the free space, in bytes, every headroom decision for a
@@ -70,6 +251,8 @@ pub fn available_bytes_at_or_above(path: &std::path::Path) -> Option<u64> {
 /// on a real checkout whose disk is full.
 pub const TEST_AVAILABLE_BYTES_ENV: &str = "AETHYME_TEST_AVAILABLE_BYTES";
 
+pub const TEST_AVAILABLE_INODES_ENV: &str = "AETHYME_TEST_AVAILABLE_INODES";
+
 /// Free space for a headroom decision about `path`, made on behalf of the
 /// repository whose checkout is `repository`.
 ///
@@ -84,12 +267,28 @@ pub(crate) fn available_bytes_for(
 }
 
 /// [`available_bytes_at_or_above`] behind the same test seam as
-/// [`available_bytes_for`].
-pub(crate) fn available_bytes_at_or_above_for(
+pub(crate) fn available_headroom_for(
     repository: &std::path::Path,
     path: &std::path::Path,
-) -> Option<u64> {
-    simulated_available_bytes(repository).or_else(|| available_bytes_at_or_above(path))
+) -> Option<DiskHeadroom> {
+    let measured = available_headroom(path);
+    let bytes =
+        simulated_available_bytes(repository).or_else(|| measured.map(|value| value.bytes))?;
+    let inodes =
+        simulated_available_inodes(repository).or_else(|| measured.and_then(|value| value.inodes));
+    Some(DiskHeadroom { bytes, inodes })
+}
+
+pub(crate) fn available_headroom_at_or_above_for(
+    repository: &std::path::Path,
+    path: &std::path::Path,
+) -> Option<DiskHeadroom> {
+    let measured = available_headroom_at_or_above(path);
+    let bytes =
+        simulated_available_bytes(repository).or_else(|| measured.map(|value| value.bytes))?;
+    let inodes =
+        simulated_available_inodes(repository).or_else(|| measured.and_then(|value| value.inodes));
+    Some(DiskHeadroom { bytes, inodes })
 }
 
 fn simulated_available_bytes(repository: &std::path::Path) -> Option<u64> {
@@ -97,6 +296,21 @@ fn simulated_available_bytes(repository: &std::path::Path) -> Option<u64> {
         std::env::var_os(TEST_AVAILABLE_BYTES_ENV).as_deref(),
         repository,
     )
+}
+
+fn simulated_available_inodes(repository: &std::path::Path) -> Option<u64> {
+    simulated_available_inodes_from(
+        std::env::var_os(TEST_AVAILABLE_INODES_ENV).as_deref(),
+        repository,
+    )
+}
+
+fn simulated_available_inodes_from(
+    value: Option<&std::ffi::OsStr>,
+    repository: &std::path::Path,
+) -> Option<u64> {
+    let inodes = value?.to_str()?.trim().parse().ok()?;
+    crate::host_state::path_is_ephemeral(repository).then_some(inodes)
 }
 
 /// [`simulated_available_bytes`] with the environment value supplied, so the
@@ -162,6 +376,22 @@ pub fn sweep_urgency(available: Option<u64>, required: u64) -> SweepUrgency {
     }
 }
 
+/// Classify pressure against both limits a gate refuses at.
+pub(crate) fn sweep_urgency_with_inodes(
+    available_bytes: Option<u64>,
+    required_bytes: u64,
+    available_inodes: Option<u64>,
+    required_inodes: u64,
+) -> SweepUrgency {
+    if sweep_urgency(available_bytes, required_bytes) == SweepUrgency::Pressured
+        || sweep_urgency(available_inodes, required_inodes) == SweepUrgency::Pressured
+    {
+        SweepUrgency::Pressured
+    } else {
+        SweepUrgency::Routine
+    }
+}
+
 /// Render bytes for operator-facing messages.
 pub(crate) fn format_gibibytes(bytes: u64) -> String {
     gibibytes(bytes)
@@ -178,9 +408,11 @@ pub struct GateCacheUsage<'a> {
     pub root: &'a std::path::Path,
     /// Every entry under `root`.
     pub total_bytes: u64,
-    /// The cache key this gate uses: the entry `gc plan` keeps as active.
+    pub total_inodes: u64,
+    /// The cache key this gate uses: the entry gc plan keeps as active.
     pub active_key: &'a str,
     pub active_bytes: u64,
+    pub active_inodes: u64,
 }
 
 /// The refusal message for a gate that cannot safely start, or `None`.
@@ -212,39 +444,77 @@ pub fn refusal_with_gate_cache(
     required: u64,
     gate_cache: Option<GateCacheUsage<'_>>,
 ) -> Option<String> {
-    let available = available?;
-    if available >= required {
+    refusal_with_headroom_and_gate_cache(available, None, required, 0, gate_cache)
+}
+
+/// Refuse when either byte or inode headroom is known to be below its limit.
+pub(crate) fn refusal_with_headroom(
+    available_bytes: Option<u64>,
+    available_inodes: Option<u64>,
+    required_bytes: u64,
+    required_inodes: u64,
+) -> Option<String> {
+    refusal_with_headroom_and_gate_cache(
+        available_bytes,
+        available_inodes,
+        required_bytes,
+        required_inodes,
+        None,
+    )
+}
+
+/// The headroom refusal with measured repository gate-cache usage.
+pub(crate) fn refusal_with_headroom_and_gate_cache(
+    available_bytes: Option<u64>,
+    available_inodes: Option<u64>,
+    required_bytes: u64,
+    required_inodes: u64,
+    gate_cache: Option<GateCacheUsage<'_>>,
+) -> Option<String> {
+    let bytes_low = available_bytes.is_some_and(|available| available < required_bytes);
+    let inodes_low = available_inodes.is_some_and(|available| available < required_inodes);
+    if !bytes_low && !inodes_low {
         return None;
     }
+
+    let mut limits = Vec::new();
+    if bytes_low {
+        limits.push(format!(
+            "{} free, {} required",
+            gibibytes(available_bytes?),
+            gibibytes(required_bytes)
+        ));
+    }
+    if inodes_low {
+        limits.push(format!(
+            "{} inodes free, {} inodes required",
+            available_inodes?, required_inodes
+        ));
+    }
+    let capacity = limits.join("; ");
     let gate_cache = match gate_cache {
-        Some(usage) if usage.total_bytes > 0 => {
-            let older = usage.total_bytes.saturating_sub(usage.active_bytes);
+        Some(usage) if usage.total_bytes > 0 || usage.total_inodes > 0 => {
+            let older_bytes = usage.total_bytes.saturating_sub(usage.active_bytes);
+            let older_inodes = usage.total_inodes.saturating_sub(usage.active_inodes);
             format!(
-                "\nThis repository's gate cache holds {} at {}: {} in `{}`, the cache \
-                 this gate reuses, which `gc plan` keeps (active), and {} in older \
-                 entries, which `gc plan` proposes beyond its budget once no gate \
-                 holds them. `gc plan --include-active-gate-cache` proposes the \
-                 active cache too, and the next gate then rebuilds it from scratch.",
+                "\nThis repository's gate cache holds {} and {} inodes at {}: {} in {} ({} inodes), the cache this gate reuses, which gc plan keeps active; {} in older entries ({} inodes), which gc plan proposes beyond its budget once no gate holds them. gc plan --include-active-gate-cache proposes the active cache too, and the next gate then rebuilds it from scratch.",
                 gibibytes(usage.total_bytes),
+                usage.total_inodes,
                 usage.root.display(),
                 gibibytes(usage.active_bytes),
                 usage.active_key,
-                gibibytes(older),
+                usage.active_inodes,
+                gibibytes(older_bytes),
+                older_inodes,
             )
         }
         _ => String::new(),
     };
-    Some(format!(
-        "refusing to start: {} free, {} required. A build that runs out of space \
-         does not report a disk error -- it reports link failures, a corrupt \
-         incremental cache and unrelated test failures, and that verdict is then \
-         cached against this tree. Reclaim space and retry.\n\
-         Build artefacts in finished session worktrees and the gate cache are \
-         usually the largest reclaimable sets, and the broker measures both:\n  \
-         aethyme broker gc plan{gate_cache}",
-        gibibytes(available),
-        gibibytes(required)
-    ))
+    let mut message = format!(
+        "refusing to start: {capacity}. A build that runs out of space or inodes does not report a useful disk error; it reports link failures, a corrupt incremental cache and unrelated test failures, and that verdict is then cached against this tree. Reclaim space and retry.\nBuild artefacts in finished session worktrees and the gate cache are usually the largest reclaimable sets, and the broker measures both:\n  aethyme broker gc plan"
+    );
+    message.push_str(&gate_cache);
+    Some(message)
 }
 
 #[cfg(test)]
@@ -294,6 +564,137 @@ mod tests {
         assert_eq!(24_i64 * 3_600_000 / pressured.interval_divisor(), 3_600_000);
     }
     use super::*;
+
+    /// btrfs and an unlimited tmpfs report zero total and zero free inodes.
+    /// That is no count at all, not a full filesystem, and must never refuse
+    /// a gate or mark the sweep pressured.
+    #[test]
+    fn a_filesystem_without_an_inode_count_reports_unknown_inodes() {
+        assert_eq!(
+            headroom_from_counts(10, 0, 0),
+            DiskHeadroom {
+                bytes: 10,
+                inodes: None
+            }
+        );
+        assert_eq!(headroom_from_counts(10, 100, 0).inodes, Some(0));
+        let unknown = headroom_from_counts(DEFAULT_GATE_HEADROOM_BYTES, 0, 0);
+        assert!(
+            refusal_with_headroom_and_gate_cache(
+                Some(unknown.bytes),
+                unknown.inodes,
+                DEFAULT_GATE_HEADROOM_BYTES,
+                MIN_GATE_HEADROOM_INODES,
+                None,
+            )
+            .is_none()
+        );
+        assert_ne!(
+            sweep_urgency_with_inodes(
+                Some(unknown.bytes),
+                DEFAULT_GATE_HEADROOM_BYTES,
+                unknown.inodes,
+                MIN_GATE_HEADROOM_INODES,
+            ),
+            SweepUrgency::Pressured
+        );
+    }
+
+    #[test]
+    fn low_inode_headroom_refuses_even_when_byte_headroom_is_ample() {
+        let message = refusal_with_headroom(
+            Some(DEFAULT_GATE_HEADROOM_BYTES),
+            Some(MIN_GATE_HEADROOM_INODES - 1),
+            DEFAULT_GATE_HEADROOM_BYTES,
+            MIN_GATE_HEADROOM_INODES,
+        )
+        .expect("low inode headroom must refuse");
+        assert!(
+            message.contains("99999 inodes free, 100000 inodes required"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn inode_threshold_is_inclusive_and_unknown_inode_count_fails_open() {
+        assert!(
+            refusal_with_headroom(
+                Some(DEFAULT_GATE_HEADROOM_BYTES),
+                Some(MIN_GATE_HEADROOM_INODES),
+                DEFAULT_GATE_HEADROOM_BYTES,
+                MIN_GATE_HEADROOM_INODES,
+            )
+            .is_none()
+        );
+        assert!(
+            refusal_with_headroom(
+                Some(DEFAULT_GATE_HEADROOM_BYTES),
+                None,
+                DEFAULT_GATE_HEADROOM_BYTES,
+                MIN_GATE_HEADROOM_INODES,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn inode_pressure_also_accelerates_the_artifact_sweep() {
+        assert_eq!(
+            sweep_urgency_with_inodes(
+                Some(DEFAULT_GATE_HEADROOM_BYTES),
+                DEFAULT_GATE_HEADROOM_BYTES,
+                Some(MIN_GATE_HEADROOM_INODES - 1),
+                MIN_GATE_HEADROOM_INODES,
+            ),
+            SweepUrgency::Pressured
+        );
+        assert_eq!(
+            sweep_urgency_with_inodes(
+                Some(DEFAULT_GATE_HEADROOM_BYTES),
+                DEFAULT_GATE_HEADROOM_BYTES,
+                Some(MIN_GATE_HEADROOM_INODES),
+                MIN_GATE_HEADROOM_INODES,
+            ),
+            SweepUrgency::Routine
+        );
+    }
+
+    #[test]
+    fn directory_usage_counts_nodes_and_hardlinks_without_following_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let tree = root.path().join("tree");
+        std::fs::create_dir_all(tree.join("nested")).unwrap();
+        std::fs::write(tree.join("nested/file"), b"abc").unwrap();
+        std::fs::hard_link(tree.join("nested/file"), tree.join("hardlink")).unwrap();
+        let outside = root.path().join("outside");
+        std::fs::write(&outside, b"outside").unwrap();
+        symlink(&outside, tree.join("link")).unwrap();
+
+        let usage = directory_usage_without_following_links(&tree).unwrap();
+        assert_eq!(
+            usage.bytes, 6,
+            "both hard-linked paths retain their logical byte size; the symlink target is outside the tree"
+        );
+        assert_eq!(
+            usage.inodes, 4,
+            "the tree root, nested directory, file, and symlink each use an inode; a hard link does not"
+        );
+    }
+
+    #[test]
+    fn bounded_directory_usage_does_not_return_partial_counts() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("file"), b"content").unwrap();
+        assert!(
+            directory_usage_bounded(
+                root.path(),
+                std::time::Instant::now() - std::time::Duration::from_millis(1),
+            )
+            .is_none()
+        );
+    }
 
     #[test]
     fn ample_space_does_not_refuse() {
@@ -373,18 +774,20 @@ mod tests {
         let usage = GateCacheUsage {
             root,
             total_bytes: 7 * GIB + 800 * 1024 * 1024,
+            total_inodes: 19_000,
             active_key: "rust-workspace-v3",
             active_bytes: 5 * GIB,
+            active_inodes: 11_000,
         };
         let message =
             refusal_with_gate_cache(Some(0), DEFAULT_GATE_HEADROOM_BYTES, Some(usage)).unwrap();
         assert!(message.contains("gate cache holds 7.8 GiB"), "{message}");
         assert!(message.contains("/cache/gates/abc"), "{message}");
         assert!(
-            message.contains("5.0 GiB in `rust-workspace-v3`"),
+            message.contains("5.0 GiB in rust-workspace-v3"),
             "{message}"
         );
-        assert!(message.contains("keeps (active)"), "{message}");
+        assert!(message.contains("keeps active"), "{message}");
         assert!(message.contains("2.8 GiB in older entries"), "{message}");
         assert!(message.contains("--include-active-gate-cache"), "{message}");
         assert!(message.contains("rebuilds it from scratch"), "{message}");
@@ -393,7 +796,9 @@ mod tests {
         // An empty cache is not worth a sentence.
         let empty = GateCacheUsage {
             total_bytes: 0,
+            total_inodes: 0,
             active_bytes: 0,
+            active_inodes: 0,
             ..usage
         };
         let quiet =
@@ -422,6 +827,23 @@ mod tests {
     }
 
     #[test]
+    fn simulated_free_inodes_apply_only_to_a_throwaway_repository() {
+        let value = Some(std::ffi::OsStr::new("512"));
+        let throwaway = tempfile::tempdir().unwrap();
+        assert_eq!(
+            simulated_available_inodes_from(value, throwaway.path()),
+            Some(512)
+        );
+
+        let checkout = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        assert!(
+            !crate::host_state::path_is_ephemeral(checkout),
+            "this test needs a checkout outside the temporary directory"
+        );
+        assert_eq!(simulated_available_inodes_from(value, checkout), None);
+    }
+
+    #[test]
     fn an_unset_or_unparsable_simulation_reads_the_real_disk() {
         let throwaway = tempfile::tempdir().unwrap();
         assert_eq!(simulated_available_bytes_from(None, throwaway.path()), None);
@@ -434,7 +856,10 @@ mod tests {
     #[test]
     fn the_real_filesystem_reports_something_plausible() {
         let here = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let available = available_bytes(here).expect("statvfs works on the checkout");
-        assert!(available > 0, "a writable checkout has some free space");
+        let headroom = available_headroom(here).expect("statvfs works on the checkout");
+        assert!(headroom.bytes > 0, "a writable checkout has free bytes");
+        assert!(available_bytes(here).is_some());
+        // Uncounted (btrfs, unlimited tmpfs) or some free inodes.
+        assert!(headroom.inodes.is_none_or(|inodes| inodes > 0));
     }
 }

@@ -35,6 +35,10 @@ pub const TARGETS: &[(&str, &str)] = &[
     (".claude/skills/aethyme/references/broker.md", ""),
     (".codex/skills/aethyme/references/broker.md", ""),
     (
+        ".claude/skills/aethyme/aethyme-explore",
+        templates::AETHYME_EXPLORE,
+    ),
+    (
         ".codex/skills/aethyme/aethyme-explore",
         templates::AETHYME_EXPLORE,
     ),
@@ -851,8 +855,8 @@ mod tests {
         assert_eq!(actions.first().unwrap().relative_path, "AGENTS.md");
         assert_eq!(actions.last().unwrap().relative_path, SETTINGS_FILE);
         assert!(actions.iter().all(|a| a.action == "created"));
-        // 1 AGENTS + 6 onboarding + 19 targets + settings = 27.
-        assert_eq!(actions.len(), 27);
+        // 1 AGENTS + 6 onboarding + 20 targets + settings = 28.
+        assert_eq!(actions.len(), 28);
 
         let settings = std::fs::read_to_string(repo.join(SETTINGS_FILE)).unwrap();
         assert_eq!(
@@ -860,18 +864,19 @@ mod tests {
             "{\n  \"hooks\": {\n    \"SessionStart\": [\n      {\n        \"matcher\": \"\",\n        \"hooks\": [\n          {\n            \"type\": \"command\",\n            \"command\": \".claude/hooks/aethyme-load-context.sh\"\n          }\n        ]\n      }\n    ]\n  }\n}\n"
         );
 
-        // Hook and Codex wrapper are executable.
+        // The hook and both Explore wrappers are executable.
         use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(repo.join(".claude/hooks/aethyme-load-context.sh"))
-            .unwrap()
-            .permissions()
-            .mode();
-        assert_eq!(mode & 0o111, 0o111);
-        let wrapper_mode = std::fs::metadata(repo.join(".codex/skills/aethyme/aethyme-explore"))
-            .unwrap()
-            .permissions()
-            .mode();
-        assert_eq!(wrapper_mode & 0o111, 0o111);
+        for executable in [
+            ".claude/hooks/aethyme-load-context.sh",
+            ".claude/skills/aethyme/aethyme-explore",
+            ".codex/skills/aethyme/aethyme-explore",
+        ] {
+            let mode = std::fs::metadata(repo.join(executable))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o111, 0o111, "{executable} is not executable");
+        }
 
         // Content-addressed onboarding excludes its own generated outputs,
         // so an unchanged source snapshot makes the whole deploy idempotent.

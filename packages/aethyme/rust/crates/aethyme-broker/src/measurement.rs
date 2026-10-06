@@ -60,6 +60,8 @@ impl SizeScan {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct SizeRecord {
     pub bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inodes: Option<u64>,
     pub measured_at_ms: i64,
 }
 
@@ -85,10 +87,21 @@ impl SizeRecords {
     }
 
     pub fn record(&mut self, path: &str, bytes: u64, measured_at_ms: i64) {
+        self.record_usage(path, bytes, None, measured_at_ms);
+    }
+
+    pub fn record_usage(
+        &mut self,
+        path: &str,
+        bytes: u64,
+        inodes: Option<u64>,
+        measured_at_ms: i64,
+    ) {
         self.records.insert(
             path.to_string(),
             SizeRecord {
                 bytes,
+                inodes,
                 measured_at_ms,
             },
         );
@@ -108,9 +121,10 @@ impl SizeRecords {
 
     /// The one path a routine pass should spend its measurement budget on.
     ///
-    /// Never-measured paths come first, because a missing record is what makes
-    /// a total a floor and closing that gap is worth more than refreshing a
-    /// figure that is merely old. After those, the oldest record past `ttl_ms`.
+    /// Paths missing either measurement come first, because a missing
+    /// observation is what makes a total a floor and closing that gap is worth
+    /// more than refreshing a figure that is merely old. After those, the
+    /// oldest complete record past `ttl_ms`.
     /// `None` when every path carries a record younger than the TTL, which is
     /// the steady state: warming stops on its own once it is done.
     ///
@@ -121,8 +135,9 @@ impl SizeRecords {
         let mut due: Option<(i64, &String)> = None;
         for path in paths {
             let measured_at = match self.records.get(path) {
-                // Never measured. Ranked ahead of every real timestamp.
+                // Missing bytes or inodes. Ranked ahead of every real timestamp.
                 None => i64::MIN,
+                Some(record) if record.inodes.is_none() => i64::MIN,
                 Some(record) if now_ms.saturating_sub(record.measured_at_ms) >= ttl_ms => {
                     record.measured_at_ms
                 }
@@ -291,6 +306,24 @@ mod tests {
     }
 
     #[test]
+    fn old_size_records_load_and_new_inode_measurements_round_trip() {
+        let legacy: SizeRecord =
+            serde_json::from_str(r#"{"bytes":12,"measured_at_ms":42}"#).unwrap();
+        assert_eq!(legacy.bytes, 12);
+        assert_eq!(legacy.inodes, None);
+        assert_eq!(legacy.measured_at_ms, 42);
+
+        let mut records = SizeRecords::default();
+        records.record_usage("/cache", 12, Some(3), 42);
+        let encoded = serde_json::to_value(&records).unwrap();
+        assert_eq!(encoded["records"]["/cache"]["inodes"], 3);
+        assert_eq!(
+            serde_json::from_value::<SizeRecords>(encoded).unwrap(),
+            records
+        );
+    }
+
+    #[test]
     fn a_directory_nobody_measured_is_unmeasured_rather_than_empty() {
         let mut total = MeasuredTotal::default();
         total.add_unmeasured();
@@ -374,7 +407,7 @@ mod tests {
     #[test]
     fn warming_closes_the_unmeasured_gap_before_refreshing_an_old_figure() {
         let mut records = SizeRecords::default();
-        records.record("/a", 1, 0);
+        records.record_usage("/a", 1, Some(1), 0);
         let paths = owned(&["/a", "/b"]);
         assert_eq!(
             records.next_to_measure(&paths, 100 * HOUR, 24 * HOUR),
@@ -383,10 +416,22 @@ mod tests {
     }
 
     #[test]
+    fn warming_prioritizes_records_missing_inode_counts() {
+        let mut records = SizeRecords::default();
+        records.record("/a", 1, 99 * HOUR);
+        records.record_usage("/b", 1, Some(2), 0);
+        let paths = owned(&["/a", "/b"]);
+        assert_eq!(
+            records.next_to_measure(&paths, 100 * HOUR, 24 * HOUR),
+            Some("/a".into())
+        );
+    }
+
+    #[test]
     fn warming_then_takes_the_stalest_record() {
         let mut records = SizeRecords::default();
-        records.record("/a", 1, 50 * HOUR);
-        records.record("/b", 1, 10 * HOUR);
+        records.record_usage("/a", 1, Some(1), 50 * HOUR);
+        records.record_usage("/b", 1, Some(1), 10 * HOUR);
         let paths = owned(&["/a", "/b"]);
         assert_eq!(
             records.next_to_measure(&paths, 100 * HOUR, 24 * HOUR),
@@ -397,8 +442,8 @@ mod tests {
     #[test]
     fn warming_stops_once_every_record_is_inside_the_ttl() {
         let mut records = SizeRecords::default();
-        records.record("/a", 1, 90 * HOUR);
-        records.record("/b", 1, 95 * HOUR);
+        records.record_usage("/a", 1, Some(1), 90 * HOUR);
+        records.record_usage("/b", 1, Some(1), 95 * HOUR);
         let paths = owned(&["/a", "/b"]);
         assert_eq!(records.next_to_measure(&paths, 100 * HOUR, 24 * HOUR), None);
     }

@@ -644,3 +644,28 @@ fn a_resumed_candidate_that_stopped_qualifying_is_retained_without_stranding_the
         "a fresh plan must be runnable"
     );
 }
+
+#[test]
+fn empty_build_output_still_reports_inode_usage() {
+    let (tmp, mut broker, _delivered_id, worktree) = fixture();
+    std::fs::write(
+        tmp.path().join(".aethyme/broker.toml"),
+        "[retention]\nclosed_worktrees_days = 30\nartifact_reclaim_days = 0\n",
+    )
+    .unwrap();
+    std::fs::write(tmp.path().join(".git/info/exclude"), "/node_modules/\n").unwrap();
+    std::fs::create_dir_all(worktree.join("node_modules/empty-package")).unwrap();
+
+    let plan = broker.gc_plan().unwrap();
+    let candidate = plan
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.relative_dir == "node_modules")
+        .expect("the ignored, non-empty node_modules tree is a build-output candidate");
+    assert_eq!(candidate.estimated_bytes, 0);
+    assert_eq!(candidate.estimated_inodes, Some(2));
+    assert!(
+        plan.estimated_build_output_reclaimable_inodes.unwrap() >= 2,
+        "the build-output total must include directory-only caches: {plan:#?}"
+    );
+}

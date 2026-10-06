@@ -103,6 +103,25 @@ fn gate_policy_changes_select_a_triggered_gate() {
     );
 }
 
+#[test]
+fn cross_process_contract_uses_load_admission_despite_its_low_cost() {
+    let gates = load_gates(&repo_root()).expect("the shipped gates.toml parses");
+    let gate = gates
+        .iter()
+        .find(|gate| gate.name == "cross-process-contract")
+        .expect("the cross-process contract gate is configured");
+
+    assert_eq!(
+        gate.cost, 1,
+        "the gate's cost should not be raised just to admit by load"
+    );
+    assert_eq!(
+        gate.max_load_per_cpu,
+        Some(3.0),
+        "the gate should wait for load to fall below 3 per CPU before starting"
+    );
+}
+
 /// The guard suites `fast-guards` runs. Each one also runs under
 /// `cargo-test`; the gate exists so their failure arrives in seconds rather
 /// than after the whole workspace suite.

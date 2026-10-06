@@ -521,6 +521,8 @@ pub struct GcWorktreeCandidate {
     pub branch_ref: String,
     pub branch_tip: Option<String>,
     pub estimated_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_inodes: Option<u64>,
     pub closed_at: i64,
 }
 
@@ -536,6 +538,8 @@ pub struct GcArtifactCandidate {
     /// Path of the build directory relative to the worktree root.
     pub relative_dir: String,
     pub estimated_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_inodes: Option<u64>,
     pub idle_days: u32,
 }
 
@@ -555,6 +559,8 @@ pub struct GcGateCacheCandidate {
     pub cache_key: String,
     pub path: String,
     pub estimated_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_inodes: Option<u64>,
     pub last_used_at_ms: i64,
     pub age_days: u32,
     pub reason: String,
@@ -589,6 +595,8 @@ pub struct GcGateCacheEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub estimated_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_inodes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_used_at_ms: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub age_days: Option<u32>,
@@ -611,12 +619,20 @@ pub struct GcGateCacheInventory {
     pub budget_bytes: u64,
     /// Every sized entry, reclaimable or not.
     pub total_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_inodes: Option<u64>,
     pub reclaimable_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reclaimable_inodes: Option<u64>,
     pub held_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held_inodes: Option<u64>,
     /// Bytes in the most recently used entry of each kind, kept because the
     /// next gate reuses them. Outside the budget, like held bytes.
     #[serde(default)]
     pub active_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_inodes: Option<u64>,
     /// Whether this plan was made with `--include-active-gate-cache`, which
     /// proposes those entries too at the cost of a cold next gate.
     #[serde(default)]
@@ -639,6 +655,8 @@ pub struct GcDeclinedArtifact {
     /// Path of the ignored directory relative to the worktree root.
     pub relative_dir: String,
     pub estimated_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_inodes: Option<u64>,
     pub reason: String,
 }
 
@@ -654,6 +672,8 @@ pub struct GcOrphanCandidate {
     pub worktree_root: String,
     pub repository_root: String,
     pub estimated_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_inodes: Option<u64>,
     pub reason: String,
 }
 
@@ -808,18 +828,28 @@ pub struct GcPlan {
     #[serde(default)]
     pub declined_artifacts: Vec<GcDeclinedArtifact>,
     pub estimated_reclaimable_bytes: u64,
+    /// Known inode count the plan proposes to reclaim. None means at least one
+    /// candidate has not been measured for inodes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_reclaimable_inodes: Option<u64>,
     /// Every byte held by retained worktrees, whether or not this plan acts on
     /// it. Reporting only: excluded from the digest so measured sizes never
     /// invalidate an authorization.
     pub estimated_retained_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_retained_inodes: Option<u64>,
     /// Bytes this plan deliberately leaves in place because a retention or
     /// provenance gate blocked them.
     pub estimated_blocked_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_blocked_inodes: Option<u64>,
     /// Bytes in [`GcPlan::declined_artifacts`]. Kept separate from
     /// `estimated_reclaimable_bytes` so evidence can never be mistaken for a
     /// deletion authorization.
     #[serde(default)]
     pub estimated_declined_artifact_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_declined_artifact_inodes: Option<u64>,
     /// This repository's gate cache, held entries included. `None` when the
     /// per-user cache directory cannot be resolved at all.
     #[serde(default)]
@@ -830,6 +860,8 @@ pub struct GcPlan {
     /// gate refusing for disk headroom needs (#295).
     #[serde(default)]
     pub estimated_build_output_reclaimable_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_build_output_reclaimable_inodes: Option<u64>,
     /// Directories under a broker worktree root that no session row claims
     /// (#176). Reporting only, and excluded from the digest for the same
     /// reason the byte totals are: this plan does not act on these, so a
@@ -995,8 +1027,14 @@ pub struct GcHealth {
     pub candidate_artifacts: usize,
     pub candidate_orphans: usize,
     pub estimated_reclaimable_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_reclaimable_inodes: Option<u64>,
     pub estimated_retained_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_retained_inodes: Option<u64>,
     pub estimated_blocked_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_blocked_inodes: Option<u64>,
     pub over_retained_bytes_budget: bool,
     pub retained_bytes_deficit: u64,
     pub clears_retained_bytes_budget: bool,
@@ -1163,6 +1201,7 @@ mod tests {
             cache_key: "rust-v2".into(),
             path: "/c/rust-v2".into(),
             estimated_bytes: 1,
+            estimated_inodes: Some(2),
             last_used_at_ms: 1,
             age_days: 0,
             reason: String::new(),
