@@ -608,6 +608,9 @@ impl Broker {
         let session = self.store().session(session_id)?;
         let checkout = GitRepo::discover(Path::new(&session.worktree_path))?;
         let head = checkout.head_commit()?;
+        // Before planning: a verify-only plan is measured against integration,
+        // and a stale one counts main's own commits as this session's (#352).
+        self.refresh_disposable_integration(crate::IntegrationRefreshTrigger::Submit);
         progress.phase("auditing lease ownership");
         let ownership = self.audit_submit_ownership(session_id)?;
         if !ownership.ok {

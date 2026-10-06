@@ -335,6 +335,29 @@ pub struct AutomaticIntegrationCleanupReport {
     pub next_action: Option<String>,
 }
 
+/// The command that refreshed a verify-only integration branch (#352).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IntegrationRefreshTrigger {
+    Start,
+    Status,
+    Submit,
+    Sync,
+}
+
+/// One automatic advance of a verify-only integration branch onto the
+/// fetched default branch; also the `broker.integration.refreshed` payload.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct IntegrationRefresh {
+    pub trigger: IntegrationRefreshTrigger,
+    pub branch: String,
+    pub upstream_ref: String,
+    pub from: String,
+    pub to: String,
+    pub cleaned_queue_entry_ids: Vec<i64>,
+    pub explanation: String,
+}
+
 #[derive(Clone)]
 struct Candidate {
     entry: MergeQueueEntry,
@@ -604,24 +627,37 @@ impl Broker {
             });
         }
 
-        let assessment =
-            self.assess_integration_drift(upstream_ref, &upstream_head, &old_integration)?;
         let manual_command = format!(
             "aethyme broker advanced integration reconcile --upstream {upstream_ref} --dry-run"
         );
-        if !assessment.automatic_cleanup_safe {
-            return Ok(AutomaticIntegrationCleanupReport {
-                state: AutomaticIntegrationCleanupState::Deferred,
-                upstream_ref: upstream_ref.to_string(),
-                upstream_head,
-                old_integration: old_integration.clone(),
-                new_integration: old_integration,
-                cleaned_queue_entry_ids: Vec::new(),
-                explanation: assessment.explanation.clone(),
-                assessment: Some(assessment),
-                next_action: Some(manual_command),
-            });
-        }
+        // An integration strictly behind upstream holds nothing upstream
+        // lacks, which is the whole question the drift assessment answers, so
+        // it is skipped there: on a long history it is the expensive part, and
+        // `status` now takes this path (#352). The reviewed plan below still
+        // decides; ancestry only spares the explanation.
+        let strictly_behind = self
+            .repo_handle()
+            .is_ancestor(&old_integration, &upstream_head);
+        let assessment = if strictly_behind {
+            None
+        } else {
+            let assessment =
+                self.assess_integration_drift(upstream_ref, &upstream_head, &old_integration)?;
+            if !assessment.automatic_cleanup_safe {
+                return Ok(AutomaticIntegrationCleanupReport {
+                    state: AutomaticIntegrationCleanupState::Deferred,
+                    upstream_ref: upstream_ref.to_string(),
+                    upstream_head,
+                    old_integration: old_integration.clone(),
+                    new_integration: old_integration,
+                    cleaned_queue_entry_ids: Vec::new(),
+                    explanation: assessment.explanation.clone(),
+                    assessment: Some(assessment),
+                    next_action: Some(manual_command),
+                });
+            }
+            Some(assessment)
+        };
 
         let dry_run = self.reconcile_integration(IntegrationReconcileOptions {
             upstream: upstream_ref.to_string(),
@@ -663,7 +699,7 @@ impl Broker {
                 old_integration: old_integration.clone(),
                 new_integration: old_integration,
                 cleaned_queue_entry_ids: Vec::new(),
-                assessment: Some(assessment),
+                assessment,
                 explanation: "the full reconciliation plan found work that is not a conclusive upstream landing; automatic cleanup was refused"
                     .into(),
                 next_action: Some(manual_command),
@@ -690,7 +726,7 @@ impl Broker {
                 old_integration,
                 new_integration: applied.new_integration,
                 cleaned_queue_entry_ids: Vec::new(),
-                assessment: Some(assessment),
+                assessment,
                 explanation:
                     "reconciliation state changed before the confirmed cleanup could apply".into(),
                 next_action: Some(manual_command),
@@ -704,7 +740,7 @@ impl Broker {
             old_integration,
             new_integration: applied.new_integration,
             cleaned_queue_entry_ids,
-            assessment: Some(assessment),
+            assessment,
             explanation: if advanced_by_fast_forward {
                 "integration held nothing upstream lacked and was fast-forwarded onto it"
             } else {
@@ -713,6 +749,76 @@ impl Broker {
                 .into(),
             next_action: None,
         })
+    }
+
+    /// Keep a verify-only repository's integration branch on the fetched
+    /// default branch (#352).
+    ///
+    /// Integration there is a disposable verification base: nothing lands
+    /// through it, but it falls behind every pull request merged outside the
+    /// broker, and a stale copy of main is what `finish` counted as
+    /// "unsubmitted" work and what reconcile asked an operator to attest.
+    /// When it carries nothing upstream lacks, it is advanced through the same
+    /// reviewed-plan machinery as the post-merge cleanup, and the move is
+    /// recorded as `broker.integration.refreshed`. An integration that holds
+    /// work of its own is left alone for the reviewed path, and promoting
+    /// repositories are never touched.
+    ///
+    /// Never fails the calling command: a refusal or error leaves integration
+    /// where it was, and status advice still describes it. `status`, the
+    /// orientation step every agent runs first, only takes the strictly-behind
+    /// case, which needs no drift assessment.
+    pub fn refresh_disposable_integration(
+        &mut self,
+        trigger: IntegrationRefreshTrigger,
+    ) -> Option<IntegrationRefresh> {
+        if crate::merge::PromoteConfig::load(self.main_root()).mode
+            != crate::merge::PromoteMode::VerifyOnly
+        {
+            return None;
+        }
+        let (upstream_ref, upstream_head) = self.repo_handle().upstream_default()?;
+        let (branch, integration) = self.integration_head().ok()?;
+        if self.repo_handle().is_ancestor(&upstream_head, &integration) {
+            return None;
+        }
+        if trigger == IntegrationRefreshTrigger::Status
+            && !self.repo_handle().is_ancestor(&integration, &upstream_head)
+        {
+            return None;
+        }
+        let report = match self.auto_cleanup_landed_integration(&upstream_ref) {
+            Ok(report) => report,
+            Err(error) => {
+                crate::warn_unrecorded::<(), _>(
+                    "refresh the verify-only integration branch",
+                    Err(error),
+                );
+                return None;
+            }
+        };
+        if report.state != AutomaticIntegrationCleanupState::Cleaned {
+            return None;
+        }
+        let refresh = IntegrationRefresh {
+            trigger,
+            branch,
+            upstream_ref,
+            from: report.old_integration,
+            to: report.new_integration,
+            cleaned_queue_entry_ids: report.cleaned_queue_entry_ids,
+            explanation: report.explanation,
+        };
+        let payload = serde_json::to_string(&refresh).unwrap_or_default();
+        crate::warn_unrecorded(
+            "record the integration refresh",
+            self.store().append_event(
+                crate::events::BROKER_INTEGRATION_REFRESHED,
+                None,
+                Some(&payload),
+            ),
+        );
+        Some(refresh)
     }
 
     /// Inspect a previously fetched upstream ref and, when `apply` is set,
