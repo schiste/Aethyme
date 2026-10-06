@@ -97,6 +97,8 @@ triggers = [
     "**/*.rs",
     "**/Cargo.toml",
     "packages/aethyme/skills/**",
+    ".claude/skills/**",
+    ".codex/skills/**",
     "packages/aethyme/scripts/eval/*.sh",
     "packages/aethyme/docs/**",
     ".github/pull_request_template.md",
@@ -153,8 +155,11 @@ triggers = [
     # path this gate covers; `gate_policy.rs` fails when they diverge.
     #
     # skill_templates.rs, playground_hygiene.rs (deployed templates,
-    # references, the SessionStart hook):
+    # references, the SessionStart hook). skill_surface_parity.rs also reads
+    # the Claude and Codex trees, so keep their source paths in this list:
     "packages/aethyme/skills/**",
+    ".claude/skills/**",
+    ".codex/skills/**",
     # playground_hygiene.rs greps these two scripts, and their patterns
     # must move in lockstep with the templates (Class-3 protocol):
     "packages/aethyme/scripts/eval/*.sh",
