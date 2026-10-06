@@ -499,6 +499,7 @@ struct OperationEcho {
     effect: Option<String>,
     scope: Option<String>,
     destructive: bool,
+    cross_session: Option<i64>,
     reason: Option<String>,
     no_wait: bool,
     queue_timeout_seconds: Option<u64>,
@@ -536,6 +537,9 @@ impl OperationEcho {
         }
         if self.destructive || missing.destructive {
             words.push("--destructive".into());
+        }
+        if let Some(session) = self.cross_session {
+            words.extend(["--cross-session".to_string(), session.to_string()]);
         }
         match &self.reason {
             Some(reason) => words.extend(["--reason".to_string(), quote(reason)]),
@@ -577,6 +581,7 @@ pub(super) fn run_git_gh(parsed: Parsed, subcommand: &str) -> Result<(), UsageEr
         effect: parsed.effect.clone(),
         scope: parsed.scope.clone(),
         destructive: parsed.destructive,
+        cross_session: parsed.cross_session,
         reason: parsed.reason.clone(),
         no_wait: parsed.no_wait,
         queue_timeout_seconds: parsed.queue_timeout_seconds,
@@ -591,6 +596,7 @@ pub(super) fn run_git_gh(parsed: Parsed, subcommand: &str) -> Result<(), UsageEr
         scope: parsed.scope,
         declared_effect,
         destructive_confirmed: parsed.destructive,
+        cross_session: parsed.cross_session,
         authorization_reason: parsed.reason,
         args: parsed.exec_command,
     };

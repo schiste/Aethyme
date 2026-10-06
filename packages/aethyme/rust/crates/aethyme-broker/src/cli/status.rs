@@ -768,6 +768,18 @@ pub(super) fn run_doctor(parsed: Parsed) -> Result<(), UsageError> {
         if let Some(digest) = &report.retention.pending_recovery_digest {
             out!("  recovery pending: aethyme broker gc apply --confirm {digest}");
         }
+        if report.retention.artifact_worktrees_not_scanned > 0 {
+            out!(
+                "  retention: {} retained {} not searched for build output within the {} s health-check budget; see all of them with `aethyme broker gc plan`",
+                report.retention.artifact_worktrees_not_scanned,
+                crate::broker::plural_word(
+                    report.retention.artifact_worktrees_not_scanned,
+                    "worktree was",
+                    "worktrees were",
+                ),
+                crate::gc::HEALTH_CHECK_ARTIFACT_SCAN_BUDGET.as_secs(),
+            );
+        }
         if report.healthy() {
             out!("doctor: healthy");
         } else {

@@ -153,6 +153,35 @@ pub(super) fn render_storage_plan(plan: &crate::StoragePlan, detail: bool) {
     }
 }
 
+pub(super) fn render_storage_attribution(report: &crate::StorageAttributionReport) {
+    let attributable = report.roots.iter().filter(|root| root.attributable).count();
+    out!(
+        "Unmarked worktree roots under {}: {} ({} provably {})",
+        report.storage_root.display(),
+        report.roots.len(),
+        attributable,
+        report.repository_key
+    );
+    for root in &report.roots {
+        let state = match (root.attributable, root.marked) {
+            (true, true) => "marked",
+            (true, false) if report.applied => "unchanged (a marker appeared meanwhile)",
+            (true, false) => "attributable",
+            (false, _) => "not attributable",
+        };
+        out!("  {state}: {}", root.root.display());
+        out!("      {}", root.reason);
+    }
+    if !report.applied && attributable > 0 {
+        out!(
+            "  next: aethyme broker gc storage attribute --apply  (writes {attributable} ownership {}; removes nothing)",
+            crate::broker::plural_word(attributable, "marker", "markers")
+        );
+    } else if report.applied && report.roots.iter().any(|root| root.marked) {
+        out!("  next: aethyme broker gc storage plan  (review what the newly owned roots hold)");
+    }
+}
+
 pub(super) fn render_storage_apply(report: &crate::StorageApplyReport) {
     out!(
         "Host storage apply {}: {} removed, {} reclaimed",
@@ -937,7 +966,7 @@ pub(super) fn run_storage(parsed: Parsed) -> Result<(), UsageError> {
     let action = parsed.positional.first().map(String::as_str);
     if parsed.positional.len() > 1 {
         return Err(UsageError::Message(
-            "storage accepts at most one action: `plan` or `apply --confirm <sha256>`".into(),
+            "storage accepts at most one action: `plan`, `apply --confirm <sha256>` or `attribute [--apply]`".into(),
         ));
     }
     let cwd = std::env::current_dir()
@@ -972,9 +1001,22 @@ pub(super) fn run_storage(parsed: Parsed) -> Result<(), UsageError> {
                 )));
             }
         }
+        Some("attribute") => {
+            if parsed.confirm.is_some() {
+                return Err(UsageError::Message(
+                    "storage attribute does not take --confirm; it writes only ownership markers it can prove, with --apply".into(),
+                ));
+            }
+            let report = crate::storage_attribute(&cwd, parsed.apply)?;
+            if parsed.json {
+                out!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                render_storage_attribution(&report);
+            }
+        }
         Some(other) => {
             return Err(UsageError::Message(format!(
-                "unknown storage action {other:?}; expected `plan` or `apply`"
+                "unknown storage action {other:?}; expected `plan`, `apply` or `attribute`"
             )));
         }
     }

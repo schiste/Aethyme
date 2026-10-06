@@ -45,8 +45,12 @@ fn pr_and_main_have_one_automatic_full_workspace_owner() {
     // nextest runs neither example targets nor doctests, and the
     // release-manifest assertions in
     // `crates/aethyme-broker/examples/release_manifest.rs` live in an example.
-    assert!(rust.contains(&"        run: cargo test --locked --workspace --examples"));
-    assert!(rust.contains(&"        run: cargo test --locked --workspace --doc"));
+    // They run in a job of their own, beside the workspace suite, on every
+    // pull request.
+    let examples = block(&oss, "  rust-examples-doctests:");
+    assert!(examples.contains(&"    if: github.event_name == 'pull_request'"));
+    assert!(examples.contains(&"        run: cargo test --locked --workspace --examples"));
+    assert!(examples.contains(&"        run: cargo test --locked --workspace --doc"));
     // No second condition can silently skip a step within this job.
     assert_eq!(
         rust.iter()
@@ -76,10 +80,93 @@ fn pr_and_main_have_one_automatic_full_workspace_owner() {
         ]
     );
     let job = block(&gates, "  gates:");
+    // Unless a pull-request run already tested this exact tree, every gate
+    // runs (`main_skips_only_the_gates_a_pr_run_tested_on_the_same_tree`).
+    assert!(job.contains(&"            exec \"$aethyme\" broker advanced gates run --all"));
+    // The job always runs; only the tree lookup is limited to pushes.
+    assert!(!job.iter().any(|line| line.starts_with("    if:")));
+    assert_eq!(
+        job.iter()
+            .filter(|line| line.trim_start().starts_with("if:"))
+            .copied()
+            .collect::<Vec<_>>(),
+        ["        if: github.event_name == 'push'"]
+    );
+}
+
+/// Main's Aethyme Gates skip a gate only when a pull-request run of this
+/// repository passed both suites on a byte-identical tree, and then only the
+/// gates those suites cover. Any other gate, including one added later, runs.
+#[test]
+fn main_skips_only_the_gates_a_pr_run_tested_on_the_same_tree() {
+    let oss = workflow("oss-ci.yml");
+    let record = block(&oss, "  record-tested-tree:");
+    assert!(record.contains(&"    if: github.event_name == 'pull_request'"));
+    assert!(record.contains(&"    needs: [rust-tests, rust-examples-doctests]"));
+    assert!(record.contains(&"          tree=\"$(git rev-parse 'HEAD^{tree}')\""));
+    assert!(record.contains(&"          name: tested-tree-${{ env.TESTED_TREE }}"));
+
+    let gates = workflow("aethyme-gates.yml");
+    let job = block(&gates, "  gates:");
+    assert!(job.contains(&"          tree=\"$(git rev-parse 'HEAD^{tree}')\""));
+    // An artifact uploaded by a fork's run never counts.
+    assert!(
+        job.iter()
+            .any(|line| line.contains(".workflow_run.head_repository_id == $repo_id"))
+    );
     assert!(job.contains(
-        &"        run: packages/aethyme/rust/target/release/aethyme broker advanced gates run --all"
+        &"          COVERED_BY_PR_SUITE: \"cargo-test fast-guards workflow-contract gate-policy\""
     ));
-    assert!(!job.iter().any(|line| line.trim_start().starts_with("if:")));
+    // The gates to run come from the manifest, not from a list in the workflow.
+    // An assignment, so a failing manifest fails the step instead of running
+    // no gate at all.
+    assert!(job.iter().any(|line| {
+        line.trim_start().starts_with("gates=\"$(")
+            && line
+                .contains("broker advanced gates manifest --json | jq -r '.manifest.gates[].name'")
+    }));
+    assert!(job.contains(&"          for gate in $gates; do"));
+    assert!(job.contains(
+        &"              *) \"$aethyme\" broker advanced gates run --all --only \"$gate\" ;;"
+    ));
+
+    // Every skipped gate must exist, and the contract gate, which reads the
+    // merged PR's body, is never skipped.
+    let policy = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(5)
+            .unwrap()
+            .join(".aethyme/gates.toml"),
+    )
+    .unwrap();
+    for gate in [
+        "cargo-test",
+        "fast-guards",
+        "workflow-contract",
+        "gate-policy",
+    ] {
+        assert!(
+            policy.contains(&format!("name = \"{gate}\"")),
+            "{gate} is not a gate"
+        );
+    }
+    assert!(!job.iter().any(
+        |line| line.contains("COVERED_BY_PR_SUITE") && line.contains("cross-process-contract")
+    ));
+}
+
+/// macOS is tested nightly, and that run must be the whole workspace: until
+/// 2026-10-06 it was `cargo test --workspace --examples`, which runs example
+/// targets only.
+#[test]
+fn macos_nightly_runs_the_whole_workspace_suite() {
+    let nightly = workflow("macos-nightly.yml");
+    let job = block(&nightly, "  rust-tests-macos-full:");
+    assert!(job.contains(&"        run: cargo nextest run --locked --workspace --profile ci"));
+    assert!(job.contains(&"        run: cargo test --locked --workspace --examples"));
+    assert!(job.contains(&"        run: cargo test --locked --workspace --doc"));
+    assert!(job.contains(&"        run: cargo build --locked --workspace --bins"));
 }
 
 #[test]
@@ -121,7 +208,11 @@ fn changed_workflows_have_read_only_permissions() {
     // The contract gate reads the merged PR's body on main; still read-only.
     assert_eq!(
         block(&workflow("aethyme-gates.yml"), "permissions:"),
-        ["  contents: read", "  pull-requests: read"]
+        [
+            "  contents: read",
+            "  actions: read",
+            "  pull-requests: read"
+        ]
     );
 }
 
