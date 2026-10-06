@@ -40,6 +40,20 @@ const REASON_PREVIEW_CHARS: usize = 160;
 pub fn render(repo: &Path, answer: &Value) -> String {
     let mut out = Vec::new();
     out.push(header(answer));
+    if let Some(stale) = answer.get("source_staleness") {
+        out.push(format!(
+            "Stale checkout: {} commit(s) behind {}; spans below may show already-fixed code. {}",
+            stale.get("behind").and_then(Value::as_u64).unwrap_or(0),
+            stale
+                .get("reference")
+                .and_then(Value::as_str)
+                .unwrap_or("a fresher ref"),
+            stale
+                .get("suggestion")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+        ));
+    }
     if let Some(reason) = answer
         .pointer("/trust_policy/reason")
         .and_then(Value::as_str)
