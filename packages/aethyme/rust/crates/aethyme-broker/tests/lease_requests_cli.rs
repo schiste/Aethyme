@@ -231,6 +231,25 @@ fn the_holder_sees_the_request_and_an_ack_releases_the_path() {
     );
     assert_eq!(acked["state"], "acked");
     assert!(!fx.holds(holding));
+    // The ack is audited like a finish release (#358): one reasoned
+    // `lease.released` naming the lease generation.
+    let store = aethyme_broker::BrokerStore::open_in_repo(&fx.repo).unwrap();
+    let released: Vec<serde_json::Value> = store
+        .events_after(0, i64::MAX)
+        .unwrap()
+        .into_iter()
+        .filter(|event| event.kind == "lease.released" && event.session_id == Some(holding))
+        .filter_map(|event| serde_json::from_str(event.payload_json.as_deref()?).ok())
+        .collect();
+    assert!(
+        released
+            .iter()
+            .any(|payload| payload["reason"] == "request_acked"
+                && payload["path"] == PATH
+                && payload["lease_id"].is_i64()
+                && payload["created_at"].is_i64()),
+        "{released:?}"
+    );
     assert_eq!(
         fx.wait(&requester.pid(), asking, "5"),
         (Some(0), "released".into())

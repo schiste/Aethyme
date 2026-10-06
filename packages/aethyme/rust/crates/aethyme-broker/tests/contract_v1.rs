@@ -420,6 +420,11 @@ fn v1_constructor_payload_field_names_are_frozen() {
         "lease.claimed / lease.released",
     );
     assert_keys(
+        &events::lease_released_payload("p", "finish", 1, 0),
+        &["created_at", "lease_id", "path", "reason"],
+        "lease.released by a terminal finish",
+    );
+    assert_keys(
         &aethyme_broker::lease_requests::request_payload("p", 2, 1, "why"),
         &[
             "holder_session_id",
