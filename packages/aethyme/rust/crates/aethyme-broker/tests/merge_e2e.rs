@@ -1477,7 +1477,9 @@ fn repeated_reuse_after_rebase_preserves_owned_work_and_finish_truth() {
     sh(&worktree, &["commit", "-qm", "document the product change"]);
     let pre_rebase_head = resolve(&worktree, "HEAD");
 
-    // Reusing a closed worktree creates a new identity at its current HEAD.
+    // Reusing a closed worktree creates a new identity. Since #294 it starts
+    // from the closed session's accepted checkpoint, because the release-note
+    // commit made after the close is still unsubmitted work it must own.
     let created = broker
         .adopt_with(
             &worktree,
@@ -1488,8 +1490,14 @@ fn repeated_reuse_after_rebase_preserves_owned_work_and_finish_truth() {
         .unwrap();
     assert_eq!(
         created.session.diff_base.as_deref(),
-        Some(pre_rebase_head.as_str())
+        Some(session_head.as_str())
     );
+    let carried = created
+        .carried_ownership
+        .as_ref()
+        .expect("the release-note commit stays owned");
+    assert_eq!(carried.from_session, first.id);
+    assert_eq!(carried.pending_owned_commits, 1);
 
     // The rebase drops the patch-equivalent product commit and rewrites the
     // release-note commit. A second active reuse must preserve the original
@@ -1508,7 +1516,7 @@ fn repeated_reuse_after_rebase_preserves_owned_work_and_finish_truth() {
     assert_eq!(reused.session.id, created.session.id);
     assert_eq!(
         reused.session.diff_base.as_deref(),
-        Some(pre_rebase_head.as_str())
+        Some(session_head.as_str())
     );
     assert_eq!(
         reused
