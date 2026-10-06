@@ -366,6 +366,7 @@ impl Broker {
                     scope: Some(scope),
                     declared_effect: Some(OperationEffect::Read),
                     destructive_confirmed: false,
+                    cross_session: None,
                     authorization_reason: None,
                     args,
                 },

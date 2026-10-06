@@ -862,6 +862,12 @@ pub struct GcPlan {
     /// The oldest recorded measurement behind the byte totals.
     #[serde(default)]
     pub sizes_measured_at_ms: Option<i64>,
+    /// Retained worktrees a recorded-size plan did not search for build
+    /// directories because its scan budget ran out (#460), so `artifacts` is
+    /// a floor. Always `0` on the full audit, and left out of the JSON when
+    /// `0` so a measured plan's digest is unchanged.
+    #[serde(default, skip_serializing_if = "is_zero_count")]
+    pub artifact_worktrees_not_scanned: usize,
     /// `None` only when re-reading a plan written before the sweep existed.
     /// That is deliberately not the same value as a sweep that found nothing:
     /// a plan that never looked must not read as a plan that looked and found
@@ -1002,6 +1008,9 @@ pub struct GcHealth {
     /// orphaned worktree roots as well as retained worktrees, because an
     /// unsized orphan is exactly as absent from the total.
     pub unmeasured_directory_count: usize,
+    /// Retained worktrees not searched for build directories within the
+    /// health-check budget; `candidate_artifacts` is a floor when non-zero.
+    pub artifact_worktrees_not_scanned: usize,
     pub sizes_measured_at_ms: Option<i64>,
     pub blockers: usize,
     /// Directories under a broker worktree root that no session claims.
@@ -1090,6 +1099,10 @@ fn without_gate_cache_budget(bytes: Vec<u8>, budget: u64) -> Vec<u8> {
     let needle = format!(r#","gate_cache_bytes_budget":{budget}}},"rows":"#);
     let text = String::from_utf8(bytes).expect("serde_json writes UTF-8");
     text.replacen(&needle, r#"},"rows":"#, 1).into_bytes()
+}
+
+fn is_zero_count(count: &usize) -> bool {
+    *count == 0
 }
 
 #[cfg(test)]
