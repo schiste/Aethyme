@@ -1,9 +1,14 @@
 exit: 0
 --- stdout
-  aethyme broker advanced gh --session <id> --repo <owner/name> [--scope <scope>] [--effect <read|write|destructive>] [--reason <text>] [--destructive [--cross-session <id>]] [--no-wait|--queue-timeout <seconds>] [--json] -- <gh-args>
+  aethyme broker advanced gh --session <id> --repo <owner/name> [--scope <scope>] [--effect <read|write|destructive>] [--reason <text>] [--destructive [--cross-session <id>] [--ref-write-acknowledged]] [--no-wait|--queue-timeout <seconds>] [--json] -- <gh-args>
       Run GitHub CLI through the same repository coordinator. The broker sets
       GH_REPO from the exact target and never persists command output or
       secret-bearing argument values. After a successful `gh pr merge`, it
       refreshes the tracked target and removes a fully landed integration
       layer; mixed or uncertain work remains unchanged with recovery guidance.
+      A command that can delete or move a branch ref (pr merge|close
+      --delete-branch, update-branch --rebase, repo sync --force, api ref
+      writes, GraphQL mutations, aliases) is checked against the exact branch
+      it touches; one the broker cannot pin to a branch is refused unless
+      --destructive --ref-write-acknowledged confirms it.
 --- stderr
