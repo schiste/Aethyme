@@ -437,11 +437,54 @@ pub(super) fn render_submission_group<'a>(
 }
 
 /// `broker submit`.
+/// Refuse a submission whose tracked cross-process removals carry no contract
+/// decision, before any gate starts building (#418).
+///
+/// Only a refusal is fatal. When the session cannot be inspected, the
+/// preflight steps aside with a warning: submit reports that failure in its
+/// own terms, and the contract gate on the merged tree stays authoritative.
+fn contract_preflight(broker: &mut crate::Broker, session: i64) -> Result<(), UsageError> {
+    let inspected = (|| -> Result<Result<(), String>, String> {
+        let info = broker
+            .store()
+            .session(session)
+            .map_err(|error| format!("cannot load session {session}: {error}"))?;
+        let repo_root = std::path::PathBuf::from(&info.worktree_path);
+        let checkout = crate::GitRepo::discover(&repo_root)
+            .map_err(|error| format!("cannot inspect the session worktree: {error}"))?;
+        let plan = broker
+            .submission_plan(session)
+            .map_err(|error| format!("cannot plan the submission: {error}"))?;
+        let base = checkout
+            .merge_base("HEAD", &plan.integration_head)
+            .map_err(|error| format!("cannot find the submission base: {error}"))?;
+        let messages = plan
+            .pending_owned_commit_ids()
+            .iter()
+            .map(|commit| checkout.commit_message(commit))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("cannot read the pending commit messages: {error}"))?
+            .join("\n");
+        crate::contract_check::preflight_submit_decision(&repo_root, &base, &messages)
+    })();
+    match inspected {
+        Ok(verdict) => verdict.map_err(UsageError::Message),
+        Err(reason) => {
+            eprintln!(
+                "warning: skipped the contract-decision preflight ({reason}); \
+                 the contract gate still checks the merged tree."
+            );
+            Ok(())
+        }
+    }
+}
+
 pub(super) fn run_submit(parsed: Parsed) -> Result<(), UsageError> {
     let session = parsed
         .session
         .ok_or(UsageError::Message("submit requires --session <id>".into()))?;
     let mut broker = open_broker(parsed.read_only_snapshot)?;
+    contract_preflight(&mut broker, session)?;
     // Preflight (dogfood feedback 2026-07-14): show exactly what
     // will be submitted before anything runs — and warn about
     // uncommitted work, which never integrates.
