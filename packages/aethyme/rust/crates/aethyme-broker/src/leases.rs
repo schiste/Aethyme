@@ -165,6 +165,10 @@ pub(crate) fn paths_overlap(a: &str, b: &str) -> bool {
 pub struct LeaseCoverageEntry {
     pub path: String,
     pub covered_by: Option<String>,
+    /// The path matches `[leases] ignore` (or a default ignored file), so the
+    /// guard never asks for a claim on it and it is not missing.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub ignored: bool,
     /// Exact-file claim to add when the path is not covered.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exact_claim: Option<String>,
@@ -189,6 +193,7 @@ pub fn plan_lease_coverage(
     session_id: i64,
     paths: &[String],
     leases: &[Lease],
+    rules: &LeaseIgnoreRules,
 ) -> LeaseCoverageReport {
     let mut paths = paths.to_vec();
     paths.sort();
@@ -207,8 +212,9 @@ pub fn plan_lease_coverage(
                 })
                 .max_by_key(|lease| lease.path.len())
                 .map(|lease| lease.path.clone());
-            if covered_by.is_some() {
+            if covered_by.is_some() || rules.is_ignored(&path) {
                 LeaseCoverageEntry {
+                    ignored: covered_by.is_none(),
                     path,
                     covered_by,
                     exact_claim: None,
@@ -223,6 +229,7 @@ pub fn plan_lease_coverage(
                     exact_claim: Some(path.clone()),
                     path,
                     covered_by: None,
+                    ignored: false,
                     recursive_claim,
                 }
             }
@@ -230,7 +237,7 @@ pub fn plan_lease_coverage(
         .collect::<Vec<_>>();
     let missing_count = entries
         .iter()
-        .filter(|entry| entry.covered_by.is_none())
+        .filter(|entry| entry.covered_by.is_none() && !entry.ignored)
         .count();
 
     LeaseCoverageReport {
@@ -372,7 +379,7 @@ mod tests {
             explicit_lease(2, "src/"),
         ];
 
-        let report = plan_lease_coverage(1, &paths, &leases);
+        let report = plan_lease_coverage(1, &paths, &leases, &LeaseIgnoreRules::default());
         assert_eq!(report.missing_count, 1);
         assert_eq!(report.paths[0].covered_by.as_deref(), Some("src/file.rs"));
         assert_eq!(report.paths[1].covered_by, None);
@@ -387,11 +394,33 @@ mod tests {
             1,
             &["src/file.rs".to_string()],
             &[lease(1, "src/"), explicit_lease(2, "src/")],
+            &LeaseIgnoreRules::default(),
         );
 
         assert_eq!(report.missing_count, 1);
         assert_eq!(report.paths[0].exact_claim.as_deref(), Some("src/file.rs"));
         assert_eq!(report.paths[0].recursive_claim.as_deref(), Some("src/"));
+    }
+
+    #[test]
+    fn lease_coverage_does_not_ask_for_claims_on_ignored_paths() {
+        let rules = LeaseIgnoreRules::from_config_text("[leases]\nignore = [\"generated/\"]\n");
+        let report = plan_lease_coverage(
+            1,
+            &[
+                "generated/schema.json".to_string(),
+                "src/file.rs".to_string(),
+            ],
+            &[],
+            &rules,
+        );
+
+        assert_eq!(report.missing_count, 1, "{report:?}");
+        assert!(report.paths[0].ignored);
+        assert_eq!(report.paths[0].exact_claim, None);
+        assert_eq!(report.paths[0].recursive_claim, None);
+        assert!(!report.paths[1].ignored);
+        assert_eq!(report.paths[1].exact_claim.as_deref(), Some("src/file.rs"));
     }
 
     #[test]

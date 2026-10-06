@@ -456,13 +456,12 @@ pub(super) fn run_exec(parsed: Parsed) -> Result<(), UsageError> {
                 "yes"
             }
         );
+        // JSON carries the whole list; a codemod can change thousands of
+        // files, so the human summary stays capped like the lists below.
         if changed_paths.is_empty() {
             out!("  changed paths: none");
         } else {
-            out!("  changed paths:");
-            for path in &changed_paths {
-                out!("    - {path}");
-            }
+            out!("  changed paths: {}", capped_join(&changed_paths, 8));
         }
         if !report.newly_dirty_paths.is_empty() {
             out!(

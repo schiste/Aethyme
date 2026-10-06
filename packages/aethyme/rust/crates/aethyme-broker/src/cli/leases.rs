@@ -74,6 +74,10 @@ fn render_lease_coverage(report: &crate::leases::LeaseCoverageReport) {
             );
             continue;
         }
+        if entry.ignored {
+            out!("  {} — ignored by lease rules; no claim needed", entry.path);
+            continue;
+        }
 
         out!("  {} — missing explicit claim", entry.path);
         if let Some(claim) = &entry.exact_claim {
@@ -324,6 +328,7 @@ pub(super) fn run_leases(parsed: Parsed) -> Result<(), UsageError> {
                     session_id,
                     &normalized_paths,
                     &leases,
+                    &crate::leases::LeaseIgnoreRules::load(broker.main_root()),
                 ))
             } else {
                 None
