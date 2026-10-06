@@ -938,7 +938,7 @@ pub fn run_resolved_with_mode(args: &[String], mode: CompatibilityMode) -> u8 {
             args.get(1).map(String::as_str),
             Some("pre-commit" | "post-commit")
         );
-    if mode == CompatibilityMode::Normal && !internal_hook {
+    if mode == CompatibilityMode::Normal && !internal_hook && !idle_delivery_poll(code) {
         if record_outcome {
             record_command_outcome(args, code, error.as_deref());
         }

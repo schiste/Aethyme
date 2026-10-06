@@ -27,7 +27,19 @@ printf '[%s] tick\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 "$BROKER" broker advanced watch pr tick --limit "$LIMIT" 2>&1 || \
     printf '  tick failed; continuing to delivery\n'
 
-if [ -x "$ADAPTER" ] || [ -f "$ADAPTER" ]; then
+# Start the adapter only when the outbox holds something for it (#417). An
+# empty pass used to open a Chau7 connection and claim nothing, every five
+# minutes, day and night; listing is a read and records nothing. A tick is
+# the only producer of new deliveries and has just run, and a deferred one is
+# still listed, so skipping here delays no delivery. If the listing itself
+# fails, run the adapter anyway: an extra empty claim is cheaper than a
+# missed notification.
+pending="$("$BROKER" broker advanced deliveries list --adapter chau7 --json 2>&1)"
+listed=$?
+if [ "$listed" -eq 0 ] && [ "$pending" = "[]" ]; then
+    printf '  no delivery pending; adapter not started\n'
+elif [ -x "$ADAPTER" ] || [ -f "$ADAPTER" ]; then
+    [ "$listed" -eq 0 ] || printf '  delivery listing failed; running the adapter anyway: %s\n' "$pending"
     python3 "$ADAPTER" --worker "$WORKER" --repo "$REPO" --broker "$BROKER" 2>&1 || \
         printf '  adapter failed\n'
 fi
