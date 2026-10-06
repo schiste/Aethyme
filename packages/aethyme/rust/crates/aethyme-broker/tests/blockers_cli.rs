@@ -523,3 +523,154 @@ fn status_json_carries_the_blockers_and_advice_names_unblock() {
             .any(|command| command.as_str().unwrap() == format!("aethyme broker unblock {id}"))
     );
 }
+
+/// #286: a push killed mid-flight leaves an `outcome_unknown` operation and a
+/// quarantined resource lease. Each must name the other, the listing must give
+/// the inspect-first order, and clearing one half must not read as recovered.
+#[test]
+fn a_killed_write_reports_both_halves_and_their_recovery_order() {
+    let fixture = Fixture::new();
+    let mut broker = fixture.broker();
+    let repository = format!("local:{}", broker.main_root().display());
+    let operation = broker
+        .store()
+        .create_coordinated_operation(&NewCoordinatedOperation {
+            session_id: fixture.session_id,
+            provider: OperationProvider::Git,
+            repository,
+            scope: "repository".into(),
+            effect: OperationEffect::Write,
+            authorization_reason: Some("test".into()),
+            command_json: r#"["git","push","origin","+abc123:refs/heads/work"]"#.into(),
+            pid: dead_pid() as i64,
+            host_operation_id: None,
+            identity_provenance: OperationIdentityProvenance::LocalRepository,
+        })
+        .unwrap();
+    for status in [OperationStatus::Running, OperationStatus::OutcomeUnknown] {
+        broker
+            .store()
+            .transition_coordinated_operation(operation.id, status, None, None)
+            .unwrap();
+    }
+    let worktree_path = broker
+        .store()
+        .session(fixture.session_id)
+        .unwrap()
+        .worktree_path;
+    drop(broker);
+    let mut coordinator =
+        HostResourceCoordinator::open(&fixture.state.join("host-resources.db")).unwrap();
+    let grant = coordinator
+        .acquire(&HostResourceRequest {
+            schema_version: aethyme_broker::HOST_RESOURCE_REQUEST_SCHEMA_VERSION,
+            request_id: "killed-push".into(),
+            repository: "unrelated-origin".into(),
+            worktree_fingerprint: format!("{:x}", Sha256::digest(worktree_path.as_bytes())),
+            run_id: "prepush".into(),
+            ttl_seconds: 600,
+            holder_pid: Some(dead_pid()),
+            resources: vec![HostResourceRequirement {
+                key: "slot".into(),
+                resource: HostResourceKind::Namespace {
+                    prefix: "prepush".into(),
+                },
+            }],
+        })
+        .unwrap();
+    coordinator
+        .quarantine(
+            &grant.lease.lease_id,
+            grant.lease.generation,
+            &grant.ownership_token,
+        )
+        .unwrap();
+    drop(coordinator);
+
+    let op_id = format!("op:{}", operation.id);
+    let lease_id = format!("resource:{}", grant.lease.lease_id);
+    let listing = fixture.run(&["unblock", "--json"]);
+    assert!(listing.status.success(), "{}", stderr(&listing));
+    let report: serde_json::Value = serde_json::from_slice(&listing.stdout).unwrap();
+    let blocker = |id: &str| {
+        report["blockers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|blocker| blocker["id"] == id)
+            .cloned()
+            .unwrap_or_else(|| panic!("{id} missing: {report:#}"))
+    };
+    let op = blocker(&op_id);
+    assert_eq!(op["inspect"], "git ls-remote origin refs/heads/work");
+    assert!(
+        op["cause"].as_str().unwrap().contains(&lease_id),
+        "the operation names the lease: {op:#}"
+    );
+    assert!(
+        blocker(&lease_id)["cause"]
+            .as_str()
+            .unwrap()
+            .contains(&op_id),
+        "the lease names the operation"
+    );
+    let pair = &report["paired_recovery"];
+    assert_eq!(pair["blockers"], serde_json::json!([op_id, lease_id]));
+    let steps: Vec<&str> = pair["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|step| step.as_str().unwrap())
+        .collect();
+    assert_eq!(steps.len(), 3, "{steps:?}");
+    assert!(steps[0].starts_with("git ls-remote origin refs/heads/work"));
+    assert_eq!(steps[1], op["clear"].as_str().unwrap());
+    assert_eq!(steps[2], blocker(&lease_id)["clear"].as_str().unwrap());
+    let text = fixture.run(&["unblock"]);
+    assert!(
+        String::from_utf8_lossy(&text.stdout).contains("recovery order:"),
+        "{}",
+        String::from_utf8_lossy(&text.stdout)
+    );
+
+    let status = fixture.run(&["status", "--json"]);
+    assert!(status.status.success(), "{}", stderr(&status));
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    let advice = status["advice"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|advice| advice["id"] == "blockers.present")
+        .expect("blocker advice")
+        .clone();
+    assert_eq!(advice["commands"], pair["steps"]);
+    assert!(advice["summary"].as_str().unwrap().contains("two halves"));
+
+    // Clearing the operation alone is reported as incomplete.
+    let cleared = fixture.run(&[
+        "unblock",
+        &op_id,
+        "--outcome",
+        "failed",
+        "--reason",
+        "ls-remote shows the branch unchanged",
+        "--json",
+    ]);
+    assert_eq!(cleared.status.code(), Some(0), "{}", stderr(&cleared));
+    let cleared: serde_json::Value = serde_json::from_slice(&cleared.stdout).unwrap();
+    assert_eq!(cleared["still_blocked_by"], serde_json::json!([lease_id]));
+    assert!(
+        cleared["action"]
+            .as_str()
+            .unwrap()
+            .contains("not recovered yet")
+    );
+
+    fixture.broker().close(fixture.session_id).unwrap();
+    let last = fixture.run(&["unblock", &lease_id, "--json"]);
+    assert_eq!(last.status.code(), Some(0), "{}", stderr(&last));
+    let last: serde_json::Value = serde_json::from_slice(&last.stdout).unwrap();
+    assert!(last.get("still_blocked_by").is_none(), "{last:#}");
+    assert!(fixture.run(&["unblock", "--json"]).status.success());
+    assert!(fixture.blockers().is_empty());
+}

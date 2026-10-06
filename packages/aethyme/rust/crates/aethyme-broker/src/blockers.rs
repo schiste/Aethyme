@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use sha2::{Digest, Sha256};
 
+use crate::broker::shell_quote;
 use crate::{Broker, BrokerOpError, GitRepo, OperationStatus, SessionStatus};
 
 /// Event recorded whenever `broker unblock` clears something.
@@ -82,6 +83,10 @@ pub struct Blocker {
     /// The exact command that clears it.
     pub clear: String,
     pub safe_to_clear_automatically: bool,
+    /// A read-only command whose answer decides the outcome `clear` asks for,
+    /// when the store recorded enough to name one (#286).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inspect: Option<String>,
 }
 
 /// A store the collection could not read. Reported rather than dropped: an
@@ -97,6 +102,23 @@ pub struct BlockerReport {
     pub blockers: Vec<Blocker>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub unavailable: Vec<BlockerSourceError>,
+    /// Present when a write blocker and a quarantined resource lease block
+    /// the repository together, as a killed coordinated write leaves them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub paired_recovery: Option<PairedRecovery>,
+}
+
+/// The ordered recovery for a write blocker and a quarantined resource lease
+/// present together (#286). Clearing only the operation leaves the next push
+/// waiting for a host slot; clearing only the lease leaves every remote write
+/// refused. The remote is inspected first because the operation's clear takes
+/// an outcome, which is a claim about the remote.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct PairedRecovery {
+    /// Every blocker in the pair, write blockers first.
+    pub blockers: Vec<String>,
+    /// The commands to run, in order.
+    pub steps: Vec<String>,
 }
 
 /// A parsed blocker id.
@@ -195,6 +217,11 @@ pub struct UnblockReport {
     pub cleared: bool,
     /// What was done, in the words of the recovery path that did it.
     pub action: String,
+    /// Write blockers and quarantined resource leases still present after
+    /// clearing a write blocker or a resource lease, so clearing one half of
+    /// a killed write never reads as a complete recovery (#286).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub still_blocked_by: Vec<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -257,6 +284,10 @@ impl Broker {
                 .unavailable
                 .push(source_error("session worktrees", error)),
         }
+        report.paired_recovery = paired_recovery(&report.blockers);
+        if report.paired_recovery.is_some() {
+            name_the_other_half(&mut report.blockers);
+        }
         report
     }
 
@@ -264,7 +295,35 @@ impl Broker {
     pub fn unblock(&mut self, request: &UnblockRequest) -> Result<UnblockOutcome, BrokerOpError> {
         let target = BlockerRef::parse(&request.id)
             .map_err(|reason| BrokerOpError::InvalidCoordinatedOperation { reason })?;
-        match &target {
+        let outcome = self.unblock_target(request, &target)?;
+        let UnblockOutcome::Cleared(mut report) = outcome else {
+            return Ok(outcome);
+        };
+        if is_write_recovery_half(report.kind) {
+            report.still_blocked_by = self
+                .blockers()
+                .blockers
+                .into_iter()
+                .filter(|blocker| is_write_recovery_half(blocker.kind))
+                .map(|blocker| blocker.id)
+                .collect();
+            if !report.still_blocked_by.is_empty() {
+                report.action = format!(
+                    "{}; not recovered yet, still blocked by {} (run `{UNBLOCK}` for the order)",
+                    report.action,
+                    report.still_blocked_by.join(", ")
+                );
+            }
+        }
+        Ok(UnblockOutcome::Cleared(report))
+    }
+
+    fn unblock_target(
+        &mut self,
+        request: &UnblockRequest,
+        target: &BlockerRef,
+    ) -> Result<UnblockOutcome, BrokerOpError> {
+        match target {
             BlockerRef::Operation(id) => self.unblock_operation(request, *id),
             BlockerRef::HostOperation(hex) => self.unblock_host_operation(request, hex),
             BlockerRef::ResourceLease(lease_id) => self.unblock_resource_lease(request, lease_id),
@@ -321,6 +380,7 @@ impl Broker {
                 session_id: Some(operation.session_id),
                 clear: format!("{} op:{} {OUTCOME_FLAGS}", UNBLOCK, operation.id),
                 safe_to_clear_automatically: false,
+                inspect: inspect_command(&operation.command_json, &operation.repository),
             });
         }
         Ok(found)
@@ -363,6 +423,7 @@ impl Broker {
                 session_id: None,
                 clear: format!("{} hostop:{} {OUTCOME_FLAGS}", UNBLOCK, row.operation_id),
                 safe_to_clear_automatically: false,
+                inspect: None,
             });
         }
         Ok(found)
@@ -434,14 +495,19 @@ impl Broker {
                 ),
                 session_id: owner.map(|session| session.id),
                 clear: if safe {
-                    format!("{UNBLOCK} resource:{}", lease.lease_id)
+                    format!(
+                        "{UNBLOCK} {}",
+                        shell_quote(&format!("resource:{}", lease.lease_id))
+                    )
                 } else {
                     format!(
-                        "{UNBLOCK} resource:{} --confirm {}",
-                        lease.lease_id, lease.generation
+                        "{UNBLOCK} {} --confirm {}",
+                        shell_quote(&format!("resource:{}", lease.lease_id)),
+                        lease.generation
                     )
                 },
                 safe_to_clear_automatically: safe,
+                inspect: None,
             });
         }
         Ok(found)
@@ -483,6 +549,7 @@ impl Broker {
                     format!("aethyme broker finish --session {}", session.id)
                 },
                 safe_to_clear_automatically: worktree_gone,
+                inspect: None,
             });
         }
         Ok(found)
@@ -534,7 +601,8 @@ impl Broker {
             }
             found.push(Blocker {
                 clear: format!(
-                    "{UNBLOCK} {id} --reason \"<why this verdict was not the code's fault>\""
+                    "{UNBLOCK} {} --reason \"<why this verdict was not the code's fault>\"",
+                    shell_quote(&id)
                 ),
                 id,
                 kind: BlockerKind::GateCache,
@@ -547,6 +615,7 @@ impl Broker {
                 ),
                 session_id,
                 safe_to_clear_automatically: false,
+                inspect: None,
             });
         }
         Ok(found)
@@ -571,8 +640,12 @@ impl Broker {
                         .map_or_else(|| "no readable pid".to_string(), |pid| format!("pid {pid}")),
                 ),
                 session_id: Some(pidfile.session_id),
-                clear: format!("{UNBLOCK} pidfile:{}-{}", pidfile.session_id, pidfile.gate),
+                clear: format!(
+                    "{UNBLOCK} {}",
+                    shell_quote(&format!("pidfile:{}-{}", pidfile.session_id, pidfile.gate))
+                ),
                 safe_to_clear_automatically: true,
+                inspect: None,
             });
         }
         found
@@ -602,6 +675,7 @@ impl Broker {
                 session_id: Some(session.id),
                 clear: format!("aethyme broker submit --session {}", session.id),
                 safe_to_clear_automatically: false,
+                inspect: None,
             });
         }
         Ok(found)
@@ -638,6 +712,7 @@ impl Broker {
             id: request.id.clone(),
             kind: BlockerKind::Operation,
             cleared: true,
+            still_blocked_by: Vec::new(),
             action: format!(
                 "operation {} reconciled as {}{}",
                 report.operation.id,
@@ -706,6 +781,7 @@ impl Broker {
                 id: request.id.clone(),
                 kind: BlockerKind::HostOperation,
                 cleared: true,
+                still_blocked_by: Vec::new(),
                 action: format!(
                     "host operation {hex} reconciled through operation {} as {}",
                     report.operation.id,
@@ -726,6 +802,7 @@ impl Broker {
             id: request.id.clone(),
             kind: BlockerKind::HostOperation,
             cleared: true,
+            still_blocked_by: Vec::new(),
             action: format!(
                 "host operation {hex} for {} reconciled as {}",
                 reconciled.remote_key,
@@ -821,6 +898,7 @@ impl Broker {
             id: request.id.clone(),
             kind: BlockerKind::ResourceLease,
             cleared: true,
+            still_blocked_by: Vec::new(),
             action: format!(
                 "resource lease {lease_id} generation {} {}",
                 released.generation,
@@ -867,6 +945,7 @@ impl Broker {
             id: request.id.clone(),
             kind: BlockerKind::PathLease,
             cleared: true,
+            still_blocked_by: Vec::new(),
             action: format!(
                 "lease {lease_id} on {} released from session {}",
                 lease.path, session.id
@@ -936,6 +1015,7 @@ impl Broker {
             id: request.id.clone(),
             kind: BlockerKind::GateCache,
             cleared: true,
+            still_blocked_by: Vec::new(),
             action: format!(
                 "marked {} cached failing {} as cleared for gate {gate} on tree {}; the next run executes \
                  the gate",
@@ -986,6 +1066,7 @@ impl Broker {
             id: request.id.clone(),
             kind: BlockerKind::Pidfile,
             cleared: true,
+            still_blocked_by: Vec::new(),
             action: format!("removed stale pidfile {}", pidfile.path.display()),
         }))
     }
@@ -1089,14 +1170,28 @@ pub(crate) fn status_advice(blockers: &[Blocker]) -> Option<crate::StatusAdvice>
         crate::StatusAdviceSeverity::Notice
     };
     let count = actionable.len();
+    let owned: Vec<Blocker> = actionable
+        .iter()
+        .map(|blocker| (*blocker).clone())
+        .collect();
+    let paired = paired_recovery(&owned);
     Some(crate::StatusAdvice {
         id: "blockers.present",
         severity,
         reason: "coordination state is blocking work; each blocker names the one command that clears it",
-        summary: format!(
-            "{count} {} across broker stores; `aethyme broker unblock` lists them with causes",
-            if count == 1 { "blocker" } else { "blockers" }
-        ),
+        summary: match &paired {
+            Some(pair) => format!(
+                "{count} {} across broker stores, including the two halves of a killed write ({}); \
+                 clear them in order: inspect the remote, record the write's outcome, then \
+                 reconcile the lease",
+                if count == 1 { "blocker" } else { "blockers" },
+                pair.blockers.join(", ")
+            ),
+            None => format!(
+                "{count} {} across broker stores; `aethyme broker unblock` lists them with causes",
+                if count == 1 { "blocker" } else { "blockers" }
+            ),
+        },
         session_id: None,
         queue_entry_id: None,
         evidence: actionable
@@ -1104,12 +1199,141 @@ pub(crate) fn status_advice(blockers: &[Blocker]) -> Option<crate::StatusAdvice>
             .take(5)
             .map(|blocker| format!("{}: {}", blocker.id, blocker.cause))
             .collect(),
-        commands: actionable
-            .iter()
-            .take(5)
-            .map(|blocker| blocker.clear.clone())
-            .collect(),
+        commands: match paired {
+            Some(pair) => pair.steps,
+            None => actionable
+                .iter()
+                .take(5)
+                .map(|blocker| blocker.clear.clone())
+                .collect(),
+        },
     })
+}
+
+/// The two halves a killed coordinated write leaves behind (#286).
+fn is_write_recovery_half(kind: BlockerKind) -> bool {
+    matches!(
+        kind,
+        BlockerKind::Operation | BlockerKind::HostOperation | BlockerKind::ResourceLease
+    )
+}
+
+fn is_write_blocker(kind: BlockerKind) -> bool {
+    matches!(kind, BlockerKind::Operation | BlockerKind::HostOperation)
+}
+
+/// The recovery order when write blockers and quarantined resource leases are
+/// present together: inspect the remote, record each write's outcome, then
+/// reconcile each lease. Neither half is cleared automatically: the write
+/// needs an outcome only the remote can decide, and the lease may still have
+/// residue on the host.
+fn paired_recovery(blockers: &[Blocker]) -> Option<PairedRecovery> {
+    let writes: Vec<&Blocker> = blockers
+        .iter()
+        .filter(|b| is_write_blocker(b.kind))
+        .collect();
+    let leases: Vec<&Blocker> = blockers
+        .iter()
+        .filter(|b| b.kind == BlockerKind::ResourceLease)
+        .collect();
+    if writes.is_empty() || leases.is_empty() {
+        return None;
+    }
+    let mut steps: Vec<String> = writes
+        .iter()
+        .map(|blocker| match &blocker.inspect {
+            Some(inspect) => format!("{inspect}   # decide {}'s real outcome first", blocker.id),
+            None => format!(
+                "inspect the remote {} wrote to and decide its real outcome first",
+                blocker.id
+            ),
+        })
+        .collect();
+    let ordered: Vec<&Blocker> = writes.into_iter().chain(leases).collect();
+    steps.extend(ordered.iter().map(|blocker| blocker.clear.clone()));
+    Some(PairedRecovery {
+        blockers: ordered.iter().map(|blocker| blocker.id.clone()).collect(),
+        steps,
+    })
+}
+
+/// Make each half's cause name the other, so clearing either one alone is
+/// never mistaken for a full recovery.
+fn name_the_other_half(blockers: &mut [Blocker]) {
+    let halves: Vec<(String, BlockerKind, Option<i64>)> = blockers
+        .iter()
+        .filter(|b| is_write_recovery_half(b.kind))
+        .map(|b| (b.id.clone(), b.kind, b.session_id))
+        .collect();
+    let names = |want_write: bool, session: Option<i64>| {
+        halves
+            .iter()
+            .filter(|(_, kind, _)| is_write_blocker(*kind) == want_write)
+            .map(|(id, _, other)| match (session, other) {
+                (Some(a), Some(b)) if a == *b => format!("{id} (same session {a})"),
+                _ => id.clone(),
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    for blocker in blockers.iter_mut() {
+        if is_write_blocker(blocker.kind) {
+            blocker.cause = format!(
+                "{}. Also blocked by quarantined resource lease {}: clearing this alone leaves \
+                 the next push waiting for a host slot",
+                blocker.cause,
+                names(false, blocker.session_id)
+            );
+        } else if blocker.kind == BlockerKind::ResourceLease {
+            blocker.cause = format!(
+                "{}. Also blocked by {}: releasing this lease alone leaves every remote write \
+                 refused",
+                blocker.cause,
+                names(true, blocker.session_id)
+            );
+        }
+    }
+}
+
+/// The read-only command that shows whether a coordinated write landed: the
+/// remote refs a push targeted, or the pull request a `gh pr` write touched.
+fn inspect_command(command_json: &str, repository: &str) -> Option<String> {
+    let argv: Vec<String> = serde_json::from_str(command_json).ok()?;
+    let mut args = argv.iter().map(String::as_str);
+    match args.next()? {
+        "git" => {
+            let rest: Vec<&str> = args.skip_while(|arg| *arg != "push").skip(1).collect();
+            let mut positional = rest.iter().filter(|arg| !arg.starts_with('-'));
+            let remote = positional.next()?;
+            let refs: Vec<&str> = positional
+                .map(|spec| {
+                    let spec = spec.trim_start_matches('+');
+                    spec.rsplit_once(':')
+                        .map_or(spec, |(_, destination)| destination)
+                })
+                .filter(|destination| !destination.is_empty())
+                .collect();
+            if refs.is_empty() {
+                return None;
+            }
+            let refs: Vec<String> = refs.into_iter().map(shell_quote).collect();
+            Some(format!(
+                "git ls-remote {} {}",
+                shell_quote(remote),
+                refs.join(" ")
+            ))
+        }
+        "gh" => match args.collect::<Vec<_>>().as_slice() {
+            ["pr", _, number, ..] if number.parse::<u64>().is_ok_and(|number| number > 0) => {
+                Some(format!(
+                    "gh pr view {number} --repo {} --json state,headRefOid,mergedAt,autoMergeRequest",
+                    shell_quote(repository)
+                ))
+            }
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 const UNBLOCK: &str = "aethyme broker unblock";
@@ -1320,6 +1544,62 @@ mod tests {
         );
         for bad in ["op:0", "op:x", "hostop:12", "gatecache:x", "nope:1", "7"] {
             assert!(BlockerRef::parse(bad).is_err(), "{bad} must not parse");
+        }
+    }
+
+    #[test]
+    fn inspect_names_the_refs_a_push_targeted_or_the_pr_a_write_touched() {
+        let push = r#"["git","push","--atomic","origin","+abc:refs/heads/x","refs/tags/v1"]"#;
+        assert_eq!(
+            inspect_command(push, "o/r").as_deref(),
+            Some("git ls-remote origin refs/heads/x refs/tags/v1")
+        );
+        assert_eq!(
+            inspect_command(r#"["gh","pr","merge","12","--squash"]"#, "o/r").as_deref(),
+            Some("gh pr view 12 --repo o/r --json state,headRefOid,mergedAt,autoMergeRequest")
+        );
+        // Stored command text is untrusted: every word is quoted for a paste.
+        let hostile = r#"["git","push","or;igin","HEAD:refs/heads/$(touch x);it's"]"#;
+        assert_eq!(
+            inspect_command(hostile, "o/r").as_deref(),
+            Some(r#"git ls-remote 'or;igin' 'refs/heads/$(touch x);it'\''s'"#)
+        );
+        assert_eq!(
+            inspect_command(r#"["gh","pr","merge","12"]"#, "o/r;$(touch x)'").as_deref(),
+            Some(
+                r#"gh pr view 12 --repo 'o/r;$(touch x)'\''' --json state,headRefOid,mergedAt,autoMergeRequest"#
+            )
+        );
+        // Pasted into a shell, the quoted words come back verbatim and run nothing.
+        let words = inspect_command(hostile, "o/r")
+            .unwrap()
+            .replacen("git ls-remote ", "", 1);
+        let sandbox = tempfile::tempdir().unwrap();
+        let echoed = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("printf '%s\\n' {words}"))
+            .current_dir(sandbox.path())
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&echoed.stdout),
+            "or;igin\nrefs/heads/$(touch x);it's\n"
+        );
+        assert!(
+            !sandbox.path().join("x").exists(),
+            "the paste ran a command"
+        );
+        assert_eq!(
+            inspect_command(r#"["gh","pr","merge","1;id"]"#, "o/r"),
+            None
+        );
+        for unnamed in [
+            r#"["git","push"]"#,
+            r#"["git","fetch","origin"]"#,
+            r#"["gh","issue","create","--title","x"]"#,
+            "not json",
+        ] {
+            assert_eq!(inspect_command(unnamed, "o/r"), None, "{unnamed}");
         }
     }
 

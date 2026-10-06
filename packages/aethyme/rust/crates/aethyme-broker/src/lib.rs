@@ -185,10 +185,11 @@ pub use aethyme_graph_storage::{
 pub use attribution::{Attribution, Identity};
 pub use blockers::{
     BLOCKER_CLEARED, Blocker, BlockerKind, BlockerRef, BlockerReport, BlockerScope,
-    BlockerSourceError, UnblockOutcome, UnblockRefusal, UnblockReport, UnblockRequest,
+    BlockerSourceError, PairedRecovery, UnblockOutcome, UnblockRefusal, UnblockReport,
+    UnblockRequest,
 };
 pub use broker::{
-    AdoptIntegrationDrift, AdoptIntegrationRelation, AdoptIntegrationSync,
+    AdoptCarriedOwnership, AdoptIntegrationDrift, AdoptIntegrationRelation, AdoptIntegrationSync,
     AdoptIntegrationSyncOutcome, AdoptMode, AdoptOptions, AdoptOutcome, AdoptReport, AgentView,
     Broker, BrokerOpError, BypassedIntegration, CLEANUP_PLAN_SCHEMA_VERSION,
     CheckpointRecoveryAction, CheckpointRefusalCode, CleanupDisposition, CleanupPlan,
