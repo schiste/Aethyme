@@ -274,3 +274,33 @@ fn finishing_an_older_holder_never_releases_a_newer_holders_lease() {
     );
     assert!(fx.finish_releases(newer).is_empty());
 }
+
+#[test]
+fn an_unidentified_holder_keeps_its_lease_until_a_verified_finish() {
+    // `run` passes AETHYME_AGENT_PID=0: no holder is ever recorded, as for a
+    // caller with no agent ancestor in CI.
+    let fx = fixture();
+    let session = fx.session_claiming("unbound", &[PATH]);
+    let explained = fx.json(&["advanced", "leases", "explain", PATH, "--json"]);
+    let lease = &explained["leases"][0];
+    assert_eq!(lease["liveness"], "unknown", "{explained}");
+    assert_eq!(
+        lease["liveness_evidence"]["holds"], true,
+        "unknown is never dead"
+    );
+
+    std::fs::write(fx.worktree(session).join(PATH), "fn main() { todo!() }\n").unwrap();
+    assert_eq!(fx.finish(session)["closed"], false);
+    assert_eq!(fx.active_paths(session), [PATH]);
+
+    std::fs::write(fx.worktree(session).join(PATH), "fn main() {}\n").unwrap();
+    let report = fx.finish(session);
+    assert!(report["closed"].as_bool().unwrap(), "{report}");
+    assert!(fx.active_paths(session).is_empty());
+    // The edit also left an implicit lease on the path; both are released.
+    let released = fx.finish_releases(session);
+    assert!(
+        !released.is_empty() && released.iter().all(|payload| payload["path"] == PATH),
+        "{released:?}"
+    );
+}
