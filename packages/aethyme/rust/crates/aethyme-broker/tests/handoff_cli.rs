@@ -212,20 +212,11 @@ fn handoff_by_worktree_returns_the_latest_completed_session() {
     assert!(text.contains("cleanup safe: yes"), "{text}");
 }
 
-/// A second session that adopts a worktree and changes nothing did no work of
-/// its own, but the checkout still holds the first session's commit, which
-/// reached no branch. Measuring from the second session's start would call
-/// that "no net change" and the worktree safe to remove. Since #294 the
-/// second session inherits that commit, so finish refuses rather than
-/// producing a handoff that would have to say so.
-#[test]
-fn adopting_unlanded_work_and_changing_nothing_is_not_cleanup_safe() {
-    let tmp = tempfile::tempdir().unwrap();
-    init_repo(tmp.path());
-    let worktree = tmp.path().join(".aethyme/worktrees/unlanded");
+fn unlanded_worktree(repo: &Path) -> PathBuf {
+    let worktree = repo.join(".aethyme/worktrees/unlanded");
     std::fs::create_dir_all(worktree.parent().unwrap()).unwrap();
     git(
-        tmp.path(),
+        repo,
         &[
             "worktree",
             "add",
@@ -236,26 +227,103 @@ fn adopting_unlanded_work_and_changing_nothing_is_not_cleanup_safe() {
             "main",
         ],
     );
+    worktree
+}
+
+fn commit_unlanded_work(worktree: &Path) {
+    std::fs::write(worktree.join("only-here.txt"), "only here\n").unwrap();
+    git(worktree, &["add", "-A"]);
+    git(worktree, &["commit", "-qm", "never submitted"]);
+}
+
+fn handoff_for(repo: &Path, worktree: &Path) -> Output {
+    run(
+        repo,
+        &[
+            "advanced",
+            "handoff",
+            "--worktree",
+            worktree.to_str().unwrap(),
+        ],
+    )
+}
+
+/// A session that adopts a worktree and changes nothing did no work of its
+/// own, but the checkout still holds a commit that reached no branch.
+/// Measuring from the session's start would call that "no net change" and the
+/// worktree safe to remove. The commit here predates any session, so no
+/// predecessor's ownership is carried (#294) and finish still closes: the
+/// handoff itself must refuse to call the worktree safe.
+#[test]
+fn adopting_unlanded_work_and_changing_nothing_is_not_cleanup_safe() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let worktree = unlanded_worktree(tmp.path());
+    commit_unlanded_work(&worktree);
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let session = broker
+        .adopt(&worktree, Some("looked, changed nothing"))
+        .unwrap();
+    assert!(broker.finish(session.id).unwrap().closed);
+
+    let output = handoff_for(tmp.path(), &worktree);
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        text.contains(&format!("Session {} handoff", session.id)),
+        "{text}{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(text.contains("cleanup safe: no"), "{text}");
+}
+
+/// The same unlanded commit, made by a session that was then closed. Since
+/// #294 the re-adopting session inherits it, so it cannot finish, and so has
+/// no handoff, while the commit is unlanded. Once it submits the inherited
+/// commit, its handoff reports the delivery and only then calls the worktree
+/// safe.
+#[test]
+fn re_adopted_session_hands_off_after_submitting_inherited_work() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let worktree = unlanded_worktree(tmp.path());
     let mut broker = Broker::open(tmp.path()).unwrap();
     let first = broker.adopt(&worktree, Some("unlanded work")).unwrap();
-    std::fs::write(worktree.join("only-here.txt"), "only here\n").unwrap();
-    git(&worktree, &["add", "-A"]);
-    git(&worktree, &["commit", "-qm", "never submitted"]);
+    commit_unlanded_work(&worktree);
     broker.close(first.id).unwrap();
     let second = broker
         .adopt(&worktree, Some("looked, changed nothing"))
         .unwrap();
-    // Issue #294: the second session carries the first one's ownership
-    // boundary, so finish sees the inherited commit and asks for a submit
-    // instead of closing a session that still owns unlanded work.
-    let finish = broker.finish(second.id).unwrap();
-    assert!(!finish.closed, "{finish:#?}");
-    assert!(!finish.cleanup_safe);
-    assert_eq!(finish.unsubmitted_commits, 1);
+
+    let refused = broker.finish(second.id).unwrap();
+    assert!(!refused.closed, "{refused:#?}");
+    assert!(!refused.cleanup_safe);
+    assert_eq!(refused.unsubmitted_commits, 1);
     assert_eq!(
-        finish.recommended_next_action.as_deref(),
+        refused.recommended_next_action.as_deref(),
         Some(format!("aethyme broker submit --session {}", second.id).as_str())
     );
+    let none_yet = handoff_for(tmp.path(), &worktree);
+    assert!(!none_yet.status.success());
+    assert!(
+        String::from_utf8_lossy(&none_yet.stderr).contains("has no completed handoff"),
+        "{}",
+        String::from_utf8_lossy(&none_yet.stderr)
+    );
+
+    assert!(broker.submit(second.id).unwrap().promoted);
+    assert!(broker.finish(second.id).unwrap().closed);
+    let output = handoff_for(tmp.path(), &worktree);
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        text.contains(&format!("Session {} handoff: closed", second.id)),
+        "{text}{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        text.contains("delivery: submitted=yes, promoted=yes"),
+        "{text}"
+    );
+    assert!(text.contains("cleanup safe: yes"), "{text}");
 }
 
 #[test]
