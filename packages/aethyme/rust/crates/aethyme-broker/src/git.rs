@@ -2048,8 +2048,12 @@ impl GitRepo {
         let mut log_stderr = log.stderr.take();
         let stderr_reader = std::thread::spawn(move || {
             let mut text = String::new();
-            if let Some(stderr) = log_stderr.as_mut() {
-                let _ = std::io::Read::read_to_string(stderr, &mut text);
+            // Only an error message uses this text, so a failed read is
+            // reported inside it rather than failing the batch.
+            if let Some(stderr) = log_stderr.as_mut()
+                && let Err(error) = std::io::Read::read_to_string(stderr, &mut text)
+            {
+                text.push_str(&format!("(git log stderr unreadable: {error})"));
             }
             text
         });
