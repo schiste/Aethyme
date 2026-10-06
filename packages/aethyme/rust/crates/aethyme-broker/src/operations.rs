@@ -6042,11 +6042,12 @@ mod tests {
             eprintln!("no git on PATH probed clean; only the equality was checked");
         }
 
-        // `gh` has no probe and needs none -- nothing in the broker parses its
-        // output to authorize anything -- so PATH resolution is correct there.
-        assert_eq!(
-            provider_command(OperationProvider::Github).get_program(),
-            std::ffi::OsStr::new("gh")
+        // `gh` is resolved once to an absolute path, so the PATH a caller
+        // hands the child never chooses the binary (#393).
+        assert!(
+            Path::new(provider_command(OperationProvider::Github).get_program()).is_absolute(),
+            "gh runs by absolute path: {:?}",
+            provider_command(OperationProvider::Github).get_program()
         );
     }
 
