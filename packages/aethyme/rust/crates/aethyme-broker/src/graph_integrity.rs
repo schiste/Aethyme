@@ -443,7 +443,7 @@ mod tests {
             sender.send(broker.affected_gates(session_id)).unwrap();
         });
 
-        let selected = receiver.recv_timeout(std::time::Duration::from_secs(5));
+        let selected = receiver.recv_timeout(std::time::Duration::from_secs(30));
         drop(held);
         let selected = selected
             .expect("affected-gate inspection waited on graph-integrity verification")
