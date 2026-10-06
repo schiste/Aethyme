@@ -89,7 +89,7 @@ triggers = ["packages/aethyme-eval/**"]
 # otherwise, and names the suites this command must keep. Every suite here
 # also runs under `cargo-test`, so nothing is lost if this gate is removed.
 name = "fast-guards"
-command = 'export CHAU7_CTO_OPTIM_ACTIVE=1 CARGO_INCREMENTAL=0 CARGO_PROFILE_TEST_DEBUG=1 CARGO_TARGET_DIR="$AETHYME_GATE_CACHE_DIR" && cargo test --locked --workspace --examples --quiet --manifest-path packages/aethyme/rust/Cargo.toml --test help_snapshots --test help_surface --test help_everywhere --test broker_discarded_results --test deprecated_spelling_callers --test docs_hygiene --test no_eval_tuning --test pr_template --test grammar_provenance --test gate_policy'
+command = 'export CHAU7_CTO_OPTIM_ACTIVE=1 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=1 CARGO_PROFILE_TEST_DEBUG=1 CARGO_TARGET_DIR="$AETHYME_GATE_CACHE_DIR" && cargo test --locked --workspace --examples --quiet --manifest-path packages/aethyme/rust/Cargo.toml --test help_snapshots --test help_surface --test help_everywhere --test broker_discarded_results --test deprecated_spelling_callers --test docs_hygiene --test no_eval_tuning --test pr_template --test grammar_provenance --test gate_policy'
 cost = 2
 timeout_seconds = 2400
 resource_wait_seconds = 900
@@ -117,7 +117,20 @@ name = "cargo-test"
 # targets, so from 2026-09-30 this gate ran three example binaries and no
 # library, binary or integration test. Both runs always execute, and the gate
 # fails if either does, so one pass still reports every failing suite.
-command = 'export CHAU7_CTO_OPTIM_ACTIVE=1 CARGO_INCREMENTAL=0 CARGO_PROFILE_TEST_DEBUG=1 CARGO_TARGET_DIR="$AETHYME_GATE_CACHE_DIR" && cargo test --locked --workspace --quiet --no-fail-fast --manifest-path packages/aethyme/rust/Cargo.toml; suite=$?; cargo test --locked --workspace --examples --quiet --no-fail-fast --manifest-path packages/aethyme/rust/Cargo.toml; examples=$?; [ "$suite" -eq 0 ] && [ "$examples" -eq 0 ]'
+# 2026-10-06: the workspace suite runs under nextest when it is installed,
+# as CI's pull-request job already does (`oss-ci.yml`). `cargo test` runs one
+# test binary at a time; nextest schedules every test of every binary at
+# once. On GitHub's runner this gate took 1004 s under `cargo test` while the
+# pull-request job ran the same suite in about 5 minutes. The product
+# binaries are built once first and the tests use them
+# (AETHYME_TESTKIT_PREBUILT_BINS, aethyme-testkit/src/bins.rs): nextest runs
+# each test in its own process, and without them every process would queue
+# its own `cargo build`. nextest runs no doctests, so they run separately.
+# Without nextest the gate runs `cargo test` exactly as before; the default
+# nextest profile is used, so nothing is retried and a flaky failure fails.
+# CARGO_PROFILE_DEV_DEBUG matches the test profile so the binaries and the
+# tests share one set of compiled dependencies.
+command = 'export CHAU7_CTO_OPTIM_ACTIVE=1 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=1 CARGO_PROFILE_TEST_DEBUG=1 CARGO_TARGET_DIR="$AETHYME_GATE_CACHE_DIR" && m=packages/aethyme/rust/Cargo.toml; if cargo nextest --version >/dev/null 2>&1; then cargo build --locked --workspace --bins --quiet --manifest-path "$m" && AETHYME_TESTKIT_PREBUILT_BINS=1 cargo nextest run --locked --workspace --no-fail-fast --cargo-quiet --manifest-path "$m"; suite=$?; cargo test --locked --workspace --doc --quiet --no-fail-fast --manifest-path "$m"; doc=$?; else cargo test --locked --workspace --quiet --no-fail-fast --manifest-path "$m"; suite=$?; doc=0; fi; cargo test --locked --workspace --examples --quiet --no-fail-fast --manifest-path "$m"; examples=$?; [ "$suite" -eq 0 ] && [ "$doc" -eq 0 ] && [ "$examples" -eq 0 ]'
 cost = 3
 # 2026-09-26: raised from 1200. A full workspace run took 1056 s on a passing
 # gate that day and hit 1200 four times (sessions 677, 684, 621) while other

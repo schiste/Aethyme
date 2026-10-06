@@ -20,6 +20,7 @@ pub mod explore_summary_cli;
 pub mod hygiene;
 pub mod local;
 pub mod onboarding;
+pub mod path_references;
 pub mod pyjson;
 pub mod render;
 pub mod repo_cli;

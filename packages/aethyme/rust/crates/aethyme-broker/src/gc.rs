@@ -27,6 +27,14 @@ pub const GC_PLAN_SCHEMA_VERSION: u32 = 2;
 /// scan bounded on large trees.
 const ARTIFACT_SCAN_DEPTH: usize = 6;
 
+/// How long a recorded-size plan spends looking for build directories in
+/// retained worktrees before it stops and reports how many it did not scan.
+/// `doctor`, `certify` and the verify loop take that path, and on a
+/// repository with hundreds of retained worktrees an unbounded walk ran for
+/// minutes (#460). A measuring `gc plan` scans everything.
+pub const HEALTH_CHECK_ARTIFACT_SCAN_BUDGET: std::time::Duration =
+    std::time::Duration::from_secs(10);
+
 /// An ignored directory must be larger than this before `gc plan` reports it
 /// as an unclassified artifact. Small ignored directories are common project
 /// metadata and would make the evidence list noisy without helping an
@@ -257,6 +265,14 @@ fn overlaps_live_worktree(root: &Path, live_worktrees: &[PathBuf]) -> bool {
 
 fn is_known_artifact_name(name: &str, extras: &[String]) -> bool {
     crate::artifact_catalog::unattended_witness(name, extras).is_some()
+}
+
+/// What [`Broker::artifact_candidates`] found, and how many worktrees it ran
+/// out of budget to scan.
+struct ArtifactCandidates {
+    candidates: Vec<GcArtifactCandidate>,
+    declined: Vec<GcDeclinedArtifact>,
+    not_scanned: usize,
 }
 
 #[derive(Default)]
@@ -856,13 +872,41 @@ impl Broker {
         sessions: &BTreeMap<i64, crate::Session>,
         excluded: ArtifactExclusions<'_>,
         size_scan: crate::SizeScan,
-    ) -> (Vec<GcArtifactCandidate>, Vec<GcDeclinedArtifact>) {
+    ) -> ArtifactCandidates {
+        let budget = (!size_scan.measures()).then_some(HEALTH_CHECK_ARTIFACT_SCAN_BUDGET);
+        self.artifact_candidates_within(
+            evaluated_at,
+            policy,
+            cleanup,
+            sessions,
+            excluded,
+            size_scan,
+            budget,
+        )
+    }
+
+    /// [`Self::artifact_candidates`] with an explicit scan budget, `None` for
+    /// a complete scan. Worktrees left once the budget is spent are counted,
+    /// not scanned.
+    #[allow(clippy::too_many_arguments)]
+    fn artifact_candidates_within(
+        &self,
+        evaluated_at: i64,
+        policy: &RetentionPolicy,
+        cleanup: &[crate::CleanupWorktreePlan],
+        sessions: &BTreeMap<i64, crate::Session>,
+        excluded: ArtifactExclusions<'_>,
+        size_scan: crate::SizeScan,
+        budget: Option<std::time::Duration>,
+    ) -> ArtifactCandidates {
         let ArtifactExclusions {
             already_removed,
             live_worktrees,
         } = excluded;
+        let started = std::time::Instant::now();
         let mut candidates = Vec::new();
         let mut declined = Vec::new();
+        let mut not_scanned = 0;
         for item in cleanup {
             if !item.worktree_present || already_removed.contains(&item.session_id) {
                 continue;
@@ -887,11 +931,32 @@ impl Broker {
             if overlaps_live_worktree(&root, live_worktrees) {
                 continue;
             }
+            if budget.is_some_and(|budget| started.elapsed() >= budget) {
+                not_scanned += 1;
+                continue;
+            }
             let Ok(checkout) = GitRepo::discover(&root) else {
                 continue;
             };
-            let artifact_scan =
-                collect_artifact_scan(&root, &policy.artefact_directories, &checkout);
+            // Ignored directories outside the catalog are only reported with
+            // their size, so a pass that measures nothing skips finding them:
+            // that search costs one `git check-ignore` per directory walked.
+            let artifact_scan = if size_scan.measures() {
+                collect_artifact_scan(&root, &policy.artefact_directories, &checkout)
+            } else {
+                let mut classified = Vec::new();
+                collect_artifact_dirs_with_extras(
+                    &root,
+                    &root,
+                    0,
+                    &policy.artefact_directories,
+                    &mut classified,
+                );
+                ArtifactScan {
+                    classified,
+                    declined: Vec::new(),
+                }
+            };
             for dir in artifact_scan.classified {
                 let Some(relative) = repo_relative(&root, &dir) else {
                     continue;
@@ -937,7 +1002,11 @@ impl Broker {
         declined.sort_by(|left, right| {
             (left.session_id, &left.relative_dir).cmp(&(right.session_id, &right.relative_dir))
         });
-        (candidates, declined)
+        ArtifactCandidates {
+            candidates,
+            declined,
+            not_scanned,
+        }
     }
 
     /// Recovery archives `gc plan` may propose, plus the inventory of every
@@ -1433,7 +1502,11 @@ impl Broker {
             .iter()
             .map(|worktree| worktree.session_id)
             .collect::<Vec<_>>();
-        let (mut artifacts, declined_artifacts) = self.artifact_candidates(
+        let ArtifactCandidates {
+            candidates: mut artifacts,
+            declined: declined_artifacts,
+            not_scanned: artifact_worktrees_not_scanned,
+        } = self.artifact_candidates(
             evaluated_at,
             &policy,
             &cleanup.worktrees,
@@ -1818,6 +1891,7 @@ impl Broker {
             sizes_measured_at_ms: cleanup.sizes_measured_at_ms,
             budget_verdict,
             recovery_archive_inventory,
+            artifact_worktrees_not_scanned,
         };
         if scan.measures() {
             plan.finish_digest()?;
@@ -1869,6 +1943,7 @@ impl Broker {
             reclaim_order: plan.reclaim_order,
             budget_verdict: plan.budget_verdict,
             unmeasured_directory_count: plan.unmeasured_directory_count,
+            artifact_worktrees_not_scanned: plan.artifact_worktrees_not_scanned,
             sizes_measured_at_ms: plan.sizes_measured_at_ms,
             blockers: plan.blockers.len(),
             unclaimed_worktree_count: plan
@@ -2954,6 +3029,98 @@ impl Broker {
 mod tests {
     use super::*;
     use crate::disk_headroom::SweepUrgency;
+
+    fn git(repo: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?}");
+    }
+
+    /// On a repository with hundreds of retained worktrees the build-output
+    /// walk ran for minutes inside `doctor` (#460). A health check stops at
+    /// its budget and counts what it did not scan; a complete scan still
+    /// finds the cache.
+    #[test]
+    fn a_health_check_counts_worktrees_it_had_no_budget_to_scan() {
+        let tmp = tempfile::tempdir().unwrap();
+        git(tmp.path(), &["init", "-q", "-b", "main"]);
+        std::fs::write(tmp.path().join("README.md"), "fixture\n").unwrap();
+        std::fs::write(tmp.path().join(".gitignore"), "/.aethyme/\n").unwrap();
+        git(tmp.path(), &["add", "-A"]);
+        git(tmp.path(), &["commit", "-qm", "init"]);
+        std::fs::create_dir_all(tmp.path().join(".aethyme")).unwrap();
+        std::fs::write(
+            tmp.path().join(".aethyme/broker.toml"),
+            "[retention]\nclosed_worktrees_days = 30\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 0\n",
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join(".git/info/exclude"), "target/\n").unwrap();
+        let mut broker = Broker::open(tmp.path()).unwrap();
+        let session = broker.start_worktree("retained build", None).unwrap();
+        let worktree = PathBuf::from(&session.worktree_path);
+        std::fs::write(worktree.join("done.txt"), "done\n").unwrap();
+        git(&worktree, &["add", "done.txt"]);
+        git(&worktree, &["commit", "-qm", "done"]);
+        assert!(broker.submit(session.id).unwrap().promoted);
+        assert!(
+            broker
+                .finish_with_options(
+                    session.id,
+                    crate::FinishOptions {
+                        keep_worktree: true,
+                    },
+                )
+                .unwrap()
+                .closed
+        );
+        let cache = worktree.join("target");
+        std::fs::create_dir_all(cache.join("debug")).unwrap();
+        std::fs::write(cache.join("CACHEDIR.TAG"), "Signature: 8a477f597d28d172\n").unwrap();
+
+        let policy = load_retention_policy(broker.main_root()).unwrap();
+        let cleanup = broker.cleanup_plan_recorded().unwrap();
+        let sessions = broker
+            .store()
+            .cleaned_sessions()
+            .unwrap()
+            .into_iter()
+            .map(|session| (session.id, session))
+            .collect::<BTreeMap<_, _>>();
+        let scan = |budget| {
+            broker.artifact_candidates_within(
+                now_ms(),
+                &policy,
+                &cleanup.worktrees,
+                &sessions,
+                ArtifactExclusions {
+                    already_removed: &[],
+                    live_worktrees: &[],
+                },
+                crate::SizeScan::Recorded,
+                budget,
+            )
+        };
+
+        let complete = scan(None);
+        assert_eq!(complete.not_scanned, 0);
+        assert_eq!(complete.candidates.len(), 1);
+        assert_eq!(complete.candidates[0].relative_dir, "target");
+        assert!(
+            complete.declined.is_empty(),
+            "a recorded pass reports no declined directories"
+        );
+
+        let bounded = scan(Some(std::time::Duration::ZERO));
+        assert_eq!(bounded.not_scanned, 1);
+        assert!(bounded.candidates.is_empty());
+    }
 
     /// A broker open runs before every command and every hook call, so its
     /// share of the sweep is small and fixed. Disk pressure used to multiply
