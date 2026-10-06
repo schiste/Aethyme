@@ -185,7 +185,8 @@ pub use aethyme_graph_storage::{
 pub use attribution::{Attribution, Identity};
 pub use blockers::{
     BLOCKER_CLEARED, Blocker, BlockerKind, BlockerRef, BlockerReport, BlockerScope,
-    BlockerSourceError, UnblockOutcome, UnblockRefusal, UnblockReport, UnblockRequest,
+    BlockerSourceError, PairedRecovery, UnblockOutcome, UnblockRefusal, UnblockReport,
+    UnblockRequest,
 };
 pub use broker::{
     AdoptCarriedOwnership, AdoptIntegrationDrift, AdoptIntegrationRelation, AdoptIntegrationSync,
