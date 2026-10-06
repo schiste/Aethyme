@@ -98,6 +98,7 @@ pub use submit_progress::{
     InFlightSubmit, SUBMIT_STALL_AFTER, SlotHolder, SubmitProgressRecord, WaitPosition,
 };
 pub mod lease_liveness;
+pub mod lease_requests;
 pub mod session_guidance;
 pub mod session_holder;
 mod text_redaction;

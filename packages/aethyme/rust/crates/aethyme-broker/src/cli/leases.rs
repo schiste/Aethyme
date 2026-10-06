@@ -423,6 +423,135 @@ pub(super) fn run_leases(parsed: Parsed) -> Result<(), UsageError> {
                 out!("Session {session} released {path}.");
             }
         }
+        Some("request-release") => {
+            let path = parsed.positional.get(1).ok_or(UsageError::Message(
+                "request-release requires a path".into(),
+            ))?;
+            let session = parsed.session.ok_or(UsageError::Message(
+                "request-release requires --session <id>".into(),
+            ))?;
+            let reason = parsed.reason.as_deref().ok_or(UsageError::Message(
+                "request-release requires --reason <why>".into(),
+            ))?;
+            let requests = broker.request_lease_release(session, path, reason)?;
+            if parsed.json {
+                out!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({ "requests": requests }))?
+                );
+            } else {
+                for request in &requests {
+                    out!(
+                        "Request {}: session {} asked session {} to release {} [{}].",
+                        request.request_id,
+                        request.requester_session_id,
+                        request.holder_session_id,
+                        request.path,
+                        request.state.as_str()
+                    );
+                }
+                out!(
+                    "Wait: aethyme broker advanced leases wait {} --session {session}",
+                    crate::broker::shell_quote(path)
+                );
+            }
+        }
+        Some(action @ ("ack" | "decline")) => {
+            let request_id = parsed
+                .positional
+                .get(1)
+                .and_then(|id| id.parse::<i64>().ok())
+                .filter(|id| *id > 0)
+                .ok_or_else(|| {
+                    UsageError::Message(format!("{action} requires a positive request id"))
+                })?;
+            let session = parsed.session.ok_or_else(|| {
+                UsageError::Message(format!("{action} requires --session <holder>"))
+            })?;
+            let request = if action == "ack" {
+                broker.ack_lease_release(session, request_id)?
+            } else {
+                let reason = parsed.reason.as_deref().ok_or(UsageError::Message(
+                    "decline requires --reason <why>".into(),
+                ))?;
+                broker.decline_lease_release(session, request_id, reason)?
+            };
+            if parsed.json {
+                out!("{}", serde_json::to_string_pretty(&request)?);
+            } else {
+                out!(
+                    "Request {} is {}: {}.",
+                    request.request_id,
+                    request.state.as_str(),
+                    request.path
+                );
+            }
+        }
+        Some("wait") => {
+            let path = parsed
+                .positional
+                .get(1)
+                .ok_or(UsageError::Message("wait requires a path".into()))?;
+            let session = parsed
+                .session
+                .ok_or(UsageError::Message("wait requires --session <id>".into()))?;
+            let timeout = std::time::Duration::from_secs(parsed.timeout_seconds.unwrap_or(300));
+            let path = crate::broker::normalize_lease_path(path)
+                .map_err(|error| UsageError::Message(error.to_string()))?;
+            let started = std::time::Instant::now();
+            let (outcome, code, requests) = loop {
+                broker.grant_stale_lease_requests()?;
+                let mine: Vec<_> = broker
+                    .lease_release_requests()?
+                    .into_iter()
+                    .filter(|request| {
+                        request.requester_session_id == session && request.path == path
+                    })
+                    .collect();
+                let held = broker.store().active_leases()?.iter().any(|lease| {
+                    lease.session_id != session && crate::leases::paths_overlap(&path, &lease.path)
+                });
+                // Only each holder's latest request counts: an outcome a newer
+                // request superseded no longer answers the wait.
+                let latest_is = |state| {
+                    mine.iter().any(|request| {
+                        request.state == state
+                            && !mine.iter().any(|newer| {
+                                newer.holder_session_id == request.holder_session_id
+                                    && newer.request_id > request.request_id
+                            })
+                    })
+                };
+                if !held {
+                    if latest_is(crate::lease_requests::RequestState::Granted) {
+                        break ("granted", crate::exit_status::LEASE_WAIT_GRANTED, mine);
+                    }
+                    break ("released", crate::exit_status::SUCCESS, mine);
+                }
+                if latest_is(crate::lease_requests::RequestState::Declined) {
+                    break ("declined", crate::exit_status::LEASE_WAIT_DECLINED, mine);
+                }
+                if started.elapsed() >= timeout {
+                    break ("timeout", crate::exit_status::LEASE_WAIT_TIMED_OUT, mine);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            };
+            if parsed.json {
+                out!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "path": path,
+                        "outcome": outcome,
+                        "requests": requests,
+                    }))?
+                );
+            } else {
+                out!("{path}: {outcome}");
+            }
+            if code != crate::exit_status::SUCCESS {
+                return Err(UsageError::SilentExit(code));
+            }
+        }
         Some("explain") => {
             let filters = parsed
                 .positional
@@ -481,7 +610,7 @@ pub(super) fn run_leases(parsed: Parsed) -> Result<(), UsageError> {
         }
         Some(other) => {
             return Err(UsageError::Message(format!(
-                "unknown leases action {other:?} — expected claim, plan, explain, export, or release"
+                "unknown leases action {other:?} — expected claim, plan, explain, request-release, ack, decline, wait, export, or release"
             )));
         }
     }
