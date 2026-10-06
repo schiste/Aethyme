@@ -1184,3 +1184,64 @@ fn reconcile_refuses_when_main_absorbed_upstream_but_integration_did_not() {
         old_integration
     );
 }
+
+/// The refusal compares the primary checkout's HEAD with upstream. When that
+/// checkout is on a feature branch, calling its HEAD "local main" sent the
+/// operator to inspect a main/upstream divergence that did not exist (#463).
+#[test]
+fn a_refusal_names_the_checked_out_branch_rather_than_local_main() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    let remote = tmp.path().join("remote.git");
+    let other = tmp.path().join("other");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::create_dir_all(&remote).unwrap();
+    git(&remote, &["init", "--bare", "-q", "-b", "main"]);
+    git(&repo, &["init", "-q", "-b", "main"]);
+    std::fs::write(repo.join(".gitignore"), ".aethyme/\n").unwrap();
+    std::fs::write(repo.join("a.txt"), "a\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-qm", "initial"]);
+    git(
+        &repo,
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+    );
+    git(&repo, &["push", "-qu", "origin", "main"]);
+    drop(Broker::open(&repo).unwrap());
+
+    // Upstream moves on; the primary checkout works on a feature branch.
+    git(
+        tmp.path(),
+        &[
+            "clone",
+            "-q",
+            remote.to_str().unwrap(),
+            other.to_str().unwrap(),
+        ],
+    );
+    commit(&other, "b.txt", "b\n", "upstream work");
+    git(&other, &["push", "-q", "origin", "main"]);
+    git(&repo, &["fetch", "-q", "origin"]);
+    git(&repo, &["switch", "-q", "-c", "feature/picker"]);
+    let feature_head = commit(&repo, "c.txt", "c\n", "feature work");
+
+    let mut broker = Broker::open(&repo).unwrap();
+    let report = broker
+        .reconcile_integration(IntegrationReconcileOptions {
+            upstream: "origin/main".into(),
+            apply: false,
+            resolution_file: None,
+            confirm: None,
+        })
+        .unwrap();
+    assert!(!report.safe);
+    let warning = report.warnings.join("\n");
+    assert!(warning.contains("branch feature/picker"), "{warning}");
+    assert!(warning.contains(&feature_head), "{warning}");
+    assert!(!warning.contains("local main"), "{warning}");
+    assert!(
+        report.next_action.contains("git switch main"),
+        "{}",
+        report.next_action
+    );
+}

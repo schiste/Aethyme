@@ -61,6 +61,20 @@ pub enum BrokerOpError {
         head: String,
         unpushed_commits: u32,
     },
+    /// Another live agent process holds the session (#393).
+    #[error(
+        "session {session_id} is held by another live agent process: pid {holder_pid} \
+         ({holder_command}){holder_context}. Run this from that agent, or pass `--take-over` \
+         to move the session to this agent; the transfer is recorded as a \
+         `session.holder_bound` event"
+    )]
+    SessionHeldByAnotherAgent {
+        session_id: i64,
+        holder_pid: i64,
+        holder_command: String,
+        /// `, agent <identity>, tab <name>` for whichever are recorded.
+        holder_context: String,
+    },
     #[error("main reconciliation is unavailable: {reason}")]
     MainReconcileUnavailable { reason: String },
     /// Representation asks a different question from reconciliation -- whether
@@ -7698,24 +7712,51 @@ impl Broker {
         }
         let in_flight_submits = crate::submit_progress::in_flight_submits(&self.main_root, now_ms);
         advice.extend(stalled_submit_advice(&in_flight_submits));
+        let foreign_started = std::time::Instant::now();
+        // The main checkout is where agents gather before starting their own
+        // sessions, so several of them there is normal, not co-tenancy.
+        let main_checkout = self.main_root.to_string_lossy();
+        let live_worktrees: Vec<(i64, String)> = agents
+            .iter()
+            .filter(|agent| {
+                matches!(
+                    agent.derived_status,
+                    SessionStatus::Active | SessionStatus::Idle | SessionStatus::Stale
+                ) && agent.session.worktree_path != main_checkout
+            })
+            .map(|agent| (agent.session.id, agent.session.worktree_path.clone()))
+            .collect();
+        let foreign = crate::session_holder::foreign_process_advice(&self.store, &live_worktrees);
+        let foreign_deferred = foreign.is_none();
+        advice.extend(foreign.unwrap_or_default());
+        phase_timings_ms.insert(
+            "foreign_processes".into(),
+            foreign_started.elapsed().as_millis() as u64,
+        );
 
         phase_timings_ms.insert("build_total".into(), started.elapsed().as_millis() as u64);
         Ok(StatusView {
-            deferred_checks: if refresh {
-                Vec::new()
-            } else {
-                vec![
-                    "dirty_worktrees",
-                    "unpushed_commits",
-                    "promoted_conflicts",
-                    "branch_drift",
-                    "shared_edit_classification",
-                    "pr_overlap_refresh",
-                    "cleanup_eligibility",
-                ]
-                .into_iter()
-                .map(String::from)
-                .collect()
+            deferred_checks: {
+                let mut deferred: Vec<String> = if refresh {
+                    Vec::new()
+                } else {
+                    vec![
+                        "dirty_worktrees",
+                        "unpushed_commits",
+                        "promoted_conflicts",
+                        "branch_drift",
+                        "shared_edit_classification",
+                        "pr_overlap_refresh",
+                        "cleanup_eligibility",
+                    ]
+                    .into_iter()
+                    .map(String::from)
+                    .collect()
+                };
+                if foreign_deferred {
+                    deferred.push("foreign_processes".into());
+                }
+                deferred
             },
             leases_refreshed_at_ms: self
                 .store
@@ -13216,6 +13257,7 @@ mod tests {
                 reclaim_order: crate::ReclaimOrder::OldestFirst,
                 budget_verdict: crate::BudgetVerdict::Within,
                 unmeasured_directory_count: 0,
+                artifact_worktrees_not_scanned: 0,
                 sizes_measured_at_ms: None,
                 blockers: 0,
             },
