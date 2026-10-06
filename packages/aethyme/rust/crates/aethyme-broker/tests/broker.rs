@@ -1939,6 +1939,82 @@ fn adopting_a_worktree_with_pre_existing_commits_says_they_are_not_owned() {
     );
 }
 
+/// Issue #294: closing a session and adopting its worktree again used to
+/// record the current HEAD as the new baseline, so the closed session's
+/// unsubmitted commits silently stopped being session-owned and submit
+/// superseded the entry without running a gate. The new session must keep the
+/// previous ownership boundary, the way reuse of a live session already does.
+#[test]
+fn re_adopting_a_closed_session_keeps_its_unsubmitted_commits_owned() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    init_repo(&repo);
+    let work = tmp.path().join("work");
+    sh(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "work",
+            work.to_str().unwrap(),
+        ],
+    );
+
+    let mut broker = Broker::open(&repo).unwrap();
+    let first = broker
+        .adopt_with(&work, Some("first task"), AdoptMode::New, None)
+        .unwrap();
+    let baseline = first.session.diff_base.clone().unwrap();
+
+    // Nothing pending: a re-adoption has nothing to carry.
+    broker.close(first.session.id).unwrap();
+    let idle = broker
+        .adopt_with(&work, Some("idle re-adopt"), AdoptMode::New, None)
+        .unwrap();
+    assert!(
+        idle.carried_ownership.is_none(),
+        "{:?}",
+        idle.carried_ownership
+    );
+
+    std::fs::write(work.join("feature.txt"), "session work\n").unwrap();
+    sh(&work, &["add", "-A"]);
+    sh(&work, &["commit", "-qm", "feat: session work"]);
+    broker.close(idle.session.id).unwrap();
+
+    let again = broker
+        .adopt_with(&work, Some("after close"), AdoptMode::New, None)
+        .unwrap();
+    let carried = again
+        .carried_ownership
+        .clone()
+        .expect("the closed session's pending commit must stay owned");
+    assert_eq!(carried.from_session, idle.session.id);
+    assert_eq!(carried.baseline, baseline);
+    assert_eq!(carried.pending_owned_commits, 1);
+    assert_eq!(again.session.diff_base.as_deref(), Some(baseline.as_str()));
+    let warning = again
+        .integration_drift
+        .and_then(|drift| drift.warning)
+        .unwrap_or_default();
+    assert!(
+        warning.contains("1 pending session-owned commit(s) are safe to submit"),
+        "submit must replay the carried commit: {warning}"
+    );
+
+    // Replacing a stale session carries the boundary the same way.
+    let replaced = broker
+        .adopt_with(&work, Some("replace"), AdoptMode::ReplaceStale, None)
+        .unwrap();
+    assert_eq!(
+        replaced.carried_ownership.map(|carried| carried.baseline),
+        Some(baseline)
+    );
+}
+
 /// Issue #182. `broker status` is the mandated first step of every session, so
 /// its cost is a tax on every agent -- measured at 2m54s with 19 live
 /// sessions, of which only 6.2s was user time. The system time is the
