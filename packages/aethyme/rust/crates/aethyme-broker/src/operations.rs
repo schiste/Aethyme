@@ -1605,53 +1605,69 @@ fn git_destructive_branch_targets(args: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// The head branch of the pull request `selector` names (or the one gh picks
-/// for the current branch when there is none), resolved before anything is
-/// journaled with the same operand, directory and `GH_REPO` the real command
-/// will get, so the branch checked is the branch gh acts on. A PR's head
-/// branch name is fixed for its lifetime. A PR URL for another repository,
-/// or anything `gh pr view` cannot name, is an error.
-fn gh_pr_head_branch(
-    selector: Option<&str>,
+/// The head branch and head commit of pull request `number`, read once with
+/// the same directory and `GH_REPO` the merge will use.
+fn gh_pr_head(
+    number: &str,
     cwd: &Path,
     target: &crate::ResolvedGithubTarget,
-) -> Result<String, String> {
-    if let Some(selector) = selector
-        && let Some((_, path)) = selector.split_once("://")
-    {
-        let mut parts = path.split('/').skip(1);
-        let slug = format!(
-            "{}/{}",
-            parts.next().unwrap_or_default(),
-            parts.next().unwrap_or_default()
-        );
-        if !slug.eq_ignore_ascii_case(&target.display_slug) {
-            return Err(format!(
-                "pull request URL {selector:?} is in {slug}, not {}",
-                target.display_slug
-            ));
-        }
-    }
-    let mut view = provider_command(OperationProvider::Github);
-    view.args(["pr", "view"]);
-    if let Some(selector) = selector {
-        view.arg(selector);
-    }
-    let output = view
-        .args(["--json", "headRefName", "--jq", ".headRefName"])
+) -> Result<(String, String), String> {
+    let output = provider_command(OperationProvider::Github)
+        .args(["pr", "view", number, "--json", "headRefName,headRefOid"])
         .current_dir(cwd)
         .stdin(Stdio::null())
         .env("GH_REPO", &target.display_slug)
         .output()
-        .map_err(|error| format!("cannot run gh pr view: {error}"))?;
-    let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if !output.status.success() || branch.is_empty() {
+        .map_err(|error| format!("cannot run gh pr view {number}: {error}"))?;
+    if !output.status.success() {
         return Err(format!(
-            "gh pr view could not name the head branch: {}",
+            "gh pr view {number} failed: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
-    Ok(branch)
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("gh pr view {number} returned no JSON: {error}"))?;
+    let head = value["headRefName"].as_str().unwrap_or_default();
+    let oid = value["headRefOid"].as_str().unwrap_or_default();
+    if head.is_empty()
+        || oid.len() != 40
+        || !oid
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return Err(format!(
+            "gh pr view {number} did not name a head branch and full head commit"
+        ));
+    }
+    Ok((head.to_string(), oid.to_string()))
+}
+
+/// The `--repo` target, required to be this checkout's `origin` on
+/// github.com with no `GH_HOST` pointing gh elsewhere.
+fn verify_github_origin<'t>(
+    cwd: &Path,
+    github_target: Option<&'t crate::ResolvedGithubTarget>,
+) -> Result<&'t crate::ResolvedGithubTarget, String> {
+    let target = github_target.ok_or("no --repo target")?;
+    if let Some(host) = std::env::var_os("GH_HOST")
+        && !host.to_string_lossy().eq_ignore_ascii_case("github.com")
+    {
+        return Err(format!(
+            "GH_HOST={} points gh at another host",
+            host.to_string_lossy()
+        ));
+    }
+    match canonical_local_repository(cwd, None) {
+        Ok(Some(origin)) if origin.eq_ignore_ascii_case(&target.coordination_key) => Ok(target),
+        Ok(Some(origin)) => Err(format!(
+            "--repo {} is not this checkout's origin ({origin})",
+            target.display_slug
+        )),
+        _ => Err(format!(
+            "cannot verify that --repo {} is this checkout's origin",
+            target.display_slug
+        )),
+    }
 }
 
 /// Positional arguments of a Git subcommand, skipping options and the values
@@ -2052,13 +2068,18 @@ fn gh_method(args: &[String]) -> Option<&str> {
 pub fn classify_gh(args: &[String]) -> Option<OperationEffect> {
     let command = args.first()?.as_str();
     let action = args.get(1).map(String::as_str);
-    // Anything that can write a branch ref, as `gh_ref_guard` decides it
-    // fail-closed, is destructive: the guard then resolves the branch or
-    // refuses (#393). Aliases and extensions stay unclassified, so the caller
-    // must declare an effect, and the guard still refuses them.
-    if crate::gh_ref_guard::BUILTIN.contains(&command)
-        && command != "extension"
-        && crate::gh_ref_guard::analyze(args, None).writes()
+    // The two exact forms `gh_ref_guard` resolves to a branch delete are
+    // destructive; anything else that may write a ref is refused by the
+    // guard unless acknowledged (#393).
+    if matches!(
+        crate::gh_ref_guard::assess(args, ""),
+        crate::gh_ref_guard::Verdict::PrMerge {
+            deletes_head: true,
+            ..
+        }
+    ) || args.first().map(String::as_str) == Some("api")
+        && args.get(1).map(String::as_str) == Some("-X")
+        && args.get(2).map(String::as_str) == Some("DELETE")
     {
         return Some(OperationEffect::Destructive);
     }
@@ -4134,45 +4155,73 @@ impl Broker {
         )
     }
 
-    /// The one branch a gh ref write targets, or why it cannot be named with
-    /// certainty. Any such write must also target this checkout's own
-    /// `origin` (the repository session branches live in) on github.com.
-    fn resolve_gh_ref_write(
+    /// Decide a gh command's branch-ref write before anything is journaled
+    /// (#393): the branches it deletes, and the exact argv to run when the
+    /// check binds it (`--match-head-commit` injected for `pr merge -d`).
+    /// Every doubt refuses; only an operator's `--destructive
+    /// --ref-write-acknowledged` lets an unverifiable command through.
+    fn check_gh_ref_write(
         &self,
-        ref_write: crate::gh_ref_guard::RefWrite,
+        request: &CoordinatedCommand,
         cwd: &Path,
         github_target: Option<&crate::ResolvedGithubTarget>,
-    ) -> Result<String, String> {
-        use crate::gh_ref_guard::RefWrite;
-        let target = github_target.ok_or("no --repo target")?;
-        if let Some(host) = std::env::var_os("GH_HOST")
-            && !host.to_string_lossy().eq_ignore_ascii_case("github.com")
-        {
-            return Err(format!(
-                "GH_HOST={} points gh at another host",
-                host.to_string_lossy()
-            ));
-        }
-        match canonical_local_repository(cwd, None) {
-            Ok(Some(origin)) if origin.eq_ignore_ascii_case(&target.coordination_key) => {}
-            Ok(Some(origin)) => {
-                return Err(format!(
-                    "--repo {} is not this checkout's origin ({origin})",
-                    target.display_slug
-                ));
+    ) -> Result<(Vec<String>, Option<Vec<String>>), BrokerOpError> {
+        use crate::gh_ref_guard::Verdict;
+        let refuse = |why: String| {
+            Err(BrokerOpError::InvalidCoordinatedOperation {
+                reason: format!(
+                    "refusing a gh command that may write a branch ref: {why}. Nothing was run. \
+                     Use `pr merge <N> --merge|--squash|--rebase [-d]` or `api -X DELETE \
+                     repos/<owner>/<repo>/git/refs/heads/<branch>`, or, only if the operator \
+                     confirmed it touches no other live session's branch, add --destructive \
+                     --ref-write-acknowledged"
+                ),
+            })
+        };
+        let slug = github_target.map_or("", |target| target.display_slug.as_str());
+        let verdict = crate::gh_ref_guard::assess(&request.args, slug);
+        let (number, match_head_commit) = match verdict {
+            Verdict::NoRefWrite
+            | Verdict::PrMerge {
+                deletes_head: false,
+                ..
+            } => return Ok((Vec::new(), None)),
+            Verdict::Unverifiable(_)
+                if request.ref_write_acknowledged && request.destructive_confirmed =>
+            {
+                return Ok((Vec::new(), None));
             }
-            _ => {
-                return Err(format!(
-                    "cannot verify that --repo {} is this checkout's origin",
-                    target.display_slug
-                ));
+            Verdict::Unverifiable(why) => return refuse(why),
+            Verdict::DeleteBranch(branch) => {
+                if let Err(why) = verify_github_origin(cwd, github_target) {
+                    return refuse(why);
+                }
+                return Ok((vec![branch], None));
             }
-        }
-        match ref_write {
-            RefWrite::None => Err("no ref write".into()),
-            RefWrite::Branch(branch) => Ok(branch),
-            RefWrite::PrHead { selector } => gh_pr_head_branch(selector.as_deref(), cwd, target),
-            RefWrite::Uncertain(why) => Err(why),
+            Verdict::PrMerge {
+                number,
+                deletes_head: true,
+                match_head_commit,
+            } => (number, match_head_commit),
+        };
+        let target = match verify_github_origin(cwd, github_target) {
+            Ok(target) => target,
+            Err(why) => return refuse(why),
+        };
+        let (head, head_oid) = match gh_pr_head(&number, cwd, target) {
+            Ok(head) => head,
+            Err(why) => return refuse(why),
+        };
+        match match_head_commit {
+            Some(sha) if sha != head_oid => refuse(format!(
+                "--match-head-commit {sha} is not pull request #{number}'s head {head_oid}"
+            )),
+            Some(_) => Ok((vec![head], None)),
+            None => {
+                let mut args = request.args.clone();
+                args.extend(["--match-head-commit".to_string(), head_oid]);
+                Ok((vec![head], Some(args)))
+            }
         }
     }
 
@@ -4183,19 +4232,9 @@ impl Broker {
         &mut self,
         request: &CoordinatedCommand,
         effect: OperationEffect,
-        cwd: &Path,
-        github_target: Option<&crate::ResolvedGithubTarget>,
+        gh_targets: Vec<String>,
     ) -> Result<Option<i64>, BrokerOpError> {
-        // gh is analyzed whatever its declared effect: an alias declared
-        // `--effect write` can still expand to a branch deletion.
-        let ref_write = match request.provider {
-            OperationProvider::Github => crate::gh_ref_guard::analyze(
-                &request.args,
-                github_target.map(|target| target.display_slug.as_str()),
-            ),
-            OperationProvider::Git => crate::gh_ref_guard::RefWrite::None,
-        };
-        if effect != OperationEffect::Destructive && !ref_write.writes() {
+        if effect != OperationEffect::Destructive && gh_targets.is_empty() {
             return match request.cross_session {
                 Some(_) => Err(BrokerOpError::InvalidCoordinatedOperation {
                     reason: "--cross-session applies only to a destructive operation".into(),
@@ -4204,24 +4243,7 @@ impl Broker {
             };
         }
         let mut targets = destructive_branch_targets(request.provider, &request.args);
-        if ref_write.writes() {
-            match self.resolve_gh_ref_write(ref_write, cwd, github_target) {
-                Ok(branch) => targets.push(branch),
-                // The operator vouched for a write the broker cannot pin to a
-                // branch; the journal records the acknowledgement.
-                Err(_) if request.ref_write_acknowledged && request.destructive_confirmed => {}
-                Err(why) => {
-                    return Err(BrokerOpError::InvalidCoordinatedOperation {
-                        reason: format!(
-                            "refusing a gh command that may write a branch ref the broker cannot \
-                             pin to one branch: {why}. Nothing was run. Use a form the broker can \
-                             resolve, or, only if the operator confirmed it touches no other live \
-                             session's branch, add --destructive --ref-write-acknowledged"
-                        ),
-                    });
-                }
-            }
-        }
+        targets.extend(gh_targets);
         let owners: Vec<crate::Session> = if targets.is_empty() {
             Vec::new()
         } else {
@@ -4264,7 +4286,7 @@ impl Broker {
     /// then durably journal structured successful stdout before success.
     pub(crate) fn run_coordinated_operation_at_with_hooks<P, F>(
         &mut self,
-        request: CoordinatedCommand,
+        mut request: CoordinatedCommand,
         cwd: &Path,
         queue_wait: QueueWait,
         pre_execute: P,
@@ -4340,9 +4362,18 @@ impl Broker {
             authorization_reason =
                 authorization_reason.map(|reason| format!("{reason} [ref-write-acknowledged]"));
         }
-        if let Some(owner) =
-            self.refuse_foreign_session_branches(&request, effect, cwd, github_target.as_ref())?
-        {
+        let gh_targets = if request.provider == OperationProvider::Github {
+            let (targets, bound_args) =
+                self.check_gh_ref_write(&request, cwd, github_target.as_ref())?;
+            if let Some(args) = bound_args {
+                // The argv journaled and run is the one just checked.
+                request.args = args;
+            }
+            targets
+        } else {
+            Vec::new()
+        };
+        if let Some(owner) = self.refuse_foreign_session_branches(&request, effect, gh_targets)? {
             // Recorded with the authorization, so the journal says which
             // session's branch this operation was allowed to touch.
             authorization_reason =
