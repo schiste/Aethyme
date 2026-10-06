@@ -47,11 +47,11 @@ aethyme-graph-schema = { path = "../aethyme-graph-schema" }
 aethyme-graph-storage = { path = "../aethyme-graph-storage" }
 # BLAKE3 for computing content_hash on File nodes. Matches the
 # choice in aethyme-graph-schema for NodeId hashing.
-blake3 = "1"
+blake3 = { workspace = true }
 # walkdir is the standard way to walk a directory tree in Rust.
 # We use it for the filesystem-only indexer that produces File /
 # NonCodeFile nodes from the repo's source tree.
-walkdir = "2"
+walkdir = { workspace = true }
 
 # Python parsing (Phase 3.3). The Astral/Ruff team's parser, via
 # the RustPython project's published fork. Picked over
@@ -69,9 +69,9 @@ walkdir = "2"
 # series tracks Ruff 0.15.x. PythonIndexer wraps this API so a
 # future version bump (or fork swap) lands in one file rather
 # than throughout the indexer.
-ruff_python_parser = { package = "rustpython-ruff_python_parser", version = "0.15" }
-ruff_python_ast = { package = "rustpython-ruff_python_ast", version = "0.15" }
-ruff_text_size = { package = "rustpython-ruff_text_size", version = "0.15" }
+ruff_python_parser = { workspace = true }
+ruff_python_ast = { workspace = true }
+ruff_text_size = { workspace = true }
 
 # rayon (Phase 3.4): data-parallelism for the file-level loop.
 # The per-file work (read content + parse + build fragment + write
@@ -79,7 +79,7 @@ ruff_text_size = { package = "rustpython-ruff_text_size", version = "0.15" }
 # to a distinct path. On 8-core machines the wall-clock win on
 # MediaWiki-scale indexing is roughly 4-8× the single-threaded
 # baseline, which dominates parser-choice gains.
-rayon = "1"
+rayon = { workspace = true }
 
 # TypeScript / JavaScript parsing (Phase 3.5). The Oxc project's
 # parser. Pure Rust, MIT-licensed, faster than SWC by 2-3× and
@@ -90,10 +90,10 @@ rayon = "1"
 # rustc 1.92 (which is our workspace toolchain). 0.126+ requires
 # rustc 1.93. Bumping past 0.125 is a follow-up after a workspace
 # rustc bump.
-oxc_parser = "=0.125"
-oxc_ast = "=0.125"
-oxc_allocator = "=0.125"
-oxc_span = "=0.125"
+oxc_parser = { workspace = true }
+oxc_ast = { workspace = true }
+oxc_allocator = { workspace = true }
+oxc_span = { workspace = true }
 
 # Rust parsing (Phase 3.6) via rust-analyzer's syntax crate.
 # ra_ap_syntax provides IDE-grade Rust parsing — the same engine
@@ -104,7 +104,7 @@ oxc_span = "=0.125"
 # for full source files at IDE responsiveness.
 # Pinned to 0.0.331 — 0.0.332 requires rustc 1.95 (our workspace
 # is 1.92). Bumping is a follow-up after a workspace rustc bump.
-ra_ap_syntax = "=0.0.331"
+ra_ap_syntax = { workspace = true }
 
 # PHP parsing (Phase 3.7) via tree-sitter. This is the ONE
 # documented C-dependency exception in the indexer crate. The
@@ -118,21 +118,21 @@ ra_ap_syntax = "=0.0.331"
 # (tree-sitter uses `links = "tree-sitter"`, which Cargo
 # enforces as one-version-per-build-graph). tree-sitter-php
 # 0.23.11 is compatible with tree-sitter 0.25.
-tree-sitter = "0.25"
-tree-sitter-php = "=0.23.11"
+tree-sitter = { workspace = true }
+tree-sitter-php = { workspace = true }
 
 # clap for the aethyme-graph-index CLI (Phase 4.1). v4 with
 # derive macros — keeps the subcommand-and-arg surface declarative
 # and the binary's source readable.
-clap = { version = "4", features = ["derive"] }
-serde_json = "1"
+clap = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
-tempfile = "3"
+tempfile = { workspace = true }
 # serde_json is used by tests to inspect the JSON shape of produced
 # Node values (e.g., to assert visibility="private" without exposing
 # accessors on every per-kind struct just for testing).
-serde_json = "1"
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

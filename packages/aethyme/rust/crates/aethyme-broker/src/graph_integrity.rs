@@ -413,6 +413,50 @@ mod tests {
     }
 
     #[test]
+    fn affected_gate_selection_does_not_wait_for_graph_integrity_slot() {
+        let repo = graph_repo();
+        std::fs::write(
+            repo.path().join(".aethyme/gates.toml"),
+            "[[gate]]\nname = 'source-check'\ncommand = 'true'\ntriggers = ['src/**']\n",
+        )
+        .unwrap();
+        git(repo.path(), &["add", ".aethyme/gates.toml"]);
+        git(repo.path(), &["commit", "-m", "configure source gate"]);
+
+        let mut setup = crate::Broker::open(repo.path()).unwrap();
+        let session = setup.start_worktree("inspection", None).unwrap();
+        drop(setup);
+        std::fs::write(
+            Path::new(&session.worktree_path).join("src/lib.rs"),
+            "pub fn answer() -> u8 { 43 }\n",
+        )
+        .unwrap();
+
+        let held =
+            crate::verification::ExactTreeVerificationSlot::acquire(repo.path(), "graph-integrity")
+                .unwrap();
+        let root = repo.path().to_path_buf();
+        let session_id = session.id;
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let mut broker = crate::Broker::open(&root).unwrap();
+            sender.send(broker.affected_gates(session_id)).unwrap();
+        });
+
+        let selected = receiver.recv_timeout(std::time::Duration::from_secs(30));
+        drop(held);
+        let selected = selected
+            .expect("affected-gate inspection waited on graph-integrity verification")
+            .unwrap();
+        worker.join().unwrap();
+
+        assert_eq!(
+            selected,
+            vec![("source-check".to_string(), Some("src/lib.rs".to_string()))]
+        );
+    }
+
+    #[test]
     fn missing_configuration_disables_graph_authority() {
         let repo = tempfile::tempdir().unwrap();
         let policy = GraphIntegrityPolicy::load(repo.path()).unwrap();
