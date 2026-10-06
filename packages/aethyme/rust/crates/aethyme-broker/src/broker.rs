@@ -8307,6 +8307,21 @@ impl Broker {
         let foreign = crate::session_holder::foreign_process_advice(&self.store, &live_worktrees);
         let foreign_deferred = foreign.is_none();
         advice.extend(foreign.unwrap_or_default());
+        let live_session_ids: Vec<i64> = agents
+            .iter()
+            .filter(|agent| {
+                matches!(
+                    agent.derived_status,
+                    SessionStatus::Active | SessionStatus::Idle | SessionStatus::Stale
+                )
+            })
+            .map(|agent| agent.session.id)
+            .collect();
+        advice.extend(crate::install_replacement::advice(
+            &self.store,
+            &live_session_ids,
+            &crate::version::current_binary_build(),
+        ));
         phase_timings_ms.insert(
             "foreign_processes".into(),
             foreign_started.elapsed().as_millis() as u64,

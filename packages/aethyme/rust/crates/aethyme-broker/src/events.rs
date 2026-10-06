@@ -23,6 +23,7 @@ pub const SESSION_HOLDER_BOUND: &str = "session.holder_bound";
 /// The broker first saw a session's holder process gone (#360). Starts the
 /// lease stale-grace clock for that holder.
 pub const SESSION_HOLDER_GONE: &str = "session.holder_gone";
+pub const SESSION_INSTALL_RECORDED: &str = "session.install_recorded";
 pub const SESSION_FINISH_CLEANUP_STARTED: &str = "session.finish_cleanup_started";
 pub const SESSION_CHECKPOINT_REANCHORED: &str = "session.checkpoint_reanchored";
 pub const REVIEW_LIFECYCLE_REASSIGNED: &str = "review.lifecycle_reassigned";
@@ -121,6 +122,22 @@ pub fn session_holder_gone_payload(holder: &crate::session_holder::AgentProcess)
         "pid": holder.pid,
         "started": holder.started,
         "command": holder.command,
+    })
+    .to_string()
+}
+
+/// `session.install_recorded`: the router build that started or adopted the
+/// session, and the engine banner on PATH beside it (#293).
+pub fn session_install_recorded_payload(
+    router: &crate::version::BinaryBuild,
+    engine_banner: Option<&str>,
+) -> String {
+    json!({
+        "version": router.version,
+        "describe": router.describe,
+        "commit": router.commit,
+        "path": router.path,
+        "engine_banner": engine_banner,
     })
     .to_string()
 }

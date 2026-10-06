@@ -2088,7 +2088,8 @@ fn admit_caller(
 }
 
 /// Record the calling agent as the holder of a session it just started or
-/// adopted. Best effort: the session exists either way.
+/// adopted, and the installed build that ran it. Best effort: the session
+/// exists either way.
 fn bind_caller_as_holder(store: &mut crate::BrokerStore, session_id: i64) {
     let caller = crate::session_holder::caller();
     if let Err(error) = crate::session_holder::bind(
@@ -2099,6 +2100,9 @@ fn bind_caller_as_holder(store: &mut crate::BrokerStore, session_id: i64) {
     ) {
         eprintln!("warning: could not record session {session_id}'s holder: {error}");
     }
+    // #293: the build that started or adopted the session, so a later swap
+    // of the installed pair is reported instead of passing silently.
+    crate::install_replacement::record(store, session_id);
 }
 
 /// Every broker invocation associated with a live session surfaces its
