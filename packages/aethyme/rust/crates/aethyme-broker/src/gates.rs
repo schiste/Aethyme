@@ -4112,6 +4112,39 @@ mod tests {
         }
     }
 
+    /// The timeout line names a scaled deadline's configured value only when
+    /// scaling raised it, and says `unavailable` for a load it could not read.
+    #[test]
+    fn timeout_diagnostic_names_the_scaled_deadline_and_both_loads() {
+        let environment = GateEnvironment {
+            load_avg_1m_start: Some(15.0),
+            load_avg_1m_end: None,
+            cpu_count: Some(10),
+            free_disk_bytes_start: None,
+            free_disk_bytes_end: None,
+        };
+        let at_timeout = crate::gate_admission::LoadSample {
+            load_1m: 40.0,
+            cpus: 10,
+        };
+        assert_eq!(
+            format_gate_timeout_diagnostic(Some(300), 450, &environment, Some(at_timeout)),
+            "aethyme gate timeout exceeded after 450s (configured 300s, scaled from start load); \
+             host load at start: load 1m 15.0/10 cpus = 1.50 per cpu; \
+             host load at timeout: load 1m 40.0/10 cpus = 4.00 per cpu\n"
+        );
+
+        let unmeasured = GateEnvironment {
+            load_avg_1m_start: None,
+            ..environment
+        };
+        assert_eq!(
+            format_gate_timeout_diagnostic(Some(300), 300, &unmeasured, None),
+            "aethyme gate timeout exceeded after 300s; host load at start: unavailable; \
+             host load at timeout: unavailable\n"
+        );
+    }
+
     /// Only faults the broker observed itself may defer a submission: a gate
     /// that never started, a host resource error, the broker's own deadline,
     /// or running out of disk.
