@@ -4,8 +4,17 @@ aethyme update — explicit paired-binary updates (never runs in the background)
 
 Usage:
   aethyme update check [--json] [--refresh]
-  aethyme update plan [--channel stable|preview] [--json] [--refresh]
-  aethyme update execute --confirm <manifest-sha256> [--json]
+  aethyme update plan [--channel stable|preview] [--version X.Y.Z] [--json] [--refresh]
+  aethyme update execute --confirm <manifest-sha256> [--json] [<signature>]
+  aethyme update apply [--channel stable|preview] [--version X.Y.Z] [--json] [<signature>]
+  aethyme self-update ...    same as `aethyme update apply ...`
+
+apply plans and executes in one step: it prints the plan, then installs it
+with that plan's manifest digest. execute and apply verify the release
+manifest's Sigstore signature whenever cosign is on PATH; <signature> is
+--require-signature (fail without cosign) or --no-verify-signature. The
+archive is checked against the manifest's SHA-256, both binaries must report
+the release version, and the pair is switched together or not at all.
 
 The release manifest is cached for 6h; --refresh bypasses the cache, and
 AETHYME_UPDATE_CACHE_TTL_SECONDS=0 disables it. Only the answer is cached:

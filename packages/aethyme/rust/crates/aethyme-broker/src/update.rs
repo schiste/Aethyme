@@ -178,6 +178,89 @@ pub struct UpdateExecutionReport {
     pub rollback_bundle: Option<PathBuf>,
     pub quick_test_passed: bool,
     pub repository_next_action: String,
+    /// `verified`, `skipped_cosign_missing`, or `disabled`: what was proven
+    /// about the release manifest's signature before anything was installed.
+    #[serde(default)]
+    pub signature_verification: String,
+}
+
+/// How `update execute`/`apply` treat the release manifest's Sigstore
+/// signature. Mirrors `install.sh`: verify whenever cosign is on PATH,
+/// `--require-signature` fails without it, `--no-verify-signature` skips it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignatureMode {
+    Auto,
+    Require,
+    Off,
+}
+
+/// The workflow identity release.yml signs with, bound to the exact tag.
+fn release_signing_identity(version: &str) -> String {
+    format!("https://github.com/schiste/Aethyme/.github/workflows/release.yml@refs/tags/v{version}")
+}
+
+/// The signature bundle published beside `manifest_url`.
+fn signature_bundle_url(manifest_url: &str) -> Result<String, String> {
+    manifest_url
+        .strip_suffix("release-manifest.json")
+        .map(|base| format!("{base}release-manifest.sigstore.json"))
+        .ok_or_else(|| format!("manifest URL {manifest_url} does not name release-manifest.json"))
+}
+
+fn cosign_on_path() -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|directory| directory.join("cosign"))
+        .find(|candidate| candidate.is_file())
+}
+
+/// Verify the downloaded manifest against its Sigstore bundle, or say why it
+/// was not verified. Any verification failure refuses the update.
+fn verify_manifest_signature(
+    manifest_path: &Path,
+    manifest_url: &str,
+    version: &str,
+    mode: SignatureMode,
+    temp: &Path,
+) -> Result<&'static str, String> {
+    if mode == SignatureMode::Off {
+        eprintln!(
+            "warning: signature verification is disabled; checksums alone do not authenticate a release"
+        );
+        return Ok("disabled");
+    }
+    let Some(cosign) = cosign_on_path() else {
+        if mode == SignatureMode::Require {
+            return Err("--require-signature needs cosign on PATH".into());
+        }
+        eprintln!(
+            "warning: cosign not found; skipping signature verification (checksums alone do not authenticate a release)"
+        );
+        return Ok("skipped_cosign_missing");
+    };
+    let bundle = temp.join("release-manifest.sigstore.json");
+    download_to(&signature_bundle_url(manifest_url)?, &bundle)
+        .map_err(|error| format!("download the release manifest signature bundle: {error}"))?;
+    let output = Command::new(cosign)
+        .arg("verify-blob")
+        .arg("--bundle")
+        .arg(&bundle)
+        .arg("--certificate-identity")
+        .arg(release_signing_identity(version))
+        .args([
+            "--certificate-oidc-issuer",
+            "https://token.actions.githubusercontent.com",
+        ])
+        .arg(manifest_path)
+        .output()
+        .map_err(|error| format!("run cosign: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "release manifest signature verification failed (pass --no-verify-signature to skip): {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok("verified")
 }
 
 #[derive(Debug, Error)]
@@ -384,32 +467,64 @@ fn run_update_cli_inner(args: &[String]) -> Result<(), String> {
         }
         Some("check") => {
             let (json, refresh) = parse_check_options(&args[1..])?;
-            let (plan, fetch) = resolve_update_plan(UpdateChannel::Stable, refresh)?;
+            let (plan, fetch) = resolve_update_plan(UpdateChannel::Stable, refresh, None)?;
             render_plan(&plan, json, false, None, &fetch)
         }
         Some("plan") => {
-            let (channel, json, refresh) = parse_plan_options(&args[1..])?;
-            let (plan, fetch) = resolve_update_plan(channel, refresh)?;
+            let options = parse_plan_options("update plan", &args[1..], false)?;
+            let (plan, fetch) =
+                resolve_update_plan(options.channel, options.refresh, options.version.as_deref())?;
             let saved_to = persist_update_plan(&plan)?;
-            render_plan(&plan, json, true, saved_to.as_deref(), &fetch)
+            render_plan(&plan, options.json, true, saved_to.as_deref(), &fetch)
         }
         Some("execute") => {
-            let (confirmation, json) = parse_execute_options(&args[1..])?;
-            let report = execute_confirmed_update(&confirmation)?;
+            let (confirmation, json, signature) = parse_execute_options(&args[1..])?;
+            let report = execute_confirmed_update_with(&confirmation, signature)?;
             render_execution(&report, json)
         }
+        Some("apply") => run_apply(&args[1..]),
         Some("bootstrap") => run_bootstrap(&args[1..]),
         Some(other) => Err(format!(
-            "unsupported update subcommand {other:?}; use check, plan, or execute"
+            "unsupported update subcommand {other:?}; use check, plan, execute, or apply"
         )),
     }
 }
 
-fn parse_execute_options(args: &[String]) -> Result<(String, bool), String> {
+/// `--require-signature` / `--verify-signature` and `--no-verify-signature`,
+/// as `install.sh` spells them. Returns `None` for any other argument.
+fn signature_flag(argument: &str) -> Option<SignatureMode> {
+    match argument {
+        "--require-signature" | "--verify-signature" => Some(SignatureMode::Require),
+        "--no-verify-signature" => Some(SignatureMode::Off),
+        _ => None,
+    }
+}
+
+fn set_signature_mode(
+    current: &mut Option<SignatureMode>,
+    mode: SignatureMode,
+    command: &str,
+) -> Result<(), String> {
+    if current.is_some_and(|existing| existing != mode) {
+        return Err(format!(
+            "{command}: --no-verify-signature conflicts with --require-signature"
+        ));
+    }
+    *current = Some(mode);
+    Ok(())
+}
+
+fn parse_execute_options(args: &[String]) -> Result<(String, bool, SignatureMode), String> {
     let mut confirmation = None;
     let mut json = false;
+    let mut signature = None;
     let mut index = 0;
     while index < args.len() {
+        if let Some(mode) = signature_flag(&args[index]) {
+            set_signature_mode(&mut signature, mode, "update execute")?;
+            index += 1;
+            continue;
+        }
         match args[index].as_str() {
             "--json" => {
                 json = true;
@@ -428,7 +543,56 @@ fn parse_execute_options(args: &[String]) -> Result<(String, bool), String> {
     }
     let confirmation = confirmation.ok_or("update execute requires --confirm <manifest-sha256>")?;
     validate_digest(&confirmation, "confirmation")?;
-    Ok((confirmation, json))
+    Ok((confirmation, json, signature.unwrap_or(SignatureMode::Auto)))
+}
+
+/// `update apply`: plan and execute in one command, the supported upgrade
+/// path (`aethyme self-update`). The plan is printed first and executed with
+/// its own manifest digest, so everything `execute` checks still applies.
+fn run_apply(args: &[String]) -> Result<(), String> {
+    if args
+        .iter()
+        .any(|argument| argument == "--help" || argument == "-h")
+    {
+        print_update_help();
+        return Ok(());
+    }
+    let options = parse_plan_options("update apply", args, true)?;
+    let (plan, fetch) =
+        resolve_update_plan(options.channel, options.refresh, options.version.as_deref())?;
+    match plan.action {
+        UpdateAction::ExecuteInstallerUpdate => {}
+        UpdateAction::UpToDate => {
+            return render_plan(&plan, options.json, false, None, &fetch);
+        }
+        UpdateAction::RefuseDowngrade => {
+            return Err(format!(
+                "refusing to downgrade from {} to {}",
+                plan.current_version, plan.target_version
+            ));
+        }
+        _ => {
+            return Err(match &plan.recommended_command {
+                Some(command) => format!(
+                    "this installation is managed by {:?}; update it with `{command}`",
+                    plan.installation.method
+                ),
+                None => format!(
+                    "this installation ({:?}) cannot be updated in place: {}",
+                    plan.installation.method, plan.installation.explanation
+                ),
+            });
+        }
+    }
+    if !options.json {
+        render_plan(&plan, false, false, None, &fetch)?;
+    }
+    persist_update_plan(&plan)?;
+    let report = execute_confirmed_update_with(
+        &plan.manifest_sha256,
+        options.signature.unwrap_or(SignatureMode::Auto),
+    )?;
+    render_execution(&report, options.json)
 }
 
 fn run_bootstrap(args: &[String]) -> Result<(), String> {
@@ -477,8 +641,21 @@ fn print_update_help() {
     println!();
     println!("Usage:");
     println!("  aethyme update check [--json] [--refresh]");
-    println!("  aethyme update plan [--channel stable|preview] [--json] [--refresh]");
-    println!("  aethyme update execute --confirm <manifest-sha256> [--json]");
+    println!(
+        "  aethyme update plan [--channel stable|preview] [--version X.Y.Z] [--json] [--refresh]"
+    );
+    println!("  aethyme update execute --confirm <manifest-sha256> [--json] [<signature>]");
+    println!(
+        "  aethyme update apply [--channel stable|preview] [--version X.Y.Z] [--json] [<signature>]"
+    );
+    println!("  aethyme self-update ...    same as `aethyme update apply ...`");
+    println!();
+    println!("apply plans and executes in one step: it prints the plan, then installs it");
+    println!("with that plan's manifest digest. execute and apply verify the release");
+    println!("manifest's Sigstore signature whenever cosign is on PATH; <signature> is");
+    println!("--require-signature (fail without cosign) or --no-verify-signature. The");
+    println!("archive is checked against the manifest's SHA-256, both binaries must report");
+    println!("the release version, and the pair is switched together or not at all.");
     println!();
     println!(
         "The release manifest is cached for {}h; --refresh bypasses the cache, and",
@@ -508,34 +685,67 @@ fn parse_check_options(args: &[String]) -> Result<(bool, bool), String> {
     Ok((json, refresh))
 }
 
-fn parse_plan_options(args: &[String]) -> Result<(UpdateChannel, bool, bool), String> {
-    let mut channel = UpdateChannel::Stable;
-    let mut json = false;
-    let mut refresh = false;
+struct PlanOptions {
+    channel: UpdateChannel,
+    json: bool,
+    refresh: bool,
+    /// An exact release to plan for (`X.Y.Z`), instead of the channel's latest.
+    version: Option<String>,
+    /// Only `update apply` accepts the signature flags.
+    signature: Option<SignatureMode>,
+}
+
+fn parse_plan_options(
+    command: &str,
+    args: &[String],
+    accepts_signature: bool,
+) -> Result<PlanOptions, String> {
+    let mut options = PlanOptions {
+        channel: UpdateChannel::Stable,
+        json: false,
+        refresh: false,
+        version: None,
+        signature: None,
+    };
     let mut index = 0;
     while index < args.len() {
+        if accepts_signature && let Some(mode) = signature_flag(&args[index]) {
+            set_signature_mode(&mut options.signature, mode, command)?;
+            index += 1;
+            continue;
+        }
         match args[index].as_str() {
             "--json" => {
-                json = true;
+                options.json = true;
                 index += 1;
             }
             "--refresh" => {
-                refresh = true;
+                options.refresh = true;
                 index += 1;
             }
             "--channel" => {
                 let value = args
                     .get(index + 1)
-                    .ok_or("update plan: --channel requires a value")?;
-                channel = value
+                    .ok_or_else(|| format!("{command}: --channel requires a value"))?;
+                options.channel = value
                     .parse()
                     .map_err(|error: UpdateError| error.to_string())?;
                 index += 2;
             }
-            other => return Err(format!("update plan: unknown option {other}")),
+            "--version" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| format!("{command}: --version requires a value"))?;
+                let value = value.strip_prefix('v').unwrap_or(value);
+                Version::parse(value)
+                    .map_err(|_| format!("{command}: invalid --version {value:?}"))?;
+                options.version = Some(value.to_string());
+                index += 2;
+            }
+            other => return Err(format!("{command}: unknown option {other}")),
         }
     }
-    Ok((channel, json, refresh))
+    Ok(options)
 }
 
 /// The manifest URL this machine would ask for on `channel`.
@@ -557,16 +767,33 @@ pub fn manifest_discovery_url(channel: UpdateChannel) -> Result<String, String> 
 fn resolve_update_plan(
     channel: UpdateChannel,
     refresh: bool,
+    version: Option<&str>,
 ) -> Result<(UpdatePlan, ManifestFetch), String> {
     let base_url = std::env::var("AETHYME_RELEASE_BASE_URL")
         .unwrap_or_else(|_| DEFAULT_RELEASE_BASE_URL.to_string());
-    let discovery_url = resolve_manifest_discovery_url(&base_url, channel)?;
+    // A pinned version reads that release's own manifest; the channel check
+    // in `build_update_plan` still applies to it.
+    let discovery_url = match version {
+        Some(version) => format!(
+            "{}/releases/download/v{version}/release-manifest.json",
+            base_url.trim_end_matches('/')
+        ),
+        None => resolve_manifest_discovery_url(&base_url, channel)?,
+    };
     let fetch =
         update_cache::fetch_manifest_cached(&discovery_url, now_unix_ms(), refresh, |url| {
             fetch_bounded(url, MAX_MANIFEST_BYTES)
         })?;
     let manifest_bytes = fetch.bytes.clone();
     let manifest = parse_valid_manifest(&manifest_bytes)?;
+    if let Some(version) = version
+        && manifest.version != version
+    {
+        return Err(format!(
+            "requested {version} but the release manifest describes {}",
+            manifest.version
+        ));
+    }
     let manifest_url = format!(
         "{}/releases/download/v{}/release-manifest.json",
         base_url.trim_end_matches('/'),
@@ -888,10 +1115,20 @@ pub fn bootstrap_install(
         rollback_bundle,
         quick_test_passed: true,
         repository_next_action: repository_upgrade_next_action(),
+        signature_verification: "installer".into(),
     })
 }
 
 pub fn execute_confirmed_update(confirmation: &str) -> Result<UpdateExecutionReport, String> {
+    execute_confirmed_update_with(confirmation, SignatureMode::Auto)
+}
+
+/// Install the reviewed plan `confirmation` names, verifying the manifest's
+/// signature as `signature` says before anything is downloaded beyond it.
+pub fn execute_confirmed_update_with(
+    confirmation: &str,
+    signature: SignatureMode,
+) -> Result<UpdateExecutionReport, String> {
     validate_digest(confirmation, "confirmation")?;
     let executable = std::env::current_exe().map_err(|error| format!("locate aethyme: {error}"))?;
     let installation = detect_installation(&executable);
@@ -926,6 +1163,13 @@ pub fn execute_confirmed_update(confirmation: &str) -> Result<UpdateExecutionRep
     }
     let manifest = parse_valid_manifest(&manifest_bytes)?;
     validate_manifest_against_plan(&manifest, &plan)?;
+    let signature_verification = verify_manifest_signature(
+        &manifest_path,
+        &plan.manifest_url,
+        &plan.target_version,
+        signature,
+        temp.path(),
+    )?;
     inspect_current_broker_schema(&manifest.compatibility)?;
 
     let archive_path = temp.path().join(&plan.archive.archive);
@@ -971,6 +1215,7 @@ pub fn execute_confirmed_update(confirmation: &str) -> Result<UpdateExecutionRep
         rollback_bundle,
         quick_test_passed: true,
         repository_next_action: repository_upgrade_next_action(),
+        signature_verification: signature_verification.into(),
     })
 }
 
@@ -992,6 +1237,7 @@ fn render_execution(report: &UpdateExecutionReport, json: bool) -> Result<(), St
             println!("  Rollback bundle: {}", path.display());
         }
         println!("  Quick test: passed");
+        println!("  Signature: {}", report.signature_verification);
         println!("Next: {}", report.repository_next_action);
     }
     Ok(())

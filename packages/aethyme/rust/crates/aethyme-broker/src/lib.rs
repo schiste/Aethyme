@@ -70,6 +70,7 @@ mod host_state;
 pub mod init;
 pub mod insights;
 pub mod install_health;
+pub mod install_replacement;
 mod issue_form;
 mod lease_export;
 mod leases;
@@ -554,10 +555,10 @@ pub use types::{
 pub use unpushed::{UnpublishedIntegrationWork, UnpushedSessionWork, UnpushedWorkReport};
 pub use update::{
     INSTALL_RECEIPT_FILENAME, INSTALL_RECEIPT_SCHEMA_VERSION, InstallReceipt, InstallationMethod,
-    InstallationProvenance, UPDATE_PLAN_SCHEMA_VERSION, UpdateAction, UpdateArchive, UpdateChannel,
-    UpdateError, UpdateExecutionReport, UpdatePlan, bootstrap_install, build_update_plan,
-    current_release_target, detect_installation, execute_confirmed_update, release_target_for,
-    run_update_cli, sha256_bytes,
+    InstallationProvenance, SignatureMode, UPDATE_PLAN_SCHEMA_VERSION, UpdateAction, UpdateArchive,
+    UpdateChannel, UpdateError, UpdateExecutionReport, UpdatePlan, bootstrap_install,
+    build_update_plan, current_release_target, detect_installation, execute_confirmed_update,
+    execute_confirmed_update_with, release_target_for, run_update_cli, sha256_bytes,
 };
 pub use verify_loop::{
     VerifyLoopCommandReport, VerifyLoopReport, VerifyLoopStep, VerifyLoopStepStatus,

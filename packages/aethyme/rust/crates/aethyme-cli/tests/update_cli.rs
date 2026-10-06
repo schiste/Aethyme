@@ -81,7 +81,13 @@ fn command(root: &Path) -> Command {
     command
 }
 
-fn write_fake_archive(root: &Path, version: &str) -> (String, String, u64) {
+/// A release archive whose engine reports `engine_version`, so a mismatched
+/// pair can be published under `version`.
+fn write_fake_pair_archive(
+    root: &Path,
+    version: &str,
+    engine_version: &str,
+) -> (String, String, u64) {
     let payload = root.join("new-payload");
     fs::create_dir_all(&payload).unwrap();
     fs::write(
@@ -93,7 +99,7 @@ fn write_fake_archive(root: &Path, version: &str) -> (String, String, u64) {
     .unwrap();
     fs::write(
         payload.join("aethyme-engine-cli"),
-        format!("#!/bin/sh\necho 'aethyme-engine-cli {version}'\n"),
+        format!("#!/bin/sh\necho 'aethyme-engine-cli {engine_version}'\n"),
     )
     .unwrap();
     use std::os::unix::fs::PermissionsExt;
@@ -118,7 +124,11 @@ fn write_fake_archive(root: &Path, version: &str) -> (String, String, u64) {
 }
 
 fn write_executable_manifest(root: &Path, version: &str) {
-    let (archive, digest, size) = write_fake_archive(root, version);
+    write_executable_pair_manifest(root, version, version);
+}
+
+fn write_executable_pair_manifest(root: &Path, version: &str, engine_version: &str) {
+    let (archive, digest, size) = write_fake_pair_archive(root, version, engine_version);
     let targets = [
         "aarch64-apple-darwin",
         "x86_64-apple-darwin",
@@ -206,14 +216,58 @@ fn install_managed_current(root: &Path) -> std::path::PathBuf {
     install_dir.join("aethyme")
 }
 
-fn plan_managed_update(root: &Path, installed_router: &Path) -> Value {
-    let output = Command::new(installed_router)
-        .args(["update", "plan", "--json"])
+/// A command for the installed router, with a PATH that holds only the
+/// system tools and `extra_bin` -- so the developer's own cosign (or its
+/// absence) never decides what a test exercises.
+fn managed(root: &Path, installed_router: &Path, extra_bin: Option<&Path>) -> Command {
+    let mut command = Command::new(installed_router);
+    let path = match extra_bin {
+        Some(bin) => format!("{}:/usr/bin:/bin", bin.display()),
+        None => "/usr/bin:/bin".to_string(),
+    };
+    command
         .env(
             "AETHYME_RELEASE_BASE_URL",
             format!("file://{}", root.display()),
         )
-        .current_dir(root)
+        .env("AETHYME_HOST_CACHE_DIR", root.join("host-cache"))
+        .env("PATH", path)
+        .current_dir(root);
+    command
+}
+
+/// A `cosign` that exits `status` and records its arguments.
+fn fake_cosign(root: &Path, status: i32) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = root.join("fake-bin");
+    fs::create_dir_all(&bin).unwrap();
+    let cosign = bin.join("cosign");
+    fs::write(
+        &cosign,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nexit {status}\n",
+            root.join("cosign-args").display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&cosign, fs::Permissions::from_mode(0o755)).unwrap();
+    bin
+}
+
+/// Publish a signature bundle beside the exact release manifest.
+fn write_signature_bundle(root: &Path, version: &str) {
+    fs::write(
+        root.join(format!(
+            "releases/download/v{version}/release-manifest.sigstore.json"
+        )),
+        "{}",
+    )
+    .unwrap();
+}
+
+fn plan_managed_update(root: &Path, installed_router: &Path) -> Value {
+    let output = managed(root, installed_router, None)
+        .args(["update", "plan", "--json"])
         .output()
         .unwrap();
     assert!(
@@ -235,8 +289,12 @@ fn update_help_is_explicit_and_never_background() {
     let stderr = String::from_utf8(output.stdout).unwrap();
     for expected in [
         "update check",
-        "update plan [--channel stable|preview] [--json] [--refresh]",
+        "update plan [--channel stable|preview] [--version X.Y.Z] [--json] [--refresh]",
         "update execute --confirm <manifest-sha256>",
+        "update apply",
+        "self-update",
+        "--require-signature",
+        "--no-verify-signature",
         "never runs in the background",
         "brew upgrade aethyme",
         "aethyme upgrade plan",
@@ -319,13 +377,8 @@ fn confirmed_execute_switches_the_pair_and_retains_the_previous_bundle() {
     assert_eq!(plan["action"], "execute_installer_update");
     let confirmation = plan["manifest_sha256"].as_str().unwrap();
 
-    let execute = Command::new(&installed_router)
+    let execute = managed(temp.path(), &installed_router, None)
         .args(["update", "execute", "--confirm", confirmation, "--json"])
-        .env(
-            "AETHYME_RELEASE_BASE_URL",
-            format!("file://{}", temp.path().display()),
-        )
-        .current_dir(temp.path())
         .output()
         .unwrap();
     assert!(
@@ -336,6 +389,7 @@ fn confirmed_execute_switches_the_pair_and_retains_the_previous_bundle() {
     let report: Value = serde_json::from_slice(&execute.stdout).unwrap();
     assert_eq!(report["installed_version"], "9.0.0");
     assert_eq!(report["quick_test_passed"], true);
+    assert_eq!(report["signature_verification"], "skipped_cosign_missing");
 
     let managed = temp.path().join("install/bin/.aethyme-managed");
     assert!(
@@ -379,17 +433,145 @@ fn checksum_mismatch_is_refused_without_moving_the_active_pair() {
     let current = temp.path().join("install/bin/.aethyme-managed/current");
     let before = fs::read_link(&current).unwrap();
 
-    let execute = Command::new(&installed_router)
+    let execute = managed(temp.path(), &installed_router, None)
         .args(["update", "execute", "--confirm", confirmation])
-        .env(
-            "AETHYME_RELEASE_BASE_URL",
-            format!("file://{}", temp.path().display()),
-        )
-        .current_dir(temp.path())
         .output()
         .unwrap();
 
     assert!(!execute.status.success());
     assert!(String::from_utf8_lossy(&execute.stderr).contains("SHA-256 mismatch"));
     assert_eq!(fs::read_link(current).unwrap(), before);
+}
+
+fn current_link(root: &Path) -> std::path::PathBuf {
+    fs::read_link(root.join("install/bin/.aethyme-managed/current")).unwrap()
+}
+
+#[test]
+fn a_failed_manifest_signature_is_refused_without_moving_the_active_pair() {
+    let temp = tempfile::tempdir().unwrap();
+    write_executable_manifest(temp.path(), "9.0.0");
+    write_signature_bundle(temp.path(), "9.0.0");
+    let installed_router = install_managed_current(temp.path());
+    let plan = plan_managed_update(temp.path(), &installed_router);
+    let confirmation = plan["manifest_sha256"].as_str().unwrap();
+    let before = current_link(temp.path());
+    let cosign = fake_cosign(temp.path(), 1);
+
+    let execute = managed(temp.path(), &installed_router, Some(&cosign))
+        .args(["update", "execute", "--confirm", confirmation])
+        .output()
+        .unwrap();
+
+    assert!(!execute.status.success());
+    assert!(
+        String::from_utf8_lossy(&execute.stderr).contains("signature verification failed"),
+        "{}",
+        String::from_utf8_lossy(&execute.stderr)
+    );
+    assert_eq!(current_link(temp.path()), before);
+}
+
+#[test]
+fn self_update_plans_verifies_the_signature_and_switches_the_pair() {
+    let temp = tempfile::tempdir().unwrap();
+    write_executable_manifest(temp.path(), "9.0.0");
+    write_signature_bundle(temp.path(), "9.0.0");
+    let installed_router = install_managed_current(temp.path());
+    let cosign = fake_cosign(temp.path(), 0);
+
+    let output = managed(temp.path(), &installed_router, Some(&cosign))
+        .args(["self-update", "--json"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["installed_version"], "9.0.0");
+    assert_eq!(report["signature_verification"], "verified");
+    let arguments = fs::read_to_string(temp.path().join("cosign-args")).unwrap();
+    assert!(
+        arguments.contains(
+            "https://github.com/schiste/Aethyme/.github/workflows/release.yml@refs/tags/v9.0.0"
+        ),
+        "{arguments}"
+    );
+    assert!(arguments.contains("release-manifest.json"), "{arguments}");
+    assert!(
+        current_link(temp.path())
+            .to_string_lossy()
+            .starts_with("versions/v9.0.0-")
+    );
+}
+
+#[test]
+fn require_signature_without_cosign_refuses_before_installing() {
+    let temp = tempfile::tempdir().unwrap();
+    write_executable_manifest(temp.path(), "9.0.0");
+    let installed_router = install_managed_current(temp.path());
+    let before = current_link(temp.path());
+
+    let output = managed(temp.path(), &installed_router, None)
+        .args(["update", "apply", "--require-signature"])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("--require-signature needs cosign"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(current_link(temp.path()), before);
+}
+
+#[test]
+fn a_mismatched_pair_is_refused_without_moving_the_active_pair() {
+    let temp = tempfile::tempdir().unwrap();
+    write_executable_pair_manifest(temp.path(), "9.0.0", "8.9.0");
+    let installed_router = install_managed_current(temp.path());
+    let before = current_link(temp.path());
+
+    let output = managed(temp.path(), &installed_router, None)
+        .args(["update", "apply"])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("aethyme-engine-cli"), "{stderr}");
+    // Refused while staging, before anything was switched -- not caught only
+    // by the post-activation check that rolls back.
+    assert!(!stderr.contains("rolled back"), "{stderr}");
+    assert_eq!(current_link(temp.path()), before);
+}
+
+#[test]
+fn a_pinned_version_plans_that_exact_release() {
+    let temp = tempfile::tempdir().unwrap();
+    write_executable_manifest(temp.path(), "9.0.0");
+    let installed_router = install_managed_current(temp.path());
+    fs::remove_dir_all(temp.path().join("releases/latest")).unwrap();
+
+    let pinned = managed(temp.path(), &installed_router, None)
+        .args(["update", "plan", "--version", "v9.0.0", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        pinned.status.success(),
+        "{}",
+        String::from_utf8_lossy(&pinned.stderr)
+    );
+    let plan: Value = serde_json::from_slice(&pinned.stdout).unwrap();
+    assert_eq!(plan["target_version"], "9.0.0");
+
+    let missing = managed(temp.path(), &installed_router, None)
+        .args(["update", "plan", "--version", "9.9.9"])
+        .output()
+        .unwrap();
+    assert!(!missing.status.success());
 }
