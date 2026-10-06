@@ -1847,7 +1847,13 @@ fn prepare_managed_gate_cache_in(
     let repository_root = root.join("gates").join(repository);
     std::fs::create_dir_all(&repository_root)?;
     let directory = repository_root.join(&policy.key);
-    let usage_before = directory_usage(&directory)?;
+    let usage_before = match directory_usage(&directory) {
+        Ok(usage) => usage,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            crate::disk_headroom::DirectoryUsage::default()
+        }
+        Err(error) => return Err(error),
+    };
     let bytes_before = usage_before.bytes;
     let rotated_before_run = bytes_before > policy.max_bytes;
     if rotated_before_run {
@@ -4273,6 +4279,32 @@ end = 55999
             std::fs::read_to_string(checkout.join("src/lib.rs")).unwrap(),
             "pub fn a() {}\n"
         );
+    }
+
+    #[test]
+    fn missing_managed_cache_is_measured_as_empty_before_creation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let policy = ManagedGateCache {
+            key: "cargo".into(),
+            max_bytes: 3,
+        };
+        let directory = tmp.path().join("gates/repository/cargo");
+        assert!(!directory.exists());
+
+        let runtime = prepare_managed_gate_cache_in(
+            Some(&policy),
+            "repository",
+            &StderrGateProgressSink,
+            "test",
+            tmp.path(),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(runtime.provenance.bytes_before, 0);
+        assert_eq!(runtime.provenance.inodes_before, 0);
+        assert!(!runtime.provenance.rotated_before_run);
+        assert!(runtime.directory.is_dir());
     }
 
     #[test]

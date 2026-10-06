@@ -239,7 +239,6 @@ pub(crate) fn available_bytes_for(
 }
 
 /// [`available_bytes_at_or_above`] behind the same test seam as
-
 pub(crate) fn available_headroom_for(
     repository: &std::path::Path,
     path: &std::path::Path,

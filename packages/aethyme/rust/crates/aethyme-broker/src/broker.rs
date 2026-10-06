@@ -10766,12 +10766,14 @@ impl Broker {
             .unwrap_or(0);
         // One reading, consumed by both the severity below and the evidence
         // line in the advice that reports it.
-        let (byte_headroom, inode_headroom) = self.gate_headroom();
-        let (host_volume_probe, host_available_bytes) = byte_headroom
-            .map(|(probe, available)| (Some(probe), Some(available)))
+        let gate_headroom = self.gate_headroom();
+        let (host_volume_probe, host_available_bytes) = gate_headroom
+            .bytes
+            .map(|probe| (Some(probe.path), Some(probe.available)))
             .unwrap_or((None, None));
-        let (host_inode_volume_probe, inodes_free) = inode_headroom
-            .map(|(probe, available)| (Some(probe), Some(available)))
+        let (host_inode_volume_probe, inodes_free) = gate_headroom
+            .inodes
+            .map(|probe| (Some(probe.path), Some(probe.available)))
             .unwrap_or((None, None));
         let severity = cleanup_retention_severity(
             plan.retained_worktree_count,
@@ -10868,7 +10870,7 @@ impl Broker {
         }
     }
 
-    fn gate_headroom(&self) -> (Option<(PathBuf, u64)>, Option<(PathBuf, u64)>) {
+    fn gate_headroom(&self) -> GateHeadroom {
         lowest_headroom_with(&self.gate_headroom_probes(), |probe| {
             crate::disk_headroom::available_headroom_at_or_above_for(&self.main_root, probe)
         })
@@ -11285,30 +11287,49 @@ fn dirty_session_count(agents: &[AgentView]) -> usize {
         .count()
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct HeadroomReading {
+    path: PathBuf,
+    available: u64,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct GateHeadroom {
+    bytes: Option<HeadroomReading>,
+    inodes: Option<HeadroomReading>,
+}
+
 fn lowest_headroom_with(
     probes: &[PathBuf],
     read: impl Fn(&Path) -> Option<crate::disk_headroom::DiskHeadroom>,
-) -> (Option<(PathBuf, u64)>, Option<(PathBuf, u64)>) {
-    let mut lowest_bytes: Option<(PathBuf, u64)> = None;
-    let mut lowest_inodes: Option<(PathBuf, u64)> = None;
+) -> GateHeadroom {
+    let mut lowest = GateHeadroom::default();
     for probe in probes {
         let Some(headroom) = read(probe) else {
             continue;
         };
-        if lowest_bytes
+        if lowest
+            .bytes
             .as_ref()
-            .is_none_or(|(_, available)| headroom.bytes < *available)
+            .is_none_or(|current| headroom.bytes < current.available)
         {
-            lowest_bytes = Some((probe.clone(), headroom.bytes));
+            lowest.bytes = Some(HeadroomReading {
+                path: probe.clone(),
+                available: headroom.bytes,
+            });
         }
-        if lowest_inodes
+        if lowest
+            .inodes
             .as_ref()
-            .is_none_or(|(_, available)| headroom.inodes < *available)
+            .is_none_or(|current| headroom.inodes < current.available)
         {
-            lowest_inodes = Some((probe.clone(), headroom.inodes));
+            lowest.inodes = Some(HeadroomReading {
+                path: probe.clone(),
+                available: headroom.inodes,
+            });
         }
     }
-    (lowest_bytes, lowest_inodes)
+    lowest
 }
 
 /// The advisory for a volume with less free space than a gate needs, or `None`.
@@ -13168,9 +13189,21 @@ mod tests {
                 })
             }
         };
-        let (bytes, inodes) = super::lowest_headroom_with(&probes, read);
-        assert_eq!(bytes, Some((PathBuf::from("/bytes"), 1)));
-        assert_eq!(inodes, Some((PathBuf::from("/inodes"), 1)));
+        let headroom = super::lowest_headroom_with(&probes, read);
+        assert_eq!(
+            headroom.bytes,
+            Some(super::HeadroomReading {
+                path: PathBuf::from("/bytes"),
+                available: 1,
+            })
+        );
+        assert_eq!(
+            headroom.inodes,
+            Some(super::HeadroomReading {
+                path: PathBuf::from("/inodes"),
+                available: 1,
+            })
+        );
         assert_eq!(reads.get(), probes.len());
     }
 
@@ -13294,15 +13327,21 @@ mod tests {
             _ => None,
         };
         assert_eq!(
-            super::lowest_headroom_with(&[roomy.clone(), starved.clone()], read).0,
-            Some((starved.clone(), 3))
+            super::lowest_headroom_with(&[roomy.clone(), starved.clone()], read).bytes,
+            Some(super::HeadroomReading {
+                path: starved.clone(),
+                available: 3,
+            })
         );
         assert_eq!(
-            super::lowest_headroom_with(&[unreadable.clone(), roomy.clone()], read).0,
-            Some((roomy, 500))
+            super::lowest_headroom_with(&[unreadable.clone(), roomy.clone()], read).bytes,
+            Some(super::HeadroomReading {
+                path: roomy,
+                available: 500,
+            })
         );
-        assert_eq!(super::lowest_headroom_with(&[unreadable], read).0, None);
-        assert_eq!(super::lowest_headroom_with(&[], read).0, None);
+        assert_eq!(super::lowest_headroom_with(&[unreadable], read).bytes, None);
+        assert_eq!(super::lowest_headroom_with(&[], read).bytes, None);
     }
 
     /// A worktree root does not exist before a repository's first session;
