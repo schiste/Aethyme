@@ -1742,6 +1742,114 @@ fn without_opting_in_the_hook_still_runs_inside_the_push() {
     );
 }
 
+/// A hook that appends `<AETHYME_PUSH_KIND>|<AETHYME_PUSH_REFS with newlines as ,>`
+/// for every run, so a test sees both how often it ran and what it was told.
+#[cfg(unix)]
+fn install_push_kind_recording_hook(repo: &Path, log: &Path) {
+    install_pre_push_hook(
+        repo,
+        &format!(
+            "#!/bin/sh\nprintf '%s|%s\\n' \"${{AETHYME_PUSH_KIND-unset}}\" \"$(printf '%s' \"${{AETHYME_PUSH_REFS-}}\" | tr '\\n' ',')\" >> {}\nexit 0\n",
+            log.display()
+        ),
+    );
+}
+
+/// Issue #264: deleting a branch must not cost a pre-push verification run. With
+/// hooks run outside the lock, the broker skips its own dry run for a
+/// delete-only push; the repository's hook still runs once, inside the push --
+/// the broker never bypasses it -- and is told the push is `delete-only` so it
+/// can short-circuit instead of falling back to its full suite.
+#[cfg(unix)]
+#[test]
+fn a_delete_only_push_skips_the_dry_run_and_tells_the_hook() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut fixture = push_fixture(tmp.path(), "delete-only");
+    let repo = fixture.broker.main_root().to_path_buf();
+    git(&repo, &["push", "-q", "origin", "main:refs/heads/feature"]);
+    enable_hooks_outside_lock(&repo);
+    let log = tmp.path().join("hook-env");
+    install_push_kind_recording_hook(&repo, &log);
+
+    let mut request = exact_push_request(
+        fixture.session_id,
+        &fixture.worktree,
+        &["--delete", "feature"],
+    );
+    request.destructive_confirmed = true;
+    let report = fixture.broker.run_coordinated_operation(request).unwrap();
+    assert!(report.ok(), "delete-only push must succeed: {report:?}");
+    assert!(
+        Command::new("git")
+            .args(["rev-parse", "--verify", "-q", "refs/heads/feature"])
+            .current_dir(&fixture.remote)
+            .output()
+            .unwrap()
+            .stdout
+            .is_empty(),
+        "the remote branch must be gone"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&log).unwrap(),
+        "delete-only|feature\n",
+        "the hook runs exactly once, inside the push, told it is delete-only"
+    );
+}
+
+/// An ordinary push is still verified, and its hook is told it is an `update`.
+#[cfg(unix)]
+#[test]
+fn an_update_push_tells_the_hook_it_is_an_update() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut fixture = push_fixture(tmp.path(), "update-kind");
+    let repo = fixture.broker.main_root().to_path_buf();
+    let log = tmp.path().join("hook-env");
+    install_push_kind_recording_hook(&repo, &log);
+    commit_push_fixture(&fixture, "work\n");
+
+    let report = fixture
+        .broker
+        .run_coordinated_operation(exact_push_request(
+            fixture.session_id,
+            &fixture.worktree,
+            &["HEAD:refs/heads/main"],
+        ))
+        .unwrap();
+    assert!(report.ok(), "{report:?}");
+    assert_eq!(
+        std::fs::read_to_string(&log).unwrap(),
+        "update|HEAD:refs/heads/main\n"
+    );
+}
+
+/// Deleting one ref while updating another is `mixed`: the push still sends
+/// content, so its hook verifies exactly as before.
+#[cfg(unix)]
+#[test]
+fn a_mixed_push_is_verified_and_tells_the_hook_it_is_mixed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut fixture = push_fixture(tmp.path(), "mixed-kind");
+    let repo = fixture.broker.main_root().to_path_buf();
+    git(&repo, &["push", "-q", "origin", "main:refs/heads/old"]);
+    let log = tmp.path().join("hook-env");
+    install_push_kind_recording_hook(&repo, &log);
+    commit_push_fixture(&fixture, "work\n");
+
+    let mut request = exact_push_request(
+        fixture.session_id,
+        &fixture.worktree,
+        &["HEAD:refs/heads/main", ":refs/heads/old"],
+    );
+    request.destructive_confirmed = true;
+    let report = fixture.broker.run_coordinated_operation(request).unwrap();
+    assert!(report.ok(), "{report:?}");
+    assert_eq!(
+        std::fs::read_to_string(&log).unwrap(),
+        "mixed|HEAD:refs/heads/main,:refs/heads/old\n",
+        "a mixed push runs its hook once, told it is mixed"
+    );
+}
+
 /// A caller parked behind a wedged operation is inside a command that never
 /// returns, so it cannot report its own wait. The one notice it printed went to
 /// stderr before it hung. Status is the only surface another agent can reach,
