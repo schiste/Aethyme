@@ -583,7 +583,7 @@ fn build_plan(
                 .push(match attribute_root(&root.path, this_repository) {
                     Attribution::ThisRepository { .. } => "its Git worktrees are registered in this repository; record that ownership with `aethyme broker gc storage attribute --apply`, then review a new plan".into(),
                     Attribution::Unattributable(reason) => format!(
-                        "not attributable to this repository: {reason}. Run `aethyme broker gc storage attribute` from the repository that owns it, or see what its worktrees hold with `aethyme broker worktrees`"
+                        "not attributable to this repository: {reason}. Run `aethyme broker gc storage attribute` from the repository that owns it, or see what its worktrees hold with `aethyme broker advanced worktrees`"
                     ),
                 });
         }
