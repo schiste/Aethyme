@@ -189,7 +189,7 @@ pub use blockers::{
     UnblockRequest,
 };
 pub use broker::{
-    AdoptIntegrationDrift, AdoptIntegrationRelation, AdoptIntegrationSync,
+    AdoptCarriedOwnership, AdoptIntegrationDrift, AdoptIntegrationRelation, AdoptIntegrationSync,
     AdoptIntegrationSyncOutcome, AdoptMode, AdoptOptions, AdoptOutcome, AdoptReport, AgentView,
     Broker, BrokerOpError, BypassedIntegration, CLEANUP_PLAN_SCHEMA_VERSION,
     CheckpointRecoveryAction, CheckpointRefusalCode, CleanupDisposition, CleanupPlan,
