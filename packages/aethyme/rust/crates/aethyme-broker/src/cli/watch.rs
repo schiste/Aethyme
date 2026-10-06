@@ -328,6 +328,7 @@ pub(super) fn run_deliveries(parsed: Parsed) -> Result<(), UsageError> {
             let seconds = parsed.seconds.unwrap_or(120);
             let claim = broker.claim_next_delivery(adapter, worker, seconds, now_ms())?;
             let Some(envelope) = claim.delivery else {
+                mark_idle_delivery_poll();
                 if parsed.json {
                     out!("{}", serde_json::json!({"claimed": false}));
                 } else {
@@ -408,8 +409,9 @@ pub(super) fn run_deliveries(parsed: Parsed) -> Result<(), UsageError> {
                     if !parsed.json {
                         out!("send delivery {} to {tab_id}", envelope.item.id);
                         out!(
-                            "  complete with: aethyme broker advanced deliveries complete --id {} --worker {worker} --generation {} --outcome delivered",
+                            "  complete with: aethyme broker advanced deliveries complete --id {} --worker {} --generation {} --outcome delivered",
                             envelope.item.id,
+                            crate::broker::shell_quote(worker),
                             envelope.item.generation
                         );
                     }
@@ -554,6 +556,9 @@ pub(super) fn run_deliveries(parsed: Parsed) -> Result<(), UsageError> {
                     .unwrap_or(crate::DEFAULT_DELIVERY_CLAIM_SECONDS),
                 now_ms(),
             )?;
+            if report.delivery.is_none() {
+                mark_idle_delivery_poll();
+            }
             if parsed.json {
                 out!("{}", serde_json::to_string_pretty(&report)?);
             } else if let Some(delivery) = report.delivery {

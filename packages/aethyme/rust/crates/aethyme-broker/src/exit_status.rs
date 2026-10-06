@@ -31,6 +31,9 @@ pub fn for_broker_error(error: &BrokerOpError) -> u8 {
     use BrokerOpError as E;
     match error {
         E::CoordinatedOperationTimedOut { .. } => OUTCOME_UNKNOWN,
+        // A read changed nothing; what did not answer was the provider or the
+        // host, so the next step is the environment, not reconciliation.
+        E::ReadOperationTimedOut { .. } => ENVIRONMENT,
         // A git killed at its deadline judged nothing: the host, a remote or
         // a lock is wedged, so the next step is to look at the environment.
         E::Git(crate::GitError::TimedOut { .. }) => ENVIRONMENT,

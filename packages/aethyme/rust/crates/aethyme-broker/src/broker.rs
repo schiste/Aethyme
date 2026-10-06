@@ -156,6 +156,23 @@ pub enum BrokerOpError {
         stage: String,
         budget: String,
     },
+    /// A read-only operation got no answer within its budget. It changed
+    /// nothing, so unlike a timed-out write it needs no reconciliation; the
+    /// phase split says whether the broker or the provider spent the time
+    /// (#555).
+    #[error(
+        "read-only operation {operation_id} for {repository} got no answer within its {budget} budget: {} preparing, then {} waiting for `{provider}` to respond; it changed nothing, so retry it, or allow more time with --queue-timeout <seconds>",
+        crate::operations::humanize_ms(*preparation_ms),
+        crate::operations::humanize_ms(*provider_wait_ms)
+    )]
+    ReadOperationTimedOut {
+        provider: &'static str,
+        operation_id: i64,
+        repository: String,
+        budget: String,
+        preparation_ms: u64,
+        provider_wait_ms: u64,
+    },
 
     #[error(transparent)]
     Git(#[from] GitError),

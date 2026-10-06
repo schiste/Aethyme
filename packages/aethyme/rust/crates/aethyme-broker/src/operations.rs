@@ -48,6 +48,43 @@ pub enum QueueWait {
 /// turning a slow network into a refusal on every call.
 const NO_WAIT_ADMISSION_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// The bound a read-only coordinated operation gets when its caller set none.
+///
+/// A read takes no lock and no write block applies to it, so the only thing an
+/// unbounded read can wait on is the provider. A stalled `gh api` therefore
+/// outlived the caller's own timeout and said nothing about why (#555). The
+/// bound sits under the 120 s most agent harnesses give a command, so the
+/// caller gets the diagnostic instead of a kill; `--queue-timeout` still sets
+/// it explicitly, and `AETHYME_BROKER_READ_BUDGET_SECS` changes the default.
+pub(crate) const READ_OPERATION_BUDGET: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// A read whose length is the point, so the default read budget must not cut
+/// it: following a run or checks until they finish, streaming a run's log,
+/// downloading artifacts, or paginating an API list. Only an explicit
+/// `--queue-timeout` bounds these (#555).
+pub(crate) fn is_long_running_read(provider: OperationProvider, args: &[String]) -> bool {
+    if provider != OperationProvider::Github {
+        return false;
+    }
+    let command = args.first().map(String::as_str);
+    let action = args.get(1).map(String::as_str);
+    let watches = action == Some("watch") || has_any(args, &["--watch", "-w"]);
+    let streams_log = command == Some("run")
+        && action == Some("view")
+        && has_any(args, &["--log", "--log-failed"]);
+    let downloads = action == Some("download");
+    let paginates = command == Some("api") && has_any(args, &["--paginate"]);
+    watches || streams_log || downloads || paginates
+}
+
+fn read_operation_budget() -> std::time::Duration {
+    std::env::var("AETHYME_BROKER_READ_BUDGET_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .map_or(READ_OPERATION_BUDGET, std::time::Duration::from_secs)
+}
+
 /// How often a bounded child is checked for completion.
 const ADMISSION_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
@@ -413,6 +450,7 @@ fn append_progress_event(path: &Path, message: &str, phase: Option<&str>) {
 /// park for 120.
 #[derive(Debug, Clone, Copy)]
 struct AdmissionDeadline {
+    started: std::time::Instant,
     at: Option<std::time::Instant>,
     budget: Option<std::time::Duration>,
 }
@@ -426,10 +464,32 @@ impl AdmissionDeadline {
             QueueWait::Refuse => Some(NO_WAIT_ADMISSION_BUDGET),
             QueueWait::Seconds(seconds) => Some(std::time::Duration::from_secs(seconds)),
         };
+        let started = std::time::Instant::now();
         Self {
-            at: budget.map(|budget| std::time::Instant::now() + budget),
+            started,
+            at: budget.map(|budget| started + budget),
             budget,
         }
+    }
+
+    /// Bound a read its caller left unbounded. A read never queues for the
+    /// lock, so "wait forever" could only mean "wait forever on the provider"
+    /// (#555). Writes keep exactly the wait their caller chose, and so does a
+    /// read that is long by design ([`is_long_running_read`]).
+    fn bounded_for(self, effect: OperationEffect, long_running: bool) -> Self {
+        if effect != OperationEffect::Read || long_running || self.budget.is_some() {
+            return self;
+        }
+        let budget = read_operation_budget();
+        Self {
+            started: self.started,
+            at: Some(self.started + budget),
+            budget: Some(budget),
+        }
+    }
+
+    fn elapsed_ms(&self) -> u64 {
+        u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
 
     fn budget_label(&self) -> String {
@@ -1222,6 +1282,15 @@ fn is_push(args: &[String]) -> bool {
     git_subcommand_args(args)
         .and_then(|args| args.first())
         .is_some_and(|command| command == "push")
+}
+
+/// Milliseconds as the shortest readable span: `850ms`, `4.2s`, `1m 31s`.
+pub(crate) fn humanize_ms(milliseconds: u64) -> String {
+    match milliseconds {
+        0..=999 => format!("{milliseconds}ms"),
+        1_000..=59_999 => format!("{:.1}s", milliseconds as f64 / 1_000.0),
+        _ => humanize_duration(milliseconds / 1_000),
+    }
 }
 
 pub(crate) fn humanize_duration(seconds: u64) -> String {
@@ -4108,6 +4177,10 @@ impl Broker {
             OperationProvider::Github => classify_gh(&request.args),
         };
         let (effect, classification) = resolve_effect(inferred, request.declared_effect)?;
+        let admission = admission.bounded_for(
+            effect,
+            is_long_running_read(request.provider, &request.args),
+        );
         if effect == OperationEffect::Destructive && !request.destructive_confirmed {
             return Err(BrokerOpError::InvalidCoordinatedOperation {
                 reason: DESTRUCTIVE_FLAG_REQUIRED.into(),
@@ -4616,6 +4689,9 @@ impl Broker {
                     .display_slug,
             );
         }
+        // Split the budget a read spent by phase, so a timeout says whether
+        // the broker or the provider used it (#555).
+        let preparation_ms = admission.elapsed_ms();
         let output = match output_within(
             command,
             admission,
@@ -4650,6 +4726,8 @@ impl Broker {
                             } else {
                                 "not_applicable"
                             },
+                            "preparation_ms": preparation_ms,
+                            "provider_wait_ms": admission.elapsed_ms().saturating_sub(preparation_ms),
                         }),
                         &push_planning,
                     ),
@@ -4679,6 +4757,16 @@ impl Broker {
                         repository,
                         operation_id: operation.id,
                         recovery: UnknownOutcomeRecovery::from_operation(&operation),
+                    });
+                }
+                if effect == OperationEffect::Read {
+                    return Err(BrokerOpError::ReadOperationTimedOut {
+                        provider: provider_executable(request.provider),
+                        operation_id: operation.id,
+                        repository,
+                        budget,
+                        preparation_ms,
+                        provider_wait_ms: admission.elapsed_ms().saturating_sub(preparation_ms),
                     });
                 }
                 return Err(BrokerOpError::CoordinatedOperationTimedOut {
@@ -5972,6 +6060,94 @@ mod tests {
             classify_gh(&args(&["api", "-Xget", "repos/o/r"])),
             Some(Read)
         );
+    }
+
+    #[test]
+    fn an_unbounded_read_gets_the_read_budget_and_writes_keep_theirs() {
+        // #555: "wait forever" on a read can only mean waiting on the provider.
+        let read =
+            AdmissionDeadline::start(QueueWait::Forever).bounded_for(OperationEffect::Read, false);
+        assert_eq!(read.budget, Some(READ_OPERATION_BUDGET));
+        assert!(read.at.is_some());
+
+        // A caller's own bound wins, and writes keep the wait they asked for.
+        let explicit = AdmissionDeadline::start(QueueWait::Seconds(5))
+            .bounded_for(OperationEffect::Read, false);
+        assert_eq!(explicit.budget, Some(Duration::from_secs(5)));
+        for effect in [OperationEffect::Write, OperationEffect::Destructive] {
+            let write = AdmissionDeadline::start(QueueWait::Forever).bounded_for(effect, false);
+            assert_eq!(write.budget, None, "{effect:?} must stay unbounded");
+            assert!(write.at.is_none());
+        }
+    }
+
+    /// #555 review: a read that is long by design keeps the caller's
+    /// unbounded wait; only an explicit `--queue-timeout` bounds it.
+    fn assert_long_running_read_is_exempt(args: &[&str]) {
+        let args = gh(args);
+        assert_eq!(classify_gh(&args), Some(OperationEffect::Read), "{args:?}");
+        assert!(
+            is_long_running_read(OperationProvider::Github, &args),
+            "{args:?}"
+        );
+        let admission = AdmissionDeadline::start(QueueWait::Forever).bounded_for(
+            OperationEffect::Read,
+            is_long_running_read(OperationProvider::Github, &args),
+        );
+        assert_eq!(admission.budget, None, "{args:?} must stay unbounded");
+    }
+
+    #[test]
+    fn run_watch_is_exempt_from_the_read_budget() {
+        assert_long_running_read_is_exempt(&["run", "watch", "123"]);
+    }
+
+    #[test]
+    fn pr_checks_watch_is_exempt_from_the_read_budget() {
+        assert_long_running_read_is_exempt(&["pr", "checks", "12", "--watch"]);
+    }
+
+    #[test]
+    fn run_view_log_is_exempt_from_the_read_budget() {
+        assert_long_running_read_is_exempt(&["run", "view", "123", "--log"]);
+        assert_long_running_read_is_exempt(&["run", "view", "123", "--log-failed"]);
+    }
+
+    #[test]
+    fn downloads_are_exempt_from_the_read_budget() {
+        assert_long_running_read_is_exempt(&["run", "download", "123"]);
+        assert_long_running_read_is_exempt(&["release", "download", "v1.0.0"]);
+    }
+
+    #[test]
+    fn paginated_api_reads_are_exempt_from_the_read_budget() {
+        assert_long_running_read_is_exempt(&["api", "repos/o/r/issues", "--paginate"]);
+    }
+
+    #[test]
+    fn short_reads_and_git_keep_the_read_budget() {
+        for args in [
+            gh(&["api", "repos/o/r/issues/230/comments?per_page=100&page=1"]),
+            gh(&["pr", "view", "12"]),
+            gh(&["pr", "checks", "12"]),
+            gh(&["run", "view", "123"]),
+        ] {
+            assert!(
+                !is_long_running_read(OperationProvider::Github, &args),
+                "{args:?}"
+            );
+        }
+        assert!(!is_long_running_read(
+            OperationProvider::Git,
+            &gh(&["log", "--watch"])
+        ));
+    }
+
+    #[test]
+    fn humanize_ms_reads_at_every_scale() {
+        assert_eq!(humanize_ms(850), "850ms");
+        assert_eq!(humanize_ms(4_200), "4.2s");
+        assert_eq!(humanize_ms(91_000), "1m 31s");
     }
 
     #[test]
