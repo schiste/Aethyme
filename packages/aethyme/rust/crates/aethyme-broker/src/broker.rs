@@ -1210,6 +1210,8 @@ pub struct CleanupWorktreePlan {
     pub disposition: CleanupDisposition,
     pub provenance: Option<CleanupProvenance>,
     pub estimated_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub estimated_inodes: Option<u64>,
     pub reason: String,
     pub inspection_commands: Vec<String>,
     pub force_cleanup_command: String,
@@ -1364,6 +1366,17 @@ pub struct CleanupRetention {
     /// The directory [`Self::host_available_bytes`] was read at, so an
     /// operator can tell which volume is short.
     pub host_volume_probe: Option<PathBuf>,
+    /// The directory the free-inode count was read at.
+    pub host_inode_volume_probe: Option<PathBuf>,
+    /// Free inodes on the most constrained broker gate volume.
+    pub inodes_free: Option<u64>,
+    /// Sum of recorded inode counts for broker-owned worktrees. A floor when
+    /// worktree_inode_unmeasured is non-zero; status never walks these trees.
+    /// A closed worktree is measured by the cleanup plan's size warmer; a live
+    /// one only by `gc storage plan`'s warmer, one directory per run, so live
+    /// sessions count as unmeasured until a storage plan has reached them.
+    pub worktree_inodes: u64,
+    pub worktree_inode_unmeasured: usize,
     pub severity: StatusAdviceSeverity,
     /// Config warnings/errors are carried with the retention picture so
     /// status can explain a bad file without failing before it can report it.
@@ -7364,7 +7377,10 @@ impl Broker {
         if let Some(headroom_advice) = gate_headroom_advice(
             cleanup_retention.host_available_bytes,
             cleanup_retention.host_volume_probe.as_deref(),
+            cleanup_retention.inodes_free,
+            cleanup_retention.host_inode_volume_probe.as_deref(),
             crate::disk_headroom::DEFAULT_GATE_HEADROOM_BYTES,
+            crate::disk_headroom::MIN_GATE_HEADROOM_INODES,
         ) {
             advice.insert(0, headroom_advice);
         }
@@ -10268,19 +10284,28 @@ impl Broker {
         if !worktree_present && branch_tip.is_none() {
             return Ok(None);
         }
-        let estimated_bytes = if !worktree_present {
+        let (estimated_bytes, estimated_inodes) = if !worktree_present {
             // Nothing on disk is a measured zero, not an unknown.
-            Some(0)
+            (Some(0), Some(0))
         } else if scan.measures() {
-            let measured = directory_size_without_following_links(&worktree_path).ok();
-            if let Some(bytes) = measured {
-                records.record(&session.worktree_path, bytes, now_ms());
+            let measured =
+                crate::disk_headroom::directory_usage_without_following_links(&worktree_path).ok();
+            if let Some(usage) = measured {
+                records.record_usage(
+                    &session.worktree_path,
+                    usage.bytes,
+                    Some(usage.inodes),
+                    now_ms(),
+                );
             }
             measured
+                .map(|usage| (Some(usage.bytes), Some(usage.inodes)))
+                .unwrap_or((None, None))
         } else {
             records
                 .get(&session.worktree_path)
-                .map(|record| record.bytes)
+                .map(|record| (Some(record.bytes), record.inodes))
+                .unwrap_or((None, None))
         };
         let unreachable = (!worktree_present)
             .then(|| {
@@ -10393,6 +10418,7 @@ impl Broker {
             disposition,
             provenance,
             estimated_bytes,
+            estimated_inodes,
             reason,
             inspection_commands,
             force_cleanup_command: format!("aethyme broker finish cleanup {} --force", session.id),
@@ -10642,10 +10668,13 @@ impl Broker {
         if !present && tip.is_none() {
             return None;
         }
-        let estimated_bytes = if present {
-            records.get(&session.worktree_path).map(|r| r.bytes)
+        let (estimated_bytes, estimated_inodes) = if present {
+            records
+                .get(&session.worktree_path)
+                .map(|record| (Some(record.bytes), record.inodes))
+                .unwrap_or((None, None))
         } else {
-            Some(0)
+            (Some(0), Some(0))
         };
         Some(CleanupWorktreePlan {
             session_id: session.id,
@@ -10658,6 +10687,7 @@ impl Broker {
             disposition: CleanupDisposition::InspectionFailed,
             provenance: None,
             estimated_bytes,
+            estimated_inodes,
             reason,
             inspection_commands: vec!["aethyme broker gc plan".into()],
             force_cleanup_command: String::new(),
@@ -10696,10 +10726,11 @@ impl Broker {
         // be falsified by a test.
         let deadline = std::time::Instant::now()
             + std::time::Duration::from_millis(policy.routine_size_budget_ms);
-        let Some(bytes) = directory_size_bounded(Path::new(&path), deadline) else {
+        let Some(usage) = crate::disk_headroom::directory_usage_bounded(Path::new(&path), deadline)
+        else {
             return Ok(());
         };
-        records.record(&path, bytes, now_ms());
+        records.record_usage(&path, usage.bytes, Some(usage.inodes), now_ms());
         crate::warn_unrecorded(
             "save worktree size records",
             crate::measurement::save_size_records(&self.main_root, &records),
@@ -10784,13 +10815,15 @@ impl Broker {
             self.cleanup_plan_observed()?
         };
         let closed_sessions = self.store.cleaned_sessions()?;
+        let (worktree_inodes, worktree_inode_unmeasured) =
+            self.recorded_worktree_inode_summary(&closed_sessions)?;
         let closed_worktrees = crate::retention::ClosedWorktreeSummary::from_cleanup(
             &plan,
             &closed_sessions,
             &self.main_root,
         );
         let oldest_closed_at = closed_sessions
-            .into_iter()
+            .iter()
             .filter(|session| {
                 let path = Path::new(&session.worktree_path);
                 path.exists() && self.is_broker_owned_worktree(session, path)
@@ -10802,10 +10835,15 @@ impl Broker {
             .unwrap_or(0);
         // One reading, consumed by both the severity below and the evidence
         // line in the advice that reports it.
-        let (host_volume_probe, host_available_bytes) = match self.gate_headroom() {
-            Some((probe, available)) => (Some(probe), Some(available)),
-            None => (None, None),
-        };
+        let gate_headroom = self.gate_headroom();
+        let (host_volume_probe, host_available_bytes) = gate_headroom
+            .bytes
+            .map(|probe| (Some(probe.path), Some(probe.available)))
+            .unwrap_or((None, None));
+        let (host_inode_volume_probe, inodes_free) = gate_headroom
+            .inodes
+            .map(|probe| (Some(probe.path), Some(probe.available)))
+            .unwrap_or((None, None));
         let severity = cleanup_retention_severity(
             plan.retained_worktree_count,
             plan.estimated_retained_bytes,
@@ -10860,6 +10898,10 @@ impl Broker {
             closed_worktrees_policy_days: policy.closed_worktrees_days,
             host_available_bytes,
             host_volume_probe,
+            host_inode_volume_probe,
+            inodes_free,
+            worktree_inodes,
+            worktree_inode_unmeasured,
             severity,
             retention_config,
             reconciliation: self.reconcile_worktree_directories(false)?,
@@ -10883,21 +10925,56 @@ impl Broker {
     /// host state). Each location is read at its nearest existing directory:
     /// a worktree root does not exist before the first session, and a missing
     /// path would read as unknown, which never escalates.
-    fn gate_headroom(&self) -> Option<(PathBuf, u64)> {
+    fn gate_headroom_probes(&self) -> Vec<PathBuf> {
         let worktree_root = self
             .worktree_root_plan()
             .ok()
             .and_then(|plan| plan.preferred_root);
         let host_state = crate::host_state::default_host_state_dir();
         let probes: Vec<PathBuf> = worktree_root.into_iter().chain(host_state).collect();
-        let probes = if probes.is_empty() {
+        if probes.is_empty() {
             vec![self.main_root.clone()]
         } else {
             probes
-        };
-        lowest_available_with(&probes, |probe| {
-            crate::disk_headroom::available_bytes_at_or_above_for(&self.main_root, probe)
+        }
+    }
+
+    fn gate_headroom(&self) -> GateHeadroom {
+        lowest_headroom_with(&self.gate_headroom_probes(), |probe| {
+            crate::disk_headroom::available_headroom_at_or_above_for(&self.main_root, probe)
         })
+    }
+
+    fn recorded_worktree_inode_summary(
+        &self,
+        closed_sessions: &[Session],
+    ) -> Result<(u64, usize), BrokerOpError> {
+        let mut paths = std::collections::BTreeSet::new();
+        for session in self
+            .store
+            .live_sessions()?
+            .iter()
+            .chain(closed_sessions.iter())
+        {
+            if session.origin != SessionOrigin::Spawned {
+                continue;
+            }
+            let path = Path::new(&session.worktree_path);
+            if is_real_directory(path) && self.is_broker_owned_worktree(session, path) {
+                paths.insert(session.worktree_path.clone());
+            }
+        }
+
+        let records = crate::measurement::load_size_records(&self.main_root);
+        let mut known = 0_u64;
+        let mut unmeasured = 0_usize;
+        for path in paths {
+            match records.get(&path).and_then(|record| record.inodes) {
+                Some(inodes) => known = known.saturating_add(inodes),
+                None => unmeasured = unmeasured.saturating_add(1),
+            }
+        }
+        Ok((known, unmeasured))
     }
 
     /// Remove a session's worktree and mark it cleaned. Refuses when the
@@ -11029,18 +11106,7 @@ fn is_real_directory(path: &Path) -> bool {
 }
 
 pub(crate) fn directory_size_without_following_links(path: &Path) -> std::io::Result<u64> {
-    let metadata = std::fs::symlink_metadata(path)?;
-    if metadata.file_type().is_symlink() {
-        return Ok(0);
-    }
-    if metadata.is_file() {
-        return Ok(metadata.len());
-    }
-    let mut total = 0_u64;
-    for entry in std::fs::read_dir(path)? {
-        total = total.saturating_add(directory_size_without_following_links(&entry?.path())?);
-    }
-    Ok(total)
+    crate::disk_headroom::directory_usage_without_following_links(path).map(|usage| usage.bytes)
 }
 
 /// Size a tree, abandoning the walk when `deadline` passes.
@@ -11050,28 +11116,6 @@ pub(crate) fn directory_size_without_following_links(path: &Path) -> std::io::Re
 /// outlives the walk that produced it, and there is no way to tell it apart
 /// from a real one afterwards. A routine check that cannot finish a
 /// measurement learns nothing, which is the honest outcome.
-pub(crate) fn directory_size_bounded(path: &Path, deadline: std::time::Instant) -> Option<u64> {
-    fn walk(path: &Path, deadline: std::time::Instant) -> Option<u64> {
-        if std::time::Instant::now() >= deadline {
-            return None;
-        }
-        let metadata = std::fs::symlink_metadata(path).ok()?;
-        if metadata.file_type().is_symlink() {
-            return Some(0);
-        }
-        if metadata.is_file() {
-            return Some(metadata.len());
-        }
-        let mut total = 0_u64;
-        for entry in std::fs::read_dir(path).ok()? {
-            let Ok(entry) = entry else { continue };
-            total = total.saturating_add(walk(&entry.path(), deadline)?);
-        }
-        Some(total)
-    }
-    walk(path, deadline)
-}
-
 pub(crate) fn plural_word(
     count: usize,
     singular: &'static str,
@@ -11312,18 +11356,50 @@ fn dirty_session_count(agents: &[AgentView]) -> usize {
         .count()
 }
 
-/// The probe with the least free space, read by `read` -- in production at
-/// its nearest existing directory, and a test can put two probes on volumes
-/// with different free space. Unreadable probes are skipped: an unknown
-/// reading is not evidence of a full disk.
-fn lowest_available_with(
+#[derive(Debug, PartialEq, Eq)]
+struct HeadroomReading {
+    path: PathBuf,
+    available: u64,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct GateHeadroom {
+    bytes: Option<HeadroomReading>,
+    inodes: Option<HeadroomReading>,
+}
+
+fn lowest_headroom_with(
     probes: &[PathBuf],
-    read: impl Fn(&Path) -> Option<u64>,
-) -> Option<(PathBuf, u64)> {
-    probes
-        .iter()
-        .filter_map(|probe| read(probe).map(|available| (probe.clone(), available)))
-        .min_by_key(|(_, available)| *available)
+    read: impl Fn(&Path) -> Option<crate::disk_headroom::DiskHeadroom>,
+) -> GateHeadroom {
+    let mut lowest = GateHeadroom::default();
+    for probe in probes {
+        let Some(headroom) = read(probe) else {
+            continue;
+        };
+        if lowest
+            .bytes
+            .as_ref()
+            .is_none_or(|current| headroom.bytes < current.available)
+        {
+            lowest.bytes = Some(HeadroomReading {
+                path: probe.clone(),
+                available: headroom.bytes,
+            });
+        }
+        if let Some(inodes) = headroom.inodes
+            && lowest
+                .inodes
+                .as_ref()
+                .is_none_or(|current| inodes < current.available)
+        {
+            lowest.inodes = Some(HeadroomReading {
+                path: probe.clone(),
+                available: inodes,
+            });
+        }
+    }
+    lowest
 }
 
 /// The advisory for a volume with less free space than a gate needs, or `None`.
@@ -11358,57 +11434,83 @@ fn lowest_available_with(
 /// Unknown headroom does not escalate, for the reason `refusal` fails open: a
 /// reading that could not be taken is not evidence of a full disk.
 fn gate_headroom_advice(
-    available: Option<u64>,
-    probe: Option<&Path>,
-    required: u64,
+    available_bytes: Option<u64>,
+    byte_probe: Option<&Path>,
+    available_inodes: Option<u64>,
+    inode_probe: Option<&Path>,
+    required_bytes: u64,
+    required_inodes: u64,
 ) -> Option<StatusAdvice> {
-    let available = available?;
-    let starved = matches!(
-        crate::disk_headroom::sweep_urgency(Some(available), required),
-        crate::disk_headroom::SweepUrgency::Pressured
-    );
-    let warn_below = required.saturating_mul(DISK_LOW_WARNING_MULTIPLE);
-    if !starved && available >= warn_below {
+    let bytes_starved = available_bytes.is_some_and(|available| available < required_bytes);
+    let inodes_starved = available_inodes.is_some_and(|available| available < required_inodes);
+    let starved = bytes_starved || inodes_starved;
+    let warn_below_bytes = required_bytes.saturating_mul(DISK_LOW_WARNING_MULTIPLE);
+    let warn_below_inodes = required_inodes.saturating_mul(DISK_LOW_WARNING_MULTIPLE);
+    let bytes_low = available_bytes.is_some_and(|available| available < warn_below_bytes);
+    let inodes_low = available_inodes.is_some_and(|available| available < warn_below_inodes);
+    if !starved && !bytes_low && !inodes_low {
         return None;
     }
-    let volume = probe
-        .map(|probe| format!(" on the volume holding {}", probe.display()))
-        .unwrap_or_default();
-    let free = crate::disk_headroom::format_gibibytes(available);
-    let needed = crate::disk_headroom::format_gibibytes(required);
-    let (id, severity, reason, summary) = if starved {
-        (
-            "host.gate-headroom",
-            StatusAdviceSeverity::Blocked,
-            "the host has less free space than a gate needs to start",
-            format!(
-                "{free} free{volume} and a gate needs {needed} to start, so every gate here refuses \
-                 before running anything until space is reclaimed"
-            ),
+
+    let mut constraints = Vec::new();
+    let mut evidence = Vec::new();
+    if let Some(available) = available_bytes {
+        let volume = byte_probe
+            .map(|probe| format!(" on {}", probe.display()))
+            .unwrap_or_default();
+        constraints.push(format!(
+            "{} free{volume}; a gate needs {}",
+            crate::disk_headroom::format_gibibytes(available),
+            crate::disk_headroom::format_gibibytes(required_bytes)
+        ));
+        evidence.push(format!("free/required bytes: {available}/{required_bytes}"));
+    }
+    if let Some(available) = available_inodes {
+        let volume = inode_probe
+            .map(|probe| format!(" on {}", probe.display()))
+            .unwrap_or_default();
+        constraints.push(format!(
+            "{} free inodes{volume}; a gate needs {} inodes",
+            available, required_inodes
+        ));
+        evidence.push(format!(
+            "free/required inodes: {available}/{required_inodes}"
+        ));
+    }
+
+    let summary = if starved {
+        format!(
+            "{}; every gate here refuses before running until resources are reclaimed",
+            constraints.join("; ")
         )
     } else {
-        (
-            "host.disk-low",
-            StatusAdviceSeverity::Warning,
-            "the host is close to the free space a gate needs to start",
-            format!(
-                "{free} free{volume}; gates refuse below {needed}, so one large build \
-                 could stop every gate here"
-            ),
+        format!(
+            "{}; one large build could stop every gate here",
+            constraints.join("; ")
         )
     };
+    evidence.push("the volume is shared: other repositories and files on it count too".into());
+    evidence.push("gc reclaim plan covers quiet open sessions' build output".into());
     Some(StatusAdvice {
-        id,
-        severity,
-        reason,
+        id: if starved {
+            "host.gate-headroom"
+        } else {
+            "host.disk-low"
+        },
+        severity: if starved {
+            StatusAdviceSeverity::Blocked
+        } else {
+            StatusAdviceSeverity::Warning
+        },
+        reason: if starved {
+            "the host has less free byte or inode headroom than a gate needs to start"
+        } else {
+            "the host is close to the byte or inode headroom a gate needs to start"
+        },
         summary,
         session_id: None,
         queue_entry_id: None,
-        evidence: vec![
-            format!("free/required: {}/{} bytes", available, required),
-            "the volume is shared: other repositories and files on it count too".into(),
-            "`gc reclaim plan` also covers quiet open sessions' build output, which `gc plan` does not".into(),
-        ],
+        evidence,
         commands: vec![
             "aethyme broker gc reclaim plan".into(),
             "aethyme broker gc plan".into(),
@@ -12607,6 +12709,7 @@ mod tests {
     };
     use crate::types::{MergeQueueEntry, Session, SessionOrigin, SessionStatus};
     use crate::version::{BinaryBuild, VersionDriftReport, VersionDriftStatus};
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn routine_inventory_zero_budget_is_incomplete_and_cannot_authorize_cleanup() {
@@ -13101,6 +13204,10 @@ mod tests {
             // `gate_headroom_advice_fires_exactly_below_the_gate_threshold`.
             host_available_bytes: None,
             host_volume_probe: None,
+            host_inode_volume_probe: None,
+            inodes_free: None,
+            worktree_inodes: 0,
+            worktree_inode_unmeasured: 0,
             severity: super::StatusAdviceSeverity::Warning,
             retention_config: Default::default(),
         };
@@ -13136,12 +13243,57 @@ mod tests {
     /// fire on exactly the same side of the same number -- one byte either way
     /// would have status and gates describing two different disks.
     #[test]
+    fn gate_headroom_probes_capture_bytes_and_inodes_in_one_stat_read_each() {
+        let probes = vec![PathBuf::from("/bytes"), PathBuf::from("/inodes")];
+        let reads = std::cell::Cell::new(0);
+        let read = |path: &Path| {
+            reads.set(reads.get() + 1);
+            if path == Path::new("/bytes") {
+                Some(crate::disk_headroom::DiskHeadroom {
+                    bytes: 1,
+                    inodes: Some(10),
+                })
+            } else {
+                Some(crate::disk_headroom::DiskHeadroom {
+                    bytes: 10,
+                    inodes: Some(1),
+                })
+            }
+        };
+        let headroom = super::lowest_headroom_with(&probes, read);
+        assert_eq!(
+            headroom.bytes,
+            Some(super::HeadroomReading {
+                path: PathBuf::from("/bytes"),
+                available: 1,
+            })
+        );
+        assert_eq!(
+            headroom.inodes,
+            Some(super::HeadroomReading {
+                path: PathBuf::from("/inodes"),
+                available: 1,
+            })
+        );
+        assert_eq!(reads.get(), probes.len());
+    }
+
+    #[test]
     fn gate_headroom_advice_fires_exactly_below_the_gate_threshold() {
         let required = crate::disk_headroom::DEFAULT_GATE_HEADROOM_BYTES;
         let probe = std::path::Path::new("/host/state/worktrees/repo");
 
-        let starved = super::gate_headroom_advice(Some(required - 1), Some(probe), required)
-            .expect("one byte under the gate threshold blocks every gate");
+        let inode_threshold = crate::disk_headroom::MIN_GATE_HEADROOM_INODES;
+        let ample_inodes = Some(inode_threshold * 2);
+        let starved = super::gate_headroom_advice(
+            Some(required - 1),
+            Some(probe),
+            ample_inodes,
+            Some(probe),
+            required,
+            inode_threshold,
+        )
+        .expect("one byte under the gate threshold blocks every gate");
         assert_eq!(starved.id, "host.gate-headroom");
         assert_eq!(starved.severity, super::StatusAdviceSeverity::Blocked);
         assert!(
@@ -13158,8 +13310,15 @@ mod tests {
             ]
         );
 
-        let at_threshold = super::gate_headroom_advice(Some(required), Some(probe), required)
-            .expect("exactly the requirement still warns: one build from refusing");
+        let at_threshold = super::gate_headroom_advice(
+            Some(required),
+            Some(probe),
+            ample_inodes,
+            Some(probe),
+            required,
+            inode_threshold,
+        )
+        .expect("exactly the requirement still warns: one build from refusing");
         assert_eq!(
             at_threshold.id, "host.disk-low",
             "exactly the requirement lets a gate start, so it must not report a blocked gate"
@@ -13168,13 +13327,55 @@ mod tests {
         assert_eq!(at_threshold.commands, starved.commands);
         let warn_below = required * super::DISK_LOW_WARNING_MULTIPLE;
         assert_eq!(
-            super::gate_headroom_advice(Some(warn_below - 1), None, required)
-                .map(|advice| advice.id),
+            super::gate_headroom_advice(
+                Some(warn_below - 1),
+                None,
+                ample_inodes,
+                None,
+                required,
+                inode_threshold
+            )
+            .map(|advice| advice.id),
             Some("host.disk-low")
         );
-        assert!(super::gate_headroom_advice(Some(warn_below), None, required).is_none());
+        assert!(
+            super::gate_headroom_advice(
+                Some(warn_below),
+                None,
+                ample_inodes,
+                None,
+                required,
+                inode_threshold
+            )
+            .is_none()
+        );
         // Unknown fails open, for the same reason `refusal` does.
-        assert!(super::gate_headroom_advice(None, Some(probe), required).is_none());
+        let inode_starved = super::gate_headroom_advice(
+            Some(required * 2),
+            None,
+            Some(inode_threshold - 1),
+            Some(probe),
+            required,
+            inode_threshold,
+        )
+        .expect("low free inodes blocks every gate");
+        assert_eq!(inode_starved.id, "host.gate-headroom");
+        assert!(
+            inode_starved
+                .summary
+                .contains("inodes on /host/state/worktrees/repo")
+        );
+        assert!(
+            super::gate_headroom_advice(
+                None,
+                Some(probe),
+                None,
+                Some(probe),
+                required,
+                inode_threshold
+            )
+            .is_none()
+        );
     }
 
     /// A session gate runs under the worktree root and a verification slot in
@@ -13186,20 +13387,32 @@ mod tests {
         let starved = std::path::PathBuf::from("/starved");
         let unreadable = std::path::PathBuf::from("/unreadable");
         let read = |path: &std::path::Path| match path.to_str() {
-            Some("/roomy") => Some(500),
-            Some("/starved") => Some(3),
+            Some("/roomy") => Some(crate::disk_headroom::DiskHeadroom {
+                bytes: 500,
+                inodes: Some(500),
+            }),
+            Some("/starved") => Some(crate::disk_headroom::DiskHeadroom {
+                bytes: 3,
+                inodes: Some(3),
+            }),
             _ => None,
         };
         assert_eq!(
-            super::lowest_available_with(&[roomy.clone(), starved.clone()], read),
-            Some((starved.clone(), 3))
+            super::lowest_headroom_with(&[roomy.clone(), starved.clone()], read).bytes,
+            Some(super::HeadroomReading {
+                path: starved.clone(),
+                available: 3,
+            })
         );
         assert_eq!(
-            super::lowest_available_with(&[unreadable.clone(), roomy.clone()], read),
-            Some((roomy, 500))
+            super::lowest_headroom_with(&[unreadable.clone(), roomy.clone()], read).bytes,
+            Some(super::HeadroomReading {
+                path: roomy,
+                available: 500,
+            })
         );
-        assert_eq!(super::lowest_available_with(&[unreadable], read), None);
-        assert_eq!(super::lowest_available_with(&[], read), None);
+        assert_eq!(super::lowest_headroom_with(&[unreadable], read).bytes, None);
+        assert_eq!(super::lowest_headroom_with(&[], read).bytes, None);
     }
 
     /// A worktree root does not exist before a repository's first session;
@@ -13211,7 +13424,7 @@ mod tests {
         assert!(!missing.exists());
         assert!(crate::disk_headroom::available_bytes(&missing).is_none());
         assert!(
-            crate::disk_headroom::available_bytes_at_or_above(&missing).is_some(),
+            crate::disk_headroom::available_headroom_at_or_above(&missing).is_some(),
             "a path that does not exist yet is read on the volume it will be created on"
         );
     }
@@ -13254,8 +13467,11 @@ mod tests {
                 candidate_artifacts: 0,
                 candidate_orphans: 0,
                 estimated_reclaimable_bytes: 0,
+                estimated_reclaimable_inodes: None,
                 estimated_retained_bytes: 0,
+                estimated_retained_inodes: None,
                 estimated_blocked_bytes: 0,
+                estimated_blocked_inodes: None,
                 over_retained_bytes_budget: false,
                 retained_bytes_deficit: 0,
                 clears_retained_bytes_budget: true,
