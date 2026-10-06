@@ -25,8 +25,27 @@ const MCP_BRIDGE_SHUTDOWN_GRACE: Duration = Duration::from_millis(200);
 #[serde(tag = "status", rename_all = "snake_case")]
 pub(crate) enum SessionTabRename {
     Renamed { tab_id: String, title: String },
+    NotApplicable { reason: String },
     Pending { reason: String },
     Refused { reason: String },
+}
+
+pub(crate) fn rename_session_tab_if_applicable(
+    session: &Session,
+    previous_short_name: Option<&str>,
+    repository_name_fallback: Option<&str>,
+) -> SessionTabRename {
+    if session
+        .tab_name
+        .as_deref()
+        .is_some_and(|name| !name.trim().is_empty())
+    {
+        rename_session_tab(session, previous_short_name, repository_name_fallback)
+    } else {
+        SessionTabRename::NotApplicable {
+            reason: "no Chau7 tab name was given or stored for this session".into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
