@@ -236,6 +236,7 @@ pub(super) const FLAG_RULES: &[(&str, &[&str])] = &[
             "--reason",
             "--destructive",
             "--cross-session",
+            "--ref-write-acknowledged",
             "--no-wait",
             "--queue-timeout",
             "--take-over",

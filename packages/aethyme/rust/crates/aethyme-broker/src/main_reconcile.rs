@@ -448,6 +448,7 @@ impl Broker {
                 declared_effect: Some(declared_effect),
                 destructive_confirmed,
                 cross_session: None,
+                ref_write_acknowledged: false,
                 authorization_reason: Some(format!(
                     "reviewed main reconcile {} onto {}",
                     plan.digest, plan.integration_sha

@@ -99,7 +99,7 @@ fn git(repo: &Path, args: &[&str]) {
 fn pr(number: u64, state: &str, draft: bool, head: &str, merge: Option<&str>) -> String {
     let merge = merge.map_or("null".to_string(), |oid| format!(r#"{{"oid":"{oid}"}}"#));
     format!(
-        r#"{{"number":{number},"state":"{state}","isDraft":{draft},"headRefOid":"{head}","baseRefName":"main","mergeCommit":{merge}}}"#
+        r#"{{"number":{number},"state":"{state}","isDraft":{draft},"headRefName":"agent/pr-{number}","headRefOid":"{head}","baseRefName":"main","mergeCommit":{merge}}}"#
     )
 }
 
@@ -146,6 +146,11 @@ impl Fixture {
         std::fs::write(repo.path().join("a.txt"), "a\n").unwrap();
         git(repo.path(), &["add", "-A"]);
         git(repo.path(), &["commit", "-qm", "init"]);
+        // The branch guard requires --repo to be this checkout's origin.
+        git(
+            repo.path(),
+            &["remote", "add", "origin", "git@github.com:o/n.git"],
+        );
 
         let mut fixture = Self {
             repo,
@@ -190,6 +195,7 @@ impl Fixture {
                     std::env::var("PATH").unwrap_or_default()
                 ),
             )
+            .env("GIT_SSH_COMMAND", "false")
             .env("AETHYME_FAKE_GH_DIR", self.gh.path())
             .output()
             .unwrap()
@@ -514,7 +520,7 @@ fn a_repo_the_session_does_not_point_at_is_refused_before_any_call() {
         fixture.repo.path(),
         &[
             "remote",
-            "add",
+            "set-url",
             "origin",
             "https://github.com/someone/else.git",
         ],

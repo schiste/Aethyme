@@ -921,6 +921,7 @@ impl Broker {
                 declared_effect: None,
                 destructive_confirmed: false,
                 cross_session: None,
+                ref_write_acknowledged: false,
                 authorization_reason: Some(format!(
                     "confirmed broker ship for queue entry {}",
                     plan.queue_entry.id
@@ -992,6 +993,7 @@ impl Broker {
                 declared_effect: None,
                 destructive_confirmed: false,
                 cross_session: None,
+                ref_write_acknowledged: false,
                 authorization_reason: Some(format!(
                     "{}; confirmed broker ship for queue entry {} at {confirm}",
                     publication_authorization_label(&publication_authorization),
@@ -1020,6 +1022,7 @@ impl Broker {
                 declared_effect: Some(OperationEffect::Read),
                 destructive_confirmed: false,
                 cross_session: None,
+                ref_write_acknowledged: false,
                 authorization_reason: None,
                 args: vec![
                     "ls-remote".into(),
@@ -1081,6 +1084,7 @@ impl Broker {
                     declared_effect: None,
                     destructive_confirmed: false,
                     cross_session: None,
+                    ref_write_acknowledged: false,
                     authorization_reason: Some(format!(
                         "explicit --sync-main after publishing queue entry {} at {confirm}",
                         plan.queue_entry.id
@@ -1692,6 +1696,7 @@ fn preserve_local_main_before_delivery(
             declared_effect: Some(OperationEffect::Write),
             destructive_confirmed: false,
             cross_session: None,
+            ref_write_acknowledged: false,
             authorization_reason: Some(format!(
                 "preserve reviewed local main tip {} before delivery plan {} for queue entry {}",
                 plan.local_default_branch_sha, plan.plan_digest, plan.queue_entry.id
@@ -1824,6 +1829,7 @@ fn merge_local_main_before_delivery(
             declared_effect: Some(OperationEffect::Write),
             destructive_confirmed: false,
             cross_session: None,
+            ref_write_acknowledged: false,
             authorization_reason: Some(format!(
                 "reviewed local_main_merge delivery plan {} for queue entry {}",
                 plan.plan_digest, plan.queue_entry.id
@@ -1904,6 +1910,7 @@ fn execute_pull_request_delivery(
             declared_effect: None,
             destructive_confirmed: false,
             cross_session: None,
+            ref_write_acknowledged: false,
             authorization_reason: Some(format!(
                 "revalidate pull-request delivery base for queue entry {}",
                 plan.queue_entry.id
@@ -1958,6 +1965,7 @@ fn execute_pull_request_delivery(
                     declared_effect: Some(OperationEffect::Write),
                     destructive_confirmed: false,
                     cross_session: None,
+                    ref_write_acknowledged: false,
                     authorization_reason: Some(format!(
                         "create deterministic delivery branch for queue entry {} at {}",
                         plan.queue_entry.id, plan.publication_sha
@@ -2010,6 +2018,7 @@ fn execute_pull_request_delivery(
             declared_effect: Some(OperationEffect::Write),
             destructive_confirmed: false,
             cross_session: None,
+            ref_write_acknowledged: false,
             authorization_reason: Some(format!(
                 "push exact pull-request delivery head {} for queue entry {}",
                 plan.publication_sha, plan.queue_entry.id
@@ -2066,6 +2075,7 @@ fn execute_pull_request_delivery(
                 declared_effect: Some(OperationEffect::Write),
                 destructive_confirmed: false,
                 cross_session: None,
+                ref_write_acknowledged: false,
                 authorization_reason: Some(format!(
                     "open pull-request delivery for queue entry {} at {}",
                     plan.queue_entry.id, plan.publication_sha
@@ -2255,6 +2265,7 @@ fn delivery_github_read(
             declared_effect: Some(OperationEffect::Read),
             destructive_confirmed: false,
             cross_session: None,
+            ref_write_acknowledged: false,
             authorization_reason: None,
             args,
         },
@@ -2308,6 +2319,7 @@ fn verify_delivery_target(
             declared_effect: None,
             destructive_confirmed: false,
             cross_session: None,
+            ref_write_acknowledged: false,
             authorization_reason: Some(format!(
                 "refresh target branch evidence after provider merge for queue entry {}",
                 plan.queue_entry.id

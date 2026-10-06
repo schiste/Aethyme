@@ -157,7 +157,14 @@ fn successful_coordinated_pr_merge_cleans_a_fully_landed_integration_layer() {
 
     write_executable(
         &fake_bin.join("gh"),
-        "#!/bin/sh\nprintf 'merged pull request 42\\n'\nexit 0\n",
+        r#"#!/bin/sh
+if [ "$1 $2" = 'pr view' ]; then
+  printf '{"headRefName":"agent/pr-42","headRefOid":"1111111111111111111111111111111111111111","baseRefName":"main"}\n'
+  exit 0
+fi
+printf 'merged pull request 42\n'
+exit 0
+"#,
     );
     write_executable(
         &fake_bin.join("git"),

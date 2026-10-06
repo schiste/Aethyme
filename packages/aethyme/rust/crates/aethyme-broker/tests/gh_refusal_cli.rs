@@ -19,6 +19,11 @@ mod common;
 /// or kills itself to stand in for a crash part-way through the request.
 const FAKE_GH: &str = r#"#!/bin/sh
 case "$1 $2" in
+  'pr view')
+    printf '{"headRefName":"agent/pr-506","headRefOid":"%s","baseRefName":"main"}\n' \
+      1111111111111111111111111111111111111111
+    exit 0
+    ;;
   'pr update-branch')
     printf '%s\n' "$AETHYME_FAKE_GH_STDERR" >&2
     if [ "$AETHYME_FAKE_GH_RC" = 'kill' ]; then kill -9 $$; fi
@@ -64,6 +69,16 @@ impl Fixture {
         std::fs::write(repo.path().join("a.txt"), "a\n").unwrap();
         git(repo.path(), &["add", "-A"]);
         git(repo.path(), &["commit", "-qm", "init"]);
+        // The branch guard requires --repo to be this checkout's origin.
+        git(
+            repo.path(),
+            &[
+                "remote",
+                "add",
+                "origin",
+                "git@github.com:schiste/Aethyme.git",
+            ],
+        );
 
         let mut fixture = Self {
             repo,
@@ -98,6 +113,7 @@ impl Fixture {
                     std::env::var("PATH").unwrap_or_default()
                 ),
             )
+            .env("GIT_SSH_COMMAND", "false")
             .env("AETHYME_FAKE_GH_STDERR", stderr)
             .env("AETHYME_FAKE_GH_RC", rc)
             .output()

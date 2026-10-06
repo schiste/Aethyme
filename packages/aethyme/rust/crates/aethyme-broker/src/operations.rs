@@ -681,6 +681,10 @@ pub struct CoordinatedCommand {
     /// The live session whose branch a destructive write may delete or
     /// rewrite (`--cross-session`). Without it such a write is refused (#393).
     pub cross_session: Option<i64>,
+    /// `--ref-write-acknowledged`: the operator confirmed that a gh command
+    /// whose branch the broker cannot determine touches no other live
+    /// session's branch. Requires `--destructive` (#393).
+    pub ref_write_acknowledged: bool,
     /// Required for writes; identifies the user request or documented workflow.
     pub authorization_reason: Option<String>,
     pub args: Vec<String>,
@@ -1549,12 +1553,9 @@ fn has_forced_refspec(args: &[String]) -> bool {
 fn destructive_branch_targets(provider: OperationProvider, args: &[String]) -> Vec<String> {
     match provider {
         OperationProvider::Git => git_destructive_branch_targets(args),
-        // `gh api -X DELETE repos/<owner>/<name>/git/refs/heads/<branch>`.
-        OperationProvider::Github => args
-            .iter()
-            .filter_map(|arg| arg.split_once("git/refs/heads/"))
-            .map(|(_, branch)| branch.to_string())
-            .collect(),
+        // gh commands are analyzed fail-closed by `gh_ref_guard`, which the
+        // guard consults directly.
+        OperationProvider::Github => Vec::new(),
     }
 }
 
@@ -1602,6 +1603,100 @@ fn git_destructive_branch_targets(args: &[String]) -> Vec<String> {
         .filter(|branch| !branch.is_empty())
         .map(str::to_string)
         .collect()
+}
+
+fn same_directory(left: &Path, right: &Path) -> bool {
+    matches!(
+        (left.canonicalize(), right.canonicalize()),
+        (Ok(left), Ok(right)) if left == right
+    )
+}
+
+/// The branches a pull request joins, read in one call.
+struct PullRequestRefs {
+    head: String,
+    head_oid: String,
+    base: String,
+}
+
+/// The head branch, head commit and base branch of pull request `number`,
+/// read once with the same directory and `GH_REPO` the command will use.
+fn gh_pr_refs(
+    number: &str,
+    cwd: &Path,
+    target: &crate::ResolvedGithubTarget,
+) -> Result<PullRequestRefs, String> {
+    let output = provider_command(OperationProvider::Github)
+        .args([
+            "pr",
+            "view",
+            number,
+            "--json",
+            "headRefName,headRefOid,baseRefName",
+        ])
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .env("GH_REPO", &target.display_slug)
+        .output()
+        .map_err(|error| format!("cannot run gh pr view {number}: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "gh pr view {number} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("gh pr view {number} returned no JSON: {error}"))?;
+    let field = |name: &str| value[name].as_str().unwrap_or_default().to_string();
+    let (head, head_oid, base) = (
+        field("headRefName"),
+        field("headRefOid"),
+        field("baseRefName"),
+    );
+    if head.is_empty()
+        || base.is_empty()
+        || !(1..=64).contains(&head_oid.len())
+        || !head_oid
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return Err(format!(
+            "gh pr view {number} did not name a head branch, a hex head commit and a base branch"
+        ));
+    }
+    Ok(PullRequestRefs {
+        head,
+        head_oid,
+        base,
+    })
+}
+
+/// The `--repo` target, required to be this checkout's `origin` on
+/// github.com with no `GH_HOST` pointing gh elsewhere.
+fn verify_github_origin<'t>(
+    cwd: &Path,
+    github_target: Option<&'t crate::ResolvedGithubTarget>,
+) -> Result<&'t crate::ResolvedGithubTarget, String> {
+    let target = github_target.ok_or("no --repo target")?;
+    if let Some(host) = std::env::var_os("GH_HOST")
+        && !host.to_string_lossy().eq_ignore_ascii_case("github.com")
+    {
+        return Err(format!(
+            "GH_HOST={} points gh at another host",
+            host.to_string_lossy()
+        ));
+    }
+    match canonical_local_repository(cwd, None) {
+        Ok(Some(origin)) if origin.eq_ignore_ascii_case(&target.coordination_key) => Ok(target),
+        Ok(Some(origin)) => Err(format!(
+            "--repo {} is not this checkout's origin ({origin})",
+            target.display_slug
+        )),
+        _ => Err(format!(
+            "cannot verify that --repo {} is this checkout's origin",
+            target.display_slug
+        )),
+    }
 }
 
 /// Positional arguments of a Git subcommand, skipping options and the values
@@ -1980,21 +2075,43 @@ pub fn classify_git(args: &[String]) -> Option<OperationEffect> {
     }
 }
 
+/// The HTTP method `gh api` will use. gh's flag parser keeps the LAST of
+/// `-X GET … -X DELETE`, so this must too: taking the first would classify a
+/// branch deletion as a read (#393).
 fn gh_method(args: &[String]) -> Option<&str> {
-    args.windows(2)
-        .find(|pair| matches!(pair[0].as_str(), "-X" | "--method"))
-        .map(|pair| pair[1].as_str())
-        .or_else(|| args.iter().find_map(|arg| arg.strip_prefix("--method=")))
-        // `-XDELETE`: the method bundled into the flag, as curl also accepts.
-        .or_else(|| {
-            args.iter()
-                .find_map(|arg| arg.strip_prefix("-X").filter(|method| !method.is_empty()))
-        })
+    let mut method = None;
+    let mut iter = args.iter().peekable();
+    while let Some(arg) = iter.next() {
+        if matches!(arg.as_str(), "-X" | "--method") {
+            method = iter.peek().map(|value| value.as_str());
+        } else if let Some(value) = arg.strip_prefix("--method=") {
+            method = Some(value);
+        } else if let Some(value) = arg.strip_prefix("-X").filter(|value| !value.is_empty()) {
+            // `-XDELETE`: the method bundled into the flag, as curl also accepts.
+            method = Some(value);
+        }
+    }
+    method
 }
 
 pub fn classify_gh(args: &[String]) -> Option<OperationEffect> {
     let command = args.first()?.as_str();
     let action = args.get(1).map(String::as_str);
+    // The two exact forms `gh_ref_guard` resolves to a branch delete are
+    // destructive; anything else that may write a ref is refused by the
+    // guard unless acknowledged (#393).
+    if matches!(
+        crate::gh_ref_guard::assess(args, ""),
+        crate::gh_ref_guard::Verdict::PrMerge {
+            deletes_head: true,
+            ..
+        }
+    ) || args.first().map(String::as_str) == Some("api")
+        && args.get(1).map(String::as_str) == Some("-X")
+        && args.get(2).map(String::as_str) == Some("DELETE")
+    {
+        return Some(OperationEffect::Destructive);
+    }
     if command == "api" {
         let method = gh_method(args).unwrap_or_else(|| {
             if has_any(args, &["-f", "--raw-field", "-F", "--field", "--input"]) {
@@ -3645,8 +3762,157 @@ fn provider_executable(provider: OperationProvider) -> &'static str {
 fn provider_command(provider: OperationProvider) -> Command {
     match provider {
         OperationProvider::Git => crate::git::git_command(),
-        OperationProvider::Github => Command::new(provider_executable(provider)),
+        OperationProvider::Github => github_command(),
     }
+}
+
+/// Variables a coordinated `gh` (and any `git` it starts) may inherit: auth,
+/// locale, proxies and certificates. Everything else is dropped, because gh
+/// and git turn variables into commands (`GH_BROWSER`, `EDITOR`, `PAGER`,
+/// `GIT_SSH_COMMAND`, `GIT_CONFIG_*` ...) or into another target (`GH_HOST`,
+/// `GH_CONFIG_DIR`, `GIT_DIR` ...), either of which bypasses the branch guard
+/// (#393). `PATH` and `HOME` are set, not inherited. `AETHYME_*` is the
+/// broker's own namespace.
+const GH_INHERITED_ENV: &[&str] = &[
+    "USER",
+    "LOGNAME",
+    "TMPDIR",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TZ",
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "HTTPS_PROXY",
+    "https_proxy",
+    "HTTP_PROXY",
+    "http_proxy",
+    "NO_PROXY",
+    "no_proxy",
+    "ALL_PROXY",
+    "all_proxy",
+];
+
+/// The only directories gh, and the git gh starts, are taken from. The
+/// caller's `PATH` never chooses either binary (#393).
+const TRUSTED_TOOL_DIRS: &[&str] = &["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"];
+
+static GH_PROGRAM: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+
+/// Where gh is looked up. Release builds use only [`TRUSTED_TOOL_DIRS`].
+/// Debug builds, which only the test suite runs, also search `PATH` first,
+/// so a fixture can stand in a fake gh; installed binaries are release builds.
+fn gh_search_dirs(include_path: bool) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if include_path && let Some(path) = std::env::var_os("PATH") {
+        dirs.extend(std::env::split_paths(&path));
+    }
+    dirs.extend(TRUSTED_TOOL_DIRS.iter().map(PathBuf::from));
+    dirs
+}
+
+/// The first `name` in `dirs` that canonicalizes to a regular executable
+/// file owned by root or the current user and writable by neither group nor
+/// others.
+fn trusted_tool(name: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    // SAFETY: getuid has no preconditions and cannot fail.
+    let uid = unsafe { libc::getuid() };
+    dirs.iter().find_map(|dir| {
+        let resolved = dir.join(name).canonicalize().ok()?;
+        let metadata = std::fs::metadata(&resolved).ok()?;
+        let mode = metadata.permissions().mode();
+        (metadata.is_file()
+            && mode & 0o111 != 0
+            && mode & 0o022 == 0
+            && (metadata.uid() == 0 || metadata.uid() == uid))
+            .then_some(resolved)
+    })
+}
+
+/// The gh binary, resolved once from [`gh_search_dirs`].
+fn gh_program() -> Option<&'static PathBuf> {
+    GH_PROGRAM
+        .get_or_init(|| trusted_tool("gh", &gh_search_dirs(cfg!(debug_assertions))))
+        .as_ref()
+}
+
+/// The invoking user's home directory from the passwd database, not `HOME`,
+/// so a relocated `HOME` cannot supply gh or git configuration.
+fn passwd_home() -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let mut buffer = vec![0_u8; 16 * 1024];
+    // SAFETY: `passwd` is a plain C struct of pointers and integers, for which
+    // all-zero bytes are a valid (empty) value; getpwuid_r overwrites it.
+    let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut result: *mut libc::passwd = std::ptr::null_mut();
+    // SAFETY: `getpwuid_r` writes only into `entry` and `buffer`, both owned
+    // here and sized as passed; `result` is null or points at `entry`.
+    let status = unsafe {
+        libc::getpwuid_r(
+            libc::getuid(),
+            &mut entry,
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+            &mut result,
+        )
+    };
+    if status != 0 || result.is_null() || entry.pw_dir.is_null() {
+        return None;
+    }
+    // SAFETY: `pw_dir` points into `buffer`, NUL-terminated by getpwuid_r.
+    let dir = unsafe { std::ffi::CStr::from_ptr(entry.pw_dir) };
+    Some(PathBuf::from(std::ffi::OsStr::from_bytes(dir.to_bytes())))
+}
+
+fn github_command() -> Command {
+    let program = gh_program()
+        .cloned()
+        .unwrap_or_else(|| PathBuf::from("/nonexistent/gh"));
+    let mut command = Command::new(&program);
+    command.env_clear();
+    for (key, value) in std::env::vars_os() {
+        let name = key.to_string_lossy();
+        if GH_INHERITED_ENV.contains(&name.as_ref()) || name.starts_with("AETHYME_") {
+            command.env(&key, &value);
+        }
+    }
+    // gh finds git, and anything else it starts, only in the trusted
+    // directories.
+    command.env("PATH", TRUSTED_TOOL_DIRS.join(":"));
+    if let Some(home) = passwd_home() {
+        command.env("HOME", home);
+    }
+    // gh's settings may name a browser, editor or pager command; the
+    // environment overrides them. The git gh starts reads no system or
+    // global configuration, and the repository's own cannot name a hook
+    // directory, an ssh command or an fsmonitor to run.
+    command
+        .env("GH_PROMPT_DISABLED", "1")
+        .env("GH_NO_UPDATE_NOTIFIER", "1")
+        .env("GH_PAGER", "cat")
+        .env("GH_BROWSER", "false")
+        .env("GH_EDITOR", "false")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        // An empty `credential.helper` resets the helper list, so a helper
+        // the repository's config names never runs. `include.path` cannot be
+        // switched off this way; it is a known limit.
+        .env("GIT_CONFIG_COUNT", "5")
+        .env("GIT_CONFIG_KEY_0", "core.hooksPath")
+        .env("GIT_CONFIG_VALUE_0", "/dev/null")
+        .env("GIT_CONFIG_KEY_1", "core.sshCommand")
+        .env("GIT_CONFIG_VALUE_1", "ssh")
+        .env("GIT_CONFIG_KEY_2", "core.fsmonitor")
+        .env("GIT_CONFIG_VALUE_2", "false")
+        .env("GIT_CONFIG_KEY_3", "credential.helper")
+        .env("GIT_CONFIG_VALUE_3", "")
+        .env("GIT_CONFIG_KEY_4", "protocol.file.allow")
+        .env("GIT_CONFIG_VALUE_4", "never");
+    command
 }
 
 /// Do not let inherited command-scope Git config change what a coordinated
@@ -3916,6 +4182,7 @@ impl Broker {
             declared_effect: None,
             destructive_confirmed: false,
             cross_session: None,
+            ref_write_acknowledged: false,
             authorization_reason: Some(
                 "refresh the tracked target after an authorized pull-request merge".into(),
             ),
@@ -4066,6 +4333,109 @@ impl Broker {
         )
     }
 
+    /// Decide a gh command's branch-ref write before anything is journaled
+    /// (#393): the branches it deletes, and the exact argv to run when the
+    /// check binds it (`--match-head-commit` injected for `pr merge -d`).
+    /// Every doubt refuses; only an operator's `--destructive
+    /// --ref-write-acknowledged` lets an unverifiable command through.
+    fn check_gh_ref_write(
+        &mut self,
+        request: &CoordinatedCommand,
+        cwd: &Path,
+        github_target: Option<&crate::ResolvedGithubTarget>,
+    ) -> Result<(Vec<String>, Option<Vec<String>>), BrokerOpError> {
+        use crate::gh_ref_guard::Verdict;
+        let refuse = |why: String| {
+            Err(BrokerOpError::InvalidCoordinatedOperation {
+                reason: format!(
+                    "refusing a gh command that may write a branch ref: {why}. Nothing was run. \
+                     Use `pr merge <N> --merge|--squash|--rebase [-d]` or `api -X DELETE \
+                     repos/<owner>/<repo>/git/refs/heads/<branch>`, or, only if the operator \
+                     confirmed it touches no other live session's branch, add --destructive \
+                     --ref-write-acknowledged"
+                ),
+            })
+        };
+        let slug = github_target.map_or("", |target| target.display_slug.as_str());
+        let verdict = crate::gh_ref_guard::assess(&request.args, slug);
+        let (number, match_head_commit) = match verdict {
+            Verdict::NoRefWrite => return Ok((Vec::new(), None)),
+            Verdict::Unverifiable(_)
+                if request.ref_write_acknowledged && request.destructive_confirmed =>
+            {
+                return Ok((Vec::new(), None));
+            }
+            Verdict::Unverifiable(why) => return refuse(why),
+            // Files land in the working directory, which must be the session
+            // worktree's root, never inside a `.git` directory.
+            Verdict::DownloadHere => {
+                return match self.store().session(request.session_id) {
+                    Ok(session) if same_directory(cwd, Path::new(&session.worktree_path)) => {
+                        Ok((Vec::new(), None))
+                    }
+                    _ => refuse(format!(
+                        "a download must run from session {}'s worktree root, not {}",
+                        request.session_id,
+                        cwd.display()
+                    )),
+                };
+            }
+            // It cannot touch a ref, but only in the session's own repository.
+            Verdict::SafeWrite => {
+                return match verify_github_origin(cwd, github_target) {
+                    Ok(_) => Ok((Vec::new(), None)),
+                    Err(why) => refuse(why),
+                };
+            }
+            Verdict::DeleteBranch(branch) | Verdict::PrBase(branch) => {
+                return match verify_github_origin(cwd, github_target) {
+                    Ok(_) => Ok((vec![branch], None)),
+                    Err(why) => refuse(why),
+                };
+            }
+            // Merging the base into the head writes the head branch.
+            Verdict::PrUpdateBranch(number) => {
+                let target = match verify_github_origin(cwd, github_target) {
+                    Ok(target) => target,
+                    Err(why) => return refuse(why),
+                };
+                return match gh_pr_refs(&number, cwd, target) {
+                    Ok(refs) => Ok((vec![refs.head], None)),
+                    Err(why) => refuse(why),
+                };
+            }
+            // Every merge advances its base and may delete its head, with
+            // `-d` or the repository's delete-on-merge setting, so both are
+            // checked and the head is bound to the commit read here.
+            Verdict::PrMerge {
+                number,
+                match_head_commit,
+                ..
+            } => (number, match_head_commit),
+        };
+        let target = match verify_github_origin(cwd, github_target) {
+            Ok(target) => target,
+            Err(why) => return refuse(why),
+        };
+        let refs = match gh_pr_refs(&number, cwd, target) {
+            Ok(refs) => refs,
+            Err(why) => return refuse(why),
+        };
+        let targets = vec![refs.head, refs.base];
+        match match_head_commit {
+            Some(sha) if sha != refs.head_oid => refuse(format!(
+                "--match-head-commit {sha} is not pull request #{number}'s head {}",
+                refs.head_oid
+            )),
+            Some(_) => Ok((targets, None)),
+            None => {
+                let mut args = request.args.clone();
+                args.extend(["--match-head-commit".to_string(), refs.head_oid]);
+                Ok((targets, Some(args)))
+            }
+        }
+    }
+
     /// Refuse a destructive operation on a branch that belongs to another
     /// live session, unless `cross_session` names exactly that session.
     /// Returns the session the caller was allowed to cross into.
@@ -4073,8 +4443,9 @@ impl Broker {
         &mut self,
         request: &CoordinatedCommand,
         effect: OperationEffect,
+        gh_targets: Vec<String>,
     ) -> Result<Option<i64>, BrokerOpError> {
-        if effect != OperationEffect::Destructive {
+        if effect != OperationEffect::Destructive && gh_targets.is_empty() {
             return match request.cross_session {
                 Some(_) => Err(BrokerOpError::InvalidCoordinatedOperation {
                     reason: "--cross-session applies only to a destructive operation".into(),
@@ -4082,7 +4453,8 @@ impl Broker {
                 None => Ok(None),
             };
         }
-        let targets = destructive_branch_targets(request.provider, &request.args);
+        let mut targets = destructive_branch_targets(request.provider, &request.args);
+        targets.extend(gh_targets);
         let owners: Vec<crate::Session> = if targets.is_empty() {
             Vec::new()
         } else {
@@ -4125,7 +4497,7 @@ impl Broker {
     /// then durably journal structured successful stdout before success.
     pub(crate) fn run_coordinated_operation_at_with_hooks<P, F>(
         &mut self,
-        request: CoordinatedCommand,
+        mut request: CoordinatedCommand,
         cwd: &Path,
         queue_wait: QueueWait,
         pre_execute: P,
@@ -4197,7 +4569,22 @@ impl Broker {
         // A session id is all a caller needs to name a session, so it proves
         // nothing about whose branch is being deleted or rewritten. Before
         // anything is journaled: the refusal leaves no operation behind (#393).
-        if let Some(owner) = self.refuse_foreign_session_branches(&request, effect)? {
+        if request.ref_write_acknowledged {
+            authorization_reason =
+                authorization_reason.map(|reason| format!("{reason} [ref-write-acknowledged]"));
+        }
+        let gh_targets = if request.provider == OperationProvider::Github {
+            let (targets, bound_args) =
+                self.check_gh_ref_write(&request, cwd, github_target.as_ref())?;
+            if let Some(args) = bound_args {
+                // The argv journaled and run is the one just checked.
+                request.args = args;
+            }
+            targets
+        } else {
+            Vec::new()
+        };
+        if let Some(owner) = self.refuse_foreign_session_branches(&request, effect, gh_targets)? {
             // Recorded with the authorization, so the journal says which
             // session's branch this operation was allowed to touch.
             authorization_reason =
@@ -4665,7 +5052,11 @@ impl Broker {
         if let Some(trace) = &git_trace {
             command.env("GIT_TRACE2_EVENT", trace.path());
         }
-        remove_inherited_git_config_overrides(&mut command);
+        // gh's child gets its own command-scope git config from
+        // `github_command`; stripping it here would undo those overrides.
+        if request.provider == OperationProvider::Git {
+            remove_inherited_git_config_overrides(&mut command);
+        }
         command
             .current_dir(cwd)
             .stdin(Stdio::inherit())
@@ -5638,12 +6029,42 @@ mod tests {
             eprintln!("no git on PATH probed clean; only the equality was checked");
         }
 
-        // `gh` has no probe and needs none -- nothing in the broker parses its
-        // output to authorize anything -- so PATH resolution is correct there.
-        assert_eq!(
-            provider_command(OperationProvider::Github).get_program(),
-            std::ffi::OsStr::new("gh")
+        // `gh` is resolved once to an absolute path, so the PATH a caller
+        // hands the child never chooses the binary (#393).
+        assert!(
+            Path::new(provider_command(OperationProvider::Github).get_program()).is_absolute(),
+            "gh runs by absolute path: {:?}",
+            provider_command(OperationProvider::Github).get_program()
         );
+    }
+
+    #[test]
+    fn gh_is_trusted_only_from_fixed_directories_and_safe_files() {
+        use std::os::unix::fs::PermissionsExt as _;
+        // Release resolution never consults PATH.
+        assert_eq!(
+            gh_search_dirs(false),
+            TRUSTED_TOOL_DIRS
+                .iter()
+                .map(PathBuf::from)
+                .collect::<Vec<_>>()
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let gh = dir.path().join("gh");
+        std::fs::write(&gh, "#!/bin/sh\n").unwrap();
+        for (mode, trusted) in [
+            (0o755, true),
+            (0o775, false),
+            (0o757, false),
+            (0o644, false),
+        ] {
+            std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(mode)).unwrap();
+            assert_eq!(
+                trusted_tool("gh", &[dir.path().to_path_buf()]).is_some(),
+                trusted,
+                "mode {mode:o}"
+            );
+        }
     }
 
     #[test]
@@ -6543,13 +6964,16 @@ mod tests {
             ["agent/a"]
         );
         assert!(git(&["reset", "--hard", "HEAD~1"]).is_empty());
-        let gh = destructive_branch_targets(
-            OperationProvider::Github,
-            &["api", "-X", "DELETE", "repos/o/n/git/refs/heads/agent/a"]
-                .iter()
-                .map(|arg| (*arg).to_string())
-                .collect::<Vec<_>>(),
+        // gh commands are resolved by `gh_ref_guard`, not by argument matching.
+        assert!(
+            destructive_branch_targets(
+                OperationProvider::Github,
+                &["api", "-X", "DELETE", "repos/o/n/git/refs/heads/agent/a"]
+                    .iter()
+                    .map(|arg| (*arg).to_string())
+                    .collect::<Vec<_>>(),
+            )
+            .is_empty()
         );
-        assert_eq!(gh, ["agent/a"]);
     }
 }

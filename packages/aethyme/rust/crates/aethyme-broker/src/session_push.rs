@@ -370,6 +370,7 @@ impl Broker {
                 // session's own last push, on this session's own branch.
                 destructive_confirmed: effect == OperationEffect::Destructive,
                 cross_session: None,
+                ref_write_acknowledged: false,
                 authorization_reason: Some(format!("repository policy {SESSION_PUSH_POLICY_KEY}")),
                 args,
             },
@@ -486,6 +487,7 @@ impl Broker {
                 declared_effect: None,
                 destructive_confirmed: false,
                 cross_session: None,
+                ref_write_acknowledged: false,
                 authorization_reason: Some(
                     "refresh the default branch to compare a session with it".into(),
                 ),
@@ -616,6 +618,7 @@ impl Broker {
                 declared_effect: Some(OperationEffect::Write),
                 destructive_confirmed: false,
                 cross_session: None,
+                ref_write_acknowledged: false,
                 authorization_reason: Some(format!("repository policy {SESSION_PUSH_POLICY_KEY}")),
                 args: vec![
                     "pr".into(),
@@ -688,6 +691,7 @@ impl Broker {
                 declared_effect: Some(OperationEffect::Read),
                 destructive_confirmed: false,
                 cross_session: None,
+                ref_write_acknowledged: false,
                 authorization_reason: None,
                 args: vec![
                     "pr".into(),
