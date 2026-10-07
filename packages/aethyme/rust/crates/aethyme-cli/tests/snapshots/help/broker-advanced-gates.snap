@@ -16,8 +16,10 @@ exit: 0
   aethyme broker advanced gates scope --base <ref> --head <ref> [--json]
       Evaluate the shared path selector for two exact commits using the
       gates.toml committed at head. Read-only; semantic hints stay advisory.
-  aethyme broker advanced gates affected --session <id> [--json]
-      Show which gates the session's diff selects and why.
+  aethyme broker advanced gates affected --session <id> [--json] [--timings]
+      Show which gates the session's diff selects and why, warning on stderr
+      when a phase exceeds its 5-second budget. --json prints the selection
+      array; --json --timings prints an object that adds per-phase timings.
   aethyme broker advanced gates semantic --session <id> [--json]
       Advisory semantic gate-selection report: shows enforced path-triggered
       gates plus caller-edge suggestion status. Never changes what submit,

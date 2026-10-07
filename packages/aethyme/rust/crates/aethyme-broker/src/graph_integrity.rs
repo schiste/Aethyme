@@ -684,20 +684,23 @@ mod tests {
         let (sender, receiver) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
             let mut broker = crate::Broker::open(&root).unwrap();
-            sender.send(broker.affected_gates(session_id)).unwrap();
+            sender
+                .send(broker.affected_gates_with_timings(session_id))
+                .unwrap();
         });
 
         let selected = receiver.recv_timeout(std::time::Duration::from_secs(30));
         drop(held);
-        let selected = selected
+        let report = selected
             .expect("affected-gate inspection waited on graph-integrity verification")
             .unwrap();
         worker.join().unwrap();
 
         assert_eq!(
-            selected,
+            report.selected_gates,
             vec![("source-check".to_string(), Some("src/lib.rs".to_string()))]
         );
+        assert_eq!(report.phase_timings_ms.lock_wait, 0);
     }
 
     #[test]
