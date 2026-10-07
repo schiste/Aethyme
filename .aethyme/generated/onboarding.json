@@ -90,7 +90,7 @@
         "member_count": 10,
         "ci_mentions": 37,
         "executable_entrypoints": 1,
-        "source_files": 562
+        "source_files": 575
       }
     },
     {
@@ -207,7 +207,7 @@
       "member_count": 10,
       "ci_mentions": 37,
       "executable_entrypoints": 1,
-      "source_files": 562
+      "source_files": 575
     }
   },
   "commands": [
@@ -377,6 +377,11 @@
       "path": ".aethyme/generated",
       "reason": "tracked generated or vendored surface; verify ownership before editing",
       "provenance": "tracked path classification"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-quality/tests/fixtures/quality_surface/src/generated",
+      "reason": "tracked generated or vendored surface; verify ownership before editing",
+      "provenance": "tracked path classification"
     }
   ],
   "dangerous_paths": [
@@ -423,9 +428,9 @@
     ]
   },
   "freshness": {
-    "source_digest": "27ae2fd7bbe84176a4ae15344fbb7fd9f6779c5c7761077a55f8614d7158a320",
+    "source_digest": "401f12e0d06a9abe653901a2c76f534030b5f223c34d5f43e07f3d44eb90be31",
     "source_commit": null,
-    "source_file_count": 987,
+    "source_file_count": 1003,
     "generator": "deterministic"
   },
   "notes": [
@@ -460,7 +465,7 @@
       "areas": 4,
       "entrypoints": 7,
       "caution_zones": 0,
-      "generated_paths": 1,
+      "generated_paths": 2,
       "dangerous_paths": 2,
       "navigation_recipes": 3,
       "notes": 9

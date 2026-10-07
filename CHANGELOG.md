@@ -4,6 +4,27 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.24] - 2026-10-08
+
+Agents can subscribe to a pull request or to every pull request of a repository, and receive a review prompt when one opens. A brokered push can run the review rules for its own pull request. Disposable checkouts are removed automatically. Tests run the same way locally and in CI. The broker database moves to schema 49 additively: 0.8.23 still opens it.
+
+### Changed
+
+- `aethyme broker advanced watch repo start|list|show|events|pause|resume|stop` subscribes a session to every pull request of a repository (`--include-drafts`, `--include-existing`, `--exclude-authors`, `--auto-watch`). Each new, ready or reopened pull request emits one event. `deliveries subscribe --repo-watch <id> --policy review|notify` sends the subscribed agent a review prompt rendered from `[watch.prompts.review]`, with pull-request text quoted as untrusted data (#611, issue #606).
+- `[review] run_on_push = true` (off by default) runs the review rules for a session's open, non-draft pull request right after `broker push`. The run is bounded by `run_on_push_budget_secs`, best-effort, and reported as `review_run` in `push --json`. Rule comment templates gain `{{head}}`, the full head SHA (#612, issue #610).
+- The unattended sweep removes a broker session checkout automatically when every owning session is terminal, no process, lease or gate uses it, it holds no local changes or valuable ignored files, and its commits are contained in the remote default branch. Each removal is journaled with its proof. A worktree with no recorded owner, the main checkout and `[cleanup] keep` pins are never removed. `[cleanup] auto_remove = false` turns it off (#605, issue #588).
+- Coordinated operations record which agent process ran them (pid, start time, program name, session). This is evidence, never authorization, and is shown by `operations show` (#613, issue #393).
+- `packages/aethyme/scripts/test-like-ci.sh` runs the test suite exactly as CI does (`--changed` or `--full`), and CI calls it (#600, issue #598).
+- The graph indexes TypeScript call edges (#608, issue #213).
+
+### Fixed
+
+- The `gh` guard lets `pr close <N>` and `pr reopen <N>` through without acknowledgement (#607).
+- `broker submit` refuses an unsupported trailing subcommand such as `status` before doing anything, with exit 2 (#609, issue #595).
+- `quality fix` no longer silently overwrites one fixer's change with another's on the same file (#614, issue #381).
+- The GC confirmation test and the gate-label test no longer flake (#601).
+- The broker opens a database that an unmerged development build migrated under a reused version number: migrations from v48 on are idempotent, and a repair pass recreates any v48+ table or column that is missing (#617).
+
 ## [0.8.23] - 2026-10-07
 
 **Breaking:** see [UPGRADING.md](UPGRADING.md#v0823).
