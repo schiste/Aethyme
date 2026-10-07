@@ -181,6 +181,7 @@ fn plan_after(
         classification: facts.classification.clone(),
         conflicts: Vec::new(),
         quality_report: None,
+        change: None,
     };
     let actions = project(
         &policies.projection,
