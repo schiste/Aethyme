@@ -16,7 +16,7 @@ version and the target, oldest first. Each schema migration runs on first open
 and is one-way, so rollback is limited to the oldest binary that still reads
 the newest schema you have opened.
 
-Breaking releases: [v0.8.8](#v088), [v0.8.2](#v082), [v0.8.1](#v081), [v0.8.0](#v080),
+Breaking releases: [v0.8.23](#v0823), [v0.8.8](#v088), [v0.8.2](#v082), [v0.8.1](#v081), [v0.8.0](#v080),
 [v0.7.25](#v0725), [v0.7.23](#v0723), [v0.7.22](#v0722), [v0.7.19](#v0719),
 [v0.7.18](#v0718), [v0.7.16](#v0716), [v0.7.9](#v079), [v0.7.8](#v078),
 [v0.7.4](#v074), [v0.7.2](#v072),
@@ -72,6 +72,40 @@ sections below keep the Compatibility, Before upgrading, Migrate and verify,
 and Rollback parts of the breaking ones. The full per-release guides, including
 the non-breaking ones, remain in Git history under
 `packages/aethyme/docs/guides/`.
+
+## v0.8.23
+
+v0.8.23 tightens what the broker lets through on shared branches and on `gh` writes. Scripts that relied on the old, looser behaviour must adapt before upgrading.
+
+### Compatibility
+
+**No schema migration.** The broker database stays at schema 47. Changed behaviour:
+
+- **Brokered `gh` writes.** Through `aethyme broker advanced gh`, only an exact allowlist runs without acknowledgement:
+  - comments on issues and pull requests;
+  - review comments and replies;
+  - reviews and review events;
+  - labels;
+  - issue edits;
+  - the porcelain `pr comment`, `pr review`, `pr edit`, `pr ready` and `issue …` commands.
+
+  `pr merge <N> --merge|--squash|--rebase [-d]` is checked against session ownership, and `--match-head-commit` is injected. Any other command that may write or delete a branch ref is refused with exit 3 unless `--destructive --ref-write-acknowledged` is given. That includes `gh api` with an unlisted endpoint, GraphQL mutations, `browse`, `config`, extensions, downloads to a chosen directory, and `pr create` without `--head`. `gh` now runs from `/opt/homebrew/bin`, `/usr/local/bin`, `/usr/bin` or `/bin`, with a fixed `PATH` and environment.
+- **Shared branches.** `main`, resolved from `origin/HEAD`, and `aethyme/integration` can no longer be deleted, force-updated or rebased through `broker advanced git|gh`. There is no override.
+- **Adopting the main checkout.** `broker start --adopt` in a repository's main checkout is refused. Use `broker start` for a fresh worktree, or `--allow-main-checkout` when the operator really means it. Re-entering an existing session there still works.
+
+### Migrate and verify
+
+Replace scripted `gh api` writes with allowlisted forms. Use the literal `repos/<owner>/<name>/…` path, never `{owner}/{repo}`. Otherwise add the acknowledgement flags where the operator approved the write. Then install the router and engine pair together, and verify:
+
+```bash
+aethyme --version && aethyme-engine-cli --version
+aethyme broker status --json
+aethyme broker advanced quick-test
+```
+
+### Rollback
+
+Reinstall the v0.8.22 router and engine pair together. It reads the same schema-47 database and restores the earlier `gh` and shared-branch behaviour.
 
 ## v0.8.8
 
