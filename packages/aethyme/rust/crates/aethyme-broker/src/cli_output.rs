@@ -5,7 +5,9 @@
 //! expensive. This repository's `gc plan` reached ~319 KB of stdout, roughly
 //! 80k tokens for a decision expressible in six lines, and it went unnoticed
 //! because `command-metrics.jsonl` recorded duration and exit status but not
-//! size.
+//! size. `gates affected` is the explicit read-only exception that records
+//! phase timings by default so stalls can be localized; other inspection
+//! commands remain telemetry-free unless output measurement is opted in.
 //!
 //! Counting happens at the single emission point [`out!`] rather than by
 //! wrapping the process's stdout, so the number is exact for everything the

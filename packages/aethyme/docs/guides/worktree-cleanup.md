@@ -1,6 +1,6 @@
 # Closed-session worktree cleanup
 
-Last Updated: 2026-09-22
+Last Updated: 2026-10-07
 
 Removing a session worktree is a reviewed operation. A closed session is not
 evidence that its work is safe to discard, and a worktree that looks clean can
@@ -43,6 +43,13 @@ It states the exact commit it proved against (the fetched upstream, not a local
 a blocker and a next action. Squash and rebase landings count as `in_target`;
 when the cleanup plan still calls one unproven, the next action is
 `aethyme broker advanced representation scan` and then `record`, not `--force`.
+The proof is ordered by cost (#588). A head that is an ancestor of any
+delivery target is landed by `ancestry`, checked against every target before
+any target gets the content and patch search, so a merge or fast-forward
+delivery never pays a candidate walk. Only squash and rebase deliveries, which
+ancestry cannot see, reach that search, and its patch comparison is verbatim
+(#586). Measured on a branch merged by a merge commit, with a diverged target
+of 2,000 commits listed first: 381 ms before, 10 ms after.
 Registrations whose directory is gone are administrative metadata: `git
 worktree prune --dry-run --verbose` handles them, separately from removing a
 checkout or a branch.

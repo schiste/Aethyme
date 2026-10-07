@@ -183,7 +183,6 @@ fn telemetry_classification_tracks_semantic_mutability() {
         args(&["report", "render", "report.json"]),
         args(&["checkpoint", "plan", "--session", "7"]),
         args(&["gates", "validate"]),
-        args(&["gates", "affected", "--session", "7"]),
         args(&["gates", "semantic", "--session", "7"]),
         args(&["gates", "doctor"]),
         args(&["doctor"]),
@@ -217,6 +216,7 @@ fn telemetry_classification_tracks_semantic_mutability() {
     }
 
     for command in [
+        args(&["gates", "affected", "--session", "7"]),
         args(&["hooks", "install"]),
         args(&["events", "prune", "--keep-days", "7"]),
         args(&["gates", "run", "--session", "7"]),
