@@ -127,14 +127,28 @@ fn documented_files() -> Vec<PathBuf> {
 /// Handles fenced examples (`$ aethyme ...`), inline code
 /// (`aethyme ...`), and list bullets.
 fn command_words(line: &str) -> Option<Vec<String>> {
-    // Strip an optional prompt marker, list bullet, or backtick.
+    // Strip any prompt/list markers before the command, then isolate a
+    // leading Markdown code span. Inline documentation often puts prose
+    // after that span (for example, an alias list); it is not part of the
+    // command path.
     let mut rest = line.trim();
-    for prefix in ["$ ", "> ", "- ", "* ", "`"] {
-        if let Some(stripped) = rest.strip_prefix(prefix) {
-            rest = stripped.trim_start();
+    loop {
+        let stripped = ["$ ", "> ", "- ", "* "]
+            .iter()
+            .find_map(|prefix| rest.strip_prefix(prefix));
+        let Some(stripped) = stripped else {
+            break;
+        };
+        rest = stripped.trim_start();
+    }
+    let delimiter_len = rest.bytes().take_while(|byte| *byte == b'`').count();
+    if delimiter_len > 0 {
+        let delimiter = "`".repeat(delimiter_len);
+        rest = &rest[delimiter_len..];
+        if let Some(end) = rest.find(&delimiter) {
+            rest = &rest[..end];
         }
     }
-    let rest = rest.trim_start_matches('`');
     let rest = rest.strip_prefix("aethyme ")?;
     // A `<placeholder>` marks a metavariable, not a literal word:
     // `aethyme broker advanced <verb>` documents the shape of a command.
@@ -271,6 +285,10 @@ fn command_extraction_recognises_documented_forms() {
         ("> aethyme task pack --repo . --task x", &["task", "pack"]),
         ("`aethyme explore`", &["explore"]),
         ("- `aethyme broker status`", &["broker", "status"]),
+        (
+            "- `aethyme broker submit` (also `submit prepare`, `submit promote`)",
+            &["broker", "submit"],
+        ),
         ("aethyme graph impact --repo .", &["graph", "impact"]),
     ];
     for (line, expected) in recognized {
