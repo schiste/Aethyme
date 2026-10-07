@@ -4,6 +4,38 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.23] - 2026-10-07
+
+**Breaking:** see [UPGRADING.md](UPGRADING.md#v0823).
+
+The broker measures pull request size and risk and can act on it through configuration, protects the default and integration branches, guards `gh` branch writes across sessions, and gains a cross-store doctor, lease liveness and handoffs, and a verified self-update.
+
+### Changed
+
+- **Breaking:** brokered `gh` commands that can write or delete a branch ref are guarded. Only an exact allowlist of non-ref writes runs without acknowledgement: issue and PR comments, reviews, labels and issue edits. `pr merge` is checked against session ownership, with `--match-head-commit` injected. Anything else that may write a ref is refused unless `--destructive --ref-write-acknowledged` is given. `gh` runs from a trusted directory with a fixed `PATH` and environment (#566, issue #393).
+- **Breaking:** `main` (resolved from `origin/HEAD`) and `aethyme/integration` can no longer be deleted, force-updated or rebased through `broker advanced git|gh`. Plain pushes and merges into them still run. `start --adopt` refuses the repository's main checkout unless `--allow-main-checkout` is given (#594, issue #284).
+- The broker measures each pull request's size, risk signals and tier (`trivial`, `normal`, `large`; risk `none` through `critical`) in `review plan`. With `[review.projection]` enabled it flags them with `aethyme/size:*` and `aethyme/risk:*` labels and does nothing else by default. `[review] pr_size` sets the size thresholds, and `broker push --pr` warns above them (#589, issues #584 and #239).
+- Review rules can condition on tier, size and signals, and can act deterministically:
+  - `waive`: a waiver bound to the head, with guardrails the broker enforces;
+  - `labels`;
+  - `comment`: a pull request comment rendered from a `[review.comments.<name>]` template with broker-computed variables only, edited in place and never re-posted unchanged.
+  (#593, #597, issues #584 and #596).
+- `broker status doctor plan|apply --confirm <digest>` reports debris across stores and removes only resources whose owner is verifiably dead. Gate commands receive `AETHYME_GATE_RUN_ID` and `AETHYME_GATE_LABELS` to label what they start (#583, issues #287 and #286).
+- Lease liveness is bound to the holder process (`active`, `idle`, `stale`, `released`, `unknown`), with a configurable stale grace period. A verified `finish` releases its leases. `leases request-release`, `ack`, `decline` and `wait` coordinate handoffs, with an automatic grant only against a stale holder (#576, #578, #579, issues #360, #358, #359 and #191).
+- `aethyme self-update` installs the verified release pair atomically. `broker status` raises `install.replaced` when the installed build changes under a session (#577, issues #293 and #251).
+- In verify-only repositories, `aethyme/integration` is a disposable verify base. It is refreshed automatically when it holds nothing of its own, and `broker ship` refuses there (#575, #581, issues #352 and #369). `integration reconcile` accepts `tracked_elsewhere` for work preserved on a pushed branch or an open pull request (#582, issue #464).
+- A sound `Stale` graph-integrity verdict advises on submit and on brokered merges, and never blocks (#574, issues #280 and #292).
+- Brokered pushes tell hooks their shape through `AETHYME_PUSH_KIND` and `AETHYME_PUSH_REFS`, and a delete-only push skips the broker's own dry run (#573, issue #264).
+- Broker commands fast-forward a clean main checkout that is strictly behind. They never do so under a live session or an in-progress Git operation (#591, issue #232).
+- `gates affected` records per-phase timings in its metric. `--timings` prints them as JSON (#585, issue #481).
+
+### Fixed
+
+- Every "already landed" verdict compares patches with `git patch-id --verbatim`, so a whitespace-only difference is no longer taken as landed (#586).
+- Landing proofs try ancestry against every delivery target before any content or patch search (#592, issue #588).
+- Review projection writes (comment edits) use the exact repository path the ref guard allows (#599).
+- The nightly workflow publishes workspace coverage (#587, issue #380).
+
 ## [0.8.22] - 2026-10-06
 
 Broker status, worktree listings and brokered reads return within a bounded time on large hosts. A provider's definitive refusal no longer write-blocks the repository. A re-adopted worktree keeps the commits it still owes. The Homebrew tap is published from a reusable, retryable workflow.

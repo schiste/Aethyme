@@ -71,6 +71,7 @@ fn report_only_commands_do_not_append_metrics() {
         "broker",
         "start",
         "--adopt",
+        "--allow-main-checkout",
         "--task",
         "fixture",
         "--short-name",

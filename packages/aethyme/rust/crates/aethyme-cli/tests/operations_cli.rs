@@ -27,6 +27,8 @@ fn repo() -> (tempfile::TempDir, i64) {
         "broker",
         "start",
         "--adopt",
+        // The fixture is its own main checkout (#284 proposal 9).
+        "--allow-main-checkout",
         "--task",
         "operation test",
         "--short-name",

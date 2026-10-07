@@ -596,7 +596,7 @@ fn execution_records_every_review_before_it_asks_for_one() {
         .display()
         .to_string();
     let (_, dispatch, actions) = plan(&policies, &change, "abc123", &[tab(&workspace)], &[]);
-    let plan = plan_execution(&dispatch, &actions, &[], 77);
+    let plan = plan_execution(&dispatch, &actions, &[], 77, "acme/product");
 
     // security -> chau7, code -> the provider bot. Both are recorded as
     // requested; neither is closed by the act of planning.
@@ -641,7 +641,7 @@ fn a_deferred_review_is_not_recorded_as_spent() {
         .display()
         .to_string();
     let (_, dispatch, actions) = plan(&policies, &change, "abc123", &[tab(&workspace)], &[]);
-    let plan = plan_execution(&dispatch, &actions, &[], 77);
+    let plan = plan_execution(&dispatch, &actions, &[], 77, "acme/product");
     for deferred in &plan.deferred {
         assert!(
             !plan
@@ -683,7 +683,7 @@ fn a_finished_reviewers_workspace_is_reclaimed_and_becomes_dispatchable_again() 
 
     // 1. Nothing is standing in the workspace, so the review is dispatched.
     let (_, dispatch, actions) = plan(&policies, &change, "aaa111", &[], &[]);
-    let first = plan_execution(&dispatch, &actions, &[], 77);
+    let first = plan_execution(&dispatch, &actions, &[], 77, "acme/product");
     assert_eq!(first.chau7.len(), 1, "the security review is handed out");
     assert_eq!(first.chau7[0].workspace, workspace);
     assert!(first.chau7_close.is_empty(), "nothing has finished yet");
@@ -747,7 +747,7 @@ fn a_finished_reviewers_workspace_is_reclaimed_and_becomes_dispatchable_again() 
     // The plan carries it, and carries it as its own step: an adapter that
     // only read `chau7` would start reviews and never release one.
     let (_, dispatch, actions) = plan(&policies, &change, "aaa111", &occupied, &[]);
-    let reclaiming = plan_execution(&dispatch, &actions, &teardown, 77);
+    let reclaiming = plan_execution(&dispatch, &actions, &teardown, 77, "acme/product");
     assert_eq!(reclaiming.chau7_close.len(), 1);
     assert_eq!(reclaiming.chau7_close[0].workspace, workspace);
 

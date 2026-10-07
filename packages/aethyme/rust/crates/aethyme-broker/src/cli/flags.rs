@@ -72,6 +72,7 @@ pub(super) const FLAG_RULES: &[(&str, &[&str])] = &[
             "--sync-integration",
             "--replace-stale",
             "--take-over",
+            "--allow-main-checkout",
             // `start --adopt` resolves here; the flag only selects the handler.
             "--adopt",
         ],
