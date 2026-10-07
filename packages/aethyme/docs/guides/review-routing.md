@@ -527,15 +527,18 @@ measurement under `change`:
 
 | Field | Meaning |
 | --- | --- |
-| `size` | `files_changed`, `lines_added`, `lines_deleted`, `churn`. Files `.gitattributes` marks `linguist-generated` and lockfiles are left out and listed under `size.excluded`; binary files count as files with no lines. |
+| `size` | `files_changed`, `lines_added`, `lines_deleted`, `churn`. Files the **base** commit's `.gitattributes` marks `linguist-generated`, and lockfiles, are left out and listed under `size.excluded`; a change cannot mark its own files generated. Binary files count as files with no lines. |
 | `signals` | Each with the evidence that set it: `sensitive_paths`, `contract_surface` (`clear`, `touched` with the symbols, or `unknown` when no diff text could be scanned), `gate_policy` (`.aethyme/gates.toml`, `.aethyme/config.toml`), `workflows` (`.github/workflows/**`), `migrations`, `dependency_manifest`, `from_fork`, `first_time_contributor`, `authored_by_model`. |
 | `tier` | `trivial`, `normal` or `large`, from the thresholds below. |
 | `computed_risk` | `high` for sensitive paths, a touched contract, gate policy, workflows, migrations or a fork; `low` for dependency manifests, a first-time contributor or a `large` change; otherwise `none`. |
 | `risk`, `risky` | The computed risk raised by a higher `Risk:` declaration -- a declaration never lowers it -- and whether that is `high` or above. |
 | `reasons` | One sentence per conclusion. |
 
-An unknown contract scan does not raise the risk label, but it never counts as
-clear for anything that relaxes review.
+`signals.unknown` lists inputs that could not be determined -- `contract_surface`
+when no diff could be scanned, `generated_attributes` when the base
+`.gitattributes` could not be read (every file then counts). An unknown input
+does not raise the risk label, but it never counts as clear for anything that
+relaxes review.
 
 Thresholds and paths are configuration:
 
