@@ -60,3 +60,89 @@ jobs:
 
       - name: Run doctests
         run: cargo test --locked --workspace --doc
+
+  rust-coverage-linux:
+    name: Rust workspace coverage (Linux)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: packages/aethyme/rust
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: packages/aethyme/rust
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: cargo-llvm-cov@0.9.1
+
+      - name: Generate workspace coverage reports
+        run: |
+          mkdir -p coverage
+          cargo llvm-cov --locked --workspace --html --output-dir coverage/html
+          cargo llvm-cov report --lcov --output-path coverage/lcov.info
+
+      - name: Add per-crate coverage to the job summary
+        run: |
+          {
+            echo "## Rust workspace coverage"
+            echo
+            echo "| Crate | Lines hit | Lines found | Coverage |"
+            echo "| --- | ---: | ---: | ---: |"
+            awk -F/ '
+              function add_file() {
+                if (crate != "") {
+                  total[crate] += file_total
+                  covered[crate] += file_covered
+                }
+              }
+              /^SF:/ {
+                add_file()
+                crate = ""
+                for (i = 1; i <= NF; i++) {
+                  if ($i == "crates" && $(i + 1) != "") {
+                    crate = $(i + 1)
+                    break
+                  }
+                }
+                file_total = 0
+                file_covered = 0
+              }
+              /^LF:/ { file_total = substr($0, 4) + 0 }
+              /^LH:/ { file_covered = substr($0, 4) + 0 }
+              END {
+                add_file()
+                for (name in total) {
+                  workspace_total += total[name]
+                  workspace_covered += covered[name]
+                  percent = total[name] ? 100 * covered[name] / total[name] : 0
+                  printf "%s|%d|%d|%.1f%%\n", name, covered[name], total[name], percent
+                }
+                percent = workspace_total ? 100 * workspace_covered / workspace_total : 0
+                printf "workspace-total|%d|%d|%.1f%%\n", workspace_covered, workspace_total, percent
+              }
+            ' coverage/lcov.info | LC_ALL=C sort -t '|' -k1,1 |
+            while IFS='|' read -r crate hit total percent; do
+              printf '| %s | %s | %s | %s |\n' "$crate" "$hit" "$total" "$percent"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload workspace coverage reports
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: rust-workspace-coverage
+          path: |
+            packages/aethyme/rust/coverage/lcov.info
+            packages/aethyme/rust/coverage/html/
+          if-no-files-found: error
+          retention-days: 14
