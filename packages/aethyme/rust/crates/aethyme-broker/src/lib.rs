@@ -62,6 +62,7 @@ pub use gate_debris::{
     DebrisPlan, DebrisRemoval, DebrisRuntime, GATE_LABELS_ENV, GATE_RUN_ID_ENV, GateRunLabels,
     RuntimeResource, RuntimeResourceKind,
 };
+mod auto_cleanup;
 mod gate_doctor;
 mod gates;
 mod gc;
@@ -194,6 +195,10 @@ pub use aethyme_graph_storage::{
     GRAPH_CONFIG_RELPATH, GraphAuthority, GraphIntegrityPolicy, GraphIntegrityPolicyError,
 };
 pub use attribution::{Attribution, Identity};
+pub use auto_cleanup::{
+    AutoCleanupPlan, AutoCleanupPolicy, AutoCleanupReport, AutoKeptCheckout, AutoRemovedCheckout,
+    BUILT_IN_REGENERABLE,
+};
 pub use blockers::{
     BLOCKER_CLEARED, Blocker, BlockerKind, BlockerRef, BlockerReport, BlockerScope,
     BlockerSourceError, PairedRecovery, UnblockOutcome, UnblockRefusal, UnblockReport,

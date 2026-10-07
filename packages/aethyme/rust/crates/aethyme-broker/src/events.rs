@@ -37,6 +37,8 @@ pub const BROKER_GC_ARTIFACTS_SWEPT: &str = "broker.gc.artifacts-swept";
 
 /// Dead shared preparation-cache entries reclaimed without an operator.
 pub const BROKER_GC_PREPARATION_SWEPT: &str = "broker.gc.preparation-swept";
+/// A disposable checkout removed by the unattended sweep, with its proof (#588).
+pub const BROKER_CLEANUP_AUTO_REMOVED: &str = "broker.cleanup.auto_removed";
 pub const BROKER_COMMAND_SUCCEEDED: &str = "broker.command.succeeded";
 /// A closed session's uncommitted or unlanded work was written to a verified
 /// recovery archive before its worktree was removed.
